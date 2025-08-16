@@ -1,0 +1,29 @@
+[workspace]
+members = [
+    "pancetta-audio",
+]
+resolver = "2"
+
+[workspace.dependencies]
+# Real-time audio processing
+cpal = "0.15"
+# Lock-free data structures for real-time communication
+ringbuf = "0.4"
+# High-precision timing
+instant = "0.1"
+# Atomic operations for real-time coordination
+atomic = "0.6"
+
+[profile.release]
+# Optimize for real-time performance
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+# Fast compilation for development
+opt-level = 1
+debug = true
+panic = "abort"

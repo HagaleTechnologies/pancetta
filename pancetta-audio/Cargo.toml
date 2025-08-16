@@ -1,0 +1,24 @@
+[package]
+name = "pancetta-audio"
+version = "0.1.0"
+edition = "2021"
+authors = ["Pancetta Team"]
+description = "Real-time audio processing core for Pancetta - Week 0 Technical POC"
+
+[dependencies]
+# Use workspace dependencies for consistency
+cpal = { workspace = true }
+ringbuf = { workspace = true }
+instant = { workspace = true }
+atomic = { workspace = true }
+
+[features]
+default = []
+# Feature for even more aggressive real-time optimizations
+rt-optimized = []
+
+# Real-time performance configuration
+[profile.release]
+panic = "abort"
+overflow-checks = false
+debug-assertions = false
