@@ -80,10 +80,9 @@ metrics = []
 prometheus = ["metrics-exporter-prometheus"]
 tracing-json = []
 
-# Benchmarks will be added in future releases
-# [[bench]]
-# name = "integration_performance"
-# harness = false
+[[bench]]
+name = "pipeline_bench"
+harness = false
 
 [profile.release]
 # Optimize for real-time performance

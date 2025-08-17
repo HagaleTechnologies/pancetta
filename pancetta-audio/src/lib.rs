@@ -17,6 +17,7 @@ pub mod error;
 pub mod processor;
 pub mod converter;
 pub mod message_bus_integration;
+pub mod manager;
 
 pub use realtime::*;
 pub use latency::*;
@@ -27,3 +28,4 @@ pub use error::*;
 pub use processor::*;
 pub use converter::*;
 pub use message_bus_integration::*;
+pub use manager::{AudioManager, AudioManagerConfig, AudioManagerStats, AudioMessage, AudioCommand};

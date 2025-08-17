@@ -20,8 +20,7 @@
 //! - Memory usage: <50MB for coordination layer
 
 use anyhow::Result;
-// TODO: Import when AudioManager is available
-// use pancetta_audio::{AudioManager, AudioConfig as AudioSettings, AudioDevice};
+use pancetta_audio::{AudioManager, AudioManagerConfig};
 use pancetta_config::Config;
 use pancetta_dsp::DspPipeline;
 use pancetta_ft8::{Ft8Decoder, Ft8Config};
@@ -235,22 +234,172 @@ impl ApplicationCoordinator {
         let span = span!(Level::INFO, "start_audio");
         let _enter = span.enter();
         
-        info!("Starting audio component (stubbed)");
+        // Check if we should use stub audio (for testing without real audio device)
+        let use_stub = std::env::var("PANCETTA_STUB_AUDIO").is_ok();
         
-        // TODO: Implement when AudioManager is available
-        // For now, just create a dummy task that generates test audio
+        if use_stub {
+            info!("Starting audio component with STUB (set PANCETTA_STUB_AUDIO to disable)");
+        } else {
+            info!("Starting audio component with real AudioManager");
+        }
+        
+        // Create message bus channel
         let (audio_tx, _audio_rx) = self.message_bus.create_channel(ComponentId::Audio).await?;
         
-        let audio_handle = {
+        let audio_handle = if !use_stub {
+            // Use real AudioManager
+            let config = self.config.read().await;
+            let audio_config = AudioManagerConfig {
+                input_device: Some(config.audio.input_device.clone()),
+                output_device: Some(config.audio.output_device.clone()),
+                sample_rate: config.audio.sample_rate,
+                buffer_size: config.audio.buffer_size as usize,
+                channels: config.audio.input_channels as u16,
+                enable_monitoring: false, // Use default for now
+                target_latency_ms: 1.0, // Use 1ms default target
+                input_gain_db: config.audio.levels.input_gain_db,
+            };
+            drop(config);
+            
+            // Create task to process audio from AudioManager
+            let shutdown = self.shutdown_signal.clone();
+            
+            // Run AudioManager in a dedicated thread (non-Send)
+            // Create it inside the thread to avoid Send requirements
+            let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(100);
+            
+            std::thread::spawn(move || {
+                // Create AudioManager inside the thread
+                let mut audio_manager = match AudioManager::with_config(audio_config) {
+                    Ok(manager) => manager,
+                    Err(e) => {
+                        error!("Failed to create AudioManager: {}", e);
+                        return;
+                    }
+                };
+                
+                // List available devices for debugging
+                let devices = audio_manager.list_devices();
+                for device in devices {
+                    debug!("Available audio device: {}", device.name);
+                }
+                
+                // Start audio stream
+                if let Err(e) = audio_manager.start() {
+                    error!("Failed to start audio stream: {}", e);
+                    return;
+                }
+                
+                info!("AudioManager started in dedicated thread");
+                
+                loop {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    
+                    // Process audio from AudioManager
+                    match audio_manager.process_audio() {
+                        Ok(Some(samples)) => {
+                            // Send samples through channel to async task
+                            if let Err(_) = result_tx.blocking_send(samples) {
+                                break; // Channel closed
+                            }
+                            
+                            // Log statistics periodically
+                            let stats = audio_manager.get_stats();
+                            if stats.samples_processed % 48000 == 0 {
+                                debug!(
+                                    "Audio stats - Latency: {}μs, Signal: {:.3}, Samples: {}",
+                                    stats.current_latency_us,
+                                    stats.signal_level,
+                                    stats.samples_processed
+                                );
+                            }
+                        }
+                        Ok(None) => {
+                            // No audio data available yet
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        Err(e) => {
+                            error!("Audio processing error: {}", e);
+                        }
+                    }
+                }
+                
+                // Stop audio manager on shutdown
+                if let Err(e) = audio_manager.stop() {
+                    error!("Error stopping audio manager: {}", e);
+                }
+                
+                info!("Audio manager thread stopped");
+            });
+            
+            // Create async task to relay audio samples to message bus
+            let last_timestamp = self.last_audio_timestamp.clone();
+            
+            tokio::spawn(async move {
+                while let Some(samples) = result_rx.recv().await {
+                    // Update timestamp
+                    {
+                        let mut timestamp = last_timestamp.write().await;
+                        *timestamp = Some(Instant::now());
+                    }
+                    
+                    // Send audio data through message bus
+                    let message = ComponentMessage::new(
+                        ComponentId::Audio,
+                        ComponentId::Dsp,
+                        MessageType::AudioData(samples),
+                        Instant::now(),
+                    );
+                    
+                    if let Err(e) = audio_tx.try_send(message) {
+                        warn!("Failed to send audio data: {}", e);
+                    }
+                }
+                
+                info!("Audio relay task stopped");
+                Ok(())
+            })
+        } else {
+            // Use stub audio for testing
             let last_timestamp = self.last_audio_timestamp.clone();
             let shutdown = self.shutdown_signal.clone();
             
+            // Get audio config from locked config
+            let config = self.config.read().await;
+            let sample_rate = config.audio.sample_rate;
+            let buffer_size = config.audio.buffer_size as usize;
+            drop(config); // Release lock early
+            
             tokio::spawn(async move {
+                let mut phase = 0.0f32;
+                let frequency = 1500.0; // FT8 center frequency
+                let mut sample_count = 0u64;
+                
+                // Calculate buffer timing based on real config
+                let buffer_duration_ms = (buffer_size as f64 * 1000.0 / sample_rate as f64) as u64;
+                let mut process_interval = interval(Duration::from_millis(buffer_duration_ms.max(5)));
+                
+                info!("Audio stub: {}Hz sample rate, {} buffer size, {}ms interval", 
+                     sample_rate, buffer_size, buffer_duration_ms);
+                
                 while !shutdown.load(Ordering::Relaxed) {
-                    // Generate test audio samples
-                    let test_samples: Vec<f32> = (0..1024)
-                        .map(|i| 0.1 * (2.0 * std::f32::consts::PI * 1500.0 * i as f32 / 48000.0).sin())
-                        .collect();
+                    process_interval.tick().await;
+                    
+                    // Generate more realistic test audio
+                    let mut samples = Vec::with_capacity(buffer_size);
+                    for _ in 0..buffer_size {
+                        // Generate sine wave (add noise later when rand is available)
+                        let sample = 0.1 * phase.sin();
+                        samples.push(sample);
+                        
+                        phase += 2.0 * std::f32::consts::PI * frequency / sample_rate as f32;
+                        if phase > 2.0 * std::f32::consts::PI {
+                            phase -= 2.0 * std::f32::consts::PI;
+                        }
+                        sample_count += 1;
+                    }
                     
                     // Update timestamp
                     {
@@ -258,11 +407,11 @@ impl ApplicationCoordinator {
                         *timestamp = Some(Instant::now());
                     }
                     
-                    // Send test audio data through message bus
+                    // Send audio data through message bus
                     let message = ComponentMessage::new(
                         ComponentId::Audio,
                         ComponentId::Dsp,
-                        MessageType::AudioData(test_samples),
+                        MessageType::AudioData(samples),
                         Instant::now(),
                     );
                     
@@ -270,8 +419,14 @@ impl ApplicationCoordinator {
                         warn!("Failed to send audio data: {}", e);
                     }
                     
-                    // Simulate audio buffer timing
-                    sleep(Duration::from_millis(20)).await;
+                    // Log statistics periodically (every second)
+                    if sample_count % sample_rate as u64 == 0 {
+                        debug!(
+                            "Audio stub stats - Samples: {}, Buffer duration: {}ms",
+                            sample_count,
+                            buffer_duration_ms
+                        );
+                    }
                 }
                 
                 info!("Audio component stopped");
@@ -281,7 +436,11 @@ impl ApplicationCoordinator {
         
         self.task_handles.push(audio_handle);
         
-        info!("Audio component started (stubbed)");
+        if use_stub {
+            info!("Audio component started (stub mode)");
+        } else {
+            info!("Audio component started (real AudioManager)");
+        }
         Ok(())
     }
     
@@ -337,20 +496,35 @@ impl ApplicationCoordinator {
                     }
                 });
                 
-                // Process DSP output
+                // Process DSP output with windowing for FT8
                 let output_task = tokio::spawn(async move {
+                    // Buffer for accumulating samples for FT8 window
+                    let mut ft8_buffer = Vec::with_capacity(151680); // 12.64s at 12kHz
+                    const FT8_WINDOW_SIZE: usize = 151680; // 12.64 seconds at 12kHz
+                    
                     while !shutdown_for_output.load(Ordering::Relaxed) {
-                        if let Ok(processed_window) = dsp_output_rx.recv() {
-                            // Send to FT8 decoder
-                            let message = ComponentMessage::new(
-                                ComponentId::Dsp,
-                                ComponentId::Ft8Decoder,
-                                MessageType::DspData(processed_window),
-                                Instant::now(),
-                            );
+                        if let Ok(processed_samples) = dsp_output_rx.recv() {
+                            // Accumulate samples
+                            ft8_buffer.extend_from_slice(&processed_samples);
                             
-                            if let Err(e) = dsp_tx.try_send(message) {
-                                warn!("Failed to send DSP data: {}", e);
+                            // Check if we have enough samples for FT8 window
+                            while ft8_buffer.len() >= FT8_WINDOW_SIZE {
+                                // Extract exactly one window
+                                let window: Vec<f32> = ft8_buffer.drain(..FT8_WINDOW_SIZE).collect();
+                                
+                                // Send to FT8 decoder
+                                let message = ComponentMessage::new(
+                                    ComponentId::Dsp,
+                                    ComponentId::Ft8Decoder,
+                                    MessageType::DspData(window),
+                                    Instant::now(),
+                                );
+                                
+                                if let Err(e) = dsp_tx.try_send(message) {
+                                    warn!("Failed to send DSP data to FT8 decoder: {}", e);
+                                }
+                                
+                                debug!("Sent FT8 window ({}  samples) to decoder", FT8_WINDOW_SIZE);
                             }
                         }
                     }
@@ -619,19 +793,92 @@ impl ApplicationCoordinator {
         
         // Start TUI task
         let tui_handle = {
-            let _config = self.config.clone();
+            let config = self.config.clone();
             let shutdown = self.shutdown_signal.clone();
             
             tokio::spawn(async move {
-                // This will be implemented when we have the TUI interface ready
-                // For now, just handle incoming messages
+                // Create TUI configuration
+                let config_lock = config.read().await;
+                let tui_config = pancetta_tui::Config {
+                    station: pancetta_tui::config::StationConfig {
+                        call_sign: config_lock.station.callsign.clone(),
+                        grid_square: config_lock.station.grid_square.clone(),
+                        power: config_lock.station.power_watts,
+                        antenna: "Vertical".to_string(), // TODO: Add antenna field to config
+                        rig: config_lock.rig.model.clone(),
+                        default_frequency: 14.074,
+                    },
+                    ui: pancetta_tui::config::UiConfig {
+                        theme: pancetta_tui::Theme::Dark,
+                        refresh_rate: 30,
+                        max_messages: 100,
+                        show_waterfall: true,
+                        show_coordinates: true,
+                        time_format: pancetta_tui::config::TimeFormat::UTC24,
+                        frequency_format: pancetta_tui::config::FrequencyFormat::MHz,
+                    },
+                    audio: pancetta_tui::config::AudioConfig {
+                        device: Some(config_lock.audio.input_device.clone()),
+                        sample_rate: config_lock.audio.sample_rate,
+                        buffer_size: config_lock.audio.buffer_size as usize,
+                        auto_gain: false,
+                        gain_level: config_lock.audio.levels.input_gain_db,
+                    },
+                    decoder: pancetta_tui::config::DecoderConfig {
+                        enabled_modes: vec!["FT8".to_string()],
+                        minimum_snr: -20,
+                        decode_depth: 3,
+                        aggressive_decode: true,
+                        enable_averaging: false,
+                    },
+                    bands: pancetta_tui::config::BandConfig {
+                        bands: vec![],
+                        default_band: "20m".to_string(),
+                    },
+                };
+                drop(config_lock);
+                
+                // Create TUI app
+                let app = match pancetta_tui::create_app(tui_config, None).await {
+                    Ok(app) => Arc::new(RwLock::new(app)),
+                    Err(e) => {
+                        error!("Failed to create TUI app: {}", e);
+                        return Err(anyhow::anyhow!("TUI creation failed"));
+                    }
+                };
+                
+                // Process messages and update TUI state
                 while !shutdown.load(Ordering::Relaxed) {
                     match tui_rx.try_recv() {
                         Ok(message) => {
                             match message.message_type {
                                 MessageType::DecodedMessage(decoded_msg) => {
-                                    // TODO: Update TUI with decoded message
-                                    info!("Decoded: {}", decoded_msg.text);
+                                    // Update TUI with decoded message
+                                    let mut app_lock = app.write().await;
+                                    
+                                    // Extract callsign and grid from the message
+                                    let call_sign = decoded_msg.message.from_callsign.clone();
+                                    let grid_square = decoded_msg.message.grid_square.clone();
+                                    
+                                    app_lock.add_decoded_message(pancetta_tui::DecodedMessage {
+                                        timestamp: chrono::Utc::now(),
+                                        frequency: 14.074, // TODO: Get actual frequency in MHz
+                                        mode: "FT8".to_string(),
+                                        snr: decoded_msg.snr_db as i32,
+                                        delta_time: decoded_msg.time_offset as f32,
+                                        delta_freq: decoded_msg.frequency_offset as f32,
+                                        call_sign,
+                                        grid_square,
+                                        message: decoded_msg.text.clone(),
+                                        distance: None, // TODO: Calculate distance from grid
+                                        bearing: None,  // TODO: Calculate bearing from grid
+                                    });
+                                    drop(app_lock);
+                                    
+                                    info!("TUI: Decoded message added - {}", decoded_msg.text);
+                                }
+                                MessageType::StatusUpdate(status) => {
+                                    debug!("TUI: Status update - {}", status);
                                 }
                                 _ => {}
                             }

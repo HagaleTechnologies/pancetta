@@ -110,6 +110,9 @@ pub enum MessageType {
     
     /// DX cluster messages
     DxMessage(DxMessage),
+    
+    /// Status update message
+    StatusUpdate(String),
 }
 
 /// Hamlib rig control messages
