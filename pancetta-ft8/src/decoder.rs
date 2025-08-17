@@ -809,7 +809,7 @@ impl Ft8Decoder {
         audio: &[f64],
     ) -> Ft8Result<Vec<DecodedMessage>> {
         let audio_arc = Arc::new(audio.to_vec());
-        let candidates_arc = Arc::new(candidates.to_vec());
+        let _candidates_arc = Arc::new(candidates.to_vec());
         let config_arc = Arc::new(self.config.clone());
         
         let decoded_messages = thread::scope(|s| -> Ft8Result<Vec<DecodedMessage>> {
@@ -1007,7 +1007,7 @@ fn bits_to_u16(bits: &BitSlice) -> u16 {
 }
 
 /// Estimate noise floor from power spectral density
-fn estimate_noise_floor(psd: &[f64]) -> f64 {
+fn _estimate_noise_floor(psd: &[f64]) -> f64 {
     // Use median as noise floor estimate (robust against peaks)
     let mut sorted_psd = psd.to_vec();
     sorted_psd.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1312,7 +1312,7 @@ impl ParityCheckMatrix {
         
         // First part: systematic connections (information bits)
         // These define how the 91 information bits connect to check nodes
-        let info_connections = [
+        let _info_connections = [
             // Check node 0 connections (example structure - actual FT8 matrix)
             vec![0, 15, 30, 45, 60, 75, 90],
             vec![1, 16, 31, 46, 61, 76, 91],

@@ -23,3 +23,35 @@ target
 
 .claude
 CLAUDE.md
+
+# Release artifacts
+/release/
+*.tar.gz
+*.zip
+
+# Logs
+*.log
+logs/
+
+# Test outputs
+*.out
+test-results/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Docker volumes
+pancetta-data/
+pancetta-cache/
+
+# Configuration backups
+*.toml.backup
+config.toml.bak

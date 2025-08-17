@@ -639,19 +639,89 @@ impl ApplicationCoordinator {
             let shutdown = self.shutdown_signal.clone();
             
             tokio::spawn(async move {
-                // Initialize with mock rig for POC
-                #[cfg(feature = "mock-rig")]
-                {
-                    use pancetta_hamlib::{MockRig, RigControl};
+                // Check if we should use mock or real rigctld
+                let use_mock = std::env::var("PANCETTA_MOCK_RIG")
+                    .map(|v| v.to_lowercase() == "true" || v == "1")
+                    .unwrap_or(true); // Default to mock for safety
+                
+                // Create appropriate rig controller
+                let rig: Box<dyn pancetta_hamlib::RigControl + Send + Sync> = if use_mock {
+                    info!("Using mock rig (set PANCETTA_MOCK_RIG to disable)");
+                    Box::new(pancetta_hamlib::MockRig::default())
+                } else {
+                    info!("Using rigctld client");
                     
-                    let rig = MockRig::default();
-                    if let Err(e) = rig.connect().await {
-                        error!("Failed to connect mock rig: {}", e);
-                        return Err(anyhow::anyhow!("Hamlib connection failed"));
+                    // Check for custom rigctld config from environment
+                    let host = std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+                    let port = std::env::var("RIGCTLD_PORT")
+                        .ok()
+                        .and_then(|p| p.parse::<u16>().ok())
+                        .unwrap_or(4532);
+                    
+                    let config = pancetta_hamlib::RigctldConfig {
+                        host,
+                        port,
+                        ..Default::default()
+                    };
+                    
+                    Box::new(pancetta_hamlib::RigctldClient::new(config))
+                };
+                
+                // Try to connect
+                match rig.connect().await {
+                    Ok(_) => {
+                        info!("Rig connected successfully");
                     }
-                    
-                    info!("Mock rig connected successfully");
+                    Err(e) => {
+                        error!("Failed to connect to rig: {}. Continuing without rig control.", e);
+                        // Continue anyway - rig control is optional
+                    }
                 }
+                
+                // Start polling task for status updates
+                let rig_poll = Arc::new(rig);
+                let rig_for_polling = Arc::clone(&rig_poll);
+                let hamlib_tx_for_polling = hamlib_tx.clone();
+                let shutdown_for_polling = shutdown.clone();
+                
+                tokio::spawn(async move {
+                    let mut poll_interval = interval(Duration::from_millis(500));
+                    
+                    while !shutdown_for_polling.load(Ordering::Relaxed) {
+                        poll_interval.tick().await;
+                        
+                        if let Ok(status) = rig_for_polling.get_status().await {
+                            if status.connection_state == pancetta_hamlib::ConnectionState::Connected {
+                                // Get current frequency
+                                if let Ok(freq) = rig_for_polling.get_frequency(pancetta_hamlib::Vfo::Current).await {
+                                let message = ComponentMessage::new(
+                                    ComponentId::Hamlib,
+                                    ComponentId::Tui,
+                                    MessageType::RigControl(crate::message_bus::RigControlMessage::FrequencyResponse {
+                                        vfo: 0,
+                                        frequency: freq,
+                                    }),
+                                    Instant::now(),
+                                );
+                                let _ = hamlib_tx_for_polling.try_send(message);
+                            }
+                            
+                                // Get signal strength
+                                if let Ok(strength) = rig_for_polling.get_s_meter().await {
+                                    let message = ComponentMessage::new(
+                                        ComponentId::Hamlib,
+                                        ComponentId::Tui,
+                                        MessageType::RigControl(crate::message_bus::RigControlMessage::SignalStrengthResponse {
+                                            dbm: strength,
+                                        }),
+                                        Instant::now(),
+                                    );
+                                    let _ = hamlib_tx_for_polling.try_send(message);
+                                }
+                            }
+                        }
+                    }
+                });
                 
                 // Process messages
                 while !shutdown.load(Ordering::Relaxed) {
@@ -665,9 +735,47 @@ impl ApplicationCoordinator {
                                 match rig_msg {
                                     crate::message_bus::RigControlMessage::SetFrequency { vfo, frequency } => {
                                         debug!("Setting frequency VFO {} to {}", vfo, frequency);
+                                        let vfo_enum = if *vfo == 0 {
+                                            pancetta_hamlib::Vfo::A
+                                        } else {
+                                            pancetta_hamlib::Vfo::B
+                                        };
+                                        
+                                        if let Err(e) = rig_poll.set_frequency(vfo_enum, *frequency).await {
+                                            error!("Failed to set frequency: {}", e);
+                                        }
                                     }
                                     crate::message_bus::RigControlMessage::SetPtt { state } => {
                                         debug!("Setting PTT to {}", state);
+                                        let ptt = if *state {
+                                            pancetta_hamlib::PttState::On
+                                        } else {
+                                            pancetta_hamlib::PttState::Off
+                                        };
+                                        
+                                        if let Err(e) = rig_poll.set_ptt(pancetta_hamlib::Vfo::Current, ptt).await {
+                                            error!("Failed to set PTT: {}", e);
+                                        }
+                                    }
+                                    crate::message_bus::RigControlMessage::GetFrequency { vfo } => {
+                                        let vfo_enum = if *vfo == 0 {
+                                            pancetta_hamlib::Vfo::A
+                                        } else {
+                                            pancetta_hamlib::Vfo::B
+                                        };
+                                        
+                                        if let Ok(freq) = rig_poll.get_frequency(vfo_enum).await {
+                                            let response = ComponentMessage::new(
+                                                ComponentId::Hamlib,
+                                                message.source,
+                                                MessageType::RigControl(crate::message_bus::RigControlMessage::FrequencyResponse {
+                                                    vfo: *vfo,
+                                                    frequency: freq,
+                                                }),
+                                                Instant::now(),
+                                            );
+                                            let _ = hamlib_tx.try_send(response);
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -872,7 +980,7 @@ impl ApplicationCoordinator {
                                         message: decoded_msg.text.clone(),
                                         distance: None, // TODO: Calculate distance from grid
                                         bearing: None,  // TODO: Calculate bearing from grid
-                                    });
+                                    }).await;
                                     drop(app_lock);
                                     
                                     info!("TUI: Decoded message added - {}", decoded_msg.text);

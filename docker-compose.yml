@@ -1,0 +1,142 @@
+version: '3.8'
+
+services:
+  pancetta:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: pancetta:latest
+    container_name: pancetta
+    restart: unless-stopped
+    
+    # Audio device access (Linux only)
+    devices:
+      - /dev/snd:/dev/snd
+    
+    # Required for audio access
+    privileged: true
+    
+    volumes:
+      # Configuration
+      - ./config:/etc/pancetta:ro
+      - pancetta-data:/home/pancetta/.local/share/pancetta
+      - pancetta-cache:/home/pancetta/.cache/pancetta
+      
+      # Logs (optional)
+      - ./logs:/var/log/pancetta
+    
+    environment:
+      # Logging
+      - RUST_LOG=info
+      
+      # Audio configuration
+      - PANCETTA_AUDIO_DEVICE=default
+      - PANCETTA_STUB_AUDIO=false
+      
+      # Hamlib configuration
+      - PANCETTA_MOCK_RIG=true
+      - RIGCTLD_HOST=rigctld
+      - RIGCTLD_PORT=4532
+      
+      # Performance
+      - PANCETTA_WORKER_THREADS=2
+    
+    networks:
+      - pancetta-net
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "pancetta", "--version"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 128M
+
+  # Optional: rigctld service for radio control
+  rigctld:
+    image: alpine:latest
+    container_name: rigctld
+    restart: unless-stopped
+    
+    # Install hamlib and run rigctld
+    command: >
+      sh -c "
+      apk add --no-cache hamlib &&
+      rigctld -m 1 -r /dev/null -t 4532 -vvv
+      "
+    
+    ports:
+      - "4532:4532"
+    
+    networks:
+      - pancetta-net
+    
+    # For real radio, mount serial device
+    # devices:
+    #   - /dev/ttyUSB0:/dev/ttyUSB0
+
+  # Optional: Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    restart: unless-stopped
+    
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    
+    ports:
+      - "9090:9090"
+    
+    networks:
+      - pancetta-net
+    
+    profiles:
+      - monitoring
+
+  # Optional: Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    restart: unless-stopped
+    
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana-dashboards:/etc/grafana/provisioning/dashboards:ro
+    
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=
+    
+    ports:
+      - "3000:3000"
+    
+    networks:
+      - pancetta-net
+    
+    profiles:
+      - monitoring
+
+networks:
+  pancetta-net:
+    driver: bridge
+
+volumes:
+  pancetta-data:
+  pancetta-cache:
+  prometheus-data:
+  grafana-data:

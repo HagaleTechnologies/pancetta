@@ -103,9 +103,18 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+overflow-checks = false
+debug-assertions = false
 
 [profile.dev]
 # Fast compilation for development
 opt-level = 1
 debug = true
 panic = "abort"
+
+[profile.bench]
+# Optimized for benchmarking
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = true

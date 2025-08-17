@@ -64,7 +64,12 @@ pub struct RuntimeConfig {
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
-            worker_threads: num_cpus::get(),
+            // Use 2 worker threads for lower CPU usage
+            // Can be overridden via environment variable
+            worker_threads: std::env::var("PANCETTA_WORKER_THREADS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
             enable_io: true,
             enable_time: true,
             max_blocking_threads: 512,

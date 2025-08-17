@@ -104,6 +104,7 @@ pub mod models;
 pub mod rig;
 pub mod advanced;
 pub mod error;
+pub mod rigctld;
 
 #[cfg(feature = "mock-rig")]
 pub mod mock;
@@ -128,6 +129,8 @@ pub use error::{
 
 #[cfg(feature = "mock-rig")]
 pub use mock::{MockRig, MockRigConfig};
+
+pub use rigctld::{RigctldClient, RigctldConfig};
 
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;

@@ -38,6 +38,7 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 mod coordinator;
+mod logging;
 mod message_bus;
 mod runtime;
 

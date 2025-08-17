@@ -73,6 +73,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 assert_cmd = "2.0"
 predicates = "3.0"
 tracing-test = "0.2"
+sysinfo = "0.30"
 
 [features]
 default = ["metrics"]
@@ -83,24 +84,3 @@ tracing-json = []
 [[bench]]
 name = "pipeline_bench"
 harness = false
-
-[profile.release]
-# Optimize for real-time performance
-opt-level = 3
-lto = true
-codegen-units = 1
-panic = "abort"
-strip = true
-
-[profile.dev]
-# Fast compilation for development
-opt-level = 1
-debug = true
-panic = "abort"
-
-[profile.bench]
-# Optimized for benchmarking
-opt-level = 3
-lto = true
-codegen-units = 1
-debug = true

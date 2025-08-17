@@ -20,9 +20,3 @@ serde = { workspace = true }
 default = []
 # Feature for even more aggressive real-time optimizations
 rt-optimized = []
-
-# Real-time performance configuration
-[profile.release]
-panic = "abort"
-overflow-checks = false
-debug-assertions = false
