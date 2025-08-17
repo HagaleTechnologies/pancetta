@@ -6,7 +6,6 @@
 
 use std::fmt;
 use std::error::Error as StdError;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 

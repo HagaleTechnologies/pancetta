@@ -17,8 +17,8 @@
 //! between components. Each component has its own receive channel and
 //! can send to any other component through the bus.
 
-use anyhow::{Context, Result};
-use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
+use anyhow::Result;
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use pancetta_ft8::DecodedMessage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

@@ -26,7 +26,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use pancetta_config::{Config, ConfigError};
+use pancetta_config::Config;
 use signal_hook::consts::SIGINT;
 use signal_hook_tokio::Signals;
 use futures::StreamExt;

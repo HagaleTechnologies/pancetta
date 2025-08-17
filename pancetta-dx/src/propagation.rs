@@ -3,12 +3,12 @@
 //! This module provides basic HF propagation prediction capabilities
 //! including solar indices, band conditions, and propagation forecasting.
 
-use crate::{Band, DxError, Result};
-use chrono::{DateTime, TimeZone, Utc, Timelike, Datelike};
+use crate::{Band, Result};
+use chrono::{DateTime, Utc, Timelike, Datelike};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Solar and geomagnetic indices
 #[derive(Debug, Clone, Serialize, Deserialize)]

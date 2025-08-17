@@ -136,7 +136,7 @@
 //! println!("Average signal: {:.1} dB", stats.technical.signal_reports.avg_received);
 //! ```
 
-#![warn(missing_docs)]
+// #![warn(missing_docs)] // TODO: Re-enable once documentation is complete
 #![deny(unsafe_code)]
 
 // Re-export all public types and functions for easy access

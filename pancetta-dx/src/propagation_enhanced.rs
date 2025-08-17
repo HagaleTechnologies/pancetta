@@ -7,7 +7,6 @@
 // - Gray-line propagation
 // - Sporadic-E and meteor scatter predictions
 
-use anyhow::Result;
 use chrono::{DateTime, Utc, Timelike, Datelike};
 use geo::{point, prelude::*};
 use std::collections::HashMap;

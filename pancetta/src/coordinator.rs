@@ -19,17 +19,16 @@
 //! - Graceful shutdown: <5s
 //! - Memory usage: <50MB for coordination layer
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 // TODO: Import when AudioManager is available
 // use pancetta_audio::{AudioManager, AudioConfig as AudioSettings, AudioDevice};
 use pancetta_config::Config;
-use pancetta_dsp::{DspPipeline, PipelineBuilder};
-use pancetta_ft8::{Ft8Decoder, Ft8Config, DecodedMessage};
-use std::path::PathBuf;
+use pancetta_dsp::DspPipeline;
+use pancetta_ft8::{Ft8Decoder, Ft8Config};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep};
 use tracing::{debug, error, info, span, warn, Level};
@@ -488,7 +487,7 @@ impl ApplicationCoordinator {
                             message.latency_tracking.received_at = Some(Instant::now());
                             message.latency_tracking.processing_started_at = Some(Instant::now());
                             
-                            if let MessageType::RigControl(rig_msg) = message.message_type {
+                            if let MessageType::RigControl(ref rig_msg) = message.message_type {
                                 match rig_msg {
                                     crate::message_bus::RigControlMessage::SetFrequency { vfo, frequency } => {
                                         debug!("Setting frequency VFO {} to {}", vfo, frequency);

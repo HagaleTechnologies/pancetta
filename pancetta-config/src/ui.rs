@@ -1978,7 +1978,7 @@ impl Default for MarkerConfig {
 }
 
 impl ConfigSection for UiConfig {
-    fn validate(&self) -> ConfigResult<()> {
+    fn validate_section(&self) -> ConfigResult<()> {
         // Validate window dimensions
         if self.window.width == 0 || self.window.height == 0 {
             return Err(ConfigError::InvalidValue {
@@ -2053,7 +2053,7 @@ mod tests {
         let config = UiConfig::default();
         assert_eq!(config.theme, "default");
         assert_eq!(config.layout, "standard");
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
     }
     
     #[test]
@@ -2061,16 +2061,16 @@ mod tests {
         let mut config = UiConfig::default();
         
         // Valid window dimensions
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         // Invalid window dimensions
         config.window.width = 0;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
         
         // Invalid transparency
         config.window.width = 1200; // Reset to valid
         config.window.transparency = 1.5;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
     }
     
     #[test]
@@ -2079,16 +2079,16 @@ mod tests {
         
         // Valid FFT size
         config.spectrum.fft_size = 2048;
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         // Invalid FFT size (not power of 2)
         config.spectrum.fft_size = 2000;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
         
         // Invalid averaging
         config.spectrum.fft_size = 2048; // Reset to valid
         config.spectrum.averaging = 1.5;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
     }
     
     #[test]

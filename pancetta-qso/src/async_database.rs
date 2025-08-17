@@ -4,10 +4,9 @@
 //! through the sqlx library, enabling proper Send/Sync support for tokio spawns.
 
 use crate::states::*;
-use crate::adif::{AdifQso, AdifProcessor};
+use crate::adif::AdifProcessor;
 use chrono::{DateTime, Utc};
 use sqlx::{sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow}, Row};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;

@@ -6,9 +6,9 @@
 use crate::{tracker::DxTracker, Band, Mode, DxError, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
-use statrs::statistics::{Statistics, OrderStatistics};
+use statrs::statistics::Statistics;
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Rarity scoring configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

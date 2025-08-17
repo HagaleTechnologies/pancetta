@@ -6,7 +6,6 @@
 use crate::{ConfigError, ConfigResult, ConfigSection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::Duration;
 
 /// Network services configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1833,7 +1832,7 @@ impl Default for ReliabilityConfig {
 }
 
 impl ConfigSection for NetworkConfig {
-    fn validate(&self) -> ConfigResult<()> {
+    fn validate_section(&self) -> ConfigResult<()> {
         // Validate PSKReporter settings
         if self.psk_reporter.enabled {
             if self.psk_reporter.upload_interval_seconds == 0 {
@@ -1935,7 +1934,7 @@ mod tests {
         let config = NetworkConfig::default();
         assert!(!config.psk_reporter.enabled);
         assert!(!config.qrz.enabled);
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
     }
     
     #[test]
@@ -1944,16 +1943,16 @@ mod tests {
         config.psk_reporter.enabled = true;
         
         // Valid configuration
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         // Invalid upload interval
         config.psk_reporter.upload_interval_seconds = 0;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
         
         // Invalid batch size
         config.psk_reporter.upload_interval_seconds = 300; // Reset to valid
         config.psk_reporter.batch_size = 0;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
     }
     
     #[test]
@@ -1962,16 +1961,16 @@ mod tests {
         config.qrz.enabled = true;
         
         // Missing credentials
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
         
         // Valid with username
         config.qrz.username = Some("test_user".to_string());
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         // Valid with API key
         config.qrz.username = None;
         config.qrz.api_key = Some("test_key".to_string());
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
     }
     
     #[test]
@@ -1980,11 +1979,11 @@ mod tests {
         config.web_api.enabled = true;
         
         // Valid configuration
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         // Invalid port
         config.web_api.port = 0;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
     }
     
     #[test]
@@ -1993,11 +1992,11 @@ mod tests {
         config.rate_limiting.enabled = true;
         
         // Valid configuration
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         // Invalid rate limit
         config.rate_limiting.global.requests_per_minute = 0;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
     }
     
     #[test]

@@ -564,8 +564,8 @@ impl LotwClient {
         
         // Try to extract counts from HTML
         let mut processed = None;
-        let mut accepted = None;
-        let mut rejected = None;
+        let accepted = None;
+        let rejected = None;
         
         // Simple regex-like extraction (in real implementation, use proper HTML parser)
         if let Some(start) = html.find("processed") {
@@ -608,6 +608,8 @@ struct AdifField {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{DateTime, Utc};
+    use crate::{Band, Mode};
     
     #[test]
     fn test_client_creation() {

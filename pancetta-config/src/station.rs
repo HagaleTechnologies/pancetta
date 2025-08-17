@@ -148,7 +148,7 @@ impl Default for StationConfig {
 }
 
 impl ConfigSection for StationConfig {
-    fn validate(&self) -> ConfigResult<()> {
+    fn validate_section(&self) -> ConfigResult<()> {
         // Perform validation using the validator crate
         use validator::Validate;
         Validate::validate(self)
@@ -410,7 +410,7 @@ mod tests {
         assert_eq!(config.callsign, "N0CALL");
         assert_eq!(config.grid_square, "AA00aa");
         assert_eq!(config.power_watts, 100);
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
     }
     
     #[test]

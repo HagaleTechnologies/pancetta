@@ -332,7 +332,7 @@ impl App {
         Ok(())
     }
 
-    async fn add_decoded_message(&mut self, message: DecodedMessage) -> Result<()> {
+    pub async fn add_decoded_message(&mut self, message: DecodedMessage) -> Result<()> {
         debug!("Adding decoded message: {}", message.message);
         
         // Add to band activity
@@ -435,7 +435,7 @@ impl App {
         info!("Theme switched to: {:?}", self.theme);
     }
 
-    fn clear_messages(&mut self) {
+    pub fn clear_messages(&mut self) {
         self.decoded_messages.clear();
         self.band_activity_scroll = 0;
         self.status_message = "Messages cleared".to_string();
@@ -456,5 +456,103 @@ impl App {
         
         // Remove old DX stations
         self.dx_stations.retain(|_, station| station.last_seen > cutoff);
+    }
+
+    // Missing public methods for tui_runner
+    pub fn update_frequency(&mut self, freq: u64) {
+        self.station_info.operating_frequency = freq as f64;
+        self.status_message = format!("Frequency: {} Hz", freq);
+    }
+
+    pub fn update_signal_strength(&mut self, strength: f32) {
+        self.audio_level = strength;
+    }
+
+    pub fn update_qso_state(&mut self, active: bool, callsign: Option<String>) {
+        self.qso_status.active = active;
+        self.qso_status.call_sign = callsign;
+        if active {
+            self.qso_status.started_at = Some(Utc::now());
+        }
+    }
+
+    pub fn add_dx_spot(&mut self, callsign: String, freq: f64, mode: String, snr: i32) {
+        let dx_station = DxStation {
+            call_sign: callsign.clone(),
+            grid_square: None,
+            frequency: freq,
+            mode,
+            last_seen: Utc::now(),
+            snr,
+            distance: None,
+            bearing: None,
+            worked_before: false,
+            priority_score: 0,
+        };
+        self.dx_stations.insert(callsign, dx_station);
+    }
+
+    pub fn add_error_message(&mut self, error: String) {
+        self.status_message = format!("Error: {}", error);
+    }
+
+    pub fn update_component_status(&mut self, component: String, status: String) {
+        self.status_message = format!("{}: {}", component, status);
+    }
+
+    pub fn next_panel(&mut self) {
+        self.active_panel = self.active_panel.next();
+    }
+
+    pub fn previous_panel(&mut self) {
+        self.active_panel = self.active_panel.previous();
+    }
+
+    pub fn next_item(&mut self) {
+        self.scroll_down();
+    }
+
+    pub fn previous_item(&mut self) {
+        self.scroll_up();
+    }
+
+    pub fn next_page(&mut self) {
+        for _ in 0..10 {
+            self.scroll_down();
+        }
+    }
+
+    pub fn previous_page(&mut self) {
+        for _ in 0..10 {
+            self.scroll_up();
+        }
+    }
+
+    pub fn toggle_help(&mut self) {
+        // TODO: Implement help panel toggle
+        self.status_message = "Help not yet implemented".to_string();
+    }
+
+    pub fn activate_selected(&mut self) {
+        // TODO: Implement item activation
+        self.status_message = "Activation not yet implemented".to_string();
+    }
+
+    pub fn get_input_text(&self) -> String {
+        // TODO: Implement input text buffer
+        String::new()
+    }
+
+    pub fn clear_input(&mut self) {
+        // TODO: Clear input buffer
+    }
+
+    pub fn input_char(&mut self, c: char) {
+        // TODO: Add character to input buffer
+        self.status_message = format!("Input: {}", c);
+    }
+
+    pub fn delete_char(&mut self) {
+        // TODO: Delete character from input buffer
     }
 }

@@ -32,7 +32,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // Re-export all configuration modules
 pub mod audio;
@@ -156,11 +156,11 @@ impl Config {
         debug!("Validating configuration");
         
         // Validate each section
-        self.station.validate()?;
-        self.audio.validate()?;
-        self.rig.validate()?;
-        self.ui.validate()?;
-        self.network.validate()?;
+        self.station.validate_section()?;
+        self.audio.validate_section()?;
+        self.rig.validate_section()?;
+        self.ui.validate_section()?;
+        self.network.validate_section()?;
         
         info!("Configuration validation successful");
         Ok(())
@@ -232,7 +232,7 @@ impl Config {
 /// Trait for configuration sections that can be merged and validated
 pub trait ConfigSection: Default + Clone {
     /// Validate this configuration section
-    fn validate(&self) -> ConfigResult<()> {
+    fn validate_section(&self) -> ConfigResult<()> {
         Ok(())
     }
     

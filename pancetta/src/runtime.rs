@@ -25,7 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Runtime configuration for optimal real-time performance
 #[derive(Debug, Clone)]

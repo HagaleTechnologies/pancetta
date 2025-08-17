@@ -730,7 +730,7 @@ impl Default for MeterBallisticsConfig {
 }
 
 impl ConfigSection for AudioConfig {
-    fn validate(&self) -> ConfigResult<()> {
+    fn validate_section(&self) -> ConfigResult<()> {
         // Validate sample rate
         if ![8000, 11025, 16000, 22050, 44100, 48000, 88200, 96000, 176400, 192000]
             .contains(&self.sample_rate) {
@@ -880,7 +880,7 @@ mod tests {
         let config = AudioConfig::default();
         assert_eq!(config.sample_rate, 48000);
         assert_eq!(config.buffer_size, 512);
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
     }
     
     #[test]
@@ -889,14 +889,14 @@ mod tests {
         
         // Valid sample rates
         config.sample_rate = 44100;
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         config.sample_rate = 48000;
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         // Invalid sample rate
         config.sample_rate = 12345;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
     }
     
     #[test]
@@ -905,18 +905,18 @@ mod tests {
         
         // Valid buffer sizes (powers of 2)
         config.buffer_size = 256;
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         config.buffer_size = 1024;
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         // Invalid buffer size (not power of 2)
         config.buffer_size = 333;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
         
         // Invalid buffer size (too small)
         config.buffer_size = 16;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
     }
     
     #[test]

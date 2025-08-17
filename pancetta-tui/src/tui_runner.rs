@@ -3,7 +3,8 @@
 // This module implements the main TUI event loop with message bus integration,
 // real-time updates, and efficient rendering.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use chrono::Timelike;
 use crossbeam_channel::{Receiver, Sender};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent},
@@ -14,7 +15,6 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
     Frame, Terminal,
 };
@@ -23,9 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
-use crate::app::{App, ActivePanel, DecodedMessage};
+use crate::app::{App, DecodedMessage};
 use crate::config::Config;
 
 /// TUI runner that manages the terminal interface
@@ -89,7 +89,7 @@ pub enum TuiCommand {
 }
 
 /// TUI performance metrics
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct TuiMetrics {
     frames_rendered: u64,
     messages_processed: u64,
@@ -213,20 +213,24 @@ impl TuiRunner {
             TuiMessage::DecodedMessage(decoded) => {
                 app.add_decoded_message(decoded);
             }
-            TuiMessage::FrequencyUpdate { vfo, frequency } => {
-                app.update_frequency(vfo, frequency);
+            TuiMessage::FrequencyUpdate { vfo: _, frequency } => {
+                app.update_frequency(frequency);
             }
             TuiMessage::SignalStrengthUpdate { dbm } => {
-                app.update_signal_strength(dbm);
+                app.update_signal_strength(dbm as f32);
             }
-            TuiMessage::QsoStateUpdate { qso_id, state } => {
-                app.update_qso_state(qso_id, state);
+            TuiMessage::QsoStateUpdate { qso_id, state: _ } => {
+                // Parse QSO state - for now just check if active
+                let active = !qso_id.is_empty();
+                let callsign = if active { Some(qso_id) } else { None };
+                app.update_qso_state(active, callsign);
             }
-            TuiMessage::DxSpot { callsign, frequency, spotter } => {
-                app.add_dx_spot(callsign, frequency, spotter);
+            TuiMessage::DxSpot { callsign, frequency, spotter: _ } => {
+                // For now use FT8 as default mode
+                app.add_dx_spot(callsign, frequency as f64, "FT8".to_string(), 0);
             }
-            TuiMessage::Error { component, message } => {
-                app.add_error_message(component, message);
+            TuiMessage::Error { component: _, message } => {
+                app.add_error_message(message);
             }
             TuiMessage::StatusUpdate { component, status } => {
                 app.update_component_status(component, status);
@@ -298,7 +302,8 @@ impl TuiRunner {
             
             // Enter - Send message or confirm
             KeyCode::Enter => {
-                if let Some(text) = app.get_input_text() {
+                let text = app.get_input_text();
+                if !text.is_empty() {
                     self.message_tx.send(TuiCommand::SendMessage { text })?;
                     app.clear_input();
                 }
@@ -321,9 +326,11 @@ impl TuiRunner {
     /// Render a frame
     async fn render_frame(&mut self) -> Result<()> {
         let app = self.app.read().await;
+        let metrics = self.metrics.clone();
+        let last_render = self.last_render;
         
         self.terminal.draw(|f| {
-            let size = f.size();
+            let size = f.area();
             
             // Main layout
             let chunks = Layout::default()
@@ -335,27 +342,167 @@ impl TuiRunner {
                 ])
                 .split(size);
             
-            // Render header
-            self.render_header(f, chunks[0], &app);
+            // Render header inline
+            let header_text = format!(
+                " Pancetta FT8 | {} | {} MHz | {} ",
+                app.station_info.call_sign,
+                app.station_info.operating_frequency / 1_000_000.0,
+                app.station_info.mode
+            );
+            let header = Paragraph::new(header_text)
+                .style(Style::default().bg(Color::Blue).fg(Color::White));
+            f.render_widget(header, chunks[0]);
             
-            // Render main content area
-            self.render_main_content(f, chunks[1], &app);
+            // Render main content inline
+            TuiRunner::render_main_content_static(f, chunks[1], &app);
             
-            // Render status bar
-            self.render_status_bar(f, chunks[2], &app);
+            // Render status bar inline
+            let status_text = format!(
+                " TX: {} | S-meter: {} | FPS: {} | F1:Help F2:CQ F5:Clear Q:Quit ",
+                if app.is_monitoring { "ON" } else { "OFF" },
+                app.audio_level as i32,
+                metrics.frames_rendered / last_render.elapsed().as_secs().max(1)
+            );
+            let status = Paragraph::new(status_text)
+                .style(Style::default().bg(Color::Gray).fg(Color::White));
+            f.render_widget(status, chunks[2]);
         })?;
         
         self.metrics.frames_rendered += 1;
         Ok(())
     }
     
+    /// Static version of render_main_content for use in closure
+    fn render_main_content_static(f: &mut Frame, area: Rect, app: &App) {
+        // Split into panels
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(60),  // Band activity
+                Constraint::Percentage(40),  // Right panels
+            ])
+            .split(area);
+        
+        // Render band activity on the left
+        Self::render_band_activity_static(f, chunks[0], app);
+        
+        // Split right side into DX and QSO panels
+        let right_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(50),  // DX stations
+                Constraint::Percentage(50),  // QSO status
+            ])
+            .split(chunks[1]);
+        
+        Self::render_dx_stations_static(f, right_chunks[0], app);
+        Self::render_qso_status_static(f, right_chunks[1], app);
+    }
+    
+    /// Static version of render_band_activity for use in closure
+    fn render_band_activity_static(f: &mut Frame, area: Rect, app: &App) {
+        let messages: Vec<ListItem> = app
+            .decoded_messages
+            .iter()
+            .map(|msg| {
+                let style = if msg.message.contains("CQ") {
+                    Style::default().fg(Color::Yellow)
+                } else if msg.call_sign.as_ref().map_or(false, |c| c == &app.station_info.call_sign) {
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                
+                let text = format!(
+                    "{:02}:{:02}:{:02} {:>4.0} {:>3} {}",
+                    msg.timestamp.naive_local().hour(),
+                    msg.timestamp.naive_local().minute(),
+                    msg.timestamp.naive_local().second(),
+                    msg.delta_freq,
+                    msg.snr,
+                    msg.message
+                );
+                
+                ListItem::new(text).style(style)
+            })
+            .collect();
+        
+        let messages_list = List::new(messages)
+            .block(
+                Block::default()
+                    .title(" Band Activity ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            )
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            );
+        
+        f.render_widget(messages_list, area);
+    }
+    
+    /// Static version of render_dx_stations for use in closure
+    fn render_dx_stations_static(f: &mut Frame, area: Rect, app: &App) {
+        let dx_items: Vec<ListItem> = app
+            .dx_stations
+            .iter()
+            .map(|dx| {
+                ListItem::new(format!(
+                    "{} {} {:>6.0}km {}dB",
+                    dx.1.call_sign, 
+                    dx.1.grid_square.as_ref().unwrap_or(&"----".to_string()),
+                    dx.1.distance.unwrap_or(0.0),
+                    dx.1.snr
+                ))
+            })
+            .collect();
+        
+        let dx_list = List::new(dx_items)
+            .block(
+                Block::default()
+                    .title(" DX Stations ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            );
+        
+        f.render_widget(dx_list, area);
+    }
+    
+    /// Static version of render_qso_status for use in closure
+    fn render_qso_status_static(f: &mut Frame, area: Rect, app: &App) {
+        let qso_text = if app.qso_status.active {
+            format!(
+                "QSO with: {}\nTX: {} dB\nRX: {} dB\nExchanges: {}",
+                app.qso_status.call_sign.as_ref().unwrap_or(&"Unknown".to_string()),
+                app.qso_status.snr_tx.unwrap_or(0),
+                app.qso_status.snr_rx.unwrap_or(0),
+                app.qso_status.exchange_count
+            )
+        } else {
+            "No active QSO".to_string()
+        };
+        
+        let qso_status = Paragraph::new(qso_text)
+            .block(
+                Block::default()
+                    .title(" QSO Status ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            )
+            .wrap(Wrap { trim: true });
+        
+        f.render_widget(qso_status, area);
+    }
+    
     /// Render header
     fn render_header(&self, f: &mut Frame, area: Rect, app: &App) {
         let header_text = format!(
             " Pancetta FT8 | {} | {} MHz | {} ",
-            app.station_info.callsign,
-            app.frequency as f64 / 1_000_000.0,
-            app.mode
+            app.station_info.call_sign,
+            app.station_info.operating_frequency / 1_000_000.0,
+            app.station_info.mode
         );
         
         let header = Paragraph::new(header_text)
@@ -389,22 +536,22 @@ impl TuiRunner {
             .decoded_messages
             .iter()
             .map(|msg| {
-                let style = if msg.is_cq {
+                let style = if msg.message.contains("CQ") {
                     Style::default().fg(Color::Yellow)
-                } else if msg.addressed_to_me {
+                } else if msg.call_sign.as_ref().map_or(false, |c| c == &app.station_info.call_sign) {
                     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
                 
                 let text = format!(
-                    "{:02}:{:02}:{:02} {:>4} {:>3} {}",
-                    msg.time.hour(),
-                    msg.time.minute(),
-                    msg.time.second(),
-                    msg.frequency_offset,
+                    "{:02}:{:02}:{:02} {:>4.0} {:>3} {}",
+                    msg.timestamp.naive_local().hour(),
+                    msg.timestamp.naive_local().minute(),
+                    msg.timestamp.naive_local().second(),
+                    msg.delta_freq,
                     msg.snr,
-                    msg.text
+                    msg.message
                 );
                 
                 ListItem::new(text).style(style)
@@ -443,8 +590,11 @@ impl TuiRunner {
             .iter()
             .map(|dx| {
                 ListItem::new(format!(
-                    "{} {} {} {}dB",
-                    dx.callsign, dx.grid, dx.distance, dx.snr
+                    "{} {} {:>6.0}km {}dB",
+                    dx.1.call_sign, 
+                    dx.1.grid_square.as_ref().unwrap_or(&"----".to_string()),
+                    dx.1.distance.unwrap_or(0.0),
+                    dx.1.snr
                 ))
             })
             .collect();
@@ -460,10 +610,13 @@ impl TuiRunner {
         f.render_widget(dx_list, chunks[0]);
         
         // QSO Status
-        let qso_text = if let Some(qso) = &app.current_qso {
+        let qso_text = if app.qso_status.active {
             format!(
-                "QSO with: {}\nState: {}\nSignal: {} dB\nExchange: {}",
-                qso.callsign, qso.state, qso.signal_report, qso.exchange_sent
+                "QSO with: {}\nTX: {} dB\nRX: {} dB\nExchanges: {}",
+                app.qso_status.call_sign.as_ref().unwrap_or(&"Unknown".to_string()),
+                app.qso_status.snr_tx.unwrap_or(0),
+                app.qso_status.snr_rx.unwrap_or(0),
+                app.qso_status.exchange_count
             )
         } else {
             "No active QSO".to_string()
@@ -485,8 +638,8 @@ impl TuiRunner {
     fn render_status_bar(&self, f: &mut Frame, area: Rect, app: &App) {
         let status_text = format!(
             " TX: {} | S-meter: {} | FPS: {} | F1:Help F2:CQ F5:Clear Q:Quit ",
-            if app.ptt_active { "ON" } else { "OFF" },
-            app.signal_strength_dbm,
+            if app.is_monitoring { "ON" } else { "OFF" },
+            app.audio_level as i32,
             self.metrics.frames_rendered / self.last_render.elapsed().as_secs().max(1)
         );
         

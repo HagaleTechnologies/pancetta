@@ -5,7 +5,7 @@
 //! This crate provides the critical real-time audio infrastructure that must
 //! achieve sub-millisecond latency for the Pancetta project to be viable.
 
-#![warn(missing_docs)]
+// #![warn(missing_docs)] // TODO: Re-enable once documentation is complete
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod realtime;

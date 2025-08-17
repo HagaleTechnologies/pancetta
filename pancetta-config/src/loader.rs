@@ -5,12 +5,11 @@
 
 use crate::{Config, ConfigError, ConfigResult};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 use tracing::{debug, error, info, warn};
 
 /// Configuration loader with hierarchical loading and hot-reload support

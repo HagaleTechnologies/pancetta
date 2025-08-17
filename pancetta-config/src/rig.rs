@@ -6,7 +6,6 @@
 use crate::{ConfigError, ConfigResult, ConfigSection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::Duration;
 
 /// Rig control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -961,7 +960,7 @@ impl Default for QuirksConfig {
 }
 
 impl ConfigSection for RigConfig {
-    fn validate(&self) -> ConfigResult<()> {
+    fn validate_section(&self) -> ConfigResult<()> {
         // Validate CAT interface settings
         if self.interface.enabled {
             if self.interface.baud_rate == 0 {
@@ -1103,7 +1102,7 @@ mod tests {
         let config = RigConfig::default();
         assert_eq!(config.model, "Generic");
         assert!(!config.interface.enabled);
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
     }
     
     #[test]
@@ -1112,16 +1111,16 @@ mod tests {
         config.interface.enabled = true;
         
         // Valid configuration
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         // Invalid data bits
         config.interface.data_bits = 9;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
         
         // Invalid baud rate
         config.interface.data_bits = 8; // Reset to valid
         config.interface.baud_rate = 0;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
     }
     
     #[test]
@@ -1130,11 +1129,11 @@ mod tests {
         
         // Valid power level
         config.power_control.default_level = 50;
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         // Invalid power level
         config.power_control.default_level = 150;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
     }
     
     #[test]
@@ -1142,12 +1141,12 @@ mod tests {
         let mut config = RigConfig::default();
         
         // Valid frequency limits
-        assert!(config.validate().is_ok());
+        assert!(config.validate_section().is_ok());
         
         // Invalid frequency limits (min >= max)
         config.frequency.limits.min_frequency = 50_000_000;
         config.frequency.limits.max_frequency = 30_000_000;
-        assert!(config.validate().is_err());
+        assert!(config.validate_section().is_err());
     }
     
     #[test]

@@ -74,7 +74,7 @@ impl GridSquare {
             _ => return Err(DxError::InvalidGridSquare(format!("Invalid grid square length: {}", grid.len()))),
         };
         
-        let mut grid_square = Self { grid, precision };
+        let grid_square = Self { grid, precision };
         grid_square.validate()?;
         
         Ok(grid_square)

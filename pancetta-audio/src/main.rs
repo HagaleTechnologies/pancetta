@@ -6,8 +6,8 @@
 //! If this test fails, the entire project needs architectural changes.
 
 use pancetta_audio::{
-    AudioProcessor, AudioProcessorBuilder, AudioProcessorConfig,
-    AudioDeviceManager, StreamConfig
+    AudioProcessor, AudioProcessorConfig,
+    AudioDeviceManager
 };
 use std::io;
 use std::time::Duration;

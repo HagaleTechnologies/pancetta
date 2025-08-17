@@ -14,7 +14,6 @@ use crate::{
     signal_processing::{FftProcessor, WindowFunction, BandpassFilter, SymbolCorrelator},
     sync::{TimeSync, SyncResult},
 };
-use std::f64::consts::PI;
 use num_complex::Complex;
 use std::time::{SystemTime, Instant};
 use std::sync::Arc;

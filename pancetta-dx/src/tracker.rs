@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 /// Award tracking status
@@ -293,7 +293,7 @@ impl DxTracker {
         };
         
         match current_entry {
-            Some(mut entry) => {
+            Some(entry) => {
                 // Update existing entry if this is an improvement
                 let should_update = match (&entry.status, &new_status) {
                     (AwardStatus::NotWorked, _) => true,

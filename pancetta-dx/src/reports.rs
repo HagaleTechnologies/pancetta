@@ -4,15 +4,14 @@
 //! radio award progress tracking.
 
 use crate::{
-    Band, Mode, tracker::DxTracker, dxcc::{DxccDatabase, DxccEntity}, 
-    statistics::{DxStatistics, BandStatistics, ModeStatistics}, 
+    Band, Mode, tracker::DxTracker, dxcc::DxccDatabase, 
     DxError, Result
 };
 use chrono::{DateTime, Utc, Datelike};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-use tracing::{debug, info};
+use tracing::info;
 
 /// DXCC progress report
 #[derive(Debug, Clone, Serialize, Deserialize)]
