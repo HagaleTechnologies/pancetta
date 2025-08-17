@@ -55,3 +55,8 @@ pancetta-cache/
 # Configuration backups
 *.toml.backup
 config.toml.bak
+
+# Environment files with secrets
+.env
+.env.local
+.env.production

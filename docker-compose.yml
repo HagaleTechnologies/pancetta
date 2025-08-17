@@ -119,7 +119,7 @@ services:
       - ./grafana-dashboards:/etc/grafana/provisioning/dashboards:ro
     
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
       - GF_INSTALL_PLUGINS=
     
     ports:
