@@ -1,0 +1,57 @@
+[package]
+name = "pancetta-qso"
+version = "0.1.0"
+edition = "2021"
+authors = ["Pancetta Development Team"]
+description = "QSO management and logging system for FT8 communications"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pancetta/pancetta-qso"
+keywords = ["ham-radio", "ft8", "qso", "adif", "logging"]
+categories = ["simulation", "science", "database"]
+
+[dependencies]
+# Internal dependencies
+pancetta-core = { path = "../pancetta-core" }
+
+# Core dependencies
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.0", features = ["v4", "serde"] }
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Database dependencies
+rusqlite = { version = "0.30", features = ["bundled", "chrono", "uuid", "backup"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Audio and signal processing
+pancetta-ft8 = { path = "../pancetta-ft8" }
+
+# Utilities
+regex = "1.5"
+lazy_static = "1.4"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.0"
+proptest = "1.0"
+
+[features]
+default = ["sqlite"]
+sqlite = []
+contest-mode = []
+dx-cluster = []
+
+[[example]]
+name = "basic_qso"
+path = "examples/basic_qso.rs"
+
+[[example]]
+name = "contest_logging"
+path = "examples/contest_logging.rs"

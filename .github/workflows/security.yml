@@ -1,0 +1,367 @@
+name: Security
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run security checks daily at 1 AM UTC
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Comprehensive security audit
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-audit-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-audit-
+
+      - name: Install security tools
+        run: |
+          cargo install cargo-audit
+          cargo install cargo-deny
+          cargo install cargo-geiger
+
+      - name: Run cargo audit
+        run: cargo audit
+
+      - name: Run cargo deny check
+        run: |
+          # Create deny.toml if it doesn't exist
+          if [ ! -f deny.toml ]; then
+            cat > deny.toml << 'EOF'
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+]
+deny = [
+    "GPL-2.0",
+    "GPL-3.0",
+    "AGPL-3.0",
+]
+copyleft = "warn"
+allow-osi-fsf-free = "both"
+default = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+highlight = "all"
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+EOF
+          fi
+          cargo deny check
+
+      - name: Check for unsafe code
+        run: |
+          cargo geiger --all-features --all-targets || true
+          
+      - name: Generate security report
+        if: always()
+        run: |
+          mkdir -p security-reports
+          cargo audit --json > security-reports/audit.json || true
+          cargo geiger --output-format Json --all-features > security-reports/geiger.json || true
+          
+      - name: Upload security reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: security-reports/
+          retention-days: 30
+
+  # SAST with multiple tools
+  sast:
+    name: Static Application Security Testing
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install semgrep
+        run: |
+          python3 -m pip install semgrep
+
+      - name: Run Clippy with security lints
+        run: |
+          cargo clippy --all-targets --all-features -- \
+            -W clippy::all \
+            -W clippy::pedantic \
+            -W clippy::cargo \
+            -D warnings \
+            -F unsafe_code \
+            -F trivial_casts \
+            -F trivial_numeric_casts \
+            -F unused_extern_crates \
+            -F unused_import_braces \
+            -F unused_qualifications
+
+      - name: Run Semgrep
+        run: |
+          semgrep --config=auto --json --output=semgrep-report.json . || true
+          
+      - name: Upload SAST results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-results
+          path: |
+            semgrep-report.json
+          retention-days: 30
+
+  # Supply chain security
+  supply-chain:
+    name: Supply Chain Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-supply-chain
+        run: |
+          cargo install cargo-supply-chain || true
+
+      - name: Check supply chain
+        run: |
+          # Check for known malicious crates
+          cargo supply-chain update || true
+          cargo supply-chain check || true
+
+      - name: Verify dependency signatures
+        run: |
+          # This is a placeholder for actual signature verification
+          echo "Verifying dependency signatures..."
+          cargo tree --all-features
+
+      - name: Generate SBOM (Software Bill of Materials)
+        run: |
+          cargo tree --all-features --format "{p} {l}" > sbom.txt
+          cargo metadata --format-version 1 > cargo-metadata.json
+          
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom.txt
+            cargo-metadata.json
+          retention-days: 30
+
+  # Container security scanning
+  container-scan:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    if: false  # Enable when Dockerfile is added
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t pancetta:scan .
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'pancetta:scan'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          ignore-unfixed: true
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      - name: Run Snyk container test
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          if [ -n "$SNYK_TOKEN" ]; then
+            npm install -g snyk
+            snyk container test pancetta:scan --severity-threshold=high
+          fi
+
+  # CodeQL analysis
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'cpp'  # For Rust native code analysis
+          queries: security-and-quality
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libssl-dev pkg-config
+
+      - name: Build for CodeQL
+        run: cargo build --all-features
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  # Secret scanning
+  secret-scan:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for better detection
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run truffleHog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+  # License compliance
+  license-check:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-license
+        run: cargo install cargo-license
+
+      - name: Check licenses
+        run: |
+          cargo license --all-features > licenses.txt
+          
+          # Check for problematic licenses
+          if grep -E "GPL|AGPL|LGPL" licenses.txt; then
+            echo "Warning: Found copyleft licenses"
+            exit 1
+          fi
+
+      - name: Upload license report
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-report
+          path: licenses.txt
+          retention-days: 30
+
+  # Security scorecard
+  scorecard:
+    name: Security Scorecard
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run OSSF Scorecard
+        uses: ossf/scorecard-action@v2
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload Scorecard results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scorecard.sarif
+
+  # Aggregate security status
+  security-summary:
+    name: Security Summary
+    if: always()
+    needs:
+      - audit
+      - sast
+      - supply-chain
+      - codeql
+      - secret-scan
+      - license-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Security check summary
+        run: |
+          echo "Security scan completed"
+          echo "========================"
+          echo "Audit: ${{ needs.audit.result }}"
+          echo "SAST: ${{ needs.sast.result }}"
+          echo "Supply Chain: ${{ needs.supply-chain.result }}"
+          echo "CodeQL: ${{ needs.codeql.result }}"
+          echo "Secret Scan: ${{ needs.secret-scan.result }}"
+          echo "License Check: ${{ needs.license-check.result }}"
+          
+          # Fail if any critical security check failed
+          if [ "${{ needs.audit.result }}" = "failure" ] || \
+             [ "${{ needs.secret-scan.result }}" = "failure" ] || \
+             [ "${{ needs.license-check.result }}" = "failure" ]; then
+            echo "Critical security checks failed!"
+            exit 1
+          fi

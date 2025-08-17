@@ -1,0 +1,375 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'benches/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'benches/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: 'Baseline branch/tag to compare against'
+        required: false
+        default: 'main'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C target-cpu=native"
+
+jobs:
+  benchmark:
+    name: Performance Benchmarks
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    
+    permissions:
+      contents: write
+      deployments: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for comparisons
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libssl-dev pkg-config
+          # Install perf for detailed profiling
+          sudo apt-get install -y linux-tools-common linux-tools-generic linux-tools-`uname -r`
+          # Allow perf without sudo
+          echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+
+      - name: Install system dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install portaudio pkg-config
+          # Install Instruments for profiling on macOS
+          xcode-select --install || true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-bench-
+
+      - name: Install benchmark tools
+        run: |
+          cargo install cargo-criterion || true
+          cargo install critcmp || true
+
+      - name: Checkout baseline
+        if: github.event_name == 'pull_request' || github.event.inputs.baseline != ''
+        run: |
+          BASELINE="${{ github.event.inputs.baseline || github.base_ref || 'main' }}"
+          git fetch origin $BASELINE
+          git checkout $BASELINE
+          echo "BASELINE_REF=$BASELINE" >> $GITHUB_ENV
+
+      - name: Run baseline benchmarks
+        if: env.BASELINE_REF != ''
+        run: |
+          cargo criterion --all-features --message-format=json > baseline.json
+          cp -r target/criterion target/criterion-baseline
+
+      - name: Checkout PR/current
+        if: env.BASELINE_REF != ''
+        run: |
+          git checkout ${{ github.sha }}
+
+      - name: Run benchmarks
+        id: benchmark
+        run: |
+          # Run criterion benchmarks
+          cargo criterion --all-features --message-format=json | tee current.json
+          
+          # Generate benchmark report
+          if [ -f baseline.json ]; then
+            echo "## Benchmark Comparison" > benchmark-report.md
+            echo "" >> benchmark-report.md
+            critcmp baseline.json current.json >> benchmark-report.md || true
+          fi
+          
+          # Extract key metrics for summary
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            echo "Extracting performance metrics..."
+            # Parse criterion output for key metrics
+            LATENCY=$(grep -o "time:.*\[.*\]" target/criterion/*/base/estimates.json | head -1 | cut -d'[' -f2 | cut -d' ' -f1) || true
+            THROUGHPUT=$(grep -o "throughput:.*" target/criterion/*/base/estimates.json | head -1 | cut -d':' -f2) || true
+            
+            echo "latency=$LATENCY" >> $GITHUB_OUTPUT
+            echo "throughput=$THROUGHPUT" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Store benchmark result
+        if: matrix.os == 'ubuntu-latest' && github.ref == 'refs/heads/main'
+        uses: benchmark-action/github-action-benchmark@v1
+        with:
+          name: Pancetta Benchmarks
+          tool: 'cargo'
+          output-file-path: current.json
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          auto-push: true
+          alert-threshold: '150%'
+          comment-on-alert: true
+          fail-on-alert: false
+          alert-comment-cc-users: '@thagale'
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ matrix.os }}
+          path: |
+            target/criterion/
+            *.json
+            benchmark-report.md
+          retention-days: 30
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request' && matrix.os == 'ubuntu-latest'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            let comment = '## Benchmark Results\n\n';
+            
+            if (fs.existsSync('benchmark-report.md')) {
+              comment += fs.readFileSync('benchmark-report.md', 'utf8');
+            } else {
+              comment += 'Benchmarks completed successfully. See artifacts for detailed results.';
+            }
+            
+            // Add performance metrics if available
+            const latency = '${{ steps.benchmark.outputs.latency }}';
+            const throughput = '${{ steps.benchmark.outputs.throughput }}';
+            if (latency || throughput) {
+              comment += '\n\n### Key Metrics\n';
+              if (latency) comment += `- **Latency**: ${latency}\n`;
+              if (throughput) comment += `- **Throughput**: ${throughput}\n`;
+            }
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+  # Latency-specific benchmarks
+  latency-benchmarks:
+    name: Latency Analysis
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libssl-dev pkg-config
+          # Install tools for latency analysis
+          sudo apt-get install -y linux-tools-common linux-tools-generic linux-tools-`uname -r`
+          echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-latency-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-latency-
+
+      - name: Build optimized binary
+        run: |
+          cargo build --release --all-features
+          
+      - name: Run latency analysis
+        run: |
+          # Create latency test script
+          cat > latency_test.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "Running latency analysis..."
+          
+          # Test buffer processing latency
+          for size in 64 128 256 512 1024 2048; do
+            echo "Testing buffer size: $size"
+            # This is a placeholder - implement actual latency test
+            perf stat -r 10 ./target/release/pancetta --benchmark --buffer-size $size 2>&1 | \
+              grep -E "task-clock|cycles|instructions|branches|branch-misses" || true
+          done
+          
+          # Generate flame graph if possible
+          if command -v perf &> /dev/null; then
+            perf record -F 99 -g ./target/release/pancetta --benchmark --duration 10 || true
+            perf script > perf.script || true
+          fi
+          EOF
+          
+          chmod +x latency_test.sh
+          ./latency_test.sh || true
+
+      - name: Upload latency analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: latency-analysis
+          path: |
+            perf.script
+            *.svg
+          retention-days: 30
+
+  # Memory profiling
+  memory-profile:
+    name: Memory Profiling
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libssl-dev pkg-config
+          sudo apt-get install -y valgrind massif-visualizer heaptrack
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-memory-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-memory-
+
+      - name: Build with debug symbols
+        run: |
+          cargo build --release --all-features
+          
+      - name: Run memory profiling
+        run: |
+          # Valgrind memory analysis
+          valgrind --tool=massif --massif-out-file=massif.out \
+            ./target/release/pancetta --benchmark --duration 5 || true
+          
+          # Heaptrack analysis
+          heaptrack ./target/release/pancetta --benchmark --duration 5 || true
+          
+          # Generate memory report
+          echo "# Memory Profile Report" > memory-report.md
+          echo "" >> memory-report.md
+          
+          if [ -f massif.out ]; then
+            ms_print massif.out | head -100 >> memory-report.md || true
+          fi
+
+      - name: Upload memory profile
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-profile
+          path: |
+            massif.out
+            heaptrack.*
+            memory-report.md
+          retention-days: 30
+
+  # Benchmark summary
+  benchmark-summary:
+    name: Benchmark Summary
+    if: always()
+    needs:
+      - benchmark
+      - latency-benchmarks
+      - memory-profile
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Generate summary report
+        run: |
+          echo "# Performance Benchmark Summary" > BENCHMARK_SUMMARY.md
+          echo "" >> BENCHMARK_SUMMARY.md
+          echo "Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> BENCHMARK_SUMMARY.md
+          echo "Commit: ${{ github.sha }}" >> BENCHMARK_SUMMARY.md
+          echo "" >> BENCHMARK_SUMMARY.md
+          
+          # Add benchmark results
+          if [ -d "artifacts/benchmark-results-ubuntu-latest" ]; then
+            echo "## Benchmark Results" >> BENCHMARK_SUMMARY.md
+            if [ -f "artifacts/benchmark-results-ubuntu-latest/benchmark-report.md" ]; then
+              cat "artifacts/benchmark-results-ubuntu-latest/benchmark-report.md" >> BENCHMARK_SUMMARY.md
+            fi
+            echo "" >> BENCHMARK_SUMMARY.md
+          fi
+          
+          # Add memory profile
+          if [ -d "artifacts/memory-profile" ]; then
+            echo "## Memory Profile" >> BENCHMARK_SUMMARY.md
+            if [ -f "artifacts/memory-profile/memory-report.md" ]; then
+              tail -20 "artifacts/memory-profile/memory-report.md" >> BENCHMARK_SUMMARY.md
+            fi
+            echo "" >> BENCHMARK_SUMMARY.md
+          fi
+          
+          echo "Full artifacts available in workflow run." >> BENCHMARK_SUMMARY.md
+
+      - name: Upload summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-summary
+          path: BENCHMARK_SUMMARY.md
+          retention-days: 90
+
+      - name: Report status
+        run: |
+          echo "Benchmark suite completed"
+          echo "========================"
+          echo "Benchmarks: ${{ needs.benchmark.result }}"
+          echo "Latency Analysis: ${{ needs.latency-benchmarks.result }}"
+          echo "Memory Profile: ${{ needs.memory-profile.result }}"

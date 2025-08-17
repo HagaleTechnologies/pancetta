@@ -1,0 +1,54 @@
+[package]
+name = "pancetta-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Terminal User Interface for Pancetta Ham Radio Digital Mode Monitor"
+authors = ["Pancetta Team"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# TUI Framework
+ratatui = "0.28"
+crossterm = "0.28"
+
+# Async runtime and channels
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = "0.7"
+
+# Serialization and configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Date and time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# CLI parsing
+clap = { version = "4.0", features = ["derive"] }
+
+# Audio processing (for future integration)
+cpal = "0.15"
+rustfft = "6.0"
+
+# Additional utility crates
+dirs = "5.0"
+
+# Ham radio specific (will be implemented later)
+# ft8-lib = { path = "../ft8-lib" }
+# pancetta-core = { path = "../pancetta-core" }
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[[bin]]
+name = "pancetta-tui"
+path = "src/main.rs"

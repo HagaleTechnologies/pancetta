@@ -11,7 +11,19 @@
 pub mod realtime;
 pub mod latency;
 pub mod ringbuffer_comm;
+pub mod device;
+pub mod stream;
+pub mod error;
+pub mod processor;
+pub mod converter;
+pub mod message_bus_integration;
 
 pub use realtime::*;
 pub use latency::*;
 pub use ringbuffer_comm::*;
+pub use device::*;
+pub use stream::*;
+pub use error::*;
+pub use processor::*;
+pub use converter::*;
+pub use message_bus_integration::*;

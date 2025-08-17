@@ -1,0 +1,47 @@
+[package]
+name = "pancetta-dsp"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance digital signal processing pipeline for amateur radio applications"
+authors = ["Pancetta Team"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Core dependencies
+tokio = { version = "1.0", features = ["full"] }
+async-trait = "0.1"
+thiserror = "1.0"
+tracing = "0.1"
+
+# Signal processing
+rustfft = "6.2"
+realfft = "3.3"
+rubato = "0.15"  # High-quality resampling
+biquad = "0.4"   # IIR filters
+
+# Numerical computing
+ndarray = "0.15"
+num-complex = "0.4"
+num-traits = "0.2"
+
+# Ring buffer and synchronization
+ringbuf = "0.3"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# Optional optimizations
+[dependencies.simdeez]
+version = "1.0"
+optional = true
+
+[features]
+default = ["simd"]
+simd = ["simdeez"]
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+rand = "0.8"
+
+[[example]]
+name = "ft8_pipeline_demo"
+required-features = []

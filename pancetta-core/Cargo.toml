@@ -1,0 +1,18 @@
+[package]
+name = "pancetta-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Pancetta Team"]
+description = "Core shared types and utilities for all Pancetta modules"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/thagale/pancetta"
+keywords = ["amateur-radio", "ham-radio", "types", "shared"]
+categories = ["multimedia", "science"]
+
+[dependencies]
+# Workspace dependencies
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]

@@ -1,6 +1,15 @@
 [workspace]
 members = [
+    "pancetta-core",
     "pancetta-audio",
+    "pancetta-ft8",
+    "pancetta-dsp",
+    "pancetta-tui",
+    "pancetta-config",
+    "pancetta-qso",
+    "pancetta-hamlib",
+    "pancetta-dx",
+    "pancetta",
 ]
 resolver = "2"
 
@@ -13,6 +22,79 @@ ringbuf = "0.4"
 instant = "0.1"
 # Atomic operations for real-time coordination
 atomic = "0.6"
+
+# Async runtime and coordination
+tokio = { version = "1.0", features = ["full", "rt-multi-thread"] }
+tokio-util = "0.7"
+futures = "0.3"
+futures-util = "0.3"
+
+# Inter-process communication
+crossbeam-channel = "0.5"
+flume = "0.11"
+async-channel = "2.0"
+parking_lot = "0.12"
+
+# CLI and configuration
+clap = { version = "4.0", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Logging and telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# System utilities
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+num_cpus = "1.0"
+
+# Signal handling
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+
+# Performance monitoring
+metrics = "0.23"
+
+# HTTP client and networking
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "cookies"] }
+
+# Geographic calculations
+geo = "0.28"
+geographiclib-rs = "0.2"
+
+# Database support
+rusqlite = { version = "0.30", features = ["bundled", "chrono"] }
+
+# XML and CSV parsing
+quick-xml = "0.36"
+csv = "1.3"
+
+# Regular expressions
+regex = "1.10"
+
+# URL parsing
+url = "2.5"
+
+# Encoding support
+base64 = "0.22"
+
+# TLS and WebSocket support
+native-tls = "0.2"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+# Statistical calculations
+statrs = "0.17"
+
+# Testing utilities
+approx = "0.5"
 
 [profile.release]
 # Optimize for real-time performance

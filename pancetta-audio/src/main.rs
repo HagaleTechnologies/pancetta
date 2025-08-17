@@ -5,38 +5,52 @@
 //! 
 //! If this test fails, the entire project needs architectural changes.
 
-use pancetta_audio::{AudioConfig, RealtimeAudioProcessor};
+use pancetta_audio::{
+    AudioProcessor, AudioProcessorBuilder, AudioProcessorConfig,
+    AudioDeviceManager, StreamConfig
+};
 use std::io;
+use std::time::Duration;
+use tokio::time::sleep;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🎯 Pancetta Week 0 Technical POC - Real-Time Audio Latency Test");
     println!("================================================================");
     println!("CRITICAL: Must prove <1ms audio callback latency for project viability\n");
     
-    // Initialize audio configuration for ultra-low latency
-    let config = AudioConfig {
-        sample_rate: 48000,    // Professional audio standard
-        buffer_size: 64,       // Ultra-low latency: 64 samples = 1.33ms at 48kHz
-        input_channels: 2,     // Stereo input
-        output_channels: 2,    // Stereo output
-    };
+    // First, enumerate available audio devices
+    println!("Available Audio Devices:");
+    let device_manager = AudioDeviceManager::new()?;
+    for device in device_manager.list_device_info() {
+        println!("  {}", device);
+    }
     
-    println!("Audio Configuration:");
-    println!("• Sample Rate: {}Hz", config.sample_rate);
-    println!("• Buffer Size: {} samples", config.buffer_size);
-    println!("• Channels: {} in, {} out", config.input_channels, config.output_channels);
-    println!("• Theoretical Min Latency: {:.3}ms\n", 
-             (config.buffer_size as f64 / config.sample_rate as f64) * 1000.0);
+    println!("\nFT8-Compatible Devices:");
+    for device in device_manager.find_ft8_compatible_devices() {
+        println!("  {} (supports: {}Hz)", device.name, 
+                 device.input_sample_rates.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", "));
+    }
+    
+    // Initialize audio processor for ultra-low latency
+    let config = AudioProcessorConfig::for_ft8();
+    
+    println!("\nAudio Configuration:");
+    println!("• Sample Rate: {}Hz", config.stream_config.sample_rate);
+    println!("• Buffer Size: {} samples", config.stream_config.buffer_size);
+    println!("• Channels: {} in, {} out", config.stream_config.input_channels, config.stream_config.output_channels);
+    println!("• Target Rate: {}Hz (FT8)", config.target_sample_rate);
+    println!("• Theoretical Min Latency: {:.3}ms\n", config.stream_config.theoretical_latency_ms());
     
     // Create the real-time audio processor
-    let mut processor = match RealtimeAudioProcessor::new(config) {
+    let mut processor = match AudioProcessor::new(config).await {
         Ok(p) => {
             println!("✅ Audio processor initialized successfully");
             p
         }
         Err(e) => {
             println!("❌ Failed to initialize audio processor: {}", e);
-            return Err(e);
+            return Err(e.into());
         }
     };
     
@@ -46,9 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Run the critical latency test
     println!("Starting real-time audio processing...");
-    println!("Generating 1kHz test tone with latency measurement\n");
+    println!("Testing with actual audio input/output streams\n");
     
-    match pancetta_audio::run_latency_stress_test(&mut processor, 30) {
+    match run_audio_latency_test(&mut processor, 30).await {
         Ok(()) => {
             println!("\n🎉 WEEK 0 POC SUCCESSFUL!");
             println!("The Pancetta real-time audio architecture is VIABLE.");
@@ -66,6 +80,100 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nPress Enter to exit...");
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
+    
+    Ok(())
+}
+
+/// Run the audio latency test using the new processor
+async fn run_audio_latency_test(
+    processor: &mut AudioProcessor,
+    test_duration_seconds: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pancetta_audio::latency::LatencyMeasurer;
+    
+    println!("Starting audio processor...");
+    processor.start().await?;
+    
+    let mut latency_measurer = LatencyMeasurer::new(1000, 1_000_000); // 1ms target
+    let mut last_stats_time = std::time::Instant::now();
+    let test_start = std::time::Instant::now();
+    
+    println!("Collecting samples and measuring latency for {} seconds...", test_duration_seconds);
+    
+    while test_start.elapsed().as_secs() < test_duration_seconds {
+        // Process any available samples
+        let samples = processor.get_processed_samples().await?;
+        
+        if !samples.is_empty() {
+            println!("Processed {} audio samples", samples.len());
+            
+            // Calculate processing latency for each sample
+            for sample in samples {
+                let latency_ns = sample.timestamp.elapsed().as_nanos() as u64;
+                latency_measurer.record_latency(latency_ns);
+            }
+        }
+        
+        // Print statistics every 5 seconds
+        if last_stats_time.elapsed().as_secs() >= 5 && latency_measurer.measurement_count() > 0 {
+            let stats = latency_measurer.get_stats();
+            let proc_stats = processor.get_statistics().await;
+            
+            println!(
+                "Progress: {}s - Avg Latency: {:.3}ms, Max: {:.3}ms, Samples: {}, Drops: {:.1}%",
+                test_start.elapsed().as_secs(),
+                stats.average_ms,
+                stats.max_ms,
+                proc_stats.stream_stats.samples_processed,
+                proc_stats.stream_stats.drop_rate_percent
+            );
+            
+            last_stats_time = std::time::Instant::now();
+        }
+        
+        // Small sleep to prevent busy loop
+        sleep(Duration::from_millis(100)).await;
+    }
+    
+    // Stop processor
+    processor.stop().await?;
+    
+    // Display final results
+    let final_stats = latency_measurer.get_stats();
+    let proc_stats = processor.get_statistics().await;
+    
+    println!("\n{}", final_stats.format_for_display());
+    println!("Stream Statistics:");
+    println!("  Samples Processed: {}", proc_stats.stream_stats.samples_processed);
+    println!("  Samples Dropped: {}", proc_stats.stream_stats.samples_dropped);
+    println!("  Drop Rate: {:.2}%", proc_stats.stream_stats.drop_rate_percent);
+    println!("  Stream Health: {}", proc_stats.stream_stats.status_description());
+    
+    // Validate if we meet the requirements
+    let success = final_stats.meeting_target && 
+                  proc_stats.stream_stats.drop_rate_percent < 1.0 &&
+                  proc_stats.stream_stats.samples_processed > 0;
+    
+    if success {
+        println!("\n✅ SUCCESS: Audio system meets all requirements!");
+        println!("   - Latency consistently <1ms");
+        println!("   - Drop rate <1%");
+        println!("   - Stream processing healthy");
+        println!("   The Pancetta real-time architecture is VIABLE.");
+    } else {
+        println!("\n❌ FAILURE: Audio system does not meet requirements.");
+        if !final_stats.meeting_target {
+            println!("   - Latency exceeds 1ms target");
+        }
+        if proc_stats.stream_stats.drop_rate_percent >= 1.0 {
+            println!("   - Sample drop rate too high: {:.1}%", proc_stats.stream_stats.drop_rate_percent);
+        }
+        if proc_stats.stream_stats.samples_processed == 0 {
+            println!("   - No audio samples processed (device issue?)");
+        }
+        println!("   The Pancetta architecture needs fundamental changes.");
+        return Err("Audio requirements not met".into());
+    }
     
     Ok(())
 }
@@ -107,21 +215,23 @@ mod tests {
     
     #[test]
     fn test_audio_config_defaults() {
-        let config = AudioConfig::default();
-        assert_eq!(config.sample_rate, 48000);
-        assert_eq!(config.buffer_size, 64);
-        assert_eq!(config.input_channels, 2);
-        assert_eq!(config.output_channels, 2);
+        let config = AudioProcessorConfig::default();
+        assert_eq!(config.stream_config.sample_rate, 48000);  // Uses 48kHz for compatibility
+        assert_eq!(config.target_sample_rate, 12000);         // Converts to 12kHz for FT8
+        assert_eq!(config.stream_config.buffer_size, 64);
+        assert_eq!(config.stream_config.input_channels, 1);
+        assert_eq!(config.stream_config.output_channels, 2);
     }
     
-    #[test]
-    fn test_theoretical_latency_calculation() {
-        let config = AudioConfig::default();
-        let processor = RealtimeAudioProcessor::new(config);
+    #[tokio::test]
+    async fn test_theoretical_latency_calculation() {
+        let config = AudioProcessorConfig::default();
+        let processor = AudioProcessor::new(config).await;
         
         // This test may fail on systems without audio devices
         if let Ok(proc) = processor {
-            let latency = proc.theoretical_min_latency_ms();
+            let config = proc.get_config();
+            let latency = config.stream_config.theoretical_latency_ms();
             // 64 samples at 48kHz = 1.333ms
             assert!((latency - 1.333).abs() < 0.001);
         }

@@ -218,7 +218,7 @@ pub fn run_latency_stress_test(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::latency::LatencyMeasurer;
     
-    let comm = Arc::new(AudioComm::new(1000));
+    let comm = Arc::new(AudioComm::new(128, 1000));
     let mut latency_measurer = LatencyMeasurer::new(1000, 1_000_000); // 1ms target
     
     println!("Starting latency stress test for {} seconds...", test_duration_seconds);

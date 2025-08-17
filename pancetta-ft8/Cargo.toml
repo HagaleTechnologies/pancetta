@@ -1,0 +1,71 @@
+[package]
+name = "pancetta-ft8"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance FT8 digital mode decoder for Pancetta"
+authors = ["Pancetta Team"]
+license = "MIT"
+
+[dependencies]
+# DSP and FFT operations
+rustfft = "6.2"
+# Numeric operations with SIMD optimization
+num-complex = "0.4"
+num-traits = "0.2"
+# Memory management and allocation control
+bumpalo = "3.14"
+# Bit manipulation for FT8 protocol
+bitvec = "1.0"
+# Time handling
+time = "0.3"
+# High-precision mathematics
+nalgebra = "0.32"
+# Concurrency primitives
+crossbeam = "0.8"
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+# Logging for debugging
+log = "0.4"
+# Serial port communication for PTT/CAT control
+serialport = { version = "4.2", optional = true }
+# GPIO control for Raspberry Pi
+rppal = { version = "0.17", optional = true }
+# Audio output and control
+cpal = { version = "0.15", optional = true }
+# Date/time handling for transmission scheduling
+chrono = { version = "0.4", features = ["serde"], optional = true }
+# Atomic operations for thread-safe state
+parking_lot = { version = "0.12", optional = true }
+# Configuration handling
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+# Async runtime for transmission control
+tokio = { version = "1.0", features = ["full"], optional = true }
+
+[dev-dependencies]
+# Testing framework
+criterion = { version = "0.5", features = ["html_reports"] }
+approx = "0.5"
+# Property-based testing
+proptest = "1.4"
+# Random number generation for tests
+rand = "0.8"
+# Async testing runtime
+tokio-test = "0.4"
+
+[[bench]]
+name = "decoder_benchmark"
+harness = false
+
+[features]
+default = ["std"]
+std = []
+# Enable SIMD optimizations
+simd = []
+# Use external ft8_lib via FFI (fallback)
+ffi = []
+# Enable GPIO support for Raspberry Pi
+gpio = ["rppal"]
+# Enable transmission capabilities
+transmit = ["serialport", "cpal", "chrono", "parking_lot", "serde", "serde_json", "tokio"]

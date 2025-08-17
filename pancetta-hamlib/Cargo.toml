@@ -1,0 +1,73 @@
+[package]
+name = "pancetta-hamlib"
+version = "0.1.0"
+edition = "2021"
+authors = ["Pancetta Team"]
+description = "Hamlib integration and CAT control for amateur radio transceivers"
+license = "MIT"
+repository = "https://github.com/thagale/pancetta"
+
+[dependencies]
+# Internal dependencies
+pancetta-core = { path = "../pancetta-core" }
+
+# Workspace dependencies
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+crossbeam-channel = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+chrono = { workspace = true }
+
+# FFI and system bindings
+libc = "0.2"
+libloading = { version = "0.8", optional = true }
+
+# Serialization for configuration
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Async utilities
+async-trait = "0.1"
+pin-project = "1.0"
+
+# Numeric types for frequency/power handling
+num-traits = "0.2"
+num-derive = "0.4"
+
+# String interning for efficient model/mode handling
+string_cache = "0.8"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.0"
+proptest = "1.0"
+tracing-subscriber = { workspace = true }
+
+[build-dependencies]
+bindgen = "0.69"
+pkg-config = "0.3"
+
+[features]
+default = ["mock-rig"]
+# Mock rig implementation for testing without hardware
+mock-rig = []
+# Enable runtime hamlib detection
+dynamic-hamlib = ["libloading"]
+# Development features (note: tracing-subscriber is a dev-dependency)
+
+[[example]]
+name = "basic_rig_control"
+required-features = ["mock-rig"]
+
+[[example]]
+name = "frequency_scanner"
+required-features = ["mock-rig"]
+
+[[example]]
+name = "band_hopper"
+required-features = ["mock-rig"]
