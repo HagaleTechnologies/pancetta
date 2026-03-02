@@ -1,6 +1,6 @@
 # Multi-stage build for Pancetta
 # Stage 1: Builder
-FROM rust:1.75-slim AS builder
+FROM rust:1.93-slim AS builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
