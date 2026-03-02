@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pancetta-ft8 = { path = "../pancetta-ft8" }
 
 # Utilities
-regex = "1.5"
+regex = "1.12"
 lazy_static = "1.4"
 
 [dev-dependencies]
