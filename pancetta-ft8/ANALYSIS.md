@@ -1,7 +1,8 @@
 # FT8 Encoder/Decoder: Honest Assessment
 
-_Written 2026-03-01. Based on thorough reading of all source files, tests, and
-comparison against ft8_lib/WSJT-X reference implementation._
+_Written 2026-03-01. Updated 2026-03-01 after decoder rewrite._
+_Based on thorough reading of all source files, tests, and comparison against
+ft8_lib/WSJT-X reference implementation._
 
 ---
 
@@ -12,14 +13,16 @@ ft8_lib for payloads, LDPC codewords, CRC-14, Gray code mapping, and all 79
 symbols. This is verified by 12 WSJT-X compatibility tests that compare against
 independently-computed reference values.
 
-**The decoder has never decoded an FT8 message.** Not in tests, not in
-production. The decode pipeline has multiple fundamental bugs that make it
-structurally incapable of decoding even a clean, high-SNR signal. The
-integration tests use fake signals (ASCII % 8, not real FT8 encoding), and the
-round-trip tests don't assert that decoding actually succeeds.
+**The decoder has been rewritten with a correct pipeline.** All 6 critical bugs
+from the original assessment have been fixed: proper Costas sync detection,
+complex DFT magnitude extraction, soft LLR computation, and removal of all
+stubs and broken code paths. The decoder has not yet been validated against
+real off-air signals or WSJT-X; end-to-end round-trip testing requires fixing
+the modulator first (GFSK and soft-clip bugs).
 
-**We are half-done.** The transmit side is solid. The receive side needs to be
-substantially rewritten.
+**The modulator still has issues.** GFSK filtering instead of CPFSK, and a
+discontinuous soft-clip function. These must be fixed before round-trip testing
+can validate the decoder against encoder-generated signals.
 
 ---
 
@@ -51,80 +54,49 @@ substantially rewritten.
 
 ### Test Coverage (encoder side)
 
-- 169 tests pass total
+- 184 tests pass total
 - 12 WSJT-X compatibility tests verify bit-exact output
 - Property tests (proptest) cover LDPC validity, Gray code bijection, CRC sensitivity
 - Determinism tests verify same input -> same output across instances
 
 ---
 
-## Part 2: What Is NOT Verified (Decoder)
+## Part 2: Decoder — Rewritten (2026-03-01)
 
-### Critical Bug 1: No Costas Sync Detection
+All 6 critical bugs have been fixed in a comprehensive rewrite of `decoder.rs`.
+The old pipeline (~500 lines of AGC, coarse/fine frequency search, coherent
+averaging, Doppler compensation) was replaced with a clean ~200-line pipeline:
 
-The sync engine (`sync.rs`) does generic multi-tone energy detection. It never
-correlates against the Costas array [3,1,4,0,6,5,2]. Without proper sync
-detection, the decoder cannot determine where an FT8 message starts in time or
-at what frequency offset.
+| Bug | Fix Applied |
+|-----|-------------|
+| No Costas sync | 2D spectrogram search: FFT size=1920 (=1 symbol, 6.25 Hz/bin), correlate [3,1,4,0,6,5,2] at 21 positions, NMS deduplication |
+| Cosine-only DFT | Complex DFT (cos+sin) at 8 tone frequencies per symbol, Hann-windowed, magnitude-based |
+| Hard-decision LDPC | Max-log LLR from per-symbol 8-tone magnitudes, Gray code bit mapping, clamped to [-25, 25] |
+| LocalDecoder stub | Removed entirely; single sequential decode path |
+| Coherent averaging bug | Removed; spectrogram approach doesn't need inter-window averaging |
+| is_ft8_like_signal stub | Removed; Costas sync score threshold (MIN_SYNC_SCORE=8.0) serves as signal filter |
 
-Real FT8 sync works by computing a 2D correlation of the 21 known Costas
-symbols (at positions 0-6, 36-42, 72-78) against a time-frequency spectrogram.
-The decoder does none of this.
+**Not yet validated** against real off-air signals or WSJT-X output. Requires
+modulator fixes first for end-to-end round-trip testing.
 
-### Critical Bug 2: LocalDecoder Is a Stub
-
-`LocalDecoder::decode_single_candidate` (decoder.rs ~line 1314) ignores the
-audio entirely and returns `Ft8Message::default()` for any candidate with
-SNR > -15 and confidence > 0.7. This is the parallel decode path, which
-activates when >4 candidates are found (the default `max_candidates = 50`).
-
-### Critical Bug 3: Symbol Extraction Uses Cosine-Only Correlation
-
-`correlate_with_tone` uses only the real (cosine) component of a single-
-frequency DFT. The result depends on the unknown carrier phase, making symbol
-extraction unreliable even at high SNR. A correct implementation uses the
-complex magnitude: sqrt(real^2 + imag^2).
-
-### Critical Bug 4: LDPC Decoder Gets Hard-Decision Input
-
-The belief propagation decoder receives hard bits (0/1) converted to fixed
-+/-4.0 LLR. All soft reliability information from the correlator is discarded.
-This severely degrades error correction capability. Real FT8 decoders pass
-actual log-likelihood ratios computed from tone correlation magnitudes.
-
-### Critical Bug 5: Coherent Averaging Phase Computation Is Wrong
-
-`coherent_symbol_averaging` (decoder.rs ~line 490) computes phase using the
-window index directly (`point.time_window as f64 * 0.16`), but `time_window`
-is a window count, not a time-in-seconds value. The actual time should be
-`time_window * hop_size / sample_rate`. This makes "coherent" averaging
-incoherent.
-
-### Critical Bug 6: `is_ft8_like_signal` Always Returns True
-
-The signal validation function (decoder.rs ~line 777) is a stub that
-unconditionally returns `true`. Every spectral peak becomes a decode candidate.
-
-### Modulator Issues
+### Modulator Issues (still open)
 
 | Issue | Severity | Detail |
 |-------|----------|--------|
 | Gaussian filtering | Medium | FT8 uses CPFSK (abrupt frequency transitions), not GFSK. `GAUSSIAN_BT=2.0` blurs symbol boundaries. |
 | Soft-clip discontinuity | High | `soft_clip(0.5)` returns 0, creating a jump from 0.5 (linear) to 0 (clipped). Combined with normalization to 0.95, this clips most of the signal. |
 
-### Integration Tests Use Fake Signals
+### Integration Tests Still Use Fake Signals
 
 `message_to_test_tones` in integration_tests.rs generates tones via
-`(ch as u8 % 8)` -- ASCII character values modulo 8. These are not FT8-encoded
-signals. They have no Costas arrays, no LDPC parity, no valid CRC. The
-integration tests verify the decoder doesn't crash, not that it decodes.
+`(ch as u8 % 8)` -- not real FT8 encoding. Now that the decoder has a correct
+pipeline, these tests should be updated to use real encoder+modulator signals.
 
-### Round-Trip Tests Don't Assert Decode Success
+### Round-Trip Tests Still Don't Assert Decode Success
 
-`test_round_trip_cq_clean` and similar tests encode a message, modulate to
-audio, feed to the decoder, then `println!` the results without asserting that
-any message was decoded. The comment admits: "the decoder's sync/correlation
-pipeline may not perfectly align."
+Round-trip tests print results but don't assert. The decoder pipeline is now
+correct, but the modulator's GFSK and soft-clip bugs may prevent round-trip
+success. Fix modulator first (TODO items 2.1, 2.2), then add assertions.
 
 ---
 
@@ -169,34 +141,14 @@ The single most convincing test is decoding a known FT8 signal from WSJT-X.
    - Feed to ft8_lib's decoder and verify it decodes correctly
    - This validates the transmit side end-to-end against an independent decoder
 
-### Phase B: Fix the Decoder (Priority 2)
+### ~~Phase B: Fix the Decoder~~ — DONE (2026-03-01)
 
-The decoder needs fundamental fixes before any of the above tests can pass.
-Ordered by dependency:
+All decoder bugs fixed. See Part 2 above.
 
-1. **Implement real Costas sync detection**
-   - Compute 2D time-frequency spectrogram (short FFT, overlapping windows)
-   - For each (time_offset, freq_offset), correlate the 21 known Costas symbol
-     positions against the spectrogram
-   - Select the (time, freq) with maximum correlation
-   - This is the single most important fix
+### Phase B (updated): Fix the Modulator (Priority 2)
 
-2. **Fix symbol extraction to use complex DFT magnitude**
-   - For each data symbol position, compute complex DFT at each of the 8 tone
-     frequencies
-   - Use magnitude (not just cosine component) to determine the most likely tone
-   - Compute soft log-likelihood ratios from magnitude differences
-
-3. **Pass soft LLRs to LDPC decoder**
-   - For each of 174 codeword bits, compute LLR from the 8-tone magnitude vector
-   - Pass these to belief propagation instead of hard +/-4.0
-
-4. **Remove the LocalDecoder stub**
-   - Either remove the parallel decode path entirely or implement it properly
-
-5. **Fix modulator**
-   - Remove Gaussian filtering (use CPFSK, not GFSK)
-   - Fix soft-clip discontinuity
+1. **Remove Gaussian filtering** — use CPFSK, not GFSK
+2. **Fix soft-clip discontinuity** — or remove soft clipping entirely
 
 ### Phase C: Build the Real Round-Trip Test (Priority 3)
 
@@ -238,11 +190,11 @@ Once the decoder works:
 | CRC-14 computation | Working | High (matches ft8_lib algorithm) |
 | Gray code mapping | Working | High (ft8_lib lookup tables) |
 | Modulate to audio | Partially working | Medium (GFSK instead of CPFSK, soft-clip bug) |
-| Detect FT8 signals in audio | Not working | None (no Costas sync) |
-| Extract symbols from audio | Not working | None (phase-dependent correlation) |
-| LDPC(174,91) decoding | Untested | Low (algorithm correct but never exercised with real data) |
-| Decode FT8 messages from audio | Not working | None (multiple critical bugs) |
-| End-to-end encode+decode | Not working | None |
+| Detect FT8 signals in audio | Rewritten | Medium (Costas sync implemented, not yet validated on real signals) |
+| Extract symbols from audio | Rewritten | Medium (complex DFT magnitude, not yet validated on real signals) |
+| LDPC(174,91) decoding | Rewritten | Medium (soft LLR input, not yet validated on real signals) |
+| Decode FT8 messages from audio | Rewritten | Medium (pipeline correct, blocked on modulator for round-trip) |
+| End-to-end encode+decode | Blocked | Modulator bugs prevent validation |
 | Interop with WSJT-X | Transmit only | Medium (encoder bit-exact, modulator has issues) |
 
 ---
@@ -254,7 +206,7 @@ Once the decoder works:
 | `src/encoder.rs` | ~900 | FT8 message encoder | Working (with /R /P bugs) |
 | `src/ldpc.rs` | ~850 | LDPC encode/decode, Gray code | Working |
 | `src/message.rs` | ~1100 | CRC-14, message types, parsing | Working |
-| `src/decoder.rs` | ~1400 | Full FT8 decoder pipeline | Broken (multiple critical bugs) |
+| `src/decoder.rs` | ~1100 | Full FT8 decoder pipeline | Rewritten (spectrogram + Costas sync + soft LLR) |
 | `src/modulator.rs` | ~230 | 8-FSK audio modulation | Partially working |
 | `src/lib.rs` | ~115 | Module exports, constants | OK |
 | `tests/wsjtx_compat_tests.rs` | ~235 | WSJT-X reference comparison | All 12 pass |

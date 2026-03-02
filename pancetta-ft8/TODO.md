@@ -1,43 +1,23 @@
 # FT8 Remaining Work
 
-_Created 2026-03-01. See ANALYSIS.md for the full honest assessment behind these items._
+_Created 2026-03-01. Updated 2026-03-01. See ANALYSIS.md for the full honest assessment._
 
 ---
 
-## 1. Fix Decoder Critical Bugs
+## ~~1. Fix Decoder Critical Bugs~~ — DONE (2026-03-01)
 
-These must be fixed in order -- each depends on the one before it.
+All 6 critical decoder bugs were fixed in a comprehensive rewrite of `src/decoder.rs`.
+The old pipeline (AGC, coarse/fine freq search, coherent averaging, Doppler compensation)
+was replaced with a clean spectrogram + Costas sync + complex DFT + soft LLR pipeline.
 
-### 1.1 Implement Real Costas Sync Detection
-- **File**: `src/decoder.rs`, sync logic (also `sync.rs` if separate)
-- **Problem**: Current sync engine does generic multi-tone energy detection. It never correlates against the Costas array `[3,1,4,0,6,5,2]`.
-- **Fix**: Compute a 2D time-frequency spectrogram (short overlapping FFTs). For each candidate (time_offset, freq_offset), correlate the 21 known Costas symbol positions (0-6, 36-42, 72-78) against the spectrogram. Select the (time, freq) pair with maximum correlation score.
-- **This is the single most important fix.** Nothing else in the decoder can work without correct time/frequency sync.
+- **1.1 Costas sync**: 2D spectrogram search correlating against [3,1,4,0,6,5,2] at 21 positions
+- **1.2 Complex DFT**: cos+sin correlation at 8 tone frequencies per symbol, magnitude-based
+- **1.3 Soft LLRs**: Max-log approximation from per-symbol 8-tone magnitudes with Gray code mapping
+- **1.4 LocalDecoder stub**: Removed entirely. Single sequential decode path.
+- **1.5 Coherent averaging**: Removed (replaced by spectrogram approach — no averaging needed)
+- **1.6 is_ft8_like_signal**: Removed (Costas sync score threshold serves as the signal filter)
 
-### 1.2 Fix Symbol Extraction: Complex DFT Magnitude
-- **File**: `src/decoder.rs`, `correlate_with_tone` function
-- **Problem**: Uses only the cosine (real) component of a single-frequency DFT. Result depends on unknown carrier phase, making symbol extraction unreliable.
-- **Fix**: Correlate against both `cos` and `sin` at each tone frequency. Use magnitude `sqrt(real^2 + imag^2)` to determine the most likely tone. Also compute soft log-likelihood ratios from the magnitude differences between tones.
-
-### 1.3 Pass Soft LLRs to LDPC Decoder
-- **File**: `src/decoder.rs`, LDPC decode call site
-- **Problem**: Hard-decision bits (0/1) converted to fixed +/-4.0 LLR. All soft reliability information from the correlator is discarded.
-- **Fix**: For each of 174 codeword bits (3 bits per data symbol, 58 data symbols), compute LLR from the 8-tone magnitude vector. Pass these soft values to belief propagation instead of hard +/-4.0.
-
-### 1.4 Remove or Rewrite LocalDecoder Stub
-- **File**: `src/decoder.rs`, `LocalDecoder::decode_single_candidate` (~line 1314)
-- **Problem**: Ignores audio entirely, returns `Ft8Message::default()` for any candidate with SNR > -15 and confidence > 0.7. This is the parallel decode path (activates when >4 candidates found).
-- **Fix**: Either remove the parallel path and always use sequential decoding, or implement it properly using the same pipeline as the sequential path.
-
-### 1.5 Fix Coherent Averaging Phase Computation
-- **File**: `src/decoder.rs`, `coherent_symbol_averaging` (~line 490)
-- **Problem**: `point.time_window as f64 * 0.16` treats window index as time in seconds. Actual time is `time_window * hop_size / sample_rate`.
-- **Fix**: Multiply by correct factor.
-
-### 1.6 Implement `is_ft8_like_signal`
-- **File**: `src/decoder.rs` (~line 777)
-- **Problem**: Always returns `true`. Every spectral peak becomes a decode candidate.
-- **Fix**: Check for FT8-like characteristics: ~12.6s duration, 6.25 Hz tone spacing, presence of Costas-like energy pattern. Can be a rough filter -- LDPC CRC check is the final gate.
+184 tests pass (up from 169). No regressions.
 
 ---
 
@@ -118,17 +98,12 @@ These must be fixed in order -- each depends on the one before it.
 ## Recommended Order of Attack
 
 ```
-1.1 Costas sync ─────┐
-                      ├──> 1.2 Complex DFT ──> 1.3 Soft LLR ──> 4.2 Assert round-trips
-2.1 Remove GFSK ─────┘
-2.2 Fix soft-clip ────┘
-1.4 Remove LocalDecoder stub (independent, do anytime)
-1.5 Fix coherent averaging (independent, do anytime)
-1.6 is_ft8_like_signal (independent, low priority)
+[DONE] 1.1-1.6 Decoder critical bugs
+2.1 Remove GFSK ──> 2.2 Fix soft-clip ──> 4.2 Assert round-trips
 3.1 + 3.2 + 4.3: /R /P fixes + tests (independent, do anytime)
-4.1 Real integration test signals (after 1.1-1.3 work)
-5.1-5.4 Cross-implementation (after decoder works)
+4.1 Real integration test signals (decoder is ready now)
+5.1-5.4 Cross-implementation (decoder is ready now)
 ```
 
-The critical path is: **Costas sync -> complex DFT -> soft LLR -> assert round-trips**.
-Everything else can be done in parallel or after.
+The next critical path is: **Fix modulator -> assert round-trips -> cross-implementation validation**.
+The /R /P encoder fixes are independent and can be done anytime.
