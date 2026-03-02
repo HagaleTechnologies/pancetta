@@ -36,6 +36,7 @@ use tracing::{debug, info};
 
 // Re-export all configuration modules
 pub mod audio;
+pub mod autonomous;
 pub mod loader;
 pub mod network;
 pub mod rig;
@@ -44,6 +45,7 @@ pub mod ui;
 pub mod hot_reload;
 
 pub use audio::*;
+pub use autonomous::*;
 pub use loader::*;
 pub use network::*;
 pub use rig::*;
@@ -86,19 +88,23 @@ pub type ConfigResult<T> = Result<T, ConfigError>;
 pub struct Config {
     /// Station configuration (callsign, grid, power)
     pub station: StationConfig,
-    
+
     /// Audio device and processing settings
     pub audio: AudioConfig,
-    
+
     /// Rig control and interface settings
     pub rig: RigConfig,
-    
+
     /// User interface preferences
     pub ui: UiConfig,
-    
+
     /// Network services configuration
     pub network: NetworkConfig,
-    
+
+    /// Autonomous operator configuration
+    #[serde(default)]
+    pub autonomous: AutonomousConfig,
+
     /// Metadata about the configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ConfigMetadata>,
@@ -128,6 +134,7 @@ impl Default for Config {
             rig: RigConfig::default(),
             ui: UiConfig::default(),
             network: NetworkConfig::default(),
+            autonomous: AutonomousConfig::default(),
             metadata: Some(ConfigMetadata {
                 version: "1.0".to_string(),
                 last_modified: Some(chrono::Utc::now()),
@@ -161,6 +168,7 @@ impl Config {
         self.rig.validate_section()?;
         self.ui.validate_section()?;
         self.network.validate_section()?;
+        self.autonomous.validate_section()?;
         
         info!("Configuration validation successful");
         Ok(())
@@ -175,6 +183,7 @@ impl Config {
         self.rig.merge_with(other.rig);
         self.ui.merge_with(other.ui);
         self.network.merge_with(other.network);
+        self.autonomous.merge_with(other.autonomous);
         
         // Update metadata
         if let Some(ref mut metadata) = self.metadata {

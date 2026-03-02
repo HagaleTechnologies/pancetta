@@ -210,19 +210,10 @@ fn demo_advanced_encoding() -> Result<(), Box<dyn std::error::Error>> {
     let strong_report = encoder.encode_signal_report("K1DEF", "W1ABC", 20)?;
     println!("  Signal reports: {} symbols each", weak_report.len());
     
-    // Contest exchange
-    let contest_symbols = encoder.encode_contest_exchange("K1DEF", "W1ABC", -12, 50)?;
-    println!("  Contest exchange: {} symbols", contest_symbols.len());
-    
     // Free text variations
     let short_text = encoder.encode_freetext("73")?;
     let long_text = encoder.encode_freetext("HELLO WORLD")?;
     println!("  Free text: {} symbols each", short_text.len());
-    
-    // Telemetry data
-    let telemetry_data = vec![0x12, 0x34, 0x56, 0x78];
-    let telem_symbols = encoder.encode_telemetry(&telemetry_data)?;
-    println!("  Telemetry: {} symbols", telem_symbols.len());
     
     println!();
     Ok(())

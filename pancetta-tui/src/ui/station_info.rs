@@ -21,6 +21,7 @@ pub fn render_station_info(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<(
             Constraint::Length(4), // Station details
             Constraint::Length(3), // Operating parameters
             Constraint::Length(2), // Audio monitoring
+            Constraint::Length(2), // Autonomous status
             Constraint::Min(1),    // Equipment/antenna info
         ])
         .split(block.inner(area));
@@ -30,15 +31,18 @@ pub fn render_station_info(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<(
 
     // Station Details
     render_station_details(f, chunks[0], app);
-    
+
     // Operating Parameters
     render_operating_parameters(f, chunks[1], app);
-    
+
     // Audio Monitoring Status
     render_audio_status(f, chunks[2], app);
-    
+
+    // Autonomous Operator Status
+    render_autonomous_status(f, chunks[3], app);
+
     // Equipment Information
-    render_equipment_info(f, chunks[3], app);
+    render_equipment_info(f, chunks[4], app);
 
     Ok(())
 }
@@ -213,6 +217,46 @@ fn render_equipment_info(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     let paragraph = Paragraph::new(all_lines);
     f.render_widget(paragraph, area);
+}
+
+fn render_autonomous_status(f: &mut Frame<'_>, area: Rect, app: &App) {
+    if let Some(ref status) = app.autonomous_status {
+        let state_color = if !status.enabled {
+            app.theme.muted_color()
+        } else if status.state == "Paused" {
+            app.theme.warning_color()
+        } else {
+            app.theme.success_color()
+        };
+
+        let parity_str = status.slot_parity.as_deref().unwrap_or("--");
+
+        let lines = vec![Line::from(vec![
+            Span::styled("[AUTO] ", Style::default().fg(app.theme.accent_color()).add_modifier(Modifier::BOLD)),
+            Span::styled(&status.state, Style::default().fg(state_color).add_modifier(Modifier::BOLD)),
+            Span::raw(" | Slot: "),
+            Span::styled(parity_str, Style::default().fg(app.theme.foreground_color())),
+            Span::raw(" | Listen: "),
+            Span::styled(&status.listen_counter, Style::default().fg(app.theme.foreground_color())),
+            Span::raw(" | QSOs: "),
+            Span::styled(
+                format!("{}/{}", status.active_qsos, status.max_qsos),
+                Style::default().fg(app.theme.foreground_color()),
+            ),
+            Span::raw(" | "),
+            Span::styled(&status.band_name, Style::default().fg(app.theme.accent_color())),
+        ])];
+
+        let paragraph = Paragraph::new(lines);
+        f.render_widget(paragraph, area);
+    } else {
+        let lines = vec![Line::from(vec![
+            Span::styled("[AUTO] ", Style::default().fg(app.theme.muted_color())),
+            Span::styled("Disabled", Style::default().fg(app.theme.muted_color())),
+        ])];
+        let paragraph = Paragraph::new(lines);
+        f.render_widget(paragraph, area);
+    }
 }
 
 fn get_audio_level_color(level: f32, theme: &crate::config::Theme) -> ratatui::style::Color {

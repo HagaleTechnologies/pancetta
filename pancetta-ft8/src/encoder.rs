@@ -1,46 +1,52 @@
-//! FT8 message encoding implementation
+//! FT8 message encoding implementation (WSJT-X compatible)
 //!
-//! This module handles encoding of text messages into FT8 protocol format:
-//! - 77-bit information payload encoding
-//! - CRC-14 checksum calculation
-//! - LDPC error correction coding
-//! - Symbol generation for transmission
-//! - Support for all standard FT8 message types
+//! This module handles encoding of text messages into FT8 protocol format,
+//! producing output bit-compatible with WSJT-X / ft8_lib.
+//!
+//! Encoding pipeline:
+//! 1. Parse message text → structured fields
+//! 2. Pack fields into 77-bit payload (i3 at bits 74-76)
+//! 3. Calculate CRC-14 checksum → 91-bit message
+//! 4. LDPC encode → 174-bit codeword
+//! 5. Map to 79 symbols via Gray code + Costas sync arrays
 
-use crate::message::{
-    MessageType, Ft8Message, PAYLOAD_BITS, CRC_BITS, calculate_crc14, NUM_SYMBOLS
-};
-use crate::{Ft8Error, Ft8Result, TONE_SPACING, NUM_TONES};
+use crate::message::{PAYLOAD_BITS, CRC_BITS, calculate_crc14, NUM_SYMBOLS};
+use crate::ldpc::{LdpcEncoder, binary_to_gray};
+use crate::{Ft8Error, Ft8Result};
 use bitvec::prelude::*;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 /// Maximum length for free text messages
 pub const MAX_FREETEXT_LENGTH: usize = 13;
 
-/// Maximum signal report value (+40 dB)
-pub const MAX_SIGNAL_REPORT: i8 = 40;
+/// Maximum signal report value in dB (WSJT-X limit: MAXGRID4 + 35 + dd < 2^15)
+pub const MAX_SIGNAL_REPORT: i8 = 30;
 
-/// Minimum signal report value (-50 dB)
-pub const MIN_SIGNAL_REPORT: i8 = -50;
+/// Minimum signal report value in dB (must satisfy 35 + dd >= 0)
+pub const MIN_SIGNAL_REPORT: i8 = -35;
+
+/// WSJT-X constants for callsign encoding
+const NTOKENS: u32 = 2_063_592;
+const MAX22: u32 = 4_194_304;
+const MAXGRID4: u16 = 32400;
+
+/// FT8 Costas synchronization array (same at all three positions)
+const COSTAS_ARRAY: [u8; 7] = [3, 1, 4, 0, 6, 5, 2];
+
+/// Free text character table (42 chars): " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?"
+const FREETEXT_CHARS: &[u8; 42] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?";
 
 /// FT8 message encoder for generating transmission-ready symbols
 pub struct Ft8Encoder {
-    /// Callsign encoding table
-    callsign_table: CallsignEncodingTable,
     /// LDPC encoder for error correction
     ldpc_encoder: LdpcEncoder,
-    /// Costas sync arrays for symbol generation
-    costas_arrays: CostasArrays,
 }
 
 impl Ft8Encoder {
     /// Create a new FT8 encoder
     pub fn new() -> Self {
         Self {
-            callsign_table: CallsignEncodingTable::new(),
             ldpc_encoder: LdpcEncoder::new(),
-            costas_arrays: CostasArrays::new(),
         }
     }
 
@@ -48,36 +54,28 @@ impl Ft8Encoder {
     ///
     /// # Arguments
     /// * `message_text` - Text message to encode (e.g., "CQ W1ABC FN42")
-    /// * `transmit_power` - Transmit power for contest exchanges (optional)
+    /// * `_transmit_power` - Transmit power for contest exchanges (unused, reserved)
     ///
     /// # Returns
     /// Array of 79 symbol values (0-7) ready for transmission
-    pub fn encode_message(&mut self, message_text: &str, transmit_power: Option<u8>) -> Ft8Result<[u8; NUM_SYMBOLS]> {
-        // Parse the message text into structured format
-        let ft8_message = self.parse_message_text(message_text, transmit_power)?;
-        
-        // Encode message into 77-bit payload
-        let payload_bits = self.encode_message_payload(&ft8_message)?;
-        
-        // Calculate CRC-14 checksum
-        let crc = calculate_crc14(&payload_bits);
-        
-        // Combine payload and CRC into 91-bit message
-        let mut message_bits = BitVec::with_capacity(PAYLOAD_BITS + CRC_BITS);
-        message_bits.extend_from_bitslice(&payload_bits);
-        
-        // Append CRC bits (MSB first)
-        for i in (0..CRC_BITS).rev() {
-            message_bits.push((crc >> i) & 1 != 0);
+    pub fn encode_message(&mut self, message_text: &str, _transmit_power: Option<u8>) -> Ft8Result<[u8; NUM_SYMBOLS]> {
+        // Normalize: uppercase, collapse whitespace
+        let text = message_text.to_uppercase();
+        let text = text.trim();
+
+        // Try standard message encoding first
+        if let Ok(payload) = self.try_encode_standard(text) {
+            return self.payload_to_symbols(&payload);
         }
-        
-        // Apply LDPC error correction encoding (91 bits -> 174 bits)
-        let ldpc_codeword = self.ldpc_encoder.encode(&message_bits)?;
-        
-        // Generate symbol sequence with Costas arrays
-        let symbols = self.generate_symbols(&ldpc_codeword)?;
-        
-        Ok(symbols)
+
+        // Fall back to free text encoding
+        if let Ok(payload) = self.encode_free_text(text) {
+            return self.payload_to_symbols(&payload);
+        }
+
+        Err(Ft8Error::MessageDecodingError(
+            format!("Cannot encode message: '{}'", message_text)
+        ))
     }
 
     /// Encode standard CQ message: "CQ [DX] <callsign> <grid>"
@@ -103,7 +101,6 @@ impl Ft8Encoder {
                 format!("Signal report {} dB out of range ({} to {})", report_db, MIN_SIGNAL_REPORT, MAX_SIGNAL_REPORT)
             ));
         }
-        
         let message_text = format!("{} {} {:+03}", to_callsign, from_callsign, report_db);
         self.encode_message(&message_text, None)
     }
@@ -127,465 +124,227 @@ impl Ft8Encoder {
                 format!("Free text message too long: {} characters (max {})", text.len(), MAX_FREETEXT_LENGTH)
             ));
         }
-        
-        // Validate characters (only basic ASCII allowed)
-        for ch in text.chars() {
-            if !self.is_valid_freetext_char(ch) {
-                return Err(Ft8Error::MessageDecodingError(
-                    format!("Invalid character in free text: '{}'", ch)
-                ));
-            }
-        }
-        
-        self.encode_message(text, None)
+        let text = text.to_uppercase();
+        let payload = self.encode_free_text(&text)?;
+        self.payload_to_symbols(&payload)
     }
 
-    /// Encode contest exchange with power
-    pub fn encode_contest_exchange(&mut self, to_callsign: &str, from_callsign: &str, report_db: i8, power_watts: u8) -> Ft8Result<[u8; NUM_SYMBOLS]> {
-        if power_watts == 0 || power_watts > 99 {
-            return Err(Ft8Error::MessageDecodingError(
-                format!("Invalid power value: {} watts (1-99)", power_watts)
-            ));
-        }
-        
-        let message_text = format!("{} {} R{:+03}", to_callsign, from_callsign, report_db);
-        self.encode_message(&message_text, Some(power_watts))
-    }
+    // ========================================================================
+    // Core encoding pipeline
+    // ========================================================================
 
-    /// Encode telemetry data (custom format)
-    pub fn encode_telemetry(&mut self, data: &[u8]) -> Ft8Result<[u8; NUM_SYMBOLS]> {
-        if data.len() > 9 {
-            return Err(Ft8Error::MessageDecodingError(
-                "Telemetry data too long (max 9 bytes)".to_string()
-            ));
+    /// Convert 77-bit payload to 79 transmission symbols
+    fn payload_to_symbols(&self, payload: &[u8; 10]) -> Ft8Result<[u8; NUM_SYMBOLS]> {
+        // Add CRC-14 to get 91 bits
+        let mut payload_bitvec = BitVec::with_capacity(PAYLOAD_BITS);
+        for i in 0..PAYLOAD_BITS {
+            payload_bitvec.push(payload[i / 8] & (0x80u8 >> (i % 8)) != 0);
         }
-        
-        // Create telemetry message
-        let ft8_message = Ft8Message {
-            message_type: MessageType::Telemetry,
-            from_callsign: None,
-            to_callsign: None,
-            grid_square: None,
-            signal_report: None,
-            text: None,
-            payload_bits: BitVec::new(),
-            crc: 0,
-            crc_valid: false,
-        };
-        
-        let payload_bits = self.encode_telemetry_payload(data)?;
-        let crc = calculate_crc14(&payload_bits);
-        
-        let mut message_bits = payload_bits;
+
+        let crc = calculate_crc14(&payload_bitvec);
+
+        // Build 91-bit message: 77 payload + 14 CRC
+        let mut message_bits = BitVec::with_capacity(PAYLOAD_BITS + CRC_BITS);
+        message_bits.extend_from_bitslice(&payload_bitvec);
         for i in (0..CRC_BITS).rev() {
             message_bits.push((crc >> i) & 1 != 0);
         }
-        
+
+        // LDPC encode (91 → 174 bits)
         let ldpc_codeword = self.ldpc_encoder.encode(&message_bits)?;
-        let symbols = self.generate_symbols(&ldpc_codeword)?;
-        
-        Ok(symbols)
-    }
 
-    /// Parse message text into structured FT8 message
-    fn parse_message_text(&mut self, text: &str, _transmit_power: Option<u8>) -> Ft8Result<Ft8Message> {
-        let parts: Vec<&str> = text.split_whitespace().collect();
-        
-        if parts.is_empty() {
-            return Err(Ft8Error::MessageDecodingError("Empty message".to_string()));
-        }
-        
-        let mut message = Ft8Message::default();
-        
-        // Determine message type and parse accordingly
-        match parts[0] {
-            "CQ" => {
-                message.message_type = MessageType::Cq;
-                if parts.len() >= 2 {
-                    let start_idx = if parts[1] == "DX" { 2 } else { 1 };
-                    if parts.len() > start_idx {
-                        message.from_callsign = Some(parts[start_idx].to_string());
-                    }
-                    if parts.len() > start_idx + 1 {
-                        message.grid_square = Some(parts[start_idx + 1].to_string());
-                    }
-                }
-            }
-            _ => {
-                // Check for signal report or other message types
-                if parts.len() >= 3 {
-                    let third_part = parts[2];
-                    if third_part == "RRR" {
-                        message.message_type = MessageType::Ack;
-                        message.to_callsign = Some(parts[0].to_string());
-                        message.from_callsign = Some(parts[1].to_string());
-                    } else if third_part == "73" {
-                        message.message_type = MessageType::Final;
-                        message.to_callsign = Some(parts[0].to_string());
-                        message.from_callsign = Some(parts[1].to_string());
-                    } else if third_part.starts_with('+') || third_part.starts_with('-') || third_part.starts_with('R') {
-                        message.message_type = MessageType::Report;
-                        message.to_callsign = Some(parts[0].to_string());
-                        message.from_callsign = Some(parts[1].to_string());
-                        
-                        let report_str = if third_part.starts_with('R') {
-                            &third_part[1..]
-                        } else {
-                            third_part
-                        };
-                        
-                        if let Ok(report) = report_str.parse::<i8>() {
-                            message.signal_report = Some(report);
-                        }
-                    } else if self.is_grid_square(third_part) {
-                        message.message_type = MessageType::Response;
-                        message.to_callsign = Some(parts[0].to_string());
-                        message.from_callsign = Some(parts[1].to_string());
-                        message.grid_square = Some(third_part.to_string());
-                    }
-                } else {
-                    // Free text or grid-only message
-                    if parts.len() == 1 && self.is_grid_square(parts[0]) {
-                        message.message_type = MessageType::GridOnly;
-                        message.grid_square = Some(parts[0].to_string());
-                    } else {
-                        message.message_type = MessageType::FreeText;
-                        message.text = Some(text.to_string());
-                    }
-                }
-            }
-        }
-        
-        Ok(message)
-    }
-
-    /// Encode FT8 message into 77-bit payload
-    fn encode_message_payload(&mut self, message: &Ft8Message) -> Ft8Result<BitVec> {
-        let mut payload = BitVec::with_capacity(PAYLOAD_BITS);
-        
-        // Encode message type (3 bits)
-        let type_bits = match message.message_type {
-            MessageType::Cq => 0u8,
-            MessageType::Response => 1u8,
-            MessageType::Report => 2u8,
-            MessageType::Ack => 3u8,
-            MessageType::Final => 4u8,
-            MessageType::FreeText => 5u8,
-            MessageType::GridOnly => 6u8,
-            MessageType::Telemetry => 7u8,
-            MessageType::Unknown => 0u8,
-        };
-        
-        for i in (0..3).rev() {
-            payload.push((type_bits >> i) & 1 != 0);
-        }
-        
-        // Encode message content based on type
-        match message.message_type {
-            MessageType::Cq => self.encode_cq_payload(&mut payload, message)?,
-            MessageType::Response => self.encode_response_payload(&mut payload, message)?,
-            MessageType::Report => self.encode_report_payload(&mut payload, message)?,
-            MessageType::Ack | MessageType::Final => self.encode_ack_payload(&mut payload, message)?,
-            MessageType::FreeText => self.encode_freetext_payload(&mut payload, message)?,
-            MessageType::GridOnly => self.encode_grid_payload(&mut payload, message)?,
-            MessageType::Telemetry => self.encode_telemetry_structured_payload(&mut payload, message)?,
-            MessageType::Unknown => {
-                // Pad with zeros
-                while payload.len() < PAYLOAD_BITS {
-                    payload.push(false);
-                }
-            }
-        }
-        
-        // Ensure exactly 77 bits
-        payload.resize(PAYLOAD_BITS, false);
-        
-        Ok(payload)
-    }
-
-    /// Encode CQ message payload
-    fn encode_cq_payload(&mut self, payload: &mut BitVec, message: &Ft8Message) -> Ft8Result<()> {
-        // Encode callsign (28 bits)
-        if let Some(ref callsign) = message.from_callsign {
-            let callsign_bits = self.callsign_table.encode_callsign(callsign)?;
-            self.append_u32_bits(payload, callsign_bits, 28);
-        } else {
-            self.append_u32_bits(payload, 0, 28);
-        }
-        
-        // Encode grid square (15 bits)
-        if let Some(ref grid) = message.grid_square {
-            let grid_bits = self.encode_grid_square(grid)?;
-            self.append_u32_bits(payload, grid_bits, 15);
-        } else {
-            self.append_u32_bits(payload, 0, 15);
-        }
-        
-        // Pad remaining bits
-        while payload.len() < PAYLOAD_BITS {
-            payload.push(false);
-        }
-        
-        Ok(())
-    }
-
-    /// Encode response message payload
-    fn encode_response_payload(&mut self, payload: &mut BitVec, message: &Ft8Message) -> Ft8Result<()> {
-        // Encode to_callsign (28 bits)
-        if let Some(ref callsign) = message.to_callsign {
-            let callsign_bits = self.callsign_table.encode_callsign(callsign)?;
-            self.append_u32_bits(payload, callsign_bits, 28);
-        } else {
-            self.append_u32_bits(payload, 0, 28);
-        }
-        
-        // Encode from_callsign (28 bits)
-        if let Some(ref callsign) = message.from_callsign {
-            let callsign_bits = self.callsign_table.encode_callsign(callsign)?;
-            self.append_u32_bits(payload, callsign_bits, 28);
-        } else {
-            self.append_u32_bits(payload, 0, 28);
-        }
-        
-        // Encode grid square (15 bits)
-        if let Some(ref grid) = message.grid_square {
-            let grid_bits = self.encode_grid_square(grid)?;
-            self.append_u32_bits(payload, grid_bits, 15);
-        } else {
-            self.append_u32_bits(payload, 0, 15);
-        }
-        
-        // Pad remaining bits
-        while payload.len() < PAYLOAD_BITS {
-            payload.push(false);
-        }
-        
-        Ok(())
-    }
-
-    /// Encode signal report message payload
-    fn encode_report_payload(&mut self, payload: &mut BitVec, message: &Ft8Message) -> Ft8Result<()> {
-        // Encode to_callsign (28 bits)
-        if let Some(ref callsign) = message.to_callsign {
-            let callsign_bits = self.callsign_table.encode_callsign(callsign)?;
-            self.append_u32_bits(payload, callsign_bits, 28);
-        } else {
-            self.append_u32_bits(payload, 0, 28);
-        }
-        
-        // Encode from_callsign (28 bits)
-        if let Some(ref callsign) = message.from_callsign {
-            let callsign_bits = self.callsign_table.encode_callsign(callsign)?;
-            self.append_u32_bits(payload, callsign_bits, 28);
-        } else {
-            self.append_u32_bits(payload, 0, 28);
-        }
-        
-        // Encode signal report (7 bits, offset by +35)
-        let report_value = if let Some(report) = message.signal_report {
-            (report + 35) as u32
-        } else {
-            35 // 0 dB default
-        };
-        self.append_u32_bits(payload, report_value, 7);
-        
-        // Pad remaining bits
-        while payload.len() < PAYLOAD_BITS {
-            payload.push(false);
-        }
-        
-        Ok(())
-    }
-
-    /// Encode acknowledgment message payload
-    fn encode_ack_payload(&mut self, payload: &mut BitVec, message: &Ft8Message) -> Ft8Result<()> {
-        // Same structure as response but different type
-        self.encode_response_payload(payload, message)
-    }
-
-    /// Encode free text message payload
-    fn encode_freetext_payload(&mut self, payload: &mut BitVec, message: &Ft8Message) -> Ft8Result<()> {
-        if let Some(ref text) = message.text {
-            // Encode each character as 6 bits
-            for ch in text.chars().take(MAX_FREETEXT_LENGTH) {
-                let char_value = self.encode_character(ch)?;
-                self.append_u32_bits(payload, char_value as u32, 6);
-            }
-        }
-        
-        // Pad remaining bits
-        while payload.len() < PAYLOAD_BITS {
-            payload.push(false);
-        }
-        
-        Ok(())
-    }
-
-    /// Encode grid-only message payload
-    fn encode_grid_payload(&mut self, payload: &mut BitVec, message: &Ft8Message) -> Ft8Result<()> {
-        if let Some(ref grid) = message.grid_square {
-            let grid_bits = self.encode_grid_square(grid)?;
-            self.append_u32_bits(payload, grid_bits, 15);
-        } else {
-            self.append_u32_bits(payload, 0, 15);
-        }
-        
-        // Pad remaining bits
-        while payload.len() < PAYLOAD_BITS {
-            payload.push(false);
-        }
-        
-        Ok(())
-    }
-
-    /// Encode structured telemetry message payload
-    fn encode_telemetry_structured_payload(&mut self, payload: &mut BitVec, _message: &Ft8Message) -> Ft8Result<()> {
-        // For structured telemetry messages - application specific
-        // Pad with zeros for now
-        while payload.len() < PAYLOAD_BITS {
-            payload.push(false);
-        }
-        Ok(())
-    }
-
-    /// Encode raw telemetry data payload
-    fn encode_telemetry_payload(&self, data: &[u8]) -> Ft8Result<BitVec> {
-        let mut payload = BitVec::with_capacity(PAYLOAD_BITS);
-        
-        // Telemetry type (3 bits)
-        self.append_u32_bits(&mut payload, 7, 3);
-        
-        // Encode data bytes
-        for &byte in data {
-            self.append_u32_bits(&mut payload, byte as u32, 8);
-        }
-        
-        // Pad remaining bits
-        payload.resize(PAYLOAD_BITS, false);
-        
-        Ok(payload)
+        // Generate symbols
+        self.generate_symbols(&ldpc_codeword)
     }
 
     /// Generate 79-symbol sequence from LDPC codeword
+    ///
+    /// FT8 symbol layout: S7 D29 S7 D29 S7
     fn generate_symbols(&self, ldpc_codeword: &BitSlice) -> Ft8Result<[u8; NUM_SYMBOLS]> {
         if ldpc_codeword.len() != 174 {
             return Err(Ft8Error::MessageDecodingError(
                 format!("Invalid LDPC codeword length: {}", ldpc_codeword.len())
             ));
         }
-        
+
         let mut symbols = [0u8; NUM_SYMBOLS];
-        
-        // First 7 symbols: Costas array
-        symbols[0..7].copy_from_slice(&self.costas_arrays.sync1);
-        
-        // Next 36 symbols: First half of data
-        for i in 0..36 {
-            let bit_start = i * 3;
-            if bit_start + 2 < 58 {
-                let symbol_bits = &ldpc_codeword[bit_start..bit_start + 3];
-                symbols[7 + i] = self.bits_to_symbol(symbol_bits);
+        let mut bit_idx = 0usize;
+
+        for i_tone in 0..NUM_SYMBOLS {
+            if i_tone < 7 {
+                symbols[i_tone] = COSTAS_ARRAY[i_tone];
+            } else if (36..43).contains(&i_tone) {
+                symbols[i_tone] = COSTAS_ARRAY[i_tone - 36];
+            } else if i_tone >= 72 {
+                symbols[i_tone] = COSTAS_ARRAY[i_tone - 72];
+            } else {
+                // Extract 3 bits, apply Gray code mapping
+                let mut bits3 = 0u8;
+                if ldpc_codeword[bit_idx] { bits3 |= 4; }
+                if ldpc_codeword[bit_idx + 1] { bits3 |= 2; }
+                if ldpc_codeword[bit_idx + 2] { bits3 |= 1; }
+                bit_idx += 3;
+
+                symbols[i_tone] = binary_to_gray(bits3);
             }
         }
-        
-        // Middle 7 symbols: Second Costas array
-        symbols[43..50].copy_from_slice(&self.costas_arrays.sync2);
-        
-        // Last 29 symbols: Second half of data
-        for i in 0..29 {
-            let bit_start = 58 + i * 3;
-            if bit_start + 2 < ldpc_codeword.len() {
-                let symbol_bits = &ldpc_codeword[bit_start..bit_start + 3];
-                symbols[50 + i] = self.bits_to_symbol(symbol_bits);
-            }
-        }
-        
+
         Ok(symbols)
     }
 
-    /// Convert 3 bits to FT8 symbol (0-7)
-    fn bits_to_symbol(&self, bits: &BitSlice) -> u8 {
-        let mut symbol = 0u8;
-        for (i, bit) in bits.iter().take(3).enumerate() {
-            if *bit {
-                symbol |= 1 << (2 - i);
+    // ========================================================================
+    // Standard message encoding (i3=1 or i3=2)
+    // ========================================================================
+
+    /// Try to encode as a standard FT8 message (Type 1)
+    ///
+    /// Standard message layout (77 bits):
+    ///   n29a (28+1) + n29b (28+1) + R1 (1) + igrid4 (15) + i3 (3)
+    fn try_encode_standard(&self, text: &str) -> Ft8Result<[u8; 10]> {
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        if parts.is_empty() {
+            return Err(Ft8Error::MessageDecodingError("Empty message".to_string()));
+        }
+
+        // Parse: call_to, call_de, extra
+        let (call_to, call_de, extra) = self.parse_standard_message(&parts)?;
+
+        // Pack callsigns
+        let (n28a, ipa) = pack28(&call_to)?;
+        let (n28b, ipb) = pack28(&call_de)?;
+
+        // Pack grid/report/token
+        let igrid4 = packgrid(&extra);
+
+        // Determine i3
+        let i3: u8 = if call_to.ends_with("/P") || call_de.ends_with("/P") { 2 } else { 1 };
+
+        // Build n29a and n29b (28-bit callsign + 1-bit suffix flag)
+        let n29a: u32 = (n28a << 1) | (ipa as u32);
+        let n29b: u32 = (n28b << 1) | (ipb as u32);
+
+        // Extract ir bit from igrid4 (bit 15 = R prefix indicator)
+        let ir: u8 = if igrid4 & 0x8000 != 0 { 1 } else { 0 };
+        let igrid4_val: u16 = igrid4 & 0x7FFF;
+
+        // Pack into 10 bytes: n29a(29) + n29b(29) + ir(1) + igrid4(15) + i3(3) = 77 bits
+        let mut payload = [0u8; 10];
+        payload[0] = (n29a >> 21) as u8;
+        payload[1] = (n29a >> 13) as u8;
+        payload[2] = (n29a >> 5) as u8;
+        payload[3] = ((n29a << 3) as u8) | ((n29b >> 26) as u8);
+        payload[4] = (n29b >> 18) as u8;
+        payload[5] = (n29b >> 10) as u8;
+        payload[6] = (n29b >> 2) as u8;
+        payload[7] = ((n29b << 6) as u8) | (ir << 5) | ((igrid4_val >> 10) as u8);
+        payload[8] = (igrid4_val >> 2) as u8;
+        payload[9] = ((igrid4_val << 6) as u8) | (i3 << 3);
+
+        Ok(payload)
+    }
+
+    /// Parse standard message text into (call_to, call_de, extra) fields
+    fn parse_standard_message<'a>(&self, parts: &[&'a str]) -> Ft8Result<(String, String, String)> {
+        if parts.is_empty() {
+            return Err(Ft8Error::MessageDecodingError("Empty message".to_string()));
+        }
+
+        let is_cq = parts[0] == "CQ";
+
+        if is_cq {
+            // CQ [modifier] <callsign> [grid]
+            let mut idx = 1;
+            let mut call_to = String::from("CQ");
+
+            // Check for CQ modifier (DX, nnn, or letter sequence)
+            if parts.len() > idx {
+                let next = parts[idx];
+                if is_cq_modifier(next) {
+                    call_to = format!("CQ {}", next);
+                    idx += 1;
+                }
+            }
+
+            let call_de = if parts.len() > idx {
+                parts[idx].to_string()
+            } else {
+                return Err(Ft8Error::MessageDecodingError("CQ message missing callsign".to_string()));
+            };
+            idx += 1;
+
+            let extra = if parts.len() > idx {
+                parts[idx].to_string()
+            } else {
+                String::new()
+            };
+
+            Ok((call_to, call_de, extra))
+        } else {
+            // <to_call> <from_call> [grid/report/token]
+            if parts.len() < 2 {
+                return Err(Ft8Error::MessageDecodingError(
+                    "Standard message needs at least 2 callsigns".to_string()
+                ));
+            }
+
+            let call_to = parts[0].to_string();
+            let call_de = parts[1].to_string();
+            let extra = if parts.len() > 2 {
+                parts[2].to_string()
+            } else {
+                String::new()
+            };
+
+            Ok((call_to, call_de, extra))
+        }
+    }
+
+    // ========================================================================
+    // Free text encoding (i3=0, n3=0)
+    // ========================================================================
+
+    /// Encode free text message using base-42 multi-precision encoding
+    ///
+    /// WSJT-X compatible: 13 characters × base-42 → 71 bits,
+    /// shifted left by 1, then i3=0/n3=0 in bits 71-76.
+    fn encode_free_text(&self, text: &str) -> Ft8Result<[u8; 10]> {
+        if text.len() > MAX_FREETEXT_LENGTH {
+            return Err(Ft8Error::MessageDecodingError(
+                format!("Free text too long: {} (max {})", text.len(), MAX_FREETEXT_LENGTH)
+            ));
+        }
+
+        // Encode 13 characters into 9-byte big integer using base-42
+        let mut b71 = [0u8; 9];
+
+        for idx in 0..13 {
+            let ch = if idx < text.len() {
+                text.as_bytes()[idx]
+            } else {
+                b' '
+            };
+
+            let cid = freetext_char_index(ch)?;
+
+            // Multiply b71 by 42 and add cid (multi-precision arithmetic)
+            let mut rem = cid as u16;
+            for i in (0..9).rev() {
+                rem += (b71[i] as u16) * 42;
+                b71[i] = (rem & 0xFF) as u8;
+                rem >>= 8;
             }
         }
-        symbol
-    }
 
-    /// Append u32 value as bits to BitVec
-    fn append_u32_bits(&self, bitvec: &mut BitVec, value: u32, num_bits: usize) {
-        for i in (0..num_bits).rev() {
-            bitvec.push((value >> i) & 1 != 0);
+        // Shift b71 left by 1 bit (telemetry encoding format)
+        let mut payload = [0u8; 10];
+        let mut carry: u8 = 0;
+        for i in (0..9).rev() {
+            payload[i] = (b71[i] << 1) | carry;
+            carry = b71[i] >> 7;
         }
-    }
+        // payload[9] = 0 — i3=0, n3=0 for free text
 
-    /// Encode grid square (4 or 6 character) to 15-bit value
-    fn encode_grid_square(&self, grid: &str) -> Ft8Result<u32> {
-        if grid.len() < 4 || grid.len() > 6 {
-            return Err(Ft8Error::MessageDecodingError(
-                format!("Invalid grid square length: {}", grid.len())
-            ));
-        }
-        
-        let grid_chars: Vec<char> = grid.to_uppercase().chars().collect();
-        
-        // Validate grid format
-        if !grid_chars[0].is_ascii_alphabetic() || !grid_chars[1].is_ascii_alphabetic() ||
-           !grid_chars[2].is_ascii_digit() || !grid_chars[3].is_ascii_digit() {
-            return Err(Ft8Error::MessageDecodingError(
-                format!("Invalid grid square format: {}", grid)
-            ));
-        }
-        
-        let lon = (grid_chars[0] as u32 - b'A' as u32) * 20 + 
-                  (grid_chars[2] as u32 - b'0' as u32) * 2;
-        let lat = (grid_chars[1] as u32 - b'A' as u32) * 10 + 
-                  (grid_chars[3] as u32 - b'0' as u32);
-        
-        let grid_value = lat * 180 + lon;
-        
-        if grid_value >= (1 << 15) {
-            return Err(Ft8Error::MessageDecodingError(
-                format!("Grid square value out of range: {}", grid_value)
-            ));
-        }
-        
-        Ok(grid_value)
-    }
-
-    /// Encode character to 6-bit value
-    fn encode_character(&self, ch: char) -> Ft8Result<u8> {
-        match ch {
-            ' ' => Ok(0),
-            'A'..='Z' => Ok((ch as u8) - b'A' + 1),
-            '0'..='9' => Ok((ch as u8) - b'0' + 27),
-            '+' => Ok(37),
-            '-' => Ok(38),
-            '.' => Ok(39),
-            '/' => Ok(40),
-            '?' => Ok(41),
-            _ => Err(Ft8Error::MessageDecodingError(
-                format!("Invalid character for FT8 encoding: '{}'", ch)
-            )),
-        }
-    }
-
-    /// Check if character is valid for free text
-    fn is_valid_freetext_char(&self, ch: char) -> bool {
-        matches!(ch, ' ' | 'A'..='Z' | '0'..='9' | '+' | '-' | '.' | '/' | '?')
-    }
-
-    /// Check if string is a valid grid square
-    fn is_grid_square(&self, s: &str) -> bool {
-        if s.len() != 4 && s.len() != 6 {
-            return false;
-        }
-        
-        let chars: Vec<char> = s.to_uppercase().chars().collect();
-        chars[0].is_ascii_alphabetic() && chars[1].is_ascii_alphabetic() &&
-        chars[2].is_ascii_digit() && chars[3].is_ascii_digit()
+        Ok(payload)
     }
 }
 
@@ -595,142 +354,258 @@ impl Default for Ft8Encoder {
     }
 }
 
-/// LDPC encoder for FT8 error correction
-struct LdpcEncoder {
-    // Generator matrix and encoding tables would go here
-    // For now, simplified implementation
+// ============================================================================
+// WSJT-X pack28: callsign → 28-bit integer
+// ============================================================================
+
+/// Pack a callsign (or special token) into a 28-bit integer.
+///
+/// Returns (n28, ip) where ip is the suffix flag (1 for /R or /P).
+///
+/// Encoding scheme (from WSJT-X):
+/// - DE → 0, QRZ → 1, CQ → 2
+/// - CQ nnn → 3 + nnn
+/// - CQ ABCD → 3 + 1000 + base-27 value
+/// - Standard callsign → NTOKENS + MAX22 + basecall_value
+/// - Non-standard → error (hash not supported without table)
+pub fn pack28(callsign: &str) -> Ft8Result<(u32, u8)> {
+    let mut ip: u8 = 0;
+
+    // Special tokens
+    if callsign == "DE" { return Ok((0, 0)); }
+    if callsign == "QRZ" { return Ok((1, 0)); }
+    if callsign == "CQ" { return Ok((2, 0)); }
+
+    // CQ with modifier
+    if callsign.starts_with("CQ ") && callsign.len() < 8 {
+        let modifier = &callsign[3..];
+        if let Some(v) = parse_cq_modifier(modifier) {
+            return Ok((3 + v, 0));
+        }
+        return Err(Ft8Error::MessageDecodingError(
+            format!("Invalid CQ modifier: {}", modifier)
+        ));
+    }
+
+    // Detect /R or /P suffix
+    let base_callsign = if callsign.ends_with("/P") || callsign.ends_with("/R") {
+        ip = 1;
+        &callsign[..callsign.len() - 2]
+    } else {
+        callsign
+    };
+
+    // Try standard basecall encoding
+    if let Some(n28) = pack_basecall(base_callsign) {
+        return Ok((NTOKENS + MAX22 + n28, ip));
+    }
+
+    Err(Ft8Error::MessageDecodingError(
+        format!("Cannot encode callsign: '{}'", callsign)
+    ))
 }
 
-impl LdpcEncoder {
-    fn new() -> Self {
-        Self {}
+/// Pack a standard base callsign into a 28-bit value.
+///
+/// Normalizes to 6 characters, right-aligned, then encodes with
+/// mixed-radix: 37 × 36 × 10 × 27 × 27 × 27
+///
+/// Character tables:
+/// - Position 0: " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" (37)
+/// - Position 1: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" (36)
+/// - Position 2: "0123456789" (10)
+/// - Positions 3-5: " ABCDEFGHIJKLMNOPQRSTUVWXYZ" (27)
+fn pack_basecall(callsign: &str) -> Option<u32> {
+    let length = callsign.len();
+    if length < 3 || length > 6 {
+        return None;
     }
-    
-    /// Encode 91-bit message to 174-bit LDPC codeword
-    fn encode(&self, message_bits: &BitSlice) -> Ft8Result<BitVec> {
-        if message_bits.len() != 91 {
-            return Err(Ft8Error::MessageDecodingError(
-                format!("Invalid LDPC input length: {}", message_bits.len())
-            ));
+
+    let bytes = callsign.as_bytes();
+
+    // Normalize to 6-character buffer (right-aligned if needed)
+    let mut c6 = [b' '; 6];
+
+    // Handle special prefixes
+    if callsign.starts_with("3DA0") && length > 4 && length <= 7 {
+        // Swaziland: 3DA0XYZ → 3D0XYZ
+        c6[0] = b'3'; c6[1] = b'D'; c6[2] = b'0';
+        for (i, &b) in bytes[4..].iter().enumerate() {
+            if i + 3 < 6 { c6[i + 3] = b; }
         }
-        
-        // Simplified LDPC encoding - in practice this would use the actual FT8 LDPC matrix
-        let mut codeword = BitVec::with_capacity(174);
-        codeword.extend_from_bitslice(message_bits);
-        
-        // Add parity bits (simplified)
-        while codeword.len() < 174 {
-            // XOR selected information bits to generate parity
-            let parity = codeword[0] ^ codeword[1] ^ codeword[2];
-            codeword.push(parity);
+    } else if callsign.starts_with("3X") && length > 2 && bytes[2].is_ascii_alphabetic() && length <= 7 {
+        // Guinea: 3XA0XYZ → QA0XYZ
+        c6[0] = b'Q';
+        for (i, &b) in bytes[2..].iter().enumerate() {
+            if i + 1 < 6 { c6[i + 1] = b; }
         }
-        
-        Ok(codeword)
+    } else if length >= 3 && bytes[2].is_ascii_digit() && length <= 6 {
+        // AB0XYZ format
+        c6[..length].copy_from_slice(&bytes[..length]);
+    } else if length >= 2 && bytes[1].is_ascii_digit() && length <= 5 {
+        // A0XYZ → " A0XYZ" (right-aligned)
+        c6[1..1 + length].copy_from_slice(&bytes[..length]);
+    } else {
+        return None;
+    }
+
+    // Encode each position
+    let i0 = nchar_alphanum_space(c6[0])?;
+    let i1 = nchar_alphanum(c6[1])?;
+    let i2 = nchar_numeric(c6[2])?;
+    let i3 = nchar_letters_space(c6[3])?;
+    let i4 = nchar_letters_space(c6[4])?;
+    let i5 = nchar_letters_space(c6[5])?;
+
+    let mut n: u32 = i0;
+    n = n * 36 + i1;
+    n = n * 10 + i2;
+    n = n * 27 + i3;
+    n = n * 27 + i4;
+    n = n * 27 + i5;
+
+    Some(n)
+}
+
+/// Parse CQ modifier: returns value for "CQ nnn" or "CQ ABCD" patterns
+fn parse_cq_modifier(modifier: &str) -> Option<u32> {
+    if modifier.is_empty() || modifier.len() > 4 {
+        return None;
+    }
+
+    let bytes = modifier.as_bytes();
+    let all_digits = bytes.iter().all(|b| b.is_ascii_digit());
+    let all_letters = bytes.iter().all(|b| b.is_ascii_uppercase());
+
+    if all_digits && modifier.len() == 3 {
+        // CQ nnn
+        let nnn: u32 = modifier.parse().ok()?;
+        Some(nnn)
+    } else if all_letters && modifier.len() <= 4 {
+        // CQ ABCD → base-27 encoding
+        let mut m: u32 = 0;
+        for &b in bytes {
+            m = 27 * m + ((b - b'A') as u32 + 1);
+        }
+        Some(1000 + m)
+    } else {
+        None
     }
 }
 
-/// Costas arrays for FT8 synchronization
-struct CostasArrays {
-    sync1: [u8; 7],
-    sync2: [u8; 7],
+/// Check if a token is a CQ modifier (DX, 3-digit number, or 1-4 letter code)
+fn is_cq_modifier(token: &str) -> bool {
+    if token == "DX" { return true; }
+    let bytes = token.as_bytes();
+    if bytes.len() == 3 && bytes.iter().all(|b| b.is_ascii_digit()) { return true; }
+    if bytes.len() <= 4 && !bytes.is_empty() && bytes.iter().all(|b| b.is_ascii_uppercase()) { return true; }
+    false
 }
 
-impl CostasArrays {
-    fn new() -> Self {
-        Self {
-            sync1: [3, 1, 4, 0, 6, 5, 2], // First Costas array
-            sync2: [2, 5, 6, 0, 4, 1, 3], // Second Costas array  
+// ============================================================================
+// WSJT-X packgrid: grid/report/token → 16-bit value
+// ============================================================================
+
+/// Pack a grid locator, signal report, or special token into a 16-bit value.
+///
+/// Returns value with bit 15 set if ir=1 (R prefix on report).
+pub fn packgrid(extra: &str) -> u16 {
+    if extra.is_empty() {
+        return MAXGRID4 + 1; // no grid/report
+    }
+
+    // Special tokens
+    if extra == "RRR" { return MAXGRID4 + 2; }
+    if extra == "RR73" { return MAXGRID4 + 3; }
+    if extra == "73" { return MAXGRID4 + 4; }
+
+    let bytes = extra.as_bytes();
+
+    // Check for 4-character grid locator (AA00..RR99)
+    if bytes.len() == 4
+        && bytes[0] >= b'A' && bytes[0] <= b'R'
+        && bytes[1] >= b'A' && bytes[1] <= b'R'
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+    {
+        let mut igrid4: u16 = (bytes[0] - b'A') as u16;
+        igrid4 = igrid4 * 18 + (bytes[1] - b'A') as u16;
+        igrid4 = igrid4 * 10 + (bytes[2] - b'0') as u16;
+        igrid4 = igrid4 * 10 + (bytes[3] - b'0') as u16;
+        return igrid4;
+    }
+
+    // Parse signal report: +dd / -dd / R+dd / R-dd
+    if bytes[0] == b'R' && bytes.len() >= 2 {
+        // R prefix → ir=1
+        if let Some(dd) = parse_report(&extra[1..]) {
+            let irpt = (35 + dd) as u16;
+            return (MAXGRID4 + irpt) | 0x8000; // ir=1
         }
+    } else if let Some(dd) = parse_report(extra) {
+        let irpt = (35 + dd) as u16;
+        return MAXGRID4 + irpt; // ir=0
+    }
+
+    MAXGRID4 + 1 // fallback: no grid
+}
+
+/// Parse a signal report string like "+05" or "-12" into an integer
+fn parse_report(s: &str) -> Option<i32> {
+    s.parse::<i32>().ok()
+}
+
+// ============================================================================
+// Character encoding helpers (matching WSJT-X text.h tables)
+// ============================================================================
+
+/// " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" (37 chars)
+fn nchar_alphanum_space(c: u8) -> Option<u32> {
+    match c {
+        b' ' => Some(0),
+        b'0'..=b'9' => Some((c - b'0') as u32 + 1),
+        b'A'..=b'Z' => Some((c - b'A') as u32 + 11),
+        _ => None,
     }
 }
 
-/// Callsign encoding table for FT8
-struct CallsignEncodingTable {
-    // Standard callsign encoding maps
-    standard_callsigns: HashMap<String, u32>,
-    hash_callsigns: HashMap<String, u32>,
-    next_hash_value: u32,
+/// "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" (36 chars)
+fn nchar_alphanum(c: u8) -> Option<u32> {
+    match c {
+        b'0'..=b'9' => Some((c - b'0') as u32),
+        b'A'..=b'Z' => Some((c - b'A') as u32 + 10),
+        _ => None,
+    }
 }
 
-impl CallsignEncodingTable {
-    fn new() -> Self {
-        Self {
-            standard_callsigns: HashMap::new(),
-            hash_callsigns: HashMap::new(),
-            next_hash_value: 0,
+/// "0123456789" (10 chars)
+fn nchar_numeric(c: u8) -> Option<u32> {
+    match c {
+        b'0'..=b'9' => Some((c - b'0') as u32),
+        _ => None,
+    }
+}
+
+/// " ABCDEFGHIJKLMNOPQRSTUVWXYZ" (27 chars)
+fn nchar_letters_space(c: u8) -> Option<u32> {
+    match c {
+        b' ' => Some(0),
+        b'A'..=b'Z' => Some((c - b'A') as u32 + 1),
+        _ => None,
+    }
+}
+
+/// Look up character index in the 42-char free text table
+fn freetext_char_index(c: u8) -> Ft8Result<u8> {
+    let c_upper = c.to_ascii_uppercase();
+    for (i, &ch) in FREETEXT_CHARS.iter().enumerate() {
+        if ch == c_upper {
+            return Ok(i as u8);
         }
     }
-    
-    /// Encode callsign to 28-bit value
-    fn encode_callsign(&mut self, callsign: &str) -> Ft8Result<u32> {
-        let callsign = callsign.to_uppercase();
-        
-        // Validate callsign format
-        if !self.is_valid_callsign(&callsign) {
-            return Err(Ft8Error::MessageDecodingError(
-                format!("Invalid callsign format: {}", callsign)
-            ));
-        }
-        
-        // Check standard encoding first
-        if let Some(&value) = self.standard_callsigns.get(&callsign) {
-            return Ok(value);
-        }
-        
-        // Try standard callsign encoding pattern
-        if let Ok(value) = self.encode_standard_callsign(&callsign) {
-            self.standard_callsigns.insert(callsign.clone(), value);
-            return Ok(value);
-        }
-        
-        // Fall back to hash encoding
-        if let Some(&value) = self.hash_callsigns.get(&callsign) {
-            return Ok(value + 262_144_000);
-        }
-        
-        // Create new hash entry
-        let hash_value = self.next_hash_value;
-        self.hash_callsigns.insert(callsign, hash_value);
-        self.next_hash_value += 1;
-        
-        Ok(hash_value + 262_144_000)
-    }
-    
-    /// Encode standard format callsign
-    fn encode_standard_callsign(&self, callsign: &str) -> Ft8Result<u32> {
-        // Simplified standard callsign encoding
-        // Real implementation would follow FT8 specification exactly
-        let mut value = 0u32;
-        
-        for (i, ch) in callsign.chars().enumerate() {
-            if i >= 6 { break; }
-            
-            let char_value = match ch {
-                'A'..='Z' => (ch as u32) - ('A' as u32) + 1,
-                '0'..='9' => (ch as u32) - ('0' as u32) + 27,
-                _ => 0,
-            };
-            
-            value = value * 37 + char_value;
-        }
-        
-        if value < 262_144_000 {
-            Ok(value)
-        } else {
-            Err(Ft8Error::MessageDecodingError(
-                "Callsign encoding overflow".to_string()
-            ))
-        }
-    }
-    
-    /// Validate callsign format
-    fn is_valid_callsign(&self, callsign: &str) -> bool {
-        if callsign.is_empty() || callsign.len() > 6 {
-            return false;
-        }
-        
-        callsign.chars().all(|c| c.is_ascii_alphanumeric())
-    }
+    Err(Ft8Error::MessageDecodingError(
+        format!("Invalid free text character: '{}'", c as char)
+    ))
 }
 
 /// Configuration for FT8 encoding
@@ -760,19 +635,104 @@ mod tests {
 
     #[test]
     fn test_encoder_creation() {
-        let encoder = Ft8Encoder::new();
-        assert!(encoder.callsign_table.standard_callsigns.is_empty());
+        let _encoder = Ft8Encoder::new();
+    }
+
+    #[test]
+    fn test_pack28_special_tokens() {
+        assert_eq!(pack28("DE").unwrap(), (0, 0));
+        assert_eq!(pack28("QRZ").unwrap(), (1, 0));
+        assert_eq!(pack28("CQ").unwrap(), (2, 0));
+    }
+
+    #[test]
+    fn test_pack28_cq_modifiers() {
+        // CQ 000
+        let (n28, ip) = pack28("CQ 000").unwrap();
+        assert_eq!(n28, 3);
+        assert_eq!(ip, 0);
+
+        // CQ 999
+        let (n28, _) = pack28("CQ 999").unwrap();
+        assert_eq!(n28, 3 + 999);
+
+        // CQ DX
+        let (n28, _) = pack28("CQ DX").unwrap();
+        assert_eq!(n28, 3 + 1000 + (4 * 27 + 24)); // D=4, X=24
+    }
+
+    #[test]
+    fn test_pack28_standard_callsign() {
+        // K1ABC should encode as a standard callsign
+        let (n28, ip) = pack28("K1ABC").unwrap();
+        assert!(n28 >= NTOKENS + MAX22);
+        assert_eq!(ip, 0);
+
+        // W1ABC
+        let (n28_w, _) = pack28("W1ABC").unwrap();
+        assert!(n28_w >= NTOKENS + MAX22);
+        assert_ne!(n28, n28_w); // different callsigns should give different values
+
+        // With /R suffix
+        let (n28_r, ip_r) = pack28("K1ABC/R").unwrap();
+        assert_eq!(n28_r, n28); // same base value
+        assert_eq!(ip_r, 1); // suffix flag set
+    }
+
+    #[test]
+    fn test_pack_basecall_k1abc() {
+        // K1ABC → " K1ABC" (right-aligned)
+        // i0 = nchar_alphanum_space(' ') = 0
+        // i1 = nchar_alphanum('K') = 10 + 10 = 20
+        // i2 = nchar_numeric('1') = 1
+        // i3 = nchar_letters_space('A') = 1
+        // i4 = nchar_letters_space('B') = 2
+        // i5 = nchar_letters_space('C') = 3
+        // n = 0*36*10*27*27*27 + 20*10*27*27*27 + 1*27*27*27 + 1*27*27 + 2*27 + 3
+        //   = 0 + 3,936,600 + 19,683 + 729 + 54 + 3 = 3,957,069
+        let n = pack_basecall("K1ABC").unwrap();
+        assert_eq!(n, 3_957_069);
+    }
+
+    #[test]
+    fn test_packgrid() {
+        // Empty
+        assert_eq!(packgrid(""), MAXGRID4 + 1);
+
+        // Special tokens
+        assert_eq!(packgrid("RRR"), MAXGRID4 + 2);
+        assert_eq!(packgrid("RR73"), MAXGRID4 + 3);
+        assert_eq!(packgrid("73"), MAXGRID4 + 4);
+
+        // Grid locator FN42
+        let igrid = packgrid("FN42");
+        assert!(igrid <= MAXGRID4);
+        // F=5, N=13, 4, 2 → 5*18*10*10 + 13*10*10 + 4*10 + 2 = 9000+1300+40+2 = 10342
+        assert_eq!(igrid, 10342);
+
+        // Signal report -12 (no R prefix, ir=0)
+        let igrid = packgrid("-12");
+        assert_eq!(igrid, MAXGRID4 + 35 - 12); // 32400 + 23 = 32423
+
+        // Signal report R-12 (R prefix, ir=1)
+        let igrid = packgrid("R-12");
+        assert_eq!(igrid, (MAXGRID4 + 35 - 12) | 0x8000);
     }
 
     #[test]
     fn test_encode_cq_message() {
         let mut encoder = Ft8Encoder::new();
-        let result = encoder.encode_cq("W1ABC", "FN42", false);
+        let result = encoder.encode_cq("K1ABC", "FN42", false);
         assert!(result.is_ok());
-        
+
         let symbols = result.unwrap();
         assert_eq!(symbols.len(), NUM_SYMBOLS);
-        assert!(symbols.iter().all(|&s| s < NUM_TONES as u8));
+        assert!(symbols.iter().all(|&s| s < 8));
+
+        // Verify Costas arrays
+        assert_eq!(&symbols[0..7], &COSTAS_ARRAY);
+        assert_eq!(&symbols[36..43], &COSTAS_ARRAY);
+        assert_eq!(&symbols[72..79], &COSTAS_ARRAY);
     }
 
     #[test]
@@ -780,7 +740,7 @@ mod tests {
         let mut encoder = Ft8Encoder::new();
         let result = encoder.encode_signal_report("K1DEF", "W1ABC", -12);
         assert!(result.is_ok());
-        
+
         let symbols = result.unwrap();
         assert_eq!(symbols.len(), NUM_SYMBOLS);
     }
@@ -790,7 +750,7 @@ mod tests {
         let mut encoder = Ft8Encoder::new();
         let result = encoder.encode_freetext("HELLO WORLD");
         assert!(result.is_ok());
-        
+
         let symbols = result.unwrap();
         assert_eq!(symbols.len(), NUM_SYMBOLS);
     }
@@ -810,71 +770,94 @@ mod tests {
     }
 
     #[test]
-    fn test_grid_square_encoding() {
-        let encoder = Ft8Encoder::new();
-        let result = encoder.encode_grid_square("FN42");
-        assert!(result.is_ok());
-        
-        let value = result.unwrap();
-        assert!(value < (1 << 15));
-    }
-
-    #[test]
-    fn test_character_encoding() {
-        let encoder = Ft8Encoder::new();
-        assert_eq!(encoder.encode_character(' ').unwrap(), 0);
-        assert_eq!(encoder.encode_character('A').unwrap(), 1);
-        assert_eq!(encoder.encode_character('0').unwrap(), 27);
-        assert_eq!(encoder.encode_character('+').unwrap(), 37);
+    fn test_freetext_char_encoding() {
+        assert_eq!(freetext_char_index(b' ').unwrap(), 0);
+        assert_eq!(freetext_char_index(b'0').unwrap(), 1);
+        assert_eq!(freetext_char_index(b'9').unwrap(), 10);
+        assert_eq!(freetext_char_index(b'A').unwrap(), 11);
+        assert_eq!(freetext_char_index(b'Z').unwrap(), 36);
+        assert_eq!(freetext_char_index(b'+').unwrap(), 37);
+        assert_eq!(freetext_char_index(b'-').unwrap(), 38);
+        assert_eq!(freetext_char_index(b'.').unwrap(), 39);
+        assert_eq!(freetext_char_index(b'/').unwrap(), 40);
+        assert_eq!(freetext_char_index(b'?').unwrap(), 41);
     }
 
     #[test]
     fn test_costas_arrays() {
-        let costas = CostasArrays::new();
-        assert_eq!(costas.sync1.len(), 7);
-        assert_eq!(costas.sync2.len(), 7);
-        assert!(costas.sync1.iter().all(|&s| s < 8));
-        assert!(costas.sync2.iter().all(|&s| s < 8));
+        assert_eq!(COSTAS_ARRAY.len(), 7);
+        assert!(COSTAS_ARRAY.iter().all(|&s| s < 8));
+        assert_eq!(COSTAS_ARRAY, [3, 1, 4, 0, 6, 5, 2]);
     }
 
     #[test]
-    fn test_bits_to_symbol() {
-        let encoder = Ft8Encoder::new();
-        let bits = bitvec![0, 0, 0];
-        assert_eq!(encoder.bits_to_symbol(&bits), 0);
-        
-        let bits = bitvec![1, 1, 1];
-        assert_eq!(encoder.bits_to_symbol(&bits), 7);
-        
-        let bits = bitvec![1, 0, 1];
-        assert_eq!(encoder.bits_to_symbol(&bits), 5);
-    }
-
-    #[test]
-    fn test_message_parsing() {
+    fn test_encode_deterministic() {
         let mut encoder = Ft8Encoder::new();
-        
-        let cq_msg = encoder.parse_message_text("CQ W1ABC FN42", None).unwrap();
-        assert_eq!(cq_msg.message_type, MessageType::Cq);
-        assert_eq!(cq_msg.from_callsign.as_deref(), Some("W1ABC"));
-        assert_eq!(cq_msg.grid_square.as_deref(), Some("FN42"));
-        
-        let resp_msg = encoder.parse_message_text("W1ABC K1DEF FN42", None).unwrap();
-        assert_eq!(resp_msg.message_type, MessageType::Response);
-        
-        let report_msg = encoder.parse_message_text("K1DEF W1ABC -12", None).unwrap();
-        assert_eq!(report_msg.message_type, MessageType::Report);
-        assert_eq!(report_msg.signal_report, Some(-12));
+
+        let symbols1 = encoder.encode_message("CQ K1ABC FN42", None).unwrap();
+        let symbols2 = encoder.encode_message("CQ K1ABC FN42", None).unwrap();
+        assert_eq!(symbols1, symbols2);
     }
 
     #[test]
-    fn test_ldpc_encoding() {
-        let encoder = LdpcEncoder::new();
-        let message_bits = bitvec![0; 91];
-        let result = encoder.encode(&message_bits);
-        assert!(result.is_ok());
-        
-        let codeword = result.unwrap();
-        assert_eq!(codeword.len(), 174);
+    fn test_message_parsing_standard() {
+        let encoder = Ft8Encoder::new();
+        let parts: Vec<&str> = "CQ K1ABC FN42".split_whitespace().collect();
+        let (call_to, call_de, extra) = encoder.parse_standard_message(&parts).unwrap();
+        assert_eq!(call_to, "CQ");
+        assert_eq!(call_de, "K1ABC");
+        assert_eq!(extra, "FN42");
+    }
+
+    #[test]
+    fn test_message_parsing_cq_dx() {
+        let encoder = Ft8Encoder::new();
+        let parts: Vec<&str> = "CQ DX K1ABC FN42".split_whitespace().collect();
+        let (call_to, call_de, extra) = encoder.parse_standard_message(&parts).unwrap();
+        assert_eq!(call_to, "CQ DX");
+        assert_eq!(call_de, "K1ABC");
+        assert_eq!(extra, "FN42");
+    }
+
+    #[test]
+    fn test_message_parsing_report() {
+        let encoder = Ft8Encoder::new();
+        let parts: Vec<&str> = "K1DEF W1ABC -12".split_whitespace().collect();
+        let (call_to, call_de, extra) = encoder.parse_standard_message(&parts).unwrap();
+        assert_eq!(call_to, "K1DEF");
+        assert_eq!(call_de, "W1ABC");
+        assert_eq!(extra, "-12");
+    }
+
+    #[test]
+    fn test_payload_cq_k1abc_fn42() {
+        // Verify the packed payload for "CQ K1ABC FN42"
+        let encoder = Ft8Encoder::new();
+        let payload = encoder.try_encode_standard("CQ K1ABC FN42").unwrap();
+
+        // n28a = pack28("CQ") = 2, ipa = 0 → n29a = 4
+        // n28b = pack28("K1ABC") = NTOKENS + MAX22 + 3957069 = 10214965, ipb = 0 → n29b = 20429930
+        // igrid4 = packgrid("FN42") = 10342
+        // ir = 0
+        // i3 = 1
+
+        let n29a: u32 = 4; // CQ=2, shifted left 1
+        let n29b: u32 = 20_429_930; // K1ABC encoded, shifted left 1
+        let igrid4: u16 = 10342;
+        let i3: u8 = 1;
+
+        let mut expected = [0u8; 10];
+        expected[0] = (n29a >> 21) as u8;
+        expected[1] = (n29a >> 13) as u8;
+        expected[2] = (n29a >> 5) as u8;
+        expected[3] = ((n29a << 3) as u8) | ((n29b >> 26) as u8);
+        expected[4] = (n29b >> 18) as u8;
+        expected[5] = (n29b >> 10) as u8;
+        expected[6] = (n29b >> 2) as u8;
+        expected[7] = ((n29b << 6) as u8) | ((igrid4 >> 10) as u8);
+        expected[8] = (igrid4 >> 2) as u8;
+        expected[9] = ((igrid4 << 6) as u8) | (i3 << 3);
+
+        assert_eq!(payload, expected, "Payload mismatch for CQ K1ABC FN42");
     }
 }

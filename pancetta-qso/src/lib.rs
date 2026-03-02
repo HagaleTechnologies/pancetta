@@ -148,6 +148,7 @@ pub use crate::adif::*;
 pub use crate::database::*;
 pub use crate::logger::*;
 pub use crate::statistics::*;
+pub use crate::autonomous::*;
 
 // Module declarations
 pub mod states;
@@ -160,6 +161,7 @@ pub mod async_database;
 pub mod logger;
 pub mod async_logger;
 pub mod statistics;
+pub mod autonomous;
 
 // Common error type for the entire library
 use thiserror::Error;
@@ -214,6 +216,13 @@ pub enum QsoError {
     Statistics {
         #[from]
         source: StatisticsError,
+    },
+
+    /// Autonomous operator error
+    #[error("Autonomous operator error: {source}")]
+    Autonomous {
+        #[from]
+        source: AutonomousError,
     },
 }
 

@@ -184,11 +184,13 @@ impl ApplicationCoordinator {
         self.start_ft8_component().await?;
         self.start_hamlib_component().await?;
         self.start_qso_component().await?;
-        
+        self.start_transmitter_component().await?;
+        self.start_autonomous_component().await?;
+
         if !self.headless {
             self.start_tui_component().await?;
         }
-        
+
         // Start coordinator tasks
         self.start_coordinator_tasks().await?;
         
@@ -582,17 +584,28 @@ impl ApplicationCoordinator {
                                             *timestamp = Some(Instant::now());
                                         }
                                         
-                                        // Send decoded messages to TUI
+                                        // Fan-out decoded messages to TUI and Autonomous
                                         for decoded_msg in decoded_messages {
+                                            // Send to TUI
                                             let tui_message = ComponentMessage::new(
                                                 ComponentId::Ft8Decoder,
                                                 ComponentId::Tui,
+                                                MessageType::DecodedMessage(decoded_msg.clone()),
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) = ft8_tx.try_send(tui_message) {
+                                                warn!("Failed to send decoded message to TUI: {}", e);
+                                            }
+
+                                            // Send to Autonomous operator
+                                            let auto_message = ComponentMessage::new(
+                                                ComponentId::Ft8Decoder,
+                                                ComponentId::Autonomous,
                                                 MessageType::DecodedMessage(decoded_msg),
                                                 Instant::now(),
                                             );
-                                            
-                                            if let Err(e) = ft8_tx.try_send(tui_message) {
-                                                warn!("Failed to send decoded message: {}", e);
+                                            if let Err(e) = ft8_tx.try_send(auto_message) {
+                                                warn!("Failed to send decoded message to Autonomous: {}", e);
                                             }
                                         }
                                     }
@@ -885,6 +898,292 @@ impl ApplicationCoordinator {
         Ok(())
     }
     
+    /// Start FT8 transmitter component
+    async fn start_transmitter_component(&mut self) -> Result<()> {
+        let span = span!(Level::INFO, "start_transmitter");
+        let _enter = span.enter();
+
+        info!("Starting FT8 transmitter component");
+
+        // Create message bus channel
+        let (_tx_sender, tx_rx) = self.message_bus.create_channel(ComponentId::Ft8Transmitter).await?;
+
+        let tx_handle = {
+            let shutdown = self.shutdown_signal.clone();
+            let message_bus = self.message_bus.clone();
+
+            tokio::spawn(async move {
+                info!("FT8 transmitter component ready (awaiting TransmitRequest messages)");
+
+                while !shutdown.load(Ordering::Relaxed) {
+                    match tx_rx.try_recv() {
+                        Ok(message) => {
+                            if let MessageType::TransmitRequest {
+                                message_text,
+                                frequency_offset,
+                                qso_id,
+                            } = message.message_type
+                            {
+                                info!(
+                                    "Transmit request: '{}' at offset {:.0} Hz (qso: {:?})",
+                                    message_text, frequency_offset, qso_id
+                                );
+
+                                // TODO: Wire to actual Ft8Transmitter when audio output is connected.
+                                // For now, log and emit TransmitComplete.
+                                let complete_msg = ComponentMessage::new(
+                                    ComponentId::Ft8Transmitter,
+                                    ComponentId::Autonomous,
+                                    MessageType::TransmitComplete {
+                                        success: true,
+                                        message_text: message_text.clone(),
+                                        duration_ms: 12640, // FT8 message duration
+                                    },
+                                    Instant::now(),
+                                );
+                                if let Err(e) = message_bus.send_message(complete_msg).await {
+                                    warn!("Failed to send TransmitComplete: {}", e);
+                                }
+                            }
+                        }
+                        Err(crossbeam_channel::TryRecvError::Empty) => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            break;
+                        }
+                    }
+                }
+
+                info!("FT8 transmitter component stopped");
+                Ok(())
+            })
+        };
+
+        self.task_handles.push(tx_handle);
+        info!("FT8 transmitter component started");
+        Ok(())
+    }
+
+    /// Start autonomous operator component
+    async fn start_autonomous_component(&mut self) -> Result<()> {
+        let span = span!(Level::INFO, "start_autonomous");
+        let _enter = span.enter();
+
+        let config = self.config.read().await;
+        let auto_config_enabled = config.autonomous.enabled;
+
+        if !auto_config_enabled {
+            info!("Autonomous operator disabled in configuration");
+            drop(config);
+            // Still create the channel so messages don't error out
+            let _ = self.message_bus.create_channel(ComponentId::Autonomous).await?;
+            return Ok(());
+        }
+
+        info!("Starting autonomous operator component");
+
+        // Build the autonomous operator config from pancetta_config types
+        let qso_auto_config = pancetta_qso::AutonomousConfig {
+            enabled: config.autonomous.enabled,
+            slot_parity: match config.autonomous.slot_parity {
+                pancetta_config::autonomous::SlotParitySetting::Even => {
+                    pancetta_qso::SlotParityConfig::Even
+                }
+                pancetta_config::autonomous::SlotParitySetting::Odd => {
+                    pancetta_qso::SlotParityConfig::Odd
+                }
+                pancetta_config::autonomous::SlotParitySetting::Auto => {
+                    pancetta_qso::SlotParityConfig::Auto
+                }
+            },
+            cq_after_idle_cycles: config.autonomous.cq_after_idle_cycles,
+            max_concurrent_qsos: config.autonomous.max_concurrent_qsos,
+            tx_offset_hz: config.autonomous.tx_offset_hz,
+            min_dx_score: config.autonomous.min_dx_score,
+            cq_direction: config.autonomous.cq_direction.clone(),
+            listen_cycle: pancetta_qso::autonomous::ListenCycleConfig {
+                initial_interval: config.autonomous.listen_cycle.initial_interval,
+                backoff_interval: config.autonomous.listen_cycle.backoff_interval,
+                collision_interval: config.autonomous.listen_cycle.collision_interval,
+                backoff_threshold: config.autonomous.listen_cycle.backoff_threshold,
+            },
+            band_hopping: pancetta_qso::autonomous::BandHoppingConfig {
+                enabled: config.autonomous.band_hopping.enabled,
+                hop_threshold: config.autonomous.band_hopping.hop_threshold,
+                bands: config
+                    .autonomous
+                    .band_hopping
+                    .bands
+                    .iter()
+                    .map(|b| pancetta_qso::autonomous::BandEntry {
+                        dial_frequency: b.dial_frequency,
+                        band_name: b.band_name.clone(),
+                        priority: b.priority,
+                    })
+                    .collect(),
+            },
+        };
+
+        let our_callsign = config.station.callsign.clone();
+        let our_grid = if config.station.grid_square.is_empty() {
+            None
+        } else {
+            Some(config.station.grid_square.clone())
+        };
+        drop(config);
+
+        // Create the operator
+        let operator = std::sync::Arc::new(tokio::sync::Mutex::new(
+            pancetta_qso::AutonomousOperator::new(qso_auto_config, our_callsign, our_grid),
+        ));
+
+        // DX evaluator — use NullDxEvaluator for now; a real adapter would wrap pancetta_dx
+        let evaluator: std::sync::Arc<dyn pancetta_qso::DxEvaluator> =
+            std::sync::Arc::new(pancetta_qso::NullDxEvaluator);
+
+        let (_auto_tx, auto_rx) = self.message_bus.create_channel(ComponentId::Autonomous).await?;
+        let message_bus = self.message_bus.clone();
+
+        let auto_handle = {
+            let shutdown = self.shutdown_signal.clone();
+            let operator = operator.clone();
+            let evaluator = evaluator.clone();
+
+            tokio::spawn(async move {
+                info!("Autonomous operator started");
+
+                // Collect decoded messages per slot, run decision engine every 15 seconds
+                let mut slot_messages: Vec<pancetta_qso::DecodedMessageInfo> = Vec::new();
+                let mut slot_interval = tokio::time::interval(Duration::from_secs(15));
+
+                loop {
+                    tokio::select! {
+                        _ = slot_interval.tick() => {
+                            // End of slot — run decision engine
+                            let mut op = operator.lock().await;
+
+                            // Feed accumulated decoded messages
+                            op.feed_decoded_messages(&slot_messages, evaluator.as_ref());
+                            slot_messages.clear();
+
+                            // Run decision engine
+                            let actions = op.decide();
+                            drop(op);
+
+                            // Process actions
+                            for action in actions {
+                                match action {
+                                    pancetta_qso::OperatorAction::Transmit {
+                                        message_text,
+                                        frequency_offset,
+                                        qso_id,
+                                    } => {
+                                        let msg = ComponentMessage::new(
+                                            ComponentId::Autonomous,
+                                            ComponentId::Ft8Transmitter,
+                                            MessageType::TransmitRequest {
+                                                message_text,
+                                                frequency_offset,
+                                                qso_id,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(msg).await {
+                                            warn!("Failed to send TransmitRequest: {}", e);
+                                        }
+                                    }
+                                    pancetta_qso::OperatorAction::ChangeBand { dial_frequency } => {
+                                        let msg = ComponentMessage::new(
+                                            ComponentId::Autonomous,
+                                            ComponentId::Hamlib,
+                                            MessageType::RigControl(
+                                                crate::message_bus::RigControlMessage::SetFrequency {
+                                                    vfo: 0,
+                                                    frequency: dial_frequency,
+                                                },
+                                            ),
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(msg).await {
+                                            warn!("Failed to send ChangeBand: {}", e);
+                                        }
+                                    }
+                                    pancetta_qso::OperatorAction::StatusUpdate(status) => {
+                                        let msg = ComponentMessage::new(
+                                            ComponentId::Autonomous,
+                                            ComponentId::Tui,
+                                            MessageType::AutonomousStatus(
+                                                crate::message_bus::AutonomousStatusData {
+                                                    enabled: status.enabled,
+                                                    state: status.state,
+                                                    slot_parity: status.slot_parity,
+                                                    listen_counter: status.listen_counter,
+                                                    active_qsos: status.active_qsos,
+                                                    max_qsos: status.max_qsos,
+                                                    idle_cycles: status.idle_cycles,
+                                                    band_name: status.band_name,
+                                                    tx_offset_hz: status.tx_offset_hz,
+                                                },
+                                            ),
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(msg).await {
+                                            warn!("Failed to send AutonomousStatus: {}", e);
+                                        }
+                                    }
+                                    pancetta_qso::OperatorAction::Listen
+                                    | pancetta_qso::OperatorAction::CollisionListen => {
+                                        // No action needed on the bus
+                                    }
+                                    pancetta_qso::OperatorAction::FrequencyShift { new_offset_hz } => {
+                                        info!("Autonomous: TX offset shifted to {:.0} Hz", new_offset_hz);
+                                    }
+                                }
+                            }
+                        }
+
+                        // Also drain incoming decoded messages from the bus
+                        _ = async {
+                            loop {
+                                match auto_rx.try_recv() {
+                                    Ok(message) => {
+                                        if let MessageType::DecodedMessage(decoded_msg) = message.message_type {
+                                            slot_messages.push(pancetta_qso::DecodedMessageInfo {
+                                                callsign: decoded_msg.message.from_callsign.clone(),
+                                                frequency_hz: decoded_msg.frequency_offset,
+                                                snr: decoded_msg.snr_db as i32,
+                                                message_text: decoded_msg.text.clone(),
+                                            });
+                                        }
+                                    }
+                                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                                        tokio::task::yield_now().await;
+                                        break;
+                                    }
+                                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                        break;
+                                    }
+                                }
+                            }
+                        } => {}
+                    }
+
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+
+                info!("Autonomous operator stopped");
+                Ok(())
+            })
+        };
+
+        self.task_handles.push(auto_handle);
+        info!("Autonomous operator component started");
+        Ok(())
+    }
+
     /// Start TUI component (if not headless)
     async fn start_tui_component(&mut self) -> Result<()> {
         if self.headless {
@@ -987,6 +1286,23 @@ impl ApplicationCoordinator {
                                 }
                                 MessageType::StatusUpdate(status) => {
                                     debug!("TUI: Status update - {}", status);
+                                }
+                                MessageType::AutonomousStatus(ref status) => {
+                                    let mut app_lock = app.write().await;
+                                    app_lock.update_autonomous_status(
+                                        pancetta_tui::AutonomousStatus {
+                                            enabled: status.enabled,
+                                            state: status.state.clone(),
+                                            slot_parity: status.slot_parity.clone(),
+                                            listen_counter: status.listen_counter.clone(),
+                                            active_qsos: status.active_qsos,
+                                            max_qsos: status.max_qsos,
+                                            idle_cycles: status.idle_cycles,
+                                            band_name: status.band_name.clone(),
+                                            tx_offset_hz: status.tx_offset_hz,
+                                        },
+                                    );
+                                    drop(app_lock);
                                 }
                                 _ => {}
                             }

@@ -53,6 +53,7 @@
 
 // Core FT8 decoding modules
 pub mod decoder;
+pub mod ldpc;
 pub mod message;
 pub mod signal_processing;
 pub mod sync;

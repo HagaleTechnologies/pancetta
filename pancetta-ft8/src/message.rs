@@ -1050,32 +1050,46 @@ fn bits_to_u32(bits: &BitSlice) -> u32 {
 }
 
 /// CRC-14 checksum calculation for FT8 (polynomial 0x2757)
+///
+/// Direct port of ft8_lib's `ftx_compute_crc()` + `ftx_add_crc()`.
+/// The CRC is computed over the 77-bit payload zero-extended to 82 bits,
+/// as specified by the FT8 protocol: `num_bits = 96 - 14 = 82`.
 pub fn calculate_crc14(payload: &BitSlice) -> u16 {
-    // FT8 uses CRC-14 with polynomial x^14 + x^12 + x^10 + x^8 + x^6 + x^4 + x^2 + x + 1
-    // Represented as 0x2757 in binary
-    const CRC14_POLYNOMIAL: u16 = 0x2757;
-    const CRC14_INIT: u16 = 0x0000;
-    
-    let mut crc = CRC14_INIT;
-    
-    for bit in payload.iter() {
-        // Check if MSB will be shifted out
-        let feedback = (crc & 0x2000) != 0;
-        
-        // Shift left and bring in new bit
-        crc = (crc << 1) & 0x3FFF; // Mask to 14 bits
-        
+    const CRC_WIDTH: u32 = 14;
+    const POLY: u16 = 0x2757;
+    const TOPBIT: u16 = 1u16 << (CRC_WIDTH - 1); // 0x2000
+    const NUM_BITS: usize = 82; // 77 payload + 5 zero padding
+
+    // Pack payload bits into bytes (MSB first), zero-extending to 82 bits
+    let num_bytes = (NUM_BITS + 7) / 8; // 11 bytes
+    let mut bytes = [0u8; 11];
+    for (i, bit) in payload.iter().enumerate() {
         if *bit {
-            crc |= 1;
-        }
-        
-        // Apply polynomial if feedback bit was set
-        if feedback {
-            crc ^= CRC14_POLYNOMIAL;
+            bytes[i / 8] |= 0x80u8 >> (i % 8);
         }
     }
-    
-    crc
+    // Ensure bits 77-79 in byte 9 are zero (they already are from init),
+    // and byte 10 is zero. This matches ft8_lib's: a91[9] &= 0xF8; a91[10] = 0;
+    bytes[9] &= 0xF8;
+
+    // Exact port of ftx_compute_crc()
+    let mut remainder: u16 = 0;
+    let mut idx_byte: usize = 0;
+
+    for idx_bit in 0..NUM_BITS {
+        if idx_bit % 8 == 0 {
+            remainder ^= (bytes[idx_byte] as u16) << (CRC_WIDTH - 8);
+            idx_byte += 1;
+        }
+
+        if remainder & TOPBIT != 0 {
+            remainder = (remainder << 1) ^ POLY;
+        } else {
+            remainder <<= 1;
+        }
+    }
+
+    remainder & ((TOPBIT << 1) - 1) // mask to 14 bits
 }
 
 /// Verify CRC-14 checksum for complete 91-bit message

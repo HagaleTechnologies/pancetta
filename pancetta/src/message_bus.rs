@@ -49,6 +49,10 @@ pub enum ComponentId {
     Qso,
     /// DX cluster and propagation
     DxCluster,
+    /// FT8 transmitter
+    Ft8Transmitter,
+    /// Autonomous operator
+    Autonomous,
 }
 
 impl std::fmt::Display for ComponentId {
@@ -63,6 +67,8 @@ impl std::fmt::Display for ComponentId {
             ComponentId::Hamlib => write!(f, "Hamlib"),
             ComponentId::Qso => write!(f, "QSO"),
             ComponentId::DxCluster => write!(f, "DXCluster"),
+            ComponentId::Ft8Transmitter => write!(f, "FT8Transmitter"),
+            ComponentId::Autonomous => write!(f, "Autonomous"),
         }
     }
 }
@@ -113,6 +119,37 @@ pub enum MessageType {
     
     /// Status update message
     StatusUpdate(String),
+
+    /// Request to transmit an FT8 message
+    TransmitRequest {
+        message_text: String,
+        frequency_offset: f64,
+        qso_id: Option<String>,
+    },
+
+    /// Transmit completed notification
+    TransmitComplete {
+        success: bool,
+        message_text: String,
+        duration_ms: u64,
+    },
+
+    /// Autonomous operator status update
+    AutonomousStatus(AutonomousStatusData),
+}
+
+/// Status data from the autonomous operator for TUI consumption.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutonomousStatusData {
+    pub enabled: bool,
+    pub state: String,
+    pub slot_parity: Option<String>,
+    pub listen_counter: String,
+    pub active_qsos: u32,
+    pub max_qsos: u32,
+    pub idle_cycles: u32,
+    pub band_name: String,
+    pub tx_offset_hz: f64,
 }
 
 /// Hamlib rig control messages

@@ -58,44 +58,17 @@ mod transmission_tests {
     }
 
     #[test]
-    fn test_encoder_contest_exchanges() {
-        let mut encoder = Ft8Encoder::new();
-        
-        // Test contest exchange with power
-        let contest_symbols = encoder.encode_contest_exchange("K1DEF", "W1ABC", -15, 50).unwrap();
-        assert_eq!(contest_symbols.len(), NUM_SYMBOLS);
-        
-        // Test invalid power values
-        assert!(encoder.encode_contest_exchange("K1DEF", "W1ABC", -15, 0).is_err());
-        assert!(encoder.encode_contest_exchange("K1DEF", "W1ABC", -15, 100).is_err());
-    }
-
-    #[test]
-    fn test_encoder_telemetry() {
-        let mut encoder = Ft8Encoder::new();
-        
-        // Test telemetry encoding
-        let telemetry_data = vec![0x12, 0x34, 0x56, 0x78];
-        let telem_symbols = encoder.encode_telemetry(&telemetry_data).unwrap();
-        assert_eq!(telem_symbols.len(), NUM_SYMBOLS);
-        
-        // Test telemetry data too long
-        let long_data = vec![0u8; 10];
-        assert!(encoder.encode_telemetry(&long_data).is_err());
-    }
-
-    #[test]
     fn test_encoder_signal_report_limits() {
         let mut encoder = Ft8Encoder::new();
         
-        // Test valid signal reports
-        assert!(encoder.encode_signal_report("K1DEF", "W1ABC", -50).is_ok());
-        assert!(encoder.encode_signal_report("K1DEF", "W1ABC", 40).is_ok());
+        // Test valid signal reports (WSJT-X range: -35 to +30 dB)
+        assert!(encoder.encode_signal_report("K1DEF", "W1ABC", -35).is_ok());
+        assert!(encoder.encode_signal_report("K1DEF", "W1ABC", 30).is_ok());
         assert!(encoder.encode_signal_report("K1DEF", "W1ABC", 0).is_ok());
-        
+
         // Test out of range signal reports
-        assert!(encoder.encode_signal_report("K1DEF", "W1ABC", -51).is_err());
-        assert!(encoder.encode_signal_report("K1DEF", "W1ABC", 41).is_err());
+        assert!(encoder.encode_signal_report("K1DEF", "W1ABC", -36).is_err());
+        assert!(encoder.encode_signal_report("K1DEF", "W1ABC", 31).is_err());
     }
 
     #[test]

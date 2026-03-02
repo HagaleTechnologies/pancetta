@@ -952,20 +952,34 @@ impl Ft8Decoder {
         Ok(correlation.abs() / symbol_audio.len() as f64)
     }
     
-    /// Demodulate symbols to bit sequence
+    /// Demodulate data symbols to bit sequence with Gray code de-mapping
+    ///
+    /// FT8 layout: S7 D29 S7 D29 S7 (79 symbols total)
+    /// Only the 58 data symbols (positions 7..36 and 43..72) are demodulated.
+    /// Costas sync symbols at positions 0..7, 36..43, 72..79 are skipped.
     fn demodulate_symbols(&self, symbols: &[u8]) -> Ft8Result<BitVec> {
-        // FT8 uses a specific gray code mapping and convolutional encoding
-        // This is a simplified implementation
-        let mut bits = BitVec::with_capacity(PAYLOAD_BITS + CRC_BITS + 82); // Include LDPC parity
-        
-        // Convert symbols to bits (3 bits per symbol for 8-FSK)
-        for &symbol in symbols {
-            let symbol_bits = symbol;
-            bits.push((symbol_bits & 4) != 0);
-            bits.push((symbol_bits & 2) != 0);
-            bits.push((symbol_bits & 1) != 0);
+        if symbols.len() != NUM_SYMBOLS {
+            return Err(Ft8Error::MessageDecodingError(
+                format!("Expected {} symbols, got {}", NUM_SYMBOLS, symbols.len())
+            ));
         }
-        
+
+        // 58 data symbols × 3 bits = 174 bits (LDPC codeword)
+        let mut bits = BitVec::with_capacity(174);
+
+        // Data symbol positions: 7..36 (29 symbols) and 43..72 (29 symbols)
+        for i_tone in 0..NUM_SYMBOLS {
+            let is_data = (7..36).contains(&i_tone) || (43..72).contains(&i_tone);
+            if !is_data {
+                continue;
+            }
+
+            let binary_value = gray_to_binary(symbols[i_tone]);
+            bits.push((binary_value & 4) != 0);
+            bits.push((binary_value & 2) != 0);
+            bits.push((binary_value & 1) != 0);
+        }
+
         Ok(bits)
     }
     
@@ -1007,7 +1021,7 @@ fn bits_to_u16(bits: &BitSlice) -> u16 {
 }
 
 /// Estimate noise floor from power spectral density
-fn _estimate_noise_floor(psd: &[f64]) -> f64 {
+fn estimate_noise_floor(psd: &[f64]) -> f64 {
     // Use median as noise floor estimate (robust against peaks)
     let mut sorted_psd = psd.to_vec();
     sorted_psd.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1279,144 +1293,7 @@ impl LdpcDecoder {
     }
 }
 
-/// Parity check matrix for FT8 LDPC(174,91) code
-/// 
-/// The matrix is stored in a sparse representation for efficiency
-struct ParityCheckMatrix {
-    /// Sparse representation: for each check node, list of connected variable nodes
-    check_connections: Vec<Vec<usize>>,
-    /// Sparse representation: for each variable node, list of connected check nodes
-    variable_connections: Vec<Vec<usize>>,
-    /// Number of check nodes (rows)
-    num_checks: usize,
-    /// Number of variable nodes (columns)
-    num_variables: usize,
-}
-
-impl ParityCheckMatrix {
-    /// Create the FT8 LDPC(174,91) parity check matrix
-    fn new_ft8() -> Self {
-        // FT8 uses a specific LDPC code designed for weak signal performance
-        // The parity check matrix structure is optimized for iterative decoding
-        
-        let num_checks = 83;
-        let num_variables = 174;
-        
-        // Initialize connection lists
-        let mut check_connections = vec![Vec::new(); num_checks];
-        let mut variable_connections = vec![Vec::new(); num_variables];
-        
-        // Define the FT8 LDPC parity check matrix structure
-        // This is based on the FT8 protocol specification
-        // The matrix has a quasi-cyclic structure for efficient implementation
-        
-        // First part: systematic connections (information bits)
-        // These define how the 91 information bits connect to check nodes
-        let _info_connections = [
-            // Check node 0 connections (example structure - actual FT8 matrix)
-            vec![0, 15, 30, 45, 60, 75, 90],
-            vec![1, 16, 31, 46, 61, 76, 91],
-            vec![2, 17, 32, 47, 62, 77, 92],
-            // ... continuing pattern for all 83 check nodes
-        ];
-        
-        // For the actual FT8 LDPC code, we use a structured approach
-        // based on the protocol's quasi-cyclic construction
-        
-        // Generate connections using the FT8 LDPC structure
-        // This is a simplified version - the actual FT8 uses specific polynomials
-        for check_idx in 0..num_checks {
-            // Each check node connects to approximately 7-8 variable nodes
-            // This creates a regular LDPC code with good error correction
-            
-            // Information bit connections (quasi-cyclic pattern)
-            for offset in 0..7 {
-                let var_idx = (check_idx + offset * 13) % 91;
-                check_connections[check_idx].push(var_idx);
-                variable_connections[var_idx].push(check_idx);
-            }
-            
-            // Parity bit connections (staircase structure)
-            let parity_idx = 91 + check_idx;
-            check_connections[check_idx].push(parity_idx);
-            variable_connections[parity_idx].push(check_idx);
-            
-            // Additional parity connections for code structure
-            if check_idx > 0 {
-                let prev_parity = 91 + check_idx - 1;
-                check_connections[check_idx].push(prev_parity);
-                variable_connections[prev_parity].push(check_idx);
-            }
-        }
-        
-        // Add additional connections for better error correction
-        // These are based on the FT8 protocol's optimized matrix
-        Self::add_ft8_optimized_connections(&mut check_connections, &mut variable_connections);
-        
-        Self {
-            check_connections,
-            variable_connections,
-            num_checks,
-            num_variables,
-        }
-    }
-    
-    /// Add FT8-specific optimized connections for better weak signal performance
-    fn add_ft8_optimized_connections(
-        check_connections: &mut Vec<Vec<usize>>,
-        variable_connections: &mut Vec<Vec<usize>>,
-    ) {
-        // Additional connections based on FT8's optimized design
-        // These improve performance at low SNR
-        
-        // Add cross-connections for better error propagation
-        for check_idx in 0..40 {
-            let var_idx = (check_idx * 3 + 7) % 91;
-            if !check_connections[check_idx].contains(&var_idx) {
-                check_connections[check_idx].push(var_idx);
-                variable_connections[var_idx].push(check_idx);
-            }
-            
-            let var_idx2 = (check_idx * 5 + 11) % 91;
-            if !check_connections[check_idx].contains(&var_idx2) {
-                check_connections[check_idx].push(var_idx2);
-                variable_connections[var_idx2].push(check_idx);
-            }
-        }
-        
-        // Add connections for the last part of the matrix
-        for check_idx in 40..83 {
-            let var_idx = (check_idx * 2 + 13) % 91;
-            if !check_connections[check_idx].contains(&var_idx) {
-                check_connections[check_idx].push(var_idx);
-                variable_connections[var_idx].push(check_idx);
-            }
-        }
-        
-        // Sort connections for consistent access patterns
-        for connections in check_connections.iter_mut() {
-            connections.sort_unstable();
-        }
-        for connections in variable_connections.iter_mut() {
-            connections.sort_unstable();
-        }
-    }
-    
-    /// Check if a check node and variable node are connected
-    fn is_connected(&self, check_idx: usize, var_idx: usize) -> bool {
-        self.check_connections[check_idx].contains(&var_idx)
-    }
-    
-    /// Get all variable nodes connected to a check node
-    fn get_connected_variables(&self, check_idx: usize) -> &[usize] {
-        &self.check_connections[check_idx]
-    }
-    
-    /// Get all check nodes connected to a variable node
-    fn get_connected_checks(&self, var_idx: usize) -> &[usize] {
-        &self.variable_connections[var_idx]
-    }
-}
+use crate::ldpc::{ParityCheckMatrix, gray_to_binary};
 
 /// Local decoder for parallel processing
 struct LocalDecoder {
@@ -1461,6 +1338,7 @@ impl LocalDecoder {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use std::f64::consts::PI;
 
     #[test]
     fn test_ft8_config_default() {

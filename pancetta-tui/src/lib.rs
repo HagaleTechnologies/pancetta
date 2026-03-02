@@ -11,7 +11,7 @@ pub mod widgets;
 pub mod tui_runner;
 
 // Re-export main types for convenience
-pub use app::{App, DecodedMessage, QsoStatus, StationInfo, DxStation, ActivePanel};
+pub use app::{App, AutonomousStatus, DecodedMessage, QsoStatus, StationInfo, DxStation, ActivePanel};
 pub use config::{Config, Theme};
 pub use events::{Event, EventHandler};
 

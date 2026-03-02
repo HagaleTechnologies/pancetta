@@ -62,6 +62,20 @@ pub struct DxStation {
     pub priority_score: u32,
 }
 
+/// Status data received from the autonomous operator.
+#[derive(Debug, Clone, Default)]
+pub struct AutonomousStatus {
+    pub enabled: bool,
+    pub state: String,
+    pub slot_parity: Option<String>,
+    pub listen_counter: String,
+    pub active_qsos: u32,
+    pub max_qsos: u32,
+    pub idle_cycles: u32,
+    pub band_name: String,
+    pub tx_offset_hz: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ActivePanel {
     BandActivity,
@@ -114,6 +128,9 @@ pub struct App {
     pub audio_level: f32,
     pub waterfall_data: Vec<Vec<f32>>,
     
+    // Autonomous operator
+    pub autonomous_status: Option<AutonomousStatus>,
+
     // Communication channels
     pub message_rx: Option<mpsc::UnboundedReceiver<DecodedMessage>>,
     pub audio_rx: Option<mpsc::UnboundedReceiver<Vec<f32>>>,
@@ -161,6 +178,7 @@ impl App {
             is_monitoring: false,
             audio_level: 0.0,
             waterfall_data: Vec::new(),
+            autonomous_status: None,
             message_rx: None,
             audio_rx: None,
         };
@@ -259,6 +277,16 @@ impl App {
             // Audio monitoring
             KeyCode::Char('m') => {
                 self.toggle_monitoring().await?;
+            }
+
+            // Autonomous mode toggle
+            KeyCode::Char('a') => {
+                self.toggle_autonomous();
+            }
+
+            // Pause/resume autonomous
+            KeyCode::Char('p') => {
+                self.toggle_autonomous_pause();
             }
             
             // Clear messages
@@ -554,5 +582,39 @@ impl App {
 
     pub fn delete_char(&mut self) {
         // TODO: Delete character from input buffer
+    }
+
+    pub fn update_autonomous_status(&mut self, status: AutonomousStatus) {
+        self.autonomous_status = Some(status);
+    }
+
+    fn toggle_autonomous(&mut self) {
+        if let Some(ref mut status) = self.autonomous_status {
+            status.enabled = !status.enabled;
+            self.status_message = if status.enabled {
+                "Autonomous mode enabled".to_string()
+            } else {
+                "Autonomous mode disabled".to_string()
+            };
+            info!("Autonomous mode: {}", if status.enabled { "enabled" } else { "disabled" });
+        } else {
+            self.status_message = "Autonomous mode not available".to_string();
+        }
+    }
+
+    fn toggle_autonomous_pause(&mut self) {
+        if let Some(ref mut status) = self.autonomous_status {
+            if status.enabled {
+                // Toggle paused state via the state string.
+                if status.state == "Paused" {
+                    status.state = "Hunting".to_string();
+                    self.status_message = "Autonomous resumed".to_string();
+                } else {
+                    status.state = "Paused".to_string();
+                    self.status_message = "Autonomous paused".to_string();
+                }
+                info!("Autonomous state: {}", status.state);
+            }
+        }
     }
 }
