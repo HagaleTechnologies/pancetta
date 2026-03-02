@@ -14,7 +14,7 @@ thiserror = "1.0"
 tracing = "0.1"
 
 # Signal processing
-rustfft = "6.2"
+rustfft = "6.4"
 realfft = "3.3"
 rubato = "0.15"  # High-quality resampling
 biquad = "0.4"   # IIR filters

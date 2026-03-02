@@ -33,7 +33,7 @@ toml = { workspace = true }
 
 # Async utilities
 async-trait = "0.1"
-pin-project = "1.0"
+pin-project = "1.1"
 
 # Numeric types for frequency/power handling
 num-traits = "0.2"
