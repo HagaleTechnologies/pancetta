@@ -58,6 +58,9 @@ pub mod message;
 pub mod signal_processing;
 pub mod sync;
 
+// ft8_lib reference implementation (FFI)
+pub mod ft8_lib_ffi;
+
 // FT8 transmission modules
 #[cfg(feature = "transmit")]
 pub mod encoder;

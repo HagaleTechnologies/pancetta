@@ -388,7 +388,6 @@ mod transmission_tests {
         assert_eq!(config.base_frequency, 1500.0);
         assert_eq!(config.tone_spacing, 6.25);
         assert_eq!(config.tx_power, 0.5);
-        assert_eq!(config.gaussian_bt, 2.0);
     }
 
     #[test]

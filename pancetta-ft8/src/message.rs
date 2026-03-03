@@ -85,6 +85,32 @@ impl fmt::Display for MessageType {
     }
 }
 
+/// Result of unpacking a 28-bit callsign field
+#[derive(Debug, Clone)]
+enum CallsignField {
+    /// Standard callsign (e.g. "W1ABC")
+    Callsign(String),
+    /// CQ with optional modifier (e.g. CQ, CQ DX, CQ 123)
+    Cq(Option<String>),
+    /// Special token (DE, QRZ)
+    Token(String),
+    /// Hash-based callsign (value only, no lookup available)
+    Hash(u32),
+}
+
+impl CallsignField {
+    /// Convert to Option<String> for use in Ft8Message fields
+    fn to_callsign(&self) -> Option<String> {
+        match self {
+            CallsignField::Callsign(s) => Some(s.clone()),
+            CallsignField::Token(s) => Some(s.clone()),
+            CallsignField::Cq(Some(m)) => Some(format!("CQ {}", m)),
+            CallsignField::Cq(None) => Some("CQ".to_string()),
+            CallsignField::Hash(h) => Some(format!("<...{}>", h & 0xFFF)),
+        }
+    }
+}
+
 /// Parsed FT8 message content
 #[derive(Debug, Clone)]
 pub struct Ft8Message {
@@ -489,138 +515,337 @@ impl MessageParser {
     }
     
     /// Parse 77-bit payload into FT8 message
+    ///
+    /// FT8 payload layout:
+    /// - i3 field (message type) is in the LAST 3 bits (74-76)
+    /// - For i3=0: n3 sub-type is in bits 71-73
+    /// - For i3=1,2: standard message layout
     pub fn parse_payload(&self, payload: &BitSlice) -> Ft8Result<Ft8Message> {
         if payload.len() != PAYLOAD_BITS {
             return Err(Ft8Error::MessageDecodingError(
                 format!("Invalid payload length: {} bits", payload.len())
             ));
         }
-        
+
         let mut message = Ft8Message::default();
         message.payload_bits = payload.to_bitvec();
-        
-        // Determine message type from first 3 bits
-        let type_value = bits_to_u32(&payload[0..3]);
-        message.message_type = self.determine_message_type(type_value)?;
-        
-        // Parse message content based on type
-        match message.message_type {
-            MessageType::Standard => self.parse_standard_message(&payload[3..], &mut message)?,
-            MessageType::Extended => self.parse_extended_message(&payload[3..], &mut message)?,
-            MessageType::Contest => self.parse_contest_message(&payload[3..], &mut message)?,
-            MessageType::FieldDay => self.parse_field_day_message(&payload[3..], &mut message)?,
-            MessageType::Telemetry => self.parse_telemetry_message(&payload[3..], &mut message)?,
-            MessageType::FreeText => self.parse_freetext_message(&payload[3..], &mut message)?,
-            MessageType::DXpedition => self.parse_dxpedition_message(&payload[3..], &mut message)?,
-            MessageType::RTTYRoundup => self.parse_rtty_roundup_message(&payload[3..], &mut message)?,
-            MessageType::Unknown => {}
+
+        // Read i3 from the LAST 3 bits (74-76)
+        let i3 = bits_to_u32(&payload[74..77]);
+
+        match i3 {
+            0 => {
+                // i3=0: sub-type determined by n3 field (bits 71-73)
+                let n3 = bits_to_u32(&payload[71..74]);
+                match n3 {
+                    0 => {
+                        // Free text: 71 bits encode 13 chars in base-42
+                        message.message_type = MessageType::FreeText;
+                        self.parse_freetext_type0(&payload[0..71], &mut message)?;
+                    }
+                    _ => {
+                        // Other i3=0 sub-types (DXpedition, Field Day, etc.) — not yet supported
+                        message.message_type = MessageType::Unknown;
+                    }
+                }
+            }
+            1 | 2 => {
+                // Standard message: n29a(29) + n29b(29) + ir(1) + igrid4(15) + i3(3)
+                message.message_type = MessageType::Standard;
+                self.parse_type1_standard(&payload, &mut message)?;
+            }
+            _ => {
+                message.message_type = MessageType::Unknown;
+            }
         }
-        
+
         Ok(message)
     }
-    
-    /// Determine message type from first 3 bits
-    fn determine_message_type(&self, type_value: u32) -> Ft8Result<MessageType> {
-        match type_value {
-            0 => Ok(MessageType::Standard),
-            1 => Ok(MessageType::Extended),
-            2 => Ok(MessageType::Contest),
-            3 => Ok(MessageType::FieldDay),
-            4 => Ok(MessageType::Telemetry),
-            5 => Ok(MessageType::FreeText),
-            6 => Ok(MessageType::DXpedition),
-            7 => Ok(MessageType::RTTYRoundup),
-            _ => Ok(MessageType::Unknown),
-        }
-    }
-    
-    /// Parse Type 0 standard messages
-    fn parse_standard_message(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
-        // Extract first callsign field (28 bits)
-        let call1 = self.decode_callsign_28bit(&payload[0..28])?;
-        
-        // Extract second callsign field (28 bits) 
-        let call2 = self.decode_callsign_28bit(&payload[28..56]);
-        
-        // Extract remaining field (variable)
-        let remaining_bits = &payload[56..];
-        
-        // Determine standard message subtype based on remaining bits
-        if remaining_bits.len() >= 15 {
-            let grid_value = bits_to_u32(&remaining_bits[0..15]);
-            
-            if grid_value == 0 {
-                // No grid - could be RRR or 73
-                if remaining_bits.len() > 15 {
-                    let flag_bits = bits_to_u32(&remaining_bits[15..]);
-                    if flag_bits & 1 != 0 {
-                        message.standard_type = Some(StandardMessageType::RR73);
-                    } else {
-                        message.standard_type = Some(StandardMessageType::Final73);
-                    }
-                } else {
-                    message.standard_type = Some(StandardMessageType::Rrr);
+
+    /// Parse i3=1/2 standard message from 77-bit payload.
+    ///
+    /// Bit layout: n29a(29) + n29b(29) + ir(1) + igrid4(15) + i3(3) = 77 bits
+    fn parse_type1_standard(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
+        // Extract fields from bit positions
+        let n29a = bits_to_u32(&payload[0..29]);
+        let n29b = bits_to_u32(&payload[29..58]);
+        let ir = payload[58] as u8;
+        let igrid4 = bits_to_u32(&payload[59..74]) as u16;
+
+        // Split callsign + suffix flag
+        let n28a = n29a >> 1;
+        let ipa = (n29a & 1) as u8;
+        let n28b = n29b >> 1;
+        let ipb = (n29b & 1) as u8;
+
+        // Decode callsigns, appending /R suffix when ip=1
+        let call_a = self.unpack28(n28a);
+        let call_b = self.unpack28(n28b);
+
+        // Helper to apply suffix: ip=1 means /R (or /P — indistinguishable in protocol)
+        let apply_suffix = |call: Option<String>, ip: u8| -> Option<String> {
+            match (call, ip) {
+                (Some(c), 1) if !c.starts_with("CQ") && !c.starts_with("DE") && !c.starts_with("QRZ") => {
+                    Some(format!("{}/R", c))
                 }
-            } else if grid_value >= 32400 {
-                // Signal report encoding
-                let report = ((grid_value - 32400) as i8) - 35;
-                message.signal_report = Some(report);
-                
-                if remaining_bits.len() > 15 && bits_to_u32(&remaining_bits[15..16]) != 0 {
-                    message.standard_type = Some(StandardMessageType::ReportWithR);
-                } else {
-                    message.standard_type = Some(StandardMessageType::Report);
+                (c, _) => c,
+            }
+        };
+
+        // Decode grid/report/token
+        let (grid, report, token) = Self::unpackgrid(igrid4, ir);
+
+        // Determine message subtype and populate fields
+        let is_cq = matches!(&call_a, CallsignField::Cq(..));
+
+        // Pre-compute callsign strings with suffixes applied
+        let call_a_str = apply_suffix(call_a.to_callsign(), ipa);
+        let call_b_str = apply_suffix(call_b.to_callsign(), ipb);
+
+        if is_cq {
+            message.standard_type = Some(StandardMessageType::Cq);
+            // For CQ messages: call_a = CQ token, call_b = calling station
+            if let CallsignField::Cq(modifier) = &call_a {
+                if let Some(m) = modifier {
+                    message.special_operation = Some(m.clone());
                 }
+            }
+            message.from_callsign = call_b_str;
+            message.grid_square = grid;
+        } else if let Some(tok) = token {
+            // Special tokens: RRR, RR73, 73
+            match tok.as_str() {
+                "RRR" => message.standard_type = Some(StandardMessageType::Rrr),
+                "RR73" => message.standard_type = Some(StandardMessageType::RR73),
+                "73" => message.standard_type = Some(StandardMessageType::Final73),
+                _ => message.standard_type = Some(StandardMessageType::Reply),
+            }
+            message.to_callsign = call_a_str;
+            message.from_callsign = call_b_str;
+        } else if let Some(rpt) = report {
+            // Signal report
+            message.signal_report = Some(rpt);
+            if ir != 0 {
+                message.standard_type = Some(StandardMessageType::ReportWithR);
             } else {
-                // Grid square
-                message.grid_square = self.decode_grid_square_15bit(grid_value)?;
-                
-                if call1.is_some() && call2.is_err() {
-                    // CQ message
-                    message.standard_type = Some(StandardMessageType::Cq);
-                    message.from_callsign = call1;
-                } else {
-                    // Reply message
-                    if remaining_bits.len() > 15 && bits_to_u32(&remaining_bits[15..16]) != 0 {
-                        message.standard_type = Some(StandardMessageType::ReplyWithR);
-                    } else {
-                        message.standard_type = Some(StandardMessageType::Reply);
-                    }
-                    message.to_callsign = call1;
-                    message.from_callsign = call2.unwrap_or(None);
-                }
+                message.standard_type = Some(StandardMessageType::Report);
             }
-        }
-        
-        // Handle CQ DX and other special operations
-        if let Some(StandardMessageType::Cq) = message.standard_type {
-            if remaining_bits.len() > 15 {
-                let dx_flag = bits_to_u32(&remaining_bits[15..16]);
-                if dx_flag != 0 {
-                    message.special_operation = Some("DX".to_string());
-                }
+            message.to_callsign = call_a_str;
+            message.from_callsign = call_b_str;
+        } else if grid.is_some() {
+            // Grid square reply
+            if ir != 0 {
+                message.standard_type = Some(StandardMessageType::ReplyWithR);
+            } else {
+                message.standard_type = Some(StandardMessageType::Reply);
             }
+            message.to_callsign = call_a_str;
+            message.from_callsign = call_b_str;
+            message.grid_square = grid;
+        } else {
+            // No grid, no report, no token — blank exchange
+            message.standard_type = Some(StandardMessageType::Reply);
+            message.to_callsign = call_a_str;
+            message.from_callsign = call_b.to_callsign();
         }
-        
+
         Ok(())
     }
-    
+
+    /// Parse free text from i3=0, n3=0 payload (first 71 bits).
+    ///
+    /// Encoding: 71 bits (left-shifted big-endian) → base-42 → 13 characters.
+    /// Reverse of encoder's `encode_free_text()`.
+    fn parse_freetext_type0(&self, bits71: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
+        const FREETEXT_CHARS: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?";
+
+        // Convert 71 bits to a big integer (stored as bytes)
+        // The encoder left-shifts by 1 bit, so we right-shift to recover b71
+        let mut b71 = [0u8; 9];
+        for i in 0..71 {
+            if bits71[i] {
+                b71[i / 8] |= 0x80u8 >> (i % 8);
+            }
+        }
+
+        // Right-shift b71 by 1 bit (reverse of encoder's left-shift)
+        let mut carry: u8 = 0;
+        for byte in b71.iter_mut() {
+            let new_carry = *byte & 1;
+            *byte = (*byte >> 1) | (carry << 7);
+            carry = new_carry;
+        }
+
+        // Decode base-42: divide by 42 repeatedly to extract 13 characters
+        let mut chars = [b' '; 13];
+        for i in (0..13).rev() {
+            // Divide b71 by 42, remainder is the character index
+            let mut rem = 0u16;
+            for byte in b71.iter_mut() {
+                rem = (rem << 8) | (*byte as u16);
+                *byte = (rem / 42) as u8;
+                rem %= 42;
+            }
+            let idx = rem as usize;
+            if idx < FREETEXT_CHARS.len() {
+                chars[i] = FREETEXT_CHARS[idx];
+            }
+        }
+
+        let text = String::from_utf8_lossy(&chars).trim_end().to_string();
+        if !text.is_empty() {
+            message.text = Some(text);
+        }
+
+        Ok(())
+    }
+
+    /// Unpack a 28-bit callsign field value into a CallsignField.
+    ///
+    /// Matches the encoder's `pack28()` encoding:
+    /// - 0: DE, 1: QRZ, 2: CQ (no modifier)
+    /// - 3..NTOKENS: CQ with modifier
+    /// - NTOKENS..NTOKENS+MAX22: hash-based callsign
+    /// - NTOKENS+MAX22 and above: standard callsign (mixed-radix)
+    fn unpack28(&self, n28: u32) -> CallsignField {
+        const NTOKENS: u32 = 2_063_592;
+        const MAX22: u32 = 4_194_304;
+
+        match n28 {
+            0 => CallsignField::Token("DE".to_string()),
+            1 => CallsignField::Token("QRZ".to_string()),
+            2 => CallsignField::Cq(None),
+            3..=2_063_591 => {
+                // CQ modifier: 3..NTOKENS
+                let mod_val = n28 - 3;
+                if mod_val < 1000 {
+                    // CQ nnn (frequency)
+                    CallsignField::Cq(Some(format!("{:03}", mod_val)))
+                } else {
+                    // CQ ABCD (directed CQ) — decode base-27 with digits 1..26
+                    // Reverse of: m = 27 * m + ((ch - 'A') + 1)
+                    let mut v = mod_val - 1000;
+                    let mut chars = Vec::new();
+                    while v > 0 {
+                        let r = (v % 27) as u8;
+                        if r == 0 { break; }
+                        chars.push(b'A' + r - 1);
+                        v /= 27;
+                    }
+                    chars.reverse();
+                    let s = String::from_utf8_lossy(&chars).trim().to_string();
+                    CallsignField::Cq(if s.is_empty() { None } else { Some(s) })
+                }
+            }
+            _ if n28 < NTOKENS + MAX22 => {
+                // Hash-based callsign — can't decode without lookup table
+                CallsignField::Hash(n28 - NTOKENS)
+            }
+            _ => {
+                // Standard callsign via mixed-radix decoding
+                let basecall_val = n28 - NTOKENS - MAX22;
+                match Self::unpack_basecall(basecall_val) {
+                    Some(call) => CallsignField::Callsign(call),
+                    None => CallsignField::Hash(n28), // fallback
+                }
+            }
+        }
+    }
+
+    /// Decode a standard callsign from its mixed-radix value.
+    ///
+    /// Reverse of encoder's `pack_basecall()`:
+    /// Radix order: 37 × 36 × 10 × 27 × 27 × 27
+    fn unpack_basecall(mut n: u32) -> Option<String> {
+        const C0: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 37
+        const C1: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";  // 36
+        const C2: &[u8] = b"0123456789";                            // 10
+        const C3: &[u8] = b" ABCDEFGHIJKLMNOPQRSTUVWXYZ";           // 27
+
+        let i5 = (n % 27) as usize; n /= 27;
+        let i4 = (n % 27) as usize; n /= 27;
+        let i3 = (n % 27) as usize; n /= 27;
+        let i2 = (n % 10) as usize; n /= 10;
+        let i1 = (n % 36) as usize; n /= 36;
+        let i0 = n as usize;
+
+        if i0 >= C0.len() || i1 >= C1.len() || i2 >= C2.len()
+            || i3 >= C3.len() || i4 >= C3.len() || i5 >= C3.len()
+        {
+            return None;
+        }
+
+        let mut call = String::with_capacity(6);
+        call.push(C0[i0] as char);
+        call.push(C1[i1] as char);
+        call.push(C2[i2] as char);
+        call.push(C3[i3] as char);
+        call.push(C3[i4] as char);
+        call.push(C3[i5] as char);
+
+        let call = call.trim().to_string();
+        if call.is_empty() { None } else { Some(call) }
+    }
+
+    /// Decode the 15-bit grid/report/token field.
+    ///
+    /// Reverse of encoder's `packgrid()`.
+    /// Returns (grid, report, token).
+    fn unpackgrid(igrid4: u16, ir: u8) -> (Option<String>, Option<i8>, Option<String>) {
+        const MAXGRID4: u16 = 32400;
+
+        if igrid4 < MAXGRID4 {
+            // Grid square: mixed-radix 18 × 18 × 10 × 10
+            let mut g = igrid4;
+            let d3 = (g % 10) as u8; g /= 10;
+            let d2 = (g % 10) as u8; g /= 10;
+            let d1 = (g % 18) as u8; g /= 18;
+            let d0 = g as u8;
+
+            if d0 < 18 && d1 < 18 && d2 < 10 && d3 < 10 {
+                let grid = format!(
+                    "{}{}{}{}",
+                    (b'A' + d0) as char,
+                    (b'A' + d1) as char,
+                    (b'0' + d2) as char,
+                    (b'0' + d3) as char,
+                );
+                return (Some(grid), None, None);
+            }
+        }
+
+        match igrid4 {
+            x if x == MAXGRID4 + 1 => (None, None, None), // empty
+            x if x == MAXGRID4 + 2 => (None, None, Some("RRR".to_string())),
+            x if x == MAXGRID4 + 3 => (None, None, Some("RR73".to_string())),
+            x if x == MAXGRID4 + 4 => (None, None, Some("73".to_string())),
+            _ => {
+                // Signal report: igrid4 = MAXGRID4 + 35 + dd
+                let report_val = (igrid4 as i16) - (MAXGRID4 as i16) - 35;
+                let report = report_val as i8;
+                // ir bit is handled by the caller to set Report vs ReportWithR
+                let _ = ir;
+                (None, Some(report), None)
+            }
+        }
+    }
+
     /// Parse Type 1 extended callsign messages
     fn parse_extended_message(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
         // Type 1 messages support callsigns with prefixes/suffixes
         // Extract base callsign (28 bits)
-        let base_call = self.decode_callsign_28bit(&payload[0..28])?;
-        
+        let base_call = self.unpack28(bits_to_u32(&payload[0..28]));
+
         // Extract prefix/suffix encoding (variable)
         let ext_bits = &payload[28..];
-        
+
         if ext_bits.len() >= 22 {
             let ext_value = bits_to_u32(&ext_bits[0..22]);
-            
+
             // Decode prefix or suffix
             let extension = self.decode_callsign_extension(ext_value)?;
-            
-            if let (Some(mut call), Some(ext)) = (base_call, extension) {
+
+            if let (Some(mut call), Some(ext)) = (base_call.to_callsign(), extension) {
                 if ext.starts_with('/') {
                     // Suffix
                     call.push_str(&ext);
@@ -794,91 +1019,11 @@ impl MessageParser {
         Ok(())
     }
     
-    /// Decode callsign from 28-bit field with complete WSJT-X algorithm
+    /// Decode callsign from 28-bit field — delegates to unpack28.
+    /// Kept for compatibility with contest/field day/DXpedition parsers.
     fn decode_callsign_28bit(&self, bits: &BitSlice) -> Ft8Result<Option<String>> {
-        let callsign_value = bits_to_u32(bits);
-        
-        if callsign_value == 0 {
-            return Ok(None);
-        }
-        
-        // Standard callsign range: 0 < value < 262,144,000
-        if callsign_value < 262_144_000 {
-            return Ok(Some(self.decode_standard_callsign(callsign_value)?));
-        }
-        
-        // Hash-based callsign range: >= 262,144,000
-        let hash_value = callsign_value - 262_144_000;
-        
-        // Check different hash types based on range
-        if hash_value < 1024 {
-            // 10-bit hash
-            Ok(self.hash_table.lookup_10bit_hash(hash_value))
-        } else if hash_value < 5120 {
-            // 12-bit hash  
-            Ok(self.hash_table.lookup_12bit_hash(hash_value - 1024))
-        } else {
-            // 22-bit hash for special operations
-            Ok(self.hash_table.lookup_22bit_hash(hash_value - 5120))
-        }
-    }
-    
-    /// Decode standard callsign using base-37 encoding
-    fn decode_standard_callsign(&self, value: u32) -> Ft8Result<String> {
-        // WSJT-X callsign encoding: base-37 with specific character set
-        const CALLSIGN_CHARS: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        
-        if value >= 262_144_000 {
-            return Err(Ft8Error::MessageDecodingError(
-                "Invalid standard callsign value".to_string()
-            ));
-        }
-        
-        let mut result = String::new();
-        let mut n = value;
-        
-        // Decode up to 6 characters
-        for _ in 0..6 {
-            let char_idx = (n % 37) as usize;
-            if char_idx < CALLSIGN_CHARS.len() {
-                result.insert(0, CALLSIGN_CHARS[char_idx] as char);
-            }
-            n /= 37;
-            if n == 0 {
-                break;
-            }
-        }
-        
-        // Remove leading spaces and validate
-        let callsign = result.trim_start().to_string();
-        
-        if callsign.is_empty() {
-            return Err(Ft8Error::MessageDecodingError(
-                "Empty callsign decoded".to_string()
-            ));
-        }
-        
-        // Basic callsign validation
-        if !self.validate_callsign(&callsign) {
-            return Err(Ft8Error::MessageDecodingError(
-                format!("Invalid callsign format: {}", callsign)
-            ));
-        }
-        
-        Ok(callsign)
-    }
-    
-    /// Validate callsign format
-    fn validate_callsign(&self, callsign: &str) -> bool {
-        if callsign.len() < 3 || callsign.len() > 6 {
-            return false;
-        }
-        
-        // Must contain at least one letter and one digit
-        let has_letter = callsign.chars().any(|c| c.is_ascii_alphabetic());
-        let has_digit = callsign.chars().any(|c| c.is_ascii_digit());
-        
-        has_letter && has_digit
+        let n28 = bits_to_u32(bits);
+        Ok(self.unpack28(n28).to_callsign())
     }
     
     /// Decode callsign extension (prefix/suffix)
@@ -908,40 +1053,9 @@ impl MessageParser {
     
     /// Decode grid square from 15-bit field using Maidenhead system
     fn decode_grid_square_15bit(&self, grid_value: u32) -> Ft8Result<Option<String>> {
-        if grid_value == 0 {
-            return Ok(None);
-        }
-        
-        // WSJT-X grid encoding: Maidenhead locator system
-        // 15 bits encode 4-character grid (AA00 to RR99)
-        
-        if grid_value >= 32400 {
-            // Values >= 32400 are used for signal reports, not grids
-            return Ok(None);
-        }
-        
-        // Decode longitude (field 1 & 3) and latitude (field 2 & 4)
-        let lng_field1 = (grid_value % 18) as u8;          // A-R (18 values)
-        let lat_field2 = ((grid_value / 18) % 18) as u8;   // A-R (18 values)
-        let lng_field3 = ((grid_value / 324) % 10) as u8;  // 0-9 (10 values)
-        let lat_field4 = ((grid_value / 3240) % 10) as u8; // 0-9 (10 values)
-        
-        // Validate ranges
-        if lng_field1 >= 18 || lat_field2 >= 18 || lng_field3 >= 10 || lat_field4 >= 10 {
-            return Err(Ft8Error::MessageDecodingError(
-                format!("Invalid grid square encoding: {}", grid_value)
-            ));
-        }
-        
-        let grid = format!(
-            "{}{}{}{}",
-            (b'A' + lng_field1) as char,
-            (b'A' + lat_field2) as char,
-            (b'0' + lng_field3) as char,
-            (b'0' + lat_field4) as char
-        );
-        
-        Ok(Some(grid))
+        // Delegate to unpackgrid — only returns the grid component
+        let (grid, _, _) = Self::unpackgrid(grid_value as u16, 0);
+        Ok(grid)
     }
     
     /// Decode free text using 6-bit character encoding
@@ -1133,15 +1247,23 @@ mod tests {
 
     #[test]
     fn test_grid_square_decoding() {
-        let parser = MessageParser::new();
-        // Test FN42 encoding (common US grid)
-        let fn42_value = 5*18*10 + 13*10 + 4*180 + 2; // Maidenhead encoding
-        let grid = parser.decode_grid_square_15bit(fn42_value).unwrap();
-        assert!(grid.is_some());
-        
-        let grid_str = grid.unwrap();
-        assert_eq!(grid_str.len(), 4);
-        assert!(grid_str.chars().all(|c| c.is_ascii_alphanumeric()));
+        // Test FN42 encoding — matches encoder's packgrid()
+        // F=5, N=13, 4=4, 2=2 → 5*1800 + 13*100 + 4*10 + 2 = 10342
+        let fn42_value = 5 * 1800 + 13 * 100 + 4 * 10 + 2;
+        let (grid, _, _) = MessageParser::unpackgrid(fn42_value as u16, 0);
+        assert_eq!(grid, Some("FN42".to_string()));
+
+        // Test special tokens
+        let (_, _, tok) = MessageParser::unpackgrid(32402, 0);
+        assert_eq!(tok, Some("RRR".to_string()));
+        let (_, _, tok) = MessageParser::unpackgrid(32403, 0);
+        assert_eq!(tok, Some("RR73".to_string()));
+        let (_, _, tok) = MessageParser::unpackgrid(32404, 0);
+        assert_eq!(tok, Some("73".to_string()));
+
+        // Test signal report: -12 dB → igrid4 = 32400 + 35 + (-12) = 32423
+        let (_, rpt, _) = MessageParser::unpackgrid(32423, 0);
+        assert_eq!(rpt, Some(-12));
     }
 
     #[test]
@@ -1170,17 +1292,32 @@ mod tests {
     }
     
     #[test]
-    fn test_callsign_encoding_decoding() {
+    fn test_callsign_unpack28_round_trip() {
         let parser = MessageParser::new();
-        
-        // Test standard callsign decoding with a simple callsign
-        let test_callsign = "A1A";
-        let encoded = parser.callsign_table.encode_standard_callsign(test_callsign).unwrap();
-        let decoded = parser.decode_standard_callsign(encoded).unwrap();
-        assert_eq!(decoded, test_callsign);
-        
-        // Test encoding doesn't overflow for short callsigns
-        assert!(encoded < 262_144_000);
+
+        // Test unpack28 for known callsign values
+        // CQ = 2
+        let cq = parser.unpack28(2);
+        assert!(matches!(cq, CallsignField::Cq(None)));
+
+        // Standard callsigns via unpack_basecall
+        // W1ABC: known from encoder tests
+        let w1abc_basecall = {
+            // Pack W1ABC manually using mixed-radix
+            // " W1ABC" → c6 = [' ', 'W', '1', 'A', 'B', 'C']
+            let i0: u32 = 0;  // space
+            let i1: u32 = 32; // W in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            let i2: u32 = 1;  // 1
+            let i3: u32 = 1;  // A in " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            let i4: u32 = 2;  // B
+            let i5: u32 = 3;  // C
+            let n = ((((i0 * 36 + i1) * 10 + i2) * 27 + i3) * 27 + i4) * 27 + i5;
+            n
+        };
+        const NTOKENS: u32 = 2_063_592;
+        const MAX22: u32 = 4_194_304;
+        let call = parser.unpack28(NTOKENS + MAX22 + w1abc_basecall);
+        assert_eq!(call.to_callsign(), Some("W1ABC".to_string()));
     }
     
     #[test] 

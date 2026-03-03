@@ -234,7 +234,7 @@ impl Ft8Decoder {
         let start_time = Instant::now();
         self.message_handler.on_window_start(SystemTime::now());
 
-        if samples.len() != WINDOW_SAMPLES {
+        if samples.len() < WINDOW_SAMPLES {
             return Err(Ft8Error::InvalidWindowSize {
                 expected: WINDOW_SAMPLES,
                 actual: samples.len(),
@@ -254,6 +254,14 @@ impl Ft8Decoder {
 
         // Step 3: Decode each candidate
         let mut decoded_messages = Vec::new();
+        let _num_candidates = sync_candidates.len();
+        let _best_score = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
+        #[cfg(feature = "debug-decode")]
+        eprintln!("[decode] {} sync candidates, best score={:.1}", _num_candidates, _best_score);
+        #[cfg(feature = "debug-decode")]
+        for (i, c) in sync_candidates.iter().take(5).enumerate() {
+            eprintln!("  [{}] t={} f={} score={:.1}", i, c.time_step, c.freq_bin, c.sync_score);
+        }
         for candidate in &sync_candidates {
             if decoded_messages.len() >= self.config.max_candidates {
                 break;
@@ -266,8 +274,14 @@ impl Ft8Decoder {
                         decoded_messages.push(msg);
                     }
                 }
-                Ok(None) => {} // CRC failed or insufficient signal
-                Err(_) => {}   // Skip errors on individual candidates
+                Ok(None) => {
+                    #[cfg(feature = "debug-decode")]
+                    eprintln!("  candidate t={} f={}: no decode", candidate.time_step, candidate.freq_bin);
+                }
+                Err(_e) => {
+                    #[cfg(feature = "debug-decode")]
+                    eprintln!("  candidate t={} f={}: error {}", candidate.time_step, candidate.freq_bin, _e);
+                }
             }
         }
 
@@ -427,12 +441,22 @@ impl Ft8Decoder {
 
     /// Compute Costas sync score for a candidate at (t0, f0) in the spectrogram.
     ///
-    /// For each of the 21 Costas sync positions, compares the power at the
-    /// expected tone bin against the average power of the other 7 tone bins.
-    /// Returns the sum of per-position log2(signal/noise).
+    /// For each of the 21 Costas sync positions, computes the log-power at
+    /// the expected tone bin minus the average log-power of noise bins OUTSIDE
+    /// the 8-tone signal range. Using external noise bins avoids contamination
+    /// from spectral leakage between adjacent 6.25 Hz bins.
     fn compute_costas_score(&self, spec: &Spectrogram, t0: usize, f0: usize) -> f64 {
         let mut score = 0.0;
         let sync_group_starts: [usize; 3] = [0, 36, 72];
+
+        // Noise estimation: use 8 bins below and 8 bins above the signal range.
+        // Signal occupies bins f0..f0+7, noise uses f0-8..f0-1 and f0+8..f0+15.
+        let noise_bins_below: Vec<usize> = (f0.saturating_sub(8)..f0)
+            .filter(|&f| f < spec.num_bins)
+            .collect();
+        let noise_bins_above: Vec<usize> = (f0 + NUM_TONES..f0 + NUM_TONES + 8)
+            .filter(|&f| f < spec.num_bins)
+            .collect();
 
         for &group_start in &sync_group_starts {
             for j in 0..7 {
@@ -454,17 +478,12 @@ impl Ft8Decoder {
                 // Power at expected tone
                 let signal_power = spec.power[time_idx][freq_idx];
 
-                // Average power of the other 7 tones (noise estimate)
+                // Noise estimate from bins outside the 8-tone signal range
                 let mut noise_power = 0.0;
                 let mut noise_count = 0;
-                for tone in 0..NUM_TONES {
-                    if tone != expected_tone {
-                        let f = f0 + tone;
-                        if f < spec.num_bins {
-                            noise_power += spec.power[time_idx][f];
-                            noise_count += 1;
-                        }
-                    }
+                for &f in noise_bins_below.iter().chain(noise_bins_above.iter()) {
+                    noise_power += spec.power[time_idx][f];
+                    noise_count += 1;
                 }
 
                 if noise_count > 0 {
@@ -518,49 +537,99 @@ impl Ft8Decoder {
 
     /// Attempt to decode a single Costas sync candidate.
     ///
-    /// Pipeline: extract symbols → compute soft LLRs → LDPC decode → CRC check → parse message
+    /// Pipeline:
+    /// 1. Fine timing search: refine coarse time offset (±half symbol, 5 steps)
+    /// 2. Frequency refinement: try ±1 bin
+    /// 3. Extract symbols with complex DFT
+    /// 4. Compute soft LLRs
+    /// 5. LDPC belief propagation
+    /// 6. CRC-14 verification
+    /// 7. Message parsing
     fn decode_candidate(
         &self,
         audio: &[f64],
         candidate: &CostasCandidate,
     ) -> Ft8Result<Option<DecodedMessage>> {
-        let time_offset_samples = candidate.time_step * SPEC_STEP;
-        let base_frequency = candidate.freq_bin as f64 * TONE_SPACING;
+        let coarse_offset = candidate.time_step * SPEC_STEP;
 
-        // Extract symbols using complex DFT magnitude (Bug 1.2 fix)
-        let (_symbols, tone_magnitudes) =
-            self.extract_symbols_complex(audio, time_offset_samples, base_frequency)?;
+        // Fine timing: search ±half symbol in sub-symbol steps.
+        // The coarse sync has ±480 samples (half symbol) uncertainty.
+        // Try 5 sub-offsets: -384, -192, 0, +192, +384 samples.
+        let time_deltas: [isize; 5] = [-384, -192, 0, 192, 384];
 
-        // Compute soft LLRs from tone magnitudes (Bug 1.3 fix)
-        let llrs = self.compute_soft_llrs(&tone_magnitudes);
+        // Frequency refinement: try ±1 bin
+        let freq_offsets: [isize; 3] = [0, -1, 1];
 
-        // LDPC decode with soft input
-        let corrected_bits = self.ldpc_decoder.decode_soft(&llrs)?;
+        // Find best (time_delta, freq_offset) by Costas correlation on extracted symbols
+        let mut best_decode = None;
 
-        // CRC check
-        if !self.verify_crc(&corrected_bits) {
-            return Ok(None);
+        for &dt in &time_deltas {
+            let time_offset = coarse_offset as isize + dt;
+            if time_offset < 0 {
+                continue;
+            }
+            let time_offset_samples = time_offset as usize;
+
+            for &df in &freq_offsets {
+                let freq_bin = candidate.freq_bin as isize + df;
+                if freq_bin < 0 {
+                    continue;
+                }
+                let base_frequency = freq_bin as f64 * TONE_SPACING;
+
+                let (_symbols, tone_magnitudes) = match self
+                    .extract_symbols_complex(audio, time_offset_samples, base_frequency)
+                {
+                    Ok(result) => result,
+                    Err(_) => continue,
+                };
+
+                let llrs = self.compute_soft_llrs(&tone_magnitudes);
+
+                #[cfg(feature = "debug-decode")]
+                {
+                    let avg_abs_llr =
+                        llrs.iter().map(|l| l.abs()).sum::<f32>() / llrs.len() as f32;
+                    let saturated = llrs.iter().filter(|&&l| l.abs() >= 24.9).count();
+                    eprintln!(
+                        "    dt={:+4} df={:+2}: avg|LLR|={:.2}, sat={}/174",
+                        dt, df, avg_abs_llr, saturated
+                    );
+                }
+
+                let corrected_bits = match self.ldpc_decoder.decode_soft(&llrs) {
+                    Ok(bits) => bits,
+                    Err(_) => continue,
+                };
+
+                if !self.verify_crc(&corrected_bits) {
+                    continue;
+                }
+
+                // CRC passed — parse message and return
+                #[cfg(feature = "debug-decode")]
+                eprintln!("    dt={:+4} df={:+2}: CRC PASSED!", dt, df);
+
+                let payload_bits = &corrected_bits[0..PAYLOAD_BITS];
+                let ft8_message = self.message_parser.parse_payload(payload_bits)?;
+
+                let snr_db = (candidate.sync_score / 21.0 * 4.343) as f32;
+                let confidence = (candidate.sync_score / 30.0).min(1.0) as f32;
+
+                let decoded_message = DecodedMessage::new(
+                    ft8_message,
+                    snr_db,
+                    confidence,
+                    base_frequency,
+                    time_offset_samples as f64 / SAMPLE_RATE as f64,
+                );
+
+                best_decode = Some(decoded_message);
+                return Ok(best_decode);
+            }
         }
 
-        // Parse message
-        let payload_bits = &corrected_bits[0..PAYLOAD_BITS];
-        let ft8_message = self.message_parser.parse_payload(payload_bits)?;
-
-        // Estimate SNR from sync score
-        // sync_score is sum of ln(signal/noise) over 21 positions
-        // Per-position average: score/21, convert to dB: * 10/ln(10) ≈ * 4.343
-        let snr_db = (candidate.sync_score / 21.0 * 4.343) as f32;
-        let confidence = (candidate.sync_score / 30.0).min(1.0) as f32;
-
-        let decoded_message = DecodedMessage::new(
-            ft8_message,
-            snr_db,
-            confidence,
-            base_frequency,
-            time_offset_samples as f64 / SAMPLE_RATE as f64,
-        );
-
-        Ok(Some(decoded_message))
+        Ok(best_decode)
     }
 
     // ========================================================================

@@ -1,9 +1,8 @@
 //! FT8 audio modulation for transmission
 //!
 //! This module handles generation of audio signals for FT8 transmission:
-//! - 8-FSK (8-tone frequency shift keying) modulation
+//! - 8-CPFSK (continuous-phase frequency shift keying) modulation
 //! - Costas array synchronization sequences
-//! - Gaussian-filtered tone shaping
 //! - Configurable frequency offset and power levels
 //! - Real-time audio generation with precise timing
 
@@ -19,9 +18,6 @@ pub const SAMPLES_PER_SYMBOL: usize = (SYMBOL_DURATION * SAMPLE_RATE as f64) as 
 
 /// Total samples in complete FT8 transmission
 pub const TOTAL_TRANSMISSION_SAMPLES: usize = (MESSAGE_DURATION * SAMPLE_RATE as f64) as usize;
-
-/// Gaussian filter BT parameter for tone shaping
-pub const GAUSSIAN_BT: f64 = 2.0;
 
 /// Default transmission power level (0.0 to 1.0)
 pub const DEFAULT_TX_POWER: f64 = 0.5;
@@ -39,8 +35,6 @@ pub struct Ft8Modulator {
     tone_spacing: f64,
     /// Transmission power level (0.0 - 1.0)
     tx_power: f64,
-    /// Gaussian filter coefficients for tone shaping
-    gaussian_filter: GaussianFilter,
     /// Phase accumulator for continuous phase modulation
     phase_accumulator: f64,
     /// Random number generator for dithering
@@ -73,14 +67,11 @@ impl Ft8Modulator {
             ));
         }
         
-        let gaussian_filter = GaussianFilter::new(GAUSSIAN_BT, sample_rate as f64)?;
-        
         Ok(Self {
             sample_rate,
             base_frequency,
             tone_spacing: TONE_SPACING,
             tx_power,
-            gaussian_filter,
             phase_accumulator: 0.0,
             dither_state: 12345, // Simple PRNG seed
         })
@@ -131,34 +122,30 @@ impl Ft8Modulator {
         Ok(audio_samples)
     }
 
-    /// Generate audio samples for a single symbol with Gaussian filtering
+    /// Generate audio samples for a single CPFSK symbol
+    ///
+    /// FT8 uses continuous-phase FSK: abrupt frequency transitions at symbol
+    /// boundaries with phase continuity maintained via the phase accumulator.
     fn generate_symbol_audio(&mut self, frequency: f64, symbol_idx: usize) -> Ft8Result<Vec<f32>> {
         let mut samples = Vec::with_capacity(SAMPLES_PER_SYMBOL);
         let angular_frequency = 2.0 * PI * frequency / self.sample_rate as f64;
-        
-        // Generate raw tone samples
+
         for _sample_idx in 0..SAMPLES_PER_SYMBOL {
-            // Calculate phase with continuous phase modulation
             self.phase_accumulator += angular_frequency;
-            
+
             // Keep phase in reasonable range to prevent numerical issues
             if self.phase_accumulator > 2.0 * PI {
                 self.phase_accumulator -= 2.0 * PI;
             }
-            
-            // Generate base sinusoid
+
             let amplitude = self.tx_power as f32;
             let sample = amplitude * self.phase_accumulator.sin() as f32;
-            
             samples.push(sample);
         }
-        
-        // Apply Gaussian filtering for spectral shaping
-        self.gaussian_filter.filter_in_place(&mut samples)?;
-        
-        // Apply symbol transition shaping to reduce spectral splatter
+
+        // Apply ramp-up/ramp-down at transmission boundaries
         self.apply_symbol_shaping(&mut samples, symbol_idx)?;
-        
+
         Ok(samples)
     }
 
@@ -188,28 +175,23 @@ impl Ft8Modulator {
         Ok(())
     }
 
-    /// Apply final processing: AGC, clipping protection, dithering
+    /// Apply final processing: normalize amplitude with headroom and add dither
     fn apply_final_processing(&mut self, samples: &mut [f32]) -> Ft8Result<()> {
-        // Find peak amplitude for normalization
         let peak = samples.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
-        
+
         if peak > 0.0 {
-            // Normalize to prevent clipping with headroom
             let headroom = 0.95; // 5% headroom
             let scale_factor = headroom / peak;
-            
+
             for sample in samples.iter_mut() {
                 *sample *= scale_factor;
-                
+
                 // Add dithering to reduce quantization noise
                 let dither = self.generate_dither() * 1e-6;
                 *sample += dither;
-                
-                // Soft clipping as final protection
-                *sample = self.soft_clip(*sample);
             }
         }
-        
+
         Ok(())
     }
 
@@ -219,15 +201,6 @@ impl Ft8Modulator {
         self.dither_state = self.dither_state.wrapping_mul(1103515245).wrapping_add(12345);
         let normalized = (self.dither_state >> 16) as f32 / 32768.0;
         normalized - 1.0 // Range: -1.0 to 1.0
-    }
-
-    /// Soft clipping function to prevent hard distortion
-    fn soft_clip(&self, x: f32) -> f32 {
-        if x.abs() <= 0.5 {
-            x
-        } else {
-            0.5 * x.signum() * (1.0 - (-2.0 * x.abs() + 1.0).exp())
-        }
     }
 
     /// Set transmission power level
@@ -259,7 +232,6 @@ impl Ft8Modulator {
             base_frequency: self.base_frequency,
             tone_spacing: self.tone_spacing,
             tx_power: self.tx_power,
-            gaussian_bt: GAUSSIAN_BT,
         }
     }
 
@@ -295,75 +267,6 @@ impl Default for Ft8Modulator {
     }
 }
 
-/// Gaussian filter for FT8 tone shaping
-struct GaussianFilter {
-    /// Filter coefficients
-    coefficients: Vec<f64>,
-    /// Filter delay line
-    delay_line: Vec<f32>,
-    /// Current delay line index
-    delay_index: usize,
-}
-
-impl GaussianFilter {
-    /// Create Gaussian filter with specified BT parameter
-    fn new(bt: f64, sample_rate: f64) -> Ft8Result<Self> {
-        let filter_length = (4.0 * sample_rate / (bt * TONE_SPACING)) as usize;
-        let filter_length = filter_length | 1; // Ensure odd length
-        
-        let mut coefficients = Vec::with_capacity(filter_length);
-        let center = filter_length as f64 / 2.0;
-        
-        // Generate Gaussian impulse response
-        let sigma = 1.0 / (2.0 * PI * bt);
-        let mut sum = 0.0;
-        
-        for i in 0..filter_length {
-            let t = (i as f64 - center) / sample_rate;
-            let coeff = (-0.5 * (t / sigma).powi(2)).exp();
-            coefficients.push(coeff);
-            sum += coeff;
-        }
-        
-        // Normalize coefficients
-        for coeff in &mut coefficients {
-            *coeff /= sum;
-        }
-        
-        Ok(Self {
-            coefficients,
-            delay_line: vec![0.0; filter_length],
-            delay_index: 0,
-        })
-    }
-    
-    /// Apply Gaussian filtering to audio samples
-    fn filter_in_place(&mut self, samples: &mut [f32]) -> Ft8Result<()> {
-        for sample in samples.iter_mut() {
-            *sample = self.filter_sample(*sample);
-        }
-        Ok(())
-    }
-    
-    /// Filter single sample
-    fn filter_sample(&mut self, input: f32) -> f32 {
-        // Store input in delay line
-        self.delay_line[self.delay_index] = input;
-        
-        // Calculate filtered output
-        let mut output = 0.0;
-        for (i, &coeff) in self.coefficients.iter().enumerate() {
-            let delay_idx = (self.delay_index + self.delay_line.len() - i) % self.delay_line.len();
-            output += coeff * self.delay_line[delay_idx] as f64;
-        }
-        
-        // Update delay line index
-        self.delay_index = (self.delay_index + 1) % self.delay_line.len();
-        
-        output as f32
-    }
-}
-
 /// Modulator configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModulatorConfig {
@@ -375,8 +278,6 @@ pub struct ModulatorConfig {
     pub tone_spacing: f64,
     /// Transmission power level (0.0 - 1.0)
     pub tx_power: f64,
-    /// Gaussian filter BT parameter
-    pub gaussian_bt: f64,
 }
 
 impl Default for ModulatorConfig {
@@ -386,7 +287,6 @@ impl Default for ModulatorConfig {
             base_frequency: BASE_FREQUENCY,
             tone_spacing: TONE_SPACING,
             tx_power: DEFAULT_TX_POWER,
-            gaussian_bt: GAUSSIAN_BT,
         }
     }
 }
@@ -596,22 +496,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gaussian_filter() {
-        let filter = GaussianFilter::new(2.0, 12000.0);
-        assert!(filter.is_ok());
-        
-        let mut filter = filter.unwrap();
-        let test_samples = vec![1.0, 0.0, 0.0, 0.0, 0.0];
-        let mut filtered = test_samples.clone();
-        
-        assert!(filter.filter_in_place(&mut filtered).is_ok());
-        
-        // Gaussian filter should smooth the impulse
-        assert!(filtered[0] < 1.0);
-        assert!(filtered[1] > 0.0);
-    }
-
-    #[test]
     fn test_audio_format_conversion() {
         let samples = vec![0.5, -0.5, 0.0, 1.0, -1.0];
         
@@ -625,28 +509,11 @@ mod tests {
     }
 
     #[test]
-    fn test_soft_clipping() {
-        let modulator = Ft8Modulator::new_default().unwrap();
-        
-        // Test values within normal range
-        assert!((modulator.soft_clip(0.3) - 0.3).abs() < 1e-6);
-        assert!((modulator.soft_clip(-0.3) + 0.3).abs() < 1e-6);
-        
-        // Test soft clipping for large values
-        let clipped_pos = modulator.soft_clip(2.0);
-        assert!(clipped_pos > 0.0 && clipped_pos < 1.0);
-        
-        let clipped_neg = modulator.soft_clip(-2.0);
-        assert!(clipped_neg < 0.0 && clipped_neg > -1.0);
-    }
-
-    #[test]
     fn test_modulator_config() {
         let config = ModulatorConfig::default();
         assert_eq!(config.sample_rate, SAMPLE_RATE);
         assert_eq!(config.base_frequency, BASE_FREQUENCY);
         assert_eq!(config.tone_spacing, TONE_SPACING);
         assert_eq!(config.tx_power, DEFAULT_TX_POWER);
-        assert_eq!(config.gaussian_bt, GAUSSIAN_BT);
     }
 }

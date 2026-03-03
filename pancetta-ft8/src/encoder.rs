@@ -193,7 +193,7 @@ impl Ft8Encoder {
     }
 
     // ========================================================================
-    // Standard message encoding (i3=1 or i3=2)
+    // Standard message encoding (i3=1)
     // ========================================================================
 
     /// Try to encode as a standard FT8 message (Type 1)
@@ -216,8 +216,8 @@ impl Ft8Encoder {
         // Pack grid/report/token
         let igrid4 = packgrid(&extra);
 
-        // Determine i3
-        let i3: u8 = if call_to.ends_with("/P") || call_de.ends_with("/P") { 2 } else { 1 };
+        // i3=1 for all standard messages (including /R and /P suffixes)
+        let i3: u8 = 1;
 
         // Build n29a and n29b (28-bit callsign + 1-bit suffix flag)
         let n29a: u32 = (n28a << 1) | (ipa as u32);

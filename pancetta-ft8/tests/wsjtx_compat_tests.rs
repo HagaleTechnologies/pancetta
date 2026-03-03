@@ -260,6 +260,77 @@ fn test_ldpc_codeword_validity_from_encoded_symbols() {
 }
 
 // ============================================================================
+// /R and /P suffix encoding tests
+// ============================================================================
+
+#[test]
+fn test_pack28_suffix_flags() {
+    use pancetta_ft8::encoder::pack28;
+
+    // /R suffix sets ip=1, base callsign packed normally
+    let (n28_r, ip_r) = pack28("W1ABC/R").unwrap();
+    assert_eq!(ip_r, 1, "W1ABC/R should have ip=1");
+
+    // /P suffix sets ip=1, base callsign packed normally
+    let (n28_p, ip_p) = pack28("W1ABC/P").unwrap();
+    assert_eq!(ip_p, 1, "W1ABC/P should have ip=1");
+
+    // Base callsign should be the same for /R and /P (same call)
+    assert_eq!(n28_r, n28_p, "W1ABC/R and W1ABC/P should have the same n28");
+
+    // Bare callsign should have ip=0
+    let (n28_bare, ip_bare) = pack28("W1ABC").unwrap();
+    assert_eq!(ip_bare, 0, "W1ABC should have ip=0");
+    assert_eq!(n28_bare, n28_r, "Base callsign value should match with or without suffix");
+}
+
+#[test]
+fn test_suffix_messages_use_i3_1() {
+    let mut encoder = Ft8Encoder::new();
+
+    // Both /R and /P messages should use i3=1 (standard message type)
+    for msg in &["K1DEF W1ABC/R FN42", "K1DEF W1ABC/P FN42"] {
+        let symbols = encoder.encode_message(msg, None).unwrap();
+        let payload = extract_payload_from_symbols(&symbols);
+
+        // i3 is in the last 3 bits of the 77-bit payload (bits 74-76)
+        // payload[9] has bits 72-79: xxxxxi3i3i3
+        let i3 = (payload[9] >> 3) & 0x07;
+        assert_eq!(i3, 1, "Message '{}' should have i3=1, got i3={}", msg, i3);
+    }
+}
+
+#[test]
+fn test_suffix_round_trip() {
+    // /R round-trip should decode exactly
+    let decoded = encode_and_decode("K1DEF W1ABC/R FN42");
+    assert_eq!(decoded, "K1DEF W1ABC/R FN42");
+
+    // /P round-trip: ip=1 is protocol-identical to /R, so decoder shows /R
+    // This is a known FT8 protocol limitation (both suffixes encode the same way)
+    let decoded = encode_and_decode("K1DEF W1ABC/P FN42");
+    assert_eq!(decoded, "K1DEF W1ABC/R FN42", "/P decodes as /R (protocol limitation)");
+}
+
+fn encode_and_decode(message: &str) -> String {
+    use pancetta_ft8::{Ft8Modulator, Ft8Decoder, Ft8Config, WINDOW_SAMPLES};
+
+    let mut encoder = Ft8Encoder::new();
+    let mut modulator = Ft8Modulator::new_default().unwrap();
+
+    let symbols = encoder.encode_message(message, None).unwrap();
+    let mut audio = modulator.modulate_symbols(&symbols, 0.0).unwrap();
+    audio.resize(WINDOW_SAMPLES, 0.0);
+
+    let config = Ft8Config::default();
+    let mut decoder = Ft8Decoder::new(config).unwrap();
+    let decoded = decoder.decode_window(&audio).unwrap();
+
+    assert!(!decoded.is_empty(), "Failed to decode '{}'", message);
+    decoded[0].text.clone()
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 

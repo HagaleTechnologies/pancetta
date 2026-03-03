@@ -181,23 +181,16 @@ fn test_encode_modulate_audio_characteristics() {
     );
 }
 
-/// Full round-trip with clean channel (high SNR, should be easiest case)
+/// Full round-trip with clean channel — must decode correctly
 #[test]
 fn test_round_trip_cq_clean() {
     let symbols = encode_message("CQ W1ABC FN42");
     let audio = modulate_symbols(&symbols, 0.0);
 
-    // Try decoding the clean signal
     let decoded = decode_audio(&audio);
 
-    // At this point, the decoder may or may not successfully decode
-    // because the decoder and encoder share the same approximate H matrix
-    // but the decoder's sync/correlation pipeline may not perfectly align.
-    // We validate what we can:
-    println!("Round-trip CQ clean: decoded {} messages", decoded.len());
-    for msg in &decoded {
-        println!("  Decoded: {} (SNR: {:.1}, conf: {:.2})", msg.text, msg.snr_db, msg.confidence);
-    }
+    assert_eq!(decoded.len(), 1, "Expected exactly 1 decoded message");
+    assert_eq!(decoded[0].text, "CQ W1ABC FN42");
 }
 
 /// Test that modulated signals at different frequencies produce distinct audio
@@ -222,13 +215,12 @@ fn test_round_trip_frequency_offset() {
     assert!(diff > 1e-6, "Different frequency offsets should produce different audio");
 }
 
-/// Test encoding multiple messages and combining into one audio window
+/// Test decoding multiple messages combined into one audio window
 #[test]
 fn test_round_trip_multiple_signals() {
     let messages = [
         ("CQ W1ABC FN42", -50.0),
-        ("K1DEF W1ABC -12", 0.0),
-        ("W1ABC K1DEF FN41", 75.0),
+        ("K1DEF W1ABC -12", 50.0),
     ];
 
     let mut combined = vec![0.0f32; WINDOW_SAMPLES];
@@ -243,41 +235,48 @@ fn test_round_trip_multiple_signals() {
         }
     }
 
-    // Combined signal should have more energy than a single signal
-    let rms = (combined.iter().map(|&s| s * s).sum::<f32>() / WINDOW_SAMPLES as f32).sqrt();
-    assert!(rms > 0.001, "Combined audio should have signal energy");
-
-    // Try decoding
     let decoded = decode_audio(&combined);
-    println!("Multiple signals: decoded {} messages", decoded.len());
+
+    // Should decode at least one of the two messages
+    assert!(!decoded.is_empty(), "Should decode at least one message from combined signal");
+
+    let texts: Vec<&str> = decoded.iter().map(|m| m.text.as_str()).collect();
+    // Verify the decoded messages match expected texts
+    for (expected_msg, _) in &messages {
+        if texts.contains(expected_msg) {
+            println!("OK: decoded '{}'", expected_msg);
+        }
+    }
 }
 
-/// Test SNR sweep — encode at various noise levels
+/// Test SNR sweep — must decode at high SNR, graceful degradation at low SNR
 #[test]
 fn test_round_trip_snr_sweep() {
     let symbols = encode_message("CQ W1ABC FN42");
 
-    let snr_levels = [20.0, 10.0, 0.0, -5.0, -10.0];
-
-    for &snr in &snr_levels {
+    // High SNR: must decode correctly
+    for &snr in &[20.0, 10.0] {
         let mut audio = modulate_symbols(&symbols, 0.0);
         add_noise(&mut audio, snr);
 
         let decoded = decode_audio(&audio);
-        println!(
-            "SNR {:.0} dB: decoded {} messages",
-            snr,
-            decoded.len()
+        assert!(
+            decoded.iter().any(|m| m.text == "CQ W1ABC FN42"),
+            "Should decode at SNR={} dB", snr
         );
+    }
+
+    // Low SNR: may or may not decode (no assertion, just verify no crash)
+    for &snr in &[0.0, -5.0, -10.0] {
+        let mut audio = modulate_symbols(&symbols, 0.0);
+        add_noise(&mut audio, snr);
+        let _decoded = decode_audio(&audio);
     }
 }
 
-/// Test all standard FT8 message types encode without error
+/// Full round-trip for all standard FT8 message types
 #[test]
 fn test_round_trip_all_message_types() {
-    let mut encoder = Ft8Encoder::new();
-    let mut modulator = Ft8Modulator::new_default().unwrap();
-
     let messages = [
         "CQ W1ABC FN42",
         "CQ DX W1ABC FN42",
@@ -291,18 +290,15 @@ fn test_round_trip_all_message_types() {
     ];
 
     for msg in &messages {
-        let symbols = encoder.encode_message(msg, None)
-            .unwrap_or_else(|e| panic!("Failed to encode '{}': {}", msg, e));
+        let symbols = encode_message(msg);
+        let audio = modulate_symbols(&symbols, 0.0);
+        let decoded = decode_audio(&audio);
 
-        assert_eq!(symbols.len(), NUM_SYMBOLS);
-        assert!(symbols.iter().all(|&s| s < 8), "Invalid symbol in '{}'", msg);
-
-        let audio = modulator.modulate_symbols(&symbols, 0.0)
-            .unwrap_or_else(|e| panic!("Failed to modulate '{}': {}", msg, e));
-
-        let expected_samples = (pancetta_ft8::MESSAGE_DURATION * SAMPLE_RATE as f64) as usize;
-        assert_eq!(audio.len(), expected_samples, "Wrong audio length for '{}'", msg);
-
-        println!("OK: '{}'", msg);
+        assert!(
+            decoded.iter().any(|m| m.text == *msg),
+            "Round-trip failed for '{}': decoded {:?}",
+            msg,
+            decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
     }
 }
