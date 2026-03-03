@@ -116,6 +116,13 @@ pub struct ftx_callsign_hash_interface_t {
     pub save_hash: Option<unsafe extern "C" fn(callsign: *const c_char, n22: u32)>,
 }
 
+/// FTX_MAX_MESSAGE_FIELDS = 3
+#[repr(C)]
+pub struct ftx_message_offsets_t {
+    pub types: [i32; 3],   // ftx_field_t enum values
+    pub offsets: [i16; 3],
+}
+
 extern "C" {
     // Encoding
     pub fn ft8_encode(payload: *const u8, tones: *mut u8);
@@ -146,7 +153,7 @@ extern "C" {
         msg: *const ftx_message_t,
         hash_if: *mut ftx_callsign_hash_interface_t,
         message: *mut c_char,
-        offsets: *mut std::ffi::c_void,
+        offsets: *mut ftx_message_offsets_t,
     ) -> ftx_message_rc_t;
 
     // Monitor (audio → waterfall)
@@ -226,13 +233,14 @@ pub fn ft8lib_decode_payload(payload: &[u8; 10]) -> Option<String> {
 
     let mut hash_if = make_hash_interface();
     let mut text_buf = [0u8; 35];
+    let mut offsets: ftx_message_offsets_t = unsafe { std::mem::zeroed() };
 
     let rc = unsafe {
         ftx_message_decode(
             &msg,
             &mut hash_if,
             text_buf.as_mut_ptr() as *mut c_char,
-            std::ptr::null_mut(),
+            &mut offsets,
         )
     };
 
@@ -289,14 +297,9 @@ pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
         )
     };
 
-    eprintln!("ft8_lib: fed {} blocks, wf.num_blocks={}, n_found={} candidates",
-        offset / block_size, mon.wf.num_blocks, n_found);
-
     // Decode each candidate
     let mut messages = Vec::new();
     let mut hash_if = make_hash_interface();
-
-    let mut n_ldpc_ok = 0;
     for i in 0..n_found as usize {
         let mut msg: ftx_message_t = unsafe { std::mem::zeroed() };
         let mut status: ftx_decode_status_t = unsafe { std::mem::zeroed() };
@@ -306,14 +309,14 @@ pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
         };
 
         if ok {
-            n_ldpc_ok += 1;
             let mut text_buf = [0u8; 35];
+            let mut offsets: ftx_message_offsets_t = unsafe { std::mem::zeroed() };
             let rc = unsafe {
                 ftx_message_decode(
                     &msg,
                     &mut hash_if,
                     text_buf.as_mut_ptr() as *mut c_char,
-                    std::ptr::null_mut(),
+                    &mut offsets,
                 )
             };
 
@@ -328,9 +331,6 @@ pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
             }
         }
     }
-
-    eprintln!("ft8_lib: {} candidates passed LDPC, {} messages decoded",
-        n_ldpc_ok, messages.len());
 
     unsafe { monitor_free(&mut mon) };
 
