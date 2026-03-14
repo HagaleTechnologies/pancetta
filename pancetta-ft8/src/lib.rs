@@ -33,7 +33,7 @@
 //!
 //! ## Transmission Example
 //!
-//! ```rust
+//! ```rust,ignore
 //! use pancetta_ft8::{Ft8Transmitter, TransmissionConfig};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {

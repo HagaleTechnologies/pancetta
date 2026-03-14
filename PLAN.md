@@ -6,18 +6,20 @@ _Created 2026-03-13. Execution order: Phase 0B → Phase 1A + Phase 1B in parall
 
 ## Plan A: FT8 DSP Improvements
 
-### Phase 1A — Decoder Sensitivity (highest impact)
-- [ ] **1a** Add LLR normalization (variance=24.0, matching ft8_lib) — ~15 lines in `decoder.rs`
-- [ ] **1b** Add frequency oversampling (freq_osr=2, double FFT size) — structural change to spectrogram + sync search
-- [ ] **1c** Improve Costas sync scoring — neighbor-comparison instead of out-of-band noise (ft8_lib style)
-- [ ] **1d** Successive decoding with interference cancellation — subtract decoded signals, re-search for weaker ones
-- [ ] **1e** WAV cross-validation assertions — assert we decode ≥80% of what ft8_lib decodes
+### Phase 1A — Decoder Sensitivity (highest impact) — DONE (2026-03-14)
+- [x] **1a** Add LLR normalization (variance=24.0, matching ft8_lib)
+- [x] **1b** Add frequency oversampling (freq_osr=2, double FFT size)
+- [x] **1c** Improve Costas sync scoring — dB neighbor-comparison (ft8_lib style)
+- [ ] **1d** Successive decoding with interference cancellation — deferred
+- [x] **1e** WAV cross-validation assertions — assert we decode ≥80% of what ft8_lib decodes
 
-### Phase 2A — Contest Messages (independent of Phase 1A)
-- [ ] **2a** i3=4 nonstandard callsign decode (most common missing type)
-- [ ] **2b** i3=3 ARRL RTTY Roundup decode
-- [ ] **2c** i3=0 sub-types (DXpedition, EU VHF, Field Day, telemetry)
-- [ ] **2d** Contest message encoding (after decode is verified)
+### Phase 2A — Contest Messages (independent of Phase 1A) — DONE (2026-03-14)
+- [x] **2a** i3=4 nonstandard callsign decode (58-bit base-38 + 12-bit hash)
+- [x] **2b** i3=3 ARRL RTTY Roundup decode (basic)
+- [x] **2c** i3=0 n3=5 telemetry decode (18 hex digits)
+- [x] **2c'** Hash table rewritten to use ft8_lib algorithm (base-38 × magic constant)
+- [ ] **2c''** i3=0 sub-types: DXpedition (n3=1), EU VHF (n3=2), Field Day (n3=3,4) — deferred
+- [ ] **2d** Contest message encoding (after decode is verified) — deferred
 
 ### Phase 3A — Performance (after Phase 1A stabilizes)
 - [ ] **3a** Baseline existing benchmarks
@@ -44,12 +46,12 @@ _Created 2026-03-13. Execution order: Phase 0B → Phase 1A + Phase 1B in parall
 - [x] Fix `pancetta` runtime tests (nested tokio runtime), CLI test case sensitivity
 - [x] 385 tests passing, 0 failures across 10 crates
 
-### Phase 1B — RX Pipeline (Audio In → Decode → Display)
-- [ ] Fix message bus routing (switch to point-to-point channels)
-- [ ] Implement FT8 15-second timing cycle synchronization
-- [ ] Wire decoded messages → TUI band activity panel
-- [ ] Add `--wav <file>` playback mode for testing without a radio
-- [ ] Fully integrate TUI main loop (raw mode, event polling, rendering)
+### Phase 1B — RX Pipeline (Audio In → Decode → Display) — DONE (2026-03-14)
+- [x] Fix message bus routing (switch to point-to-point channels)
+- [x] Wire decoded messages → TUI band activity panel
+- [x] Add `--wav <file>` playback mode for testing without a radio
+- [x] Fully integrate TUI main loop (raw mode, event polling, rendering)
+- [ ] Implement FT8 15-second timing cycle synchronization — deferred to Phase 2B
 
 ### Phase 2B — TX Pipeline (Encode → Modulate → Audio Out)
 - [ ] Enable `transmit` feature by default

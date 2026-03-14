@@ -28,22 +28,24 @@ pub const NUM_SYMBOLS: usize = 79;
 /// FT8 message types based on protocol specification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
-    /// Type 0: Standard messages with callsigns and grid/report
+    /// i3=1,2: Standard messages with callsigns and grid/report
     Standard,
-    /// Type 1: Extended callsign support with prefix/suffix
+    /// i3=1: Extended callsign support with prefix/suffix
     Extended,
-    /// Type 2: Contest and special messages
+    /// i3=2: EU VHF contest
     Contest,
-    /// Type 3: Field Day messages
+    /// i3=0 n3=3,4: ARRL Field Day messages
     FieldDay,
-    /// Type 4: Telemetry and data
+    /// i3=0 n3=5: Telemetry (18 hex digits)
     Telemetry,
-    /// Type 5: Free text messages
+    /// i3=0 n3=0: Free text messages (13 chars base-42)
     FreeText,
-    /// Type 6: DXpedition and EU VHF contest
+    /// i3=0 n3=1: DXpedition mode
     DXpedition,
-    /// Type 7: ARRL RTTY Roundup
+    /// i3=3: ARRL RTTY Roundup
     RTTYRoundup,
+    /// i3=4: Nonstandard callsigns (12-bit hash + 58-bit call)
+    NonStdCall,
     /// Unknown/invalid message type
     Unknown,
 }
@@ -80,6 +82,7 @@ impl fmt::Display for MessageType {
             MessageType::FreeText => write!(f, "Free Text"),
             MessageType::DXpedition => write!(f, "DXpedition"),
             MessageType::RTTYRoundup => write!(f, "RTTY Roundup"),
+            MessageType::NonStdCall => write!(f, "Non-Std Call"),
             MessageType::Unknown => write!(f, "Unknown"),
         }
     }
@@ -283,7 +286,23 @@ impl fmt::Display for Ft8Message {
                 }
             }
             MessageType::Telemetry => {
-                write!(f, "<Telemetry>")?;
+                if let Some(ref text) = self.text {
+                    write!(f, "{}", text)?;
+                } else {
+                    write!(f, "<Telemetry>")?;
+                }
+            }
+            MessageType::NonStdCall => {
+                // i3=4: one callsign is full, one is hashed
+                if let Some(ref to) = self.to_callsign {
+                    write!(f, "{}", to)?;
+                }
+                if let Some(ref from) = self.from_callsign {
+                    write!(f, " {}", from)?;
+                }
+                if let Some(ref exchange) = self.contest_exchange {
+                    write!(f, " {}", exchange)?;
+                }
             }
             MessageType::Extended | MessageType::DXpedition | MessageType::RTTYRoundup => {
                 // Format extended/special messages
@@ -411,31 +430,46 @@ impl HashTable {
         self.hash_22bit.get(&hash).cloned()
     }
     
-    /// Calculate 10-bit hash (djb2 algorithm, truncated)
-    fn calculate_hash_10bit(&self, callsign: &str) -> u32 {
-        let mut hash = 5381u32;
-        for byte in callsign.bytes() {
-            hash = hash.wrapping_mul(33).wrapping_add(byte as u32);
+    /// Calculate the 22-bit hash for a callsign, matching ft8_lib's `save_callsign()`.
+    ///
+    /// Algorithm: encode callsign as base-38 in 11-char field (space-padded),
+    /// then n22 = (47055833459 * n58) >> (64-22) & 0x3FFFFF.
+    fn calculate_n22(callsign: &str) -> u32 {
+        // FT8_CHAR_TABLE_ALPHANUM_SPACE_SLASH: " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/"
+        const CHARSET: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
+
+        let upper = callsign.to_ascii_uppercase();
+        let bytes = upper.as_bytes();
+        let mut n58: u64 = 0;
+        let mut count = 0;
+        for &b in bytes.iter().take(11) {
+            let j = CHARSET.iter().position(|&c| c == b).unwrap_or(0);
+            n58 = n58 * 38 + j as u64;
+            count += 1;
         }
-        hash & 0x3FF // 10 bits
-    }
-    
-    /// Calculate 12-bit hash (djb2 algorithm, truncated)
-    fn calculate_hash_12bit(&self, callsign: &str) -> u32 {
-        let mut hash = 5381u32;
-        for byte in callsign.bytes() {
-            hash = hash.wrapping_mul(33).wrapping_add(byte as u32);
+        // Pad with spaces (index 0) to 11 characters
+        while count < 11 {
+            n58 *= 38;
+            count += 1;
         }
-        (hash >> 2) & 0xFFF // 12 bits, offset for different distribution
+
+        let n22 = ((47055833459u64.wrapping_mul(n58)) >> (64 - 22)) & 0x3FFFFF;
+        n22 as u32
     }
-    
-    /// Calculate 22-bit hash (djb2 algorithm, truncated)
+
+    /// 22-bit hash
     fn calculate_hash_22bit(&self, callsign: &str) -> u32 {
-        let mut hash = 5381u32;
-        for byte in callsign.bytes() {
-            hash = hash.wrapping_mul(33).wrapping_add(byte as u32);
-        }
-        (hash >> 4) & 0x3FFFFF // 22 bits
+        Self::calculate_n22(callsign)
+    }
+
+    /// 12-bit hash = n22 >> 10
+    fn calculate_hash_12bit(&self, callsign: &str) -> u32 {
+        Self::calculate_n22(callsign) >> 10
+    }
+
+    /// 10-bit hash = n22 >> 12
+    fn calculate_hash_10bit(&self, callsign: &str) -> u32 {
+        Self::calculate_n22(callsign) >> 12
     }
 }
 
@@ -543,8 +577,14 @@ impl MessageParser {
                         message.message_type = MessageType::FreeText;
                         self.parse_freetext_type0(&payload[0..71], &mut message)?;
                     }
+                    5 => {
+                        // Telemetry: 71 bits → 18 hex digits
+                        message.message_type = MessageType::Telemetry;
+                        self.parse_telemetry_type0(&payload[0..71], &mut message)?;
+                    }
                     _ => {
-                        // Other i3=0 sub-types (DXpedition, Field Day, etc.) — not yet supported
+                        // Other i3=0 sub-types (DXpedition n3=1, EU VHF n3=2,
+                        // Field Day n3=3/4, Contesting n3=6) — not yet supported
                         message.message_type = MessageType::Unknown;
                     }
                 }
@@ -553,6 +593,16 @@ impl MessageParser {
                 // Standard message: n29a(29) + n29b(29) + ir(1) + igrid4(15) + i3(3)
                 message.message_type = MessageType::Standard;
                 self.parse_type1_standard(&payload, &mut message)?;
+            }
+            3 => {
+                // ARRL RTTY Roundup: TU(1) + n29a(29) + n29b(29) + R(1) + nexch(3) + nrpt(13) + i3(3)
+                message.message_type = MessageType::RTTYRoundup;
+                self.parse_rtty_roundup(&payload, &mut message)?;
+            }
+            4 => {
+                // Nonstandard callsign: n12(12) + n58(58) + iflip(1) + nrpt(2) + icq(1) + i3(3)
+                message.message_type = MessageType::NonStdCall;
+                self.parse_nonstd_call(&payload, &mut message)?;
             }
             _ => {
                 message.message_type = MessageType::Unknown;
@@ -696,6 +746,145 @@ impl MessageParser {
         if !text.is_empty() {
             message.text = Some(text);
         }
+
+        Ok(())
+    }
+
+    /// Parse i3=0, n3=5 telemetry payload (first 71 bits → 18 hex digits).
+    ///
+    /// Same bit layout as free text (right-shift by 1 to get b71),
+    /// but interpreted as raw bytes → hex string instead of base-42.
+    fn parse_telemetry_type0(&self, bits71: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
+        // Convert 71 bits to bytes, then right-shift by 1 (same as free text)
+        let mut b71 = [0u8; 9];
+        for i in 0..71 {
+            if bits71[i] {
+                b71[i / 8] |= 0x80u8 >> (i % 8);
+            }
+        }
+
+        // Right-shift by 1 bit
+        let mut carry: u8 = 0;
+        for byte in b71.iter_mut() {
+            let new_carry = *byte & 1;
+            *byte = (*byte >> 1) | (carry << 7);
+            carry = new_carry;
+        }
+
+        // Convert to 18 hex digits (72 bits, but we only have 71 usable)
+        let mut hex = String::with_capacity(18);
+        for i in 0..9 {
+            hex.push_str(&format!("{:02X}", b71[i]));
+        }
+
+        message.text = Some(hex);
+        Ok(())
+    }
+
+    /// Parse i3=4 nonstandard callsign message.
+    ///
+    /// Bit layout: n12(12) + n58(58) + iflip(1) + nrpt(2) + icq(1) + i3(3) = 77 bits
+    ///
+    /// One callsign is encoded as 58-bit base-38 (up to 11 chars), the other as a
+    /// 12-bit hash. The `iflip` bit determines which is which.
+    fn parse_nonstd_call(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
+        let n12 = bits_to_u32(&payload[0..12]) as u16;
+        let n58 = bits_to_u64(&payload[12..70]);
+        let iflip = payload[70] as u8;
+        let nrpt = bits_to_u32(&payload[71..73]) as u8;
+        let icq = payload[73] as u8;
+
+        // Decode the 58-bit callsign (base-38, 11 chars, space-padded)
+        let call_decoded = Self::unpack58(n58);
+
+        // Look up the 12-bit hashed callsign
+        let call_hashed = self.hash_table.lookup_12bit_hash(n12 as u32)
+            .map(|c| format!("<{}>", c))
+            .unwrap_or_else(|| "<...>".to_string());
+
+        // iflip determines which call is which
+        let (call_1, call_2) = if iflip != 0 {
+            (call_decoded.clone(), call_hashed)
+        } else {
+            (call_hashed, call_decoded.clone())
+        };
+
+        if icq != 0 {
+            // CQ message with nonstandard callsign
+            message.to_callsign = Some("CQ".to_string());
+            message.from_callsign = Some(call_decoded);
+        } else {
+            message.to_callsign = Some(call_1);
+            message.from_callsign = Some(call_2);
+
+            // Decode report token
+            match nrpt {
+                1 => { message.contest_exchange = Some("RRR".to_string()); }
+                2 => { message.contest_exchange = Some("RR73".to_string()); }
+                3 => { message.contest_exchange = Some("73".to_string()); }
+                _ => {}
+            }
+        }
+
+        // Save decoded callsign to hash table for future lookups
+        // (hash_table is immutable here, but the decoder accumulates hashes
+        // across decode cycles via add_callsign)
+
+        Ok(())
+    }
+
+    /// Decode a 58-bit base-38 encoded callsign (up to 11 characters).
+    ///
+    /// Character set: " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/" (38 chars)
+    fn unpack58(mut n58: u64) -> String {
+        const CHARSET: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
+
+        let mut c11 = [b' '; 11];
+        for i in (0..11).rev() {
+            c11[i] = CHARSET[(n58 % 38) as usize];
+            n58 /= 38;
+        }
+
+        String::from_utf8_lossy(&c11).trim().to_string()
+    }
+
+    /// Parse i3=3 ARRL RTTY Roundup message.
+    ///
+    /// Bit layout: TU(1) + n28a(28) + ipa(1) + n28b(28) + ipb(1) + R(1) + nexch(3) + nrpt(13) + i3(3) = 77 bits
+    ///
+    /// Note: ft8_lib doesn't decode this type, but WSJT-X does. We implement basic decoding.
+    fn parse_rtty_roundup(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
+        let tu = payload[0] as u8;
+        let n28a = bits_to_u32(&payload[1..29]);
+        let _ipa = payload[29] as u8;
+        let n28b = bits_to_u32(&payload[30..58]);
+        let _ipb = payload[58] as u8;
+        let r_flag = payload[59] as u8;
+        let _nexch = bits_to_u32(&payload[60..63]) as u8;
+        let nrpt = bits_to_u32(&payload[63..74]) as u16;
+
+        let call_a = self.unpack28(n28a);
+        let call_b = self.unpack28(n28b);
+
+        if tu != 0 {
+            message.special_operation = Some("TU".to_string());
+        }
+
+        message.to_callsign = call_a.to_callsign();
+        message.from_callsign = call_b.to_callsign();
+
+        // nrpt encodes RST (3 digits) and state/province (13-bit combined)
+        // For now, just show the raw exchange value
+        let rst = 519 + (nrpt & 0x1FFF) / 84; // approximate RST
+        let state_idx = (nrpt & 0x1FFF) % 84;
+
+        let mut exchange = String::new();
+        if r_flag != 0 {
+            exchange.push_str("R ");
+        }
+        exchange.push_str(&format!("{} {}", rst, state_idx));
+
+        message.contest_exchange = Some(exchange);
 
         Ok(())
     }
@@ -1163,6 +1352,17 @@ fn bits_to_u32(bits: &BitSlice) -> u32 {
     value
 }
 
+/// Convert bit slice to u64 value (for fields wider than 32 bits, e.g. 58-bit nonstandard callsign)
+fn bits_to_u64(bits: &BitSlice) -> u64 {
+    let mut value = 0u64;
+    for (i, bit) in bits.iter().enumerate() {
+        if *bit {
+            value |= 1u64 << (bits.len() - 1 - i);
+        }
+    }
+    value
+}
+
 /// CRC-14 checksum calculation for FT8 (polynomial 0x2757)
 ///
 /// Direct port of ft8_lib's `ftx_compute_crc()` + `ftx_add_crc()`.
@@ -1228,6 +1428,7 @@ mod tests {
         assert_eq!(MessageType::Standard.to_string(), "Standard");
         assert_eq!(MessageType::Contest.to_string(), "Contest");
         assert_eq!(MessageType::FreeText.to_string(), "Free Text");
+        assert_eq!(MessageType::NonStdCall.to_string(), "Non-Std Call");
     }
 
     #[test]
@@ -1333,6 +1534,163 @@ mod tests {
         assert_eq!(lookup_10, Some("K1ABC".to_string()));
     }
     
+    #[test]
+    fn test_bits_to_u64() {
+        let bits = bitvec![1, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0,
+                           1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
+                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(bits_to_u64(&bits), 0xB0F0AAAA0001u64);
+    }
+
+    #[test]
+    fn test_unpack58_callsign() {
+        // Pack "PJ4/KA1ABC" the same way ft8_lib does: base-38, 11 chars, space-padded
+        const CHARSET: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
+        let call = "PJ4/KA1ABC";
+        let mut n58: u64 = 0;
+        for &b in call.as_bytes() {
+            let j = CHARSET.iter().position(|&c| c == b).unwrap();
+            n58 = n58 * 38 + j as u64;
+        }
+        // Pad remaining chars with space (index 0)
+        for _ in call.len()..11 {
+            n58 *= 38;
+        }
+
+        let decoded = MessageParser::unpack58(n58);
+        assert_eq!(decoded, "PJ4/KA1ABC");
+    }
+
+    #[test]
+    fn test_nonstd_call_parse() {
+        // Build a 77-bit i3=4 payload: CQ PJ4/KA1ABC
+        // Format: n12(12) + n58(58) + iflip(1) + nrpt(2) + icq(1) + i3(3)
+        const CHARSET: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
+        let call = "PJ4/KA1ABC";
+        let mut n58: u64 = 0;
+        for &b in call.as_bytes() {
+            let j = CHARSET.iter().position(|&c| c == b).unwrap();
+            n58 = n58 * 38 + j as u64;
+        }
+        for _ in call.len()..11 { n58 *= 38; }
+
+        let n12: u16 = 0; // not used for CQ
+        let iflip: u8 = 0;
+        let nrpt: u8 = 0;
+        let icq: u8 = 1; // CQ message
+        let i3: u8 = 4;
+
+        let mut payload = BitVec::with_capacity(77);
+        // n12: 12 bits
+        for i in (0..12).rev() { payload.push((n12 >> i) & 1 != 0); }
+        // n58: 58 bits
+        for i in (0..58).rev() { payload.push((n58 >> i) & 1 != 0); }
+        // iflip: 1 bit
+        payload.push(iflip != 0);
+        // nrpt: 2 bits
+        for i in (0..2).rev() { payload.push((nrpt >> i) & 1 != 0); }
+        // icq: 1 bit
+        payload.push(icq != 0);
+        // i3: 3 bits
+        for i in (0..3).rev() { payload.push((i3 >> i) & 1 != 0); }
+
+        assert_eq!(payload.len(), 77);
+
+        let parser = MessageParser::new();
+        let msg = parser.parse_payload(&payload).unwrap();
+        assert_eq!(msg.message_type, MessageType::NonStdCall);
+        assert_eq!(msg.to_callsign, Some("CQ".to_string()));
+        assert_eq!(msg.from_callsign, Some("PJ4/KA1ABC".to_string()));
+    }
+
+    #[test]
+    fn test_nonstd_call_with_report() {
+        // Build: <...> PJ4/KA1ABC RR73 (iflip=0, nrpt=2, icq=0)
+        const CHARSET: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
+        let call = "PJ4/KA1ABC";
+        let mut n58: u64 = 0;
+        for &b in call.as_bytes() {
+            let j = CHARSET.iter().position(|&c| c == b).unwrap();
+            n58 = n58 * 38 + j as u64;
+        }
+        for _ in call.len()..11 { n58 *= 38; }
+
+        let n12: u16 = 42; // some hash
+        let iflip: u8 = 0;
+        let nrpt: u8 = 2; // RR73
+        let icq: u8 = 0;
+        let i3: u8 = 4;
+
+        let mut payload = BitVec::with_capacity(77);
+        for i in (0..12).rev() { payload.push((n12 >> i) & 1 != 0); }
+        for i in (0..58).rev() { payload.push((n58 >> i) & 1 != 0); }
+        payload.push(iflip != 0);
+        for i in (0..2).rev() { payload.push((nrpt >> i) & 1 != 0); }
+        payload.push(icq != 0);
+        for i in (0..3).rev() { payload.push((i3 >> i) & 1 != 0); }
+
+        let parser = MessageParser::new();
+        let msg = parser.parse_payload(&payload).unwrap();
+        assert_eq!(msg.message_type, MessageType::NonStdCall);
+        assert_eq!(msg.to_callsign, Some("<...>".to_string())); // hash not in table
+        assert_eq!(msg.from_callsign, Some("PJ4/KA1ABC".to_string()));
+        assert_eq!(msg.contest_exchange, Some("RR73".to_string()));
+    }
+
+    #[test]
+    fn test_telemetry_parse() {
+        // Build i3=0, n3=5 telemetry payload
+        // The telemetry is 71 bits: the raw bytes left-shifted by 1 bit, then n3=5 in bits 71-73, i3=0 in 74-76
+        let test_bytes: [u8; 9] = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x12];
+
+        // Left-shift by 1 bit to create the b71 encoding
+        let mut shifted = [0u8; 9];
+        for i in 0..9 {
+            shifted[i] = test_bytes[i] << 1;
+            if i < 8 {
+                shifted[i] |= test_bytes[i + 1] >> 7;
+            }
+        }
+
+        // Build 77-bit payload: shifted bytes (71 bits) + n3=5 (bits 71-73) + i3=0 (bits 74-76)
+        let mut payload = BitVec::with_capacity(77);
+        for i in 0..71 {
+            payload.push((shifted[i / 8] >> (7 - (i % 8))) & 1 != 0);
+        }
+        // n3 = 5 = 0b101
+        payload.push(true); payload.push(false); payload.push(true);
+        // i3 = 0 = 0b000
+        payload.push(false); payload.push(false); payload.push(false);
+
+        assert_eq!(payload.len(), 77);
+
+        let parser = MessageParser::new();
+        let msg = parser.parse_payload(&payload).unwrap();
+        assert_eq!(msg.message_type, MessageType::Telemetry);
+        // Should decode back to the original hex
+        assert_eq!(msg.text, Some("123456789ABCDEF012".to_string()));
+    }
+
+    #[test]
+    fn test_hash_table_ft8lib_compatible() {
+        // Verify our hash matches ft8_lib's algorithm
+        let mut ht = HashTable::new();
+        ht.add_callsign("K1ABC");
+
+        // The hash should be deterministic
+        let n22 = HashTable::calculate_n22("K1ABC");
+        assert!(n22 < 0x400000); // 22 bits
+        let n12 = n22 >> 10;
+        assert!(n12 < 0x1000); // 12 bits
+        let n10 = n22 >> 12;
+        assert!(n10 < 0x400); // 10 bits
+
+        // Verify lookup works
+        assert_eq!(ht.lookup_22bit_hash(n22), Some("K1ABC".to_string()));
+        assert_eq!(ht.lookup_12bit_hash(n12), Some("K1ABC".to_string()));
+        assert_eq!(ht.lookup_10bit_hash(n10), Some("K1ABC".to_string()));
+    }
+
     #[test]
     fn test_crc14_calculation() {
         // Test with known payload (77 bits for FT8)

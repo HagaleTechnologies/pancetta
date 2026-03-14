@@ -351,7 +351,7 @@ mod tests {
     #[test]
     fn test_calculate_distance() {
         let distance = calculate_distance("FN20", "EM79").unwrap();
-        assert!(distance > 1000.0 && distance < 2000.0); // Rough check
+        assert!(distance > 500.0 && distance < 2000.0); // Rough check (~950 km)
     }
 
     #[test]
