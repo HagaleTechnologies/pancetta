@@ -27,10 +27,10 @@ _Created 2026-03-13. Execution order: Phase 0B → Phase 1A + Phase 1B in parall
 - [ ] **3c** Profile hot spots (flamegraph) — deferred
 - [ ] **3d** Optimize LDPC/candidate pruning to hit real-time (<12.64s) — deferred
 
-### Phase 4A — GFSK Modulation (independent, low priority)
-- [ ] **4a** Gaussian pulse shaping filter (BT=2.0)
-- [ ] **4b** Apply to frequency trajectory, add `PulseShape` enum
-- [ ] **4c** Validate: ft8_lib decodes our GFSK, round-trip tests pass
+### Phase 4A — GFSK Modulation (independent, low priority) — DONE (2026-03-14)
+- [x] **4a** Gaussian pulse shaping filter (BT=2.0)
+- [x] **4b** Apply to frequency trajectory, add `PulseShape` enum
+- [x] **4c** Validate: ft8_lib decodes our GFSK, round-trip tests pass
 
 ---
 

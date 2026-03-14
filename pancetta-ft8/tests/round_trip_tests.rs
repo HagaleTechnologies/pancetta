@@ -8,8 +8,9 @@
 mod test_signal_generator;
 
 use pancetta_ft8::{
-    Ft8Encoder, Ft8Modulator, Ft8Decoder, Ft8Config,
+    Ft8Encoder, Ft8Modulator, Ft8Decoder, Ft8Config, PulseShape,
     WINDOW_SAMPLES, NUM_SYMBOLS, SAMPLE_RATE,
+    ft8_lib_ffi::ft8lib_decode_audio,
 };
 use pancetta_ft8::ldpc::{LdpcEncoder, LDPC_INFO_BITS, LDPC_CODEWORD_BITS};
 use bitvec::prelude::*;
@@ -24,6 +25,17 @@ fn encode_message(text: &str) -> [u8; NUM_SYMBOLS] {
 /// Helper: modulate symbols to audio at given frequency offset
 fn modulate_symbols(symbols: &[u8; NUM_SYMBOLS], frequency_offset: f64) -> Vec<f32> {
     let mut modulator = Ft8Modulator::new_default().unwrap();
+    let mut audio = modulator.modulate_symbols(symbols, frequency_offset).unwrap();
+    audio.resize(WINDOW_SAMPLES, 0.0);
+    audio
+}
+
+/// Helper: modulate symbols to audio using GFSK pulse shaping
+fn modulate_symbols_gfsk(symbols: &[u8; NUM_SYMBOLS], frequency_offset: f64) -> Vec<f32> {
+    use pancetta_ft8::BASE_FREQUENCY;
+    let mut modulator = Ft8Modulator::with_pulse_shape(
+        SAMPLE_RATE, BASE_FREQUENCY, 0.5, PulseShape::Gaussian { bt: 2.0 },
+    ).unwrap();
     let mut audio = modulator.modulate_symbols(symbols, frequency_offset).unwrap();
     audio.resize(WINDOW_SAMPLES, 0.0);
     audio
@@ -301,4 +313,32 @@ fn test_round_trip_all_message_types() {
             decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
         );
     }
+}
+
+// =========================================================================
+// GFSK validation: ft8_lib should decode our GFSK-modulated signals
+// =========================================================================
+
+#[test]
+fn test_gfsk_decoded_by_ft8lib() {
+    let message = "CQ W1ABC FN42";
+    let symbols = encode_message(message);
+    let audio = modulate_symbols_gfsk(&symbols, 0.0);
+
+    let decoded = ft8lib_decode_audio(&audio);
+    println!(
+        "GFSK '{}': ft8_lib decoded {} messages",
+        message,
+        decoded.len()
+    );
+    for (text, freq, _time, _ldpc) in &decoded {
+        println!("  [ft8lib] {:.1} Hz  {}", freq, text);
+    }
+
+    assert!(
+        decoded.iter().any(|(text, _, _, _)| text.contains("W1ABC")),
+        "ft8_lib should decode our GFSK signal for '{}': got {:?}",
+        message,
+        decoded.iter().map(|(t, _, _, _)| t).collect::<Vec<_>>()
+    );
 }

@@ -25,6 +25,28 @@ pub const DEFAULT_TX_POWER: f64 = 0.5;
 /// Maximum frequency deviation (Hz)
 pub const MAX_FREQUENCY_DEVIATION: f64 = 2500.0;
 
+/// Default GFSK bandwidth-time product for FT8
+pub const DEFAULT_BT: f64 = 2.0;
+
+/// Pulse shaping mode for FT8 modulation
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum PulseShape {
+    /// Rectangular pulse (pure CPFSK, no smoothing)
+    Rectangular,
+    /// Gaussian pulse shaping with configurable BT product
+    /// BT=2.0 is the FT8 standard (close to rectangular but with smooth transitions)
+    Gaussian { bt: f64 },
+}
+
+impl Default for PulseShape {
+    fn default() -> Self {
+        // Rectangular is the default for decoder compatibility.
+        // GFSK produces cleaner spectral output but requires a
+        // matched decoder (not yet implemented).
+        PulseShape::Rectangular
+    }
+}
+
 /// FT8 audio modulator for generating transmission signals
 pub struct Ft8Modulator {
     /// Sample rate for audio generation
@@ -39,6 +61,8 @@ pub struct Ft8Modulator {
     phase_accumulator: f64,
     /// Random number generator for dithering
     dither_state: u32,
+    /// Pulse shaping mode
+    pulse_shape: PulseShape,
 }
 
 impl Ft8Modulator {
@@ -49,24 +73,37 @@ impl Ft8Modulator {
     /// * `base_frequency` - Base frequency offset in Hz (typically 1500 Hz)
     /// * `tx_power` - Transmission power level (0.0 - 1.0)
     pub fn new(sample_rate: u32, base_frequency: f64, tx_power: f64) -> Ft8Result<Self> {
+        Self::with_pulse_shape(sample_rate, base_frequency, tx_power, PulseShape::default())
+    }
+
+    /// Create a new FT8 modulator with specific pulse shaping
+    pub fn with_pulse_shape(sample_rate: u32, base_frequency: f64, tx_power: f64, pulse_shape: PulseShape) -> Ft8Result<Self> {
         if sample_rate == 0 || sample_rate > 192_000 {
             return Err(Ft8Error::ConfigError(
                 format!("Invalid sample rate: {} Hz", sample_rate)
             ));
         }
-        
+
         if base_frequency < 200.0 || base_frequency > 4000.0 {
             return Err(Ft8Error::ConfigError(
                 format!("Base frequency {} Hz out of range (200-4000 Hz)", base_frequency)
             ));
         }
-        
+
         if tx_power < 0.0 || tx_power > 1.0 {
             return Err(Ft8Error::ConfigError(
                 format!("TX power {} out of range (0.0-1.0)", tx_power)
             ));
         }
-        
+
+        if let PulseShape::Gaussian { bt } = pulse_shape {
+            if bt <= 0.0 || bt > 10.0 {
+                return Err(Ft8Error::ConfigError(
+                    format!("BT product {} out of range (0.0-10.0)", bt)
+                ));
+            }
+        }
+
         Ok(Self {
             sample_rate,
             base_frequency,
@@ -74,12 +111,18 @@ impl Ft8Modulator {
             tx_power,
             phase_accumulator: 0.0,
             dither_state: 12345, // Simple PRNG seed
+            pulse_shape,
         })
     }
 
-    /// Create modulator with default settings for FT8
+    /// Create modulator with default settings for FT8 (GFSK, BT=2.0)
     pub fn new_default() -> Ft8Result<Self> {
         Self::new(SAMPLE_RATE, BASE_FREQUENCY, DEFAULT_TX_POWER)
+    }
+
+    /// Create modulator with rectangular pulse shaping (pure CPFSK)
+    pub fn new_rectangular() -> Ft8Result<Self> {
+        Self::with_pulse_shape(SAMPLE_RATE, BASE_FREQUENCY, DEFAULT_TX_POWER, PulseShape::Rectangular)
     }
 
     /// Generate complete FT8 transmission audio samples
@@ -96,83 +139,137 @@ impl Ft8Modulator {
                 "Invalid symbol value (must be 0-7)".to_string()
             ));
         }
-        
+
         let total_frequency = self.base_frequency + frequency_offset;
         if total_frequency < 200.0 || total_frequency + (NUM_TONES as f64 - 1.0) * self.tone_spacing > MAX_FREQUENCY_DEVIATION {
             return Err(Ft8Error::SignalProcessingError(
                 format!("Frequency {} Hz would exceed deviation limits", total_frequency)
             ));
         }
-        
+
+        // Build per-sample frequency trajectory
+        let freq_trajectory = self.build_frequency_trajectory(symbols, total_frequency);
+
+        // Generate audio from frequency trajectory via phase accumulation
         let mut audio_samples = Vec::with_capacity(TOTAL_TRANSMISSION_SAMPLES);
-        
-        // Reset phase accumulator for new transmission
         self.phase_accumulator = 0.0;
-        
-        // Generate audio for each symbol
-        for (symbol_idx, &symbol) in symbols.iter().enumerate() {
-            let symbol_frequency = total_frequency + (symbol as f64) * self.tone_spacing;
-            let symbol_samples = self.generate_symbol_audio(symbol_frequency, symbol_idx)?;
-            audio_samples.extend_from_slice(&symbol_samples);
-        }
-        
-        // Apply final amplitude scaling and clipping protection
-        self.apply_final_processing(&mut audio_samples)?;
-        
-        Ok(audio_samples)
-    }
 
-    /// Generate audio samples for a single CPFSK symbol
-    ///
-    /// FT8 uses continuous-phase FSK: abrupt frequency transitions at symbol
-    /// boundaries with phase continuity maintained via the phase accumulator.
-    fn generate_symbol_audio(&mut self, frequency: f64, symbol_idx: usize) -> Ft8Result<Vec<f32>> {
-        let mut samples = Vec::with_capacity(SAMPLES_PER_SYMBOL);
-        let angular_frequency = 2.0 * PI * frequency / self.sample_rate as f64;
+        let ramp_samples = (self.sample_rate as f64 * 0.005) as usize; // 5ms ramp
 
-        for _sample_idx in 0..SAMPLES_PER_SYMBOL {
-            self.phase_accumulator += angular_frequency;
-
-            // Keep phase in reasonable range to prevent numerical issues
+        for (i, &freq) in freq_trajectory.iter().enumerate() {
+            let angular_freq = 2.0 * PI * freq / self.sample_rate as f64;
+            self.phase_accumulator += angular_freq;
             if self.phase_accumulator > 2.0 * PI {
                 self.phase_accumulator -= 2.0 * PI;
             }
 
-            let amplitude = self.tx_power as f32;
-            let sample = amplitude * self.phase_accumulator.sin() as f32;
-            samples.push(sample);
+            let mut sample = (self.tx_power * self.phase_accumulator.sin()) as f32;
+
+            // Ramp up at start
+            if i < ramp_samples {
+                let factor = (i as f64 / ramp_samples as f64).sin().powi(2) as f32;
+                sample *= factor;
+            }
+            // Ramp down at end
+            let total = freq_trajectory.len();
+            if i >= total - ramp_samples {
+                let remaining = total - i;
+                let factor = (remaining as f64 / ramp_samples as f64).sin().powi(2) as f32;
+                sample *= factor;
+            }
+
+            audio_samples.push(sample);
         }
 
-        // Apply ramp-up/ramp-down at transmission boundaries
-        self.apply_symbol_shaping(&mut samples, symbol_idx)?;
+        // Apply final amplitude scaling and clipping protection
+        self.apply_final_processing(&mut audio_samples)?;
 
-        Ok(samples)
+        Ok(audio_samples)
     }
 
-    /// Apply symbol transition shaping to reduce spectral splatter
-    fn apply_symbol_shaping(&self, samples: &mut [f32], symbol_idx: usize) -> Ft8Result<()> {
-        let ramp_samples = (self.sample_rate as f64 * 0.01) as usize; // 10ms ramp
-        let ramp_samples = ramp_samples.min(samples.len() / 4);
-        
-        // Apply smooth transitions at symbol boundaries
-        if symbol_idx == 0 {
-            // Ramp up at start of transmission
-            for i in 0..ramp_samples {
-                let factor = (i as f64 / ramp_samples as f64).sin().powi(2) as f32;
-                samples[i] *= factor;
+    /// Build per-sample frequency trajectory with pulse shaping.
+    ///
+    /// For `Rectangular`: each sample gets the frequency of its current symbol (pure CPFSK).
+    /// For `Gaussian { bt }`: symbol transitions are smoothed by a Gaussian filter,
+    /// producing GFSK (Gaussian Frequency Shift Keying).
+    fn build_frequency_trajectory(&self, symbols: &[u8; NUM_SYMBOLS], base_freq: f64) -> Vec<f64> {
+        let n_sym = NUM_SYMBOLS;
+        let sps = SAMPLES_PER_SYMBOL;
+        let total = n_sym * sps;
+
+        match self.pulse_shape {
+            PulseShape::Rectangular => {
+                // Pure CPFSK: abrupt frequency transitions
+                let mut trajectory = Vec::with_capacity(total);
+                for &sym in symbols.iter() {
+                    let freq = base_freq + (sym as f64) * self.tone_spacing;
+                    for _ in 0..sps {
+                        trajectory.push(freq);
+                    }
+                }
+                trajectory
+            }
+            PulseShape::Gaussian { bt } => {
+                // GFSK: smooth the rectangular frequency waveform with a Gaussian filter.
+                //
+                // 1. Build rectangular trajectory (same as CPFSK)
+                // 2. Convolve with a Gaussian kernel to smooth symbol transitions
+                //
+                // The Gaussian kernel has standard deviation:
+                //   σ = √(ln2) / (2π·BT) symbol periods
+                // For BT=2.0, σ ≈ 0.059 symbols — very narrow, close to rectangular.
+
+                // Step 1: rectangular trajectory
+                let mut trajectory = Vec::with_capacity(total);
+                for &sym in symbols.iter() {
+                    let freq = base_freq + (sym as f64) * self.tone_spacing;
+                    for _ in 0..sps {
+                        trajectory.push(freq);
+                    }
+                }
+
+                // Step 2: build Gaussian smoothing kernel
+                let sigma_symbols = (2.0_f64.ln()).sqrt() / (2.0 * PI * bt);
+                let sigma_samples = sigma_symbols * sps as f64;
+
+                // Kernel spans ±3σ (captures 99.7% of energy)
+                let half_len = (3.0 * sigma_samples).ceil() as usize;
+                if half_len < 1 {
+                    // BT so high that filter is sub-sample — skip filtering
+                    return trajectory;
+                }
+
+                let kernel_len = 2 * half_len + 1;
+                let mut kernel = vec![0.0f64; kernel_len];
+                let mut kernel_sum = 0.0;
+
+                for i in 0..kernel_len {
+                    let t = (i as f64 - half_len as f64) / sigma_samples;
+                    kernel[i] = (-0.5 * t * t).exp();
+                    kernel_sum += kernel[i];
+                }
+
+                // Normalize kernel
+                for k in kernel.iter_mut() {
+                    *k /= kernel_sum;
+                }
+
+                // Step 3: convolve trajectory with kernel (same-size output)
+                let mut smoothed = vec![0.0f64; total];
+                for i in 0..total {
+                    let mut acc = 0.0;
+                    for j in 0..kernel_len {
+                        let src_idx = i as isize + j as isize - half_len as isize;
+                        // Clamp to boundary (extend edge values)
+                        let src_idx = src_idx.max(0).min(total as isize - 1) as usize;
+                        acc += trajectory[src_idx] * kernel[j];
+                    }
+                    smoothed[i] = acc;
+                }
+
+                smoothed
             }
         }
-        
-        if symbol_idx == NUM_SYMBOLS - 1 {
-            // Ramp down at end of transmission
-            let start_idx = samples.len() - ramp_samples;
-            for i in 0..ramp_samples {
-                let factor = ((ramp_samples - i) as f64 / ramp_samples as f64).sin().powi(2) as f32;
-                samples[start_idx + i] *= factor;
-            }
-        }
-        
-        Ok(())
     }
 
     /// Apply final processing: normalize amplitude with headroom and add dither
@@ -232,7 +329,21 @@ impl Ft8Modulator {
             base_frequency: self.base_frequency,
             tone_spacing: self.tone_spacing,
             tx_power: self.tx_power,
+            pulse_shape: self.pulse_shape,
         }
+    }
+
+    /// Set pulse shaping mode
+    pub fn set_pulse_shape(&mut self, pulse_shape: PulseShape) -> Ft8Result<()> {
+        if let PulseShape::Gaussian { bt } = pulse_shape {
+            if bt <= 0.0 || bt > 10.0 {
+                return Err(Ft8Error::ConfigError(
+                    format!("BT product {} out of range (0.0-10.0)", bt)
+                ));
+            }
+        }
+        self.pulse_shape = pulse_shape;
+        Ok(())
     }
 
     /// Generate test tone for audio system verification
@@ -267,6 +378,18 @@ impl Default for Ft8Modulator {
     }
 }
 
+/// Complementary error function approximation (Abramowitz & Stegun 7.1.26)
+fn erfc(x: f64) -> f64 {
+    let t = 1.0 / (1.0 + 0.3275911 * x.abs());
+    let poly = t * (0.254829592
+        + t * (-0.284496736
+            + t * (1.421413741
+                + t * (-1.453152027
+                    + t * 1.061405429))));
+    let result = poly * (-x * x).exp();
+    if x >= 0.0 { result } else { 2.0 - result }
+}
+
 /// Modulator configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModulatorConfig {
@@ -278,6 +401,8 @@ pub struct ModulatorConfig {
     pub tone_spacing: f64,
     /// Transmission power level (0.0 - 1.0)
     pub tx_power: f64,
+    /// Pulse shaping mode
+    pub pulse_shape: PulseShape,
 }
 
 impl Default for ModulatorConfig {
@@ -287,6 +412,7 @@ impl Default for ModulatorConfig {
             base_frequency: BASE_FREQUENCY,
             tone_spacing: TONE_SPACING,
             tx_power: DEFAULT_TX_POWER,
+            pulse_shape: PulseShape::default(),
         }
     }
 }
@@ -515,5 +641,94 @@ mod tests {
         assert_eq!(config.base_frequency, BASE_FREQUENCY);
         assert_eq!(config.tone_spacing, TONE_SPACING);
         assert_eq!(config.tx_power, DEFAULT_TX_POWER);
+        assert_eq!(config.pulse_shape, PulseShape::Rectangular);
+    }
+
+    #[test]
+    fn test_gfsk_modulation_produces_valid_audio() {
+        let mut modulator = Ft8Modulator::with_pulse_shape(
+            SAMPLE_RATE, BASE_FREQUENCY, DEFAULT_TX_POWER,
+            PulseShape::Gaussian { bt: 2.0 },
+        ).unwrap();
+
+        let symbols = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7,
+                       0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7,
+                       0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7,
+                       0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7,
+                       0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6]; // 79 symbols
+
+        let result = modulator.modulate_symbols(&symbols, 0.0);
+        assert!(result.is_ok());
+
+        let audio = result.unwrap();
+        assert_eq!(audio.len(), TOTAL_TRANSMISSION_SAMPLES);
+        assert!(audio.iter().all(|&s| s.abs() <= 1.0));
+    }
+
+    #[test]
+    fn test_gfsk_smoother_than_rectangular() {
+        // GFSK should have smaller max frequency derivative (smoother transitions)
+        let symbols = [0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7,
+                       0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7,
+                       0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7,
+                       0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7,
+                       0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0]; // worst-case transitions
+
+        let rect_mod = Ft8Modulator::with_pulse_shape(
+            SAMPLE_RATE, BASE_FREQUENCY, DEFAULT_TX_POWER, PulseShape::Rectangular,
+        ).unwrap();
+        let gfsk_mod = Ft8Modulator::with_pulse_shape(
+            SAMPLE_RATE, BASE_FREQUENCY, DEFAULT_TX_POWER,
+            PulseShape::Gaussian { bt: 2.0 },
+        ).unwrap();
+
+        let rect_traj = rect_mod.build_frequency_trajectory(&symbols, 1500.0);
+        let gfsk_traj = gfsk_mod.build_frequency_trajectory(&symbols, 1500.0);
+
+        // Max derivative (frequency change between adjacent samples)
+        let rect_max_df: f64 = rect_traj.windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f64::max);
+        let gfsk_max_df: f64 = gfsk_traj.windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f64::max);
+
+        // Rectangular has abrupt jumps, GFSK should be smoother
+        assert!(
+            gfsk_max_df < rect_max_df,
+            "GFSK max dF ({:.4}) should be less than rectangular ({:.4})",
+            gfsk_max_df, rect_max_df,
+        );
+    }
+
+    #[test]
+    fn test_pulse_shape_setting() {
+        let mut modulator = Ft8Modulator::new_default().unwrap();
+        assert_eq!(modulator.get_config().pulse_shape, PulseShape::Rectangular);
+
+        assert!(modulator.set_pulse_shape(PulseShape::Gaussian { bt: 2.0 }).is_ok());
+        assert_eq!(modulator.get_config().pulse_shape, PulseShape::Gaussian { bt: 2.0 });
+
+        assert!(modulator.set_pulse_shape(PulseShape::Gaussian { bt: 0.0 }).is_err());
+        assert!(modulator.set_pulse_shape(PulseShape::Gaussian { bt: 11.0 }).is_err());
+    }
+
+    #[test]
+    fn test_erfc_approximation() {
+        // erfc(0) = 1.0
+        assert!((erfc(0.0) - 1.0).abs() < 1e-6);
+        // erfc(∞) → 0
+        assert!(erfc(5.0) < 1e-10);
+        // erfc(-∞) → 2
+        assert!((erfc(-5.0) - 2.0).abs() < 1e-10);
+        // erfc(1) ≈ 0.1573
+        assert!((erfc(1.0) - 0.1573).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_rectangular_modulator_creation() {
+        let modulator = Ft8Modulator::new_rectangular();
+        assert!(modulator.is_ok());
+        assert_eq!(modulator.unwrap().get_config().pulse_shape, PulseShape::Rectangular);
     }
 }
