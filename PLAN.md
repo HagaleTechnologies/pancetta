@@ -82,8 +82,8 @@ _Created 2026-03-13. Execution order: Phase 0B → Phase 1A + Phase 1B in parall
 - [x] DX cluster integration (spot monitoring, forwarding to TUI)
 - [ ] DXCC highlighting — deferred (needs entity database)
 - [x] PSK Reporter spot upload (UDP binary IPFIX protocol, batched every 5 min)
-- [ ] Band hopping runtime loop — deferred (config + strategies exist, needs coordinator integration)
-- [ ] Contest mode — deferred
+- [x] Band hopping (config + autonomous operator integration with ChangeBand → hamlib)
+- [ ] Contest mode — deferred (needs contest-specific message types and logging)
 
 ---
 
