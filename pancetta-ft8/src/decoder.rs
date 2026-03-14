@@ -1,4 +1,4 @@
-//! Core FT8 decoder implementation
+//! Core FT8 decoder implementation (Phase 1A sensitivity improvements)
 //!
 //! Implements the FT8 decode pipeline:
 //! 1. Compute time-frequency spectrogram (one-symbol FFT windows)
@@ -27,7 +27,7 @@ use bitvec::prelude::*;
 // ============================================================================
 
 /// Maximum number of decode candidates to process
-const MAX_DECODE_CANDIDATES: usize = 50;
+const MAX_DECODE_CANDIDATES: usize = 100;
 
 /// Minimum SNR for attempting decode (dB)
 const MIN_DECODE_SNR: f32 = -25.0;
@@ -41,17 +41,23 @@ const COSTAS: [u8; 7] = [3, 1, 4, 0, 6, 5, 2];
 /// Samples per FT8 symbol at 12 kHz
 const SAMPLES_PER_SYMBOL: usize = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize; // 1920
 
-/// FFT size for spectrogram (one symbol period = exact 6.25 Hz resolution)
-const SPEC_NFFT: usize = SAMPLES_PER_SYMBOL; // 1920
+/// FFT size for spectrogram with freq_osr=2 (double resolution = 3.125 Hz per bin)
+const SPEC_NFFT: usize = SAMPLES_PER_SYMBOL * 2; // 3840
 
-/// Spectrogram step size (half symbol for 2× oversampling)
+/// Spectrogram step size (half symbol for 2× time oversampling)
 const SPEC_STEP: usize = SAMPLES_PER_SYMBOL / 2; // 960
 
-/// Minimum Costas sync score to consider a candidate
-const MIN_SYNC_SCORE: f64 = 8.0;
+/// Frequency oversampling rate (2 = sub-bin resolution)
+const FREQ_OSR: usize = 2;
+
+/// Target LLR variance for normalization (matches ft8_lib's ftx_normalize_logl)
+const LLR_TARGET_VARIANCE: f32 = 24.0;
+
+/// Minimum Costas sync score to consider a candidate (dB difference, neighbor comparison)
+const MIN_SYNC_SCORE: f64 = 3.5;
 
 /// Maximum candidates from sync search before NMS
-const MAX_SYNC_CANDIDATES: usize = 200;
+const MAX_SYNC_CANDIDATES: usize = 300;
 
 /// Minimum frequency bin for FT8 search (~200 Hz / 6.25 Hz)
 const MIN_FREQ_BIN: usize = 32;
@@ -113,14 +119,17 @@ impl Default for Ft8Config {
 // Internal data structures
 // ============================================================================
 
-/// Time-frequency spectrogram
+/// Time-frequency spectrogram with frequency oversampling support
 struct Spectrogram {
-    /// Power values [time_step][freq_bin]
-    power: Vec<Vec<f64>>,
+    /// Power values [time_step][freq_sub][freq_bin]
+    /// With freq_osr=2: freq_sub 0 = even bins (0, 2, 4, ...), freq_sub 1 = odd bins (1, 3, 5, ...)
+    power: Vec<Vec<Vec<f64>>>,
     /// Number of time steps
     num_steps: usize,
-    /// Number of frequency bins (NFFT/2 + 1)
+    /// Number of frequency bins per sub-bin (in 6.25 Hz units)
     num_bins: usize,
+    /// Frequency oversampling rate
+    freq_osr: usize,
 }
 
 /// Costas sync search candidate
@@ -129,6 +138,8 @@ struct CostasCandidate {
     time_step: usize,
     /// Base frequency bin in spectrogram (bin * 6.25 Hz)
     freq_bin: usize,
+    /// Frequency sub-bin index (0..freq_osr-1)
+    freq_sub: usize,
     /// Costas sync correlation score
     sync_score: f64,
 }
@@ -299,7 +310,7 @@ impl Ft8Decoder {
                     / decoded_messages.len() as f32
             },
             peak_memory_bytes: self.allocator.allocated_bytes(),
-            sync_quality: (best_sync / 30.0).min(1.0) as f32,
+            sync_quality: (best_sync / 12.0).min(1.0) as f32,
             timestamp: SystemTime::now(),
         };
 
@@ -331,30 +342,38 @@ impl Ft8Decoder {
     // Step 1: Spectrogram
     // ========================================================================
 
-    /// Compute power spectrogram of audio data.
+    /// Compute power spectrogram of audio data with frequency oversampling.
     ///
-    /// Uses FFT windows of exactly one symbol period (1920 samples at 12 kHz),
-    /// giving 6.25 Hz frequency resolution — exactly one tone spacing per bin.
-    /// Windows overlap by 50% (960-sample step).
+    /// Uses FFT windows of 2× symbol period (3840 samples at 12 kHz) with
+    /// freq_osr=2, giving 3.125 Hz frequency resolution. The FFT bins are
+    /// then organized as freq_sub=0 (even bins: 0, 2, 4, ...) and
+    /// freq_sub=1 (odd bins: 1, 3, 5, ...), where each sub-bin set has
+    /// 6.25 Hz spacing. This matches ft8_lib's frequency oversampling approach.
     fn compute_spectrogram(&self, audio: &[f64]) -> Ft8Result<Spectrogram> {
         let nfft = SPEC_NFFT;
         let step = SPEC_STEP;
+        let freq_osr = FREQ_OSR;
 
-        if audio.len() < nfft {
+        // We only need block_size samples of actual data per step, but the FFT
+        // window is nfft = block_size * freq_osr. Zero-pad the remainder.
+        let block_size = SAMPLES_PER_SYMBOL;
+
+        if audio.len() < block_size {
             return Err(Ft8Error::InsufficientData {
-                needed: nfft,
+                needed: block_size,
                 available: audio.len(),
             });
         }
 
-        let num_steps = (audio.len() - nfft) / step + 1;
-        let num_bins = nfft / 2 + 1;
+        let num_steps = (audio.len() - block_size) / step + 1;
+        // Number of frequency bins in 6.25 Hz units (= block_size/2 + 1)
+        let num_bins = block_size / 2 + 1; // 961
 
         // FFT plan
         let mut planner = FftPlanner::<f64>::new();
         let fft = planner.plan_fft_forward(nfft);
 
-        // Hann window
+        // Hann window of length nfft
         let window: Vec<f64> = (0..nfft)
             .map(|i| {
                 0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / (nfft - 1) as f64).cos())
@@ -366,27 +385,48 @@ impl Ft8Decoder {
 
         for t in 0..num_steps {
             let start = t * step;
+            let end = (start + nfft).min(audio.len());
 
-            // Apply window and load into FFT buffer
+            // Apply window and load into FFT buffer, zero-pad if needed
             for i in 0..nfft {
-                fft_buffer[i] = Complex::new(audio[start + i] * window[i], 0.0);
+                if start + i < end {
+                    fft_buffer[i] = Complex::new(audio[start + i] * window[i], 0.0);
+                } else {
+                    fft_buffer[i] = Complex::new(0.0, 0.0);
+                }
             }
 
             // Compute FFT in-place
             fft.process(&mut fft_buffer);
 
-            // Compute power spectrum for positive frequencies
-            let mut row = Vec::with_capacity(num_bins);
-            for bin in 0..num_bins {
-                row.push(fft_buffer[bin].norm_sqr());
+            // Organize into freq_osr sub-bins
+            // FFT bin k corresponds to frequency k * (sample_rate / nfft)
+            // = k * (12000 / 3840) = k * 3.125 Hz
+            // In 6.25 Hz units: bin_6hz = k / freq_osr, freq_sub = k % freq_osr
+            let mut sub_power = Vec::with_capacity(freq_osr);
+            for fs in 0..freq_osr {
+                let mut row = Vec::with_capacity(num_bins);
+                for bin in 0..num_bins {
+                    let src_bin = bin * freq_osr + fs;
+                    if src_bin < nfft / 2 + 1 {
+                        // Store log-magnitude (dB) like ft8_lib for neighbor scoring
+                        let mag2 = fft_buffer[src_bin].norm_sqr();
+                        let db = 10.0 * (1e-12f64 + mag2).log10();
+                        row.push(db);
+                    } else {
+                        row.push(-120.0);
+                    }
+                }
+                sub_power.push(row);
             }
-            power.push(row);
+            power.push(sub_power);
         }
 
         Ok(Spectrogram {
             power,
             num_steps,
             num_bins,
+            freq_osr,
         })
     }
 
@@ -398,8 +438,9 @@ impl Ft8Decoder {
     /// against the spectrogram in 2D (time offset, frequency offset).
     ///
     /// The Costas array [3,1,4,0,6,5,2] appears at symbol positions 0-6,
-    /// 36-42, and 72-78. For each candidate (t0, f0), we check all 21
-    /// Costas positions and sum the signal-to-noise ratio at each one.
+    /// 36-42, and 72-78. For each candidate (t0, f0, freq_sub), we check
+    /// all 21 Costas positions and score using neighbor comparison (ft8_lib style).
+    /// With freq_osr=2, we search both even and odd frequency sub-bins.
     fn costas_sync_search(&self, spectrogram: &Spectrogram) -> Ft8Result<Vec<CostasCandidate>> {
         let mut candidates = Vec::new();
 
@@ -411,16 +452,19 @@ impl Ft8Decoder {
         let max_freq_bin = spectrogram.num_bins.saturating_sub(NUM_TONES);
         let max_freq_bin = max_freq_bin.min((4000.0 / TONE_SPACING) as usize);
 
-        for t0 in 0..=max_time_step {
-            for f0 in MIN_FREQ_BIN..max_freq_bin {
-                let score = self.compute_costas_score(spectrogram, t0, f0);
+        for freq_sub in 0..spectrogram.freq_osr {
+            for t0 in 0..=max_time_step {
+                for f0 in MIN_FREQ_BIN..max_freq_bin {
+                    let score = self.compute_costas_score(spectrogram, t0, f0, freq_sub);
 
-                if score > MIN_SYNC_SCORE {
-                    candidates.push(CostasCandidate {
-                        time_step: t0,
-                        freq_bin: f0,
-                        sync_score: score,
-                    });
+                    if score > MIN_SYNC_SCORE {
+                        candidates.push(CostasCandidate {
+                            time_step: t0,
+                            freq_bin: f0,
+                            freq_sub,
+                            sync_score: score,
+                        });
+                    }
                 }
             }
         }
@@ -439,66 +483,78 @@ impl Ft8Decoder {
         Ok(candidates)
     }
 
-    /// Compute Costas sync score for a candidate at (t0, f0) in the spectrogram.
+    /// Compute Costas sync score using ft8_lib-style neighbor comparison.
     ///
-    /// For each of the 21 Costas sync positions, computes the log-power at
-    /// the expected tone bin minus the average log-power of noise bins OUTSIDE
-    /// the 8-tone signal range. Using external noise bins avoids contamination
-    /// from spectral leakage between adjacent 6.25 Hz bins.
-    fn compute_costas_score(&self, spec: &Spectrogram, t0: usize, f0: usize) -> f64 {
-        let mut score = 0.0;
+    /// For each sync symbol, compares the expected bin's magnitude against
+    /// its frequency-adjacent and time-adjacent neighbors. This is more robust
+    /// to colored noise than comparing against distant noise bins.
+    ///
+    /// Score = average of (signal_bin - neighbor_bin) across all valid comparisons.
+    fn compute_costas_score(&self, spec: &Spectrogram, t0: usize, f0: usize, freq_sub: usize) -> f64 {
+        let mut score = 0.0f64;
+        let mut num_average = 0usize;
         let sync_group_starts: [usize; 3] = [0, 36, 72];
 
-        // Noise estimation: use 8 bins below and 8 bins above the signal range.
-        // Signal occupies bins f0..f0+7, noise uses f0-8..f0-1 and f0+8..f0+15.
-        let noise_bins_below: Vec<usize> = (f0.saturating_sub(8)..f0)
-            .filter(|&f| f < spec.num_bins)
-            .collect();
-        let noise_bins_above: Vec<usize> = (f0 + NUM_TONES..f0 + NUM_TONES + 8)
-            .filter(|&f| f < spec.num_bins)
-            .collect();
-
-        for &group_start in &sync_group_starts {
-            for j in 0..7 {
-                let symbol_idx = group_start + j;
+        for (m, &group_start) in sync_group_starts.iter().enumerate() {
+            for k in 0..7usize {
+                let symbol_idx = group_start + k;
                 // Each symbol occupies 2 time steps; use the first one
                 let time_idx = t0 + symbol_idx * 2;
 
                 if time_idx >= spec.num_steps {
-                    return 0.0;
+                    continue;
                 }
 
-                let expected_tone = COSTAS[j] as usize;
-                let freq_idx = f0 + expected_tone;
+                let sm = COSTAS[k] as usize; // expected tone bin (0..7)
+                let freq_idx = f0 + sm;
 
                 if freq_idx >= spec.num_bins {
-                    return 0.0;
+                    continue;
                 }
 
-                // Power at expected tone
-                let signal_power = spec.power[time_idx][freq_idx];
+                let signal_mag = spec.power[time_idx][freq_sub][freq_idx];
 
-                // Noise estimate from bins outside the 8-tone signal range
-                let mut noise_power = 0.0;
-                let mut noise_count = 0;
-                for &f in noise_bins_below.iter().chain(noise_bins_above.iter()) {
-                    noise_power += spec.power[time_idx][f];
-                    noise_count += 1;
+                // Check frequency neighbor below
+                if sm > 0 && f0 + sm - 1 < spec.num_bins {
+                    let neighbor = spec.power[time_idx][freq_sub][f0 + sm - 1];
+                    score += signal_mag - neighbor;
+                    num_average += 1;
                 }
 
-                if noise_count > 0 {
-                    noise_power /= noise_count as f64;
+                // Check frequency neighbor above
+                if sm < 7 && f0 + sm + 1 < spec.num_bins {
+                    let neighbor = spec.power[time_idx][freq_sub][f0 + sm + 1];
+                    score += signal_mag - neighbor;
+                    num_average += 1;
                 }
 
-                if noise_power > 0.0 {
-                    score += (signal_power / noise_power).ln();
-                } else if signal_power > 0.0 {
-                    score += 10.0;
+                // Check time neighbor behind (previous symbol in this sync group)
+                if k > 0 && time_idx > 0 {
+                    let prev_time = time_idx - 2; // previous symbol's time step
+                    if prev_time < spec.num_steps {
+                        let neighbor = spec.power[prev_time][freq_sub][freq_idx];
+                        score += signal_mag - neighbor;
+                        num_average += 1;
+                    }
+                }
+
+                // Check time neighbor ahead (next symbol in this sync group)
+                if k + 1 < 7 {
+                    let next_time = time_idx + 2; // next symbol's time step
+                    if next_time < spec.num_steps {
+                        let neighbor = spec.power[next_time][freq_sub][freq_idx];
+                        score += signal_mag - neighbor;
+                        num_average += 1;
+                    }
                 }
             }
         }
 
-        score
+        if num_average > 0 {
+            score / num_average as f64
+        } else {
+            0.0
+        }
     }
 
     /// Non-maximum suppression: remove weaker candidates near stronger ones
@@ -541,7 +597,7 @@ impl Ft8Decoder {
     /// 1. Fine timing search: refine coarse time offset (±half symbol, 5 steps)
     /// 2. Frequency refinement: try ±1 bin
     /// 3. Extract symbols with complex DFT
-    /// 4. Compute soft LLRs
+    /// 4. Compute soft LLRs + normalize to target variance
     /// 5. LDPC belief propagation
     /// 6. CRC-14 verification
     /// 7. Message parsing
@@ -560,6 +616,9 @@ impl Ft8Decoder {
         // Frequency refinement: try ±1 bin
         let freq_offsets: [isize; 3] = [0, -1, 1];
 
+        // freq_sub shifts the base frequency by half a bin (3.125 Hz) when freq_osr=2
+        let sub_bin_offset = candidate.freq_sub as f64 * (TONE_SPACING / FREQ_OSR as f64);
+
         // Find best (time_delta, freq_offset) by Costas correlation on extracted symbols
         let mut best_decode = None;
 
@@ -575,7 +634,7 @@ impl Ft8Decoder {
                 if freq_bin < 0 {
                     continue;
                 }
-                let base_frequency = freq_bin as f64 * TONE_SPACING;
+                let base_frequency = freq_bin as f64 * TONE_SPACING + sub_bin_offset;
 
                 let (_symbols, tone_magnitudes) = match self
                     .extract_symbols_complex(audio, time_offset_samples, base_frequency)
@@ -584,7 +643,10 @@ impl Ft8Decoder {
                     Err(_) => continue,
                 };
 
-                let llrs = self.compute_soft_llrs(&tone_magnitudes);
+                let mut llrs = self.compute_soft_llrs(&tone_magnitudes);
+
+                // LLR normalization: scale to target variance (ft8_lib's ftx_normalize_logl)
+                normalize_llrs(&mut llrs);
 
                 #[cfg(feature = "debug-decode")]
                 {
@@ -613,8 +675,9 @@ impl Ft8Decoder {
                 let payload_bits = &corrected_bits[0..PAYLOAD_BITS];
                 let ft8_message = self.message_parser.parse_payload(payload_bits)?;
 
-                let snr_db = (candidate.sync_score / 21.0 * 4.343) as f32;
-                let confidence = (candidate.sync_score / 30.0).min(1.0) as f32;
+                // sync_score is average dB difference between signal and neighbor bins
+                let snr_db = candidate.sync_score as f32;
+                let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
                 let decoded_message = DecodedMessage::new(
                     ft8_message,
@@ -717,15 +780,22 @@ impl Ft8Decoder {
 
     /// Compute soft log-likelihood ratios from per-symbol tone magnitudes.
     ///
-    /// For each of the 58 data symbols × 3 bits = 174 codeword bits,
-    /// computes the LLR using the max-log approximation:
+    /// Matches ft8_lib's ft8_extract_symbol approach: for each of the 58 data
+    /// symbols x 3 bits = 174 codeword bits, compute the LLR using the max-log
+    /// approximation on log-magnitude (dB) values:
     ///
-    ///   LLR(bit_k) ≈ (max mag²[t : bit_k(t)=0] - max mag²[t : bit_k(t)=1]) / (2σ²)
+    ///   LLR(bit_k) = max(dB_mag[tones where bit_k=1]) - max(dB_mag[tones where bit_k=0])
     ///
-    /// where σ² is estimated per-symbol from the median tone magnitude.
-    /// The Gray code mapping determines which tones correspond to bit=0 vs bit=1.
+    /// Gray code mapping determines which tones correspond to bit=0 vs bit=1.
+    /// The raw LLRs are later normalized by normalize_llrs() to target variance.
     fn compute_soft_llrs(&self, tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<f32> {
         let mut llrs = Vec::with_capacity(174);
+
+        // FT8 Gray map: maps binary values 0..7 to tone indices
+        // gray_to_binary reverses this
+        // But ft8_lib's extract_symbol does: s2[j] = mag[gray_map[j]]
+        // where j is the binary value (0..7), and gray_map[j] is the tone index
+        // We need the same mapping here.
 
         // Data symbol positions: 7..36 (29 symbols) and 43..72 (29 symbols)
         let data_positions: Vec<usize> = (7..36).chain(43..72).collect();
@@ -733,34 +803,33 @@ impl Ft8Decoder {
         for &sym_idx in &data_positions {
             let mags = &tone_magnitudes[sym_idx];
 
-            // Per-symbol noise estimate: median of tone magnitude-squared values
-            let mut mag_sq: Vec<f64> = mags.iter().map(|&m| m * m).collect();
-            mag_sq.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let noise = mag_sq[mag_sq.len() / 2].max(1e-10);
-
-            // For each of 3 bits (MSB first: bit2, bit1, bit0)
-            for bit_pos in (0..3).rev() {
-                let bit_mask = 1u8 << bit_pos;
-
-                let mut max_0 = f64::NEG_INFINITY; // max mag² where bit=0
-                let mut max_1 = f64::NEG_INFINITY; // max mag² where bit=1
-
-                for tone in 0..NUM_TONES {
-                    let binary = gray_to_binary(tone as u8);
-                    let ms = mags[tone] * mags[tone];
-
-                    if binary & bit_mask == 0 {
-                        max_0 = max_0.max(ms);
-                    } else {
-                        max_1 = max_1.max(ms);
-                    }
-                }
-
-                // LLR = (max_0 - max_1) / (2 * noise_variance)
-                // Positive LLR → bit=0 more likely; negative → bit=1 more likely
-                let llr = ((max_0 - max_1) / (2.0 * noise)) as f32;
-                llrs.push(llr.clamp(-25.0, 25.0));
+            // Convert magnitudes to log-domain (dB), matching ft8_lib's WF_ELEM_MAG
+            let mut s2 = [0.0f64; NUM_TONES];
+            for j in 0..NUM_TONES {
+                // s2[j] = log-magnitude of the tone that corresponds to binary value j
+                // ft8_lib uses: s2[j] = WF_ELEM_MAG(wf[kFT8_Gray_map[j]])
+                // kFT8_Gray_map maps binary -> tone: [0,1,3,2,5,6,4,7]
+                let tone_idx = crate::ldpc::binary_to_gray(j as u8) as usize;
+                s2[j] = (1e-12 + mags[tone_idx] * mags[tone_idx]).log10() * 10.0;
             }
+
+            // ft8_lib computes LLRs as:
+            // logl[0] = max4(s2[4],s2[5],s2[6],s2[7]) - max4(s2[0],s2[1],s2[2],s2[3])
+            // logl[1] = max4(s2[2],s2[3],s2[6],s2[7]) - max4(s2[0],s2[1],s2[4],s2[5])
+            // logl[2] = max4(s2[1],s2[3],s2[5],s2[7]) - max4(s2[0],s2[2],s2[4],s2[6])
+            fn max4(a: f64, b: f64, c: f64, d: f64) -> f64 {
+                a.max(b).max(c.max(d))
+            }
+
+            let llr0 = max4(s2[4], s2[5], s2[6], s2[7]) - max4(s2[0], s2[1], s2[2], s2[3]);
+            let llr1 = max4(s2[2], s2[3], s2[6], s2[7]) - max4(s2[0], s2[1], s2[4], s2[5]);
+            let llr2 = max4(s2[1], s2[3], s2[5], s2[7]) - max4(s2[0], s2[2], s2[4], s2[6]);
+
+            // Negate to match our LDPC convention: positive = bit=0, negative = bit=1
+            // (ft8_lib uses the opposite convention)
+            llrs.push(-llr0 as f32);
+            llrs.push(-llr1 as f32);
+            llrs.push(-llr2 as f32);
         }
 
         debug_assert_eq!(llrs.len(), 174);
@@ -896,6 +965,29 @@ impl Ft8Decoder {
 // ============================================================================
 // Helper functions
 // ============================================================================
+
+/// Normalize LLR values to have target variance, matching ft8_lib's ftx_normalize_logl().
+///
+/// LDPC belief propagation is tuned for a specific LLR scale. This function
+/// computes the variance of the 174 LLR values and scales them so the variance
+/// equals LLR_TARGET_VARIANCE (24.0). This is critical for decoding weak signals.
+fn normalize_llrs(llrs: &mut [f32]) {
+    debug_assert_eq!(llrs.len(), 174);
+    let n = llrs.len() as f32;
+    let inv_n = 1.0 / n;
+
+    let sum: f32 = llrs.iter().sum();
+    let sum2: f32 = llrs.iter().map(|&x| x * x).sum();
+
+    let variance = (sum2 - sum * sum * inv_n) * inv_n;
+
+    if variance > 0.0 {
+        let norm_factor = (LLR_TARGET_VARIANCE / variance).sqrt();
+        for llr in llrs.iter_mut() {
+            *llr *= norm_factor;
+        }
+    }
+}
 
 /// Convert bit slice to u16
 fn bits_to_u16(bits: &BitSlice) -> u16 {
@@ -1216,17 +1308,19 @@ mod tests {
         assert!(spec.num_steps > 0);
         assert!(spec.num_bins > 0);
         assert_eq!(spec.power.len(), spec.num_steps);
-        assert_eq!(spec.power[0].len(), spec.num_bins);
+        assert_eq!(spec.freq_osr, FREQ_OSR);
+        assert_eq!(spec.power[0].len(), spec.freq_osr);
+        assert_eq!(spec.power[0][0].len(), spec.num_bins);
 
         // The 1500 Hz tone should produce a peak at bin 1500/6.25 = 240
         let tone_bin = (1500.0 / TONE_SPACING) as usize;
         let mid_step = spec.num_steps / 2;
 
-        // Power at tone bin should be much larger than at a random bin
-        let signal_power = spec.power[mid_step][tone_bin];
-        let noise_power = spec.power[mid_step][10]; // Low-frequency noise bin
-        assert!(signal_power > noise_power * 100.0,
-            "Signal power {:.2} should be >> noise power {:.2}", signal_power, noise_power);
+        // Power (dB) at tone bin should be much larger than at a random bin (freq_sub=0)
+        let signal_db = spec.power[mid_step][0][tone_bin];
+        let noise_db = spec.power[mid_step][0][10]; // Low-frequency noise bin
+        assert!(signal_db > noise_db + 20.0,
+            "Signal dB {:.2} should be >> noise dB {:.2}", signal_db, noise_db);
     }
 
     #[test]
@@ -1235,34 +1329,36 @@ mod tests {
         let decoder = Ft8Decoder::new(config).unwrap();
 
         // Create a spectrogram where Costas tones are present at t0=0, f0=240
+        // Spectrogram stores log-magnitude (dB) values
         let num_steps = 157;
-        let num_bins = SPEC_NFFT / 2 + 1;
-        let noise_level = 0.01;
-        let signal_level = 1.0;
+        let num_bins = SAMPLES_PER_SYMBOL / 2 + 1; // bins in 6.25 Hz units
+        let freq_osr = FREQ_OSR;
+        let noise_db = -40.0; // noise floor in dB
+        let signal_db = -10.0; // signal level in dB (30 dB above noise)
         let f0 = 240usize; // 1500 Hz
 
-        let mut power = vec![vec![noise_level; num_bins]; num_steps];
+        let mut power = vec![vec![vec![noise_db; num_bins]; freq_osr]; num_steps];
 
-        // Place Costas tones at the correct positions
+        // Place Costas tones at the correct positions (freq_sub=0)
         for &group_start in &[0usize, 36, 72] {
             for j in 0..7 {
                 let sym = group_start + j;
                 let time_idx = sym * 2;
                 let tone = COSTAS[j] as usize;
                 if time_idx < num_steps && f0 + tone < num_bins {
-                    power[time_idx][f0 + tone] = signal_level;
+                    power[time_idx][0][f0 + tone] = signal_db;
                 }
             }
         }
 
-        let spec = Spectrogram { power, num_steps, num_bins };
+        let spec = Spectrogram { power, num_steps, num_bins, freq_osr };
 
-        let score = decoder.compute_costas_score(&spec, 0, f0);
+        let score = decoder.compute_costas_score(&spec, 0, f0, 0);
         assert!(score > MIN_SYNC_SCORE,
             "Costas score {:.2} should exceed threshold {:.2}", score, MIN_SYNC_SCORE);
 
         // Score at a wrong frequency should be much lower
-        let wrong_score = decoder.compute_costas_score(&spec, 0, f0 + 20);
+        let wrong_score = decoder.compute_costas_score(&spec, 0, f0 + 20, 0);
         assert!(score > wrong_score * 2.0,
             "Correct score {:.2} should be >> wrong score {:.2}", score, wrong_score);
     }
@@ -1475,10 +1571,10 @@ mod tests {
         let decoder = Ft8Decoder::new(config).unwrap();
 
         let mut candidates = vec![
-            CostasCandidate { time_step: 0, freq_bin: 240, sync_score: 20.0 },
-            CostasCandidate { time_step: 1, freq_bin: 240, sync_score: 15.0 }, // near #0
-            CostasCandidate { time_step: 0, freq_bin: 241, sync_score: 12.0 }, // near #0
-            CostasCandidate { time_step: 0, freq_bin: 300, sync_score: 18.0 }, // far from #0
+            CostasCandidate { time_step: 0, freq_bin: 240, freq_sub: 0, sync_score: 20.0 },
+            CostasCandidate { time_step: 1, freq_bin: 240, freq_sub: 0, sync_score: 15.0 }, // near #0
+            CostasCandidate { time_step: 0, freq_bin: 241, freq_sub: 0, sync_score: 12.0 }, // near #0
+            CostasCandidate { time_step: 0, freq_bin: 300, freq_sub: 0, sync_score: 18.0 }, // far from #0
         ];
 
         decoder.nms_candidates(&mut candidates);
@@ -1488,5 +1584,88 @@ mod tests {
         assert_eq!(candidates[0].freq_bin, 240);
         assert_eq!(candidates[0].sync_score, 20.0);
         assert_eq!(candidates[1].freq_bin, 300);
+    }
+
+    #[test]
+    fn test_llr_normalization_scales_to_target_variance() {
+        // Create LLRs with known variance
+        let mut llrs = vec![0.0f32; 174];
+        for (i, llr) in llrs.iter_mut().enumerate() {
+            // Create a pattern with variance != 24.0
+            *llr = if i % 2 == 0 { 2.0 } else { -2.0 };
+        }
+
+        // Original variance should be ~4.0
+        let orig_var = compute_variance(&llrs);
+        assert!((orig_var - 4.0).abs() < 0.1, "Expected variance ~4.0, got {}", orig_var);
+
+        // Normalize
+        normalize_llrs(&mut llrs);
+
+        // After normalization, variance should be ~24.0
+        let norm_var = compute_variance(&llrs);
+        assert!((norm_var - LLR_TARGET_VARIANCE).abs() < 0.1,
+            "Expected variance ~{}, got {}", LLR_TARGET_VARIANCE, norm_var);
+    }
+
+    #[test]
+    fn test_llr_normalization_preserves_sign() {
+        let mut llrs = vec![0.0f32; 174];
+        for (i, llr) in llrs.iter_mut().enumerate() {
+            *llr = if i % 3 == 0 { 5.0 } else if i % 3 == 1 { -3.0 } else { 1.0 };
+        }
+
+        let signs: Vec<bool> = llrs.iter().map(|&x| x > 0.0).collect();
+        normalize_llrs(&mut llrs);
+        let new_signs: Vec<bool> = llrs.iter().map(|&x| x > 0.0).collect();
+        assert_eq!(signs, new_signs, "Normalization should preserve LLR signs");
+    }
+
+    #[test]
+    fn test_llr_normalization_zero_variance() {
+        // All same values: variance = 0, should not crash
+        let mut llrs = vec![3.0f32; 174];
+        normalize_llrs(&mut llrs);
+        // Should be unchanged (no scaling possible)
+        assert_eq!(llrs[0], 3.0);
+    }
+
+    #[test]
+    fn test_freq_osr_produces_sub_bins() {
+        let config = Ft8Config::default();
+        let decoder = Ft8Decoder::new(config).unwrap();
+
+        // Generate a tone at 1503.125 Hz (between 240th and 241st 6.25 Hz bins)
+        // This should show up strongly in freq_sub=1 at bin 240
+        let freq = 1503.125; // = 240 * 6.25 + 3.125
+        let mut audio = vec![0.0f64; WINDOW_SAMPLES];
+        for i in 0..audio.len() {
+            let t = i as f64 / SAMPLE_RATE as f64;
+            audio[i] = (2.0 * PI * freq * t).sin() * 0.5;
+        }
+
+        let spec = decoder.compute_spectrogram(&audio).unwrap();
+        assert_eq!(spec.freq_osr, 2);
+
+        let mid = spec.num_steps / 2;
+        let bin = 240;
+
+        // The signal should appear in freq_sub=1 at bin 240 (since 1503.125 = 240*6.25 + 3.125)
+        // Spectrogram values are in dB
+        let db_sub0 = spec.power[mid][0][bin];
+        let db_sub1 = spec.power[mid][1][bin];
+
+        // freq_sub=1 should have stronger signal (higher dB) for a tone at bin+0.5
+        assert!(db_sub1 > db_sub0 + 3.0,
+            "freq_sub=1 dB ({:.2}) should be > freq_sub=0 dB ({:.2}) + 3 for half-bin tone",
+            db_sub1, db_sub0);
+    }
+
+    /// Helper to compute variance of a slice
+    fn compute_variance(values: &[f32]) -> f32 {
+        let n = values.len() as f32;
+        let sum: f32 = values.iter().sum();
+        let sum2: f32 = values.iter().map(|&x| x * x).sum();
+        (sum2 - sum * sum / n) / n
     }
 }

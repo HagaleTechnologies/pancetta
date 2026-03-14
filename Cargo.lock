@@ -2763,6 +2763,7 @@ dependencies = [
  "dirs",
  "flume",
  "futures",
+ "hound",
  "metrics",
  "metrics-exporter-prometheus",
  "num_cpus",

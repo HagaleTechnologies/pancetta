@@ -663,7 +663,8 @@ impl Default for DxClusterClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+    use chrono::Timelike;
+
     #[test]
     fn test_client_creation() {
         let client = DxClusterClient::new();
@@ -686,8 +687,8 @@ mod tests {
     #[test]
     fn test_time_parsing() {
         let time = DxClusterClient::parse_cluster_time("1234Z").unwrap();
-        assert_eq!(time.time().hour(), 12);
-        assert_eq!(time.time().minute(), 34);
+        assert_eq!(chrono::Timelike::hour(&time.time()), 12);
+        assert_eq!(chrono::Timelike::minute(&time.time()), 34);
         
         assert!(DxClusterClient::parse_cluster_time("2560Z").is_none()); // Invalid hour
         assert!(DxClusterClient::parse_cluster_time("1234").is_none());  // Missing Z

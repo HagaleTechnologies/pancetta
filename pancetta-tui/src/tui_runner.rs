@@ -211,7 +211,7 @@ impl TuiRunner {
         
         match message {
             TuiMessage::DecodedMessage(decoded) => {
-                app.add_decoded_message(decoded);
+                let _ = app.add_decoded_message(decoded).await;
             }
             TuiMessage::FrequencyUpdate { vfo: _, frequency } => {
                 app.update_frequency(frequency);

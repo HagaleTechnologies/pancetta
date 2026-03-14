@@ -9,6 +9,10 @@ repository = "https://github.com/pancetta-team/pancetta"
 keywords = ["amateur-radio", "ft8", "dsp", "real-time", "ham-radio"]
 categories = ["science", "multimedia::audio", "network-programming"]
 
+[lib]
+name = "pancetta_lib"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pancetta"
 path = "src/main.rs"
@@ -20,7 +24,7 @@ pancetta-dsp = { path = "../pancetta-dsp" }
 pancetta-ft8 = { path = "../pancetta-ft8" }
 pancetta-tui = { path = "../pancetta-tui" }
 pancetta-config = { path = "../pancetta-config" }
-pancetta-hamlib = { path = "../pancetta-hamlib" }
+pancetta-hamlib = { path = "../pancetta-hamlib", optional = true }
 pancetta-qso = { path = "../pancetta-qso" }
 pancetta-dx = { path = "../pancetta-dx" }
 
@@ -66,6 +70,9 @@ signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 # Performance monitoring
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", optional = true }
+
+# WAV file reading for playback mode
+hound = "3.5"
 
 [dev-dependencies]
 tempfile = "3.0"

@@ -39,9 +39,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 mod logging;
 
-use pancetta::coordinator::ApplicationCoordinator;
-use pancetta::runtime::PancettaRuntime;
-use pancetta::runtime;
+use pancetta_lib::coordinator::ApplicationCoordinator;
+use pancetta_lib::runtime::{PancettaRuntime, RuntimeConfig};
 
 /// Pancetta - High-Performance Amateur Radio FT8 Processing Application
 #[derive(Clone, Parser)]
@@ -102,6 +101,10 @@ struct Cli {
     /// Disable TUI (run in headless mode)
     #[arg(long, global = true)]
     headless: bool,
+
+    /// WAV file to decode (enables playback mode — decodes and exits)
+    #[arg(long, global = true)]
+    wav: Option<PathBuf>,
 
     /// Enable metrics collection
     #[arg(long, global = true)]
@@ -282,7 +285,7 @@ async fn run_application(cli: Cli) -> Result<()> {
     });
 
     // Create runtime with optimized settings
-    let runtime_config = runtime::RuntimeConfig {
+    let runtime_config = RuntimeConfig {
         worker_threads: num_cpus::get(),
         enable_io: true,
         enable_time: true,
@@ -305,6 +308,7 @@ async fn run_application(cli: Cli) -> Result<()> {
         cli.headless,
         cli.metrics,
         cli.metrics_port,
+        cli.wav,
         shutdown.clone(),
     ).await?;
 
