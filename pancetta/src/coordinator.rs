@@ -195,6 +195,7 @@ impl ApplicationCoordinator {
         self.start_transmitter_component().await?;
         self.start_autonomous_component().await?;
         self.start_dx_cluster_component().await?;
+        self.start_pskreporter_component().await?;
 
         // Start coordinator tasks
         self.start_coordinator_tasks().await?;
@@ -690,11 +691,22 @@ impl ApplicationCoordinator {
                                     let qso_msg = ComponentMessage::new(
                                         ComponentId::Ft8Decoder,
                                         ComponentId::Qso,
-                                        MessageType::DecodedMessage(decoded_msg),
+                                        MessageType::DecodedMessage(decoded_msg.clone()),
                                         Instant::now(),
                                     );
                                     if let Err(e) = message_bus.send_message(qso_msg).await {
                                         debug!("Failed to send to QSO: {}", e);
+                                    }
+
+                                    // Send to PSKReporter for spot upload
+                                    let psk_msg = ComponentMessage::new(
+                                        ComponentId::Ft8Decoder,
+                                        ComponentId::PskReporter,
+                                        MessageType::DecodedMessage(decoded_msg),
+                                        Instant::now(),
+                                    );
+                                    if let Err(e) = message_bus.send_message(psk_msg).await {
+                                        debug!("Failed to send to PSKReporter: {}", e);
                                     }
                                 }
                             }
@@ -1355,6 +1367,124 @@ impl ApplicationCoordinator {
 
         self.task_handles.push(dx_handle);
         info!("DX cluster component started");
+        Ok(())
+    }
+
+    /// Start PSKReporter upload component
+    ///
+    /// Receives decoded FT8 messages, batches them, and uploads to PSKReporter
+    /// at the configured interval (default: 5 minutes).
+    async fn start_pskreporter_component(&mut self) -> Result<()> {
+        let config = self.config.read().await;
+        if !config.network.psk_reporter.enabled {
+            info!("PSKReporter upload disabled in configuration");
+            drop(config);
+            let _ = self.message_bus.create_channel(ComponentId::PskReporter).await?;
+            return Ok(());
+        }
+
+        let our_callsign = config.station.callsign.clone();
+        let our_grid = config.station.grid_square.clone();
+        let upload_interval = config.network.psk_reporter.upload_interval_seconds;
+        let antenna = config.network.psk_reporter.reporter_info.antenna_info
+            .clone()
+            .unwrap_or_default();
+        let software = format!(
+            "{}/{}",
+            config.network.psk_reporter.reporter_info.software_name,
+            config.network.psk_reporter.reporter_info.software_version
+        );
+        drop(config);
+
+        info!("Starting PSKReporter upload component (interval: {}s)", upload_interval);
+
+        let (_psk_tx, psk_rx) = self.message_bus.create_channel(ComponentId::PskReporter).await?;
+
+        let psk_handle = {
+            let shutdown = self.shutdown_signal.clone();
+
+            tokio::spawn(async move {
+                use pancetta_dx::pskreporter::{
+                    PskReporterUploader, PskReporterUploadConfig, ReceptionReport,
+                };
+
+                let upload_config = PskReporterUploadConfig {
+                    reporter_callsign: our_callsign,
+                    reporter_grid: our_grid,
+                    antenna,
+                    software,
+                    upload_interval_secs: upload_interval,
+                    ..Default::default()
+                };
+
+                let mut uploader = PskReporterUploader::new(upload_config);
+                let mut upload_timer = interval(Duration::from_secs(upload_interval));
+
+                while !shutdown.load(Ordering::Relaxed) {
+                    // Drain incoming decoded messages
+                    loop {
+                        match psk_rx.try_recv() {
+                            Ok(message) => {
+                                if let MessageType::DecodedMessage(ref decoded_msg) = message.message_type {
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs() as i64;
+
+                                    if let Some(ref callsign) = decoded_msg.message.from_callsign {
+                                        uploader.add_report(ReceptionReport {
+                                            tx_callsign: callsign.clone(),
+                                            frequency: decoded_msg.frequency_offset as u64,
+                                            snr: Some(decoded_msg.snr_db as i32),
+                                            mode: "FT8".to_string(),
+                                            tx_grid: decoded_msg.message.grid_square.clone(),
+                                            timestamp,
+                                        });
+                                    }
+                                }
+                            }
+                            Err(crossbeam_channel::TryRecvError::Empty) => break,
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                info!("PSKReporter channel disconnected");
+                                return Ok(());
+                            }
+                        }
+                    }
+
+                    // Check if it's time to upload
+                    tokio::select! {
+                        _ = upload_timer.tick() => {
+                            if uploader.pending_count() > 0 {
+                                match uploader.flush().await {
+                                    Ok(count) => {
+                                        info!("PSKReporter: uploaded {} spots", count);
+                                    }
+                                    Err(e) => {
+                                        warn!("PSKReporter upload failed: {}", e);
+                                    }
+                                }
+                            }
+                        }
+                        _ = sleep(Duration::from_millis(100)) => {
+                            // Short sleep to avoid busy-looping
+                        }
+                    }
+                }
+
+                // Flush remaining on shutdown
+                if uploader.pending_count() > 0 {
+                    if let Err(e) = uploader.flush().await {
+                        warn!("PSKReporter final flush failed: {}", e);
+                    }
+                }
+
+                info!("PSKReporter component stopped");
+                Ok(())
+            })
+        };
+
+        self.task_handles.push(psk_handle);
+        info!("PSKReporter component started");
         Ok(())
     }
 

@@ -541,6 +541,274 @@ impl Default for PskReporterClient {
     }
 }
 
+// =============================================================================
+// PSKReporter Upload (UDP binary protocol, IPFIX-based)
+// =============================================================================
+
+/// A reception report to upload to PSKReporter
+#[derive(Debug, Clone)]
+pub struct ReceptionReport {
+    /// Transmitter callsign (the station we heard)
+    pub tx_callsign: String,
+    /// Frequency in Hz
+    pub frequency: u64,
+    /// SNR in dB (optional)
+    pub snr: Option<i32>,
+    /// Mode string (e.g., "FT8")
+    pub mode: String,
+    /// Transmitter grid square (if known)
+    pub tx_grid: Option<String>,
+    /// Time of reception (Unix timestamp)
+    pub timestamp: i64,
+}
+
+/// Configuration for PSKReporter upload
+#[derive(Debug, Clone)]
+pub struct PskReporterUploadConfig {
+    /// Reporter callsign (our station)
+    pub reporter_callsign: String,
+    /// Reporter grid square
+    pub reporter_grid: String,
+    /// Antenna description
+    pub antenna: String,
+    /// Software name and version
+    pub software: String,
+    /// Upload server hostname
+    pub server: String,
+    /// Upload server port
+    pub port: u16,
+    /// Minimum interval between uploads (seconds)
+    pub upload_interval_secs: u64,
+}
+
+impl Default for PskReporterUploadConfig {
+    fn default() -> Self {
+        Self {
+            reporter_callsign: String::new(),
+            reporter_grid: String::new(),
+            antenna: String::new(),
+            software: "Pancetta/0.1".to_string(),
+            server: "report.pskreporter.info".to_string(),
+            port: 4739,
+            upload_interval_secs: 300, // 5 minutes per PSKReporter guidelines
+        }
+    }
+}
+
+/// PSKReporter uploader that batches and sends reception reports
+pub struct PskReporterUploader {
+    config: PskReporterUploadConfig,
+    /// Pending reports to be uploaded
+    pending_reports: Vec<ReceptionReport>,
+    /// Random identifier for this session
+    session_id: u32,
+    /// Sequence number for packets
+    sequence_number: u32,
+}
+
+impl PskReporterUploader {
+    /// Create a new uploader with the given configuration
+    pub fn new(config: PskReporterUploadConfig) -> Self {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        std::time::SystemTime::now().hash(&mut hasher);
+        let session_id = hasher.finish() as u32;
+
+        Self {
+            config,
+            pending_reports: Vec::new(),
+            session_id,
+            sequence_number: 0,
+        }
+    }
+
+    /// Add a reception report to the upload queue
+    pub fn add_report(&mut self, report: ReceptionReport) {
+        self.pending_reports.push(report);
+    }
+
+    /// Get number of pending reports
+    pub fn pending_count(&self) -> usize {
+        self.pending_reports.len()
+    }
+
+    /// Build the binary UDP packet for PSKReporter
+    ///
+    /// PSKReporter uses an IPFIX-inspired binary format:
+    /// - Header (16 bytes): version, length, export time, sequence, observation domain
+    /// - Sender descriptor (template record describing sender info fields)
+    /// - Receiver descriptor (template record describing reception report fields)
+    /// - Sender data (our station info)
+    /// - Receiver data (the spots we're reporting)
+    fn build_packet(&mut self) -> Vec<u8> {
+        let mut packet = Vec::with_capacity(1024);
+
+        // We'll fill in the header length later
+        let header_pos = packet.len();
+        // IPFIX header: version=10, length=TBD, export_time, seq, observation_domain_id
+        packet.extend_from_slice(&0x000Au16.to_be_bytes()); // Version 10
+        packet.extend_from_slice(&0u16.to_be_bytes());      // Length placeholder
+        let export_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as u32;
+        packet.extend_from_slice(&export_time.to_be_bytes());
+        packet.extend_from_slice(&self.sequence_number.to_be_bytes());
+        packet.extend_from_slice(&self.session_id.to_be_bytes());
+
+        // --- Sender information descriptor (Template Set, ID=2) ---
+        // Template Set header: Set ID=2, Length
+        let sender_desc_start = packet.len();
+        packet.extend_from_slice(&2u16.to_be_bytes()); // Set ID for template
+        packet.extend_from_slice(&0u16.to_be_bytes()); // Length placeholder
+        // Template Record: ID=0x5002, field count=4
+        packet.extend_from_slice(&0x5002u16.to_be_bytes()); // Template ID
+        packet.extend_from_slice(&4u16.to_be_bytes());      // Field count
+        // Field: senderCallsign (ID=1, PEN=30351, variable length)
+        packet.extend_from_slice(&(0x8001u16).to_be_bytes()); // Enterprise bit + ID 1
+        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());   // Variable length
+        packet.extend_from_slice(&30351u32.to_be_bytes());     // IANA PEN for PSKReporter
+        // Field: senderLocator (ID=3, PEN=30351, variable length)
+        packet.extend_from_slice(&(0x8003u16).to_be_bytes());
+        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        packet.extend_from_slice(&30351u32.to_be_bytes());
+        // Field: decoderSoftware (ID=4, PEN=30351, variable length)
+        packet.extend_from_slice(&(0x8004u16).to_be_bytes());
+        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        packet.extend_from_slice(&30351u32.to_be_bytes());
+        // Field: antennaInformation (ID=5, PEN=30351, variable length)
+        packet.extend_from_slice(&(0x8005u16).to_be_bytes());
+        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        packet.extend_from_slice(&30351u32.to_be_bytes());
+        // Patch sender descriptor length
+        let sender_desc_len = (packet.len() - sender_desc_start) as u16;
+        packet[sender_desc_start + 2..sender_desc_start + 4]
+            .copy_from_slice(&sender_desc_len.to_be_bytes());
+
+        // --- Receiver information descriptor (Template Set, ID=2) ---
+        let rx_desc_start = packet.len();
+        packet.extend_from_slice(&2u16.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes()); // Length placeholder
+        // Template Record: ID=0x5003, field count=5
+        packet.extend_from_slice(&0x5003u16.to_be_bytes());
+        packet.extend_from_slice(&5u16.to_be_bytes());
+        // Field: senderCallsign (reused ID=1, PEN=30351, variable length)
+        packet.extend_from_slice(&(0x8001u16).to_be_bytes());
+        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        packet.extend_from_slice(&30351u32.to_be_bytes());
+        // Field: frequency (ID=2, PEN=30351, 4 bytes)
+        packet.extend_from_slice(&(0x8002u16).to_be_bytes());
+        packet.extend_from_slice(&4u16.to_be_bytes());
+        packet.extend_from_slice(&30351u32.to_be_bytes());
+        // Field: sNR (ID=6, PEN=30351, 1 byte)
+        packet.extend_from_slice(&(0x8006u16).to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&30351u32.to_be_bytes());
+        // Field: mode (ID=10, PEN=30351, variable length)
+        packet.extend_from_slice(&(0x800Au16).to_be_bytes());
+        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        packet.extend_from_slice(&30351u32.to_be_bytes());
+        // Field: flowStartSeconds (ID=150, standard IPFIX, 4 bytes)
+        packet.extend_from_slice(&150u16.to_be_bytes());
+        packet.extend_from_slice(&4u16.to_be_bytes());
+        // Patch receiver descriptor length
+        let rx_desc_len = (packet.len() - rx_desc_start) as u16;
+        packet[rx_desc_start + 2..rx_desc_start + 4]
+            .copy_from_slice(&rx_desc_len.to_be_bytes());
+
+        // --- Sender data record (Data Set, ID=0x5002) ---
+        let sender_data_start = packet.len();
+        packet.extend_from_slice(&0x5002u16.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes()); // Length placeholder
+        // Variable-length encoding: length byte + data
+        Self::write_variable_field(&mut packet, self.config.reporter_callsign.as_bytes());
+        Self::write_variable_field(&mut packet, self.config.reporter_grid.as_bytes());
+        Self::write_variable_field(&mut packet, self.config.software.as_bytes());
+        Self::write_variable_field(&mut packet, self.config.antenna.as_bytes());
+        // Patch sender data length
+        let sender_data_len = (packet.len() - sender_data_start) as u16;
+        packet[sender_data_start + 2..sender_data_start + 4]
+            .copy_from_slice(&sender_data_len.to_be_bytes());
+
+        // --- Receiver data records (Data Set, ID=0x5003) ---
+        let rx_data_start = packet.len();
+        packet.extend_from_slice(&0x5003u16.to_be_bytes());
+        packet.extend_from_slice(&0u16.to_be_bytes()); // Length placeholder
+
+        for report in &self.pending_reports {
+            // senderCallsign (variable)
+            Self::write_variable_field(&mut packet, report.tx_callsign.as_bytes());
+            // frequency (4 bytes, u32)
+            packet.extend_from_slice(&(report.frequency as u32).to_be_bytes());
+            // SNR (1 byte, signed)
+            packet.push(report.snr.unwrap_or(0) as u8);
+            // mode (variable)
+            Self::write_variable_field(&mut packet, report.mode.as_bytes());
+            // flowStartSeconds (4 bytes, u32)
+            packet.extend_from_slice(&(report.timestamp as u32).to_be_bytes());
+        }
+
+        // Patch receiver data length
+        let rx_data_len = (packet.len() - rx_data_start) as u16;
+        packet[rx_data_start + 2..rx_data_start + 4]
+            .copy_from_slice(&rx_data_len.to_be_bytes());
+
+        // Patch total packet length in header
+        let total_len = packet.len() as u16;
+        packet[header_pos + 2..header_pos + 4]
+            .copy_from_slice(&total_len.to_be_bytes());
+
+        self.sequence_number += 1;
+        packet
+    }
+
+    /// Write a variable-length field: 1-byte length + data (for fields < 255 bytes)
+    fn write_variable_field(packet: &mut Vec<u8>, data: &[u8]) {
+        let len = data.len().min(254) as u8;
+        packet.push(len);
+        packet.extend_from_slice(&data[..len as usize]);
+    }
+
+    /// Send all pending reports to PSKReporter
+    ///
+    /// Returns the number of reports sent, or an error.
+    pub async fn flush(&mut self) -> Result<usize> {
+        if self.pending_reports.is_empty() {
+            return Ok(0);
+        }
+
+        if self.config.reporter_callsign.is_empty() {
+            return Err(DxError::Configuration(
+                "Reporter callsign must be set for PSKReporter upload".to_string(),
+            ));
+        }
+
+        let count = self.pending_reports.len();
+        let packet = self.build_packet();
+
+        info!(
+            "Uploading {} reception reports to PSKReporter ({} bytes)",
+            count,
+            packet.len()
+        );
+
+        let addr = format!("{}:{}", self.config.server, self.config.port);
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .map_err(|e| DxError::Io(e))?;
+
+        socket
+            .send_to(&packet, &addr)
+            .await
+            .map_err(|e| DxError::Io(e))?;
+
+        info!("Successfully uploaded {} reports to PSKReporter", count);
+        self.pending_reports.clear();
+        Ok(count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,5 +906,147 @@ mod tests {
         assert_eq!(dx_spot.grid_square, Some("FN42".to_string()));
         assert!(dx_spot.comment.is_some());
         assert!(dx_spot.comment.unwrap().contains("SNR: -5"));
+    }
+
+    // =========================================================================
+    // PSKReporter Uploader tests
+    // =========================================================================
+
+    #[test]
+    fn test_uploader_creation() {
+        let config = PskReporterUploadConfig {
+            reporter_callsign: "W1ABC".to_string(),
+            reporter_grid: "FN42".to_string(),
+            ..Default::default()
+        };
+        let uploader = PskReporterUploader::new(config);
+        assert_eq!(uploader.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_uploader_add_report() {
+        let config = PskReporterUploadConfig {
+            reporter_callsign: "W1ABC".to_string(),
+            reporter_grid: "FN42".to_string(),
+            ..Default::default()
+        };
+        let mut uploader = PskReporterUploader::new(config);
+
+        uploader.add_report(ReceptionReport {
+            tx_callsign: "VE3XYZ".to_string(),
+            frequency: 14_074_000,
+            snr: Some(-12),
+            mode: "FT8".to_string(),
+            tx_grid: Some("FN03".to_string()),
+            timestamp: 1600000000,
+        });
+
+        assert_eq!(uploader.pending_count(), 1);
+    }
+
+    #[test]
+    fn test_uploader_build_packet_structure() {
+        let config = PskReporterUploadConfig {
+            reporter_callsign: "W1ABC".to_string(),
+            reporter_grid: "FN42".to_string(),
+            antenna: "Dipole".to_string(),
+            software: "Pancetta/0.1".to_string(),
+            ..Default::default()
+        };
+        let mut uploader = PskReporterUploader::new(config);
+
+        uploader.add_report(ReceptionReport {
+            tx_callsign: "K1DEF".to_string(),
+            frequency: 14_074_000,
+            snr: Some(-5),
+            mode: "FT8".to_string(),
+            tx_grid: None,
+            timestamp: 1600000000,
+        });
+
+        let packet = uploader.build_packet();
+
+        // Verify IPFIX header
+        assert_eq!(packet[0], 0x00); // Version high byte
+        assert_eq!(packet[1], 0x0A); // Version low byte = 10
+
+        // Verify total length matches
+        let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+        assert_eq!(total_len, packet.len());
+
+        // Verify packet is reasonable size (header + descriptors + data)
+        assert!(packet.len() > 16, "Packet should be larger than just header");
+        assert!(packet.len() < 2000, "Packet should be under 2KB for single report");
+
+        // Verify pending reports were cleared by sequence increment
+        assert_eq!(uploader.sequence_number, 1);
+    }
+
+    #[test]
+    fn test_uploader_multiple_reports() {
+        let config = PskReporterUploadConfig {
+            reporter_callsign: "W1ABC".to_string(),
+            reporter_grid: "FN42".to_string(),
+            ..Default::default()
+        };
+        let mut uploader = PskReporterUploader::new(config);
+
+        for i in 0..5 {
+            uploader.add_report(ReceptionReport {
+                tx_callsign: format!("K{}DEF", i),
+                frequency: 14_074_000 + i as u64 * 100,
+                snr: Some(-10 + i as i32),
+                mode: "FT8".to_string(),
+                tx_grid: None,
+                timestamp: 1600000000 + i as i64 * 15,
+            });
+        }
+
+        assert_eq!(uploader.pending_count(), 5);
+
+        let packet = uploader.build_packet();
+        // Multiple reports should produce a larger packet
+        assert!(packet.len() > 100);
+    }
+
+    #[test]
+    fn test_variable_field_encoding() {
+        let mut buf = Vec::new();
+        PskReporterUploader::write_variable_field(&mut buf, b"W1ABC");
+        assert_eq!(buf[0], 5); // length
+        assert_eq!(&buf[1..6], b"W1ABC");
+    }
+
+    #[tokio::test]
+    async fn test_uploader_flush_empty() {
+        let config = PskReporterUploadConfig {
+            reporter_callsign: "W1ABC".to_string(),
+            reporter_grid: "FN42".to_string(),
+            ..Default::default()
+        };
+        let mut uploader = PskReporterUploader::new(config);
+
+        // Flushing with no reports should return Ok(0)
+        let result = uploader.flush().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_uploader_flush_no_callsign() {
+        let config = PskReporterUploadConfig::default(); // Empty callsign
+        let mut uploader = PskReporterUploader::new(config);
+        uploader.add_report(ReceptionReport {
+            tx_callsign: "K1DEF".to_string(),
+            frequency: 14_074_000,
+            snr: Some(-5),
+            mode: "FT8".to_string(),
+            tx_grid: None,
+            timestamp: 1600000000,
+        });
+
+        // Should fail because reporter callsign is empty
+        let result = uploader.flush().await;
+        assert!(result.is_err());
     }
 }

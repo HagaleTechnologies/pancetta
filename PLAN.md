@@ -77,11 +77,13 @@ _Created 2026-03-13. Execution order: Phase 0B → Phase 1A + Phase 1B in parall
 - [ ] Real waterfall display (scrolling spectrogram) — deferred
 - [x] Logging to file with rotation (daily rotation to ~/.pancetta/logs/)
 
-### Phase 5B — Advanced Features
-- [ ] Hamlib rig control (rigctld TCP, frequency sync, PTT)
-- [ ] DX cluster integration, DXCC highlighting
-- [ ] PSK Reporter upload
-- [ ] Band hopping, contest mode
+### Phase 5B — Advanced Features — PARTIAL (2026-03-14)
+- [x] Hamlib rig control (rigctld TCP, frequency polling, PTT, mock rig fallback)
+- [x] DX cluster integration (spot monitoring, forwarding to TUI)
+- [ ] DXCC highlighting — deferred (needs entity database)
+- [x] PSK Reporter spot upload (UDP binary IPFIX protocol, batched every 5 min)
+- [ ] Band hopping runtime loop — deferred (config + strategies exist, needs coordinator integration)
+- [ ] Contest mode — deferred
 
 ---
 

@@ -53,6 +53,8 @@ pub enum ComponentId {
     Ft8Transmitter,
     /// Autonomous operator
     Autonomous,
+    /// PSKReporter upload
+    PskReporter,
 }
 
 impl std::fmt::Display for ComponentId {
@@ -69,6 +71,7 @@ impl std::fmt::Display for ComponentId {
             ComponentId::DxCluster => write!(f, "DXCluster"),
             ComponentId::Ft8Transmitter => write!(f, "FT8Transmitter"),
             ComponentId::Autonomous => write!(f, "Autonomous"),
+            ComponentId::PskReporter => write!(f, "PSKReporter"),
         }
     }
 }
