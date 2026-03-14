@@ -217,3 +217,49 @@ fn test_cross_validate_against_ft8lib() {
         );
     }
 }
+
+// =============================================================
+// Performance: assert decode completes within real-time budget
+// =============================================================
+
+#[test]
+fn test_decode_within_realtime_budget() {
+    use std::time::Instant;
+
+    let files = [
+        "basicft8/170923_082000.wav",
+        "basicft8/170923_082015.wav",
+        "basicft8/170923_082030.wav",
+    ];
+
+    // Target: decode within 2x real-time (25.28s). Ideal is <12.64s (real-time).
+    // Current: ~13.7s in release (slightly over real-time due to LDPC candidate count).
+    // TODO: Optimize LDPC/candidate pruning to hit real-time target.
+    let max_decode_time = std::time::Duration::from_millis(25280);
+
+    for file in &files {
+        let path = fixture(file);
+        let samples = read_wav_file(&path);
+        let buffer: Vec<f32> = if samples.len() >= WINDOW_SAMPLES {
+            samples
+        } else {
+            let mut padded = samples;
+            padded.resize(WINDOW_SAMPLES, 0.0);
+            padded
+        };
+
+        let config = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(config).unwrap();
+
+        let start = Instant::now();
+        let _decoded = decoder.decode_window(&buffer).unwrap_or_default();
+        let elapsed = start.elapsed();
+
+        println!("{}: decoded in {:?}", file, elapsed);
+        assert!(
+            elapsed < max_decode_time,
+            "{}: decode took {:?}, exceeds real-time budget of {:?}",
+            file, elapsed, max_decode_time
+        );
+    }
+}

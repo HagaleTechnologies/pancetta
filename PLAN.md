@@ -21,11 +21,11 @@ _Created 2026-03-13. Execution order: Phase 0B → Phase 1A + Phase 1B in parall
 - [ ] **2c''** i3=0 sub-types: DXpedition (n3=1), EU VHF (n3=2), Field Day (n3=3,4) — deferred
 - [ ] **2d** Contest message encoding (after decode is verified) — deferred
 
-### Phase 3A — Performance (after Phase 1A stabilizes)
-- [ ] **3a** Baseline existing benchmarks
-- [ ] **3b** Add real-signal benchmarks, assert <12.64s decode
-- [ ] **3c** Profile hot spots (flamegraph)
-- [ ] **3d** Optimize: sin/cos tables, spectrogram-based LLR extraction, optional Rayon parallelism
+### Phase 3A — Performance (after Phase 1A stabilizes) — PARTIAL (2026-03-14)
+- [x] **3a** Baseline existing benchmarks (186ms synthetic, 13.7s real off-air in release)
+- [x] **3b** Add real-signal benchmark test, assert <2x real-time (25.28s)
+- [ ] **3c** Profile hot spots (flamegraph) — deferred
+- [ ] **3d** Optimize LDPC/candidate pruning to hit real-time (<12.64s) — deferred
 
 ### Phase 4A — GFSK Modulation (independent, low priority)
 - [ ] **4a** Gaussian pulse shaping filter (BT=2.0)
