@@ -82,6 +82,8 @@ pub enum TuiCommand {
     SendMessage { text: String },
     /// Toggle PTT
     TogglePtt,
+    /// Call a station (click-to-call from band activity)
+    CallStation { callsign: String, frequency: u64 },
     /// Clear decoded messages
     ClearMessages,
     /// Request status
@@ -295,8 +297,11 @@ impl TuiRunner {
                 self.message_tx.send(TuiCommand::TogglePtt)?;
             }
             
-            // Space - Select/activate
+            // Space - Select/activate (click-to-call)
             KeyCode::Char(' ') => {
+                if let Some((callsign, frequency)) = app.get_selected_station() {
+                    self.message_tx.send(TuiCommand::CallStation { callsign, frequency })?;
+                }
                 app.activate_selected();
             }
             

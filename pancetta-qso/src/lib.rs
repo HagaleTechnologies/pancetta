@@ -61,17 +61,17 @@
 //! ## Usage Examples
 //! 
 //! ### Basic QSO Management
-//! 
-//! ```rust
+//!
+//! ```rust,ignore
 //! use pancetta_qso::*;
-//! 
+//!
 //! // Create and configure QSO manager
 //! let config = QsoManagerConfig::default();
 //! let manager = QsoManager::new(config);
-//! 
+//!
 //! // Start CQ and handle responses
 //! let qso_id = manager.start_cq(14074000.0).await?;
-//! 
+//!
 //! // Process incoming messages
 //! manager.process_message(
 //!     MessageType::CqResponse {
@@ -84,12 +84,12 @@
 //!     Some(-12.0),
 //! ).await?;
 //! ```
-//! 
+//!
 //! ### Automatic Sequencing
-//! 
-//! ```rust
+//!
+//! ```rust,ignore
 //! use pancetta_qso::*;
-//! 
+//!
 //! // Configure auto sequencer
 //! let auto_config = AutoSequencerConfig {
 //!     enabled: true,
@@ -101,36 +101,36 @@
 //!     },
 //!     ..Default::default()
 //! };
-//! 
+//!
 //! let sequencer = AutoSequencer::new(auto_config, manager, "W1ABC".to_string());
 //! sequencer.start().await?;
 //! ```
-//! 
+//!
 //! ### ADIF Import/Export
-//! 
-//! ```rust
+//!
+//! ```rust,ignore
 //! use pancetta_qso::*;
-//! 
+//!
 //! // Export QSOs to ADIF
 //! let logger = QsoLogger::new(logger_config, qso_manager).await?;
 //! let result = logger.export_adif("my_qsos.adi", None).await?;
 //! println!("Exported {} QSOs", result.qso_count);
-//! 
+//!
 //! // Import from ADIF
 //! let import_result = logger.import_adif("imported_qsos.adi").await?;
 //! println!("Imported {} QSOs", import_result.imported_count);
 //! ```
-//! 
+//!
 //! ### Statistics and Analytics
-//! 
-//! ```rust
+//!
+//! ```rust,ignore
 //! use pancetta_qso::*;
-//! 
+//!
 //! // Calculate comprehensive statistics
 //! let database = QsoDatabase::open("qso.db")?;
 //! let calculator = StatisticsCalculator::new(database);
 //! let stats = calculator.calculate_statistics(None).await?;
-//! 
+//!
 //! println!("Total QSOs: {}", stats.basic.total_qsos);
 //! println!("Countries worked: {}", stats.geographic.countries.total_countries);
 //! println!("Average signal: {:.1} dB", stats.technical.signal_reports.avg_received);

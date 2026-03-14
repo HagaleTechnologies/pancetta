@@ -678,11 +678,22 @@ impl ApplicationCoordinator {
                                     let auto_msg = ComponentMessage::new(
                                         ComponentId::Ft8Decoder,
                                         ComponentId::Autonomous,
-                                        MessageType::DecodedMessage(decoded_msg),
+                                        MessageType::DecodedMessage(decoded_msg.clone()),
                                         Instant::now(),
                                     );
                                     if let Err(e) = message_bus.send_message(auto_msg).await {
                                         debug!("Failed to send to Autonomous: {}", e);
+                                    }
+
+                                    // Send to QSO manager for state tracking and logging
+                                    let qso_msg = ComponentMessage::new(
+                                        ComponentId::Ft8Decoder,
+                                        ComponentId::Qso,
+                                        MessageType::DecodedMessage(decoded_msg),
+                                        Instant::now(),
+                                    );
+                                    if let Err(e) = message_bus.send_message(qso_msg).await {
+                                        debug!("Failed to send to QSO: {}", e);
                                     }
                                 }
                             }
@@ -817,6 +828,21 @@ impl ApplicationCoordinator {
                                 );
                                 if let Err(e) = cmd_message_bus.send_message(msg).await {
                                     warn!("Failed to forward TUI command: {}", e);
+                                }
+                            }
+                            pancetta_tui::tui_runner::TuiCommand::CallStation { callsign, frequency } => {
+                                info!("TUI CallStation: {} at {} Hz", callsign, frequency);
+                                let msg = ComponentMessage::new(
+                                    ComponentId::Tui,
+                                    ComponentId::Qso,
+                                    MessageType::QsoMessage(crate::message_bus::QsoMessage::StartQso {
+                                        callsign,
+                                        frequency,
+                                    }),
+                                    Instant::now(),
+                                );
+                                if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                    warn!("Failed to forward CallStation command: {}", e);
                                 }
                             }
                             _ => {
@@ -1067,6 +1093,9 @@ impl ApplicationCoordinator {
     }
 
     /// Start QSO management component
+    ///
+    /// Wires decoded FT8 messages into the QSO manager for state tracking,
+    /// auto-logging to SQLite at `~/.pancetta/qso.db`, and duplicate detection.
     async fn start_qso_component(&mut self) -> Result<()> {
         let span = span!(Level::INFO, "start_qso");
         let _enter = span.enter();
@@ -1074,41 +1103,134 @@ impl ApplicationCoordinator {
         info!("Starting QSO component");
 
         let (_qso_tx, qso_rx) = self.message_bus.create_channel(ComponentId::Qso).await?;
+        let message_bus = self.message_bus.clone();
+
+        // Read station config for callsign/grid
+        let config = self.config.read().await;
+        let our_callsign = config.station.callsign.clone();
+        let our_grid = if config.station.grid_square.is_empty() {
+            None
+        } else {
+            Some(config.station.grid_square.clone())
+        };
+        drop(config);
 
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                use pancetta_qso::{QsoManager, QsoManagerConfig};
+                use pancetta_qso::{QsoManager, QsoManagerConfig, QsoLogger, LoggerConfig};
 
-                let config = QsoManagerConfig {
-                    our_callsign: "NOCALL".to_string(),
-                    our_grid: Some("FN42".to_string()),
+                let qso_config = QsoManagerConfig {
+                    our_callsign: our_callsign.clone(),
+                    our_grid: our_grid.clone(),
                     ..Default::default()
                 };
 
-                let qso_manager = QsoManager::new(config);
+                let qso_manager = QsoManager::new(qso_config);
                 if let Err(e) = qso_manager.start().await {
                     error!("Failed to start QSO manager: {}", e);
                     return Err(anyhow::anyhow!("QSO manager startup failed"));
                 }
 
+                // Initialize QSO logger with SQLite database at ~/.pancetta/qso.db
+                let db_path = dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".pancetta")
+                    .join("qso.db");
+                let logger_config = LoggerConfig {
+                    database_path: db_path.clone(),
+                    ..Default::default()
+                };
+
+                let logger = match QsoLogger::new(logger_config, qso_manager.clone()).await {
+                    Ok(l) => {
+                        info!("QSO logger initialized with database at {:?}", db_path);
+                        if let Err(e) = l.start().await {
+                            warn!("QSO logger background tasks failed to start: {}", e);
+                        }
+                        Some(l)
+                    }
+                    Err(e) => {
+                        warn!("Failed to initialize QSO logger (continuing without): {}", e);
+                        None
+                    }
+                };
+
+                info!("QSO component ready (callsign={}, grid={:?})", our_callsign, our_grid);
+
                 while !shutdown.load(Ordering::Relaxed) {
                     match qso_rx.try_recv() {
                         Ok(message) => {
-                            if let MessageType::QsoMessage(qso_msg) = message.message_type {
-                                match qso_msg {
-                                    crate::message_bus::QsoMessage::StartQso {
-                                        callsign,
-                                        frequency,
-                                    } => {
-                                        debug!("Starting QSO with {} on {}", callsign, frequency);
+                            match message.message_type {
+                                // Decoded FT8 messages forwarded from the decoder
+                                MessageType::DecodedMessage(ref decoded_msg) => {
+                                    let raw_text = decoded_msg.text.clone();
+                                    let frequency = decoded_msg.frequency_offset as f64;
+                                    let snr = decoded_msg.snr_db as f32;
+
+                                    // Parse the FT8 message to determine its type
+                                    match pancetta_qso::utils::parse_ft8_message(&raw_text, &our_callsign) {
+                                        Ok(msg_type) => {
+                                            if let Err(e) = qso_manager.process_message(
+                                                msg_type,
+                                                raw_text.clone(),
+                                                frequency,
+                                                Some(snr),
+                                            ).await {
+                                                debug!("QSO process_message error: {}", e);
+                                            }
+                                        }
+                                        Err(e) => {
+                                            debug!("Could not parse FT8 message '{}': {}", raw_text, e);
+                                        }
                                     }
-                                    crate::message_bus::QsoMessage::LogQso { qso_data } => {
-                                        debug!("Logging QSO: {}", qso_data);
-                                    }
-                                    _ => {}
                                 }
+
+                                // QSO control messages (start QSO, log, etc.)
+                                MessageType::QsoMessage(qso_msg) => {
+                                    match qso_msg {
+                                        crate::message_bus::QsoMessage::StartQso {
+                                            callsign,
+                                            frequency,
+                                        } => {
+                                            info!("Starting QSO with {} on {} Hz", callsign, frequency);
+                                            match qso_manager.respond_to_cq(
+                                                callsign.clone(),
+                                                frequency as f64,
+                                            ).await {
+                                                Ok(qso_id) => {
+                                                    info!("QSO started with {}: {}", callsign, qso_id);
+                                                    // Send grid reply as TX request
+                                                    let grid = our_grid.as_deref().unwrap_or("AA00");
+                                                    let reply = format!("{} {} {}", callsign, our_callsign, grid);
+                                                    let tx_msg = ComponentMessage::new(
+                                                        ComponentId::Qso,
+                                                        ComponentId::Ft8Transmitter,
+                                                        MessageType::TransmitRequest {
+                                                            message_text: reply,
+                                                            frequency_offset: frequency as f64,
+                                                            qso_id: Some(qso_id.to_string()),
+                                                        },
+                                                        Instant::now(),
+                                                    );
+                                                    if let Err(e) = message_bus.send_message(tx_msg).await {
+                                                        warn!("Failed to send QSO TX request: {}", e);
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to start QSO with {}: {}", callsign, e);
+                                                }
+                                            }
+                                        }
+                                        crate::message_bus::QsoMessage::LogQso { qso_data } => {
+                                            debug!("Manual log QSO: {}", qso_data);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                _ => {}
                             }
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {

@@ -62,12 +62,12 @@ _Created 2026-03-13. Execution order: Phase 0B → Phase 1A + Phase 1B in parall
 - [ ] PTT control via hamlib — deferred (needs hardware)
 - [ ] Audio output routing through `AudioManager` — deferred (needs audio output device)
 
-### Phase 3B — QSO Management (parallel with Phase 2B)
-- [ ] Connect `pancetta-qso` to coordinator (decoded msgs in, TX requests out)
-- [ ] Wire auto-sequencing (CQ → grid → report → RR73 → 73)
-- [ ] Click-to-call from TUI band activity
-- [ ] SQLite database init at `~/.pancetta/qso.db`, auto-logging
-- [ ] ADIF export, duplicate detection
+### Phase 3B — QSO Management (parallel with Phase 2B) — DONE (2026-03-14)
+- [x] Connect `pancetta-qso` to coordinator (decoded msgs in, TX requests out)
+- [ ] Wire auto-sequencing (CQ → grid → report → RR73 → 73) — deferred (auto-sequencer ~60% implemented)
+- [x] Click-to-call from TUI band activity
+- [x] SQLite database init at `~/.pancetta/qso.db`, auto-logging
+- [x] ADIF export, duplicate detection (already implemented in pancetta-qso crate)
 
 ### Phase 4B — Configuration & Polish
 - [ ] First-run setup wizard (callsign, grid, audio device)

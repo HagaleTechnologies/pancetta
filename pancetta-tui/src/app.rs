@@ -571,9 +571,27 @@ impl App {
         self.status_message = "Help not yet implemented".to_string();
     }
 
+    /// Get the callsign and frequency of the currently selected band activity entry.
+    pub fn get_selected_station(&self) -> Option<(String, u64)> {
+        if self.active_panel != ActivePanel::BandActivity {
+            return None;
+        }
+        let msg = self.decoded_messages.iter().nth(self.band_activity_scroll)?;
+        let callsign = msg.call_sign.as_ref()?;
+        if callsign.is_empty() {
+            return None;
+        }
+        // Convert MHz frequency to Hz for QSO manager
+        let freq_hz = (msg.frequency * 1_000_000.0) as u64 + msg.delta_freq as u64;
+        Some((callsign.clone(), freq_hz))
+    }
+
     pub fn activate_selected(&mut self) {
-        // TODO: Implement item activation
-        self.status_message = "Activation not yet implemented".to_string();
+        if let Some((callsign, _freq)) = self.get_selected_station() {
+            self.status_message = format!("Calling {}...", callsign);
+        } else {
+            self.status_message = "No station selected".to_string();
+        }
     }
 
     pub fn get_input_text(&self) -> String {

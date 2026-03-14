@@ -232,10 +232,14 @@ fn test_decode_within_realtime_budget() {
         "basicft8/170923_082030.wav",
     ];
 
-    // Target: decode within 2x real-time (25.28s). Ideal is <12.64s (real-time).
-    // Current: ~13.7s in release (slightly over real-time due to LDPC candidate count).
+    // In release mode: target 2x real-time (25.28s). In debug mode: allow 5x (63.2s).
+    // Current release: ~13.7s (slightly over real-time due to LDPC candidate count).
     // TODO: Optimize LDPC/candidate pruning to hit real-time target.
-    let max_decode_time = std::time::Duration::from_millis(25280);
+    let max_decode_time = if cfg!(debug_assertions) {
+        std::time::Duration::from_millis(63200) // 5x real-time for debug
+    } else {
+        std::time::Duration::from_millis(25280) // 2x real-time for release
+    };
 
     for file in &files {
         let path = fixture(file);
