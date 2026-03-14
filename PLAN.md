@@ -69,13 +69,13 @@ _Created 2026-03-13. Execution order: Phase 0B → Phase 1A + Phase 1B in parall
 - [x] SQLite database init at `~/.pancetta/qso.db`, auto-logging
 - [x] ADIF export, duplicate detection (already implemented in pancetta-qso crate)
 
-### Phase 4B — Configuration & Polish
-- [ ] First-run setup wizard (callsign, grid, audio device)
-- [ ] Hot-reload config via file watcher
-- [ ] Audio device selection UI
-- [ ] Error recovery (device disconnect, component crash restart)
-- [ ] Real waterfall display (scrolling spectrogram)
-- [ ] Logging to file with rotation
+### Phase 4B — Configuration & Polish — PARTIAL (2026-03-14)
+- [x] First-run setup wizard (callsign, grid, power; saves to ~/.pancetta/pancetta.toml)
+- [x] Hot-reload config via file watcher (already implemented in pancetta-config)
+- [ ] Audio device selection UI — deferred (needs cpal device enumeration)
+- [ ] Error recovery (device disconnect, component crash restart) — deferred
+- [ ] Real waterfall display (scrolling spectrogram) — deferred
+- [x] Logging to file with rotation (daily rotation to ~/.pancetta/logs/)
 
 ### Phase 5B — Advanced Features
 - [ ] Hamlib rig control (rigctld TCP, frequency sync, PTT)

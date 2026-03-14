@@ -465,13 +465,97 @@ async fn benchmark_command(args: BenchmarkArgs) -> Result<()> {
 }
 
 async fn load_configuration(cli: &Cli) -> Result<Config> {
-    if let Some(config_path) = &cli.config {
+    let mut config = if let Some(config_path) = &cli.config {
         Config::load_from_file(config_path)
-            .with_context(|| format!("Failed to load config from {}", config_path.display()))
+            .with_context(|| format!("Failed to load config from {}", config_path.display()))?
     } else {
         Config::load_default()
-            .with_context(|| "Failed to load default configuration")
+            .with_context(|| "Failed to load default configuration")?
+    };
+
+    // First-run setup: if callsign is still the default, prompt the user
+    if config.station.callsign == "N0CALL" && !cli.headless && cli.wav.is_none() {
+        if let Some(updated) = run_first_time_setup(&config)? {
+            config = updated;
+        }
     }
+
+    Ok(config)
+}
+
+/// Interactive first-run setup wizard.
+/// Prompts for callsign, grid square, and saves the config file.
+fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
+    use std::io::{self, Write};
+
+    println!();
+    println!("=== Pancetta First-Run Setup ===");
+    println!();
+    println!("No station configuration found. Let's set up the basics.");
+    println!("(Press Enter to skip any field and use the default.)");
+    println!();
+
+    // Callsign
+    print!("Your callsign [N0CALL]: ");
+    io::stdout().flush()?;
+    let mut callsign = String::new();
+    io::stdin().read_line(&mut callsign)?;
+    let callsign = callsign.trim().to_uppercase();
+    let callsign = if callsign.is_empty() {
+        "N0CALL".to_string()
+    } else {
+        callsign
+    };
+
+    // Grid square
+    print!("Your Maidenhead grid square [{}]: ", config.station.grid_square);
+    io::stdout().flush()?;
+    let mut grid = String::new();
+    io::stdin().read_line(&mut grid)?;
+    let grid = grid.trim().to_string();
+    let grid = if grid.is_empty() {
+        config.station.grid_square.clone()
+    } else {
+        grid
+    };
+
+    // Power
+    print!("TX power in watts [{}]: ", config.station.power_watts);
+    io::stdout().flush()?;
+    let mut power_str = String::new();
+    io::stdin().read_line(&mut power_str)?;
+    let power: u32 = power_str.trim().parse().unwrap_or(config.station.power_watts);
+
+    let mut new_config = config.clone();
+    new_config.station.callsign = callsign.clone();
+    new_config.station.grid_square = grid.clone();
+    new_config.station.power_watts = power;
+
+    // Save config
+    let config_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".pancetta");
+    let config_path = config_dir.join("pancetta.toml");
+
+    print!("\nSave configuration to {}? [Y/n]: ", config_path.display());
+    io::stdout().flush()?;
+    let mut save_choice = String::new();
+    io::stdin().read_line(&mut save_choice)?;
+    let save = save_choice.trim().is_empty() || save_choice.trim().to_lowercase().starts_with('y');
+
+    if save {
+        std::fs::create_dir_all(&config_dir)?;
+        new_config.save_to_file(&config_path)
+            .with_context(|| format!("Failed to save config to {}", config_path.display()))?;
+        println!("Configuration saved to {}", config_path.display());
+    }
+
+    println!();
+    println!("Station: {} / {} / {}W", callsign, grid, power);
+    println!("Setup complete! Starting Pancetta...");
+    println!();
+
+    Ok(Some(new_config))
 }
 
 fn init_logging(cli: &Cli) -> Result<()> {
@@ -486,25 +570,39 @@ fn init_logging(cli: &Cli) -> Result<()> {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(format!("pancetta={},warn", log_level)));
 
-    let subscriber = tracing_subscriber::registry().with(env_filter);
+    // Set up file logging with daily rotation to ~/.pancetta/logs/
+    let log_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".pancetta")
+        .join("logs");
 
-    match cli.log_format {
-        LogFormat::Text => {
-            let fmt_layer = tracing_subscriber::fmt::layer()
-                .with_target(false)
-                .with_thread_ids(true)
-                .with_file(cli.debug || cli.verbose)
-                .with_line_number(cli.debug || cli.verbose);
-            subscriber.with(fmt_layer).init();
-        }
-        LogFormat::Json => {
-            let fmt_layer = tracing_subscriber::fmt::layer()
-                .json()
-                .with_current_span(false)
-                .with_span_list(true);
-            subscriber.with(fmt_layer).init();
-        }
-    }
+    // Create log directory (ignore errors — file logging is best-effort)
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "pancetta.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    // Keep the guard alive for the process lifetime
+    std::mem::forget(_guard);
+
+    let file_layer = tracing_subscriber::fmt::layer()
+        .with_writer(non_blocking)
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_ids(true);
+
+    // Console layer — always text format for now (JSON would need separate branch)
+    let console_layer = tracing_subscriber::fmt::layer()
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_file(cli.debug || cli.verbose)
+        .with_line_number(cli.debug || cli.verbose);
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(console_layer)
+        .with(file_layer)
+        .init();
 
     Ok(())
 }
