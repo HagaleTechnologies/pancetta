@@ -131,6 +131,12 @@ pub struct App {
     // Autonomous operator
     pub autonomous_status: Option<AutonomousStatus>,
 
+    // TX input
+    pub tx_input_buffer: String,
+    pub tx_input_cursor: usize,
+    pub is_transmitting: bool,
+    pub tx_frequency_offset: f64,
+
     // Communication channels
     pub message_rx: Option<mpsc::UnboundedReceiver<DecodedMessage>>,
     pub audio_rx: Option<mpsc::UnboundedReceiver<Vec<f32>>>,
@@ -179,6 +185,10 @@ impl App {
             audio_level: 0.0,
             waterfall_data: Vec::new(),
             autonomous_status: None,
+            tx_input_buffer: String::new(),
+            tx_input_cursor: 0,
+            is_transmitting: false,
+            tx_frequency_offset: 1500.0,
             message_rx: None,
             audio_rx: None,
         };
@@ -567,21 +577,29 @@ impl App {
     }
 
     pub fn get_input_text(&self) -> String {
-        // TODO: Implement input text buffer
-        String::new()
+        self.tx_input_buffer.clone()
     }
 
     pub fn clear_input(&mut self) {
-        // TODO: Clear input buffer
+        self.tx_input_buffer.clear();
+        self.tx_input_cursor = 0;
     }
 
     pub fn input_char(&mut self, c: char) {
-        // TODO: Add character to input buffer
-        self.status_message = format!("Input: {}", c);
+        let c = c.to_ascii_uppercase();
+        if self.tx_input_buffer.len() < 13 {
+            self.tx_input_buffer.insert(self.tx_input_cursor, c);
+            self.tx_input_cursor += 1;
+            self.status_message = format!("TX: {}", self.tx_input_buffer);
+        }
     }
 
     pub fn delete_char(&mut self) {
-        // TODO: Delete character from input buffer
+        if self.tx_input_cursor > 0 {
+            self.tx_input_cursor -= 1;
+            self.tx_input_buffer.remove(self.tx_input_cursor);
+            self.status_message = format!("TX: {}", self.tx_input_buffer);
+        }
     }
 
     pub fn update_autonomous_status(&mut self, status: AutonomousStatus) {

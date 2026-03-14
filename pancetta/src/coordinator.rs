@@ -20,7 +20,7 @@ use anyhow::Result;
 use pancetta_audio::{AudioManager, AudioManagerConfig};
 use pancetta_config::Config;
 use pancetta_dsp::DspPipeline;
-use pancetta_ft8::{Ft8Decoder, Ft8Config};
+use pancetta_ft8::{Ft8Decoder, Ft8Config, Ft8Encoder, Ft8Modulator};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -795,6 +795,45 @@ impl ApplicationCoordinator {
         });
         self.task_handles.push(relay_handle);
 
+        // Task: relay TUI commands (e.g. SendMessage) to message bus as TransmitRequests
+        let cmd_shutdown = self.shutdown_signal.clone();
+        let cmd_message_bus = self.message_bus.clone();
+        let cmd_handle = tokio::spawn(async move {
+            while !cmd_shutdown.load(Ordering::Relaxed) {
+                match tui_cmd_rx.try_recv() {
+                    Ok(cmd) => {
+                        match cmd {
+                            pancetta_tui::tui_runner::TuiCommand::SendMessage { text } => {
+                                info!("TUI SendMessage: '{}'", text);
+                                let msg = ComponentMessage::new(
+                                    ComponentId::Tui,
+                                    ComponentId::Ft8Transmitter,
+                                    MessageType::TransmitRequest {
+                                        message_text: text,
+                                        frequency_offset: 1500.0,
+                                        qso_id: None,
+                                    },
+                                    Instant::now(),
+                                );
+                                if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                    warn!("Failed to forward TUI command: {}", e);
+                                }
+                            }
+                            _ => {
+                                debug!("Unhandled TUI command: {:?}", cmd);
+                            }
+                        }
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => {
+                        tokio::task::yield_now().await;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                }
+            }
+            Ok(())
+        });
+        self.task_handles.push(cmd_handle);
+
         // Run the TUI on a blocking task (it takes over the terminal)
         let tui_config_lock = config.read().await;
         let tui_config = pancetta_tui::Config {
@@ -1107,6 +1146,15 @@ impl ApplicationCoordinator {
             tokio::spawn(async move {
                 info!("FT8 transmitter component ready");
 
+                let mut encoder = Ft8Encoder::new();
+                let mut modulator = match Ft8Modulator::new_default() {
+                    Ok(m) => m,
+                    Err(e) => {
+                        error!("Failed to create modulator: {}", e);
+                        return Err(anyhow::anyhow!("Modulator init failed: {}", e));
+                    }
+                };
+
                 while !shutdown.load(Ordering::Relaxed) {
                     match tx_rx.try_recv() {
                         Ok(message) => {
@@ -1121,13 +1169,41 @@ impl ApplicationCoordinator {
                                     message_text, frequency_offset, qso_id
                                 );
 
+                                // Encode the message to FT8 symbols
+                                let encode_result = encoder.encode_message(&message_text, None);
+                                let (success, duration_ms) = match encode_result {
+                                    Ok(symbols) => {
+                                        // Modulate symbols to audio samples
+                                        match modulator.modulate_symbols(&symbols, frequency_offset) {
+                                            Ok(samples) => {
+                                                let duration = (samples.len() as f64 / 12000.0 * 1000.0) as u64;
+                                                info!(
+                                                    "Encoded '{}' → {} symbols → {} audio samples ({} ms)",
+                                                    message_text, symbols.len(), samples.len(), duration
+                                                );
+                                                // TODO: Route samples to audio output device
+                                                // For now, samples are generated but not played
+                                                (true, duration)
+                                            }
+                                            Err(e) => {
+                                                warn!("Modulation failed for '{}': {}", message_text, e);
+                                                (false, 0)
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Encoding failed for '{}': {}", message_text, e);
+                                        (false, 0)
+                                    }
+                                };
+
                                 let complete_msg = ComponentMessage::new(
                                     ComponentId::Ft8Transmitter,
                                     ComponentId::Autonomous,
                                     MessageType::TransmitComplete {
-                                        success: true,
+                                        success,
                                         message_text,
-                                        duration_ms: 12640,
+                                        duration_ms,
                                     },
                                     Instant::now(),
                                 );

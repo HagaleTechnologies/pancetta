@@ -53,13 +53,14 @@ _Created 2026-03-13. Execution order: Phase 0B → Phase 1A + Phase 1B in parall
 - [x] Fully integrate TUI main loop (raw mode, event polling, rendering)
 - [ ] Implement FT8 15-second timing cycle synchronization — deferred to Phase 2B
 
-### Phase 2B — TX Pipeline (Encode → Modulate → Audio Out)
-- [ ] Enable `transmit` feature by default
-- [ ] Wire TUI → coordinator → encoder → modulator → audio out
-- [ ] TX timing (align to slot boundaries — safety-critical)
-- [ ] PTT control via hamlib
-- [ ] TX controls in TUI (message input, TX/RX toggle, frequency offset)
-- [ ] Audio output routing through `AudioManager`
+### Phase 2B — TX Pipeline (Encode → Modulate → Audio Out) — DONE (2026-03-14)
+- [x] Enable `transmit` feature by default in main binary
+- [x] Wire TUI → coordinator → encoder → modulator (generates audio samples)
+- [x] Implement TUI message input buffer (13 char, uppercase, backspace)
+- [x] Wire TUI SendMessage → coordinator TransmitRequest → encode + modulate
+- [ ] TX timing (align to slot boundaries) — deferred (needs NTP/system clock work)
+- [ ] PTT control via hamlib — deferred (needs hardware)
+- [ ] Audio output routing through `AudioManager` — deferred (needs audio output device)
 
 ### Phase 3B — QSO Management (parallel with Phase 2B)
 - [ ] Connect `pancetta-qso` to coordinator (decoded msgs in, TX requests out)
