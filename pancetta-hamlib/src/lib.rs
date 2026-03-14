@@ -470,9 +470,12 @@ pub mod prelude {
         Band, Mode, Vfo, RigModelType, RigCapabilities,
         Rig, RigControl, RigConfig, RigStatus, ConnectionState, PttState,
         AdvancedRig, AdvancedRigControl, MemoryChannel, ScanConfig, ScanType,
+        ScanStatus, MonitoringData,
         RigBuilder, AdvancedRigBuilder,
         HamlibError, HamlibResult, ErrorSeverity, ErrorContext, ContextualError, ContextualResult,
     };
+
+    pub use crate::models::ModeExt;
 
     #[cfg(feature = "mock-rig")]
     pub use crate::{MockRig, MockRigConfig};

@@ -58,6 +58,8 @@ default = ["mock-rig"]
 mock-rig = []
 # Enable runtime hamlib detection
 dynamic-hamlib = ["libloading"]
+# Set automatically by build.rs when libhamlib is detected via pkg-config
+hamlib-found = []
 # Development features (note: tracing-subscriber is a dev-dependency)
 
 [[example]]

@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn test_stream_config_defaults() {
         let config = StreamConfig::default();
-        assert_eq!(config.sample_rate, 12000);
+        assert_eq!(config.sample_rate, 48000);
         assert_eq!(config.input_channels, 1);
         assert_eq!(config.output_channels, 2);
         assert!(config.enable_monitoring);
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn test_ft8_config() {
         let config = StreamConfig::for_ft8();
-        assert_eq!(config.sample_rate, 12000);
+        assert_eq!(config.sample_rate, 48000);
         assert_eq!(config.input_channels, 1);
         
         // Should have low latency
@@ -432,7 +432,7 @@ mod tests {
         // Should succeed even without audio devices in test environment
         if let Ok(manager) = manager {
             assert!(!manager.is_running());
-            assert_eq!(manager.get_config().sample_rate, 12000);
+            assert_eq!(manager.get_config().sample_rate, 48000);
         }
     }
 

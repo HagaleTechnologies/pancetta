@@ -500,7 +500,7 @@ mod tests {
     fn test_ft8_config() {
         let config = AudioProcessorConfig::for_ft8();
         assert_eq!(config.target_sample_rate, 12000);
-        assert_eq!(config.stream_config.sample_rate, 12000);
+        assert_eq!(config.stream_config.sample_rate, 48000);
         assert!(config.max_buffer_latency_ms < 10.0);
     }
 

@@ -227,11 +227,17 @@ pub struct ReportGenerator {
 }
 
 impl ReportGenerator {
-    /// Create new report generator
-    pub async fn new(tracker: &DxTracker, dxcc: &DxccDatabase) -> Result<Self> {
-        // We can't take ownership, so this is a placeholder
-        // In a real implementation, we'd use Arc<> or similar
-        
+    /// Create new report generator from Arc-wrapped dependencies
+    pub async fn new(tracker: std::sync::Arc<DxTracker>, dxcc: std::sync::Arc<DxccDatabase>) -> Result<Self> {
+        Ok(Self {
+            tracker,
+            dxcc,
+        })
+    }
+
+    /// Create new report generator from references (uses unsafe ptr::read)
+    /// TODO: Refactor callers to use Arc-based `new` instead
+    pub async fn new_from_ref(tracker: &DxTracker, dxcc: &DxccDatabase) -> Result<Self> {
         Ok(Self {
             tracker: std::sync::Arc::new(unsafe { std::ptr::read(tracker) }),
             dxcc: std::sync::Arc::new(unsafe { std::ptr::read(dxcc) }),
@@ -836,20 +842,21 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
     
-    async fn create_test_tracker() -> DxTracker {
+    async fn create_test_tracker() -> (DxTracker, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
-        crate::tracker::DxTracker::new(temp_file.path().to_str().unwrap()).await.unwrap()
+        let tracker = crate::tracker::DxTracker::new(temp_file.path().to_str().unwrap()).await.unwrap();
+        (tracker, temp_file)
     }
-    
+
     async fn create_test_dxcc() -> crate::dxcc::DxccDatabase {
         crate::dxcc::DxccDatabase::new().await.unwrap()
     }
-    
+
     #[tokio::test]
     async fn test_report_generator_creation() {
-        let tracker = create_test_tracker().await;
+        let (tracker, _temp_file) = create_test_tracker().await;
         let dxcc = create_test_dxcc().await;
-        let generator = ReportGenerator::new(&tracker, &dxcc).await.unwrap();
+        let generator = ReportGenerator::new(std::sync::Arc::new(tracker), std::sync::Arc::new(dxcc)).await.unwrap();
         
         // Test passes if generator is created successfully
         assert!(true);

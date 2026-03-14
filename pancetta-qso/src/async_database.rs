@@ -57,7 +57,7 @@ impl AsyncQsoDatabase {
         let database_url = if path.as_ref() == Path::new(":memory:") {
             "sqlite::memory:".to_string()
         } else {
-            format!("sqlite:{}", path.as_ref().display())
+            format!("sqlite:{}?mode=rwc", path.as_ref().display())
         };
         
         let pool = SqlitePoolOptions::new()

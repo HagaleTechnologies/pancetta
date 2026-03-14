@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_migration_from_old_mode() {
-        let old_mode = super::mode::Mode::FT8;
+        let old_mode = crate::types::mode::Mode::FT8;
         let new_mode: ModeValue = old_mode.into();
         assert_eq!(new_mode, ModeValue::standard(StandardMode::FT8));
     }

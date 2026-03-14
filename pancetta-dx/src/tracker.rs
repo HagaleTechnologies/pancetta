@@ -459,12 +459,12 @@ impl DxTracker {
             ))?;
         
         let mode = row.get::<_, Option<String>>("mode")?
-            .map(|s| serde_json::from_str(&s))
+            .map(|s| s.parse::<Mode>())
             .transpose()
             .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
                 7, // column index
                 rusqlite::types::Type::Text,
-                Box::new(e)
+                Box::new(DxError::Parse(e))
             ))?;
         
         Ok(AwardEntry {
@@ -692,20 +692,22 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
     
-    async fn create_test_tracker() -> DxTracker {
+    async fn create_test_tracker() -> (DxTracker, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
-        DxTracker::new(temp_file.path().to_str().unwrap()).await.unwrap()
+        let tracker = DxTracker::new(temp_file.path().to_str().unwrap()).await.unwrap();
+        (tracker, temp_file)
     }
     
     #[tokio::test]
     async fn test_tracker_creation() {
-        let tracker = create_test_tracker().await;
-        assert!(tracker.connection.execute("SELECT 1", []).is_ok());
+        let (tracker, _temp_file) = create_test_tracker().await;
+        let result: i64 = tracker.connection.query_row("SELECT 1", [], |row| row.get(0)).unwrap();
+        assert_eq!(result, 1);
     }
     
     #[tokio::test]
     async fn test_add_qso() {
-        let mut tracker = create_test_tracker().await;
+        let (mut tracker, _temp_file) = create_test_tracker().await;
         
         let qso = DxQso {
             id: None,
@@ -733,7 +735,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_award_tracking() {
-        let mut tracker = create_test_tracker().await;
+        let (mut tracker, _temp_file) = create_test_tracker().await;
         
         let qso = DxQso {
             id: None,
@@ -766,7 +768,7 @@ mod tests {
     
     #[tokio::test]
     async fn test_qso_statistics() {
-        let mut tracker = create_test_tracker().await;
+        let (mut tracker, _temp_file) = create_test_tracker().await;
         
         // Add test QSOs
         for i in 0..5 {

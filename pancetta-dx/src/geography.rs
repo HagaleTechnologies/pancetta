@@ -140,7 +140,7 @@ impl GeographyCalculator {
         lat2: f64,
         lon2: f64,
     ) -> DistanceResult {
-        let (distance_m, forward_azimuth, reverse_azimuth) = self.geodesic.inverse(lat1, lon1, lat2, lon2);
+        let (distance_m, forward_azimuth, reverse_azimuth, _arc) = self.geodesic.inverse(lat1, lon1, lat2, lon2);
         
         let distance_km = distance_m / 1000.0;
         let distance_miles = distance_km * 0.621371;
@@ -163,7 +163,7 @@ impl GeographyCalculator {
         lat2: f64,
         lon2: f64,
     ) -> BearingResult {
-        let (_, forward_azimuth, _) = self.geodesic.inverse(lat1, lon1, lat2, lon2);
+        let (_distance, forward_azimuth, _reverse, _arc) = self.geodesic.inverse(lat1, lon1, lat2, lon2);
         let true_bearing = normalize_azimuth(forward_azimuth);
         
         BearingResult {

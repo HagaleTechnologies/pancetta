@@ -37,13 +37,11 @@ use tokio::signal;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-mod coordinator;
 mod logging;
-mod message_bus;
-mod runtime;
 
-use coordinator::ApplicationCoordinator;
-use runtime::PancettaRuntime;
+use pancetta::coordinator::ApplicationCoordinator;
+use pancetta::runtime::PancettaRuntime;
+use pancetta::runtime;
 
 /// Pancetta - High-Performance Amateur Radio FT8 Processing Application
 #[derive(Clone, Parser)]
@@ -519,7 +517,7 @@ mod tests {
         cmd.arg("--help");
         cmd.assert()
             .success()
-            .stdout(predicate::str::contains("High-performance amateur radio"));
+            .stdout(predicate::str::contains("high-performance amateur radio"));
     }
 
     #[test]

@@ -132,80 +132,183 @@ pub struct RigState {
     pub dcd: c_uint,
 }
 
-// Hamlib function declarations
+// Hamlib function declarations - only available when hamlib is installed
+#[cfg(feature = "hamlib-found")]
 extern "C" {
     /// Initialize hamlib
     pub fn rig_init(debug_level: c_int);
-    
+
     /// Create a new rig handle
     pub fn rig_init_rig(rig_model: RigModel) -> *mut c_void;
-    
+
     /// Open connection to rig
     pub fn rig_open(rig: *mut c_void) -> c_int;
-    
+
     /// Close connection to rig
     pub fn rig_close(rig: *mut c_void) -> c_int;
-    
+
     /// Cleanup rig handle
     pub fn rig_cleanup(rig: *mut c_void) -> c_int;
-    
+
     /// Set rig parameter (device path, baud rate, etc.)
     pub fn rig_set_conf(rig: *mut c_void, token: c_uint, val: *const c_char) -> c_int;
-    
+
     /// Get rig parameter
     pub fn rig_get_conf(rig: *mut c_void, token: c_uint, val: *mut c_char) -> c_int;
-    
+
     /// Set frequency
     pub fn rig_set_freq(rig: *mut c_void, vfo: c_uint, freq: Frequency) -> c_int;
-    
-    /// Get frequency  
+
+    /// Get frequency
     pub fn rig_get_freq(rig: *mut c_void, vfo: c_uint, freq: *mut Frequency) -> c_int;
-    
+
     /// Set mode and passband
     pub fn rig_set_mode(rig: *mut c_void, vfo: c_uint, mode: c_uint, width: c_long) -> c_int;
-    
+
     /// Get mode and passband
     pub fn rig_get_mode(rig: *mut c_void, vfo: c_uint, mode: *mut c_uint, width: *mut c_long) -> c_int;
-    
+
     /// Set VFO
     pub fn rig_set_vfo(rig: *mut c_void, vfo: c_uint) -> c_int;
-    
+
     /// Get VFO
     pub fn rig_get_vfo(rig: *mut c_void, vfo: *mut c_uint) -> c_int;
-    
+
     /// Set PTT
     pub fn rig_set_ptt(rig: *mut c_void, vfo: c_uint, ptt: c_uint) -> c_int;
-    
+
     /// Get PTT
     pub fn rig_get_ptt(rig: *mut c_void, vfo: c_uint, ptt: *mut c_uint) -> c_int;
-    
+
     /// Set power level
     pub fn rig_set_level(rig: *mut c_void, vfo: c_uint, level_type: c_uint, val: *const c_void) -> c_int;
-    
+
     /// Get power level, S-meter, SWR, etc.
     pub fn rig_get_level(rig: *mut c_void, vfo: c_uint, level_type: c_uint, val: *mut c_void) -> c_int;
-    
+
     /// Set memory channel
     pub fn rig_set_mem(rig: *mut c_void, vfo: c_uint, ch: c_int) -> c_int;
-    
+
     /// Get memory channel
     pub fn rig_get_mem(rig: *mut c_void, vfo: c_uint, ch: *mut c_int) -> c_int;
-    
+
     /// Start/stop scanning
     pub fn rig_scan(rig: *mut c_void, vfo: c_uint, scan: c_uint, ch: c_int) -> c_int;
-    
+
     /// Get rig info string
     pub fn rig_get_info(rig: *mut c_void) -> *const c_char;
-    
+
     /// Get error string for error code
     pub fn rigerror(errnum: c_int) -> *const c_char;
-    
+
     /// Set timeout for operations
     pub fn rig_set_timeout(rig: *mut c_void, timeout: c_int) -> c_int;
-    
+
     /// Get timeout
     pub fn rig_get_timeout(rig: *mut c_void, timeout: *mut c_int) -> c_int;
 }
+
+// Stub implementations when hamlib is not installed.
+// These allow the crate to compile and use MockRig without requiring libhamlib.
+#[cfg(not(feature = "hamlib-found"))]
+/// Initialize hamlib (stub - hamlib not installed)
+pub unsafe fn rig_init(_debug_level: c_int) {}
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Create a new rig handle (stub - hamlib not installed)
+pub unsafe fn rig_init_rig(_rig_model: RigModel) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Open connection to rig (stub - hamlib not installed)
+pub unsafe fn rig_open(_rig: *mut c_void) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Close connection to rig (stub - hamlib not installed)
+pub unsafe fn rig_close(_rig: *mut c_void) -> c_int { RIG_OK }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Cleanup rig handle (stub - hamlib not installed)
+pub unsafe fn rig_cleanup(_rig: *mut c_void) -> c_int { RIG_OK }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Set rig parameter (stub - hamlib not installed)
+pub unsafe fn rig_set_conf(_rig: *mut c_void, _token: c_uint, _val: *const c_char) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Get rig parameter (stub - hamlib not installed)
+pub unsafe fn rig_get_conf(_rig: *mut c_void, _token: c_uint, _val: *mut c_char) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Set frequency (stub - hamlib not installed)
+pub unsafe fn rig_set_freq(_rig: *mut c_void, _vfo: c_uint, _freq: Frequency) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Get frequency (stub - hamlib not installed)
+pub unsafe fn rig_get_freq(_rig: *mut c_void, _vfo: c_uint, _freq: *mut Frequency) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Set mode and passband (stub - hamlib not installed)
+pub unsafe fn rig_set_mode(_rig: *mut c_void, _vfo: c_uint, _mode: c_uint, _width: c_long) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Get mode and passband (stub - hamlib not installed)
+pub unsafe fn rig_get_mode(_rig: *mut c_void, _vfo: c_uint, _mode: *mut c_uint, _width: *mut c_long) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Set VFO (stub - hamlib not installed)
+pub unsafe fn rig_set_vfo(_rig: *mut c_void, _vfo: c_uint) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Get VFO (stub - hamlib not installed)
+pub unsafe fn rig_get_vfo(_rig: *mut c_void, _vfo: *mut c_uint) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Set PTT (stub - hamlib not installed)
+pub unsafe fn rig_set_ptt(_rig: *mut c_void, _vfo: c_uint, _ptt: c_uint) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Get PTT (stub - hamlib not installed)
+pub unsafe fn rig_get_ptt(_rig: *mut c_void, _vfo: c_uint, _ptt: *mut c_uint) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Set power level (stub - hamlib not installed)
+pub unsafe fn rig_set_level(_rig: *mut c_void, _vfo: c_uint, _level_type: c_uint, _val: *const c_void) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Get power level, S-meter, SWR, etc. (stub - hamlib not installed)
+pub unsafe fn rig_get_level(_rig: *mut c_void, _vfo: c_uint, _level_type: c_uint, _val: *mut c_void) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Set memory channel (stub - hamlib not installed)
+pub unsafe fn rig_set_mem(_rig: *mut c_void, _vfo: c_uint, _ch: c_int) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Get memory channel (stub - hamlib not installed)
+pub unsafe fn rig_get_mem(_rig: *mut c_void, _vfo: c_uint, _ch: *mut c_int) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Start/stop scanning (stub - hamlib not installed)
+pub unsafe fn rig_scan(_rig: *mut c_void, _vfo: c_uint, _scan: c_uint, _ch: c_int) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Get rig info string (stub - hamlib not installed)
+pub unsafe fn rig_get_info(_rig: *mut c_void) -> *const c_char { std::ptr::null() }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Get error string for error code (stub - hamlib not installed)
+pub unsafe fn rigerror(_errnum: c_int) -> *const c_char {
+    b"hamlib not installed\0".as_ptr() as *const c_char
+}
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Set timeout for operations (stub - hamlib not installed)
+pub unsafe fn rig_set_timeout(_rig: *mut c_void, _timeout: c_int) -> c_int { RIG_EINVAL }
+
+#[cfg(not(feature = "hamlib-found"))]
+/// Get timeout (stub - hamlib not installed)
+pub unsafe fn rig_get_timeout(_rig: *mut c_void, _timeout: *mut c_int) -> c_int { RIG_EINVAL }
 
 // Level types for rig_set_level/rig_get_level
 pub const RIG_LEVEL_RF: c_uint = 1 << 0;

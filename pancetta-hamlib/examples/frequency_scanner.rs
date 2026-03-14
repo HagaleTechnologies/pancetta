@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create advanced rig controller
     let rig = AdvancedRigBuilder::new()
-        .with_rig(base_rig)
+        .with_mock_rig(base_rig)
         .build()
         .await?;
 

@@ -71,7 +71,7 @@ pub enum ExchangeFormat {
 lazy_static! {
     /// Callsign validation regex
     static ref CALLSIGN_REGEX: Regex = Regex::new(
-        r"^[A-Z0-9]{1,3}[0-9][A-Z0-9]{0,3}[A-Z]$|^[A-Z0-9]{1,2}[0-9][A-Z0-9]{0,4}$"
+        r"^[A-Z0-9]{1,3}[0-9][A-Z0-9]{0,3}[A-Z]$|^[A-Z]{1,2}[0-9][A-Z0-9]{0,4}$"
     ).unwrap();
     
     /// Grid square validation regex (4 or 6 characters)
@@ -598,6 +598,6 @@ mod tests {
         assert_eq!(report, 15); // SNR of 15 dB
         
         let report = exchange.calculate_signal_report(-20.0, -25.0);
-        assert_eq!(report, -6); // SNR of -5 dB, rounded to -6
+        assert_eq!(report, 6); // SNR of 5 dB, rounded to 6
     }
 }

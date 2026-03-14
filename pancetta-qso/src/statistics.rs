@@ -1130,7 +1130,7 @@ impl StatisticsCalculator {
         }
         
         let total_days = if let (Some(first), Some(last)) = (records.first(), records.last()) {
-            (last.metadata.start_time.date_naive() - first.metadata.start_time.date_naive()).num_days() + 1
+            (last.metadata.start_time.date_naive() - first.metadata.start_time.date_naive()).num_days().abs() + 1
         } else {
             1
         };

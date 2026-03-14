@@ -478,36 +478,45 @@ impl AsyncQsoLogger {
 mod tests {
     use super::*;
     use crate::qso_manager::QsoManagerConfig;
-    
+
+    fn test_logger_config() -> LoggerConfig {
+        let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
+        let db_path = tmp_dir.into_path().join("test_qso.db");
+        LoggerConfig {
+            database_path: db_path,
+            ..LoggerConfig::default()
+        }
+    }
+
     #[tokio::test]
     async fn test_async_logger_creation() {
-        let config = LoggerConfig::default();
+        let config = test_logger_config();
         let qso_manager = QsoManager::new(QsoManagerConfig::default());
-        
+
         let logger = AsyncQsoLogger::new(config, qso_manager).await;
         assert!(logger.is_ok());
     }
-    
+
     #[tokio::test]
     async fn test_async_logger_is_send_sync() {
         // This test verifies that AsyncQsoLogger implements Send + Sync
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AsyncQsoLogger>();
     }
-    
+
     #[tokio::test]
     async fn test_async_spawns_work() {
-        let config = LoggerConfig::default();
+        let config = test_logger_config();
         let qso_manager = QsoManager::new(QsoManagerConfig::default());
-        
+
         let logger = AsyncQsoLogger::new(config, qso_manager).await.unwrap();
-        
+
         // This should now compile without Send/Sync errors!
         let logger_clone = logger.clone();
         let handle = tokio::spawn(async move {
             logger_clone.get_statistics().await
         });
-        
+
         let result = handle.await;
         assert!(result.is_ok());
     }

@@ -298,7 +298,8 @@ impl QsoSystemBuilder {
         qso_manager.start().await?;
         
         let auto_sequencer = if self.enable_auto_sequencer {
-            let auto_config = self.auto_config.unwrap_or_default();
+            let mut auto_config = self.auto_config.unwrap_or_default();
+            auto_config.enabled = true;
             let our_callsign = "W1ABC".to_string(); // TODO: Get from qso_manager
             let sequencer = AutoSequencer::new(auto_config, qso_manager.clone(), our_callsign);
             sequencer.start().await?;

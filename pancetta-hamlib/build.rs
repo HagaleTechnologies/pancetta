@@ -11,17 +11,16 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
 
-    // Try to find hamlib library
+    // Check for explicit hamlib path overrides
     if let Ok(lib_dir) = env::var("HAMLIB_LIB_DIR") {
         println!("cargo:rustc-link-search=native={}", lib_dir);
     }
-
     if let Ok(include_dir) = env::var("HAMLIB_INCLUDE_DIR") {
         println!("cargo:include={}", include_dir);
     }
 
-    // Try pkg-config first
-    match pkg_config::Config::new()
+    // Try pkg-config to find hamlib
+    let hamlib_found = match pkg_config::Config::new()
         .atleast_version("4.0")
         .probe("hamlib")
     {
@@ -33,58 +32,40 @@ fn main() {
             for lib in &library.libs {
                 println!("cargo:rustc-link-lib={}", lib);
             }
+            true
         }
         Err(_) => {
-            // Fallback: try common library names and paths
-            println!("cargo:warning=hamlib not found via pkg-config, trying fallback");
-            
-            // Common library names to try
-            let lib_names = ["hamlib", "rig"];
-            let mut found = false;
-            
-            for lib_name in &lib_names {
-                // Try linking
-                println!("cargo:rustc-link-lib={}", lib_name);
-                found = true;
-                break; // For now, just try the first one
-            }
-            
-            if !found {
-                println!("cargo:warning=hamlib library not found. Mock rig will be used instead.");
-                println!("cargo:warning=To use real hardware, install hamlib development packages:");
-                println!("cargo:warning=  Ubuntu/Debian: sudo apt-get install libhamlib-dev");
-                println!("cargo:warning=  Fedora/RHEL: sudo dnf install hamlib-devel");
-                println!("cargo:warning=  macOS: brew install hamlib");
-                println!("cargo:rustc-cfg=feature=\"no-hamlib\"");
-            } else {
-                println!("cargo:rustc-cfg=feature=\"hamlib-found\"");
-            }
+            // hamlib not found - don't try to link it
+            println!("cargo:warning=hamlib library not found. Mock rig will be used instead.");
+            println!("cargo:warning=To use real hardware, install hamlib development packages:");
+            println!("cargo:warning=  Ubuntu/Debian: sudo apt-get install libhamlib-dev");
+            println!("cargo:warning=  Fedora/RHEL: sudo dnf install hamlib-devel");
+            println!("cargo:warning=  macOS: brew install hamlib");
+            println!("cargo:rustc-cfg=feature=\"no-hamlib\"");
+            false
         }
-    }
+    };
 
-    // Platform-specific configuration
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
-    match target_os.as_str() {
-        "windows" => {
-            // Windows-specific configuration
-            println!("cargo:rustc-link-lib=ws2_32");
-            if env::var("CARGO_CFG_TARGET_ENV").unwrap() == "msvc" {
-                // MSVC-specific settings
-                println!("cargo:rustc-link-lib=user32");
+    // Platform-specific configuration (only needed when linking hamlib)
+    if hamlib_found {
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+        match target_os.as_str() {
+            "windows" => {
+                println!("cargo:rustc-link-lib=ws2_32");
+                if env::var("CARGO_CFG_TARGET_ENV").unwrap() == "msvc" {
+                    println!("cargo:rustc-link-lib=user32");
+                }
             }
-        }
-        "macos" => {
-            // macOS-specific configuration
-            println!("cargo:rustc-link-lib=framework=CoreFoundation");
-            println!("cargo:rustc-link-lib=framework=IOKit");
-        }
-        "linux" => {
-            // Linux-specific configuration
-            println!("cargo:rustc-link-lib=pthread");
-        }
-        _ => {
-            // Other Unix-like systems
-            println!("cargo:rustc-link-lib=pthread");
+            "macos" => {
+                println!("cargo:rustc-link-lib=framework=CoreFoundation");
+                println!("cargo:rustc-link-lib=framework=IOKit");
+            }
+            "linux" => {
+                println!("cargo:rustc-link-lib=pthread");
+            }
+            _ => {
+                println!("cargo:rustc-link-lib=pthread");
+            }
         }
     }
 

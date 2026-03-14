@@ -184,11 +184,20 @@ pub struct StatisticsEngine {
 }
 
 impl StatisticsEngine {
-    /// Create new statistics engine
-    pub async fn new(tracker: &DxTracker) -> Result<Self> {
-        // We can't take ownership of tracker, so this is a placeholder
-        // In a real implementation, we'd use Arc<> or similar
-        
+    /// Create new statistics engine from an Arc-wrapped tracker
+    pub async fn new(tracker: std::sync::Arc<DxTracker>) -> Result<Self> {
+        Ok(Self {
+            tracker,
+            dxcc: std::sync::Arc::new(crate::dxcc::DxccDatabase::new().await?),
+            cached_stats: None,
+            cache_time: None,
+            cache_timeout_minutes: 15,
+        })
+    }
+
+    /// Create new statistics engine from a tracker reference (uses unsafe ptr::read)
+    /// TODO: Refactor callers to use Arc-based `new` instead
+    pub async fn new_from_ref(tracker: &DxTracker) -> Result<Self> {
         Ok(Self {
             tracker: std::sync::Arc::new(unsafe { std::ptr::read(tracker) }),
             dxcc: std::sync::Arc::new(crate::dxcc::DxccDatabase::new().await?),
@@ -638,15 +647,17 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
     
-    async fn create_test_tracker() -> DxTracker {
+    async fn create_test_tracker() -> (DxTracker, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
-        crate::tracker::DxTracker::new(temp_file.path().to_str().unwrap()).await.unwrap()
+        let tracker = crate::tracker::DxTracker::new(temp_file.path().to_str().unwrap()).await.unwrap();
+        (tracker, temp_file)
     }
-    
+
     #[tokio::test]
     async fn test_statistics_engine_creation() {
-        let tracker = create_test_tracker().await;
-        let stats_engine = StatisticsEngine::new(&tracker).await.unwrap();
+        let (tracker, _temp_file) = create_test_tracker().await;
+        let tracker_arc = std::sync::Arc::new(tracker);
+        let stats_engine = StatisticsEngine::new(tracker_arc).await.unwrap();
         assert_eq!(stats_engine.cache_timeout_minutes, 15);
     }
     

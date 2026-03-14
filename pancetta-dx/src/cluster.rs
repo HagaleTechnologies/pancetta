@@ -4,7 +4,7 @@
 //! DX spot monitoring and posting.
 
 use crate::{Band, Mode, DxSpot, DxError, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Timelike};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::Config;
 
@@ -89,7 +89,10 @@ impl ConfigHotReload {
         let validate = self.validate_before_reload;
         let config_arc = self.config.clone();
         let last_good = self.last_good_config.clone();
-        
+
+        // Capture the tokio runtime handle before entering the non-async callback
+        let runtime_handle = tokio::runtime::Handle::current();
+
         // Create file watcher
         let mut watcher = RecommendedWatcher::new(
             move |result: notify::Result<Event>| {
@@ -102,8 +105,8 @@ impl ConfigHotReload {
                             let last_reload = last_reload.clone();
                             let config_arc = config_arc.clone();
                             let last_good = last_good.clone();
-                            
-                            tokio::spawn(async move {
+
+                            runtime_handle.spawn(async move {
                                 // Debounce check
                                 {
                                     let last = last_reload.read().await;

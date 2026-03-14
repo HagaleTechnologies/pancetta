@@ -231,12 +231,13 @@ impl QsoDatabase {
             .map_err(|e| DatabaseError::Sqlite { source: e })?;
         
         // Enable foreign keys and WAL mode for better performance
-        connection.execute("PRAGMA foreign_keys = ON", [])
-            .map_err(|e| DatabaseError::Sqlite { source: e })?;
-        connection.execute("PRAGMA journal_mode = WAL", [])
-            .map_err(|e| DatabaseError::Sqlite { source: e })?;
-        connection.execute("PRAGMA synchronous = NORMAL", [])
-            .map_err(|e| DatabaseError::Sqlite { source: e })?;
+        // Note: PRAGMA journal_mode returns a result row, so we must use
+        // execute_batch or query_row instead of execute.
+        connection.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;"
+        ).map_err(|e| DatabaseError::Sqlite { source: e })?;
         
         let mut db = Self {
             connection,
@@ -626,7 +627,6 @@ impl QsoDatabase {
             
             -- Insert schema version
             INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', '1');
-            INSERT OR REPLACE INTO metadata (key, value) VALUES ('created_at', ?1);
         "#;
         
         self.connection.execute_batch(sql)

@@ -282,9 +282,11 @@ impl DxHunter {
         let pskreporter = pskreporter::PskReporterClient::new();
         let cluster = cluster::DxClusterClient::new();
         let lotw = lotw::LotwClient::new(station_config.lotw_username.clone());
-        let statistics = statistics::StatisticsEngine::new(&tracker).await?;
-        let reports = reports::ReportGenerator::new(&tracker, &dxcc).await?;
-        
+        // SAFETY: These use unsafe ptr::read to create Arc-wrapped copies.
+        // This is a known issue - should be refactored to use proper Arc sharing.
+        let statistics = statistics::StatisticsEngine::new_from_ref(&tracker).await?;
+        let reports = reports::ReportGenerator::new_from_ref(&tracker, &dxcc).await?;
+
         Ok(Self {
             dxcc,
             tracker,

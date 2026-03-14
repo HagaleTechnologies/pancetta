@@ -60,6 +60,10 @@ tokio-test = "0.4"
 # WAV file reading for off-air signal tests
 hound = "3.5"
 
+[[example]]
+name = "transmission_demo"
+required-features = ["transmit"]
+
 [[bench]]
 name = "decoder_benchmark"
 harness = false

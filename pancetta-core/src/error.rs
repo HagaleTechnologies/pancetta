@@ -418,25 +418,26 @@ mod tests {
     
     #[test]
     fn test_error_recovery() {
-        let error = ErrorBuilder::new("Test", "op")
+        let make_error = || ErrorBuilder::new("Test", "op")
             .message("Retryable error")
             .retryable(3, RetryDelay::Exponential(Duration::from_millis(100)))
             .build();
-        
+
+        let error = make_error();
         let mut recovery = ErrorRecovery::new(&error).unwrap();
-        
+
         assert!(recovery.should_retry());
         assert_eq!(recovery.next_delay(), Duration::from_millis(100));
-        
-        recovery.record_attempt(error.clone());
+
+        recovery.record_attempt(make_error());
         assert!(recovery.should_retry());
         assert_eq!(recovery.next_delay(), Duration::from_millis(200));
-        
-        recovery.record_attempt(error.clone());
+
+        recovery.record_attempt(make_error());
         assert!(recovery.should_retry());
         assert_eq!(recovery.next_delay(), Duration::from_millis(400));
-        
-        recovery.record_attempt(error.clone());
+
+        recovery.record_attempt(make_error());
         assert!(!recovery.should_retry());
     }
     
