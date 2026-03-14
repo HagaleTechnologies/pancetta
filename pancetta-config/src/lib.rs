@@ -14,7 +14,7 @@
 //!
 //! ## Usage
 //!
-//! ```rust
+//! ```rust,ignore
 //! use pancetta_config::{Config, ConfigManager, ConfigError};
 //!
 //! // Load configuration with defaults

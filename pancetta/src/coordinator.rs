@@ -194,6 +194,7 @@ impl ApplicationCoordinator {
         self.start_qso_component().await?;
         self.start_transmitter_component().await?;
         self.start_autonomous_component().await?;
+        self.start_dx_cluster_component().await?;
 
         // Start coordinator tasks
         self.start_coordinator_tasks().await?;
@@ -796,6 +797,20 @@ impl ApplicationCoordinator {
                                     },
                                 );
                             }
+                            MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
+                                callsign,
+                                frequency,
+                                spotter,
+                                ..
+                            }) => {
+                                let _ = tui_msg_tx_relay.send(
+                                    pancetta_tui::tui_runner::TuiMessage::DxSpot {
+                                        callsign,
+                                        frequency,
+                                        spotter,
+                                    },
+                                );
+                            }
                             _ => {}
                         }
                     }
@@ -1247,6 +1262,99 @@ impl ApplicationCoordinator {
 
         self.task_handles.push(qso_handle);
         info!("QSO component started");
+        Ok(())
+    }
+
+    /// Start DX cluster component for real-time spot monitoring
+    async fn start_dx_cluster_component(&mut self) -> Result<()> {
+        let config = self.config.read().await;
+        if !config.network.dx_cluster.enabled {
+            info!("DX cluster disabled in configuration");
+            drop(config);
+            // Still create channel so message bus doesn't complain
+            let _ = self.message_bus.create_channel(ComponentId::DxCluster).await?;
+            return Ok(());
+        }
+
+        let cluster_hostname = config.network.dx_cluster.servers
+            .first()
+            .map(|s| s.hostname.clone())
+            .unwrap_or_else(|| "dxc.nc7j.com".to_string());
+        let cluster_port = config.network.dx_cluster.servers
+            .first()
+            .map(|s| s.port)
+            .unwrap_or(23);
+        let our_callsign = config.station.callsign.clone();
+        drop(config);
+
+        info!("Starting DX cluster component ({}:{})", cluster_hostname, cluster_port);
+
+        let (_dx_tx, _dx_rx) = self.message_bus.create_channel(ComponentId::DxCluster).await?;
+        let message_bus = self.message_bus.clone();
+
+        let dx_handle = {
+            let shutdown = self.shutdown_signal.clone();
+
+            tokio::spawn(async move {
+                use pancetta_dx::cluster::DxClusterClient;
+
+                let mut client = DxClusterClient::new();
+
+                match client.connect().await {
+                    Ok(_) => {
+                        info!("Connected to DX cluster");
+
+                        // Login with our callsign
+                        if let Err(e) = client.login().await {
+                            warn!("DX cluster login failed: {}. Continuing without.", e);
+                        }
+
+                        // Monitor spots and forward to TUI
+                        while !shutdown.load(Ordering::Relaxed) {
+                            match tokio::time::timeout(
+                                Duration::from_secs(5),
+                                client.receive_spot(),
+                            ).await {
+                                Ok(Some(spot)) => {
+                                    debug!("DX spot: {} on {} Hz by {}", spot.callsign, spot.frequency, spot.spotter);
+
+                                    let msg = ComponentMessage::new(
+                                        ComponentId::DxCluster,
+                                        ComponentId::Tui,
+                                        MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
+                                            callsign: spot.callsign,
+                                            frequency: spot.frequency,
+                                            spotter: spot.spotter,
+                                            comment: spot.comment.unwrap_or_default(),
+                                        }),
+                                        Instant::now(),
+                                    );
+                                    if let Err(e) = message_bus.send_message(msg).await {
+                                        debug!("Failed to forward DX spot: {}", e);
+                                    }
+                                }
+                                Ok(None) => {
+                                    // No spot available, yield
+                                    tokio::task::yield_now().await;
+                                }
+                                Err(_) => {
+                                    // Timeout — normal, just loop
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to connect to DX cluster: {}. Feature disabled.", e);
+                    }
+                }
+
+                info!("DX cluster component stopped");
+                Ok(())
+            })
+        };
+
+        self.task_handles.push(dx_handle);
+        info!("DX cluster component started");
         Ok(())
     }
 
