@@ -497,6 +497,79 @@ fn test_ft4_round_trip_all_message_types() {
 // Multi-TX round-trip tests
 // =========================================================================
 
+// =========================================================================
+// FT2 round-trip tests (experimental, feature-gated)
+// =========================================================================
+
+#[cfg(feature = "ft2")]
+#[test]
+fn test_ft2_encode_modulate_basic() {
+    use pancetta_ft8::ProtocolParams;
+    let params = ProtocolParams::ft2();
+
+    let mut encoder = Ft8Encoder::with_protocol(params.clone());
+    let symbols = encoder
+        .encode_message_protocol("CQ W1ABC FN42", None)
+        .unwrap();
+
+    assert_eq!(symbols.len(), 79);
+    assert!(symbols.iter().all(|&s| s < 8));
+
+    // Modulate
+    let mut modulator = Ft8Modulator::with_pulse_shape(
+        SAMPLE_RATE,
+        1500.0,
+        0.5,
+        PulseShape::Rectangular,
+    )
+    .unwrap();
+    let audio = modulator
+        .modulate_symbols_protocol(&symbols, 0.0, &params)
+        .unwrap();
+
+    // FT2: 79 symbols × 480 samples/symbol = 37920 samples
+    assert_eq!(audio.len(), params.total_samples(SAMPLE_RATE));
+    assert!(audio.iter().all(|&s| s.abs() <= 1.0));
+}
+
+#[cfg(feature = "ft2")]
+#[test]
+fn test_ft2_round_trip() {
+    use pancetta_ft8::{Protocol, ProtocolParams};
+
+    let params = ProtocolParams::ft2();
+    let mut encoder = Ft8Encoder::with_protocol(params.clone());
+    let symbols = encoder
+        .encode_message_protocol("CQ W1ABC FN42", None)
+        .unwrap();
+
+    let mut modulator = Ft8Modulator::with_pulse_shape(
+        SAMPLE_RATE,
+        1500.0,
+        0.5,
+        PulseShape::Rectangular,
+    )
+    .unwrap();
+    let mut audio = modulator
+        .modulate_symbols_protocol(&symbols, 0.0, &params)
+        .unwrap();
+    audio.resize(params.window_samples(SAMPLE_RATE), 0.0);
+
+    let config = Ft8Config {
+        protocol: Protocol::Ft2,
+        max_decode_passes: 1,
+        ..Ft8Config::default()
+    };
+    let mut decoder = Ft8Decoder::new(config).unwrap();
+    let decoded = decoder.decode_window(&audio).unwrap_or_default();
+
+    assert!(
+        decoded.iter().any(|m| m.text == "CQ W1ABC FN42"),
+        "FT2 round-trip failed: decoded {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+}
+
 /// Test: two FT8 messages at different frequencies → decode both
 #[test]
 fn test_multi_tx_round_trip_two_ft8() {
