@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
+use ratatui::style::Color;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
-use ratatui::style::Color;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -181,7 +181,7 @@ impl Default for Config {
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
-        
+
         // Expand tilde in path
         let expanded_path = if path.starts_with("~") {
             if let Some(home) = dirs::home_dir() {
@@ -211,7 +211,7 @@ impl Config {
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
         let path = path.as_ref();
-        
+
         // Expand tilde in path
         let expanded_path = if path.starts_with("~") {
             if let Some(home) = dirs::home_dir() {
@@ -225,12 +225,12 @@ impl Config {
 
         // Create directory if it doesn't exist
         if let Some(parent) = expanded_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create config directory: {}", parent.display())
+            })?;
         }
 
-        let contents = toml::to_string_pretty(self)
-            .context("Failed to serialize config")?;
+        let contents = toml::to_string_pretty(self).context("Failed to serialize config")?;
 
         fs::write(&expanded_path, contents)
             .with_context(|| format!("Failed to write config file: {}", expanded_path.display()))?;
@@ -243,9 +243,10 @@ impl Config {
     }
 
     pub fn get_current_band(&self, frequency: f64) -> Option<&Band> {
-        self.bands.bands.iter().find(|b| {
-            frequency >= b.frequency_range.0 && frequency <= b.frequency_range.1
-        })
+        self.bands
+            .bands
+            .iter()
+            .find(|b| frequency >= b.frequency_range.0 && frequency <= b.frequency_range.1)
     }
 }
 
@@ -342,10 +343,10 @@ mod tests {
     fn test_config_save_and_load() {
         let temp_file = NamedTempFile::new().unwrap();
         let config = Config::default();
-        
+
         config.save(temp_file.path()).unwrap();
         let loaded_config = Config::load(temp_file.path()).unwrap();
-        
+
         assert_eq!(config.station.call_sign, loaded_config.station.call_sign);
         assert_eq!(config.ui.theme as u8, loaded_config.ui.theme as u8);
     }
@@ -354,7 +355,7 @@ mod tests {
     fn test_theme_colors() {
         let dark_theme = Theme::Dark;
         let light_theme = Theme::Light;
-        
+
         assert_eq!(dark_theme.background_color(), Color::Black);
         assert_eq!(light_theme.background_color(), Color::White);
         assert_eq!(dark_theme.foreground_color(), Color::White);
@@ -364,7 +365,7 @@ mod tests {
     #[test]
     fn test_frequency_formatting() {
         let freq = 14.074;
-        
+
         assert_eq!(FrequencyFormat::MHz.format_frequency(freq), "14.074 MHz");
         assert_eq!(FrequencyFormat::KHz.format_frequency(freq), "14074.0 kHz");
         assert_eq!(FrequencyFormat::Hz.format_frequency(freq), "14074000 Hz");

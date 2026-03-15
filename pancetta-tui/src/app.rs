@@ -84,7 +84,7 @@ pub enum DevicePanel {
 
 #[derive(Debug, Clone)]
 pub struct DeviceSelectionState {
-    pub input_devices: Vec<(String, bool)>,  // (name, is_default)
+    pub input_devices: Vec<(String, bool)>, // (name, is_default)
     pub output_devices: Vec<(String, bool)>,
     pub selected_input_idx: usize,
     pub selected_output_idx: usize,
@@ -156,12 +156,16 @@ impl DeviceSelectionState {
 
     /// Get the selected input device name.
     pub fn selected_input_name(&self) -> Option<String> {
-        self.input_devices.get(self.selected_input_idx).map(|(name, _)| name.clone())
+        self.input_devices
+            .get(self.selected_input_idx)
+            .map(|(name, _)| name.clone())
     }
 
     /// Get the selected output device name.
     pub fn selected_output_name(&self) -> Option<String> {
-        self.output_devices.get(self.selected_output_idx).map(|(name, _)| name.clone())
+        self.output_devices
+            .get(self.selected_output_idx)
+            .map(|(name, _)| name.clone())
     }
 }
 
@@ -197,12 +201,12 @@ pub struct App {
     pub config: Config,
     pub should_quit: bool,
     pub active_panel: ActivePanel,
-    
+
     // UI State
     pub terminal_size: (u16, u16),
     pub status_message: String,
     pub theme: Theme,
-    
+
     // Data
     pub decoded_messages: VecDeque<DecodedMessage>,
     pub qso_status: QsoStatus,
@@ -210,13 +214,13 @@ pub struct App {
     pub dx_stations: HashMap<String, DxStation>,
     pub band_activity_scroll: usize,
     pub dx_hunter_scroll: usize,
-    
+
     // Audio processing
     pub audio_device: Option<String>,
     pub is_monitoring: bool,
     pub audio_level: f32,
     pub waterfall_data: Vec<Vec<f32>>,
-    
+
     // Autonomous operator
     pub autonomous_status: Option<AutonomousStatus>,
 
@@ -291,7 +295,10 @@ impl App {
             app.start_audio_monitoring(&device).await?;
         }
 
-        info!("App initialized with station {}", app.station_info.call_sign);
+        info!(
+            "App initialized with station {}",
+            app.station_info.call_sign
+        );
         Ok(app)
     }
 
@@ -337,7 +344,7 @@ impl App {
                     return Ok(true);
                 }
             }
-            
+
             // Panel navigation
             KeyCode::Tab => {
                 self.active_panel = self.active_panel.next();
@@ -347,13 +354,13 @@ impl App {
                 self.active_panel = self.active_panel.previous();
                 debug!("Switched to panel: {:?}", self.active_panel);
             }
-            
+
             // Panel-specific shortcuts
             KeyCode::Char('1') => self.active_panel = ActivePanel::BandActivity,
             KeyCode::Char('2') => self.active_panel = ActivePanel::QsoStatus,
             KeyCode::Char('3') => self.active_panel = ActivePanel::StationInfo,
             KeyCode::Char('4') => self.active_panel = ActivePanel::DxHunter,
-            
+
             // Scrolling
             KeyCode::Up | KeyCode::Char('k') => {
                 self.scroll_up();
@@ -371,12 +378,12 @@ impl App {
                     self.scroll_down();
                 }
             }
-            
+
             // Theme switching
             KeyCode::Char('t') => {
                 self.toggle_theme();
             }
-            
+
             // Audio monitoring
             KeyCode::Char('m') => {
                 self.toggle_monitoring().await?;
@@ -391,12 +398,12 @@ impl App {
             KeyCode::Char('p') => {
                 self.toggle_autonomous_pause();
             }
-            
+
             // Clear messages
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.clear_messages();
             }
-            
+
             _ => {}
         }
 
@@ -438,8 +445,15 @@ impl App {
             "Audio monitoring disabled"
         }
         .to_string();
-        
-        info!("Audio monitoring: {}", if self.is_monitoring { "enabled" } else { "disabled" });
+
+        info!(
+            "Audio monitoring: {}",
+            if self.is_monitoring {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
         Ok(())
     }
 
@@ -453,22 +467,22 @@ impl App {
         if self.waterfall_data.len() > 100 {
             self.waterfall_data.remove(0);
         }
-        
+
         // Simple frequency domain representation (placeholder)
-        let fft_data: Vec<f32> = (0..64).map(|i| {
-            (self.audio_level * (i as f32 / 64.0).sin()).abs()
-        }).collect();
-        
+        let fft_data: Vec<f32> = (0..64)
+            .map(|i| (self.audio_level * (i as f32 / 64.0).sin()).abs())
+            .collect();
+
         self.waterfall_data.push(fft_data);
         Ok(())
     }
 
     pub async fn add_decoded_message(&mut self, message: DecodedMessage) -> Result<()> {
         debug!("Adding decoded message: {}", message.message);
-        
+
         // Add to band activity
         self.decoded_messages.push_back(message.clone());
-        
+
         // Limit message history
         while self.decoded_messages.len() > 1000 {
             self.decoded_messages.pop_front();
@@ -488,7 +502,7 @@ impl App {
                 worked_before: false, // TODO: Check logbook
                 priority_score: self.calculate_dx_priority(&message),
             };
-            
+
             self.dx_stations.insert(call_sign.clone(), dx_station);
         }
 
@@ -498,12 +512,12 @@ impl App {
 
     fn calculate_dx_priority(&self, message: &DecodedMessage) -> u32 {
         let mut score = 0u32;
-        
+
         // Higher SNR gets more points
         if message.snr > 0 {
             score += message.snr as u32;
         }
-        
+
         // Distance bonus
         if let Some(distance) = message.distance {
             if distance > 1000.0 {
@@ -513,13 +527,13 @@ impl App {
                 score += 100;
             }
         }
-        
+
         // TODO: Add more sophisticated scoring based on:
         // - DXCC entity
         // - Band/mode combinations worked
         // - Contest status
         // - Propagation conditions
-        
+
         score
     }
 
@@ -575,7 +589,7 @@ impl App {
 
     fn cleanup_old_data(&mut self) {
         let cutoff = Utc::now() - chrono::Duration::hours(24);
-        
+
         // Remove old messages
         while let Some(front) = self.decoded_messages.front() {
             if front.timestamp < cutoff {
@@ -584,9 +598,10 @@ impl App {
                 break;
             }
         }
-        
+
         // Remove old DX stations
-        self.dx_stations.retain(|_, station| station.last_seen > cutoff);
+        self.dx_stations
+            .retain(|_, station| station.last_seen > cutoff);
     }
 
     // Missing public methods for tui_runner
@@ -679,7 +694,10 @@ impl App {
         if self.active_panel != ActivePanel::BandActivity {
             return None;
         }
-        let msg = self.decoded_messages.iter().nth(self.band_activity_scroll)?;
+        let msg = self
+            .decoded_messages
+            .iter()
+            .nth(self.band_activity_scroll)?;
         let callsign = msg.call_sign.as_ref()?;
         if callsign.is_empty() {
             return None;
@@ -735,7 +753,14 @@ impl App {
             } else {
                 "Autonomous mode disabled".to_string()
             };
-            info!("Autonomous mode: {}", if status.enabled { "enabled" } else { "disabled" });
+            info!(
+                "Autonomous mode: {}",
+                if status.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
         } else {
             self.status_message = "Autonomous mode not available".to_string();
         }

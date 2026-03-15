@@ -1,15 +1,15 @@
 //! Band hopper example
-//! 
+//!
 //! This example demonstrates automatic band switching based on propagation
 //! conditions, time of day, and signal activity. It showcases advanced
 //! band management and intelligent frequency selection.
 
+use chrono::{DateTime, Timelike, Utc};
 use pancetta_hamlib::prelude::*;
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::{sleep, Instant};
-use tracing::{info, warn, debug};
-use chrono::{DateTime, Utc, Timelike};
+use tracing::{debug, info, warn};
 
 /// Band propagation prediction based on time of day
 #[derive(Debug, Clone)]
@@ -92,9 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting band hopper example");
 
     // Create rig
-    let base_rig = RigBuilder::new()
-        .build_mock()
-        .await?;
+    let base_rig = RigBuilder::new().build_mock().await?;
 
     let rig = AdvancedRigBuilder::new()
         .with_mock_rig(base_rig)
@@ -111,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start monitoring for activity detection
     let mut monitor_rx = rig.start_monitoring(1000).await?;
-    
+
     // Run different hopping strategies
     info!("Demonstrating propagation-based hopping...");
     run_propagation_hopping(&rig, &config).await?;
@@ -141,7 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Final summary
     info!("Band hopping demonstration completed");
-    
+
     rig.disconnect().await?;
     Ok(())
 }
@@ -155,16 +153,21 @@ async fn run_propagation_hopping(
 
     let start_time = Instant::now();
     let mut current_band_index = 0;
-    
+
     while start_time.elapsed() < Duration::from_secs(60) {
         // Get band conditions
         let conditions = predict_band_conditions();
-        
+
         // Sort bands by predicted conditions
-        let mut sorted_bands: Vec<_> = conditions.iter()
+        let mut sorted_bands: Vec<_> = conditions
+            .iter()
             .filter(|c| config.bands.contains(&c.band))
             .collect();
-        sorted_bands.sort_by(|a, b| b.predicted_strength.partial_cmp(&a.predicted_strength).unwrap());
+        sorted_bands.sort_by(|a, b| {
+            b.predicted_strength
+                .partial_cmp(&a.predicted_strength)
+                .unwrap()
+        });
 
         // Select best band
         if let Some(best_condition) = sorted_bands.first() {
@@ -186,19 +189,19 @@ async fn run_propagation_hopping(
 
             // Check actual signal conditions
             sleep(Duration::from_secs(2)).await; // Allow settling time
-            
+
             match rig.get_s_meter().await {
                 Ok(s_meter) => {
                     let s_reading = pancetta_hamlib::utils::format_s_meter(s_meter);
                     info!("  Actual signal: {} ({} dBm)", s_reading, s_meter);
-                    
+
                     // Determine dwell time based on signal strength
                     let dwell_time = if s_meter > config.signal_threshold {
                         config.dwell_time * 2 // Stay longer on active band
                     } else {
                         config.dwell_time / 2 // Move on quickly from quiet band
                     };
-                    
+
                     info!("  Dwelling for {} seconds", dwell_time);
                     sleep(Duration::from_secs(dwell_time)).await;
                 }
@@ -240,7 +243,11 @@ async fn run_activity_hopping(
             }
 
             let freq = rig.get_frequency(Vfo::A).await?;
-            info!("Checking activity on {:?} ({:.3} MHz)", band, freq as f64 / 1_000_000.0);
+            info!(
+                "Checking activity on {:?} ({:.3} MHz)",
+                band,
+                freq as f64 / 1_000_000.0
+            );
 
             // Collect activity data for 3 seconds
             let mut signal_readings = Vec::new();
@@ -248,14 +255,16 @@ async fn run_activity_hopping(
 
             while activity_check_start.elapsed() < Duration::from_secs(3) {
                 // Try to get monitoring data
-                if let Ok(data) = tokio::time::timeout(Duration::from_millis(100), monitor_rx.recv()).await {
+                if let Ok(data) =
+                    tokio::time::timeout(Duration::from_millis(100), monitor_rx.recv()).await
+                {
                     if let Ok(monitor_data) = data {
                         if let Some(s_meter) = monitor_data.s_meter {
                             signal_readings.push(s_meter);
                         }
                     }
                 }
-                
+
                 sleep(Duration::from_millis(100)).await;
             }
 
@@ -263,22 +272,32 @@ async fn run_activity_hopping(
             let activity_score = calculate_activity_score(&signal_readings);
             band_activity.insert(*band, activity_score);
 
-            info!("  Activity score: {:.2} (based on {} readings)", activity_score, signal_readings.len());
+            info!(
+                "  Activity score: {:.2} (based on {} readings)",
+                activity_score,
+                signal_readings.len()
+            );
         }
 
         // Find most active band
-        let most_active_band = band_activity.iter()
+        let most_active_band = band_activity
+            .iter()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
             .map(|(band, score)| (*band, *score));
 
         if let Some((band, score)) = most_active_band {
             info!("Most active band: {:?} (score: {:.2})", band, score);
-            
-            if score > 0.3 { // Threshold for "active"
+
+            if score > 0.3 {
+                // Threshold for "active"
                 rig.switch_to_band(band).await?;
                 let freq = rig.get_frequency(Vfo::A).await?;
-                info!("Staying on active band {:?} ({:.3} MHz)", band, freq as f64 / 1_000_000.0);
-                
+                info!(
+                    "Staying on active band {:?} ({:.3} MHz)",
+                    band,
+                    freq as f64 / 1_000_000.0
+                );
+
                 // Stay longer on active band
                 sleep(Duration::from_secs(config.dwell_time * 2)).await;
             } else {
@@ -299,12 +318,12 @@ async fn run_time_based_hopping(
 
     let now = Utc::now();
     let hour = now.time().hour();
-    
+
     info!("Current UTC time: {} (hour: {})", now.format("%H:%M"), hour);
 
     // Band recommendations based on time of day (simplified)
     let time_recommendations = get_time_based_recommendations(hour);
-    
+
     info!("Recommended bands for current time:");
     for (band, reason) in &time_recommendations {
         info!("  {:?}: {}", band, reason);
@@ -313,7 +332,7 @@ async fn run_time_based_hopping(
     // Visit recommended bands in order
     for (band, reason) in time_recommendations {
         info!("Visiting {:?} - {}", band, reason);
-        
+
         if let Err(e) = rig.switch_to_band(band).await {
             warn!("Failed to switch to {:?}: {}", band, e);
             continue;
@@ -322,7 +341,7 @@ async fn run_time_based_hopping(
         // Get frequency and mode
         let freq = rig.get_frequency(Vfo::A).await?;
         let (mode, width) = rig.get_mode(Vfo::A).await?;
-        
+
         info!("  Frequency: {:.3} MHz", freq as f64 / 1_000_000.0);
         info!("  Mode: {:?} ({} Hz)", mode, width);
 
@@ -364,7 +383,12 @@ async fn run_contest_hopping(
             continue;
         }
 
-        info!("Checking {} ({:.3} MHz {:?})", description, frequency as f64 / 1_000_000.0, mode);
+        info!(
+            "Checking {} ({:.3} MHz {:?})",
+            description,
+            frequency as f64 / 1_000_000.0,
+            mode
+        );
 
         // Set frequency and mode
         rig.set_frequency(Vfo::A, frequency).await?;
@@ -420,7 +444,12 @@ async fn run_dx_hunting(
             continue;
         }
 
-        info!("Hunting DX on {} ({:.3} MHz {:?})", description, frequency as f64 / 1_000_000.0, mode);
+        info!(
+            "Hunting DX on {} ({:.3} MHz {:?})",
+            description,
+            frequency as f64 / 1_000_000.0,
+            mode
+        );
 
         // Set frequency and mode
         rig.set_frequency(Vfo::A, frequency).await?;
@@ -437,7 +466,7 @@ async fn run_dx_hunting(
                 // DX hunting logic - look for specific signal patterns
                 if s_meter > -70 && s_meter < -40 {
                     info!("  Potential DX signal strength - extended monitoring");
-                    
+
                     // Monitor signal for variation (possible DX fade)
                     let mut readings = Vec::new();
                     for _ in 0..10 {
@@ -450,7 +479,7 @@ async fn run_dx_hunting(
                     if !readings.is_empty() {
                         let variation = calculate_signal_variation(&readings);
                         info!("  Signal variation: {:.1} dB", variation);
-                        
+
                         if variation > 6.0 {
                             info!("  High signal variation - possible DX QSB!");
                             sleep(Duration::from_secs(15)).await; // Extended listening
@@ -474,7 +503,7 @@ async fn run_dx_hunting(
 fn predict_band_conditions() -> Vec<BandConditions> {
     let now = Utc::now();
     let hour = now.time().hour();
-    
+
     // Simplified propagation prediction
     vec![
         BandConditions {
@@ -512,7 +541,10 @@ fn predict_band_conditions() -> Vec<BandConditions> {
 fn get_time_based_recommendations(hour: u32) -> Vec<(Band, String)> {
     match hour {
         0..=6 => vec![
-            (Band::Band40m, "Night time - excellent local/regional".to_string()),
+            (
+                Band::Band40m,
+                "Night time - excellent local/regional".to_string(),
+            ),
             (Band::Band80m, "Night time - good for local".to_string()),
         ],
         7..=9 => vec![
@@ -544,11 +576,11 @@ fn calculate_activity_score(readings: &[i32]) -> f32 {
 
     let avg = readings.iter().sum::<i32>() as f32 / readings.len() as f32;
     let variation = calculate_signal_variation(readings);
-    
+
     // Higher average signal and more variation indicate activity
     let signal_score = ((avg + 120.0) / 120.0).max(0.0).min(1.0); // Normalize -120 to 0 dBm
     let variation_score = (variation / 20.0).max(0.0).min(1.0); // Normalize variation
-    
+
     (signal_score + variation_score) / 2.0
 }
 
@@ -559,9 +591,11 @@ fn calculate_signal_variation(readings: &[i32]) -> f32 {
     }
 
     let avg = readings.iter().sum::<i32>() as f32 / readings.len() as f32;
-    let variance = readings.iter()
+    let variance = readings
+        .iter()
         .map(|&x| (x as f32 - avg).powi(2))
-        .sum::<f32>() / readings.len() as f32;
-    
+        .sum::<f32>()
+        / readings.len() as f32;
+
     variance.sqrt()
 }

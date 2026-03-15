@@ -98,15 +98,15 @@ impl AudioError {
     /// Check if this is a recoverable error
     pub fn is_recoverable(&self) -> bool {
         match self {
-            AudioError::Device { .. } => false,        // Device issues usually require restart
-            AudioError::Stream { .. } => true,         // Streams can be recreated
+            AudioError::Device { .. } => false, // Device issues usually require restart
+            AudioError::Stream { .. } => true,  // Streams can be recreated
             AudioError::Configuration { .. } => false, // Config errors need fixing
-            AudioError::SampleRate { .. } => true,     // Can fallback to different rates
-            AudioError::Buffer { .. } => true,         // Buffer issues can be handled
+            AudioError::SampleRate { .. } => true, // Can fallback to different rates
+            AudioError::Buffer { .. } => true,  // Buffer issues can be handled
             AudioError::LatencyExceeded { .. } => true, // Can adjust buffer sizes
-            AudioError::Threading { .. } => false,     // Threading issues are serious
-            AudioError::CpalStream { .. } => true,    // CPAL errors might be transient
-            AudioError::System { .. } => false,        // System failures are usually fatal
+            AudioError::Threading { .. } => false, // Threading issues are serious
+            AudioError::CpalStream { .. } => true, // CPAL errors might be transient
+            AudioError::System { .. } => false, // System failures are usually fatal
         }
     }
 
@@ -178,7 +178,7 @@ impl From<cpal::BuildStreamError> for AudioError {
 impl From<cpal::StreamError> for AudioError {
     fn from(err: cpal::StreamError) -> Self {
         AudioError::CpalStream {
-            message: format!("{}", err)
+            message: format!("{}", err),
         }
     }
 }

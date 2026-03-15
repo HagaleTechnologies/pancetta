@@ -12,34 +12,34 @@ use std::collections::HashMap;
 pub struct RigConfig {
     /// Transceiver model/manufacturer
     pub model: String,
-    
+
     /// CAT interface configuration
     pub interface: CatInterfaceConfig,
-    
+
     /// PTT control configuration
     pub ptt: PttConfig,
-    
+
     /// Frequency management settings
     pub frequency: FrequencyConfig,
-    
+
     /// Band switching configuration
     pub band_switching: BandSwitchingConfig,
-    
+
     /// Antenna switching configuration
     pub antenna_switching: AntennaSwitchingConfig,
-    
+
     /// Power control settings
     pub power_control: PowerControlConfig,
-    
+
     /// Mode and filter settings
     pub modes: ModeConfig,
-    
+
     /// Timing and polling configuration
     pub timing: TimingConfig,
-    
+
     /// Rig-specific parameters
     pub rig_parameters: RigParametersConfig,
-    
+
     /// Custom commands and macros
     #[serde(default)]
     pub custom_commands: HashMap<String, String>,
@@ -50,37 +50,37 @@ pub struct RigConfig {
 pub struct CatInterfaceConfig {
     /// Serial port device (e.g., "/dev/ttyUSB0", "COM3")
     pub port: String,
-    
+
     /// Baud rate
     pub baud_rate: u32,
-    
+
     /// Data bits (5, 6, 7, 8)
     pub data_bits: u8,
-    
+
     /// Stop bits (1, 2)
     pub stop_bits: StopBits,
-    
+
     /// Parity setting
     pub parity: Parity,
-    
+
     /// Flow control
     pub flow_control: FlowControl,
-    
+
     /// Connection timeout in milliseconds
     pub timeout_ms: u64,
-    
+
     /// Enable CAT control
     pub enabled: bool,
-    
+
     /// CAT protocol type
     pub protocol: CatProtocol,
-    
+
     /// Command termination character
     pub termination: String,
-    
+
     /// Response timeout in milliseconds
     pub response_timeout_ms: u64,
-    
+
     /// Retry count for failed commands
     pub retry_count: u8,
 }
@@ -119,22 +119,22 @@ pub enum FlowControl {
 pub enum CatProtocol {
     /// Hamlib generic protocol
     Hamlib,
-    
+
     /// Yaesu CAT protocol
     Yaesu,
-    
+
     /// Icom CI-V protocol
     Icom,
-    
+
     /// Kenwood protocol
     Kenwood,
-    
+
     /// Elecraft protocol
     Elecraft,
-    
+
     /// FlexRadio protocol
     FlexRadio,
-    
+
     /// Custom protocol implementation
     Custom,
 }
@@ -144,22 +144,22 @@ pub enum CatProtocol {
 pub struct PttConfig {
     /// PTT control method
     pub method: PttMethod,
-    
+
     /// PTT device/port for hardware control
     pub device: Option<String>,
-    
+
     /// PTT signal polarity
     pub polarity: PttPolarity,
-    
+
     /// PTT delay before transmission (milliseconds)
     pub tx_delay_ms: u64,
-    
+
     /// PTT delay after transmission (milliseconds)
     pub tx_tail_ms: u64,
-    
+
     /// VOX (Voice Operated eXchange) settings
     pub vox: VoxConfig,
-    
+
     /// PTT timeout in seconds (safety feature)
     pub timeout_seconds: u64,
 }
@@ -170,25 +170,25 @@ pub struct PttConfig {
 pub enum PttMethod {
     /// No PTT control
     None,
-    
+
     /// CAT command PTT
     Cat,
-    
+
     /// Serial port RTS/DTR
     Serial,
-    
+
     /// Parallel port
     Parallel,
-    
+
     /// USB device
     Usb,
-    
+
     /// Sound card PTT
     SoundCard,
-    
+
     /// VOX only
     Vox,
-    
+
     /// Network PTT (for remote rigs)
     Network,
 }
@@ -199,7 +199,7 @@ pub enum PttMethod {
 pub enum PttPolarity {
     /// Active high (positive logic)
     Positive,
-    
+
     /// Active low (negative logic)
     Negative,
 }
@@ -209,16 +209,16 @@ pub enum PttPolarity {
 pub struct VoxConfig {
     /// Enable VOX
     pub enabled: bool,
-    
+
     /// VOX gain/sensitivity (0.0 to 1.0)
     pub gain: f32,
-    
+
     /// VOX delay in milliseconds
     pub delay_ms: u64,
-    
+
     /// Anti-VOX (prevents receiver audio from triggering VOX)
     pub anti_vox: bool,
-    
+
     /// VOX threshold level in dB
     pub threshold_db: f32,
 }
@@ -228,19 +228,19 @@ pub struct VoxConfig {
 pub struct FrequencyConfig {
     /// Enable frequency control
     pub control_enabled: bool,
-    
+
     /// Automatically follow rig frequency
     pub follow_rig: bool,
-    
+
     /// Frequency polling interval in milliseconds
     pub polling_interval_ms: u64,
-    
+
     /// Memory channel management
     pub memory_channels: MemoryChannelConfig,
-    
+
     /// Frequency limits and ranges
     pub limits: FrequencyLimitsConfig,
-    
+
     /// Band plan configuration
     pub band_plan: BandPlanConfig,
 }
@@ -250,13 +250,13 @@ pub struct FrequencyConfig {
 pub struct MemoryChannelConfig {
     /// Enable memory channel control
     pub enabled: bool,
-    
+
     /// Automatically save current frequency to memory
     pub auto_save: bool,
-    
+
     /// Memory channel database file
     pub database_file: Option<String>,
-    
+
     /// Quick memory slots (1-10)
     pub quick_memories: Vec<MemoryChannel>,
 }
@@ -266,22 +266,22 @@ pub struct MemoryChannelConfig {
 pub struct MemoryChannel {
     /// Channel number
     pub channel: u16,
-    
+
     /// Frequency in Hz
     pub frequency: u64,
-    
+
     /// Operating mode
     pub mode: String,
-    
+
     /// Channel name/description
     pub name: String,
-    
+
     /// Bandwidth/filter setting
     pub bandwidth: Option<u32>,
-    
+
     /// Power level for this channel
     pub power: Option<u8>,
-    
+
     /// Antenna selection
     pub antenna: Option<u8>,
 }
@@ -291,10 +291,10 @@ pub struct MemoryChannel {
 pub struct FrequencyLimitsConfig {
     /// Minimum frequency in Hz
     pub min_frequency: u64,
-    
+
     /// Maximum frequency in Hz
     pub max_frequency: u64,
-    
+
     /// Per-band frequency limits
     pub band_limits: HashMap<String, FrequencyRange>,
 }
@@ -304,10 +304,10 @@ pub struct FrequencyLimitsConfig {
 pub struct FrequencyRange {
     /// Start frequency in Hz
     pub start: u64,
-    
+
     /// End frequency in Hz
     pub end: u64,
-    
+
     /// Allowed modes for this range
     pub modes: Vec<String>,
 }
@@ -317,10 +317,10 @@ pub struct FrequencyRange {
 pub struct BandPlanConfig {
     /// Region-specific band plan (ITU Region 1, 2, or 3)
     pub region: u8,
-    
+
     /// Custom band definitions
     pub custom_bands: HashMap<String, BandDefinition>,
-    
+
     /// Band edge warnings
     pub edge_warnings: bool,
 }
@@ -330,13 +330,13 @@ pub struct BandPlanConfig {
 pub struct BandDefinition {
     /// Band name (e.g., "40m", "20m")
     pub name: String,
-    
+
     /// Frequency ranges for this band
     pub ranges: Vec<FrequencyRange>,
-    
+
     /// Default mode for this band
     pub default_mode: String,
-    
+
     /// Band type (HF, VHF, UHF, etc.)
     pub band_type: BandType,
 }
@@ -347,22 +347,22 @@ pub struct BandDefinition {
 pub enum BandType {
     /// Low Frequency (30-300 kHz)
     Lf,
-    
+
     /// Medium Frequency (300 kHz - 3 MHz)
     Mf,
-    
+
     /// High Frequency (3-30 MHz)
     Hf,
-    
+
     /// Very High Frequency (30-300 MHz)
     Vhf,
-    
+
     /// Ultra High Frequency (300 MHz - 3 GHz)
     Uhf,
-    
+
     /// Super High Frequency (3-30 GHz)
     Shf,
-    
+
     /// Extremely High Frequency (30-300 GHz)
     Ehf,
 }
@@ -372,16 +372,16 @@ pub enum BandType {
 pub struct BandSwitchingConfig {
     /// Enable automatic band switching
     pub auto_switching: bool,
-    
+
     /// Band switching method
     pub method: BandSwitchMethod,
-    
+
     /// Band switching device/interface
     pub device: Option<String>,
-    
+
     /// Band switching delay in milliseconds
     pub switching_delay_ms: u64,
-    
+
     /// Band-to-output mapping
     pub band_outputs: HashMap<String, u8>,
 }
@@ -392,19 +392,19 @@ pub struct BandSwitchingConfig {
 pub enum BandSwitchMethod {
     /// No band switching
     None,
-    
+
     /// Serial port control
     Serial,
-    
+
     /// Parallel port control
     Parallel,
-    
+
     /// USB device control
     Usb,
-    
+
     /// Network control
     Network,
-    
+
     /// CAT command
     Cat,
 }
@@ -414,19 +414,19 @@ pub enum BandSwitchMethod {
 pub struct AntennaSwitchingConfig {
     /// Enable antenna switching
     pub enabled: bool,
-    
+
     /// Antenna switching method
     pub method: AntennaSwitchMethod,
-    
+
     /// Antenna switching device
     pub device: Option<String>,
-    
+
     /// Antenna switching delay in milliseconds
     pub switching_delay_ms: u64,
-    
+
     /// Antenna definitions
     pub antennas: Vec<AntennaDefinition>,
-    
+
     /// Auto-switching rules
     pub auto_rules: Vec<AntennaRule>,
 }
@@ -437,16 +437,16 @@ pub struct AntennaSwitchingConfig {
 pub enum AntennaSwitchMethod {
     /// No antenna switching
     None,
-    
+
     /// Manual selection only
     Manual,
-    
+
     /// Serial port control
     Serial,
-    
+
     /// Network control
     Network,
-    
+
     /// CAT command
     Cat,
 }
@@ -456,16 +456,16 @@ pub enum AntennaSwitchMethod {
 pub struct AntennaDefinition {
     /// Antenna ID
     pub id: u8,
-    
+
     /// Antenna name
     pub name: String,
-    
+
     /// Supported bands
     pub bands: Vec<String>,
-    
+
     /// Antenna type
     pub antenna_type: String,
-    
+
     /// Control signal/address
     pub control_address: u8,
 }
@@ -475,16 +475,16 @@ pub struct AntennaDefinition {
 pub struct AntennaRule {
     /// Rule name
     pub name: String,
-    
+
     /// Frequency range for this rule
     pub frequency_range: FrequencyRange,
-    
+
     /// Preferred antenna ID
     pub antenna_id: u8,
-    
+
     /// Rule priority (higher = more important)
     pub priority: u8,
-    
+
     /// Rule enabled
     pub enabled: bool,
 }
@@ -494,19 +494,19 @@ pub struct AntennaRule {
 pub struct PowerControlConfig {
     /// Enable power control
     pub enabled: bool,
-    
+
     /// Power control method
     pub method: PowerControlMethod,
-    
+
     /// Default power level (0-100%)
     pub default_level: u8,
-    
+
     /// Per-band power settings
     pub band_power: HashMap<String, u8>,
-    
+
     /// Power ramping settings
     pub ramping: PowerRampingConfig,
-    
+
     /// Power protection settings
     pub protection: PowerProtectionConfig,
 }
@@ -517,13 +517,13 @@ pub struct PowerControlConfig {
 pub enum PowerControlMethod {
     /// No power control
     None,
-    
+
     /// CAT command control
     Cat,
-    
+
     /// Manual control only
     Manual,
-    
+
     /// Automatic power control
     Automatic,
 }
@@ -533,13 +533,13 @@ pub enum PowerControlMethod {
 pub struct PowerRampingConfig {
     /// Enable power ramping
     pub enabled: bool,
-    
+
     /// Ramp up time in milliseconds
     pub ramp_up_ms: u64,
-    
+
     /// Ramp down time in milliseconds
     pub ramp_down_ms: u64,
-    
+
     /// Ramping curve (linear, exponential, etc.)
     pub curve: RampingCurve,
 }
@@ -559,16 +559,16 @@ pub enum RampingCurve {
 pub struct PowerProtectionConfig {
     /// Maximum power limit (watts)
     pub max_power_watts: u16,
-    
+
     /// Enable SWR protection
     pub swr_protection: bool,
-    
+
     /// Maximum SWR threshold
     pub max_swr: f32,
-    
+
     /// Temperature protection
     pub temperature_protection: bool,
-    
+
     /// Maximum temperature (Celsius)
     pub max_temperature_c: f32,
 }
@@ -578,13 +578,13 @@ pub struct PowerProtectionConfig {
 pub struct ModeConfig {
     /// Supported modes
     pub supported_modes: Vec<String>,
-    
+
     /// Default mode
     pub default_mode: String,
-    
+
     /// Mode-specific settings
     pub mode_settings: HashMap<String, ModeSettings>,
-    
+
     /// Filter settings
     pub filters: FilterConfig,
 }
@@ -594,16 +594,16 @@ pub struct ModeConfig {
 pub struct ModeSettings {
     /// Mode bandwidth in Hz
     pub bandwidth: u32,
-    
+
     /// Default power level for this mode
     pub power_level: u8,
-    
+
     /// AGC setting for this mode
     pub agc_mode: String,
-    
+
     /// Noise blanker settings
     pub noise_blanker: bool,
-    
+
     /// Mode-specific parameters
     pub parameters: HashMap<String, String>,
 }
@@ -613,10 +613,10 @@ pub struct ModeSettings {
 pub struct FilterConfig {
     /// Available filter widths
     pub available_widths: Vec<u32>,
-    
+
     /// Default filter for each mode
     pub mode_defaults: HashMap<String, u32>,
-    
+
     /// Custom filter definitions
     pub custom_filters: Vec<CustomFilter>,
 }
@@ -626,13 +626,13 @@ pub struct FilterConfig {
 pub struct CustomFilter {
     /// Filter name
     pub name: String,
-    
+
     /// Filter bandwidth in Hz
     pub bandwidth: u32,
-    
+
     /// Filter shape factor
     pub shape_factor: f32,
-    
+
     /// Filter type (roofing, IF, etc.)
     pub filter_type: String,
 }
@@ -642,16 +642,16 @@ pub struct CustomFilter {
 pub struct TimingConfig {
     /// Command interval in milliseconds
     pub command_interval_ms: u64,
-    
+
     /// Status polling interval in milliseconds
     pub status_polling_ms: u64,
-    
+
     /// Connection retry interval in milliseconds
     pub retry_interval_ms: u64,
-    
+
     /// Keep-alive interval in milliseconds
     pub keepalive_interval_ms: u64,
-    
+
     /// Rig response timeout in milliseconds
     pub response_timeout_ms: u64,
 }
@@ -661,16 +661,16 @@ pub struct TimingConfig {
 pub struct RigParametersConfig {
     /// Rig identification string
     pub rig_id: Option<String>,
-    
+
     /// Firmware version
     pub firmware_version: Option<String>,
-    
+
     /// Extended features supported
     pub extended_features: Vec<String>,
-    
+
     /// Calibration data
     pub calibration: CalibrationConfig,
-    
+
     /// Rig-specific quirks and workarounds
     pub quirks: QuirksConfig,
 }
@@ -680,13 +680,13 @@ pub struct RigParametersConfig {
 pub struct CalibrationConfig {
     /// Frequency calibration offset in Hz
     pub frequency_offset: i32,
-    
+
     /// Power meter calibration
     pub power_calibration: Vec<CalibrationPoint>,
-    
+
     /// S-meter calibration
     pub s_meter_calibration: Vec<CalibrationPoint>,
-    
+
     /// SWR meter calibration
     pub swr_calibration: Vec<CalibrationPoint>,
 }
@@ -696,10 +696,10 @@ pub struct CalibrationConfig {
 pub struct CalibrationPoint {
     /// Raw value from rig
     pub raw_value: u16,
-    
+
     /// Calibrated value
     pub calibrated_value: f32,
-    
+
     /// Unit of measurement
     pub unit: String,
 }
@@ -709,10 +709,10 @@ pub struct CalibrationPoint {
 pub struct QuirksConfig {
     /// Commands that need special handling
     pub special_commands: HashMap<String, String>,
-    
+
     /// Known issues and workarounds
     pub workarounds: Vec<String>,
-    
+
     /// Timing adjustments for specific operations
     pub timing_adjustments: HashMap<String, u64>,
 }
@@ -807,7 +807,7 @@ impl Default for MemoryChannelConfig {
 impl Default for FrequencyLimitsConfig {
     fn default() -> Self {
         Self {
-            min_frequency: 1_800_000, // 1.8 MHz
+            min_frequency: 1_800_000,   // 1.8 MHz
             max_frequency: 440_000_000, // 440 MHz
             band_limits: HashMap::new(),
         }
@@ -969,7 +969,7 @@ impl ConfigSection for RigConfig {
                     value: self.interface.baud_rate.to_string(),
                 });
             }
-            
+
             if ![5, 6, 7, 8].contains(&self.interface.data_bits) {
                 return Err(ConfigError::InvalidValue {
                     field: "interface.data_bits".to_string(),
@@ -977,7 +977,7 @@ impl ConfigSection for RigConfig {
                 });
             }
         }
-        
+
         // Validate PTT timeout
         if self.ptt.timeout_seconds == 0 {
             return Err(ConfigError::InvalidValue {
@@ -985,7 +985,7 @@ impl ConfigSection for RigConfig {
                 value: self.ptt.timeout_seconds.to_string(),
             });
         }
-        
+
         // Validate power settings
         if self.power_control.default_level > 100 {
             return Err(ConfigError::InvalidValue {
@@ -993,26 +993,27 @@ impl ConfigSection for RigConfig {
                 value: self.power_control.default_level.to_string(),
             });
         }
-        
+
         // Validate frequency limits
         if self.frequency.limits.min_frequency >= self.frequency.limits.max_frequency {
             return Err(ConfigError::InvalidValue {
                 field: "frequency.limits".to_string(),
-                value: format!("min >= max ({} >= {})", 
-                              self.frequency.limits.min_frequency,
-                              self.frequency.limits.max_frequency),
+                value: format!(
+                    "min >= max ({} >= {})",
+                    self.frequency.limits.min_frequency, self.frequency.limits.max_frequency
+                ),
             });
         }
-        
+
         Ok(())
     }
-    
+
     fn merge_with(&mut self, other: Self) {
         // Merge non-default values
         if other.model != "Generic" {
             self.model = other.model;
         }
-        
+
         // Merge complex configurations
         self.interface.merge_with(other.interface);
         self.ptt.merge_with(other.ptt);
@@ -1023,7 +1024,7 @@ impl ConfigSection for RigConfig {
         self.modes.merge_with(other.modes);
         self.timing.merge_with(other.timing);
         self.rig_parameters.merge_with(other.rig_parameters);
-        
+
         // Merge custom commands
         self.custom_commands.extend(other.custom_commands);
     }
@@ -1096,7 +1097,7 @@ impl RigParametersConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_default_rig_config() {
         let config = RigConfig::default();
@@ -1104,51 +1105,51 @@ mod tests {
         assert!(!config.interface.enabled);
         assert!(config.validate_section().is_ok());
     }
-    
+
     #[test]
     fn test_cat_interface_validation() {
         let mut config = RigConfig::default();
         config.interface.enabled = true;
-        
+
         // Valid configuration
         assert!(config.validate_section().is_ok());
-        
+
         // Invalid data bits
         config.interface.data_bits = 9;
         assert!(config.validate_section().is_err());
-        
+
         // Invalid baud rate
         config.interface.data_bits = 8; // Reset to valid
         config.interface.baud_rate = 0;
         assert!(config.validate_section().is_err());
     }
-    
+
     #[test]
     fn test_power_control_validation() {
         let mut config = RigConfig::default();
-        
+
         // Valid power level
         config.power_control.default_level = 50;
         assert!(config.validate_section().is_ok());
-        
+
         // Invalid power level
         config.power_control.default_level = 150;
         assert!(config.validate_section().is_err());
     }
-    
+
     #[test]
     fn test_frequency_limits_validation() {
         let mut config = RigConfig::default();
-        
+
         // Valid frequency limits
         assert!(config.validate_section().is_ok());
-        
+
         // Invalid frequency limits (min >= max)
         config.frequency.limits.min_frequency = 50_000_000;
         config.frequency.limits.max_frequency = 30_000_000;
         assert!(config.validate_section().is_err());
     }
-    
+
     #[test]
     fn test_memory_channel() {
         let channel = MemoryChannel {
@@ -1160,7 +1161,7 @@ mod tests {
             power: Some(50),
             antenna: Some(1),
         };
-        
+
         assert_eq!(channel.frequency, 14_205_000);
         assert_eq!(channel.mode, "USB");
     }

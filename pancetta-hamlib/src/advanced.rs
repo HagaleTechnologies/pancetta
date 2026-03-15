@@ -1,5 +1,5 @@
 //! Advanced rig control features
-//! 
+//!
 //! This module provides advanced functionality for band switching, memory channel
 //! management, scanning operations, and real-time monitoring of rig parameters.
 
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{interval, sleep};
-use tracing::{debug, error, info, warn, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 /// Memory channel information
 #[derive(Debug, Clone)]
@@ -208,7 +208,9 @@ impl BandPlan {
 
     /// Get band plan for specific band
     pub fn for_band(band: Band) -> Option<Self> {
-        Self::standard_bands().into_iter().find(|bp| bp.band == band)
+        Self::standard_bands()
+            .into_iter()
+            .find(|bp| bp.band == band)
     }
 }
 
@@ -240,43 +242,46 @@ pub struct MonitoringData {
 pub trait AdvancedRigControl: RigControl {
     /// Switch to band with default settings
     async fn switch_to_band(&self, band: Band) -> Result<()>;
-    
+
     /// Get band plan for current frequency
     async fn get_current_band_plan(&self) -> Result<Option<BandPlan>>;
-    
+
     /// Save current settings to memory channel
     async fn save_to_memory(&self, channel: i32, name: Option<String>) -> Result<()>;
-    
+
     /// Load settings from memory channel
     async fn load_from_memory(&self, channel: i32) -> Result<MemoryChannel>;
-    
+
     /// Get all programmed memory channels
     async fn list_memory_channels(&self) -> Result<Vec<MemoryChannel>>;
-    
+
     /// Clear memory channel
     async fn clear_memory_channel(&self, channel: i32) -> Result<()>;
-    
+
     /// Start scanning with configuration
     async fn start_scan(&self, config: ScanConfig) -> Result<()>;
-    
+
     /// Stop scanning
     async fn stop_scan(&self) -> Result<()>;
-    
+
     /// Get current scan status
     async fn get_scan_status(&self) -> Result<ScanStatus>;
-    
+
     /// Start real-time monitoring
-    async fn start_monitoring(&self, interval_ms: u64) -> Result<broadcast::Receiver<MonitoringData>>;
-    
+    async fn start_monitoring(
+        &self,
+        interval_ms: u64,
+    ) -> Result<broadcast::Receiver<MonitoringData>>;
+
     /// Stop real-time monitoring
     async fn stop_monitoring(&self) -> Result<()>;
-    
+
     /// Get antenna switch position (if supported)
     async fn get_antenna(&self) -> Result<u32>;
-    
+
     /// Set antenna switch position (if supported)
     async fn set_antenna(&self, antenna: u32) -> Result<()>;
-    
+
     /// Get available antenna positions
     async fn list_antennas(&self) -> Result<Vec<u32>>;
 }
@@ -350,9 +355,9 @@ impl AdvancedRig {
     async fn load_memory_channels(&self) -> Result<()> {
         let capabilities = self.rig.capabilities();
         let max_channels = capabilities.memory_channels.unwrap_or(100);
-        
+
         let mut channels = HashMap::new();
-        
+
         for channel in 0..max_channels {
             // Try to load each memory channel
             match self.load_from_memory(channel as i32).await {
@@ -365,7 +370,7 @@ impl AdvancedRig {
                 }
             }
         }
-        
+
         *self.memory_channels.write().await = channels;
         Ok(())
     }
@@ -373,7 +378,7 @@ impl AdvancedRig {
     /// Execute scanning loop
     async fn scan_loop(&self, config: ScanConfig) -> Result<()> {
         let mut scan_positions = Vec::new();
-        
+
         // Build scan list based on configuration
         match config.scan_type {
             ScanType::Memory => {
@@ -414,11 +419,11 @@ impl AdvancedRig {
         }
 
         info!("Starting scan with {} positions", scan_positions.len());
-        
+
         let mut position_index = 0;
         let scan_interval = Duration::from_secs_f32(1.0 / config.speed);
         let mut interval_timer = interval(scan_interval);
-        
+
         // Update scan status
         {
             let mut status = self.scan_status.write().await;
@@ -431,7 +436,7 @@ impl AdvancedRig {
 
         loop {
             interval_timer.tick().await;
-            
+
             // Check if scan should stop
             {
                 let status = self.scan_status.read().await;
@@ -441,7 +446,7 @@ impl AdvancedRig {
             }
 
             let position = &scan_positions[position_index];
-            
+
             // Update current position
             {
                 let mut status = self.scan_status.write().await;
@@ -474,7 +479,7 @@ impl AdvancedRig {
 
             if signal_present {
                 info!("Signal detected at position {:?}", position);
-                
+
                 // Update scan status
                 {
                     let mut status = self.scan_status.write().await;
@@ -484,7 +489,7 @@ impl AdvancedRig {
 
                 // Pause on active signal
                 sleep(Duration::from_secs_f32(config.pause_time)).await;
-                
+
                 // Check if signal is still present
                 let still_present = match self.rig.get_s_meter().await {
                     Ok(s_meter) => s_meter > config.squelch_threshold,
@@ -513,14 +518,18 @@ impl AdvancedRig {
     }
 
     /// Execute monitoring loop
-    async fn monitoring_loop(&self, interval_ms: u64, tx: broadcast::Sender<MonitoringData>) -> Result<()> {
+    async fn monitoring_loop(
+        &self,
+        interval_ms: u64,
+        tx: broadcast::Sender<MonitoringData>,
+    ) -> Result<()> {
         let mut interval_timer = interval(Duration::from_millis(interval_ms));
-        
+
         info!("Starting monitoring with {}ms interval", interval_ms);
-        
+
         loop {
             interval_timer.tick().await;
-            
+
             // Check if monitoring should stop
             if tx.receiver_count() == 0 {
                 info!("No more monitoring receivers, stopping");
@@ -535,8 +544,16 @@ impl AdvancedRig {
                 power_output: self.rig.get_power_level().await.ok(),
                 alc_level: None, // Would need ALC level reading implementation
                 frequency: self.rig.get_frequency(Vfo::Current).await.ok(),
-                mode: self.rig.get_mode(Vfo::Current).await.ok().map(|(mode, _)| mode),
-                ptt_active: self.rig.get_ptt(Vfo::Current).await
+                mode: self
+                    .rig
+                    .get_mode(Vfo::Current)
+                    .await
+                    .ok()
+                    .map(|(mode, _)| mode),
+                ptt_active: self
+                    .rig
+                    .get_ptt(Vfo::Current)
+                    .await
                     .map(|ptt| ptt != PttState::Off)
                     .unwrap_or(false),
                 squelch_open: false, // Would need squelch state reading
@@ -583,7 +600,7 @@ impl RigControl for AdvancedRig {
         if let Err(e) = self.stop_scan().await {
             warn!("Error stopping scan: {}", e);
         }
-        
+
         self.rig.disconnect().await
     }
 
@@ -660,16 +677,25 @@ impl RigControl for AdvancedRig {
 impl AdvancedRigControl for AdvancedRig {
     #[instrument(skip(self))]
     async fn switch_to_band(&self, band: Band) -> Result<()> {
-        let band_plan = BandPlan::for_band(band)
-            .ok_or_else(|| anyhow!("No band plan for band {:?}", band))?;
+        let band_plan =
+            BandPlan::for_band(band).ok_or_else(|| anyhow!("No band plan for band {:?}", band))?;
 
         // Set frequency to default for this band
-        self.set_frequency(Vfo::Current, band_plan.default_frequency).await?;
-        
-        // Set mode to default for this band
-        self.set_mode(Vfo::Current, band_plan.default_mode, Some(band_plan.default_width)).await?;
+        self.set_frequency(Vfo::Current, band_plan.default_frequency)
+            .await?;
 
-        info!("Switched to band {:?} at {} Hz", band, band_plan.default_frequency);
+        // Set mode to default for this band
+        self.set_mode(
+            Vfo::Current,
+            band_plan.default_mode,
+            Some(band_plan.default_width),
+        )
+        .await?;
+
+        info!(
+            "Switched to band {:?} at {} Hz",
+            band, band_plan.default_frequency
+        );
         Ok(())
     }
 
@@ -700,7 +726,10 @@ impl AdvancedRigControl for AdvancedRig {
 
         // Save to rig (simplified - real implementation would use rig_set_channel)
         // For now, we'll just store in our cache
-        self.memory_channels.write().await.insert(channel, memory_channel.clone());
+        self.memory_channels
+            .write()
+            .await
+            .insert(channel, memory_channel.clone());
 
         info!("Saved current settings to memory channel {}", channel);
         Ok(())
@@ -711,16 +740,22 @@ impl AdvancedRigControl for AdvancedRig {
         // Try to load from cache first
         if let Some(memory_channel) = self.memory_channels.read().await.get(&channel).cloned() {
             // Load settings to rig
-            self.set_frequency(Vfo::Current, memory_channel.frequency).await?;
-            self.set_mode(Vfo::Current, memory_channel.mode, Some(memory_channel.width)).await?;
-            
+            self.set_frequency(Vfo::Current, memory_channel.frequency)
+                .await?;
+            self.set_mode(
+                Vfo::Current,
+                memory_channel.mode,
+                Some(memory_channel.width),
+            )
+            .await?;
+
             info!("Loaded memory channel {}", channel);
             return Ok(memory_channel);
         }
 
         // Try to load from rig
         self.set_memory_channel(Vfo::Current, channel).await?;
-        
+
         // Get current settings (which should now be from the memory channel)
         let frequency = self.get_frequency(Vfo::Current).await?;
         let (mode, width) = self.get_mode(Vfo::Current).await?;
@@ -738,7 +773,10 @@ impl AdvancedRigControl for AdvancedRig {
         };
 
         // Cache it
-        self.memory_channels.write().await.insert(channel, memory_channel.clone());
+        self.memory_channels
+            .write()
+            .await
+            .insert(channel, memory_channel.clone());
 
         Ok(memory_channel)
     }
@@ -754,7 +792,7 @@ impl AdvancedRigControl for AdvancedRig {
     async fn clear_memory_channel(&self, channel: i32) -> Result<()> {
         // Remove from cache
         self.memory_channels.write().await.remove(&channel);
-        
+
         // Clear from rig (simplified - real implementation would use rig_clear_channel)
         info!("Cleared memory channel {}", channel);
         Ok(())
@@ -767,13 +805,13 @@ impl AdvancedRigControl for AdvancedRig {
 
         // Clone the necessary components for the scan task
         let rig_clone = Arc::clone(&self.rig);
-        
+
         // Create scan task
         let handle = tokio::spawn(async move {
             // Create a simplified AdvancedRig for the scan task
             // We don't need all the components for scanning
             let temp_rig = AdvancedRig::new(rig_clone);
-            
+
             if let Err(e) = temp_rig.scan_loop(config).await {
                 error!("Scan loop error: {}", e);
             }
@@ -808,7 +846,10 @@ impl AdvancedRigControl for AdvancedRig {
     }
 
     #[instrument(skip(self))]
-    async fn start_monitoring(&self, interval_ms: u64) -> Result<broadcast::Receiver<MonitoringData>> {
+    async fn start_monitoring(
+        &self,
+        interval_ms: u64,
+    ) -> Result<broadcast::Receiver<MonitoringData>> {
         // Stop any existing monitoring
         self.stop_monitoring().await?;
 
@@ -829,7 +870,7 @@ impl AdvancedRigControl for AdvancedRig {
         });
 
         *self.monitoring_handle.write().await = Some(handle);
-        
+
         info!("Started monitoring with {}ms interval", interval_ms);
         Ok(rx)
     }
@@ -871,17 +912,17 @@ impl AdvancedRigControl for AdvancedRig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rig::RigConfig;
     use crate::models::RigModelType;
+    use crate::rig::RigConfig;
 
     #[tokio::test]
     async fn test_band_plan_creation() {
         let band_plans = BandPlan::standard_bands();
         assert!(!band_plans.is_empty());
-        
+
         let band_20m = BandPlan::for_band(Band::Band20m);
         assert!(band_20m.is_some());
-        
+
         let plan = band_20m.unwrap();
         assert_eq!(plan.band, Band::Band20m);
         assert_eq!(plan.default_mode, Mode::USB);

@@ -2,12 +2,12 @@
 //
 // This module provides comprehensive propagation prediction models including:
 // - VOACAP-based predictions
-// - Real-time solar data integration  
+// - Real-time solar data integration
 // - Multi-path propagation analysis
 // - Gray-line propagation
 // - Sporadic-E and meteor scatter predictions
 
-use chrono::{DateTime, Utc, Timelike, Datelike};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use geo::{point, prelude::*};
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -204,13 +204,13 @@ impl EnhancedPropagation {
             muf_maps: MufMaps::new(),
         }
     }
-    
+
     /// Update solar data
     pub fn update_solar_data(&mut self, data: SolarData) {
         self.solar_data = data;
         self.update_ionosphere();
     }
-    
+
     /// Calculate propagation prediction
     pub fn predict(
         &self,
@@ -225,44 +225,36 @@ impl EnhancedPropagation {
         // Calculate path parameters
         let distance_km = self.calculate_distance(from_lat, from_lon, to_lat, to_lon);
         let bearing = self.calculate_bearing(from_lat, from_lon, to_lat, to_lon);
-        
+
         // Calculate MUF/LUF/FOT
         let muf = self.calculate_muf(distance_km, time);
         let luf = self.calculate_luf(distance_km, time);
         let fot = muf * 0.85; // FOT is typically 85% of MUF
-        
+
         // Determine propagation mode
         let mode = self.determine_mode(frequency_mhz, distance_km, time);
         let alt_modes = self.find_alternative_modes(frequency_mhz, distance_km, time);
-        
+
         // Calculate signal parameters
         let elevation = self.calculate_elevation_angle(distance_km, mode);
         let hops = self.calculate_hops(distance_km, mode);
-        let path_loss = self.calculate_path_loss(frequency_mhz, distance_km, mode, &self.solar_data);
-        
+        let path_loss =
+            self.calculate_path_loss(frequency_mhz, distance_km, mode, &self.solar_data);
+
         // Calculate noise and SNR
         let noise_level = self.calculate_noise_level(frequency_mhz, time);
-        let signal_strength = self.calculate_signal_strength(
-            power_watts,
-            path_loss,
-            frequency_mhz,
-            distance_km,
-        );
+        let signal_strength =
+            self.calculate_signal_strength(power_watts, path_loss, frequency_mhz, distance_km);
         let snr = signal_strength - noise_level;
-        
+
         // Calculate reliability
-        let reliability = self.calculate_reliability(
-            frequency_mhz,
-            muf,
-            luf,
-            &self.solar_data,
-            time,
-        );
-        
+        let reliability =
+            self.calculate_reliability(frequency_mhz, muf, luf, &self.solar_data, time);
+
         // Calculate multipath parameters
         let delay_spread = self.calculate_delay_spread(distance_km, mode);
         let doppler_spread = self.calculate_doppler_spread(frequency_mhz, mode);
-        
+
         PropagationPrediction {
             muf,
             luf,
@@ -280,32 +272,31 @@ impl EnhancedPropagation {
             doppler_spread,
         }
     }
-    
+
     /// Calculate great circle distance
     fn calculate_distance(&self, lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
         let p1 = point!(x: lon1, y: lat1);
         let p2 = point!(x: lon2, y: lat2);
         p1.haversine_distance(&p2) / 1000.0 // Convert to km
     }
-    
+
     /// Calculate bearing between two points
     fn calculate_bearing(&self, lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
         let lat1_rad = lat1.to_radians();
         let lat2_rad = lat2.to_radians();
         let delta_lon = (lon2 - lon1).to_radians();
-        
+
         let y = delta_lon.sin() * lat2_rad.cos();
-        let x = lat1_rad.cos() * lat2_rad.sin() - 
-                lat1_rad.sin() * lat2_rad.cos() * delta_lon.cos();
-        
+        let x = lat1_rad.cos() * lat2_rad.sin() - lat1_rad.sin() * lat2_rad.cos() * delta_lon.cos();
+
         y.atan2(x).to_degrees()
     }
-    
+
     /// Calculate MUF using improved model
     fn calculate_muf(&self, distance_km: f64, time: DateTime<Utc>) -> f64 {
         // Base MUF from ionospheric model
         let base_muf = self.ionosphere.fof2 * self.ionosphere.muf_factor;
-        
+
         // Distance factor (MUF increases with distance up to one hop)
         let one_hop = 3000.0; // km
         let distance_factor = if distance_km <= one_hop {
@@ -313,54 +304,59 @@ impl EnhancedPropagation {
         } else {
             3.0 - (distance_km - one_hop) / 10000.0
         };
-        
+
         // Time factor (diurnal variation)
         let hour = time.hour() as f64;
         let time_factor = 1.0 + 0.3 * ((hour - 12.0) * PI / 12.0).cos();
-        
+
         // Solar activity factor
         let solar_factor = 1.0 + (self.solar_data.sfi - 70.0) / 200.0;
-        
+
         base_muf * distance_factor * time_factor * solar_factor
     }
-    
+
     /// Calculate LUF using D-layer absorption
     fn calculate_luf(&self, distance_km: f64, time: DateTime<Utc>) -> f64 {
         // Base LUF from D-layer absorption
         let base_luf = 2.0 + self.ionosphere.d_absorption * 3.0;
-        
+
         // Distance factor (LUF decreases with distance)
         let distance_factor = 1.0 - (distance_km / 20000.0).min(0.5);
-        
+
         // Time factor (higher during day)
         let hour = time.hour() as f64;
         let time_factor = 1.0 + 0.5 * ((hour - 12.0) * PI / 12.0).cos().max(0.0);
-        
+
         base_luf * distance_factor * time_factor
     }
-    
+
     /// Determine primary propagation mode
-    fn determine_mode(&self, freq_mhz: f64, distance_km: f64, time: DateTime<Utc>) -> PropagationMode {
+    fn determine_mode(
+        &self,
+        freq_mhz: f64,
+        distance_km: f64,
+        time: DateTime<Utc>,
+    ) -> PropagationMode {
         // Ground wave for short distances and low frequencies
         if distance_km < 100.0 && freq_mhz < 10.0 {
             return PropagationMode::GroundWave;
         }
-        
+
         // Tropospheric for VHF/UHF
         if freq_mhz > 50.0 && distance_km < 500.0 {
             return PropagationMode::Tropo;
         }
-        
+
         // Check for gray-line
         if self.is_gray_line(time) {
             return PropagationMode::GrayLine;
         }
-        
+
         // Check for sporadic E (summer, mid-latitudes)
         if freq_mhz > 20.0 && self.is_sporadic_e_likely(time) {
             return PropagationMode::SporadicE;
         }
-        
+
         // F-layer propagation
         let hops = (distance_km / 3000.0).ceil() as u8;
         if hops > 1 {
@@ -371,7 +367,7 @@ impl EnhancedPropagation {
             PropagationMode::F2
         }
     }
-    
+
     /// Find alternative propagation modes
     fn find_alternative_modes(
         &self,
@@ -380,25 +376,25 @@ impl EnhancedPropagation {
         time: DateTime<Utc>,
     ) -> Vec<PropagationMode> {
         let mut modes = Vec::new();
-        
+
         // Long path possibility for distances > 5000 km
         if distance_km > 5000.0 {
             modes.push(PropagationMode::LongPath);
         }
-        
+
         // Meteor scatter for VHF
         if freq_mhz > 30.0 && freq_mhz < 150.0 {
             modes.push(PropagationMode::MeteorScatter);
         }
-        
+
         // E-layer skip
         if freq_mhz < self.ionosphere.foe * 4.0 {
             modes.push(PropagationMode::E);
         }
-        
+
         modes
     }
-    
+
     /// Calculate elevation angle
     fn calculate_elevation_angle(&self, distance_km: f64, mode: PropagationMode) -> f64 {
         match mode {
@@ -408,7 +404,7 @@ impl EnhancedPropagation {
                 let max_elevation = 45.0;
                 let min_elevation = 5.0;
                 let one_hop = 3000.0;
-                
+
                 if distance_km <= one_hop {
                     max_elevation - (max_elevation - min_elevation) * (distance_km / one_hop)
                 } else {
@@ -425,7 +421,7 @@ impl EnhancedPropagation {
             PropagationMode::MultiHop(_) => 10.0,
         }
     }
-    
+
     /// Calculate number of hops
     fn calculate_hops(&self, distance_km: f64, mode: PropagationMode) -> u8 {
         match mode {
@@ -439,7 +435,7 @@ impl EnhancedPropagation {
             _ => 1,
         }
     }
-    
+
     /// Calculate path loss
     fn calculate_path_loss(
         &self,
@@ -450,7 +446,7 @@ impl EnhancedPropagation {
     ) -> f64 {
         // Free space path loss
         let fspl = 20.0 * freq_mhz.log10() + 20.0 * distance_km.log10() + 32.45;
-        
+
         // Additional losses based on mode
         let mode_loss = match mode {
             PropagationMode::GroundWave => 20.0 + distance_km * 0.01,
@@ -467,30 +463,30 @@ impl EnhancedPropagation {
             PropagationMode::LongPath => fspl * 0.3, // Additional 30%
             PropagationMode::MultiHop(n) => 10.0 * n as f64,
         };
-        
+
         fspl + mode_loss
     }
-    
+
     /// Calculate noise level
     fn calculate_noise_level(&self, freq_mhz: f64, time: DateTime<Utc>) -> f64 {
         // Atmospheric noise (decreases with frequency)
         let atmospheric = -174.0 + 10.0 * (290.0_f64).log10() + 30.0 / freq_mhz;
-        
+
         // Man-made noise (higher in day time)
         let hour = time.hour() as f64;
         let man_made = -140.0 + 10.0 * ((hour - 2.0).abs() / 10.0);
-        
+
         // Galactic noise (significant at HF)
         let galactic = if freq_mhz < 30.0 {
             -150.0 + 200.0 / freq_mhz
         } else {
             -160.0
         };
-        
+
         // Return highest noise source
         atmospheric.max(man_made).max(galactic)
     }
-    
+
     /// Calculate signal strength
     fn calculate_signal_strength(
         &self,
@@ -501,15 +497,15 @@ impl EnhancedPropagation {
     ) -> f64 {
         // Convert power to dBm
         let power_dbm = 10.0 * power_watts.log10() + 30.0;
-        
+
         // Antenna gains (assumed)
         let tx_gain = 6.0; // dBi
         let rx_gain = 6.0; // dBi
-        
+
         // Calculate received power
         power_dbm + tx_gain + rx_gain - path_loss
     }
-    
+
     /// Calculate reliability percentage
     fn calculate_reliability(
         &self,
@@ -529,7 +525,7 @@ impl EnhancedPropagation {
             let deviation = (freq_mhz - optimal).abs() / (muf - luf);
             100.0 * (1.0 - deviation).max(0.0)
         };
-        
+
         // Solar activity factor
         let solar_factor = if solar_data.k_index > 5.0 {
             0.5 // Disturbed conditions
@@ -538,10 +534,10 @@ impl EnhancedPropagation {
         } else {
             1.0
         };
-        
+
         freq_factor * solar_factor
     }
-    
+
     /// Calculate multipath delay spread
     fn calculate_delay_spread(&self, distance_km: f64, mode: PropagationMode) -> f64 {
         match mode {
@@ -554,7 +550,7 @@ impl EnhancedPropagation {
             _ => 0.1,
         }
     }
-    
+
     /// Calculate Doppler spread
     fn calculate_doppler_spread(&self, freq_mhz: f64, mode: PropagationMode) -> f64 {
         match mode {
@@ -567,33 +563,33 @@ impl EnhancedPropagation {
             _ => 0.1,
         }
     }
-    
+
     /// Update ionospheric model based on solar data
     fn update_ionosphere(&mut self) {
         // Simple model relating solar flux to critical frequencies
         let sfi_factor = self.solar_data.sfi / 100.0;
-        
+
         self.ionosphere.fof2 = 5.0 + 5.0 * sfi_factor;
         self.ionosphere.fof1 = 3.0 + 2.0 * sfi_factor;
         self.ionosphere.foe = 2.0 + 1.0 * sfi_factor;
-        
+
         // D-layer absorption increases with X-ray flux
         self.ionosphere.d_absorption = self.solar_data.xray_flux.log10().max(0.0) / 5.0;
-        
+
         // MUF factor based on solar activity
         self.ionosphere.muf_factor = 3.0 + sfi_factor;
-        
+
         // F2 layer height
         self.ionosphere.hmf2 = 250.0 + 50.0 * sfi_factor;
     }
-    
+
     /// Check if current time is in gray-line
     fn is_gray_line(&self, time: DateTime<Utc>) -> bool {
         let hour = time.hour();
         // Simplified: gray-line around sunrise/sunset
         (5..=7).contains(&hour) || (17..=19).contains(&hour)
     }
-    
+
     /// Check if sporadic-E is likely
     fn is_sporadic_e_likely(&self, time: DateTime<Utc>) -> bool {
         let month = time.month();
@@ -652,30 +648,32 @@ impl MufMaps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_propagation_prediction() {
         let prop = EnhancedPropagation::new();
-        
+
         // New York to London
         let prediction = prop.predict(
-            40.7128, -74.0060,  // NYC
-            51.5074, -0.1278,   // London
-            14.200,             // 20m band
+            40.7128,
+            -74.0060, // NYC
+            51.5074,
+            -0.1278, // London
+            14.200,  // 20m band
             Utc::now(),
-            100.0,              // 100W
+            100.0, // 100W
         );
-        
+
         assert!(prediction.muf > 0.0);
         assert!(prediction.luf > 0.0);
         assert!(prediction.fot > 0.0);
         assert!(prediction.reliability >= 0.0 && prediction.reliability <= 100.0);
     }
-    
+
     #[test]
     fn test_solar_data_update() {
         let mut prop = EnhancedPropagation::new();
-        
+
         let solar = SolarData {
             sfi: 150.0,
             ssn: 100.0,
@@ -686,24 +684,21 @@ mod tests {
             xray_flux: 1e-5,
             updated: Utc::now(),
         };
-        
+
         prop.update_solar_data(solar);
-        
+
         // Check that ionosphere was updated
         assert!(prop.ionosphere.fof2 > 5.0);
         assert!(prop.ionosphere.muf_factor > 3.0);
     }
-    
+
     #[test]
     fn test_distance_calculation() {
         let prop = EnhancedPropagation::new();
-        
+
         // NYC to London (~5570 km)
-        let distance = prop.calculate_distance(
-            40.7128, -74.0060,
-            51.5074, -0.1278,
-        );
-        
+        let distance = prop.calculate_distance(40.7128, -74.0060, 51.5074, -0.1278);
+
         assert!((distance - 5570.0).abs() < 100.0);
     }
 }

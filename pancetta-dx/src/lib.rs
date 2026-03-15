@@ -42,52 +42,52 @@ pub type Result<T> = std::result::Result<T, DxError>;
 pub enum DxError {
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
-    
+
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
-    
+
     #[error("Geographic calculation error: {0}")]
     Geography(String),
-    
+
     #[error("DXCC entity not found: {0}")]
     DxccNotFound(String),
-    
+
     #[error("Invalid callsign format: {0}")]
     InvalidCallsign(String),
-    
+
     #[error("Invalid grid square: {0}")]
     InvalidGridSquare(String),
-    
+
     #[error("Propagation prediction error: {0}")]
     Propagation(String),
-    
+
     #[error("External service error: {0}")]
     ExternalService(String),
-    
+
     #[error("Configuration error: {0}")]
     Configuration(String),
-    
+
     #[error("Parse error: {0}")]
     Parse(String),
-    
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
-    
+
     #[error("CSV error: {0}")]
     Csv(#[from] csv::Error),
-    
+
     #[error("XML error: {0}")]
     Xml(#[from] quick_xml::Error),
-    
+
     #[error("Websocket error: {0}")]
     WebSocket(#[from] tokio_tungstenite::tungstenite::Error),
-    
+
     #[error("Join error: {0}")]
     Join(#[from] tokio::task::JoinError),
-    
+
     #[error("Format error: {0}")]
     Format(#[from] std::fmt::Error),
 }
@@ -231,13 +231,13 @@ impl Default for DxPriorityConfig {
         for band in Band::all() {
             band_priorities.insert(*band, 5); // Default medium priority
         }
-        
+
         let mut mode_priorities = HashMap::new();
         mode_priorities.insert(Mode::CW, 8);
         mode_priorities.insert(Mode::USB, 7);
         mode_priorities.insert(Mode::FT8, 6);
         mode_priorities.insert(Mode::RTTY, 6);
-        
+
         Self {
             awards: HashMap::new(),
             band_priorities,
@@ -274,10 +274,8 @@ impl DxHunter {
         let tracker = tracker::DxTracker::new(database_path).await?;
         let scorer = scorer::RarityScorer::new(&tracker).await?;
         let priorities = priorities::PriorityManager::new(DxPriorityConfig::default());
-        let geography = geography::GeographyCalculator::new(
-            station_config.latitude,
-            station_config.longitude,
-        );
+        let geography =
+            geography::GeographyCalculator::new(station_config.latitude, station_config.longitude);
         let propagation = propagation::PropagationPredictor::new();
         let pskreporter = pskreporter::PskReporterClient::new();
         let cluster = cluster::DxClusterClient::new();
@@ -302,12 +300,12 @@ impl DxHunter {
             station_config,
         })
     }
-    
+
     /// Get station configuration
     pub fn station_config(&self) -> &StationConfig {
         &self.station_config
     }
-    
+
     /// Update station configuration
     pub fn update_station_config(&mut self, config: StationConfig) {
         self.station_config = config;
@@ -316,7 +314,7 @@ impl DxHunter {
             self.station_config.longitude,
         );
     }
-    
+
     /// Process a DX spot and calculate priority
     pub async fn process_spot(&self, mut spot: DxSpot) -> Result<DxSpot> {
         // Look up DXCC entity if not provided
@@ -325,7 +323,7 @@ impl DxHunter {
                 spot.dxcc_entity = Some(entity.entity_code);
             }
         }
-        
+
         // Calculate geographic information if grid square is available
         if let Some(grid) = &spot.grid_square {
             if let Ok((lat, lon)) = gridsquare::grid_to_coordinates(grid) {
@@ -333,37 +331,35 @@ impl DxHunter {
                 spot.bearing_degrees = Some(self.geography.calculate_bearing(lat, lon));
             }
         }
-        
+
         // Calculate rarity score
         if let Some(entity_code) = spot.dxcc_entity {
             let band = Band::from_frequency(spot.frequency);
             spot.rarity_score = Some(
-                self.scorer.calculate_rarity_score(
-                    entity_code,
-                    band,
-                    spot.mode.as_ref(),
-                ).await?
+                self.scorer
+                    .calculate_rarity_score(entity_code, band, spot.mode.as_ref())
+                    .await?,
             );
         }
-        
+
         Ok(spot)
     }
-    
+
     /// Check if a QSO would be needed for awards
     pub async fn is_needed(&self, callsign: &str, band: Band, mode: &Mode) -> Result<bool> {
         self.tracker.is_needed(callsign, band, mode).await
     }
-    
+
     /// Record a new QSO
     pub async fn record_qso(&mut self, qso: DxQso) -> Result<uuid::Uuid> {
         let qso_id = self.tracker.add_qso(qso).await?;
-        
+
         // Update statistics
         self.statistics.update_statistics().await?;
-        
+
         Ok(qso_id)
     }
-    
+
     /// Get priority spots based on current configuration
     pub async fn get_priority_spots(&self, limit: usize) -> Result<Vec<DxSpot>> {
         // This would integrate with various spot sources
@@ -375,20 +371,20 @@ impl DxHunter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_band_frequency_detection() {
         assert_eq!(Band::from_frequency(14_200_000), Some(Band::Band20m));
         assert_eq!(Band::from_frequency(7_150_000), Some(Band::Band40m));
         assert_eq!(Band::from_frequency(1_000_000), None);
     }
-    
+
     #[test]
     fn test_band_contains_frequency() {
         assert!(Band::Band20m.contains_frequency(14_200_000));
         assert!(!Band::Band20m.contains_frequency(7_150_000));
     }
-    
+
     #[test]
     fn test_mode_display() {
         assert_eq!(Mode::FT8.to_string(), "FT8");

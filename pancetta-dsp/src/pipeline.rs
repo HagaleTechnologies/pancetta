@@ -1,5 +1,5 @@
 use crate::{
-    agc::{AutomaticGainControl, AgcConfig},
+    agc::{AgcConfig, AutomaticGainControl},
     buffer::{AudioRingBuffer, WindowExtractor},
     filter::{FilterConfig, IirFilter, NoiseReductionFilter},
     resampler::AudioResampler,
@@ -128,17 +128,17 @@ impl PipelineConfig {
             });
         }
 
-        self.agc_config.validate().map_err(|e| {
-            PipelineError::InitializationFailed {
+        self.agc_config
+            .validate()
+            .map_err(|e| PipelineError::InitializationFailed {
                 message: format!("AGC config validation failed: {}", e),
-            }
-        })?;
+            })?;
 
-        self.bandpass_config.validate().map_err(|e| {
-            PipelineError::InitializationFailed {
+        self.bandpass_config
+            .validate()
+            .map_err(|e| PipelineError::InitializationFailed {
                 message: format!("Filter config validation failed: {}", e),
-            }
-        })?;
+            })?;
 
         Ok(())
     }
@@ -177,10 +177,10 @@ impl AudioFrame {
 pub trait PipelineStage: Send {
     /// Process an audio frame
     async fn process(&mut self, input: AudioFrame) -> Result<AudioFrame>;
-    
+
     /// Get stage name for debugging
     fn name(&self) -> &str;
-    
+
     /// Reset stage state
     fn reset(&mut self);
 }
@@ -205,8 +205,9 @@ impl ResamplingStage {
 impl PipelineStage for ResamplingStage {
     async fn process(&mut self, input: AudioFrame) -> Result<AudioFrame> {
         let mut output_samples = Vec::new();
-        self.resampler.process(&input.samples, &mut output_samples)?;
-        
+        self.resampler
+            .process(&input.samples, &mut output_samples)?;
+
         Ok(AudioFrame {
             samples: output_samples,
             sample_rate: self.output_sample_rate,
@@ -241,7 +242,7 @@ impl PipelineStage for AgcStage {
     async fn process(&mut self, input: AudioFrame) -> Result<AudioFrame> {
         let mut output_samples = vec![0.0; input.samples.len()];
         self.agc.process(&input.samples, &mut output_samples)?;
-        
+
         Ok(AudioFrame {
             samples: output_samples,
             sample_rate: input.sample_rate,
@@ -276,7 +277,7 @@ impl PipelineStage for FilterStage {
     async fn process(&mut self, input: AudioFrame) -> Result<AudioFrame> {
         let mut output_samples = vec![0.0; input.samples.len()];
         self.filter.process(&input.samples, &mut output_samples)?;
-        
+
         Ok(AudioFrame {
             samples: output_samples,
             sample_rate: input.sample_rate,
@@ -310,16 +311,17 @@ impl NoiseReductionStage {
 impl PipelineStage for NoiseReductionStage {
     async fn process(&mut self, input: AudioFrame) -> Result<AudioFrame> {
         let mut output_samples = Vec::new();
-        self.nr_filter.process(&input.samples, &mut output_samples)
+        self.nr_filter
+            .process(&input.samples, &mut output_samples)
             .map_err(|e| PipelineError::ProcessingFailed {
                 message: format!("Noise reduction failed: {}", e),
             })?;
-        
+
         // Pad output if needed
         if output_samples.len() < input.samples.len() {
             output_samples.resize(input.samples.len(), 0.0);
         }
-        
+
         Ok(AudioFrame {
             samples: output_samples,
             sample_rate: input.sample_rate,
@@ -381,10 +383,7 @@ impl DspPipeline {
         let (output_tx, output_rx) = bounded(config.num_threads * 4);
 
         // Create input buffer
-        let input_buffer = AudioRingBuffer::new(
-            config.input_sample_rate,
-            config.max_latency,
-        )?;
+        let input_buffer = AudioRingBuffer::new(config.input_sample_rate, config.max_latency)?;
 
         // Create window extractor for FT8
         let window_extractor = WindowExtractor::new_ft8(config.output_sample_rate);
@@ -393,14 +392,15 @@ impl DspPipeline {
         let mut stages: Vec<Box<dyn PipelineStage>> = Vec::new();
 
         // Resampling stage (if needed)
-        if AudioResampler::is_resampling_needed(config.input_sample_rate, config.output_sample_rate) {
-            let resampling_stage = ResamplingStage::new(
-                config.input_sample_rate,
-                config.output_sample_rate,
-            )?;
+        if AudioResampler::is_resampling_needed(config.input_sample_rate, config.output_sample_rate)
+        {
+            let resampling_stage =
+                ResamplingStage::new(config.input_sample_rate, config.output_sample_rate)?;
             stages.push(Box::new(resampling_stage));
-            info!("Added resampling stage: {}Hz -> {}Hz", 
-                  config.input_sample_rate, config.output_sample_rate);
+            info!(
+                "Added resampling stage: {}Hz -> {}Hz",
+                config.input_sample_rate, config.output_sample_rate
+            );
         }
 
         // Bandpass filter stage
@@ -506,7 +506,7 @@ impl DspPipeline {
     /// Process buffered audio data
     async fn process_buffered_audio(&mut self) -> Result<()> {
         let block_size = self.config.block_size;
-        
+
         // Check if we have enough samples to process
         if self.input_buffer.len() < block_size {
             return Ok(());
@@ -524,11 +524,7 @@ impl DspPipeline {
         }
 
         // Create audio frame
-        let mut frame = AudioFrame::new(
-            samples,
-            self.config.input_sample_rate,
-            self.frame_counter,
-        );
+        let mut frame = AudioFrame::new(samples, self.config.input_sample_rate, self.frame_counter);
         self.frame_counter += 1;
 
         // Process through all stages
@@ -552,11 +548,11 @@ impl DspPipeline {
     fn update_stats(&self, processing_time: Duration) {
         let mut stats = self.stats.lock();
         stats.processing_time_ms = processing_time.as_secs_f64() * 1000.0;
-        
+
         // Calculate current CPU load
         let block_duration = self.config.block_size as f64 / self.config.input_sample_rate as f64;
         stats.current_load = (stats.processing_time_ms / 1000.0 / block_duration) as f32;
-        
+
         // Update average latency
         let buffer_latency = self.input_buffer.latency() * 1000.0; // Convert to ms
         stats.average_latency_ms = buffer_latency as f64;
@@ -667,7 +663,7 @@ mod tests {
             .output_sample_rate(12000.0)
             .enable_agc(true)
             .build();
-        
+
         assert!(result.is_ok());
     }
 
@@ -683,7 +679,7 @@ mod tests {
     async fn test_pipeline_stages() {
         let config = AgcConfig::new_ft8_optimized();
         let mut agc_stage = AgcStage::new(config, 12000.0).unwrap();
-        
+
         let frame = AudioFrame::new(vec![0.1; 1000], 12000.0, 0);
         let result = agc_stage.process(frame).await;
         assert!(result.is_ok());

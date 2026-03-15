@@ -37,12 +37,12 @@ use tracing::{debug, info};
 // Re-export all configuration modules
 pub mod audio;
 pub mod autonomous;
+pub mod hot_reload;
 pub mod loader;
 pub mod network;
 pub mod rig;
 pub mod station;
 pub mod ui;
-pub mod hot_reload;
 
 pub use audio::*;
 pub use autonomous::*;
@@ -57,25 +57,25 @@ pub use ui::*;
 pub enum ConfigError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
-    
+
     #[error("TOML parsing error: {0}")]
     Toml(#[from] toml::de::Error),
-    
+
     #[error("JSON parsing error: {0}")]
     Json(#[from] serde_json::Error),
-    
+
     #[error("Validation error: {0}")]
     Validation(String),
-    
+
     #[error("File watcher error: {0}")]
     Watcher(#[from] notify::Error),
-    
+
     #[error("Configuration file not found: {0}")]
     FileNotFound(PathBuf),
-    
+
     #[error("Invalid configuration value: {field} = {value}")]
     InvalidValue { field: String, value: String },
-    
+
     #[error("Missing required configuration: {0}")]
     MissingRequired(String),
 }
@@ -115,13 +115,13 @@ pub struct Config {
 pub struct ConfigMetadata {
     /// Configuration schema version
     pub version: String,
-    
+
     /// When this configuration was last modified
     pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
-    
+
     /// Source files that contributed to this configuration
     pub sources: Vec<PathBuf>,
-    
+
     /// Unique identifier for this configuration instance
     pub instance_id: uuid::Uuid,
 }
@@ -151,17 +151,17 @@ impl Config {
         let loader = ConfigLoader::new()?;
         loader.load()
     }
-    
+
     /// Load configuration from a specific file
     pub fn load_from_file<P: AsRef<std::path::Path>>(path: P) -> ConfigResult<Self> {
         let loader = ConfigLoader::new()?;
         loader.load_from_file(path)
     }
-    
+
     /// Validate the entire configuration
     pub fn validate(&self) -> ConfigResult<()> {
         debug!("Validating configuration");
-        
+
         // Validate each section
         self.station.validate_section()?;
         self.audio.validate_section()?;
@@ -169,22 +169,22 @@ impl Config {
         self.ui.validate_section()?;
         self.network.validate_section()?;
         self.autonomous.validate_section()?;
-        
+
         info!("Configuration validation successful");
         Ok(())
     }
-    
+
     /// Merge this configuration with another, with the other taking precedence
     pub fn merge_with(&mut self, other: Config) {
         debug!("Merging configuration");
-        
+
         self.station.merge_with(other.station);
         self.audio.merge_with(other.audio);
         self.rig.merge_with(other.rig);
         self.ui.merge_with(other.ui);
         self.network.merge_with(other.network);
         self.autonomous.merge_with(other.autonomous);
-        
+
         // Update metadata
         if let Some(ref mut metadata) = self.metadata {
             metadata.last_modified = Some(chrono::Utc::now());
@@ -193,28 +193,28 @@ impl Config {
             }
         }
     }
-    
+
     /// Save configuration to a file in TOML format
     pub fn save_to_file<P: AsRef<std::path::Path>>(&self, path: P) -> ConfigResult<()> {
         let path = path.as_ref();
         debug!("Saving configuration to: {}", path.display());
-        
+
         // Create parent directories if they don't exist
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
+
         // Serialize to TOML
         let toml_string = toml::to_string_pretty(self)
             .map_err(|e| ConfigError::Validation(format!("Failed to serialize config: {}", e)))?;
-        
+
         // Write to file
         std::fs::write(path, toml_string)?;
-        
+
         info!("Configuration saved to: {}", path.display());
         Ok(())
     }
-    
+
     /// Get a summary of the current configuration
     pub fn summary(&self) -> String {
         format!(
@@ -232,8 +232,16 @@ impl Config {
             self.rig.interface.port,
             self.ui.theme,
             self.ui.layout,
-            if self.network.psk_reporter.enabled { "enabled" } else { "disabled" },
-            if self.network.qrz.enabled { "enabled" } else { "disabled" }
+            if self.network.psk_reporter.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            if self.network.qrz.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
         )
     }
 }
@@ -244,7 +252,7 @@ pub trait ConfigSection: Default + Clone {
     fn validate_section(&self) -> ConfigResult<()> {
         Ok(())
     }
-    
+
     /// Merge this section with another, with the other taking precedence
     fn merge_with(&mut self, other: Self);
 }
@@ -253,50 +261,50 @@ pub trait ConfigSection: Default + Clone {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
-    
+
     #[test]
     fn test_default_config() {
         let config = Config::default();
         assert_eq!(config.station.callsign, "N0CALL");
         assert!(config.validate().is_ok());
     }
-    
+
     #[test]
     fn test_config_serialization() {
         let config = Config::default();
         let toml_str = toml::to_string(&config).unwrap();
         let deserialized: Config = toml::from_str(&toml_str).unwrap();
-        
+
         assert_eq!(config.station.callsign, deserialized.station.callsign);
     }
-    
+
     #[test]
     fn test_config_save_load() {
         let config = Config::default();
         let temp_file = NamedTempFile::new().unwrap();
-        
+
         // Save configuration
         config.save_to_file(temp_file.path()).unwrap();
-        
+
         // Load configuration
         let loaded_config = Config::load_from_file(temp_file.path()).unwrap();
         assert_eq!(config.station.callsign, loaded_config.station.callsign);
     }
-    
+
     #[test]
     fn test_config_merge() {
         let mut config1 = Config::default();
         let mut config2 = Config::default();
-        
+
         config2.station.callsign = "K1ABC".to_string();
         config2.station.power_watts = 50;
-        
+
         config1.merge_with(config2);
-        
+
         assert_eq!(config1.station.callsign, "K1ABC");
         assert_eq!(config1.station.power_watts, 50);
     }
-    
+
     #[test]
     fn test_config_summary() {
         let config = Config::default();

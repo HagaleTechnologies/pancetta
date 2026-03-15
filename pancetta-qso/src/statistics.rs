@@ -1,12 +1,12 @@
 //! QSO statistics and analytics
-//! 
+//!
 //! This module provides comprehensive statistics and analytics for QSO data,
 //! including achievements, trends, contest analysis, and performance metrics.
 
-use crate::database::{QsoDatabase, QsoFilter, QueryOptions, QsoDatabaseRecord};
-use chrono::{DateTime, Utc, Duration, Datelike, Timelike, TimeZone};
+use crate::database::{QsoDatabase, QsoDatabaseRecord, QsoFilter, QueryOptions};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -14,14 +14,16 @@ use tracing::{debug, info};
 #[derive(Debug, Error)]
 pub enum StatisticsError {
     #[error("Database error: {source}")]
-    Database { source: crate::database::DatabaseError },
-    
+    Database {
+        source: crate::database::DatabaseError,
+    },
+
     #[error("Calculation error: {message}")]
     Calculation { message: String },
-    
+
     #[error("Invalid date range: {message}")]
     InvalidDateRange { message: String },
-    
+
     #[error("Insufficient data: {message}")]
     InsufficientData { message: String },
 }
@@ -31,25 +33,25 @@ pub enum StatisticsError {
 pub struct QsoStatistics {
     /// Basic counts
     pub basic: BasicStatistics,
-    
+
     /// Time-based statistics
     pub temporal: TemporalStatistics,
-    
+
     /// Geographic statistics
     pub geographic: GeographicStatistics,
-    
+
     /// Technical statistics
     pub technical: TechnicalStatistics,
-    
+
     /// Contest statistics
     pub contest: ContestStatistics,
-    
+
     /// Achievement tracking
     pub achievements: AchievementStatistics,
-    
+
     /// Performance metrics
     pub performance: PerformanceStatistics,
-    
+
     /// Trend analysis
     pub trends: TrendAnalysis,
 }
@@ -59,37 +61,37 @@ pub struct QsoStatistics {
 pub struct BasicStatistics {
     /// Total number of QSOs
     pub total_qsos: u64,
-    
+
     /// Confirmed QSOs
     pub confirmed_qsos: u64,
-    
+
     /// Unique callsigns worked
     pub unique_callsigns: u64,
-    
+
     /// QSOs by mode
     pub by_mode: HashMap<String, u64>,
-    
+
     /// QSOs by band
     pub by_band: HashMap<String, u64>,
-    
+
     /// QSOs by year
     pub by_year: BTreeMap<u32, u64>,
-    
+
     /// QSOs by month
     pub by_month: BTreeMap<u8, u64>,
-    
+
     /// QSOs by day of week
     pub by_day_of_week: BTreeMap<u8, u64>,
-    
+
     /// QSOs by hour of day (UTC)
     pub by_hour: BTreeMap<u8, u64>,
-    
+
     /// First QSO date
     pub first_qso: Option<DateTime<Utc>>,
-    
+
     /// Last QSO date
     pub last_qso: Option<DateTime<Utc>>,
-    
+
     /// Average QSO duration (seconds)
     pub avg_qso_duration: f64,
 }
@@ -99,16 +101,16 @@ pub struct BasicStatistics {
 pub struct TemporalStatistics {
     /// QSOs per day statistics
     pub daily: DailyStatistics,
-    
+
     /// QSOs per month statistics
     pub monthly: MonthlyStatistics,
-    
+
     /// QSOs per year statistics
     pub yearly: YearlyStatistics,
-    
+
     /// Activity patterns
     pub patterns: ActivityPatterns,
-    
+
     /// Peak activity periods
     pub peak_periods: Vec<ActivityPeak>,
 }
@@ -118,19 +120,19 @@ pub struct TemporalStatistics {
 pub struct DailyStatistics {
     /// Average QSOs per day
     pub average_per_day: f64,
-    
+
     /// Maximum QSOs in a single day
     pub max_in_day: u64,
-    
+
     /// Date of maximum activity
     pub max_day: Option<DateTime<Utc>>,
-    
+
     /// Days with QSO activity
     pub active_days: u64,
-    
+
     /// Total days in range
     pub total_days: u64,
-    
+
     /// Activity percentage
     pub activity_percentage: f64,
 }
@@ -140,16 +142,16 @@ pub struct DailyStatistics {
 pub struct MonthlyStatistics {
     /// Average QSOs per month
     pub average_per_month: f64,
-    
+
     /// Maximum QSOs in a single month
     pub max_in_month: u64,
-    
+
     /// Month/year of maximum activity
     pub max_month: Option<(u32, u8)>, // (year, month)
-    
+
     /// Months with QSO activity
     pub active_months: u64,
-    
+
     /// Seasonal distribution
     pub seasonal_distribution: SeasonalDistribution,
 }
@@ -159,16 +161,16 @@ pub struct MonthlyStatistics {
 pub struct YearlyStatistics {
     /// Average QSOs per year
     pub average_per_year: f64,
-    
+
     /// Maximum QSOs in a single year
     pub max_in_year: u64,
-    
+
     /// Year of maximum activity
     pub max_year: Option<u32>,
-    
+
     /// Years with QSO activity
     pub active_years: u64,
-    
+
     /// Year-over-year growth rate
     pub growth_rate: f64,
 }
@@ -178,16 +180,16 @@ pub struct YearlyStatistics {
 pub struct ActivityPatterns {
     /// Most active hour of day (UTC)
     pub peak_hour: u8,
-    
+
     /// Most active day of week (0=Sunday)
     pub peak_day_of_week: u8,
-    
+
     /// Most active month
     pub peak_month: u8,
-    
+
     /// Weekend vs weekday activity ratio
     pub weekend_ratio: f64,
-    
+
     /// Day vs night activity ratio (day = 06:00-18:00 UTC)
     pub day_night_ratio: f64,
 }
@@ -197,13 +199,13 @@ pub struct ActivityPatterns {
 pub struct SeasonalDistribution {
     /// Spring (Mar-May) QSOs
     pub spring: u64,
-    
+
     /// Summer (Jun-Aug) QSOs
     pub summer: u64,
-    
+
     /// Autumn (Sep-Nov) QSOs
     pub autumn: u64,
-    
+
     /// Winter (Dec-Feb) QSOs
     pub winter: u64,
 }
@@ -213,13 +215,13 @@ pub struct SeasonalDistribution {
 pub struct ActivityPeak {
     /// Start time of peak
     pub start: DateTime<Utc>,
-    
+
     /// End time of peak
     pub end: DateTime<Utc>,
-    
+
     /// Number of QSOs in peak
     pub qso_count: u64,
-    
+
     /// Peak type
     pub peak_type: PeakType,
 }
@@ -239,13 +241,13 @@ pub enum PeakType {
 pub struct GeographicStatistics {
     /// Countries worked
     pub countries: CountryStatistics,
-    
+
     /// Grid squares worked
     pub grids: GridStatistics,
-    
+
     /// Zones worked
     pub zones: ZoneStatistics,
-    
+
     /// Distance statistics
     pub distances: DistanceStatistics,
 }
@@ -255,19 +257,19 @@ pub struct GeographicStatistics {
 pub struct CountryStatistics {
     /// Total unique countries worked
     pub total_countries: u64,
-    
+
     /// Countries by QSO count
     pub by_qso_count: BTreeMap<String, u64>,
-    
+
     /// Countries by band
     pub by_band: HashMap<String, HashSet<String>>,
-    
+
     /// Countries by mode
     pub by_mode: HashMap<String, HashSet<String>>,
-    
+
     /// DXCC entities worked
     pub dxcc_entities: u64,
-    
+
     /// Most worked country
     pub most_worked: Option<(String, u64)>,
 }
@@ -277,16 +279,16 @@ pub struct CountryStatistics {
 pub struct GridStatistics {
     /// Total unique grid squares worked
     pub total_grids: u64,
-    
+
     /// Grids by QSO count
     pub by_qso_count: BTreeMap<String, u64>,
-    
+
     /// Grid fields worked (first 2 characters)
     pub grid_fields: HashSet<String>,
-    
+
     /// Grid squares by band
     pub by_band: HashMap<String, HashSet<String>>,
-    
+
     /// Most worked grid square
     pub most_worked: Option<(String, u64)>,
 }
@@ -296,13 +298,13 @@ pub struct GridStatistics {
 pub struct ZoneStatistics {
     /// CQ zones worked
     pub cq_zones: HashSet<u8>,
-    
+
     /// ITU zones worked
     pub itu_zones: HashSet<u8>,
-    
+
     /// CQ zones by band
     pub cq_by_band: HashMap<String, HashSet<u8>>,
-    
+
     /// ITU zones by band
     pub itu_by_band: HashMap<String, HashSet<u8>>,
 }
@@ -312,16 +314,16 @@ pub struct ZoneStatistics {
 pub struct DistanceStatistics {
     /// Total kilometers worked
     pub total_km: f64,
-    
+
     /// Average distance per QSO
     pub average_km: f64,
-    
+
     /// Maximum distance worked
     pub max_distance: f64,
-    
+
     /// Maximum distance QSO details
     pub max_distance_qso: Option<DistanceRecord>,
-    
+
     /// Distance distribution
     pub distance_bands: BTreeMap<String, u64>,
 }
@@ -343,13 +345,13 @@ pub struct DistanceRecord {
 pub struct TechnicalStatistics {
     /// Signal report statistics
     pub signal_reports: SignalReportStatistics,
-    
+
     /// Frequency distribution
     pub frequencies: FrequencyStatistics,
-    
+
     /// QSO completion rates
     pub completion_rates: CompletionRateStatistics,
-    
+
     /// Error rates
     pub error_rates: ErrorRateStatistics,
 }
@@ -359,25 +361,25 @@ pub struct TechnicalStatistics {
 pub struct SignalReportStatistics {
     /// Average signal sent
     pub avg_sent: f64,
-    
+
     /// Average signal received
     pub avg_received: f64,
-    
+
     /// Signal sent distribution
     pub sent_distribution: BTreeMap<i8, u64>,
-    
+
     /// Signal received distribution
     pub received_distribution: BTreeMap<i8, u64>,
-    
+
     /// Best signal sent
     pub best_sent: i8,
-    
+
     /// Best signal received
     pub best_received: i8,
-    
+
     /// Worst signal sent
     pub worst_sent: i8,
-    
+
     /// Worst signal received
     pub worst_received: i8,
 }
@@ -387,13 +389,13 @@ pub struct SignalReportStatistics {
 pub struct FrequencyStatistics {
     /// QSOs by frequency (grouped)
     pub by_frequency: BTreeMap<String, u64>,
-    
+
     /// Most used frequency
     pub most_used: Option<(f64, u64)>,
-    
+
     /// Frequency spread (kHz)
     pub frequency_spread: f64,
-    
+
     /// Average frequency
     pub average_frequency: f64,
 }
@@ -403,13 +405,13 @@ pub struct FrequencyStatistics {
 pub struct CompletionRateStatistics {
     /// Overall completion rate
     pub overall_rate: f64,
-    
+
     /// Completion rate by band
     pub by_band: HashMap<String, f64>,
-    
+
     /// Completion rate by mode
     pub by_mode: HashMap<String, f64>,
-    
+
     /// Completion rate by hour
     pub by_hour: BTreeMap<u8, f64>,
 }
@@ -419,13 +421,13 @@ pub struct CompletionRateStatistics {
 pub struct ErrorRateStatistics {
     /// Overall error rate
     pub overall_rate: f64,
-    
+
     /// Most common error types
     pub error_types: HashMap<String, u64>,
-    
+
     /// Error rate by band
     pub by_band: HashMap<String, f64>,
-    
+
     /// Error rate trends
     pub trends: Vec<ErrorTrend>,
 }
@@ -443,10 +445,10 @@ pub struct ErrorTrend {
 pub struct ContestStatistics {
     /// Contest participation
     pub participation: ContestParticipation,
-    
+
     /// Contest performance
     pub performance: ContestPerformance,
-    
+
     /// Contest trends
     pub trends: ContestTrends,
 }
@@ -456,13 +458,13 @@ pub struct ContestStatistics {
 pub struct ContestParticipation {
     /// Total contests participated in
     pub total_contests: u64,
-    
+
     /// QSOs by contest
     pub by_contest: HashMap<String, u64>,
-    
+
     /// Most active contest
     pub most_active: Option<(String, u64)>,
-    
+
     /// Contest activity by year
     pub by_year: BTreeMap<u32, u64>,
 }
@@ -472,13 +474,13 @@ pub struct ContestParticipation {
 pub struct ContestPerformance {
     /// Average QSOs per contest
     pub avg_qsos_per_contest: f64,
-    
+
     /// Best contest performance
     pub best_contest: Option<ContestRecord>,
-    
+
     /// QSO rate statistics
     pub qso_rates: QsoRateStatistics,
-    
+
     /// Multiplier statistics
     pub multipliers: MultiplierStatistics,
 }
@@ -498,10 +500,10 @@ pub struct ContestRecord {
 pub struct QsoRateStatistics {
     /// Peak QSO rate (QSOs per hour)
     pub peak_rate: f64,
-    
+
     /// Average QSO rate
     pub average_rate: f64,
-    
+
     /// QSO rate by hour
     pub by_hour: BTreeMap<u8, f64>,
 }
@@ -511,10 +513,10 @@ pub struct QsoRateStatistics {
 pub struct MultiplierStatistics {
     /// Total multipliers worked
     pub total_multipliers: u64,
-    
+
     /// Multipliers by type
     pub by_type: HashMap<String, u64>,
-    
+
     /// Multiplier efficiency (mult per QSO)
     pub efficiency: f64,
 }
@@ -524,7 +526,7 @@ pub struct MultiplierStatistics {
 pub struct ContestTrends {
     /// Contest activity trend
     pub activity_trend: Vec<ContestActivityPoint>,
-    
+
     /// Performance improvement trend
     pub performance_trend: Vec<PerformancePoint>,
 }
@@ -551,16 +553,16 @@ pub struct PerformancePoint {
 pub struct AchievementStatistics {
     /// DXCC achievements
     pub dxcc: DxccAchievements,
-    
+
     /// WAS (Worked All States) achievements
     pub was: WasAchievements,
-    
+
     /// WAZ (Worked All Zones) achievements
     pub waz: WazAchievements,
-    
+
     /// Grid square achievements
     pub grids: GridAchievements,
-    
+
     /// Custom achievements
     pub custom: Vec<CustomAchievement>,
 }
@@ -570,16 +572,16 @@ pub struct AchievementStatistics {
 pub struct DxccAchievements {
     /// Total DXCC entities confirmed
     pub confirmed_entities: u64,
-    
+
     /// DXCC progress by band
     pub by_band: HashMap<String, u64>,
-    
+
     /// DXCC progress by mode
     pub by_mode: HashMap<String, u64>,
-    
+
     /// Honor Roll status
     pub honor_roll_eligible: bool,
-    
+
     /// Deleted entities worked
     pub deleted_entities: u64,
 }
@@ -589,13 +591,13 @@ pub struct DxccAchievements {
 pub struct WasAchievements {
     /// Confirmed US states
     pub confirmed_states: u64,
-    
+
     /// WAS completion by band
     pub by_band: HashMap<String, u64>,
-    
+
     /// WAS completion by mode
     pub by_mode: HashMap<String, u64>,
-    
+
     /// Missing states
     pub missing_states: Vec<String>,
 }
@@ -605,16 +607,16 @@ pub struct WasAchievements {
 pub struct WazAchievements {
     /// Confirmed CQ zones
     pub confirmed_cq_zones: u64,
-    
+
     /// Confirmed ITU zones
     pub confirmed_itu_zones: u64,
-    
+
     /// WAZ completion by band
     pub cq_by_band: HashMap<String, u64>,
-    
+
     /// ITU zones by band
     pub itu_by_band: HashMap<String, u64>,
-    
+
     /// Missing zones
     pub missing_cq_zones: Vec<u8>,
     pub missing_itu_zones: Vec<u8>,
@@ -625,13 +627,13 @@ pub struct WazAchievements {
 pub struct GridAchievements {
     /// Grid squares confirmed
     pub confirmed_grids: u64,
-    
+
     /// Grid fields worked
     pub grid_fields: u64,
-    
+
     /// Century Club levels achieved
     pub century_levels: Vec<u64>,
-    
+
     /// Grid challenge progress
     pub challenge_progress: HashMap<String, u64>,
 }
@@ -652,13 +654,13 @@ pub struct CustomAchievement {
 pub struct PerformanceStatistics {
     /// QSO efficiency metrics
     pub efficiency: EfficiencyMetrics,
-    
+
     /// Quality metrics
     pub quality: QualityMetrics,
-    
+
     /// Consistency metrics
     pub consistency: ConsistencyMetrics,
-    
+
     /// Improvement trends
     pub improvement: ImprovementMetrics,
 }
@@ -668,16 +670,16 @@ pub struct PerformanceStatistics {
 pub struct EfficiencyMetrics {
     /// QSOs per hour
     pub qsos_per_hour: f64,
-    
+
     /// QSOs per session
     pub qsos_per_session: f64,
-    
+
     /// Session efficiency trend
     pub efficiency_trend: Vec<EfficiencyPoint>,
-    
+
     /// Time to first QSO
     pub time_to_first_qso: f64,
-    
+
     /// Average QSO setup time
     pub avg_setup_time: f64,
 }
@@ -695,13 +697,13 @@ pub struct EfficiencyPoint {
 pub struct QualityMetrics {
     /// Complete QSO percentage
     pub completion_percentage: f64,
-    
+
     /// Information completeness score
     pub completeness_score: f64,
-    
+
     /// Signal quality index
     pub signal_quality_index: f64,
-    
+
     /// QSO validation score
     pub validation_score: f64,
 }
@@ -711,16 +713,16 @@ pub struct QualityMetrics {
 pub struct ConsistencyMetrics {
     /// Activity consistency score
     pub activity_consistency: f64,
-    
+
     /// Performance consistency score
     pub performance_consistency: f64,
-    
+
     /// Standard deviation of daily QSOs
     pub daily_qso_stddev: f64,
-    
+
     /// Longest active streak (days)
     pub longest_streak: u64,
-    
+
     /// Current active streak
     pub current_streak: u64,
 }
@@ -730,13 +732,13 @@ pub struct ConsistencyMetrics {
 pub struct ImprovementMetrics {
     /// Overall improvement trend
     pub overall_trend: TrendDirection,
-    
+
     /// Improvement rate (% per month)
     pub improvement_rate: f64,
-    
+
     /// Key improvement areas
     pub improvement_areas: Vec<ImprovementArea>,
-    
+
     /// Performance milestones
     pub milestones: Vec<PerformanceMilestone>,
 }
@@ -784,13 +786,13 @@ pub enum MilestoneType {
 pub struct TrendAnalysis {
     /// Activity trends
     pub activity: ActivityTrends,
-    
+
     /// Technical trends
     pub technical: TechnicalTrends,
-    
+
     /// Geographic trends
     pub geographic: GeographicTrends,
-    
+
     /// Predictions
     pub predictions: TrendPredictions,
 }
@@ -800,13 +802,13 @@ pub struct TrendAnalysis {
 pub struct ActivityTrends {
     /// Monthly activity trend
     pub monthly_trend: TrendDirection,
-    
+
     /// Seasonal patterns
     pub seasonal_patterns: Vec<SeasonalPattern>,
-    
+
     /// Peak activity predictions
     pub predicted_peaks: Vec<ActivityPeak>,
-    
+
     /// Activity correlation factors
     pub correlations: Vec<ActivityCorrelation>,
 }
@@ -833,10 +835,10 @@ pub struct ActivityCorrelation {
 pub struct TechnicalTrends {
     /// Signal strength trends
     pub signal_trends: SignalTrends,
-    
+
     /// Success rate trends
     pub success_trends: SuccessTrends,
-    
+
     /// Equipment performance trends
     pub equipment_trends: EquipmentTrends,
 }
@@ -871,13 +873,13 @@ pub struct EquipmentTrends {
 pub struct GeographicTrends {
     /// New country rate
     pub new_country_rate: f64,
-    
+
     /// Grid square progression
     pub grid_progression: f64,
-    
+
     /// Geographic diversity index
     pub diversity_index: f64,
-    
+
     /// Exploration patterns
     pub exploration_patterns: Vec<ExplorationPattern>,
 }
@@ -896,13 +898,13 @@ pub struct ExplorationPattern {
 pub struct TrendPredictions {
     /// Predicted activity levels
     pub activity_predictions: Vec<ActivityPrediction>,
-    
+
     /// Achievement predictions
     pub achievement_predictions: Vec<AchievementPrediction>,
-    
+
     /// Performance predictions
     pub performance_predictions: Vec<PerformancePrediction>,
-    
+
     /// Confidence intervals
     pub confidence_levels: HashMap<String, f64>,
 }
@@ -944,30 +946,32 @@ impl StatisticsCalculator {
     pub fn new(database: QsoDatabase) -> Self {
         Self { database }
     }
-    
+
     /// Calculate comprehensive statistics
     pub async fn calculate_statistics(
         &self,
         filter: Option<&QsoFilter>,
     ) -> Result<QsoStatistics, StatisticsError> {
         info!("Calculating comprehensive QSO statistics");
-        
+
         let default_filter = QsoFilter::default();
         let filter = filter.unwrap_or(&default_filter);
         let options = QueryOptions::default();
-        
+
         // Get all QSO records
-        let records = self.database.search_qsos(filter, &options)
+        let records = self
+            .database
+            .search_qsos(filter, &options)
             .map_err(|e| StatisticsError::Database { source: e })?;
-        
+
         if records.is_empty() {
             return Err(StatisticsError::InsufficientData {
                 message: "No QSO records found for statistics calculation".to_string(),
             });
         }
-        
+
         debug!("Calculating statistics for {} QSO records", records.len());
-        
+
         let basic = self.calculate_basic_statistics(&records).await?;
         let temporal = self.calculate_temporal_statistics(&records).await?;
         let geographic = self.calculate_geographic_statistics(&records).await?;
@@ -976,7 +980,7 @@ impl StatisticsCalculator {
         let achievements = self.calculate_achievement_statistics(&records).await?;
         let performance = self.calculate_performance_statistics(&records).await?;
         let trends = self.calculate_trend_analysis(&records).await?;
-        
+
         Ok(QsoStatistics {
             basic,
             temporal,
@@ -988,7 +992,7 @@ impl StatisticsCalculator {
             trends,
         })
     }
-    
+
     /// Calculate statistics for a specific time period
     pub async fn calculate_period_statistics(
         &self,
@@ -1000,40 +1004,48 @@ impl StatisticsCalculator {
                 message: "Start date must be before end date".to_string(),
             });
         }
-        
+
         let filter = QsoFilter {
             date_range: Some(crate::database::DateRange { start, end }),
             ..Default::default()
         };
-        
+
         self.calculate_statistics(Some(&filter)).await
     }
-    
+
     /// Calculate year-over-year comparison
     pub async fn calculate_yearly_comparison(
         &self,
         year1: u32,
         year2: u32,
     ) -> Result<YearlyComparison, StatisticsError> {
-        let start1 = chrono::NaiveDate::from_ymd_opt(year1 as i32, 1, 1).unwrap()
-            .and_hms_opt(0, 0, 0).unwrap()
+        let start1 = chrono::NaiveDate::from_ymd_opt(year1 as i32, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
             .and_utc();
-        let end1 = chrono::NaiveDate::from_ymd_opt(year1 as i32, 12, 31).unwrap()
-            .and_hms_opt(23, 59, 59).unwrap()
+        let end1 = chrono::NaiveDate::from_ymd_opt(year1 as i32, 12, 31)
+            .unwrap()
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
             .and_utc();
-        
-        let start2 = chrono::NaiveDate::from_ymd_opt(year2 as i32, 1, 1).unwrap()
-            .and_hms_opt(0, 0, 0).unwrap()
+
+        let start2 = chrono::NaiveDate::from_ymd_opt(year2 as i32, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
             .and_utc();
-        let end2 = chrono::NaiveDate::from_ymd_opt(year2 as i32, 12, 31).unwrap()
-            .and_hms_opt(23, 59, 59).unwrap()
+        let end2 = chrono::NaiveDate::from_ymd_opt(year2 as i32, 12, 31)
+            .unwrap()
+            .and_hms_opt(23, 59, 59)
+            .unwrap()
             .and_utc();
-        
+
         let stats1 = self.calculate_period_statistics(start1, end1).await?;
         let stats2 = self.calculate_period_statistics(start2, end2).await?;
-        
+
         let differences = self.calculate_differences(&stats1, &stats2);
-        
+
         Ok(YearlyComparison {
             year1,
             year2,
@@ -1042,47 +1054,54 @@ impl StatisticsCalculator {
             differences,
         })
     }
-    
+
     // Private calculation methods
-    
-    async fn calculate_basic_statistics(&self, records: &[QsoDatabaseRecord]) -> Result<BasicStatistics, StatisticsError> {
+
+    async fn calculate_basic_statistics(
+        &self,
+        records: &[QsoDatabaseRecord],
+    ) -> Result<BasicStatistics, StatisticsError> {
         let total_qsos = records.len() as u64;
-        let confirmed_qsos = records.iter()
+        let confirmed_qsos = records
+            .iter()
             .filter(|r| r.metadata.end_time.is_some())
             .count() as u64;
-        
-        let unique_callsigns = records.iter()
+
+        let unique_callsigns = records
+            .iter()
             .filter_map(|r| r.metadata.their_callsign.as_ref())
             .collect::<HashSet<_>>()
             .len() as u64;
-        
+
         let mut by_mode = HashMap::new();
         let mut by_band = HashMap::new();
         let mut by_year = BTreeMap::new();
         let mut by_month = BTreeMap::new();
         let mut by_day_of_week = BTreeMap::new();
         let mut by_hour = BTreeMap::new();
-        
+
         let mut first_qso = None;
         let mut last_qso = None;
         let mut total_duration = 0u64;
         let mut duration_count = 0u64;
-        
+
         for record in records {
             // Mode statistics
             *by_mode.entry(record.metadata.mode.clone()).or_insert(0) += 1;
-            
+
             // Band statistics
             *by_band.entry(record.adif_data.band.clone()).or_insert(0) += 1;
-            
+
             // Time statistics
             let qso_time = record.metadata.start_time;
-            
+
             *by_year.entry(qso_time.year() as u32).or_insert(0) += 1;
             *by_month.entry(qso_time.month() as u8).or_insert(0) += 1;
-            *by_day_of_week.entry(qso_time.weekday().num_days_from_sunday() as u8).or_insert(0) += 1;
+            *by_day_of_week
+                .entry(qso_time.weekday().num_days_from_sunday() as u8)
+                .or_insert(0) += 1;
             *by_hour.entry(qso_time.time().hour() as u8).or_insert(0) += 1;
-            
+
             // First/last QSO
             if first_qso.is_none() || qso_time < first_qso.unwrap() {
                 first_qso = Some(qso_time);
@@ -1090,7 +1109,7 @@ impl StatisticsCalculator {
             if last_qso.is_none() || qso_time > last_qso.unwrap() {
                 last_qso = Some(qso_time);
             }
-            
+
             // Duration statistics
             if let Some(end_time) = record.metadata.end_time {
                 let duration = (end_time - record.metadata.start_time).num_seconds() as u64;
@@ -1098,13 +1117,13 @@ impl StatisticsCalculator {
                 duration_count += 1;
             }
         }
-        
+
         let avg_qso_duration = if duration_count > 0 {
             total_duration as f64 / duration_count as f64
         } else {
             0.0
         };
-        
+
         Ok(BasicStatistics {
             total_qsos,
             confirmed_qsos,
@@ -1120,30 +1139,37 @@ impl StatisticsCalculator {
             avg_qso_duration,
         })
     }
-    
-    async fn calculate_temporal_statistics(&self, records: &[QsoDatabaseRecord]) -> Result<TemporalStatistics, StatisticsError> {
+
+    async fn calculate_temporal_statistics(
+        &self,
+        records: &[QsoDatabaseRecord],
+    ) -> Result<TemporalStatistics, StatisticsError> {
         // Calculate daily statistics
         let mut daily_counts = BTreeMap::new();
         for record in records {
             let date = record.metadata.start_time.date_naive();
             *daily_counts.entry(date).or_insert(0) += 1;
         }
-        
+
         let total_days = if let (Some(first), Some(last)) = (records.first(), records.last()) {
-            (last.metadata.start_time.date_naive() - first.metadata.start_time.date_naive()).num_days().abs() + 1
+            (last.metadata.start_time.date_naive() - first.metadata.start_time.date_naive())
+                .num_days()
+                .abs()
+                + 1
         } else {
             1
         };
-        
+
         let active_days = daily_counts.len() as u64;
         let total_qsos = records.len() as u64;
         let average_per_day = total_qsos as f64 / total_days as f64;
         let max_in_day = daily_counts.values().max().copied().unwrap_or(0) as u64;
-        let max_day = daily_counts.iter()
+        let max_day = daily_counts
+            .iter()
             .max_by_key(|(_, &count)| count)
             .map(|(date, _)| chrono::Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap()));
         let activity_percentage = (active_days as f64 / total_days as f64) * 100.0;
-        
+
         let daily = DailyStatistics {
             average_per_day,
             max_in_day,
@@ -1152,14 +1178,17 @@ impl StatisticsCalculator {
             total_days: total_days as u64,
             activity_percentage,
         };
-        
+
         // Calculate monthly statistics
         let mut monthly_counts = BTreeMap::new();
         for record in records {
-            let month_key = (record.metadata.start_time.year() as u32, record.metadata.start_time.month() as u8);
+            let month_key = (
+                record.metadata.start_time.year() as u32,
+                record.metadata.start_time.month() as u8,
+            );
             *monthly_counts.entry(month_key).or_insert(0) += 1;
         }
-        
+
         let active_months = monthly_counts.len() as u64;
         let average_per_month = if active_months > 0 {
             total_qsos as f64 / active_months as f64
@@ -1167,15 +1196,19 @@ impl StatisticsCalculator {
             0.0
         };
         let max_in_month = monthly_counts.values().max().copied().unwrap_or(0) as u64;
-        let max_month = monthly_counts.iter()
+        let max_month = monthly_counts
+            .iter()
             .max_by_key(|(_, &count)| count)
             .map(|((year, month), _)| (*year, *month));
-        
+
         // Calculate seasonal distribution
         let mut seasonal = SeasonalDistribution {
-            spring: 0, summer: 0, autumn: 0, winter: 0,
+            spring: 0,
+            summer: 0,
+            autumn: 0,
+            winter: 0,
         };
-        
+
         for record in records {
             match record.metadata.start_time.month() {
                 3..=5 => seasonal.spring += 1,
@@ -1184,7 +1217,7 @@ impl StatisticsCalculator {
                 _ => seasonal.winter += 1,
             }
         }
-        
+
         let monthly = MonthlyStatistics {
             average_per_month,
             max_in_month,
@@ -1192,14 +1225,14 @@ impl StatisticsCalculator {
             active_months,
             seasonal_distribution: seasonal,
         };
-        
+
         // Calculate yearly statistics
         let mut yearly_counts = BTreeMap::new();
         for record in records {
             let year = record.metadata.start_time.year() as u32;
             *yearly_counts.entry(year).or_insert(0) += 1;
         }
-        
+
         let active_years = yearly_counts.len() as u64;
         let average_per_year = if active_years > 0 {
             total_qsos as f64 / active_years as f64
@@ -1207,16 +1240,17 @@ impl StatisticsCalculator {
             0.0
         };
         let max_in_year = yearly_counts.values().max().copied().unwrap_or(0) as u64;
-        let max_year = yearly_counts.iter()
+        let max_year = yearly_counts
+            .iter()
             .max_by_key(|(_, &count)| count)
             .map(|(&year, _)| year);
-        
+
         // Calculate growth rate (year over year)
         let growth_rate = if yearly_counts.len() >= 2 {
             let years: Vec<_> = yearly_counts.keys().collect();
             let first_year = yearly_counts[years[0]];
             let last_year = yearly_counts[years[years.len() - 1]];
-            
+
             if first_year > 0 {
                 ((last_year as f64 - first_year as f64) / first_year as f64) * 100.0
             } else {
@@ -1225,7 +1259,7 @@ impl StatisticsCalculator {
         } else {
             0.0
         };
-        
+
         let yearly = YearlyStatistics {
             average_per_year,
             max_in_year,
@@ -1233,34 +1267,39 @@ impl StatisticsCalculator {
             active_years,
             growth_rate,
         };
-        
+
         // Calculate activity patterns
         let mut hour_counts = BTreeMap::new();
         let mut dow_counts = BTreeMap::new();
         let mut month_counts = BTreeMap::new();
-        
+
         for record in records {
             let time = record.metadata.start_time;
             *hour_counts.entry(time.time().hour() as u8).or_insert(0) += 1;
-            *dow_counts.entry(time.weekday().num_days_from_sunday() as u8).or_insert(0) += 1;
+            *dow_counts
+                .entry(time.weekday().num_days_from_sunday() as u8)
+                .or_insert(0) += 1;
             *month_counts.entry(time.month() as u8).or_insert(0) += 1;
         }
-        
-        let peak_hour = hour_counts.iter()
+
+        let peak_hour = hour_counts
+            .iter()
             .max_by_key(|(_, &count)| count)
             .map(|(&hour, _)| hour)
             .unwrap_or(0);
-        
-        let peak_day_of_week = dow_counts.iter()
+
+        let peak_day_of_week = dow_counts
+            .iter()
             .max_by_key(|(_, &count)| count)
             .map(|(&dow, _)| dow)
             .unwrap_or(0);
-        
-        let peak_month = month_counts.iter()
+
+        let peak_month = month_counts
+            .iter()
             .max_by_key(|(_, &count)| count)
             .map(|(&month, _)| month)
             .unwrap_or(1);
-        
+
         // Calculate weekend vs weekday ratio
         let weekend_qsos = dow_counts.get(&0).unwrap_or(&0) + dow_counts.get(&6).unwrap_or(&0);
         let weekday_qsos = total_qsos - weekend_qsos;
@@ -1269,7 +1308,7 @@ impl StatisticsCalculator {
         } else {
             0.0
         };
-        
+
         // Calculate day vs night ratio (day = 06:00-18:00 UTC)
         let day_qsos: u64 = (6..18).map(|h| hour_counts.get(&h).unwrap_or(&0)).sum();
         let night_qsos = total_qsos - day_qsos;
@@ -1278,7 +1317,7 @@ impl StatisticsCalculator {
         } else {
             0.0
         };
-        
+
         let patterns = ActivityPatterns {
             peak_hour,
             peak_day_of_week,
@@ -1286,10 +1325,10 @@ impl StatisticsCalculator {
             weekend_ratio,
             day_night_ratio,
         };
-        
+
         // TODO: Implement peak period detection
         let peak_periods = vec![];
-        
+
         Ok(TemporalStatistics {
             daily,
             monthly,
@@ -1298,8 +1337,11 @@ impl StatisticsCalculator {
             peak_periods,
         })
     }
-    
-    async fn calculate_geographic_statistics(&self, records: &[QsoDatabaseRecord]) -> Result<GeographicStatistics, StatisticsError> {
+
+    async fn calculate_geographic_statistics(
+        &self,
+        records: &[QsoDatabaseRecord],
+    ) -> Result<GeographicStatistics, StatisticsError> {
         // Placeholder implementation - would need geographic data lookups
         let countries = CountryStatistics {
             total_countries: 0,
@@ -1309,7 +1351,7 @@ impl StatisticsCalculator {
             dxcc_entities: 0,
             most_worked: None,
         };
-        
+
         let grids = GridStatistics {
             total_grids: 0,
             by_qso_count: BTreeMap::new(),
@@ -1317,14 +1359,14 @@ impl StatisticsCalculator {
             by_band: HashMap::new(),
             most_worked: None,
         };
-        
+
         let zones = ZoneStatistics {
             cq_zones: HashSet::new(),
             itu_zones: HashSet::new(),
             cq_by_band: HashMap::new(),
             itu_by_band: HashMap::new(),
         };
-        
+
         let distances = DistanceStatistics {
             total_km: 0.0,
             average_km: 0.0,
@@ -1332,7 +1374,7 @@ impl StatisticsCalculator {
             max_distance_qso: None,
             distance_bands: BTreeMap::new(),
         };
-        
+
         Ok(GeographicStatistics {
             countries,
             grids,
@@ -1340,14 +1382,17 @@ impl StatisticsCalculator {
             distances,
         })
     }
-    
-    async fn calculate_technical_statistics(&self, records: &[QsoDatabaseRecord]) -> Result<TechnicalStatistics, StatisticsError> {
+
+    async fn calculate_technical_statistics(
+        &self,
+        records: &[QsoDatabaseRecord],
+    ) -> Result<TechnicalStatistics, StatisticsError> {
         // Signal report statistics
         let mut sent_reports = Vec::new();
         let mut received_reports = Vec::new();
         let mut sent_distribution = BTreeMap::new();
         let mut received_distribution = BTreeMap::new();
-        
+
         for record in records {
             if let Some(sent) = record.metadata.reports.sent {
                 sent_reports.push(sent);
@@ -1358,19 +1403,19 @@ impl StatisticsCalculator {
                 *received_distribution.entry(received).or_insert(0) += 1;
             }
         }
-        
+
         let avg_sent = if !sent_reports.is_empty() {
             sent_reports.iter().sum::<i8>() as f64 / sent_reports.len() as f64
         } else {
             0.0
         };
-        
+
         let avg_received = if !received_reports.is_empty() {
             received_reports.iter().sum::<i8>() as f64 / received_reports.len() as f64
         } else {
             0.0
         };
-        
+
         let signal_reports = SignalReportStatistics {
             avg_sent,
             avg_received,
@@ -1381,25 +1426,26 @@ impl StatisticsCalculator {
             worst_sent: sent_reports.iter().min().copied().unwrap_or(0),
             worst_received: received_reports.iter().min().copied().unwrap_or(0),
         };
-        
+
         // Frequency statistics
         let mut frequency_groups = BTreeMap::new();
         let mut frequencies = Vec::new();
-        
+
         for record in records {
             let freq = record.metadata.frequency;
             frequencies.push(freq);
-            
+
             // Group frequencies into bands
             let freq_mhz = freq / 1_000_000.0;
             let group = format!("{:.1}", (freq_mhz * 10.0).round() / 10.0);
             *frequency_groups.entry(group).or_insert(0) += 1;
         }
-        
-        let most_used = frequency_groups.iter()
+
+        let most_used = frequency_groups
+            .iter()
             .max_by_key(|(_, &count)| count)
             .map(|(freq_str, &count)| (freq_str.parse().unwrap_or(0.0), count as u64));
-        
+
         let frequency_spread = if frequencies.len() > 1 {
             let min_freq = frequencies.iter().fold(f64::INFINITY, |a, &b| a.min(b));
             let max_freq = frequencies.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
@@ -1407,39 +1453,40 @@ impl StatisticsCalculator {
         } else {
             0.0
         };
-        
+
         let average_frequency = if !frequencies.is_empty() {
             frequencies.iter().sum::<f64>() / frequencies.len() as f64
         } else {
             0.0
         };
-        
+
         let frequency_stats = FrequencyStatistics {
             by_frequency: frequency_groups,
             most_used,
             frequency_spread,
             average_frequency,
         };
-        
+
         // Completion rates
         let total_qsos = records.len() as f64;
-        let completed_qsos = records.iter()
+        let completed_qsos = records
+            .iter()
             .filter(|r| r.metadata.end_time.is_some())
             .count() as f64;
-        
+
         let overall_rate = if total_qsos > 0.0 {
             (completed_qsos / total_qsos) * 100.0
         } else {
             0.0
         };
-        
+
         let completion_rates = CompletionRateStatistics {
             overall_rate,
             by_band: HashMap::new(),
             by_mode: HashMap::new(),
             by_hour: BTreeMap::new(),
         };
-        
+
         // Error rates (placeholder)
         let error_rates = ErrorRateStatistics {
             overall_rate: 0.0,
@@ -1447,7 +1494,7 @@ impl StatisticsCalculator {
             by_band: HashMap::new(),
             trends: vec![],
         };
-        
+
         Ok(TechnicalStatistics {
             signal_reports,
             frequencies: frequency_stats,
@@ -1455,8 +1502,11 @@ impl StatisticsCalculator {
             error_rates,
         })
     }
-    
-    async fn calculate_contest_statistics(&self, _records: &[QsoDatabaseRecord]) -> Result<ContestStatistics, StatisticsError> {
+
+    async fn calculate_contest_statistics(
+        &self,
+        _records: &[QsoDatabaseRecord],
+    ) -> Result<ContestStatistics, StatisticsError> {
         // Placeholder implementation
         Ok(ContestStatistics {
             participation: ContestParticipation {
@@ -1485,8 +1535,11 @@ impl StatisticsCalculator {
             },
         })
     }
-    
-    async fn calculate_achievement_statistics(&self, _records: &[QsoDatabaseRecord]) -> Result<AchievementStatistics, StatisticsError> {
+
+    async fn calculate_achievement_statistics(
+        &self,
+        _records: &[QsoDatabaseRecord],
+    ) -> Result<AchievementStatistics, StatisticsError> {
         // Placeholder implementation
         Ok(AchievementStatistics {
             dxcc: DxccAchievements {
@@ -1519,25 +1572,29 @@ impl StatisticsCalculator {
             custom: vec![],
         })
     }
-    
-    async fn calculate_performance_statistics(&self, records: &[QsoDatabaseRecord]) -> Result<PerformanceStatistics, StatisticsError> {
+
+    async fn calculate_performance_statistics(
+        &self,
+        records: &[QsoDatabaseRecord],
+    ) -> Result<PerformanceStatistics, StatisticsError> {
         let total_qsos = records.len() as f64;
-        let completed_qsos = records.iter()
+        let completed_qsos = records
+            .iter()
             .filter(|r| r.metadata.end_time.is_some())
             .count() as f64;
-        
+
         let completion_percentage = if total_qsos > 0.0 {
             (completed_qsos / total_qsos) * 100.0
         } else {
             0.0
         };
-        
+
         // Calculate session-based metrics
         let mut session_qsos = Vec::new();
         let mut session_durations = Vec::new();
         let mut current_session: Vec<&QsoDatabaseRecord> = Vec::new();
         let session_gap = Duration::hours(1); // 1 hour gap defines new session
-        
+
         for record in records {
             if let Some(last) = current_session.last() {
                 if record.metadata.start_time - last.metadata.start_time > session_gap {
@@ -1545,58 +1602,65 @@ impl StatisticsCalculator {
                         session_qsos.push(current_session.len());
                         // Calculate session duration
                         let session_start = current_session.first().unwrap().metadata.start_time;
-                        let session_end = current_session.last().unwrap().metadata.end_time
-                            .unwrap_or(current_session.last().unwrap().metadata.start_time + Duration::minutes(2));
-                        session_durations.push((session_end - session_start).num_seconds() as f64 / 3600.0); // hours
+                        let session_end =
+                            current_session.last().unwrap().metadata.end_time.unwrap_or(
+                                current_session.last().unwrap().metadata.start_time
+                                    + Duration::minutes(2),
+                            );
+                        session_durations
+                            .push((session_end - session_start).num_seconds() as f64 / 3600.0);
+                        // hours
                     }
                     current_session.clear();
                 }
             }
             current_session.push(record);
         }
-        
+
         if !current_session.is_empty() {
             session_qsos.push(current_session.len());
             let session_start = current_session.first().unwrap().metadata.start_time;
-            let session_end = current_session.last().unwrap().metadata.end_time
-                .unwrap_or(current_session.last().unwrap().metadata.start_time + Duration::minutes(2));
+            let session_end = current_session.last().unwrap().metadata.end_time.unwrap_or(
+                current_session.last().unwrap().metadata.start_time + Duration::minutes(2),
+            );
             session_durations.push((session_end - session_start).num_seconds() as f64 / 3600.0);
         }
-        
+
         let qsos_per_session = if !session_qsos.is_empty() {
             session_qsos.iter().sum::<usize>() as f64 / session_qsos.len() as f64
         } else {
             0.0
         };
-        
+
         // Calculate QSOs per hour
-        let qsos_per_hour = if !session_durations.is_empty() && session_durations.iter().sum::<f64>() > 0.0 {
-            total_qsos / session_durations.iter().sum::<f64>()
-        } else {
-            0.0
-        };
-        
+        let qsos_per_hour =
+            if !session_durations.is_empty() && session_durations.iter().sum::<f64>() > 0.0 {
+                total_qsos / session_durations.iter().sum::<f64>()
+            } else {
+                0.0
+            };
+
         // Calculate time to first QSO (average time from session start to first QSO)
         let time_to_first_qso = if !session_durations.is_empty() {
             // For FT8, this is typically the time to find a suitable frequency and start calling
             // We'll estimate this as 2-5 minutes on average based on session patterns
             let mut first_qso_times = Vec::new();
             let mut current_session_records: Vec<&QsoDatabaseRecord> = Vec::new();
-            
+
             for record in records {
                 if let Some(last) = current_session_records.last() {
                     if record.metadata.start_time - last.metadata.start_time > session_gap {
                         current_session_records.clear();
                     }
                 }
-                
+
                 if current_session_records.is_empty() {
                     // This is the first QSO of a session - estimate setup time as 3 minutes average
                     first_qso_times.push(180.0); // 3 minutes in seconds
                 }
                 current_session_records.push(record);
             }
-            
+
             if !first_qso_times.is_empty() {
                 first_qso_times.iter().sum::<f64>() / first_qso_times.len() as f64
             } else {
@@ -1605,18 +1669,19 @@ impl StatisticsCalculator {
         } else {
             0.0
         };
-        
+
         // Calculate average setup time (time between QSOs within a session)
         let avg_setup_time = if records.len() > 1 {
             let mut setup_times = Vec::new();
             for window in records.windows(2) {
-                let time_diff = (window[1].metadata.start_time - window[0].metadata.start_time).num_seconds() as f64;
+                let time_diff = (window[1].metadata.start_time - window[0].metadata.start_time)
+                    .num_seconds() as f64;
                 // Only consider gaps less than session_gap as setup time
                 if time_diff < session_gap.num_seconds() as f64 && time_diff > 0.0 {
                     setup_times.push(time_diff);
                 }
             }
-            
+
             if !setup_times.is_empty() {
                 setup_times.iter().sum::<f64>() / setup_times.len() as f64
             } else {
@@ -1625,7 +1690,7 @@ impl StatisticsCalculator {
         } else {
             0.0
         };
-        
+
         let efficiency = EfficiencyMetrics {
             qsos_per_hour,
             qsos_per_session,
@@ -1633,30 +1698,30 @@ impl StatisticsCalculator {
             time_to_first_qso,
             avg_setup_time,
         };
-        
+
         // Calculate completeness score based on required fields filled
         let completeness_score = self.calculate_completeness_score(records);
-        
+
         // Calculate signal quality index based on average RST reports
         let signal_quality_index = self.calculate_signal_quality_index(records);
-        
+
         // Calculate validation score based on callsign and grid square validity
         let validation_score = self.calculate_validation_score(records);
-        
+
         let quality = QualityMetrics {
             completion_percentage,
             completeness_score,
             signal_quality_index,
             validation_score,
         };
-        
+
         // Calculate activity consistency and performance consistency
         let (activity_consistency, daily_qso_stddev) = self.calculate_activity_consistency(records);
         let performance_consistency = self.calculate_performance_consistency(records);
-        
+
         // Calculate streaks
         let (longest_streak, current_streak) = self.calculate_activity_streaks(records);
-        
+
         let consistency = ConsistencyMetrics {
             activity_consistency,
             performance_consistency,
@@ -1664,10 +1729,10 @@ impl StatisticsCalculator {
             longest_streak,
             current_streak,
         };
-        
+
         // Calculate improvement rate
         let improvement_rate = self.calculate_improvement_rate(records);
-        
+
         let improvement = ImprovementMetrics {
             overall_trend: if improvement_rate > 5.0 {
                 TrendDirection::Improving
@@ -1680,7 +1745,7 @@ impl StatisticsCalculator {
             improvement_areas: vec![],
             milestones: vec![],
         };
-        
+
         Ok(PerformanceStatistics {
             efficiency,
             quality,
@@ -1688,8 +1753,11 @@ impl StatisticsCalculator {
             improvement,
         })
     }
-    
-    async fn calculate_trend_analysis(&self, _records: &[QsoDatabaseRecord]) -> Result<TrendAnalysis, StatisticsError> {
+
+    async fn calculate_trend_analysis(
+        &self,
+        _records: &[QsoDatabaseRecord],
+    ) -> Result<TrendAnalysis, StatisticsError> {
         // Placeholder implementation
         Ok(TrendAnalysis {
             activity: ActivityTrends {
@@ -1730,40 +1798,56 @@ impl StatisticsCalculator {
             },
         })
     }
-    
+
     /// Calculate completeness score based on required fields filled
     fn calculate_completeness_score(&self, records: &[QsoDatabaseRecord]) -> f64 {
         if records.is_empty() {
             return 0.0;
         }
-        
+
         let mut total_score = 0.0;
         let required_fields = 8.0; // callsign, frequency, mode, start_time, reports, band, etc.
-        
+
         for record in records {
             let mut field_score = 0.0;
-            
+
             // Check essential fields
-            if record.metadata.their_callsign.is_some() { field_score += 1.0; }
-            if record.metadata.frequency > 0.0 { field_score += 1.0; }
-            if !record.metadata.mode.is_empty() { field_score += 1.0; }
-            if record.metadata.reports.sent.is_some() { field_score += 1.0; }
-            if record.metadata.reports.received.is_some() { field_score += 1.0; }
-            if record.metadata.grids.theirs.is_some() { field_score += 1.0; }
-            if !record.adif_data.band.is_empty() { field_score += 1.0; }
-            if record.metadata.end_time.is_some() { field_score += 1.0; }
-            
+            if record.metadata.their_callsign.is_some() {
+                field_score += 1.0;
+            }
+            if record.metadata.frequency > 0.0 {
+                field_score += 1.0;
+            }
+            if !record.metadata.mode.is_empty() {
+                field_score += 1.0;
+            }
+            if record.metadata.reports.sent.is_some() {
+                field_score += 1.0;
+            }
+            if record.metadata.reports.received.is_some() {
+                field_score += 1.0;
+            }
+            if record.metadata.grids.theirs.is_some() {
+                field_score += 1.0;
+            }
+            if !record.adif_data.band.is_empty() {
+                field_score += 1.0;
+            }
+            if record.metadata.end_time.is_some() {
+                field_score += 1.0;
+            }
+
             total_score += (field_score / required_fields) * 100.0;
         }
-        
+
         total_score / records.len() as f64
     }
-    
+
     /// Calculate signal quality index based on average RST reports
     fn calculate_signal_quality_index(&self, records: &[QsoDatabaseRecord]) -> f64 {
         let mut sent_reports = Vec::new();
         let mut received_reports = Vec::new();
-        
+
         for record in records {
             if let Some(sent) = record.metadata.reports.sent {
                 sent_reports.push(sent);
@@ -1772,44 +1856,44 @@ impl StatisticsCalculator {
                 received_reports.push(received);
             }
         }
-        
+
         if sent_reports.is_empty() && received_reports.is_empty() {
             return 0.0;
         }
-        
+
         // FT8 signal reports typically range from -30 to +20 dB
         // Convert to percentage where -10 dB = 50%, 0 dB = 75%, +10 dB = 100%
         let mut total_quality = 0.0;
         let mut count = 0;
-        
+
         for &report in &sent_reports {
             let quality = ((report as f64 + 30.0) / 50.0 * 100.0).clamp(0.0, 100.0);
             total_quality += quality;
             count += 1;
         }
-        
+
         for &report in &received_reports {
             let quality = ((report as f64 + 30.0) / 50.0 * 100.0).clamp(0.0, 100.0);
             total_quality += quality;
             count += 1;
         }
-        
+
         if count > 0 {
             total_quality / count as f64
         } else {
             0.0
         }
     }
-    
+
     /// Calculate validation score based on callsign validity, grid squares, etc
     fn calculate_validation_score(&self, records: &[QsoDatabaseRecord]) -> f64 {
         if records.is_empty() {
             return 0.0;
         }
-        
+
         let mut valid_count = 0;
         let mut total_checks = 0;
-        
+
         for record in records {
             // Check callsign validity
             if let Some(ref callsign) = record.metadata.their_callsign {
@@ -1818,7 +1902,7 @@ impl StatisticsCalculator {
                     valid_count += 1;
                 }
             }
-            
+
             // Check grid square validity
             if let Some(ref grid) = record.metadata.grids.theirs {
                 total_checks += 1;
@@ -1826,130 +1910,138 @@ impl StatisticsCalculator {
                     valid_count += 1;
                 }
             }
-            
+
             // Check frequency validity for band
             total_checks += 1;
             if self.is_frequency_valid_for_band(record.metadata.frequency, &record.adif_data.band) {
                 valid_count += 1;
             }
-            
+
             // Check mode consistency
             total_checks += 1;
             if record.metadata.mode == "FT8" || record.metadata.mode == "DATA" {
                 valid_count += 1;
             }
         }
-        
+
         if total_checks > 0 {
             (valid_count as f64 / total_checks as f64) * 100.0
         } else {
             100.0 // No data to validate
         }
     }
-    
+
     /// Calculate activity consistency and daily QSO standard deviation
     fn calculate_activity_consistency(&self, records: &[QsoDatabaseRecord]) -> (f64, f64) {
         if records.is_empty() {
             return (0.0, 0.0);
         }
-        
+
         // Group QSOs by day
         let mut daily_counts = BTreeMap::new();
         for record in records {
             let date = record.metadata.start_time.date_naive();
             *daily_counts.entry(date).or_insert(0) += 1;
         }
-        
+
         if daily_counts.len() < 2 {
             return (100.0, 0.0); // Perfect consistency with single day
         }
-        
+
         let counts: Vec<f64> = daily_counts.values().map(|&x| x as f64).collect();
         let mean = counts.iter().sum::<f64>() / counts.len() as f64;
-        
+
         // Calculate standard deviation
-        let variance = counts.iter()
-            .map(|&x| (x - mean).powi(2))
-            .sum::<f64>() / counts.len() as f64;
+        let variance =
+            counts.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / counts.len() as f64;
         let stddev = variance.sqrt();
-        
+
         // Calculate consistency score (lower stddev = higher consistency)
         // Use coefficient of variation (stddev/mean) normalized to 0-100 scale
         let cv = if mean > 0.0 { stddev / mean } else { 0.0 };
         let consistency = (1.0 - cv.min(1.0)) * 100.0;
-        
+
         (consistency, stddev)
     }
-    
+
     /// Calculate performance consistency based on completion rates and signal reports
     fn calculate_performance_consistency(&self, records: &[QsoDatabaseRecord]) -> f64 {
         if records.is_empty() {
             return 0.0;
         }
-        
+
         // Group by time periods (e.g., weeks) and calculate completion rates
         let mut weekly_completion_rates = Vec::new();
         let mut weekly_signal_averages = Vec::new();
-        
+
         // Simple approach: divide records into chunks and calculate metrics
         let chunk_size = (records.len() / 4).max(1); // Divide into ~4 periods
-        
+
         for chunk in records.chunks(chunk_size) {
-            let completed = chunk.iter().filter(|r| r.metadata.end_time.is_some()).count();
+            let completed = chunk
+                .iter()
+                .filter(|r| r.metadata.end_time.is_some())
+                .count();
             let completion_rate = completed as f64 / chunk.len() as f64;
             weekly_completion_rates.push(completion_rate);
-            
-            let signal_reports: Vec<i8> = chunk.iter()
+
+            let signal_reports: Vec<i8> = chunk
+                .iter()
                 .filter_map(|r| r.metadata.reports.received)
                 .collect();
-            
+
             if !signal_reports.is_empty() {
-                let avg_signal = signal_reports.iter().sum::<i8>() as f64 / signal_reports.len() as f64;
+                let avg_signal =
+                    signal_reports.iter().sum::<i8>() as f64 / signal_reports.len() as f64;
                 weekly_signal_averages.push(avg_signal);
             }
         }
-        
+
         if weekly_completion_rates.len() < 2 {
             return 100.0;
         }
-        
+
         // Calculate consistency of completion rates
-        let mean_completion = weekly_completion_rates.iter().sum::<f64>() / weekly_completion_rates.len() as f64;
-        let completion_variance = weekly_completion_rates.iter()
+        let mean_completion =
+            weekly_completion_rates.iter().sum::<f64>() / weekly_completion_rates.len() as f64;
+        let completion_variance = weekly_completion_rates
+            .iter()
             .map(|&x| (x - mean_completion).powi(2))
-            .sum::<f64>() / weekly_completion_rates.len() as f64;
+            .sum::<f64>()
+            / weekly_completion_rates.len() as f64;
         let completion_consistency = 1.0 - completion_variance.sqrt();
-        
+
         (completion_consistency * 100.0).clamp(0.0, 100.0)
     }
-    
+
     /// Calculate activity streaks (longest and current)
     fn calculate_activity_streaks(&self, records: &[QsoDatabaseRecord]) -> (u64, u64) {
         if records.is_empty() {
             return (0, 0);
         }
-        
+
         // Get unique activity days
-        let mut activity_days: Vec<_> = records.iter()
+        let mut activity_days: Vec<_> = records
+            .iter()
             .map(|r| r.metadata.start_time.date_naive())
             .collect::<HashSet<_>>()
             .into_iter()
             .collect();
         activity_days.sort();
-        
+
         if activity_days.is_empty() {
             return (0, 0);
         }
-        
+
         let mut longest_streak = 1u64;
         let mut current_streak_len = 1u64;
         let mut current_streak = 1u64;
         let today = Utc::now().date_naive();
-        
+
         for i in 1..activity_days.len() {
             let prev_date = activity_days[i - 1];
             let curr_date = activity_days[i];
-            
+
             if (curr_date - prev_date).num_days() == 1 {
                 // Consecutive day
                 current_streak_len += 1;
@@ -1959,9 +2051,9 @@ impl StatisticsCalculator {
                 current_streak_len = 1;
             }
         }
-        
+
         longest_streak = longest_streak.max(current_streak_len);
-        
+
         // Calculate current streak (active if last activity was today or yesterday)
         if let Some(&last_day) = activity_days.last() {
             let days_since_last = (today - last_day).num_days();
@@ -1971,110 +2063,118 @@ impl StatisticsCalculator {
                 current_streak = 0;
             }
         }
-        
+
         (longest_streak, current_streak)
     }
-    
+
     /// Calculate improvement rate (trend percentage)
     fn calculate_improvement_rate(&self, records: &[QsoDatabaseRecord]) -> f64 {
         if records.len() < 10 {
             return 0.0; // Insufficient data
         }
-        
+
         // Split records into first half and second half
         let midpoint = records.len() / 2;
         let first_half = &records[0..midpoint];
         let second_half = &records[midpoint..];
-        
+
         // Calculate metrics for each half
-        let first_completion_rate = first_half.iter()
+        let first_completion_rate = first_half
+            .iter()
             .filter(|r| r.metadata.end_time.is_some())
-            .count() as f64 / first_half.len() as f64;
-        
-        let second_completion_rate = second_half.iter()
+            .count() as f64
+            / first_half.len() as f64;
+
+        let second_completion_rate = second_half
+            .iter()
             .filter(|r| r.metadata.end_time.is_some())
-            .count() as f64 / second_half.len() as f64;
-        
+            .count() as f64
+            / second_half.len() as f64;
+
         // Calculate signal quality improvement
-        let first_signals: Vec<i8> = first_half.iter()
+        let first_signals: Vec<i8> = first_half
+            .iter()
             .filter_map(|r| r.metadata.reports.received)
             .collect();
-        let second_signals: Vec<i8> = second_half.iter()
+        let second_signals: Vec<i8> = second_half
+            .iter()
             .filter_map(|r| r.metadata.reports.received)
             .collect();
-        
+
         let first_signal_avg = if !first_signals.is_empty() {
             first_signals.iter().sum::<i8>() as f64 / first_signals.len() as f64
         } else {
             0.0
         };
-        
+
         let second_signal_avg = if !second_signals.is_empty() {
             second_signals.iter().sum::<i8>() as f64 / second_signals.len() as f64
         } else {
             0.0
         };
-        
+
         // Calculate improvement rates
         let completion_improvement = if first_completion_rate > 0.0 {
             ((second_completion_rate - first_completion_rate) / first_completion_rate) * 100.0
         } else {
             0.0
         };
-        
+
         let signal_improvement = if first_signal_avg != 0.0 {
             ((second_signal_avg - first_signal_avg) / first_signal_avg.abs()) * 100.0
         } else {
             0.0
         };
-        
+
         // Weighted average of improvements
         (completion_improvement * 0.7 + signal_improvement * 0.3).clamp(-100.0, 100.0)
     }
-    
+
     /// Basic callsign validation
     fn is_valid_callsign(&self, callsign: &str) -> bool {
         if callsign.is_empty() || callsign.len() < 3 || callsign.len() > 10 {
             return false;
         }
-        
+
         // Basic pattern: starts with letter or number, contains at least one letter and one number
         let has_letter = callsign.chars().any(|c| c.is_ascii_alphabetic());
         let has_number = callsign.chars().any(|c| c.is_ascii_digit());
-        let valid_chars = callsign.chars().all(|c| c.is_ascii_alphanumeric() || c == '/');
-        
+        let valid_chars = callsign
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '/');
+
         has_letter && has_number && valid_chars
     }
-    
+
     /// Basic grid square validation
     fn is_valid_grid_square(&self, grid: &str) -> bool {
         if grid.len() < 4 || grid.len() > 8 {
             return false;
         }
-        
+
         let chars: Vec<char> = grid.chars().collect();
-        
+
         // First two characters should be letters A-R
         if !chars[0].is_ascii_alphabetic() || !chars[1].is_ascii_alphabetic() {
             return false;
         }
-        
+
         if chars[0] < 'A' || chars[0] > 'R' || chars[1] < 'A' || chars[1] > 'R' {
             return false;
         }
-        
+
         // Next two characters should be digits 0-9
         if !chars[2].is_ascii_digit() || !chars[3].is_ascii_digit() {
             return false;
         }
-        
+
         true
     }
-    
+
     /// Check if frequency is valid for the specified band
     fn is_frequency_valid_for_band(&self, frequency: f64, band: &str) -> bool {
         let freq_mhz = frequency / 1_000_000.0;
-        
+
         match band {
             "20M" => freq_mhz >= 14.0 && freq_mhz <= 14.35,
             "40M" => freq_mhz >= 7.0 && freq_mhz <= 7.3,
@@ -2089,8 +2189,12 @@ impl StatisticsCalculator {
             _ => true, // Unknown band, assume valid
         }
     }
-    
-    fn calculate_differences(&self, _stats1: &QsoStatistics, _stats2: &QsoStatistics) -> StatisticsDifferences {
+
+    fn calculate_differences(
+        &self,
+        _stats1: &QsoStatistics,
+        _stats2: &QsoStatistics,
+    ) -> StatisticsDifferences {
         // Placeholder implementation
         StatisticsDifferences {
             qso_count_change: 0,
@@ -2133,11 +2237,11 @@ mod tests {
     async fn create_test_records() -> Vec<QsoDatabaseRecord> {
         let mut records = Vec::new();
         let now = Utc::now();
-        
+
         for i in 0..10 {
             let qso_id = Uuid::new_v4();
             let start_time = now - Duration::days(i as i64);
-            
+
             let metadata = QsoMetadata {
                 qso_id,
                 our_callsign: "W1ABC".to_string(),
@@ -2158,7 +2262,7 @@ mod tests {
                 tags: HashMap::new(),
                 notes: None,
             };
-            
+
             let adif_data = crate::adif::AdifQso {
                 qso_date: start_time,
                 qso_date_off: Some(start_time + Duration::minutes(2)),
@@ -2191,7 +2295,7 @@ mod tests {
                 notes: None,
                 additional_fields: HashMap::new(),
             };
-            
+
             let record = QsoDatabaseRecord {
                 id: i as i64 + 1,
                 qso_id,
@@ -2211,10 +2315,10 @@ mod tests {
                 updated_at: start_time,
                 checksum: "test".to_string(),
             };
-            
+
             records.push(record);
         }
-        
+
         records
     }
 
@@ -2223,13 +2327,16 @@ mod tests {
         // Create a temporary database file instead of in-memory to avoid initialization issues
         let temp_path = std::env::temp_dir().join("test_basic_stats.db");
         let _ = std::fs::remove_file(&temp_path); // Clean up if exists
-        
+
         let dummy_db = QsoDatabase::open(&temp_path).unwrap();
         let calculator = StatisticsCalculator::new(dummy_db);
         let records = create_test_records().await;
-        
-        let basic = calculator.calculate_basic_statistics(&records).await.unwrap();
-        
+
+        let basic = calculator
+            .calculate_basic_statistics(&records)
+            .await
+            .unwrap();
+
         assert_eq!(basic.total_qsos, 10);
         assert_eq!(basic.confirmed_qsos, 10);
         assert_eq!(basic.unique_callsigns, 10);
@@ -2237,7 +2344,7 @@ mod tests {
         assert!(basic.by_band.contains_key("20M"));
         assert!(basic.first_qso.is_some());
         assert!(basic.last_qso.is_some());
-        
+
         // Clean up
         let _ = std::fs::remove_file(&temp_path);
     }
@@ -2246,19 +2353,22 @@ mod tests {
     async fn test_temporal_statistics() {
         let temp_path = std::env::temp_dir().join("test_temporal_stats.db");
         let _ = std::fs::remove_file(&temp_path);
-        
+
         let dummy_db = QsoDatabase::open(&temp_path).unwrap();
         let calculator = StatisticsCalculator::new(dummy_db);
         let records = create_test_records().await;
-        
-        let temporal = calculator.calculate_temporal_statistics(&records).await.unwrap();
-        
+
+        let temporal = calculator
+            .calculate_temporal_statistics(&records)
+            .await
+            .unwrap();
+
         assert_eq!(temporal.daily.active_days, 10);
         assert!(temporal.daily.average_per_day > 0.0);
         assert!(temporal.patterns.peak_hour < 24);
         assert!(temporal.patterns.peak_day_of_week < 7);
         assert!(temporal.patterns.peak_month >= 1 && temporal.patterns.peak_month <= 12);
-        
+
         let _ = std::fs::remove_file(&temp_path);
     }
 
@@ -2266,20 +2376,23 @@ mod tests {
     async fn test_technical_statistics() {
         let temp_path = std::env::temp_dir().join("test_technical_stats.db");
         let _ = std::fs::remove_file(&temp_path);
-        
+
         let dummy_db = QsoDatabase::open(&temp_path).unwrap();
         let calculator = StatisticsCalculator::new(dummy_db);
         let records = create_test_records().await;
-        
-        let technical = calculator.calculate_technical_statistics(&records).await.unwrap();
-        
+
+        let technical = calculator
+            .calculate_technical_statistics(&records)
+            .await
+            .unwrap();
+
         assert!(technical.signal_reports.avg_sent != 0.0);
         assert!(technical.signal_reports.avg_received != 0.0);
         assert!(!technical.signal_reports.sent_distribution.is_empty());
         assert!(!technical.signal_reports.received_distribution.is_empty());
         assert!(technical.frequencies.average_frequency > 0.0);
         assert_eq!(technical.completion_rates.overall_rate, 100.0);
-        
+
         let _ = std::fs::remove_file(&temp_path);
     }
 
@@ -2288,37 +2401,38 @@ mod tests {
         // Since we only need the calculation functions and they don't use the database,
         // we can create a minimal test that just tests the calculations directly
         let records = create_test_records().await;
-        
+
         // Test the individual calculation helper functions
         let completeness_score = calculate_completeness_score_test(&records);
         let signal_quality_index = calculate_signal_quality_index_test(&records);
         let validation_score = calculate_validation_score_test(&records);
-        let (activity_consistency, daily_qso_stddev) = calculate_activity_consistency_test(&records);
+        let (activity_consistency, daily_qso_stddev) =
+            calculate_activity_consistency_test(&records);
         let performance_consistency = calculate_performance_consistency_test(&records);
         let improvement_rate = calculate_improvement_rate_test(&records);
-        
+
         // Test that our new calculations are working
         assert!(completeness_score > 0.0);
         assert!(completeness_score <= 100.0);
-        
+
         assert!(signal_quality_index > 0.0);
         assert!(signal_quality_index <= 100.0);
-        
+
         assert!(validation_score > 0.0);
         assert!(validation_score <= 100.0);
-        
+
         assert!(activity_consistency >= 0.0);
         assert!(activity_consistency <= 100.0);
-        
+
         assert!(performance_consistency >= 0.0);
         assert!(performance_consistency <= 100.0);
-        
+
         assert!(daily_qso_stddev >= 0.0);
-        
+
         // Test the improvement rate is calculated
         assert!(improvement_rate >= -100.0);
         assert!(improvement_rate <= 100.0);
-        
+
         println!("Completeness Score: {}", completeness_score);
         println!("Signal Quality Index: {}", signal_quality_index);
         println!("Validation Score: {}", validation_score);
@@ -2333,32 +2447,48 @@ mod tests {
         if records.is_empty() {
             return 0.0;
         }
-        
+
         let mut total_score = 0.0;
         let required_fields = 8.0;
-        
+
         for record in records {
             let mut field_score = 0.0;
-            
-            if record.metadata.their_callsign.is_some() { field_score += 1.0; }
-            if record.metadata.frequency > 0.0 { field_score += 1.0; }
-            if !record.metadata.mode.is_empty() { field_score += 1.0; }
-            if record.metadata.reports.sent.is_some() { field_score += 1.0; }
-            if record.metadata.reports.received.is_some() { field_score += 1.0; }
-            if record.metadata.grids.theirs.is_some() { field_score += 1.0; }
-            if !record.adif_data.band.is_empty() { field_score += 1.0; }
-            if record.metadata.end_time.is_some() { field_score += 1.0; }
-            
+
+            if record.metadata.their_callsign.is_some() {
+                field_score += 1.0;
+            }
+            if record.metadata.frequency > 0.0 {
+                field_score += 1.0;
+            }
+            if !record.metadata.mode.is_empty() {
+                field_score += 1.0;
+            }
+            if record.metadata.reports.sent.is_some() {
+                field_score += 1.0;
+            }
+            if record.metadata.reports.received.is_some() {
+                field_score += 1.0;
+            }
+            if record.metadata.grids.theirs.is_some() {
+                field_score += 1.0;
+            }
+            if !record.adif_data.band.is_empty() {
+                field_score += 1.0;
+            }
+            if record.metadata.end_time.is_some() {
+                field_score += 1.0;
+            }
+
             total_score += (field_score / required_fields) * 100.0;
         }
-        
+
         total_score / records.len() as f64
     }
-    
+
     fn calculate_signal_quality_index_test(records: &[QsoDatabaseRecord]) -> f64 {
         let mut sent_reports = Vec::new();
         let mut received_reports = Vec::new();
-        
+
         for record in records {
             if let Some(sent) = record.metadata.reports.sent {
                 sent_reports.push(sent);
@@ -2367,41 +2497,41 @@ mod tests {
                 received_reports.push(received);
             }
         }
-        
+
         if sent_reports.is_empty() && received_reports.is_empty() {
             return 0.0;
         }
-        
+
         let mut total_quality = 0.0;
         let mut count = 0;
-        
+
         for &report in &sent_reports {
             let quality = ((report as f64 + 30.0) / 50.0 * 100.0).clamp(0.0, 100.0);
             total_quality += quality;
             count += 1;
         }
-        
+
         for &report in &received_reports {
             let quality = ((report as f64 + 30.0) / 50.0 * 100.0).clamp(0.0, 100.0);
             total_quality += quality;
             count += 1;
         }
-        
+
         if count > 0 {
             total_quality / count as f64
         } else {
             0.0
         }
     }
-    
+
     fn calculate_validation_score_test(records: &[QsoDatabaseRecord]) -> f64 {
         if records.is_empty() {
             return 0.0;
         }
-        
+
         let mut valid_count = 0;
         let mut total_checks = 0;
-        
+
         for record in records {
             // Check callsign validity
             if let Some(ref callsign) = record.metadata.their_callsign {
@@ -2410,7 +2540,7 @@ mod tests {
                     valid_count += 1;
                 }
             }
-            
+
             // Check grid square validity
             if let Some(ref grid) = record.metadata.grids.theirs {
                 total_checks += 1;
@@ -2418,171 +2548,184 @@ mod tests {
                     valid_count += 1;
                 }
             }
-            
+
             // Check frequency validity for band
             total_checks += 1;
             if is_frequency_valid_for_band_test(record.metadata.frequency, &record.adif_data.band) {
                 valid_count += 1;
             }
-            
+
             // Check mode consistency
             total_checks += 1;
             if record.metadata.mode == "FT8" || record.metadata.mode == "DATA" {
                 valid_count += 1;
             }
         }
-        
+
         if total_checks > 0 {
             (valid_count as f64 / total_checks as f64) * 100.0
         } else {
             100.0
         }
     }
-    
+
     fn calculate_activity_consistency_test(records: &[QsoDatabaseRecord]) -> (f64, f64) {
         if records.is_empty() {
             return (0.0, 0.0);
         }
-        
+
         let mut daily_counts = BTreeMap::new();
         for record in records {
             let date = record.metadata.start_time.date_naive();
             *daily_counts.entry(date).or_insert(0) += 1;
         }
-        
+
         if daily_counts.len() < 2 {
             return (100.0, 0.0);
         }
-        
+
         let counts: Vec<f64> = daily_counts.values().map(|&x| x as f64).collect();
         let mean = counts.iter().sum::<f64>() / counts.len() as f64;
-        
-        let variance = counts.iter()
-            .map(|&x| (x - mean).powi(2))
-            .sum::<f64>() / counts.len() as f64;
+
+        let variance =
+            counts.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / counts.len() as f64;
         let stddev = variance.sqrt();
-        
+
         let cv = if mean > 0.0 { stddev / mean } else { 0.0 };
         let consistency = (1.0 - cv.min(1.0)) * 100.0;
-        
+
         (consistency, stddev)
     }
-    
+
     fn calculate_performance_consistency_test(records: &[QsoDatabaseRecord]) -> f64 {
         if records.is_empty() {
             return 0.0;
         }
-        
+
         let mut weekly_completion_rates = Vec::new();
         let chunk_size = (records.len() / 4).max(1);
-        
+
         for chunk in records.chunks(chunk_size) {
-            let completed = chunk.iter().filter(|r| r.metadata.end_time.is_some()).count();
+            let completed = chunk
+                .iter()
+                .filter(|r| r.metadata.end_time.is_some())
+                .count();
             let completion_rate = completed as f64 / chunk.len() as f64;
             weekly_completion_rates.push(completion_rate);
         }
-        
+
         if weekly_completion_rates.len() < 2 {
             return 100.0;
         }
-        
-        let mean_completion = weekly_completion_rates.iter().sum::<f64>() / weekly_completion_rates.len() as f64;
-        let completion_variance = weekly_completion_rates.iter()
+
+        let mean_completion =
+            weekly_completion_rates.iter().sum::<f64>() / weekly_completion_rates.len() as f64;
+        let completion_variance = weekly_completion_rates
+            .iter()
             .map(|&x| (x - mean_completion).powi(2))
-            .sum::<f64>() / weekly_completion_rates.len() as f64;
+            .sum::<f64>()
+            / weekly_completion_rates.len() as f64;
         let completion_consistency = 1.0 - completion_variance.sqrt();
-        
+
         (completion_consistency * 100.0).clamp(0.0, 100.0)
     }
-    
+
     fn calculate_improvement_rate_test(records: &[QsoDatabaseRecord]) -> f64 {
         if records.len() < 10 {
             return 0.0;
         }
-        
+
         let midpoint = records.len() / 2;
         let first_half = &records[0..midpoint];
         let second_half = &records[midpoint..];
-        
-        let first_completion_rate = first_half.iter()
+
+        let first_completion_rate = first_half
+            .iter()
             .filter(|r| r.metadata.end_time.is_some())
-            .count() as f64 / first_half.len() as f64;
-        
-        let second_completion_rate = second_half.iter()
+            .count() as f64
+            / first_half.len() as f64;
+
+        let second_completion_rate = second_half
+            .iter()
             .filter(|r| r.metadata.end_time.is_some())
-            .count() as f64 / second_half.len() as f64;
-        
-        let first_signals: Vec<i8> = first_half.iter()
+            .count() as f64
+            / second_half.len() as f64;
+
+        let first_signals: Vec<i8> = first_half
+            .iter()
             .filter_map(|r| r.metadata.reports.received)
             .collect();
-        let second_signals: Vec<i8> = second_half.iter()
+        let second_signals: Vec<i8> = second_half
+            .iter()
             .filter_map(|r| r.metadata.reports.received)
             .collect();
-        
+
         let first_signal_avg = if !first_signals.is_empty() {
             first_signals.iter().sum::<i8>() as f64 / first_signals.len() as f64
         } else {
             0.0
         };
-        
+
         let second_signal_avg = if !second_signals.is_empty() {
             second_signals.iter().sum::<i8>() as f64 / second_signals.len() as f64
         } else {
             0.0
         };
-        
+
         let completion_improvement = if first_completion_rate > 0.0 {
             ((second_completion_rate - first_completion_rate) / first_completion_rate) * 100.0
         } else {
             0.0
         };
-        
+
         let signal_improvement = if first_signal_avg != 0.0 {
             ((second_signal_avg - first_signal_avg) / first_signal_avg.abs()) * 100.0
         } else {
             0.0
         };
-        
+
         (completion_improvement * 0.7 + signal_improvement * 0.3).clamp(-100.0, 100.0)
     }
-    
+
     fn is_valid_callsign_test(callsign: &str) -> bool {
         if callsign.is_empty() || callsign.len() < 3 || callsign.len() > 10 {
             return false;
         }
-        
+
         let has_letter = callsign.chars().any(|c| c.is_ascii_alphabetic());
         let has_number = callsign.chars().any(|c| c.is_ascii_digit());
-        let valid_chars = callsign.chars().all(|c| c.is_ascii_alphanumeric() || c == '/');
-        
+        let valid_chars = callsign
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '/');
+
         has_letter && has_number && valid_chars
     }
-    
+
     fn is_valid_grid_square_test(grid: &str) -> bool {
         if grid.len() < 4 || grid.len() > 8 {
             return false;
         }
-        
+
         let chars: Vec<char> = grid.chars().collect();
-        
+
         if !chars[0].is_ascii_alphabetic() || !chars[1].is_ascii_alphabetic() {
             return false;
         }
-        
+
         if chars[0] < 'A' || chars[0] > 'R' || chars[1] < 'A' || chars[1] > 'R' {
             return false;
         }
-        
+
         if !chars[2].is_ascii_digit() || !chars[3].is_ascii_digit() {
             return false;
         }
-        
+
         true
     }
-    
+
     fn is_frequency_valid_for_band_test(frequency: f64, band: &str) -> bool {
         let freq_mhz = frequency / 1_000_000.0;
-        
+
         match band {
             "20M" => freq_mhz >= 14.0 && freq_mhz <= 14.35,
             "40M" => freq_mhz >= 7.0 && freq_mhz <= 7.3,

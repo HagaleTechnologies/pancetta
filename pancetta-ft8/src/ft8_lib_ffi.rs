@@ -56,16 +56,16 @@ pub enum ftx_protocol_t {
 
 #[repr(C)]
 pub struct ftx_waterfall_t {
-    pub max_blocks: i32,    // offset 0
-    pub num_blocks: i32,    // offset 4
-    pub num_bins: i32,      // offset 8
-    pub time_osr: i32,      // offset 12
-    pub freq_osr: i32,      // offset 16
-    _pad0: u32,             // offset 20 (padding for pointer alignment)
-    pub mag: *mut u8,       // offset 24
-    pub block_stride: i32,  // offset 32
+    pub max_blocks: i32,          // offset 0
+    pub num_blocks: i32,          // offset 4
+    pub num_bins: i32,            // offset 8
+    pub time_osr: i32,            // offset 12
+    pub freq_osr: i32,            // offset 16
+    _pad0: u32,                   // offset 20 (padding for pointer alignment)
+    pub mag: *mut u8,             // offset 24
+    pub block_stride: i32,        // offset 32
     pub protocol: ftx_protocol_t, // offset 36
-}   // total size: 40
+} // total size: 40
 
 #[repr(C)]
 pub struct monitor_config_t {
@@ -80,22 +80,22 @@ pub struct monitor_config_t {
 // Opaque monitor struct — layout must match C exactly (112 bytes on 64-bit)
 #[repr(C)]
 pub struct monitor_t {
-    pub symbol_period: f32,         // offset 0
-    pub min_bin: i32,               // offset 4
-    pub max_bin: i32,               // offset 8
-    pub block_size: i32,            // offset 12
-    pub subblock_size: i32,         // offset 16
-    pub nfft: i32,                  // offset 20
-    pub fft_norm: f32,              // offset 24
-    _pad0: u32,                     // offset 28 (padding for pointer alignment)
-    pub window: *mut f32,           // offset 32
-    pub last_frame: *mut f32,       // offset 40
-    pub wf: ftx_waterfall_t,        // offset 48 (size 40)
-    pub max_mag: f32,               // offset 88
-    _pad1: u32,                     // offset 92 (padding for pointer alignment)
+    pub symbol_period: f32,              // offset 0
+    pub min_bin: i32,                    // offset 4
+    pub max_bin: i32,                    // offset 8
+    pub block_size: i32,                 // offset 12
+    pub subblock_size: i32,              // offset 16
+    pub nfft: i32,                       // offset 20
+    pub fft_norm: f32,                   // offset 24
+    _pad0: u32,                          // offset 28 (padding for pointer alignment)
+    pub window: *mut f32,                // offset 32
+    pub last_frame: *mut f32,            // offset 40
+    pub wf: ftx_waterfall_t,             // offset 48 (size 40)
+    pub max_mag: f32,                    // offset 88
+    _pad1: u32,                          // offset 92 (padding for pointer alignment)
     pub fft_work: *mut std::ffi::c_void, // offset 96
     pub fft_cfg: *mut std::ffi::c_void,  // offset 104
-}   // total size: 112
+} // total size: 112
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -110,16 +110,15 @@ pub enum ftx_message_rc_t {
 
 #[repr(C)]
 pub struct ftx_callsign_hash_interface_t {
-    pub lookup_hash: Option<
-        unsafe extern "C" fn(hash_type: i32, hash: u32, callsign: *mut c_char) -> bool,
-    >,
+    pub lookup_hash:
+        Option<unsafe extern "C" fn(hash_type: i32, hash: u32, callsign: *mut c_char) -> bool>,
     pub save_hash: Option<unsafe extern "C" fn(callsign: *const c_char, n22: u32)>,
 }
 
 /// FTX_MAX_MESSAGE_FIELDS = 3
 #[repr(C)]
 pub struct ftx_message_offsets_t {
-    pub types: [i32; 3],   // ftx_field_t enum values
+    pub types: [i32; 3], // ftx_field_t enum values
     pub offsets: [i16; 3],
 }
 
@@ -167,11 +166,7 @@ extern "C" {
 // Hash interface callbacks (no-op — we don't maintain a hash table)
 // ============================================================================
 
-unsafe extern "C" fn noop_lookup_hash(
-    _hash_type: i32,
-    _hash: u32,
-    _callsign: *mut c_char,
-) -> bool {
+unsafe extern "C" fn noop_lookup_hash(_hash_type: i32, _hash: u32, _callsign: *mut c_char) -> bool {
     false
 }
 
@@ -288,14 +283,8 @@ pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
         num_candidates
     ];
 
-    let n_found = unsafe {
-        ftx_find_candidates(
-            &mon.wf,
-            num_candidates as i32,
-            candidates.as_mut_ptr(),
-            0,
-        )
-    };
+    let n_found =
+        unsafe { ftx_find_candidates(&mon.wf, num_candidates as i32, candidates.as_mut_ptr(), 0) };
 
     // Decode each candidate
     let mut messages = Vec::new();
@@ -304,9 +293,8 @@ pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
         let mut msg: ftx_message_t = unsafe { std::mem::zeroed() };
         let mut status: ftx_decode_status_t = unsafe { std::mem::zeroed() };
 
-        let ok = unsafe {
-            ftx_decode_candidate(&mon.wf, &candidates[i], 25, &mut msg, &mut status)
-        };
+        let ok =
+            unsafe { ftx_decode_candidate(&mon.wf, &candidates[i], 25, &mut msg, &mut status) };
 
         if ok {
             let mut text_buf = [0u8; 35];
@@ -325,7 +313,10 @@ pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
                 let text = c_str.to_string_lossy().trim().to_string();
 
                 // Deduplicate
-                if !messages.iter().any(|(t, _, _, _): &(String, f32, f32, i32)| *t == text) {
+                if !messages
+                    .iter()
+                    .any(|(t, _, _, _): &(String, f32, f32, i32)| *t == text)
+                {
                     messages.push((text, status.freq, status.time, status.ldpc_errors));
                 }
             }

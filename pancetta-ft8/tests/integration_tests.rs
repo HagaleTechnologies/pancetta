@@ -6,25 +6,23 @@
 #![cfg(feature = "transmit")]
 
 use pancetta_ft8::{
-    Ft8Decoder, Ft8Encoder, Ft8Modulator, Ft8Config, DecodedMessage,
-    SAMPLE_RATE, WINDOW_SAMPLES, NUM_SYMBOLS, SYMBOL_DURATION, MESSAGE_DURATION,
+    DecodedMessage, Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, MESSAGE_DURATION, NUM_SYMBOLS,
+    SAMPLE_RATE, SYMBOL_DURATION, WINDOW_SAMPLES,
 };
 use std::time::Duration;
 
 /// Generate a real FT8 signal using the encoder + modulator pipeline,
 /// then add Gaussian noise at the given SNR.
-fn generate_ft8_test_signal(
-    message: &str,
-    snr_db: f32,
-    frequency_offset: f64,
-) -> Vec<f32> {
+fn generate_ft8_test_signal(message: &str, snr_db: f32, frequency_offset: f64) -> Vec<f32> {
     let mut encoder = Ft8Encoder::new();
     let mut modulator = Ft8Modulator::new_default().unwrap();
 
-    let symbols = encoder.encode_message(message, None)
+    let symbols = encoder
+        .encode_message(message, None)
         .unwrap_or_else(|e| panic!("Failed to encode '{}': {}", message, e));
 
-    let mut audio = modulator.modulate_symbols(&symbols, frequency_offset)
+    let mut audio = modulator
+        .modulate_symbols(&symbols, frequency_offset)
         .unwrap_or_else(|e| panic!("Failed to modulate '{}': {}", message, e));
 
     // Pad/trim to WINDOW_SAMPLES
@@ -109,7 +107,10 @@ fn test_decoder_with_multiple_signals() {
 
     let decoded = result.unwrap();
     // Should decode at least one signal
-    assert!(!decoded.is_empty(), "Should decode at least one of the combined signals");
+    assert!(
+        !decoded.is_empty(),
+        "Should decode at least one of the combined signals"
+    );
 }
 
 #[test]
@@ -222,14 +223,17 @@ fn test_synchronization_quality() {
     assert!(result.is_ok());
 
     let metrics = decoder.get_last_metrics();
-    assert!(metrics.sync_quality > 0.5, "Clean signal should have high sync quality");
+    assert!(
+        metrics.sync_quality > 0.5,
+        "Clean signal should have high sync quality"
+    );
 }
 
 /// Integration test for message handler callbacks
 #[test]
 fn test_message_handler_callbacks() {
+    use pancetta_ft8::{DecodingMetrics, MessageHandler};
     use std::sync::{Arc, Mutex};
-    use pancetta_ft8::{MessageHandler, DecodingMetrics};
 
     #[derive(Default)]
     struct TestMessageHandler {
@@ -257,10 +261,8 @@ fn test_message_handler_callbacks() {
     let starts = handler.window_starts.clone();
     let completes = handler.window_completes.clone();
 
-    let mut decoder = Ft8Decoder::with_message_handler(
-        Ft8Config::default(),
-        Box::new(handler),
-    ).unwrap();
+    let mut decoder =
+        Ft8Decoder::with_message_handler(Ft8Config::default(), Box::new(handler)).unwrap();
 
     let test_samples = generate_ft8_test_signal("CQ W1ABC FN42", 20.0, 0.0);
     let result = decoder.decode_window(&test_samples);
@@ -270,7 +272,10 @@ fn test_message_handler_callbacks() {
     assert_eq!(*completes.lock().unwrap(), 1);
 
     // With a strong clean signal, the handler should receive the decoded message
-    assert!(!messages.lock().unwrap().is_empty(), "Handler should receive decoded message");
+    assert!(
+        !messages.lock().unwrap().is_empty(),
+        "Handler should receive decoded message"
+    );
 }
 
 #[test]

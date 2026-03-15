@@ -462,10 +462,7 @@ mod tests {
             ModeValue::standard(StandardMode::USB).default_bandwidth(),
             Some(2700)
         );
-        assert_eq!(
-            ModeValue::custom("OLIVIA").default_bandwidth(),
-            Some(500)
-        );
+        assert_eq!(ModeValue::custom("OLIVIA").default_bandwidth(), Some(500));
     }
 
     #[test]

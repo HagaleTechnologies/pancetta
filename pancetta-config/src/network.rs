@@ -12,40 +12,40 @@ use std::collections::HashMap;
 pub struct NetworkConfig {
     /// PSKReporter service configuration
     pub psk_reporter: PskReporterConfig,
-    
+
     /// QRZ.com service configuration
     pub qrz: QrzConfig,
-    
+
     /// ARRL Logbook of the World configuration
     pub lotw: LotwConfig,
-    
+
     /// eQSL service configuration
     pub eqsl: EqslConfig,
-    
+
     /// Clublog service configuration
     pub clublog: ClublogConfig,
-    
+
     /// WSPR configuration
     pub wspr: WsprConfig,
-    
+
     /// DX cluster configuration
     pub dx_cluster: DxClusterConfig,
-    
+
     /// Web API configuration
     pub web_api: WebApiConfig,
-    
+
     /// Proxy settings
     pub proxy: ProxyConfig,
-    
+
     /// SSL/TLS settings
     pub tls: TlsConfig,
-    
+
     /// Rate limiting configuration
     pub rate_limiting: RateLimitingConfig,
-    
+
     /// Retry and timeout settings
     pub reliability: ReliabilityConfig,
-    
+
     /// Custom service integrations
     #[serde(default)]
     pub custom_services: HashMap<String, CustomServiceConfig>,
@@ -56,34 +56,34 @@ pub struct NetworkConfig {
 pub struct PskReporterConfig {
     /// Enable PSKReporter uploads
     pub enabled: bool,
-    
+
     /// PSKReporter server URL
     pub server_url: String,
-    
+
     /// Upload interval in seconds
     pub upload_interval_seconds: u64,
-    
+
     /// Batch size for uploads
     pub batch_size: u32,
-    
+
     /// Include receive reports
     pub include_receives: bool,
-    
+
     /// Include transmit reports
     pub include_transmits: bool,
-    
+
     /// Minimum signal-to-noise ratio for reports
     pub min_snr_db: f32,
-    
+
     /// Maximum age of reports to upload (hours)
     pub max_age_hours: u32,
-    
+
     /// Reporter identification
     pub reporter_info: ReporterInfo,
-    
+
     /// Frequency accuracy in Hz
     pub frequency_accuracy_hz: u32,
-    
+
     /// Filter settings
     pub filters: PskReporterFilters,
 }
@@ -93,13 +93,13 @@ pub struct PskReporterConfig {
 pub struct ReporterInfo {
     /// Software name
     pub software_name: String,
-    
+
     /// Software version
     pub software_version: String,
-    
+
     /// Antenna information
     pub antenna_info: Option<String>,
-    
+
     /// Additional comments
     pub comments: Option<String>,
 }
@@ -109,16 +109,16 @@ pub struct ReporterInfo {
 pub struct PskReporterFilters {
     /// Enabled modes for reporting
     pub enabled_modes: Vec<String>,
-    
+
     /// Enabled bands for reporting
     pub enabled_bands: Vec<String>,
-    
+
     /// Minimum frequency in Hz
     pub min_frequency: Option<u64>,
-    
+
     /// Maximum frequency in Hz
     pub max_frequency: Option<u64>,
-    
+
     /// Geographic filters
     pub geographic: GeographicFilters,
 }
@@ -128,22 +128,22 @@ pub struct PskReporterFilters {
 pub struct GeographicFilters {
     /// Include specific DXCC entities
     pub include_dxcc: Vec<u16>,
-    
+
     /// Exclude specific DXCC entities
     pub exclude_dxcc: Vec<u16>,
-    
+
     /// Include specific ITU zones
     pub include_itu_zones: Vec<u8>,
-    
+
     /// Exclude specific ITU zones
     pub exclude_itu_zones: Vec<u8>,
-    
+
     /// Include specific CQ zones
     pub include_cq_zones: Vec<u8>,
-    
+
     /// Exclude specific CQ zones
     pub exclude_cq_zones: Vec<u8>,
-    
+
     /// Distance filters
     pub distance: DistanceFilters,
 }
@@ -153,10 +153,10 @@ pub struct GeographicFilters {
 pub struct DistanceFilters {
     /// Minimum distance in kilometers
     pub min_distance_km: Option<f64>,
-    
+
     /// Maximum distance in kilometers
     pub max_distance_km: Option<f64>,
-    
+
     /// Use great circle distance calculation
     pub great_circle: bool,
 }
@@ -166,28 +166,28 @@ pub struct DistanceFilters {
 pub struct QrzConfig {
     /// Enable QRZ.com integration
     pub enabled: bool,
-    
+
     /// QRZ.com username
     pub username: Option<String>,
-    
+
     /// QRZ.com password (encrypted)
     pub password_encrypted: Option<String>,
-    
+
     /// QRZ.com XML API key
     pub api_key: Option<String>,
-    
+
     /// QRZ.com API endpoint
     pub api_endpoint: String,
-    
+
     /// Session management
     pub session: QrzSessionConfig,
-    
+
     /// Lookup preferences
     pub lookup: QrzLookupConfig,
-    
+
     /// Cache settings
     pub cache: CacheConfig,
-    
+
     /// Logbook integration
     pub logbook: QrzLogbookConfig,
 }
@@ -197,10 +197,10 @@ pub struct QrzConfig {
 pub struct QrzSessionConfig {
     /// Session timeout in minutes
     pub timeout_minutes: u32,
-    
+
     /// Auto-refresh sessions
     pub auto_refresh: bool,
-    
+
     /// Session cache file
     pub cache_file: Option<String>,
 }
@@ -210,16 +210,16 @@ pub struct QrzSessionConfig {
 pub struct QrzLookupConfig {
     /// Automatically lookup callsigns
     pub auto_lookup: bool,
-    
+
     /// Lookup timeout in seconds
     pub timeout_seconds: u32,
-    
+
     /// Fields to retrieve
     pub fields: Vec<String>,
-    
+
     /// Include image URLs
     pub include_images: bool,
-    
+
     /// Include biographical data
     pub include_bio: bool,
 }
@@ -229,16 +229,16 @@ pub struct QrzLookupConfig {
 pub struct CacheConfig {
     /// Enable caching
     pub enabled: bool,
-    
+
     /// Cache duration in hours
     pub duration_hours: u32,
-    
+
     /// Maximum cache size in MB
     pub max_size_mb: u32,
-    
+
     /// Cache directory
     pub directory: Option<String>,
-    
+
     /// Auto-cleanup old entries
     pub auto_cleanup: bool,
 }
@@ -248,16 +248,16 @@ pub struct CacheConfig {
 pub struct QrzLogbookConfig {
     /// Enable logbook upload
     pub upload_enabled: bool,
-    
+
     /// Automatically upload QSOs
     pub auto_upload: bool,
-    
+
     /// Upload batch size
     pub batch_size: u32,
-    
+
     /// Upload confirmation required
     pub confirmation_required: bool,
-    
+
     /// ADIF field mapping
     pub field_mapping: HashMap<String, String>,
 }
@@ -267,22 +267,22 @@ pub struct QrzLogbookConfig {
 pub struct LotwConfig {
     /// Enable LOTW integration
     pub enabled: bool,
-    
+
     /// LOTW username
     pub username: Option<String>,
-    
+
     /// LOTW password (encrypted)
     pub password_encrypted: Option<String>,
-    
+
     /// Certificate settings
     pub certificate: LotwCertificateConfig,
-    
+
     /// Upload settings
     pub upload: LotwUploadConfig,
-    
+
     /// Download settings
     pub download: LotwDownloadConfig,
-    
+
     /// TQSL integration
     pub tqsl: TqslConfig,
 }
@@ -292,13 +292,13 @@ pub struct LotwConfig {
 pub struct LotwCertificateConfig {
     /// Certificate file path
     pub cert_file: Option<String>,
-    
+
     /// Private key file path
     pub key_file: Option<String>,
-    
+
     /// Certificate password (encrypted)
     pub password_encrypted: Option<String>,
-    
+
     /// Auto-renewal settings
     pub auto_renewal: CertRenewalConfig,
 }
@@ -308,10 +308,10 @@ pub struct LotwCertificateConfig {
 pub struct CertRenewalConfig {
     /// Enable auto-renewal
     pub enabled: bool,
-    
+
     /// Days before expiry to renew
     pub renewal_days: u32,
-    
+
     /// Notification settings
     pub notifications: bool,
 }
@@ -321,13 +321,13 @@ pub struct CertRenewalConfig {
 pub struct LotwUploadConfig {
     /// Automatically upload QSOs
     pub auto_upload: bool,
-    
+
     /// Upload interval in hours
     pub interval_hours: u32,
-    
+
     /// Include QSL sent status
     pub include_qsl_sent: bool,
-    
+
     /// ADIF export settings
     pub adif_export: AdifExportConfig,
 }
@@ -337,13 +337,13 @@ pub struct LotwUploadConfig {
 pub struct AdifExportConfig {
     /// ADIF version
     pub version: String,
-    
+
     /// Include all fields
     pub include_all_fields: bool,
-    
+
     /// Custom field inclusions
     pub custom_fields: Vec<String>,
-    
+
     /// Export format
     pub format: AdifFormat,
 }
@@ -354,10 +354,10 @@ pub struct AdifExportConfig {
 pub enum AdifFormat {
     /// Standard ADIF text format
     Adi,
-    
+
     /// ADIF XML format
     Adx,
-    
+
     /// Compressed ADIF
     Compressed,
 }
@@ -367,13 +367,13 @@ pub enum AdifFormat {
 pub struct LotwDownloadConfig {
     /// Automatically download confirmations
     pub auto_download: bool,
-    
+
     /// Download interval in hours
     pub interval_hours: u32,
-    
+
     /// Download since last check
     pub incremental: bool,
-    
+
     /// Process confirmations automatically
     pub auto_process: bool,
 }
@@ -383,13 +383,13 @@ pub struct LotwDownloadConfig {
 pub struct TqslConfig {
     /// TQSL executable path
     pub executable_path: Option<String>,
-    
+
     /// Station location
     pub station_location: Option<String>,
-    
+
     /// Command line options
     pub command_options: Vec<String>,
-    
+
     /// Working directory
     pub working_directory: Option<String>,
 }
@@ -399,22 +399,22 @@ pub struct TqslConfig {
 pub struct EqslConfig {
     /// Enable eQSL integration
     pub enabled: bool,
-    
+
     /// eQSL username
     pub username: Option<String>,
-    
+
     /// eQSL password (encrypted)
     pub password_encrypted: Option<String>,
-    
+
     /// eQSL API endpoint
     pub api_endpoint: String,
-    
+
     /// Upload settings
     pub upload: EqslUploadConfig,
-    
+
     /// Download settings
     pub download: EqslDownloadConfig,
-    
+
     /// eQSL card settings
     pub cards: EqslCardConfig,
 }
@@ -424,13 +424,13 @@ pub struct EqslConfig {
 pub struct EqslUploadConfig {
     /// Automatically upload QSOs
     pub auto_upload: bool,
-    
+
     /// Upload batch size
     pub batch_size: u32,
-    
+
     /// Include QSL message
     pub include_message: bool,
-    
+
     /// Default QSL message
     pub default_message: String,
 }
@@ -440,13 +440,13 @@ pub struct EqslUploadConfig {
 pub struct EqslDownloadConfig {
     /// Automatically download inbox
     pub auto_download: bool,
-    
+
     /// Download interval in hours
     pub interval_hours: u32,
-    
+
     /// Download card images
     pub download_images: bool,
-    
+
     /// Image quality
     pub image_quality: ImageQuality,
 }
@@ -466,10 +466,10 @@ pub enum ImageQuality {
 pub struct EqslCardConfig {
     /// Default card template
     pub default_template: Option<String>,
-    
+
     /// Card customization
     pub customization: CardCustomizationConfig,
-    
+
     /// Storage settings
     pub storage: CardStorageConfig,
 }
@@ -479,13 +479,13 @@ pub struct EqslCardConfig {
 pub struct CardCustomizationConfig {
     /// Custom background image
     pub background_image: Option<String>,
-    
+
     /// Custom message template
     pub message_template: Option<String>,
-    
+
     /// Font settings
     pub font_settings: FontSettings,
-    
+
     /// Color scheme
     pub color_scheme: String,
 }
@@ -495,16 +495,16 @@ pub struct CardCustomizationConfig {
 pub struct FontSettings {
     /// Font family
     pub family: String,
-    
+
     /// Font size
     pub size: u32,
-    
+
     /// Font color
     pub color: String,
-    
+
     /// Bold text
     pub bold: bool,
-    
+
     /// Italic text
     pub italic: bool,
 }
@@ -514,13 +514,13 @@ pub struct FontSettings {
 pub struct CardStorageConfig {
     /// Storage directory
     pub directory: String,
-    
+
     /// Organize by year
     pub organize_by_year: bool,
-    
+
     /// Organize by band
     pub organize_by_band: bool,
-    
+
     /// File naming pattern
     pub naming_pattern: String,
 }
@@ -530,22 +530,22 @@ pub struct CardStorageConfig {
 pub struct ClublogConfig {
     /// Enable Clublog integration
     pub enabled: bool,
-    
+
     /// Clublog email
     pub email: Option<String>,
-    
+
     /// Clublog password (encrypted)
     pub password_encrypted: Option<String>,
-    
+
     /// Clublog API key
     pub api_key: Option<String>,
-    
+
     /// API endpoint
     pub api_endpoint: String,
-    
+
     /// Upload settings
     pub upload: ClublogUploadConfig,
-    
+
     /// OQRS settings
     pub oqrs: OqrsConfig,
 }
@@ -555,13 +555,13 @@ pub struct ClublogConfig {
 pub struct ClublogUploadConfig {
     /// Automatically upload QSOs
     pub auto_upload: bool,
-    
+
     /// Upload batch size
     pub batch_size: u32,
-    
+
     /// Include QSL information
     pub include_qsl_info: bool,
-    
+
     /// Upload confirmations
     pub upload_confirmations: bool,
 }
@@ -571,13 +571,13 @@ pub struct ClublogUploadConfig {
 pub struct OqrsConfig {
     /// Enable OQRS integration
     pub enabled: bool,
-    
+
     /// Automatically process requests
     pub auto_process: bool,
-    
+
     /// Email notifications
     pub email_notifications: bool,
-    
+
     /// Request processing settings
     pub processing: OqrsProcessingConfig,
 }
@@ -587,10 +587,10 @@ pub struct OqrsConfig {
 pub struct OqrsProcessingConfig {
     /// Default QSL route
     pub default_route: QslRoute,
-    
+
     /// Automatic approval rules
     pub auto_approval_rules: Vec<ApprovalRule>,
-    
+
     /// Manual review threshold
     pub manual_review_threshold: u32,
 }
@@ -610,16 +610,16 @@ pub enum QslRoute {
 pub struct ApprovalRule {
     /// Rule name
     pub name: String,
-    
+
     /// Rule condition
     pub condition: String,
-    
+
     /// Action to take
     pub action: ApprovalAction,
-    
+
     /// Rule priority
     pub priority: u8,
-    
+
     /// Rule enabled
     pub enabled: bool,
 }
@@ -639,19 +639,19 @@ pub enum ApprovalAction {
 pub struct WsprConfig {
     /// Enable WSPR integration
     pub enabled: bool,
-    
+
     /// WSPR database URL
     pub database_url: String,
-    
+
     /// Upload spots
     pub upload_spots: bool,
-    
+
     /// Download spots
     pub download_spots: bool,
-    
+
     /// Spot filtering
     pub filtering: WsprFilteringConfig,
-    
+
     /// Analysis settings
     pub analysis: WsprAnalysisConfig,
 }
@@ -661,16 +661,16 @@ pub struct WsprConfig {
 pub struct WsprFilteringConfig {
     /// Minimum SNR
     pub min_snr: f32,
-    
+
     /// Maximum drift
     pub max_drift_hz: f32,
-    
+
     /// Band filters
     pub bands: Vec<String>,
-    
+
     /// Geographic filters
     pub geographic: GeographicFilters,
-    
+
     /// Time window in hours
     pub time_window_hours: u32,
 }
@@ -680,13 +680,13 @@ pub struct WsprFilteringConfig {
 pub struct WsprAnalysisConfig {
     /// Propagation analysis
     pub propagation_analysis: bool,
-    
+
     /// Band comparison
     pub band_comparison: bool,
-    
+
     /// Antenna pattern analysis
     pub antenna_analysis: bool,
-    
+
     /// Export analysis data
     pub export_analysis: bool,
 }
@@ -696,16 +696,16 @@ pub struct WsprAnalysisConfig {
 pub struct DxClusterConfig {
     /// Enable DX cluster connection
     pub enabled: bool,
-    
+
     /// Cluster servers
     pub servers: Vec<ClusterServer>,
-    
+
     /// Connection settings
     pub connection: ClusterConnectionConfig,
-    
+
     /// Filtering settings
     pub filtering: ClusterFilteringConfig,
-    
+
     /// Alert settings
     pub alerts: ClusterAlertConfig,
 }
@@ -715,22 +715,22 @@ pub struct DxClusterConfig {
 pub struct ClusterServer {
     /// Server name
     pub name: String,
-    
+
     /// Server hostname
     pub hostname: String,
-    
+
     /// Server port
     pub port: u16,
-    
+
     /// Server type
     pub server_type: ClusterType,
-    
+
     /// Authentication required
     pub auth_required: bool,
-    
+
     /// Username
     pub username: Option<String>,
-    
+
     /// Server priority
     pub priority: u8,
 }
@@ -751,16 +751,16 @@ pub enum ClusterType {
 pub struct ClusterConnectionConfig {
     /// Auto-connect on startup
     pub auto_connect: bool,
-    
+
     /// Reconnection attempts
     pub reconnect_attempts: u32,
-    
+
     /// Reconnection delay in seconds
     pub reconnect_delay_seconds: u64,
-    
+
     /// Keep-alive interval
     pub keepalive_interval_seconds: u64,
-    
+
     /// Connection timeout
     pub timeout_seconds: u32,
 }
@@ -770,19 +770,19 @@ pub struct ClusterConnectionConfig {
 pub struct ClusterFilteringConfig {
     /// Band filters
     pub bands: Vec<String>,
-    
+
     /// Mode filters
     pub modes: Vec<String>,
-    
+
     /// DXCC filters
     pub dxcc_filters: Vec<u16>,
-    
+
     /// Minimum frequency
     pub min_frequency: Option<u64>,
-    
+
     /// Maximum frequency
     pub max_frequency: Option<u64>,
-    
+
     /// Duplicate filtering
     pub duplicate_window_minutes: u32,
 }
@@ -792,13 +792,13 @@ pub struct ClusterFilteringConfig {
 pub struct ClusterAlertConfig {
     /// Enable visual alerts
     pub visual_alerts: bool,
-    
+
     /// Enable audio alerts
     pub audio_alerts: bool,
-    
+
     /// Alert conditions
     pub conditions: Vec<AlertCondition>,
-    
+
     /// Alert sounds
     pub sounds: AlertSoundConfig,
 }
@@ -808,13 +808,13 @@ pub struct ClusterAlertConfig {
 pub struct AlertCondition {
     /// Condition name
     pub name: String,
-    
+
     /// Condition expression
     pub expression: String,
-    
+
     /// Alert priority
     pub priority: AlertPriority,
-    
+
     /// Condition enabled
     pub enabled: bool,
 }
@@ -834,16 +834,16 @@ pub enum AlertPriority {
 pub struct AlertSoundConfig {
     /// Sound file for low priority
     pub low_priority_sound: Option<String>,
-    
+
     /// Sound file for medium priority
     pub medium_priority_sound: Option<String>,
-    
+
     /// Sound file for high priority
     pub high_priority_sound: Option<String>,
-    
+
     /// Sound file for critical priority
     pub critical_priority_sound: Option<String>,
-    
+
     /// Alert volume
     pub volume: f32,
 }
@@ -853,22 +853,22 @@ pub struct AlertSoundConfig {
 pub struct WebApiConfig {
     /// Enable web API server
     pub enabled: bool,
-    
+
     /// API server bind address
     pub bind_address: String,
-    
+
     /// API server port
     pub port: u16,
-    
+
     /// API authentication
     pub authentication: ApiAuthConfig,
-    
+
     /// CORS settings
     pub cors: CorsConfig,
-    
+
     /// Rate limiting
     pub rate_limiting: ApiRateLimitingConfig,
-    
+
     /// API documentation
     pub documentation: ApiDocumentationConfig,
 }
@@ -878,13 +878,13 @@ pub struct WebApiConfig {
 pub struct ApiAuthConfig {
     /// Authentication required
     pub required: bool,
-    
+
     /// Authentication method
     pub method: AuthMethod,
-    
+
     /// API keys
     pub api_keys: Vec<ApiKey>,
-    
+
     /// JWT settings
     pub jwt: JwtConfig,
 }
@@ -905,16 +905,16 @@ pub enum AuthMethod {
 pub struct ApiKey {
     /// Key name/identifier
     pub name: String,
-    
+
     /// API key value (encrypted)
     pub key_encrypted: String,
-    
+
     /// Key permissions
     pub permissions: Vec<String>,
-    
+
     /// Key expiration
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    
+
     /// Key enabled
     pub enabled: bool,
 }
@@ -924,13 +924,13 @@ pub struct ApiKey {
 pub struct JwtConfig {
     /// JWT secret key (encrypted)
     pub secret_encrypted: String,
-    
+
     /// Token expiration time in hours
     pub expiration_hours: u32,
-    
+
     /// Token issuer
     pub issuer: String,
-    
+
     /// Token audience
     pub audience: String,
 }
@@ -940,19 +940,19 @@ pub struct JwtConfig {
 pub struct CorsConfig {
     /// Enable CORS
     pub enabled: bool,
-    
+
     /// Allowed origins
     pub allowed_origins: Vec<String>,
-    
+
     /// Allowed methods
     pub allowed_methods: Vec<String>,
-    
+
     /// Allowed headers
     pub allowed_headers: Vec<String>,
-    
+
     /// Allow credentials
     pub allow_credentials: bool,
-    
+
     /// Max age in seconds
     pub max_age_seconds: u32,
 }
@@ -962,16 +962,16 @@ pub struct CorsConfig {
 pub struct ApiRateLimitingConfig {
     /// Enable rate limiting
     pub enabled: bool,
-    
+
     /// Requests per minute
     pub requests_per_minute: u32,
-    
+
     /// Burst allowance
     pub burst_allowance: u32,
-    
+
     /// Rate limit by IP
     pub by_ip: bool,
-    
+
     /// Rate limit by API key
     pub by_api_key: bool,
 }
@@ -981,16 +981,16 @@ pub struct ApiRateLimitingConfig {
 pub struct ApiDocumentationConfig {
     /// Enable documentation endpoint
     pub enabled: bool,
-    
+
     /// Documentation path
     pub path: String,
-    
+
     /// Documentation title
     pub title: String,
-    
+
     /// Documentation description
     pub description: String,
-    
+
     /// API version
     pub version: String,
 }
@@ -1000,19 +1000,19 @@ pub struct ApiDocumentationConfig {
 pub struct ProxyConfig {
     /// Enable proxy
     pub enabled: bool,
-    
+
     /// Proxy type
     pub proxy_type: ProxyType,
-    
+
     /// Proxy server
     pub server: String,
-    
+
     /// Proxy port
     pub port: u16,
-    
+
     /// Proxy authentication
     pub auth: Option<ProxyAuth>,
-    
+
     /// Proxy exclusions
     pub exclusions: Vec<String>,
 }
@@ -1032,7 +1032,7 @@ pub enum ProxyType {
 pub struct ProxyAuth {
     /// Username
     pub username: String,
-    
+
     /// Password (encrypted)
     pub password_encrypted: String,
 }
@@ -1042,16 +1042,16 @@ pub struct ProxyAuth {
 pub struct TlsConfig {
     /// Verify certificates
     pub verify_certificates: bool,
-    
+
     /// Certificate bundle path
     pub ca_bundle_path: Option<String>,
-    
+
     /// Client certificate
     pub client_cert: Option<ClientCertConfig>,
-    
+
     /// TLS version
     pub min_version: TlsVersion,
-    
+
     /// Cipher suites
     pub cipher_suites: Vec<String>,
 }
@@ -1071,10 +1071,10 @@ pub enum TlsVersion {
 pub struct ClientCertConfig {
     /// Certificate file path
     pub cert_file: String,
-    
+
     /// Private key file path
     pub key_file: String,
-    
+
     /// Key password (encrypted)
     pub key_password_encrypted: Option<String>,
 }
@@ -1084,10 +1084,10 @@ pub struct ClientCertConfig {
 pub struct RateLimitingConfig {
     /// Enable rate limiting
     pub enabled: bool,
-    
+
     /// Global rate limits
     pub global: GlobalRateLimit,
-    
+
     /// Service-specific rate limits
     pub services: HashMap<String, ServiceRateLimit>,
 }
@@ -1097,10 +1097,10 @@ pub struct RateLimitingConfig {
 pub struct GlobalRateLimit {
     /// Requests per minute
     pub requests_per_minute: u32,
-    
+
     /// Requests per hour
     pub requests_per_hour: u32,
-    
+
     /// Requests per day
     pub requests_per_day: u32,
 }
@@ -1110,10 +1110,10 @@ pub struct GlobalRateLimit {
 pub struct ServiceRateLimit {
     /// Requests per minute
     pub requests_per_minute: u32,
-    
+
     /// Burst allowance
     pub burst_allowance: u32,
-    
+
     /// Cooldown period in seconds
     pub cooldown_seconds: u64,
 }
@@ -1123,16 +1123,16 @@ pub struct ServiceRateLimit {
 pub struct ReliabilityConfig {
     /// Connection timeout in seconds
     pub connection_timeout_seconds: u32,
-    
+
     /// Request timeout in seconds
     pub request_timeout_seconds: u32,
-    
+
     /// Retry configuration
     pub retry: RetryConfig,
-    
+
     /// Circuit breaker settings
     pub circuit_breaker: CircuitBreakerConfig,
-    
+
     /// Health check settings
     pub health_check: HealthCheckConfig,
 }
@@ -1142,16 +1142,16 @@ pub struct ReliabilityConfig {
 pub struct RetryConfig {
     /// Maximum retry attempts
     pub max_attempts: u32,
-    
+
     /// Base delay in milliseconds
     pub base_delay_ms: u64,
-    
+
     /// Maximum delay in milliseconds
     pub max_delay_ms: u64,
-    
+
     /// Exponential backoff multiplier
     pub backoff_multiplier: f32,
-    
+
     /// Jitter factor
     pub jitter_factor: f32,
 }
@@ -1161,13 +1161,13 @@ pub struct RetryConfig {
 pub struct CircuitBreakerConfig {
     /// Enable circuit breaker
     pub enabled: bool,
-    
+
     /// Failure threshold
     pub failure_threshold: u32,
-    
+
     /// Success threshold
     pub success_threshold: u32,
-    
+
     /// Timeout in milliseconds
     pub timeout_ms: u64,
 }
@@ -1177,13 +1177,13 @@ pub struct CircuitBreakerConfig {
 pub struct HealthCheckConfig {
     /// Enable health checks
     pub enabled: bool,
-    
+
     /// Check interval in seconds
     pub interval_seconds: u64,
-    
+
     /// Health check timeout
     pub timeout_seconds: u32,
-    
+
     /// Unhealthy threshold
     pub unhealthy_threshold: u32,
 }
@@ -1193,22 +1193,22 @@ pub struct HealthCheckConfig {
 pub struct CustomServiceConfig {
     /// Service name
     pub name: String,
-    
+
     /// Service URL
     pub url: String,
-    
+
     /// Service type
     pub service_type: String,
-    
+
     /// Authentication configuration
     pub auth: Option<CustomAuthConfig>,
-    
+
     /// Custom headers
     pub headers: HashMap<String, String>,
-    
+
     /// Custom parameters
     pub parameters: HashMap<String, serde_json::Value>,
-    
+
     /// Service enabled
     pub enabled: bool,
 }
@@ -1218,10 +1218,10 @@ pub struct CustomServiceConfig {
 pub struct CustomAuthConfig {
     /// Authentication type
     pub auth_type: String,
-    
+
     /// Authentication parameters
     pub parameters: HashMap<String, String>,
-    
+
     /// Encrypted credentials
     pub credentials: HashMap<String, String>,
 }
@@ -1841,7 +1841,7 @@ impl ConfigSection for NetworkConfig {
                     value: self.psk_reporter.upload_interval_seconds.to_string(),
                 });
             }
-            
+
             if self.psk_reporter.batch_size == 0 {
                 return Err(ConfigError::InvalidValue {
                     field: "psk_reporter.batch_size".to_string(),
@@ -1849,16 +1849,16 @@ impl ConfigSection for NetworkConfig {
                 });
             }
         }
-        
+
         // Validate QRZ settings
         if self.qrz.enabled {
             if self.qrz.username.is_none() && self.qrz.api_key.is_none() {
                 return Err(ConfigError::MissingRequired(
-                    "qrz.username or qrz.api_key".to_string()
+                    "qrz.username or qrz.api_key".to_string(),
                 ));
             }
         }
-        
+
         // Validate web API settings
         if self.web_api.enabled {
             if self.web_api.port == 0 {
@@ -1868,7 +1868,7 @@ impl ConfigSection for NetworkConfig {
                 });
             }
         }
-        
+
         // Validate rate limiting
         if self.rate_limiting.enabled {
             if self.rate_limiting.global.requests_per_minute == 0 {
@@ -1878,48 +1878,48 @@ impl ConfigSection for NetworkConfig {
                 });
             }
         }
-        
+
         Ok(())
     }
-    
+
     fn merge_with(&mut self, other: Self) {
         // Merge service configurations
         if other.psk_reporter.enabled {
             self.psk_reporter = other.psk_reporter;
         }
-        
+
         if other.qrz.enabled {
             self.qrz = other.qrz;
         }
-        
+
         if other.lotw.enabled {
             self.lotw = other.lotw;
         }
-        
+
         if other.eqsl.enabled {
             self.eqsl = other.eqsl;
         }
-        
+
         if other.clublog.enabled {
             self.clublog = other.clublog;
         }
-        
+
         if other.wspr.enabled {
             self.wspr = other.wspr;
         }
-        
+
         if other.dx_cluster.enabled {
             self.dx_cluster = other.dx_cluster;
         }
-        
+
         if other.web_api.enabled {
             self.web_api = other.web_api;
         }
-        
+
         if other.proxy.enabled {
             self.proxy = other.proxy;
         }
-        
+
         // Merge custom services
         self.custom_services.extend(other.custom_services);
     }
@@ -1928,7 +1928,7 @@ impl ConfigSection for NetworkConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_default_network_config() {
         let config = NetworkConfig::default();
@@ -1936,69 +1936,69 @@ mod tests {
         assert!(!config.qrz.enabled);
         assert!(config.validate_section().is_ok());
     }
-    
+
     #[test]
     fn test_psk_reporter_validation() {
         let mut config = NetworkConfig::default();
         config.psk_reporter.enabled = true;
-        
+
         // Valid configuration
         assert!(config.validate_section().is_ok());
-        
+
         // Invalid upload interval
         config.psk_reporter.upload_interval_seconds = 0;
         assert!(config.validate_section().is_err());
-        
+
         // Invalid batch size
         config.psk_reporter.upload_interval_seconds = 300; // Reset to valid
         config.psk_reporter.batch_size = 0;
         assert!(config.validate_section().is_err());
     }
-    
+
     #[test]
     fn test_qrz_validation() {
         let mut config = NetworkConfig::default();
         config.qrz.enabled = true;
-        
+
         // Missing credentials
         assert!(config.validate_section().is_err());
-        
+
         // Valid with username
         config.qrz.username = Some("test_user".to_string());
         assert!(config.validate_section().is_ok());
-        
+
         // Valid with API key
         config.qrz.username = None;
         config.qrz.api_key = Some("test_key".to_string());
         assert!(config.validate_section().is_ok());
     }
-    
+
     #[test]
     fn test_web_api_validation() {
         let mut config = NetworkConfig::default();
         config.web_api.enabled = true;
-        
+
         // Valid configuration
         assert!(config.validate_section().is_ok());
-        
+
         // Invalid port
         config.web_api.port = 0;
         assert!(config.validate_section().is_err());
     }
-    
+
     #[test]
     fn test_rate_limiting_validation() {
         let mut config = NetworkConfig::default();
         config.rate_limiting.enabled = true;
-        
+
         // Valid configuration
         assert!(config.validate_section().is_ok());
-        
+
         // Invalid rate limit
         config.rate_limiting.global.requests_per_minute = 0;
         assert!(config.validate_section().is_err());
     }
-    
+
     #[test]
     fn test_psk_reporter_filters() {
         let filters = PskReporterFilters::default();
@@ -2006,7 +2006,7 @@ mod tests {
         assert!(filters.enabled_bands.contains(&"20m".to_string()));
         assert!(filters.geographic.distance.great_circle);
     }
-    
+
     #[test]
     fn test_dx_cluster_server() {
         let server = ClusterServer {
@@ -2018,7 +2018,7 @@ mod tests {
             username: None,
             priority: 1,
         };
-        
+
         assert_eq!(server.port, 7300);
         assert!(!server.auth_required);
     }

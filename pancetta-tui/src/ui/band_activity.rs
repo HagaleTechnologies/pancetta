@@ -7,8 +7,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{ActivePanel, App, DecodedMessage};
 use super::{create_panel_block, format_distance, get_snr_color};
+use crate::app::{ActivePanel, App, DecodedMessage};
 
 pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let is_active = matches!(app.active_panel, ActivePanel::BandActivity);
@@ -16,15 +16,22 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
 
     // Prepare table data
     let header_cells = [
-        "Time", "Freq", "Mode", "SNR", "DT", "DF", "Call", "Grid", "Dist", "Msg"
+        "Time", "Freq", "Mode", "SNR", "DT", "DF", "Call", "Grid", "Dist", "Msg",
     ]
     .iter()
-    .map(|h| Cell::from(*h).style(Style::default().fg(app.theme.accent_color()).add_modifier(Modifier::BOLD)));
+    .map(|h| {
+        Cell::from(*h).style(
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        )
+    });
 
     let header = Row::new(header_cells).height(1).bottom_margin(0);
 
     // Convert messages to table rows
-    let mut rows: Vec<Row> = app.decoded_messages
+    let mut rows: Vec<Row> = app
+        .decoded_messages
         .iter()
         .rev() // Show newest first
         .skip(app.band_activity_scroll)
@@ -34,31 +41,38 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
 
     // If no messages, show placeholder
     if rows.is_empty() {
-        rows.push(Row::new([
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from("No messages"),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from("Monitoring..."),
-        ].iter().map(|c| c.clone().style(Style::default().fg(app.theme.muted_color())))));
+        rows.push(Row::new(
+            [
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from("No messages"),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from("Monitoring..."),
+            ]
+            .iter()
+            .map(|c| {
+                c.clone()
+                    .style(Style::default().fg(app.theme.muted_color()))
+            }),
+        ));
     }
 
     let widths = [
-        Constraint::Length(8),  // Time
-        Constraint::Length(7),  // Freq
-        Constraint::Length(4),  // Mode
-        Constraint::Length(4),  // SNR
-        Constraint::Length(4),  // DT
-        Constraint::Length(4),  // DF
-        Constraint::Length(8),  // Call
-        Constraint::Length(4),  // Grid
-        Constraint::Length(6),  // Dist
-        Constraint::Min(10),    // Message
+        Constraint::Length(8), // Time
+        Constraint::Length(7), // Freq
+        Constraint::Length(4), // Mode
+        Constraint::Length(4), // SNR
+        Constraint::Length(4), // DT
+        Constraint::Length(4), // DF
+        Constraint::Length(8), // Call
+        Constraint::Length(4), // Grid
+        Constraint::Length(6), // Dist
+        Constraint::Min(10),   // Message
     ];
 
     let table = Table::new(rows, widths)
@@ -78,11 +92,11 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
     // Show scroll indicator if there are more messages
     if app.decoded_messages.len() > (area.height as usize).saturating_sub(4) {
         let scroll_info = format!(
-            "{}/{}", 
-            app.band_activity_scroll + 1, 
+            "{}/{}",
+            app.band_activity_scroll + 1,
             app.decoded_messages.len()
         );
-        
+
         let scroll_area = Rect {
             x: area.x + area.width - scroll_info.len() as u16 - 2,
             y: area.y,
@@ -92,7 +106,7 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
 
         let scroll_text = Line::from(Span::styled(
             scroll_info,
-            Style::default().fg(app.theme.muted_color())
+            Style::default().fg(app.theme.muted_color()),
         ));
 
         let scroll_widget = ratatui::widgets::Paragraph::new(scroll_text);
@@ -129,15 +143,21 @@ fn create_message_row<'a>(msg: &'a DecodedMessage, app: &App) -> Row<'a> {
     // Color coding based on content
     let snr_style = Style::default().fg(get_snr_color(msg.snr, &app.theme));
     let call_style = if msg.call_sign.is_some() {
-        Style::default().fg(app.theme.success_color()).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(app.theme.success_color())
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(app.theme.muted_color())
     };
 
     let msg_style = if msg.message.contains("CQ") {
-        Style::default().fg(app.theme.warning_color()).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(app.theme.warning_color())
+            .add_modifier(Modifier::BOLD)
     } else if msg.message.contains(&app.station_info.call_sign) {
-        Style::default().fg(app.theme.selected_color()).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(app.theme.selected_color())
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(app.theme.foreground_color())
     };
@@ -160,39 +180,39 @@ fn create_message_row<'a>(msg: &'a DecodedMessage, app: &App) -> Row<'a> {
 pub fn is_interesting_message(msg: &DecodedMessage, our_call: &str) -> bool {
     let message_upper = msg.message.to_uppercase();
     let our_call_upper = our_call.to_uppercase();
-    
+
     // Check if message contains our call sign
     if message_upper.contains(&our_call_upper) {
         return true;
     }
-    
+
     // Check if it's a CQ call
     if message_upper.starts_with("CQ") {
         return true;
     }
-    
+
     // Check if it's a new DXCC entity (would need DXCC database)
     // For now, just check if it has good SNR and distance
     if msg.snr > 0 && msg.distance.unwrap_or(0.0) > 1000.0 {
         return true;
     }
-    
+
     false
 }
 
 /// Extract callsign from various message formats
 pub fn extract_callsign_from_message(message: &str) -> Option<String> {
     let parts: Vec<&str> = message.split_whitespace().collect();
-    
+
     if parts.is_empty() {
         return None;
     }
-    
+
     // Handle CQ messages: "CQ DX K1ABC FN42"
     if parts[0] == "CQ" && parts.len() >= 3 {
         return Some(parts[2].to_string());
     }
-    
+
     // Handle exchange messages: "K1ABC W2XYZ RRR"
     if parts.len() >= 2 {
         // First part might be a callsign
@@ -204,17 +224,18 @@ pub fn extract_callsign_from_message(message: &str) -> Option<String> {
             return Some(parts[1].to_string());
         }
     }
-    
+
     None
 }
 
 /// Basic callsign validation
 fn is_valid_callsign(s: &str) -> bool {
     // Very basic check: contains letters and numbers, reasonable length
-    s.len() >= 3 && s.len() <= 10 && 
-    s.chars().any(|c| c.is_ascii_alphabetic()) && 
-    s.chars().any(|c| c.is_ascii_digit()) &&
-    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
+    s.len() >= 3
+        && s.len() <= 10
+        && s.chars().any(|c| c.is_ascii_alphabetic())
+        && s.chars().any(|c| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
 }
 
 #[cfg(test)]
@@ -225,13 +246,19 @@ mod tests {
     #[test]
     fn test_extract_callsign_from_cq() {
         let message = "CQ DX K1ABC FN42";
-        assert_eq!(extract_callsign_from_message(message), Some("K1ABC".to_string()));
+        assert_eq!(
+            extract_callsign_from_message(message),
+            Some("K1ABC".to_string())
+        );
     }
 
     #[test]
     fn test_extract_callsign_from_exchange() {
         let message = "K1ABC W2XYZ -15";
-        assert_eq!(extract_callsign_from_message(message), Some("K1ABC".to_string()));
+        assert_eq!(
+            extract_callsign_from_message(message),
+            Some("K1ABC".to_string())
+        );
     }
 
     #[test]

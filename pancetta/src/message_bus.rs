@@ -81,45 +81,45 @@ impl std::fmt::Display for ComponentId {
 pub enum MessageType {
     /// Raw audio samples from input device
     AudioData(Vec<f32>),
-    
+
     /// Processed audio data from DSP pipeline
     DspData(Vec<f32>),
-    
+
     /// Decoded FT8 message
     DecodedMessage(DecodedMessage),
-    
+
     /// Component heartbeat for health monitoring
     Heartbeat {
         component_id: ComponentId,
         timestamp: Instant,
         metrics: ComponentMetrics,
     },
-    
+
     /// Configuration update notification
     ConfigUpdate {
         section: String,
         config_data: String, // JSON-serialized config
     },
-    
+
     /// Control messages
     Control(ControlMessage),
-    
+
     /// Error notification
     Error {
         component_id: ComponentId,
         error_message: String,
         error_code: Option<u32>,
     },
-    
+
     /// Hamlib rig control messages
     RigControl(RigControlMessage),
-    
+
     /// QSO management messages
     QsoMessage(QsoMessage),
-    
+
     /// DX cluster messages
     DxMessage(DxMessage),
-    
+
     /// Status update message
     StatusUpdate(String),
 
@@ -141,10 +141,7 @@ pub enum MessageType {
     AutonomousStatus(AutonomousStatusData),
 
     /// Audio output samples for transmission
-    AudioOutput {
-        samples: Vec<f32>,
-        sample_rate: u32,
-    },
+    AudioOutput { samples: Vec<f32>, sample_rate: u32 },
 
     /// Waterfall spectrogram data for TUI display
     WaterfallData {
@@ -179,7 +176,11 @@ pub enum RigControlMessage {
     /// Frequency response
     FrequencyResponse { vfo: u8, frequency: u64 },
     /// Set mode
-    SetMode { vfo: u8, mode: String, passband: Option<u32> },
+    SetMode {
+        vfo: u8,
+        mode: String,
+        passband: Option<u32>,
+    },
     /// PTT control
     SetPtt { state: bool },
     /// Get signal strength
@@ -205,7 +206,12 @@ pub enum QsoMessage {
 #[derive(Debug, Clone)]
 pub enum DxMessage {
     /// New DX spot
-    Spot { callsign: String, frequency: u64, spotter: String, comment: String },
+    Spot {
+        callsign: String,
+        frequency: u64,
+        spotter: String,
+        comment: String,
+    },
     /// Propagation update
     PropagationUpdate { band: String, conditions: String },
     /// Band activity
@@ -303,7 +309,7 @@ impl ComponentMessage {
     ) -> Self {
         let mut latency_tracking = LatencyTracking::default();
         latency_tracking.queued_at = Some(Instant::now());
-        
+
         Self {
             id: generate_message_id(),
             source,
@@ -315,7 +321,7 @@ impl ComponentMessage {
             latency_tracking,
         }
     }
-    
+
     /// Create a high-priority message (for real-time audio)
     pub fn new_high_priority(
         source: ComponentId,
@@ -325,7 +331,7 @@ impl ComponentMessage {
     ) -> Self {
         let mut latency_tracking = LatencyTracking::default();
         latency_tracking.queued_at = Some(Instant::now());
-        
+
         Self {
             id: generate_message_id(),
             source,
@@ -337,41 +343,47 @@ impl ComponentMessage {
             latency_tracking,
         }
     }
-    
+
     /// Get message age in microseconds
     pub fn age_us(&self) -> u64 {
         self.timestamp.elapsed().as_micros() as u64
     }
-    
+
     /// Check if message has expired (age > threshold)
     pub fn is_expired(&self, threshold_us: u64) -> bool {
         self.age_us() > threshold_us
     }
-    
+
     /// Get total latency in microseconds
     pub fn total_latency_us(&self) -> Option<u64> {
-        if let (Some(queued), Some(completed)) = 
-            (self.latency_tracking.queued_at, self.latency_tracking.processing_completed_at) {
+        if let (Some(queued), Some(completed)) = (
+            self.latency_tracking.queued_at,
+            self.latency_tracking.processing_completed_at,
+        ) {
             Some(completed.duration_since(queued).as_micros() as u64)
         } else {
             None
         }
     }
-    
+
     /// Get transit latency in microseconds (queue to receive)
     pub fn transit_latency_us(&self) -> Option<u64> {
-        if let (Some(queued), Some(received)) = 
-            (self.latency_tracking.queued_at, self.latency_tracking.received_at) {
+        if let (Some(queued), Some(received)) = (
+            self.latency_tracking.queued_at,
+            self.latency_tracking.received_at,
+        ) {
             Some(received.duration_since(queued).as_micros() as u64)
         } else {
             None
         }
     }
-    
+
     /// Get processing latency in microseconds
     pub fn processing_latency_us(&self) -> Option<u64> {
-        if let (Some(started), Some(completed)) = 
-            (self.latency_tracking.processing_started_at, self.latency_tracking.processing_completed_at) {
+        if let (Some(started), Some(completed)) = (
+            self.latency_tracking.processing_started_at,
+            self.latency_tracking.processing_completed_at,
+        ) {
             Some(completed.duration_since(started).as_micros() as u64)
         } else {
             None
@@ -450,7 +462,7 @@ impl MessageBus {
             max_queue_size: buffer_size,
             ..Default::default()
         };
-        
+
         Ok(Self {
             config,
             channels: Arc::new(RwLock::new(HashMap::new())),
@@ -460,7 +472,7 @@ impl MessageBus {
             expired_messages: Arc::new(AtomicU64::new(0)),
         })
     }
-    
+
     /// Create a new message bus with custom configuration
     pub fn with_config(config: MessageBusConfig) -> Result<Self> {
         Ok(Self {
@@ -472,20 +484,23 @@ impl MessageBus {
             expired_messages: Arc::new(AtomicU64::new(0)),
         })
     }
-    
+
     /// Create a communication channel for a component
     pub async fn create_channel(
         &self,
         component_id: ComponentId,
     ) -> Result<(Sender<ComponentMessage>, Receiver<ComponentMessage>)> {
         let mut channels = self.channels.write().await;
-        
+
         if channels.contains_key(&component_id) {
-            return Err(anyhow::anyhow!("Channel already exists for component: {}", component_id));
+            return Err(anyhow::anyhow!(
+                "Channel already exists for component: {}",
+                component_id
+            ));
         }
-        
+
         let (sender, receiver) = unbounded();
-        
+
         let channel = ComponentChannel {
             sender: sender.clone(),
             receiver: receiver.clone(),
@@ -494,112 +509,128 @@ impl MessageBus {
             error_count: Arc::new(AtomicU64::new(0)),
             last_heartbeat: Arc::new(RwLock::new(None)),
         };
-        
+
         channels.insert(component_id, channel);
-        
+
         debug!("Created message channel for component: {}", component_id);
-        
+
         Ok((sender, receiver))
     }
-    
+
     /// Send a message to a specific component
     pub async fn send_message(&self, mut message: ComponentMessage) -> Result<()> {
         // Check message expiration
         if message.is_expired(self.config.message_timeout_us) {
             self.expired_messages.fetch_add(1, Ordering::Relaxed);
-            warn!("Dropping expired message from {} to {} (age: {}μs)", 
-                  message.source, message.destination, message.age_us());
+            warn!(
+                "Dropping expired message from {} to {} (age: {}μs)",
+                message.source,
+                message.destination,
+                message.age_us()
+            );
             return Ok(());
         }
-        
+
         // Mark message as sent
         message.latency_tracking.sent_at = Some(Instant::now());
-        
+
         let channels = self.channels.read().await;
-        
+
         if let Some(channel) = channels.get(&message.destination) {
             match channel.sender.try_send(message.clone()) {
                 Ok(_) => {
                     channel.message_count.fetch_add(1, Ordering::Relaxed);
                     self.total_messages.fetch_add(1, Ordering::Relaxed);
-                    
+
                     // Update latency metrics if available
                     if let Some(transit_us) = message.transit_latency_us() {
                         // Store average latency (simplified - in production would use rolling average)
                         let _avg_latency = transit_us as f64;
                     }
-                    
+
                     if self.config.enable_tracing {
-                        trace!("Message sent from {} to {}: {:?} (transit: {:?}μs)", 
-                               message.source, message.destination, message.id,
-                               message.transit_latency_us());
+                        trace!(
+                            "Message sent from {} to {}: {:?} (transit: {:?}μs)",
+                            message.source,
+                            message.destination,
+                            message.id,
+                            message.transit_latency_us()
+                        );
                     }
                 }
                 Err(crossbeam_channel::TrySendError::Full(_)) => {
                     channel.error_count.fetch_add(1, Ordering::Relaxed);
                     self.dropped_messages.fetch_add(1, Ordering::Relaxed);
-                    warn!("Channel full, dropping message from {} to {}", 
-                          message.source, message.destination);
+                    warn!(
+                        "Channel full, dropping message from {} to {}",
+                        message.source, message.destination
+                    );
                 }
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                     channel.error_count.fetch_add(1, Ordering::Relaxed);
                     self.dropped_messages.fetch_add(1, Ordering::Relaxed);
-                    error!("Channel disconnected for component: {}", message.destination);
+                    error!(
+                        "Channel disconnected for component: {}",
+                        message.destination
+                    );
                 }
             }
         } else {
-            warn!("No channel found for destination component: {}", message.destination);
+            warn!(
+                "No channel found for destination component: {}",
+                message.destination
+            );
             self.dropped_messages.fetch_add(1, Ordering::Relaxed);
         }
-        
+
         Ok(())
     }
-    
+
     /// Broadcast a message to all components except the sender
     pub async fn broadcast_message(&self, message: ComponentMessage) -> Result<()> {
         let channels = self.channels.read().await;
-        
+
         for (&component_id, channel) in channels.iter() {
             if component_id != message.source {
                 let mut broadcast_message = message.clone();
                 broadcast_message.destination = component_id;
                 broadcast_message.hop_count += 1;
-                
+
                 if let Err(e) = channel.sender.try_send(broadcast_message) {
                     warn!("Failed to broadcast to {}: {}", component_id, e);
                     channel.error_count.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
-        
+
         self.total_messages.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
-    
+
     /// Get health status for all components
     pub async fn get_component_health(&self) -> Vec<ComponentHealth> {
         let channels = self.channels.read().await;
         let mut health_status = Vec::new();
-        
+
         for (&component_id, channel) in channels.iter() {
             let message_count = channel.message_count.load(Ordering::Relaxed);
             let error_count = channel.error_count.load(Ordering::Relaxed) as u32;
-            
+
             let last_heartbeat = {
                 let heartbeat = channel.last_heartbeat.read().await;
                 heartbeat.unwrap_or_else(Instant::now)
             };
-            
-            let is_healthy = error_count < 100 && 
-                           last_heartbeat.elapsed() < Duration::from_secs(30);
-            
+
+            let is_healthy =
+                error_count < 100 && last_heartbeat.elapsed() < Duration::from_secs(30);
+
             let avg_latency_ms = if message_count > 0 {
                 // Simplified latency calculation
                 1.0 // TODO: Implement proper latency tracking
             } else {
                 0.0
             };
-            
+
             health_status.push(ComponentHealth {
                 component_id,
                 is_healthy,
@@ -610,10 +641,10 @@ impl MessageBus {
                 metrics: ComponentMetrics::default(),
             });
         }
-        
+
         health_status
     }
-    
+
     /// Get message bus statistics
     pub fn get_statistics(&self) -> MessageBusStatistics {
         MessageBusStatistics {
@@ -623,29 +654,29 @@ impl MessageBus {
             active_channels: 0, // Will be calculated when called
         }
     }
-    
+
     /// Update component heartbeat
     pub async fn update_heartbeat(&self, component_id: ComponentId) -> Result<()> {
         let channels = self.channels.read().await;
-        
+
         if let Some(channel) = channels.get(&component_id) {
             let mut heartbeat = channel.last_heartbeat.write().await;
             *heartbeat = Some(Instant::now());
         }
-        
+
         Ok(())
     }
-    
+
     /// Remove a component channel (cleanup)
     pub async fn remove_channel(&self, component_id: ComponentId) -> Result<()> {
         let mut channels = self.channels.write().await;
-        
+
         if channels.remove(&component_id).is_some() {
             debug!("Removed channel for component: {}", component_id);
         } else {
             warn!("Attempted to remove non-existent channel: {}", component_id);
         }
-        
+
         Ok(())
     }
 }
@@ -670,82 +701,82 @@ fn generate_message_id() -> u64 {
 mod tests {
     use super::*;
     use tokio::time::sleep;
-    
+
     #[tokio::test]
     async fn test_message_bus_creation() {
         let bus = MessageBus::new(1000).unwrap();
         let stats = bus.get_statistics();
         assert_eq!(stats.total_messages, 0);
     }
-    
+
     #[tokio::test]
     async fn test_channel_creation() {
         let bus = MessageBus::new(1000).unwrap();
         let result = bus.create_channel(ComponentId::Audio).await;
         assert!(result.is_ok());
-        
+
         // Should fail to create duplicate channel
         let duplicate_result = bus.create_channel(ComponentId::Audio).await;
         assert!(duplicate_result.is_err());
     }
-    
+
     #[tokio::test]
     async fn test_message_sending() {
         let bus = MessageBus::new(1000).unwrap();
         let (tx, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
         let (dsp_tx, dsp_rx) = bus.create_channel(ComponentId::Dsp).await.unwrap();
-        
+
         let message = ComponentMessage::new(
             ComponentId::Audio,
             ComponentId::Dsp,
             MessageType::AudioData(vec![0.1, 0.2, 0.3]),
             Instant::now(),
         );
-        
+
         bus.send_message(message).await.unwrap();
-        
+
         // Should be able to receive the message
         let received = dsp_rx.try_recv();
         assert!(received.is_ok());
     }
-    
+
     #[tokio::test]
     async fn test_message_expiration() {
         let mut config = MessageBusConfig::default();
         config.message_timeout_us = 1; // 1 microsecond timeout
-        
+
         let bus = MessageBus::with_config(config).unwrap();
         let (tx, rx) = bus.create_channel(ComponentId::Dsp).await.unwrap();
-        
+
         let old_message = ComponentMessage::new(
             ComponentId::Audio,
             ComponentId::Dsp,
             MessageType::AudioData(vec![0.1]),
             Instant::now() - Duration::from_millis(10),
         );
-        
+
         // Sleep to ensure message is old
         sleep(Duration::from_micros(10)).await;
-        
+
         bus.send_message(old_message).await.unwrap();
-        
+
         // Message should be dropped due to expiration
         let stats = bus.get_statistics();
         assert_eq!(stats.expired_messages, 1);
     }
-    
+
     #[tokio::test]
     async fn test_component_health() {
         let bus = MessageBus::new(1000).unwrap();
         bus.create_channel(ComponentId::Audio).await.unwrap();
         bus.update_heartbeat(ComponentId::Audio).await.unwrap();
-        
+
         let health = bus.get_component_health().await;
         assert_eq!(health.len(), 1);
         assert_eq!(health[0].component_id, ComponentId::Audio);
         assert!(health[0].is_healthy);
     }
-    
+
     #[test]
     fn test_component_message_creation() {
         let message = ComponentMessage::new(
@@ -754,13 +785,13 @@ mod tests {
             MessageType::AudioData(vec![0.1, 0.2]),
             Instant::now(),
         );
-        
+
         assert_eq!(message.source, ComponentId::Audio);
         assert_eq!(message.destination, ComponentId::Dsp);
         assert_eq!(message.priority, 128);
         assert_eq!(message.hop_count, 0);
     }
-    
+
     #[test]
     fn test_high_priority_message() {
         let message = ComponentMessage::new_high_priority(
@@ -769,7 +800,7 @@ mod tests {
             MessageType::AudioData(vec![0.1]),
             Instant::now(),
         );
-        
+
         assert_eq!(message.priority, 0);
     }
 }

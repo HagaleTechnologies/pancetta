@@ -63,11 +63,11 @@ pub struct FilterConfig {
     pub filter_type: FilterType,
     pub design: FilterDesign,
     pub sample_rate: f32,
-    pub cutoff_low: Option<f32>,   // Low cutoff for bandpass/bandstop
-    pub cutoff_high: Option<f32>,  // High cutoff or main cutoff
-    pub q_factor: f32,             // Quality factor
-    pub order: usize,              // Filter order (must be even for biquad cascade)
-    pub gain: f32,                 // Filter gain in dB
+    pub cutoff_low: Option<f32>,  // Low cutoff for bandpass/bandstop
+    pub cutoff_high: Option<f32>, // High cutoff or main cutoff
+    pub q_factor: f32,            // Quality factor
+    pub order: usize,             // Filter order (must be even for biquad cascade)
+    pub gain: f32,                // Filter gain in dB
 }
 
 #[derive(Debug, Clone, Default)]
@@ -86,10 +86,10 @@ impl FilterConfig {
             filter_type: FilterType::BandPass,
             design: FilterDesign::Butterworth,
             sample_rate,
-            cutoff_low: Some(200.0),    // FT8 typically 200Hz to 4kHz
+            cutoff_low: Some(200.0), // FT8 typically 200Hz to 4kHz
             cutoff_high: Some(4000.0),
             q_factor: Q_BUTTERWORTH_F32,
-            order: 4,                   // 4th order = 2 biquad sections
+            order: 4, // 4th order = 2 biquad sections
             gain: 0.0,
         }
     }
@@ -103,7 +103,7 @@ impl FilterConfig {
             cutoff_low: None,
             cutoff_high: Some(sample_rate * cutoff_ratio), // e.g., 0.4 for Nyquist
             q_factor: Q_BUTTERWORTH_F32,
-            order: 6,                   // 6th order for steep rolloff
+            order: 6, // 6th order for steep rolloff
             gain: 0.0,
         }
     }
@@ -117,7 +117,7 @@ impl FilterConfig {
             cutoff_low: None,
             cutoff_high: Some(cutoff),
             q_factor: Q_BUTTERWORTH_F32,
-            order: 2,                   // 2nd order for gentle rolloff
+            order: 2, // 2nd order for gentle rolloff
             gain: 0.0,
         }
     }
@@ -158,7 +158,8 @@ impl FilterConfig {
                     }
                 } else {
                     return Err(FilterError::DesignFailed {
-                        message: "Both cutoff frequencies required for bandpass/bandstop".to_string(),
+                        message: "Both cutoff frequencies required for bandpass/bandstop"
+                            .to_string(),
                     });
                 }
             }
@@ -209,68 +210,58 @@ impl IirFilter {
     /// Design biquad coefficients for a filter section
     fn design_biquad_section(config: &FilterConfig, _section: usize) -> Result<Coefficients<f32>> {
         let fs = config.sample_rate.hz();
-        
+
         match config.filter_type {
             FilterType::LowPass => {
                 let cutoff = config.cutoff_high.unwrap().hz();
-                Ok(Coefficients::<f32>::from_params(
-                    Type::LowPass,
-                    fs,
-                    cutoff,
-                    config.q_factor,
-                ).map_err(|e| FilterError::DesignFailed { 
-                    message: format!("Lowpass design failed: {:?}", e) 
-                })?)
+                Ok(
+                    Coefficients::<f32>::from_params(Type::LowPass, fs, cutoff, config.q_factor)
+                        .map_err(|e| FilterError::DesignFailed {
+                            message: format!("Lowpass design failed: {:?}", e),
+                        })?,
+                )
             }
             FilterType::HighPass => {
                 let cutoff = config.cutoff_high.unwrap().hz();
-                Ok(Coefficients::<f32>::from_params(
-                    Type::HighPass,
-                    fs,
-                    cutoff,
-                    config.q_factor,
-                ).map_err(|e| FilterError::DesignFailed { 
-                    message: format!("Highpass design failed: {:?}", e) 
-                })?)
+                Ok(
+                    Coefficients::<f32>::from_params(Type::HighPass, fs, cutoff, config.q_factor)
+                        .map_err(|e| FilterError::DesignFailed {
+                        message: format!("Highpass design failed: {:?}", e),
+                    })?,
+                )
             }
             FilterType::BandPass => {
                 let center_freq = (config.cutoff_low.unwrap() * config.cutoff_high.unwrap()).sqrt();
                 let bandwidth = config.cutoff_high.unwrap() - config.cutoff_low.unwrap();
                 let q = center_freq / bandwidth;
-                
-                Ok(Coefficients::<f32>::from_params(
-                    Type::BandPass,
-                    fs,
-                    center_freq.hz(),
-                    q,
-                ).map_err(|e| FilterError::DesignFailed { 
-                    message: format!("Bandpass design failed: {:?}", e) 
-                })?)
+
+                Ok(
+                    Coefficients::<f32>::from_params(Type::BandPass, fs, center_freq.hz(), q)
+                        .map_err(|e| FilterError::DesignFailed {
+                            message: format!("Bandpass design failed: {:?}", e),
+                        })?,
+                )
             }
             FilterType::BandStop => {
                 let center_freq = (config.cutoff_low.unwrap() * config.cutoff_high.unwrap()).sqrt();
                 let bandwidth = config.cutoff_high.unwrap() - config.cutoff_low.unwrap();
                 let q = center_freq / bandwidth;
-                
-                Ok(Coefficients::<f32>::from_params(
-                    Type::Notch,
-                    fs,
-                    center_freq.hz(),
-                    q,
-                ).map_err(|e| FilterError::DesignFailed { 
-                    message: format!("Bandstop design failed: {:?}", e) 
-                })?)
+
+                Ok(
+                    Coefficients::<f32>::from_params(Type::Notch, fs, center_freq.hz(), q)
+                        .map_err(|e| FilterError::DesignFailed {
+                            message: format!("Bandstop design failed: {:?}", e),
+                        })?,
+                )
             }
             FilterType::AllPass => {
                 let cutoff = config.cutoff_high.unwrap_or(1000.0).hz();
-                Ok(Coefficients::<f32>::from_params(
-                    Type::AllPass,
-                    fs,
-                    cutoff,
-                    config.q_factor,
-                ).map_err(|e| FilterError::DesignFailed { 
-                    message: format!("Allpass design failed: {:?}", e) 
-                })?)
+                Ok(
+                    Coefficients::<f32>::from_params(Type::AllPass, fs, cutoff, config.q_factor)
+                        .map_err(|e| FilterError::DesignFailed {
+                            message: format!("Allpass design failed: {:?}", e),
+                        })?,
+                )
             }
         }
     }
@@ -279,13 +270,17 @@ impl IirFilter {
     pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> Result<()> {
         if input.len() != output.len() {
             return Err(FilterError::ProcessingFailed {
-                message: format!("Input/output length mismatch: {} vs {}", input.len(), output.len()),
+                message: format!(
+                    "Input/output length mismatch: {} vs {}",
+                    input.len(),
+                    output.len()
+                ),
             });
         }
 
         // Process through cascaded biquad sections
         let mut temp_buffer = input.to_vec();
-        
+
         for section in &mut self.sections {
             let mut output = vec![0.0; temp_buffer.len()];
             for (i, &sample) in temp_buffer.iter().enumerate() {
@@ -323,7 +318,7 @@ impl IirFilter {
         for &sample in input {
             self.stats.peak_input = self.stats.peak_input.max(sample.abs());
         }
-        
+
         for &sample in output {
             self.stats.peak_output = self.stats.peak_output.max(sample.abs());
         }
@@ -331,10 +326,12 @@ impl IirFilter {
         // Update RMS values (running average)
         let input_power: f64 = input.iter().map(|&x| (x as f64).powi(2)).sum();
         let output_power: f64 = output.iter().map(|&x| (x as f64).powi(2)).sum();
-        
+
         let alpha = 0.001; // Smoothing factor
-        self.stats.rms_input = (1.0 - alpha) * self.stats.rms_input + alpha * input_power / input.len() as f64;
-        self.stats.rms_output = (1.0 - alpha) * self.stats.rms_output + alpha * output_power / output.len() as f64;
+        self.stats.rms_input =
+            (1.0 - alpha) * self.stats.rms_input + alpha * input_power / input.len() as f64;
+        self.stats.rms_output =
+            (1.0 - alpha) * self.stats.rms_output + alpha * output_power / output.len() as f64;
     }
 
     /// Reset filter state
@@ -398,7 +395,7 @@ impl NoiseReductionFilter {
     /// Create a new noise reduction filter
     pub fn new(sample_rate: f32, frame_size: usize, overlap_factor: f32) -> Self {
         let window = Self::create_hann_window(frame_size);
-        
+
         debug!(
             "Created noise reduction filter: fs={}Hz, frame_size={}, overlap={}",
             sample_rate, frame_size, overlap_factor
@@ -410,8 +407,8 @@ impl NoiseReductionFilter {
             overlap_factor,
             noise_estimate: vec![0.001; frame_size / 2 + 1], // Initial noise floor
             signal_estimate: vec![0.0; frame_size / 2 + 1],
-            alpha: 2.0,     // Spectral subtraction factor
-            beta: 0.01,     // Over-subtraction factor
+            alpha: 2.0, // Spectral subtraction factor
+            beta: 0.01, // Over-subtraction factor
             input_buffer: VecDeque::new(),
             output_buffer: VecDeque::new(),
             window,
@@ -422,7 +419,9 @@ impl NoiseReductionFilter {
     /// Create Hann window function
     fn create_hann_window(size: usize) -> Vec<f32> {
         (0..size)
-            .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (size - 1) as f32).cos()))
+            .map(|i| {
+                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (size - 1) as f32).cos())
+            })
             .collect()
     }
 
@@ -436,7 +435,8 @@ impl NoiseReductionFilter {
         // Process complete frames
         while self.input_buffer.len() >= self.frame_size {
             // Extract frame
-            let mut frame: Vec<f32> = self.input_buffer
+            let mut frame: Vec<f32> = self
+                .input_buffer
                 .iter()
                 .take(self.frame_size)
                 .cloned()
@@ -474,7 +474,7 @@ impl NoiseReductionFilter {
     fn process_frame(&mut self, frame: &mut [f32]) -> Result<()> {
         // This is a simplified implementation
         // A full implementation would use FFT for spectral processing
-        
+
         // Calculate frame energy
         let energy: f32 = frame.iter().map(|&x| x * x).sum();
         let rms = (energy / frame.len() as f32).sqrt();
@@ -575,7 +575,11 @@ impl FilterBank {
     pub fn process(&mut self, input: &[f32], outputs: &mut [Vec<f32>]) -> Result<()> {
         if outputs.len() != self.filters.len() {
             return Err(FilterError::ProcessingFailed {
-                message: format!("Output band count mismatch: {} vs {}", outputs.len(), self.filters.len()),
+                message: format!(
+                    "Output band count mismatch: {} vs {}",
+                    outputs.len(),
+                    self.filters.len()
+                ),
             });
         }
 
@@ -603,10 +607,10 @@ mod tests {
     fn test_filter_processing() {
         let config = FilterConfig::new_ft8_bandpass(12000.0);
         let mut filter = IirFilter::new(config).unwrap();
-        
+
         let input = vec![0.1; 1000];
         let mut output = vec![0.0; 1000];
-        
+
         let result = filter.process(&input, &mut output);
         assert!(result.is_ok());
     }

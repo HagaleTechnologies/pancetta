@@ -1,7 +1,7 @@
 //! # Pancetta FT8 Codec
 //!
 //! High-performance FT8 digital mode decoder and encoder optimized for real-time processing.
-//! 
+//!
 //! This crate provides a complete FT8 implementation with:
 //! - >95% decode accuracy at SNR -20dB
 //! - 12.64 second processing windows
@@ -25,7 +25,7 @@
 //! let decoded_messages = decoder.decode_window(&samples)?;
 //!
 //! for message in decoded_messages {
-//!     println!("Decoded: {} (SNR: {:.1}dB, Confidence: {:.2})", 
+//!     println!("Decoded: {} (SNR: {:.1}dB, Confidence: {:.2})",
 //!              message.text, message.snr_db, message.confidence);
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -70,21 +70,23 @@ pub mod modulator;
 pub mod transmit;
 
 // Core decoding exports
-pub use decoder::{Ft8Decoder, Ft8Config, WaterfallData};
+pub use decoder::{Ft8Config, Ft8Decoder, WaterfallData};
 pub use message::{DecodedMessage, Ft8Message, MessageType};
-pub use signal_processing::{WindowFunction, FftProcessor};
-pub use sync::{TimeSync, SyncResult};
+pub use signal_processing::{FftProcessor, WindowFunction};
+pub use sync::{SyncResult, TimeSync};
 
 // Transmission exports (when transmit feature is enabled)
 #[cfg(feature = "transmit")]
 pub use encoder::{Ft8Encoder, Ft8EncodingConfig};
 #[cfg(feature = "transmit")]
-pub use modulator::{Ft8Modulator, ModulatorConfig, PulseShape, AudioFormat, SampleType, convert_samples};
+pub use modulator::{
+    convert_samples, AudioFormat, Ft8Modulator, ModulatorConfig, PulseShape, SampleType,
+};
 #[cfg(feature = "transmit")]
 pub use transmit::{
-    Ft8Transmitter, TransmissionConfig, TransmissionState, TransmissionReport,
-    TransmissionStatistics, FrequencyConfig, PowerConfig, AudioConfig, PttConfig,
-    PttMethod, SafetyConfig, BandLimits, TestReport
+    AudioConfig, BandLimits, FrequencyConfig, Ft8Transmitter, PowerConfig, PttConfig, PttMethod,
+    SafetyConfig, TestReport, TransmissionConfig, TransmissionReport, TransmissionState,
+    TransmissionStatistics,
 };
 
 use std::time::{Duration, SystemTime};
@@ -125,28 +127,28 @@ pub type Ft8Result<T> = Result<T, Ft8Error>;
 pub enum Ft8Error {
     #[error("Invalid sample rate: expected {expected}, got {actual}")]
     InvalidSampleRate { expected: u32, actual: u32 },
-    
+
     #[error("Invalid window size: expected {expected}, got {actual}")]
     InvalidWindowSize { expected: usize, actual: usize },
-    
+
     #[error("FFT processing error: {0}")]
     FftError(String),
-    
+
     #[error("Signal processing error: {0}")]
     SignalProcessingError(String),
-    
+
     #[error("Message decoding error: {0}")]
     MessageDecodingError(String),
-    
+
     #[error("Time synchronization error: {0}")]
     SyncError(String),
-    
+
     #[error("Configuration error: {0}")]
     ConfigError(String),
-    
+
     #[error("Insufficient data: need {needed} samples, got {available}")]
     InsufficientData { needed: usize, available: usize },
-    
+
     #[error("Invalid data size: expected {expected}, got {actual}")]
     InvalidDataSize { expected: usize, actual: usize },
 }
@@ -156,19 +158,19 @@ pub enum Ft8Error {
 pub struct DecodingMetrics {
     /// Number of messages decoded in this window
     pub messages_decoded: usize,
-    
+
     /// Processing time for this window
     pub processing_time: Duration,
-    
+
     /// Average SNR of decoded messages
     pub average_snr: f32,
-    
+
     /// Peak memory usage during decoding
     pub peak_memory_bytes: usize,
-    
+
     /// Time synchronization quality (0.0 - 1.0)
     pub sync_quality: f32,
-    
+
     /// Timestamp when decoding completed
     pub timestamp: SystemTime,
 }
@@ -190,10 +192,10 @@ impl Default for DecodingMetrics {
 pub trait MessageHandler {
     /// Called when a new message is decoded
     fn on_message_decoded(&mut self, message: &DecodedMessage, metrics: &DecodingMetrics);
-    
+
     /// Called when decoding window starts
     fn on_window_start(&mut self, timestamp: SystemTime);
-    
+
     /// Called when decoding window completes
     fn on_window_complete(&mut self, metrics: &DecodingMetrics);
 }
@@ -221,9 +223,9 @@ mod tests {
 
     #[test]
     fn test_error_creation() {
-        let error = Ft8Error::InvalidSampleRate { 
-            expected: 12000, 
-            actual: 48000 
+        let error = Ft8Error::InvalidSampleRate {
+            expected: 12000,
+            actual: 48000,
         };
         assert!(error.to_string().contains("Invalid sample rate"));
     }

@@ -68,7 +68,7 @@ impl AudioDeviceManager {
             host,
             devices: Vec::new(),
         };
-        
+
         manager.refresh_devices()?;
         Ok(manager)
     }
@@ -81,7 +81,9 @@ impl AudioDeviceManager {
         let default_output = self.host.default_output_device();
 
         // Get all available devices
-        let devices = self.host.devices()
+        let devices = self
+            .host
+            .devices()
             .map_err(|e| AudioError::device(format!("Failed to enumerate devices: {}", e)))?;
 
         for device in devices {
@@ -129,7 +131,8 @@ impl AudioDeviceManager {
         // 3. First device that supports 48kHz (for conversion)
         // 4. Any compatible device
 
-        let compatible_devices: Vec<_> = self.devices
+        let compatible_devices: Vec<_> = self
+            .devices
             .iter()
             .filter(|(_, info)| {
                 info.supports_input
@@ -172,11 +175,10 @@ impl AudioDeviceManager {
 
     /// Get the best output device for monitoring
     pub fn get_best_output_device(&self) -> AudioResult<&Device> {
-        let compatible_devices: Vec<_> = self.devices
+        let compatible_devices: Vec<_> = self
+            .devices
             .iter()
-            .filter(|(_, info)| {
-                info.supports_output && !info.output_channels.is_empty()
-            })
+            .filter(|(_, info)| info.supports_output && !info.output_channels.is_empty())
             .collect();
 
         if compatible_devices.is_empty() {
@@ -217,7 +219,8 @@ impl AudioDeviceManager {
         target_sample_rate: u32,
         target_channels: u16,
     ) -> AudioResult<SupportedStreamConfig> {
-        let configs = device.supported_input_configs()
+        let configs = device
+            .supported_input_configs()
             .map_err(|e| AudioError::device(format!("Failed to get input configs: {}", e)))?;
 
         let mut best_config = None;
@@ -257,8 +260,9 @@ impl AudioDeviceManager {
             if score > best_score {
                 best_score = score;
                 // Use a sample rate that's within the supported range
-                let sample_rate = if target_sample_rate >= config.min_sample_rate().0 
-                    && target_sample_rate <= config.max_sample_rate().0 {
+                let sample_rate = if target_sample_rate >= config.min_sample_rate().0
+                    && target_sample_rate <= config.max_sample_rate().0
+                {
                     target_sample_rate
                 } else if config.max_sample_rate().0 >= 48000 {
                     48000
@@ -286,7 +290,8 @@ impl AudioDeviceManager {
         target_sample_rate: u32,
         target_channels: u16,
     ) -> AudioResult<SupportedStreamConfig> {
-        let configs = device.supported_output_configs()
+        let configs = device
+            .supported_output_configs()
             .map_err(|e| AudioError::device(format!("Failed to get output configs: {}", e)))?;
 
         let mut best_config = None;
@@ -326,8 +331,9 @@ impl AudioDeviceManager {
             if score > best_score {
                 best_score = score;
                 // Use a sample rate that's within the supported range
-                let sample_rate = if target_sample_rate >= config.min_sample_rate().0 
-                    && target_sample_rate <= config.max_sample_rate().0 {
+                let sample_rate = if target_sample_rate >= config.min_sample_rate().0
+                    && target_sample_rate <= config.max_sample_rate().0
+                {
                     target_sample_rate
                 } else if config.max_sample_rate().0 >= 48000 {
                     48000
@@ -355,7 +361,9 @@ impl AudioDeviceManager {
         default_input: &Option<Device>,
         default_output: &Option<Device>,
     ) -> AudioResult<AudioDeviceInfo> {
-        let name = device.name().unwrap_or_else(|_| "Unknown Device".to_string());
+        let name = device
+            .name()
+            .unwrap_or_else(|_| "Unknown Device".to_string());
 
         // Check if this is a default device
         let is_default_input = default_input
@@ -369,62 +377,62 @@ impl AudioDeviceManager {
             .unwrap_or(false);
 
         // Check input capabilities
-        let (supports_input, input_sample_rates, input_channels) =
-            match device.supported_input_configs() {
-                Ok(configs) => {
-                    let mut sample_rates = Vec::new();
-                    let mut channels = Vec::new();
+        let (supports_input, input_sample_rates, input_channels) = match device
+            .supported_input_configs()
+        {
+            Ok(configs) => {
+                let mut sample_rates = Vec::new();
+                let mut channels = Vec::new();
 
-                    for config in configs {
-                        // Collect sample rate range
-                        let min_rate = config.min_sample_rate().0;
-                        let max_rate = config.max_sample_rate().0;
+                for config in configs {
+                    // Collect sample rate range
+                    let min_rate = config.min_sample_rate().0;
+                    let max_rate = config.max_sample_rate().0;
 
-                        // Add common sample rates within range
-                        for &rate in &[8000, 12000, 16000, 22050, 44100, 48000, 96000, 192000] {
-                            if rate >= min_rate && rate <= max_rate && !sample_rates.contains(&rate)
-                            {
-                                sample_rates.push(rate);
-                            }
-                        }
-
-                        if !channels.contains(&config.channels()) {
-                            channels.push(config.channels());
+                    // Add common sample rates within range
+                    for &rate in &[8000, 12000, 16000, 22050, 44100, 48000, 96000, 192000] {
+                        if rate >= min_rate && rate <= max_rate && !sample_rates.contains(&rate) {
+                            sample_rates.push(rate);
                         }
                     }
 
-                    (true, sample_rates, channels)
+                    if !channels.contains(&config.channels()) {
+                        channels.push(config.channels());
+                    }
                 }
-                Err(_) => (false, Vec::new(), Vec::new()),
-            };
+
+                (true, sample_rates, channels)
+            }
+            Err(_) => (false, Vec::new(), Vec::new()),
+        };
 
         // Check output capabilities
-        let (supports_output, output_sample_rates, output_channels) =
-            match device.supported_output_configs() {
-                Ok(configs) => {
-                    let mut sample_rates = Vec::new();
-                    let mut channels = Vec::new();
+        let (supports_output, output_sample_rates, output_channels) = match device
+            .supported_output_configs()
+        {
+            Ok(configs) => {
+                let mut sample_rates = Vec::new();
+                let mut channels = Vec::new();
 
-                    for config in configs {
-                        let min_rate = config.min_sample_rate().0;
-                        let max_rate = config.max_sample_rate().0;
+                for config in configs {
+                    let min_rate = config.min_sample_rate().0;
+                    let max_rate = config.max_sample_rate().0;
 
-                        for &rate in &[8000, 12000, 16000, 22050, 44100, 48000, 96000, 192000] {
-                            if rate >= min_rate && rate <= max_rate && !sample_rates.contains(&rate)
-                            {
-                                sample_rates.push(rate);
-                            }
-                        }
-
-                        if !channels.contains(&config.channels()) {
-                            channels.push(config.channels());
+                    for &rate in &[8000, 12000, 16000, 22050, 44100, 48000, 96000, 192000] {
+                        if rate >= min_rate && rate <= max_rate && !sample_rates.contains(&rate) {
+                            sample_rates.push(rate);
                         }
                     }
 
-                    (true, sample_rates, channels)
+                    if !channels.contains(&config.channels()) {
+                        channels.push(config.channels());
+                    }
                 }
-                Err(_) => (false, Vec::new(), Vec::new()),
-            };
+
+                (true, sample_rates, channels)
+            }
+            Err(_) => (false, Vec::new(), Vec::new()),
+        };
 
         // Get supported sample formats (simplified)
         let sample_formats = vec!["F32".to_string(), "I32".to_string(), "I16".to_string()];
@@ -464,7 +472,7 @@ mod tests {
     fn test_device_enumeration() {
         let manager = AudioDeviceManager::new().unwrap();
         let devices = manager.list_device_info();
-        
+
         // Should have at least one device on any system with audio
         // Note: This might fail in CI environments without audio
         if !devices.is_empty() {
@@ -479,7 +487,7 @@ mod tests {
     fn test_ft8_device_search() {
         let manager = AudioDeviceManager::new().unwrap();
         let ft8_devices = manager.find_ft8_compatible_devices();
-        
+
         println!("Found {} FT8-compatible devices", ft8_devices.len());
         for device in ft8_devices {
             println!("  {}", device.name);

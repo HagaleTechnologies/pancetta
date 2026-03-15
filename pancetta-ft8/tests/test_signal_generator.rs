@@ -44,11 +44,13 @@ pub fn generate_real_ft8_signal(
     let mut modulator = Ft8Modulator::new_default().unwrap();
 
     // Encode message to symbols
-    let symbols = encoder.encode_message(message_text, None)
+    let symbols = encoder
+        .encode_message(message_text, None)
         .expect("Failed to encode message");
 
     // Modulate symbols to audio
-    let mut audio = modulator.modulate_symbols(&symbols, frequency_offset)
+    let mut audio = modulator
+        .modulate_symbols(&symbols, frequency_offset)
         .expect("Failed to modulate symbols");
 
     // Pad to full window size
@@ -202,7 +204,10 @@ mod tests {
         assert!(non_zero_count > 0, "Signal should contain non-zero samples");
 
         let max_amplitude = signal.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
-        assert!(max_amplitude > 0.0 && max_amplitude < 2.0, "Signal amplitude should be reasonable");
+        assert!(
+            max_amplitude > 0.0 && max_amplitude < 2.0,
+            "Signal amplitude should be reasonable"
+        );
     }
 
     #[test]
@@ -223,7 +228,10 @@ mod tests {
         let signal = generate_silence(12000, 1.0);
 
         assert_eq!(signal.len(), 12000);
-        assert!(signal.iter().all(|&x| x == 0.0), "All samples should be zero");
+        assert!(
+            signal.iter().all(|&x| x == 0.0),
+            "All samples should be zero"
+        );
     }
 
     #[test]
@@ -237,11 +245,13 @@ mod tests {
             let signal = generate_ft8_test_signal(&params);
             assert_eq!(signal.len(), 151680);
 
-            let variance: f32 = signal.iter()
-                .map(|&x| x * x)
-                .sum::<f32>() / signal.len() as f32;
+            let variance: f32 = signal.iter().map(|&x| x * x).sum::<f32>() / signal.len() as f32;
 
-            assert!(variance > 0.0, "Signal should have non-zero variance at SNR {}", snr);
+            assert!(
+                variance > 0.0,
+                "Signal should have non-zero variance at SNR {}",
+                snr
+            );
         }
     }
 

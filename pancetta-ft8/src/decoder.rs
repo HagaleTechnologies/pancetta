@@ -10,18 +10,18 @@
 //! 7. Message parsing
 
 use crate::{
-    Ft8Error, Ft8Result, DecodingMetrics, MessageHandler, NullMessageHandler,
-    SAMPLE_RATE, SYMBOL_DURATION, WINDOW_SAMPLES, NUM_SYMBOLS, NUM_TONES, TONE_SPACING,
-    message::{MessageParser, DecodedMessage, calculate_crc14, PAYLOAD_BITS, CRC_BITS},
-    signal_processing::{FftProcessor, WindowFunction, BandpassFilter, SymbolCorrelator},
+    message::{calculate_crc14, DecodedMessage, MessageParser, CRC_BITS, PAYLOAD_BITS},
+    signal_processing::{BandpassFilter, FftProcessor, SymbolCorrelator, WindowFunction},
     sync::TimeSync,
+    DecodingMetrics, Ft8Error, Ft8Result, MessageHandler, NullMessageHandler, NUM_SYMBOLS,
+    NUM_TONES, SAMPLE_RATE, SYMBOL_DURATION, TONE_SPACING, WINDOW_SAMPLES,
 };
+use bitvec::prelude::*;
+use bumpalo::Bump;
 use num_complex::Complex;
 use rustfft::FftPlanner;
 use std::collections::HashSet;
-use std::time::{SystemTime, Instant};
-use bumpalo::Bump;
-use bitvec::prelude::*;
+use std::time::{Instant, SystemTime};
 
 // ============================================================================
 // Constants
@@ -286,10 +286,16 @@ impl Ft8Decoder {
             let _num_candidates = sync_candidates.len();
             let _best_score = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
             #[cfg(feature = "debug-decode")]
-            eprintln!("[decode pass {}] {} sync candidates, best score={:.1}", pass, _num_candidates, _best_score);
+            eprintln!(
+                "[decode pass {}] {} sync candidates, best score={:.1}",
+                pass, _num_candidates, _best_score
+            );
             #[cfg(feature = "debug-decode")]
             for (i, c) in sync_candidates.iter().take(5).enumerate() {
-                eprintln!("  [{}] t={} f={} score={:.1}", i, c.time_step, c.freq_bin, c.sync_score);
+                eprintln!(
+                    "  [{}] t={} f={} score={:.1}",
+                    i, c.time_step, c.freq_bin, c.sync_score
+                );
             }
             for candidate in &sync_candidates {
                 if all_decoded_messages.len() + pass_decoded.len() >= self.config.max_candidates {
@@ -305,11 +311,17 @@ impl Ft8Decoder {
                     }
                     Ok(None) => {
                         #[cfg(feature = "debug-decode")]
-                        eprintln!("  candidate t={} f={}: no decode", candidate.time_step, candidate.freq_bin);
+                        eprintln!(
+                            "  candidate t={} f={}: no decode",
+                            candidate.time_step, candidate.freq_bin
+                        );
                     }
                     Err(_e) => {
                         #[cfg(feature = "debug-decode")]
-                        eprintln!("  candidate t={} f={}: error {}", candidate.time_step, candidate.freq_bin, _e);
+                        eprintln!(
+                            "  candidate t={} f={}: error {}",
+                            candidate.time_step, candidate.freq_bin, _e
+                        );
                     }
                 }
             }
@@ -320,7 +332,11 @@ impl Ft8Decoder {
             }
 
             #[cfg(feature = "debug-decode")]
-            eprintln!("[decode pass {}] decoded {} new messages", pass, pass_decoded.len());
+            eprintln!(
+                "[decode pass {}] decoded {} new messages",
+                pass,
+                pass_decoded.len()
+            );
 
             // Subtract decoded signals from residual audio for next pass
             if pass + 1 < max_passes {
@@ -350,7 +366,8 @@ impl Ft8Decoder {
         };
 
         for message in &all_decoded_messages {
-            self.message_handler.on_message_decoded(message, &self.last_metrics);
+            self.message_handler
+                .on_message_decoded(message, &self.last_metrics);
         }
         self.message_handler.on_window_complete(&self.last_metrics);
 
@@ -401,7 +418,9 @@ impl Ft8Decoder {
             };
 
             let time_offset_samples = (msg.time_offset * SAMPLE_RATE as f64) as usize;
-            let signal_len = reconstructed.len().min(audio.len().saturating_sub(time_offset_samples));
+            let signal_len = reconstructed
+                .len()
+                .min(audio.len().saturating_sub(time_offset_samples));
             if signal_len == 0 {
                 return;
             }
@@ -607,7 +626,13 @@ impl Ft8Decoder {
     /// to colored noise than comparing against distant noise bins.
     ///
     /// Score = average of (signal_bin - neighbor_bin) across all valid comparisons.
-    fn compute_costas_score(&self, spec: &Spectrogram, t0: usize, f0: usize, freq_sub: usize) -> f64 {
+    fn compute_costas_score(
+        &self,
+        spec: &Spectrogram,
+        t0: usize,
+        f0: usize,
+        freq_sub: usize,
+    ) -> f64 {
         let mut score = 0.0f64;
         let mut num_average = 0usize;
         let sync_group_starts: [usize; 3] = [0, 36, 72];
@@ -687,8 +712,10 @@ impl Ft8Decoder {
                 if !keep[j] {
                     continue;
                 }
-                let dt = (candidates[i].time_step as isize - candidates[j].time_step as isize).unsigned_abs();
-                let df = (candidates[i].freq_bin as isize - candidates[j].freq_bin as isize).unsigned_abs();
+                let dt = (candidates[i].time_step as isize - candidates[j].time_step as isize)
+                    .unsigned_abs();
+                let df = (candidates[i].freq_bin as isize - candidates[j].freq_bin as isize)
+                    .unsigned_abs();
 
                 if dt <= NMS_TIME_RADIUS && df <= NMS_FREQ_RADIUS {
                     keep[j] = false; // suppress the weaker candidate
@@ -753,9 +780,11 @@ impl Ft8Decoder {
                 }
                 let base_frequency = freq_bin as f64 * TONE_SPACING + sub_bin_offset;
 
-                let (_symbols, tone_magnitudes) = match self
-                    .extract_symbols_complex(audio, time_offset_samples, base_frequency)
-                {
+                let (_symbols, tone_magnitudes) = match self.extract_symbols_complex(
+                    audio,
+                    time_offset_samples,
+                    base_frequency,
+                ) {
                     Ok(result) => result,
                     Err(_) => continue,
                 };
@@ -767,8 +796,7 @@ impl Ft8Decoder {
 
                 #[cfg(feature = "debug-decode")]
                 {
-                    let avg_abs_llr =
-                        llrs.iter().map(|l| l.abs()).sum::<f32>() / llrs.len() as f32;
+                    let avg_abs_llr = llrs.iter().map(|l| l.abs()).sum::<f32>() / llrs.len() as f32;
                     let saturated = llrs.iter().filter(|&&l| l.abs() >= 24.9).count();
                     eprintln!(
                         "    dt={:+4} df={:+2}: avg|LLR|={:.2}, sat={}/174",
@@ -844,10 +872,7 @@ impl Ft8Decoder {
 
         // Pre-compute Hann window for one symbol
         let window: Vec<f64> = (0..SAMPLES_PER_SYMBOL)
-            .map(|i| {
-                0.5 * (1.0
-                    - (pi2 * i as f64 / (SAMPLES_PER_SYMBOL - 1) as f64).cos())
-            })
+            .map(|i| 0.5 * (1.0 - (pi2 * i as f64 / (SAMPLES_PER_SYMBOL - 1) as f64).cos()))
             .collect();
 
         let mut symbols = Vec::with_capacity(NUM_SYMBOLS);
@@ -1056,9 +1081,9 @@ impl Ft8Decoder {
             }
 
             waterfall_data.power_matrix.push(window_powers);
-            waterfall_data.time_bins.push(
-                window_idx as f64 * hop_size as f64 / SAMPLE_RATE as f64,
-            );
+            waterfall_data
+                .time_bins
+                .push(window_idx as f64 * hop_size as f64 / SAMPLE_RATE as f64);
         }
 
         Ok(waterfall_data)
@@ -1159,7 +1184,9 @@ impl LdpcDecoder {
             let mut positions = Vec::with_capacity(connected_checks.len());
             for &check_idx in connected_checks {
                 let check_vars = parity_check_matrix.get_connected_variables(check_idx);
-                let pos = check_vars.iter().position(|&v| v == var_idx)
+                let pos = check_vars
+                    .iter()
+                    .position(|&v| v == var_idx)
                     .expect("Inconsistent parity check matrix");
                 positions.push((check_idx, pos));
             }
@@ -1347,7 +1374,7 @@ impl LdpcDecoder {
     }
 }
 
-use crate::ldpc::{ParityCheckMatrix, gray_to_binary};
+use crate::ldpc::{gray_to_binary, ParityCheckMatrix};
 
 // ============================================================================
 // Tests
@@ -1459,8 +1486,12 @@ mod tests {
         // Power (dB) at tone bin should be much larger than at a random bin (freq_sub=0)
         let signal_db = spec.power[mid_step][0][tone_bin];
         let noise_db = spec.power[mid_step][0][10]; // Low-frequency noise bin
-        assert!(signal_db > noise_db + 20.0,
-            "Signal dB {:.2} should be >> noise dB {:.2}", signal_db, noise_db);
+        assert!(
+            signal_db > noise_db + 20.0,
+            "Signal dB {:.2} should be >> noise dB {:.2}",
+            signal_db,
+            noise_db
+        );
     }
 
     #[test]
@@ -1491,16 +1522,29 @@ mod tests {
             }
         }
 
-        let spec = Spectrogram { power, num_steps, num_bins, freq_osr };
+        let spec = Spectrogram {
+            power,
+            num_steps,
+            num_bins,
+            freq_osr,
+        };
 
         let score = decoder.compute_costas_score(&spec, 0, f0, 0);
-        assert!(score > MIN_SYNC_SCORE,
-            "Costas score {:.2} should exceed threshold {:.2}", score, MIN_SYNC_SCORE);
+        assert!(
+            score > MIN_SYNC_SCORE,
+            "Costas score {:.2} should exceed threshold {:.2}",
+            score,
+            MIN_SYNC_SCORE
+        );
 
         // Score at a wrong frequency should be much lower
         let wrong_score = decoder.compute_costas_score(&spec, 0, f0 + 20, 0);
-        assert!(score > wrong_score * 2.0,
-            "Correct score {:.2} should be >> wrong score {:.2}", score, wrong_score);
+        assert!(
+            score > wrong_score * 2.0,
+            "Correct score {:.2} should be >> wrong score {:.2}",
+            score,
+            wrong_score
+        );
     }
 
     #[test]
@@ -1525,15 +1569,22 @@ mod tests {
 
         // Every symbol should detect tone 3
         for (i, &sym) in symbols.iter().enumerate() {
-            assert_eq!(sym, target_tone,
-                "Symbol {} detected tone {} instead of {}", i, sym, target_tone);
+            assert_eq!(
+                sym, target_tone,
+                "Symbol {} detected tone {} instead of {}",
+                i, sym, target_tone
+            );
         }
 
         // Magnitude at target tone should dominate
         for (i, m) in mags.iter().enumerate() {
-            assert!(m[target_tone as usize] > m[0] * 5.0,
+            assert!(
+                m[target_tone as usize] > m[0] * 5.0,
                 "Symbol {}: target mag {:.4} should dominate other mag {:.4}",
-                i, m[target_tone as usize], m[0]);
+                i,
+                m[target_tone as usize],
+                m[0]
+            );
         }
     }
 
@@ -1557,8 +1608,12 @@ mod tests {
         // Tone 0 → gray_to_binary(0) = 0 → bits 000
         // All LLRs should be positive (bit=0 is more likely)
         for (i, &llr) in llrs.iter().enumerate() {
-            assert!(llr > 0.0,
-                "LLR[{}] = {:.2} should be positive (bit=0 likely for tone 0)", i, llr);
+            assert!(
+                llr > 0.0,
+                "LLR[{}] = {:.2} should be positive (bit=0 likely for tone 0)",
+                i,
+                llr
+            );
         }
     }
 
@@ -1601,8 +1656,8 @@ mod tests {
         let bits = decoder.llrs_to_bits(&llrs).unwrap();
 
         assert_eq!(bits.len(), 174);
-        assert!(bits[0]);   // negative LLR → bit 1
-        assert!(!bits[1]);  // positive LLR → bit 0
+        assert!(bits[0]); // negative LLR → bit 1
+        assert!(!bits[1]); // positive LLR → bit 0
         assert!(bits[2]);
         assert!(!bits[3]);
         assert!(bits[4]);
@@ -1712,10 +1767,30 @@ mod tests {
         let decoder = Ft8Decoder::new(config).unwrap();
 
         let mut candidates = vec![
-            CostasCandidate { time_step: 0, freq_bin: 240, freq_sub: 0, sync_score: 20.0 },
-            CostasCandidate { time_step: 1, freq_bin: 240, freq_sub: 0, sync_score: 15.0 }, // near #0
-            CostasCandidate { time_step: 0, freq_bin: 241, freq_sub: 0, sync_score: 12.0 }, // near #0
-            CostasCandidate { time_step: 0, freq_bin: 300, freq_sub: 0, sync_score: 18.0 }, // far from #0
+            CostasCandidate {
+                time_step: 0,
+                freq_bin: 240,
+                freq_sub: 0,
+                sync_score: 20.0,
+            },
+            CostasCandidate {
+                time_step: 1,
+                freq_bin: 240,
+                freq_sub: 0,
+                sync_score: 15.0,
+            }, // near #0
+            CostasCandidate {
+                time_step: 0,
+                freq_bin: 241,
+                freq_sub: 0,
+                sync_score: 12.0,
+            }, // near #0
+            CostasCandidate {
+                time_step: 0,
+                freq_bin: 300,
+                freq_sub: 0,
+                sync_score: 18.0,
+            }, // far from #0
         ];
 
         decoder.nms_candidates(&mut candidates);
@@ -1738,22 +1813,36 @@ mod tests {
 
         // Original variance should be ~4.0
         let orig_var = compute_variance(&llrs);
-        assert!((orig_var - 4.0).abs() < 0.1, "Expected variance ~4.0, got {}", orig_var);
+        assert!(
+            (orig_var - 4.0).abs() < 0.1,
+            "Expected variance ~4.0, got {}",
+            orig_var
+        );
 
         // Normalize
         normalize_llrs(&mut llrs);
 
         // After normalization, variance should be ~24.0
         let norm_var = compute_variance(&llrs);
-        assert!((norm_var - LLR_TARGET_VARIANCE).abs() < 0.1,
-            "Expected variance ~{}, got {}", LLR_TARGET_VARIANCE, norm_var);
+        assert!(
+            (norm_var - LLR_TARGET_VARIANCE).abs() < 0.1,
+            "Expected variance ~{}, got {}",
+            LLR_TARGET_VARIANCE,
+            norm_var
+        );
     }
 
     #[test]
     fn test_llr_normalization_preserves_sign() {
         let mut llrs = vec![0.0f32; 174];
         for (i, llr) in llrs.iter_mut().enumerate() {
-            *llr = if i % 3 == 0 { 5.0 } else if i % 3 == 1 { -3.0 } else { 1.0 };
+            *llr = if i % 3 == 0 {
+                5.0
+            } else if i % 3 == 1 {
+                -3.0
+            } else {
+                1.0
+            };
         }
 
         let signs: Vec<bool> = llrs.iter().map(|&x| x > 0.0).collect();
@@ -1797,9 +1886,12 @@ mod tests {
         let db_sub1 = spec.power[mid][1][bin];
 
         // freq_sub=1 should have stronger signal (higher dB) for a tone at bin+0.5
-        assert!(db_sub1 > db_sub0 + 3.0,
+        assert!(
+            db_sub1 > db_sub0 + 3.0,
             "freq_sub=1 dB ({:.2}) should be > freq_sub=0 dB ({:.2}) + 3 for half-bin tone",
-            db_sub1, db_sub0);
+            db_sub1,
+            db_sub0
+        );
     }
 
     /// Helper to compute variance of a slice

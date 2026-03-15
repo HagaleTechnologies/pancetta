@@ -145,12 +145,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// High-level API for common use cases
 pub mod prelude {
     //! Convenient re-exports for common use cases
-    
+
     pub use crate::{
         AgcConfig, AgcMode, AudioFrame, AudioResampler, AudioRingBuffer, AutomaticGainControl,
         DspPipeline, PipelineBuilder, PipelineConfig,
     };
-    
+
     pub use crossbeam_channel::{Receiver, Sender};
     pub use tokio;
 }
@@ -158,11 +158,11 @@ pub mod prelude {
 /// Factory functions for creating common configurations
 pub mod factory {
     //! Factory functions for creating pre-configured components
-    
+
     use crate::*;
 
     /// Create an FT8-optimized DSP pipeline
-    /// 
+    ///
     /// This creates a complete pipeline optimized for FT8 digital mode processing:
     /// - 48kHz input → 12kHz output resampling
     /// - 200-4000Hz bandpass filter
@@ -186,7 +186,7 @@ pub mod factory {
     }
 
     /// Create a general amateur radio DSP pipeline
-    /// 
+    ///
     /// This creates a pipeline suitable for various amateur radio modes:
     /// - 48kHz input → 24kHz output resampling
     /// - Wide bandwidth (no bandpass filtering)
@@ -202,7 +202,7 @@ pub mod factory {
     }
 
     /// Create a high-quality audio resampler
-    /// 
+    ///
     /// Uses optimal settings for amateur radio applications with
     /// excellent anti-aliasing and minimal artifacts.
     pub fn create_ft8_resampler() -> resampler::Result<AudioResampler> {
@@ -210,7 +210,7 @@ pub mod factory {
     }
 
     /// Create an FT8-optimized AGC
-    /// 
+    ///
     /// Configured for digital mode processing with appropriate
     /// attack/decay times and compression settings.
     pub fn create_ft8_agc(sample_rate: f32) -> agc::Result<AutomaticGainControl> {
@@ -218,7 +218,7 @@ pub mod factory {
     }
 
     /// Create an FT8 bandpass filter
-    /// 
+    ///
     /// Filters to 200-4000Hz range typical for FT8 operations.
     pub fn create_ft8_filter(sample_rate: f32) -> filter::Result<IirFilter> {
         let config = FilterConfig::new_ft8_bandpass(sample_rate);
@@ -226,14 +226,17 @@ pub mod factory {
     }
 
     /// Create an audio ring buffer for real-time streaming
-    /// 
+    ///
     /// Optimized for low-latency audio processing with overflow handling.
-    pub fn create_audio_buffer(sample_rate: f32, max_latency: f32) -> buffer::Result<AudioRingBuffer> {
+    pub fn create_audio_buffer(
+        sample_rate: f32,
+        max_latency: f32,
+    ) -> buffer::Result<AudioRingBuffer> {
         AudioRingBuffer::new(sample_rate, max_latency)
     }
 
     /// Create an FT8 window extractor
-    /// 
+    ///
     /// Extracts 12.64-second windows with 50% overlap for FT8 processing.
     pub fn create_ft8_window_extractor(sample_rate: f32) -> WindowExtractor {
         WindowExtractor::new_ft8(sample_rate)
@@ -243,7 +246,7 @@ pub mod factory {
 /// Utility functions for signal processing
 pub mod utils {
     //! Utility functions for common signal processing tasks
-    
+
     /// Convert dB to linear scale
     pub fn db_to_linear(db: f32) -> f32 {
         10.0_f32.powf(db / 20.0)
@@ -259,7 +262,7 @@ pub mod utils {
         if samples.is_empty() {
             return 0.0;
         }
-        
+
         let sum_squares: f32 = samples.iter().map(|&x| x * x).sum();
         (sum_squares / samples.len() as f32).sqrt()
     }
@@ -282,7 +285,8 @@ pub mod utils {
     pub fn apply_hann_window(samples: &mut [f32]) {
         let len = samples.len();
         for (i, sample) in samples.iter_mut().enumerate() {
-            let window_value = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (len - 1) as f32).cos());
+            let window_value =
+                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (len - 1) as f32).cos());
             *sample *= window_value;
         }
     }
@@ -302,7 +306,10 @@ pub mod utils {
     /// Validate sample rate for amateur radio applications
     pub fn validate_sample_rate(sample_rate: f32) -> bool {
         // Common amateur radio sample rates
-        matches!(sample_rate as u32, 8000 | 12000 | 16000 | 24000 | 44100 | 48000 | 96000 | 192000)
+        matches!(
+            sample_rate as u32,
+            8000 | 12000 | 16000 | 24000 | 44100 | 48000 | 96000 | 192000
+        )
     }
 }
 
@@ -331,14 +338,14 @@ mod tests {
     fn test_utils() {
         assert_eq!(utils::db_to_linear(0.0), 1.0);
         assert_eq!(utils::linear_to_db(1.0), 0.0);
-        
+
         let samples = vec![0.1, 0.2, 0.3, 0.4, 0.5];
         let rms = utils::calculate_rms(&samples);
         assert!(rms > 0.0);
-        
+
         let peak = utils::calculate_peak(&samples);
         assert_eq!(peak, 0.5);
-        
+
         assert!(utils::validate_sample_rate(48000.0));
         assert!(!utils::validate_sample_rate(47999.0));
     }
@@ -346,16 +353,16 @@ mod tests {
     #[tokio::test]
     async fn test_pipeline_integration() {
         let (pipeline, input_tx, _output_rx) = factory::create_ft8_pipeline().unwrap();
-        
+
         // Test that we can create the pipeline and channels
         assert!(!pipeline.is_running());
-        
+
         // Test basic buffer operations
         let buffer = factory::create_audio_buffer(48000.0, 0.1).unwrap();
         let test_samples = vec![0.1; 100];
         let write_result = buffer.write(&test_samples);
         assert!(write_result.is_ok());
-        
+
         // Test that we can send data through channel
         let test_samples = vec![0.1; 1024];
         let send_result = input_tx.try_send(test_samples);

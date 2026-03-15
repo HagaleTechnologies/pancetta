@@ -96,7 +96,14 @@ impl Mode {
     pub fn is_voice(&self) -> bool {
         matches!(
             self,
-            Mode::USB | Mode::LSB | Mode::AM | Mode::FM | Mode::WFM | Mode::DMR | Mode::DSTAR | Mode::YSF
+            Mode::USB
+                | Mode::LSB
+                | Mode::AM
+                | Mode::FM
+                | Mode::WFM
+                | Mode::DMR
+                | Mode::DSTAR
+                | Mode::YSF
         )
     }
 
@@ -197,7 +204,7 @@ mod tests {
         let mode = Mode::FT8;
         let json = serde_json::to_string(&mode).unwrap();
         assert_eq!(json, "\"FT8\"");
-        
+
         let decoded: Mode = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, mode);
     }

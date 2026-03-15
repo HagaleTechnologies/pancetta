@@ -3,7 +3,7 @@
 //! This module manages tracking of worked and confirmed QSOs for various
 //! amateur radio awards including DXCC, WAS, WAZ, etc.
 
-use crate::{Band, Mode, ConfirmationStatus, DxQso, DxError, Result};
+use crate::{Band, ConfirmationStatus, DxError, DxQso, Mode, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -94,17 +94,17 @@ impl DxTracker {
     /// Create new DX tracker with database
     pub async fn new(database_path: &str) -> Result<Self> {
         let connection = Connection::open(database_path)?;
-        
+
         let mut tracker = Self { connection };
         tracker.initialize_database().await?;
-        
+
         Ok(tracker)
     }
-    
+
     /// Initialize database schema
     async fn initialize_database(&mut self) -> Result<()> {
         info!("Initializing DX tracker database schema");
-        
+
         // QSOs table
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS qsos (
@@ -130,7 +130,7 @@ impl DxTracker {
             )",
             [],
         )?;
-        
+
         // Award tracking table
         self.connection.execute(
             "CREATE TABLE IF NOT EXISTS award_tracking (
@@ -149,52 +149,48 @@ impl DxTracker {
             )",
             [],
         )?;
-        
+
         // Indexes for performance
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_qsos_callsign ON qsos(callsign)",
             [],
         )?;
-        
+
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_qsos_dxcc_entity ON qsos(dxcc_entity)",
             [],
         )?;
-        
+
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_qsos_datetime ON qsos(datetime)",
             [],
         )?;
-        
-        self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_qsos_band ON qsos(band)",
-            [],
-        )?;
-        
-        self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_qsos_mode ON qsos(mode)",
-            [],
-        )?;
-        
+
+        self.connection
+            .execute("CREATE INDEX IF NOT EXISTS idx_qsos_band ON qsos(band)", [])?;
+
+        self.connection
+            .execute("CREATE INDEX IF NOT EXISTS idx_qsos_mode ON qsos(mode)", [])?;
+
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_award_entity_band ON award_tracking(entity_code, band)",
             [],
         )?;
-        
+
         info!("Database schema initialized successfully");
         Ok(())
     }
-    
+
     /// Add a new QSO
     pub async fn add_qso(&mut self, mut qso: DxQso) -> Result<Uuid> {
         if qso.id.is_none() {
             qso.id = Some(Uuid::new_v4());
         }
-        
+
         let qso_id = qso.id.unwrap();
-        
+
         debug!("Adding QSO: {} on {} {}", qso.callsign, qso.band, qso.mode);
-        
+
         self.connection.execute(
             "INSERT INTO qsos (
                 id, callsign, datetime, frequency, band, mode,
@@ -222,22 +218,24 @@ impl DxTracker {
                 qso.notes,
             ],
         )?;
-        
+
         // Update award tracking
         self.update_award_tracking(&qso).await?;
-        
+
         info!("Added QSO {} with entity {}", qso_id, qso.dxcc_entity);
         Ok(qso_id)
     }
-    
+
     /// Update QSO record
     pub async fn update_qso(&mut self, qso: &DxQso) -> Result<()> {
         let Some(qso_id) = qso.id else {
-            return Err(DxError::Configuration("QSO ID is required for update".to_string()));
+            return Err(DxError::Configuration(
+                "QSO ID is required for update".to_string(),
+            ));
         };
-        
+
         debug!("Updating QSO: {}", qso_id);
-        
+
         let rows_affected = self.connection.execute(
             "UPDATE qsos SET
                 callsign = ?1, datetime = ?2, frequency = ?3, band = ?4, mode = ?5,
@@ -265,33 +263,40 @@ impl DxTracker {
                 qso_id.to_string(),
             ],
         )?;
-        
+
         if rows_affected == 0 {
             return Err(DxError::Configuration(format!("QSO {} not found", qso_id)));
         }
-        
+
         // Update award tracking
         self.update_award_tracking(qso).await?;
-        
+
         Ok(())
     }
-    
+
     /// Update award tracking for a QSO
     async fn update_award_tracking(&mut self, qso: &DxQso) -> Result<()> {
         // Check current award status
-        let current_entry = self.get_award_entry(qso.dxcc_entity, qso.band, Some(&qso.mode)).await?;
-        
-        let is_confirmed = matches!(qso.confirmation_status, 
-            ConfirmationStatus::QslCard | ConfirmationStatus::EQsl | 
-            ConfirmationStatus::Lotw | ConfirmationStatus::ClubLog | 
-            ConfirmationStatus::Qrz | ConfirmationStatus::Other(_));
-        
+        let current_entry = self
+            .get_award_entry(qso.dxcc_entity, qso.band, Some(&qso.mode))
+            .await?;
+
+        let is_confirmed = matches!(
+            qso.confirmation_status,
+            ConfirmationStatus::QslCard
+                | ConfirmationStatus::EQsl
+                | ConfirmationStatus::Lotw
+                | ConfirmationStatus::ClubLog
+                | ConfirmationStatus::Qrz
+                | ConfirmationStatus::Other(_)
+        );
+
         let new_status = if is_confirmed {
             AwardStatus::Confirmed
         } else {
             AwardStatus::Worked
         };
-        
+
         match current_entry {
             Some(entry) => {
                 // Update existing entry if this is an improvement
@@ -300,29 +305,29 @@ impl DxTracker {
                     (AwardStatus::Worked, AwardStatus::Confirmed) => true,
                     (AwardStatus::Confirmed, AwardStatus::Confirmed) => {
                         // Update if this is an earlier confirmation
-                        entry.first_confirmed.is_none() || 
-                        entry.first_confirmed > Some(qso.datetime)
-                    },
+                        entry.first_confirmed.is_none()
+                            || entry.first_confirmed > Some(qso.datetime)
+                    }
                     _ => false,
                 };
-                
+
                 if should_update {
                     self.update_award_entry(qso, &entry, new_status).await?;
                 }
-            },
+            }
             None => {
                 // Create new entry
                 self.create_award_entry(qso, new_status).await?;
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Create new award tracking entry
     async fn create_award_entry(&mut self, qso: &DxQso, status: AwardStatus) -> Result<()> {
         let is_confirmed = status == AwardStatus::Confirmed;
-        
+
         self.connection.execute(
             "INSERT INTO award_tracking (
                 entity_code, band, mode, status, first_worked, first_confirmed,
@@ -334,23 +339,42 @@ impl DxTracker {
                 qso.mode.to_string(),
                 serde_json::to_string(&status)?,
                 qso.datetime.to_rfc3339(),
-                if is_confirmed { Some(qso.datetime.to_rfc3339()) } else { None },
+                if is_confirmed {
+                    Some(qso.datetime.to_rfc3339())
+                } else {
+                    None
+                },
                 qso.id.map(|id| id.to_string()),
-                if is_confirmed { qso.id.map(|id| id.to_string()) } else { None },
-                if is_confirmed { Some(serde_json::to_string(&qso.confirmation_status)?) } else { None },
+                if is_confirmed {
+                    qso.id.map(|id| id.to_string())
+                } else {
+                    None
+                },
+                if is_confirmed {
+                    Some(serde_json::to_string(&qso.confirmation_status)?)
+                } else {
+                    None
+                },
             ],
         )?;
-        
-        debug!("Created award entry for entity {} on {} {}", 
-               qso.dxcc_entity, qso.band, qso.mode);
-        
+
+        debug!(
+            "Created award entry for entity {} on {} {}",
+            qso.dxcc_entity, qso.band, qso.mode
+        );
+
         Ok(())
     }
-    
+
     /// Update existing award tracking entry
-    async fn update_award_entry(&mut self, qso: &DxQso, entry: &AwardEntry, new_status: AwardStatus) -> Result<()> {
+    async fn update_award_entry(
+        &mut self,
+        qso: &DxQso,
+        entry: &AwardEntry,
+        new_status: AwardStatus,
+    ) -> Result<()> {
         let is_confirmed = new_status == AwardStatus::Confirmed;
-        
+
         self.connection.execute(
             "UPDATE award_tracking SET
                 status = ?1,
@@ -361,112 +385,158 @@ impl DxTracker {
             WHERE entity_code = ?5 AND band = ?6 AND mode = ?7",
             params![
                 serde_json::to_string(&new_status)?,
-                if is_confirmed { Some(qso.datetime.to_rfc3339()) } else { entry.first_confirmed.map(|d| d.to_rfc3339()) },
-                if is_confirmed { qso.id.map(|id| id.to_string()) } else { entry.confirmed_qso_id.map(|id| id.to_string()) },
-                if is_confirmed { Some(serde_json::to_string(&qso.confirmation_status)?) } else { entry.confirmation_method.as_ref().map(|c| serde_json::to_string(c)).transpose()? },
+                if is_confirmed {
+                    Some(qso.datetime.to_rfc3339())
+                } else {
+                    entry.first_confirmed.map(|d| d.to_rfc3339())
+                },
+                if is_confirmed {
+                    qso.id.map(|id| id.to_string())
+                } else {
+                    entry.confirmed_qso_id.map(|id| id.to_string())
+                },
+                if is_confirmed {
+                    Some(serde_json::to_string(&qso.confirmation_status)?)
+                } else {
+                    entry
+                        .confirmation_method
+                        .as_ref()
+                        .map(|c| serde_json::to_string(c))
+                        .transpose()?
+                },
                 qso.dxcc_entity as i64,
                 qso.band.to_string(),
                 qso.mode.to_string(),
             ],
         )?;
-        
-        debug!("Updated award entry for entity {} on {} {}", 
-               qso.dxcc_entity, qso.band, qso.mode);
-        
+
+        debug!(
+            "Updated award entry for entity {} on {} {}",
+            qso.dxcc_entity, qso.band, qso.mode
+        );
+
         Ok(())
     }
-    
+
     /// Get award tracking entry
-    pub async fn get_award_entry(&self, entity_code: u16, band: Band, mode: Option<&Mode>) -> Result<Option<AwardEntry>> {
+    pub async fn get_award_entry(
+        &self,
+        entity_code: u16,
+        band: Band,
+        mode: Option<&Mode>,
+    ) -> Result<Option<AwardEntry>> {
         let mode_str = mode.map(|m| m.to_string());
-        
-        let row = self.connection.query_row(
-            "SELECT entity_code, band, mode, status, first_worked, first_confirmed,
+
+        let row = self
+            .connection
+            .query_row(
+                "SELECT entity_code, band, mode, status, first_worked, first_confirmed,
                     worked_qso_id, confirmed_qso_id, confirmation_method
              FROM award_tracking
              WHERE entity_code = ?1 AND band = ?2 AND mode = ?3",
-            params![entity_code as i64, band.to_string(), mode_str],
-            |row| self.award_entry_from_row(row)
-        ).optional()?;
-        
+                params![entity_code as i64, band.to_string(), mode_str],
+                |row| self.award_entry_from_row(row),
+            )
+            .optional()?;
+
         Ok(row)
     }
-    
+
     /// Convert database row to AwardEntry
     fn award_entry_from_row(&self, row: &Row) -> rusqlite::Result<AwardEntry> {
         let status_json: String = row.get("status")?;
-        let status: AwardStatus = serde_json::from_str(&status_json)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                0, // column index 
-                rusqlite::types::Type::Text, 
-                Box::new(e)
-            ))?;
-        
-        let first_worked = row.get::<_, Option<String>>("first_worked")?
+        let status: AwardStatus = serde_json::from_str(&status_json).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0, // column index
+                rusqlite::types::Type::Text,
+                Box::new(e),
+            )
+        })?;
+
+        let first_worked = row
+            .get::<_, Option<String>>("first_worked")?
             .map(|s| DateTime::parse_from_rfc3339(&s))
             .transpose()
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                1, // column index
-                rusqlite::types::Type::Text,
-                Box::new(e)
-            ))?
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1, // column index
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?
             .map(|dt| dt.with_timezone(&Utc));
-        
-        let first_confirmed = row.get::<_, Option<String>>("first_confirmed")?
+
+        let first_confirmed = row
+            .get::<_, Option<String>>("first_confirmed")?
             .map(|s| DateTime::parse_from_rfc3339(&s))
             .transpose()
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                2, // column index
-                rusqlite::types::Type::Text,
-                Box::new(e)
-            ))?
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2, // column index
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?
             .map(|dt| dt.with_timezone(&Utc));
-        
-        let worked_qso_id = row.get::<_, Option<String>>("worked_qso_id")?
+
+        let worked_qso_id = row
+            .get::<_, Option<String>>("worked_qso_id")?
             .map(|s| Uuid::parse_str(&s))
             .transpose()
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                3, // column index
-                rusqlite::types::Type::Text,
-                Box::new(e)
-            ))?;
-        
-        let confirmed_qso_id = row.get::<_, Option<String>>("confirmed_qso_id")?
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3, // column index
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+
+        let confirmed_qso_id = row
+            .get::<_, Option<String>>("confirmed_qso_id")?
             .map(|s| Uuid::parse_str(&s))
             .transpose()
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                4, // column index
-                rusqlite::types::Type::Text,
-                Box::new(e)
-            ))?;
-        
-        let confirmation_method = row.get::<_, Option<String>>("confirmation_method")?
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4, // column index
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+
+        let confirmation_method = row
+            .get::<_, Option<String>>("confirmation_method")?
             .map(|s| serde_json::from_str(&s))
             .transpose()
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                5, // column index
-                rusqlite::types::Type::Text,
-                Box::new(e)
-            ))?;
-        
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5, // column index
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+
         // Parse band and mode
         let band_str: String = row.get("band")?;
-        let band = band_str.parse::<Band>()
-            .map_err(|_| rusqlite::Error::FromSqlConversionFailure(
+        let band = band_str.parse::<Band>().map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
                 6, // column index
                 rusqlite::types::Type::Text,
-                Box::new(DxError::Parse(format!("Invalid band: {}", band_str)))
-            ))?;
-        
-        let mode = row.get::<_, Option<String>>("mode")?
+                Box::new(DxError::Parse(format!("Invalid band: {}", band_str))),
+            )
+        })?;
+
+        let mode = row
+            .get::<_, Option<String>>("mode")?
             .map(|s| s.parse::<Mode>())
             .transpose()
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                7, // column index
-                rusqlite::types::Type::Text,
-                Box::new(DxError::Parse(e))
-            ))?;
-        
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7, // column index
+                    rusqlite::types::Type::Text,
+                    Box::new(DxError::Parse(e)),
+                )
+            })?;
+
         Ok(AwardEntry {
             entity_code: row.get::<_, i64>("entity_code")? as u16,
             band,
@@ -479,167 +549,179 @@ impl DxTracker {
             confirmation_method,
         })
     }
-    
+
     /// Check if entity/band/mode combination is needed
     pub async fn is_needed(&self, callsign: &str, band: Band, mode: &Mode) -> Result<bool> {
         // This would need DXCC lookup to get entity code from callsign
         // For now, return true as placeholder
         Ok(true)
     }
-    
+
     /// Get QSO statistics by entity
     pub async fn get_qso_statistics_by_entity(&self) -> Result<HashMap<u16, u32>> {
         let mut stmt = self.connection.prepare(
             "SELECT dxcc_entity, COUNT(*) as qso_count
              FROM qsos
-             GROUP BY dxcc_entity"
+             GROUP BY dxcc_entity",
         )?;
-        
+
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>("dxcc_entity")? as u16,
                 row.get::<_, i64>("qso_count")? as u32,
             ))
         })?;
-        
+
         let mut stats = HashMap::new();
         for row in rows {
             let (entity_code, count) = row?;
             stats.insert(entity_code, count);
         }
-        
+
         Ok(stats)
     }
-    
+
     /// Get QSO statistics by entity since a date
-    pub async fn get_qso_statistics_by_entity_since(&self, since: DateTime<Utc>) -> Result<HashMap<u16, u32>> {
+    pub async fn get_qso_statistics_by_entity_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<u16, u32>> {
         let mut stmt = self.connection.prepare(
             "SELECT dxcc_entity, COUNT(*) as qso_count
              FROM qsos
              WHERE datetime >= ?1
-             GROUP BY dxcc_entity"
+             GROUP BY dxcc_entity",
         )?;
-        
+
         let rows = stmt.query_map([since.to_rfc3339()], |row| {
             Ok((
                 row.get::<_, i64>("dxcc_entity")? as u16,
                 row.get::<_, i64>("qso_count")? as u32,
             ))
         })?;
-        
+
         let mut stats = HashMap::new();
         for row in rows {
             let (entity_code, count) = row?;
             stats.insert(entity_code, count);
         }
-        
+
         Ok(stats)
     }
-    
+
     /// Get QSO statistics by band for an entity
     pub async fn get_qso_statistics_by_band(&self, entity_code: u16) -> Result<HashMap<Band, u32>> {
         let mut stmt = self.connection.prepare(
             "SELECT band, COUNT(*) as qso_count
              FROM qsos
              WHERE dxcc_entity = ?1
-             GROUP BY band"
+             GROUP BY band",
         )?;
-        
+
         let rows = stmt.query_map([entity_code as i64], |row| {
             let band_str: String = row.get("band")?;
-            let band = band_str.parse::<Band>()
-                .map_err(|_| rusqlite::Error::FromSqlConversionFailure(
+            let band = band_str.parse::<Band>().map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
                     1, // column index
                     rusqlite::types::Type::Text,
-                    Box::new(DxError::Parse(format!("Invalid band: {}", band_str)))
-                ))?;
-            
+                    Box::new(DxError::Parse(format!("Invalid band: {}", band_str))),
+                )
+            })?;
+
             Ok((band, row.get::<_, i64>("qso_count")? as u32))
         })?;
-        
+
         let mut stats = HashMap::new();
         for row in rows {
             let (band, count) = row?;
             stats.insert(band, count);
         }
-        
+
         Ok(stats)
     }
-    
+
     /// Get QSO statistics by mode for an entity
     pub async fn get_qso_statistics_by_mode(&self, entity_code: u16) -> Result<HashMap<Mode, u32>> {
         let mut stmt = self.connection.prepare(
             "SELECT mode, COUNT(*) as qso_count
              FROM qsos
              WHERE dxcc_entity = ?1
-             GROUP BY mode"
+             GROUP BY mode",
         )?;
-        
+
         let rows = stmt.query_map([entity_code as i64], |row| {
             let mode_str: String = row.get("mode")?;
-            let mode: Mode = serde_json::from_str(&format!("\"{}\"", mode_str))
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+            let mode: Mode = serde_json::from_str(&format!("\"{}\"", mode_str)).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
                     2, // column index
                     rusqlite::types::Type::Text,
-                    Box::new(e)
-                ))?;
-            
+                    Box::new(e),
+                )
+            })?;
+
             Ok((mode, row.get::<_, i64>("qso_count")? as u32))
         })?;
-        
+
         let mut stats = HashMap::new();
         for row in rows {
             let (mode, count) = row?;
             stats.insert(mode, count);
         }
-        
+
         Ok(stats)
     }
-    
+
     /// Get last QSO date for an entity
     pub async fn get_last_qso_date(&self, entity_code: u16) -> Result<Option<DateTime<Utc>>> {
-        let result = self.connection.query_row(
-            "SELECT MAX(datetime) as last_qso
+        let result = self
+            .connection
+            .query_row(
+                "SELECT MAX(datetime) as last_qso
              FROM qsos
              WHERE dxcc_entity = ?1",
-            [entity_code as i64],
-            |row| {
-                let date_str: Option<String> = row.get("last_qso")?;
-                Ok(date_str)
-            }
-        ).optional()?;
-        
+                [entity_code as i64],
+                |row| {
+                    let date_str: Option<String> = row.get("last_qso")?;
+                    Ok(date_str)
+                },
+            )
+            .optional()?;
+
         match result {
             Some(Some(date_str)) => {
                 let parsed = DateTime::parse_from_rfc3339(&date_str)
                     .map_err(|e| DxError::Parse(format!("Invalid date format: {}", e)))?;
                 Ok(Some(parsed.with_timezone(&Utc)))
-            },
+            }
             _ => Ok(None),
         }
     }
-    
+
     /// Get award summary for DXCC
-    pub async fn get_dxcc_summary(&self, band: Option<Band>, mode: Option<Mode>) -> Result<AwardSummary> {
+    pub async fn get_dxcc_summary(
+        &self,
+        band: Option<Band>,
+        mode: Option<Mode>,
+    ) -> Result<AwardSummary> {
         let mut where_conditions = Vec::new();
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        
+
         if let Some(band) = band {
             where_conditions.push("band = ?");
             params.push(Box::new(band.to_string()));
         }
-        
+
         if let Some(mode) = mode {
             where_conditions.push("mode = ?");
             params.push(Box::new(mode.to_string()));
         }
-        
+
         let where_clause = if where_conditions.is_empty() {
             String::new()
         } else {
             format!(" WHERE {}", where_conditions.join(" AND "))
         };
-        
+
         let query = format!(
             "SELECT 
                 COUNT(CASE WHEN status = '\"Worked\"' OR status = '\"Confirmed\"' THEN 1 END) as worked_count,
@@ -647,30 +729,28 @@ impl DxTracker {
              FROM award_tracking{}",
             where_clause
         );
-        
+
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        
-        let (worked_count, confirmed_count) = self.connection.query_row(
-            &query,
-            param_refs.as_slice(),
-            |row| {
-                Ok((
-                    row.get::<_, i64>("worked_count")? as u32,
-                    row.get::<_, i64>("confirmed_count")? as u32,
-                ))
-            }
-        )?;
-        
+
+        let (worked_count, confirmed_count) =
+            self.connection
+                .query_row(&query, param_refs.as_slice(), |row| {
+                    Ok((
+                        row.get::<_, i64>("worked_count")? as u32,
+                        row.get::<_, i64>("confirmed_count")? as u32,
+                    ))
+                })?;
+
         // For DXCC, there are currently 340 entities
         let total_entities = 340u32;
-        
+
         let award_name = match (band, mode) {
             (Some(b), Some(m)) => format!("DXCC {} {}", b, m),
             (Some(b), None) => format!("DXCC {}", b),
             (None, Some(m)) => format!("DXCC {}", m),
             (None, None) => "DXCC Mixed".to_string(),
         };
-        
+
         Ok(AwardSummary {
             award_name,
             band,
@@ -691,24 +771,29 @@ impl DxTracker {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
-    
+
     async fn create_test_tracker() -> (DxTracker, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
-        let tracker = DxTracker::new(temp_file.path().to_str().unwrap()).await.unwrap();
+        let tracker = DxTracker::new(temp_file.path().to_str().unwrap())
+            .await
+            .unwrap();
         (tracker, temp_file)
     }
-    
+
     #[tokio::test]
     async fn test_tracker_creation() {
         let (tracker, _temp_file) = create_test_tracker().await;
-        let result: i64 = tracker.connection.query_row("SELECT 1", [], |row| row.get(0)).unwrap();
+        let result: i64 = tracker
+            .connection
+            .query_row("SELECT 1", [], |row| row.get(0))
+            .unwrap();
         assert_eq!(result, 1);
     }
-    
+
     #[tokio::test]
     async fn test_add_qso() {
         let (mut tracker, _temp_file) = create_test_tracker().await;
-        
+
         let qso = DxQso {
             id: None,
             callsign: "W1ABC".to_string(),
@@ -728,15 +813,15 @@ mod tests {
             contest_id: None,
             notes: None,
         };
-        
+
         let qso_id = tracker.add_qso(qso).await.unwrap();
         assert!(qso_id != Uuid::nil());
     }
-    
+
     #[tokio::test]
     async fn test_award_tracking() {
         let (mut tracker, _temp_file) = create_test_tracker().await;
-        
+
         let qso = DxQso {
             id: None,
             callsign: "JA1ABC".to_string(),
@@ -756,20 +841,23 @@ mod tests {
             contest_id: None,
             notes: None,
         };
-        
+
         tracker.add_qso(qso).await.unwrap();
-        
-        let entry = tracker.get_award_entry(61, Band::Band20m, Some(&Mode::CW)).await.unwrap();
+
+        let entry = tracker
+            .get_award_entry(61, Band::Band20m, Some(&Mode::CW))
+            .await
+            .unwrap();
         assert!(entry.is_some());
         let entry = entry.unwrap();
         assert_eq!(entry.status, AwardStatus::Confirmed);
         assert_eq!(entry.entity_code, 61);
     }
-    
+
     #[tokio::test]
     async fn test_qso_statistics() {
         let (mut tracker, _temp_file) = create_test_tracker().await;
-        
+
         // Add test QSOs
         for i in 0..5 {
             let qso = DxQso {
@@ -793,7 +881,7 @@ mod tests {
             };
             tracker.add_qso(qso).await.unwrap();
         }
-        
+
         let stats = tracker.get_qso_statistics_by_entity().await.unwrap();
         assert_eq!(stats.get(&6), Some(&5));
     }

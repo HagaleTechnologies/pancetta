@@ -20,7 +20,7 @@ use anyhow::Result;
 use pancetta_audio::{AudioManager, AudioManagerConfig};
 use pancetta_config::Config;
 use pancetta_dsp::DspPipeline;
-use pancetta_ft8::{Ft8Decoder, Ft8Config, Ft8Encoder, Ft8Modulator};
+use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +32,7 @@ use tokio::time::{interval, sleep};
 use tracing::{debug, error, info, span, warn, Level};
 use uuid::Uuid;
 
-use crate::message_bus::{MessageBus, ComponentMessage, ComponentId, MessageType};
+use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
 
 /// Application coordinator that manages all Pancetta components
 pub struct ApplicationCoordinator {
@@ -302,8 +302,9 @@ impl ApplicationCoordinator {
         info!("WAV playback mode: {}", wav_path.display());
 
         // Read WAV file
-        let reader = hound::WavReader::open(&wav_path)
-            .map_err(|e| anyhow::anyhow!("Failed to open WAV file {}: {}", wav_path.display(), e))?;
+        let reader = hound::WavReader::open(&wav_path).map_err(|e| {
+            anyhow::anyhow!("Failed to open WAV file {}: {}", wav_path.display(), e)
+        })?;
 
         let spec = reader.spec();
         info!(
@@ -431,18 +432,17 @@ impl ApplicationCoordinator {
         let (dsp_to_ft8_tx, dsp_to_ft8_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
         let (ft8_to_tui_tx, ft8_to_tui_rx) =
             crossbeam_channel::unbounded::<pancetta_ft8::DecodedMessage>();
-        let (waterfall_tx, waterfall_rx) =
-            crossbeam_channel::unbounded::<Vec<Vec<f32>>>();
+        let (waterfall_tx, waterfall_rx) = crossbeam_channel::unbounded::<Vec<Vec<f32>>>();
 
         // Also create message bus channels for control messages (hamlib, autonomous, etc.)
         let (_audio_bus_tx, _audio_bus_rx) =
             self.message_bus.create_channel(ComponentId::Audio).await?;
-        let (_dsp_bus_tx, _dsp_bus_rx) =
-            self.message_bus.create_channel(ComponentId::Dsp).await?;
-        let (_ft8_bus_tx, _ft8_bus_rx) =
-            self.message_bus.create_channel(ComponentId::Ft8Decoder).await?;
-        let (_tui_bus_tx, tui_bus_rx) =
-            self.message_bus.create_channel(ComponentId::Tui).await?;
+        let (_dsp_bus_tx, _dsp_bus_rx) = self.message_bus.create_channel(ComponentId::Dsp).await?;
+        let (_ft8_bus_tx, _ft8_bus_rx) = self
+            .message_bus
+            .create_channel(ComponentId::Ft8Decoder)
+            .await?;
+        let (_tui_bus_tx, tui_bus_rx) = self.message_bus.create_channel(ComponentId::Tui).await?;
 
         // --- Audio component ---
         self.start_audio_pipeline(audio_to_dsp_tx).await?;
@@ -514,8 +514,7 @@ impl ApplicationCoordinator {
             let handle = tokio::spawn(async move {
                 let mut phase = 0.0f32;
                 let frequency = 1500.0;
-                let buffer_duration_ms =
-                    (buffer_size as f64 * 1000.0 / sample_rate as f64) as u64;
+                let buffer_duration_ms = (buffer_size as f64 * 1000.0 / sample_rate as f64) as u64;
                 let mut process_interval =
                     interval(Duration::from_millis(buffer_duration_ms.max(5)));
 
@@ -688,8 +687,7 @@ impl ApplicationCoordinator {
                         ft8_buffer.extend_from_slice(&processed_samples);
 
                         while ft8_buffer.len() >= FT8_WINDOW_SIZE {
-                            let window: Vec<f32> =
-                                ft8_buffer.drain(..FT8_WINDOW_SIZE).collect();
+                            let window: Vec<f32> = ft8_buffer.drain(..FT8_WINDOW_SIZE).collect();
                             if dsp_to_ft8_tx.send(window).is_err() {
                                 return;
                             }
@@ -745,15 +743,19 @@ impl ApplicationCoordinator {
                                     // Normalize power_matrix to 0..1 range as Vec<Vec<f32>>
                                     let range = wf.max_power - wf.min_power;
                                     let rows: Vec<Vec<f32>> = if range > 0.0 {
-                                        wf.power_matrix.iter().map(|row| {
-                                            row.iter().map(|&p| {
-                                                ((p - wf.min_power) / range) as f32
-                                            }).collect()
-                                        }).collect()
+                                        wf.power_matrix
+                                            .iter()
+                                            .map(|row| {
+                                                row.iter()
+                                                    .map(|&p| ((p - wf.min_power) / range) as f32)
+                                                    .collect()
+                                            })
+                                            .collect()
                                     } else {
-                                        wf.power_matrix.iter().map(|row| {
-                                            vec![0.0f32; row.len()]
-                                        }).collect()
+                                        wf.power_matrix
+                                            .iter()
+                                            .map(|row| vec![0.0f32; row.len()])
+                                            .collect()
                                     };
                                     let _ = waterfall_tx.send(rows);
                                 }
@@ -833,7 +835,8 @@ impl ApplicationCoordinator {
             Ok(())
         });
 
-        self.named_task_handles.push((ComponentId::Ft8Decoder, handle));
+        self.named_task_handles
+            .push((ComponentId::Ft8Decoder, handle));
         info!("FT8 component started");
         Ok(())
     }
@@ -854,8 +857,10 @@ impl ApplicationCoordinator {
         let shutdown = self.shutdown_signal.clone();
 
         // Create TUI message/command channels for the TuiRunner
-        let (tui_msg_tx, tui_msg_rx) = crossbeam_channel::unbounded::<pancetta_tui::tui_runner::TuiMessage>();
-        let (tui_cmd_tx, tui_cmd_rx) = crossbeam_channel::unbounded::<pancetta_tui::tui_runner::TuiCommand>();
+        let (tui_msg_tx, tui_msg_rx) =
+            crossbeam_channel::unbounded::<pancetta_tui::tui_runner::TuiMessage>();
+        let (tui_cmd_tx, tui_cmd_rx) =
+            crossbeam_channel::unbounded::<pancetta_tui::tui_runner::TuiCommand>();
 
         // Task: relay decoded messages from point-to-point channel into TuiMessage channel
         let relay_shutdown = shutdown.clone();
@@ -940,16 +945,16 @@ impl ApplicationCoordinator {
                 // Relay waterfall data from FT8 decoder to TUI
                 match waterfall_rx.try_recv() {
                     Ok(rows) => {
-                        let _ = tui_msg_tx_relay.send(
-                            pancetta_tui::tui_runner::TuiMessage::WaterfallUpdate { rows },
-                        );
+                        let _ = tui_msg_tx_relay
+                            .send(pancetta_tui::tui_runner::TuiMessage::WaterfallUpdate { rows });
                     }
                     Err(_) => {}
                 }
             }
             Ok(())
         });
-        self.named_task_handles.push((ComponentId::Tui, relay_handle));
+        self.named_task_handles
+            .push((ComponentId::Tui, relay_handle));
 
         // Task: relay TUI commands (e.g. SendMessage) to message bus as TransmitRequests
         let cmd_shutdown = self.shutdown_signal.clone();
@@ -957,44 +962,45 @@ impl ApplicationCoordinator {
         let cmd_handle = tokio::spawn(async move {
             while !cmd_shutdown.load(Ordering::Relaxed) {
                 match tui_cmd_rx.try_recv() {
-                    Ok(cmd) => {
-                        match cmd {
-                            pancetta_tui::tui_runner::TuiCommand::SendMessage { text } => {
-                                info!("TUI SendMessage: '{}'", text);
-                                let msg = ComponentMessage::new(
-                                    ComponentId::Tui,
-                                    ComponentId::Ft8Transmitter,
-                                    MessageType::TransmitRequest {
-                                        message_text: text,
-                                        frequency_offset: 1500.0,
-                                        qso_id: None,
-                                    },
-                                    Instant::now(),
-                                );
-                                if let Err(e) = cmd_message_bus.send_message(msg).await {
-                                    warn!("Failed to forward TUI command: {}", e);
-                                }
-                            }
-                            pancetta_tui::tui_runner::TuiCommand::CallStation { callsign, frequency } => {
-                                info!("TUI CallStation: {} at {} Hz", callsign, frequency);
-                                let msg = ComponentMessage::new(
-                                    ComponentId::Tui,
-                                    ComponentId::Qso,
-                                    MessageType::QsoMessage(crate::message_bus::QsoMessage::StartQso {
-                                        callsign,
-                                        frequency,
-                                    }),
-                                    Instant::now(),
-                                );
-                                if let Err(e) = cmd_message_bus.send_message(msg).await {
-                                    warn!("Failed to forward CallStation command: {}", e);
-                                }
-                            }
-                            _ => {
-                                debug!("Unhandled TUI command: {:?}", cmd);
+                    Ok(cmd) => match cmd {
+                        pancetta_tui::tui_runner::TuiCommand::SendMessage { text } => {
+                            info!("TUI SendMessage: '{}'", text);
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Ft8Transmitter,
+                                MessageType::TransmitRequest {
+                                    message_text: text,
+                                    frequency_offset: 1500.0,
+                                    qso_id: None,
+                                },
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to forward TUI command: {}", e);
                             }
                         }
-                    }
+                        pancetta_tui::tui_runner::TuiCommand::CallStation {
+                            callsign,
+                            frequency,
+                        } => {
+                            info!("TUI CallStation: {} at {} Hz", callsign, frequency);
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Qso,
+                                MessageType::QsoMessage(crate::message_bus::QsoMessage::StartQso {
+                                    callsign,
+                                    frequency,
+                                }),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to forward CallStation command: {}", e);
+                            }
+                        }
+                        _ => {
+                            debug!("Unhandled TUI command: {:?}", cmd);
+                        }
+                    },
                     Err(crossbeam_channel::TryRecvError::Empty) => {
                         tokio::task::yield_now().await;
                     }
@@ -1051,10 +1057,7 @@ impl ApplicationCoordinator {
             let rt = tokio::runtime::Handle::current();
             rt.block_on(async {
                 pancetta_tui::tui_runner::run_tui_with_message_bus(
-                    tui_config,
-                    tui_msg_rx,
-                    tui_cmd_tx,
-                    shutdown,
+                    tui_config, tui_msg_rx, tui_cmd_tx, shutdown,
                 )
                 .await
             })
@@ -1068,7 +1071,8 @@ impl ApplicationCoordinator {
                 Err(e) => Err(anyhow::anyhow!("TUI task panicked: {}", e)),
             }
         });
-        self.named_task_handles.push((ComponentId::Tui, tui_wrapper));
+        self.named_task_handles
+            .push((ComponentId::Tui, tui_wrapper));
 
         info!("TUI component started");
         Ok(())
@@ -1086,8 +1090,8 @@ impl ApplicationCoordinator {
         {
             use metrics_exporter_prometheus::PrometheusBuilder;
 
-            let builder = PrometheusBuilder::new()
-                .with_http_listener(([0, 0, 0, 0], self.metrics_port));
+            let builder =
+                PrometheusBuilder::new().with_http_listener(([0, 0, 0, 0], self.metrics_port));
 
             builder
                 .install()
@@ -1123,8 +1127,8 @@ impl ApplicationCoordinator {
                     Box::new(pancetta_hamlib::MockRig::default())
                 } else {
                     info!("Using rigctld client");
-                    let host = std::env::var("RIGCTLD_HOST")
-                        .unwrap_or_else(|_| "127.0.0.1".to_string());
+                    let host =
+                        std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
                     let port = std::env::var("RIGCTLD_PORT")
                         .ok()
                         .and_then(|p| p.parse::<u16>().ok())
@@ -1187,8 +1191,7 @@ impl ApplicationCoordinator {
                 // force it off to prevent accidental continuous transmission
                 // (e.g. if the TX pipeline crashes mid-transmission).
                 const PTT_SAFETY_TIMEOUT_SECS: u64 = 30;
-                let ptt_on_since: Arc<RwLock<Option<Instant>>> =
-                    Arc::new(RwLock::new(None));
+                let ptt_on_since: Arc<RwLock<Option<Instant>>> = Arc::new(RwLock::new(None));
 
                 // Spawn the PTT watchdog as a background task
                 let rig_for_watchdog = Arc::clone(&rig_poll);
@@ -1298,7 +1301,8 @@ impl ApplicationCoordinator {
             })
         };
 
-        self.named_task_handles.push((ComponentId::Hamlib, hamlib_handle));
+        self.named_task_handles
+            .push((ComponentId::Hamlib, hamlib_handle));
         info!("Hamlib component started");
         Ok(())
     }
@@ -1330,7 +1334,7 @@ impl ApplicationCoordinator {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                use pancetta_qso::{QsoManager, QsoManagerConfig, QsoLogger, LoggerConfig};
+                use pancetta_qso::{LoggerConfig, QsoLogger, QsoManager, QsoManagerConfig};
 
                 let qso_config = QsoManagerConfig {
                     our_callsign: our_callsign.clone(),
@@ -1363,12 +1367,18 @@ impl ApplicationCoordinator {
                         Some(l)
                     }
                     Err(e) => {
-                        warn!("Failed to initialize QSO logger (continuing without): {}", e);
+                        warn!(
+                            "Failed to initialize QSO logger (continuing without): {}",
+                            e
+                        );
                         None
                     }
                 };
 
-                info!("QSO component ready (callsign={}, grid={:?})", our_callsign, our_grid);
+                info!(
+                    "QSO component ready (callsign={}, grid={:?})",
+                    our_callsign, our_grid
+                );
 
                 while !shutdown.load(Ordering::Relaxed) {
                     match qso_rx.try_recv() {
@@ -1381,19 +1391,28 @@ impl ApplicationCoordinator {
                                     let snr = decoded_msg.snr_db as f32;
 
                                     // Parse the FT8 message to determine its type
-                                    match pancetta_qso::utils::parse_ft8_message(&raw_text, &our_callsign) {
+                                    match pancetta_qso::utils::parse_ft8_message(
+                                        &raw_text,
+                                        &our_callsign,
+                                    ) {
                                         Ok(msg_type) => {
-                                            if let Err(e) = qso_manager.process_message(
-                                                msg_type,
-                                                raw_text.clone(),
-                                                frequency,
-                                                Some(snr),
-                                            ).await {
+                                            if let Err(e) = qso_manager
+                                                .process_message(
+                                                    msg_type,
+                                                    raw_text.clone(),
+                                                    frequency,
+                                                    Some(snr),
+                                                )
+                                                .await
+                                            {
                                                 debug!("QSO process_message error: {}", e);
                                             }
                                         }
                                         Err(e) => {
-                                            debug!("Could not parse FT8 message '{}': {}", raw_text, e);
+                                            debug!(
+                                                "Could not parse FT8 message '{}': {}",
+                                                raw_text, e
+                                            );
                                         }
                                     }
                                 }
@@ -1405,16 +1424,26 @@ impl ApplicationCoordinator {
                                             callsign,
                                             frequency,
                                         } => {
-                                            info!("Starting QSO with {} on {} Hz", callsign, frequency);
-                                            match qso_manager.respond_to_cq(
-                                                callsign.clone(),
-                                                frequency as f64,
-                                            ).await {
+                                            info!(
+                                                "Starting QSO with {} on {} Hz",
+                                                callsign, frequency
+                                            );
+                                            match qso_manager
+                                                .respond_to_cq(callsign.clone(), frequency as f64)
+                                                .await
+                                            {
                                                 Ok(qso_id) => {
-                                                    info!("QSO started with {}: {}", callsign, qso_id);
+                                                    info!(
+                                                        "QSO started with {}: {}",
+                                                        callsign, qso_id
+                                                    );
                                                     // Send grid reply as TX request
-                                                    let grid = our_grid.as_deref().unwrap_or("AA00");
-                                                    let reply = format!("{} {} {}", callsign, our_callsign, grid);
+                                                    let grid =
+                                                        our_grid.as_deref().unwrap_or("AA00");
+                                                    let reply = format!(
+                                                        "{} {} {}",
+                                                        callsign, our_callsign, grid
+                                                    );
                                                     let tx_msg = ComponentMessage::new(
                                                         ComponentId::Qso,
                                                         ComponentId::Ft8Transmitter,
@@ -1425,12 +1454,20 @@ impl ApplicationCoordinator {
                                                         },
                                                         Instant::now(),
                                                     );
-                                                    if let Err(e) = message_bus.send_message(tx_msg).await {
-                                                        warn!("Failed to send QSO TX request: {}", e);
+                                                    if let Err(e) =
+                                                        message_bus.send_message(tx_msg).await
+                                                    {
+                                                        warn!(
+                                                            "Failed to send QSO TX request: {}",
+                                                            e
+                                                        );
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    warn!("Failed to start QSO with {}: {}", callsign, e);
+                                                    warn!(
+                                                        "Failed to start QSO with {}: {}",
+                                                        callsign, e
+                                                    );
                                                 }
                                             }
                                         }
@@ -1468,24 +1505,39 @@ impl ApplicationCoordinator {
             info!("DX cluster disabled in configuration");
             drop(config);
             // Still create channel so message bus doesn't complain
-            let _ = self.message_bus.create_channel(ComponentId::DxCluster).await?;
+            let _ = self
+                .message_bus
+                .create_channel(ComponentId::DxCluster)
+                .await?;
             return Ok(());
         }
 
-        let cluster_hostname = config.network.dx_cluster.servers
+        let cluster_hostname = config
+            .network
+            .dx_cluster
+            .servers
             .first()
             .map(|s| s.hostname.clone())
             .unwrap_or_else(|| "dxc.nc7j.com".to_string());
-        let cluster_port = config.network.dx_cluster.servers
+        let cluster_port = config
+            .network
+            .dx_cluster
+            .servers
             .first()
             .map(|s| s.port)
             .unwrap_or(23);
         let our_callsign = config.station.callsign.clone();
         drop(config);
 
-        info!("Starting DX cluster component ({}:{})", cluster_hostname, cluster_port);
+        info!(
+            "Starting DX cluster component ({}:{})",
+            cluster_hostname, cluster_port
+        );
 
-        let (_dx_tx, _dx_rx) = self.message_bus.create_channel(ComponentId::DxCluster).await?;
+        let (_dx_tx, _dx_rx) = self
+            .message_bus
+            .create_channel(ComponentId::DxCluster)
+            .await?;
         let message_bus = self.message_bus.clone();
 
         let dx_handle = {
@@ -1510,19 +1562,26 @@ impl ApplicationCoordinator {
                             match tokio::time::timeout(
                                 Duration::from_secs(5),
                                 client.receive_spot(),
-                            ).await {
+                            )
+                            .await
+                            {
                                 Ok(Some(spot)) => {
-                                    debug!("DX spot: {} on {} Hz by {}", spot.callsign, spot.frequency, spot.spotter);
+                                    debug!(
+                                        "DX spot: {} on {} Hz by {}",
+                                        spot.callsign, spot.frequency, spot.spotter
+                                    );
 
                                     let msg = ComponentMessage::new(
                                         ComponentId::DxCluster,
                                         ComponentId::Tui,
-                                        MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
-                                            callsign: spot.callsign,
-                                            frequency: spot.frequency,
-                                            spotter: spot.spotter,
-                                            comment: spot.comment.unwrap_or_default(),
-                                        }),
+                                        MessageType::DxMessage(
+                                            crate::message_bus::DxMessage::Spot {
+                                                callsign: spot.callsign,
+                                                frequency: spot.frequency,
+                                                spotter: spot.spotter,
+                                                comment: spot.comment.unwrap_or_default(),
+                                            },
+                                        ),
                                         Instant::now(),
                                     );
                                     if let Err(e) = message_bus.send_message(msg).await {
@@ -1549,7 +1608,8 @@ impl ApplicationCoordinator {
             })
         };
 
-        self.named_task_handles.push((ComponentId::DxCluster, dx_handle));
+        self.named_task_handles
+            .push((ComponentId::DxCluster, dx_handle));
         info!("DX cluster component started");
         Ok(())
     }
@@ -1563,14 +1623,21 @@ impl ApplicationCoordinator {
         if !config.network.psk_reporter.enabled {
             info!("PSKReporter upload disabled in configuration");
             drop(config);
-            let _ = self.message_bus.create_channel(ComponentId::PskReporter).await?;
+            let _ = self
+                .message_bus
+                .create_channel(ComponentId::PskReporter)
+                .await?;
             return Ok(());
         }
 
         let our_callsign = config.station.callsign.clone();
         let our_grid = config.station.grid_square.clone();
         let upload_interval = config.network.psk_reporter.upload_interval_seconds;
-        let antenna = config.network.psk_reporter.reporter_info.antenna_info
+        let antenna = config
+            .network
+            .psk_reporter
+            .reporter_info
+            .antenna_info
             .clone()
             .unwrap_or_default();
         let software = format!(
@@ -1580,16 +1647,22 @@ impl ApplicationCoordinator {
         );
         drop(config);
 
-        info!("Starting PSKReporter upload component (interval: {}s)", upload_interval);
+        info!(
+            "Starting PSKReporter upload component (interval: {}s)",
+            upload_interval
+        );
 
-        let (_psk_tx, psk_rx) = self.message_bus.create_channel(ComponentId::PskReporter).await?;
+        let (_psk_tx, psk_rx) = self
+            .message_bus
+            .create_channel(ComponentId::PskReporter)
+            .await?;
 
         let psk_handle = {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
                 use pancetta_dx::pskreporter::{
-                    PskReporterUploader, PskReporterUploadConfig, ReceptionReport,
+                    PskReporterUploadConfig, PskReporterUploader, ReceptionReport,
                 };
 
                 let upload_config = PskReporterUploadConfig {
@@ -1609,11 +1682,14 @@ impl ApplicationCoordinator {
                     loop {
                         match psk_rx.try_recv() {
                             Ok(message) => {
-                                if let MessageType::DecodedMessage(ref decoded_msg) = message.message_type {
+                                if let MessageType::DecodedMessage(ref decoded_msg) =
+                                    message.message_type
+                                {
                                     let timestamp = std::time::SystemTime::now()
                                         .duration_since(std::time::UNIX_EPOCH)
                                         .unwrap_or_default()
-                                        .as_secs() as i64;
+                                        .as_secs()
+                                        as i64;
 
                                     if let Some(ref callsign) = decoded_msg.message.from_callsign {
                                         uploader.add_report(ReceptionReport {
@@ -1667,7 +1743,8 @@ impl ApplicationCoordinator {
             })
         };
 
-        self.named_task_handles.push((ComponentId::PskReporter, psk_handle));
+        self.named_task_handles
+            .push((ComponentId::PskReporter, psk_handle));
         info!("PSKReporter component started");
         Ok(())
     }
@@ -1679,7 +1756,8 @@ impl ApplicationCoordinator {
 
         info!("Starting FT8 transmitter component");
 
-        let (_tx_sender, tx_rx) = self.message_bus
+        let (_tx_sender, tx_rx) = self
+            .message_bus
             .create_channel(ComponentId::Ft8Transmitter)
             .await?;
         let message_bus = self.message_bus.clone();
@@ -1730,7 +1808,10 @@ impl ApplicationCoordinator {
                                 };
 
                                 if slot_wait.as_millis() > 100 {
-                                    info!("Waiting {:.1}s for next TX slot boundary", slot_wait.as_secs_f64());
+                                    info!(
+                                        "Waiting {:.1}s for next TX slot boundary",
+                                        slot_wait.as_secs_f64()
+                                    );
                                     sleep(slot_wait).await;
                                 }
 
@@ -1739,7 +1820,9 @@ impl ApplicationCoordinator {
                                     ComponentId::Ft8Transmitter,
                                     ComponentId::Hamlib,
                                     MessageType::RigControl(
-                                        crate::message_bus::RigControlMessage::SetPtt { state: true },
+                                        crate::message_bus::RigControlMessage::SetPtt {
+                                            state: true,
+                                        },
                                     ),
                                     Instant::now(),
                                 );
@@ -1752,12 +1835,17 @@ impl ApplicationCoordinator {
                                 let encode_result = encoder.encode_message(&message_text, None);
                                 let (success, duration_ms) = match encode_result {
                                     Ok(symbols) => {
-                                        match modulator.modulate_symbols(&symbols, frequency_offset) {
+                                        match modulator.modulate_symbols(&symbols, frequency_offset)
+                                        {
                                             Ok(samples) => {
-                                                let duration = (samples.len() as f64 / 12000.0 * 1000.0) as u64;
+                                                let duration = (samples.len() as f64 / 12000.0
+                                                    * 1000.0)
+                                                    as u64;
                                                 info!(
                                                     "TX: '{}' → {} samples ({:.1}s)",
-                                                    message_text, samples.len(), duration as f64 / 1000.0
+                                                    message_text,
+                                                    samples.len(),
+                                                    duration as f64 / 1000.0
                                                 );
 
                                                 // --- Step 4: Route audio to output ---
@@ -1770,7 +1858,9 @@ impl ApplicationCoordinator {
                                                     },
                                                     Instant::now(),
                                                 );
-                                                if let Err(e) = message_bus.send_message(audio_msg).await {
+                                                if let Err(e) =
+                                                    message_bus.send_message(audio_msg).await
+                                                {
                                                     debug!("Audio output routing: {}", e);
                                                 }
 
@@ -1778,7 +1868,10 @@ impl ApplicationCoordinator {
                                                 (true, duration)
                                             }
                                             Err(e) => {
-                                                warn!("Modulation failed for '{}': {}", message_text, e);
+                                                warn!(
+                                                    "Modulation failed for '{}': {}",
+                                                    message_text, e
+                                                );
                                                 (false, 0)
                                             }
                                         }
@@ -1794,7 +1887,9 @@ impl ApplicationCoordinator {
                                     ComponentId::Ft8Transmitter,
                                     ComponentId::Hamlib,
                                     MessageType::RigControl(
-                                        crate::message_bus::RigControlMessage::SetPtt { state: false },
+                                        crate::message_bus::RigControlMessage::SetPtt {
+                                            state: false,
+                                        },
                                     ),
                                     Instant::now(),
                                 );
@@ -1830,7 +1925,8 @@ impl ApplicationCoordinator {
             })
         };
 
-        self.named_task_handles.push((ComponentId::Ft8Transmitter, tx_handle));
+        self.named_task_handles
+            .push((ComponentId::Ft8Transmitter, tx_handle));
         info!("FT8 transmitter component started");
         Ok(())
     }
@@ -1846,7 +1942,8 @@ impl ApplicationCoordinator {
         if !auto_config_enabled {
             info!("Autonomous operator disabled in configuration");
             drop(config);
-            let _ = self.message_bus
+            let _ = self
+                .message_bus
                 .create_channel(ComponentId::Autonomous)
                 .await?;
             return Ok(());
@@ -1910,7 +2007,8 @@ impl ApplicationCoordinator {
         let evaluator: std::sync::Arc<dyn pancetta_qso::DxEvaluator> =
             std::sync::Arc::new(pancetta_qso::NullDxEvaluator);
 
-        let (_auto_tx, auto_rx) = self.message_bus
+        let (_auto_tx, auto_rx) = self
+            .message_bus
             .create_channel(ComponentId::Autonomous)
             .await?;
         let message_bus = self.message_bus.clone();
@@ -2037,7 +2135,8 @@ impl ApplicationCoordinator {
             })
         };
 
-        self.named_task_handles.push((ComponentId::Autonomous, auto_handle));
+        self.named_task_handles
+            .push((ComponentId::Autonomous, auto_handle));
         info!("Autonomous operator component started");
         Ok(())
     }
@@ -2232,10 +2331,7 @@ impl ApplicationCoordinator {
                     );
                 }
                 ComponentCriticality::NonCritical => {
-                    warn!(
-                        "Component {} has stopped: {}",
-                        component_id, degradation
-                    );
+                    warn!("Component {} has stopped: {}", component_id, degradation);
                 }
             }
 
@@ -2321,10 +2417,16 @@ impl ApplicationCoordinator {
                     debug!("Task {} ({}) completed successfully", index, component_id);
                 }
                 Ok(Err(e)) => {
-                    warn!("Task {} ({}) completed with error: {}", index, component_id, e);
+                    warn!(
+                        "Task {} ({}) completed with error: {}",
+                        index, component_id, e
+                    );
                 }
                 Err(_) => {
-                    warn!("Task {} ({}) timed out during shutdown", index, component_id);
+                    warn!(
+                        "Task {} ({}) timed out during shutdown",
+                        index, component_id
+                    );
                 }
             }
         }
@@ -2382,13 +2484,10 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let coordinator = ApplicationCoordinator::new(
-            config,
-            None,
-            true,  // no_audio
+            config, None, true,  // no_audio
             true,  // headless
             false, // metrics
-            9090,
-            None, // no WAV
+            9090, None, // no WAV
             shutdown,
         )
         .await;
@@ -2427,7 +2526,10 @@ mod tests {
             .join("../pancetta-ft8/tests/fixtures/wav/wsjt/210703_133430.wav");
 
         if !wav_path.exists() {
-            eprintln!("Skipping WAV playback test: fixture not found at {:?}", wav_path);
+            eprintln!(
+                "Skipping WAV playback test: fixture not found at {:?}",
+                wav_path
+            );
             return;
         }
 
@@ -2449,6 +2551,10 @@ mod tests {
 
         // run_wav_playback exits after decoding — should not error
         let result = coordinator.run().await;
-        assert!(result.is_ok(), "WAV playback should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "WAV playback should succeed: {:?}",
+            result.err()
+        );
     }
 }

@@ -1,6 +1,5 @@
 use rubato::{
-    Resampler, SincFixedIn, 
-    SincInterpolationParameters, SincInterpolationType, WindowFunction
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 use std::collections::VecDeque;
 use thiserror::Error;
@@ -43,21 +42,24 @@ pub struct AudioResampler {
 
 impl AudioResampler {
     /// Create a new high-quality resampler
-    /// 
+    ///
     /// # Arguments
     /// * `input_rate` - Input sample rate in Hz
     /// * `output_rate` - Output sample rate in Hz
     /// * `chunk_size` - Input chunk size for processing
-    /// 
+    ///
     /// # Returns
     /// A new AudioResampler instance optimized for the given rates
     pub fn new(input_rate: f32, output_rate: f32, chunk_size: usize) -> Result<Self> {
         if input_rate <= 0.0 || output_rate <= 0.0 {
-            return Err(ResamplerError::InvalidSampleRate { input_rate, output_rate });
+            return Err(ResamplerError::InvalidSampleRate {
+                input_rate,
+                output_rate,
+            });
         }
 
         let ratio = output_rate as f64 / input_rate as f64;
-        
+
         debug!(
             "Creating resampler: {}Hz -> {}Hz (ratio: {:.6}), chunk_size: {}",
             input_rate, output_rate, ratio, chunk_size
@@ -65,8 +67,8 @@ impl AudioResampler {
 
         // Configure SINC interpolation parameters for high quality
         let params = SincInterpolationParameters {
-            sinc_len: 256,           // High quality, more taps
-            f_cutoff: 0.95,          // Preserve most of the frequency content
+            sinc_len: 256,  // High quality, more taps
+            f_cutoff: 0.95, // Preserve most of the frequency content
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 256, // High oversampling for quality
             window: WindowFunction::BlackmanHarris2, // Excellent stopband attenuation
@@ -79,8 +81,9 @@ impl AudioResampler {
             params,
             chunk_size,
             1, // Mono channel
-        ).map_err(|e| ResamplerError::InitializationFailed { 
-            message: format!("SincFixedIn creation failed: {}", e) 
+        )
+        .map_err(|e| ResamplerError::InitializationFailed {
+            message: format!("SincFixedIn creation failed: {}", e),
         })?;
 
         let input_chunk_size = resampler.input_frames_next();
@@ -88,7 +91,9 @@ impl AudioResampler {
 
         debug!(
             "Resampler configured: input_chunk={}, output_chunk={}, delay={}",
-            input_chunk_size, output_chunk_size, resampler.output_delay()
+            input_chunk_size,
+            output_chunk_size,
+            resampler.output_delay()
         );
 
         Ok(Self {
@@ -117,11 +122,11 @@ impl AudioResampler {
     }
 
     /// Process audio samples through the resampler
-    /// 
+    ///
     /// # Arguments
     /// * `input` - Input audio samples
     /// * `output` - Output buffer for resampled audio
-    /// 
+    ///
     /// # Returns
     /// Number of output samples produced
     pub fn process(&mut self, input: &[f32], output: &mut Vec<f32>) -> Result<usize> {
@@ -141,10 +146,11 @@ impl AudioResampler {
             }
 
             // Resample the chunk
-            let output_chunk = self.resampler.process(&input_chunk, None)
-                .map_err(|e| ResamplerError::ProcessingFailed { 
-                    message: format!("Resampling failed: {}", e) 
-                })?;
+            let output_chunk = self.resampler.process(&input_chunk, None).map_err(|e| {
+                ResamplerError::ProcessingFailed {
+                    message: format!("Resampling failed: {}", e),
+                }
+            })?;
 
             // Add output samples to buffer
             self.output_buffer.extend(output_chunk[0].iter());
@@ -153,7 +159,7 @@ impl AudioResampler {
         // Extract available output samples
         let available_output = self.output_buffer.len();
         let initial_output_len = output.len();
-        
+
         for _ in 0..available_output {
             if let Some(sample) = self.output_buffer.pop_front() {
                 output.push(sample);
@@ -163,7 +169,10 @@ impl AudioResampler {
 
         debug!(
             "Resampled {} input samples -> {} output samples (buffer: in={}, out={})",
-            input.len(), total_output, self.input_buffer.len(), self.output_buffer.len()
+            input.len(),
+            total_output,
+            self.input_buffer.len(),
+            self.output_buffer.len()
         );
 
         Ok(total_output)
@@ -178,7 +187,7 @@ impl AudioResampler {
         // If we don't have enough output samples, return what we have
         if output.len() >= output_size {
             output.truncate(output_size);
-            
+
             // Put remainder back in buffer
             if output.len() < output.len() {
                 let remainder: Vec<f32> = output.drain(output_size..).collect();
@@ -211,10 +220,11 @@ impl AudioResampler {
                 }
             }
 
-            let output_chunk = self.resampler.process(&input_chunk, None)
-                .map_err(|e| ResamplerError::ProcessingFailed { 
-                    message: format!("Final resampling failed: {}", e) 
-                })?;
+            let output_chunk = self.resampler.process(&input_chunk, None).map_err(|e| {
+                ResamplerError::ProcessingFailed {
+                    message: format!("Final resampling failed: {}", e),
+                }
+            })?;
 
             self.output_buffer.extend(output_chunk[0].iter());
         }
@@ -310,7 +320,7 @@ mod tests {
     fn test_ft8_resampler_creation() {
         let resampler = AudioResampler::new_ft8_optimized();
         assert!(resampler.is_ok());
-        
+
         let resampler = resampler.unwrap();
         assert_eq!(resampler.input_rate(), 48000.0);
         assert_eq!(resampler.output_rate(), 12000.0);

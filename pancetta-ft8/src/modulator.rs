@@ -7,11 +7,11 @@
 //! - Real-time audio generation with precise timing
 
 use crate::{
-    Ft8Error, Ft8Result, SAMPLE_RATE, SYMBOL_DURATION, MESSAGE_DURATION, 
-    BASE_FREQUENCY, TONE_SPACING, NUM_SYMBOLS, NUM_TONES
+    Ft8Error, Ft8Result, BASE_FREQUENCY, MESSAGE_DURATION, NUM_SYMBOLS, NUM_TONES, SAMPLE_RATE,
+    SYMBOL_DURATION, TONE_SPACING,
 };
-use std::f64::consts::PI;
 use serde::{Deserialize, Serialize};
+use std::f64::consts::PI;
 
 /// Number of samples per FT8 symbol
 pub const SAMPLES_PER_SYMBOL: usize = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
@@ -77,30 +77,39 @@ impl Ft8Modulator {
     }
 
     /// Create a new FT8 modulator with specific pulse shaping
-    pub fn with_pulse_shape(sample_rate: u32, base_frequency: f64, tx_power: f64, pulse_shape: PulseShape) -> Ft8Result<Self> {
+    pub fn with_pulse_shape(
+        sample_rate: u32,
+        base_frequency: f64,
+        tx_power: f64,
+        pulse_shape: PulseShape,
+    ) -> Ft8Result<Self> {
         if sample_rate == 0 || sample_rate > 192_000 {
-            return Err(Ft8Error::ConfigError(
-                format!("Invalid sample rate: {} Hz", sample_rate)
-            ));
+            return Err(Ft8Error::ConfigError(format!(
+                "Invalid sample rate: {} Hz",
+                sample_rate
+            )));
         }
 
         if base_frequency < 200.0 || base_frequency > 4000.0 {
-            return Err(Ft8Error::ConfigError(
-                format!("Base frequency {} Hz out of range (200-4000 Hz)", base_frequency)
-            ));
+            return Err(Ft8Error::ConfigError(format!(
+                "Base frequency {} Hz out of range (200-4000 Hz)",
+                base_frequency
+            )));
         }
 
         if tx_power < 0.0 || tx_power > 1.0 {
-            return Err(Ft8Error::ConfigError(
-                format!("TX power {} out of range (0.0-1.0)", tx_power)
-            ));
+            return Err(Ft8Error::ConfigError(format!(
+                "TX power {} out of range (0.0-1.0)",
+                tx_power
+            )));
         }
 
         if let PulseShape::Gaussian { bt } = pulse_shape {
             if bt <= 0.0 || bt > 10.0 {
-                return Err(Ft8Error::ConfigError(
-                    format!("BT product {} out of range (0.0-10.0)", bt)
-                ));
+                return Err(Ft8Error::ConfigError(format!(
+                    "BT product {} out of range (0.0-10.0)",
+                    bt
+                )));
             }
         }
 
@@ -122,7 +131,12 @@ impl Ft8Modulator {
 
     /// Create modulator with rectangular pulse shaping (pure CPFSK)
     pub fn new_rectangular() -> Ft8Result<Self> {
-        Self::with_pulse_shape(SAMPLE_RATE, BASE_FREQUENCY, DEFAULT_TX_POWER, PulseShape::Rectangular)
+        Self::with_pulse_shape(
+            SAMPLE_RATE,
+            BASE_FREQUENCY,
+            DEFAULT_TX_POWER,
+            PulseShape::Rectangular,
+        )
     }
 
     /// Generate complete FT8 transmission audio samples
@@ -133,18 +147,26 @@ impl Ft8Modulator {
     ///
     /// # Returns
     /// Vector of audio samples ready for transmission
-    pub fn modulate_symbols(&mut self, symbols: &[u8; NUM_SYMBOLS], frequency_offset: f64) -> Ft8Result<Vec<f32>> {
+    pub fn modulate_symbols(
+        &mut self,
+        symbols: &[u8; NUM_SYMBOLS],
+        frequency_offset: f64,
+    ) -> Ft8Result<Vec<f32>> {
         if symbols.iter().any(|&s| s >= NUM_TONES as u8) {
             return Err(Ft8Error::SignalProcessingError(
-                "Invalid symbol value (must be 0-7)".to_string()
+                "Invalid symbol value (must be 0-7)".to_string(),
             ));
         }
 
         let total_frequency = self.base_frequency + frequency_offset;
-        if total_frequency < 200.0 || total_frequency + (NUM_TONES as f64 - 1.0) * self.tone_spacing > MAX_FREQUENCY_DEVIATION {
-            return Err(Ft8Error::SignalProcessingError(
-                format!("Frequency {} Hz would exceed deviation limits", total_frequency)
-            ));
+        if total_frequency < 200.0
+            || total_frequency + (NUM_TONES as f64 - 1.0) * self.tone_spacing
+                > MAX_FREQUENCY_DEVIATION
+        {
+            return Err(Ft8Error::SignalProcessingError(format!(
+                "Frequency {} Hz would exceed deviation limits",
+                total_frequency
+            )));
         }
 
         // Build per-sample frequency trajectory
@@ -295,7 +317,10 @@ impl Ft8Modulator {
     /// Generate dither noise for quantization noise reduction
     fn generate_dither(&mut self) -> f32 {
         // Simple linear congruential generator for dither
-        self.dither_state = self.dither_state.wrapping_mul(1103515245).wrapping_add(12345);
+        self.dither_state = self
+            .dither_state
+            .wrapping_mul(1103515245)
+            .wrapping_add(12345);
         let normalized = (self.dither_state >> 16) as f32 / 32768.0;
         normalized - 1.0 // Range: -1.0 to 1.0
     }
@@ -303,9 +328,10 @@ impl Ft8Modulator {
     /// Set transmission power level
     pub fn set_tx_power(&mut self, power: f64) -> Ft8Result<()> {
         if power < 0.0 || power > 1.0 {
-            return Err(Ft8Error::ConfigError(
-                format!("TX power {} out of range (0.0-1.0)", power)
-            ));
+            return Err(Ft8Error::ConfigError(format!(
+                "TX power {} out of range (0.0-1.0)",
+                power
+            )));
         }
         self.tx_power = power;
         Ok(())
@@ -314,9 +340,10 @@ impl Ft8Modulator {
     /// Set base frequency offset
     pub fn set_base_frequency(&mut self, frequency: f64) -> Ft8Result<()> {
         if frequency < 200.0 || frequency > 4000.0 {
-            return Err(Ft8Error::ConfigError(
-                format!("Base frequency {} Hz out of range (200-4000 Hz)", frequency)
-            ));
+            return Err(Ft8Error::ConfigError(format!(
+                "Base frequency {} Hz out of range (200-4000 Hz)",
+                frequency
+            )));
         }
         self.base_frequency = frequency;
         Ok(())
@@ -337,9 +364,10 @@ impl Ft8Modulator {
     pub fn set_pulse_shape(&mut self, pulse_shape: PulseShape) -> Ft8Result<()> {
         if let PulseShape::Gaussian { bt } = pulse_shape {
             if bt <= 0.0 || bt > 10.0 {
-                return Err(Ft8Error::ConfigError(
-                    format!("BT product {} out of range (0.0-10.0)", bt)
-                ));
+                return Err(Ft8Error::ConfigError(format!(
+                    "BT product {} out of range (0.0-10.0)",
+                    bt
+                )));
             }
         }
         self.pulse_shape = pulse_shape;
@@ -351,13 +379,13 @@ impl Ft8Modulator {
         let num_samples = (duration_seconds * self.sample_rate as f64) as usize;
         let mut samples = Vec::with_capacity(num_samples);
         let angular_frequency = 2.0 * PI * frequency / self.sample_rate as f64;
-        
+
         for i in 0..num_samples {
             let phase = angular_frequency * i as f64;
             let sample = (self.tx_power * phase.sin()) as f32;
             samples.push(sample);
         }
-        
+
         Ok(samples)
     }
 
@@ -381,13 +409,15 @@ impl Default for Ft8Modulator {
 /// Complementary error function approximation (Abramowitz & Stegun 7.1.26)
 fn erfc(x: f64) -> f64 {
     let t = 1.0 / (1.0 + 0.3275911 * x.abs());
-    let poly = t * (0.254829592
-        + t * (-0.284496736
-            + t * (1.421413741
-                + t * (-1.453152027
-                    + t * 1.061405429))));
+    let poly = t
+        * (0.254829592
+            + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
     let result = poly * (-x * x).exp();
-    if x >= 0.0 { result } else { 2.0 - result }
+    if x >= 0.0 {
+        result
+    } else {
+        2.0 - result
+    }
 }
 
 /// Modulator configuration
@@ -466,7 +496,7 @@ impl AudioFormat {
             sample_type: SampleType::I16,
         }
     }
-    
+
     /// High quality FT8 format (12 kHz, 32-bit float, mono)
     pub fn ft8_high_quality() -> Self {
         Self {
@@ -476,12 +506,12 @@ impl AudioFormat {
             sample_type: SampleType::F32,
         }
     }
-    
+
     /// Calculate bytes per sample
     pub fn bytes_per_sample(&self) -> usize {
         (self.bits_per_sample as usize / 8) * self.channels as usize
     }
-    
+
     /// Calculate frame size in bytes
     pub fn frame_size(&self) -> usize {
         self.bytes_per_sample()
@@ -491,7 +521,7 @@ impl AudioFormat {
 /// Convert f32 samples to specified audio format
 pub fn convert_samples(samples: &[f32], format: AudioFormat) -> Vec<u8> {
     let mut output = Vec::with_capacity(samples.len() * format.bytes_per_sample());
-    
+
     match format.sample_type {
         SampleType::F32 => {
             for &sample in samples {
@@ -513,12 +543,15 @@ pub fn convert_samples(samples: &[f32], format: AudioFormat) -> Vec<u8> {
         }
         SampleType::I32 => {
             for &sample in samples {
-                let scaled = (sample * 2147483647.0).round().max(-2147483648.0).min(2147483647.0) as i32;
+                let scaled = (sample * 2147483647.0)
+                    .round()
+                    .max(-2147483648.0)
+                    .min(2147483647.0) as i32;
                 output.extend_from_slice(&scaled.to_le_bytes());
             }
         }
     }
-    
+
     output
 }
 
@@ -530,13 +563,13 @@ mod tests {
     fn test_modulator_creation() {
         let modulator = Ft8Modulator::new(12000, 1500.0, 0.5);
         assert!(modulator.is_ok());
-        
+
         let mod_invalid_rate = Ft8Modulator::new(0, 1500.0, 0.5);
         assert!(mod_invalid_rate.is_err());
-        
+
         let mod_invalid_freq = Ft8Modulator::new(12000, 5000.0, 0.5);
         assert!(mod_invalid_freq.is_err());
-        
+
         let mod_invalid_power = Ft8Modulator::new(12000, 1500.0, 2.0);
         assert!(mod_invalid_power.is_err());
     }
@@ -545,7 +578,7 @@ mod tests {
     fn test_default_modulator() {
         let modulator = Ft8Modulator::new_default();
         assert!(modulator.is_ok());
-        
+
         let config = modulator.unwrap().get_config();
         assert_eq!(config.sample_rate, SAMPLE_RATE);
         assert_eq!(config.base_frequency, BASE_FREQUENCY);
@@ -554,18 +587,18 @@ mod tests {
     #[test]
     fn test_symbol_modulation() {
         let mut modulator = Ft8Modulator::new_default().unwrap();
-        let symbols = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 
-                       0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7,
-                       0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7,
-                       0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7,
-                       0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6]; // 79 symbols
-        
+        let symbols = [
+            0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4,
+            5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1,
+            2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6,
+        ]; // 79 symbols
+
         let result = modulator.modulate_symbols(&symbols, 0.0);
         assert!(result.is_ok());
-        
+
         let audio = result.unwrap();
         assert_eq!(audio.len(), TOTAL_TRANSMISSION_SAMPLES);
-        
+
         // Check that samples are properly bounded
         assert!(audio.iter().all(|&s| s.abs() <= 1.0));
     }
@@ -575,7 +608,7 @@ mod tests {
         let mut modulator = Ft8Modulator::new_default().unwrap();
         let mut symbols = [0u8; 79];
         symbols[0] = 8; // Invalid symbol (> 7)
-        
+
         let result = modulator.modulate_symbols(&symbols, 0.0);
         assert!(result.is_err());
     }
@@ -584,7 +617,7 @@ mod tests {
     fn test_frequency_limits() {
         let mut modulator = Ft8Modulator::new_default().unwrap();
         let symbols = [0u8; 79];
-        
+
         // Test excessive frequency offset
         let result = modulator.modulate_symbols(&symbols, 3000.0);
         assert!(result.is_err());
@@ -595,7 +628,7 @@ mod tests {
         let modulator = Ft8Modulator::new_default().unwrap();
         let result = modulator.generate_test_tone(1000.0, 1.0);
         assert!(result.is_ok());
-        
+
         let tone = result.unwrap();
         assert_eq!(tone.len(), 12000); // 1 second at 12 kHz
     }
@@ -603,10 +636,10 @@ mod tests {
     #[test]
     fn test_power_setting() {
         let mut modulator = Ft8Modulator::new_default().unwrap();
-        
+
         assert!(modulator.set_tx_power(0.8).is_ok());
         assert_eq!(modulator.get_config().tx_power, 0.8);
-        
+
         assert!(modulator.set_tx_power(1.5).is_err());
         assert!(modulator.set_tx_power(-0.1).is_err());
     }
@@ -615,7 +648,7 @@ mod tests {
     fn test_symbol_timing() {
         let modulator = Ft8Modulator::new_default().unwrap();
         let timing = modulator.calculate_symbol_timing();
-        
+
         assert_eq!(timing.samples_per_symbol, SAMPLES_PER_SYMBOL);
         assert_eq!(timing.symbol_duration_ms, (SYMBOL_DURATION * 1000.0) as u32);
         assert_eq!(timing.total_duration_ms, (MESSAGE_DURATION * 1000.0) as u32);
@@ -624,11 +657,11 @@ mod tests {
     #[test]
     fn test_audio_format_conversion() {
         let samples = vec![0.5, -0.5, 0.0, 1.0, -1.0];
-        
+
         let format_i16 = AudioFormat::ft8_standard();
         let converted_i16 = convert_samples(&samples, format_i16);
         assert_eq!(converted_i16.len(), samples.len() * 2); // 2 bytes per sample
-        
+
         let format_f32 = AudioFormat::ft8_high_quality();
         let converted_f32 = convert_samples(&samples, format_f32);
         assert_eq!(converted_f32.len(), samples.len() * 4); // 4 bytes per sample
@@ -647,15 +680,18 @@ mod tests {
     #[test]
     fn test_gfsk_modulation_produces_valid_audio() {
         let mut modulator = Ft8Modulator::with_pulse_shape(
-            SAMPLE_RATE, BASE_FREQUENCY, DEFAULT_TX_POWER,
+            SAMPLE_RATE,
+            BASE_FREQUENCY,
+            DEFAULT_TX_POWER,
             PulseShape::Gaussian { bt: 2.0 },
-        ).unwrap();
+        )
+        .unwrap();
 
-        let symbols = [0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7,
-                       0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7,
-                       0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7,
-                       0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7,
-                       0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6]; // 79 symbols
+        let symbols = [
+            0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4,
+            5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1,
+            2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6,
+        ]; // 79 symbols
 
         let result = modulator.modulate_symbols(&symbols, 0.0);
         assert!(result.is_ok());
@@ -668,28 +704,37 @@ mod tests {
     #[test]
     fn test_gfsk_smoother_than_rectangular() {
         // GFSK should have smaller max frequency derivative (smoother transitions)
-        let symbols = [0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7,
-                       0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7,
-                       0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7,
-                       0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7,
-                       0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0]; // worst-case transitions
+        let symbols = [
+            0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0,
+            7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7,
+            0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0, 7, 0,
+        ]; // worst-case transitions
 
         let rect_mod = Ft8Modulator::with_pulse_shape(
-            SAMPLE_RATE, BASE_FREQUENCY, DEFAULT_TX_POWER, PulseShape::Rectangular,
-        ).unwrap();
+            SAMPLE_RATE,
+            BASE_FREQUENCY,
+            DEFAULT_TX_POWER,
+            PulseShape::Rectangular,
+        )
+        .unwrap();
         let gfsk_mod = Ft8Modulator::with_pulse_shape(
-            SAMPLE_RATE, BASE_FREQUENCY, DEFAULT_TX_POWER,
+            SAMPLE_RATE,
+            BASE_FREQUENCY,
+            DEFAULT_TX_POWER,
             PulseShape::Gaussian { bt: 2.0 },
-        ).unwrap();
+        )
+        .unwrap();
 
         let rect_traj = rect_mod.build_frequency_trajectory(&symbols, 1500.0);
         let gfsk_traj = gfsk_mod.build_frequency_trajectory(&symbols, 1500.0);
 
         // Max derivative (frequency change between adjacent samples)
-        let rect_max_df: f64 = rect_traj.windows(2)
+        let rect_max_df: f64 = rect_traj
+            .windows(2)
             .map(|w| (w[1] - w[0]).abs())
             .fold(0.0, f64::max);
-        let gfsk_max_df: f64 = gfsk_traj.windows(2)
+        let gfsk_max_df: f64 = gfsk_traj
+            .windows(2)
             .map(|w| (w[1] - w[0]).abs())
             .fold(0.0, f64::max);
 
@@ -697,7 +742,8 @@ mod tests {
         assert!(
             gfsk_max_df < rect_max_df,
             "GFSK max dF ({:.4}) should be less than rectangular ({:.4})",
-            gfsk_max_df, rect_max_df,
+            gfsk_max_df,
+            rect_max_df,
         );
     }
 
@@ -706,11 +752,20 @@ mod tests {
         let mut modulator = Ft8Modulator::new_default().unwrap();
         assert_eq!(modulator.get_config().pulse_shape, PulseShape::Rectangular);
 
-        assert!(modulator.set_pulse_shape(PulseShape::Gaussian { bt: 2.0 }).is_ok());
-        assert_eq!(modulator.get_config().pulse_shape, PulseShape::Gaussian { bt: 2.0 });
+        assert!(modulator
+            .set_pulse_shape(PulseShape::Gaussian { bt: 2.0 })
+            .is_ok());
+        assert_eq!(
+            modulator.get_config().pulse_shape,
+            PulseShape::Gaussian { bt: 2.0 }
+        );
 
-        assert!(modulator.set_pulse_shape(PulseShape::Gaussian { bt: 0.0 }).is_err());
-        assert!(modulator.set_pulse_shape(PulseShape::Gaussian { bt: 11.0 }).is_err());
+        assert!(modulator
+            .set_pulse_shape(PulseShape::Gaussian { bt: 0.0 })
+            .is_err());
+        assert!(modulator
+            .set_pulse_shape(PulseShape::Gaussian { bt: 11.0 })
+            .is_err());
     }
 
     #[test]
@@ -729,6 +784,9 @@ mod tests {
     fn test_rectangular_modulator_creation() {
         let modulator = Ft8Modulator::new_rectangular();
         assert!(modulator.is_ok());
-        assert_eq!(modulator.unwrap().get_config().pulse_shape, PulseShape::Rectangular);
+        assert_eq!(
+            modulator.unwrap().get_config().pulse_shape,
+            PulseShape::Rectangular
+        );
     }
 }

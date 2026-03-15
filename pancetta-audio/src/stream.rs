@@ -6,12 +6,14 @@
 use crate::{
     device::AudioDeviceManager,
     error::{AudioError, AudioResult},
-    ringbuffer_comm::{AudioComm, AudioSample, DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE},
     latency::CallbackTimer,
+    ringbuffer_comm::{
+        AudioComm, AudioSample, DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE,
+    },
 };
 use cpal::{
     traits::{DeviceTrait, StreamTrait},
-    Stream, InputCallbackInfo, OutputCallbackInfo,
+    InputCallbackInfo, OutputCallbackInfo, Stream,
 };
 use std::sync::Arc;
 
@@ -52,7 +54,7 @@ impl StreamConfig {
     /// Create FT8-optimized configuration
     pub fn for_ft8() -> Self {
         Self {
-            sample_rate: 48000,      // Use 48kHz and convert to 12kHz
+            sample_rate: 48000, // Use 48kHz and convert to 12kHz
             input_channels: 1,
             output_channels: 2,
             buffer_size: 64,
@@ -124,7 +126,7 @@ impl AudioStreamManager {
     pub fn set_config(&mut self, config: StreamConfig) -> AudioResult<()> {
         if self.is_running {
             return Err(AudioError::configuration(
-                "Cannot change configuration while streams are running"
+                "Cannot change configuration while streams are running",
             ));
         }
         self.config = config;
@@ -186,7 +188,7 @@ impl AudioStreamManager {
     /// Get current stream statistics
     pub fn get_statistics(&self) -> StreamStatistics {
         let buffer_stats = self.comm.get_buffer_stats();
-        
+
         StreamStatistics {
             is_running: self.is_running,
             config: self.config.clone(),
@@ -360,9 +362,9 @@ pub struct StreamStatistics {
 impl StreamStatistics {
     /// Check if the stream is healthy (low drop rate, not overrunning)
     pub fn is_healthy(&self) -> bool {
-        self.is_running 
+        self.is_running
             && self.drop_rate_percent < 1.0  // Less than 1% drops
-            && self.buffer_usage_percent < 80.0  // Not near buffer capacity
+            && self.buffer_usage_percent < 80.0 // Not near buffer capacity
     }
 
     /// Get a human-readable status description
@@ -399,7 +401,7 @@ mod tests {
         let config = StreamConfig::for_ft8();
         assert_eq!(config.sample_rate, 48000);
         assert_eq!(config.input_channels, 1);
-        
+
         // Should have low latency
         assert!(config.theoretical_latency_ms() < 10.0);
     }
@@ -418,7 +420,7 @@ mod tests {
             buffer_size: 64,
             ..Default::default()
         };
-        
+
         // 64 samples at 48kHz = 1.333ms
         let expected_latency = 64.0 / 48000.0 * 1000.0;
         assert!((config.theoretical_latency_ms() - expected_latency).abs() < 0.001);
@@ -428,7 +430,7 @@ mod tests {
     fn test_stream_manager_creation() {
         let config = StreamConfig::for_ft8();
         let manager = AudioStreamManager::new(config);
-        
+
         // Should succeed even without audio devices in test environment
         if let Ok(manager) = manager {
             assert!(!manager.is_running());
@@ -449,7 +451,7 @@ mod tests {
             drop_rate_percent: 0.0,
             has_buffer_overruns: false,
         };
-        
+
         assert!(stats.is_healthy());
         assert_eq!(stats.status_description(), "Healthy");
     }
@@ -467,7 +469,7 @@ mod tests {
             drop_rate_percent: 5.0,
             has_buffer_overruns: true,
         };
-        
+
         assert!(!stats.is_healthy());
         assert_eq!(stats.status_description(), "Buffer Overruns");
     }

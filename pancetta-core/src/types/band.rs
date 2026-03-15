@@ -127,13 +127,22 @@ impl Band {
     /// Get all standard bands
     pub fn all() -> &'static [Band] {
         &[
-            Band::Band160m, Band::Band80m, Band::Band60m, Band::Band40m,
-            Band::Band30m, Band::Band20m, Band::Band17m, Band::Band15m,
-            Band::Band12m, Band::Band10m, Band::Band6m, Band::Band2m,
+            Band::Band160m,
+            Band::Band80m,
+            Band::Band60m,
+            Band::Band40m,
+            Band::Band30m,
+            Band::Band20m,
+            Band::Band17m,
+            Band::Band15m,
+            Band::Band12m,
+            Band::Band10m,
+            Band::Band6m,
+            Band::Band2m,
             Band::Band70cm,
         ]
     }
-    
+
     /// Check if frequency is within this band
     pub fn contains_frequency(&self, freq: u64) -> bool {
         let (low, high) = self.frequency_range();
@@ -209,7 +218,7 @@ impl Default for Band {
 
 impl FromStr for Band {
     type Err = String;
-    
+
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "160m" => Ok(Band::Band160m),
@@ -261,7 +270,7 @@ mod tests {
         let band = Band::Band20m;
         let json = serde_json::to_string(&band).unwrap();
         assert_eq!(json, "\"20m\"");
-        
+
         let decoded: Band = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, band);
     }

@@ -1,5 +1,5 @@
 //! Supported rig models and their capabilities
-//! 
+//!
 //! This module defines the amateur radio transceiver models supported by hamlib
 //! and their specific capabilities for optimal integration.
 
@@ -189,7 +189,7 @@ impl ModeExt for Mode {
             Mode::FT4 => HamlibMode::FT4,
             Mode::PSK31 | Mode::PSK63 | Mode::PSK125 => HamlibMode::PKTUSB,
             Mode::PACKET => HamlibMode::PKTFM,
-            Mode::JS8 => HamlibMode::USB, // JS8 is USB-based
+            Mode::JS8 => HamlibMode::USB,  // JS8 is USB-based
             Mode::WSPR => HamlibMode::USB, // WSPR is USB-based
             // No Custom variant in Mode enum, handle all specific cases above
             // Map other digital modes to USB (most common)
@@ -340,8 +340,12 @@ impl Default for RigCapabilities {
             has_if_shift: false,
             has_noise_reduction: false,
             bands: vec![
-                Band::Band160m, Band::Band80m, Band::Band40m, Band::Band20m,
-                Band::Band15m, Band::Band10m,
+                Band::Band160m,
+                Band::Band80m,
+                Band::Band40m,
+                Band::Band20m,
+                Band::Band15m,
+                Band::Band10m,
             ],
             default_baud_rate: 9600,
             default_timeout: 2000,
@@ -431,7 +435,9 @@ impl RigModelType {
         match self {
             RigModelType::Dummy => "Hamlib",
             RigModelType::NetRigctl => "Hamlib",
-            RigModelType::YaesuFT991A | RigModelType::YaesuFTdx10 | RigModelType::YaesuFT818 => "Yaesu",
+            RigModelType::YaesuFT991A | RigModelType::YaesuFTdx10 | RigModelType::YaesuFT818 => {
+                "Yaesu"
+            }
             RigModelType::IcomIC7300 | RigModelType::IcomIC7610 | RigModelType::IcomIC705 => "Icom",
             RigModelType::KenwoodTS590SG | RigModelType::KenwoodTS890S => "Kenwood",
             RigModelType::ElecraftK3S | RigModelType::ElecraftKX3 => "Elecraft",
@@ -465,10 +471,23 @@ impl RigModelType {
         match self {
             RigModelType::Dummy => RigCapabilities::default(),
             RigModelType::NetRigctl => RigCapabilities::default(),
-            
+
             RigModelType::YaesuFT991A => RigCapabilities {
-                modes: vec![Mode::LSB, Mode::USB, Mode::CW, Mode::FM, Mode::AM, Mode::RTTY, Mode::PACKET],  // Use Mode::PACKET instead of PKT variants
-                frequency_ranges: vec![(30000, 56000000), (76000000, 108000000), (118000000, 164000000), (420000000, 450000000)],
+                modes: vec![
+                    Mode::LSB,
+                    Mode::USB,
+                    Mode::CW,
+                    Mode::FM,
+                    Mode::AM,
+                    Mode::RTTY,
+                    Mode::PACKET,
+                ], // Use Mode::PACKET instead of PKT variants
+                frequency_ranges: vec![
+                    (30000, 56000000),
+                    (76000000, 108000000),
+                    (118000000, 164000000),
+                    (420000000, 450000000),
+                ],
                 has_dual_vfo: true,
                 has_memory: true,
                 memory_channels: Some(500),
@@ -479,13 +498,35 @@ impl RigModelType {
                 has_antenna_switch: true,
                 has_if_shift: true,
                 has_noise_reduction: true,
-                bands: vec![Band::Band160m, Band::Band80m, Band::Band60m, Band::Band40m, Band::Band30m, Band::Band20m, Band::Band17m, Band::Band15m, Band::Band12m, Band::Band10m, Band::Band6m, Band::Band2m, Band::Band70cm],
+                bands: vec![
+                    Band::Band160m,
+                    Band::Band80m,
+                    Band::Band60m,
+                    Band::Band40m,
+                    Band::Band30m,
+                    Band::Band20m,
+                    Band::Band17m,
+                    Band::Band15m,
+                    Band::Band12m,
+                    Band::Band10m,
+                    Band::Band6m,
+                    Band::Band2m,
+                    Band::Band70cm,
+                ],
                 default_baud_rate: 38400,
                 default_timeout: 2000,
             },
 
             RigModelType::IcomIC7300 => RigCapabilities {
-                modes: vec![Mode::LSB, Mode::USB, Mode::CW, Mode::RTTY, Mode::AM, Mode::FM, Mode::PACKET],  // Use Mode::PACKET instead of PKT variants
+                modes: vec![
+                    Mode::LSB,
+                    Mode::USB,
+                    Mode::CW,
+                    Mode::RTTY,
+                    Mode::AM,
+                    Mode::FM,
+                    Mode::PACKET,
+                ], // Use Mode::PACKET instead of PKT variants
                 frequency_ranges: vec![(30000, 74800000)],
                 has_dual_vfo: true,
                 has_memory: true,
@@ -497,7 +538,19 @@ impl RigModelType {
                 has_antenna_switch: false,
                 has_if_shift: true,
                 has_noise_reduction: true,
-                bands: vec![Band::Band160m, Band::Band80m, Band::Band60m, Band::Band40m, Band::Band30m, Band::Band20m, Band::Band17m, Band::Band15m, Band::Band12m, Band::Band10m, Band::Band6m],
+                bands: vec![
+                    Band::Band160m,
+                    Band::Band80m,
+                    Band::Band60m,
+                    Band::Band40m,
+                    Band::Band30m,
+                    Band::Band20m,
+                    Band::Band17m,
+                    Band::Band15m,
+                    Band::Band12m,
+                    Band::Band10m,
+                    Band::Band6m,
+                ],
                 default_baud_rate: 19200,
                 default_timeout: 2000,
             },
@@ -516,7 +569,7 @@ impl RigModelRegistry {
     /// Create new registry with common models
     pub fn new() -> Self {
         let mut models = HashMap::new();
-        
+
         // Add popular models
         models.insert(Atom::from("dummy"), RigModelType::Dummy);
         models.insert(Atom::from("netrigctl"), RigModelType::NetRigctl);
@@ -542,7 +595,8 @@ impl RigModelRegistry {
 
     /// List all available models
     pub fn list_models(&self) -> Vec<(&str, &RigModelType)> {
-        self.models.iter()
+        self.models
+            .iter()
             .map(|(name, model)| (name.as_ref(), model))
             .collect()
     }

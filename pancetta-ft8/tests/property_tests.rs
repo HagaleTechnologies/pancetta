@@ -5,14 +5,13 @@
 
 #![cfg(feature = "transmit")]
 
-use proptest::prelude::*;
-use pancetta_ft8::{Ft8Encoder, NUM_SYMBOLS};
+use bitvec::prelude::*;
 use pancetta_ft8::ldpc::{
-    LdpcEncoder, binary_to_gray, gray_to_binary,
-    LDPC_INFO_BITS, LDPC_CODEWORD_BITS,
+    binary_to_gray, gray_to_binary, LdpcEncoder, LDPC_CODEWORD_BITS, LDPC_INFO_BITS,
 };
 use pancetta_ft8::message::{calculate_crc14, PAYLOAD_BITS};
-use bitvec::prelude::*;
+use pancetta_ft8::{Ft8Encoder, NUM_SYMBOLS};
+use proptest::prelude::*;
 
 // =============================================================
 // LDPC Validity Property
@@ -163,13 +162,20 @@ fn prop_all_encoded_symbols_in_range() {
 
     for msg in &messages {
         let symbols = encoder.encode_message(msg, None).unwrap();
-        assert_eq!(symbols.len(), NUM_SYMBOLS, "Wrong symbol count for '{}'", msg);
+        assert_eq!(
+            symbols.len(),
+            NUM_SYMBOLS,
+            "Wrong symbol count for '{}'",
+            msg
+        );
 
         for (i, &s) in symbols.iter().enumerate() {
             assert!(
                 s < 8,
                 "Symbol {} = {} out of range [0,7] for '{}'",
-                i, s, msg
+                i,
+                s,
+                msg
             );
         }
     }
@@ -182,8 +188,7 @@ fn prop_all_encoded_symbols_in_range() {
 /// Strategy for generating valid amateur callsigns
 fn callsign_strategy() -> impl Strategy<Value = String> {
     // Simple format: 1-2 letters, 1 digit, 1-3 letters (e.g., W1ABC, AA1BB)
-    prop::string::string_regex("[A-Z]{1,2}[0-9][A-Z]{1,3}")
-        .unwrap()
+    prop::string::string_regex("[A-Z]{1,2}[0-9][A-Z]{1,3}").unwrap()
 }
 
 proptest! {

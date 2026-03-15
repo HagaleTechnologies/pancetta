@@ -48,10 +48,10 @@ async fn main() -> Result<()> {
 
     // Initialize logging
     let log_level = if cli.debug { Level::DEBUG } else { Level::INFO };
-    
+
     let file_appender = tracing_appender::rolling::never("/tmp", "pancetta-tui.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-    
+
     tracing_subscriber::fmt()
         .with_writer(non_blocking)
         .with_max_level(log_level)

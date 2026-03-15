@@ -7,7 +7,7 @@ use crate::error::{AudioError, AudioResult};
 use std::collections::VecDeque;
 
 /// Linear interpolation sample rate converter
-/// 
+///
 /// Provides basic but efficient sample rate conversion suitable for
 /// real-time audio processing with minimal CPU usage.
 pub struct LinearResampler {
@@ -33,13 +33,13 @@ impl LinearResampler {
         if source_rate == 0 || target_rate == 0 {
             return Err(AudioError::sample_rate("Sample rates must be non-zero"));
         }
-        
+
         if channels == 0 {
             return Err(AudioError::sample_rate("Channel count must be non-zero"));
         }
 
         let ratio = target_rate as f64 / source_rate as f64;
-        
+
         Ok(Self {
             source_rate,
             target_rate,
@@ -55,7 +55,7 @@ impl LinearResampler {
     pub fn process(&mut self, input: &[f32]) -> AudioResult<Vec<f32>> {
         if input.len() % self.channels as usize != 0 {
             return Err(AudioError::sample_rate(
-                "Input length must be multiple of channel count"
+                "Input length must be multiple of channel count",
             ));
         }
 
@@ -75,13 +75,13 @@ impl LinearResampler {
                 for ch in 0..self.channels as usize {
                     let prev_idx = ch;
                     let curr_idx = ch + frame_size;
-                    
+
                     let prev_sample = if prev_idx < self.input_buffer.len() {
                         self.input_buffer[prev_idx]
                     } else {
                         self.prev_samples[ch]
                     };
-                    
+
                     let curr_sample = if curr_idx < self.input_buffer.len() {
                         self.input_buffer[curr_idx]
                     } else {
@@ -89,7 +89,8 @@ impl LinearResampler {
                     };
 
                     // Linear interpolation
-                    let interpolated = prev_sample + (curr_sample - prev_sample) * self.position as f32;
+                    let interpolated =
+                        prev_sample + (curr_sample - prev_sample) * self.position as f32;
                     output.push(interpolated);
                 }
 
@@ -153,7 +154,7 @@ impl LinearResampler {
 }
 
 /// High-quality sample rate converter using sinc interpolation
-/// 
+///
 /// Provides better quality conversion at the cost of higher CPU usage.
 /// Suitable for offline processing or when quality is more important than latency.
 pub struct SincResampler {
@@ -181,20 +182,20 @@ impl SincResampler {
         if source_rate == 0 || target_rate == 0 {
             return Err(AudioError::sample_rate("Sample rates must be non-zero"));
         }
-        
+
         if channels == 0 {
             return Err(AudioError::sample_rate("Channel count must be non-zero"));
         }
 
         let ratio = target_rate as f64 / source_rate as f64;
         let table_size = 1024; // Size of sinc interpolation table
-        
+
         // Generate sinc table
         let sinc_table = Self::generate_sinc_table(table_size);
-        
+
         // History buffer size (enough for sinc kernel)
         let history_size = 32 * channels as usize;
-        
+
         Ok(Self {
             source_rate,
             target_rate,
@@ -211,23 +212,23 @@ impl SincResampler {
     fn generate_sinc_table(size: usize) -> Vec<f32> {
         let mut table = Vec::with_capacity(size);
         let half_size = size / 2;
-        
+
         for i in 0..size {
             let x = (i as f32 - half_size as f32) / half_size as f32 * 4.0;
-            
+
             let sinc_val = if x.abs() < 1e-6 {
                 1.0
             } else {
                 let pi_x = std::f32::consts::PI * x;
                 pi_x.sin() / pi_x
             };
-            
+
             // Apply Hamming window
             let window = 0.54 + 0.46 * (std::f32::consts::PI * i as f32 / (size - 1) as f32).cos();
-            
+
             table.push(sinc_val * window);
         }
-        
+
         table
     }
 
@@ -235,7 +236,7 @@ impl SincResampler {
     pub fn process(&mut self, input: &[f32]) -> AudioResult<Vec<f32>> {
         if input.len() % self.channels as usize != 0 {
             return Err(AudioError::sample_rate(
-                "Input length must be multiple of channel count"
+                "Input length must be multiple of channel count",
             ));
         }
 
@@ -258,25 +259,26 @@ impl SincResampler {
         while self.history.len() >= (kernel_size * 2 + 1) * frame_size {
             for ch in 0..self.channels as usize {
                 let mut sum = 0.0;
-                
+
                 // Apply sinc kernel
                 for k in 0..kernel_size * 2 + 1 {
                     let history_idx = (self.position as usize + k) * frame_size + ch;
-                    
+
                     if history_idx < self.history.len() {
                         let sample = self.history[history_idx];
-                        let table_idx = (k as f32 * self.table_size as f32 / (kernel_size * 2) as f32) as usize;
+                        let table_idx =
+                            (k as f32 * self.table_size as f32 / (kernel_size * 2) as f32) as usize;
                         let table_idx = table_idx.min(self.table_size - 1);
-                        
+
                         sum += sample * self.sinc_table[table_idx];
                     }
                 }
-                
+
                 output.push(sum);
             }
 
             self.position += 1.0 / self.ratio;
-            
+
             // Remove consumed samples
             while self.position >= 1.0 && self.history.len() > frame_size {
                 for _ in 0..frame_size {
@@ -312,9 +314,17 @@ impl ResamplerFactory {
         }
 
         if high_quality {
-            Ok(Box::new(SincResampler::new(source_rate, target_rate, channels)?))
+            Ok(Box::new(SincResampler::new(
+                source_rate,
+                target_rate,
+                channels,
+            )?))
         } else {
-            Ok(Box::new(LinearResampler::new(source_rate, target_rate, channels)?))
+            Ok(Box::new(LinearResampler::new(
+                source_rate,
+                target_rate,
+                channels,
+            )?))
         }
     }
 
@@ -338,13 +348,13 @@ impl ResamplerFactory {
 pub trait SampleRateConverter: Send + Sync {
     /// Process audio samples
     fn process(&mut self, input: &[f32]) -> AudioResult<Vec<f32>>;
-    
+
     /// Reset converter state
     fn reset(&mut self);
-    
+
     /// Get expected output length
     fn output_length(&self, input_length: usize) -> usize;
-    
+
     /// Check if this is a passthrough converter
     fn is_passthrough(&self) -> bool;
 }
@@ -353,15 +363,15 @@ impl SampleRateConverter for LinearResampler {
     fn process(&mut self, input: &[f32]) -> AudioResult<Vec<f32>> {
         LinearResampler::process(self, input)
     }
-    
+
     fn reset(&mut self) {
         LinearResampler::reset(self)
     }
-    
+
     fn output_length(&self, input_length: usize) -> usize {
         LinearResampler::output_length(self, input_length)
     }
-    
+
     fn is_passthrough(&self) -> bool {
         LinearResampler::is_passthrough(self)
     }
@@ -371,15 +381,15 @@ impl SampleRateConverter for SincResampler {
     fn process(&mut self, input: &[f32]) -> AudioResult<Vec<f32>> {
         SincResampler::process(self, input)
     }
-    
+
     fn reset(&mut self) {
         SincResampler::reset(self)
     }
-    
+
     fn output_length(&self, input_length: usize) -> usize {
         (input_length as f64 * self.ratio).ceil() as usize
     }
-    
+
     fn is_passthrough(&self) -> bool {
         self.source_rate == self.target_rate
     }
@@ -400,15 +410,15 @@ impl SampleRateConverter for PassthroughResampler {
     fn process(&mut self, input: &[f32]) -> AudioResult<Vec<f32>> {
         Ok(input.to_vec())
     }
-    
+
     fn reset(&mut self) {
         // Nothing to reset
     }
-    
+
     fn output_length(&self, input_length: usize) -> usize {
         input_length
     }
-    
+
     fn is_passthrough(&self) -> bool {
         true
     }
@@ -435,11 +445,11 @@ mod tests {
     #[test]
     fn test_linear_resampler_downsampling() {
         let mut resampler = LinearResampler::new(48000, 12000, 1).unwrap();
-        
+
         // Input: 48 samples at 48kHz should produce ~12 samples at 12kHz
         let input = vec![1.0; 48];
         let output = resampler.process(&input).unwrap();
-        
+
         // Should be approximately 1/4 the length
         assert!(output.len() >= 8 && output.len() <= 16);
     }
@@ -447,11 +457,11 @@ mod tests {
     #[test]
     fn test_linear_resampler_upsampling() {
         let mut resampler = LinearResampler::new(12000, 48000, 1).unwrap();
-        
+
         // Input: 12 samples at 12kHz should produce ~48 samples at 48kHz
         let input = vec![0.5; 12];
         let output = resampler.process(&input).unwrap();
-        
+
         // Should be approximately 4x the length
         assert!(output.len() >= 32 && output.len() <= 64);
     }
@@ -459,11 +469,11 @@ mod tests {
     #[test]
     fn test_linear_resampler_stereo() {
         let mut resampler = LinearResampler::new(48000, 12000, 2).unwrap();
-        
+
         // Input: 48 samples (24 frames) at 48kHz stereo
         let input = vec![0.5; 48];
         let output = resampler.process(&input).unwrap();
-        
+
         // Output should be even length (stereo)
         assert_eq!(output.len() % 2, 0);
     }
@@ -480,11 +490,11 @@ mod tests {
         // Test passthrough
         let resampler = ResamplerFactory::create_resampler(48000, 48000, 1, false).unwrap();
         assert!(resampler.is_passthrough());
-        
+
         // Test linear conversion
         let resampler = ResamplerFactory::create_resampler(48000, 12000, 1, false).unwrap();
         assert!(!resampler.is_passthrough());
-        
+
         // Test sinc conversion
         let resampler = ResamplerFactory::create_resampler(48000, 12000, 1, true).unwrap();
         assert!(!resampler.is_passthrough());
@@ -495,7 +505,7 @@ mod tests {
         let mut resampler = PassthroughResampler::new(2);
         let input = vec![0.1, 0.2, 0.3, 0.4];
         let output = resampler.process(&input).unwrap();
-        
+
         assert_eq!(input, output);
         assert_eq!(resampler.output_length(100), 100);
         assert!(resampler.is_passthrough());
@@ -506,7 +516,7 @@ mod tests {
         assert!(!ResamplerFactory::needs_conversion(48000, 48000));
         assert!(ResamplerFactory::needs_conversion(48000, 12000));
         assert_eq!(ResamplerFactory::recommended_ft8_rate(), 12000);
-        
+
         let rates = ResamplerFactory::common_rates();
         assert!(rates.contains(&12000));
         assert!(rates.contains(&48000));
@@ -517,10 +527,10 @@ mod tests {
         // Zero sample rates
         assert!(LinearResampler::new(0, 48000, 1).is_err());
         assert!(LinearResampler::new(48000, 0, 1).is_err());
-        
+
         // Zero channels
         assert!(LinearResampler::new(48000, 12000, 0).is_err());
-        
+
         // Wrong input length
         let mut resampler = LinearResampler::new(48000, 12000, 2).unwrap();
         let result = resampler.process(&[0.1, 0.2, 0.3]); // Odd length for stereo

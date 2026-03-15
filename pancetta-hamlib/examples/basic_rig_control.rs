@@ -1,19 +1,17 @@
 //! Basic rig control example
-//! 
+//!
 //! This example demonstrates the fundamental operations for controlling
 //! an amateur radio transceiver using the pancetta-hamlib crate.
 
 use pancetta_hamlib::prelude::*;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     // Initialize the hamlib library
     pancetta_hamlib::init();
@@ -22,9 +20,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create a mock rig for demonstration
     // In real usage, you would specify an actual rig model and device path
-    let rig = RigBuilder::new()
-        .build_mock()
-        .await?;
+    let rig = RigBuilder::new().build_mock().await?;
 
     info!("Created mock rig for demonstration");
 
@@ -43,8 +39,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set frequency to 14.200 MHz (20 meters)
     let frequency = 14_200_000; // Hz
-    info!("Setting frequency to {:.3} MHz", frequency as f64 / 1_000_000.0);
-    
+    info!(
+        "Setting frequency to {:.3} MHz",
+        frequency as f64 / 1_000_000.0
+    );
+
     if let Err(e) = rig.set_frequency(Vfo::A, frequency).await {
         warn!("Failed to set frequency: {}", e);
     } else {
@@ -59,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Set mode to USB with 2.4 kHz bandwidth
     info!("Setting mode to USB with 2.4 kHz bandwidth");
-    
+
     if let Err(e) = rig.set_mode(Vfo::A, Mode::USB, Some(2400)).await {
         warn!("Failed to set mode: {}", e);
     } else {
@@ -83,7 +82,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set different frequency on VFO B
     let freq_b = 21_200_000; // 15 meters
     info!("Setting VFO B to {:.3} MHz", freq_b as f64 / 1_000_000.0);
-    
+
     if let Err(e) = rig.set_frequency(Vfo::B, freq_b).await {
         warn!("Failed to set VFO B frequency: {}", e);
     }
@@ -107,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate monitoring capabilities
     info!("Reading rig telemetry...");
-    
+
     // Read S-meter
     match rig.get_s_meter().await {
         Ok(s_meter) => {
@@ -128,16 +127,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate PTT control (be careful with real rigs!)
     info!("Testing PTT control (transmit for 1 second)");
-    
+
     // Turn PTT on
     if let Err(e) = rig.set_ptt(Vfo::A, PttState::On).await {
         warn!("Failed to set PTT on: {}", e);
     } else {
         info!("PTT ON - Transmitting");
-        
+
         // Brief transmission
         sleep(Duration::from_secs(1)).await;
-        
+
         // Turn PTT off
         if let Err(e) = rig.set_ptt(Vfo::A, PttState::Off).await {
             error!("Failed to set PTT off: {}", e);
@@ -154,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate error handling
     info!("Testing error handling with invalid frequency");
-    
+
     // Try to set an invalid frequency (outside amateur bands)
     let invalid_freq = 1_000_000_000; // 1 GHz
     match rig.set_frequency(Vfo::A, invalid_freq).await {
@@ -212,7 +211,7 @@ async fn validate_and_set_frequency(
             band,
             mode
         );
-        
+
         rig.set_frequency(vfo, frequency).await?;
         rig.set_mode(vfo, mode, None).await?;
     } else {
@@ -220,7 +219,7 @@ async fn validate_and_set_frequency(
             "Setting {:.3} MHz with default USB mode",
             frequency as f64 / 1_000_000.0
         );
-        
+
         rig.set_frequency(vfo, frequency).await?;
         rig.set_mode(vfo, Mode::USB, Some(2400)).await?;
     }

@@ -1,11 +1,11 @@
 //! Pancetta Hamlib Integration
-//! 
+//!
 //! This crate provides safe, async Rust bindings for the Hamlib amateur radio
 //! control library, enabling comprehensive control of amateur radio transceivers
 //! through CAT (Computer Aided Transceiver) interfaces.
-//! 
+//!
 //! # Features
-//! 
+//!
 //! - **Safe API**: Memory-safe wrappers around Hamlib C library
 //! - **Async Support**: Full async/await support for non-blocking operations
 //! - **Connection Management**: Automatic reconnection and error recovery
@@ -14,13 +14,13 @@
 //! - **Mock Implementation**: Complete mock rig for testing and development
 //! - **Real-time Monitoring**: Live S-meter, SWR, and other parameter monitoring
 //! - **Band Management**: Standard amateur radio band plans and switching
-//! 
+//!
 //! # Quick Start
-//! 
+//!
 //! ```no_run
 //! use pancetta_hamlib::{RigBuilder, RigModelType, Vfo};
 //! use pancetta_core::Mode;
-//! 
+//!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create and connect to a rig
@@ -30,29 +30,29 @@
 //!         .baud_rate(19200)
 //!         .build()
 //!         .await?;
-//! 
+//!
 //!     // Connect to the rig
 //!     rig.connect().await?;
-//! 
+//!
 //!     // Set frequency to 14.200 MHz
 //!     rig.set_frequency(Vfo::A, 14_200_000).await?;
-//! 
+//!
 //!     // Set mode to USB
 //!     rig.set_mode(Vfo::A, Mode::USB, None).await?;
-//! 
+//!
 //!     // Read S-meter
 //!     let s_meter = rig.get_s_meter().await?;
 //!     println!("S-meter: {} dBm", s_meter);
-//! 
+//!
 //!     Ok(())
 //! }
 //! ```
-//! 
+//!
 //! # Mock Rig for Testing
-//! 
+//!
 //! ```
 //! use pancetta_hamlib::{MockRig, RigControl, Mode, Vfo};
-//! 
+//!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create mock rig for testing
@@ -67,12 +67,12 @@
 //!     Ok(())
 //! }
 //! ```
-//! 
+//!
 //! # Advanced Features
-//! 
+//!
 //! ```no_run
 //! use pancetta_hamlib::{AdvancedRig, AdvancedRigControl, Band, ScanConfig, ScanType};
-//! 
+//!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create advanced rig controller
@@ -99,33 +99,27 @@
 #![deny(missing_docs)]
 #![warn(clippy::all)]
 
+pub mod advanced;
 pub mod bindings;
+pub mod error;
 pub mod models;
 pub mod rig;
-pub mod advanced;
-pub mod error;
 pub mod rigctld;
 
 #[cfg(feature = "mock-rig")]
 pub mod mock;
 
 // Re-export key types for public API
-pub use models::{
-    Band, Mode, Vfo, RigModelType, RigCapabilities, RigModelRegistry
-};
+pub use models::{Band, Mode, RigCapabilities, RigModelRegistry, RigModelType, Vfo};
 
-pub use rig::{
-    Rig, RigControl, RigConfig, RigStatus, ConnectionState, PttState
-};
+pub use rig::{ConnectionState, PttState, Rig, RigConfig, RigControl, RigStatus};
 
 pub use advanced::{
-    AdvancedRig, AdvancedRigControl, MemoryChannel, ScanConfig, ScanType, 
-    ScanStatus, BandPlan, MonitoringData
+    AdvancedRig, AdvancedRigControl, BandPlan, MemoryChannel, MonitoringData, ScanConfig,
+    ScanStatus, ScanType,
 };
 
-pub use error::{
-    HamlibError, ErrorSeverity, ErrorContext, ContextualError, ContextualResult
-};
+pub use error::{ContextualError, ContextualResult, ErrorContext, ErrorSeverity, HamlibError};
 
 #[cfg(feature = "mock-rig")]
 pub use mock::{MockRig, MockRigConfig};
@@ -217,8 +211,12 @@ impl RigBuilder {
 
     /// Build the rig
     pub async fn build(self) -> Result<Arc<Rig>> {
-        let model = self.model.ok_or_else(|| anyhow!("Model must be specified"))?;
-        let device_path = self.device_path.unwrap_or_else(|| "/dev/ttyUSB0".to_string());
+        let model = self
+            .model
+            .ok_or_else(|| anyhow!("Model must be specified"))?;
+        let device_path = self
+            .device_path
+            .unwrap_or_else(|| "/dev/ttyUSB0".to_string());
 
         let config = RigConfig {
             model,
@@ -351,9 +349,18 @@ pub mod utils {
     /// Validate frequency for amateur radio use
     pub fn is_amateur_frequency(frequency: u64) -> bool {
         let amateur_bands = [
-            Band::Band160m, Band::Band80m, Band::Band60m, Band::Band40m,
-            Band::Band30m, Band::Band20m, Band::Band17m, Band::Band15m,
-            Band::Band12m, Band::Band10m, Band::Band6m, Band::Band2m,
+            Band::Band160m,
+            Band::Band80m,
+            Band::Band60m,
+            Band::Band40m,
+            Band::Band30m,
+            Band::Band20m,
+            Band::Band17m,
+            Band::Band15m,
+            Band::Band12m,
+            Band::Band10m,
+            Band::Band6m,
+            Band::Band2m,
             Band::Band70cm,
         ];
 
@@ -379,7 +386,7 @@ pub mod utils {
     /// Parse frequency from string
     pub fn parse_frequency(input: &str) -> Result<u64> {
         let input = input.trim().to_lowercase();
-        
+
         if let Some(value_str) = input.strip_suffix("ghz") {
             let value: f64 = value_str.trim().parse()?;
             Ok((value * 1_000_000_000.0) as u64)
@@ -467,12 +474,10 @@ pub mod utils {
 /// Prelude module for convenient imports
 pub mod prelude {
     pub use crate::{
-        Band, Mode, Vfo, RigModelType, RigCapabilities,
-        Rig, RigControl, RigConfig, RigStatus, ConnectionState, PttState,
-        AdvancedRig, AdvancedRigControl, MemoryChannel, ScanConfig, ScanType,
-        ScanStatus, MonitoringData,
-        RigBuilder, AdvancedRigBuilder,
-        HamlibError, HamlibResult, ErrorSeverity, ErrorContext, ContextualError, ContextualResult,
+        AdvancedRig, AdvancedRigBuilder, AdvancedRigControl, Band, ConnectionState,
+        ContextualError, ContextualResult, ErrorContext, ErrorSeverity, HamlibError, HamlibResult,
+        MemoryChannel, Mode, MonitoringData, PttState, Rig, RigBuilder, RigCapabilities, RigConfig,
+        RigControl, RigModelType, RigStatus, ScanConfig, ScanStatus, ScanType, Vfo,
     };
 
     pub use crate::models::ModeExt;
@@ -487,13 +492,13 @@ pub mod prelude {
 static INIT: std::sync::Once = std::sync::Once::new();
 
 /// Initialize the hamlib library
-/// 
+///
 /// This function should be called once before using any hamlib functionality.
 /// It's safe to call multiple times - subsequent calls will be ignored.
 pub fn init() {
     INIT.call_once(|| {
         info!("Initializing pancetta-hamlib");
-        
+
         // Initialize hamlib with appropriate debug level
         #[cfg(debug_assertions)]
         {
@@ -501,14 +506,14 @@ pub fn init() {
                 crate::bindings::rig_init(2); // Debug level 2 for development
             }
         }
-        
+
         #[cfg(not(debug_assertions))]
         {
             unsafe {
                 crate::bindings::rig_init(0); // Error level only for release
             }
         }
-        
+
         info!("Hamlib initialized successfully");
     });
 }
@@ -560,9 +565,11 @@ mod tests {
     fn test_supported_models() {
         let models = supported_models();
         assert!(!models.is_empty());
-        
+
         // Should include dummy model
-        assert!(models.iter().any(|(model, _, _)| *model == RigModelType::Dummy));
+        assert!(models
+            .iter()
+            .any(|(model, _, _)| *model == RigModelType::Dummy));
     }
 
     #[test]
@@ -594,10 +601,10 @@ mod tests {
     #[test]
     fn test_amateur_frequency_validation() {
         assert!(is_amateur_frequency(14_200_000)); // 20m
-        assert!(is_amateur_frequency(7_100_000));  // 40m
+        assert!(is_amateur_frequency(7_100_000)); // 40m
         assert!(is_amateur_frequency(144_500_000)); // 2m
         assert!(!is_amateur_frequency(100_000_000)); // Broadcast FM
-        assert!(!is_amateur_frequency(500_000));     // Below amateur bands
+        assert!(!is_amateur_frequency(500_000)); // Below amateur bands
     }
 
     #[test]
@@ -617,17 +624,15 @@ mod tests {
             .timeout_ms(1000)
             .build()
             .await;
-        
+
         assert!(result.is_ok());
     }
 
     #[cfg(feature = "mock-rig")]
     #[tokio::test]
     async fn test_mock_rig_builder() {
-        let result = RigBuilder::new()
-            .build_mock()
-            .await;
-        
+        let result = RigBuilder::new().build_mock().await;
+
         assert!(result.is_ok());
     }
 

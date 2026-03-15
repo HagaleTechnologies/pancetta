@@ -6,12 +6,15 @@
 pub mod app;
 pub mod config;
 pub mod events;
+pub mod tui_runner;
 pub mod ui;
 pub mod widgets;
-pub mod tui_runner;
 
 // Re-export main types for convenience
-pub use app::{App, AutonomousStatus, DecodedMessage, QsoStatus, StationInfo, DxStation, ActivePanel, DevicePanel, DeviceSelectionState};
+pub use app::{
+    ActivePanel, App, AutonomousStatus, DecodedMessage, DevicePanel, DeviceSelectionState,
+    DxStation, QsoStatus, StationInfo,
+};
 pub use config::{Config, Theme};
 pub use events::{Event, EventHandler};
 
@@ -28,10 +31,10 @@ pub async fn create_app(config: config::Config, audio_device: Option<String>) ->
 /// Run the TUI application
 pub async fn run_tui(config: config::Config, audio_device: Option<String>) -> Result<()> {
     let _app = create_app(config, audio_device).await?;
-    
+
     // TODO: Implement TUI main loop
     // This would integrate with the main application coordinator
     // For now, just return success
-    
+
     Ok(())
 }

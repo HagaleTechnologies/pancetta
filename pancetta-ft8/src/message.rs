@@ -8,10 +8,10 @@
 //! - Callsign and grid square validation
 
 use crate::{Ft8Error, Ft8Result};
+use bitvec::prelude::*;
+use std::collections::HashMap;
 use std::fmt;
 use std::time::SystemTime;
-use std::collections::HashMap;
-use bitvec::prelude::*;
 
 /// Number of bits in FT8 information payload
 pub const PAYLOAD_BITS: usize = 77;
@@ -168,96 +168,94 @@ impl Default for Ft8Message {
 impl fmt::Display for Ft8Message {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.message_type {
-            MessageType::Standard => {
-                match self.standard_type {
-                    Some(StandardMessageType::Cq) => {
-                        write!(f, "CQ")?;
-                        if let Some(ref op) = self.special_operation {
-                            write!(f, " {}", op)?;
-                        }
-                        if let Some(ref call) = self.from_callsign {
-                            write!(f, " {}", call)?;
-                        }
-                        if let Some(ref grid) = self.grid_square {
-                            write!(f, " {}", grid)?;
-                        }
+            MessageType::Standard => match self.standard_type {
+                Some(StandardMessageType::Cq) => {
+                    write!(f, "CQ")?;
+                    if let Some(ref op) = self.special_operation {
+                        write!(f, " {}", op)?;
                     }
-                    Some(StandardMessageType::Reply) => {
-                        if let Some(ref to) = self.to_callsign {
-                            write!(f, "{}", to)?;
-                        }
-                        if let Some(ref from) = self.from_callsign {
-                            write!(f, " {}", from)?;
-                        }
-                        if let Some(ref grid) = self.grid_square {
-                            write!(f, " {}", grid)?;
-                        }
+                    if let Some(ref call) = self.from_callsign {
+                        write!(f, " {}", call)?;
                     }
-                    Some(StandardMessageType::ReplyWithR) => {
-                        if let Some(ref to) = self.to_callsign {
-                            write!(f, "{}", to)?;
-                        }
-                        if let Some(ref from) = self.from_callsign {
-                            write!(f, " {}", from)?;
-                        }
-                        write!(f, " R")?;
-                        if let Some(ref grid) = self.grid_square {
-                            write!(f, " {}", grid)?;
-                        }
+                    if let Some(ref grid) = self.grid_square {
+                        write!(f, " {}", grid)?;
                     }
-                    Some(StandardMessageType::Report) => {
-                        if let Some(ref to) = self.to_callsign {
-                            write!(f, "{}", to)?;
-                        }
-                        if let Some(ref from) = self.from_callsign {
-                            write!(f, " {}", from)?;
-                        }
-                        if let Some(report) = self.signal_report {
-                            write!(f, " {:+03}", report)?;
-                        }
-                    }
-                    Some(StandardMessageType::ReportWithR) => {
-                        if let Some(ref to) = self.to_callsign {
-                            write!(f, "{}", to)?;
-                        }
-                        if let Some(ref from) = self.from_callsign {
-                            write!(f, " {}", from)?;
-                        }
-                        write!(f, " R")?;
-                        if let Some(report) = self.signal_report {
-                            write!(f, " {:+03}", report)?;
-                        }
-                    }
-                    Some(StandardMessageType::Rrr) => {
-                        if let Some(ref to) = self.to_callsign {
-                            write!(f, "{}", to)?;
-                        }
-                        if let Some(ref from) = self.from_callsign {
-                            write!(f, " {}", from)?;
-                        }
-                        write!(f, " RRR")?;
-                    }
-                    Some(StandardMessageType::Final73) => {
-                        if let Some(ref to) = self.to_callsign {
-                            write!(f, "{}", to)?;
-                        }
-                        if let Some(ref from) = self.from_callsign {
-                            write!(f, " {}", from)?;
-                        }
-                        write!(f, " 73")?;
-                    }
-                    Some(StandardMessageType::RR73) => {
-                        if let Some(ref to) = self.to_callsign {
-                            write!(f, "{}", to)?;
-                        }
-                        if let Some(ref from) = self.from_callsign {
-                            write!(f, " {}", from)?;
-                        }
-                        write!(f, " RR73")?;
-                    }
-                    None => write!(f, "<Unknown Standard>")?,
                 }
-            }
+                Some(StandardMessageType::Reply) => {
+                    if let Some(ref to) = self.to_callsign {
+                        write!(f, "{}", to)?;
+                    }
+                    if let Some(ref from) = self.from_callsign {
+                        write!(f, " {}", from)?;
+                    }
+                    if let Some(ref grid) = self.grid_square {
+                        write!(f, " {}", grid)?;
+                    }
+                }
+                Some(StandardMessageType::ReplyWithR) => {
+                    if let Some(ref to) = self.to_callsign {
+                        write!(f, "{}", to)?;
+                    }
+                    if let Some(ref from) = self.from_callsign {
+                        write!(f, " {}", from)?;
+                    }
+                    write!(f, " R")?;
+                    if let Some(ref grid) = self.grid_square {
+                        write!(f, " {}", grid)?;
+                    }
+                }
+                Some(StandardMessageType::Report) => {
+                    if let Some(ref to) = self.to_callsign {
+                        write!(f, "{}", to)?;
+                    }
+                    if let Some(ref from) = self.from_callsign {
+                        write!(f, " {}", from)?;
+                    }
+                    if let Some(report) = self.signal_report {
+                        write!(f, " {:+03}", report)?;
+                    }
+                }
+                Some(StandardMessageType::ReportWithR) => {
+                    if let Some(ref to) = self.to_callsign {
+                        write!(f, "{}", to)?;
+                    }
+                    if let Some(ref from) = self.from_callsign {
+                        write!(f, " {}", from)?;
+                    }
+                    write!(f, " R")?;
+                    if let Some(report) = self.signal_report {
+                        write!(f, " {:+03}", report)?;
+                    }
+                }
+                Some(StandardMessageType::Rrr) => {
+                    if let Some(ref to) = self.to_callsign {
+                        write!(f, "{}", to)?;
+                    }
+                    if let Some(ref from) = self.from_callsign {
+                        write!(f, " {}", from)?;
+                    }
+                    write!(f, " RRR")?;
+                }
+                Some(StandardMessageType::Final73) => {
+                    if let Some(ref to) = self.to_callsign {
+                        write!(f, "{}", to)?;
+                    }
+                    if let Some(ref from) = self.from_callsign {
+                        write!(f, " {}", from)?;
+                    }
+                    write!(f, " 73")?;
+                }
+                Some(StandardMessageType::RR73) => {
+                    if let Some(ref to) = self.to_callsign {
+                        write!(f, "{}", to)?;
+                    }
+                    if let Some(ref from) = self.from_callsign {
+                        write!(f, " {}", from)?;
+                    }
+                    write!(f, " RR73")?;
+                }
+                None => write!(f, "<Unknown Standard>")?,
+            },
             MessageType::Contest => {
                 if let Some(ref to) = self.to_callsign {
                     write!(f, "{}", to)?;
@@ -376,11 +374,7 @@ impl fmt::Display for DecodedMessage {
         write!(
             f,
             "{:6.1} {:4.1} {:4.0} {:.1} {}",
-            self.time_offset,
-            self.snr_db,
-            self.frequency_offset,
-            self.confidence,
-            self.text
+            self.time_offset, self.snr_db, self.frequency_offset, self.confidence, self.text
         )
     }
 }
@@ -403,33 +397,33 @@ impl HashTable {
             hash_22bit: HashMap::new(),
         }
     }
-    
+
     /// Add callsign to hash tables
     pub fn add_callsign(&mut self, callsign: &str) {
         let hash_10 = self.calculate_hash_10bit(callsign);
         let hash_12 = self.calculate_hash_12bit(callsign);
         let hash_22 = self.calculate_hash_22bit(callsign);
-        
+
         self.hash_10bit.insert(hash_10, callsign.to_string());
         self.hash_12bit.insert(hash_12, callsign.to_string());
         self.hash_22bit.insert(hash_22, callsign.to_string());
     }
-    
+
     /// Lookup 10-bit hash
     pub fn lookup_10bit_hash(&self, hash: u32) -> Option<String> {
         self.hash_10bit.get(&hash).cloned()
     }
-    
+
     /// Lookup 12-bit hash
     pub fn lookup_12bit_hash(&self, hash: u32) -> Option<String> {
         self.hash_12bit.get(&hash).cloned()
     }
-    
+
     /// Lookup 22-bit hash
     pub fn lookup_22bit_hash(&self, hash: u32) -> Option<String> {
         self.hash_22bit.get(&hash).cloned()
     }
-    
+
     /// Calculate the 22-bit hash for a callsign, matching ft8_lib's `save_callsign()`.
     ///
     /// Algorithm: encode callsign as base-38 in 11-char field (space-padded),
@@ -491,37 +485,39 @@ impl CallsignTable {
             standard_cache: HashMap::new(),
         }
     }
-    
+
     /// Encode standard callsign to 28-bit value
     pub fn encode_standard_callsign(&self, callsign: &str) -> Ft8Result<u32> {
         const CALLSIGN_CHARS: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-        
+
         if callsign.len() > 6 {
             return Err(Ft8Error::MessageDecodingError(
-                "Callsign too long".to_string()
+                "Callsign too long".to_string(),
             ));
         }
-        
+
         let mut value = 0u32;
         // Pad with leading spaces to 6 characters
         let padded = format!("{:>6}", callsign);
-        
+
         for ch in padded.chars() {
             let ch_upper = ch.to_ascii_uppercase();
-            let pos = CALLSIGN_CHARS.iter().position(|&c| c == ch_upper as u8)
-                .ok_or_else(|| Ft8Error::MessageDecodingError(
-                    format!("Invalid character in callsign: {}", ch)
-                ))?;
-            
+            let pos = CALLSIGN_CHARS
+                .iter()
+                .position(|&c| c == ch_upper as u8)
+                .ok_or_else(|| {
+                    Ft8Error::MessageDecodingError(format!("Invalid character in callsign: {}", ch))
+                })?;
+
             value = value * 37 + pos as u32;
         }
-        
+
         if value >= 262_144_000 {
             return Err(Ft8Error::MessageDecodingError(
-                "Callsign encoding overflow".to_string()
+                "Callsign encoding overflow".to_string(),
             ));
         }
-        
+
         Ok(value)
     }
 }
@@ -542,12 +538,12 @@ impl MessageParser {
             hash_table: HashTable::new(),
         }
     }
-    
+
     /// Add callsign to hash table
     pub fn add_callsign(&mut self, callsign: &str) {
         self.hash_table.add_callsign(callsign);
     }
-    
+
     /// Parse 77-bit payload into FT8 message
     ///
     /// FT8 payload layout:
@@ -556,9 +552,10 @@ impl MessageParser {
     /// - For i3=1,2: standard message layout
     pub fn parse_payload(&self, payload: &BitSlice) -> Ft8Result<Ft8Message> {
         if payload.len() != PAYLOAD_BITS {
-            return Err(Ft8Error::MessageDecodingError(
-                format!("Invalid payload length: {} bits", payload.len())
-            ));
+            return Err(Ft8Error::MessageDecodingError(format!(
+                "Invalid payload length: {} bits",
+                payload.len()
+            )));
         }
 
         let mut message = Ft8Message::default();
@@ -648,7 +645,9 @@ impl MessageParser {
         // Helper to apply suffix: ip=1 means /R (or /P — indistinguishable in protocol)
         let apply_suffix = |call: Option<String>, ip: u8| -> Option<String> {
             match (call, ip) {
-                (Some(c), 1) if !c.starts_with("CQ") && !c.starts_with("DE") && !c.starts_with("QRZ") => {
+                (Some(c), 1)
+                    if !c.starts_with("CQ") && !c.starts_with("DE") && !c.starts_with("QRZ") =>
+                {
                     Some(format!("{}/R", c))
                 }
                 (c, _) => c,
@@ -811,7 +810,9 @@ impl MessageParser {
         let call_decoded = Self::unpack58(n58);
 
         // Look up the 12-bit hashed callsign
-        let call_hashed = self.hash_table.lookup_12bit_hash(n12 as u32)
+        let call_hashed = self
+            .hash_table
+            .lookup_12bit_hash(n12 as u32)
             .map(|c| format!("<{}>", c))
             .unwrap_or_else(|| "<...>".to_string());
 
@@ -832,9 +833,15 @@ impl MessageParser {
 
             // Decode report token
             match nrpt {
-                1 => { message.contest_exchange = Some("RRR".to_string()); }
-                2 => { message.contest_exchange = Some("RR73".to_string()); }
-                3 => { message.contest_exchange = Some("73".to_string()); }
+                1 => {
+                    message.contest_exchange = Some("RRR".to_string());
+                }
+                2 => {
+                    message.contest_exchange = Some("RR73".to_string());
+                }
+                3 => {
+                    message.contest_exchange = Some("73".to_string());
+                }
                 _ => {}
             }
         }
@@ -930,7 +937,9 @@ impl MessageParser {
                     let mut chars = Vec::new();
                     while v > 0 {
                         let r = (v % 27) as u8;
-                        if r == 0 { break; }
+                        if r == 0 {
+                            break;
+                        }
                         chars.push(b'A' + r - 1);
                         v /= 27;
                     }
@@ -960,19 +969,28 @@ impl MessageParser {
     /// Radix order: 37 × 36 × 10 × 27 × 27 × 27
     fn unpack_basecall(mut n: u32) -> Option<String> {
         const C0: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 37
-        const C1: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";  // 36
-        const C2: &[u8] = b"0123456789";                            // 10
-        const C3: &[u8] = b" ABCDEFGHIJKLMNOPQRSTUVWXYZ";           // 27
+        const C1: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 36
+        const C2: &[u8] = b"0123456789"; // 10
+        const C3: &[u8] = b" ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // 27
 
-        let i5 = (n % 27) as usize; n /= 27;
-        let i4 = (n % 27) as usize; n /= 27;
-        let i3 = (n % 27) as usize; n /= 27;
-        let i2 = (n % 10) as usize; n /= 10;
-        let i1 = (n % 36) as usize; n /= 36;
+        let i5 = (n % 27) as usize;
+        n /= 27;
+        let i4 = (n % 27) as usize;
+        n /= 27;
+        let i3 = (n % 27) as usize;
+        n /= 27;
+        let i2 = (n % 10) as usize;
+        n /= 10;
+        let i1 = (n % 36) as usize;
+        n /= 36;
         let i0 = n as usize;
 
-        if i0 >= C0.len() || i1 >= C1.len() || i2 >= C2.len()
-            || i3 >= C3.len() || i4 >= C3.len() || i5 >= C3.len()
+        if i0 >= C0.len()
+            || i1 >= C1.len()
+            || i2 >= C2.len()
+            || i3 >= C3.len()
+            || i4 >= C3.len()
+            || i5 >= C3.len()
         {
             return None;
         }
@@ -986,7 +1004,11 @@ impl MessageParser {
         call.push(C3[i5] as char);
 
         let call = call.trim().to_string();
-        if call.is_empty() { None } else { Some(call) }
+        if call.is_empty() {
+            None
+        } else {
+            Some(call)
+        }
     }
 
     /// Decode the 15-bit grid/report/token field.
@@ -999,9 +1021,12 @@ impl MessageParser {
         if igrid4 < MAXGRID4 {
             // Grid square: mixed-radix 18 × 18 × 10 × 10
             let mut g = igrid4;
-            let d3 = (g % 10) as u8; g /= 10;
-            let d2 = (g % 10) as u8; g /= 10;
-            let d1 = (g % 18) as u8; g /= 18;
+            let d3 = (g % 10) as u8;
+            g /= 10;
+            let d2 = (g % 10) as u8;
+            g /= 10;
+            let d1 = (g % 18) as u8;
+            g /= 18;
             let d0 = g as u8;
 
             if d0 < 18 && d1 < 18 && d2 < 10 && d3 < 10 {
@@ -1033,7 +1058,11 @@ impl MessageParser {
     }
 
     /// Parse Type 1 extended callsign messages
-    fn parse_extended_message(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
+    fn parse_extended_message(
+        &self,
+        payload: &BitSlice,
+        message: &mut Ft8Message,
+    ) -> Ft8Result<()> {
         // Type 1 messages support callsigns with prefixes/suffixes
         // Extract base callsign (28 bits)
         let base_call = self.unpack28(bits_to_u32(&payload[0..28]));
@@ -1058,29 +1087,29 @@ impl MessageParser {
                 message.from_callsign = Some(call);
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Parse Type 2 contest messages
     fn parse_contest_message(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
         // Extract callsigns
         let call1 = self.decode_callsign_28bit(&payload[0..28])?;
         let call2 = self.decode_callsign_28bit(&payload[28..56]);
-        
+
         message.to_callsign = call1;
         message.from_callsign = call2.unwrap_or(None);
-        
+
         // Extract contest exchange (remaining bits)
         if payload.len() > 56 {
             let exchange_bits = &payload[56..];
             let exchange_value = bits_to_u32(exchange_bits);
-            
+
             // Contest exchange formats vary:
             // - Serial number (0001-9999)
             // - Grid square + serial
             // - Section/state abbreviation
-            
+
             if exchange_value < 10000 {
                 // Serial number
                 message.contest_exchange = Some(format!("{:04}", exchange_value));
@@ -1089,10 +1118,10 @@ impl MessageParser {
                 message.contest_exchange = Some(format!("<{:06X}>", exchange_value));
             }
         }
-        
+
         Ok(())
     }
-    
+
     // =========================================================================
     // i3=0 sub-type parsers (n3 field determines format)
     // =========================================================================
@@ -1253,7 +1282,12 @@ impl MessageParser {
     ///
     /// Class: 1A through 33F (4 bits for count 1-32, encoded as 0-15 then letter)
     /// Section: ARRL/RAC section code (7 bits = 0-83)
-    fn parse_field_day_type0(&self, bits: &BitSlice, n3: u32, message: &mut Ft8Message) -> Ft8Result<()> {
+    fn parse_field_day_type0(
+        &self,
+        bits: &BitSlice,
+        n3: u32,
+        message: &mut Ft8Message,
+    ) -> Ft8Result<()> {
         let n28a = bits_to_u32(&bits[0..28]);
         let n28b = bits_to_u32(&bits[28..56]);
         let ir = bits[56];
@@ -1297,20 +1331,20 @@ impl MessageParser {
 
         Ok(())
     }
-    
+
     /// Decode callsign from 28-bit field — delegates to unpack28.
     /// Kept for compatibility with contest/field day/DXpedition parsers.
     fn decode_callsign_28bit(&self, bits: &BitSlice) -> Ft8Result<Option<String>> {
         let n28 = bits_to_u32(bits);
         Ok(self.unpack28(n28).to_callsign())
     }
-    
+
     /// Decode callsign extension (prefix/suffix)
     fn decode_callsign_extension(&self, value: u32) -> Ft8Result<Option<String>> {
         if value == 0 {
             return Ok(None);
         }
-        
+
         // Extension encoding varies by type
         if value < 1024 {
             // Numeric suffix (/0-/9, /P, /M, /MM, /AM, /QRP, etc.)
@@ -1329,103 +1363,83 @@ impl MessageParser {
             Ok(Some(self.decode_prefix_code(prefix_code)?))
         }
     }
-    
+
     /// Decode grid square from 15-bit field using Maidenhead system
     fn decode_grid_square_15bit(&self, grid_value: u32) -> Ft8Result<Option<String>> {
         // Delegate to unpackgrid — only returns the grid component
         let (grid, _, _) = Self::unpackgrid(grid_value as u16, 0);
         Ok(grid)
     }
-    
+
     /// Decode free text using 6-bit character encoding
     fn decode_text_6bit(&self, bits: &BitSlice) -> Ft8Result<Option<String>> {
         let mut text = String::new();
-        
+
         // Decode 6-bit characters (max 13 characters)
         for chunk in bits.chunks(6) {
             if chunk.len() < 6 {
                 break; // Incomplete character
             }
-            
+
             let char_value = bits_to_u32(chunk) as u8;
             let ch = self.decode_6bit_character(char_value)?;
-            
+
             if ch == '\0' {
                 break; // Null terminator
             }
-            
+
             text.push(ch);
-            
+
             if text.len() >= 13 {
                 break; // Maximum length
             }
         }
-        
+
         if text.is_empty() {
             Ok(None)
         } else {
             Ok(Some(text.trim_end().to_string()))
         }
     }
-    
+
     /// Decode 6-bit character value (WSJT-X character set)
     fn decode_6bit_character(&self, value: u8) -> Ft8Result<char> {
         // WSJT-X 6-bit character encoding
         const CHAR_SET: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?";
-        
+
         if (value as usize) < CHAR_SET.len() {
             Ok(CHAR_SET[value as usize] as char)
         } else {
             Ok('\0') // Invalid/null character
         }
     }
-    
+
     /// Decode ARRL/RAC section code (84 sections, matching WSJT-X)
     fn decode_arrl_section(&self, code: u8) -> Ft8Result<String> {
         const SECTIONS: [&str; 84] = [
             // New England (0-6)
-            "CT", "EMA", "ME", "NH", "RI", "VT", "WMA",
-            // Atlantic (7-12)
-            "ENY", "NLI", "NNJ", "NNY", "SNJ", "WNY",
-            // Mid-Atlantic (13-16)
-            "DE", "EPA", "MDC", "WPA",
-            // Southeast (17-24)
-            "AL", "GA", "KY", "NC", "NFL", "SC", "SFL", "WCF",
-            // Tennessee (25)
-            "TN",
-            // Virginia (26-27)
-            "VA", "PR",
-            // Great Lakes (28-32)
-            "MI", "OH", "WV", "IL", "IN",
-            // Wisconsin (33)
-            "WI",
-            // Midwest (34-38)
-            "AR", "LA", "MS", "NM", "OK",
-            // North Texas (39)
-            "NTX",
-            // South Texas (40)
-            "STX",
-            // West Texas (41)
-            "WTX",
-            // Central (42-47)
-            "CO", "IA", "KS", "MN", "MO", "NE",
-            // North Dakota/South Dakota (48-49)
-            "ND", "SD",
-            // Northwest (50-54)
-            "OR", "EWA", "WWA", "ID", "MT",
-            // Wyoming (55)
-            "WY",
-            // Pacific (56-58)
-            "AK", "HI", "PAC",
-            // Southwest (59-63)
+            "CT", "EMA", "ME", "NH", "RI", "VT", "WMA", // Atlantic (7-12)
+            "ENY", "NLI", "NNJ", "NNY", "SNJ", "WNY", // Mid-Atlantic (13-16)
+            "DE", "EPA", "MDC", "WPA", // Southeast (17-24)
+            "AL", "GA", "KY", "NC", "NFL", "SC", "SFL", "WCF", // Tennessee (25)
+            "TN",  // Virginia (26-27)
+            "VA", "PR", // Great Lakes (28-32)
+            "MI", "OH", "WV", "IL", "IN", // Wisconsin (33)
+            "WI", // Midwest (34-38)
+            "AR", "LA", "MS", "NM", "OK",  // North Texas (39)
+            "NTX", // South Texas (40)
+            "STX", // West Texas (41)
+            "WTX", // Central (42-47)
+            "CO", "IA", "KS", "MN", "MO", "NE", // North Dakota/South Dakota (48-49)
+            "ND", "SD", // Northwest (50-54)
+            "OR", "EWA", "WWA", "ID", "MT", // Wyoming (55)
+            "WY", // Pacific (56-58)
+            "AK", "HI", "PAC", // Southwest (59-63)
             "AZ", "EBay", "LAX", "ORG", "SB",
             // San Diego/Santa Clara/San Francisco/San Joaquin (64-67)
-            "SDG", "SCV", "SF", "SJV",
-            // Sierra/Nevada/Utah (68-70)
-            "SV", "NV", "UT",
-            // Canada (71-83)
-            "AB", "BC", "GH", "MB", "NB", "NL", "NS", "NT",
-            "ON", "PE", "QC", "SK", "YT",
+            "SDG", "SCV", "SF", "SJV", // Sierra/Nevada/Utah (68-70)
+            "SV", "NV", "UT", // Canada (71-83)
+            "AB", "BC", "GH", "MB", "NB", "NL", "NS", "NT", "ON", "PE", "QC", "SK", "YT",
         ];
 
         if (code as usize) < SECTIONS.len() {
@@ -1434,21 +1448,17 @@ impl MessageParser {
             Ok(format!("S{:02}", code))
         }
     }
-    
+
     /// Decode state/province code for RTTY Roundup (US states + Canadian provinces + DC/DX)
     fn decode_state_code(&self, code: u8) -> Ft8Result<String> {
         const STATES: [&str; 63] = [
             // US States (0-49)
-            "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
-            "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
-            "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
-            "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
-            "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
-            // DC (50)
-            "DC",
-            // Canadian provinces (51-62)
-            "AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE",
-            "QC", "SK",
+            "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN",
+            "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV",
+            "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN",
+            "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", // DC (50)
+            "DC", // Canadian provinces (51-62)
+            "AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE", "QC", "SK",
         ];
 
         if (code as usize) < STATES.len() {
@@ -1457,12 +1467,12 @@ impl MessageParser {
             Ok(format!("DX"))
         }
     }
-    
+
     /// Decode prefix code for extended callsigns
     fn decode_prefix_code(&self, code: u32) -> Ft8Result<String> {
         // Common prefixes based on ITU regions and special operations
         match code {
-            0..=99 => Ok(format!("K{}", code)),      // US regions
+            0..=99 => Ok(format!("K{}", code)),           // US regions
             100..=199 => Ok(format!("VE{}", code - 100)), // Canada
             200..=299 => Ok(format!("JA{}", code - 200)), // Japan
             // ... more prefix mappings
@@ -1547,11 +1557,11 @@ pub fn verify_crc14(message_bits: &BitSlice) -> bool {
     if message_bits.len() != TOTAL_MESSAGE_BITS {
         return false;
     }
-    
+
     let payload = &message_bits[0..PAYLOAD_BITS];
     let received_crc = bits_to_u32(&message_bits[PAYLOAD_BITS..]) as u16;
     let calculated_crc = calculate_crc14(payload);
-    
+
     received_crc == calculated_crc
 }
 
@@ -1610,7 +1620,7 @@ mod tests {
         message.standard_type = Some(StandardMessageType::Cq);
         message.from_callsign = Some("W1ABC".to_string());
         message.grid_square = Some("FN42".to_string());
-        
+
         let display = message.to_string();
         assert!(display.contains("CQ"));
         assert!(display.contains("W1ABC"));
@@ -1621,13 +1631,13 @@ mod tests {
     fn test_decoded_message_creation() {
         let ft8_msg = Ft8Message::default();
         let decoded = DecodedMessage::new(ft8_msg, -15.5, 0.85, 1523.4, 2.1);
-        
+
         assert_eq!(decoded.snr_db, -15.5);
         assert_eq!(decoded.confidence, 0.85);
         assert_eq!(decoded.frequency_offset, 1523.4);
         assert_eq!(decoded.time_offset, 2.1);
     }
-    
+
     #[test]
     fn test_callsign_unpack28_round_trip() {
         let parser = MessageParser::new();
@@ -1642,12 +1652,12 @@ mod tests {
         let w1abc_basecall = {
             // Pack W1ABC manually using mixed-radix
             // " W1ABC" → c6 = [' ', 'W', '1', 'A', 'B', 'C']
-            let i0: u32 = 0;  // space
+            let i0: u32 = 0; // space
             let i1: u32 = 32; // W in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            let i2: u32 = 1;  // 1
-            let i3: u32 = 1;  // A in " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-            let i4: u32 = 2;  // B
-            let i5: u32 = 3;  // C
+            let i2: u32 = 1; // 1
+            let i3: u32 = 1; // A in " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            let i4: u32 = 2; // B
+            let i5: u32 = 3; // C
             let n = ((((i0 * 36 + i1) * 10 + i2) * 27 + i3) * 27 + i4) * 27 + i5;
             n
         };
@@ -1656,25 +1666,26 @@ mod tests {
         let call = parser.unpack28(NTOKENS + MAX22 + w1abc_basecall);
         assert_eq!(call.to_callsign(), Some("W1ABC".to_string()));
     }
-    
-    #[test] 
+
+    #[test]
     fn test_hash_table_operations() {
         let mut hash_table = HashTable::new();
-        
+
         // Add test callsign
         hash_table.add_callsign("K1ABC");
-        
+
         // Test hash lookups
         let hash_10 = hash_table.calculate_hash_10bit("K1ABC");
         let lookup_10 = hash_table.lookup_10bit_hash(hash_10);
         assert_eq!(lookup_10, Some("K1ABC".to_string()));
     }
-    
+
     #[test]
     fn test_bits_to_u64() {
-        let bits = bitvec![1, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0,
-                           1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0,
-                           0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let bits = bitvec![
+            1, 0, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+            0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1
+        ];
         assert_eq!(bits_to_u64(&bits), 0xB0F0AAAA0001u64);
     }
 
@@ -1708,7 +1719,9 @@ mod tests {
             let j = CHARSET.iter().position(|&c| c == b).unwrap();
             n58 = n58 * 38 + j as u64;
         }
-        for _ in call.len()..11 { n58 *= 38; }
+        for _ in call.len()..11 {
+            n58 *= 38;
+        }
 
         let n12: u16 = 0; // not used for CQ
         let iflip: u8 = 0;
@@ -1718,17 +1731,25 @@ mod tests {
 
         let mut payload = BitVec::with_capacity(77);
         // n12: 12 bits
-        for i in (0..12).rev() { payload.push((n12 >> i) & 1 != 0); }
+        for i in (0..12).rev() {
+            payload.push((n12 >> i) & 1 != 0);
+        }
         // n58: 58 bits
-        for i in (0..58).rev() { payload.push((n58 >> i) & 1 != 0); }
+        for i in (0..58).rev() {
+            payload.push((n58 >> i) & 1 != 0);
+        }
         // iflip: 1 bit
         payload.push(iflip != 0);
         // nrpt: 2 bits
-        for i in (0..2).rev() { payload.push((nrpt >> i) & 1 != 0); }
+        for i in (0..2).rev() {
+            payload.push((nrpt >> i) & 1 != 0);
+        }
         // icq: 1 bit
         payload.push(icq != 0);
         // i3: 3 bits
-        for i in (0..3).rev() { payload.push((i3 >> i) & 1 != 0); }
+        for i in (0..3).rev() {
+            payload.push((i3 >> i) & 1 != 0);
+        }
 
         assert_eq!(payload.len(), 77);
 
@@ -1749,7 +1770,9 @@ mod tests {
             let j = CHARSET.iter().position(|&c| c == b).unwrap();
             n58 = n58 * 38 + j as u64;
         }
-        for _ in call.len()..11 { n58 *= 38; }
+        for _ in call.len()..11 {
+            n58 *= 38;
+        }
 
         let n12: u16 = 42; // some hash
         let iflip: u8 = 0;
@@ -1758,12 +1781,20 @@ mod tests {
         let i3: u8 = 4;
 
         let mut payload = BitVec::with_capacity(77);
-        for i in (0..12).rev() { payload.push((n12 >> i) & 1 != 0); }
-        for i in (0..58).rev() { payload.push((n58 >> i) & 1 != 0); }
+        for i in (0..12).rev() {
+            payload.push((n12 >> i) & 1 != 0);
+        }
+        for i in (0..58).rev() {
+            payload.push((n58 >> i) & 1 != 0);
+        }
         payload.push(iflip != 0);
-        for i in (0..2).rev() { payload.push((nrpt >> i) & 1 != 0); }
+        for i in (0..2).rev() {
+            payload.push((nrpt >> i) & 1 != 0);
+        }
         payload.push(icq != 0);
-        for i in (0..3).rev() { payload.push((i3 >> i) & 1 != 0); }
+        for i in (0..3).rev() {
+            payload.push((i3 >> i) & 1 != 0);
+        }
 
         let parser = MessageParser::new();
         let msg = parser.parse_payload(&payload).unwrap();
@@ -1794,9 +1825,13 @@ mod tests {
             payload.push((shifted[i / 8] >> (7 - (i % 8))) & 1 != 0);
         }
         // n3 = 5 = 0b101
-        payload.push(true); payload.push(false); payload.push(true);
+        payload.push(true);
+        payload.push(false);
+        payload.push(true);
         // i3 = 0 = 0b000
-        payload.push(false); payload.push(false); payload.push(false);
+        payload.push(false);
+        payload.push(false);
+        payload.push(false);
 
         assert_eq!(payload.len(), 77);
 
@@ -1841,15 +1876,17 @@ mod tests {
         for i in 0..(77 % 16) {
             payload.push(pattern[i] != 0);
         }
-        
+
         let crc = calculate_crc14(&payload);
         assert!(crc <= 0x3FFF); // 14-bit value
-        
+
         // Test CRC verification with proper 91-bit message
         let mut full_message = payload.clone();
-        let crc_bits = (0..14).map(|i| (crc >> (13 - i)) & 1 != 0).collect::<BitVec>();
+        let crc_bits = (0..14)
+            .map(|i| (crc >> (13 - i)) & 1 != 0)
+            .collect::<BitVec>();
         full_message.extend(crc_bits);
-        
+
         assert_eq!(full_message.len(), TOTAL_MESSAGE_BITS);
         assert!(verify_crc14(&full_message));
     }

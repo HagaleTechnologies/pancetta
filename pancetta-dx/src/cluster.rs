@@ -3,8 +3,9 @@
 //! This module provides connectivity to DX cluster networks for real-time
 //! DX spot monitoring and posting.
 
-use crate::{Band, Mode, DxSpot, DxError, Result};
-use chrono::{DateTime, Utc, Timelike};
+use crate::{Band, DxError, DxSpot, Mode, Result};
+use chrono::{DateTime, Timelike, Utc};
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,8 +14,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Duration;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use futures_util::{SinkExt, StreamExt};
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 use url::Url;
 
 /// DX Cluster configuration
@@ -64,8 +64,8 @@ pub struct ClusterFilter {
 impl Default for ClusterFilter {
     fn default() -> Self {
         Self {
-            bands: Vec::new(), // Empty = all bands
-            modes: Vec::new(), // Empty = all modes
+            bands: Vec::new(),         // Empty = all bands
+            modes: Vec::new(),         // Empty = all modes
             dxcc_entities: Vec::new(), // Empty = all entities
             min_frequency: None,
             max_frequency: None,
@@ -158,7 +158,7 @@ impl DxClusterClient {
             recent_spots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-    
+
     /// Create client with custom configuration
     pub fn with_config(config: ClusterConfig) -> Self {
         Self {
@@ -169,28 +169,31 @@ impl DxClusterClient {
             recent_spots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
-    
+
     /// Update configuration
     pub fn update_config(&mut self, config: ClusterConfig) {
         self.config = config;
     }
-    
+
     /// Get current configuration
     pub fn config(&self) -> &ClusterConfig {
         &self.config
     }
-    
+
     /// Get connection status
     pub async fn status(&self) -> ConnectionStatus {
         self.status.lock().await.clone()
     }
-    
+
     /// Connect to DX cluster
     pub async fn connect(&mut self) -> Result<()> {
         *self.status.lock().await = ConnectionStatus::Connecting;
-        
-        info!("Connecting to DX cluster: {}:{}", self.config.hostname, self.config.port);
-        
+
+        info!(
+            "Connecting to DX cluster: {}:{}",
+            self.config.hostname, self.config.port
+        );
+
         if self.config.use_websocket {
             if let Some(ws_url) = self.config.websocket_url.clone() {
                 self.connect_websocket(&ws_url).await
@@ -201,52 +204,56 @@ impl DxClusterClient {
             self.connect_telnet().await
         }
     }
-    
+
     /// Connect via Telnet
     async fn connect_telnet(&mut self) -> Result<()> {
         let addr = format!("{}:{}", self.config.hostname, self.config.port);
-        
+
         let stream = tokio::time::timeout(
             Duration::from_secs(self.config.timeout_seconds),
-            TcpStream::connect(&addr)
-        ).await
+            TcpStream::connect(&addr),
+        )
+        .await
         .map_err(|_| DxError::ExternalService("Connection timeout".to_string()))?
         .map_err(|e| DxError::ExternalService(e.to_string()))?;
-        
+
         let (reader, mut writer) = stream.into_split();
         let mut reader = BufReader::new(reader);
-        
+
         // Create channels for communication
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
         let (spot_tx, spot_rx) = mpsc::unbounded_channel::<DxSpot>();
-        
+
         self.command_sender = Some(cmd_tx);
         self.spot_receiver = Some(spot_rx);
-        
+
         let status = self.status.clone();
         let recent_spots = self.recent_spots.clone();
         let filter = self.config.filter_settings.clone();
         let callsign = self.config.callsign.clone();
-        
+
         // Spawn writer task
         let writer_status = status.clone();
         tokio::spawn(async move {
             while let Some(command) = cmd_rx.recv().await {
                 debug!("Sending cluster command: {}", command);
-                
-                if let Err(e) = writer.write_all(format!("{}\r\n", command).as_bytes()).await {
+
+                if let Err(e) = writer
+                    .write_all(format!("{}\r\n", command).as_bytes())
+                    .await
+                {
                     error!("Failed to send command to cluster: {}", e);
                     *writer_status.lock().await = ConnectionStatus::Error(e.to_string());
                     break;
                 }
             }
         });
-        
+
         // Spawn reader task
         tokio::spawn(async move {
             let mut line = String::new();
             let mut logged_in = false;
-            
+
             loop {
                 line.clear();
                 match reader.read_line(&mut line).await {
@@ -254,18 +261,21 @@ impl DxClusterClient {
                         warn!("DX cluster connection closed");
                         *status.lock().await = ConnectionStatus::Disconnected;
                         break;
-                    },
+                    }
                     Ok(_) => {
                         let line = line.trim();
                         if line.is_empty() {
                             continue;
                         }
-                        
+
                         debug!("Cluster: {}", line);
-                        
+
                         // Handle login
                         if !logged_in {
-                            if line.contains("call:") || line.contains("callsign:") || line.contains("Please enter your call") {
+                            if line.contains("call:")
+                                || line.contains("callsign:")
+                                || line.contains("Please enter your call")
+                            {
                                 // Login prompt detected - this would be handled by command sender
                                 info!("Login prompt detected");
                                 // The actual login would be initiated by the calling code
@@ -276,25 +286,31 @@ impl DxClusterClient {
                             }
                             continue;
                         }
-                        
+
                         // Parse cluster messages
                         if let Some(message) = Self::parse_cluster_line(line) {
                             match message {
                                 ClusterMessage::Spot(cluster_spot) => {
-                                    if let Ok(dx_spot) = Self::convert_cluster_spot(cluster_spot, &filter, &recent_spots).await {
+                                    if let Ok(dx_spot) = Self::convert_cluster_spot(
+                                        cluster_spot,
+                                        &filter,
+                                        &recent_spots,
+                                    )
+                                    .await
+                                    {
                                         if spot_tx.send(dx_spot).is_err() {
                                             warn!("Spot receiver dropped");
                                             break;
                                         }
                                     }
-                                },
+                                }
                                 _ => {
                                     // Handle other message types as needed
                                     debug!("Received cluster message: {:?}", message);
                                 }
                             }
                         }
-                    },
+                    }
                     Err(e) => {
                         error!("Error reading from cluster: {}", e);
                         *status.lock().await = ConnectionStatus::Error(e.to_string());
@@ -303,39 +319,40 @@ impl DxClusterClient {
                 }
             }
         });
-        
+
         *self.status.lock().await = ConnectionStatus::Connected;
         Ok(())
     }
-    
+
     /// Connect via WebSocket
     async fn connect_websocket(&mut self, ws_url: &str) -> Result<()> {
         // Validate URL first
         let _url = Url::parse(ws_url)
             .map_err(|e| DxError::Configuration(format!("Invalid WebSocket URL: {}", e)))?;
-        
-        let (ws_stream, _response) = connect_async(ws_url).await
+
+        let (ws_stream, _response) = connect_async(ws_url)
+            .await
             .map_err(|e| DxError::ExternalService(format!("WebSocket connection failed: {}", e)))?;
-        
+
         let (mut write, mut read) = ws_stream.split();
-        
+
         // Create channels
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
         let (spot_tx, spot_rx) = mpsc::unbounded_channel::<DxSpot>();
-        
+
         self.command_sender = Some(cmd_tx);
         self.spot_receiver = Some(spot_rx);
-        
+
         let status = self.status.clone();
         let recent_spots = self.recent_spots.clone();
         let filter = self.config.filter_settings.clone();
-        
+
         // Spawn writer task
         let writer_status = status.clone();
         tokio::spawn(async move {
             while let Some(command) = cmd_rx.recv().await {
                 debug!("Sending WebSocket command: {}", command);
-                
+
                 if let Err(e) = write.send(Message::Text(command)).await {
                     error!("Failed to send WebSocket message: {}", e);
                     *writer_status.lock().await = ConnectionStatus::Error(e.to_string());
@@ -343,17 +360,20 @@ impl DxClusterClient {
                 }
             }
         });
-        
+
         // Spawn reader task
         tokio::spawn(async move {
             while let Some(message) = read.next().await {
                 match message {
                     Ok(Message::Text(text)) => {
                         debug!("WebSocket: {}", text);
-                        
+
                         if let Some(cluster_message) = Self::parse_cluster_line(&text) {
                             if let ClusterMessage::Spot(cluster_spot) = cluster_message {
-                                if let Ok(dx_spot) = Self::convert_cluster_spot(cluster_spot, &filter, &recent_spots).await {
+                                if let Ok(dx_spot) =
+                                    Self::convert_cluster_spot(cluster_spot, &filter, &recent_spots)
+                                        .await
+                                {
                                     if spot_tx.send(dx_spot).is_err() {
                                         warn!("Spot receiver dropped");
                                         break;
@@ -361,80 +381,90 @@ impl DxClusterClient {
                                 }
                             }
                         }
-                    },
+                    }
                     Ok(Message::Close(_)) => {
                         info!("WebSocket connection closed");
                         *status.lock().await = ConnectionStatus::Disconnected;
                         break;
-                    },
+                    }
                     Err(e) => {
                         error!("WebSocket error: {}", e);
                         *status.lock().await = ConnectionStatus::Error(e.to_string());
                         break;
-                    },
+                    }
                     _ => {}
                 }
             }
         });
-        
+
         *self.status.lock().await = ConnectionStatus::Connected;
         Ok(())
     }
-    
+
     /// Login to cluster
     pub async fn login(&self) -> Result<()> {
         if let Some(sender) = &self.command_sender {
-            sender.send(self.config.callsign.clone())
-                .map_err(|_| DxError::ExternalService("Failed to send login command".to_string()))?;
+            sender.send(self.config.callsign.clone()).map_err(|_| {
+                DxError::ExternalService("Failed to send login command".to_string())
+            })?;
         }
         Ok(())
     }
-    
+
     /// Send command to cluster
     pub async fn send_command(&self, command: &str) -> Result<()> {
         if let Some(sender) = &self.command_sender {
-            sender.send(command.to_string())
+            sender
+                .send(command.to_string())
                 .map_err(|_| DxError::ExternalService("Failed to send command".to_string()))?;
             Ok(())
         } else {
-            Err(DxError::ExternalService("Not connected to cluster".to_string()))
+            Err(DxError::ExternalService(
+                "Not connected to cluster".to_string(),
+            ))
         }
     }
-    
+
     /// Post a DX spot
     pub async fn post_spot(&self, spot: &DxSpot) -> Result<()> {
         let freq_khz = spot.frequency as f64 / 1000.0;
-        let command = format!("DX {:.1} {} {}", 
-                             freq_khz, 
-                             spot.callsign,
-                             spot.comment.as_deref().unwrap_or(""));
-        
+        let command = format!(
+            "DX {:.1} {} {}",
+            freq_khz,
+            spot.callsign,
+            spot.comment.as_deref().unwrap_or("")
+        );
+
         self.send_command(&command).await
     }
-    
+
     /// Set cluster filters
     pub async fn set_filters(&self) -> Result<()> {
         let filter = &self.config.filter_settings;
-        
+
         // Set band filters
         if !filter.bands.is_empty() {
-            let bands_str = filter.bands.iter()
+            let bands_str = filter
+                .bands
+                .iter()
                 .map(|b| b.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
-            self.send_command(&format!("SET/FILTER BAND {}", bands_str)).await?;
+            self.send_command(&format!("SET/FILTER BAND {}", bands_str))
+                .await?;
         }
-        
+
         // Set frequency filters
         if let (Some(min_freq), Some(max_freq)) = (filter.min_frequency, filter.max_frequency) {
             let min_khz = min_freq as f64 / 1000.0;
             let max_khz = max_freq as f64 / 1000.0;
-            self.send_command(&format!("SET/FILTER FREQ {}-{}", min_khz, max_khz)).await?;
+            self.send_command(&format!("SET/FILTER FREQ {}-{}", min_khz, max_khz))
+                .await?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Receive spots
     pub async fn receive_spot(&mut self) -> Option<DxSpot> {
         if let Some(receiver) = &mut self.spot_receiver {
@@ -443,47 +473,47 @@ impl DxClusterClient {
             None
         }
     }
-    
+
     /// Monitor spots with callback
     pub async fn monitor_spots<F>(&mut self, mut callback: F) -> Result<()>
     where
         F: FnMut(DxSpot) -> Result<()>,
     {
         info!("Starting DX cluster spot monitoring");
-        
+
         while let Some(spot) = self.receive_spot().await {
             if let Err(e) = callback(spot) {
                 error!("Error in spot callback: {}", e);
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Disconnect from cluster
     pub async fn disconnect(&mut self) {
         if let Some(sender) = &self.command_sender {
             let _ = sender.send("BYE".to_string());
         }
-        
+
         self.command_sender = None;
         self.spot_receiver = None;
         *self.status.lock().await = ConnectionStatus::Disconnected;
-        
+
         info!("Disconnected from DX cluster");
     }
-    
+
     /// Parse cluster line into message
     fn parse_cluster_line(line: &str) -> Option<ClusterMessage> {
         let line = line.trim();
-        
+
         // DX spot format: DX de W1ABC:     14074.0  JA1XYZ       FT8 from Tokyo     1234Z
         if line.starts_with("DX de ") {
             if let Some(spot) = Self::parse_dx_spot(line) {
                 return Some(ClusterMessage::Spot(spot));
             }
         }
-        
+
         // Announcements
         if line.starts_with("To ALL de ") || line.starts_with("WWV de ") {
             return Some(ClusterMessage::Announcement {
@@ -491,42 +521,42 @@ impl DxClusterClient {
                 time: Utc::now(),
             });
         }
-        
+
         // System messages
         if line.starts_with("Login: ") || line.contains("Welcome") || line.contains("Hello") {
             return Some(ClusterMessage::Login {
                 text: line.to_string(),
             });
         }
-        
+
         // Default to raw message
         Some(ClusterMessage::Raw {
             text: line.to_string(),
         })
     }
-    
+
     /// Parse DX spot line
     fn parse_dx_spot(line: &str) -> Option<ClusterSpot> {
         // Expected format: DX de W1ABC:     14074.0  JA1XYZ       FT8 from Tokyo     1234Z
         let parts: Vec<&str> = line.split_whitespace().collect();
-        
+
         if parts.len() < 5 {
             return None;
         }
-        
+
         // Extract spotter (remove "de" and ":")
         let spotter = parts.get(2)?.trim_end_matches(':');
-        
+
         // Extract frequency
         let frequency_khz: f64 = parts.get(3)?.parse().ok()?;
-        
+
         // Extract spotted callsign
         let callsign = parts.get(4)?.to_string();
-        
+
         // Extract comment (everything after callsign)
         let comment_start = line.find(callsign.as_str())? + callsign.len();
         let comment = line[comment_start..].trim();
-        
+
         // Extract time (last token ending with Z)
         let time_str = parts.last()?;
         let time = if time_str.ends_with('Z') {
@@ -535,7 +565,7 @@ impl DxClusterClient {
         } else {
             Utc::now()
         };
-        
+
         Some(ClusterSpot {
             callsign: callsign.to_uppercase(),
             frequency_khz,
@@ -545,26 +575,26 @@ impl DxClusterClient {
             raw_line: line.to_string(),
         })
     }
-    
+
     /// Parse cluster time format (HHMMZ)
     fn parse_cluster_time(time_str: &str) -> Option<DateTime<Utc>> {
         if !time_str.ends_with('Z') || time_str.len() != 5 {
             return None;
         }
-        
+
         let time_digits = &time_str[0..4];
         let hour: u32 = time_digits[0..2].parse().ok()?;
         let minute: u32 = time_digits[2..4].parse().ok()?;
-        
+
         if hour > 23 || minute > 59 {
             return None;
         }
-        
+
         let now = Utc::now();
         let today = now.date_naive();
-        
+
         let time = today.and_hms_opt(hour, minute, 0)?.and_utc();
-        
+
         // If the time is in the future (next hour), assume it's from yesterday
         if time > now + chrono::Duration::hours(1) {
             Some(time - chrono::Duration::days(1))
@@ -572,7 +602,7 @@ impl DxClusterClient {
             Some(time)
         }
     }
-    
+
     /// Convert cluster spot to DxSpot
     async fn convert_cluster_spot(
         cluster_spot: ClusterSpot,
@@ -580,37 +610,46 @@ impl DxClusterClient {
         recent_spots: &Arc<Mutex<HashMap<String, DateTime<Utc>>>>,
     ) -> Result<DxSpot> {
         // Check for duplicates
-        let spot_key = format!("{}:{}", cluster_spot.callsign, cluster_spot.frequency_khz as u64);
+        let spot_key = format!(
+            "{}:{}",
+            cluster_spot.callsign, cluster_spot.frequency_khz as u64
+        );
         {
             let mut recent = recent_spots.lock().await;
             if let Some(last_time) = recent.get(&spot_key) {
                 let elapsed = Utc::now().signed_duration_since(*last_time);
                 if elapsed.num_seconds() < filter.duplicate_timeout as i64 {
-                    return Err(DxError::Configuration("Duplicate spot filtered".to_string()));
+                    return Err(DxError::Configuration(
+                        "Duplicate spot filtered".to_string(),
+                    ));
                 }
             }
             recent.insert(spot_key, cluster_spot.time);
         }
-        
+
         // Convert frequency to Hz
         let frequency = (cluster_spot.frequency_khz * 1000.0) as u64;
-        
+
         // Apply frequency filters
         if let Some(min_freq) = filter.min_frequency {
             if frequency < min_freq {
-                return Err(DxError::Configuration("Frequency below minimum".to_string()));
+                return Err(DxError::Configuration(
+                    "Frequency below minimum".to_string(),
+                ));
             }
         }
-        
+
         if let Some(max_freq) = filter.max_frequency {
             if frequency > max_freq {
-                return Err(DxError::Configuration("Frequency above maximum".to_string()));
+                return Err(DxError::Configuration(
+                    "Frequency above maximum".to_string(),
+                ));
             }
         }
-        
+
         // Try to extract mode from comment
         let mode = Self::extract_mode_from_comment(&cluster_spot.comment);
-        
+
         Ok(DxSpot {
             callsign: cluster_spot.callsign,
             frequency,
@@ -618,18 +657,18 @@ impl DxClusterClient {
             spotter: cluster_spot.spotter,
             time: cluster_spot.time,
             comment: Some(cluster_spot.comment),
-            dxcc_entity: None, // Will be filled by DX Hunter
-            grid_square: None, // Could be extracted from comment
-            distance_km: None, // Will be calculated
+            dxcc_entity: None,     // Will be filled by DX Hunter
+            grid_square: None,     // Could be extracted from comment
+            distance_km: None,     // Will be calculated
             bearing_degrees: None, // Will be calculated
-            rarity_score: None, // Will be calculated
+            rarity_score: None,    // Will be calculated
         })
     }
-    
+
     /// Extract mode from spot comment
     fn extract_mode_from_comment(comment: &str) -> Option<Mode> {
         let comment_upper = comment.to_uppercase();
-        
+
         if comment_upper.contains("FT8") {
             Some(Mode::FT8)
         } else if comment_upper.contains("FT4") {
@@ -671,37 +710,49 @@ mod tests {
         assert_eq!(client.config.hostname, "dxc.nc7j.com");
         assert_eq!(client.config.port, 23);
     }
-    
+
     #[test]
     fn test_dx_spot_parsing() {
         let line = "DX de W1ABC:     14074.0  JA1XYZ       FT8 from Tokyo     1234Z";
         let spot = DxClusterClient::parse_dx_spot(line).unwrap();
-        
+
         assert_eq!(spot.spotter, "W1ABC");
         assert_eq!(spot.frequency_khz, 14074.0);
         assert_eq!(spot.callsign, "JA1XYZ");
         assert!(spot.comment.contains("FT8"));
         assert!(spot.comment.contains("Tokyo"));
     }
-    
+
     #[test]
     fn test_time_parsing() {
         let time = DxClusterClient::parse_cluster_time("1234Z").unwrap();
         assert_eq!(chrono::Timelike::hour(&time.time()), 12);
         assert_eq!(chrono::Timelike::minute(&time.time()), 34);
-        
+
         assert!(DxClusterClient::parse_cluster_time("2560Z").is_none()); // Invalid hour
-        assert!(DxClusterClient::parse_cluster_time("1234").is_none());  // Missing Z
+        assert!(DxClusterClient::parse_cluster_time("1234").is_none()); // Missing Z
     }
-    
+
     #[test]
     fn test_mode_extraction() {
-        assert_eq!(DxClusterClient::extract_mode_from_comment("FT8 from Tokyo"), Some(Mode::FT8));
-        assert_eq!(DxClusterClient::extract_mode_from_comment("CW QRP"), Some(Mode::CW));
-        assert_eq!(DxClusterClient::extract_mode_from_comment("SSB contest"), Some(Mode::USB));
-        assert_eq!(DxClusterClient::extract_mode_from_comment("Just saying hello"), None);
+        assert_eq!(
+            DxClusterClient::extract_mode_from_comment("FT8 from Tokyo"),
+            Some(Mode::FT8)
+        );
+        assert_eq!(
+            DxClusterClient::extract_mode_from_comment("CW QRP"),
+            Some(Mode::CW)
+        );
+        assert_eq!(
+            DxClusterClient::extract_mode_from_comment("SSB contest"),
+            Some(Mode::USB)
+        );
+        assert_eq!(
+            DxClusterClient::extract_mode_from_comment("Just saying hello"),
+            None
+        );
     }
-    
+
     #[test]
     fn test_cluster_filter_default() {
         let filter = ClusterFilter::default();
@@ -709,7 +760,7 @@ mod tests {
         assert!(filter.modes.is_empty());
         assert_eq!(filter.duplicate_timeout, 300);
     }
-    
+
     #[test]
     fn test_message_parsing() {
         // Test DX spot
@@ -719,18 +770,22 @@ mod tests {
         } else {
             panic!("Failed to parse DX spot");
         }
-        
+
         // Test announcement
         let ann_line = "To ALL de W1ABC: Contest starts now!";
-        if let Some(ClusterMessage::Announcement { text, .. }) = DxClusterClient::parse_cluster_line(ann_line) {
+        if let Some(ClusterMessage::Announcement { text, .. }) =
+            DxClusterClient::parse_cluster_line(ann_line)
+        {
             assert!(text.contains("Contest"));
         } else {
             panic!("Failed to parse announcement");
         }
-        
+
         // Test login
         let login_line = "Login: W1ABC";
-        if let Some(ClusterMessage::Login { text }) = DxClusterClient::parse_cluster_line(login_line) {
+        if let Some(ClusterMessage::Login { text }) =
+            DxClusterClient::parse_cluster_line(login_line)
+        {
             assert!(text.contains("Login"));
         } else {
             panic!("Failed to parse login");

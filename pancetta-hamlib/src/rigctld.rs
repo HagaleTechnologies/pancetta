@@ -92,43 +92,47 @@ impl RigctldClient {
     /// Send a command and get response
     async fn send_command(&self, command: &str) -> Result<String> {
         let mut stream_guard = self.stream.lock().await;
-        
+
         if let Some(stream) = stream_guard.as_mut() {
             // Send command
             let cmd_with_newline = format!("{}\n", command);
             debug!("Sending rigctld command: {}", command);
-            
+
             stream.write_all(cmd_with_newline.as_bytes()).await?;
             stream.flush().await?;
-            
+
             // Read response
             let mut response = String::new();
             let mut reader = BufReader::new(stream);
-            
+
             // Read with timeout
             match timeout(
                 Duration::from_millis(self.config.command_timeout_ms),
-                reader.read_line(&mut response)
-            ).await {
+                reader.read_line(&mut response),
+            )
+            .await
+            {
                 Ok(Ok(_)) => {
                     response = response.trim().to_string();
-                    
+
                     // Check for errors
                     if response.starts_with("RPRT") {
-                        let code = response.split_whitespace().nth(1)
+                        let code = response
+                            .split_whitespace()
+                            .nth(1)
                             .and_then(|s| s.parse::<i32>().ok())
                             .unwrap_or(-1);
-                        
+
                         if code != 0 {
                             return Err(anyhow!("Rigctld error code: {}", code));
                         }
-                        
+
                         // Read actual data after RPRT 0
                         response.clear();
                         reader.read_line(&mut response).await?;
                         response = response.trim().to_string();
                     }
-                    
+
                     debug!("Rigctld response: {}", response);
                     Ok(response)
                 }
@@ -143,14 +147,14 @@ impl RigctldClient {
     /// Send command with retry logic
     async fn send_command_with_retry(&self, command: &str) -> Result<String> {
         let mut last_error = None;
-        
+
         for attempt in 0..self.config.retry_count {
             match self.send_command(command).await {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     warn!("Command failed (attempt {}): {}", attempt + 1, e);
                     last_error = Some(e);
-                    
+
                     // Reconnect if disconnected
                     let state = self.state.read().await;
                     if !state.connected {
@@ -160,13 +164,14 @@ impl RigctldClient {
                 }
             }
         }
-        
+
         Err(last_error.unwrap_or_else(|| anyhow!("Command failed after retries")))
     }
 
     /// Parse frequency from response
     fn parse_frequency(response: &str) -> Result<u64> {
-        response.trim()
+        response
+            .trim()
             .parse::<u64>()
             .map_err(|e| anyhow!("Failed to parse frequency: {}", e))
     }
@@ -232,34 +237,40 @@ impl RigctldClient {
 impl RigControl for RigctldClient {
     #[instrument(skip(self))]
     async fn connect(&self) -> Result<()> {
-        info!("Connecting to rigctld at {}:{}", self.config.host, self.config.port);
-        
+        info!(
+            "Connecting to rigctld at {}:{}",
+            self.config.host, self.config.port
+        );
+
         // Try to connect with timeout
         let addr = format!("{}:{}", self.config.host, self.config.port);
         let connect_result = timeout(
             Duration::from_millis(self.config.timeout_ms),
-            TcpStream::connect(&addr)
-        ).await;
-        
+            TcpStream::connect(&addr),
+        )
+        .await;
+
         match connect_result {
             Ok(Ok(stream)) => {
                 // Set TCP keepalive
                 stream.set_nodelay(true)?;
-                
+
                 // Store stream
                 *self.stream.lock().await = Some(stream);
-                
+
                 // Update state
                 let mut state = self.state.write().await;
                 state.connected = true;
-                
+
                 info!("Successfully connected to rigctld");
-                
+
                 // Test connection with a simple command
                 match timeout(
                     Duration::from_millis(1000),
-                    self.send_command("\\dump_state")
-                ).await {
+                    self.send_command("\\dump_state"),
+                )
+                .await
+                {
                     Ok(Ok(_)) => {
                         info!("Rigctld connection verified");
                         Ok(())
@@ -291,20 +302,20 @@ impl RigControl for RigctldClient {
 
     async fn disconnect(&self) -> Result<()> {
         info!("Disconnecting from rigctld");
-        
+
         // Close stream
         *self.stream.lock().await = None;
-        
+
         // Update state
         let mut state = self.state.write().await;
         state.connected = false;
-        
+
         Ok(())
     }
 
     async fn get_status(&self) -> Result<RigStatus> {
         let state = self.state.read().await;
-        
+
         Ok(RigStatus {
             connection_state: if state.connected {
                 ConnectionState::Connected
@@ -330,11 +341,11 @@ impl RigControl for RigctldClient {
         // Rigctld expects frequency in Hz
         let cmd = format!("\\set_freq {} {}", Self::vfo_to_string(vfo), frequency);
         self.send_command_with_retry(&cmd).await?;
-        
+
         // Update cached value
         let mut state = self.state.write().await;
         state.last_frequency = frequency;
-        
+
         Ok(())
     }
 
@@ -342,29 +353,30 @@ impl RigControl for RigctldClient {
         let cmd = format!("\\get_freq {}", Self::vfo_to_string(vfo));
         let response = self.send_command_with_retry(&cmd).await?;
         let frequency = Self::parse_frequency(&response)?;
-        
+
         // Update cached value
         let mut state = self.state.write().await;
         state.last_frequency = frequency;
-        
+
         Ok(frequency)
     }
 
     #[instrument(skip(self))]
     async fn set_mode(&self, vfo: Vfo, mode: Mode, passband: Option<i32>) -> Result<()> {
         let pb = passband.unwrap_or(0);
-        let cmd = format!("\\set_mode {} {} {}", 
+        let cmd = format!(
+            "\\set_mode {} {} {}",
             Self::vfo_to_string(vfo),
             Self::mode_to_string(mode),
             pb
         );
-        
+
         self.send_command_with_retry(&cmd).await?;
-        
+
         // Update cached value
         let mut state = self.state.write().await;
         state.last_mode = mode;
-        
+
         Ok(())
     }
 
@@ -372,11 +384,11 @@ impl RigControl for RigctldClient {
         let cmd = format!("\\get_mode {}", Self::vfo_to_string(vfo));
         let response = self.send_command_with_retry(&cmd).await?;
         let (mode, passband) = Self::parse_mode(&response)?;
-        
+
         // Update cached value
         let mut state = self.state.write().await;
         state.last_mode = mode;
-        
+
         Ok((mode, passband))
     }
 
@@ -386,46 +398,44 @@ impl RigControl for RigctldClient {
             PttState::On | PttState::OnMic | PttState::OnData => "1",
             PttState::Off => "0",
         };
-        
+
         let cmd = format!("\\set_ptt {} {}", Self::vfo_to_string(vfo), ptt_value);
         self.send_command_with_retry(&cmd).await?;
-        
+
         // Update cached value
         let mut state_guard = self.state.write().await;
         state_guard.last_ptt = state;
-        
+
         Ok(())
     }
 
     async fn get_ptt(&self, vfo: Vfo) -> Result<PttState> {
         let cmd = format!("\\get_ptt {}", Self::vfo_to_string(vfo));
         let response = self.send_command_with_retry(&cmd).await?;
-        
+
         let ptt = match response.trim() {
             "1" => PttState::On,
             _ => PttState::Off,
         };
-        
+
         // Update cached value
         let mut state = self.state.write().await;
         state.last_ptt = ptt;
-        
+
         Ok(ptt)
     }
 
     async fn get_s_meter(&self) -> Result<i32> {
         // Get signal strength
         let response = self.send_command_with_retry("\\get_level STRENGTH").await?;
-        
+
         // Parse as dBm (rigctld returns values like "-54")
-        let strength = response.trim()
-            .parse::<i32>()
-            .unwrap_or(-120);
-        
+        let strength = response.trim().parse::<i32>().unwrap_or(-120);
+
         // Update cached value
         let mut state = self.state.write().await;
         state.last_signal_strength = strength;
-        
+
         Ok(strength)
     }
 
@@ -437,13 +447,13 @@ impl RigControl for RigctldClient {
 
     async fn get_vfo(&self) -> Result<Vfo> {
         let response = self.send_command_with_retry("\\get_vfo").await?;
-        
+
         let vfo = match response.trim() {
             "VFOA" => Vfo::A,
             "VFOB" => Vfo::B,
             _ => Vfo::Current,
         };
-        
+
         Ok(vfo)
     }
 
@@ -458,24 +468,20 @@ impl RigControl for RigctldClient {
 
     async fn get_power_level(&self) -> Result<f32> {
         let response = self.send_command_with_retry("\\get_level RFPOWER").await?;
-        
+
         // Parse as fraction (0.0 - 1.0) and convert to watts
-        let level = response.trim()
-            .parse::<f32>()
-            .unwrap_or(0.0);
-        
+        let level = response.trim().parse::<f32>().unwrap_or(0.0);
+
         Ok(level * 100.0) // Convert to watts (assuming 100W max)
     }
 
     async fn get_swr(&self) -> Result<f32> {
         // Get SWR reading
         let response = self.send_command_with_retry("\\get_level SWR").await?;
-        
+
         // Parse as SWR value
-        let swr = response.trim()
-            .parse::<f32>()
-            .unwrap_or(1.0);
-        
+        let swr = response.trim().parse::<f32>().unwrap_or(1.0);
+
         Ok(swr)
     }
 
@@ -488,17 +494,22 @@ impl RigControl for RigctldClient {
     async fn get_memory_channel(&self, vfo: Vfo) -> Result<i32> {
         let cmd = format!("\\get_mem {}", Self::vfo_to_string(vfo));
         let response = self.send_command_with_retry(&cmd).await?;
-        
-        let channel = response.trim()
+
+        let channel = response
+            .trim()
             .parse::<i32>()
             .map_err(|e| anyhow!("Failed to parse memory channel: {}", e))?;
-        
+
         Ok(channel)
     }
 
     async fn set_scan(&self, vfo: Vfo, enable: bool) -> Result<()> {
         let scan_value = if enable { "1" } else { "0" };
-        let cmd = format!("\\set_func {} SCAN {}", Self::vfo_to_string(vfo), scan_value);
+        let cmd = format!(
+            "\\set_func {} SCAN {}",
+            Self::vfo_to_string(vfo),
+            scan_value
+        );
         self.send_command_with_retry(&cmd).await?;
         Ok(())
     }

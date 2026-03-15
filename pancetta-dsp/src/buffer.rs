@@ -43,7 +43,7 @@ impl AudioRingBuffer {
     /// Create a new ring buffer with specified capacity
     pub fn new(sample_rate: f32, max_latency: f32) -> Result<Self> {
         let capacity = (sample_rate * max_latency) as usize;
-        
+
         if capacity == 0 {
             return Err(BufferError::InvalidSize { size: capacity });
         }
@@ -65,21 +65,21 @@ impl AudioRingBuffer {
     pub fn write(&self, samples: &[f32]) -> Result<usize> {
         let mut buffer = self.buffer.lock();
         let available_space = self.capacity - buffer.len();
-        
+
         if samples.len() > available_space {
             // Buffer overflow - drop oldest samples
             let overflow_count = samples.len() - available_space;
             warn!(
-                "Audio buffer overflow: dropping {} samples ({:.2}ms)", 
-                overflow_count, 
+                "Audio buffer overflow: dropping {} samples ({:.2}ms)",
+                overflow_count,
                 overflow_count as f32 / self.sample_rate * 1000.0
             );
-            
+
             // Remove old samples to make space
             for _ in 0..overflow_count {
                 buffer.pop_front();
             }
-            
+
             // Update statistics
             {
                 let mut stats = self.stats.lock();
@@ -90,7 +90,7 @@ impl AudioRingBuffer {
         // Write samples to buffer
         buffer.extend(samples.iter());
         let written = samples.len();
-        
+
         // Update statistics
         {
             let mut stats = self.stats.lock();
@@ -109,20 +109,21 @@ impl AudioRingBuffer {
     pub fn read(&self, output: &mut [f32]) -> Result<usize> {
         let mut buffer = self.buffer.lock();
         let available_samples = buffer.len();
-        
+
         if output.len() > available_samples {
             // Buffer underflow
             debug!(
                 "Audio buffer underflow: requested {} samples, only {} available",
-                output.len(), available_samples
+                output.len(),
+                available_samples
             );
-            
+
             // Update statistics
             {
                 let mut stats = self.stats.lock();
                 stats.underflow_count += 1;
             }
-            
+
             return Err(BufferError::Underflow);
         }
 
@@ -135,7 +136,7 @@ impl AudioRingBuffer {
             }
         }
         let read = output.len();
-        
+
         // Update statistics
         {
             let mut stats = self.stats.lock();
@@ -151,7 +152,7 @@ impl AudioRingBuffer {
     pub fn try_read(&self, output: &mut [f32]) -> usize {
         let mut buffer = self.buffer.lock();
         let available = buffer.len().min(output.len());
-        
+
         if available > 0 {
             for i in 0..available {
                 if let Some(sample) = buffer.pop_front() {
@@ -160,14 +161,14 @@ impl AudioRingBuffer {
                     break;
                 }
             }
-            
+
             // Update statistics
             {
                 let mut stats = self.stats.lock();
                 stats.total_samples_read += available as u64;
                 stats.current_occupancy = buffer.len();
             }
-            
+
             available
         } else {
             0
@@ -209,7 +210,7 @@ impl AudioRingBuffer {
     pub fn clear(&self) {
         let mut buffer = self.buffer.lock();
         buffer.clear();
-        
+
         let mut stats = self.stats.lock();
         stats.current_occupancy = 0;
     }
@@ -248,7 +249,7 @@ impl WindowExtractor {
     pub fn new(sample_rate: f32, window_duration: f32, overlap_factor: f32) -> Self {
         let window_size = (sample_rate * window_duration) as usize;
         let step_size = (window_size as f32 * (1.0 - overlap_factor)) as usize;
-        
+
         debug!(
             "Creating window extractor: sample_rate={}, window_duration={}s, window_size={}, step_size={}",
             sample_rate, window_duration, window_size, step_size
@@ -271,26 +272,26 @@ impl WindowExtractor {
     }
 
     /// Process audio samples and extract windows when ready
-    pub fn process<F>(&mut self, input: &[f32], mut window_callback: F) 
-    where 
-        F: FnMut(&[f32])
+    pub fn process<F>(&mut self, input: &[f32], mut window_callback: F)
+    where
+        F: FnMut(&[f32]),
     {
         let mut input_pos = 0;
-        
+
         while input_pos < input.len() {
             let remaining_in_window = self.window_size - self.position;
             let remaining_in_input = input.len() - input_pos;
             let to_copy = remaining_in_window.min(remaining_in_input);
-            
+
             self.accumulator[self.position..self.position + to_copy]
                 .copy_from_slice(&input[input_pos..input_pos + to_copy]);
-            
+
             self.position += to_copy;
             input_pos += to_copy;
-            
+
             if self.position >= self.window_size {
                 window_callback(&self.accumulator);
-                
+
                 if self.step_size < self.window_size {
                     self.accumulator.copy_within(self.step_size.., 0);
                     self.position = self.window_size - self.step_size;

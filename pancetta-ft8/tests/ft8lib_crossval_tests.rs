@@ -54,11 +54,7 @@ fn test_ft8lib_encode_multiple_messages() {
 
     for msg in &messages {
         let tones = ft8_lib_ffi::ft8lib_encode(msg);
-        assert!(
-            tones.is_some(),
-            "ft8_lib should encode '{}'",
-            msg
-        );
+        assert!(tones.is_some(), "ft8_lib should encode '{}'", msg);
         let tones = tones.unwrap();
         assert_eq!(tones.len(), 79);
         // Verify Costas sync at all 3 positions
@@ -71,11 +67,7 @@ fn test_ft8lib_encode_multiple_messages() {
 #[test]
 fn test_ft8lib_payload_round_trip() {
     // Standard messages should round-trip perfectly
-    let std_messages = [
-        "CQ K1ABC FN42",
-        "K1DEF W1ABC -12",
-        "K1DEF W1ABC RR73",
-    ];
+    let std_messages = ["CQ K1ABC FN42", "K1DEF W1ABC -12", "K1DEF W1ABC RR73"];
 
     for msg in &std_messages {
         let payload = ft8_lib_ffi::ft8lib_encode_payload(msg).unwrap();
@@ -122,9 +114,12 @@ fn test_encoder_matches_ft8lib() {
         let our_tones = encoder.encode_message(msg, None).unwrap();
 
         assert_eq!(
-            &ft8lib_tones[..], &our_tones[..],
+            &ft8lib_tones[..],
+            &our_tones[..],
             "Tone mismatch for '{}'\nft8_lib: {:?}\nours:    {:?}",
-            msg, ft8lib_tones, our_tones
+            msg,
+            ft8lib_tones,
+            our_tones
         );
     }
 
@@ -233,7 +228,8 @@ fn test_our_encoder_ft8lib_decoder_payload() {
         // Verify our tones match ft8_lib
         let ft8lib_tones = ft8_lib_ffi::ft8lib_encode(msg).unwrap();
         assert_eq!(
-            &ft8lib_tones[..], &our_tones[..],
+            &ft8lib_tones[..],
+            &our_tones[..],
             "Tone mismatch for '{}'",
             msg
         );
@@ -259,7 +255,7 @@ fn test_our_encoder_ft8lib_decoder_payload() {
 #[cfg(feature = "transmit")]
 #[test]
 fn test_our_audio_decoded_by_ft8lib() {
-    use pancetta_ft8::{Ft8Encoder, Ft8Modulator, SAMPLE_RATE, NUM_SYMBOLS};
+    use pancetta_ft8::{Ft8Encoder, Ft8Modulator, NUM_SYMBOLS, SAMPLE_RATE};
 
     let messages = [
         ("CQ K1ABC FN42", 1000.0),
@@ -316,7 +312,7 @@ fn test_our_audio_decoded_by_ft8lib() {
 /// These files are known to be valid (ft8_lib's own demo decodes them).
 #[test]
 fn test_ft8lib_audio_decoded_by_our_decoder() {
-    use pancetta_ft8::{Ft8Decoder, Ft8Config};
+    use pancetta_ft8::{Ft8Config, Ft8Decoder};
 
     let test_cases = [
         ("generated/ft8_cq.wav", "CQ K1ABC FN42"),

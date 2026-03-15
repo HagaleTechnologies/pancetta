@@ -4,8 +4,8 @@
 // It implements a hierarchical error system with context tracking, severity levels, and
 // automatic retry policies.
 
-use std::fmt;
 use std::error::Error as StdError;
+use std::fmt;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
@@ -81,20 +81,17 @@ impl fmt::Display for PancettaError {
         write!(
             f,
             "[{:?}] {} in {}: {}",
-            self.severity,
-            self.context.component,
-            self.context.operation,
-            self.message
+            self.severity, self.context.component, self.context.operation, self.message
         )?;
-        
+
         if let Some(ref code) = self.code {
             write!(f, " ({})", code)?;
         }
-        
+
         if let Some(ref hint) = self.context.recovery_hint {
             write!(f, " | Hint: {}", hint)?;
         }
-        
+
         Ok(())
     }
 }
@@ -105,39 +102,39 @@ pub enum ComponentError {
     /// Audio component errors
     #[error("Audio error: {0}")]
     Audio(PancettaError),
-    
+
     /// DSP pipeline errors
     #[error("DSP error: {0}")]
     Dsp(PancettaError),
-    
+
     /// FT8 decoder errors
     #[error("FT8 error: {0}")]
     Ft8(PancettaError),
-    
+
     /// TUI errors
     #[error("TUI error: {0}")]
     Tui(PancettaError),
-    
+
     /// Configuration errors
     #[error("Config error: {0}")]
     Config(PancettaError),
-    
+
     /// Hamlib errors
     #[error("Hamlib error: {0}")]
     Hamlib(PancettaError),
-    
+
     /// QSO management errors
     #[error("QSO error: {0}")]
     Qso(PancettaError),
-    
+
     /// DX cluster errors
     #[error("DX error: {0}")]
     Dx(PancettaError),
-    
+
     /// Message bus errors
     #[error("Message bus error: {0}")]
     MessageBus(PancettaError),
-    
+
     /// Coordinator errors
     #[error("Coordinator error: {0}")]
     Coordinator(PancettaError),
@@ -175,37 +172,37 @@ impl ErrorBuilder {
             source: None,
         }
     }
-    
+
     /// Set severity
     pub fn severity(mut self, severity: ErrorSeverity) -> Self {
         self.severity = severity;
         self
     }
-    
+
     /// Set message
     pub fn message(mut self, message: impl Into<String>) -> Self {
         self.message = message.into();
         self
     }
-    
+
     /// Set error code
     pub fn code(mut self, code: impl Into<String>) -> Self {
         self.code = Some(code.into());
         self
     }
-    
+
     /// Add metadata
     pub fn metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.metadata.push((key.into(), value.into()));
         self
     }
-    
+
     /// Set recovery hint
     pub fn recovery_hint(mut self, hint: impl Into<String>) -> Self {
         self.recovery_hint = Some(hint.into());
         self
     }
-    
+
     /// Make retryable with strategy
     pub fn retryable(mut self, max_retries: u32, delay: RetryDelay) -> Self {
         self.retryable = true;
@@ -213,13 +210,13 @@ impl ErrorBuilder {
         self.retry_delay = delay;
         self
     }
-    
+
     /// Set source error
     pub fn source<E: StdError + Send + Sync + 'static>(mut self, source: E) -> Self {
         self.source = Some(Box::new(source));
         self
     }
-    
+
     /// Build the error
     pub fn build(self) -> PancettaError {
         PancettaError {
@@ -275,7 +272,7 @@ pub trait ResultExt<T> {
         component: impl Into<String>,
         operation: impl Into<String>,
     ) -> PancettaResult<T>;
-    
+
     /// Add context and make retryable
     fn retryable(
         self,
@@ -294,7 +291,7 @@ impl<T, E: StdError + Send + Sync + 'static> ResultExt<T> for Result<T, E> {
     ) -> PancettaResult<T> {
         self.map_err(|e| e.into_pancetta_error(component, operation))
     }
-    
+
     fn retryable(
         self,
         component: impl Into<String>,
@@ -334,12 +331,12 @@ impl ErrorRecovery {
             None
         }
     }
-    
+
     /// Check if retry should be attempted
     pub fn should_retry(&self) -> bool {
         self.attempt < self.max_attempts
     }
-    
+
     /// Get delay before next retry
     pub fn next_delay(&self) -> Duration {
         match self.delay_strategy {
@@ -349,13 +346,13 @@ impl ErrorRecovery {
             RetryDelay::None => Duration::ZERO,
         }
     }
-    
+
     /// Record retry attempt
     pub fn record_attempt(&mut self, error: PancettaError) {
         self.attempt += 1;
         self.last_error = Some(error);
     }
-    
+
     /// Get final error after all retries
     pub fn final_error(self) -> Option<PancettaError> {
         self.last_error
@@ -370,7 +367,7 @@ macro_rules! pancetta_error {
             .message($message)
             .build()
     };
-    
+
     ($component:expr, $operation:expr, $message:expr, $severity:expr) => {
         $crate::error::ErrorBuilder::new($component, $operation)
             .message($message)
@@ -385,9 +382,10 @@ macro_rules! retryable_error {
     ($component:expr, $operation:expr, $message:expr, $retries:expr) => {
         $crate::error::ErrorBuilder::new($component, $operation)
             .message($message)
-            .retryable($retries, $crate::error::RetryDelay::Exponential(
-                std::time::Duration::from_millis(100)
-            ))
+            .retryable(
+                $retries,
+                $crate::error::RetryDelay::Exponential(std::time::Duration::from_millis(100)),
+            )
             .build()
     };
 }
@@ -395,7 +393,7 @@ macro_rules! retryable_error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_error_builder() {
         let error = ErrorBuilder::new("TestComponent", "test_operation")
@@ -406,7 +404,7 @@ mod tests {
             .recovery_hint("Try again later")
             .retryable(3, RetryDelay::Fixed(Duration::from_secs(1)))
             .build();
-        
+
         assert_eq!(error.severity, ErrorSeverity::Warning);
         assert_eq!(error.context.component, "TestComponent");
         assert_eq!(error.context.operation, "test_operation");
@@ -415,13 +413,15 @@ mod tests {
         assert!(error.context.retryable);
         assert_eq!(error.context.max_retries, 3);
     }
-    
+
     #[test]
     fn test_error_recovery() {
-        let make_error = || ErrorBuilder::new("Test", "op")
-            .message("Retryable error")
-            .retryable(3, RetryDelay::Exponential(Duration::from_millis(100)))
-            .build();
+        let make_error = || {
+            ErrorBuilder::new("Test", "op")
+                .message("Retryable error")
+                .retryable(3, RetryDelay::Exponential(Duration::from_millis(100)))
+                .build()
+        };
 
         let error = make_error();
         let mut recovery = ErrorRecovery::new(&error).unwrap();
@@ -440,7 +440,7 @@ mod tests {
         recovery.record_attempt(make_error());
         assert!(!recovery.should_retry());
     }
-    
+
     #[test]
     fn test_error_display() {
         let error = ErrorBuilder::new("Audio", "process_samples")
@@ -449,7 +449,7 @@ mod tests {
             .code("AUD001")
             .recovery_hint("Reduce sample rate")
             .build();
-        
+
         let display = format!("{}", error);
         assert!(display.contains("Audio"));
         assert!(display.contains("process_samples"));

@@ -12,43 +12,43 @@ use std::collections::HashMap;
 pub struct UiConfig {
     /// Color theme settings
     pub theme: String,
-    
+
     /// UI layout configuration
     pub layout: String,
-    
+
     /// Window management settings
     pub window: WindowConfig,
-    
+
     /// Font and typography settings
     pub typography: TypographyConfig,
-    
+
     /// Color scheme customization
     pub colors: ColorSchemeConfig,
-    
+
     /// Widget and panel settings
     pub panels: PanelConfig,
-    
+
     /// Accessibility settings
     pub accessibility: AccessibilityConfig,
-    
+
     /// Animation and transition settings
     pub animations: AnimationConfig,
-    
+
     /// Toolbar and menu customization
     pub toolbars: ToolbarConfig,
-    
+
     /// Status bar configuration
     pub status_bar: StatusBarConfig,
-    
+
     /// Keyboard shortcuts
     pub keyboard: KeyboardConfig,
-    
+
     /// Logging and display preferences
     pub logging: LoggingDisplayConfig,
-    
+
     /// Waterfall and spectrum display settings
     pub spectrum: SpectrumDisplayConfig,
-    
+
     /// Custom UI components
     #[serde(default)]
     pub custom_widgets: HashMap<String, WidgetConfig>,
@@ -59,34 +59,34 @@ pub struct UiConfig {
 pub struct WindowConfig {
     /// Default window width
     pub width: u32,
-    
+
     /// Default window height
     pub height: u32,
-    
+
     /// Default window position X
     pub position_x: Option<i32>,
-    
+
     /// Default window position Y
     pub position_y: Option<i32>,
-    
+
     /// Window state (normal, maximized, minimized)
     pub state: WindowState,
-    
+
     /// Enable window decorations
     pub decorations: bool,
-    
+
     /// Enable window resizing
     pub resizable: bool,
-    
+
     /// Window transparency (0.0 to 1.0)
     pub transparency: f32,
-    
+
     /// Always on top
     pub always_on_top: bool,
-    
+
     /// Multi-monitor settings
     pub multi_monitor: MultiMonitorConfig,
-    
+
     /// Window session management
     pub session: SessionConfig,
 }
@@ -106,13 +106,13 @@ pub enum WindowState {
 pub struct MultiMonitorConfig {
     /// Preferred monitor index
     pub preferred_monitor: u8,
-    
+
     /// Allow spanning across monitors
     pub span_monitors: bool,
-    
+
     /// Remember monitor placement
     pub remember_placement: bool,
-    
+
     /// DPI scaling per monitor
     pub monitor_scaling: HashMap<u8, f32>,
 }
@@ -122,13 +122,13 @@ pub struct MultiMonitorConfig {
 pub struct SessionConfig {
     /// Restore window positions on startup
     pub restore_positions: bool,
-    
+
     /// Restore panel layouts
     pub restore_layouts: bool,
-    
+
     /// Session file path
     pub session_file: Option<String>,
-    
+
     /// Auto-save session interval (minutes)
     pub auto_save_interval_minutes: u32,
 }
@@ -138,22 +138,22 @@ pub struct SessionConfig {
 pub struct TypographyConfig {
     /// Default font family
     pub font_family: String,
-    
+
     /// Default font size in points
     pub font_size: f32,
-    
+
     /// Monospace font for logs and data
     pub monospace_font: String,
-    
+
     /// Monospace font size
     pub monospace_size: f32,
-    
+
     /// Font weights
     pub font_weights: FontWeightConfig,
-    
+
     /// Text rendering settings
     pub rendering: TextRenderingConfig,
-    
+
     /// Font scaling for different UI elements
     pub scaling: FontScalingConfig,
 }
@@ -163,13 +163,13 @@ pub struct TypographyConfig {
 pub struct FontWeightConfig {
     /// Normal text weight
     pub normal: u16,
-    
+
     /// Bold text weight
     pub bold: u16,
-    
+
     /// Light text weight
     pub light: u16,
-    
+
     /// Heavy text weight
     pub heavy: u16,
 }
@@ -179,16 +179,16 @@ pub struct FontWeightConfig {
 pub struct TextRenderingConfig {
     /// Antialiasing mode
     pub antialiasing: AntialiasingMode,
-    
+
     /// Subpixel rendering
     pub subpixel_rendering: bool,
-    
+
     /// Hinting mode
     pub hinting: HintingMode,
-    
+
     /// Line height multiplier
     pub line_height: f32,
-    
+
     /// Letter spacing adjustment
     pub letter_spacing: f32,
 }
@@ -217,16 +217,16 @@ pub enum HintingMode {
 pub struct FontScalingConfig {
     /// UI element font scaling
     pub ui_scale: f32,
-    
+
     /// Log text scaling
     pub log_scale: f32,
-    
+
     /// Button text scaling
     pub button_scale: f32,
-    
+
     /// Menu text scaling
     pub menu_scale: f32,
-    
+
     /// Tooltip text scaling
     pub tooltip_scale: f32,
 }
@@ -236,25 +236,25 @@ pub struct FontScalingConfig {
 pub struct ColorSchemeConfig {
     /// Primary colors
     pub primary: ColorPalette,
-    
+
     /// Secondary colors
     pub secondary: ColorPalette,
-    
+
     /// Background colors
     pub background: BackgroundColors,
-    
+
     /// Text colors
     pub text: TextColors,
-    
+
     /// Border and separator colors
     pub borders: BorderColors,
-    
+
     /// Status and alert colors
     pub status: StatusColors,
-    
+
     /// Spectrum and waterfall colors
     pub spectrum: SpectrumColors,
-    
+
     /// Custom color definitions
     #[serde(default)]
     pub custom_colors: HashMap<String, String>,
@@ -265,13 +265,13 @@ pub struct ColorSchemeConfig {
 pub struct ColorPalette {
     /// Base color
     pub base: String,
-    
+
     /// Light variant
     pub light: String,
-    
+
     /// Dark variant
     pub dark: String,
-    
+
     /// Contrast color
     pub contrast: String,
 }
@@ -281,19 +281,19 @@ pub struct ColorPalette {
 pub struct BackgroundColors {
     /// Main background
     pub primary: String,
-    
+
     /// Secondary background
     pub secondary: String,
-    
+
     /// Panel background
     pub panel: String,
-    
+
     /// Input field background
     pub input: String,
-    
+
     /// Selected item background
     pub selected: String,
-    
+
     /// Hover state background
     pub hover: String,
 }
@@ -303,19 +303,19 @@ pub struct BackgroundColors {
 pub struct TextColors {
     /// Primary text color
     pub primary: String,
-    
+
     /// Secondary text color
     pub secondary: String,
-    
+
     /// Disabled text color
     pub disabled: String,
-    
+
     /// Link text color
     pub link: String,
-    
+
     /// Selected text color
     pub selected: String,
-    
+
     /// Placeholder text color
     pub placeholder: String,
 }
@@ -325,16 +325,16 @@ pub struct TextColors {
 pub struct BorderColors {
     /// Normal border color
     pub normal: String,
-    
+
     /// Focus border color
     pub focus: String,
-    
+
     /// Error border color
     pub error: String,
-    
+
     /// Success border color
     pub success: String,
-    
+
     /// Warning border color
     pub warning: String,
 }
@@ -344,25 +344,25 @@ pub struct BorderColors {
 pub struct StatusColors {
     /// Success/OK status
     pub success: String,
-    
+
     /// Warning status
     pub warning: String,
-    
+
     /// Error status
     pub error: String,
-    
+
     /// Information status
     pub info: String,
-    
+
     /// Connected status
     pub connected: String,
-    
+
     /// Disconnected status
     pub disconnected: String,
-    
+
     /// Transmitting status
     pub transmitting: String,
-    
+
     /// Receiving status
     pub receiving: String,
 }
@@ -372,19 +372,19 @@ pub struct StatusColors {
 pub struct SpectrumColors {
     /// Spectrum line color
     pub spectrum_line: String,
-    
+
     /// Waterfall gradient colors
     pub waterfall_gradient: Vec<String>,
-    
+
     /// Grid line color
     pub grid_lines: String,
-    
+
     /// Frequency marker color
     pub frequency_markers: String,
-    
+
     /// Signal detection color
     pub signal_detection: String,
-    
+
     /// Background noise color
     pub background_noise: String,
 }
@@ -394,16 +394,16 @@ pub struct SpectrumColors {
 pub struct PanelConfig {
     /// Available panels
     pub available_panels: Vec<PanelDefinition>,
-    
+
     /// Default panel layout
     pub default_layout: String,
-    
+
     /// Panel docking settings
     pub docking: DockingConfig,
-    
+
     /// Panel sizing and spacing
     pub sizing: PanelSizingConfig,
-    
+
     /// Panel visibility settings
     pub visibility: PanelVisibilityConfig,
 }
@@ -413,25 +413,25 @@ pub struct PanelConfig {
 pub struct PanelDefinition {
     /// Panel identifier
     pub id: String,
-    
+
     /// Display name
     pub name: String,
-    
+
     /// Panel type
     pub panel_type: PanelType,
-    
+
     /// Default position
     pub default_position: PanelPosition,
-    
+
     /// Default size
     pub default_size: PanelSize,
-    
+
     /// Can be closed by user
     pub closeable: bool,
-    
+
     /// Can be moved/docked
     pub moveable: bool,
-    
+
     /// Can be resized
     pub resizable: bool,
 }
@@ -442,31 +442,31 @@ pub struct PanelDefinition {
 pub enum PanelType {
     /// Spectrum/waterfall display
     Spectrum,
-    
+
     /// Logging panel
     Logging,
-    
+
     /// Rig control panel
     RigControl,
-    
+
     /// Audio controls
     AudioControl,
-    
+
     /// Band/frequency selection
     BandControl,
-    
+
     /// Memory channels
     Memory,
-    
+
     /// QSO details
     QsoDetails,
-    
+
     /// Macro/function keys
     Macros,
-    
+
     /// Status information
     Status,
-    
+
     /// Custom panel
     Custom,
 }
@@ -488,19 +488,19 @@ pub enum PanelPosition {
 pub struct PanelSize {
     /// Width in pixels or percentage
     pub width: SizeSpec,
-    
+
     /// Height in pixels or percentage
     pub height: SizeSpec,
-    
+
     /// Minimum width
     pub min_width: Option<u32>,
-    
+
     /// Minimum height
     pub min_height: Option<u32>,
-    
+
     /// Maximum width
     pub max_width: Option<u32>,
-    
+
     /// Maximum height
     pub max_height: Option<u32>,
 }
@@ -511,7 +511,7 @@ pub struct PanelSize {
 pub enum SizeSpec {
     /// Absolute size in pixels
     Pixels(u32),
-    
+
     /// Percentage of available space
     Percentage(f32),
 }
@@ -521,16 +521,16 @@ pub enum SizeSpec {
 pub struct DockingConfig {
     /// Enable panel docking
     pub enabled: bool,
-    
+
     /// Docking sensitivity in pixels
     pub sensitivity: u32,
-    
+
     /// Show docking guides
     pub show_guides: bool,
-    
+
     /// Snap to edges
     pub snap_to_edges: bool,
-    
+
     /// Docking zones
     pub zones: Vec<DockingZone>,
 }
@@ -540,13 +540,13 @@ pub struct DockingConfig {
 pub struct DockingZone {
     /// Zone name
     pub name: String,
-    
+
     /// Zone area
     pub area: ZoneArea,
-    
+
     /// Maximum panels in zone
     pub max_panels: u8,
-    
+
     /// Panel arrangement in zone
     pub arrangement: ZoneArrangement,
 }
@@ -556,13 +556,13 @@ pub struct DockingZone {
 pub struct ZoneArea {
     /// X position (pixels or percentage)
     pub x: SizeSpec,
-    
+
     /// Y position (pixels or percentage)
     pub y: SizeSpec,
-    
+
     /// Width (pixels or percentage)
     pub width: SizeSpec,
-    
+
     /// Height (pixels or percentage)
     pub height: SizeSpec,
 }
@@ -573,13 +573,13 @@ pub struct ZoneArea {
 pub enum ZoneArrangement {
     /// Horizontal tabs
     Tabbed,
-    
+
     /// Vertical stack
     Stacked,
-    
+
     /// Side by side
     Horizontal,
-    
+
     /// Grid layout
     Grid,
 }
@@ -589,16 +589,16 @@ pub enum ZoneArrangement {
 pub struct PanelSizingConfig {
     /// Default panel spacing
     pub spacing: u32,
-    
+
     /// Panel border width
     pub border_width: u32,
-    
+
     /// Panel title bar height
     pub title_bar_height: u32,
-    
+
     /// Splitter width
     pub splitter_width: u32,
-    
+
     /// Tab height
     pub tab_height: u32,
 }
@@ -608,16 +608,16 @@ pub struct PanelSizingConfig {
 pub struct PanelVisibilityConfig {
     /// Initially visible panels
     pub initial_panels: Vec<String>,
-    
+
     /// Hide panels when inactive
     pub auto_hide: bool,
-    
+
     /// Auto-hide delay in milliseconds
     pub auto_hide_delay_ms: u64,
-    
+
     /// Show panel titles
     pub show_titles: bool,
-    
+
     /// Show close buttons
     pub show_close_buttons: bool,
 }
@@ -627,22 +627,22 @@ pub struct PanelVisibilityConfig {
 pub struct AccessibilityConfig {
     /// High contrast mode
     pub high_contrast: bool,
-    
+
     /// Large fonts mode
     pub large_fonts: bool,
-    
+
     /// Screen reader support
     pub screen_reader: bool,
-    
+
     /// Keyboard navigation
     pub keyboard_navigation: KeyboardNavigationConfig,
-    
+
     /// Visual indicators
     pub visual_indicators: VisualIndicatorConfig,
-    
+
     /// Sound feedback
     pub sound_feedback: SoundFeedbackConfig,
-    
+
     /// Motion sensitivity
     pub motion_sensitivity: MotionSensitivityConfig,
 }
@@ -652,16 +652,16 @@ pub struct AccessibilityConfig {
 pub struct KeyboardNavigationConfig {
     /// Enable keyboard navigation
     pub enabled: bool,
-    
+
     /// Show focus indicators
     pub show_focus: bool,
-    
+
     /// Focus ring width
     pub focus_ring_width: u32,
-    
+
     /// Focus ring color
     pub focus_ring_color: String,
-    
+
     /// Tab navigation order
     pub tab_order: TabOrderConfig,
 }
@@ -672,10 +672,10 @@ pub struct KeyboardNavigationConfig {
 pub enum TabOrderConfig {
     /// Left to right, top to bottom
     Standard,
-    
+
     /// Logical grouping
     Logical,
-    
+
     /// Custom order
     Custom,
 }
@@ -685,16 +685,16 @@ pub enum TabOrderConfig {
 pub struct VisualIndicatorConfig {
     /// Show status indicators
     pub show_status: bool,
-    
+
     /// Use color coding
     pub color_coding: bool,
-    
+
     /// Show progress indicators
     pub show_progress: bool,
-    
+
     /// Animation for changes
     pub change_animation: bool,
-    
+
     /// Highlight active elements
     pub highlight_active: bool,
 }
@@ -704,16 +704,16 @@ pub struct VisualIndicatorConfig {
 pub struct SoundFeedbackConfig {
     /// Enable sound feedback
     pub enabled: bool,
-    
+
     /// Button click sounds
     pub button_clicks: bool,
-    
+
     /// Alert sounds
     pub alerts: bool,
-    
+
     /// Status change sounds
     pub status_changes: bool,
-    
+
     /// Sound volume (0.0 to 1.0)
     pub volume: f32,
 }
@@ -723,13 +723,13 @@ pub struct SoundFeedbackConfig {
 pub struct MotionSensitivityConfig {
     /// Reduce animations
     pub reduce_animations: bool,
-    
+
     /// Disable auto-scroll
     pub disable_auto_scroll: bool,
-    
+
     /// Parallax effects
     pub disable_parallax: bool,
-    
+
     /// Static backgrounds
     pub static_backgrounds: bool,
 }
@@ -739,16 +739,16 @@ pub struct MotionSensitivityConfig {
 pub struct AnimationConfig {
     /// Enable animations
     pub enabled: bool,
-    
+
     /// Animation duration scale (0.0 to 2.0)
     pub duration_scale: f32,
-    
+
     /// Easing functions
     pub easing: EasingConfig,
-    
+
     /// Specific animation settings
     pub transitions: TransitionConfig,
-    
+
     /// Performance settings
     pub performance: AnimationPerformanceConfig,
 }
@@ -758,13 +758,13 @@ pub struct AnimationConfig {
 pub struct EasingConfig {
     /// Default easing function
     pub default: EasingFunction,
-    
+
     /// Button hover easing
     pub button_hover: EasingFunction,
-    
+
     /// Panel transition easing
     pub panel_transition: EasingFunction,
-    
+
     /// Fade in/out easing
     pub fade: EasingFunction,
 }
@@ -790,16 +790,16 @@ pub enum EasingFunction {
 pub struct TransitionConfig {
     /// Fade transitions
     pub fade_duration_ms: u64,
-    
+
     /// Slide transitions
     pub slide_duration_ms: u64,
-    
+
     /// Scale transitions
     pub scale_duration_ms: u64,
-    
+
     /// Rotation transitions
     pub rotation_duration_ms: u64,
-    
+
     /// Color transitions
     pub color_duration_ms: u64,
 }
@@ -809,13 +809,13 @@ pub struct TransitionConfig {
 pub struct AnimationPerformanceConfig {
     /// Use hardware acceleration
     pub hardware_acceleration: bool,
-    
+
     /// Maximum FPS for animations
     pub max_fps: u32,
-    
+
     /// Reduce animations on low performance
     pub adaptive_quality: bool,
-    
+
     /// Performance monitoring
     pub performance_monitoring: bool,
 }
@@ -825,10 +825,10 @@ pub struct AnimationPerformanceConfig {
 pub struct ToolbarConfig {
     /// Available toolbars
     pub toolbars: Vec<ToolbarDefinition>,
-    
+
     /// Toolbar visibility
     pub visibility: ToolbarVisibilityConfig,
-    
+
     /// Toolbar customization
     pub customization: ToolbarCustomizationConfig,
 }
@@ -838,19 +838,19 @@ pub struct ToolbarConfig {
 pub struct ToolbarDefinition {
     /// Toolbar identifier
     pub id: String,
-    
+
     /// Display name
     pub name: String,
-    
+
     /// Toolbar position
     pub position: ToolbarPosition,
-    
+
     /// Toolbar items
     pub items: Vec<ToolbarItem>,
-    
+
     /// Show text labels
     pub show_labels: bool,
-    
+
     /// Icon size
     pub icon_size: IconSize,
 }
@@ -871,25 +871,25 @@ pub enum ToolbarPosition {
 pub struct ToolbarItem {
     /// Item identifier
     pub id: String,
-    
+
     /// Item type
     pub item_type: ToolbarItemType,
-    
+
     /// Display text
     pub text: Option<String>,
-    
+
     /// Icon name
     pub icon: Option<String>,
-    
+
     /// Tooltip text
     pub tooltip: Option<String>,
-    
+
     /// Action command
     pub action: Option<String>,
-    
+
     /// Item enabled state
     pub enabled: bool,
-    
+
     /// Item visibility
     pub visible: bool,
 }
@@ -912,10 +912,10 @@ pub enum ToolbarItemType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IconSize {
-    Small,   // 16x16
-    Medium,  // 24x24
-    Large,   // 32x32
-    XLarge,  // 48x48
+    Small,  // 16x16
+    Medium, // 24x24
+    Large,  // 32x32
+    XLarge, // 48x48
 }
 
 /// Toolbar visibility configuration
@@ -923,16 +923,16 @@ pub enum IconSize {
 pub struct ToolbarVisibilityConfig {
     /// Show main toolbar
     pub main_toolbar: bool,
-    
+
     /// Show status toolbar
     pub status_toolbar: bool,
-    
+
     /// Show formatting toolbar
     pub formatting_toolbar: bool,
-    
+
     /// Auto-hide toolbars
     pub auto_hide: bool,
-    
+
     /// Lock toolbar positions
     pub lock_positions: bool,
 }
@@ -942,16 +942,16 @@ pub struct ToolbarVisibilityConfig {
 pub struct ToolbarCustomizationConfig {
     /// Allow toolbar customization
     pub enabled: bool,
-    
+
     /// Allow adding/removing items
     pub allow_add_remove: bool,
-    
+
     /// Allow reordering items
     pub allow_reorder: bool,
-    
+
     /// Allow creating new toolbars
     pub allow_new_toolbars: bool,
-    
+
     /// Save customizations
     pub save_customizations: bool,
 }
@@ -961,16 +961,16 @@ pub struct ToolbarCustomizationConfig {
 pub struct StatusBarConfig {
     /// Show status bar
     pub visible: bool,
-    
+
     /// Status bar position
     pub position: StatusBarPosition,
-    
+
     /// Status bar items
     pub items: Vec<StatusBarItem>,
-    
+
     /// Update interval in milliseconds
     pub update_interval_ms: u64,
-    
+
     /// Show progress indicators
     pub show_progress: bool,
 }
@@ -988,22 +988,22 @@ pub enum StatusBarPosition {
 pub struct StatusBarItem {
     /// Item identifier
     pub id: String,
-    
+
     /// Item type
     pub item_type: StatusBarItemType,
-    
+
     /// Display format
     pub format: Option<String>,
-    
+
     /// Item width
     pub width: Option<u32>,
-    
+
     /// Item alignment
     pub alignment: ItemAlignment,
-    
+
     /// Item priority (for overflow)
     pub priority: u8,
-    
+
     /// Item visibility
     pub visible: bool,
 }
@@ -1038,13 +1038,13 @@ pub enum ItemAlignment {
 pub struct KeyboardConfig {
     /// Keyboard shortcuts map
     pub shortcuts: HashMap<String, KeyboardShortcut>,
-    
+
     /// Enable global shortcuts
     pub global_shortcuts: bool,
-    
+
     /// Shortcut conflict resolution
     pub conflict_resolution: ConflictResolution,
-    
+
     /// Show shortcut hints
     pub show_hints: bool,
 }
@@ -1054,16 +1054,16 @@ pub struct KeyboardConfig {
 pub struct KeyboardShortcut {
     /// Key combination
     pub keys: String,
-    
+
     /// Action command
     pub action: String,
-    
+
     /// Shortcut description
     pub description: String,
-    
+
     /// Context where shortcut is active
     pub context: ShortcutContext,
-    
+
     /// Shortcut enabled state
     pub enabled: bool,
 }
@@ -1074,16 +1074,16 @@ pub struct KeyboardShortcut {
 pub enum ShortcutContext {
     /// Global (always active)
     Global,
-    
+
     /// Main window focus
     MainWindow,
-    
+
     /// Specific panel focus
     Panel(String),
-    
+
     /// Dialog windows
     Dialog,
-    
+
     /// Input fields
     Input,
 }
@@ -1094,13 +1094,13 @@ pub enum ShortcutContext {
 pub enum ConflictResolution {
     /// First registered wins
     FirstWins,
-    
+
     /// Last registered wins
     LastWins,
-    
+
     /// Warn user about conflicts
     WarnUser,
-    
+
     /// Disable conflicting shortcuts
     DisableConflicting,
 }
@@ -1110,22 +1110,22 @@ pub enum ConflictResolution {
 pub struct LoggingDisplayConfig {
     /// Maximum log entries to display
     pub max_entries: u32,
-    
+
     /// Log entry format
     pub entry_format: String,
-    
+
     /// Show timestamps
     pub show_timestamps: bool,
-    
+
     /// Timestamp format
     pub timestamp_format: String,
-    
+
     /// Color coding by log level
     pub color_by_level: bool,
-    
+
     /// Auto-scroll to new entries
     pub auto_scroll: bool,
-    
+
     /// Log filtering options
     pub filtering: LogFilterConfig,
 }
@@ -1135,16 +1135,16 @@ pub struct LoggingDisplayConfig {
 pub struct LogFilterConfig {
     /// Minimum log level to display
     pub min_level: LogLevel,
-    
+
     /// Category filters
     pub category_filters: Vec<String>,
-    
+
     /// Text search filter
     pub text_filter: Option<String>,
-    
+
     /// Show only recent entries
     pub recent_only: bool,
-    
+
     /// Recent time window in minutes
     pub recent_window_minutes: u32,
 }
@@ -1165,28 +1165,28 @@ pub enum LogLevel {
 pub struct SpectrumDisplayConfig {
     /// Spectrum display mode
     pub mode: SpectrumMode,
-    
+
     /// FFT size
     pub fft_size: u32,
-    
+
     /// Averaging factor
     pub averaging: f32,
-    
+
     /// Update rate in Hz
     pub update_rate: f32,
-    
+
     /// Waterfall settings
     pub waterfall: WaterfallConfig,
-    
+
     /// Frequency axis settings
     pub frequency_axis: FrequencyAxisConfig,
-    
+
     /// Amplitude axis settings
     pub amplitude_axis: AmplitudeAxisConfig,
-    
+
     /// Grid settings
     pub grid: GridConfig,
-    
+
     /// Marker settings
     pub markers: MarkerConfig,
 }
@@ -1197,13 +1197,13 @@ pub struct SpectrumDisplayConfig {
 pub enum SpectrumMode {
     /// Spectrum only
     Spectrum,
-    
+
     /// Waterfall only
     Waterfall,
-    
+
     /// Both spectrum and waterfall
     Combined,
-    
+
     /// Oscilloscope mode
     Oscilloscope,
 }
@@ -1213,16 +1213,16 @@ pub enum SpectrumMode {
 pub struct WaterfallConfig {
     /// Waterfall height in pixels
     pub height: u32,
-    
+
     /// Scroll speed in pixels per second
     pub scroll_speed: f32,
-    
+
     /// Color mapping
     pub color_mapping: ColorMapping,
-    
+
     /// Contrast adjustment
     pub contrast: f32,
-    
+
     /// Brightness adjustment
     pub brightness: f32,
 }
@@ -1254,16 +1254,16 @@ pub enum FrequencyUnits {
 pub struct FrequencyAxisConfig {
     /// Show frequency axis
     pub visible: bool,
-    
+
     /// Frequency units
     pub units: FrequencyUnits,
-    
+
     /// Major tick interval
     pub major_ticks: f32,
-    
+
     /// Minor tick interval
     pub minor_ticks: f32,
-    
+
     /// Axis label format
     pub label_format: String,
 }
@@ -1274,13 +1274,13 @@ pub struct FrequencyAxisConfig {
 pub enum AmplitudeUnits {
     /// Decibels
     Db,
-    
+
     /// Decibels relative to milliwatt
     Dbm,
-    
+
     /// Decibels relative to microvolt
     Dbuv,
-    
+
     /// Linear scale
     Linear,
 }
@@ -1298,16 +1298,16 @@ pub enum AmplitudeScale {
 pub struct AmplitudeAxisConfig {
     /// Show amplitude axis
     pub visible: bool,
-    
+
     /// Amplitude units
     pub units: AmplitudeUnits,
-    
+
     /// Scale type
     pub scale: AmplitudeScale,
-    
+
     /// Reference level
     pub reference_level: f32,
-    
+
     /// Dynamic range
     pub dynamic_range: f32,
 }
@@ -1317,16 +1317,16 @@ pub struct AmplitudeAxisConfig {
 pub struct GridConfig {
     /// Show grid lines
     pub visible: bool,
-    
+
     /// Major grid color
     pub major_color: String,
-    
+
     /// Minor grid color
     pub minor_color: String,
-    
+
     /// Grid line width
     pub line_width: f32,
-    
+
     /// Grid line style
     pub line_style: LineStyle,
 }
@@ -1346,16 +1346,16 @@ pub enum LineStyle {
 pub struct MarkerConfig {
     /// Show frequency markers
     pub visible: bool,
-    
+
     /// Marker color
     pub color: String,
-    
+
     /// Marker width
     pub width: f32,
-    
+
     /// Marker style
     pub style: MarkerStyle,
-    
+
     /// Show marker labels
     pub show_labels: bool,
 }
@@ -1376,16 +1376,16 @@ pub enum MarkerStyle {
 pub struct WidgetConfig {
     /// Widget type
     pub widget_type: String,
-    
+
     /// Widget properties
     pub properties: HashMap<String, serde_json::Value>,
-    
+
     /// Widget position
     pub position: Option<WidgetPosition>,
-    
+
     /// Widget size
     pub size: Option<WidgetSize>,
-    
+
     /// Widget visibility
     pub visible: bool,
 }
@@ -1848,24 +1848,30 @@ impl Default for StatusBarConfig {
 impl Default for KeyboardConfig {
     fn default() -> Self {
         let mut shortcuts = HashMap::new();
-        
+
         // Add default shortcuts
-        shortcuts.insert("quit".to_string(), KeyboardShortcut {
-            keys: "Ctrl+Q".to_string(),
-            action: "application.quit".to_string(),
-            description: "Quit application".to_string(),
-            context: ShortcutContext::Global,
-            enabled: true,
-        });
-        
-        shortcuts.insert("connect".to_string(), KeyboardShortcut {
-            keys: "Ctrl+Shift+C".to_string(),
-            action: "rig.connect".to_string(),
-            description: "Connect to rig".to_string(),
-            context: ShortcutContext::MainWindow,
-            enabled: true,
-        });
-        
+        shortcuts.insert(
+            "quit".to_string(),
+            KeyboardShortcut {
+                keys: "Ctrl+Q".to_string(),
+                action: "application.quit".to_string(),
+                description: "Quit application".to_string(),
+                context: ShortcutContext::Global,
+                enabled: true,
+            },
+        );
+
+        shortcuts.insert(
+            "connect".to_string(),
+            KeyboardShortcut {
+                keys: "Ctrl+Shift+C".to_string(),
+                action: "rig.connect".to_string(),
+                description: "Connect to rig".to_string(),
+                context: ShortcutContext::MainWindow,
+                enabled: true,
+            },
+        );
+
         Self {
             shortcuts,
             global_shortcuts: false,
@@ -1986,7 +1992,7 @@ impl ConfigSection for UiConfig {
                 value: format!("{}x{}", self.window.width, self.window.height),
             });
         }
-        
+
         // Validate transparency
         if self.window.transparency < 0.0 || self.window.transparency > 1.0 {
             return Err(ConfigError::InvalidValue {
@@ -1994,15 +2000,18 @@ impl ConfigSection for UiConfig {
                 value: self.window.transparency.to_string(),
             });
         }
-        
+
         // Validate font sizes
         if self.typography.font_size <= 0.0 || self.typography.monospace_size <= 0.0 {
             return Err(ConfigError::InvalidValue {
                 field: "typography.font_size".to_string(),
-                value: format!("{}/{}", self.typography.font_size, self.typography.monospace_size),
+                value: format!(
+                    "{}/{}",
+                    self.typography.font_size, self.typography.monospace_size
+                ),
             });
         }
-        
+
         // Validate spectrum settings
         if !self.spectrum.fft_size.is_power_of_two() || self.spectrum.fft_size < 128 {
             return Err(ConfigError::InvalidValue {
@@ -2010,27 +2019,27 @@ impl ConfigSection for UiConfig {
                 value: self.spectrum.fft_size.to_string(),
             });
         }
-        
+
         if self.spectrum.averaging < 0.0 || self.spectrum.averaging > 1.0 {
             return Err(ConfigError::InvalidValue {
                 field: "spectrum.averaging".to_string(),
                 value: self.spectrum.averaging.to_string(),
             });
         }
-        
+
         Ok(())
     }
-    
+
     fn merge_with(&mut self, other: Self) {
         // Merge non-default values
         if other.theme != "default" {
             self.theme = other.theme;
         }
-        
+
         if other.layout != "standard" {
             self.layout = other.layout;
         }
-        
+
         // Merge complex structures (simplified for brevity)
         if other.window.width != 1200 {
             self.window.width = other.window.width;
@@ -2038,7 +2047,7 @@ impl ConfigSection for UiConfig {
         if other.window.height != 800 {
             self.window.height = other.window.height;
         }
-        
+
         // Merge custom widgets
         self.custom_widgets.extend(other.custom_widgets);
     }
@@ -2047,7 +2056,7 @@ impl ConfigSection for UiConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_default_ui_config() {
         let config = UiConfig::default();
@@ -2055,49 +2064,49 @@ mod tests {
         assert_eq!(config.layout, "standard");
         assert!(config.validate_section().is_ok());
     }
-    
+
     #[test]
     fn test_window_validation() {
         let mut config = UiConfig::default();
-        
+
         // Valid window dimensions
         assert!(config.validate_section().is_ok());
-        
+
         // Invalid window dimensions
         config.window.width = 0;
         assert!(config.validate_section().is_err());
-        
+
         // Invalid transparency
         config.window.width = 1200; // Reset to valid
         config.window.transparency = 1.5;
         assert!(config.validate_section().is_err());
     }
-    
+
     #[test]
     fn test_spectrum_validation() {
         let mut config = UiConfig::default();
-        
+
         // Valid FFT size
         config.spectrum.fft_size = 2048;
         assert!(config.validate_section().is_ok());
-        
+
         // Invalid FFT size (not power of 2)
         config.spectrum.fft_size = 2000;
         assert!(config.validate_section().is_err());
-        
+
         // Invalid averaging
         config.spectrum.fft_size = 2048; // Reset to valid
         config.spectrum.averaging = 1.5;
         assert!(config.validate_section().is_err());
     }
-    
+
     #[test]
     fn test_keyboard_shortcuts() {
         let config = UiConfig::default();
         assert!(config.keyboard.shortcuts.contains_key("quit"));
         assert!(config.keyboard.shortcuts.contains_key("connect"));
     }
-    
+
     #[test]
     fn test_color_scheme() {
         let config = UiConfig::default();

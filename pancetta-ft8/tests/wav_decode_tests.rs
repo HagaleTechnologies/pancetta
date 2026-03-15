@@ -5,12 +5,14 @@
 //! 2. Off-air recordings (best-effort — these may not decode with either
 //!    our decoder or ft8_lib due to unknown signal characteristics)
 
-use pancetta_ft8::{Ft8Decoder, Ft8Config, DecodedMessage, WINDOW_SAMPLES, SAMPLE_RATE,
-                   ft8_lib_ffi::ft8lib_decode_audio};
+use pancetta_ft8::{
+    ft8_lib_ffi::ft8lib_decode_audio, DecodedMessage, Ft8Config, Ft8Decoder, SAMPLE_RATE,
+    WINDOW_SAMPLES,
+};
 
 fn read_wav_file(path: &str) -> Vec<f32> {
-    let reader = hound::WavReader::open(path)
-        .unwrap_or_else(|e| panic!("Failed to open {}: {}", path, e));
+    let reader =
+        hound::WavReader::open(path).unwrap_or_else(|e| panic!("Failed to open {}: {}", path, e));
     let spec = reader.spec();
     assert_eq!(spec.channels, 1);
     assert_eq!(spec.sample_rate, SAMPLE_RATE);
@@ -51,10 +53,7 @@ fn test_decode_generated_cq() {
     let decoded = decode_wav_file(&fixture("generated/ft8_cq.wav"));
     // Our decoder may or may not decode GFSK signals from ft8_lib.
     // This test documents current capability.
-    println!(
-        "generated/ft8_cq.wav: {} messages decoded",
-        decoded.len()
-    );
+    println!("generated/ft8_cq.wav: {} messages decoded", decoded.len());
     for m in &decoded {
         println!("  [{:6.1} dB] {}", m.snr_db, m.text);
     }
@@ -75,10 +74,7 @@ fn test_decode_generated_report() {
 #[test]
 fn test_decode_generated_rr73() {
     let decoded = decode_wav_file(&fixture("generated/ft8_rr73.wav"));
-    println!(
-        "generated/ft8_rr73.wav: {} messages decoded",
-        decoded.len()
-    );
+    println!("generated/ft8_rr73.wav: {} messages decoded", decoded.len());
     for m in &decoded {
         println!("  [{:6.1} dB] {}", m.snr_db, m.text);
     }
@@ -119,7 +115,9 @@ fn test_decode_offair_summary() {
 
     println!(
         "\nOff-air summary: {} messages from {}/{} files",
-        total, with_decodes, files.len()
+        total,
+        with_decodes,
+        files.len()
     );
     // Note: ft8_lib (kgoba/ft8_lib latest) also decodes 0 from these files.
     // These recordings may not contain standard FT8 or may require a different
@@ -183,7 +181,10 @@ fn test_cross_validate_against_ft8lib() {
             if ratio < 0.80 {
                 files_below_threshold.push(format!(
                     "{}: ours={} vs ft8_lib={} ({:.0}%)",
-                    file, our_count, ft8lib_count, ratio * 100.0
+                    file,
+                    our_count,
+                    ft8lib_count,
+                    ratio * 100.0
                 ));
             }
         }
@@ -266,7 +267,9 @@ fn test_decode_within_realtime_budget() {
         assert!(
             elapsed < max_decode_time,
             "{}: decode took {:?}, exceeds real-time budget of {:?}",
-            file, elapsed, max_decode_time
+            file,
+            elapsed,
+            max_decode_time
         );
     }
 }

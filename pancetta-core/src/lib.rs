@@ -3,17 +3,16 @@
 //! This crate provides the fundamental types and utilities that are shared
 //! across all Pancetta modules, ensuring consistency and reducing duplication.
 
-pub mod types;
 pub mod error;
+pub mod types;
 
 // Re-export core types at the crate root for convenience
-pub use types::{Band, Mode, ModeValue, StandardMode, PancettaError, PancettaResult};
+pub use types::{Band, Mode, ModeValue, PancettaError, PancettaResult, StandardMode};
 
 // Re-export error handling types
 pub use error::{
-    ErrorSeverity, ErrorContext as NewErrorContext, PancettaError as UnifiedError,
-    ComponentError, ErrorBuilder, PancettaResult as UnifiedResult,
-    ResultExt, ErrorRecovery, RetryDelay,
+    ComponentError, ErrorBuilder, ErrorContext as NewErrorContext, ErrorRecovery, ErrorSeverity,
+    PancettaError as UnifiedError, PancettaResult as UnifiedResult, ResultExt, RetryDelay,
 };
 
 // Re-export error context trait

@@ -62,7 +62,11 @@ pub enum TuiMessage {
     /// QSO state update
     QsoStateUpdate { qso_id: String, state: String },
     /// DX spot
-    DxSpot { callsign: String, frequency: u64, spotter: String },
+    DxSpot {
+        callsign: String,
+        frequency: u64,
+        spotter: String,
+    },
     /// Error message
     Error { component: String, message: String },
     /// Status update
@@ -122,7 +126,7 @@ impl TuiRunner {
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
-        
+
         Ok(Self {
             app,
             config,
@@ -135,24 +139,24 @@ impl TuiRunner {
             metrics: TuiMetrics::default(),
         })
     }
-    
+
     /// Run the TUI main loop
     pub async fn run(mut self) -> Result<()> {
         info!("Starting TUI main loop");
-        
+
         let frame_duration = Duration::from_millis(1000 / self.target_fps as u64);
         let mut event_timeout = Duration::from_millis(50);
-        
+
         loop {
             // Check shutdown signal
             if self.shutdown.load(Ordering::Relaxed) {
                 info!("TUI shutdown requested");
                 break;
             }
-            
+
             // Process incoming messages (non-blocking)
             self.process_messages().await?;
-            
+
             // Handle user input (with timeout)
             if event::poll(event_timeout)? {
                 if let Event::Key(key) = event::read()? {
@@ -161,22 +165,22 @@ impl TuiRunner {
                     }
                 }
             }
-            
+
             // Render frame if needed (rate limited)
             if self.last_render.elapsed() >= frame_duration {
                 let render_start = Instant::now();
-                
+
                 self.render_frame().await?;
-                
+
                 let render_time = render_start.elapsed();
                 self.update_metrics(render_time);
-                
+
                 self.last_render = Instant::now();
             } else {
                 // Small yield to prevent busy waiting
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
-            
+
             // Adaptive timeout based on activity
             event_timeout = if self.metrics.messages_processed > 0 {
                 Duration::from_millis(10) // More responsive when active
@@ -184,17 +188,17 @@ impl TuiRunner {
                 Duration::from_millis(50) // Less CPU when idle
             };
         }
-        
+
         self.cleanup()?;
         info!("TUI main loop completed");
         Ok(())
     }
-    
+
     /// Process incoming messages from message bus
     async fn process_messages(&mut self) -> Result<()> {
         let mut message_count = 0;
         const MAX_MESSAGES_PER_FRAME: usize = 10;
-        
+
         // Process up to MAX_MESSAGES_PER_FRAME to avoid blocking render
         while message_count < MAX_MESSAGES_PER_FRAME {
             match self.message_rx.try_recv() {
@@ -210,14 +214,14 @@ impl TuiRunner {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Handle incoming message
     async fn handle_message(&mut self, message: TuiMessage) -> Result<()> {
         let mut app = self.app.write().await;
-        
+
         match message {
             TuiMessage::DecodedMessage(decoded) => {
                 let _ = app.add_decoded_message(decoded).await;
@@ -234,11 +238,18 @@ impl TuiRunner {
                 let callsign = if active { Some(qso_id) } else { None };
                 app.update_qso_state(active, callsign);
             }
-            TuiMessage::DxSpot { callsign, frequency, spotter: _ } => {
+            TuiMessage::DxSpot {
+                callsign,
+                frequency,
+                spotter: _,
+            } => {
                 // For now use FT8 as default mode
                 app.add_dx_spot(callsign, frequency as f64, "FT8".to_string(), 0);
             }
-            TuiMessage::Error { component: _, message } => {
+            TuiMessage::Error {
+                component: _,
+                message,
+            } => {
                 app.add_error_message(message);
             }
             TuiMessage::StatusUpdate { component, status } => {
@@ -248,10 +259,10 @@ impl TuiRunner {
                 app.push_waterfall_rows(rows);
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Handle keyboard events
     async fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
         let mut app = self.app.write().await;
@@ -307,16 +318,15 @@ impl TuiRunner {
                 // Real device lists are populated by the coordinator
                 // via TuiMessage before or when the modal opens.
                 if app.device_selection.input_devices.is_empty() {
-                    app.device_selection.input_devices = vec![
-                        ("Default Input".to_string(), true),
-                    ];
+                    app.device_selection.input_devices = vec![("Default Input".to_string(), true)];
                 }
                 if app.device_selection.output_devices.is_empty() {
-                    app.device_selection.output_devices = vec![
-                        ("Default Output".to_string(), true),
-                    ];
+                    app.device_selection.output_devices =
+                        vec![("Default Output".to_string(), true)];
                 }
-                app.status_message = "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)".to_string();
+                app.status_message =
+                    "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"
+                        .to_string();
             }
 
             // Panel navigation
@@ -367,7 +377,10 @@ impl TuiRunner {
             // Space - Select/activate (click-to-call)
             KeyCode::Char(' ') => {
                 if let Some((callsign, frequency)) = app.get_selected_station() {
-                    self.message_tx.send(TuiCommand::CallStation { callsign, frequency })?;
+                    self.message_tx.send(TuiCommand::CallStation {
+                        callsign,
+                        frequency,
+                    })?;
                 }
                 app.activate_selected();
             }
@@ -394,26 +407,26 @@ impl TuiRunner {
 
         Ok(true)
     }
-    
+
     /// Render a frame
     async fn render_frame(&mut self) -> Result<()> {
         let app = self.app.read().await;
         let metrics = self.metrics.clone();
         let last_render = self.last_render;
-        
+
         self.terminal.draw(|f| {
             let size = f.area();
-            
+
             // Main layout
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(3),    // Header
-                    Constraint::Min(10),      // Main content
-                    Constraint::Length(3),    // Status bar
+                    Constraint::Length(3), // Header
+                    Constraint::Min(10),   // Main content
+                    Constraint::Length(3), // Status bar
                 ])
                 .split(size);
-            
+
             // Render header inline
             let header_text = format!(
                 " Pancetta FT8 | {} | {} MHz | {} ",
@@ -424,10 +437,10 @@ impl TuiRunner {
             let header = Paragraph::new(header_text)
                 .style(Style::default().bg(Color::Blue).fg(Color::White));
             f.render_widget(header, chunks[0]);
-            
+
             // Render main content inline
             TuiRunner::render_main_content_static(f, chunks[1], &app);
-            
+
             // Render status bar inline
             let status_text = format!(
                 " TX: {} | S-meter: {} | FPS: {} | F1:Help F2:CQ F5:Clear D:Devices Q:Quit ",
@@ -444,19 +457,19 @@ impl TuiRunner {
                 TuiRunner::render_device_selection_modal(f, size, &app.device_selection);
             }
         })?;
-        
+
         self.metrics.frames_rendered += 1;
         Ok(())
     }
-    
+
     /// Static version of render_main_content for use in closure
     fn render_main_content_static(f: &mut Frame, area: Rect, app: &App) {
         // Split into panels
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(60),  // Left: band activity + waterfall
-                Constraint::Percentage(40),  // Right panels
+                Constraint::Percentage(60), // Left: band activity + waterfall
+                Constraint::Percentage(40), // Right panels
             ])
             .split(area);
 
@@ -464,8 +477,8 @@ impl TuiRunner {
         let left_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(60),  // Band activity
-                Constraint::Percentage(40),  // Waterfall
+                Constraint::Percentage(60), // Band activity
+                Constraint::Percentage(40), // Waterfall
             ])
             .split(chunks[0]);
 
@@ -476,8 +489,8 @@ impl TuiRunner {
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(50),  // DX stations
-                Constraint::Percentage(50),  // QSO status
+                Constraint::Percentage(50), // DX stations
+                Constraint::Percentage(50), // QSO status
             ])
             .split(chunks[1]);
 
@@ -500,7 +513,11 @@ impl TuiRunner {
         let mut label_lines: Vec<ratatui::text::Line> = Vec::new();
         for i in 0..usable_rows {
             let idx = i * labels.len() / usable_rows.max(1);
-            let text = if idx < labels.len() { labels[idx] } else { "     " };
+            let text = if idx < labels.len() {
+                labels[idx]
+            } else {
+                "     "
+            };
             label_lines.push(ratatui::text::Line::from(text));
         }
         let label_block = Block::default().borders(Borders::RIGHT);
@@ -514,7 +531,7 @@ impl TuiRunner {
         let waterfall = Waterfall::new(&app.waterfall_data).block(waterfall_block);
         f.render_widget(waterfall, chunks[1]);
     }
-    
+
     /// Static version of render_band_activity for use in closure
     fn render_band_activity_static(f: &mut Frame, area: Rect, app: &App) {
         let messages: Vec<ListItem> = app
@@ -523,12 +540,18 @@ impl TuiRunner {
             .map(|msg| {
                 let style = if msg.message.contains("CQ") {
                     Style::default().fg(Color::Yellow)
-                } else if msg.call_sign.as_ref().map_or(false, |c| c == &app.station_info.call_sign) {
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                } else if msg
+                    .call_sign
+                    .as_ref()
+                    .map_or(false, |c| c == &app.station_info.call_sign)
+                {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
-                
+
                 let text = format!(
                     "{:02}:{:02}:{:02} {:>4.0} {:>3} {}",
                     msg.timestamp.naive_local().hour(),
@@ -538,11 +561,11 @@ impl TuiRunner {
                     msg.snr,
                     msg.message
                 );
-                
+
                 ListItem::new(text).style(style)
             })
             .collect();
-        
+
         let messages_list = List::new(messages)
             .block(
                 Block::default()
@@ -555,10 +578,10 @@ impl TuiRunner {
                     .bg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
             );
-        
+
         f.render_widget(messages_list, area);
     }
-    
+
     /// Static version of render_dx_stations for use in closure
     fn render_dx_stations_static(f: &mut Frame, area: Rect, app: &App) {
         let dx_items: Vec<ListItem> = app
@@ -567,31 +590,33 @@ impl TuiRunner {
             .map(|dx| {
                 ListItem::new(format!(
                     "{} {} {:>6.0}km {}dB",
-                    dx.1.call_sign, 
+                    dx.1.call_sign,
                     dx.1.grid_square.as_ref().unwrap_or(&"----".to_string()),
                     dx.1.distance.unwrap_or(0.0),
                     dx.1.snr
                 ))
             })
             .collect();
-        
-        let dx_list = List::new(dx_items)
-            .block(
-                Block::default()
-                    .title(" DX Stations ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            );
-        
+
+        let dx_list = List::new(dx_items).block(
+            Block::default()
+                .title(" DX Stations ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        );
+
         f.render_widget(dx_list, area);
     }
-    
+
     /// Static version of render_qso_status for use in closure
     fn render_qso_status_static(f: &mut Frame, area: Rect, app: &App) {
         let qso_text = if app.qso_status.active {
             format!(
                 "QSO with: {}\nTX: {} dB\nRX: {} dB\nExchanges: {}",
-                app.qso_status.call_sign.as_ref().unwrap_or(&"Unknown".to_string()),
+                app.qso_status
+                    .call_sign
+                    .as_ref()
+                    .unwrap_or(&"Unknown".to_string()),
                 app.qso_status.snr_tx.unwrap_or(0),
                 app.qso_status.snr_rx.unwrap_or(0),
                 app.qso_status.exchange_count
@@ -599,7 +624,7 @@ impl TuiRunner {
         } else {
             "No active QSO".to_string()
         };
-        
+
         let qso_status = Paragraph::new(qso_text)
             .block(
                 Block::default()
@@ -608,10 +633,10 @@ impl TuiRunner {
                     .border_type(BorderType::Rounded),
             )
             .wrap(Wrap { trim: true });
-        
+
         f.render_widget(qso_status, area);
     }
-    
+
     /// Render device selection modal as an overlay
     fn render_device_selection_modal(f: &mut Frame, area: Rect, state: &DeviceSelectionState) {
         // Modal dimensions: roughly 60% width, height to fit content
@@ -645,17 +670,14 @@ impl TuiRunner {
         let vert_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(3),       // Device lists
-                Constraint::Length(2),     // Footer / help text
+                Constraint::Min(3),    // Device lists
+                Constraint::Length(2), // Footer / help text
             ])
             .split(inner);
 
         let panel_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(50),
-                Constraint::Percentage(50),
-            ])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(vert_chunks[0]);
 
         // --- Input devices panel ---
@@ -672,13 +694,17 @@ impl TuiRunner {
             .map(|(i, (name, is_default))| {
                 let marker = if *is_default { " *" } else { "" };
                 let label = format!("{}{}", name, marker);
-                let style = if i == state.selected_input_idx && state.active_panel == DevicePanel::Input {
-                    Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
-                } else if i == state.selected_input_idx {
-                    Style::default().bg(Color::DarkGray).fg(Color::White)
-                } else {
-                    Style::default()
-                };
+                let style =
+                    if i == state.selected_input_idx && state.active_panel == DevicePanel::Input {
+                        Style::default()
+                            .bg(Color::Cyan)
+                            .fg(Color::Black)
+                            .add_modifier(Modifier::BOLD)
+                    } else if i == state.selected_input_idx {
+                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                    } else {
+                        Style::default()
+                    };
                 ListItem::new(label).style(style)
             })
             .collect();
@@ -705,8 +731,13 @@ impl TuiRunner {
             .map(|(i, (name, is_default))| {
                 let marker = if *is_default { " *" } else { "" };
                 let label = format!("{}{}", name, marker);
-                let style = if i == state.selected_output_idx && state.active_panel == DevicePanel::Output {
-                    Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                let style = if i == state.selected_output_idx
+                    && state.active_panel == DevicePanel::Output
+                {
+                    Style::default()
+                        .bg(Color::Cyan)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD)
                 } else if i == state.selected_output_idx {
                     Style::default().bg(Color::DarkGray).fg(Color::White)
                 } else {
@@ -725,8 +756,9 @@ impl TuiRunner {
         f.render_widget(output_list, panel_chunks[1]);
 
         // --- Footer help text ---
-        let footer = Paragraph::new(" Tab: switch panel | Up/Down: select | Enter: confirm | Esc: cancel")
-            .style(Style::default().fg(Color::DarkGray));
+        let footer =
+            Paragraph::new(" Tab: switch panel | Up/Down: select | Enter: confirm | Esc: cancel")
+                .style(Style::default().fg(Color::DarkGray));
         f.render_widget(footer, vert_chunks[1]);
     }
 
@@ -738,32 +770,32 @@ impl TuiRunner {
             app.station_info.operating_frequency / 1_000_000.0,
             app.station_info.mode
         );
-        
+
         let header = Paragraph::new(header_text)
             .style(Style::default().bg(Color::Blue).fg(Color::White))
             .block(Block::default().borders(Borders::NONE));
-        
+
         f.render_widget(header, area);
     }
-    
+
     /// Render main content area
     fn render_main_content(&self, f: &mut Frame, area: Rect, app: &App) {
         // Split into columns
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(60),  // Decoded messages
-                Constraint::Percentage(40),  // Side panels
+                Constraint::Percentage(60), // Decoded messages
+                Constraint::Percentage(40), // Side panels
             ])
             .split(area);
-        
+
         // Render decoded messages
         self.render_decoded_messages(f, chunks[0], app);
-        
+
         // Render side panels
         self.render_side_panels(f, chunks[1], app);
     }
-    
+
     /// Render decoded messages panel
     fn render_decoded_messages(&self, f: &mut Frame, area: Rect, app: &App) {
         let messages: Vec<ListItem> = app
@@ -772,12 +804,18 @@ impl TuiRunner {
             .map(|msg| {
                 let style = if msg.message.contains("CQ") {
                     Style::default().fg(Color::Yellow)
-                } else if msg.call_sign.as_ref().map_or(false, |c| c == &app.station_info.call_sign) {
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                } else if msg
+                    .call_sign
+                    .as_ref()
+                    .map_or(false, |c| c == &app.station_info.call_sign)
+                {
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
-                
+
                 let text = format!(
                     "{:02}:{:02}:{:02} {:>4.0} {:>3} {}",
                     msg.timestamp.naive_local().hour(),
@@ -787,11 +825,11 @@ impl TuiRunner {
                     msg.snr,
                     msg.message
                 );
-                
+
                 ListItem::new(text).style(style)
             })
             .collect();
-        
+
         let messages_list = List::new(messages)
             .block(
                 Block::default()
@@ -804,20 +842,20 @@ impl TuiRunner {
                     .bg(Color::DarkGray)
                     .add_modifier(Modifier::BOLD),
             );
-        
+
         f.render_widget(messages_list, area);
     }
-    
+
     /// Render side panels
     fn render_side_panels(&self, f: &mut Frame, area: Rect, app: &App) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(50),  // DX stations
-                Constraint::Percentage(50),  // QSO status
+                Constraint::Percentage(50), // DX stations
+                Constraint::Percentage(50), // QSO status
             ])
             .split(area);
-        
+
         // DX Stations
         let dx_items: Vec<ListItem> = app
             .dx_stations
@@ -825,29 +863,31 @@ impl TuiRunner {
             .map(|dx| {
                 ListItem::new(format!(
                     "{} {} {:>6.0}km {}dB",
-                    dx.1.call_sign, 
+                    dx.1.call_sign,
                     dx.1.grid_square.as_ref().unwrap_or(&"----".to_string()),
                     dx.1.distance.unwrap_or(0.0),
                     dx.1.snr
                 ))
             })
             .collect();
-        
-        let dx_list = List::new(dx_items)
-            .block(
-                Block::default()
-                    .title(" DX Stations ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            );
-        
+
+        let dx_list = List::new(dx_items).block(
+            Block::default()
+                .title(" DX Stations ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        );
+
         f.render_widget(dx_list, chunks[0]);
-        
+
         // QSO Status
         let qso_text = if app.qso_status.active {
             format!(
                 "QSO with: {}\nTX: {} dB\nRX: {} dB\nExchanges: {}",
-                app.qso_status.call_sign.as_ref().unwrap_or(&"Unknown".to_string()),
+                app.qso_status
+                    .call_sign
+                    .as_ref()
+                    .unwrap_or(&"Unknown".to_string()),
                 app.qso_status.snr_tx.unwrap_or(0),
                 app.qso_status.snr_rx.unwrap_or(0),
                 app.qso_status.exchange_count
@@ -855,7 +895,7 @@ impl TuiRunner {
         } else {
             "No active QSO".to_string()
         };
-        
+
         let qso_status = Paragraph::new(qso_text)
             .block(
                 Block::default()
@@ -864,10 +904,10 @@ impl TuiRunner {
                     .border_type(BorderType::Rounded),
             )
             .wrap(Wrap { trim: true });
-        
+
         f.render_widget(qso_status, chunks[1]);
     }
-    
+
     /// Render status bar
     fn render_status_bar(&self, f: &mut Frame, area: Rect, app: &App) {
         let status_text = format!(
@@ -876,27 +916,27 @@ impl TuiRunner {
             app.audio_level as i32,
             self.metrics.frames_rendered / self.last_render.elapsed().as_secs().max(1)
         );
-        
+
         let status = Paragraph::new(status_text)
             .style(Style::default().bg(Color::DarkGray).fg(Color::White))
             .block(Block::default().borders(Borders::NONE));
-        
+
         f.render_widget(status, area);
     }
-    
+
     /// Update performance metrics
     fn update_metrics(&mut self, render_time: Duration) {
         let render_ms = render_time.as_millis() as f64;
-        
+
         // Update average (simple moving average)
-        self.metrics.avg_render_time_ms = 
+        self.metrics.avg_render_time_ms =
             (self.metrics.avg_render_time_ms * 0.9) + (render_ms * 0.1);
-        
+
         // Update peak
         if render_ms > self.metrics.peak_render_time_ms {
             self.metrics.peak_render_time_ms = render_ms;
         }
-        
+
         // Check for dropped frames
         let target_frame_time = 1000.0 / self.target_fps as f64;
         if render_ms > target_frame_time {
@@ -904,7 +944,7 @@ impl TuiRunner {
             debug!("Dropped frame: render took {:.2}ms", render_ms);
         }
     }
-    
+
     /// Cleanup terminal on exit
     fn cleanup(&mut self) -> Result<()> {
         disable_raw_mode()?;
@@ -914,7 +954,7 @@ impl TuiRunner {
             DisableMouseCapture
         )?;
         self.terminal.show_cursor()?;
-        
+
         info!(
             "TUI metrics - Frames: {}, Messages: {}, Avg render: {:.2}ms, Dropped: {}",
             self.metrics.frames_rendered,
@@ -922,7 +962,7 @@ impl TuiRunner {
             self.metrics.avg_render_time_ms,
             self.metrics.dropped_frames
         );
-        
+
         Ok(())
     }
 }
@@ -935,10 +975,8 @@ pub async fn run_tui_with_message_bus(
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
     // Create app state
-    let app = Arc::new(RwLock::new(
-        App::new(config.clone(), None).await?
-    ));
-    
+    let app = Arc::new(RwLock::new(App::new(config.clone(), None).await?));
+
     // Create and run TUI runner
     let runner = TuiRunner::new(app, config, message_rx, message_tx, shutdown)?;
     runner.run().await

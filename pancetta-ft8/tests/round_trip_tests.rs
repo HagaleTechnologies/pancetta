@@ -7,25 +7,27 @@
 
 mod test_signal_generator;
 
-use pancetta_ft8::{
-    Ft8Encoder, Ft8Modulator, Ft8Decoder, Ft8Config, PulseShape,
-    WINDOW_SAMPLES, NUM_SYMBOLS, SAMPLE_RATE,
-    ft8_lib_ffi::ft8lib_decode_audio,
-};
-use pancetta_ft8::ldpc::{LdpcEncoder, LDPC_INFO_BITS, LDPC_CODEWORD_BITS};
 use bitvec::prelude::*;
+use pancetta_ft8::ldpc::{LdpcEncoder, LDPC_CODEWORD_BITS, LDPC_INFO_BITS};
+use pancetta_ft8::{
+    ft8_lib_ffi::ft8lib_decode_audio, Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, PulseShape,
+    NUM_SYMBOLS, SAMPLE_RATE, WINDOW_SAMPLES,
+};
 
 /// Helper: encode message text to symbols
 fn encode_message(text: &str) -> [u8; NUM_SYMBOLS] {
     let mut encoder = Ft8Encoder::new();
-    encoder.encode_message(text, None)
+    encoder
+        .encode_message(text, None)
         .unwrap_or_else(|e| panic!("Failed to encode '{}': {}", text, e))
 }
 
 /// Helper: modulate symbols to audio at given frequency offset
 fn modulate_symbols(symbols: &[u8; NUM_SYMBOLS], frequency_offset: f64) -> Vec<f32> {
     let mut modulator = Ft8Modulator::new_default().unwrap();
-    let mut audio = modulator.modulate_symbols(symbols, frequency_offset).unwrap();
+    let mut audio = modulator
+        .modulate_symbols(symbols, frequency_offset)
+        .unwrap();
     audio.resize(WINDOW_SAMPLES, 0.0);
     audio
 }
@@ -34,9 +36,15 @@ fn modulate_symbols(symbols: &[u8; NUM_SYMBOLS], frequency_offset: f64) -> Vec<f
 fn modulate_symbols_gfsk(symbols: &[u8; NUM_SYMBOLS], frequency_offset: f64) -> Vec<f32> {
     use pancetta_ft8::BASE_FREQUENCY;
     let mut modulator = Ft8Modulator::with_pulse_shape(
-        SAMPLE_RATE, BASE_FREQUENCY, 0.5, PulseShape::Gaussian { bt: 2.0 },
-    ).unwrap();
-    let mut audio = modulator.modulate_symbols(symbols, frequency_offset).unwrap();
+        SAMPLE_RATE,
+        BASE_FREQUENCY,
+        0.5,
+        PulseShape::Gaussian { bt: 2.0 },
+    )
+    .unwrap();
+    let mut audio = modulator
+        .modulate_symbols(symbols, frequency_offset)
+        .unwrap();
     audio.resize(WINDOW_SAMPLES, 0.0);
     audio
 }
@@ -65,7 +73,10 @@ fn test_ldpc_bit_level_round_trip() {
     for pattern in 0..20u8 {
         let mut info_bits = bitvec![0; LDPC_INFO_BITS];
         for i in 0..LDPC_INFO_BITS {
-            info_bits.set(i, ((i as u8).wrapping_add(pattern).wrapping_mul(7)) % 3 == 0);
+            info_bits.set(
+                i,
+                ((i as u8).wrapping_add(pattern).wrapping_mul(7)) % 3 == 0,
+            );
         }
 
         let codeword = encoder.encode(&info_bits).unwrap();
@@ -75,7 +86,8 @@ fn test_ldpc_bit_level_round_trip() {
         for i in 0..LDPC_INFO_BITS {
             assert_eq!(
                 codeword[i], info_bits[i],
-                "Bit {} mismatch in pattern {}", i, pattern
+                "Bit {} mismatch in pattern {}",
+                i, pattern
             );
         }
 
@@ -110,7 +122,9 @@ fn test_different_messages_produce_different_symbols() {
     let symbols_report = encoder.encode_message("K1DEF W1ABC -12", None).unwrap();
 
     // The data symbols should differ (sync symbols are the same)
-    let data_differ = symbols_cq.iter().zip(symbols_report.iter())
+    let data_differ = symbols_cq
+        .iter()
+        .zip(symbols_report.iter())
         .enumerate()
         .filter(|(i, _)| {
             // Skip sync positions
@@ -118,7 +132,10 @@ fn test_different_messages_produce_different_symbols() {
         })
         .any(|(_, (a, b))| a != b);
 
-    assert!(data_differ, "Different messages should produce different data symbols");
+    assert!(
+        data_differ,
+        "Different messages should produce different data symbols"
+    );
 }
 
 #[test]
@@ -138,9 +155,24 @@ fn test_costas_arrays_in_encoded_symbols() {
     for msg in &messages {
         let symbols = encoder.encode_message(msg, None).unwrap();
 
-        assert_eq!(&symbols[0..7], &costas, "First Costas mismatch for '{}'", msg);
-        assert_eq!(&symbols[36..43], &costas, "Second Costas mismatch for '{}'", msg);
-        assert_eq!(&symbols[72..79], &costas, "Third Costas mismatch for '{}'", msg);
+        assert_eq!(
+            &symbols[0..7],
+            &costas,
+            "First Costas mismatch for '{}'",
+            msg
+        );
+        assert_eq!(
+            &symbols[36..43],
+            &costas,
+            "Second Costas mismatch for '{}'",
+            msg
+        );
+        assert_eq!(
+            &symbols[72..79],
+            &costas,
+            "Third Costas mismatch for '{}'",
+            msg
+        );
     }
 }
 
@@ -164,7 +196,9 @@ fn test_all_symbols_in_valid_range() {
             assert!(
                 s < 8,
                 "Symbol {} = {} out of range [0,7] for '{}'",
-                i, s, msg
+                i,
+                s,
+                msg
             );
         }
     }
@@ -221,19 +255,22 @@ fn test_round_trip_frequency_offset() {
 
     // Different frequency offsets should produce measurably different audio
     // (compare RMS of difference between offset=0 and offset=100)
-    let diff: f32 = audios[0].iter().zip(audios[2].iter())
+    let diff: f32 = audios[0]
+        .iter()
+        .zip(audios[2].iter())
         .map(|(a, b)| (a - b).powi(2))
-        .sum::<f32>() / WINDOW_SAMPLES as f32;
-    assert!(diff > 1e-6, "Different frequency offsets should produce different audio");
+        .sum::<f32>()
+        / WINDOW_SAMPLES as f32;
+    assert!(
+        diff > 1e-6,
+        "Different frequency offsets should produce different audio"
+    );
 }
 
 /// Test decoding multiple messages combined into one audio window
 #[test]
 fn test_round_trip_multiple_signals() {
-    let messages = [
-        ("CQ W1ABC FN42", -50.0),
-        ("K1DEF W1ABC -12", 50.0),
-    ];
+    let messages = [("CQ W1ABC FN42", -50.0), ("K1DEF W1ABC -12", 50.0)];
 
     let mut combined = vec![0.0f32; WINDOW_SAMPLES];
 
@@ -250,7 +287,10 @@ fn test_round_trip_multiple_signals() {
     let decoded = decode_audio(&combined);
 
     // Should decode at least one of the two messages
-    assert!(!decoded.is_empty(), "Should decode at least one message from combined signal");
+    assert!(
+        !decoded.is_empty(),
+        "Should decode at least one message from combined signal"
+    );
 
     let texts: Vec<&str> = decoded.iter().map(|m| m.text.as_str()).collect();
     // Verify the decoded messages match expected texts
@@ -274,7 +314,8 @@ fn test_round_trip_snr_sweep() {
         let decoded = decode_audio(&audio);
         assert!(
             decoded.iter().any(|m| m.text == "CQ W1ABC FN42"),
-            "Should decode at SNR={} dB", snr
+            "Should decode at SNR={} dB",
+            snr
         );
     }
 

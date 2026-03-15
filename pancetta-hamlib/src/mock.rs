@@ -1,5 +1,5 @@
 //! Mock rig implementation for testing and development
-//! 
+//!
 //! This module provides a complete mock implementation of a transceiver
 //! that simulates realistic behavior without requiring actual hardware.
 
@@ -133,8 +133,15 @@ impl MockRig {
         // Create realistic capabilities for a modern transceiver
         let capabilities = RigCapabilities {
             modes: vec![
-                Mode::LSB, Mode::USB, Mode::CW, Mode::FM, Mode::AM,
-                Mode::RTTY, Mode::PACKET, Mode::FT8, Mode::FT4,
+                Mode::LSB,
+                Mode::USB,
+                Mode::CW,
+                Mode::FM,
+                Mode::AM,
+                Mode::RTTY,
+                Mode::PACKET,
+                Mode::FT8,
+                Mode::FT4,
             ],
             frequency_ranges: vec![config.frequency_range],
             has_dual_vfo: true,
@@ -148,9 +155,18 @@ impl MockRig {
             has_if_shift: true,
             has_noise_reduction: true,
             bands: vec![
-                Band::Band160m, Band::Band80m, Band::Band60m, Band::Band40m,
-                Band::Band30m, Band::Band20m, Band::Band17m, Band::Band15m,
-                Band::Band12m, Band::Band10m, Band::Band6m, Band::Band2m,
+                Band::Band160m,
+                Band::Band80m,
+                Band::Band60m,
+                Band::Band40m,
+                Band::Band30m,
+                Band::Band20m,
+                Band::Band17m,
+                Band::Band15m,
+                Band::Band12m,
+                Band::Band10m,
+                Band::Band6m,
+                Band::Band2m,
                 Band::Band70cm,
             ],
             default_baud_rate: 38400,
@@ -159,11 +175,21 @@ impl MockRig {
 
         // Initialize some memory channels
         let mut state = MockRigState::default();
-        state.memory_channels.insert(1, (14_200_000, Mode::USB, 2400));
-        state.memory_channels.insert(2, (14_074_000, Mode::FT8, 3000));
-        state.memory_channels.insert(3, (7_200_000, Mode::LSB, 2400));
-        state.memory_channels.insert(4, (7_074_000, Mode::FT8, 3000));
-        state.memory_channels.insert(5, (21_200_000, Mode::USB, 2400));
+        state
+            .memory_channels
+            .insert(1, (14_200_000, Mode::USB, 2400));
+        state
+            .memory_channels
+            .insert(2, (14_074_000, Mode::FT8, 3000));
+        state
+            .memory_channels
+            .insert(3, (7_200_000, Mode::LSB, 2400));
+        state
+            .memory_channels
+            .insert(4, (7_074_000, Mode::FT8, 3000));
+        state
+            .memory_channels
+            .insert(5, (21_200_000, Mode::USB, 2400));
 
         Self {
             config,
@@ -194,10 +220,10 @@ impl MockRig {
 
         let count = self.operation_count.fetch_add(1, Ordering::Relaxed);
         let seed = self.random_seed.load(Ordering::Relaxed);
-        
+
         // Simple pseudo-random number generator
         let random = ((count.wrapping_mul(1103515245).wrapping_add(seed)) >> 16) as f32 / 65536.0;
-        
+
         if random < self.config.failure_rate {
             return Err(anyhow!("Simulated failure for operation: {}", operation));
         }
@@ -213,21 +239,22 @@ impl MockRig {
 
         let count = self.operation_count.load(Ordering::Relaxed);
         let seed = self.random_seed.load(Ordering::Relaxed);
-        
+
         // Base signal level varies by band
         let base_level = match Band::from_frequency(frequency) {
-            Some(Band::Band20m) => -50,  // Good propagation
-            Some(Band::Band40m) => -60,  // Medium propagation
-            Some(Band::Band80m) => -70,  // Poor propagation during day
-            Some(Band::Band15m) => -80,  // Variable propagation
-            Some(Band::Band10m) => -90,  // Poor propagation
-            _ => -100,                   // Other bands
+            Some(Band::Band20m) => -50, // Good propagation
+            Some(Band::Band40m) => -60, // Medium propagation
+            Some(Band::Band80m) => -70, // Poor propagation during day
+            Some(Band::Band15m) => -80, // Variable propagation
+            Some(Band::Band10m) => -90, // Poor propagation
+            _ => -100,                  // Other bands
         };
 
         // Add noise and variation
-        let noise = ((count.wrapping_mul(1103515245).wrapping_add(seed)) as i32 % (self.config.s_meter_noise * 2)) 
-                   - self.config.s_meter_noise;
-        
+        let noise = ((count.wrapping_mul(1103515245).wrapping_add(seed)) as i32
+            % (self.config.s_meter_noise * 2))
+            - self.config.s_meter_noise;
+
         // Occasional strong signals
         let strong_signal = if (count % 100) == 0 { 30 } else { 0 };
 
@@ -241,14 +268,16 @@ impl MockRig {
         }
 
         let count = self.operation_count.load(Ordering::Relaxed);
-        
+
         // SWR varies slightly with frequency
         let freq_variation = ((frequency as f32 / 1_000_000.0) % 10.0) * 0.01;
-        
+
         // Add some random variation
         let random_variation = ((count % 100) as f32 / 1000.0) - 0.05;
-        
-        (self.config.base_swr + freq_variation + random_variation).max(1.0).min(3.0)
+
+        (self.config.base_swr + freq_variation + random_variation)
+            .max(1.0)
+            .min(3.0)
     }
 
     /// Update last operation time
@@ -288,7 +317,9 @@ impl MockRig {
         if frequency < min_freq || frequency > max_freq {
             return Err(anyhow!(
                 "Frequency {} Hz is outside valid range ({}-{} Hz)",
-                frequency, min_freq, max_freq
+                frequency,
+                min_freq,
+                max_freq
             ));
         }
         Ok(())
@@ -299,7 +330,8 @@ impl MockRig {
         if channel < 0 || channel >= self.config.memory_channels as i32 {
             return Err(anyhow!(
                 "Memory channel {} is outside valid range (0-{})",
-                channel, self.config.memory_channels - 1
+                channel,
+                self.config.memory_channels - 1
             ));
         }
         Ok(())
@@ -311,9 +343,9 @@ impl RigControl for MockRig {
     #[instrument(skip(self))]
     async fn connect(&self) -> Result<()> {
         self.simulate_failure("connect")?;
-        
+
         info!("Mock rig connecting...");
-        
+
         // Simulate connection delay
         if self.config.connection_delay_ms > 0 {
             sleep(Duration::from_millis(self.config.connection_delay_ms)).await;
@@ -332,7 +364,7 @@ impl RigControl for MockRig {
     #[instrument(skip(self))]
     async fn disconnect(&self) -> Result<()> {
         info!("Mock rig disconnecting...");
-        
+
         {
             let mut state = self.state.write();
             state.connected = false;
@@ -345,7 +377,7 @@ impl RigControl for MockRig {
 
     async fn get_status(&self) -> Result<RigStatus> {
         let state = self.state.read();
-        
+
         let connection_state = if state.connected {
             ConnectionState::Connected
         } else {
@@ -360,9 +392,13 @@ impl RigControl for MockRig {
             vfo: Some(state.current_vfo),
             ptt: state.ptt_states.get(&state.current_vfo).copied(),
             power_level: Some(state.power_level),
-            s_meter: state.frequencies.get(&state.current_vfo)
+            s_meter: state
+                .frequencies
+                .get(&state.current_vfo)
                 .map(|&freq| self.simulate_s_meter(freq)),
-            swr: state.frequencies.get(&state.current_vfo)
+            swr: state
+                .frequencies
+                .get(&state.current_vfo)
                 .map(|&freq| self.simulate_swr(freq)),
             memory_channel: state.current_memory.get(&state.current_vfo).copied(),
             last_update: state.last_operation,
@@ -413,12 +449,17 @@ impl RigControl for MockRig {
             vfo
         };
 
-        let frequency = state.frequencies.get(&actual_vfo)
+        let frequency = state
+            .frequencies
+            .get(&actual_vfo)
             .copied()
             .ok_or_else(|| anyhow!("No frequency set for VFO {:?}", actual_vfo))?;
 
         self.update_operation_time();
-        debug!("Mock rig get frequency: {} Hz from VFO {:?}", frequency, vfo);
+        debug!(
+            "Mock rig get frequency: {} Hz from VFO {:?}",
+            frequency, vfo
+        );
         Ok(frequency)
     }
 
@@ -447,7 +488,10 @@ impl RigControl for MockRig {
         }
 
         self.update_operation_time();
-        debug!("Mock rig set mode to {:?} with width {} Hz on VFO {:?}", mode, actual_width, vfo);
+        debug!(
+            "Mock rig set mode to {:?} with width {} Hz on VFO {:?}",
+            mode, actual_width, vfo
+        );
         Ok(())
     }
 
@@ -467,12 +511,17 @@ impl RigControl for MockRig {
             vfo
         };
 
-        let (mode, width) = state.modes.get(&actual_vfo)
+        let (mode, width) = state
+            .modes
+            .get(&actual_vfo)
             .copied()
             .ok_or_else(|| anyhow!("No mode set for VFO {:?}", actual_vfo))?;
 
         self.update_operation_time();
-        debug!("Mock rig get mode: {:?} with width {} Hz from VFO {:?}", mode, width, vfo);
+        debug!(
+            "Mock rig get mode: {:?} with width {} Hz from VFO {:?}",
+            mode, width, vfo
+        );
         Ok((mode, width))
     }
 
@@ -560,7 +609,9 @@ impl RigControl for MockRig {
             vfo
         };
 
-        let ptt = state.ptt_states.get(&actual_vfo)
+        let ptt = state
+            .ptt_states
+            .get(&actual_vfo)
             .copied()
             .unwrap_or(PttState::Off);
 
@@ -621,7 +672,9 @@ impl RigControl for MockRig {
             return Err(anyhow!("Mock rig not connected"));
         }
 
-        let frequency = state.frequencies.get(&state.current_vfo)
+        let frequency = state
+            .frequencies
+            .get(&state.current_vfo)
             .copied()
             .unwrap_or(14_200_000);
 
@@ -641,7 +694,9 @@ impl RigControl for MockRig {
             return Err(anyhow!("Mock rig not connected"));
         }
 
-        let frequency = state.frequencies.get(&state.current_vfo)
+        let frequency = state
+            .frequencies
+            .get(&state.current_vfo)
             .copied()
             .unwrap_or(14_200_000);
 
@@ -667,7 +722,9 @@ impl RigControl for MockRig {
         // Load memory channel settings
         let (frequency, mode, width) = {
             let state = self.state.read();
-            state.memory_channels.get(&channel)
+            state
+                .memory_channels
+                .get(&channel)
                 .copied()
                 .ok_or_else(|| anyhow!("Memory channel {} is empty", channel))?
         };
@@ -679,7 +736,7 @@ impl RigControl for MockRig {
             state.frequencies.insert(vfo, frequency);
             state.modes.insert(vfo, (mode, width));
             state.current_memory.insert(vfo, channel);
-            
+
             if vfo == Vfo::Current {
                 state.frequencies.insert(current_vfo, frequency);
                 state.modes.insert(current_vfo, (mode, width));
@@ -708,12 +765,17 @@ impl RigControl for MockRig {
             vfo
         };
 
-        let channel = state.current_memory.get(&actual_vfo)
+        let channel = state
+            .current_memory
+            .get(&actual_vfo)
             .copied()
             .ok_or_else(|| anyhow!("No memory channel selected for VFO {:?}", actual_vfo))?;
 
         self.update_operation_time();
-        debug!("Mock rig get memory channel: {} from VFO {:?}", channel, vfo);
+        debug!(
+            "Mock rig get memory channel: {} from VFO {:?}",
+            channel, vfo
+        );
         Ok(channel)
     }
 
@@ -773,18 +835,18 @@ mod tests {
     #[tokio::test]
     async fn test_mock_rig_connection() {
         let rig = MockRig::default();
-        
+
         // Test connection
         let result = rig.connect().await;
         assert!(result.is_ok());
-        
+
         let status = rig.get_status().await.unwrap();
         assert_eq!(status.connection_state, ConnectionState::Connected);
-        
+
         // Test disconnection
         let result = rig.disconnect().await;
         assert!(result.is_ok());
-        
+
         let status = rig.get_status().await.unwrap();
         assert_eq!(status.connection_state, ConnectionState::Disconnected);
     }
@@ -793,14 +855,14 @@ mod tests {
     async fn test_mock_rig_frequency_control() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
-        
+
         // Test setting frequency
         let test_freq = 14_200_000;
         rig.set_frequency(Vfo::A, test_freq).await.unwrap();
-        
+
         let freq = rig.get_frequency(Vfo::A).await.unwrap();
         assert_eq!(freq, test_freq);
-        
+
         // Test invalid frequency
         let invalid_freq = 1_000_000_000; // 1 GHz - outside range
         let result = rig.set_frequency(Vfo::A, invalid_freq).await;
@@ -811,14 +873,14 @@ mod tests {
     async fn test_mock_rig_mode_control() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
-        
+
         // Test setting mode
         rig.set_mode(Vfo::A, Mode::CW, Some(500)).await.unwrap();
-        
+
         let (mode, width) = rig.get_mode(Vfo::A).await.unwrap();
         assert_eq!(mode, Mode::CW);
         assert_eq!(width, 500);
-        
+
         // Test mode with default width
         rig.set_mode(Vfo::A, Mode::USB, None).await.unwrap();
         let (mode, width) = rig.get_mode(Vfo::A).await.unwrap();
@@ -830,12 +892,12 @@ mod tests {
     async fn test_mock_rig_vfo_control() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
-        
+
         // Test VFO switching
         rig.set_vfo(Vfo::B).await.unwrap();
         let vfo = rig.get_vfo().await.unwrap();
         assert_eq!(vfo, Vfo::B);
-        
+
         // Test setting frequency on specific VFO
         rig.set_frequency(Vfo::B, 21_200_000).await.unwrap();
         let freq = rig.get_frequency(Vfo::B).await.unwrap();
@@ -846,16 +908,16 @@ mod tests {
     async fn test_mock_rig_memory_channels() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
-        
+
         // Test loading memory channel
         rig.set_memory_channel(Vfo::A, 1).await.unwrap();
         let channel = rig.get_memory_channel(Vfo::A).await.unwrap();
         assert_eq!(channel, 1);
-        
+
         // Verify frequency was loaded from memory
         let freq = rig.get_frequency(Vfo::A).await.unwrap();
         assert_eq!(freq, 14_200_000); // From pre-loaded memory
-        
+
         // Test invalid memory channel
         let result = rig.set_memory_channel(Vfo::A, 999).await;
         assert!(result.is_err());
@@ -865,12 +927,12 @@ mod tests {
     async fn test_mock_rig_ptt_control() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
-        
+
         // Test PTT on
         rig.set_ptt(Vfo::A, PttState::On).await.unwrap();
         let ptt = rig.get_ptt(Vfo::A).await.unwrap();
         assert_eq!(ptt, PttState::On);
-        
+
         // Test PTT off
         rig.set_ptt(Vfo::A, PttState::Off).await.unwrap();
         let ptt = rig.get_ptt(Vfo::A).await.unwrap();
@@ -881,12 +943,12 @@ mod tests {
     async fn test_mock_rig_power_control() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
-        
+
         // Test setting power level
         rig.set_power_level(0.75).await.unwrap();
         let power = rig.get_power_level().await.unwrap();
         assert!((power - 0.75).abs() < 0.01);
-        
+
         // Test invalid power level
         let result = rig.set_power_level(1.5).await;
         assert!(result.is_err());
@@ -897,12 +959,12 @@ mod tests {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
         rig.set_frequency(Vfo::A, 14_200_000).await.unwrap();
-        
+
         // Test S-meter reading
         let s_meter = rig.get_s_meter().await.unwrap();
         assert!(s_meter >= -120);
         assert!(s_meter <= 60);
-        
+
         // Test SWR reading
         let swr = rig.get_swr().await.unwrap();
         assert!(swr >= 1.0);
@@ -915,11 +977,11 @@ mod tests {
         config.operation_delay_ms = 50;
         let rig = MockRig::new(config);
         rig.connect().await.unwrap();
-        
+
         let start = Instant::now();
         rig.get_frequency(Vfo::A).await.unwrap();
         let duration = start.elapsed();
-        
+
         // Should take at least the configured delay
         assert!(duration >= Duration::from_millis(50));
     }
@@ -929,17 +991,17 @@ mod tests {
         let mut config = MockRigConfig::default();
         config.failure_rate = 1.0; // 100% failure rate
         let rig = MockRig::new(config);
-        
+
         // Connection should fail
         let result = rig.connect().await;
         assert!(result.is_err());
-        
+
         // Reset for partial testing
         let mut config = MockRigConfig::default();
         config.failure_rate = 0.0; // 0% failure rate
         let rig = MockRig::new(config);
         rig.connect().await.unwrap();
-        
+
         // Operations should succeed
         let result = rig.get_frequency(Vfo::A).await;
         assert!(result.is_ok());
@@ -949,7 +1011,7 @@ mod tests {
     async fn test_mock_rig_info() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
-        
+
         let info = rig.get_info().await.unwrap();
         assert!(info.contains("Mock Transceiver"));
         assert!(info.contains("MHz"));
@@ -960,17 +1022,17 @@ mod tests {
     async fn test_mock_rig_operation_count() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
-        
+
         let initial_count = rig.get_operation_count();
-        
+
         // Perform some operations
         rig.get_frequency(Vfo::A).await.unwrap();
         rig.get_mode(Vfo::A).await.unwrap();
         rig.get_s_meter().await.unwrap();
-        
+
         let final_count = rig.get_operation_count();
         assert!(final_count > initial_count);
-        
+
         // Reset count
         rig.reset_operation_count();
         assert_eq!(rig.get_operation_count(), 0);

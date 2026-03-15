@@ -3,8 +3,8 @@
 //! This module provides comprehensive statistics calculation and achievement
 //! tracking for amateur radio DX activities and awards.
 
-use crate::{Band, Mode, tracker::DxTracker, dxcc::DxccDatabase, DxError, Result};
-use chrono::{DateTime, Utc, Duration, Datelike};
+use crate::{dxcc::DxccDatabase, tracker::DxTracker, Band, DxError, Mode, Result};
+use chrono::{DateTime, Datelike, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{debug, info};
@@ -206,23 +206,23 @@ impl StatisticsEngine {
             cache_timeout_minutes: 15,
         })
     }
-    
+
     /// Set cache timeout
     pub fn set_cache_timeout(&mut self, minutes: i64) {
         self.cache_timeout_minutes = minutes;
     }
-    
+
     /// Update statistics (refresh cache)
     pub async fn update_statistics(&mut self) -> Result<()> {
         info!("Updating DX statistics");
-        
+
         let stats = self.calculate_overall_statistics().await?;
         self.cached_stats = Some(stats);
         self.cache_time = Some(Utc::now());
-        
+
         Ok(())
     }
-    
+
     /// Get overall statistics
     pub async fn get_statistics(&mut self) -> Result<DxStatistics> {
         // Check cache
@@ -233,54 +233,56 @@ impl StatisticsEngine {
                 return Ok(stats.clone());
             }
         }
-        
+
         // Calculate fresh statistics
         self.update_statistics().await?;
         Ok(self.cached_stats.clone().unwrap())
     }
-    
+
     /// Calculate overall statistics
     async fn calculate_overall_statistics(&self) -> Result<DxStatistics> {
         // Get basic QSO counts
         let entity_stats = self.tracker.get_qso_statistics_by_entity().await?;
         let total_qsos = entity_stats.values().sum();
         let dxcc_entities_worked = entity_stats.len() as u32;
-        
+
         // Calculate confirmed entities (placeholder - would need actual confirmation tracking)
         let dxcc_entities_confirmed = (dxcc_entities_worked as f64 * 0.7) as u32; // Assume 70% confirmed
-        
+
         // Get band/mode breakdowns
         let qsos_by_band = self.calculate_band_breakdown().await?;
         let qsos_by_mode = self.calculate_mode_breakdown().await?;
-        
+
         // Calculate yearly breakdown
         let qsos_by_year = self.calculate_yearly_breakdown().await?;
-        
+
         // Calculate monthly breakdown (last 12 months)
         let qsos_by_month = self.calculate_monthly_breakdown().await?;
-        
+
         // Calculate average QSOs per day (last 30 days)
         let avg_qsos_per_day = self.calculate_avg_qsos_per_day().await?;
-        
+
         // Find most active band and mode
-        let most_active_band = qsos_by_band.iter()
+        let most_active_band = qsos_by_band
+            .iter()
             .max_by_key(|(_, &count)| count)
             .map(|(&band, _)| band);
-        
-        let most_active_mode = qsos_by_mode.iter()
+
+        let most_active_mode = qsos_by_mode
+            .iter()
             .max_by_key(|(_, &count)| count)
             .map(|(mode, _)| mode.clone());
-        
+
         // Get date range
         let (first_qso_date, last_qso_date) = self.get_qso_date_range().await?;
-        
+
         // Calculate other metrics
         let unique_callsigns = self.calculate_unique_callsigns().await?;
         let longest_distance_km = self.calculate_longest_distance().await?;
         let most_worked_entity = self.find_most_worked_entity(&entity_stats);
         let countries_per_continent = self.calculate_countries_per_continent().await?;
         let confirmation_rate = self.calculate_confirmation_rate().await?;
-        
+
         Ok(DxStatistics {
             total_qsos,
             unique_callsigns,
@@ -301,19 +303,19 @@ impl StatisticsEngine {
             confirmation_rate,
         })
     }
-    
+
     /// Get statistics for specific band
     pub async fn get_band_statistics(&self, band: Band) -> Result<BandStatistics> {
         info!("Calculating statistics for band {}", band);
-        
+
         // This would query the tracker for band-specific data
         // For now, return placeholder data
-        
+
         let total_qsos = 100; // Placeholder
         let unique_callsigns = 85; // Placeholder
         let entities_worked = 45; // Placeholder
         let entities_confirmed = 32; // Placeholder
-        
+
         Ok(BandStatistics {
             band,
             total_qsos,
@@ -330,19 +332,19 @@ impl StatisticsEngine {
             confirmation_rate: 71.1,
         })
     }
-    
+
     /// Get statistics for specific mode
     pub async fn get_mode_statistics(&self, mode: &Mode) -> Result<ModeStatistics> {
         info!("Calculating statistics for mode {}", mode);
-        
+
         // This would query the tracker for mode-specific data
         // For now, return placeholder data
-        
+
         let total_qsos = 150; // Placeholder
         let unique_callsigns = 120; // Placeholder
         let entities_worked = 55; // Placeholder
         let entities_confirmed = 40; // Placeholder
-        
+
         Ok(ModeStatistics {
             mode: mode.clone(),
             total_qsos,
@@ -356,15 +358,17 @@ impl StatisticsEngine {
             confirmation_rate: 72.7,
         })
     }
-    
+
     /// Get all achievements
     pub async fn get_achievements(&self) -> Result<Vec<Achievement>> {
         let mut achievements = Vec::new();
-        
+
         // Get overall stats for calculating achievements
-        let stats = self.cached_stats.as_ref()
+        let stats = self
+            .cached_stats
+            .as_ref()
             .ok_or_else(|| DxError::Configuration("Statistics not calculated".to_string()))?;
-        
+
         // DXCC achievements
         achievements.push(Achievement {
             id: "dxcc_mixed".to_string(),
@@ -374,11 +378,15 @@ impl StatisticsEngine {
             current: stats.dxcc_entities_worked,
             target: 100,
             progress_percent: (stats.dxcc_entities_worked as f64 / 100.0 * 100.0).min(100.0),
-            achieved_date: if stats.dxcc_entities_worked >= 100 { Some(Utc::now()) } else { None },
+            achieved_date: if stats.dxcc_entities_worked >= 100 {
+                Some(Utc::now())
+            } else {
+                None
+            },
             first_attempt_date: stats.first_qso_date,
             completed: stats.dxcc_entities_worked >= 100,
         });
-        
+
         achievements.push(Achievement {
             id: "dxcc_honor_roll".to_string(),
             name: "DXCC Honor Roll".to_string(),
@@ -387,11 +395,15 @@ impl StatisticsEngine {
             current: stats.dxcc_entities_worked,
             target: 331,
             progress_percent: (stats.dxcc_entities_worked as f64 / 331.0 * 100.0).min(100.0),
-            achieved_date: if stats.dxcc_entities_worked >= 331 { Some(Utc::now()) } else { None },
+            achieved_date: if stats.dxcc_entities_worked >= 331 {
+                Some(Utc::now())
+            } else {
+                None
+            },
             first_attempt_date: stats.first_qso_date,
             completed: stats.dxcc_entities_worked >= 331,
         });
-        
+
         // QSO count achievements
         achievements.push(Achievement {
             id: "qso_1000".to_string(),
@@ -401,11 +413,15 @@ impl StatisticsEngine {
             current: stats.total_qsos,
             target: 1000,
             progress_percent: (stats.total_qsos as f64 / 1000.0 * 100.0).min(100.0),
-            achieved_date: if stats.total_qsos >= 1000 { Some(Utc::now()) } else { None },
+            achieved_date: if stats.total_qsos >= 1000 {
+                Some(Utc::now())
+            } else {
+                None
+            },
             first_attempt_date: stats.first_qso_date,
             completed: stats.total_qsos >= 1000,
         });
-        
+
         achievements.push(Achievement {
             id: "qso_10000".to_string(),
             name: "10,000 QSOs".to_string(),
@@ -414,11 +430,15 @@ impl StatisticsEngine {
             current: stats.total_qsos,
             target: 10000,
             progress_percent: (stats.total_qsos as f64 / 10000.0 * 100.0).min(100.0),
-            achieved_date: if stats.total_qsos >= 10000 { Some(Utc::now()) } else { None },
+            achieved_date: if stats.total_qsos >= 10000 {
+                Some(Utc::now())
+            } else {
+                None
+            },
             first_attempt_date: stats.first_qso_date,
             completed: stats.total_qsos >= 10000,
         });
-        
+
         // Band-specific achievements
         for &band in Band::all() {
             if let Some(&qso_count) = stats.qsos_by_band.get(&band) {
@@ -430,13 +450,17 @@ impl StatisticsEngine {
                     current: qso_count,
                     target: 100,
                     progress_percent: (qso_count as f64 / 100.0 * 100.0).min(100.0),
-                    achieved_date: if qso_count >= 100 { Some(Utc::now()) } else { None },
+                    achieved_date: if qso_count >= 100 {
+                        Some(Utc::now())
+                    } else {
+                        None
+                    },
                     first_attempt_date: stats.first_qso_date,
                     completed: qso_count >= 100,
                 });
             }
         }
-        
+
         // Confirmation achievements
         achievements.push(Achievement {
             id: "confirmation_rate_90".to_string(),
@@ -446,37 +470,41 @@ impl StatisticsEngine {
             current: (stats.confirmation_rate * 100.0) as u32,
             target: 90,
             progress_percent: stats.confirmation_rate,
-            achieved_date: if stats.confirmation_rate >= 90.0 { Some(Utc::now()) } else { None },
+            achieved_date: if stats.confirmation_rate >= 90.0 {
+                Some(Utc::now())
+            } else {
+                None
+            },
             first_attempt_date: stats.first_qso_date,
             completed: stats.confirmation_rate >= 90.0,
         });
-        
+
         Ok(achievements)
     }
-    
+
     /// Get contest statistics
     pub async fn get_contest_statistics(&self) -> Result<Vec<ContestStatistics>> {
         // This would analyze QSOs with contest_id field
         // For now, return empty list
         Ok(Vec::new())
     }
-    
+
     /// Get activity timeline
     pub async fn get_activity_timeline(&self, days: i64) -> Result<Vec<ActivityTimelineEntry>> {
         let mut timeline = Vec::new();
-        
+
         // This would analyze QSO history for significant events
         // For now, create some sample entries
-        
+
         let now = Utc::now();
-        
+
         timeline.push(ActivityTimelineEntry {
             date: now - Duration::days(1),
             event_type: "milestone".to_string(),
             description: "Reached 1,000 QSOs".to_string(),
             values: [("qso_count".to_string(), "1000".to_string())].into(),
         });
-        
+
         timeline.push(ActivityTimelineEntry {
             date: now - Duration::days(7),
             event_type: "new_dxcc".to_string(),
@@ -484,9 +512,10 @@ impl StatisticsEngine {
             values: [
                 ("entity_code".to_string(), "306".to_string()),
                 ("callsign".to_string(), "A51AA".to_string()),
-            ].into(),
+            ]
+            .into(),
         });
-        
+
         timeline.push(ActivityTimelineEntry {
             date: now - Duration::days(14),
             event_type: "contest".to_string(),
@@ -494,51 +523,56 @@ impl StatisticsEngine {
             values: [
                 ("contest".to_string(), "CQ-WW-DX".to_string()),
                 ("qsos".to_string(), "150".to_string()),
-            ].into(),
+            ]
+            .into(),
         });
-        
+
         Ok(timeline)
     }
-    
+
     /// Get top worked entities
     pub async fn get_top_worked_entities(&self, limit: usize) -> Result<Vec<(u16, String, u32)>> {
         let entity_stats = self.tracker.get_qso_statistics_by_entity().await?;
-        
+
         let mut entities: Vec<(u16, u32)> = entity_stats.into_iter().collect();
         entities.sort_by(|a, b| b.1.cmp(&a.1));
         entities.truncate(limit);
-        
+
         let mut result = Vec::new();
         for (entity_code, count) in entities {
             if let Some(entity) = self.dxcc.get_entity(entity_code) {
                 result.push((entity_code, entity.name.clone(), count));
             } else {
-                result.push((entity_code, format!("Unknown Entity {}", entity_code), count));
+                result.push((
+                    entity_code,
+                    format!("Unknown Entity {}", entity_code),
+                    count,
+                ));
             }
         }
-        
+
         Ok(result)
     }
-    
+
     /// Calculate QSO rate trends
     pub async fn calculate_qso_rate_trends(&self, days: i64) -> Result<Vec<(DateTime<Utc>, u32)>> {
         // This would analyze QSO rates over time
         // For now, return placeholder data
-        
+
         let mut trends = Vec::new();
         let now = Utc::now();
-        
+
         for i in 0..days {
             let date = now - Duration::days(days - i);
             let qso_count = ((i as f64 / days as f64) * 50.0) as u32 + 10; // Simulated growth
             trends.push((date, qso_count));
         }
-        
+
         Ok(trends)
     }
-    
+
     // Helper methods for statistics calculation
-    
+
     async fn calculate_band_breakdown(&self) -> Result<HashMap<Band, u32>> {
         // This would aggregate QSOs by band from the tracker
         // For now, return placeholder data
@@ -550,7 +584,7 @@ impl StatisticsEngine {
         breakdown.insert(Band::Band10m, 60);
         Ok(breakdown)
     }
-    
+
     async fn calculate_mode_breakdown(&self) -> Result<HashMap<Mode, u32>> {
         // This would aggregate QSOs by mode from the tracker
         // For now, return placeholder data
@@ -562,41 +596,45 @@ impl StatisticsEngine {
         breakdown.insert(Mode::RTTY, 70);
         Ok(breakdown)
     }
-    
+
     async fn calculate_yearly_breakdown(&self) -> Result<HashMap<u32, u32>> {
         // This would aggregate QSOs by year
         let mut breakdown = HashMap::new();
         let current_year = Utc::now().year() as u32;
-        
+
         for year in (current_year - 5)..=current_year {
-            let count = if year == current_year { 300 } else { 200 + (year % 100) };
+            let count = if year == current_year {
+                300
+            } else {
+                200 + (year % 100)
+            };
             breakdown.insert(year, count);
         }
-        
+
         Ok(breakdown)
     }
-    
+
     async fn calculate_monthly_breakdown(&self) -> Result<HashMap<String, u32>> {
         // This would aggregate QSOs by month for last 12 months
         let mut breakdown = HashMap::new();
         let now = Utc::now();
-        
+
         for i in 0..12 {
             let date = now - Duration::days(i * 30);
             let month_key = date.format("%Y-%m").to_string();
             let count = 50 + (i * 5) as u32; // Simulated data
             breakdown.insert(month_key, count);
         }
-        
+
         Ok(breakdown)
     }
-    
+
     async fn calculate_avg_qsos_per_day(&self) -> Result<f64> {
         // This would calculate average from actual QSO data
         // For now, return placeholder
         Ok(3.2)
     }
-    
+
     async fn get_qso_date_range(&self) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
         // This would query the tracker for first and last QSO dates
         // For now, return placeholder data
@@ -604,25 +642,26 @@ impl StatisticsEngine {
         let first = now - Duration::days(365 * 2); // 2 years ago
         Ok((Some(first), Some(now)))
     }
-    
+
     async fn calculate_unique_callsigns(&self) -> Result<u32> {
         // This would count unique callsigns from tracker
         // For now, return placeholder
         Ok(650)
     }
-    
+
     async fn calculate_longest_distance(&self) -> Result<Option<f64>> {
         // This would find the QSO with maximum distance
         // For now, return placeholder
         Ok(Some(19850.0)) // Approximate antipodal distance
     }
-    
+
     fn find_most_worked_entity(&self, entity_stats: &HashMap<u16, u32>) -> Option<(u16, u32)> {
-        entity_stats.iter()
+        entity_stats
+            .iter()
             .max_by_key(|(_, &count)| count)
             .map(|(&entity, &count)| (entity, count))
     }
-    
+
     async fn calculate_countries_per_continent(&self) -> Result<HashMap<String, u32>> {
         // This would count entities per continent using DXCC database
         let mut counts = HashMap::new();
@@ -634,7 +673,7 @@ impl StatisticsEngine {
         counts.insert("Oceania".to_string(), 12);
         Ok(counts)
     }
-    
+
     async fn calculate_confirmation_rate(&self) -> Result<f64> {
         // This would calculate actual confirmation rate from tracker
         // For now, return placeholder
@@ -646,10 +685,12 @@ impl StatisticsEngine {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
-    
+
     async fn create_test_tracker() -> (DxTracker, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
-        let tracker = crate::tracker::DxTracker::new(temp_file.path().to_str().unwrap()).await.unwrap();
+        let tracker = crate::tracker::DxTracker::new(temp_file.path().to_str().unwrap())
+            .await
+            .unwrap();
         (tracker, temp_file)
     }
 
@@ -660,7 +701,7 @@ mod tests {
         let stats_engine = StatisticsEngine::new(tracker_arc).await.unwrap();
         assert_eq!(stats_engine.cache_timeout_minutes, 15);
     }
-    
+
     #[tokio::test]
     async fn test_achievement_creation() {
         let achievement = Achievement {
@@ -675,11 +716,11 @@ mod tests {
             first_attempt_date: Some(Utc::now()),
             completed: false,
         };
-        
+
         assert_eq!(achievement.progress_percent, 50.0);
         assert!(!achievement.completed);
     }
-    
+
     #[test]
     fn test_band_statistics() {
         let stats = BandStatistics {
@@ -697,12 +738,12 @@ mod tests {
             longest_distance_km: Some(15000.0),
             confirmation_rate: 71.1,
         };
-        
+
         assert_eq!(stats.band, Band::Band20m);
         assert_eq!(stats.total_qsos, 100);
         assert_eq!(stats.confirmation_rate, 71.1);
     }
-    
+
     #[test]
     fn test_mode_statistics() {
         let stats = ModeStatistics {
@@ -717,12 +758,12 @@ mod tests {
             avg_rst_received: 597.8,
             confirmation_rate: 72.7,
         };
-        
+
         assert_eq!(stats.mode, Mode::FT8);
         assert_eq!(stats.total_qsos, 150);
         assert_eq!(stats.most_active_band, Some(Band::Band20m));
     }
-    
+
     #[test]
     fn test_contest_statistics() {
         let stats = ContestStatistics {
@@ -738,12 +779,12 @@ mod tests {
             operating_hours: 24.0,
             qsos_per_hour: 8.33,
         };
-        
+
         assert_eq!(stats.contest_id, "CQ-WW-DX");
         assert_eq!(stats.total_qsos, 200);
         assert_eq!(stats.score, Some(25000));
     }
-    
+
     #[test]
     fn test_activity_timeline_entry() {
         let entry = ActivityTimelineEntry {
@@ -752,7 +793,7 @@ mod tests {
             description: "Reached 1,000 QSOs".to_string(),
             values: [("qso_count".to_string(), "1000".to_string())].into(),
         };
-        
+
         assert_eq!(entry.event_type, "milestone");
         assert_eq!(entry.values.get("qso_count"), Some(&"1000".to_string()));
     }

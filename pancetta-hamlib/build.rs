@@ -1,5 +1,5 @@
 //! Build script for pancetta-hamlib
-//! 
+//!
 //! This build script handles:
 //! - Detection of hamlib library on the system
 //! - Generation of bindings if needed

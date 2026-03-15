@@ -1,5 +1,5 @@
 //! QSO state definitions for FT8 communications
-//! 
+//!
 //! This module defines the various states a QSO can be in during the
 //! standard FT8 communication flow and contest operations.
 
@@ -25,28 +25,28 @@ pub type SerialNumber = u32;
 pub enum QsoState {
     /// Initial state - no communication started
     Idle,
-    
+
     /// Calling CQ and waiting for response
     CallingCq {
         frequency: f64,
         started_at: DateTime<Utc>,
         call_count: u32,
     },
-    
+
     /// Responding to a CQ call
     RespondingToCq {
         target_callsign: String,
         frequency: f64,
         started_at: DateTime<Utc>,
     },
-    
+
     /// Waiting for signal report
     WaitingForReport {
         their_callsign: String,
         frequency: f64,
         started_at: DateTime<Utc>,
     },
-    
+
     /// Sending signal report
     SendingReport {
         their_callsign: String,
@@ -55,7 +55,7 @@ pub enum QsoState {
         frequency: f64,
         started_at: DateTime<Utc>,
     },
-    
+
     /// Waiting for confirmation (RR73 or similar)
     WaitingForConfirmation {
         their_callsign: String,
@@ -65,7 +65,7 @@ pub enum QsoState {
         grid_square: Option<GridSquare>,
         started_at: DateTime<Utc>,
     },
-    
+
     /// Sending final confirmation
     SendingConfirmation {
         their_callsign: String,
@@ -75,7 +75,7 @@ pub enum QsoState {
         grid_square: Option<GridSquare>,
         started_at: DateTime<Utc>,
     },
-    
+
     /// QSO completed successfully
     Completed {
         their_callsign: String,
@@ -86,14 +86,14 @@ pub enum QsoState {
         completed_at: DateTime<Utc>,
         duration_seconds: u32,
     },
-    
+
     /// QSO failed or timed out
     Failed {
         reason: QsoFailureReason,
         failed_at: DateTime<Utc>,
         last_state: Box<QsoState>,
     },
-    
+
     /// Contest-specific states
     Contest(ContestState),
 }
@@ -109,7 +109,7 @@ pub enum ContestState {
         frequency: f64,
         started_at: DateTime<Utc>,
     },
-    
+
     /// Contest QSO completed
     ContestCompleted {
         their_callsign: String,
@@ -126,25 +126,25 @@ pub enum ContestState {
 pub enum QsoFailureReason {
     /// Timeout waiting for response
     Timeout,
-    
+
     /// Signal lost or too weak
     SignalLost,
-    
+
     /// Duplicate QSO detected
     Duplicate,
-    
+
     /// Invalid callsign format
     InvalidCallsign,
-    
+
     /// Frequency conflict
     FrequencyConflict,
-    
+
     /// User cancelled the QSO
     UserCancelled,
-    
+
     /// Other station went QRT
     StationQrt,
-    
+
     /// Protocol error
     ProtocolError(String),
 }
@@ -157,40 +157,40 @@ pub enum MessageType {
         callsign: String,
         grid: Option<GridSquare>,
     },
-    
+
     /// Response to CQ: "W1ABC K1DEF FN31"
     CqResponse {
         calling_station: String,
         responding_station: String,
         grid: Option<GridSquare>,
     },
-    
+
     /// Signal report: "K1DEF W1ABC -15"
     SignalReport {
         to_station: String,
         from_station: String,
         report: SignalReport,
     },
-    
+
     /// Report acknowledgment: "W1ABC K1DEF R-12"
     ReportAck {
         to_station: String,
         from_station: String,
         report: SignalReport,
     },
-    
+
     /// Final confirmation: "K1DEF W1ABC RR73"
     FinalConfirmation {
         to_station: String,
         from_station: String,
     },
-    
+
     /// 73 message: "W1ABC K1DEF 73"
     SeventyThree {
         to_station: String,
         from_station: String,
     },
-    
+
     /// Contest exchange: "W1ABC K1DEF 599 001"
     ContestExchange {
         to_station: String,
@@ -198,11 +198,9 @@ pub enum MessageType {
         report: SignalReport,
         serial: SerialNumber,
     },
-    
+
     /// Non-standard message
-    NonStandard {
-        text: String,
-    },
+    NonStandard { text: String },
 }
 
 /// QSO progress tracking
@@ -210,13 +208,13 @@ pub enum MessageType {
 pub struct QsoProgress {
     /// Current state
     pub state: QsoState,
-    
+
     /// State history
     pub state_history: Vec<StateTransition>,
-    
+
     /// Messages exchanged
     pub messages: Vec<QsoMessage>,
-    
+
     /// QSO metadata
     pub metadata: QsoMetadata,
 }
@@ -226,13 +224,13 @@ pub struct QsoProgress {
 pub struct StateTransition {
     /// Previous state
     pub from_state: QsoState,
-    
+
     /// New state
     pub to_state: QsoState,
-    
+
     /// Timestamp of transition
     pub timestamp: DateTime<Utc>,
-    
+
     /// Reason for transition
     pub reason: TransitionReason,
 }
@@ -242,19 +240,19 @@ pub struct StateTransition {
 pub enum TransitionReason {
     /// Message received
     MessageReceived(MessageType),
-    
+
     /// Message sent
     MessageSent(MessageType),
-    
+
     /// Timeout occurred
     Timeout,
-    
+
     /// User initiated
     UserAction,
-    
+
     /// Automatic progression
     AutoSequence,
-    
+
     /// Error condition
     Error(String),
 }
@@ -264,19 +262,19 @@ pub enum TransitionReason {
 pub struct QsoMessage {
     /// Message timestamp
     pub timestamp: DateTime<Utc>,
-    
+
     /// Message direction
     pub direction: MessageDirection,
-    
+
     /// Message content
     pub message_type: MessageType,
-    
+
     /// Raw message text
     pub raw_text: String,
-    
+
     /// Signal strength when received
     pub signal_strength: Option<f32>,
-    
+
     /// Frequency
     pub frequency: f64,
 }
@@ -286,7 +284,7 @@ pub struct QsoMessage {
 pub enum MessageDirection {
     /// Message we sent
     Sent,
-    
+
     /// Message we received
     Received,
 }
@@ -296,37 +294,37 @@ pub enum MessageDirection {
 pub struct QsoMetadata {
     /// QSO unique identifier
     pub qso_id: QsoId,
-    
+
     /// Our callsign
     pub our_callsign: String,
-    
+
     /// Their callsign (if known)
     pub their_callsign: Option<String>,
-    
+
     /// Operating frequency in Hz
     pub frequency: f64,
-    
+
     /// Operating mode (should be "FT8")
     pub mode: String,
-    
+
     /// QSO start time
     pub start_time: DateTime<Utc>,
-    
+
     /// QSO end time (if completed)
     pub end_time: Option<DateTime<Utc>>,
-    
+
     /// Signal reports
     pub reports: SignalReports,
-    
+
     /// Grid squares
     pub grids: GridSquares,
-    
+
     /// Contest information
     pub contest_info: Option<ContestInfo>,
-    
+
     /// Additional tags
     pub tags: HashMap<String, String>,
-    
+
     /// Notes
     pub notes: Option<String>,
 }
@@ -336,7 +334,7 @@ pub struct QsoMetadata {
 pub struct SignalReports {
     /// Report we sent
     pub sent: Option<SignalReport>,
-    
+
     /// Report we received
     pub received: Option<SignalReport>,
 }
@@ -346,7 +344,7 @@ pub struct SignalReports {
 pub struct GridSquares {
     /// Our grid square
     pub ours: Option<GridSquare>,
-    
+
     /// Their grid square
     pub theirs: Option<GridSquare>,
 }
@@ -356,16 +354,16 @@ pub struct GridSquares {
 pub struct ContestInfo {
     /// Contest name/identifier
     pub contest_name: String,
-    
+
     /// Contest category
     pub category: String,
-    
+
     /// Serial numbers
     pub serials: ContestSerials,
-    
+
     /// Points value
     pub points: u32,
-    
+
     /// Multiplier information
     pub multiplier: Option<String>,
 }
@@ -375,7 +373,7 @@ pub struct ContestInfo {
 pub struct ContestSerials {
     /// Serial number we sent
     pub sent: Option<SerialNumber>,
-    
+
     /// Serial number we received
     pub received: Option<SerialNumber>,
 }
@@ -385,10 +383,10 @@ pub struct ContestSerials {
 pub enum QsoValidation {
     /// QSO is valid
     Valid,
-    
+
     /// QSO is invalid with reason
     Invalid(String),
-    
+
     /// QSO is duplicate
     Duplicate {
         original_qso_id: QsoId,
@@ -401,12 +399,12 @@ impl QsoState {
     pub fn is_terminal(&self) -> bool {
         matches!(self, QsoState::Completed { .. } | QsoState::Failed { .. })
     }
-    
+
     /// Check if the QSO is active (not idle or terminal)
     pub fn is_active(&self) -> bool {
         !matches!(self, QsoState::Idle) && !self.is_terminal()
     }
-    
+
     /// Get the current frequency if available
     pub fn frequency(&self) -> Option<f64> {
         match self {
@@ -422,22 +420,28 @@ impl QsoState {
             _ => None,
         }
     }
-    
+
     /// Get the other station's callsign if known
     pub fn their_callsign(&self) -> Option<&str> {
         match self {
-            QsoState::RespondingToCq { target_callsign, .. } => Some(target_callsign),
+            QsoState::RespondingToCq {
+                target_callsign, ..
+            } => Some(target_callsign),
             QsoState::WaitingForReport { their_callsign, .. }
             | QsoState::SendingReport { their_callsign, .. }
             | QsoState::WaitingForConfirmation { their_callsign, .. }
             | QsoState::SendingConfirmation { their_callsign, .. }
             | QsoState::Completed { their_callsign, .. } => Some(their_callsign),
-            QsoState::Contest(ContestState::ExchangingInfo { their_callsign, .. }) => Some(their_callsign),
-            QsoState::Contest(ContestState::ContestCompleted { their_callsign, .. }) => Some(their_callsign),
+            QsoState::Contest(ContestState::ExchangingInfo { their_callsign, .. }) => {
+                Some(their_callsign)
+            }
+            QsoState::Contest(ContestState::ContestCompleted { their_callsign, .. }) => {
+                Some(their_callsign)
+            }
             _ => None,
         }
     }
-    
+
     /// Get the duration of the current state
     pub fn state_duration(&self, now: DateTime<Utc>) -> Option<chrono::Duration> {
         let start_time = match self {
@@ -450,7 +454,7 @@ impl QsoState {
             QsoState::Contest(ContestState::ExchangingInfo { started_at, .. }) => Some(*started_at),
             _ => None,
         };
-        
+
         start_time.map(|start| now - start)
     }
 }
@@ -459,7 +463,9 @@ impl MessageType {
     /// Check if this message type is addressed to a specific station
     pub fn is_addressed_to(&self, callsign: &str) -> bool {
         match self {
-            MessageType::CqResponse { calling_station, .. } => calling_station == callsign,
+            MessageType::CqResponse {
+                calling_station, ..
+            } => calling_station == callsign,
             MessageType::SignalReport { to_station, .. }
             | MessageType::ReportAck { to_station, .. }
             | MessageType::FinalConfirmation { to_station, .. }
@@ -468,12 +474,14 @@ impl MessageType {
             _ => false,
         }
     }
-    
+
     /// Check if this message type is from a specific station
     pub fn is_from(&self, callsign: &str) -> bool {
         match self {
             MessageType::Cq { callsign: call, .. } => call == callsign,
-            MessageType::CqResponse { responding_station, .. } => responding_station == callsign,
+            MessageType::CqResponse {
+                responding_station, ..
+            } => responding_station == callsign,
             MessageType::SignalReport { from_station, .. }
             | MessageType::ReportAck { from_station, .. }
             | MessageType::FinalConfirmation { from_station, .. }
@@ -501,7 +509,7 @@ mod tests {
         };
         assert!(completed.is_terminal());
         assert!(!completed.is_active());
-        
+
         let active = QsoState::WaitingForReport {
             their_callsign: "W1ABC".to_string(),
             frequency: 14074000.0,
@@ -509,12 +517,12 @@ mod tests {
         };
         assert!(!active.is_terminal());
         assert!(active.is_active());
-        
+
         let idle = QsoState::Idle;
         assert!(!idle.is_terminal());
         assert!(!idle.is_active());
     }
-    
+
     #[test]
     fn test_message_addressing() {
         let msg = MessageType::SignalReport {
@@ -522,7 +530,7 @@ mod tests {
             from_station: "K1DEF".to_string(),
             report: -15,
         };
-        
+
         assert!(msg.is_addressed_to("W1ABC"));
         assert!(!msg.is_addressed_to("K1DEF"));
         assert!(msg.is_from("K1DEF"));

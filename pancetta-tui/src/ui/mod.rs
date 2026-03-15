@@ -23,14 +23,14 @@ use station_info::render_station_info;
 /// Main UI rendering function
 pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     let size = f.area();
-    
+
     // Create main layout
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // Title bar
-            Constraint::Min(1),     // Main content
-            Constraint::Length(3),  // Status bar
+            Constraint::Length(1), // Title bar
+            Constraint::Min(1),    // Main content
+            Constraint::Length(3), // Status bar
         ])
         .split(size);
 
@@ -68,30 +68,58 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     render_status_bar(f, chunks[2], app);
 
     // Render active panel highlight
-    render_active_panel_highlight(f, app, &[left_chunks[0], left_chunks[2], right_chunks[0], right_chunks[1]]);
+    render_active_panel_highlight(
+        f,
+        app,
+        &[
+            left_chunks[0],
+            left_chunks[2],
+            right_chunks[0],
+            right_chunks[1],
+        ],
+    );
 
     Ok(())
 }
 
 fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     let title = Line::from(vec![
-        Span::styled("Pancetta TUI", Style::default().fg(app.theme.accent_color()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Pancetta TUI",
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" | "),
-        Span::styled(&app.station_info.call_sign, Style::default().fg(app.theme.success_color()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            &app.station_info.call_sign,
+            Style::default()
+                .fg(app.theme.success_color())
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" | "),
-        Span::styled(&app.station_info.grid_square, Style::default().fg(app.theme.foreground_color())),
+        Span::styled(
+            &app.station_info.grid_square,
+            Style::default().fg(app.theme.foreground_color()),
+        ),
         Span::raw(" | "),
         Span::styled(
             format!("{:.3} MHz", app.station_info.operating_frequency),
-            Style::default().fg(app.theme.warning_color())
+            Style::default().fg(app.theme.warning_color()),
         ),
         Span::raw(" | "),
-        Span::styled(&app.station_info.mode, Style::default().fg(app.theme.accent_color())),
+        Span::styled(
+            &app.station_info.mode,
+            Style::default().fg(app.theme.accent_color()),
+        ),
     ]);
 
-    let paragraph = Paragraph::new(title)
-        .style(Style::default().bg(app.theme.background_color()).fg(app.theme.foreground_color()));
-    
+    let paragraph = Paragraph::new(title).style(
+        Style::default()
+            .bg(app.theme.background_color())
+            .fg(app.theme.foreground_color()),
+    );
+
     f.render_widget(paragraph, area);
 }
 
@@ -106,55 +134,100 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     let dx_count = app.dx_stations.len();
 
     let status_line = Line::from(vec![
-        Span::styled(audio_status, 
-            Style::default().fg(if app.is_monitoring { 
-                app.theme.success_color() 
-            } else { 
-                app.theme.muted_color() 
-            }).add_modifier(Modifier::BOLD)
+        Span::styled(
+            audio_status,
+            Style::default()
+                .fg(if app.is_monitoring {
+                    app.theme.success_color()
+                } else {
+                    app.theme.muted_color()
+                })
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(" | "),
-        Span::styled(format!("Messages: {}", messages_count), Style::default().fg(app.theme.foreground_color())),
+        Span::styled(
+            format!("Messages: {}", messages_count),
+            Style::default().fg(app.theme.foreground_color()),
+        ),
         Span::raw(" | "),
-        Span::styled(format!("DX: {}", dx_count), Style::default().fg(app.theme.foreground_color())),
+        Span::styled(
+            format!("DX: {}", dx_count),
+            Style::default().fg(app.theme.foreground_color()),
+        ),
         Span::raw(" | "),
-        Span::styled(&app.status_message, Style::default().fg(app.theme.accent_color())),
+        Span::styled(
+            &app.status_message,
+            Style::default().fg(app.theme.accent_color()),
+        ),
     ]);
 
     let help_line = Line::from(vec![
-        Span::styled("Tab", Style::default().fg(app.theme.accent_color()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Tab",
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(":Switch | "),
-        Span::styled("↑↓", Style::default().fg(app.theme.accent_color()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "↑↓",
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(":Scroll | "),
-        Span::styled("M", Style::default().fg(app.theme.accent_color()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "M",
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(":Monitor | "),
-        Span::styled("T", Style::default().fg(app.theme.accent_color()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "T",
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(":Theme | "),
-        Span::styled("Q", Style::default().fg(app.theme.accent_color()).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "Q",
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(":Quit"),
     ]);
 
     // Split status bar into two lines
     let status_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(area);
 
-    let status_paragraph = Paragraph::new(status_line)
-        .style(Style::default().bg(app.theme.background_color()).fg(app.theme.foreground_color()));
-    
-    let help_paragraph = Paragraph::new(help_line)
-        .style(Style::default().bg(app.theme.background_color()).fg(app.theme.muted_color()));
+    let status_paragraph = Paragraph::new(status_line).style(
+        Style::default()
+            .bg(app.theme.background_color())
+            .fg(app.theme.foreground_color()),
+    );
+
+    let help_paragraph = Paragraph::new(help_line).style(
+        Style::default()
+            .bg(app.theme.background_color())
+            .fg(app.theme.muted_color()),
+    );
 
     f.render_widget(status_paragraph, status_chunks[0]);
     f.render_widget(help_paragraph, status_chunks[1]);
 
     // Border line
-    let border_line = Line::from(vec![
-        Span::raw("─".repeat(area.width as usize))
-    ]);
-    let border_paragraph = Paragraph::new(border_line)
-        .style(Style::default().fg(app.theme.border_color()));
+    let border_line = Line::from(vec![Span::raw("─".repeat(area.width as usize))]);
+    let border_paragraph =
+        Paragraph::new(border_line).style(Style::default().fg(app.theme.border_color()));
     f.render_widget(border_paragraph, status_chunks[2]);
 }
 
@@ -167,15 +240,7 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Frequency scale labels (200-4000 Hz range)
     let freq_labels = vec![
-        " 4000",
-        "     ",
-        " 3000",
-        "     ",
-        " 2000",
-        "     ",
-        " 1000",
-        "     ",
-        "  200",
+        " 4000", "     ", " 3000", "     ", " 2000", "     ", " 1000", "     ", "  200",
     ];
     let label_area = chunks[0];
     let available_rows = label_area.height.saturating_sub(2) as usize; // minus borders
@@ -195,7 +260,10 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
         }
     }
     let label_block = Block::default()
-        .title(Span::styled(" Hz", Style::default().fg(app.theme.muted_color())))
+        .title(Span::styled(
+            " Hz",
+            Style::default().fg(app.theme.muted_color()),
+        ))
         .borders(Borders::RIGHT);
     let label_paragraph = Paragraph::new(label_lines).block(label_block);
     f.render_widget(label_paragraph, label_area);
@@ -222,9 +290,11 @@ fn render_active_panel_highlight(f: &mut Frame<'_>, app: &App, panel_areas: &[Re
     };
 
     // Draw a subtle highlight border around the active panel
-    let highlight_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(app.theme.selected_color()).add_modifier(Modifier::BOLD));
+    let highlight_block = Block::default().borders(Borders::ALL).border_style(
+        Style::default()
+            .fg(app.theme.selected_color())
+            .add_modifier(Modifier::BOLD),
+    );
 
     f.render_widget(Clear, active_area); // Clear the area first
     f.render_widget(highlight_block, active_area);
@@ -233,13 +303,17 @@ fn render_active_panel_highlight(f: &mut Frame<'_>, app: &App, panel_areas: &[Re
 /// Create a styled block for panels
 pub fn create_panel_block<'a>(title: &'a str, is_active: bool, app: &App) -> Block<'a> {
     let border_style = if is_active {
-        Style::default().fg(app.theme.selected_color()).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(app.theme.selected_color())
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(app.theme.border_color())
     };
 
     let title_style = if is_active {
-        Style::default().fg(app.theme.selected_color()).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(app.theme.selected_color())
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(app.theme.accent_color())
     };
@@ -280,7 +354,7 @@ pub fn format_bearing(bearing: Option<f64>) -> String {
 pub fn format_time_ago(timestamp: chrono::DateTime<chrono::Utc>) -> String {
     let now = chrono::Utc::now();
     let duration = now.signed_duration_since(timestamp);
-    
+
     if duration.num_seconds() < 60 {
         format!("{}s", duration.num_seconds())
     } else if duration.num_minutes() < 60 {

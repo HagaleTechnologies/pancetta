@@ -162,7 +162,6 @@ impl SlotManager {
             auto_detect_even_activity: 0,
             auto_detect_odd_activity: 0,
         }
-
     }
 
     /// Feed activity counts during auto-parity detection.
@@ -179,11 +178,13 @@ impl SlotManager {
 
         // After 4 slots pick the quieter parity for TX.
         if self.auto_detect_slots_seen >= 4 {
-            self.our_slot = Some(if self.auto_detect_even_activity <= self.auto_detect_odd_activity {
-                SlotParity::Even
-            } else {
-                SlotParity::Odd
-            });
+            self.our_slot = Some(
+                if self.auto_detect_even_activity <= self.auto_detect_odd_activity {
+                    SlotParity::Even
+                } else {
+                    SlotParity::Odd
+                },
+            );
             info!(
                 "Auto-detected TX parity: {:?} (even={}, odd={})",
                 self.our_slot.unwrap(),
@@ -428,8 +429,16 @@ impl Default for BandHoppingConfig {
             enabled: false,
             hop_threshold: 20,
             bands: vec![
-                BandEntry { dial_frequency: 14_074_000, band_name: "20m".into(), priority: 1 },
-                BandEntry { dial_frequency: 7_074_000, band_name: "40m".into(), priority: 2 },
+                BandEntry {
+                    dial_frequency: 14_074_000,
+                    band_name: "20m".into(),
+                    priority: 1,
+                },
+                BandEntry {
+                    dial_frequency: 7_074_000,
+                    band_name: "40m".into(),
+                    priority: 2,
+                },
             ],
         }
     }
@@ -534,7 +543,10 @@ impl BandStrategy {
             self.settling_cycles = 2; // 2-cycle settling period.
 
             let band = &self.config.bands[self.current_band_index];
-            info!("Band hopping to {} ({})", band.band_name, band.dial_frequency);
+            info!(
+                "Band hopping to {} ({})",
+                band.band_name, band.dial_frequency
+            );
             Some(band.dial_frequency)
         } else {
             None
@@ -582,14 +594,9 @@ pub struct AutonomousOperator {
 }
 
 impl AutonomousOperator {
-    pub fn new(
-        config: AutonomousConfig,
-        our_callsign: String,
-        our_grid: Option<String>,
-    ) -> Self {
+    pub fn new(config: AutonomousConfig, our_callsign: String, our_grid: Option<String>) -> Self {
         let slot_manager = SlotManager::new(config.slot_parity, &config.listen_cycle);
-        let collision_detector =
-            CollisionDetector::new(config.tx_offset_hz, 50.0);
+        let collision_detector = CollisionDetector::new(config.tx_offset_hz, 50.0);
         let band_strategy = BandStrategy::new(config.band_hopping.clone());
 
         Self {
@@ -637,12 +644,7 @@ impl AutonomousOperator {
 
                     let grid = extract_grid_from_cq(&msg.message_text);
                     let snr = msg.snr.clamp(-128, 127) as i8;
-                    let score = evaluator.evaluate_cq(
-                        call,
-                        grid.as_deref(),
-                        snr,
-                        msg.frequency_hz,
-                    );
+                    let score = evaluator.evaluate_cq(call, grid.as_deref(), snr, msg.frequency_hz);
 
                     self.pending_cqs.push(CqCandidate {
                         callsign: call.clone(),
@@ -656,8 +658,11 @@ impl AutonomousOperator {
         }
 
         // Sort: best score first.
-        self.pending_cqs
-            .sort_by(|a, b| b.dx_score.partial_cmp(&a.dx_score).unwrap_or(std::cmp::Ordering::Equal));
+        self.pending_cqs.sort_by(|a, b| {
+            b.dx_score
+                .partial_cmp(&a.dx_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     /// Tell the operator how many QSOs the auto-sequencer is currently managing.
@@ -666,11 +671,7 @@ impl AutonomousOperator {
     }
 
     /// Feed a message the auto-sequencer wants to send this cycle.
-    pub fn set_pending_sequencer_message(
-        &mut self,
-        message_text: String,
-        qso_id: Option<String>,
-    ) {
+    pub fn set_pending_sequencer_message(&mut self, message_text: String, qso_id: Option<String>) {
         self.pending_sequencer_message = Some((message_text, qso_id));
     }
 
@@ -791,12 +792,10 @@ impl AutonomousOperator {
                             .as_deref()
                             .map(|g| format!(" {}", g))
                             .unwrap_or_default();
-                        let message_text = format!(
-                            "{} {} {}",
-                            cq.callsign, self.our_callsign, grid_part
-                        )
-                        .trim()
-                        .to_string();
+                        let message_text =
+                            format!("{} {} {}", cq.callsign, self.our_callsign, grid_part)
+                                .trim()
+                                .to_string();
 
                         debug!(
                             "Responding to CQ from {} (score={:.2}, snr={})",
@@ -817,7 +816,11 @@ impl AutonomousOperator {
                             self.idle_cycles = 0;
 
                             let cq_text = if self.config.cq_direction.is_empty() {
-                                format!("CQ {} {}", self.our_callsign, self.our_grid.as_deref().unwrap_or(""))
+                                format!(
+                                    "CQ {} {}",
+                                    self.our_callsign,
+                                    self.our_grid.as_deref().unwrap_or("")
+                                )
                             } else {
                                 format!(
                                     "CQ {} {} {}",
@@ -848,15 +851,15 @@ impl AutonomousOperator {
     }
 
     /// Handle the result of a collision-listen slot.
-    pub fn process_collision_listen(&mut self, decoded: &[DecodedMessageInfo]) -> Vec<OperatorAction> {
+    pub fn process_collision_listen(
+        &mut self,
+        decoded: &[DecodedMessageInfo],
+    ) -> Vec<OperatorAction> {
         let result = self.collision_detector.check_for_collision(decoded);
         let mut actions = Vec::new();
 
         if result.detected {
-            warn!(
-                "Collision detected with: {:?}",
-                result.interfering_calls
-            );
+            warn!("Collision detected with: {:?}", result.interfering_calls);
             self.slot_manager
                 .listen_policy
                 .record_collision(&self.config.listen_cycle);
@@ -913,8 +916,14 @@ fn extract_grid_from_cq(text: &str) -> Option<String> {
     if let Some(last) = parts.last() {
         if last.len() >= 4
             && last.len() <= 6
-            && last.chars().nth(0).map_or(false, |c| c.is_ascii_alphabetic())
-            && last.chars().nth(1).map_or(false, |c| c.is_ascii_alphabetic())
+            && last
+                .chars()
+                .nth(0)
+                .map_or(false, |c| c.is_ascii_alphabetic())
+            && last
+                .chars()
+                .nth(1)
+                .map_or(false, |c| c.is_ascii_alphabetic())
             && last.chars().nth(2).map_or(false, |c| c.is_ascii_digit())
             && last.chars().nth(3).map_or(false, |c| c.is_ascii_digit())
         {
@@ -1062,7 +1071,9 @@ mod tests {
         for _ in 0..2 {
             let actions = op.decide_at(even_ts);
             // Should either listen or produce a status.
-            assert!(actions.iter().any(|a| matches!(a, OperatorAction::Listen | OperatorAction::StatusUpdate(_))));
+            assert!(actions
+                .iter()
+                .any(|a| matches!(a, OperatorAction::Listen | OperatorAction::StatusUpdate(_))));
         }
 
         // 3rd cycle should trigger CQ.
@@ -1116,8 +1127,16 @@ mod tests {
             enabled: true,
             hop_threshold: 3,
             bands: vec![
-                BandEntry { dial_frequency: 14_074_000, band_name: "20m".into(), priority: 1 },
-                BandEntry { dial_frequency: 7_074_000, band_name: "40m".into(), priority: 2 },
+                BandEntry {
+                    dial_frequency: 14_074_000,
+                    band_name: "20m".into(),
+                    priority: 1,
+                },
+                BandEntry {
+                    dial_frequency: 7_074_000,
+                    band_name: "40m".into(),
+                    priority: 2,
+                },
             ],
         };
 
@@ -1145,7 +1164,9 @@ mod tests {
 
         let actions = op.decide();
         // When paused, should only get status updates.
-        assert!(actions.iter().all(|a| matches!(a, OperatorAction::StatusUpdate(_))));
+        assert!(actions
+            .iter()
+            .all(|a| matches!(a, OperatorAction::StatusUpdate(_))));
 
         op.resume();
         assert!(!op.is_paused());

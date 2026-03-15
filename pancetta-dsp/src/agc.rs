@@ -112,14 +112,14 @@ impl AgcConfig {
                 value: self.target_level,
             });
         }
-        
+
         if self.attack_time <= 0.0 {
             return Err(AgcError::InvalidParameter {
                 parameter: "attack_time".to_string(),
                 value: self.attack_time,
             });
         }
-        
+
         if self.decay_time <= 0.0 {
             return Err(AgcError::InvalidParameter {
                 parameter: "decay_time".to_string(),
@@ -194,7 +194,7 @@ impl PeakDetector {
 
     fn process(&mut self, input: f32) -> f32 {
         let input_abs = input.abs();
-        
+
         if input_abs > self.peak {
             // Attack: fast rise
             self.peak = self.peak * self.attack_alpha + input_abs * (1.0 - self.attack_alpha);
@@ -202,7 +202,7 @@ impl PeakDetector {
             // Decay: slow fall
             self.peak = self.peak * self.decay_alpha;
         }
-        
+
         self.peak
     }
 
@@ -246,7 +246,7 @@ impl AutomaticGainControl {
         let peak_detector = PeakDetector::new(
             config.attack_time * 0.1, // Faster peak detection
             config.decay_time * 0.5,  // Medium peak decay
-            sample_rate
+            sample_rate,
         );
 
         let gain_smoother = ExponentialFilter::new(config.attack_time, sample_rate);
@@ -255,7 +255,7 @@ impl AutomaticGainControl {
             "Created AGC: target={}, attack={}ms, decay={}ms, hang={}ms, gain_range={}dB to {}dB",
             config.target_level,
             config.attack_time * 1000.0,
-            config.decay_time * 1000.0, 
+            config.decay_time * 1000.0,
             config.hang_time * 1000.0,
             config.min_gain_db,
             config.max_gain_db
@@ -284,14 +284,18 @@ impl AutomaticGainControl {
     pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> Result<()> {
         if input.len() != output.len() {
             return Err(AgcError::ProcessingFailed {
-                message: format!("Input/output length mismatch: {} vs {}", input.len(), output.len()),
+                message: format!(
+                    "Input/output length mismatch: {} vs {}",
+                    input.len(),
+                    output.len()
+                ),
             });
         }
 
         for (i, &sample) in input.iter().enumerate() {
             // Peak detection
             let peak_level = self.peak_detector.process(sample);
-            
+
             // Calculate desired gain
             let desired_gain = if peak_level > self.config.threshold {
                 let compression_gain = if peak_level > self.config.target_level {
@@ -303,10 +307,11 @@ impl AutomaticGainControl {
                     // Linear gain below target level
                     self.config.target_level / peak_level
                 };
-                
+
                 // Convert to dB and clamp
                 let gain_db = 20.0 * compression_gain.log10();
-                let clamped_gain_db = gain_db.clamp(self.config.min_gain_db, self.config.max_gain_db);
+                let clamped_gain_db =
+                    gain_db.clamp(self.config.min_gain_db, self.config.max_gain_db);
                 10.0_f32.powf(clamped_gain_db / 20.0)
             } else {
                 // Below threshold - minimal gain
@@ -346,7 +351,7 @@ impl AutomaticGainControl {
         // Update gain history for average calculation
         let current_gain_db = 20.0 * self.current_gain.log10();
         self.stats.current_gain_db = current_gain_db;
-        
+
         self.gain_history.push_back(current_gain_db);
         if self.gain_history.len() > 1000 {
             self.gain_history.pop_front();
@@ -354,12 +359,16 @@ impl AutomaticGainControl {
 
         // Calculate average gain
         if !self.gain_history.is_empty() {
-            self.stats.average_gain_db = self.gain_history.iter().sum::<f32>() / self.gain_history.len() as f32;
+            self.stats.average_gain_db =
+                self.gain_history.iter().sum::<f32>() / self.gain_history.len() as f32;
         }
 
         trace!(
             "AGC processed {} samples, current_gain={}dB, peak_in={:.3}, peak_out={:.3}",
-            input.len(), current_gain_db, self.stats.peak_input_level, self.stats.peak_output_level
+            input.len(),
+            current_gain_db,
+            self.stats.peak_input_level,
+            self.stats.peak_output_level
         );
 
         Ok(())
@@ -402,21 +411,22 @@ impl AutomaticGainControl {
     /// Update AGC configuration
     pub fn update_config(&mut self, config: AgcConfig) -> Result<()> {
         config.validate()?;
-        
+
         self.config = config;
         self.attack_alpha = (-1.0 / (self.config.attack_time * self.sample_rate)).exp();
         self.decay_alpha = (-1.0 / (self.config.decay_time * self.sample_rate)).exp();
-        
+
         // Update peak detector time constants
         self.peak_detector = PeakDetector::new(
             self.config.attack_time * 0.1,
             self.config.decay_time * 0.5,
-            self.sample_rate
+            self.sample_rate,
         );
 
         // Update gain smoother
-        self.gain_smoother.set_time_constant(self.config.attack_time, self.sample_rate);
-        
+        self.gain_smoother
+            .set_time_constant(self.config.attack_time, self.sample_rate);
+
         debug!("AGC configuration updated");
         Ok(())
     }
@@ -447,10 +457,10 @@ mod tests {
     #[test]
     fn test_agc_processing() {
         let mut agc = AutomaticGainControl::new_ft8_optimized(12000.0).unwrap();
-        
+
         let input = vec![0.1; 1000];
         let mut output = vec![0.0; 1000];
-        
+
         let result = agc.process(&input, &mut output);
         assert!(result.is_ok());
         assert!(agc.stats().samples_processed == 1000);
@@ -460,7 +470,7 @@ mod tests {
     fn test_config_validation() {
         let mut config = AgcConfig::default();
         config.target_level = 1.5; // Invalid: > 1.0
-        
+
         assert!(config.validate().is_err());
     }
 }

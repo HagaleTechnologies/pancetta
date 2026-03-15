@@ -16,28 +16,28 @@ use tracing_subscriber::{
 pub struct LogConfig {
     /// Log level filter (e.g., "info", "debug", "trace")
     pub level: String,
-    
+
     /// Enable file logging
     pub file_logging: bool,
-    
+
     /// Log file directory
     pub log_dir: PathBuf,
-    
+
     /// Enable JSON formatting
     pub json_format: bool,
-    
+
     /// Enable color output
     pub use_color: bool,
-    
+
     /// Enable thread IDs in logs
     pub show_thread_ids: bool,
-    
+
     /// Enable span events
     pub span_events: bool,
-    
+
     /// Maximum log file size in MB
     pub max_file_size_mb: u64,
-    
+
     /// Number of log files to keep
     pub max_files: u32,
 }
@@ -64,9 +64,9 @@ impl Default for LogConfig {
 /// Initialize logging system
 pub fn init_logging(config: LogConfig) -> Result<Option<WorkerGuard>> {
     // Create environment filter
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.level));
-    
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
+
     // Console layer for terminal output
     let console_layer = if config.json_format {
         fmt::layer()
@@ -85,27 +85,24 @@ pub fn init_logging(config: LogConfig) -> Result<Option<WorkerGuard>> {
             .with_file(false)
             .with_line_number(false)
             .with_ansi(config.use_color);
-        
+
         if config.span_events {
             layer.with_span_events(FmtSpan::FULL).boxed()
         } else {
             layer.boxed()
         }
     };
-    
+
     // File layer for persistent logging
     let (file_layer, guard) = if config.file_logging {
         // Create log directory
         std::fs::create_dir_all(&config.log_dir)?;
-        
+
         // Create rotating file appender
-        let file_appender = tracing_appender::rolling::daily(
-            config.log_dir,
-            "pancetta.log"
-        );
-        
+        let file_appender = tracing_appender::rolling::daily(config.log_dir, "pancetta.log");
+
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-        
+
         let file_layer = fmt::layer()
             .json()
             .with_writer(non_blocking)
@@ -116,23 +113,21 @@ pub fn init_logging(config: LogConfig) -> Result<Option<WorkerGuard>> {
             .with_line_number(true)
             .with_current_span(true)
             .with_span_list(true);
-        
+
         (Some(file_layer.boxed()), Some(guard))
     } else {
         (None, None)
     };
-    
+
     // Build subscriber
-    let subscriber = Registry::default()
-        .with(env_filter)
-        .with(console_layer);
-    
+    let subscriber = Registry::default().with(env_filter).with(console_layer);
+
     if let Some(file_layer) = file_layer {
         subscriber.with(file_layer).init();
     } else {
         subscriber.init();
     }
-    
+
     Ok(guard)
 }
 
@@ -140,11 +135,7 @@ pub fn init_logging(config: LogConfig) -> Result<Option<WorkerGuard>> {
 #[macro_export]
 macro_rules! log_metric {
     ($name:expr, $value:expr) => {
-        tracing::debug!(
-            metric = $name,
-            value = $value,
-            "Performance metric"
-        );
+        tracing::debug!(metric = $name, value = $value, "Performance metric");
     };
     ($name:expr, $value:expr, $unit:expr) => {
         tracing::debug!(
@@ -208,7 +199,7 @@ impl DiagnosticInfo {
             "System diagnostics"
         );
     }
-    
+
     /// Generate diagnostic report
     pub fn report(&self) -> String {
         format!(

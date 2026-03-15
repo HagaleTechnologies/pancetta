@@ -226,7 +226,7 @@ impl AudioProcessor {
     }
 
     /// Get processed audio samples
-    /// 
+    ///
     /// Returns samples converted to the target sample rate and ready for DSP processing
     pub async fn get_processed_samples(&mut self) -> AudioResult<Vec<AudioSample>> {
         let mut processed_samples = Vec::new();
@@ -243,7 +243,8 @@ impl AudioProcessor {
                 self.update_conversion_stats(
                     raw_sample.data.len() as u64,
                     conversion_time.as_micros() as u64,
-                ).await;
+                )
+                .await;
 
                 AudioSample {
                     data: converted_data,
@@ -297,14 +298,15 @@ impl AudioProcessor {
     pub async fn update_config(&mut self, config: AudioProcessorConfig) -> AudioResult<()> {
         if self.is_running().await {
             return Err(AudioError::configuration(
-                "Cannot update configuration while processor is running"
+                "Cannot update configuration while processor is running",
             ));
         }
 
         self.config = config;
-        
+
         // Update stream configuration
-        self.stream_manager.set_config(self.config.stream_config.clone())?;
+        self.stream_manager
+            .set_config(self.config.stream_config.clone())?;
 
         // Update resampler if needed
         self.resampler = if ResamplerFactory::needs_conversion(
@@ -338,10 +340,10 @@ impl AudioProcessor {
 
         tokio::spawn(async move {
             let mut interval_timer = tokio::time::interval(interval_duration);
-            
+
             loop {
                 interval_timer.tick().await;
-                
+
                 // This is a simplified version - in a real implementation,
                 // you'd get updated stats from the stream manager
                 let mut stats = statistics.write().await;
@@ -354,18 +356,17 @@ impl AudioProcessor {
     /// Update sample rate conversion statistics
     async fn update_conversion_stats(&self, samples_processed: u64, processing_time_us: u64) {
         let mut stats = self.statistics.write().await;
-        
+
         if let Some(ref resampler) = self.resampler {
             stats.conversion_stats.is_active = true;
             stats.conversion_stats.samples_converted += samples_processed;
             stats.conversion_stats.conversion_time_us += processing_time_us;
-            
+
             if !resampler.is_passthrough() {
                 stats.conversion_stats.source_rate = self.config.stream_config.sample_rate;
                 stats.conversion_stats.target_rate = self.config.target_sample_rate;
-                stats.conversion_stats.conversion_ratio = 
-                    self.config.target_sample_rate as f64 / 
-                    self.config.stream_config.sample_rate as f64;
+                stats.conversion_stats.conversion_ratio = self.config.target_sample_rate as f64
+                    / self.config.stream_config.sample_rate as f64;
             }
         }
     }
@@ -460,7 +461,7 @@ mod tests {
     async fn test_audio_processor_creation() {
         let config = AudioProcessorConfig::for_ft8();
         let processor = AudioProcessor::new(config).await;
-        
+
         // Should succeed even without audio devices in test environment
         if let Ok(processor) = processor {
             assert!(!processor.is_running().await);
@@ -477,7 +478,7 @@ mod tests {
             .high_quality_conversion(true);
 
         let processor = builder.build().await;
-        
+
         if let Ok(processor) = processor {
             let config = processor.get_config();
             assert_eq!(config.stream_config.sample_rate, 48000);

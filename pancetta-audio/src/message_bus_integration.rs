@@ -4,8 +4,8 @@
 //! for coordinated operation with other components.
 
 use crate::{
-    processor::{AudioProcessor, AudioProcessingStats},
     error::{AudioError, AudioResult},
+    processor::{AudioProcessingStats, AudioProcessor},
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -157,15 +157,15 @@ impl AudioMessageBusIntegration {
         // Simplified version to avoid Send/Sync issues for now
         tokio::spawn(async move {
             info!("Audio message handler started");
-            
+
             let mut interval_timer = interval(Duration::from_millis(100));
-            
+
             while *is_running.read().await {
                 interval_timer.tick().await;
                 // Handle any incoming control messages
                 // In a real implementation, this would process messages from the receiver
             }
-            
+
             info!("Audio message handler stopped");
         });
     }
@@ -179,14 +179,14 @@ impl AudioMessageBusIntegration {
         // Simplified version to avoid Send/Sync issues for now
         tokio::spawn(async move {
             info!("Audio data publisher started");
-            
+
             let mut publish_interval = interval(Duration::from_millis(10));
-            
+
             while *is_running.read().await {
                 publish_interval.tick().await;
                 // In a real implementation, this would get and publish audio samples
             }
-            
+
             info!("Audio data publisher stopped");
         });
     }
@@ -201,15 +201,15 @@ impl AudioMessageBusIntegration {
         // Simplified version to avoid Send/Sync issues for now
         tokio::spawn(async move {
             info!("Audio health monitor started");
-            
+
             let mut health_timer = interval(health_interval);
-            
+
             while *is_running.read().await {
                 health_timer.tick().await;
                 // In a real implementation, this would check processor health
                 debug!("Audio processor health check (simplified)");
             }
-            
+
             info!("Audio health monitor stopped");
         });
     }
@@ -224,15 +224,15 @@ impl AudioMessageBusIntegration {
         // Simplified version to avoid Send/Sync issues for now
         tokio::spawn(async move {
             info!("Audio stats broadcaster started");
-            
+
             let mut stats_timer = interval(stats_interval);
-            
+
             while *is_running.read().await {
                 stats_timer.tick().await;
                 // In a real implementation, this would broadcast statistics
                 debug!("Audio stats broadcast (simplified)");
             }
-            
+
             info!("Audio stats broadcaster stopped");
         });
     }
@@ -342,7 +342,7 @@ mod tests {
     async fn test_integration_creation() {
         let config = AudioProcessorConfig::for_ft8();
         let processor = AudioProcessor::new(config).await.unwrap();
-        
+
         let (integration, _sender) = AudioMessageBusIntegration::new(
             processor,
             Duration::from_secs(5),
@@ -356,7 +356,7 @@ mod tests {
     async fn test_integration_stats() {
         let config = AudioProcessorConfig::for_ft8();
         let processor = AudioProcessor::new(config).await.unwrap();
-        
+
         let (integration, _sender) = AudioMessageBusIntegration::new(
             processor,
             Duration::from_secs(5),

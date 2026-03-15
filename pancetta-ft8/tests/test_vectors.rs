@@ -6,15 +6,12 @@
 
 #![cfg(feature = "transmit")]
 
-use pancetta_ft8::{
-    Ft8Encoder, NUM_SYMBOLS,
-};
+use bitvec::prelude::*;
 use pancetta_ft8::ldpc::{
-    LdpcEncoder, binary_to_gray, gray_to_binary,
-    LDPC_INFO_BITS, LDPC_CODEWORD_BITS,
+    binary_to_gray, gray_to_binary, LdpcEncoder, LDPC_CODEWORD_BITS, LDPC_INFO_BITS,
 };
 use pancetta_ft8::message::{calculate_crc14, PAYLOAD_BITS};
-use bitvec::prelude::*;
+use pancetta_ft8::{Ft8Encoder, NUM_SYMBOLS};
 
 /// FT8 Costas array that must appear at positions 0-6, 36-42, 72-78
 const COSTAS: [u8; 7] = [3, 1, 4, 0, 6, 5, 2];
@@ -50,7 +47,11 @@ fn test_encoder_determinism() {
 
         // Also verify repeated encoding on the same instance
         let symbols3 = encoder1.encode_message(msg, None).unwrap();
-        assert_eq!(symbols1, symbols3, "Encoding of '{}' not stable across calls", msg);
+        assert_eq!(
+            symbols1, symbols3,
+            "Encoding of '{}' not stable across calls",
+            msg
+        );
     }
 }
 
@@ -63,19 +64,38 @@ fn test_crc14_known_values() {
     // All-zeros payload → deterministic CRC
     let zeros = bitvec![0; PAYLOAD_BITS];
     let crc_zeros = calculate_crc14(&zeros);
-    assert!(crc_zeros < (1 << 14), "CRC should be 14-bit: got {}", crc_zeros);
+    assert!(
+        crc_zeros < (1 << 14),
+        "CRC should be 14-bit: got {}",
+        crc_zeros
+    );
 
     // All-ones payload → deterministic (and different) CRC
     let ones = bitvec![1; PAYLOAD_BITS];
     let crc_ones = calculate_crc14(&ones);
-    assert!(crc_ones < (1 << 14), "CRC should be 14-bit: got {}", crc_ones);
+    assert!(
+        crc_ones < (1 << 14),
+        "CRC should be 14-bit: got {}",
+        crc_ones
+    );
 
     // Different payloads → different CRCs
-    assert_ne!(crc_zeros, crc_ones, "Different payloads should have different CRCs");
+    assert_ne!(
+        crc_zeros, crc_ones,
+        "Different payloads should have different CRCs"
+    );
 
     // CRC is deterministic
-    assert_eq!(calculate_crc14(&zeros), crc_zeros, "CRC should be deterministic");
-    assert_eq!(calculate_crc14(&ones), crc_ones, "CRC should be deterministic");
+    assert_eq!(
+        calculate_crc14(&zeros),
+        crc_zeros,
+        "CRC should be deterministic"
+    );
+    assert_eq!(
+        calculate_crc14(&ones),
+        crc_ones,
+        "CRC should be deterministic"
+    );
 
     // Record values for regression (if these change, the CRC implementation changed)
     println!("CRC(all-zeros) = {:#06x}", crc_zeros);
@@ -95,7 +115,8 @@ fn test_crc14_single_bit_sensitivity() {
 
         assert_ne!(
             base_crc, modified_crc,
-            "CRC unchanged when flipping bit {}", bit_idx
+            "CRC unchanged when flipping bit {}",
+            bit_idx
         );
     }
 }
@@ -156,27 +177,29 @@ fn test_encoder_produces_valid_codewords() {
 fn test_costas_array_positions() {
     let mut encoder = Ft8Encoder::new();
 
-    let messages = [
-        "CQ W1ABC FN42",
-        "K1DEF W1ABC -12",
-        "HELLO WORLD",
-    ];
+    let messages = ["CQ W1ABC FN42", "K1DEF W1ABC -12", "HELLO WORLD"];
 
     for msg in &messages {
         let symbols = encoder.encode_message(msg, None).unwrap();
 
         // Verify Costas arrays at all three positions
         assert_eq!(
-            &symbols[0..7], &COSTAS,
-            "First Costas array wrong for '{}'", msg
+            &symbols[0..7],
+            &COSTAS,
+            "First Costas array wrong for '{}'",
+            msg
         );
         assert_eq!(
-            &symbols[36..43], &COSTAS,
-            "Second Costas array wrong for '{}'", msg
+            &symbols[36..43],
+            &COSTAS,
+            "Second Costas array wrong for '{}'",
+            msg
         );
         assert_eq!(
-            &symbols[72..79], &COSTAS,
-            "Third Costas array wrong for '{}'", msg
+            &symbols[72..79],
+            &COSTAS,
+            "Third Costas array wrong for '{}'",
+            msg
         );
     }
 }
@@ -227,9 +250,12 @@ fn test_gray_code_3bit_sequence() {
 
     for (binary, &gray) in expected.iter().enumerate() {
         assert_eq!(
-            binary_to_gray(binary as u8), gray,
+            binary_to_gray(binary as u8),
+            gray,
             "binary_to_gray({}) expected {:03b} got {:03b}",
-            binary, gray, binary_to_gray(binary as u8)
+            binary,
+            gray,
+            binary_to_gray(binary as u8)
         );
     }
 }

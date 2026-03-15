@@ -26,10 +26,10 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use futures::StreamExt;
 use pancetta_config::Config;
 use signal_hook::consts::SIGINT;
 use signal_hook_tokio::Signals;
-use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -248,23 +248,24 @@ async fn main() -> Result<()> {
 async fn run_application(cli: Cli) -> Result<()> {
     // Load configuration
     let config = load_configuration(&cli).await?;
-    
+
     info!("Configuration loaded successfully");
     debug!("Configuration: {}", config.summary());
 
     // Validate configuration
-    config.validate().context("Configuration validation failed")?;
-    
+    config
+        .validate()
+        .context("Configuration validation failed")?;
+
     // Create shutdown signal handler
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
-    
+
     // Set up signal handlers
     let shutdown_for_signals = shutdown.clone();
     tokio::spawn(async move {
-        let mut signals = Signals::new(&[SIGINT])
-            .expect("Failed to register signal handler");
-        
+        let mut signals = Signals::new(&[SIGINT]).expect("Failed to register signal handler");
+
         while let Some(signal) = signals.next().await {
             match signal {
                 SIGINT => {
@@ -299,7 +300,7 @@ async fn run_application(cli: Cli) -> Result<()> {
     };
 
     let pancetta_runtime = PancettaRuntime::new(runtime_config)?;
-    
+
     // Create application coordinator
     let coordinator = ApplicationCoordinator::new(
         config,
@@ -310,7 +311,8 @@ async fn run_application(cli: Cli) -> Result<()> {
         cli.metrics_port,
         cli.wav,
         shutdown.clone(),
-    ).await?;
+    )
+    .await?;
 
     info!("Application coordinator initialized");
 
@@ -418,7 +420,7 @@ async fn info_command() -> Result<()> {
     println!("Build: {}", "development"); // TODO: Add build info when available
     println!("Rust: {}", "stable"); // TODO: Add rust version when available
     println!();
-    
+
     // System information
     println!("System:");
     println!("  OS: {}", std::env::consts::OS);
@@ -452,7 +454,7 @@ async fn benchmark_command(args: BenchmarkArgs) -> Result<()> {
 
     if args.all || args.dsp {
         println!("Running DSP benchmarks...");
-        // TODO: Implement DSP benchmarks  
+        // TODO: Implement DSP benchmarks
     }
 
     if args.all || args.ft8 {
@@ -469,8 +471,7 @@ async fn load_configuration(cli: &Cli) -> Result<Config> {
         Config::load_from_file(config_path)
             .with_context(|| format!("Failed to load config from {}", config_path.display()))?
     } else {
-        Config::load_default()
-            .with_context(|| "Failed to load default configuration")?
+        Config::load_default().with_context(|| "Failed to load default configuration")?
     };
 
     // First-run setup: if callsign is still the default, prompt the user
@@ -508,7 +509,10 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
     };
 
     // Grid square
-    print!("Your Maidenhead grid square [{}]: ", config.station.grid_square);
+    print!(
+        "Your Maidenhead grid square [{}]: ",
+        config.station.grid_square
+    );
     io::stdout().flush()?;
     let mut grid = String::new();
     io::stdin().read_line(&mut grid)?;
@@ -524,7 +528,10 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
     io::stdout().flush()?;
     let mut power_str = String::new();
     io::stdin().read_line(&mut power_str)?;
-    let power: u32 = power_str.trim().parse().unwrap_or(config.station.power_watts);
+    let power: u32 = power_str
+        .trim()
+        .parse()
+        .unwrap_or(config.station.power_watts);
 
     let mut new_config = config.clone();
     new_config.station.callsign = callsign.clone();
@@ -545,7 +552,8 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
 
     if save {
         std::fs::create_dir_all(&config_dir)?;
-        new_config.save_to_file(&config_path)
+        new_config
+            .save_to_file(&config_path)
             .with_context(|| format!("Failed to save config to {}", config_path.display()))?;
         println!("Configuration saved to {}", config_path.display());
     }
@@ -639,8 +647,14 @@ mod tests {
 
     #[test]
     fn test_log_format_parsing() {
-        assert!(matches!("text".parse::<LogFormat>().unwrap(), LogFormat::Text));
-        assert!(matches!("json".parse::<LogFormat>().unwrap(), LogFormat::Json));
+        assert!(matches!(
+            "text".parse::<LogFormat>().unwrap(),
+            LogFormat::Text
+        ));
+        assert!(matches!(
+            "json".parse::<LogFormat>().unwrap(),
+            LogFormat::Json
+        ));
         assert!("invalid".parse::<LogFormat>().is_err());
     }
 }

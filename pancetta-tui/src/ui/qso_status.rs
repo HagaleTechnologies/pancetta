@@ -7,8 +7,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{ActivePanel, App};
 use super::{create_panel_block, format_time_ago};
+use crate::app::{ActivePanel, App};
 
 pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let is_active = matches!(app.active_panel, ActivePanel::QsoStatus);
@@ -30,13 +30,13 @@ pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()>
 
     // QSO Information
     render_qso_info(f, chunks[0], app);
-    
+
     // TX/RX Status
     render_tx_rx_status(f, chunks[1], app);
-    
+
     // SNR Meters
     render_snr_meters(f, chunks[2], app);
-    
+
     // Timing and Progress
     render_timing_progress(f, chunks[3], app);
 
@@ -45,30 +45,38 @@ pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()>
 
 fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
     let qso = &app.qso_status;
-    
-    let status_text = if qso.active {
-        "ACTIVE QSO"
-    } else {
-        "STANDBY"
-    };
+
+    let status_text = if qso.active { "ACTIVE QSO" } else { "STANDBY" };
 
     let status_style = if qso.active {
-        Style::default().fg(app.theme.success_color()).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(app.theme.success_color())
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(app.theme.muted_color())
     };
 
     let call_text = qso.call_sign.as_deref().unwrap_or("---");
-    let freq_text = qso.frequency.map_or("---".to_string(), |f| format!("{:.3}", f));
+    let freq_text = qso
+        .frequency
+        .map_or("---".to_string(), |f| format!("{:.3}", f));
     let mode_text = qso.mode.as_deref().unwrap_or("---");
 
     let lines = vec![
         Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(app.theme.foreground_color())),
+            Span::styled(
+                "Status: ",
+                Style::default().fg(app.theme.foreground_color()),
+            ),
             Span::styled(status_text, status_style),
             Span::raw("  "),
             Span::styled("Call: ", Style::default().fg(app.theme.foreground_color())),
-            Span::styled(call_text, Style::default().fg(app.theme.accent_color()).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                call_text,
+                Style::default()
+                    .fg(app.theme.accent_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Freq: ", Style::default().fg(app.theme.foreground_color())),
@@ -77,8 +85,14 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled("Mode: ", Style::default().fg(app.theme.foreground_color())),
             Span::styled(mode_text, Style::default().fg(app.theme.accent_color())),
             Span::raw("  "),
-            Span::styled("Exchanges: ", Style::default().fg(app.theme.foreground_color())),
-            Span::styled(format!("{}", qso.exchange_count), Style::default().fg(app.theme.success_color())),
+            Span::styled(
+                "Exchanges: ",
+                Style::default().fg(app.theme.foreground_color()),
+            ),
+            Span::styled(
+                format!("{}", qso.exchange_count),
+                Style::default().fg(app.theme.success_color()),
+            ),
         ]),
     ];
 
@@ -88,7 +102,7 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     let qso = &app.qso_status;
-    
+
     let tx_status = if let Some(last_tx) = qso.last_tx {
         format!("TX: {}", format_time_ago(last_tx))
     } else {
@@ -101,13 +115,11 @@ fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
         "RX: Never".to_string()
     };
 
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(tx_status, Style::default().fg(app.theme.warning_color())),
-            Span::raw("    "),
-            Span::styled(rx_status, Style::default().fg(app.theme.success_color())),
-        ]),
-    ];
+    let lines = vec![Line::from(vec![
+        Span::styled(tx_status, Style::default().fg(app.theme.warning_color())),
+        Span::raw("    "),
+        Span::styled(rx_status, Style::default().fg(app.theme.success_color())),
+    ])];
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
@@ -115,7 +127,7 @@ fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_snr_meters(f: &mut Frame<'_>, area: Rect, app: &App) {
     let qso = &app.qso_status;
-    
+
     // Split into two columns for TX and RX SNR
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -125,7 +137,7 @@ fn render_snr_meters(f: &mut Frame<'_>, area: Rect, app: &App) {
     // TX SNR Gauge
     let tx_snr = qso.snr_tx.unwrap_or(-50);
     let tx_ratio = ((tx_snr + 50) as f64 / 80.0).clamp(0.0, 1.0); // Map -50 to +30 dB to 0-1
-    
+
     let tx_gauge = Gauge::default()
         .block(ratatui::widgets::Block::default().title("TX SNR"))
         .gauge_style(Style::default().fg(get_snr_gauge_color(tx_snr, &app.theme)))
@@ -137,7 +149,7 @@ fn render_snr_meters(f: &mut Frame<'_>, area: Rect, app: &App) {
     // RX SNR Gauge
     let rx_snr = qso.snr_rx.unwrap_or(-50);
     let rx_ratio = ((rx_snr + 50) as f64 / 80.0).clamp(0.0, 1.0);
-    
+
     let rx_gauge = Gauge::default()
         .block(ratatui::widgets::Block::default().title("RX SNR"))
         .gauge_style(Style::default().fg(get_snr_gauge_color(rx_snr, &app.theme)))
@@ -149,22 +161,26 @@ fn render_snr_meters(f: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
     let qso = &app.qso_status;
-    
+
     if !qso.active {
         // Show general monitoring status
         let lines = vec![
+            Line::from(vec![Span::styled(
+                "Monitoring for calls...",
+                Style::default().fg(app.theme.muted_color()),
+            )]),
             Line::from(vec![
-                Span::styled("Monitoring for calls...", Style::default().fg(app.theme.muted_color())),
-            ]),
-            Line::from(vec![
-                Span::styled("Audio Level: ", Style::default().fg(app.theme.foreground_color())),
+                Span::styled(
+                    "Audio Level: ",
+                    Style::default().fg(app.theme.foreground_color()),
+                ),
                 Span::styled(
                     format!("{:.1}%", app.audio_level * 100.0),
-                    Style::default().fg(get_audio_level_color(app.audio_level, &app.theme))
+                    Style::default().fg(get_audio_level_color(app.audio_level, &app.theme)),
                 ),
             ]),
         ];
-        
+
         let paragraph = Paragraph::new(lines);
         f.render_widget(paragraph, area);
         return;
@@ -173,7 +189,11 @@ fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
     // Show QSO timing and progress
     let duration = if let Some(started) = qso.started_at {
         let elapsed = chrono::Utc::now().signed_duration_since(started);
-        format!("Duration: {}m {}s", elapsed.num_minutes(), elapsed.num_seconds() % 60)
+        format!(
+            "Duration: {}m {}s",
+            elapsed.num_minutes(),
+            elapsed.num_seconds() % 60
+        )
     } else {
         "Duration: Unknown".to_string()
     };
@@ -182,20 +202,18 @@ fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
     let now = chrono::Utc::now();
     let seconds_in_cycle = now.timestamp() % 15;
     let cycle_progress = seconds_in_cycle as f64 / 15.0;
-    
+
     let cycle_status = if seconds_in_cycle < 13 {
         "RX Period"
     } else {
         "TX Window"
     };
 
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(duration, Style::default().fg(app.theme.foreground_color())),
-            Span::raw("  "),
-            Span::styled(cycle_status, Style::default().fg(app.theme.accent_color())),
-        ]),
-    ];
+    let lines = vec![Line::from(vec![
+        Span::styled(duration, Style::default().fg(app.theme.foreground_color())),
+        Span::raw("  "),
+        Span::styled(cycle_status, Style::default().fg(app.theme.accent_color())),
+    ])];
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
@@ -229,10 +247,10 @@ fn get_snr_gauge_color(snr: i32, theme: &crate::config::Theme) -> ratatui::style
 
 fn get_audio_level_color(level: f32, theme: &crate::config::Theme) -> ratatui::style::Color {
     match level {
-        level if level > 0.8 => theme.error_color(),   // Too loud
+        level if level > 0.8 => theme.error_color(), // Too loud
         level if level > 0.1 => theme.success_color(), // Good level
         level if level > 0.01 => theme.warning_color(), // Low but present
-        _ => theme.muted_color(), // Very low/no signal
+        _ => theme.muted_color(),                    // Very low/no signal
     }
 }
 
@@ -240,13 +258,13 @@ fn get_audio_level_color(level: f32, theme: &crate::config::Theme) -> ratatui::s
 pub fn update_qso_from_message(app: &mut App, message: &crate::app::DecodedMessage) {
     let our_call = &app.station_info.call_sign.to_uppercase();
     let message_upper = message.message.to_uppercase();
-    
+
     // Check if this message involves our station
     if message_upper.contains(our_call) {
         // Extract the other station's call sign
         if let Some(other_call) = extract_other_callsign(&message_upper, our_call) {
             let qso = &mut app.qso_status;
-            
+
             if !qso.active {
                 // Start new QSO
                 qso.active = true;
@@ -256,7 +274,7 @@ pub fn update_qso_from_message(app: &mut App, message: &crate::app::DecodedMessa
                 qso.started_at = Some(message.timestamp);
                 qso.exchange_count = 0;
             }
-            
+
             // Update receive time and SNR
             qso.last_rx = Some(message.timestamp);
             qso.snr_rx = Some(message.snr);
@@ -267,22 +285,23 @@ pub fn update_qso_from_message(app: &mut App, message: &crate::app::DecodedMessa
 
 fn extract_other_callsign(message: &str, our_call: &str) -> Option<String> {
     let parts: Vec<&str> = message.split_whitespace().collect();
-    
+
     for part in parts {
         if part != our_call && is_valid_callsign(part) {
             return Some(part.to_string());
         }
     }
-    
+
     None
 }
 
 fn is_valid_callsign(s: &str) -> bool {
     // Basic callsign validation
-    s.len() >= 3 && s.len() <= 10 && 
-    s.chars().any(|c| c.is_ascii_alphabetic()) && 
-    s.chars().any(|c| c.is_ascii_digit()) &&
-    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
+    s.len() >= 3
+        && s.len() <= 10
+        && s.chars().any(|c| c.is_ascii_alphabetic())
+        && s.chars().any(|c| c.is_ascii_digit())
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
 }
 
 #[cfg(test)]
@@ -309,7 +328,7 @@ mod tests {
     fn test_snr_gauge_color() {
         use crate::config::Theme;
         let theme = Theme::Dark;
-        
+
         assert_eq!(get_snr_gauge_color(15, &theme), theme.success_color());
         assert_eq!(get_snr_gauge_color(5, &theme), theme.warning_color());
         assert_eq!(get_snr_gauge_color(-15, &theme), theme.error_color());

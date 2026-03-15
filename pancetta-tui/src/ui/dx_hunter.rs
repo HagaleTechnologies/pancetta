@@ -2,24 +2,28 @@ use anyhow::Result;
 use ratatui::{
     layout::{Constraint, Rect},
     style::{Modifier, Style},
-    text::{Span},
+    text::Span,
     widgets::{Cell, Row, Table, TableState},
     Frame,
 };
 
+use super::{create_panel_block, format_bearing, format_distance, format_time_ago};
 use crate::app::{ActivePanel, App, DxStation};
-use super::{create_panel_block, format_distance, format_bearing, format_time_ago};
 
 pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let is_active = matches!(app.active_panel, ActivePanel::DxHunter);
     let block = create_panel_block("DX Hunter", is_active, app);
 
     // Prepare table data
-    let header_cells = [
-        "Call", "Grid", "Freq", "SNR", "Dist", "Bear", "Last", "Pri"
-    ]
-    .iter()
-    .map(|h| Cell::from(*h).style(Style::default().fg(app.theme.accent_color()).add_modifier(Modifier::BOLD)));
+    let header_cells = ["Call", "Grid", "Freq", "SNR", "Dist", "Bear", "Last", "Pri"]
+        .iter()
+        .map(|h| {
+            Cell::from(*h).style(
+                Style::default()
+                    .fg(app.theme.accent_color())
+                    .add_modifier(Modifier::BOLD),
+            )
+        });
 
     let header = Row::new(header_cells).height(1).bottom_margin(0);
 
@@ -37,27 +41,34 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
 
     // If no DX stations, show placeholder
     if rows.is_empty() {
-        rows.push(Row::new([
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from("No DX"),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from("stations"),
-            Cell::from(""),
-        ].iter().map(|c| c.clone().style(Style::default().fg(app.theme.muted_color())))));
+        rows.push(Row::new(
+            [
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from("No DX"),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from("stations"),
+                Cell::from(""),
+            ]
+            .iter()
+            .map(|c| {
+                c.clone()
+                    .style(Style::default().fg(app.theme.muted_color()))
+            }),
+        ));
     }
 
     let widths = [
-        Constraint::Length(8),  // Call
-        Constraint::Length(4),  // Grid
-        Constraint::Length(7),  // Freq
-        Constraint::Length(4),  // SNR
-        Constraint::Length(6),  // Dist
-        Constraint::Length(4),  // Bear
-        Constraint::Length(5),  // Last
-        Constraint::Length(3),  // Pri
+        Constraint::Length(8), // Call
+        Constraint::Length(4), // Grid
+        Constraint::Length(7), // Freq
+        Constraint::Length(4), // SNR
+        Constraint::Length(6), // Dist
+        Constraint::Length(4), // Bear
+        Constraint::Length(5), // Last
+        Constraint::Length(3), // Pri
     ];
 
     let table = Table::new(rows, widths)
@@ -76,12 +87,8 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
 
     // Show scroll indicator if there are more stations
     if dx_list.len() > (area.height as usize).saturating_sub(4) {
-        let scroll_info = format!(
-            "{}/{}", 
-            app.dx_hunter_scroll + 1, 
-            dx_list.len()
-        );
-        
+        let scroll_info = format!("{}/{}", app.dx_hunter_scroll + 1, dx_list.len());
+
         let scroll_area = Rect {
             x: area.x + area.width - scroll_info.len() as u16 - 2,
             y: area.y,
@@ -91,7 +98,7 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
 
         let scroll_text = ratatui::text::Line::from(Span::styled(
             scroll_info,
-            Style::default().fg(app.theme.muted_color())
+            Style::default().fg(app.theme.muted_color()),
         ));
 
         let scroll_widget = ratatui::widgets::Paragraph::new(scroll_text);
@@ -115,18 +122,28 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
     let call_style = if station.worked_before {
         Style::default().fg(app.theme.muted_color())
     } else if is_rare_dx(&station.call_sign) {
-        Style::default().fg(app.theme.error_color()).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(app.theme.error_color())
+            .add_modifier(Modifier::BOLD)
     } else if station.distance.unwrap_or(0.0) > 5000.0 {
-        Style::default().fg(app.theme.warning_color()).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(app.theme.warning_color())
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(app.theme.success_color()).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(app.theme.success_color())
+            .add_modifier(Modifier::BOLD)
     };
 
     let snr_style = Style::default().fg(get_snr_color(station.snr, &app.theme));
-    
+
     let priority_style = match station.priority_score {
-        score if score > 100 => Style::default().fg(app.theme.error_color()).add_modifier(Modifier::BOLD),
-        score if score > 50 => Style::default().fg(app.theme.warning_color()).add_modifier(Modifier::BOLD),
+        score if score > 100 => Style::default()
+            .fg(app.theme.error_color())
+            .add_modifier(Modifier::BOLD),
+        score if score > 50 => Style::default()
+            .fg(app.theme.warning_color())
+            .add_modifier(Modifier::BOLD),
         _ => Style::default().fg(app.theme.foreground_color()),
     };
 
@@ -154,14 +171,15 @@ fn get_snr_color(snr: i32, theme: &crate::config::Theme) -> ratatui::style::Colo
 fn is_rare_dx(call_sign: &str) -> bool {
     // Basic check for some rare prefixes
     let rare_prefixes = [
-        "1A", "3Y", "4U", "7O", "8Q", "9Q", "BS7", "BV9", "BY9", "CY0", "CY9",
-        "E3", "E4", "EK0", "FT/G", "FT/J", "FT/W", "FT/X", "FT/Z", "H40", "HK0",
-        "P5", "S0", "T31", "T32", "T33", "VK0H", "VK0M", "VK9C", "VK9L", "VK9M",
-        "VK9N", "VK9W", "VK9X", "VP8G", "VP8H", "VP8O", "VP8S", "XF4", "XU",
-        "XW", "XX9", "YJ0", "Z2", "ZS8"
+        "1A", "3Y", "4U", "7O", "8Q", "9Q", "BS7", "BV9", "BY9", "CY0", "CY9", "E3", "E4", "EK0",
+        "FT/G", "FT/J", "FT/W", "FT/X", "FT/Z", "H40", "HK0", "P5", "S0", "T31", "T32", "T33",
+        "VK0H", "VK0M", "VK9C", "VK9L", "VK9M", "VK9N", "VK9W", "VK9X", "VP8G", "VP8H", "VP8O",
+        "VP8S", "XF4", "XU", "XW", "XX9", "YJ0", "Z2", "ZS8",
     ];
 
-    rare_prefixes.iter().any(|&prefix| call_sign.starts_with(prefix))
+    rare_prefixes
+        .iter()
+        .any(|&prefix| call_sign.starts_with(prefix))
 }
 
 /// Check if a callsign is from a new DXCC entity
@@ -174,13 +192,13 @@ pub fn is_new_dxcc(call_sign: &str, worked_dxcc: &std::collections::HashSet<Stri
 fn extract_dxcc_prefix(call_sign: &str) -> String {
     // Very basic DXCC prefix extraction
     // In a real implementation, you'd use a proper DXCC database
-    
+
     let call_upper = call_sign.to_uppercase();
-    
+
     // Handle special cases with slashes
     if call_upper.contains('/') {
         let parts: Vec<&str> = call_upper.split('/').collect();
-        
+
         // Portable operations: take the base call
         if parts.len() == 2 {
             if parts[1].len() <= 3 && parts[1].chars().all(|c| c.is_ascii_alphanumeric()) {
@@ -192,7 +210,7 @@ fn extract_dxcc_prefix(call_sign: &str) -> String {
             }
         }
     }
-    
+
     extract_base_prefix(&call_upper)
 }
 
@@ -202,12 +220,12 @@ fn extract_base_prefix(call_sign: &str) -> String {
         if digit_pos == 0 {
             return call_sign.chars().take(2).collect();
         }
-        
+
         // Standard format: prefix + digit + suffix
         let prefix_chars: String = call_sign.chars().take(digit_pos + 1).collect();
         return prefix_chars;
     }
-    
+
     // Fallback: take first 2-3 characters
     call_sign.chars().take(3).collect()
 }
@@ -242,7 +260,7 @@ pub fn calculate_dx_priority(
     if is_new_dxcc {
         score += 200; // New country
     }
-    
+
     if is_new_band {
         score += 100; // New band
     }
@@ -261,7 +279,7 @@ pub fn calculate_dx_priority(
     let age_minutes = chrono::Utc::now()
         .signed_duration_since(station.last_seen)
         .num_minutes();
-    
+
     if age_minutes < 5 {
         score += 20;
     } else if age_minutes < 15 {
@@ -298,7 +316,7 @@ mod tests {
         let mut worked = HashSet::new();
         worked.insert("W1".to_string());
         worked.insert("G0".to_string());
-        
+
         assert!(is_new_dxcc("JA1ABC", &worked));
         assert!(!is_new_dxcc("W1XYZ", &worked));
     }

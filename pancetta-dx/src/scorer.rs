@@ -3,7 +3,7 @@
 //! This module provides sophisticated algorithms for calculating the rarity
 //! and desirability of DX entities, bands, and modes for prioritization.
 
-use crate::{tracker::DxTracker, Band, Mode, DxError, Result};
+use crate::{tracker::DxTracker, Band, DxError, Mode, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use statrs::statistics::Statistics;
@@ -142,11 +142,11 @@ impl RarityScorer {
             },
             last_update: Utc::now(),
         };
-        
+
         scorer.update_statistics(tracker).await?;
         Ok(scorer)
     }
-    
+
     /// Create scorer with custom configuration
     pub async fn new_with_config(tracker: &DxTracker, config: ScoringConfig) -> Result<Self> {
         let mut scorer = Self {
@@ -162,16 +162,16 @@ impl RarityScorer {
             },
             last_update: Utc::now(),
         };
-        
+
         scorer.update_statistics(tracker).await?;
         Ok(scorer)
     }
-    
+
     /// Update scoring configuration
     pub fn update_config(&mut self, config: ScoringConfig) {
         self.config = config;
     }
-    
+
     /// Calculate rarity score for an entity/band/mode combination
     pub async fn calculate_rarity_score(
         &self,
@@ -179,10 +179,12 @@ impl RarityScorer {
         band: Option<Band>,
         mode: Option<&Mode>,
     ) -> Result<f64> {
-        let metrics = self.calculate_rarity_metrics(entity_code, band, mode).await?;
+        let metrics = self
+            .calculate_rarity_metrics(entity_code, band, mode)
+            .await?;
         Ok(metrics.overall_score)
     }
-    
+
     /// Calculate detailed rarity metrics
     pub async fn calculate_rarity_metrics(
         &self,
@@ -190,30 +192,30 @@ impl RarityScorer {
         band: Option<Band>,
         mode: Option<&Mode>,
     ) -> Result<RarityMetrics> {
-        let entity_stats = self.entity_stats.get(&entity_code)
-            .ok_or_else(|| DxError::DxccNotFound(format!("No statistics for entity {}", entity_code)))?;
-        
+        let entity_stats = self.entity_stats.get(&entity_code).ok_or_else(|| {
+            DxError::DxccNotFound(format!("No statistics for entity {}", entity_code))
+        })?;
+
         // Calculate individual component scores
         let entity_score = self.calculate_entity_rarity_score(entity_stats);
         let band_score = self.calculate_band_rarity_score(entity_stats, band);
         let mode_score = self.calculate_mode_rarity_score(entity_stats, mode);
         let recency_score = self.calculate_recency_score(entity_stats);
         let propagation_score = self.calculate_propagation_score(entity_code, band).await;
-        
+
         // Combine scores using configured weights
-        let overall_score = 
-            entity_score * self.config.entity_weight +
-            band_score * self.config.band_weight +
-            mode_score * self.config.mode_weight +
-            recency_score * self.config.recency_weight +
-            propagation_score * self.config.propagation_weight;
-        
+        let overall_score = entity_score * self.config.entity_weight
+            + band_score * self.config.band_weight
+            + mode_score * self.config.mode_weight
+            + recency_score * self.config.recency_weight
+            + propagation_score * self.config.propagation_weight;
+
         // Determine activity level
         let activity_level = self.classify_activity_level(entity_stats);
-        
+
         // Calculate percentile rank
         let percentile_rank = self.calculate_percentile_rank(entity_stats.total_qsos);
-        
+
         Ok(RarityMetrics {
             overall_score,
             entity_score,
@@ -225,31 +227,33 @@ impl RarityScorer {
             percentile_rank,
         })
     }
-    
+
     /// Update statistics from QSO database
     pub async fn update_statistics(&mut self, tracker: &DxTracker) -> Result<()> {
         info!("Updating rarity scoring statistics");
-        
+
         self.entity_stats.clear();
         let cutoff_date = Utc::now() - Duration::days(self.config.recency_days);
-        
+
         // Get QSO statistics per entity
         let qso_stats = tracker.get_qso_statistics_by_entity().await?;
-        let recent_qso_stats = tracker.get_qso_statistics_by_entity_since(cutoff_date).await?;
-        
+        let recent_qso_stats = tracker
+            .get_qso_statistics_by_entity_since(cutoff_date)
+            .await?;
+
         // Build entity statistics
         for (entity_code, total_qsos) in qso_stats {
             let recent_qsos = recent_qso_stats.get(&entity_code).copied().unwrap_or(0);
             let band_qsos = tracker.get_qso_statistics_by_band(entity_code).await?;
             let mode_qsos = tracker.get_qso_statistics_by_mode(entity_code).await?;
             let last_qso = tracker.get_last_qso_date(entity_code).await?;
-            
+
             let activity_rate = if self.config.recency_days > 0 {
                 recent_qsos as f64 / self.config.recency_days as f64
             } else {
                 0.0
             };
-            
+
             let stats = RarityStats {
                 total_qsos,
                 recent_qsos,
@@ -258,34 +262,39 @@ impl RarityScorer {
                 last_qso,
                 activity_rate,
             };
-            
+
             self.entity_stats.insert(entity_code, stats);
         }
-        
+
         // Calculate global statistics for normalization
         self.update_global_statistics();
-        
+
         self.last_update = Utc::now();
-        info!("Updated statistics for {} entities", self.entity_stats.len());
-        
+        info!(
+            "Updated statistics for {} entities",
+            self.entity_stats.len()
+        );
+
         Ok(())
     }
-    
+
     /// Update global statistics for normalization
     fn update_global_statistics(&mut self) {
-        let qso_counts: Vec<u32> = self.entity_stats.values()
+        let qso_counts: Vec<u32> = self
+            .entity_stats
+            .values()
             .map(|stats| stats.total_qsos)
             .collect();
-        
+
         if qso_counts.is_empty() {
             return;
         }
-        
+
         let qso_counts_f64: Vec<f64> = qso_counts.iter().map(|&x| x as f64).collect();
-        
+
         let mean_qsos = Self::calculate_mean(&qso_counts_f64);
         let stddev_qsos = Self::calculate_std_dev(&qso_counts_f64, mean_qsos);
-        
+
         self.global_stats = GlobalStats {
             active_entities: qso_counts.len() as u32,
             qso_distribution: qso_counts.clone(),
@@ -295,106 +304,106 @@ impl RarityScorer {
             p95_qsos: Self::calculate_percentile(&qso_counts_f64, 95.0),
         };
     }
-    
+
     /// Calculate entity rarity score based on total activity
     fn calculate_entity_rarity_score(&self, stats: &RarityStats) -> f64 {
         if self.global_stats.active_entities == 0 {
             return 0.5; // Default neutral score
         }
-        
+
         let qso_count = if self.config.logarithmic_scaling {
             (stats.total_qsos as f64 + 1.0).ln()
         } else {
             stats.total_qsos as f64
         };
-        
+
         let reference_count = if self.config.logarithmic_scaling {
             (self.global_stats.mean_qsos + 1.0).ln()
         } else {
             self.global_stats.mean_qsos
         };
-        
+
         // Invert score so that lower activity = higher rarity
         let normalized = 1.0 - (qso_count / (reference_count * 2.0)).min(1.0);
         normalized.max(0.0)
     }
-    
+
     /// Calculate band-specific rarity score
     fn calculate_band_rarity_score(&self, stats: &RarityStats, band: Option<Band>) -> f64 {
         let Some(band) = band else {
             return 0.5; // Neutral score if no band specified
         };
-        
+
         let band_qsos = stats.band_qsos.get(&band).copied().unwrap_or(0) as f64;
         let total_qsos = stats.total_qsos as f64;
-        
+
         if total_qsos == 0.0 {
             return 1.0; // Maximum rarity if no QSOs
         }
-        
+
         // Calculate band activity ratio
         let band_ratio = band_qsos / total_qsos;
-        
+
         // Invert ratio for rarity score (less activity on band = higher rarity)
         1.0 - band_ratio
     }
-    
+
     /// Calculate mode-specific rarity score
     fn calculate_mode_rarity_score(&self, stats: &RarityStats, mode: Option<&Mode>) -> f64 {
         let Some(mode) = mode else {
             return 0.5; // Neutral score if no mode specified
         };
-        
+
         let mode_qsos = stats.mode_qsos.get(mode).copied().unwrap_or(0) as f64;
         let total_qsos = stats.total_qsos as f64;
-        
+
         if total_qsos == 0.0 {
             return 1.0; // Maximum rarity if no QSOs
         }
-        
+
         // Calculate mode activity ratio
         let mode_ratio = mode_qsos / total_qsos;
-        
+
         // Invert ratio for rarity score (less activity on mode = higher rarity)
         1.0 - mode_ratio
     }
-    
+
     /// Calculate recency score (higher = less recent activity)
     fn calculate_recency_score(&self, stats: &RarityStats) -> f64 {
         let Some(last_qso) = stats.last_qso else {
             return 1.0; // Maximum score if never worked
         };
-        
+
         let days_since = Utc::now().signed_duration_since(last_qso).num_days();
         let max_days = self.config.recency_days;
-        
+
         if days_since <= 0 {
             return 0.0; // Recent activity
         }
-        
+
         if days_since >= max_days {
             return 1.0; // Very old or no activity
         }
-        
+
         // Linear scaling based on days since last QSO
         days_since as f64 / max_days as f64
     }
-    
+
     /// Calculate propagation score (placeholder - would integrate with propagation prediction)
     async fn calculate_propagation_score(&self, _entity_code: u16, _band: Option<Band>) -> f64 {
         // This would integrate with actual propagation prediction
         // For now, return neutral score
         0.5
     }
-    
+
     /// Classify activity level based on statistics
     fn classify_activity_level(&self, stats: &RarityStats) -> ActivityLevel {
         if stats.total_qsos == 0 {
             return ActivityLevel::Inactive;
         }
-        
+
         let percentile = self.calculate_percentile_rank(stats.total_qsos);
-        
+
         match percentile {
             p if p >= 95.0 => ActivityLevel::VeryCommon,
             p if p >= 75.0 => ActivityLevel::Common,
@@ -403,45 +412,53 @@ impl RarityScorer {
             _ => ActivityLevel::VeryRare,
         }
     }
-    
+
     /// Calculate percentile rank for QSO count
     fn calculate_percentile_rank(&self, qso_count: u32) -> f64 {
         if self.global_stats.qso_distribution.is_empty() {
             return 50.0;
         }
-        
-        let lower_count = self.global_stats.qso_distribution.iter()
+
+        let lower_count = self
+            .global_stats
+            .qso_distribution
+            .iter()
             .filter(|&&count| count < qso_count)
             .count();
-        
-        let equal_count = self.global_stats.qso_distribution.iter()
+
+        let equal_count = self
+            .global_stats
+            .qso_distribution
+            .iter()
             .filter(|&&count| count == qso_count)
             .count();
-        
+
         let total_count = self.global_stats.qso_distribution.len();
-        
+
         if total_count == 0 {
             return 50.0;
         }
-        
+
         // Calculate percentile using midrank method
         ((lower_count as f64 + equal_count as f64 / 2.0) / total_count as f64) * 100.0
     }
-    
+
     /// Get top rarest entities
     pub fn get_rarest_entities(&self, limit: usize) -> Vec<(u16, f64)> {
-        let mut entities: Vec<(u16, f64)> = self.entity_stats.iter()
+        let mut entities: Vec<(u16, f64)> = self
+            .entity_stats
+            .iter()
             .map(|(&entity_code, stats)| {
                 let score = self.calculate_entity_rarity_score(stats);
                 (entity_code, score)
             })
             .collect();
-        
+
         entities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         entities.truncate(limit);
         entities
     }
-    
+
     /// Get entities needing specific band/mode combinations
     pub async fn get_needed_combinations(
         &self,
@@ -450,47 +467,66 @@ impl RarityScorer {
         modes: &[Mode],
     ) -> Result<Vec<(Band, Mode, f64)>> {
         let mut combinations = Vec::new();
-        
+
         for &band in bands {
             for mode in modes {
-                let score = self.calculate_rarity_score(entity_code, Some(band), Some(mode)).await?;
+                let score = self
+                    .calculate_rarity_score(entity_code, Some(band), Some(mode))
+                    .await?;
                 combinations.push((band, mode.clone(), score));
             }
         }
-        
+
         // Sort by rarity score (highest first)
         combinations.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         Ok(combinations)
     }
-    
+
     /// Get scoring statistics summary
     pub fn get_statistics_summary(&self) -> HashMap<String, f64> {
         let mut summary = HashMap::new();
-        
+
         summary.insert("total_entities".to_string(), self.entity_stats.len() as f64);
-        summary.insert("mean_qsos_per_entity".to_string(), self.global_stats.mean_qsos);
-        summary.insert("median_qsos_per_entity".to_string(), self.global_stats.median_qsos);
-        summary.insert("stddev_qsos_per_entity".to_string(), self.global_stats.stddev_qsos);
-        summary.insert("p95_qsos_per_entity".to_string(), self.global_stats.p95_qsos);
-        
-        let active_entities = self.entity_stats.values()
+        summary.insert(
+            "mean_qsos_per_entity".to_string(),
+            self.global_stats.mean_qsos,
+        );
+        summary.insert(
+            "median_qsos_per_entity".to_string(),
+            self.global_stats.median_qsos,
+        );
+        summary.insert(
+            "stddev_qsos_per_entity".to_string(),
+            self.global_stats.stddev_qsos,
+        );
+        summary.insert(
+            "p95_qsos_per_entity".to_string(),
+            self.global_stats.p95_qsos,
+        );
+
+        let active_entities = self
+            .entity_stats
+            .values()
             .filter(|stats| stats.recent_qsos > 0)
             .count();
-        summary.insert("recently_active_entities".to_string(), active_entities as f64);
-        
+        summary.insert(
+            "recently_active_entities".to_string(),
+            active_entities as f64,
+        );
+
         summary
     }
-    
+
     /// Calculate median value from a vector of f64
     fn calculate_median(values: &[f64]) -> f64 {
         if values.is_empty() {
             return 0.0;
         }
-        
+
         let mut sorted = values.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         let mid = sorted.len() / 2;
         if sorted.len() % 2 == 0 {
             (sorted[mid - 1] + sorted[mid]) / 2.0
@@ -498,20 +534,20 @@ impl RarityScorer {
             sorted[mid]
         }
     }
-    
+
     /// Calculate percentile value from a vector of f64
     fn calculate_percentile(values: &[f64], percentile: f64) -> f64 {
         if values.is_empty() {
             return 0.0;
         }
-        
+
         let mut sorted = values.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        
+
         let index = (percentile / 100.0 * (sorted.len() - 1) as f64).round() as usize;
         sorted[index.min(sorted.len() - 1)]
     }
-    
+
     /// Calculate mean value from a vector of f64
     fn calculate_mean(values: &[f64]) -> f64 {
         if values.is_empty() {
@@ -519,17 +555,16 @@ impl RarityScorer {
         }
         values.iter().sum::<f64>() / values.len() as f64
     }
-    
+
     /// Calculate standard deviation from a vector of f64 and its mean
     fn calculate_std_dev(values: &[f64], mean: f64) -> f64 {
         if values.len() <= 1 {
             return 0.0;
         }
-        
-        let variance: f64 = values.iter()
-            .map(|&x| (x - mean).powi(2))
-            .sum::<f64>() / (values.len() - 1) as f64;
-        
+
+        let variance: f64 =
+            values.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (values.len() - 1) as f64;
+
         variance.sqrt()
     }
 }
@@ -538,19 +573,21 @@ impl RarityScorer {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
-    
+
     async fn create_test_tracker() -> DxTracker {
         let temp_file = NamedTempFile::new().unwrap();
-        DxTracker::new(temp_file.path().to_str().unwrap()).await.unwrap()
+        DxTracker::new(temp_file.path().to_str().unwrap())
+            .await
+            .unwrap()
     }
-    
+
     #[tokio::test]
     async fn test_scorer_creation() {
         let tracker = create_test_tracker().await;
         let scorer = RarityScorer::new(&tracker).await.unwrap();
         assert!(scorer.entity_stats.is_empty());
     }
-    
+
     #[tokio::test]
     async fn test_custom_config() {
         let tracker = create_test_tracker().await;
@@ -559,11 +596,13 @@ mod tests {
             band_weight: 0.3,
             ..Default::default()
         };
-        let scorer = RarityScorer::new_with_config(&tracker, config).await.unwrap();
+        let scorer = RarityScorer::new_with_config(&tracker, config)
+            .await
+            .unwrap();
         assert_eq!(scorer.config.entity_weight, 0.5);
         assert_eq!(scorer.config.band_weight, 0.3);
     }
-    
+
     #[test]
     fn test_activity_level_classification() {
         let scorer = RarityScorer {
@@ -579,7 +618,7 @@ mod tests {
             },
             last_update: Utc::now(),
         };
-        
+
         let stats = RarityStats {
             total_qsos: 0,
             recent_qsos: 0,
@@ -588,9 +627,12 @@ mod tests {
             last_qso: None,
             activity_rate: 0.0,
         };
-        
-        assert_eq!(scorer.classify_activity_level(&stats), ActivityLevel::Inactive);
-        
+
+        assert_eq!(
+            scorer.classify_activity_level(&stats),
+            ActivityLevel::Inactive
+        );
+
         let stats = RarityStats {
             total_qsos: 1,
             recent_qsos: 1,
@@ -599,10 +641,13 @@ mod tests {
             last_qso: Some(Utc::now()),
             activity_rate: 1.0,
         };
-        
-        assert_eq!(scorer.classify_activity_level(&stats), ActivityLevel::VeryRare);
+
+        assert_eq!(
+            scorer.classify_activity_level(&stats),
+            ActivityLevel::VeryRare
+        );
     }
-    
+
     #[test]
     fn test_percentile_calculation() {
         let scorer = RarityScorer {
@@ -618,7 +663,7 @@ mod tests {
             },
             last_update: Utc::now(),
         };
-        
+
         assert!((scorer.calculate_percentile_rank(1) - 5.0).abs() < 1.0);
         assert!((scorer.calculate_percentile_rank(5) - 45.0).abs() < 5.0);
         assert!((scorer.calculate_percentile_rank(10) - 95.0).abs() < 5.0);

@@ -3,11 +3,8 @@
 //! This module generates comprehensive reports for DXCC and other amateur
 //! radio award progress tracking.
 
-use crate::{
-    Band, Mode, tracker::DxTracker, dxcc::DxccDatabase, 
-    DxError, Result
-};
-use chrono::{DateTime, Utc, Datelike};
+use crate::{dxcc::DxccDatabase, tracker::DxTracker, Band, DxError, Mode, Result};
+use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -228,11 +225,11 @@ pub struct ReportGenerator {
 
 impl ReportGenerator {
     /// Create new report generator from Arc-wrapped dependencies
-    pub async fn new(tracker: std::sync::Arc<DxTracker>, dxcc: std::sync::Arc<DxccDatabase>) -> Result<Self> {
-        Ok(Self {
-            tracker,
-            dxcc,
-        })
+    pub async fn new(
+        tracker: std::sync::Arc<DxTracker>,
+        dxcc: std::sync::Arc<DxccDatabase>,
+    ) -> Result<Self> {
+        Ok(Self { tracker, dxcc })
     }
 
     /// Create new report generator from references (uses unsafe ptr::read)
@@ -243,19 +240,21 @@ impl ReportGenerator {
             dxcc: std::sync::Arc::new(unsafe { std::ptr::read(dxcc) }),
         })
     }
-    
+
     /// Generate DXCC progress report
     pub async fn generate_dxcc_report(&self, station_callsign: &str) -> Result<DxccProgressReport> {
         info!("Generating DXCC progress report for {}", station_callsign);
-        
+
         let overall_status = self.calculate_overall_dxcc_status().await?;
         let band_status = self.calculate_band_dxcc_status().await?;
         let mode_status = self.calculate_mode_dxcc_status().await?;
         let needed_entities = self.find_needed_entities().await?;
         let recent_entities = self.get_recent_entities().await?;
         let progress_data = self.generate_progress_data().await?;
-        let recommendations = self.generate_recommendations(&overall_status, &needed_entities).await?;
-        
+        let recommendations = self
+            .generate_recommendations(&overall_status, &needed_entities)
+            .await?;
+
         Ok(DxccProgressReport {
             generated_at: Utc::now(),
             station_callsign: station_callsign.to_string(),
@@ -268,16 +267,18 @@ impl ReportGenerator {
             recommendations,
         })
     }
-    
+
     /// Generate award tracking report
     pub async fn generate_award_report(&self) -> Result<AwardTrackingReport> {
         info!("Generating award tracking report");
-        
+
         let dxcc_awards = self.get_dxcc_award_status().await?;
         let other_awards = self.get_other_award_status().await?;
         let goals = self.get_goal_status().await?;
-        let recommendations = self.generate_award_recommendations(&dxcc_awards, &goals).await?;
-        
+        let recommendations = self
+            .generate_award_recommendations(&dxcc_awards, &goals)
+            .await?;
+
         Ok(AwardTrackingReport {
             generated_at: Utc::now(),
             dxcc_awards,
@@ -286,54 +287,93 @@ impl ReportGenerator {
             recommendations,
         })
     }
-    
+
     /// Export DXCC report as HTML
     pub async fn export_dxcc_html(&self, report: &DxccProgressReport) -> Result<String> {
         let mut html = String::new();
-        
+
         writeln!(html, "<!DOCTYPE html>")?;
         writeln!(html, "<html>")?;
         writeln!(html, "<head>")?;
-        writeln!(html, "<title>DXCC Progress Report - {}</title>", report.station_callsign)?;
+        writeln!(
+            html,
+            "<title>DXCC Progress Report - {}</title>",
+            report.station_callsign
+        )?;
         writeln!(html, "<style>")?;
-        writeln!(html, "body {{ font-family: Arial, sans-serif; margin: 20px; }}")?;
+        writeln!(
+            html,
+            "body {{ font-family: Arial, sans-serif; margin: 20px; }}"
+        )?;
         writeln!(html, "table {{ border-collapse: collapse; width: 100%; }}")?;
-        writeln!(html, "th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}")?;
+        writeln!(
+            html,
+            "th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}"
+        )?;
         writeln!(html, "th {{ background-color: #f2f2f2; }}")?;
-        writeln!(html, ".progress-bar {{ background-color: #f0f0f0; border-radius: 5px; height: 20px; }}")?;
-        writeln!(html, ".progress-fill {{ background-color: #4CAF50; height: 100%; border-radius: 5px; }}")?;
-        writeln!(html, ".status-achieved {{ color: green; font-weight: bold; }}")?;
+        writeln!(
+            html,
+            ".progress-bar {{ background-color: #f0f0f0; border-radius: 5px; height: 20px; }}"
+        )?;
+        writeln!(
+            html,
+            ".progress-fill {{ background-color: #4CAF50; height: 100%; border-radius: 5px; }}"
+        )?;
+        writeln!(
+            html,
+            ".status-achieved {{ color: green; font-weight: bold; }}"
+        )?;
         writeln!(html, ".status-progress {{ color: orange; }}")?;
         writeln!(html, ".status-needed {{ color: red; }}")?;
         writeln!(html, "</style>")?;
         writeln!(html, "</head>")?;
         writeln!(html, "<body>")?;
-        
+
         // Header
         writeln!(html, "<h1>DXCC Progress Report</h1>")?;
-        writeln!(html, "<p><strong>Station:</strong> {}</p>", report.station_callsign)?;
-        writeln!(html, "<p><strong>Generated:</strong> {}</p>", report.generated_at.format("%Y-%m-%d %H:%M UTC"))?;
-        
+        writeln!(
+            html,
+            "<p><strong>Station:</strong> {}</p>",
+            report.station_callsign
+        )?;
+        writeln!(
+            html,
+            "<p><strong>Generated:</strong> {}</p>",
+            report.generated_at.format("%Y-%m-%d %H:%M UTC")
+        )?;
+
         // Overall status
         writeln!(html, "<h2>Overall DXCC Status</h2>")?;
         self.write_dxcc_status_html(&mut html, "Mixed", &report.overall_status)?;
-        
+
         // Band status
         writeln!(html, "<h2>DXCC by Band</h2>")?;
         writeln!(html, "<table>")?;
         writeln!(html, "<tr><th>Band</th><th>Worked</th><th>Confirmed</th><th>Progress</th><th>Status</th></tr>")?;
-        
+
         for (band, status) in &report.band_status {
-            let status_class = if status.award_achieved { "status-achieved" } else { "status-progress" };
-            let status_text = if status.award_achieved { "ACHIEVED" } else { "In Progress" };
-            
+            let status_class = if status.award_achieved {
+                "status-achieved"
+            } else {
+                "status-progress"
+            };
+            let status_text = if status.award_achieved {
+                "ACHIEVED"
+            } else {
+                "In Progress"
+            };
+
             writeln!(html, "<tr>")?;
             writeln!(html, "<td>{}</td>", band)?;
             writeln!(html, "<td>{}</td>", status.worked)?;
             writeln!(html, "<td>{}</td>", status.confirmed)?;
             writeln!(html, "<td>")?;
             writeln!(html, "<div class=\"progress-bar\">")?;
-            writeln!(html, "<div class=\"progress-fill\" style=\"width: {}%;\"></div>", status.progress_percent)?;
+            writeln!(
+                html,
+                "<div class=\"progress-fill\" style=\"width: {}%;\"></div>",
+                status.progress_percent
+            )?;
             writeln!(html, "</div>")?;
             writeln!(html, "{:.1}%", status.progress_percent)?;
             writeln!(html, "</td>")?;
@@ -341,12 +381,12 @@ impl ReportGenerator {
             writeln!(html, "</tr>")?;
         }
         writeln!(html, "</table>")?;
-        
+
         // Needed entities
         writeln!(html, "<h2>Entities Still Needed</h2>")?;
         writeln!(html, "<table>")?;
         writeln!(html, "<tr><th>Entity</th><th>Prefix</th><th>Continent</th><th>Priority</th><th>Activity</th></tr>")?;
-        
+
         for entity in &report.needed_entities {
             writeln!(html, "<tr>")?;
             writeln!(html, "<td>{}</td>", entity.entity_name)?;
@@ -357,16 +397,24 @@ impl ReportGenerator {
             writeln!(html, "</tr>")?;
         }
         writeln!(html, "</table>")?;
-        
+
         // Recent activity
         writeln!(html, "<h2>Recent Activity</h2>")?;
         writeln!(html, "<table>")?;
         writeln!(html, "<tr><th>Date</th><th>Callsign</th><th>Entity</th><th>Band</th><th>Mode</th><th>Status</th></tr>")?;
-        
+
         for entity in &report.recent_entities {
-            let status = if entity.confirmed { "Confirmed" } else { "Worked" };
-            let status_class = if entity.confirmed { "status-achieved" } else { "status-progress" };
-            
+            let status = if entity.confirmed {
+                "Confirmed"
+            } else {
+                "Worked"
+            };
+            let status_class = if entity.confirmed {
+                "status-achieved"
+            } else {
+                "status-progress"
+            };
+
             writeln!(html, "<tr>")?;
             writeln!(html, "<td>{}</td>", entity.date_worked.format("%Y-%m-%d"))?;
             writeln!(html, "<td>{}</td>", entity.callsign)?;
@@ -377,7 +425,7 @@ impl ReportGenerator {
             writeln!(html, "</tr>")?;
         }
         writeln!(html, "</table>")?;
-        
+
         // Recommendations
         if !report.recommendations.is_empty() {
             writeln!(html, "<h2>Recommendations</h2>")?;
@@ -387,62 +435,85 @@ impl ReportGenerator {
             }
             writeln!(html, "</ul>")?;
         }
-        
+
         writeln!(html, "</body>")?;
         writeln!(html, "</html>")?;
-        
+
         Ok(html)
     }
-    
+
     /// Export DXCC report as CSV
     pub async fn export_dxcc_csv(&self, report: &DxccProgressReport) -> Result<String> {
         let mut csv = String::new();
-        
+
         // Header
         writeln!(csv, "DXCC Progress Report")?;
         writeln!(csv, "Station: {}", report.station_callsign)?;
-        writeln!(csv, "Generated: {}", report.generated_at.format("%Y-%m-%d %H:%M UTC"))?;
+        writeln!(
+            csv,
+            "Generated: {}",
+            report.generated_at.format("%Y-%m-%d %H:%M UTC")
+        )?;
         writeln!(csv)?;
-        
+
         // Overall status
         writeln!(csv, "Overall DXCC Status")?;
         writeln!(csv, "Category,Total,Worked,Confirmed,Progress %,Achieved")?;
-        writeln!(csv, "Mixed,{},{},{},{:.1},{}", 
-                report.overall_status.total_entities,
-                report.overall_status.worked,
-                report.overall_status.confirmed,
-                report.overall_status.progress_percent,
-                report.overall_status.award_achieved)?;
+        writeln!(
+            csv,
+            "Mixed,{},{},{},{:.1},{}",
+            report.overall_status.total_entities,
+            report.overall_status.worked,
+            report.overall_status.confirmed,
+            report.overall_status.progress_percent,
+            report.overall_status.award_achieved
+        )?;
         writeln!(csv)?;
-        
+
         // Band status
         writeln!(csv, "DXCC by Band")?;
         writeln!(csv, "Band,Worked,Confirmed,Progress %,Achieved")?;
         for (band, status) in &report.band_status {
-            writeln!(csv, "{},{},{},{:.1},{}", 
-                    band, status.worked, status.confirmed, 
-                    status.progress_percent, status.award_achieved)?;
+            writeln!(
+                csv,
+                "{},{},{},{:.1},{}",
+                band,
+                status.worked,
+                status.confirmed,
+                status.progress_percent,
+                status.award_achieved
+            )?;
         }
         writeln!(csv)?;
-        
+
         // Needed entities
         writeln!(csv, "Entities Still Needed")?;
-        writeln!(csv, "Entity Code,Entity Name,Prefix,Continent,Priority,Activity Level")?;
+        writeln!(
+            csv,
+            "Entity Code,Entity Name,Prefix,Continent,Priority,Activity Level"
+        )?;
         for entity in &report.needed_entities {
-            writeln!(csv, "{},{},{},{},{:.2},{}", 
-                    entity.entity_code, entity.entity_name, entity.prefix,
-                    entity.continent, entity.priority_score, entity.activity_level)?;
+            writeln!(
+                csv,
+                "{},{},{},{},{:.2},{}",
+                entity.entity_code,
+                entity.entity_name,
+                entity.prefix,
+                entity.continent,
+                entity.priority_score,
+                entity.activity_level
+            )?;
         }
-        
+
         Ok(csv)
     }
-    
+
     /// Export award report as JSON
     pub async fn export_award_json(&self, report: &AwardTrackingReport) -> Result<String> {
         serde_json::to_string_pretty(report)
             .map_err(|e| DxError::Parse(format!("JSON export error: {}", e)))
     }
-    
+
     /// Calculate overall DXCC status
     async fn calculate_overall_dxcc_status(&self) -> Result<DxccStatus> {
         let entity_stats = self.tracker.get_qso_statistics_by_entity().await?;
@@ -451,9 +522,9 @@ impl ReportGenerator {
         let total_entities = self.dxcc.current_entity_count() as u32;
         let progress_percent = (confirmed as f64 / 100.0 * 100.0).min(100.0);
         let award_achieved = confirmed >= 100;
-        
+
         let continent_breakdown = self.calculate_continent_breakdown().await?;
-        
+
         Ok(DxccStatus {
             total_entities,
             worked,
@@ -461,15 +532,19 @@ impl ReportGenerator {
             needed_for_award: 100,
             progress_percent,
             award_achieved,
-            achievement_date: if award_achieved { Some(Utc::now()) } else { None },
+            achievement_date: if award_achieved {
+                Some(Utc::now())
+            } else {
+                None
+            },
             continent_breakdown,
         })
     }
-    
+
     /// Calculate band-specific DXCC status
     async fn calculate_band_dxcc_status(&self) -> Result<HashMap<Band, DxccStatus>> {
         let mut status_map = HashMap::new();
-        
+
         for &band in Band::all() {
             // This would calculate actual band statistics
             // For now, generate placeholder data
@@ -478,28 +553,35 @@ impl ReportGenerator {
             let total_entities = self.dxcc.current_entity_count() as u32;
             let progress_percent = (confirmed as f64 / 100.0 * 100.0).min(100.0);
             let award_achieved = confirmed >= 100;
-            
-            status_map.insert(band, DxccStatus {
-                total_entities,
-                worked,
-                confirmed,
-                needed_for_award: 100,
-                progress_percent,
-                award_achieved,
-                achievement_date: if award_achieved { Some(Utc::now()) } else { None },
-                continent_breakdown: HashMap::new(),
-            });
+
+            status_map.insert(
+                band,
+                DxccStatus {
+                    total_entities,
+                    worked,
+                    confirmed,
+                    needed_for_award: 100,
+                    progress_percent,
+                    award_achieved,
+                    achievement_date: if award_achieved {
+                        Some(Utc::now())
+                    } else {
+                        None
+                    },
+                    continent_breakdown: HashMap::new(),
+                },
+            );
         }
-        
+
         Ok(status_map)
     }
-    
+
     /// Calculate mode-specific DXCC status
     async fn calculate_mode_dxcc_status(&self) -> Result<HashMap<Mode, DxccStatus>> {
         let mut status_map = HashMap::new();
-        
+
         let modes = [Mode::CW, Mode::USB, Mode::FT8, Mode::RTTY, Mode::PSK31];
-        
+
         for mode in &modes {
             // This would calculate actual mode statistics
             // For now, generate placeholder data
@@ -508,28 +590,35 @@ impl ReportGenerator {
             let total_entities = self.dxcc.current_entity_count() as u32;
             let progress_percent = (confirmed as f64 / 100.0 * 100.0).min(100.0);
             let award_achieved = confirmed >= 100;
-            
-            status_map.insert(mode.clone(), DxccStatus {
-                total_entities,
-                worked,
-                confirmed,
-                needed_for_award: 100,
-                progress_percent,
-                award_achieved,
-                achievement_date: if award_achieved { Some(Utc::now()) } else { None },
-                continent_breakdown: HashMap::new(),
-            });
+
+            status_map.insert(
+                mode.clone(),
+                DxccStatus {
+                    total_entities,
+                    worked,
+                    confirmed,
+                    needed_for_award: 100,
+                    progress_percent,
+                    award_achieved,
+                    achievement_date: if award_achieved {
+                        Some(Utc::now())
+                    } else {
+                        None
+                    },
+                    continent_breakdown: HashMap::new(),
+                },
+            );
         }
-        
+
         Ok(status_map)
     }
-    
+
     /// Find entities still needed
     async fn find_needed_entities(&self) -> Result<Vec<NeededEntity>> {
         let mut needed = Vec::new();
         let worked_entities = self.tracker.get_qso_statistics_by_entity().await?;
         let worked_set: HashSet<u16> = worked_entities.keys().cloned().collect();
-        
+
         for entity in self.dxcc.get_current_entities() {
             if !worked_set.contains(&entity.entity_code) {
                 needed.push(NeededEntity {
@@ -546,24 +635,28 @@ impl ReportGenerator {
                 });
             }
         }
-        
+
         // Sort by priority score (highest first)
-        needed.sort_by(|a, b| b.priority_score.partial_cmp(&a.priority_score).unwrap_or(std::cmp::Ordering::Equal));
-        
+        needed.sort_by(|a, b| {
+            b.priority_score
+                .partial_cmp(&a.priority_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
         // Limit to top 50
         needed.truncate(50);
-        
+
         Ok(needed)
     }
-    
+
     /// Get recent entities worked
     async fn get_recent_entities(&self) -> Result<Vec<RecentEntity>> {
         // This would query actual QSO history
         // For now, return placeholder data
-        
+
         let mut recent = Vec::new();
         let entities = self.dxcc.get_current_entities().take(10);
-        
+
         for (i, entity) in entities.enumerate() {
             recent.push(RecentEntity {
                 entity_code: entity.entity_code,
@@ -577,30 +670,30 @@ impl ReportGenerator {
                 new_entity: i < 3,
             });
         }
-        
+
         Ok(recent)
     }
-    
+
     /// Generate progress data for charts
     async fn generate_progress_data(&self) -> Result<ProgressData> {
         let mut monthly_progress = Vec::new();
         let mut yearly_totals = HashMap::new();
         let mut confirmation_trends = Vec::new();
-        
+
         let now = Utc::now();
-        
+
         // Generate monthly progress for last 12 months
         for i in 0..12 {
             let date = now - chrono::Duration::days(i * 30);
             let entities_worked = 50 + (i * 5) as u32;
             let entities_confirmed = (entities_worked as f64 * 0.7) as u32;
-            
+
             monthly_progress.push(ProgressPoint {
                 date,
                 entities_worked,
                 entities_confirmed,
             });
-            
+
             // Confirmation trends
             let confirmation_rate = 65.0 + (i as f64 * 2.0);
             confirmation_trends.push(ConfirmationPoint {
@@ -610,16 +703,17 @@ impl ReportGenerator {
                     ("LoTW".to_string(), 30),
                     ("eQSL".to_string(), 15),
                     ("Paper QSL".to_string(), 10),
-                ].into(),
+                ]
+                .into(),
             });
         }
-        
+
         // Generate yearly totals
         let current_year = now.year() as u32;
         for year in (current_year - 5)..=current_year {
             yearly_totals.insert(year, 100 + ((year - current_year + 5) * 20));
         }
-        
+
         // Band comparison
         let band_comparison = [
             (Band::Band20m, 85),
@@ -627,8 +721,9 @@ impl ReportGenerator {
             (Band::Band80m, 45),
             (Band::Band15m, 60),
             (Band::Band10m, 35),
-        ].into();
-        
+        ]
+        .into();
+
         // Mode comparison
         let mode_comparison = [
             (Mode::FT8, 95),
@@ -636,8 +731,9 @@ impl ReportGenerator {
             (Mode::USB, 65),
             (Mode::RTTY, 42),
             (Mode::PSK31, 25),
-        ].into();
-        
+        ]
+        .into();
+
         // Continent comparison
         let continent_comparison = [
             ("Europe".to_string(), 45),
@@ -646,8 +742,9 @@ impl ReportGenerator {
             ("Africa".to_string(), 20),
             ("South America".to_string(), 15),
             ("Oceania".to_string(), 12),
-        ].into();
-        
+        ]
+        .into();
+
         Ok(ProgressData {
             monthly_progress,
             yearly_totals,
@@ -657,32 +754,38 @@ impl ReportGenerator {
             confirmation_trends,
         })
     }
-    
+
     /// Generate recommendations
-    async fn generate_recommendations(&self, status: &DxccStatus, needed: &[NeededEntity]) -> Result<Vec<String>> {
+    async fn generate_recommendations(
+        &self,
+        status: &DxccStatus,
+        needed: &[NeededEntity],
+    ) -> Result<Vec<String>> {
         let mut recommendations = Vec::new();
-        
+
         if status.confirmed < 100 {
             recommendations.push(format!(
                 "You need {} more confirmed entities for DXCC Mixed. Focus on high-activity entities.",
                 100 - status.confirmed
             ));
         }
-        
+
         if (status.confirmed as f64) / (status.worked as f64) < 0.7 {
             recommendations.push(
                 "Your confirmation rate is below 70%. Consider using LoTW for faster confirmations.".to_string()
             );
         }
-        
+
         if !needed.is_empty() {
-            let high_priority: Vec<&NeededEntity> = needed.iter()
+            let high_priority: Vec<&NeededEntity> = needed
+                .iter()
                 .filter(|e| e.priority_score > 8.0)
                 .take(3)
                 .collect();
-            
+
             if !high_priority.is_empty() {
-                let names: Vec<&str> = high_priority.iter()
+                let names: Vec<&str> = high_priority
+                    .iter()
                     .map(|e| e.entity_name.as_str())
                     .collect();
                 recommendations.push(format!(
@@ -691,23 +794,23 @@ impl ReportGenerator {
                 ));
             }
         }
-        
+
         // Band-specific recommendations
         if let Some(continent_status) = status.continent_breakdown.get("Africa") {
             if continent_status.worked < 10 {
                 recommendations.push(
-                    "Consider focusing on African entities - only a few worked so far.".to_string()
+                    "Consider focusing on African entities - only a few worked so far.".to_string(),
                 );
             }
         }
-        
+
         Ok(recommendations)
     }
-    
+
     /// Get DXCC award status
     async fn get_dxcc_award_status(&self) -> Result<Vec<AwardStatus>> {
         let mut awards = Vec::new();
-        
+
         // Mixed DXCC
         awards.push(AwardStatus {
             award_name: "DXCC Mixed".to_string(),
@@ -720,7 +823,7 @@ impl ReportGenerator {
             next_milestone: Some(100),
             estimated_completion: Some(Utc::now() + chrono::Duration::days(90)),
         });
-        
+
         // Band DXCCs
         for &band in [Band::Band20m, Band::Band40m, Band::Band80m].iter() {
             awards.push(AwardStatus {
@@ -735,14 +838,14 @@ impl ReportGenerator {
                 estimated_completion: Some(Utc::now() + chrono::Duration::days(180)),
             });
         }
-        
+
         Ok(awards)
     }
-    
+
     /// Get other award status
     async fn get_other_award_status(&self) -> Result<Vec<AwardStatus>> {
         let mut awards = Vec::new();
-        
+
         // WAS (Worked All States)
         awards.push(AwardStatus {
             award_name: "WAS (Worked All States)".to_string(),
@@ -755,7 +858,7 @@ impl ReportGenerator {
             next_milestone: Some(50),
             estimated_completion: Some(Utc::now() + chrono::Duration::days(30)),
         });
-        
+
         // WAZ (Worked All Zones)
         awards.push(AwardStatus {
             award_name: "WAZ (Worked All Zones)".to_string(),
@@ -768,71 +871,118 @@ impl ReportGenerator {
             next_milestone: Some(40),
             estimated_completion: Some(Utc::now() + chrono::Duration::days(60)),
         });
-        
+
         Ok(awards)
     }
-    
+
     /// Get goal status
     async fn get_goal_status(&self) -> Result<Vec<GoalStatus>> {
         let mut goals = Vec::new();
-        
+
         goals.push(GoalStatus {
             goal_name: "DXCC by End of Year".to_string(),
             description: "Achieve DXCC Mixed award by December 31".to_string(),
             current: 85,
             target: 100,
-            deadline: Some(chrono::NaiveDate::from_ymd_opt(2024, 12, 31).unwrap()
-                .and_hms_opt(23, 59, 59).unwrap()
-                .and_utc()),
+            deadline: Some(
+                chrono::NaiveDate::from_ymd_opt(2024, 12, 31)
+                    .unwrap()
+                    .and_hms_opt(23, 59, 59)
+                    .unwrap()
+                    .and_utc(),
+            ),
             on_track: true,
             days_remaining: Some(120),
             required_rate: Some(0.125), // entities per day
         });
-        
+
         Ok(goals)
     }
-    
+
     /// Generate award recommendations
-    async fn generate_award_recommendations(&self, _awards: &[AwardStatus], _goals: &[GoalStatus]) -> Result<Vec<String>> {
+    async fn generate_award_recommendations(
+        &self,
+        _awards: &[AwardStatus],
+        _goals: &[GoalStatus],
+    ) -> Result<Vec<String>> {
         let mut recommendations = Vec::new();
-        
+
         recommendations.push("Focus on working WAS - only 8 states remaining".to_string());
-        recommendations.push("Consider QRT on 80m for DXCC - good propagation season coming".to_string());
+        recommendations
+            .push("Consider QRT on 80m for DXCC - good propagation season coming".to_string());
         recommendations.push("Update LoTW to get more confirmations".to_string());
-        
+
         Ok(recommendations)
     }
-    
+
     /// Helper method to write DXCC status as HTML
-    fn write_dxcc_status_html(&self, html: &mut String, category: &str, status: &DxccStatus) -> Result<()> {
+    fn write_dxcc_status_html(
+        &self,
+        html: &mut String,
+        category: &str,
+        status: &DxccStatus,
+    ) -> Result<()> {
         writeln!(html, "<h3>{}</h3>", category)?;
         writeln!(html, "<table>")?;
         writeln!(html, "<tr><th>Metric</th><th>Value</th></tr>")?;
-        writeln!(html, "<tr><td>Entities Worked</td><td>{}</td></tr>", status.worked)?;
-        writeln!(html, "<tr><td>Entities Confirmed</td><td>{}</td></tr>", status.confirmed)?;
-        writeln!(html, "<tr><td>Progress to Award</td><td>{:.1}%</td></tr>", status.progress_percent)?;
-        writeln!(html, "<tr><td>Award Status</td><td class=\"{}\">{}</td></tr>", 
-                if status.award_achieved { "status-achieved" } else { "status-progress" },
-                if status.award_achieved { "ACHIEVED" } else { "In Progress" })?;
+        writeln!(
+            html,
+            "<tr><td>Entities Worked</td><td>{}</td></tr>",
+            status.worked
+        )?;
+        writeln!(
+            html,
+            "<tr><td>Entities Confirmed</td><td>{}</td></tr>",
+            status.confirmed
+        )?;
+        writeln!(
+            html,
+            "<tr><td>Progress to Award</td><td>{:.1}%</td></tr>",
+            status.progress_percent
+        )?;
+        writeln!(
+            html,
+            "<tr><td>Award Status</td><td class=\"{}\">{}</td></tr>",
+            if status.award_achieved {
+                "status-achieved"
+            } else {
+                "status-progress"
+            },
+            if status.award_achieved {
+                "ACHIEVED"
+            } else {
+                "In Progress"
+            }
+        )?;
         writeln!(html, "</table>")?;
         Ok(())
     }
-    
+
     /// Calculate continent breakdown
     async fn calculate_continent_breakdown(&self) -> Result<HashMap<String, ContinentStatus>> {
         let mut breakdown = HashMap::new();
-        
-        let continents = ["North America", "Europe", "Asia", "Africa", "South America", "Oceania"];
+
+        let continents = [
+            "North America",
+            "Europe",
+            "Asia",
+            "Africa",
+            "South America",
+            "Oceania",
+        ];
         for continent in &continents {
-            breakdown.insert(continent.to_string(), ContinentStatus {
-                continent: continent.to_string(),
-                total_available: 50, // Placeholder
-                worked: 25,          // Placeholder
-                confirmed: 18,       // Placeholder
-                progress_percent: 50.0,
-            });
+            breakdown.insert(
+                continent.to_string(),
+                ContinentStatus {
+                    continent: continent.to_string(),
+                    total_available: 50, // Placeholder
+                    worked: 25,          // Placeholder
+                    confirmed: 18,       // Placeholder
+                    progress_percent: 50.0,
+                },
+            );
         }
-        
+
         Ok(breakdown)
     }
 }
@@ -841,10 +991,12 @@ impl ReportGenerator {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
-    
+
     async fn create_test_tracker() -> (DxTracker, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
-        let tracker = crate::tracker::DxTracker::new(temp_file.path().to_str().unwrap()).await.unwrap();
+        let tracker = crate::tracker::DxTracker::new(temp_file.path().to_str().unwrap())
+            .await
+            .unwrap();
         (tracker, temp_file)
     }
 
@@ -856,12 +1008,15 @@ mod tests {
     async fn test_report_generator_creation() {
         let (tracker, _temp_file) = create_test_tracker().await;
         let dxcc = create_test_dxcc().await;
-        let generator = ReportGenerator::new(std::sync::Arc::new(tracker), std::sync::Arc::new(dxcc)).await.unwrap();
-        
+        let generator =
+            ReportGenerator::new(std::sync::Arc::new(tracker), std::sync::Arc::new(dxcc))
+                .await
+                .unwrap();
+
         // Test passes if generator is created successfully
         assert!(true);
     }
-    
+
     #[test]
     fn test_dxcc_status() {
         let status = DxccStatus {
@@ -874,12 +1029,12 @@ mod tests {
             achievement_date: None,
             continent_breakdown: HashMap::new(),
         };
-        
+
         assert_eq!(status.worked, 85);
         assert_eq!(status.confirmed, 72);
         assert!(!status.award_achieved);
     }
-    
+
     #[test]
     fn test_needed_entity() {
         let entity = NeededEntity {
@@ -894,12 +1049,12 @@ mod tests {
             activity_level: "Low".to_string(),
             recent_spots: 2,
         };
-        
+
         assert_eq!(entity.entity_code, 306);
         assert_eq!(entity.priority_score, 9.5);
         assert_eq!(entity.bands_needed.len(), 2);
     }
-    
+
     #[test]
     fn test_award_status() {
         let award = AwardStatus {
@@ -913,13 +1068,13 @@ mod tests {
             next_milestone: Some(100),
             estimated_completion: Some(Utc::now() + chrono::Duration::days(90)),
         };
-        
+
         assert_eq!(award.current, 85);
         assert_eq!(award.target, 100);
         assert!(!award.achieved);
         assert_eq!(award.next_milestone, Some(100));
     }
-    
+
     #[test]
     fn test_progress_point() {
         let point = ProgressPoint {
@@ -927,11 +1082,11 @@ mod tests {
             entities_worked: 85,
             entities_confirmed: 72,
         };
-        
+
         assert_eq!(point.entities_worked, 85);
         assert_eq!(point.entities_confirmed, 72);
     }
-    
+
     #[test]
     fn test_goal_status() {
         let goal = GoalStatus {
@@ -944,7 +1099,7 @@ mod tests {
             days_remaining: Some(120),
             required_rate: Some(0.125),
         };
-        
+
         assert_eq!(goal.current, 85);
         assert!(goal.on_track);
         assert_eq!(goal.required_rate, Some(0.125));

@@ -28,10 +28,10 @@ impl EventHandler {
     pub fn new(tick_rate: u64) -> Self {
         let tick_rate = Duration::from_millis(tick_rate);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
-        
+
         // Clone sender for the event loop
         let tx = event_tx.clone();
-        
+
         // Spawn crossterm event handler
         tokio::spawn(async move {
             loop {
@@ -70,7 +70,7 @@ impl EventHandler {
                         }
                     }
                 }
-                
+
                 // Small delay to prevent busy waiting
                 sleep(Duration::from_millis(10)).await;
             }
@@ -86,7 +86,8 @@ impl EventHandler {
 
     pub async fn next(&mut self) -> Event {
         // Calculate time until next tick
-        let timeout = self.tick_rate
+        let timeout = self
+            .tick_rate
             .checked_sub(self.last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
 
@@ -137,7 +138,7 @@ impl AudioEventHandler {
             // TODO: Initialize CPAL audio input stream
             // For now, simulate audio data
             let mut counter = 0u32;
-            
+
             loop {
                 // Simulate audio data generation
                 let audio_data: Vec<f32> = (0..1024)
@@ -214,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn test_event_handler_tick() {
         let mut handler = EventHandler::new(100); // 100ms tick rate
-        
+
         let start = Instant::now();
         let event = handler.next().await;
         let elapsed = start.elapsed();
@@ -232,9 +233,9 @@ mod tests {
     async fn test_audio_event_handler() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut audio_handler = AudioEventHandler::new(tx);
-        
+
         audio_handler.start_audio_processing(None).await.unwrap();
-        
+
         // Wait for audio data
         let event = tokio::time::timeout(Duration::from_millis(100), rx.recv())
             .await

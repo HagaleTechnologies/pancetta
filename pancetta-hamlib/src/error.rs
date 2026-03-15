@@ -1,5 +1,5 @@
 //! Comprehensive error handling for hamlib operations
-//! 
+//!
 //! This module provides structured error types, error recovery mechanisms,
 //! and detailed error reporting for all hamlib operations.
 
@@ -211,7 +211,11 @@ impl HamlibError {
     }
 
     /// Create timeout error
-    pub fn timeout<S: Into<String>>(operation: S, timeout_ms: u32, retry_recommended: bool) -> Self {
+    pub fn timeout<S: Into<String>>(
+        operation: S,
+        timeout_ms: u32,
+        retry_recommended: bool,
+    ) -> Self {
         Self::Timeout {
             operation: operation.into(),
             timeout_ms,
@@ -298,7 +302,11 @@ impl HamlibError {
     }
 
     /// Create PTT error
-    pub fn ptt<S: Into<String>>(message: S, current_state: Option<String>, safe_state: bool) -> Self {
+    pub fn ptt<S: Into<String>>(
+        message: S,
+        current_state: Option<String>,
+        safe_state: bool,
+    ) -> Self {
         Self::Ptt {
             message: message.into(),
             current_state,
@@ -307,11 +315,7 @@ impl HamlibError {
     }
 
     /// Create scan error
-    pub fn scan<S: Into<String>>(
-        message: S,
-        operation: Option<String>,
-        resumable: bool,
-    ) -> Self {
+    pub fn scan<S: Into<String>>(message: S, operation: Option<String>, resumable: bool) -> Self {
         Self::Scan {
             message: message.into(),
             operation,
@@ -339,13 +343,18 @@ impl HamlibError {
             Self::Communication { .. } => true, // Usually recoverable with retry
             Self::InvalidParameter { .. } => false, // Need parameter fix
             Self::NotSupported { .. } => false, // Feature not available
-            Self::Timeout { retry_recommended, .. } => *retry_recommended,
-            Self::Hardware { intervention_required, .. } => !intervention_required,
+            Self::Timeout {
+                retry_recommended, ..
+            } => *retry_recommended,
+            Self::Hardware {
+                intervention_required,
+                ..
+            } => !intervention_required,
             Self::Configuration { .. } => false, // Need configuration fix
-            Self::Internal { .. } => false, // Internal errors usually not recoverable
-            Self::Frequency { .. } => false, // Need frequency adjustment
-            Self::Mode { .. } => false, // Need mode adjustment
-            Self::Memory { .. } => false, // Need channel adjustment
+            Self::Internal { .. } => false,      // Internal errors usually not recoverable
+            Self::Frequency { .. } => false,     // Need frequency adjustment
+            Self::Mode { .. } => false,          // Need mode adjustment
+            Self::Memory { .. } => false,        // Need channel adjustment
             Self::Ptt { safe_state, .. } => *safe_state,
             Self::Scan { resumable, .. } => *resumable,
             Self::Monitoring { recoverable, .. } => *recoverable,
@@ -356,14 +365,25 @@ impl HamlibError {
     pub fn severity(&self) -> ErrorSeverity {
         match self {
             Self::Connection { recoverable, .. } => {
-                if *recoverable { ErrorSeverity::Warning } else { ErrorSeverity::Error }
+                if *recoverable {
+                    ErrorSeverity::Warning
+                } else {
+                    ErrorSeverity::Error
+                }
             }
             Self::Communication { .. } => ErrorSeverity::Warning,
             Self::InvalidParameter { .. } => ErrorSeverity::Error,
             Self::NotSupported { .. } => ErrorSeverity::Info,
             Self::Timeout { .. } => ErrorSeverity::Warning,
-            Self::Hardware { intervention_required, .. } => {
-                if *intervention_required { ErrorSeverity::Critical } else { ErrorSeverity::Error }
+            Self::Hardware {
+                intervention_required,
+                ..
+            } => {
+                if *intervention_required {
+                    ErrorSeverity::Critical
+                } else {
+                    ErrorSeverity::Error
+                }
             }
             Self::Configuration { .. } => ErrorSeverity::Error,
             Self::Internal { .. } => ErrorSeverity::Critical,
@@ -371,7 +391,11 @@ impl HamlibError {
             Self::Mode { .. } => ErrorSeverity::Error,
             Self::Memory { .. } => ErrorSeverity::Error,
             Self::Ptt { safe_state, .. } => {
-                if *safe_state { ErrorSeverity::Warning } else { ErrorSeverity::Critical }
+                if *safe_state {
+                    ErrorSeverity::Warning
+                } else {
+                    ErrorSeverity::Critical
+                }
             }
             Self::Scan { .. } => ErrorSeverity::Warning,
             Self::Monitoring { .. } => ErrorSeverity::Warning,
@@ -381,41 +405,80 @@ impl HamlibError {
     /// Get user-friendly error message
     pub fn user_message(&self) -> String {
         match self {
-            Self::Connection { message, recoverable, .. } => {
+            Self::Connection {
+                message,
+                recoverable,
+                ..
+            } => {
                 if *recoverable {
                     format!("Connection issue: {}. Will retry automatically.", message)
                 } else {
-                    format!("Connection failed: {}. Please check cable and settings.", message)
+                    format!(
+                        "Connection failed: {}. Please check cable and settings.",
+                        message
+                    )
                 }
             }
-            Self::Communication { message, retries, .. } => {
-                format!("Communication problem: {}. Tried {} times.", message, retries + 1)
+            Self::Communication {
+                message, retries, ..
+            } => {
+                format!(
+                    "Communication problem: {}. Tried {} times.",
+                    message,
+                    retries + 1
+                )
             }
-            Self::InvalidParameter { parameter, suggestion, .. } => {
+            Self::InvalidParameter {
+                parameter,
+                suggestion,
+                ..
+            } => {
                 if let Some(suggestion) = suggestion {
                     format!("Invalid {}: {}. Try: {}", parameter, self, suggestion)
                 } else {
                     format!("Invalid {}: {}", parameter, self)
                 }
             }
-            Self::NotSupported { feature, alternative, .. } => {
+            Self::NotSupported {
+                feature,
+                alternative,
+                ..
+            } => {
                 if let Some(alt) = alternative {
                     format!("Feature '{}' not supported. Try: {}", feature, alt)
                 } else {
                     format!("Feature '{}' not supported by this rig.", feature)
                 }
             }
-            Self::Timeout { operation, timeout_ms, .. } => {
-                format!("Operation '{}' timed out after {}ms. Rig may be unresponsive.", operation, timeout_ms)
+            Self::Timeout {
+                operation,
+                timeout_ms,
+                ..
+            } => {
+                format!(
+                    "Operation '{}' timed out after {}ms. Rig may be unresponsive.",
+                    operation, timeout_ms
+                )
             }
-            Self::Hardware { message, intervention_required, .. } => {
+            Self::Hardware {
+                message,
+                intervention_required,
+                ..
+            } => {
                 if *intervention_required {
-                    format!("Hardware problem: {}. Please check rig and connections.", message)
+                    format!(
+                        "Hardware problem: {}. Please check rig and connections.",
+                        message
+                    )
                 } else {
                     format!("Hardware issue: {}. May resolve automatically.", message)
                 }
             }
-            Self::Frequency { requested, valid_range, .. } => {
+            Self::Frequency {
+                requested,
+                valid_range,
+                ..
+            } => {
                 if let (Some(req), Some((min, max))) = (requested, valid_range) {
                     format!(
                         "Frequency {:.3} MHz is outside valid range ({:.3}-{:.3} MHz)",
@@ -427,16 +490,31 @@ impl HamlibError {
                     format!("Invalid frequency: {}", self)
                 }
             }
-            Self::Mode { requested, supported, .. } => {
+            Self::Mode {
+                requested,
+                supported,
+                ..
+            } => {
                 if let (Some(req), Some(sup)) = (requested, supported) {
-                    format!("Mode '{}' not supported. Available: {}", req, sup.join(", "))
+                    format!(
+                        "Mode '{}' not supported. Available: {}",
+                        req,
+                        sup.join(", ")
+                    )
                 } else {
                     format!("Invalid mode: {}", self)
                 }
             }
-            Self::Memory { channel, valid_range, .. } => {
+            Self::Memory {
+                channel,
+                valid_range,
+                ..
+            } => {
                 if let (Some(ch), Some((min, max))) = (channel, valid_range) {
-                    format!("Memory channel {} is outside valid range ({}-{})", ch, min, max)
+                    format!(
+                        "Memory channel {} is outside valid range ({}-{})",
+                        ch, min, max
+                    )
                 } else {
                     format!("Memory channel error: {}", self)
                 }
@@ -448,66 +526,50 @@ impl HamlibError {
     /// Convert from hamlib error code
     pub fn from_hamlib_code(code: i32, operation: &str) -> Self {
         let message = bindings::hamlib_error_message(code);
-        
+
         match code {
             bindings::RIG_EINVAL => Self::invalid_parameter(
                 "parameter",
                 &message,
                 Some("Check parameter values and ranges".to_string()),
             ),
-            bindings::RIG_ECONF => Self::configuration(
-                message,
-                None,
-                Some("Check rig configuration".to_string()),
-            ),
+            bindings::RIG_ECONF => {
+                Self::configuration(message, None, Some("Check rig configuration".to_string()))
+            }
             bindings::RIG_ENOMEM => Self::internal(
                 "Out of memory",
                 None,
                 Some(format!("Operation: {}", operation)),
             ),
-            bindings::RIG_ENIMPL => Self::not_supported(
-                operation,
-                None,
-                Some("Check rig capabilities".to_string()),
-            ),
+            bindings::RIG_ENIMPL => {
+                Self::not_supported(operation, None, Some("Check rig capabilities".to_string()))
+            }
             bindings::RIG_ETIMEOUT => Self::timeout(operation, 0, true),
             bindings::RIG_EIO => Self::communication(message, Some(code), 0),
-            bindings::RIG_EINTERNAL => Self::internal(message, None, Some(format!("Code: {}", code))),
-            bindings::RIG_EPROTO => Self::communication(
-                format!("Protocol error: {}", message),
-                Some(code),
-                0,
-            ),
-            bindings::RIG_ERJCTED => Self::hardware(
-                format!("Command rejected: {}", message),
-                None,
-                false,
-            ),
-            bindings::RIG_ETRUNC => Self::communication(
-                format!("Response truncated: {}", message),
-                Some(code),
-                0,
-            ),
-            bindings::RIG_ENAVAIL => Self::not_supported(
-                operation,
-                None,
-                None,
-            ),
-            bindings::RIG_ENTARGET => Self::connection(
-                format!("No target: {}", message),
-                Some(code),
-                true,
-            ),
+            bindings::RIG_EINTERNAL => {
+                Self::internal(message, None, Some(format!("Code: {}", code)))
+            }
+            bindings::RIG_EPROTO => {
+                Self::communication(format!("Protocol error: {}", message), Some(code), 0)
+            }
+            bindings::RIG_ERJCTED => {
+                Self::hardware(format!("Command rejected: {}", message), None, false)
+            }
+            bindings::RIG_ETRUNC => {
+                Self::communication(format!("Response truncated: {}", message), Some(code), 0)
+            }
+            bindings::RIG_ENAVAIL => Self::not_supported(operation, None, None),
+            bindings::RIG_ENTARGET => {
+                Self::connection(format!("No target: {}", message), Some(code), true)
+            }
             bindings::RIG_BUSERROR => Self::hardware(
                 format!("Bus error: {}", message),
                 Some("Communication bus".to_string()),
                 true,
             ),
-            bindings::RIG_BUSBUSY => Self::communication(
-                format!("Bus busy: {}", message),
-                Some(code),
-                0,
-            ),
+            bindings::RIG_BUSBUSY => {
+                Self::communication(format!("Bus busy: {}", message), Some(code), 0)
+            }
             bindings::RIG_EARG => Self::invalid_parameter(
                 "argument",
                 &message,
@@ -557,7 +619,10 @@ impl HamlibError {
                 suggestions.push("Check rig responsiveness".to_string());
                 suggestions.push("Reduce operation frequency".to_string());
             }
-            Self::Hardware { intervention_required, .. } => {
+            Self::Hardware {
+                intervention_required,
+                ..
+            } => {
                 if *intervention_required {
                     suggestions.push("Check rig power and connections".to_string());
                     suggestions.push("Verify antenna connections".to_string());
@@ -702,30 +767,40 @@ impl ContextualError {
     /// Get formatted error report
     pub fn report(&self) -> String {
         let mut report = String::new();
-        
-        report.push_str(&format!("[{}] {}\n", self.error.severity(), self.error.user_message()));
+
+        report.push_str(&format!(
+            "[{}] {}\n",
+            self.error.severity(),
+            self.error.user_message()
+        ));
         report.push_str(&format!("Operation: {}\n", self.context.operation));
-        report.push_str(&format!("Time: {}\n", self.context.timestamp.format("%Y-%m-%d %H:%M:%S UTC")));
-        
+        report.push_str(&format!(
+            "Time: {}\n",
+            self.context.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+        ));
+
         if let Some(model) = &self.context.rig_model {
             report.push_str(&format!("Rig: {}\n", model));
         }
-        
+
         if let Some(freq) = self.context.frequency {
-            report.push_str(&format!("Frequency: {:.3} MHz\n", freq as f64 / 1_000_000.0));
+            report.push_str(&format!(
+                "Frequency: {:.3} MHz\n",
+                freq as f64 / 1_000_000.0
+            ));
         }
-        
+
         if let Some(vfo) = &self.context.vfo {
             report.push_str(&format!("VFO: {}\n", vfo));
         }
-        
+
         if !self.context.context.is_empty() {
             report.push_str("Additional Context:\n");
             for (key, value) in &self.context.context {
                 report.push_str(&format!("  {}: {}\n", key, value));
             }
         }
-        
+
         let suggestions = self.error.recovery_suggestions();
         if !suggestions.is_empty() {
             report.push_str("Recovery Suggestions:\n");
@@ -733,7 +808,7 @@ impl ContextualError {
                 report.push_str(&format!("  • {}\n", suggestion));
             }
         }
-        
+
         report
     }
 }
@@ -771,10 +846,10 @@ mod tests {
             Some(100_000_000),
             Some((1_800_000, 30_000_000)),
         );
-        
+
         assert!(!err.is_recoverable());
         assert_eq!(err.severity(), ErrorSeverity::Error);
-        
+
         let message = err.user_message();
         assert!(message.contains("100.000 MHz"));
         assert!(message.contains("1.800-30.000 MHz"));
@@ -787,7 +862,7 @@ mod tests {
             .with_frequency(14_200_000)
             .with_vfo("A")
             .with_context("retry_count", "3");
-        
+
         assert_eq!(context.operation, "set_frequency");
         assert_eq!(context.rig_model, Some("IC-7300".to_string()));
         assert_eq!(context.frequency, Some(14_200_000));
@@ -798,12 +873,11 @@ mod tests {
     #[test]
     fn test_contextual_error() {
         let error = HamlibError::timeout("get_frequency", 2000, true);
-        let context = ErrorContext::new("get_frequency")
-            .with_rig_model("FT-991A");
-        
+        let context = ErrorContext::new("get_frequency").with_rig_model("FT-991A");
+
         let contextual_error = ContextualError::new(error, context);
         let report = contextual_error.report();
-        
+
         assert!(report.contains("WARN"));
         assert!(report.contains("get_frequency"));
         assert!(report.contains("FT-991A"));
@@ -814,7 +888,7 @@ mod tests {
     fn test_recovery_suggestions() {
         let error = HamlibError::communication("Port error", None, 2);
         let suggestions = error.recovery_suggestions();
-        
+
         assert!(!suggestions.is_empty());
         assert!(suggestions.iter().any(|s| s.contains("cable")));
         assert!(suggestions.iter().any(|s| s.contains("baud rate")));
@@ -823,7 +897,7 @@ mod tests {
     #[test]
     fn test_hamlib_error_conversion() {
         let error = HamlibError::from_hamlib_code(bindings::RIG_EINVAL, "set_frequency");
-        
+
         match error {
             HamlibError::InvalidParameter { parameter, .. } => {
                 assert_eq!(parameter, "parameter");
@@ -839,7 +913,7 @@ mod tests {
             Some("INVALID".to_string()),
             Some(vec!["USB".to_string(), "LSB".to_string(), "CW".to_string()]),
         );
-        
+
         let message = error.user_message();
         assert!(message.contains("INVALID"));
         assert!(message.contains("USB, LSB, CW"));

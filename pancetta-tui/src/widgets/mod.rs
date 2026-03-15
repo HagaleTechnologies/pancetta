@@ -40,7 +40,7 @@ impl<'a> Waterfall<'a> {
 
     fn get_color_for_intensity(&self, intensity: f32) -> Color {
         let clamped = intensity.clamp(0.0, 1.0);
-        
+
         match self.color_scheme {
             WaterfallColorScheme::Classic => {
                 if clamped < 0.2 {
@@ -96,24 +96,26 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
             (waterfall_area.width as usize) / self.data[0].len().max(1)
         };
 
-        for (row_idx, row_data) in self.data
+        for (row_idx, row_data) in self
+            .data
             .iter()
             .rev() // Newest at top
             .take(rows_to_show)
             .enumerate()
         {
             let y = waterfall_area.y + row_idx as u16;
-            
+
             for (bin_idx, &intensity) in row_data.iter().enumerate() {
                 let x_start = waterfall_area.x + (bin_idx * cols_per_bin.max(1)) as u16;
-                let x_end = (x_start + cols_per_bin as u16).min(waterfall_area.x + waterfall_area.width);
-                
+                let x_end =
+                    (x_start + cols_per_bin as u16).min(waterfall_area.x + waterfall_area.width);
+
                 if x_start >= waterfall_area.x + waterfall_area.width {
                     break;
                 }
 
                 let color = self.get_color_for_intensity(intensity);
-                
+
                 for x in x_start..x_end {
                     if x < waterfall_area.x + waterfall_area.width {
                         buf[(x, y)].set_char('█').set_fg(color);
@@ -205,7 +207,7 @@ impl<'a> ratatui::widgets::Widget for SignalMeter<'a> {
                 } else {
                     '░'
                 };
-                
+
                 let fg_color = if x < meter_area.x + filled_width {
                     color
                 } else {
@@ -220,7 +222,7 @@ impl<'a> ratatui::widgets::Widget for SignalMeter<'a> {
         if let Some(label) = self.label {
             let label_x = meter_area.x + (meter_area.width.saturating_sub(label.len() as u16)) / 2;
             let label_y = meter_area.y + meter_area.height / 2;
-            
+
             if label_y < meter_area.y + meter_area.height {
                 for (i, ch) in label.chars().enumerate() {
                     let x = label_x + i as u16;
@@ -282,7 +284,7 @@ impl<'a> ratatui::widgets::Widget for Modal<'a> {
         // Calculate modal size (centered, with padding)
         let modal_width = (area.width * 2 / 3).min(60);
         let modal_height = (self.content.len() + 5) as u16; // Content + title + buttons + padding
-        
+
         let modal_area = Rect {
             x: (area.width.saturating_sub(modal_width)) / 2,
             y: (area.height.saturating_sub(modal_height)) / 2,
@@ -306,7 +308,7 @@ impl<'a> ratatui::widgets::Widget for Modal<'a> {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Min(1), // Content
+                Constraint::Min(1),    // Content
                 Constraint::Length(1), // Spacing
                 Constraint::Length(1), // Buttons
             ])
@@ -320,7 +322,8 @@ impl<'a> ratatui::widgets::Widget for Modal<'a> {
 
         // Render buttons
         if !self.buttons.is_empty() {
-            let button_text: Vec<Span> = self.buttons
+            let button_text: Vec<Span> = self
+                .buttons
                 .iter()
                 .enumerate()
                 .flat_map(|(i, &button)| {
@@ -329,7 +332,7 @@ impl<'a> ratatui::widgets::Widget for Modal<'a> {
                     } else {
                         Style::default()
                     };
-                    
+
                     let mut spans = vec![Span::styled(format!(" {} ", button), style)];
                     if i < self.buttons.len() - 1 {
                         spans.push(Span::raw("  "));
@@ -407,7 +410,7 @@ impl<'a> ratatui::widgets::Widget for SpectrumDisplay<'a> {
 
         // Draw spectrum
         let bins_per_pixel = self.data.len() as f32 / spectrum_area.width as f32;
-        
+
         for x in 0..spectrum_area.width {
             let bin_index = (x as f32 * bins_per_pixel) as usize;
             if bin_index >= self.data.len() {
@@ -420,7 +423,7 @@ impl<'a> ratatui::widgets::Widget for SpectrumDisplay<'a> {
             for y in 0..bar_height.min(spectrum_area.height) {
                 let actual_y = spectrum_area.y + spectrum_area.height - 1 - y;
                 let actual_x = spectrum_area.x + x;
-                
+
                 // Color based on intensity
                 let color = if normalized > 0.8 {
                     Color::Red
@@ -456,7 +459,7 @@ mod tests {
     #[test]
     fn test_waterfall_color_intensity() {
         let waterfall = Waterfall::new(&[]).color_scheme(WaterfallColorScheme::Classic);
-        
+
         assert_eq!(waterfall.get_color_for_intensity(0.1), Color::Blue);
         assert_eq!(waterfall.get_color_for_intensity(0.5), Color::Green);
         assert_eq!(waterfall.get_color_for_intensity(0.9), Color::Red);
@@ -466,10 +469,10 @@ mod tests {
     fn test_signal_meter_color_thresholds() {
         let meter = SignalMeter::new(0.5).thresholds(0.3, 0.8);
         assert_eq!(meter.get_meter_color(), Color::Yellow);
-        
+
         let meter_low = SignalMeter::new(0.1).thresholds(0.3, 0.8);
         assert_eq!(meter_low.get_meter_color(), Color::Red);
-        
+
         let meter_high = SignalMeter::new(0.9).thresholds(0.3, 0.8);
         assert_eq!(meter_high.get_meter_color(), Color::Green);
     }

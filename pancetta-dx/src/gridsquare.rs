@@ -33,7 +33,7 @@ impl GridPrecision {
             GridPrecision::SubExtendedSquare,
         ]
     }
-    
+
     /// Get approximate resolution in degrees
     pub fn resolution_degrees(&self) -> (f64, f64) {
         match self {
@@ -44,7 +44,7 @@ impl GridPrecision {
             GridPrecision::SubExtendedSquare => (0.125 / 60.0, 0.0625 / 60.0),
         }
     }
-    
+
     /// Get approximate resolution in kilometers at equator
     pub fn resolution_km(&self) -> (f64, f64) {
         let (lon_deg, lat_deg) = self.resolution_degrees();
@@ -71,111 +71,120 @@ impl GridSquare {
             6 => GridPrecision::Subsquare,
             8 => GridPrecision::ExtendedSquare,
             10 => GridPrecision::SubExtendedSquare,
-            _ => return Err(DxError::InvalidGridSquare(format!("Invalid grid square length: {}", grid.len()))),
+            _ => {
+                return Err(DxError::InvalidGridSquare(format!(
+                    "Invalid grid square length: {}",
+                    grid.len()
+                )))
+            }
         };
-        
+
         let grid_square = Self { grid, precision };
         grid_square.validate()?;
-        
+
         Ok(grid_square)
     }
-    
+
     /// Create grid square from coordinates
-    pub fn from_coordinates(latitude: f64, longitude: f64, precision: GridPrecision) -> Result<Self> {
+    pub fn from_coordinates(
+        latitude: f64,
+        longitude: f64,
+        precision: GridPrecision,
+    ) -> Result<Self> {
         let grid = coordinates_to_grid(latitude, longitude, precision)?;
         Ok(Self { grid, precision })
     }
-    
+
     /// Get grid square string
     pub fn grid(&self) -> &str {
         &self.grid
     }
-    
+
     /// Get precision level
     pub fn precision(&self) -> GridPrecision {
         self.precision
     }
-    
+
     /// Convert to coordinates (center of grid square)
     pub fn to_coordinates(&self) -> Result<(f64, f64)> {
         grid_to_coordinates(&self.grid)
     }
-    
+
     /// Get grid square bounds (southwest and northeast corners)
     pub fn bounds(&self) -> Result<((f64, f64), (f64, f64))> {
         let (center_lat, center_lon) = self.to_coordinates()?;
         let (lon_res, lat_res) = self.precision.resolution_degrees();
-        
+
         let sw_lat = center_lat - lat_res / 2.0;
         let sw_lon = center_lon - lon_res / 2.0;
         let ne_lat = center_lat + lat_res / 2.0;
         let ne_lon = center_lon + lon_res / 2.0;
-        
+
         Ok(((sw_lat, sw_lon), (ne_lat, ne_lon)))
     }
-    
+
     /// Calculate distance to another grid square
     pub fn distance_to(&self, other: &GridSquare) -> Result<f64> {
         let (lat1, lon1) = self.to_coordinates()?;
         let (lat2, lon2) = other.to_coordinates()?;
-        
+
         Ok(calculate_distance(lat1, lon1, lat2, lon2))
     }
-    
+
     /// Calculate bearing to another grid square
     pub fn bearing_to(&self, other: &GridSquare) -> Result<f64> {
         let (lat1, lon1) = self.to_coordinates()?;
         let (lat2, lon2) = other.to_coordinates()?;
-        
+
         Ok(calculate_bearing(lat1, lon1, lat2, lon2))
     }
-    
+
     /// Extend precision of grid square
     pub fn extend_precision(&self, new_precision: GridPrecision) -> Result<Self> {
         if (new_precision as usize) <= (self.precision as usize) {
             return Err(DxError::InvalidGridSquare(
-                "Cannot extend to lower precision".to_string()
+                "Cannot extend to lower precision".to_string(),
             ));
         }
-        
+
         let (lat, lon) = self.to_coordinates()?;
         Self::from_coordinates(lat, lon, new_precision)
     }
-    
+
     /// Reduce precision of grid square
     pub fn reduce_precision(&self, new_precision: GridPrecision) -> Result<Self> {
         if (new_precision as usize) >= (self.precision as usize) {
             return Err(DxError::InvalidGridSquare(
-                "Cannot reduce to higher precision".to_string()
+                "Cannot reduce to higher precision".to_string(),
             ));
         }
-        
+
         let new_len = new_precision as usize;
         let truncated_grid = &self.grid[..new_len];
-        
+
         Ok(Self {
             grid: truncated_grid.to_string(),
             precision: new_precision,
         })
     }
-    
+
     /// Get adjacent grid squares
     pub fn adjacent_squares(&self) -> Result<Vec<GridSquare>> {
         let (center_lat, center_lon) = self.to_coordinates()?;
         let (lon_res, lat_res) = self.precision.resolution_degrees();
-        
+
         let mut adjacent = Vec::new();
-        
+
         // 8 surrounding squares
         for lat_offset in [-1, 0, 1] {
             for lon_offset in [-1, 0, 1] {
                 if lat_offset == 0 && lon_offset == 0 {
                     continue; // Skip center square
                 }
-                
+
                 let adj_lat = center_lat + lat_offset as f64 * lat_res;
                 let adj_lon = center_lon + lon_offset as f64 * lon_res;
-                
+
                 // Wrap longitude
                 let adj_lon = if adj_lon > 180.0 {
                     adj_lon - 360.0
@@ -184,96 +193,107 @@ impl GridSquare {
                 } else {
                     adj_lon
                 };
-                
+
                 // Skip if latitude is out of bounds
                 if adj_lat < -90.0 || adj_lat > 90.0 {
                     continue;
                 }
-                
+
                 if let Ok(grid) = Self::from_coordinates(adj_lat, adj_lon, self.precision) {
                     adjacent.push(grid);
                 }
             }
         }
-        
+
         Ok(adjacent)
     }
-    
+
     /// Check if this grid square contains given coordinates
     pub fn contains(&self, latitude: f64, longitude: f64) -> Result<bool> {
         let ((sw_lat, sw_lon), (ne_lat, ne_lon)) = self.bounds()?;
-        
-        Ok(latitude >= sw_lat && latitude < ne_lat && 
-           longitude >= sw_lon && longitude < ne_lon)
+
+        Ok(latitude >= sw_lat && latitude < ne_lat && longitude >= sw_lon && longitude < ne_lon)
     }
-    
+
     /// Validate grid square format
     fn validate(&self) -> Result<()> {
         let chars: Vec<char> = self.grid.chars().collect();
-        
+
         if chars.is_empty() || chars.len() > 10 || chars.len() % 2 != 0 {
             return Err(DxError::InvalidGridSquare(
-                "Grid square must have 2, 4, 6, 8, or 10 characters".to_string()
+                "Grid square must have 2, 4, 6, 8, or 10 characters".to_string(),
             ));
         }
-        
+
         // Validate each pair of characters
         for (i, chunk) in chars.chunks(2).enumerate() {
             match i {
                 0 => {
                     // First pair: letters A-R
-                    if !chunk[0].is_ascii_alphabetic() || !chunk[1].is_ascii_alphabetic() ||
-                       chunk[0] < 'A' || chunk[0] > 'R' ||
-                       chunk[1] < 'A' || chunk[1] > 'R' {
+                    if !chunk[0].is_ascii_alphabetic()
+                        || !chunk[1].is_ascii_alphabetic()
+                        || chunk[0] < 'A'
+                        || chunk[0] > 'R'
+                        || chunk[1] < 'A'
+                        || chunk[1] > 'R'
+                    {
                         return Err(DxError::InvalidGridSquare(
-                            "First pair must be letters A-R".to_string()
+                            "First pair must be letters A-R".to_string(),
                         ));
                     }
-                },
+                }
                 1 => {
                     // Second pair: digits 0-9
                     if !chunk[0].is_ascii_digit() || !chunk[1].is_ascii_digit() {
                         return Err(DxError::InvalidGridSquare(
-                            "Second pair must be digits 0-9".to_string()
+                            "Second pair must be digits 0-9".to_string(),
                         ));
                     }
-                },
+                }
                 2 => {
                     // Third pair: letters A-X
-                    if !chunk[0].is_ascii_alphabetic() || !chunk[1].is_ascii_alphabetic() ||
-                       chunk[0] < 'A' || chunk[0] > 'X' ||
-                       chunk[1] < 'A' || chunk[1] > 'X' {
+                    if !chunk[0].is_ascii_alphabetic()
+                        || !chunk[1].is_ascii_alphabetic()
+                        || chunk[0] < 'A'
+                        || chunk[0] > 'X'
+                        || chunk[1] < 'A'
+                        || chunk[1] > 'X'
+                    {
                         return Err(DxError::InvalidGridSquare(
-                            "Third pair must be letters A-X".to_string()
+                            "Third pair must be letters A-X".to_string(),
                         ));
                     }
-                },
+                }
                 3 => {
                     // Fourth pair: digits 0-9
                     if !chunk[0].is_ascii_digit() || !chunk[1].is_ascii_digit() {
                         return Err(DxError::InvalidGridSquare(
-                            "Fourth pair must be digits 0-9".to_string()
+                            "Fourth pair must be digits 0-9".to_string(),
                         ));
                     }
-                },
+                }
                 4 => {
                     // Fifth pair: letters A-X
-                    if !chunk[0].is_ascii_alphabetic() || !chunk[1].is_ascii_alphabetic() ||
-                       chunk[0] < 'A' || chunk[0] > 'X' ||
-                       chunk[1] < 'A' || chunk[1] > 'X' {
+                    if !chunk[0].is_ascii_alphabetic()
+                        || !chunk[1].is_ascii_alphabetic()
+                        || chunk[0] < 'A'
+                        || chunk[0] > 'X'
+                        || chunk[1] < 'A'
+                        || chunk[1] > 'X'
+                    {
                         return Err(DxError::InvalidGridSquare(
-                            "Fifth pair must be letters A-X".to_string()
+                            "Fifth pair must be letters A-X".to_string(),
                         ));
                     }
-                },
+                }
                 _ => {
                     return Err(DxError::InvalidGridSquare(
-                        "Too many character pairs".to_string()
+                        "Too many character pairs".to_string(),
                     ));
                 }
             }
         }
-        
+
         Ok(())
     }
 }
@@ -286,84 +306,94 @@ impl fmt::Display for GridSquare {
 
 impl std::str::FromStr for GridSquare {
     type Err = DxError;
-    
+
     fn from_str(s: &str) -> Result<Self> {
         Self::new(s)
     }
 }
 
 /// Convert coordinates to Maidenhead grid square
-pub fn coordinates_to_grid(latitude: f64, longitude: f64, precision: GridPrecision) -> Result<String> {
+pub fn coordinates_to_grid(
+    latitude: f64,
+    longitude: f64,
+    precision: GridPrecision,
+) -> Result<String> {
     if latitude < -90.0 || latitude > 90.0 {
-        return Err(DxError::InvalidGridSquare(format!("Invalid latitude: {}", latitude)));
+        return Err(DxError::InvalidGridSquare(format!(
+            "Invalid latitude: {}",
+            latitude
+        )));
     }
     if longitude < -180.0 || longitude > 180.0 {
-        return Err(DxError::InvalidGridSquare(format!("Invalid longitude: {}", longitude)));
+        return Err(DxError::InvalidGridSquare(format!(
+            "Invalid longitude: {}",
+            longitude
+        )));
     }
-    
+
     let mut grid = String::new();
-    
+
     // Normalize coordinates
     let mut lon = longitude + 180.0; // 0-360
-    let mut lat = latitude + 90.0;   // 0-180
-    
+    let mut lat = latitude + 90.0; // 0-180
+
     // Field (first pair - letters A-R)
     if precision as usize >= 2 {
         let lon_field = (lon / 20.0) as usize;
         let lat_field = (lat / 10.0) as usize;
-        
+
         grid.push(char::from(b'A' + lon_field as u8));
         grid.push(char::from(b'A' + lat_field as u8));
-        
+
         lon %= 20.0;
         lat %= 10.0;
     }
-    
+
     // Square (second pair - digits 0-9)
     if precision as usize >= 4 {
         let lon_square = (lon / 2.0) as usize;
         let lat_square = (lat / 1.0) as usize;
-        
+
         grid.push(char::from(b'0' + lon_square as u8));
         grid.push(char::from(b'0' + lat_square as u8));
-        
+
         lon %= 2.0;
         lat %= 1.0;
     }
-    
+
     // Subsquare (third pair - letters a-x, converted to A-X)
     if precision as usize >= 6 {
         let lon_subsquare = (lon / (2.0 / 24.0)) as usize;
         let lat_subsquare = (lat / (1.0 / 24.0)) as usize;
-        
+
         grid.push(char::from(b'A' + lon_subsquare as u8));
         grid.push(char::from(b'A' + lat_subsquare as u8));
-        
+
         lon %= 2.0 / 24.0;
         lat %= 1.0 / 24.0;
     }
-    
+
     // Extended square (fourth pair - digits 0-9)
     if precision as usize >= 8 {
         let lon_ext = (lon / (2.0 / 240.0)) as usize;
         let lat_ext = (lat / (1.0 / 240.0)) as usize;
-        
+
         grid.push(char::from(b'0' + lon_ext as u8));
         grid.push(char::from(b'0' + lat_ext as u8));
-        
+
         lon %= 2.0 / 240.0;
         lat %= 1.0 / 240.0;
     }
-    
+
     // Sub-extended square (fifth pair - letters A-X)
     if precision as usize >= 10 {
         let lon_subext = (lon / (2.0 / 5760.0)) as usize;
         let lat_subext = (lat / (1.0 / 5760.0)) as usize;
-        
+
         grid.push(char::from(b'A' + lon_subext as u8));
         grid.push(char::from(b'A' + lat_subext as u8));
     }
-    
+
     Ok(grid)
 }
 
@@ -371,16 +401,16 @@ pub fn coordinates_to_grid(latitude: f64, longitude: f64, precision: GridPrecisi
 pub fn grid_to_coordinates(grid: &str) -> Result<(f64, f64)> {
     let grid = grid.to_uppercase();
     let chars: Vec<char> = grid.chars().collect();
-    
+
     if chars.is_empty() || chars.len() > 10 || chars.len() % 2 != 0 {
         return Err(DxError::InvalidGridSquare(
-            "Invalid grid square length".to_string()
+            "Invalid grid square length".to_string(),
         ));
     }
-    
+
     let mut longitude = 0.0;
     let mut latitude = 0.0;
-    
+
     // Process each pair
     for (i, chunk) in chars.chunks(2).enumerate() {
         match i {
@@ -390,39 +420,39 @@ pub fn grid_to_coordinates(grid: &str) -> Result<(f64, f64)> {
                 let lat_field = (chunk[1] as u8 - b'A') as f64;
                 longitude += lon_field * 20.0;
                 latitude += lat_field * 10.0;
-            },
+            }
             1 => {
                 // Square (0-9)
                 let lon_square = (chunk[0] as u8 - b'0') as f64;
                 let lat_square = (chunk[1] as u8 - b'0') as f64;
                 longitude += lon_square * 2.0;
                 latitude += lat_square * 1.0;
-            },
+            }
             2 => {
                 // Subsquare (A-X)
                 let lon_subsquare = (chunk[0] as u8 - b'A') as f64;
                 let lat_subsquare = (chunk[1] as u8 - b'A') as f64;
                 longitude += lon_subsquare * (2.0 / 24.0);
                 latitude += lat_subsquare * (1.0 / 24.0);
-            },
+            }
             3 => {
                 // Extended square (0-9)
                 let lon_ext = (chunk[0] as u8 - b'0') as f64;
                 let lat_ext = (chunk[1] as u8 - b'0') as f64;
                 longitude += lon_ext * (2.0 / 240.0);
                 latitude += lat_ext * (1.0 / 240.0);
-            },
+            }
             4 => {
                 // Sub-extended square (A-X)
                 let lon_subext = (chunk[0] as u8 - b'A') as f64;
                 let lat_subext = (chunk[1] as u8 - b'A') as f64;
                 longitude += lon_subext * (2.0 / 5760.0);
                 latitude += lat_subext * (1.0 / 5760.0);
-            },
+            }
             _ => {}
         }
     }
-    
+
     // Add half of the resolution to get center coordinates
     let precision = match chars.len() {
         2 => GridPrecision::Field,
@@ -432,15 +462,15 @@ pub fn grid_to_coordinates(grid: &str) -> Result<(f64, f64)> {
         10 => GridPrecision::SubExtendedSquare,
         _ => return Err(DxError::InvalidGridSquare("Invalid length".to_string())),
     };
-    
+
     let (lon_res, lat_res) = precision.resolution_degrees();
     longitude += lon_res / 2.0;
     latitude += lat_res / 2.0;
-    
+
     // Convert back to standard coordinates
     longitude -= 180.0;
     latitude -= 90.0;
-    
+
     Ok((latitude, longitude))
 }
 
@@ -448,7 +478,7 @@ pub fn grid_to_coordinates(grid: &str) -> Result<(f64, f64)> {
 pub fn grid_distance(grid1: &str, grid2: &str) -> Result<f64> {
     let (lat1, lon1) = grid_to_coordinates(grid1)?;
     let (lat2, lon2) = grid_to_coordinates(grid2)?;
-    
+
     Ok(calculate_distance(lat1, lon1, lat2, lon2))
 }
 
@@ -456,23 +486,23 @@ pub fn grid_distance(grid1: &str, grid2: &str) -> Result<f64> {
 pub fn grid_bearing(grid1: &str, grid2: &str) -> Result<f64> {
     let (lat1, lon1) = grid_to_coordinates(grid1)?;
     let (lat2, lon2) = grid_to_coordinates(grid2)?;
-    
+
     Ok(calculate_bearing(lat1, lon1, lat2, lon2))
 }
 
 /// Calculate great circle distance between coordinates (km)
 fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let earth_radius_km = 6371.0;
-    
+
     let lat1_rad = lat1.to_radians();
     let lat2_rad = lat2.to_radians();
     let delta_lat = (lat2 - lat1).to_radians();
     let delta_lon = (lon2 - lon1).to_radians();
-    
-    let a = (delta_lat / 2.0).sin().powi(2) + 
-            lat1_rad.cos() * lat2_rad.cos() * (delta_lon / 2.0).sin().powi(2);
+
+    let a = (delta_lat / 2.0).sin().powi(2)
+        + lat1_rad.cos() * lat2_rad.cos() * (delta_lon / 2.0).sin().powi(2);
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-    
+
     earth_radius_km * c
 }
 
@@ -481,11 +511,10 @@ fn calculate_bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let lat1_rad = lat1.to_radians();
     let lat2_rad = lat2.to_radians();
     let delta_lon = (lon2 - lon1).to_radians();
-    
+
     let y = delta_lon.sin() * lat2_rad.cos();
-    let x = lat1_rad.cos() * lat2_rad.sin() - 
-            lat1_rad.sin() * lat2_rad.cos() * delta_lon.cos();
-    
+    let x = lat1_rad.cos() * lat2_rad.sin() - lat1_rad.sin() * lat2_rad.cos() * delta_lon.cos();
+
     let bearing_rad = y.atan2(x);
     (bearing_rad.to_degrees() + 360.0) % 360.0
 }
@@ -493,20 +522,20 @@ fn calculate_bearing(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 /// Parse multiple grid squares from text
 pub fn parse_grids_from_text(text: &str) -> Vec<GridSquare> {
     let mut grids = Vec::new();
-    
+
     // Look for potential grid square patterns
     let words: Vec<&str> = text.split_whitespace().collect();
-    
+
     for word in words {
         // Remove common punctuation
         let clean_word = word.trim_matches(|c: char| !c.is_alphanumeric());
-        
+
         // Try to parse as grid square
         if let Ok(grid) = GridSquare::new(clean_word) {
             grids.push(grid);
         }
     }
-    
+
     grids
 }
 
@@ -520,85 +549,85 @@ pub fn validate_grid(grid: &str) -> Result<()> {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
-    
+
     #[test]
     fn test_grid_creation() {
         let grid = GridSquare::new("FN31pr").unwrap();
         assert_eq!(grid.grid(), "FN31PR");
         assert_eq!(grid.precision(), GridPrecision::Subsquare);
     }
-    
+
     #[test]
     fn test_invalid_grids() {
         assert!(GridSquare::new("ZZ99zz").is_err()); // Invalid field
-        assert!(GridSquare::new("AA").is_ok());      // Valid field
-        assert!(GridSquare::new("AAAA").is_err());   // Invalid digits
-        assert!(GridSquare::new("AA00").is_ok());    // Valid square
+        assert!(GridSquare::new("AA").is_ok()); // Valid field
+        assert!(GridSquare::new("AAAA").is_err()); // Invalid digits
+        assert!(GridSquare::new("AA00").is_ok()); // Valid square
     }
-    
+
     #[test]
     fn test_coordinates_conversion() {
         let (lat, lon) = grid_to_coordinates("FN31pr").unwrap();
         assert_relative_eq!(lat, 41.729167, epsilon = 0.1);
         assert_relative_eq!(lon, -72.708333, epsilon = 0.1);
-        
+
         let grid = coordinates_to_grid(lat, lon, GridPrecision::Subsquare).unwrap();
         assert_eq!(grid, "FN31PR");
     }
-    
+
     #[test]
     fn test_distance_calculation() {
         let distance = grid_distance("FN31pr", "EN90cv").unwrap();
         assert!(distance > 700.0 && distance < 850.0); // ~764 km
-        
+
         let grid1 = GridSquare::new("FN31pr").unwrap();
         let grid2 = GridSquare::new("EN90cv").unwrap();
         let distance2 = grid1.distance_to(&grid2).unwrap();
-        
+
         assert_relative_eq!(distance, distance2, epsilon = 0.1);
     }
-    
+
     #[test]
     fn test_bearing_calculation() {
         let bearing = grid_bearing("FN31pr", "EN90cv").unwrap();
         assert!(bearing >= 0.0 && bearing < 360.0);
-        
+
         let grid1 = GridSquare::new("FN31pr").unwrap();
         let grid2 = GridSquare::new("EN90cv").unwrap();
         let bearing2 = grid1.bearing_to(&grid2).unwrap();
-        
+
         assert_relative_eq!(bearing, bearing2, epsilon = 0.1);
     }
-    
+
     #[test]
     fn test_grid_bounds() {
         let grid = GridSquare::new("FN31").unwrap();
         let ((sw_lat, sw_lon), (ne_lat, ne_lon)) = grid.bounds().unwrap();
-        
+
         assert!(sw_lat < ne_lat);
         assert!(sw_lon < ne_lon);
         assert_relative_eq!(ne_lat - sw_lat, 1.0, epsilon = 0.01); // 1 degree latitude
         assert_relative_eq!(ne_lon - sw_lon, 2.0, epsilon = 0.01); // 2 degrees longitude
     }
-    
+
     #[test]
     fn test_contains() {
         let grid = GridSquare::new("FN31").unwrap();
         let (center_lat, center_lon) = grid.to_coordinates().unwrap();
-        
+
         assert!(grid.contains(center_lat, center_lon).unwrap());
-        
+
         // Test point outside
         assert!(!grid.contains(center_lat + 2.0, center_lon).unwrap());
     }
-    
+
     #[test]
     fn test_adjacent_squares() {
         let grid = GridSquare::new("FN31").unwrap();
         let adjacent = grid.adjacent_squares().unwrap();
-        
+
         assert_eq!(adjacent.len(), 8); // 8 surrounding squares
-        
+
         // All adjacent squares should be different
         for (i, grid1) in adjacent.iter().enumerate() {
             for (j, grid2) in adjacent.iter().enumerate() {
@@ -608,34 +637,34 @@ mod tests {
             }
         }
     }
-    
+
     #[test]
     fn test_precision_conversion() {
         let grid = GridSquare::new("FN31pr12").unwrap();
         assert_eq!(grid.precision(), GridPrecision::ExtendedSquare);
-        
+
         let reduced = grid.reduce_precision(GridPrecision::Square).unwrap();
         assert_eq!(reduced.grid(), "FN31");
         assert_eq!(reduced.precision(), GridPrecision::Square);
-        
+
         let extended = reduced.extend_precision(GridPrecision::Subsquare).unwrap();
         assert_eq!(extended.precision(), GridPrecision::Subsquare);
         assert_eq!(extended.grid().len(), 6);
     }
-    
+
     #[test]
     fn test_grid_precision_resolution() {
         let field_res = GridPrecision::Field.resolution_degrees();
         assert_eq!(field_res, (20.0, 10.0));
-        
+
         let square_res = GridPrecision::Square.resolution_degrees();
         assert_eq!(square_res, (2.0, 1.0));
-        
+
         let subsquare_res = GridPrecision::Subsquare.resolution_degrees();
         assert_relative_eq!(subsquare_res.0, 5.0 / 60.0, epsilon = 0.001);
         assert_relative_eq!(subsquare_res.1, 2.5 / 60.0, epsilon = 0.001);
     }
-    
+
     #[test]
     fn test_parse_grids_from_text() {
         let text = "QRT FN31pr 73 GL";
@@ -645,22 +674,22 @@ mod tests {
         assert_eq!(grids[0].grid(), "FN31PR");
         assert_eq!(grids[1].grid(), "GL"); // "GL" is a valid 2-char field grid
     }
-    
+
     #[test]
     fn test_grid_display() {
         let grid = GridSquare::new("fn31pr").unwrap();
         assert_eq!(format!("{}", grid), "FN31PR");
     }
-    
+
     #[test]
     fn test_coordinate_edge_cases() {
         // Test coordinates at edges
         let grid_north = coordinates_to_grid(89.0, 0.0, GridPrecision::Square).unwrap();
         assert!(grid_north.starts_with("JR"));
-        
+
         let grid_south = coordinates_to_grid(-89.0, 0.0, GridPrecision::Square).unwrap();
         assert!(grid_south.starts_with("JA"));
-        
+
         let grid_west = coordinates_to_grid(0.0, -179.0, GridPrecision::Square).unwrap();
         assert!(grid_west.starts_with("AJ"));
 

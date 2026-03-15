@@ -7,10 +7,10 @@
 
 #![cfg(feature = "transmit")]
 
-use pancetta_ft8::{Ft8Encoder, NUM_SYMBOLS};
-use pancetta_ft8::ldpc::{LdpcEncoder, LDPC_INFO_BITS, LDPC_CODEWORD_BITS, gray_to_binary};
-use pancetta_ft8::message::{calculate_crc14, PAYLOAD_BITS};
 use bitvec::prelude::*;
+use pancetta_ft8::ldpc::{gray_to_binary, LdpcEncoder, LDPC_CODEWORD_BITS, LDPC_INFO_BITS};
+use pancetta_ft8::message::{calculate_crc14, PAYLOAD_BITS};
+use pancetta_ft8::{Ft8Encoder, NUM_SYMBOLS};
 
 // ============================================================================
 // pack28 reference values
@@ -45,10 +45,12 @@ fn test_packgrid_fn42_matches_wsjtx() {
 // ============================================================================
 
 /// Reference payload for "CQ K1ABC FN42" from ft8_lib
-const CQ_K1ABC_FN42_PAYLOAD: [u8; 10] = [0x00, 0x00, 0x00, 0x20, 0x4d, 0xef, 0x1a, 0x8a, 0x19, 0x88];
+const CQ_K1ABC_FN42_PAYLOAD: [u8; 10] =
+    [0x00, 0x00, 0x00, 0x20, 0x4d, 0xef, 0x1a, 0x8a, 0x19, 0x88];
 
 /// Reference payload for "K1DEF W1ABC -12" from ft8_lib
-const K1DEF_W1ABC_M12_PAYLOAD: [u8; 10] = [0x09, 0xbe, 0x71, 0x40, 0x5f, 0xf4, 0x4e, 0x9f, 0xa9, 0xc8];
+const K1DEF_W1ABC_M12_PAYLOAD: [u8; 10] =
+    [0x09, 0xbe, 0x71, 0x40, 0x5f, 0xf4, 0x4e, 0x9f, 0xa9, 0xc8];
 
 /// Reference payload for "HELLO WORLD" (free text) from ft8_lib
 const HELLO_WORLD_PAYLOAD: [u8; 10] = [0x3c, 0x02, 0x0b, 0x01, 0xe3, 0x89, 0xcc, 0x38, 0x10, 0x00];
@@ -101,22 +103,23 @@ fn test_hello_world_payload_matches_wsjtx() {
 
 /// Reference symbols for "CQ K1ABC FN42" from ft8_lib
 const CQ_K1ABC_FN42_SYMBOLS: [u8; 79] = [
-    3, 1, 4, 0, 6, 5, 2,  // Costas 1
-    0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 5, 4, 7, 6, 7, 0, 4, 6, 0, 6, 0,  // Data 1 (29)
-    2, 1, 5, 3, 3, 4, 3,  // ← wait, that's only 7, need to include in data block
-    3, 1, 4, 0, 6, 5, 2,  // Costas 2
-    7, 3, 6, 0, 1, 1, 0, 4, 7, 5, 1, 7, 0, 0, 7, 3, 3, 4, 7, 4, 5, 4, 5, 5, 1, 3, 3, 5, 4,  // Data 2 (29)
-    3, 1, 4, 0, 6, 5, 2,  // Costas 3
+    3, 1, 4, 0, 6, 5, 2, // Costas 1
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 5, 4, 7, 6, 7, 0, 4, 6, 0, 6, 0, // Data 1 (29)
+    2, 1, 5, 3, 3, 4, 3, // ← wait, that's only 7, need to include in data block
+    3, 1, 4, 0, 6, 5, 2, // Costas 2
+    7, 3, 6, 0, 1, 1, 0, 4, 7, 5, 1, 7, 0, 0, 7, 3, 3, 4, 7, 4, 5, 4, 5, 5, 1, 3, 3, 5,
+    4, // Data 2 (29)
+    3, 1, 4, 0, 6, 5, 2, // Costas 3
 ];
 
 /// Reference symbols for "K1DEF W1ABC -12" from ft8_lib
 const K1DEF_W1ABC_M12_SYMBOLS: [u8; 79] = [
-    3, 1, 4, 0, 6, 5, 2,  // Costas 1
-    0, 3, 2, 2, 7, 1, 4, 1, 3, 0, 0, 6, 7, 7, 4, 5, 3, 2, 6, 1, 7, 4,  // Data 1 (29)
-    6, 1, 4, 3, 0, 3, 5,
-    3, 1, 4, 0, 6, 5, 2,  // Costas 2
-    3, 2, 3, 2, 7, 7, 6, 2, 4, 2, 3, 4, 1, 1, 0, 5, 0, 6, 0, 7, 1, 7, 1, 2, 3, 5, 3, 7, 5,  // Data 2 (29)
-    3, 1, 4, 0, 6, 5, 2,  // Costas 3
+    3, 1, 4, 0, 6, 5, 2, // Costas 1
+    0, 3, 2, 2, 7, 1, 4, 1, 3, 0, 0, 6, 7, 7, 4, 5, 3, 2, 6, 1, 7, 4, // Data 1 (29)
+    6, 1, 4, 3, 0, 3, 5, 3, 1, 4, 0, 6, 5, 2, // Costas 2
+    3, 2, 3, 2, 7, 7, 6, 2, 4, 2, 3, 4, 1, 1, 0, 5, 0, 6, 0, 7, 1, 7, 1, 2, 3, 5, 3, 7,
+    5, // Data 2 (29)
+    3, 1, 4, 0, 6, 5, 2, // Costas 3
 ];
 
 #[test]
@@ -151,9 +154,18 @@ fn test_special_tokens_payload() {
 
     // RRR, RR73, 73 all share the same callsigns, differ only in grid field
     let messages = [
-        ("K1ABC W9XYZ RRR",  [0x09u8, 0xbd, 0xe3, 0x50, 0x61, 0x49, 0xdc, 0x1f, 0xa4, 0x88]),
-        ("K1ABC W9XYZ 73",   [0x09, 0xbd, 0xe3, 0x50, 0x61, 0x49, 0xdc, 0x1f, 0xa5, 0x08]),
-        ("K1ABC W9XYZ RR73", [0x09, 0xbd, 0xe3, 0x50, 0x61, 0x49, 0xdc, 0x1f, 0xa4, 0xc8]),
+        (
+            "K1ABC W9XYZ RRR",
+            [0x09u8, 0xbd, 0xe3, 0x50, 0x61, 0x49, 0xdc, 0x1f, 0xa4, 0x88],
+        ),
+        (
+            "K1ABC W9XYZ 73",
+            [0x09, 0xbd, 0xe3, 0x50, 0x61, 0x49, 0xdc, 0x1f, 0xa5, 0x08],
+        ),
+        (
+            "K1ABC W9XYZ RR73",
+            [0x09, 0xbd, 0xe3, 0x50, 0x61, 0x49, 0xdc, 0x1f, 0xa4, 0xc8],
+        ),
     ];
 
     for (msg, expected_payload) in &messages {
@@ -199,7 +211,12 @@ fn test_crc14_for_reference_payloads() {
         }
 
         let crc = calculate_crc14(&payload_bits);
-        assert!(crc < (1 << 14), "CRC for '{}' exceeds 14 bits: {}", name, crc);
+        assert!(
+            crc < (1 << 14),
+            "CRC for '{}' exceeds 14 bits: {}",
+            name,
+            crc
+        );
 
         // Build 91-bit message and verify LDPC encoding works
         let mut msg_bits = BitVec::with_capacity(LDPC_INFO_BITS);
@@ -213,7 +230,8 @@ fn test_crc14_for_reference_payloads() {
         assert_eq!(codeword.len(), LDPC_CODEWORD_BITS);
         assert!(
             encoder.verify_syndrome(&codeword),
-            "Syndrome check failed for '{}'", name
+            "Syndrome check failed for '{}'",
+            name
         );
     }
 }
@@ -242,7 +260,9 @@ fn test_ldpc_codeword_validity_from_encoded_symbols() {
         let mut codeword = BitVec::with_capacity(LDPC_CODEWORD_BITS);
         for i_tone in 0..NUM_SYMBOLS {
             let is_data = (7..36).contains(&i_tone) || (43..72).contains(&i_tone);
-            if !is_data { continue; }
+            if !is_data {
+                continue;
+            }
 
             let binary_value = gray_to_binary(symbols[i_tone]);
             codeword.push((binary_value & 4) != 0);
@@ -281,7 +301,10 @@ fn test_pack28_suffix_flags() {
     // Bare callsign should have ip=0
     let (n28_bare, ip_bare) = pack28("W1ABC").unwrap();
     assert_eq!(ip_bare, 0, "W1ABC should have ip=0");
-    assert_eq!(n28_bare, n28_r, "Base callsign value should match with or without suffix");
+    assert_eq!(
+        n28_bare, n28_r,
+        "Base callsign value should match with or without suffix"
+    );
 }
 
 #[test]
@@ -309,11 +332,14 @@ fn test_suffix_round_trip() {
     // /P round-trip: ip=1 is protocol-identical to /R, so decoder shows /R
     // This is a known FT8 protocol limitation (both suffixes encode the same way)
     let decoded = encode_and_decode("K1DEF W1ABC/P FN42");
-    assert_eq!(decoded, "K1DEF W1ABC/R FN42", "/P decodes as /R (protocol limitation)");
+    assert_eq!(
+        decoded, "K1DEF W1ABC/R FN42",
+        "/P decodes as /R (protocol limitation)"
+    );
 }
 
 fn encode_and_decode(message: &str) -> String {
-    use pancetta_ft8::{Ft8Modulator, Ft8Decoder, Ft8Config, WINDOW_SAMPLES};
+    use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Modulator, WINDOW_SAMPLES};
 
     let mut encoder = Ft8Encoder::new();
     let mut modulator = Ft8Modulator::new_default().unwrap();
@@ -342,7 +368,9 @@ fn extract_payload_from_symbols(symbols: &[u8; NUM_SYMBOLS]) -> [u8; 10] {
     let mut codeword_bits = Vec::with_capacity(LDPC_CODEWORD_BITS);
     for i_tone in 0..NUM_SYMBOLS {
         let is_data = (7..36).contains(&i_tone) || (43..72).contains(&i_tone);
-        if !is_data { continue; }
+        if !is_data {
+            continue;
+        }
 
         let binary_value = gray_to_binary(symbols[i_tone]);
         codeword_bits.push((binary_value & 4) != 0);

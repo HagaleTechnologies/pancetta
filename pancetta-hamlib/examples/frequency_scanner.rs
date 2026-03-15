@@ -1,5 +1,5 @@
 //! Frequency scanner example
-//! 
+//!
 //! This example demonstrates advanced scanning capabilities including
 //! memory channel scanning, frequency range scanning, and real-time
 //! signal monitoring.
@@ -7,7 +7,7 @@
 use pancetta_hamlib::prelude::*;
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,9 +22,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting frequency scanner example");
 
     // Create mock rig for demonstration
-    let base_rig = RigBuilder::new()
-        .build_mock()
-        .await?;
+    let base_rig = RigBuilder::new().build_mock().await?;
 
     // Create advanced rig controller
     let rig = AdvancedRigBuilder::new()
@@ -55,12 +53,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate memory channel scanning
     info!("Starting memory channel scan...");
-    
+
     let scan_config = ScanConfig {
         scan_type: ScanType::Memory,
-        speed: 3.0, // 3 channels per second
-        pause_time: 2.0, // 2 seconds on active signal
-        resume_timeout: 5.0, // 5 seconds before resuming
+        speed: 3.0,             // 3 channels per second
+        pause_time: 2.0,        // 2 seconds on active signal
+        resume_timeout: 5.0,    // 5 seconds before resuming
         squelch_threshold: -80, // -80 dBm threshold
         include_memory: true,
         include_vfo: false,
@@ -78,15 +76,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while start_time.elapsed() < scan_duration {
         sleep(Duration::from_secs(2)).await;
-        
+
         match rig.get_scan_status().await {
             Ok(status) => {
                 if status.active {
                     info!(
                         "Scan active - Position: {}, Channels: {}, Signals: {}",
-                        status.current_position,
-                        status.channels_scanned,
-                        status.signals_found
+                        status.current_position, status.channels_scanned, status.signals_found
                     );
                 } else {
                     info!("Scan stopped");
@@ -103,10 +99,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate frequency range scanning
     info!("Starting 20m band frequency scan...");
-    
+
     let band_20m = Band::Band20m;
     let (start_freq, end_freq) = band_20m.frequency_range();
-    
+
     // Create custom frequency list for 20m band (25 kHz steps)
     let mut custom_frequencies = Vec::new();
     let mut freq = start_freq;
@@ -142,15 +138,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while range_start_time.elapsed() < range_scan_duration {
         sleep(Duration::from_secs(1)).await;
-        
+
         match rig.get_scan_status().await {
             Ok(status) => {
                 if status.active {
                     info!(
                         "Range scan - Position: {}, Scanned: {}, Signals: {}",
-                        status.current_position,
-                        status.channels_scanned,
-                        status.signals_found
+                        status.current_position, status.channels_scanned, status.signals_found
                     );
                 } else {
                     break;
@@ -166,46 +160,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate real-time monitoring
     info!("Starting real-time monitoring...");
-    
+
     // Set to a specific frequency for monitoring
     rig.set_frequency(Vfo::A, 14_200_000).await?;
     rig.set_mode(Vfo::A, Mode::USB, Some(2400)).await?;
 
     // Start monitoring with 500ms updates
     let mut monitor_rx = rig.start_monitoring(500).await?;
-    
+
     info!("Monitoring rig parameters for 15 seconds...");
-    
+
     // Monitor for 15 seconds or until no more data
     let monitor_result = timeout(Duration::from_secs(15), async {
         while let Ok(data) = monitor_rx.recv().await {
-            let freq_str = data.frequency
+            let freq_str = data
+                .frequency
                 .map(|f| format!("{:.3} MHz", f as f64 / 1_000_000.0))
                 .unwrap_or_else(|| "Unknown".to_string());
-            
-            let mode_str = data.mode
+
+            let mode_str = data
+                .mode
                 .map(|m| format!("{:?}", m))
                 .unwrap_or_else(|| "Unknown".to_string());
-            
-            let s_meter_str = data.s_meter
+
+            let s_meter_str = data
+                .s_meter
                 .map(|s| pancetta_hamlib::utils::format_s_meter(s))
                 .unwrap_or_else(|| "N/A".to_string());
-            
-            let swr_str = data.swr
+
+            let swr_str = data
+                .swr
                 .map(|s| pancetta_hamlib::utils::format_swr(s))
                 .unwrap_or_else(|| "N/A".to_string());
-            
+
             let ptt_str = if data.ptt_active { "TX" } else { "RX" };
-            
+
             info!(
                 "Monitor - Freq: {}, Mode: {}, S-meter: {}, SWR: {}, PTT: {}",
                 freq_str, mode_str, s_meter_str, swr_str, ptt_str
             );
-            
+
             // Brief pause to avoid flooding logs
             sleep(Duration::from_millis(100)).await;
         }
-    }).await;
+    })
+    .await;
 
     match monitor_result {
         Ok(_) => info!("Monitoring completed normally"),
@@ -217,17 +216,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate band switching
     info!("Demonstrating band switching...");
-    
-    let bands_to_test = vec![
-        Band::Band40m,
-        Band::Band20m,
-        Band::Band15m,
-        Band::Band10m,
-    ];
+
+    let bands_to_test = vec![Band::Band40m, Band::Band20m, Band::Band15m, Band::Band10m];
 
     for band in bands_to_test {
         info!("Switching to {:?} band", band);
-        
+
         if let Err(e) = rig.switch_to_band(band).await {
             warn!("Failed to switch to {:?}: {}", band, e);
             continue;
@@ -236,7 +230,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Get current settings after band switch
         let freq = rig.get_frequency(Vfo::A).await?;
         let (mode, width) = rig.get_mode(Vfo::A).await?;
-        
+
         info!(
             "  Band {:?}: {:.3} MHz, {:?}, {} Hz",
             band,
@@ -259,12 +253,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Demonstrate priority channel monitoring
     info!("Setting up priority channel monitoring...");
-    
+
     // Program a priority channel
     rig.set_frequency(Vfo::A, 14_300_000).await?; // Emergency frequency
     rig.set_mode(Vfo::A, Mode::USB, Some(2400)).await?;
-    rig.save_to_memory(99, Some("Priority/Emergency".to_string())).await?;
-    
+    rig.save_to_memory(99, Some("Priority/Emergency".to_string()))
+        .await?;
+
     info!("Priority channel programmed: 14.300 MHz USB");
 
     // Final status
@@ -298,10 +293,10 @@ async fn program_memory_channels(rig: &AdvancedRig) -> Result<(), Box<dyn std::e
         // Set frequency and mode
         rig.set_frequency(Vfo::A, frequency).await?;
         rig.set_mode(Vfo::A, mode, mode.default_width()).await?;
-        
+
         // Save to memory
         rig.save_to_memory(channel, Some(name.to_string())).await?;
-        
+
         info!(
             "Programmed channel {}: {:.3} MHz {:?} ({})",
             channel,
@@ -329,7 +324,7 @@ fn analyze_scan_results(status: &ScanStatus) {
         info!("  Channels scanned: {}", status.channels_scanned);
         info!("  Signals found: {}", status.signals_found);
         info!("  Scan rate: {:.1} channels/second", scan_rate);
-        
+
         if status.channels_scanned > 0 {
             let hit_rate = (status.signals_found as f64 / status.channels_scanned as f64) * 100.0;
             info!("  Hit rate: {:.1}%", hit_rate);
