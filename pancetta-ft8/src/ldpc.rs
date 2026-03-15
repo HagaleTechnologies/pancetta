@@ -588,6 +588,25 @@ pub fn gray_to_binary(g: u8) -> u8 {
     FT8_GRAY_UNMAP[g as usize]
 }
 
+/// FT4 Gray code map for 4-FSK: binary value (0..3) → tone index
+///
+/// Standard 2-bit Gray code: 0→0, 1→1, 2→3, 3→2
+/// This is the same pattern as the first 4 entries of the FT8 map.
+const FT4_GRAY_MAP: [u8; 4] = [0, 1, 3, 2];
+
+/// FT4 inverse Gray code: tone index → binary value
+const FT4_GRAY_UNMAP: [u8; 4] = [0, 1, 3, 2]; // self-inverse for 2-bit Gray
+
+/// Map binary value to 4-FSK Gray code tone index (FT4)
+pub fn binary_to_gray_4fsk(b: u8) -> u8 {
+    FT4_GRAY_MAP[b as usize]
+}
+
+/// Map 4-FSK Gray code tone index to binary value (FT4)
+pub fn gray_to_binary_4fsk(g: u8) -> u8 {
+    FT4_GRAY_UNMAP[g as usize]
+}
+
 // ============================================================================
 // Parity Check Matrix (sparse representation for decoder)
 // ============================================================================

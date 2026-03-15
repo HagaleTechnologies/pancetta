@@ -7,6 +7,7 @@
 //! - Real-time audio generation with precise timing
 
 use crate::{
+    protocol::ProtocolParams,
     Ft8Error, Ft8Result, BASE_FREQUENCY, MESSAGE_DURATION, NUM_SYMBOLS, NUM_TONES, SAMPLE_RATE,
     SYMBOL_DURATION, TONE_SPACING,
 };
@@ -137,6 +138,87 @@ impl Ft8Modulator {
             DEFAULT_TX_POWER,
             PulseShape::Rectangular,
         )
+    }
+
+    /// Generate transmission audio for any protocol (FT8, FT4, FT2).
+    ///
+    /// # Arguments
+    /// * `symbols` - Symbol values (length must match `params.num_symbols`)
+    /// * `frequency_offset` - Additional frequency offset in Hz
+    /// * `params` - Protocol parameters defining tone count, spacing, timing
+    ///
+    /// # Returns
+    /// Vector of audio samples ready for transmission
+    pub fn modulate_symbols_protocol(
+        &mut self,
+        symbols: &[u8],
+        frequency_offset: f64,
+        params: &ProtocolParams,
+    ) -> Ft8Result<Vec<f32>> {
+        if symbols.len() != params.num_symbols {
+            return Err(Ft8Error::InvalidDataSize {
+                expected: params.num_symbols,
+                actual: symbols.len(),
+            });
+        }
+
+        if symbols.iter().any(|&s| s >= params.num_tones as u8) {
+            return Err(Ft8Error::SignalProcessingError(format!(
+                "Invalid symbol value (must be 0-{})",
+                params.num_tones - 1
+            )));
+        }
+
+        let tone_spacing = params.tone_spacing;
+        let total_frequency = self.base_frequency + frequency_offset;
+        if total_frequency < 200.0
+            || total_frequency + (params.num_tones as f64 - 1.0) * tone_spacing
+                > MAX_FREQUENCY_DEVIATION
+        {
+            return Err(Ft8Error::SignalProcessingError(format!(
+                "Frequency {} Hz would exceed deviation limits",
+                total_frequency
+            )));
+        }
+
+        let sps = params.samples_per_symbol(self.sample_rate);
+        let total_samples = params.total_samples(self.sample_rate);
+
+        // Build per-sample frequency trajectory
+        let freq_trajectory =
+            self.build_frequency_trajectory_generic(symbols, total_frequency, tone_spacing, sps);
+
+        // Generate audio from frequency trajectory via phase accumulation
+        let mut audio_samples = Vec::with_capacity(total_samples);
+        self.phase_accumulator = 0.0;
+
+        let ramp_samples = (self.sample_rate as f64 * 0.005) as usize;
+
+        for (i, &freq) in freq_trajectory.iter().enumerate() {
+            let angular_freq = 2.0 * PI * freq / self.sample_rate as f64;
+            self.phase_accumulator += angular_freq;
+            if self.phase_accumulator > 2.0 * PI {
+                self.phase_accumulator -= 2.0 * PI;
+            }
+
+            let mut sample = (self.tx_power * self.phase_accumulator.sin()) as f32;
+
+            if i < ramp_samples {
+                let factor = (i as f64 / ramp_samples as f64).sin().powi(2) as f32;
+                sample *= factor;
+            }
+            let total = freq_trajectory.len();
+            if i >= total - ramp_samples {
+                let remaining = total - i;
+                let factor = (remaining as f64 / ramp_samples as f64).sin().powi(2) as f32;
+                sample *= factor;
+            }
+
+            audio_samples.push(sample);
+        }
+
+        self.apply_final_processing(&mut audio_samples)?;
+        Ok(audio_samples)
     }
 
     /// Generate complete FT8 transmission audio samples
@@ -283,6 +365,73 @@ impl Ft8Modulator {
                     for j in 0..kernel_len {
                         let src_idx = i as isize + j as isize - half_len as isize;
                         // Clamp to boundary (extend edge values)
+                        let src_idx = src_idx.max(0).min(total as isize - 1) as usize;
+                        acc += trajectory[src_idx] * kernel[j];
+                    }
+                    smoothed[i] = acc;
+                }
+
+                smoothed
+            }
+        }
+    }
+
+    /// Build per-sample frequency trajectory for any protocol.
+    fn build_frequency_trajectory_generic(
+        &self,
+        symbols: &[u8],
+        base_freq: f64,
+        tone_spacing: f64,
+        sps: usize,
+    ) -> Vec<f64> {
+        let total = symbols.len() * sps;
+
+        match self.pulse_shape {
+            PulseShape::Rectangular => {
+                let mut trajectory = Vec::with_capacity(total);
+                for &sym in symbols.iter() {
+                    let freq = base_freq + (sym as f64) * tone_spacing;
+                    for _ in 0..sps {
+                        trajectory.push(freq);
+                    }
+                }
+                trajectory
+            }
+            PulseShape::Gaussian { bt } => {
+                let mut trajectory = Vec::with_capacity(total);
+                for &sym in symbols.iter() {
+                    let freq = base_freq + (sym as f64) * tone_spacing;
+                    for _ in 0..sps {
+                        trajectory.push(freq);
+                    }
+                }
+
+                let sigma_symbols = (2.0_f64.ln()).sqrt() / (2.0 * PI * bt);
+                let sigma_samples = sigma_symbols * sps as f64;
+
+                let half_len = (3.0 * sigma_samples).ceil() as usize;
+                if half_len < 1 {
+                    return trajectory;
+                }
+
+                let kernel_len = 2 * half_len + 1;
+                let mut kernel = vec![0.0f64; kernel_len];
+                let mut kernel_sum = 0.0;
+
+                for i in 0..kernel_len {
+                    let t = (i as f64 - half_len as f64) / sigma_samples;
+                    kernel[i] = (-0.5 * t * t).exp();
+                    kernel_sum += kernel[i];
+                }
+                for k in kernel.iter_mut() {
+                    *k /= kernel_sum;
+                }
+
+                let mut smoothed = vec![0.0f64; total];
+                for i in 0..total {
+                    let mut acc = 0.0;
+                    for j in 0..kernel_len {
+                        let src_idx = i as isize + j as isize - half_len as isize;
                         let src_idx = src_idx.max(0).min(total as isize - 1) as usize;
                         acc += trajectory[src_idx] * kernel[j];
                     }

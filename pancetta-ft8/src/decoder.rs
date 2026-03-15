@@ -11,10 +11,11 @@
 
 use crate::{
     message::{calculate_crc14, DecodedMessage, MessageParser, CRC_BITS, PAYLOAD_BITS},
+    protocol::ProtocolParams,
     signal_processing::{BandpassFilter, FftProcessor, SymbolCorrelator, WindowFunction},
     sync::TimeSync,
-    DecodingMetrics, Ft8Error, Ft8Result, MessageHandler, NullMessageHandler, NUM_SYMBOLS,
-    NUM_TONES, SAMPLE_RATE, SYMBOL_DURATION, TONE_SPACING, WINDOW_SAMPLES,
+    DecodingMetrics, Ft8Error, Ft8Result, MessageHandler, NullMessageHandler, Protocol,
+    NUM_SYMBOLS, NUM_TONES, SAMPLE_RATE, SYMBOL_DURATION, TONE_SPACING, WINDOW_SAMPLES,
 };
 use bitvec::prelude::*;
 use bumpalo::Bump;
@@ -39,14 +40,8 @@ const LDPC_MAX_ITERATIONS: usize = 100;
 /// FT8 Costas synchronization array
 const COSTAS: [u8; 7] = [3, 1, 4, 0, 6, 5, 2];
 
-/// Samples per FT8 symbol at 12 kHz
+/// Samples per FT8 symbol at 12 kHz (used only as fallback reference)
 const SAMPLES_PER_SYMBOL: usize = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize; // 1920
-
-/// FFT size for spectrogram with freq_osr=2 (double resolution = 3.125 Hz per bin)
-const SPEC_NFFT: usize = SAMPLES_PER_SYMBOL * 2; // 3840
-
-/// Spectrogram step size (half symbol for 2× time oversampling)
-const SPEC_STEP: usize = SAMPLES_PER_SYMBOL / 2; // 960
 
 /// Frequency oversampling rate (2 = sub-bin resolution)
 const FREQ_OSR: usize = 2;
@@ -73,11 +68,14 @@ const NMS_FREQ_RADIUS: usize = 2;
 // Decoder configuration
 // ============================================================================
 
-/// FT8 decoder configuration
+/// Decoder configuration for FT8/FT4/FT2 protocols
 #[derive(Debug, Clone)]
 pub struct Ft8Config {
-    /// Sample rate (must be 12 kHz for FT8)
+    /// Sample rate (must be 12 kHz)
     pub sample_rate: u32,
+
+    /// Protocol to decode (FT8, FT4, or FT2)
+    pub protocol: Protocol,
 
     /// Enable multi-threading for parallel decoding
     pub enable_multithreading: bool,
@@ -108,6 +106,7 @@ impl Default for Ft8Config {
     fn default() -> Self {
         Self {
             sample_rate: SAMPLE_RATE,
+            protocol: Protocol::Ft8,
             enable_multithreading: true,
             max_candidates: MAX_DECODE_CANDIDATES,
             min_snr_db: MIN_DECODE_SNR,
@@ -168,10 +167,13 @@ pub struct WaterfallData {
 // Ft8Decoder
 // ============================================================================
 
-/// High-performance FT8 decoder
+/// High-performance decoder for FT8/FT4/FT2 protocols
 pub struct Ft8Decoder {
     /// Decoder configuration
     config: Ft8Config,
+
+    /// Protocol parameters derived from config.protocol
+    protocol_params: ProtocolParams,
 
     /// FFT processor for waterfall display
     fft_processor: FftProcessor,
@@ -207,7 +209,7 @@ impl Ft8Decoder {
         Self::with_message_handler(config, Box::new(NullMessageHandler))
     }
 
-    /// Create a new FT8 decoder with custom message handler
+    /// Create a new decoder with custom message handler
     pub fn with_message_handler(
         config: Ft8Config,
         message_handler: Box<dyn MessageHandler + Send>,
@@ -219,6 +221,13 @@ impl Ft8Decoder {
             });
         }
 
+        let protocol_params = match config.protocol {
+            Protocol::Ft8 => ProtocolParams::ft8(),
+            Protocol::Ft4 => ProtocolParams::ft4(),
+            #[cfg(feature = "ft2")]
+            Protocol::Ft2 => ProtocolParams::ft2(),
+        };
+
         let fft_processor = FftProcessor::new(4096, WindowFunction::Hann)?;
         let bandpass_filter = BandpassFilter::new(1500.0, 400.0, 65)?;
         let symbol_correlator = SymbolCorrelator::new()?;
@@ -229,6 +238,7 @@ impl Ft8Decoder {
 
         Ok(Self {
             config,
+            protocol_params,
             fft_processor,
             bandpass_filter,
             symbol_correlator,
@@ -241,6 +251,11 @@ impl Ft8Decoder {
         })
     }
 
+    /// Get the current protocol parameters
+    pub fn protocol_params(&self) -> &ProtocolParams {
+        &self.protocol_params
+    }
+
     // ========================================================================
     // Main decode pipeline
     // ========================================================================
@@ -250,9 +265,10 @@ impl Ft8Decoder {
         let start_time = Instant::now();
         self.message_handler.on_window_start(SystemTime::now());
 
-        if samples.len() < WINDOW_SAMPLES {
+        let min_samples = self.protocol_params.total_samples(SAMPLE_RATE);
+        if samples.len() < min_samples {
             return Err(Ft8Error::InvalidWindowSize {
-                expected: WINDOW_SAMPLES,
+                expected: min_samples,
                 actual: samples.len(),
             });
         }
@@ -486,13 +502,11 @@ impl Ft8Decoder {
     /// freq_sub=1 (odd bins: 1, 3, 5, ...), where each sub-bin set has
     /// 6.25 Hz spacing. This matches ft8_lib's frequency oversampling approach.
     fn compute_spectrogram(&self, audio: &[f64]) -> Ft8Result<Spectrogram> {
-        let nfft = SPEC_NFFT;
-        let step = SPEC_STEP;
+        let pp = &self.protocol_params;
+        let block_size = pp.samples_per_symbol(SAMPLE_RATE);
         let freq_osr = FREQ_OSR;
-
-        // We only need block_size samples of actual data per step, but the FFT
-        // window is nfft = block_size * freq_osr. Zero-pad the remainder.
-        let block_size = SAMPLES_PER_SYMBOL;
+        let nfft = block_size * freq_osr;
+        let step = block_size / 2; // half-symbol time oversampling
 
         if audio.len() < block_size {
             return Err(Ft8Error::InsufficientData {
@@ -579,14 +593,16 @@ impl Ft8Decoder {
     /// With freq_osr=2, we search both even and odd frequency sub-bins.
     fn costas_sync_search(&self, spectrogram: &Spectrogram) -> Ft8Result<Vec<CostasCandidate>> {
         let mut candidates = Vec::new();
+        let pp = &self.protocol_params;
 
-        // A full 79-symbol message occupies 79 * 2 = 158 half-symbol steps.
-        // The last Costas symbol is at position 78, which is step t0 + 2*78 = t0 + 156.
-        let max_time_step = spectrogram.num_steps.saturating_sub(157);
+        // A full message occupies num_symbols * 2 half-symbol steps.
+        let max_time_step = spectrogram
+            .num_steps
+            .saturating_sub(pp.num_symbols * 2 + 1);
 
-        // Frequency range: need bins f0..f0+7 to all be valid
-        let max_freq_bin = spectrogram.num_bins.saturating_sub(NUM_TONES);
-        let max_freq_bin = max_freq_bin.min((4000.0 / TONE_SPACING) as usize);
+        // Frequency range: need bins f0..f0+num_tones to all be valid
+        let max_freq_bin = spectrogram.num_bins.saturating_sub(pp.num_tones);
+        let max_freq_bin = max_freq_bin.min((4000.0 / pp.tone_spacing) as usize);
 
         for freq_sub in 0..spectrogram.freq_osr {
             for t0 in 0..=max_time_step {
@@ -635,10 +651,10 @@ impl Ft8Decoder {
     ) -> f64 {
         let mut score = 0.0f64;
         let mut num_average = 0usize;
-        let sync_group_starts: [usize; 3] = [0, 36, 72];
+        let pp = &self.protocol_params;
 
-        for (m, &group_start) in sync_group_starts.iter().enumerate() {
-            for k in 0..7usize {
+        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+            for k in 0..pp.costas_length {
                 let symbol_idx = group_start + k;
                 // Each symbol occupies 2 time steps; use the first one
                 let time_idx = t0 + symbol_idx * 2;
@@ -647,7 +663,7 @@ impl Ft8Decoder {
                     continue;
                 }
 
-                let sm = COSTAS[k] as usize; // expected tone bin (0..7)
+                let sm = pp.costas_arrays[m][k] as usize; // expected tone bin
                 let freq_idx = f0 + sm;
 
                 if freq_idx >= spec.num_bins {
@@ -664,7 +680,7 @@ impl Ft8Decoder {
                 }
 
                 // Check frequency neighbor above
-                if sm < 7 && f0 + sm + 1 < spec.num_bins {
+                if sm + 1 < pp.num_tones && f0 + sm + 1 < spec.num_bins {
                     let neighbor = spec.power[time_idx][freq_sub][f0 + sm + 1];
                     score += signal_mag - neighbor;
                     num_average += 1;
@@ -681,7 +697,7 @@ impl Ft8Decoder {
                 }
 
                 // Check time neighbor ahead (next symbol in this sync group)
-                if k + 1 < 7 {
+                if k + 1 < pp.costas_length {
                     let next_time = time_idx + 2; // next symbol's time step
                     if next_time < spec.num_steps {
                         let neighbor = spec.power[next_time][freq_sub][freq_idx];
@@ -750,18 +766,26 @@ impl Ft8Decoder {
         audio: &[f64],
         candidate: &CostasCandidate,
     ) -> Ft8Result<Option<DecodedMessage>> {
-        let coarse_offset = candidate.time_step * SPEC_STEP;
+        let pp = &self.protocol_params;
+        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        let spec_step = sps / 2;
+        let coarse_offset = candidate.time_step * spec_step;
 
         // Fine timing: search ±half symbol in sub-symbol steps.
-        // The coarse sync has ±480 samples (half symbol) uncertainty.
-        // Try 5 sub-offsets: -384, -192, 0, +192, +384 samples.
-        let time_deltas: [isize; 5] = [-384, -192, 0, 192, 384];
+        let quarter_sym = (sps / 4) as isize;
+        let time_deltas: [isize; 5] = [
+            -2 * quarter_sym,
+            -quarter_sym,
+            0,
+            quarter_sym,
+            2 * quarter_sym,
+        ];
 
         // Frequency refinement: try ±1 bin
         let freq_offsets: [isize; 3] = [0, -1, 1];
 
-        // freq_sub shifts the base frequency by half a bin (3.125 Hz) when freq_osr=2
-        let sub_bin_offset = candidate.freq_sub as f64 * (TONE_SPACING / FREQ_OSR as f64);
+        // freq_sub shifts the base frequency by half a bin when freq_osr=2
+        let sub_bin_offset = candidate.freq_sub as f64 * (pp.tone_spacing / FREQ_OSR as f64);
 
         // Find best (time_delta, freq_offset) by Costas correlation on extracted symbols
         let mut best_decode = None;
@@ -778,7 +802,7 @@ impl Ft8Decoder {
                 if freq_bin < 0 {
                     continue;
                 }
-                let base_frequency = freq_bin as f64 * TONE_SPACING + sub_bin_offset;
+                let base_frequency = freq_bin as f64 * pp.tone_spacing + sub_bin_offset;
 
                 let (_symbols, tone_magnitudes) = match self.extract_symbols_complex(
                     audio,
@@ -817,8 +841,27 @@ impl Ft8Decoder {
                 #[cfg(feature = "debug-decode")]
                 eprintln!("    dt={:+4} df={:+2}: CRC PASSED!", dt, df);
 
-                let payload_bits = &corrected_bits[0..PAYLOAD_BITS];
-                let ft8_message = self.message_parser.parse_payload(payload_bits)?;
+                // For FT4, un-apply the XOR scrambling on the payload
+                let payload_bits = if let Some(xor_seq) = pp.xor_sequence {
+                    let mut bits = corrected_bits[0..PAYLOAD_BITS].to_owned();
+                    for byte_idx in 0..10 {
+                        let xor_byte = xor_seq[byte_idx];
+                        for bit_pos in 0..8 {
+                            let global_bit = byte_idx * 8 + bit_pos;
+                            if global_bit >= PAYLOAD_BITS {
+                                break;
+                            }
+                            if (xor_byte >> (7 - bit_pos)) & 1 == 1 {
+                                let cur = bits[global_bit];
+                                bits.set(global_bit, !cur);
+                            }
+                        }
+                    }
+                    bits
+                } else {
+                    corrected_bits[0..PAYLOAD_BITS].to_owned()
+                };
+                let ft8_message = self.message_parser.parse_payload(&payload_bits)?;
 
                 // sync_score is average dB difference between signal and neighbor bins
                 let snr_db = candidate.sync_score as f32;
@@ -859,7 +902,9 @@ impl Ft8Decoder {
         time_offset_samples: usize,
         base_frequency: f64,
     ) -> Ft8Result<(Vec<u8>, Vec<[f64; NUM_TONES]>)> {
-        let end_sample = time_offset_samples + NUM_SYMBOLS * SAMPLES_PER_SYMBOL;
+        let pp = &self.protocol_params;
+        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        let end_sample = time_offset_samples + pp.num_symbols * sps;
         if end_sample > audio.len() {
             return Err(Ft8Error::InsufficientData {
                 needed: end_sample,
@@ -871,23 +916,25 @@ impl Ft8Decoder {
         let pi2 = 2.0 * std::f64::consts::PI;
 
         // Pre-compute Hann window for one symbol
-        let window: Vec<f64> = (0..SAMPLES_PER_SYMBOL)
-            .map(|i| 0.5 * (1.0 - (pi2 * i as f64 / (SAMPLES_PER_SYMBOL - 1) as f64).cos()))
+        let window: Vec<f64> = (0..sps)
+            .map(|i| 0.5 * (1.0 - (pi2 * i as f64 / (sps - 1) as f64).cos()))
             .collect();
 
-        let mut symbols = Vec::with_capacity(NUM_SYMBOLS);
-        let mut tone_magnitudes = Vec::with_capacity(NUM_SYMBOLS);
+        let mut symbols = Vec::with_capacity(pp.num_symbols);
+        let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
 
-        for sym_idx in 0..NUM_SYMBOLS {
-            let sym_start = time_offset_samples + sym_idx * SAMPLES_PER_SYMBOL;
-            let symbol_audio = &audio[sym_start..sym_start + SAMPLES_PER_SYMBOL];
+        for sym_idx in 0..pp.num_symbols {
+            let sym_start = time_offset_samples + sym_idx * sps;
+            let symbol_audio = &audio[sym_start..sym_start + sps];
 
+            // NOTE: tone_magnitudes uses [f64; NUM_TONES] (8) even for FT4 (4 tones).
+            // Unused entries stay 0.0. This avoids a generic array parameter.
             let mut mags = [0.0f64; NUM_TONES];
             let mut best_tone = 0u8;
             let mut best_mag = 0.0;
 
-            for tone in 0..NUM_TONES {
-                let freq = base_frequency + tone as f64 * TONE_SPACING;
+            for tone in 0..pp.num_tones {
+                let freq = base_frequency + tone as f64 * pp.tone_spacing;
 
                 // Complex DFT at this frequency with Hann window
                 let mut real_sum = 0.0;
@@ -931,47 +978,56 @@ impl Ft8Decoder {
     /// Gray code mapping determines which tones correspond to bit=0 vs bit=1.
     /// The raw LLRs are later normalized by normalize_llrs() to target variance.
     fn compute_soft_llrs(&self, tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<f32> {
+        let pp = &self.protocol_params;
         let mut llrs = Vec::with_capacity(174);
-
-        // FT8 Gray map: maps binary values 0..7 to tone indices
-        // gray_to_binary reverses this
-        // But ft8_lib's extract_symbol does: s2[j] = mag[gray_map[j]]
-        // where j is the binary value (0..7), and gray_map[j] is the tone index
-        // We need the same mapping here.
-
-        // Data symbol positions: 7..36 (29 symbols) and 43..72 (29 symbols)
-        let data_positions: Vec<usize> = (7..36).chain(43..72).collect();
+        let data_positions = pp.data_symbol_indices();
 
         for &sym_idx in &data_positions {
             let mags = &tone_magnitudes[sym_idx];
 
-            // Convert magnitudes to log-domain (dB), matching ft8_lib's WF_ELEM_MAG
-            let mut s2 = [0.0f64; NUM_TONES];
-            for j in 0..NUM_TONES {
-                // s2[j] = log-magnitude of the tone that corresponds to binary value j
-                // ft8_lib uses: s2[j] = WF_ELEM_MAG(wf[kFT8_Gray_map[j]])
-                // kFT8_Gray_map maps binary -> tone: [0,1,3,2,5,6,4,7]
-                let tone_idx = crate::ldpc::binary_to_gray(j as u8) as usize;
-                s2[j] = (1e-12 + mags[tone_idx] * mags[tone_idx]).log10() * 10.0;
+            match pp.bits_per_symbol {
+                3 => {
+                    // 8-FSK (FT8/FT2): 3 LLRs per symbol
+                    let mut s2 = [0.0f64; 8];
+                    for j in 0..8 {
+                        let tone_idx = crate::ldpc::binary_to_gray(j as u8) as usize;
+                        s2[j] = (1e-12 + mags[tone_idx] * mags[tone_idx]).log10() * 10.0;
+                    }
+
+                    fn max4(a: f64, b: f64, c: f64, d: f64) -> f64 {
+                        a.max(b).max(c.max(d))
+                    }
+
+                    let llr0 = max4(s2[4], s2[5], s2[6], s2[7])
+                        - max4(s2[0], s2[1], s2[2], s2[3]);
+                    let llr1 = max4(s2[2], s2[3], s2[6], s2[7])
+                        - max4(s2[0], s2[1], s2[4], s2[5]);
+                    let llr2 = max4(s2[1], s2[3], s2[5], s2[7])
+                        - max4(s2[0], s2[2], s2[4], s2[6]);
+
+                    llrs.push(-llr0 as f32);
+                    llrs.push(-llr1 as f32);
+                    llrs.push(-llr2 as f32);
+                }
+                2 => {
+                    // 4-FSK (FT4): 2 LLRs per symbol
+                    // Gray map: binary 0→tone 0, 1→tone 1, 2→tone 3, 3→tone 2
+                    let mut s2 = [0.0f64; 4];
+                    for j in 0..4 {
+                        let tone_idx = crate::ldpc::binary_to_gray_4fsk(j as u8) as usize;
+                        s2[j] = (1e-12 + mags[tone_idx] * mags[tone_idx]).log10() * 10.0;
+                    }
+
+                    // bit0: binary values {2,3} have bit0=1, {0,1} have bit0=0
+                    let llr0 = s2[2].max(s2[3]) - s2[0].max(s2[1]);
+                    // bit1: binary values {1,3} have bit1=1, {0,2} have bit1=0
+                    let llr1 = s2[1].max(s2[3]) - s2[0].max(s2[2]);
+
+                    llrs.push(-llr0 as f32);
+                    llrs.push(-llr1 as f32);
+                }
+                _ => unreachable!("Unsupported bits_per_symbol"),
             }
-
-            // ft8_lib computes LLRs as:
-            // logl[0] = max4(s2[4],s2[5],s2[6],s2[7]) - max4(s2[0],s2[1],s2[2],s2[3])
-            // logl[1] = max4(s2[2],s2[3],s2[6],s2[7]) - max4(s2[0],s2[1],s2[4],s2[5])
-            // logl[2] = max4(s2[1],s2[3],s2[5],s2[7]) - max4(s2[0],s2[2],s2[4],s2[6])
-            fn max4(a: f64, b: f64, c: f64, d: f64) -> f64 {
-                a.max(b).max(c.max(d))
-            }
-
-            let llr0 = max4(s2[4], s2[5], s2[6], s2[7]) - max4(s2[0], s2[1], s2[2], s2[3]);
-            let llr1 = max4(s2[2], s2[3], s2[6], s2[7]) - max4(s2[0], s2[1], s2[4], s2[5]);
-            let llr2 = max4(s2[1], s2[3], s2[5], s2[7]) - max4(s2[0], s2[2], s2[4], s2[6]);
-
-            // Negate to match our LDPC convention: positive = bit=0, negative = bit=1
-            // (ft8_lib uses the opposite convention)
-            llrs.push(-llr0 as f32);
-            llrs.push(-llr1 as f32);
-            llrs.push(-llr2 as f32);
         }
 
         debug_assert_eq!(llrs.len(), 174);
@@ -1007,26 +1063,36 @@ impl Ft8Decoder {
     /// Only the 58 data symbols (positions 7..36 and 43..72) are demodulated.
     /// Costas sync symbols at positions 0..7, 36..43, 72..79 are skipped.
     fn demodulate_symbols(&self, symbols: &[u8]) -> Ft8Result<BitVec> {
-        if symbols.len() != NUM_SYMBOLS {
+        let pp = &self.protocol_params;
+        if symbols.len() != pp.num_symbols {
             return Err(Ft8Error::MessageDecodingError(format!(
                 "Expected {} symbols, got {}",
-                NUM_SYMBOLS,
+                pp.num_symbols,
                 symbols.len()
             )));
         }
 
         let mut bits = BitVec::with_capacity(174);
 
-        for i_tone in 0..NUM_SYMBOLS {
-            let is_data = (7..36).contains(&i_tone) || (43..72).contains(&i_tone);
-            if !is_data {
+        for i_tone in 0..pp.num_symbols {
+            if !pp.is_data_symbol(i_tone) {
                 continue;
             }
 
-            let binary_value = gray_to_binary(symbols[i_tone]);
-            bits.push((binary_value & 4) != 0);
-            bits.push((binary_value & 2) != 0);
-            bits.push((binary_value & 1) != 0);
+            match pp.bits_per_symbol {
+                3 => {
+                    let binary_value = gray_to_binary(symbols[i_tone]);
+                    bits.push((binary_value & 4) != 0);
+                    bits.push((binary_value & 2) != 0);
+                    bits.push((binary_value & 1) != 0);
+                }
+                2 => {
+                    let binary_value = crate::ldpc::gray_to_binary_4fsk(symbols[i_tone]);
+                    bits.push((binary_value & 2) != 0);
+                    bits.push((binary_value & 1) != 0);
+                }
+                _ => unreachable!("Unsupported bits_per_symbol"),
+            }
         }
 
         Ok(bits)

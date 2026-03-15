@@ -21,6 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Configure decoder for weak signal detection
     let config = Ft8Config {
         sample_rate: SAMPLE_RATE,
+        protocol: pancetta_ft8::Protocol::Ft8,
         enable_multithreading: true,
         max_candidates: 100,       // Process more candidates for weak signals
         min_snr_db: -24.0,         // Target -24 dB SNR as per FT8 spec

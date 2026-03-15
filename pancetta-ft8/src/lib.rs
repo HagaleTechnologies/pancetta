@@ -51,6 +51,9 @@
 //! # }
 //! ```
 
+// Protocol abstraction layer (FT8/FT4/FT2)
+pub mod protocol;
+
 // Core FT8 decoding modules
 pub mod decoder;
 pub mod ldpc;
@@ -68,6 +71,9 @@ pub mod encoder;
 pub mod modulator;
 #[cfg(feature = "transmit")]
 pub mod transmit;
+
+// Protocol exports
+pub use protocol::{ModulationType, Protocol, ProtocolParams};
 
 // Core decoding exports
 pub use decoder::{Ft8Config, Ft8Decoder, WaterfallData};

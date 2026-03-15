@@ -81,3 +81,5 @@ gpio = ["rppal"]
 transmit = ["serialport", "cpal", "chrono", "parking_lot", "serde", "serde_json", "tokio"]
 # Enable decoder debug output (temporary)
 debug-decode = []
+# Enable experimental FT2 protocol support
+ft2 = []

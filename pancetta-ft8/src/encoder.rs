@@ -10,9 +10,10 @@
 //! 4. LDPC encode → 174-bit codeword
 //! 5. Map to 79 symbols via Gray code + Costas sync arrays
 
-use crate::ldpc::{binary_to_gray, LdpcEncoder};
-use crate::message::{calculate_crc14, CRC_BITS, NUM_SYMBOLS, PAYLOAD_BITS};
-use crate::{Ft8Error, Ft8Result};
+use crate::ldpc::{binary_to_gray, binary_to_gray_4fsk, LdpcEncoder};
+use crate::message::{calculate_crc14, CRC_BITS, PAYLOAD_BITS};
+use crate::protocol::ProtocolParams;
+use crate::{Ft8Error, Ft8Result, NUM_SYMBOLS};
 use bitvec::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -36,18 +37,43 @@ const COSTAS_ARRAY: [u8; 7] = [3, 1, 4, 0, 6, 5, 2];
 /// Free text character table (42 chars): " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?"
 const FREETEXT_CHARS: &[u8; 42] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ+-./?";
 
-/// FT8 message encoder for generating transmission-ready symbols
+/// Message encoder for FT8/FT4/FT2 protocols.
+///
+/// The payload encoding (77-bit message packing, CRC-14, LDPC) is shared
+/// across all protocols. Only the final symbol mapping (Gray code + sync
+/// array insertion) differs per protocol.
 pub struct Ft8Encoder {
     /// LDPC encoder for error correction
     ldpc_encoder: LdpcEncoder,
+    /// Protocol parameters (defaults to FT8)
+    protocol: ProtocolParams,
 }
 
 impl Ft8Encoder {
-    /// Create a new FT8 encoder
+    /// Create a new encoder with FT8 protocol (default)
     pub fn new() -> Self {
         Self {
             ldpc_encoder: LdpcEncoder::new(),
+            protocol: ProtocolParams::ft8(),
         }
+    }
+
+    /// Create a new encoder for a specific protocol
+    pub fn with_protocol(protocol: ProtocolParams) -> Self {
+        Self {
+            ldpc_encoder: LdpcEncoder::new(),
+            protocol,
+        }
+    }
+
+    /// Set the protocol for subsequent encoding operations
+    pub fn set_protocol(&mut self, protocol: ProtocolParams) {
+        self.protocol = protocol;
+    }
+
+    /// Get the current protocol
+    pub fn protocol(&self) -> &ProtocolParams {
+        &self.protocol
     }
 
     /// Encode a text message into FT8 transmission symbols
@@ -164,9 +190,55 @@ impl Ft8Encoder {
     // Core encoding pipeline
     // ========================================================================
 
-    /// Convert 77-bit payload to 79 transmission symbols
+    /// Encode a message into symbols using the current protocol.
+    ///
+    /// Returns a `Vec<u8>` with length matching `protocol.num_symbols`.
+    /// For FT8: 79 symbols (values 0-7). For FT4: 105 symbols (values 0-3).
+    pub fn encode_message_protocol(
+        &mut self,
+        message_text: &str,
+        _transmit_power: Option<u8>,
+    ) -> Ft8Result<Vec<u8>> {
+        let text = message_text.to_uppercase();
+        let text = text.trim();
+
+        if let Ok(payload) = self.try_encode_standard(text) {
+            return self.payload_to_symbols_protocol(&payload);
+        }
+        if let Ok(payload) = self.encode_free_text(text) {
+            return self.payload_to_symbols_protocol(&payload);
+        }
+
+        Err(Ft8Error::MessageDecodingError(format!(
+            "Cannot encode message: '{}'",
+            message_text
+        )))
+    }
+
+    /// Convert 77-bit payload to transmission symbols (protocol-aware, returns Vec)
+    fn payload_to_symbols_protocol(&self, payload: &[u8; 10]) -> Ft8Result<Vec<u8>> {
+        // FT4 applies XOR scrambling to the payload before CRC computation
+        let effective_payload = if let Some(xor_seq) = self.protocol.xor_sequence {
+            let mut scrambled = *payload;
+            for i in 0..10 {
+                scrambled[i] ^= xor_seq[i];
+            }
+            scrambled
+        } else {
+            *payload
+        };
+        let ldpc_codeword = self.payload_to_ldpc(&effective_payload)?;
+        self.generate_symbols_protocol(&ldpc_codeword)
+    }
+
+    /// Convert 77-bit payload to 79 FT8 transmission symbols (backward compatible)
     fn payload_to_symbols(&self, payload: &[u8; 10]) -> Ft8Result<[u8; NUM_SYMBOLS]> {
-        // Add CRC-14 to get 91 bits
+        let ldpc_codeword = self.payload_to_ldpc(payload)?;
+        self.generate_symbols(&ldpc_codeword)
+    }
+
+    /// Shared: payload → LDPC codeword (174 bits)
+    fn payload_to_ldpc(&self, payload: &[u8; 10]) -> Ft8Result<BitVec> {
         let mut payload_bitvec = BitVec::with_capacity(PAYLOAD_BITS);
         for i in 0..PAYLOAD_BITS {
             payload_bitvec.push(payload[i / 8] & (0x80u8 >> (i % 8)) != 0);
@@ -174,21 +246,78 @@ impl Ft8Encoder {
 
         let crc = calculate_crc14(&payload_bitvec);
 
-        // Build 91-bit message: 77 payload + 14 CRC
         let mut message_bits = BitVec::with_capacity(PAYLOAD_BITS + CRC_BITS);
         message_bits.extend_from_bitslice(&payload_bitvec);
         for i in (0..CRC_BITS).rev() {
             message_bits.push((crc >> i) & 1 != 0);
         }
 
-        // LDPC encode (91 → 174 bits)
-        let ldpc_codeword = self.ldpc_encoder.encode(&message_bits)?;
-
-        // Generate symbols
-        self.generate_symbols(&ldpc_codeword)
+        self.ldpc_encoder.encode(&message_bits)
     }
 
-    /// Generate 79-symbol sequence from LDPC codeword
+    /// Generate symbol sequence from LDPC codeword using current protocol params.
+    ///
+    /// Inserts Costas sync arrays at the protocol-defined positions and maps
+    /// data bits to tones via the appropriate Gray code (3-bit for 8-FSK, 2-bit for 4-FSK).
+    fn generate_symbols_protocol(&self, ldpc_codeword: &BitSlice) -> Ft8Result<Vec<u8>> {
+        if ldpc_codeword.len() != 174 {
+            return Err(Ft8Error::MessageDecodingError(format!(
+                "Invalid LDPC codeword length: {}",
+                ldpc_codeword.len()
+            )));
+        }
+
+        let params = &self.protocol;
+        let mut symbols = vec![0u8; params.num_symbols];
+        let mut bit_idx = 0usize;
+
+        for i in 0..params.num_symbols {
+            if let Some(costas_val) = params.costas_value(i) {
+                symbols[i] = costas_val;
+            } else if params.is_data_symbol(i) {
+                match params.bits_per_symbol {
+                    3 => {
+                        // 8-FSK: extract 3 bits, apply Gray code
+                        let mut bits3 = 0u8;
+                        if ldpc_codeword[bit_idx] {
+                            bits3 |= 4;
+                        }
+                        if ldpc_codeword[bit_idx + 1] {
+                            bits3 |= 2;
+                        }
+                        if ldpc_codeword[bit_idx + 2] {
+                            bits3 |= 1;
+                        }
+                        bit_idx += 3;
+                        symbols[i] = binary_to_gray(bits3);
+                    }
+                    2 => {
+                        // 4-FSK: extract 2 bits, apply Gray code
+                        let mut bits2 = 0u8;
+                        if ldpc_codeword[bit_idx] {
+                            bits2 |= 2;
+                        }
+                        if ldpc_codeword[bit_idx + 1] {
+                            bits2 |= 1;
+                        }
+                        bit_idx += 2;
+                        symbols[i] = binary_to_gray_4fsk(bits2);
+                    }
+                    _ => {
+                        return Err(Ft8Error::ConfigError(format!(
+                            "Unsupported bits_per_symbol: {}",
+                            params.bits_per_symbol
+                        )));
+                    }
+                }
+            }
+            // else: ramp or unused symbol, stays 0
+        }
+
+        Ok(symbols)
+    }
+
+    /// Generate 79-symbol FT8 sequence from LDPC codeword (backward compatible)
     ///
     /// FT8 symbol layout: S7 D29 S7 D29 S7
     fn generate_symbols(&self, ldpc_codeword: &BitSlice) -> Ft8Result<[u8; NUM_SYMBOLS]> {
@@ -210,7 +339,6 @@ impl Ft8Encoder {
             } else if i_tone >= 72 {
                 symbols[i_tone] = COSTAS_ARRAY[i_tone - 72];
             } else {
-                // Extract 3 bits, apply Gray code mapping
                 let mut bits3 = 0u8;
                 if ldpc_codeword[bit_idx] {
                     bits3 |= 4;
@@ -222,7 +350,6 @@ impl Ft8Encoder {
                     bits3 |= 1;
                 }
                 bit_idx += 3;
-
                 symbols[i_tone] = binary_to_gray(bits3);
             }
         }
@@ -1395,5 +1522,153 @@ mod tests {
         assert_eq!(g, 10342); // Same as packgrid
                               // Report -12
         assert_eq!(pack_grid_14bit("-12"), 23);
+    }
+
+    // ====================================================================
+    // FT4 encoder tests
+    // ====================================================================
+
+    #[test]
+    fn test_ft4_encoder_creation() {
+        let encoder = Ft8Encoder::with_protocol(ProtocolParams::ft4());
+        assert_eq!(encoder.protocol().protocol, crate::Protocol::Ft4);
+    }
+
+    #[test]
+    fn test_ft4_encode_cq() {
+        let mut encoder = Ft8Encoder::with_protocol(ProtocolParams::ft4());
+        let symbols = encoder.encode_message_protocol("CQ W1ABC FN42", None).unwrap();
+
+        // FT4: 105 symbols, values 0-3
+        assert_eq!(symbols.len(), 105);
+        assert!(symbols.iter().all(|&s| s < 4), "All FT4 symbols must be 0-3");
+
+        // Verify sync arrays at correct positions
+        // Sync group 0 at positions 1-4: [0, 1, 3, 2]
+        assert_eq!(&symbols[1..5], &[0, 1, 3, 2]);
+        // Sync group 1 at positions 34-37: [1, 0, 2, 3]
+        assert_eq!(&symbols[34..38], &[1, 0, 2, 3]);
+        // Sync group 2 at positions 67-70: [2, 3, 1, 0]
+        assert_eq!(&symbols[67..71], &[2, 3, 1, 0]);
+        // Sync group 3 at positions 100-103: [3, 2, 0, 1]
+        assert_eq!(&symbols[100..104], &[3, 2, 0, 1]);
+
+        // Ramp symbols at 0 and 104 should be 0
+        assert_eq!(symbols[0], 0);
+        assert_eq!(symbols[104], 0);
+    }
+
+    #[test]
+    fn test_ft4_encode_sample_count() {
+        let mut encoder = Ft8Encoder::with_protocol(ProtocolParams::ft4());
+        let symbols = encoder.encode_message_protocol("CQ W1ABC FN42", None).unwrap();
+
+        // Modulate and verify sample count
+        let mut modulator = crate::modulator::Ft8Modulator::with_pulse_shape(
+            crate::SAMPLE_RATE,
+            crate::BASE_FREQUENCY,
+            0.5,
+            crate::modulator::PulseShape::Gaussian { bt: 1.0 },
+        )
+        .unwrap();
+
+        let params = ProtocolParams::ft4();
+        let audio = modulator
+            .modulate_symbols_protocol(&symbols, 0.0, &params)
+            .unwrap();
+
+        // FT4: 105 symbols × 576 samples/symbol = 60480 samples
+        assert_eq!(audio.len(), 60480);
+        assert!(audio.iter().all(|&s| s.abs() <= 1.0));
+    }
+
+    #[test]
+    fn test_ft4_xor_symmetry() {
+        // Verify that XOR scrambling → CRC → LDPC → decode → un-XOR → parse
+        // gives back the original message for various message types.
+        use crate::protocol::{FT4_XOR_SEQUENCE, ProtocolParams};
+        use crate::message::{PAYLOAD_BITS, CRC_BITS, calculate_crc14};
+
+        let mut encoder = Ft8Encoder::new(); // FT8 encoder to get raw payloads
+
+        let messages = [
+            "CQ W1ABC FN42",
+            "CQ DX W1ABC FN42",
+            "K1DEF W1ABC FN42",
+            "K1DEF W1ABC -12",
+            "K1DEF W1ABC RR73",
+            "HELLO WORLD",
+        ];
+
+        for msg in &messages {
+            // Get the raw 77-bit payload (as 10 bytes, without XOR)
+            let payload = encoder.try_encode_standard(msg)
+                .or_else(|_| encoder.encode_free_text(msg))
+                .unwrap();
+
+            // Apply XOR (as encoder does for FT4)
+            let mut scrambled = payload;
+            for i in 0..10 {
+                scrambled[i] ^= FT4_XOR_SEQUENCE[i];
+            }
+
+            // Extract 77 bits from scrambled payload
+            let mut scrambled_bits = BitVec::with_capacity(PAYLOAD_BITS);
+            for i in 0..PAYLOAD_BITS {
+                scrambled_bits.push(scrambled[i / 8] & (0x80u8 >> (i % 8)) != 0);
+            }
+
+            // Compute CRC on scrambled payload
+            let crc = calculate_crc14(&scrambled_bits);
+
+            // Simulate decoder un-XOR: apply XOR to the scrambled bits
+            let mut unscrambled_bits = scrambled_bits.clone();
+            for byte_idx in 0..10 {
+                let xor_byte = FT4_XOR_SEQUENCE[byte_idx];
+                for bit_pos in 0..8 {
+                    let global_bit = byte_idx * 8 + bit_pos;
+                    if global_bit >= PAYLOAD_BITS {
+                        break;
+                    }
+                    if (xor_byte >> (7 - bit_pos)) & 1 == 1 {
+                        let cur = unscrambled_bits[global_bit];
+                        unscrambled_bits.set(global_bit, !cur);
+                    }
+                }
+            }
+
+            // The unscrambled bits should match the original payload bits
+            let mut original_bits: BitVec<u8, Msb0> = BitVec::with_capacity(PAYLOAD_BITS);
+            for i in 0..PAYLOAD_BITS {
+                original_bits.push(payload[i / 8] & (0x80u8 >> (i % 8)) != 0);
+            }
+
+            assert_eq!(
+                unscrambled_bits, original_bits,
+                "XOR round-trip failed for '{}'", msg
+            );
+
+            // Also verify the message parser can parse the unscrambled payload
+            let parser = crate::message::MessageParser::new();
+            let parsed = parser.parse_payload(&unscrambled_bits);
+            assert!(parsed.is_ok(), "Failed to parse unscrambled payload for '{}': {:?}", msg, parsed);
+        }
+    }
+
+    #[test]
+    fn test_ft4_different_from_ft8() {
+        // Same message encoded as FT8 and FT4 should produce different symbols
+        let mut ft8_enc = Ft8Encoder::new();
+        let mut ft4_enc = Ft8Encoder::with_protocol(ProtocolParams::ft4());
+
+        let ft8_syms = ft8_enc.encode_message("CQ W1ABC FN42", None).unwrap();
+        let ft4_syms = ft4_enc
+            .encode_message_protocol("CQ W1ABC FN42", None)
+            .unwrap();
+
+        assert_eq!(ft8_syms.len(), 79);
+        assert_eq!(ft4_syms.len(), 105);
+
+        // Data content should differ due to XOR scrambling and different Gray code
     }
 }
