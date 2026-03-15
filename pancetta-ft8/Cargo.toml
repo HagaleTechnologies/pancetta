@@ -8,12 +8,12 @@ license = "MIT"
 
 [dependencies]
 # DSP and FFT operations
-rustfft = "6.2"
+rustfft = "6.4"
 # Numeric operations with SIMD optimization
 num-complex = "0.4"
 num-traits = "0.2"
 # Memory management and allocation control
-bumpalo = "3.14"
+bumpalo = "3.20"
 # Bit manipulation for FT8 protocol
 bitvec = "1.0"
 # Time handling
@@ -28,7 +28,7 @@ anyhow = "1.0"
 # Logging for debugging
 log = "0.4"
 # Serial port communication for PTT/CAT control
-serialport = { version = "4.2", optional = true }
+serialport = { version = "4.7", optional = true }
 # GPIO control for Raspberry Pi
 rppal = { version = "0.17", optional = true }
 # Audio output and control
@@ -41,18 +41,18 @@ parking_lot = { version = "0.12", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 # Async runtime for transmission control
-tokio = { version = "1.0", features = ["full"], optional = true }
+tokio = { version = "1.50", features = ["full"], optional = true }
 
 [build-dependencies]
 # C compiler for ft8_lib FFI
-cc = "1.0"
+cc = "1.2"
 
 [dev-dependencies]
 # Testing framework
 criterion = { version = "0.5", features = ["html_reports"] }
 approx = "0.5"
 # Property-based testing
-proptest = "1.4"
+proptest = "1.10"
 # Random number generation for tests
 rand = "0.8"
 # Async testing runtime
