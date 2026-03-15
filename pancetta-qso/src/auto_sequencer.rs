@@ -441,20 +441,121 @@ impl AutoSequencer {
             }
             
             SequenceAction::SendReport { qso_id, report } => {
-                // Implementation would send report message
+                let progress = self.qso_manager.get_qso(qso_id).await
+                    .map_err(|e| AutoSequencerError::QsoManager { source: e })?;
+
+                if let Some(their_callsign) = progress.state.their_callsign() {
+                    let our_callsign = progress.metadata.our_callsign.clone();
+                    let frequency = progress.state.frequency().unwrap_or(progress.metadata.frequency);
+                    let their_call = their_callsign.to_string();
+
+                    let message = MessageType::SignalReport {
+                        to_station: their_call,
+                        from_station: our_callsign,
+                        report,
+                    };
+
+                    self.qso_manager.send_message(qso_id, message, frequency).await;
+                    info!("Sent signal report {:+} for QSO {}", report, qso_id);
+                }
+
                 self.update_sequence_activity(qso_id).await;
             }
-            
+
+            SequenceAction::SendReportAck { qso_id, report } => {
+                let progress = self.qso_manager.get_qso(qso_id).await
+                    .map_err(|e| AutoSequencerError::QsoManager { source: e })?;
+
+                if let Some(their_callsign) = progress.state.their_callsign() {
+                    let our_callsign = progress.metadata.our_callsign.clone();
+                    let frequency = progress.state.frequency().unwrap_or(progress.metadata.frequency);
+                    let their_call = their_callsign.to_string();
+
+                    let message = MessageType::FinalConfirmation {
+                        to_station: their_call,
+                        from_station: our_callsign,
+                    };
+
+                    self.qso_manager.send_message(qso_id, message, frequency).await;
+                    info!("Sent RR73 for QSO {}", qso_id);
+                }
+
+                self.update_sequence_activity(qso_id).await;
+            }
+
+            SequenceAction::SendConfirmation { qso_id } => {
+                let progress = self.qso_manager.get_qso(qso_id).await
+                    .map_err(|e| AutoSequencerError::QsoManager { source: e })?;
+
+                if let Some(their_callsign) = progress.state.their_callsign() {
+                    let our_callsign = progress.metadata.our_callsign.clone();
+                    let frequency = progress.state.frequency().unwrap_or(progress.metadata.frequency);
+                    let their_call = their_callsign.to_string();
+
+                    let message = MessageType::FinalConfirmation {
+                        to_station: their_call,
+                        from_station: our_callsign,
+                    };
+
+                    self.qso_manager.send_message(qso_id, message, frequency).await;
+                    info!("Sent confirmation (RR73) for QSO {}", qso_id);
+                }
+
+                self.update_sequence_activity(qso_id).await;
+            }
+
+            SequenceAction::Send73 { qso_id } => {
+                let progress = self.qso_manager.get_qso(qso_id).await
+                    .map_err(|e| AutoSequencerError::QsoManager { source: e })?;
+
+                if let Some(their_callsign) = progress.state.their_callsign() {
+                    let our_callsign = progress.metadata.our_callsign.clone();
+                    let frequency = progress.state.frequency().unwrap_or(progress.metadata.frequency);
+                    let their_call = their_callsign.to_string();
+
+                    let message = MessageType::SeventyThree {
+                        to_station: their_call,
+                        from_station: our_callsign,
+                    };
+
+                    self.qso_manager.send_message(qso_id, message, frequency).await;
+                    info!("Sent 73 for QSO {}", qso_id);
+                }
+
+                self.update_sequence_activity(qso_id).await;
+            }
+
+            SequenceAction::SendContestExchange { qso_id, serial } => {
+                let progress = self.qso_manager.get_qso(qso_id).await
+                    .map_err(|e| AutoSequencerError::QsoManager { source: e })?;
+
+                if let Some(their_callsign) = progress.state.their_callsign() {
+                    let our_callsign = progress.metadata.our_callsign.clone();
+                    let frequency = progress.state.frequency().unwrap_or(progress.metadata.frequency);
+                    let their_call = their_callsign.to_string();
+
+                    let report = progress.metadata.reports.received.unwrap_or(-15);
+
+                    let message = MessageType::ContestExchange {
+                        to_station: their_call,
+                        from_station: our_callsign,
+                        report,
+                        serial,
+                    };
+
+                    self.qso_manager.send_message(qso_id, message, frequency).await;
+                    info!("Sent contest exchange (serial {}) for QSO {}", serial, qso_id);
+                }
+
+                self.update_sequence_activity(qso_id).await;
+            }
+
             SequenceAction::CancelQso { qso_id, reason } => {
+                info!("Cancelling QSO {}: {}", qso_id, reason);
                 self.qso_manager.cancel_qso(qso_id).await
                     .map_err(|e| AutoSequencerError::QsoManager { source: e })?;
-                
+
                 self.end_sequence(qso_id).await;
-            }
-            
-            _ => {
-                // Implement other actions
-                debug!("Action not yet implemented: {:?}", action);
             }
         }
         
@@ -591,21 +692,54 @@ impl AutoSequencer {
         qso_id: QsoId,
     ) -> Option<SequenceAction> {
         match state {
-            QsoState::WaitingForReport { .. } 
+            QsoState::WaitingForReport { .. }
                 if self.config.response_behavior.auto_send_reports => {
+                // Look up the actual SNR from the most recent received message
+                let report = self.get_received_snr(qso_id).await.unwrap_or(-15);
                 Some(SequenceAction::SendReport {
                     qso_id,
-                    report: -15, // Default report, should be calculated
+                    report,
                 })
             }
-            
-            QsoState::WaitingForConfirmation { .. } 
+
+            QsoState::SendingReport { .. }
+                if self.config.response_behavior.auto_send_confirmations => {
+                let report = self.get_received_snr(qso_id).await.unwrap_or(-15);
+                Some(SequenceAction::SendReportAck {
+                    qso_id,
+                    report,
+                })
+            }
+
+            QsoState::WaitingForConfirmation { .. }
                 if self.config.response_behavior.auto_send_confirmations => {
                 Some(SequenceAction::SendConfirmation { qso_id })
             }
-            
+
+            QsoState::SendingConfirmation { .. } => {
+                Some(SequenceAction::Send73 { qso_id })
+            }
+
             _ => None,
         }
+    }
+
+    /// Extract the SNR from the most recent received message for a QSO
+    async fn get_received_snr(&self, qso_id: QsoId) -> Option<SignalReport> {
+        let progress = self.qso_manager.get_qso(qso_id).await.ok()?;
+
+        // First check the metadata reports
+        if let Some(received) = progress.metadata.reports.received {
+            return Some(received);
+        }
+
+        // Fall back to computing from the last received message's signal_strength
+        let last_received = progress.messages.iter()
+            .rev()
+            .find(|m| m.direction == MessageDirection::Received)?;
+
+        let signal_strength = last_received.signal_strength?;
+        Some(self.calculate_snr(signal_strength).await)
     }
     
     async fn check_auto_cq(&self) -> Result<(), AutoSequencerError> {

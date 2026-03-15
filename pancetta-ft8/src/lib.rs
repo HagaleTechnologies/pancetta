@@ -70,7 +70,7 @@ pub mod modulator;
 pub mod transmit;
 
 // Core decoding exports
-pub use decoder::{Ft8Decoder, Ft8Config};
+pub use decoder::{Ft8Decoder, Ft8Config, WaterfallData};
 pub use message::{DecodedMessage, Ft8Message, MessageType};
 pub use signal_processing::{WindowFunction, FftProcessor};
 pub use sync::{TimeSync, SyncResult};

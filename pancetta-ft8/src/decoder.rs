@@ -18,6 +18,7 @@ use crate::{
 };
 use num_complex::Complex;
 use rustfft::FftPlanner;
+use std::collections::HashSet;
 use std::time::{SystemTime, Instant};
 use bumpalo::Bump;
 use bitvec::prelude::*;
@@ -57,7 +58,7 @@ const LLR_TARGET_VARIANCE: f32 = 24.0;
 const MIN_SYNC_SCORE: f64 = 3.5;
 
 /// Maximum candidates from sync search before NMS
-const MAX_SYNC_CANDIDATES: usize = 300;
+const MAX_SYNC_CANDIDATES: usize = 200;
 
 /// Minimum frequency bin for FT8 search (~200 Hz / 6.25 Hz)
 const MIN_FREQ_BIN: usize = 32;
@@ -98,6 +99,9 @@ pub struct Ft8Config {
 
     /// Time search range (seconds)
     pub time_range: f64,
+
+    /// Maximum number of successive decoding passes (1 = no interference cancellation)
+    pub max_decode_passes: usize,
 }
 
 impl Default for Ft8Config {
@@ -111,6 +115,7 @@ impl Default for Ft8Config {
             aggressive_decoding: false,
             frequency_range: 200.0,
             time_range: 2.0,
+            max_decode_passes: 3,
         }
     }
 }
@@ -254,72 +259,184 @@ impl Ft8Decoder {
 
         self.allocator.reset();
 
-        // Convert to f64 and normalize
-        let audio = self.preprocess_audio(samples)?;
+        let max_passes = self.config.max_decode_passes.max(1);
 
-        // Step 1: Compute time-frequency spectrogram
-        let spectrogram = self.compute_spectrogram(&audio)?;
+        // Working copy of audio that we subtract decoded signals from
+        let mut residual_samples: Vec<f32> = samples.to_vec();
+        let mut all_decoded_messages: Vec<DecodedMessage> = Vec::new();
+        let mut seen_messages: HashSet<String> = HashSet::new();
+        let mut best_sync_score = 0.0f64;
 
-        // Step 2: Find candidates via Costas sync pattern search
-        let sync_candidates = self.costas_sync_search(&spectrogram)?;
+        for pass in 0..max_passes {
+            // Convert to f64 and normalize
+            let audio = self.preprocess_audio(&residual_samples)?;
 
-        // Step 3: Decode each candidate
-        let mut decoded_messages = Vec::new();
-        let _num_candidates = sync_candidates.len();
-        let _best_score = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
-        #[cfg(feature = "debug-decode")]
-        eprintln!("[decode] {} sync candidates, best score={:.1}", _num_candidates, _best_score);
-        #[cfg(feature = "debug-decode")]
-        for (i, c) in sync_candidates.iter().take(5).enumerate() {
-            eprintln!("  [{}] t={} f={} score={:.1}", i, c.time_step, c.freq_bin, c.sync_score);
-        }
-        for candidate in &sync_candidates {
-            if decoded_messages.len() >= self.config.max_candidates {
+            // Step 1: Compute time-frequency spectrogram
+            let spectrogram = self.compute_spectrogram(&audio)?;
+
+            // Step 2: Find candidates via Costas sync pattern search
+            let sync_candidates = self.costas_sync_search(&spectrogram)?;
+
+            if pass == 0 {
+                best_sync_score = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
+            }
+
+            // Step 3: Decode each candidate
+            let mut pass_decoded: Vec<DecodedMessage> = Vec::new();
+            let _num_candidates = sync_candidates.len();
+            let _best_score = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
+            #[cfg(feature = "debug-decode")]
+            eprintln!("[decode pass {}] {} sync candidates, best score={:.1}", pass, _num_candidates, _best_score);
+            #[cfg(feature = "debug-decode")]
+            for (i, c) in sync_candidates.iter().take(5).enumerate() {
+                eprintln!("  [{}] t={} f={} score={:.1}", i, c.time_step, c.freq_bin, c.sync_score);
+            }
+            for candidate in &sync_candidates {
+                if all_decoded_messages.len() + pass_decoded.len() >= self.config.max_candidates {
+                    break;
+                }
+
+                match self.decode_candidate(&audio, candidate) {
+                    Ok(Some(msg)) => {
+                        // Deduplicate using HashSet for O(1) lookup
+                        if seen_messages.insert(msg.text.clone()) {
+                            pass_decoded.push(msg);
+                        }
+                    }
+                    Ok(None) => {
+                        #[cfg(feature = "debug-decode")]
+                        eprintln!("  candidate t={} f={}: no decode", candidate.time_step, candidate.freq_bin);
+                    }
+                    Err(_e) => {
+                        #[cfg(feature = "debug-decode")]
+                        eprintln!("  candidate t={} f={}: error {}", candidate.time_step, candidate.freq_bin, _e);
+                    }
+                }
+            }
+
+            // If no new messages decoded in this pass, stop iterating
+            if pass_decoded.is_empty() {
                 break;
             }
 
-            match self.decode_candidate(&audio, candidate) {
-                Ok(Some(msg)) => {
-                    // Deduplicate by message text
-                    if !decoded_messages.iter().any(|m: &DecodedMessage| m.text == msg.text) {
-                        decoded_messages.push(msg);
-                    }
-                }
-                Ok(None) => {
-                    #[cfg(feature = "debug-decode")]
-                    eprintln!("  candidate t={} f={}: no decode", candidate.time_step, candidate.freq_bin);
-                }
-                Err(_e) => {
-                    #[cfg(feature = "debug-decode")]
-                    eprintln!("  candidate t={} f={}: error {}", candidate.time_step, candidate.freq_bin, _e);
+            #[cfg(feature = "debug-decode")]
+            eprintln!("[decode pass {}] decoded {} new messages", pass, pass_decoded.len());
+
+            // Subtract decoded signals from residual audio for next pass
+            if pass + 1 < max_passes {
+                for msg in &pass_decoded {
+                    self.subtract_signal(&mut residual_samples, msg);
                 }
             }
+
+            all_decoded_messages.extend(pass_decoded);
         }
 
         // Metrics
         let processing_time = start_time.elapsed();
-        let best_sync = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
 
         self.last_metrics = DecodingMetrics {
-            messages_decoded: decoded_messages.len(),
+            messages_decoded: all_decoded_messages.len(),
             processing_time,
-            average_snr: if decoded_messages.is_empty() {
+            average_snr: if all_decoded_messages.is_empty() {
                 0.0
             } else {
-                decoded_messages.iter().map(|m| m.snr_db).sum::<f32>()
-                    / decoded_messages.len() as f32
+                all_decoded_messages.iter().map(|m| m.snr_db).sum::<f32>()
+                    / all_decoded_messages.len() as f32
             },
             peak_memory_bytes: self.allocator.allocated_bytes(),
-            sync_quality: (best_sync / 12.0).min(1.0) as f32,
+            sync_quality: (best_sync_score / 12.0).min(1.0) as f32,
             timestamp: SystemTime::now(),
         };
 
-        for message in &decoded_messages {
+        for message in &all_decoded_messages {
             self.message_handler.on_message_decoded(message, &self.last_metrics);
         }
         self.message_handler.on_window_complete(&self.last_metrics);
 
-        Ok(decoded_messages)
+        Ok(all_decoded_messages)
+    }
+
+    /// Subtract a decoded signal from the audio buffer (time-domain interference cancellation).
+    ///
+    /// Re-encodes the decoded message text to FT8 symbols, modulates them at the
+    /// detected frequency offset, and subtracts the reconstructed signal from the
+    /// audio. This removes strong signals so weaker ones underneath can be decoded
+    /// in subsequent passes.
+    fn subtract_signal(&self, audio: &mut [f32], msg: &DecodedMessage) {
+        #[cfg(feature = "transmit")]
+        {
+            use crate::encoder::Ft8Encoder;
+            use crate::modulator::Ft8Modulator;
+
+            let mut encoder = Ft8Encoder::new();
+            let symbols = match encoder.encode_message(&msg.text, None) {
+                Ok(s) => s,
+                Err(_e) => {
+                    #[cfg(feature = "debug-decode")]
+                    eprintln!("  [subtract] failed to re-encode '{}': {}", msg.text, _e);
+                    return;
+                }
+            };
+
+            let base_freq = crate::BASE_FREQUENCY;
+            let freq_offset = msg.frequency_offset - base_freq;
+
+            let mut modulator = match Ft8Modulator::new(SAMPLE_RATE, base_freq, 1.0) {
+                Ok(m) => m,
+                Err(_e) => {
+                    #[cfg(feature = "debug-decode")]
+                    eprintln!("  [subtract] modulator error: {}", _e);
+                    return;
+                }
+            };
+
+            let reconstructed = match modulator.modulate_symbols(&symbols, freq_offset) {
+                Ok(r) => r,
+                Err(_e) => {
+                    #[cfg(feature = "debug-decode")]
+                    eprintln!("  [subtract] modulation error: {}", _e);
+                    return;
+                }
+            };
+
+            let time_offset_samples = (msg.time_offset * SAMPLE_RATE as f64) as usize;
+            let signal_len = reconstructed.len().min(audio.len().saturating_sub(time_offset_samples));
+            if signal_len == 0 {
+                return;
+            }
+
+            let orig_energy: f64 = (0..signal_len)
+                .map(|i| {
+                    let s = audio[time_offset_samples + i] as f64;
+                    s * s
+                })
+                .sum();
+
+            let recon_energy: f64 = (0..signal_len)
+                .map(|i| {
+                    let s = reconstructed[i] as f64;
+                    s * s
+                })
+                .sum();
+
+            // Scale with conservative factor (0.9) to avoid over-subtraction artifacts
+            let scale = if recon_energy > 1e-12 {
+                (orig_energy / recon_energy).sqrt() as f32 * 0.9
+            } else {
+                0.0
+            };
+
+            for i in 0..signal_len {
+                audio[time_offset_samples + i] -= reconstructed[i] * scale;
+            }
+
+            #[cfg(feature = "debug-decode")]
+            eprintln!(
+                "  [subtract] '{}' at {:.1} Hz, t={:.3}s, scale={:.3}",
+                msg.text, msg.frequency_offset, msg.time_offset, scale
+            );
+        }
     }
 
     /// Pre-process audio: convert to f64 and normalize
@@ -1020,14 +1137,11 @@ fn estimate_noise_floor(psd: &[f64]) -> f64 {
 /// - Min-sum belief propagation algorithm
 struct LdpcDecoder {
     max_iterations: usize,
-    /// Parity check matrix (83×174)
+    /// Parity check matrix (83x174) - sparse representation
     parity_check_matrix: ParityCheckMatrix,
-    /// Variable node degree (number of check nodes connected to each variable node)
-    variable_degrees: Vec<usize>,
-    /// Check node degree (number of variable nodes connected to each check node)
-    check_degrees: Vec<usize>,
-    /// Early termination threshold for syndrome check
-    early_termination: bool,
+    /// For each variable node, the position index within each connected check node's list.
+    /// var_positions[var_idx] = [(check_idx, position_in_check), ...] with exactly 3 entries.
+    var_positions: Vec<Vec<(usize, usize)>>,
     /// Min-sum normalization factor
     normalization_factor: f32,
 }
@@ -1036,24 +1150,26 @@ impl LdpcDecoder {
     fn new(max_iterations: usize) -> Ft8Result<Self> {
         let parity_check_matrix = ParityCheckMatrix::new_ft8();
 
-        let mut variable_degrees = vec![0; 174];
-        let mut check_degrees = vec![0; 83];
-
-        for check_idx in 0..83 {
-            for var_idx in 0..174 {
-                if parity_check_matrix.is_connected(check_idx, var_idx) {
-                    variable_degrees[var_idx] += 1;
-                    check_degrees[check_idx] += 1;
-                }
+        // Pre-compute position lookup: for each variable node, find its position
+        // in each connected check node's variable list. This avoids O(degree)
+        // linear searches during belief propagation iterations.
+        let mut var_positions = Vec::with_capacity(174);
+        for var_idx in 0..174 {
+            let connected_checks = parity_check_matrix.get_connected_checks(var_idx);
+            let mut positions = Vec::with_capacity(connected_checks.len());
+            for &check_idx in connected_checks {
+                let check_vars = parity_check_matrix.get_connected_variables(check_idx);
+                let pos = check_vars.iter().position(|&v| v == var_idx)
+                    .expect("Inconsistent parity check matrix");
+                positions.push((check_idx, pos));
             }
+            var_positions.push(positions);
         }
 
         Ok(Self {
             max_iterations,
             parity_check_matrix,
-            variable_degrees,
-            check_degrees,
-            early_termination: true,
+            var_positions,
             normalization_factor: 0.75,
         })
     }
@@ -1109,88 +1225,112 @@ impl LdpcDecoder {
         Ok(bits)
     }
 
-    /// Belief propagation algorithm using min-sum approximation
+    /// Belief propagation algorithm using min-sum approximation.
+    ///
+    /// Uses sparse message storage (only connected edges) and checks syndrome
+    /// after every iteration for early termination. Most decodable messages
+    /// converge in 10-30 iterations rather than running all 100.
     fn belief_propagation(&self, channel_llrs: &[f32]) -> Ft8Result<Vec<f32>> {
-        let mut variable_to_check = vec![vec![0.0f32; 174]; 83];
-        let mut check_to_variable = vec![vec![0.0f32; 174]; 83];
-        let mut output_llrs = channel_llrs.to_vec();
+        let num_checks = self.parity_check_matrix.num_checks;
+        let num_vars = self.parity_check_matrix.num_variables;
+
+        // Sparse message storage: one f32 per edge in the Tanner graph.
+        // For each check node, store messages indexed by position in its connection list.
+        // Max degree is 7, so we use fixed-size arrays to avoid heap allocation.
+        let mut v2c = [[0.0f32; 7]; 83]; // variable-to-check messages
+        let mut c2v = [[0.0f32; 7]; 83]; // check-to-variable messages
+        let mut output_llrs = [0.0f32; 174];
+        output_llrs[..num_vars].copy_from_slice(&channel_llrs[..num_vars]);
 
         // Initialize variable-to-check messages with channel LLRs
-        for check_idx in 0..83 {
-            for var_idx in 0..174 {
-                if self.parity_check_matrix.is_connected(check_idx, var_idx) {
-                    variable_to_check[check_idx][var_idx] = channel_llrs[var_idx];
-                }
+        for check_idx in 0..num_checks {
+            let connected_vars = self.parity_check_matrix.get_connected_variables(check_idx);
+            for (pos, &var_idx) in connected_vars.iter().enumerate() {
+                v2c[check_idx][pos] = channel_llrs[var_idx];
             }
         }
 
-        for iteration in 0..self.max_iterations {
+        for _iteration in 0..self.max_iterations {
             // Check node update (min-sum algorithm)
-            for check_idx in 0..83 {
+            for check_idx in 0..num_checks {
                 let connected_vars = self.parity_check_matrix.get_connected_variables(check_idx);
+                let degree = connected_vars.len();
 
-                for &var_idx in connected_vars {
-                    let mut sign_product = 1.0f32;
-                    let mut min_magnitude = f32::MAX;
-                    let mut second_min_magnitude = f32::MAX;
-                    let mut min_index = 0;
+                // Compute sign product and find two smallest magnitudes across all edges
+                let mut total_sign: i8 = 1;
+                let mut min1_mag = f32::MAX;
+                let mut min2_mag = f32::MAX;
+                let mut min1_pos: usize = 0;
+                let mut signs = [1i8; 7];
 
-                    for &other_var in connected_vars {
-                        if other_var != var_idx {
-                            let msg = variable_to_check[check_idx][other_var];
-                            sign_product *= msg.signum();
+                for pos in 0..degree {
+                    let msg = v2c[check_idx][pos];
+                    let s = if msg < 0.0 { -1i8 } else { 1i8 };
+                    signs[pos] = s;
+                    total_sign *= s;
 
-                            let magnitude = msg.abs();
-                            if magnitude < min_magnitude {
-                                second_min_magnitude = min_magnitude;
-                                min_magnitude = magnitude;
-                                min_index = other_var;
-                            } else if magnitude < second_min_magnitude {
-                                second_min_magnitude = magnitude;
-                            }
-                        }
+                    let mag = msg.abs();
+                    if mag < min1_mag {
+                        min2_mag = min1_mag;
+                        min1_mag = mag;
+                        min1_pos = pos;
+                    } else if mag < min2_mag {
+                        min2_mag = mag;
                     }
+                }
 
-                    let magnitude = if var_idx == min_index {
-                        second_min_magnitude
-                    } else {
-                        min_magnitude
-                    };
-
-                    check_to_variable[check_idx][var_idx] =
-                        sign_product * magnitude * self.normalization_factor;
+                // Now compute check-to-variable messages
+                for pos in 0..degree {
+                    // Sign: product of all other signs = total_sign / this_sign
+                    let edge_sign = total_sign * signs[pos]; // removes this edge's sign
+                    let mag = if pos == min1_pos { min2_mag } else { min1_mag };
+                    c2v[check_idx][pos] = edge_sign as f32 * mag * self.normalization_factor;
                 }
             }
 
-            // Variable node update
-            for var_idx in 0..174 {
-                let connected_checks = self.parity_check_matrix.get_connected_checks(var_idx);
+            // Variable node update using pre-computed position lookup
+            for var_idx in 0..num_vars {
+                let positions = &self.var_positions[var_idx];
 
-                output_llrs[var_idx] = channel_llrs[var_idx];
-                for &check_idx in connected_checks {
-                    output_llrs[var_idx] += check_to_variable[check_idx][var_idx];
+                // Sum all incoming check-to-variable messages
+                let mut total = channel_llrs[var_idx];
+                for &(check_idx, pos) in positions {
+                    total += c2v[check_idx][pos];
                 }
+                output_llrs[var_idx] = total;
 
-                for &check_idx in connected_checks {
-                    variable_to_check[check_idx][var_idx] =
-                        output_llrs[var_idx] - check_to_variable[check_idx][var_idx];
+                // Update variable-to-check messages (total minus the incoming from that check)
+                for &(check_idx, pos) in positions {
+                    v2c[check_idx][pos] = total - c2v[check_idx][pos];
                 }
             }
 
-            // Early termination
-            if self.early_termination && iteration > 0 && self.check_syndrome(&output_llrs) {
-                return Ok(output_llrs);
+            // Early termination: check syndrome every iteration (including iteration 0).
+            // Most decodable messages converge in 10-30 iterations.
+            if self.check_syndrome_fast(&output_llrs) {
+                return Ok(output_llrs.to_vec());
             }
         }
 
-        Ok(output_llrs)
+        Ok(output_llrs.to_vec())
     }
 
-    /// Check if syndrome is zero (all parity checks satisfied)
+    /// Check if syndrome is zero (all parity checks satisfied).
+    /// Accepts a slice for compatibility; requires length >= 174.
     fn check_syndrome(&self, llrs: &[f32]) -> bool {
-        for check_idx in 0..83 {
+        if llrs.len() < 174 {
+            return false;
+        }
+        let arr: &[f32; 174] = llrs[..174].try_into().unwrap();
+        self.check_syndrome_fast(arr)
+    }
+
+    /// Fast syndrome check using hard decisions from LLRs.
+    /// Returns true if all 83 parity checks are satisfied.
+    fn check_syndrome_fast(&self, llrs: &[f32; 174]) -> bool {
+        for check_idx in 0..self.parity_check_matrix.num_checks {
             let connected_vars = self.parity_check_matrix.get_connected_variables(check_idx);
-            let mut parity = 0;
+            let mut parity = 0u8;
 
             for &var_idx in connected_vars {
                 if llrs[var_idx] < 0.0 {
@@ -1429,8 +1569,9 @@ mod tests {
 
         let ldpc = decoder.unwrap();
         assert_eq!(ldpc.max_iterations, 50);
-        assert!(ldpc.early_termination);
         assert_eq!(ldpc.normalization_factor, 0.75);
+        // Early termination is always on (syndrome checked every iteration)
+        assert!(!ldpc.var_positions.is_empty());
     }
 
     #[test]

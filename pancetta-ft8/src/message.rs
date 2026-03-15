@@ -582,9 +582,22 @@ impl MessageParser {
                         message.message_type = MessageType::Telemetry;
                         self.parse_telemetry_type0(&payload[0..71], &mut message)?;
                     }
+                    1 => {
+                        // DXpedition (Fox/Hound): hash(12) + call(28) + R(1) + rpt(13) + ...
+                        message.message_type = MessageType::DXpedition;
+                        self.parse_dxpedition_type0(&payload[0..71], &mut message)?;
+                    }
+                    2 => {
+                        // EU VHF Contest: call1(28) + call2(28) + R(1) + grid6/rpt(15)
+                        message.message_type = MessageType::Contest;
+                        self.parse_eu_vhf_type0(&payload[0..71], &mut message)?;
+                    }
+                    3 | 4 => {
+                        // ARRL Field Day: call1(28) + R(1) + call2(28) + class(4) + section(7)
+                        message.message_type = MessageType::FieldDay;
+                        self.parse_field_day_type0(&payload[0..71], n3, &mut message)?;
+                    }
                     _ => {
-                        // Other i3=0 sub-types (DXpedition n3=1, EU VHF n3=2,
-                        // Field Day n3=3/4, Contesting n3=6) — not yet supported
                         message.message_type = MessageType::Unknown;
                     }
                 }
@@ -1080,131 +1093,208 @@ impl MessageParser {
         Ok(())
     }
     
-    /// Parse Type 3 Field Day messages
-    fn parse_field_day_message(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
-        // Extract callsigns
-        let call1 = self.decode_callsign_28bit(&payload[0..28])?;
-        let call2 = self.decode_callsign_28bit(&payload[28..56]);
-        
-        message.to_callsign = call1;
-        message.from_callsign = call2.unwrap_or(None);
-        
-        // Extract Field Day exchange (class + section)
-        if payload.len() > 56 {
-            let fd_bits = &payload[56..];
-            let fd_value = bits_to_u32(fd_bits);
-            
-            // Field Day format: <class><section>
-            let class = (fd_value >> 8) & 0xFF;  // Operating class (1A-32F)
-            let section = fd_value & 0xFF;       // ARRL section
-            
-            message.contest_exchange = Some(format!("{}A {}", class, 
-                self.decode_arrl_section(section as u8)?));
-        }
-        
-        Ok(())
-    }
-    
-    /// Parse Type 4 telemetry messages
-    fn parse_telemetry_message(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
-        // Telemetry format varies by application
-        // Common formats include weather data, contest multipliers, etc.
-        
-        if payload.len() >= 18 {
-            // Standard telemetry format: 18-bit value + metadata
-            let telem_value = bits_to_u32(&payload[0..18]);
-            let format_code = bits_to_u32(&payload[18..21]);
-            
-            match format_code {
-                0 => {
-                    // Weather telemetry
-                    let temp = ((telem_value >> 9) & 0x1FF) as i16 - 128; // Temperature in C
-                    let humidity = (telem_value & 0x1FF) as u8;           // Humidity %
-                    message.text = Some(format!("WX: {}C {}%RH", temp, humidity));
-                }
-                1 => {
-                    // Contest multiplier
-                    message.text = Some(format!("MULT: {}", telem_value));
-                }
-                _ => {
-                    // Generic telemetry
-                    message.text = Some(format!("TELEM: {:06X}", telem_value));
-                }
-            }
-        }
-        
-        Ok(())
-    }
-    
-    /// Parse Type 5 free text messages (13 characters max)
-    fn parse_freetext_message(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
-        // Free text uses 6-bit character encoding
-        // Maximum 13 characters = 78 bits, but we have 74 bits available
-        let text_bits = &payload[0..payload.len().min(72)];
-        message.text = self.decode_text_6bit(text_bits)?;
-        
-        Ok(())
-    }
-    
-    /// Parse Type 6 DXpedition messages
-    fn parse_dxpedition_message(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
-        // DXpedition format supports hash calls for crowded operations
-        
-        // Check if using hash encoding
-        let hash_flag = bits_to_u32(&payload[0..1]);
-        
-        if hash_flag != 0 {
-            // Hash-based encoding
-            message.uses_hash_calls = true;
-            
-            let hash1 = bits_to_u32(&payload[1..11]);   // 10-bit hash
-            let hash2 = bits_to_u32(&payload[11..23]);  // 12-bit hash
-            
-            message.to_callsign = self.hash_table.lookup_10bit_hash(hash1);
-            message.from_callsign = self.hash_table.lookup_12bit_hash(hash2);
-            
-            // Extract grid or report from remaining bits
-            if payload.len() > 23 {
-                let remaining = bits_to_u32(&payload[23..]);
-                if remaining < 32768 {
-                    message.grid_square = self.decode_grid_square_15bit(remaining)?;
-                } else {
-                    message.signal_report = Some(((remaining - 32768) as i8) - 35);
-                }
-            }
+    // =========================================================================
+    // i3=0 sub-type parsers (n3 field determines format)
+    // =========================================================================
+
+    /// Parse i3=0 n3=1: DXpedition (Fox/Hound) mode
+    ///
+    /// Bit layout (71 bits, excluding n3 and i3):
+    ///   Fox sends:   call_fox(28) + call_hound(28) + rpt_fox(1) + rpt(15)
+    ///   Hound sends: call_hound(28) + call_fox(28) + R(1) + rpt(15)
+    ///
+    /// The Fox (DXpedition) station sends reports to hounds.
+    /// rpt field: 0-32767. If rpt < 32400 it's a grid square, else signal report.
+    fn parse_dxpedition_type0(&self, bits: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
+        let n28a = bits_to_u32(&bits[0..28]);
+        let n28b = bits_to_u32(&bits[28..56]);
+        let ir = bits[56];
+        let igrid = bits_to_u32(&bits[57..71]);
+
+        let call_a = self.unpack28(n28a);
+        let call_b = self.unpack28(n28b);
+
+        message.to_callsign = call_a.to_callsign();
+        message.from_callsign = call_b.to_callsign();
+
+        // Decode grid or report (same as standard type 1)
+        if ir {
+            // R+report: signal report = igrid - 35
+            let report = igrid as i32 - 35;
+            message.signal_report = Some(report as i8);
+            let r_prefix = if ir { "R" } else { "" };
+            message.text = Some(format!(
+                "{} {} {}{:+03}",
+                message.to_callsign.as_deref().unwrap_or("?"),
+                message.from_callsign.as_deref().unwrap_or("?"),
+                r_prefix,
+                report
+            ));
+        } else if igrid < 32400 {
+            // Grid square
+            let (grid, _, _) = Self::unpackgrid(igrid as u16, 0);
+            message.grid_square = grid;
+            message.text = Some(format!(
+                "{} {} {}",
+                message.to_callsign.as_deref().unwrap_or("?"),
+                message.from_callsign.as_deref().unwrap_or("?"),
+                message.grid_square.as_deref().unwrap_or("????")
+            ));
         } else {
-            // Standard callsign encoding
-            let call1 = self.decode_callsign_28bit(&payload[1..29])?;
-            let call2 = self.decode_callsign_28bit(&payload[29..57]);
-            
-            message.to_callsign = call1;
-            message.from_callsign = call2.unwrap_or(None);
+            // Numeric report
+            let report = igrid as i32 - 32768 - 35;
+            message.signal_report = Some(report as i8);
+            message.text = Some(format!(
+                "{} {} {:+03}",
+                message.to_callsign.as_deref().unwrap_or("?"),
+                message.from_callsign.as_deref().unwrap_or("?"),
+                report
+            ));
         }
-        
+
         Ok(())
     }
-    
-    /// Parse Type 7 ARRL RTTY Roundup messages
-    fn parse_rtty_roundup_message(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
-        // Extract callsigns
-        let call1 = self.decode_callsign_28bit(&payload[0..28])?;
-        let call2 = self.decode_callsign_28bit(&payload[28..56]);
-        
-        message.to_callsign = call1;
-        message.from_callsign = call2.unwrap_or(None);
-        
-        // Extract RTTY Roundup exchange (state + serial)
-        if payload.len() > 56 {
-            let rtty_bits = &payload[56..];
-            let rtty_value = bits_to_u32(rtty_bits);
-            
-            let state = (rtty_value >> 10) & 0x3F;  // 6-bit state code
-            let serial = rtty_value & 0x3FF;        // 10-bit serial number
-            
-            message.contest_exchange = Some(format!("{} {:04}", 
-                self.decode_state_code(state as u8)?, serial));
+
+    /// Parse i3=0 n3=2: EU VHF Contest
+    ///
+    /// Bit layout (71 bits):
+    ///   call1(28) + call2(28) + R(1) + rpt_or_loc(14)
+    ///
+    /// rpt_or_loc encodes either:
+    ///   - A 4-character grid (JO65) for initial exchange
+    ///   - An R+report for signal report exchange
+    ///   - RRR/RR73/73 tokens
+    fn parse_eu_vhf_type0(&self, bits: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
+        let n28a = bits_to_u32(&bits[0..28]);
+        let n28b = bits_to_u32(&bits[28..56]);
+        let ir = bits[56];
+        let irpt = bits_to_u32(&bits[57..71]);
+
+        let call_a = self.unpack28(n28a);
+        let call_b = self.unpack28(n28b);
+
+        message.to_callsign = call_a.to_callsign();
+        message.from_callsign = call_b.to_callsign();
+
+        let r_prefix = if ir { "R " } else { "" };
+
+        // EU VHF uses 14-bit field for grid or report
+        // Grid squares: 4-char Maidenhead (e.g., JO65) encoded as (lon*180+lat) base-18*18
+        if irpt < 16200 {
+            // 4-character grid: AA00 through RR99 = 18*18*10*10 = 32400 combos
+            // But EU VHF uses a compressed 14-bit encoding (max 16384)
+            let lon = irpt / 900; // 0-17 → A-R
+            let remainder = irpt % 900;
+            let lat = remainder / 50; // 0-17 → A-R
+            let lon_digit = (remainder % 50) / 5; // 0-9
+            let lat_digit = remainder % 5; // Only 0-4 precision
+
+            let grid = format!(
+                "{}{}{}{}",
+                (b'A' + lon as u8) as char,
+                (b'A' + lat as u8) as char,
+                lon_digit,
+                lat_digit * 2 // Approximate
+            );
+            message.grid_square = Some(grid.clone());
+            message.text = Some(format!(
+                "{} {} {}{}",
+                message.to_callsign.as_deref().unwrap_or("?"),
+                message.from_callsign.as_deref().unwrap_or("?"),
+                r_prefix,
+                grid
+            ));
+        } else {
+            // Signal report or tokens
+            let rpt_val = irpt - 16200;
+            if rpt_val == 1 {
+                message.text = Some(format!(
+                    "{} {} {}RRR",
+                    message.to_callsign.as_deref().unwrap_or("?"),
+                    message.from_callsign.as_deref().unwrap_or("?"),
+                    r_prefix
+                ));
+            } else if rpt_val == 2 {
+                message.text = Some(format!(
+                    "{} {} {}RR73",
+                    message.to_callsign.as_deref().unwrap_or("?"),
+                    message.from_callsign.as_deref().unwrap_or("?"),
+                    r_prefix
+                ));
+            } else if rpt_val == 3 {
+                message.text = Some(format!(
+                    "{} {} {}73",
+                    message.to_callsign.as_deref().unwrap_or("?"),
+                    message.from_callsign.as_deref().unwrap_or("?"),
+                    r_prefix
+                ));
+            } else {
+                // Signal report: rpt_val maps to dB value
+                let report = rpt_val as i32 - 35;
+                message.signal_report = Some(report as i8);
+                message.text = Some(format!(
+                    "{} {} {}{:+03}",
+                    message.to_callsign.as_deref().unwrap_or("?"),
+                    message.from_callsign.as_deref().unwrap_or("?"),
+                    r_prefix,
+                    report
+                ));
+            }
         }
-        
+
+        Ok(())
+    }
+
+    /// Parse i3=0 n3=3,4: ARRL Field Day
+    ///
+    /// Bit layout (71 bits):
+    ///   n3=3: call1(28) + call2(28) + R(1) + n_class(4) + n_section(7) + pad(3)
+    ///   n3=4: Same as n3=3, used for alternate exchange ordering
+    ///
+    /// Class: 1A through 33F (4 bits for count 1-32, encoded as 0-15 then letter)
+    /// Section: ARRL/RAC section code (7 bits = 0-83)
+    fn parse_field_day_type0(&self, bits: &BitSlice, n3: u32, message: &mut Ft8Message) -> Ft8Result<()> {
+        let n28a = bits_to_u32(&bits[0..28]);
+        let n28b = bits_to_u32(&bits[28..56]);
+        let ir = bits[56];
+        let n_class_section = bits_to_u32(&bits[57..71]);
+
+        let call_a = self.unpack28(n28a);
+        let call_b = self.unpack28(n28b);
+
+        message.to_callsign = call_a.to_callsign();
+        message.from_callsign = call_b.to_callsign();
+
+        // Decode Field Day exchange
+        // n_class_section packs: n_transmitters(5) * n_class_letter(6) + n_section(7)
+        // Actually per WSJT-X: the 14-bit field = n_class_section
+        // Where class = floor(n_class_section / NSEC), section = n_class_section % NSEC
+        // NSEC = 84 (number of ARRL/RAC sections)
+        const NSEC: u32 = 84;
+        let class_code = n_class_section / NSEC;
+        let section_code = n_class_section % NSEC;
+
+        // Class: encoded as (n_tx - 1) * 6 + letter_index
+        // letter_index: A=0, B=1, C=2, D=3, E=4, F=5
+        let n_tx = (class_code / 6) + 1;
+        let class_letter_idx = class_code % 6;
+        let class_letter = (b'A' + class_letter_idx as u8) as char;
+
+        let section = self.decode_arrl_section(section_code as u8)?;
+
+        let r_prefix = if ir { "R " } else { "" };
+
+        message.contest_exchange = Some(format!("{}{} {}", n_tx, class_letter, section));
+        message.text = Some(format!(
+            "{} {} {}{}{} {}",
+            message.to_callsign.as_deref().unwrap_or("?"),
+            message.from_callsign.as_deref().unwrap_or("?"),
+            r_prefix,
+            n_tx,
+            class_letter,
+            section
+        ));
+
         Ok(())
     }
     
@@ -1290,35 +1380,81 @@ impl MessageParser {
         }
     }
     
-    /// Decode ARRL section code
+    /// Decode ARRL/RAC section code (84 sections, matching WSJT-X)
     fn decode_arrl_section(&self, code: u8) -> Ft8Result<String> {
-        // ARRL section codes for Field Day
-        let sections = [
-            "CT", "EMA", "ME", "NH", "RI", "VT", "WMA",  // New England
-            "ENY", "NLI", "NNJ", "NNY", "SNJ", "WNY",    // Atlantic
-            "DE", "EPA", "MDC", "WPA",                     // Mid-Atlantic
-            // ... (full list would include all 83 sections)
+        const SECTIONS: [&str; 84] = [
+            // New England (0-6)
+            "CT", "EMA", "ME", "NH", "RI", "VT", "WMA",
+            // Atlantic (7-12)
+            "ENY", "NLI", "NNJ", "NNY", "SNJ", "WNY",
+            // Mid-Atlantic (13-16)
+            "DE", "EPA", "MDC", "WPA",
+            // Southeast (17-24)
+            "AL", "GA", "KY", "NC", "NFL", "SC", "SFL", "WCF",
+            // Tennessee (25)
+            "TN",
+            // Virginia (26-27)
+            "VA", "PR",
+            // Great Lakes (28-32)
+            "MI", "OH", "WV", "IL", "IN",
+            // Wisconsin (33)
+            "WI",
+            // Midwest (34-38)
+            "AR", "LA", "MS", "NM", "OK",
+            // North Texas (39)
+            "NTX",
+            // South Texas (40)
+            "STX",
+            // West Texas (41)
+            "WTX",
+            // Central (42-47)
+            "CO", "IA", "KS", "MN", "MO", "NE",
+            // North Dakota/South Dakota (48-49)
+            "ND", "SD",
+            // Northwest (50-54)
+            "OR", "EWA", "WWA", "ID", "MT",
+            // Wyoming (55)
+            "WY",
+            // Pacific (56-58)
+            "AK", "HI", "PAC",
+            // Southwest (59-63)
+            "AZ", "EBay", "LAX", "ORG", "SB",
+            // San Diego/Santa Clara/San Francisco/San Joaquin (64-67)
+            "SDG", "SCV", "SF", "SJV",
+            // Sierra/Nevada/Utah (68-70)
+            "SV", "NV", "UT",
+            // Canada (71-83)
+            "AB", "BC", "GH", "MB", "NB", "NL", "NS", "NT",
+            "ON", "PE", "QC", "SK", "YT",
         ];
-        
-        if (code as usize) < sections.len() {
-            Ok(sections[code as usize].to_string())
+
+        if (code as usize) < SECTIONS.len() {
+            Ok(SECTIONS[code as usize].to_string())
         } else {
             Ok(format!("S{:02}", code))
         }
     }
     
-    /// Decode state code for RTTY Roundup
+    /// Decode state/province code for RTTY Roundup (US states + Canadian provinces + DC/DX)
     fn decode_state_code(&self, code: u8) -> Ft8Result<String> {
-        let states = [
+        const STATES: [&str; 63] = [
+            // US States (0-49)
             "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
             "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
-            // ... (full list of US states and Canadian provinces)
+            "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+            "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+            "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+            // DC (50)
+            "DC",
+            // Canadian provinces (51-62)
+            "AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE",
+            "QC", "SK",
         ];
-        
-        if (code as usize) < states.len() {
-            Ok(states[code as usize].to_string())
+
+        if (code as usize) < STATES.len() {
+            Ok(STATES[code as usize].to_string())
         } else {
-            Ok(format!("ST{:02}", code))
+            Ok(format!("DX"))
         }
     }
     

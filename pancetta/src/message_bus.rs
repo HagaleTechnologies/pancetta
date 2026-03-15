@@ -139,6 +139,20 @@ pub enum MessageType {
 
     /// Autonomous operator status update
     AutonomousStatus(AutonomousStatusData),
+
+    /// Audio output samples for transmission
+    AudioOutput {
+        samples: Vec<f32>,
+        sample_rate: u32,
+    },
+
+    /// Waterfall spectrogram data for TUI display
+    WaterfallData {
+        /// Power values in dB, one row per time step
+        power_matrix: Vec<Vec<f32>>,
+        /// Frequency range in Hz (min, max)
+        freq_range: (f32, f32),
+    },
 }
 
 /// Status data from the autonomous operator for TUI consumption.

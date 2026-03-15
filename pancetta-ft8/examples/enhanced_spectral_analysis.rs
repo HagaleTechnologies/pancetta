@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         aggressive_decoding: true,    // Enable aggressive mode
         frequency_range: 300.0,       // Wider frequency search for Doppler
         time_range: 3.0,             // Wider time search
+        max_decode_passes: 3,        // Multiple passes for interference cancellation
     };
     
     // Create decoder

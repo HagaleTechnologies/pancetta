@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::app::{App, DecodedMessage};
+use crate::app::{App, DecodedMessage, DevicePanel, DeviceSelectionState};
 use crate::config::Config;
 
 /// TUI runner that manages the terminal interface
@@ -67,6 +67,8 @@ pub enum TuiMessage {
     Error { component: String, message: String },
     /// Status update
     StatusUpdate { component: String, status: String },
+    /// Waterfall display data (normalized power rows, each Vec<f32> is one time-slice)
+    WaterfallUpdate { rows: Vec<Vec<f32>> },
 }
 
 /// Commands sent from TUI
@@ -88,6 +90,11 @@ pub enum TuiCommand {
     ClearMessages,
     /// Request status
     RequestStatus,
+    /// Select audio devices by name
+    SelectDevice {
+        input_device: Option<String>,
+        output_device: Option<String>,
+    },
 }
 
 /// TUI performance metrics
@@ -237,6 +244,9 @@ impl TuiRunner {
             TuiMessage::StatusUpdate { component, status } => {
                 app.update_component_status(component, status);
             }
+            TuiMessage::WaterfallUpdate { rows } => {
+                app.push_waterfall_rows(rows);
+            }
         }
         
         Ok(())
@@ -245,13 +255,70 @@ impl TuiRunner {
     /// Handle keyboard events
     async fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
         let mut app = self.app.write().await;
-        
+
+        // If device selection modal is visible, route keys there
+        if app.device_selection.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    app.device_selection.visible = false;
+                    app.status_message = "Device selection cancelled".to_string();
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    app.device_selection.toggle_panel();
+                }
+                KeyCode::Up => {
+                    app.device_selection.move_up();
+                }
+                KeyCode::Down => {
+                    app.device_selection.move_down();
+                }
+                KeyCode::Enter => {
+                    let input = app.device_selection.selected_input_name();
+                    let output = app.device_selection.selected_output_name();
+                    app.device_selection.visible = false;
+
+                    let msg = format!(
+                        "Devices: IN={} OUT={}",
+                        input.as_deref().unwrap_or("(none)"),
+                        output.as_deref().unwrap_or("(none)")
+                    );
+                    app.status_message = msg;
+
+                    self.message_tx.send(TuiCommand::SelectDevice {
+                        input_device: input,
+                        output_device: output,
+                    })?;
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+
         match key.code {
             // Quit
             KeyCode::Char('q') | KeyCode::Char('Q') => {
                 return Ok(false);
             }
-            
+
+            // Device selection modal
+            KeyCode::Char('D') => {
+                app.device_selection.visible = true;
+                // Populate with placeholder devices if empty.
+                // Real device lists are populated by the coordinator
+                // via TuiMessage before or when the modal opens.
+                if app.device_selection.input_devices.is_empty() {
+                    app.device_selection.input_devices = vec![
+                        ("Default Input".to_string(), true),
+                    ];
+                }
+                if app.device_selection.output_devices.is_empty() {
+                    app.device_selection.output_devices = vec![
+                        ("Default Output".to_string(), true),
+                    ];
+                }
+                app.status_message = "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)".to_string();
+            }
+
             // Panel navigation
             KeyCode::Tab => {
                 app.next_panel();
@@ -259,7 +326,7 @@ impl TuiRunner {
             KeyCode::BackTab => {
                 app.previous_panel();
             }
-            
+
             // Arrow keys for list navigation
             KeyCode::Up => {
                 app.previous_item();
@@ -273,7 +340,7 @@ impl TuiRunner {
             KeyCode::Right => {
                 app.next_page();
             }
-            
+
             // Function keys
             KeyCode::F(1) => {
                 // F1 - Help
@@ -296,7 +363,7 @@ impl TuiRunner {
                 // F9 - Toggle PTT
                 self.message_tx.send(TuiCommand::TogglePtt)?;
             }
-            
+
             // Space - Select/activate (click-to-call)
             KeyCode::Char(' ') => {
                 if let Some((callsign, frequency)) = app.get_selected_station() {
@@ -304,7 +371,7 @@ impl TuiRunner {
                 }
                 app.activate_selected();
             }
-            
+
             // Enter - Send message or confirm
             KeyCode::Enter => {
                 let text = app.get_input_text();
@@ -313,7 +380,7 @@ impl TuiRunner {
                     app.clear_input();
                 }
             }
-            
+
             // Text input
             KeyCode::Char(c) => {
                 app.input_char(c);
@@ -321,10 +388,10 @@ impl TuiRunner {
             KeyCode::Backspace => {
                 app.delete_char();
             }
-            
+
             _ => {}
         }
-        
+
         Ok(true)
     }
     
@@ -363,7 +430,7 @@ impl TuiRunner {
             
             // Render status bar inline
             let status_text = format!(
-                " TX: {} | S-meter: {} | FPS: {} | F1:Help F2:CQ F5:Clear Q:Quit ",
+                " TX: {} | S-meter: {} | FPS: {} | F1:Help F2:CQ F5:Clear D:Devices Q:Quit ",
                 if app.is_monitoring { "ON" } else { "OFF" },
                 app.audio_level as i32,
                 metrics.frames_rendered / last_render.elapsed().as_secs().max(1)
@@ -371,6 +438,11 @@ impl TuiRunner {
             let status = Paragraph::new(status_text)
                 .style(Style::default().bg(Color::Gray).fg(Color::White));
             f.render_widget(status, chunks[2]);
+
+            // Render device selection modal overlay if visible
+            if app.device_selection.visible {
+                TuiRunner::render_device_selection_modal(f, size, &app.device_selection);
+            }
         })?;
         
         self.metrics.frames_rendered += 1;
@@ -383,14 +455,23 @@ impl TuiRunner {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(60),  // Band activity
+                Constraint::Percentage(60),  // Left: band activity + waterfall
                 Constraint::Percentage(40),  // Right panels
             ])
             .split(area);
-        
-        // Render band activity on the left
-        Self::render_band_activity_static(f, chunks[0], app);
-        
+
+        // Split left side into band activity and waterfall
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(60),  // Band activity
+                Constraint::Percentage(40),  // Waterfall
+            ])
+            .split(chunks[0]);
+
+        Self::render_band_activity_static(f, left_chunks[0], app);
+        Self::render_waterfall_static(f, left_chunks[1], app);
+
         // Split right side into DX and QSO panels
         let right_chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -399,9 +480,39 @@ impl TuiRunner {
                 Constraint::Percentage(50),  // QSO status
             ])
             .split(chunks[1]);
-        
+
         Self::render_dx_stations_static(f, right_chunks[0], app);
         Self::render_qso_status_static(f, right_chunks[1], app);
+    }
+
+    /// Static version of render_waterfall for use in closure
+    fn render_waterfall_static(f: &mut Frame, area: Rect, app: &App) {
+        use crate::widgets::Waterfall;
+
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(6), Constraint::Min(1)])
+            .split(area);
+
+        // Frequency scale labels
+        let labels = [" 4000", " 3000", " 2000", " 1000", "  200"];
+        let usable_rows = chunks[0].height.saturating_sub(2) as usize;
+        let mut label_lines: Vec<ratatui::text::Line> = Vec::new();
+        for i in 0..usable_rows {
+            let idx = i * labels.len() / usable_rows.max(1);
+            let text = if idx < labels.len() { labels[idx] } else { "     " };
+            label_lines.push(ratatui::text::Line::from(text));
+        }
+        let label_block = Block::default().borders(Borders::RIGHT);
+        let label_paragraph = Paragraph::new(label_lines).block(label_block);
+        f.render_widget(label_paragraph, chunks[0]);
+
+        let waterfall_block = Block::default()
+            .title(" Waterfall ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded);
+        let waterfall = Waterfall::new(&app.waterfall_data).block(waterfall_block);
+        f.render_widget(waterfall, chunks[1]);
     }
     
     /// Static version of render_band_activity for use in closure
@@ -501,6 +612,124 @@ impl TuiRunner {
         f.render_widget(qso_status, area);
     }
     
+    /// Render device selection modal as an overlay
+    fn render_device_selection_modal(f: &mut Frame, area: Rect, state: &DeviceSelectionState) {
+        // Modal dimensions: roughly 60% width, height to fit content
+        let modal_width = (area.width * 3 / 5).min(70).max(40);
+        let modal_height = {
+            let max_devices = state.input_devices.len().max(state.output_devices.len());
+            // title(1) + border(2) + header(1) + devices + footer(2) + border
+            (max_devices as u16 + 7).min(area.height - 2).max(10)
+        };
+
+        let modal_area = Rect {
+            x: (area.width.saturating_sub(modal_width)) / 2,
+            y: (area.height.saturating_sub(modal_height)) / 2,
+            width: modal_width,
+            height: modal_height,
+        };
+
+        // Clear background behind modal
+        f.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let outer_block = Block::default()
+            .title(" Audio Device Selection ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .style(Style::default().bg(Color::Black).fg(Color::White));
+
+        let inner = outer_block.inner(modal_area);
+        f.render_widget(outer_block, modal_area);
+
+        // Split inner area: two side-by-side panels + footer
+        let vert_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(3),       // Device lists
+                Constraint::Length(2),     // Footer / help text
+            ])
+            .split(inner);
+
+        let panel_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(50),
+                Constraint::Percentage(50),
+            ])
+            .split(vert_chunks[0]);
+
+        // --- Input devices panel ---
+        let input_border_style = if state.active_panel == DevicePanel::Input {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let input_items: Vec<ListItem> = state
+            .input_devices
+            .iter()
+            .enumerate()
+            .map(|(i, (name, is_default))| {
+                let marker = if *is_default { " *" } else { "" };
+                let label = format!("{}{}", name, marker);
+                let style = if i == state.selected_input_idx && state.active_panel == DevicePanel::Input {
+                    Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                } else if i == state.selected_input_idx {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(label).style(style)
+            })
+            .collect();
+
+        let input_list = List::new(input_items).block(
+            Block::default()
+                .title(" Input ")
+                .borders(Borders::ALL)
+                .border_style(input_border_style),
+        );
+        f.render_widget(input_list, panel_chunks[0]);
+
+        // --- Output devices panel ---
+        let output_border_style = if state.active_panel == DevicePanel::Output {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+
+        let output_items: Vec<ListItem> = state
+            .output_devices
+            .iter()
+            .enumerate()
+            .map(|(i, (name, is_default))| {
+                let marker = if *is_default { " *" } else { "" };
+                let label = format!("{}{}", name, marker);
+                let style = if i == state.selected_output_idx && state.active_panel == DevicePanel::Output {
+                    Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD)
+                } else if i == state.selected_output_idx {
+                    Style::default().bg(Color::DarkGray).fg(Color::White)
+                } else {
+                    Style::default()
+                };
+                ListItem::new(label).style(style)
+            })
+            .collect();
+
+        let output_list = List::new(output_items).block(
+            Block::default()
+                .title(" Output ")
+                .borders(Borders::ALL)
+                .border_style(output_border_style),
+        );
+        f.render_widget(output_list, panel_chunks[1]);
+
+        // --- Footer help text ---
+        let footer = Paragraph::new(" Tab: switch panel | Up/Down: select | Enter: confirm | Esc: cancel")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(footer, vert_chunks[1]);
+    }
+
     /// Render header
     fn render_header(&self, f: &mut Frame, area: Rect, app: &App) {
         let header_text = format!(

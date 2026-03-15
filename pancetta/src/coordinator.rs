@@ -21,6 +21,7 @@ use pancetta_audio::{AudioManager, AudioManagerConfig};
 use pancetta_config::Config;
 use pancetta_dsp::DspPipeline;
 use pancetta_ft8::{Ft8Decoder, Ft8Config, Ft8Encoder, Ft8Modulator};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -48,8 +49,11 @@ pub struct ApplicationCoordinator {
     dsp_pipeline: Option<DspPipeline>,
     ft8_decoder: Option<Ft8Decoder>,
 
-    /// Component task handles
-    task_handles: Vec<JoinHandle<Result<()>>>,
+    /// Named component task handles for health monitoring
+    named_task_handles: Vec<(ComponentId, JoinHandle<Result<()>>)>,
+
+    /// Component health status map (shared with health monitor task)
+    component_status: Arc<RwLock<HashMap<ComponentId, ComponentStatus>>>,
 
     /// Application state
     is_running: Arc<AtomicBool>,
@@ -103,7 +107,7 @@ impl Default for CoordinatorConfig {
     }
 }
 
-/// Component health status
+/// Component health status (coordinator-level)
 #[derive(Debug, Clone)]
 pub struct ComponentHealth {
     pub component_id: ComponentId,
@@ -112,6 +116,79 @@ pub struct ComponentHealth {
     pub error_count: u32,
     pub message_count: u64,
     pub avg_latency_ms: f64,
+}
+
+/// State of a component as tracked by the health monitor
+#[derive(Debug, Clone, PartialEq)]
+pub enum ComponentState {
+    /// Component is running normally
+    Running,
+    /// Component has failed (with error description)
+    Failed(String),
+    /// Component was never started or is disabled
+    NotStarted,
+}
+
+impl std::fmt::Display for ComponentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ComponentState::Running => write!(f, "Running"),
+            ComponentState::Failed(msg) => write!(f, "Failed: {}", msg),
+            ComponentState::NotStarted => write!(f, "NotStarted"),
+        }
+    }
+}
+
+/// Per-component status tracked by the coordinator health monitor
+#[derive(Debug, Clone)]
+pub struct ComponentStatus {
+    pub state: ComponentState,
+    pub last_seen: Instant,
+    pub error_count: u32,
+}
+
+impl ComponentStatus {
+    fn new_running() -> Self {
+        Self {
+            state: ComponentState::Running,
+            last_seen: Instant::now(),
+            error_count: 0,
+        }
+    }
+}
+
+/// Criticality level of a component — determines shutdown behavior on failure
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ComponentCriticality {
+    /// Application can continue without this component
+    NonCritical,
+    /// Component failure should be logged prominently but app continues
+    Important,
+}
+
+fn component_criticality(id: ComponentId) -> ComponentCriticality {
+    match id {
+        ComponentId::Ft8Decoder => ComponentCriticality::Important,
+        ComponentId::Audio => ComponentCriticality::NonCritical,
+        ComponentId::Dsp => ComponentCriticality::Important,
+        _ => ComponentCriticality::NonCritical,
+    }
+}
+
+/// Human-readable degradation message for a failed component
+fn degradation_message(id: ComponentId) -> &'static str {
+    match id {
+        ComponentId::Audio => "Audio disconnected — no RX/TX until reconnected",
+        ComponentId::Hamlib => "Rig control lost — PTT safety defaulting to OFF",
+        ComponentId::DxCluster => "DX cluster disconnected — continuing without spots",
+        ComponentId::Ft8Decoder => "FT8 decoder crashed — no decoding until restart",
+        ComponentId::Dsp => "DSP pipeline failed — audio processing halted",
+        ComponentId::PskReporter => "PSKReporter upload failed — spots not being reported",
+        ComponentId::Qso => "QSO manager failed — contact logging unavailable",
+        ComponentId::Ft8Transmitter => "FT8 transmitter failed — TX disabled",
+        ComponentId::Autonomous => "Autonomous operator failed — manual operation only",
+        _ => "Component failed",
+    }
 }
 
 impl ApplicationCoordinator {
@@ -147,7 +224,8 @@ impl ApplicationCoordinator {
             message_bus,
             dsp_pipeline: None,
             ft8_decoder: None,
-            task_handles: Vec::new(),
+            named_task_handles: Vec::new(),
+            component_status: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(AtomicBool::new(false)),
             shutdown_signal,
             startup_time,
@@ -353,6 +431,8 @@ impl ApplicationCoordinator {
         let (dsp_to_ft8_tx, dsp_to_ft8_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
         let (ft8_to_tui_tx, ft8_to_tui_rx) =
             crossbeam_channel::unbounded::<pancetta_ft8::DecodedMessage>();
+        let (waterfall_tx, waterfall_rx) =
+            crossbeam_channel::unbounded::<Vec<Vec<f32>>>();
 
         // Also create message bus channels for control messages (hamlib, autonomous, etc.)
         let (_audio_bus_tx, _audio_bus_rx) =
@@ -372,12 +452,12 @@ impl ApplicationCoordinator {
             .await?;
 
         // --- FT8 decoder component ---
-        self.start_ft8_pipeline(dsp_to_ft8_rx, ft8_to_tui_tx)
+        self.start_ft8_pipeline(dsp_to_ft8_rx, ft8_to_tui_tx, waterfall_tx)
             .await?;
 
         // --- TUI component ---
         if !self.headless {
-            self.start_tui_pipeline(ft8_to_tui_rx, tui_bus_rx)
+            self.start_tui_pipeline(ft8_to_tui_rx, tui_bus_rx, waterfall_rx.clone())
                 .await?;
         } else {
             // In headless mode, just drain decoded messages and log them
@@ -399,7 +479,7 @@ impl ApplicationCoordinator {
                 }
                 Ok(())
             });
-            self.task_handles.push(handle);
+            self.named_task_handles.push((ComponentId::Tui, handle));
         }
 
         Ok(())
@@ -466,7 +546,7 @@ impl ApplicationCoordinator {
                 Ok(())
             });
 
-            self.task_handles.push(handle);
+            self.named_task_handles.push((ComponentId::Audio, handle));
         } else {
             info!("Starting audio component with real AudioManager");
 
@@ -546,7 +626,7 @@ impl ApplicationCoordinator {
                 Ok(())
             });
 
-            self.task_handles.push(handle);
+            self.named_task_handles.push((ComponentId::Audio, handle));
         }
 
         info!("Audio component started");
@@ -629,7 +709,7 @@ impl ApplicationCoordinator {
             Ok(())
         });
 
-        self.task_handles.push(handle);
+        self.named_task_handles.push((ComponentId::Dsp, handle));
         info!("DSP component started");
         Ok(())
     }
@@ -639,6 +719,7 @@ impl ApplicationCoordinator {
         &mut self,
         ft8_rx: crossbeam_channel::Receiver<Vec<f32>>,
         ft8_to_tui_tx: crossbeam_channel::Sender<pancetta_ft8::DecodedMessage>,
+        waterfall_tx: crossbeam_channel::Sender<Vec<Vec<f32>>>,
     ) -> Result<()> {
         let span = span!(Level::INFO, "start_ft8");
         let _enter = span.enter();
@@ -656,6 +737,32 @@ impl ApplicationCoordinator {
             while !shutdown.load(Ordering::Relaxed) {
                 match ft8_rx.try_recv() {
                     Ok(window) => {
+                        // Generate waterfall data from this audio window
+                        {
+                            let audio_f64: Vec<f64> = window.iter().map(|&s| s as f64).collect();
+                            match decoder.generate_waterfall_data(&audio_f64) {
+                                Ok(wf) => {
+                                    // Normalize power_matrix to 0..1 range as Vec<Vec<f32>>
+                                    let range = wf.max_power - wf.min_power;
+                                    let rows: Vec<Vec<f32>> = if range > 0.0 {
+                                        wf.power_matrix.iter().map(|row| {
+                                            row.iter().map(|&p| {
+                                                ((p - wf.min_power) / range) as f32
+                                            }).collect()
+                                        }).collect()
+                                    } else {
+                                        wf.power_matrix.iter().map(|row| {
+                                            vec![0.0f32; row.len()]
+                                        }).collect()
+                                    };
+                                    let _ = waterfall_tx.send(rows);
+                                }
+                                Err(e) => {
+                                    debug!("Waterfall generation error: {}", e);
+                                }
+                            }
+                        }
+
                         match decoder.decode_window(&window) {
                             Ok(decoded_messages) => {
                                 {
@@ -726,7 +833,7 @@ impl ApplicationCoordinator {
             Ok(())
         });
 
-        self.task_handles.push(handle);
+        self.named_task_handles.push((ComponentId::Ft8Decoder, handle));
         info!("FT8 component started");
         Ok(())
     }
@@ -736,6 +843,7 @@ impl ApplicationCoordinator {
         &mut self,
         ft8_to_tui_rx: crossbeam_channel::Receiver<pancetta_ft8::DecodedMessage>,
         tui_bus_rx: crossbeam_channel::Receiver<ComponentMessage>,
+        waterfall_rx: crossbeam_channel::Receiver<Vec<Vec<f32>>>,
     ) -> Result<()> {
         let span = span!(Level::INFO, "start_tui");
         let _enter = span.enter();
@@ -828,10 +936,20 @@ impl ApplicationCoordinator {
                     }
                     Err(_) => {}
                 }
+
+                // Relay waterfall data from FT8 decoder to TUI
+                match waterfall_rx.try_recv() {
+                    Ok(rows) => {
+                        let _ = tui_msg_tx_relay.send(
+                            pancetta_tui::tui_runner::TuiMessage::WaterfallUpdate { rows },
+                        );
+                    }
+                    Err(_) => {}
+                }
             }
             Ok(())
         });
-        self.task_handles.push(relay_handle);
+        self.named_task_handles.push((ComponentId::Tui, relay_handle));
 
         // Task: relay TUI commands (e.g. SendMessage) to message bus as TransmitRequests
         let cmd_shutdown = self.shutdown_signal.clone();
@@ -885,7 +1003,7 @@ impl ApplicationCoordinator {
             }
             Ok(())
         });
-        self.task_handles.push(cmd_handle);
+        self.named_task_handles.push((ComponentId::Tui, cmd_handle));
 
         // Run the TUI on a blocking task (it takes over the terminal)
         let tui_config_lock = config.read().await;
@@ -942,7 +1060,7 @@ impl ApplicationCoordinator {
             })
         });
 
-        // Wrap the JoinHandle<Result<()>> to match our task_handles type
+        // Wrap the JoinHandle<Result<()>> to match our named_task_handles type
         let tui_wrapper = tokio::spawn(async move {
             match tui_handle.await {
                 Ok(Ok(())) => Ok(()),
@@ -950,7 +1068,7 @@ impl ApplicationCoordinator {
                 Err(e) => Err(anyhow::anyhow!("TUI task panicked: {}", e)),
             }
         });
-        self.task_handles.push(tui_wrapper);
+        self.named_task_handles.push((ComponentId::Tui, tui_wrapper));
 
         info!("TUI component started");
         Ok(())
@@ -1064,6 +1182,56 @@ impl ApplicationCoordinator {
                     }
                 });
 
+                // PTT safety watchdog: track when PTT was turned on
+                // If PTT stays on for longer than PTT_SAFETY_TIMEOUT_SECS,
+                // force it off to prevent accidental continuous transmission
+                // (e.g. if the TX pipeline crashes mid-transmission).
+                const PTT_SAFETY_TIMEOUT_SECS: u64 = 30;
+                let ptt_on_since: Arc<RwLock<Option<Instant>>> =
+                    Arc::new(RwLock::new(None));
+
+                // Spawn the PTT watchdog as a background task
+                let rig_for_watchdog = Arc::clone(&rig_poll);
+                let ptt_watchdog_tracker = ptt_on_since.clone();
+                let shutdown_for_watchdog = shutdown.clone();
+                tokio::spawn(async move {
+                    let mut watchdog_interval = interval(Duration::from_secs(1));
+                    loop {
+                        watchdog_interval.tick().await;
+                        if shutdown_for_watchdog.load(Ordering::Relaxed) {
+                            break;
+                        }
+
+                        let ptt_time = {
+                            let guard = ptt_watchdog_tracker.read().await;
+                            *guard
+                        };
+
+                        if let Some(on_since) = ptt_time {
+                            if on_since.elapsed() > Duration::from_secs(PTT_SAFETY_TIMEOUT_SECS) {
+                                error!(
+                                    "PTT SAFETY WATCHDOG: PTT has been on for >{} seconds — forcing OFF",
+                                    PTT_SAFETY_TIMEOUT_SECS
+                                );
+                                if let Err(e) = rig_for_watchdog
+                                    .set_ptt(
+                                        pancetta_hamlib::Vfo::Current,
+                                        pancetta_hamlib::PttState::Off,
+                                    )
+                                    .await
+                                {
+                                    error!("PTT SAFETY WATCHDOG: failed to force PTT off: {}", e);
+                                } else {
+                                    warn!("PTT SAFETY WATCHDOG: PTT forced off successfully");
+                                }
+                                // Clear the tracker so we don't keep firing
+                                let mut guard = ptt_watchdog_tracker.write().await;
+                                *guard = None;
+                            }
+                        }
+                    }
+                });
+
                 // Process messages
                 while !shutdown.load(Ordering::Relaxed) {
                     match hamlib_rx.try_recv() {
@@ -1086,6 +1254,22 @@ impl ApplicationCoordinator {
                                         }
                                     }
                                     crate::message_bus::RigControlMessage::SetPtt { state } => {
+                                        // Update PTT watchdog tracker
+                                        {
+                                            let mut guard = ptt_on_since.write().await;
+                                            if *state {
+                                                // PTT going on — record the time
+                                                if guard.is_none() {
+                                                    *guard = Some(Instant::now());
+                                                    debug!("PTT watchdog: PTT ON, timer started");
+                                                }
+                                            } else {
+                                                // PTT going off — clear the timer
+                                                *guard = None;
+                                                debug!("PTT watchdog: PTT OFF, timer cleared");
+                                            }
+                                        }
+
                                         let ptt = if *state {
                                             pancetta_hamlib::PttState::On
                                         } else {
@@ -1114,7 +1298,7 @@ impl ApplicationCoordinator {
             })
         };
 
-        self.task_handles.push(hamlib_handle);
+        self.named_task_handles.push((ComponentId::Hamlib, hamlib_handle));
         info!("Hamlib component started");
         Ok(())
     }
@@ -1272,7 +1456,7 @@ impl ApplicationCoordinator {
             })
         };
 
-        self.task_handles.push(qso_handle);
+        self.named_task_handles.push((ComponentId::Qso, qso_handle));
         info!("QSO component started");
         Ok(())
     }
@@ -1365,7 +1549,7 @@ impl ApplicationCoordinator {
             })
         };
 
-        self.task_handles.push(dx_handle);
+        self.named_task_handles.push((ComponentId::DxCluster, dx_handle));
         info!("DX cluster component started");
         Ok(())
     }
@@ -1483,7 +1667,7 @@ impl ApplicationCoordinator {
             })
         };
 
-        self.task_handles.push(psk_handle);
+        self.named_task_handles.push((ComponentId::PskReporter, psk_handle));
         info!("PSKReporter component started");
         Ok(())
     }
@@ -1529,20 +1713,68 @@ impl ApplicationCoordinator {
                                     message_text, frequency_offset, qso_id
                                 );
 
-                                // Encode the message to FT8 symbols
+                                // --- Step 1: Wait for next FT8 slot boundary ---
+                                // FT8 slots are 15 seconds long, starting at T=0,15,30,45.
+                                let slot_wait = {
+                                    use std::time::{SystemTime, UNIX_EPOCH};
+                                    let now = SystemTime::now()
+                                        .duration_since(UNIX_EPOCH)
+                                        .unwrap_or_default();
+                                    let secs = now.as_secs();
+                                    let slot_pos = secs % 15;
+                                    let wait_secs = if slot_pos == 0 { 0 } else { 15 - slot_pos };
+                                    let wait_ms = wait_secs * 1000
+                                        + (1000 - now.subsec_millis() as u64)
+                                        - 200; // 200ms guard for PTT latency
+                                    Duration::from_millis(wait_ms.min(15000))
+                                };
+
+                                if slot_wait.as_millis() > 100 {
+                                    info!("Waiting {:.1}s for next TX slot boundary", slot_wait.as_secs_f64());
+                                    sleep(slot_wait).await;
+                                }
+
+                                // --- Step 2: Assert PTT ---
+                                let ptt_msg = ComponentMessage::new(
+                                    ComponentId::Ft8Transmitter,
+                                    ComponentId::Hamlib,
+                                    MessageType::RigControl(
+                                        crate::message_bus::RigControlMessage::SetPtt { state: true },
+                                    ),
+                                    Instant::now(),
+                                );
+                                if let Err(e) = message_bus.send_message(ptt_msg).await {
+                                    debug!("PTT on failed (no rig?): {}", e);
+                                }
+                                sleep(Duration::from_millis(50)).await;
+
+                                // --- Step 3: Encode and modulate ---
                                 let encode_result = encoder.encode_message(&message_text, None);
                                 let (success, duration_ms) = match encode_result {
                                     Ok(symbols) => {
-                                        // Modulate symbols to audio samples
                                         match modulator.modulate_symbols(&symbols, frequency_offset) {
                                             Ok(samples) => {
                                                 let duration = (samples.len() as f64 / 12000.0 * 1000.0) as u64;
                                                 info!(
-                                                    "Encoded '{}' → {} symbols → {} audio samples ({} ms)",
-                                                    message_text, symbols.len(), samples.len(), duration
+                                                    "TX: '{}' → {} samples ({:.1}s)",
+                                                    message_text, samples.len(), duration as f64 / 1000.0
                                                 );
-                                                // TODO: Route samples to audio output device
-                                                // For now, samples are generated but not played
+
+                                                // --- Step 4: Route audio to output ---
+                                                let audio_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Audio,
+                                                    MessageType::AudioOutput {
+                                                        samples: samples.clone(),
+                                                        sample_rate: 12000,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) = message_bus.send_message(audio_msg).await {
+                                                    debug!("Audio output routing: {}", e);
+                                                }
+
+                                                sleep(Duration::from_millis(duration)).await;
                                                 (true, duration)
                                             }
                                             Err(e) => {
@@ -1557,6 +1789,20 @@ impl ApplicationCoordinator {
                                     }
                                 };
 
+                                // --- Step 5: De-assert PTT ---
+                                let ptt_off_msg = ComponentMessage::new(
+                                    ComponentId::Ft8Transmitter,
+                                    ComponentId::Hamlib,
+                                    MessageType::RigControl(
+                                        crate::message_bus::RigControlMessage::SetPtt { state: false },
+                                    ),
+                                    Instant::now(),
+                                );
+                                if let Err(e) = message_bus.send_message(ptt_off_msg).await {
+                                    debug!("PTT off failed (no rig?): {}", e);
+                                }
+
+                                // --- Step 6: Send TransmitComplete ---
                                 let complete_msg = ComponentMessage::new(
                                     ComponentId::Ft8Transmitter,
                                     ComponentId::Autonomous,
@@ -1584,7 +1830,7 @@ impl ApplicationCoordinator {
             })
         };
 
-        self.task_handles.push(tx_handle);
+        self.named_task_handles.push((ComponentId::Ft8Transmitter, tx_handle));
         info!("FT8 transmitter component started");
         Ok(())
     }
@@ -1791,7 +2037,7 @@ impl ApplicationCoordinator {
             })
         };
 
-        self.task_handles.push(auto_handle);
+        self.named_task_handles.push((ComponentId::Autonomous, auto_handle));
         info!("Autonomous operator component started");
         Ok(())
     }
@@ -1802,30 +2048,18 @@ impl ApplicationCoordinator {
 
     /// Start coordinator management tasks
     async fn start_coordinator_tasks(&mut self) -> Result<()> {
-        // Health monitoring task
-        let health_handle = {
-            let message_bus = self.message_bus.clone();
-            let shutdown = self.shutdown_signal.clone();
-            let mut health_interval = interval(Duration::from_secs(5));
+        // Initialize component status for all registered task handles
+        {
+            let mut status_map = self.component_status.write().await;
+            for (id, _) in &self.named_task_handles {
+                status_map
+                    .entry(*id)
+                    .or_insert_with(ComponentStatus::new_running);
+            }
+        }
 
-            tokio::spawn(async move {
-                while !shutdown.load(Ordering::Relaxed) {
-                    health_interval.tick().await;
-
-                    let health_status = message_bus.get_component_health().await;
-                    for health in health_status {
-                        if !health.is_healthy {
-                            warn!(
-                                "Component {:?} is unhealthy: {} errors",
-                                health.component_id, health.error_count
-                            );
-                        }
-                    }
-                }
-
-                Ok(())
-            })
-        };
+        // Health monitoring task — checks task handles and message bus health
+        let health_handle = self.start_health_monitor().await;
 
         // Configuration hot-reload task
         let config_handle = {
@@ -1840,22 +2074,100 @@ impl ApplicationCoordinator {
             })
         };
 
-        self.task_handles.push(health_handle);
-        self.task_handles.push(config_handle);
+        self.named_task_handles
+            .push((ComponentId::Coordinator, health_handle));
+        self.named_task_handles
+            .push((ComponentId::Coordinator, config_handle));
 
         Ok(())
     }
 
+    /// Start the health monitor task.
+    ///
+    /// Runs every `health_check_interval` (5s) and:
+    /// 1. Checks each named task handle with `is_finished()`
+    /// 2. If a task finished unexpectedly, logs the appropriate degradation message
+    /// 3. Sends a health status summary to the TUI via the message bus
+    ///
+    /// No component failure crashes the whole application — the coordinator
+    /// continues running in degraded mode.
+    async fn start_health_monitor(&self) -> JoinHandle<Result<()>> {
+        let message_bus = self.message_bus.clone();
+        let shutdown = self.shutdown_signal.clone();
+        let component_status = self.component_status.clone();
+        let mut health_interval = interval(Duration::from_secs(5));
+
+        tokio::spawn(async move {
+            while !shutdown.load(Ordering::Relaxed) {
+                health_interval.tick().await;
+
+                // Check message bus level health (heartbeats, error counts)
+                let bus_health = message_bus.get_component_health().await;
+                for health in &bus_health {
+                    if !health.is_healthy {
+                        warn!(
+                            "Component {} is unhealthy: {} errors",
+                            health.component_id, health.error_count
+                        );
+                    }
+                }
+
+                // Build a status summary from the component_status map
+                let status_map = component_status.read().await;
+                let mut summary_parts: Vec<String> = Vec::new();
+                let mut any_failed = false;
+
+                for (id, status) in status_map.iter() {
+                    match &status.state {
+                        ComponentState::Running => {
+                            // Component is fine
+                        }
+                        ComponentState::Failed(err) => {
+                            any_failed = true;
+                            summary_parts.push(format!("{}: {}", id, err));
+                        }
+                        ComponentState::NotStarted => {
+                            // Not started / disabled — don't report
+                        }
+                    }
+                }
+
+                // Send health summary to TUI
+                if any_failed {
+                    let summary = format!("Degraded — {}", summary_parts.join("; "));
+                    let msg = ComponentMessage::new(
+                        ComponentId::Coordinator,
+                        ComponentId::Tui,
+                        MessageType::StatusUpdate(summary),
+                        Instant::now(),
+                    );
+                    if let Err(e) = message_bus.send_message(msg).await {
+                        debug!("Failed to send health summary to TUI: {}", e);
+                    }
+                }
+            }
+
+            Ok(())
+        })
+    }
+
     /// Main application loop
-    async fn run_main_loop(&self) -> Result<()> {
+    ///
+    /// Periodically checks task handles for unexpected termination and updates
+    /// the component_status map so the health monitor can report to the TUI.
+    async fn run_main_loop(&mut self) -> Result<()> {
         info!("Entering main application loop");
 
         let mut stats_interval = interval(Duration::from_secs(30));
+        let mut health_check_interval = interval(Duration::from_secs(5));
 
         while !self.shutdown_signal.load(Ordering::Relaxed) {
             tokio::select! {
                 _ = stats_interval.tick() => {
                     self.log_performance_stats().await;
+                }
+                _ = health_check_interval.tick() => {
+                    self.check_task_handles().await;
                 }
                 _ = sleep(Duration::from_millis(100)) => {
                     // Main loop iteration
@@ -1865,6 +2177,92 @@ impl ApplicationCoordinator {
 
         info!("Main application loop completed");
         Ok(())
+    }
+
+    /// Check all named task handles for unexpected termination.
+    ///
+    /// When a component task finishes (is_finished() == true), we inspect
+    /// the result and update the component_status map. The health monitor
+    /// task picks this up on its next cycle and reports to the TUI.
+    ///
+    /// Graceful degradation: no single component failure shuts down the
+    /// application. Critical components are logged at error level, others
+    /// at warn level.
+    async fn check_task_handles(&mut self) {
+        for (component_id, handle) in &self.named_task_handles {
+            // Skip coordinator's own tasks and already-known failures
+            if *component_id == ComponentId::Coordinator {
+                continue;
+            }
+
+            if !handle.is_finished() {
+                // Task is still running — update last_seen
+                let mut status_map = self.component_status.write().await;
+                if let Some(status) = status_map.get_mut(component_id) {
+                    if status.state == ComponentState::Running {
+                        status.last_seen = Instant::now();
+                    }
+                }
+                continue;
+            }
+
+            // Task has finished — check if we already know about it
+            let mut status_map = self.component_status.write().await;
+            let status = status_map
+                .entry(*component_id)
+                .or_insert_with(ComponentStatus::new_running);
+
+            if status.state != ComponentState::Running {
+                // Already recorded this failure
+                continue;
+            }
+
+            // First time seeing this component as finished
+            let degradation = degradation_message(*component_id);
+            let criticality = component_criticality(*component_id);
+
+            status.error_count += 1;
+            status.state = ComponentState::Failed(degradation.to_string());
+
+            match criticality {
+                ComponentCriticality::Important => {
+                    error!(
+                        "CRITICAL component {} has stopped unexpectedly: {}",
+                        component_id, degradation
+                    );
+                }
+                ComponentCriticality::NonCritical => {
+                    warn!(
+                        "Component {} has stopped: {}",
+                        component_id, degradation
+                    );
+                }
+            }
+
+            // For Hamlib failure: ensure PTT defaults to off for safety
+            if *component_id == ComponentId::Hamlib {
+                warn!("PTT safety: forcing PTT off due to Hamlib disconnect");
+                let ptt_off_msg = ComponentMessage::new(
+                    ComponentId::Coordinator,
+                    ComponentId::Hamlib,
+                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                        state: false,
+                    }),
+                    Instant::now(),
+                );
+                // Best-effort: channel may be disconnected
+                let _ = self.message_bus.send_message(ptt_off_msg).await;
+            }
+
+            // Notify TUI of the component failure
+            let error_msg = ComponentMessage::new(
+                ComponentId::Coordinator,
+                ComponentId::Tui,
+                MessageType::StatusUpdate(format!("{}: {}", component_id, degradation)),
+                Instant::now(),
+            );
+            let _ = self.message_bus.send_message(error_msg).await;
+        }
     }
 
     /// Log performance statistics
@@ -1909,7 +2307,7 @@ impl ApplicationCoordinator {
         let shutdown_timeout = Duration::from_secs(10);
         let start_time = Instant::now();
 
-        for (index, handle) in self.task_handles.into_iter().enumerate() {
+        for (index, (component_id, handle)) in self.named_task_handles.into_iter().enumerate() {
             let remaining_time = shutdown_timeout.saturating_sub(start_time.elapsed());
 
             if remaining_time.is_zero() {
@@ -1920,13 +2318,13 @@ impl ApplicationCoordinator {
 
             match tokio::time::timeout(remaining_time, handle).await {
                 Ok(Ok(_)) => {
-                    debug!("Task {} completed successfully", index);
+                    debug!("Task {} ({}) completed successfully", index, component_id);
                 }
                 Ok(Err(e)) => {
-                    warn!("Task {} completed with error: {}", index, e);
+                    warn!("Task {} ({}) completed with error: {}", index, component_id, e);
                 }
                 Err(_) => {
-                    warn!("Task {} timed out during shutdown", index);
+                    warn!("Task {} ({}) timed out during shutdown", index, component_id);
                 }
             }
         }

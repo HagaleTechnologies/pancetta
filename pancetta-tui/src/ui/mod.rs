@@ -8,6 +8,7 @@ use ratatui::{
 };
 
 use crate::app::{ActivePanel, App};
+use crate::widgets::Waterfall;
 
 pub mod band_activity;
 pub mod dx_hunter;
@@ -44,7 +45,11 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
 
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .constraints([
+            Constraint::Percentage(45), // Band activity
+            Constraint::Percentage(30), // Waterfall
+            Constraint::Percentage(25), // QSO status
+        ])
         .split(main_chunks[0]);
 
     let right_chunks = Layout::default()
@@ -54,7 +59,8 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
 
     // Render panels
     render_band_activity(f, left_chunks[0], app)?;
-    render_qso_status(f, left_chunks[1], app)?;
+    render_waterfall(f, left_chunks[1], app);
+    render_qso_status(f, left_chunks[2], app)?;
     render_station_info(f, right_chunks[0], app)?;
     render_dx_hunter(f, right_chunks[1], app)?;
 
@@ -62,7 +68,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     render_status_bar(f, chunks[2], app);
 
     // Render active panel highlight
-    render_active_panel_highlight(f, app, &[left_chunks[0], left_chunks[1], right_chunks[0], right_chunks[1]]);
+    render_active_panel_highlight(f, app, &[left_chunks[0], left_chunks[2], right_chunks[0], right_chunks[1]]);
 
     Ok(())
 }
@@ -150,6 +156,61 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     let border_paragraph = Paragraph::new(border_line)
         .style(Style::default().fg(app.theme.border_color()));
     f.render_widget(border_paragraph, status_chunks[2]);
+}
+
+fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
+    // Split into frequency label column + waterfall display
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(6), Constraint::Min(1)])
+        .split(area);
+
+    // Frequency scale labels (200-4000 Hz range)
+    let freq_labels = vec![
+        " 4000",
+        "     ",
+        " 3000",
+        "     ",
+        " 2000",
+        "     ",
+        " 1000",
+        "     ",
+        "  200",
+    ];
+    let label_area = chunks[0];
+    let available_rows = label_area.height.saturating_sub(2) as usize; // minus borders
+    let mut label_lines: Vec<Line> = Vec::new();
+    if available_rows > 0 {
+        for i in 0..available_rows {
+            let label_idx = i * freq_labels.len() / available_rows;
+            let label = if label_idx < freq_labels.len() {
+                freq_labels[label_idx]
+            } else {
+                "     "
+            };
+            label_lines.push(Line::from(Span::styled(
+                label,
+                Style::default().fg(app.theme.muted_color()),
+            )));
+        }
+    }
+    let label_block = Block::default()
+        .title(Span::styled(" Hz", Style::default().fg(app.theme.muted_color())))
+        .borders(Borders::RIGHT);
+    let label_paragraph = Paragraph::new(label_lines).block(label_block);
+    f.render_widget(label_paragraph, label_area);
+
+    // Waterfall display
+    let waterfall_block = Block::default()
+        .title(Span::styled(
+            " Waterfall ",
+            Style::default().fg(app.theme.accent_color()),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.border_color()));
+
+    let waterfall = Waterfall::new(&app.waterfall_data).block(waterfall_block);
+    f.render_widget(waterfall, chunks[1]);
 }
 
 fn render_active_panel_highlight(f: &mut Frame<'_>, app: &App, panel_areas: &[Rect]) {

@@ -317,6 +317,100 @@ impl AudioManager {
     pub fn get_config(&self) -> &AudioManagerConfig {
         &self.config
     }
+
+    /// Queue audio samples for output playback.
+    ///
+    /// Resamples from `input_rate` to the output device rate if necessary,
+    /// then writes to the output ring buffer for the audio stream to consume.
+    pub fn queue_output(&mut self, samples: &[f32], input_rate: u32) -> Result<(), AudioError> {
+        let output_samples = if input_rate != self.config.sample_rate {
+            // Resample to output device rate
+            let ratio = self.config.sample_rate as f64 / input_rate as f64;
+            let out_len = (samples.len() as f64 * ratio).ceil() as usize;
+            let mut resampled = Vec::with_capacity(out_len);
+            for i in 0..out_len {
+                let src_idx = i as f64 / ratio;
+                let idx0 = src_idx.floor() as usize;
+                let frac = (src_idx - idx0 as f64) as f32;
+                let s0 = samples.get(idx0).copied().unwrap_or(0.0);
+                let s1 = samples.get(idx0 + 1).copied().unwrap_or(s0);
+                resampled.push(s0 + frac * (s1 - s0));
+            }
+            resampled
+        } else {
+            samples.to_vec()
+        };
+
+        // Write to ring buffer for audio output stream in chunks
+        let chunk_size = self.config.buffer_size;
+        let mut written = 0;
+        for chunk in output_samples.chunks(chunk_size) {
+            let sample = AudioSample::new(
+                chunk.to_vec(),
+                self.config.sample_rate,
+                self.config.channels,
+            );
+            match self.audio_comm.push_audio_sample(sample) {
+                Ok(_) => written += chunk.len(),
+                Err(_) => {
+                    warn!("Audio output buffer full after {} samples", written);
+                    break;
+                }
+            }
+        }
+
+        self.stats.samples_processed += written as u64;
+        info!("Queued {} samples for audio output", written);
+        Ok(())
+    }
+
+    /// Get list of available input devices
+    pub fn list_input_devices(&self) -> Vec<&AudioDeviceInfo> {
+        self.device_manager.list_device_info()
+            .into_iter()
+            .filter(|d| d.supports_input)
+            .collect()
+    }
+
+    /// Get list of available output devices
+    pub fn list_output_devices(&self) -> Vec<&AudioDeviceInfo> {
+        self.device_manager.list_device_info()
+            .into_iter()
+            .filter(|d| d.supports_output)
+            .collect()
+    }
+
+    /// Select input device by name
+    pub fn select_input_device(&mut self, name: &str) -> Result<(), AudioError> {
+        let found = self.device_manager.list_device_info()
+            .iter()
+            .any(|d| d.supports_input && d.name == name);
+        if found {
+            self.config.input_device = Some(name.to_string());
+            info!("Selected input device: {}", name);
+            Ok(())
+        } else {
+            Err(AudioError::Configuration {
+                message: format!("Input device '{}' not found", name),
+            })
+        }
+    }
+
+    /// Select output device by name
+    pub fn select_output_device(&mut self, name: &str) -> Result<(), AudioError> {
+        let found = self.device_manager.list_device_info()
+            .iter()
+            .any(|d| d.supports_output && d.name == name);
+        if found {
+            self.config.output_device = Some(name.to_string());
+            info!("Selected output device: {}", name);
+            Ok(())
+        } else {
+            Err(AudioError::Configuration {
+                message: format!("Output device '{}' not found", name),
+            })
+        }
+    }
 }
 
 impl Drop for AudioManager {

@@ -300,6 +300,137 @@ impl Ft8Encoder {
     }
 
     // ========================================================================
+    // Contest message encoding (i3=0, n3=1..4)
+    // ========================================================================
+
+    /// Encode an ARRL Field Day message: "<to_call> <from_call> [R] <class> <section>"
+    ///
+    /// i3=0, n3=3 (or n3=4 for alternate order).
+    /// Class format: nL where n=transmitters (1-32), L=A-F
+    /// Section: one of 84 ARRL/RAC sections
+    pub fn encode_field_day(
+        &mut self,
+        to_callsign: &str,
+        from_callsign: &str,
+        r_prefix: bool,
+        n_transmitters: u8,
+        class_letter: char,
+        section: &str,
+    ) -> Ft8Result<[u8; NUM_SYMBOLS]> {
+        if n_transmitters < 1 || n_transmitters > 32 {
+            return Err(Ft8Error::MessageDecodingError(
+                format!("Field Day transmitter count must be 1-32, got {}", n_transmitters)
+            ));
+        }
+        let letter_idx = match class_letter.to_ascii_uppercase() {
+            'A' => 0u32,
+            'B' => 1,
+            'C' => 2,
+            'D' => 3,
+            'E' => 4,
+            'F' => 5,
+            _ => return Err(Ft8Error::MessageDecodingError(
+                format!("Invalid Field Day class letter: {}", class_letter)
+            )),
+        };
+        let section_code = encode_arrl_section(section)?;
+
+        let (n28a, _) = pack28(to_callsign)?;
+        let (n28b, _) = pack28(from_callsign)?;
+
+        const NSEC: u32 = 84;
+        let class_code = (n_transmitters as u32 - 1) * 6 + letter_idx;
+        let n_class_section = class_code * NSEC + section_code as u32;
+
+        let ir: u8 = if r_prefix { 1 } else { 0 };
+        let n3: u8 = 3;
+
+        let payload = pack_type0(n28a, n28b, ir, n_class_section as u16, n3);
+        self.payload_to_symbols(&payload)
+    }
+
+    /// Encode a DXpedition message: "<to_call> <from_call> [R] <grid_or_report>"
+    ///
+    /// i3=0, n3=1. Same field layout as standard type 1 but uses
+    /// the type-0 container with n3=1.
+    pub fn encode_dxpedition(
+        &mut self,
+        to_callsign: &str,
+        from_callsign: &str,
+        r_prefix: bool,
+        grid_or_report: &str,
+    ) -> Ft8Result<[u8; NUM_SYMBOLS]> {
+        let (n28a, _) = pack28(to_callsign)?;
+        let (n28b, _) = pack28(from_callsign)?;
+
+        let ir: u8 = if r_prefix { 1 } else { 0 };
+
+        // Pack grid/report into 14-bit field (same logic as standard igrid4 but 14 bits)
+        let igrid14 = pack_grid_14bit(grid_or_report);
+        let n3: u8 = 1;
+
+        let payload = pack_type0(n28a, n28b, ir, igrid14, n3);
+        self.payload_to_symbols(&payload)
+    }
+
+    /// Encode an EU VHF Contest message: "<to_call> <from_call> [R] <grid_or_token>"
+    ///
+    /// i3=0, n3=2. Uses compressed grid encoding for 14-bit field.
+    pub fn encode_eu_vhf(
+        &mut self,
+        to_callsign: &str,
+        from_callsign: &str,
+        r_prefix: bool,
+        exchange: &str,
+    ) -> Ft8Result<[u8; NUM_SYMBOLS]> {
+        let (n28a, _) = pack28(to_callsign)?;
+        let (n28b, _) = pack28(from_callsign)?;
+
+        let ir: u8 = if r_prefix { 1 } else { 0 };
+
+        // EU VHF uses compressed grid or tokens in 14-bit field
+        let irpt = pack_eu_vhf_14bit(exchange);
+        let n3: u8 = 2;
+
+        let payload = pack_type0(n28a, n28b, ir, irpt, n3);
+        self.payload_to_symbols(&payload)
+    }
+
+    /// Encode an RTTY Roundup message: "<to_call> <from_call> [R] <rst> <state>"
+    ///
+    /// i3=0, n3=5. Packs RST + state/province into 14-bit field.
+    pub fn encode_rtty_roundup(
+        &mut self,
+        to_callsign: &str,
+        from_callsign: &str,
+        r_prefix: bool,
+        rst: u16,
+        state: &str,
+    ) -> Ft8Result<[u8; NUM_SYMBOLS]> {
+        let (n28a, _) = pack28(to_callsign)?;
+        let (n28b, _) = pack28(from_callsign)?;
+
+        let ir: u8 = if r_prefix { 1 } else { 0 };
+
+        let state_code = encode_state_code(state)?;
+        // RTTY Roundup: 14-bit field = rst_code * 64 + state_code
+        // RST is typically 559 or 599; encode as (rst / 10) - 52 = index
+        let rst_code = match rst {
+            529 => 0u16, 539 => 1, 549 => 2, 559 => 3, 569 => 4,
+            579 => 5, 589 => 6, 599 => 7,
+            _ => return Err(Ft8Error::MessageDecodingError(
+                format!("Invalid RST: {} (must be 529-599 in steps of 10)", rst)
+            )),
+        };
+
+        let irpt = rst_code * 64 + state_code as u16;
+        let n3: u8 = 5;
+
+        let payload = pack_type0(n28a, n28b, ir, irpt, n3);
+        self.payload_to_symbols(&payload)
+    }
+
+    // ========================================================================
     // Free text encoding (i3=0, n3=0)
     // ========================================================================
 
@@ -608,6 +739,177 @@ fn freetext_char_index(c: u8) -> Ft8Result<u8> {
     ))
 }
 
+// ============================================================================
+// Type-0 message packing (i3=0, n3=1..5)
+// ============================================================================
+
+/// Pack a type-0 message into 10-byte payload.
+///
+/// Layout (77 bits): n28a(28) + n28b(28) + ir(1) + field14(14) + n3(3) + i3(3)
+/// i3 is always 0 for type-0 messages.
+fn pack_type0(n28a: u32, n28b: u32, ir: u8, field14: u16, n3: u8) -> [u8; 10] {
+    let mut payload = [0u8; 10];
+
+    // Bits 0-27: n28a (28 bits)
+    payload[0] = (n28a >> 20) as u8;
+    payload[1] = (n28a >> 12) as u8;
+    payload[2] = (n28a >> 4) as u8;
+    payload[3] = ((n28a & 0xF) << 4) as u8 | ((n28b >> 24) as u8);
+    // Bits 28-55: n28b (28 bits)
+    payload[4] = (n28b >> 16) as u8;
+    payload[5] = (n28b >> 8) as u8;
+    payload[6] = n28b as u8;
+    // Bit 56: ir (1 bit)
+    // Bits 57-70: field14 (14 bits)
+    // Bits 71-73: n3 (3 bits)
+    // Bits 74-76: i3 = 0 (3 bits)
+    payload[7] = ((ir & 1) << 7) | ((field14 >> 8) as u8 & 0x7F);
+    payload[8] = field14 as u8;
+    payload[9] = n3 << 3; // i3=0, so lower 3 bits are 0
+
+    payload
+}
+
+/// Pack a 14-bit grid/report field for DXpedition messages.
+///
+/// Grid: 4-char Maidenhead → standard encoding (0..32399)
+/// Report: signal report → 35+dd (no R prefix in this field; R is the ir bit)
+/// Tokens: RRR=32402, RR73=32403, 73=32404
+fn pack_grid_14bit(exchange: &str) -> u16 {
+    if exchange.is_empty() {
+        return 0;
+    }
+
+    let bytes = exchange.as_bytes();
+
+    // Tokens
+    if exchange == "RRR" { return MAXGRID4 + 2; }
+    if exchange == "RR73" { return MAXGRID4 + 3; }
+    if exchange == "73" { return MAXGRID4 + 4; }
+
+    // 4-character grid
+    if bytes.len() == 4
+        && bytes[0] >= b'A' && bytes[0] <= b'R'
+        && bytes[1] >= b'A' && bytes[1] <= b'R'
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+    {
+        let mut igrid: u16 = (bytes[0] - b'A') as u16;
+        igrid = igrid * 18 + (bytes[1] - b'A') as u16;
+        igrid = igrid * 10 + (bytes[2] - b'0') as u16;
+        igrid = igrid * 10 + (bytes[3] - b'0') as u16;
+        return igrid;
+    }
+
+    // Signal report
+    if let Ok(dd) = exchange.parse::<i32>() {
+        return (35 + dd) as u16;
+    }
+
+    0 // fallback
+}
+
+/// Pack EU VHF compressed grid/report into 14-bit field.
+///
+/// Grid: compressed 14-bit encoding (lon*900 + lat*50 + lon_digit*5 + lat_digit)
+/// Tokens: RRR=16201, RR73=16202, 73=16203
+/// Report: 16200 + 35 + dd
+fn pack_eu_vhf_14bit(exchange: &str) -> u16 {
+    if exchange.is_empty() {
+        return 0;
+    }
+
+    // Tokens
+    if exchange == "RRR" { return 16200 + 1; }
+    if exchange == "RR73" { return 16200 + 2; }
+    if exchange == "73" { return 16200 + 3; }
+
+    let bytes = exchange.as_bytes();
+
+    // 4-character grid (compressed encoding)
+    if bytes.len() == 4
+        && bytes[0] >= b'A' && bytes[0] <= b'R'
+        && bytes[1] >= b'A' && bytes[1] <= b'R'
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+    {
+        let lon = (bytes[0] - b'A') as u16;
+        let lat = (bytes[1] - b'A') as u16;
+        let lon_digit = (bytes[2] - b'0') as u16;
+        let lat_digit = (bytes[3] - b'0') as u16 / 2; // Compress: only 0-4
+        return lon * 900 + lat * 50 + lon_digit * 5 + lat_digit;
+    }
+
+    // Signal report
+    if let Ok(dd) = exchange.parse::<i32>() {
+        return (16200 + 35 + dd) as u16;
+    }
+
+    0 // fallback
+}
+
+/// Look up ARRL section name → code (0-83)
+fn encode_arrl_section(section: &str) -> Ft8Result<u8> {
+    const SECTIONS: [&str; 84] = [
+        "CT", "EMA", "ME", "NH", "RI", "VT", "WMA",
+        "ENY", "NLI", "NNJ", "NNY", "SNJ", "WNY",
+        "DE", "EPA", "MDC", "WPA",
+        "AL", "GA", "KY", "NC", "NFL", "SC", "SFL", "WCF",
+        "TN",
+        "VA", "PR",
+        "MI", "OH", "WV", "IL", "IN",
+        "WI",
+        "AR", "LA", "MS", "NM", "OK",
+        "NTX", "STX", "WTX",
+        "CO", "IA", "KS", "MN", "MO", "NE",
+        "ND", "SD",
+        "OR", "EWA", "WWA", "ID", "MT",
+        "WY",
+        "AK", "HI", "PAC",
+        "AZ", "EBay", "LAX", "ORG", "SB",
+        "SDG", "SCV", "SF", "SJV",
+        "SV", "NV", "UT",
+        "AB", "BC", "GH", "MB", "NB", "NL", "NS", "NT",
+        "ON", "PE", "QC", "SK", "YT",
+    ];
+
+    let section_upper = section.to_uppercase();
+    for (i, &s) in SECTIONS.iter().enumerate() {
+        if s.eq_ignore_ascii_case(&section_upper) {
+            return Ok(i as u8);
+        }
+    }
+
+    Err(Ft8Error::MessageDecodingError(
+        format!("Unknown ARRL section: '{}'", section)
+    ))
+}
+
+/// Look up state/province name → code (0-62)
+fn encode_state_code(state: &str) -> Ft8Result<u8> {
+    const STATES: [&str; 63] = [
+        "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA",
+        "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD",
+        "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ",
+        "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC",
+        "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
+        "DC",
+        "AB", "BC", "MB", "NB", "NL", "NS", "NT", "NU", "ON", "PE",
+        "QC", "SK",
+    ];
+
+    let state_upper = state.to_uppercase();
+    for (i, &s) in STATES.iter().enumerate() {
+        if s == state_upper {
+            return Ok(i as u8);
+        }
+    }
+
+    Err(Ft8Error::MessageDecodingError(
+        format!("Unknown state/province: '{}'", state)
+    ))
+}
+
 /// Configuration for FT8 encoding
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ft8EncodingConfig {
@@ -859,5 +1161,130 @@ mod tests {
         expected[9] = ((igrid4 << 6) as u8) | (i3 << 3);
 
         assert_eq!(payload, expected, "Payload mismatch for CQ K1ABC FN42");
+    }
+
+    #[test]
+    fn test_encode_field_day() {
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_field_day("K1DEF", "W1ABC", false, 2, 'A', "CT");
+        assert!(result.is_ok(), "Field Day encoding failed: {:?}", result.err());
+        let symbols = result.unwrap();
+        assert_eq!(symbols.len(), NUM_SYMBOLS);
+        assert!(symbols.iter().all(|&s| s < 8));
+    }
+
+    #[test]
+    fn test_encode_field_day_with_r() {
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_field_day("K1DEF", "W1ABC", true, 1, 'B', "WMA");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_encode_field_day_invalid_class() {
+        let mut encoder = Ft8Encoder::new();
+        assert!(encoder.encode_field_day("K1DEF", "W1ABC", false, 0, 'A', "CT").is_err());
+        assert!(encoder.encode_field_day("K1DEF", "W1ABC", false, 33, 'A', "CT").is_err());
+        assert!(encoder.encode_field_day("K1DEF", "W1ABC", false, 1, 'G', "CT").is_err());
+    }
+
+    #[test]
+    fn test_encode_field_day_invalid_section() {
+        let mut encoder = Ft8Encoder::new();
+        assert!(encoder.encode_field_day("K1DEF", "W1ABC", false, 1, 'A', "ZZZ").is_err());
+    }
+
+    #[test]
+    fn test_encode_dxpedition() {
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_dxpedition("K1DEF", "W1ABC", false, "FN42");
+        assert!(result.is_ok());
+        let symbols = result.unwrap();
+        assert_eq!(symbols.len(), NUM_SYMBOLS);
+    }
+
+    #[test]
+    fn test_encode_dxpedition_report() {
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_dxpedition("K1DEF", "W1ABC", true, "-12");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_encode_eu_vhf_grid() {
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_eu_vhf("K1DEF", "W1ABC", false, "JO65");
+        assert!(result.is_ok());
+        let symbols = result.unwrap();
+        assert_eq!(symbols.len(), NUM_SYMBOLS);
+    }
+
+    #[test]
+    fn test_encode_eu_vhf_tokens() {
+        let mut encoder = Ft8Encoder::new();
+        assert!(encoder.encode_eu_vhf("K1DEF", "W1ABC", false, "RRR").is_ok());
+        assert!(encoder.encode_eu_vhf("K1DEF", "W1ABC", false, "RR73").is_ok());
+        assert!(encoder.encode_eu_vhf("K1DEF", "W1ABC", false, "73").is_ok());
+    }
+
+    #[test]
+    fn test_encode_rtty_roundup() {
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_rtty_roundup("K1DEF", "W1ABC", false, 599, "NY");
+        assert!(result.is_ok());
+        let symbols = result.unwrap();
+        assert_eq!(symbols.len(), NUM_SYMBOLS);
+    }
+
+    #[test]
+    fn test_encode_rtty_roundup_invalid_rst() {
+        let mut encoder = Ft8Encoder::new();
+        assert!(encoder.encode_rtty_roundup("K1DEF", "W1ABC", false, 500, "NY").is_err());
+    }
+
+    #[test]
+    fn test_encode_rtty_roundup_invalid_state() {
+        let mut encoder = Ft8Encoder::new();
+        assert!(encoder.encode_rtty_roundup("K1DEF", "W1ABC", false, 599, "ZZ").is_err());
+    }
+
+    #[test]
+    fn test_arrl_section_lookup() {
+        assert_eq!(encode_arrl_section("CT").unwrap(), 0);
+        assert_eq!(encode_arrl_section("WMA").unwrap(), 6);
+        assert_eq!(encode_arrl_section("YT").unwrap(), 83);
+        assert!(encode_arrl_section("ZZZ").is_err());
+    }
+
+    #[test]
+    fn test_state_code_lookup() {
+        assert_eq!(encode_state_code("AL").unwrap(), 0);
+        assert_eq!(encode_state_code("NY").unwrap(), 31);
+        assert_eq!(encode_state_code("DC").unwrap(), 50);
+        assert_eq!(encode_state_code("SK").unwrap(), 62);
+        assert!(encode_state_code("ZZ").is_err());
+    }
+
+    #[test]
+    fn test_pack_type0_structure() {
+        // Verify the type-0 packing produces correct bit layout
+        let payload = pack_type0(0x0ABCDEF, 0x0123456, 1, 0x3FFF, 3);
+        // i3 should be 0 (lower 3 bits of last byte)
+        assert_eq!(payload[9] & 0x07, 0, "i3 must be 0 for type-0 messages");
+        // n3 should be 3 (bits 71-73 = upper 3 bits of payload[9] >> 3)
+        assert_eq!((payload[9] >> 3) & 0x07, 3, "n3 should be 3");
+    }
+
+    #[test]
+    fn test_pack_grid_14bit() {
+        assert_eq!(pack_grid_14bit("RRR"), MAXGRID4 + 2);
+        assert_eq!(pack_grid_14bit("RR73"), MAXGRID4 + 3);
+        assert_eq!(pack_grid_14bit("73"), MAXGRID4 + 4);
+        // FN42 grid
+        let g = pack_grid_14bit("FN42");
+        assert!(g < MAXGRID4);
+        assert_eq!(g, 10342); // Same as packgrid
+        // Report -12
+        assert_eq!(pack_grid_14bit("-12"), 23);
     }
 }

@@ -77,6 +77,95 @@ pub struct AutonomousStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DevicePanel {
+    Input,
+    Output,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceSelectionState {
+    pub input_devices: Vec<(String, bool)>,  // (name, is_default)
+    pub output_devices: Vec<(String, bool)>,
+    pub selected_input_idx: usize,
+    pub selected_output_idx: usize,
+    pub active_panel: DevicePanel,
+    pub visible: bool,
+}
+
+impl DeviceSelectionState {
+    pub fn new() -> Self {
+        Self {
+            input_devices: Vec::new(),
+            output_devices: Vec::new(),
+            selected_input_idx: 0,
+            selected_output_idx: 0,
+            active_panel: DevicePanel::Input,
+            visible: false,
+        }
+    }
+
+    /// Get the currently selected index for the active panel.
+    pub fn selected_idx(&self) -> usize {
+        match self.active_panel {
+            DevicePanel::Input => self.selected_input_idx,
+            DevicePanel::Output => self.selected_output_idx,
+        }
+    }
+
+    /// Move selection up in the active panel.
+    pub fn move_up(&mut self) {
+        match self.active_panel {
+            DevicePanel::Input => {
+                if self.selected_input_idx > 0 {
+                    self.selected_input_idx -= 1;
+                }
+            }
+            DevicePanel::Output => {
+                if self.selected_output_idx > 0 {
+                    self.selected_output_idx -= 1;
+                }
+            }
+        }
+    }
+
+    /// Move selection down in the active panel.
+    pub fn move_down(&mut self) {
+        match self.active_panel {
+            DevicePanel::Input => {
+                let max = self.input_devices.len().saturating_sub(1);
+                if self.selected_input_idx < max {
+                    self.selected_input_idx += 1;
+                }
+            }
+            DevicePanel::Output => {
+                let max = self.output_devices.len().saturating_sub(1);
+                if self.selected_output_idx < max {
+                    self.selected_output_idx += 1;
+                }
+            }
+        }
+    }
+
+    /// Toggle between Input and Output panels.
+    pub fn toggle_panel(&mut self) {
+        self.active_panel = match self.active_panel {
+            DevicePanel::Input => DevicePanel::Output,
+            DevicePanel::Output => DevicePanel::Input,
+        };
+    }
+
+    /// Get the selected input device name.
+    pub fn selected_input_name(&self) -> Option<String> {
+        self.input_devices.get(self.selected_input_idx).map(|(name, _)| name.clone())
+    }
+
+    /// Get the selected output device name.
+    pub fn selected_output_name(&self) -> Option<String> {
+        self.output_devices.get(self.selected_output_idx).map(|(name, _)| name.clone())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ActivePanel {
     BandActivity,
     QsoStatus,
@@ -130,6 +219,9 @@ pub struct App {
     
     // Autonomous operator
     pub autonomous_status: Option<AutonomousStatus>,
+
+    // Device selection modal
+    pub device_selection: DeviceSelectionState,
 
     // TX input
     pub tx_input_buffer: String,
@@ -185,6 +277,7 @@ impl App {
             audio_level: 0.0,
             waterfall_data: Vec::new(),
             autonomous_status: None,
+            device_selection: DeviceSelectionState::new(),
             tx_input_buffer: String::new(),
             tx_input_cursor: 0,
             is_transmitting: false,
@@ -536,6 +629,16 @@ impl App {
 
     pub fn update_component_status(&mut self, component: String, status: String) {
         self.status_message = format!("{}: {}", component, status);
+    }
+
+    /// Append waterfall rows from a decoded window, keeping last 30 windows of data.
+    pub fn push_waterfall_rows(&mut self, rows: Vec<Vec<f32>>) {
+        const MAX_WATERFALL_ROWS: usize = 300;
+        self.waterfall_data.extend(rows);
+        if self.waterfall_data.len() > MAX_WATERFALL_ROWS {
+            let excess = self.waterfall_data.len() - MAX_WATERFALL_ROWS;
+            self.waterfall_data.drain(..excess);
+        }
     }
 
     pub fn next_panel(&mut self) {

@@ -490,6 +490,20 @@ impl QsoManager {
         Ok(())
     }
     
+    /// Emit a MessageToSend event for a QSO (crate-internal use by auto_sequencer)
+    pub(crate) async fn send_message(
+        &self,
+        qso_id: QsoId,
+        message: MessageType,
+        frequency: f64,
+    ) {
+        self.emit_event(QsoEvent::MessageToSend {
+            qso_id,
+            message,
+            frequency,
+        }).await;
+    }
+
     /// Get next contest serial number
     pub async fn get_next_serial(&self) -> SerialNumber {
         let mut next_serial = self.next_serial.write().await;
