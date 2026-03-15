@@ -2764,6 +2764,7 @@ dependencies = [
  "flume",
  "futures",
  "hound",
+ "libc",
  "metrics",
  "metrics-exporter-prometheus",
  "num_cpus",
