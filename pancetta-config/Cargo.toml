@@ -25,7 +25,7 @@ tokio = { version = "1.0", features = ["full"] }
 notify = "6.1"
 
 # Path and environment utilities
-dirs = "5.0"
+dirs = "6.0"
 shellexpand = "3.1"
 
 # Validation and utilities

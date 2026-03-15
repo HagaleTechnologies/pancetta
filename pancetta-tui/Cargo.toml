@@ -41,7 +41,7 @@ cpal = "0.15"
 rustfft = "6.0"
 
 # Additional utility crates
-dirs = "5.0"
+dirs = "6.0"
 
 # Ham radio specific (will be implemented later)
 # ft8-lib = { path = "../ft8-lib" }
