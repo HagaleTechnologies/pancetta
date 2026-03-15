@@ -33,7 +33,7 @@ toml = { workspace = true }
 
 # Async utilities
 async-trait = "0.1"
-pin-project = "1.0"
+pin-project = "1.1"
 
 # Numeric types for frequency/power handling
 num-traits = "0.2"
@@ -44,8 +44,8 @@ string_cache = "0.8"
 
 [dev-dependencies]
 tokio-test = "0.4"
-tempfile = "3.0"
-proptest = "1.0"
+tempfile = "3.27"
+proptest = "1.10"
 tracing-subscriber = { workspace = true }
 
 [build-dependencies]
