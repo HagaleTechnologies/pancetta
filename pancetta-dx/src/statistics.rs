@@ -4,7 +4,7 @@
 //! tracking for amateur radio DX activities and awards.
 
 use crate::{dxcc::DxccDatabase, tracker::DxTracker, Band, DxError, Mode, Result};
-use chrono::{DateTime, Datelike, Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{debug, info};
@@ -195,18 +195,6 @@ impl StatisticsEngine {
         })
     }
 
-    /// Create new statistics engine from a tracker reference (uses unsafe ptr::read)
-    /// TODO: Refactor callers to use Arc-based `new` instead
-    pub async fn new_from_ref(tracker: &DxTracker) -> Result<Self> {
-        Ok(Self {
-            tracker: std::sync::Arc::new(unsafe { std::ptr::read(tracker) }),
-            dxcc: std::sync::Arc::new(crate::dxcc::DxccDatabase::new().await?),
-            cached_stats: None,
-            cache_time: None,
-            cache_timeout_minutes: 15,
-        })
-    }
-
     /// Set cache timeout
     pub fn set_cache_timeout(&mut self, minutes: i64) {
         self.cache_timeout_minutes = minutes;
@@ -246,8 +234,8 @@ impl StatisticsEngine {
         let total_qsos = entity_stats.values().sum();
         let dxcc_entities_worked = entity_stats.len() as u32;
 
-        // Calculate confirmed entities (placeholder - would need actual confirmation tracking)
-        let dxcc_entities_confirmed = (dxcc_entities_worked as f64 * 0.7) as u32; // Assume 70% confirmed
+        // Count confirmed entities from award tracking table
+        let dxcc_entities_confirmed = self.count_confirmed_entities().await.unwrap_or(0);
 
         // Get band/mode breakdowns
         let qsos_by_band = self.calculate_band_breakdown().await?;
@@ -308,28 +296,21 @@ impl StatisticsEngine {
     pub async fn get_band_statistics(&self, band: Band) -> Result<BandStatistics> {
         info!("Calculating statistics for band {}", band);
 
-        // This would query the tracker for band-specific data
-        // For now, return placeholder data
-
-        let total_qsos = 100; // Placeholder
-        let unique_callsigns = 85; // Placeholder
-        let entities_worked = 45; // Placeholder
-        let entities_confirmed = 32; // Placeholder
-
+        // Not yet implemented — return zeroed stats rather than fake data
         Ok(BandStatistics {
             band,
-            total_qsos,
-            unique_callsigns,
-            entities_worked,
-            entities_confirmed,
+            total_qsos: 0,
+            unique_callsigns: 0,
+            entities_worked: 0,
+            entities_confirmed: 0,
             qsos_by_mode: HashMap::new(),
             qsos_by_continent: HashMap::new(),
-            avg_rst_sent: 590.5,
-            avg_rst_received: 588.3,
-            most_active_hour: Some(14), // 2 PM UTC
+            avg_rst_sent: 0.0,
+            avg_rst_received: 0.0,
+            most_active_hour: None,
             activity_by_hour: HashMap::new(),
-            longest_distance_km: Some(15000.0),
-            confirmation_rate: 71.1,
+            longest_distance_km: None,
+            confirmation_rate: 0.0,
         })
     }
 
@@ -337,25 +318,18 @@ impl StatisticsEngine {
     pub async fn get_mode_statistics(&self, mode: &Mode) -> Result<ModeStatistics> {
         info!("Calculating statistics for mode {}", mode);
 
-        // This would query the tracker for mode-specific data
-        // For now, return placeholder data
-
-        let total_qsos = 150; // Placeholder
-        let unique_callsigns = 120; // Placeholder
-        let entities_worked = 55; // Placeholder
-        let entities_confirmed = 40; // Placeholder
-
+        // Not yet implemented — return zeroed stats rather than fake data
         Ok(ModeStatistics {
             mode: mode.clone(),
-            total_qsos,
-            unique_callsigns,
-            entities_worked,
-            entities_confirmed,
+            total_qsos: 0,
+            unique_callsigns: 0,
+            entities_worked: 0,
+            entities_confirmed: 0,
             qsos_by_band: HashMap::new(),
-            most_active_band: Some(Band::Band20m),
-            avg_rst_sent: 599.0,
-            avg_rst_received: 597.8,
-            confirmation_rate: 72.7,
+            most_active_band: None,
+            avg_rst_sent: 0.0,
+            avg_rst_received: 0.0,
+            confirmation_rate: 0.0,
         })
     }
 
@@ -555,104 +529,51 @@ impl StatisticsEngine {
     }
 
     /// Calculate QSO rate trends
-    pub async fn calculate_qso_rate_trends(&self, days: i64) -> Result<Vec<(DateTime<Utc>, u32)>> {
-        // This would analyze QSO rates over time
-        // For now, return placeholder data
-
-        let mut trends = Vec::new();
-        let now = Utc::now();
-
-        for i in 0..days {
-            let date = now - Duration::days(days - i);
-            let qso_count = ((i as f64 / days as f64) * 50.0) as u32 + 10; // Simulated growth
-            trends.push((date, qso_count));
-        }
-
-        Ok(trends)
+    pub async fn calculate_qso_rate_trends(&self, _days: i64) -> Result<Vec<(DateTime<Utc>, u32)>> {
+        // Not yet implemented — requires date-based aggregate query
+        Ok(Vec::new())
     }
 
     // Helper methods for statistics calculation
 
     async fn calculate_band_breakdown(&self) -> Result<HashMap<Band, u32>> {
-        // This would aggregate QSOs by band from the tracker
-        // For now, return placeholder data
-        let mut breakdown = HashMap::new();
-        breakdown.insert(Band::Band20m, 250);
-        breakdown.insert(Band::Band40m, 180);
-        breakdown.insert(Band::Band80m, 120);
-        breakdown.insert(Band::Band15m, 90);
-        breakdown.insert(Band::Band10m, 60);
-        Ok(breakdown)
+        // Not yet implemented — requires aggregate query across all entities
+        Ok(HashMap::new())
     }
 
     async fn calculate_mode_breakdown(&self) -> Result<HashMap<Mode, u32>> {
-        // This would aggregate QSOs by mode from the tracker
-        // For now, return placeholder data
-        let mut breakdown = HashMap::new();
-        breakdown.insert(Mode::FT8, 300);
-        breakdown.insert(Mode::CW, 200);
-        breakdown.insert(Mode::USB, 150);
-        breakdown.insert(Mode::FT4, 80);
-        breakdown.insert(Mode::RTTY, 70);
-        Ok(breakdown)
+        // Not yet implemented — requires aggregate query across all entities
+        Ok(HashMap::new())
     }
 
     async fn calculate_yearly_breakdown(&self) -> Result<HashMap<u32, u32>> {
-        // This would aggregate QSOs by year
-        let mut breakdown = HashMap::new();
-        let current_year = Utc::now().year() as u32;
-
-        for year in (current_year - 5)..=current_year {
-            let count = if year == current_year {
-                300
-            } else {
-                200 + (year % 100)
-            };
-            breakdown.insert(year, count);
-        }
-
-        Ok(breakdown)
+        // Not yet implemented — requires date-based aggregate query
+        Ok(HashMap::new())
     }
 
     async fn calculate_monthly_breakdown(&self) -> Result<HashMap<String, u32>> {
-        // This would aggregate QSOs by month for last 12 months
-        let mut breakdown = HashMap::new();
-        let now = Utc::now();
-
-        for i in 0..12 {
-            let date = now - Duration::days(i * 30);
-            let month_key = date.format("%Y-%m").to_string();
-            let count = 50 + (i * 5) as u32; // Simulated data
-            breakdown.insert(month_key, count);
-        }
-
-        Ok(breakdown)
+        // Not yet implemented — requires date-based aggregate query
+        Ok(HashMap::new())
     }
 
     async fn calculate_avg_qsos_per_day(&self) -> Result<f64> {
-        // This would calculate average from actual QSO data
-        // For now, return placeholder
-        Ok(3.2)
+        // Not yet implemented — requires date-based query
+        Ok(0.0)
     }
 
     async fn get_qso_date_range(&self) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
-        // This would query the tracker for first and last QSO dates
-        // For now, return placeholder data
-        let now = Utc::now();
-        let first = now - Duration::days(365 * 2); // 2 years ago
-        Ok((Some(first), Some(now)))
+        // Not yet implemented — requires MIN/MAX datetime query
+        Ok((None, None))
     }
 
     async fn calculate_unique_callsigns(&self) -> Result<u32> {
-        // This would count unique callsigns from tracker
-        // For now, return placeholder
-        Ok(650)
+        // Not yet implemented — requires COUNT(DISTINCT callsign) query
+        Ok(0)
     }
 
     async fn calculate_longest_distance(&self) -> Result<Option<f64>> {
-        // This would find the QSO with maximum distance
-        // For now, return placeholder
-        Ok(Some(19850.0)) // Approximate antipodal distance
+        // Not yet implemented — QSO table doesn't store distance
+        Ok(None)
     }
 
     fn find_most_worked_entity(&self, entity_stats: &HashMap<u16, u32>) -> Option<(u16, u32)> {
@@ -663,21 +584,18 @@ impl StatisticsEngine {
     }
 
     async fn calculate_countries_per_continent(&self) -> Result<HashMap<String, u32>> {
-        // This would count entities per continent using DXCC database
-        let mut counts = HashMap::new();
-        counts.insert("North America".to_string(), 25);
-        counts.insert("Europe".to_string(), 45);
-        counts.insert("Asia".to_string(), 35);
-        counts.insert("Africa".to_string(), 20);
-        counts.insert("South America".to_string(), 15);
-        counts.insert("Oceania".to_string(), 12);
-        Ok(counts)
+        // Not yet implemented — requires DXCC database join
+        Ok(HashMap::new())
     }
 
     async fn calculate_confirmation_rate(&self) -> Result<f64> {
-        // This would calculate actual confirmation rate from tracker
-        // For now, return placeholder
-        Ok(68.5) // 68.5% confirmation rate
+        // Not yet implemented — requires confirmation tracking query
+        Ok(0.0)
+    }
+
+    async fn count_confirmed_entities(&self) -> Result<u32> {
+        // Not yet implemented — requires award_tracking table query
+        Ok(0)
     }
 }
 

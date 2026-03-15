@@ -314,19 +314,18 @@ impl TuiRunner {
             // Device selection modal
             KeyCode::Char('D') => {
                 app.device_selection.visible = true;
-                // Populate with placeholder devices if empty.
-                // Real device lists are populated by the coordinator
-                // via TuiMessage before or when the modal opens.
-                if app.device_selection.input_devices.is_empty() {
-                    app.device_selection.input_devices = vec![("Default Input".to_string(), true)];
+                // Device lists are populated by the coordinator via TuiMessage.
+                // If no devices have been reported, show empty list rather than fake data.
+                if app.device_selection.input_devices.is_empty()
+                    && app.device_selection.output_devices.is_empty()
+                {
+                    app.status_message =
+                        "No audio devices reported — check coordinator connection".to_string();
+                } else {
+                    app.status_message =
+                        "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"
+                            .to_string();
                 }
-                if app.device_selection.output_devices.is_empty() {
-                    app.device_selection.output_devices =
-                        vec![("Default Output".to_string(), true)];
-                }
-                app.status_message =
-                    "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"
-                        .to_string();
             }
 
             // Panel navigation
@@ -760,168 +759,6 @@ impl TuiRunner {
             Paragraph::new(" Tab: switch panel | Up/Down: select | Enter: confirm | Esc: cancel")
                 .style(Style::default().fg(Color::DarkGray));
         f.render_widget(footer, vert_chunks[1]);
-    }
-
-    /// Render header
-    fn render_header(&self, f: &mut Frame, area: Rect, app: &App) {
-        let header_text = format!(
-            " Pancetta FT8 | {} | {} MHz | {} ",
-            app.station_info.call_sign,
-            app.station_info.operating_frequency / 1_000_000.0,
-            app.station_info.mode
-        );
-
-        let header = Paragraph::new(header_text)
-            .style(Style::default().bg(Color::Blue).fg(Color::White))
-            .block(Block::default().borders(Borders::NONE));
-
-        f.render_widget(header, area);
-    }
-
-    /// Render main content area
-    fn render_main_content(&self, f: &mut Frame, area: Rect, app: &App) {
-        // Split into columns
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(60), // Decoded messages
-                Constraint::Percentage(40), // Side panels
-            ])
-            .split(area);
-
-        // Render decoded messages
-        self.render_decoded_messages(f, chunks[0], app);
-
-        // Render side panels
-        self.render_side_panels(f, chunks[1], app);
-    }
-
-    /// Render decoded messages panel
-    fn render_decoded_messages(&self, f: &mut Frame, area: Rect, app: &App) {
-        let messages: Vec<ListItem> = app
-            .decoded_messages
-            .iter()
-            .map(|msg| {
-                let style = if msg.message.contains("CQ") {
-                    Style::default().fg(Color::Yellow)
-                } else if msg
-                    .call_sign
-                    .as_ref()
-                    .map_or(false, |c| c == &app.station_info.call_sign)
-                {
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-
-                let text = format!(
-                    "{:02}:{:02}:{:02} {:>4.0} {:>3} {}",
-                    msg.timestamp.naive_local().hour(),
-                    msg.timestamp.naive_local().minute(),
-                    msg.timestamp.naive_local().second(),
-                    msg.delta_freq,
-                    msg.snr,
-                    msg.message
-                );
-
-                ListItem::new(text).style(style)
-            })
-            .collect();
-
-        let messages_list = List::new(messages)
-            .block(
-                Block::default()
-                    .title(" Decoded Messages ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            );
-
-        f.render_widget(messages_list, area);
-    }
-
-    /// Render side panels
-    fn render_side_panels(&self, f: &mut Frame, area: Rect, app: &App) {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(50), // DX stations
-                Constraint::Percentage(50), // QSO status
-            ])
-            .split(area);
-
-        // DX Stations
-        let dx_items: Vec<ListItem> = app
-            .dx_stations
-            .iter()
-            .map(|dx| {
-                ListItem::new(format!(
-                    "{} {} {:>6.0}km {}dB",
-                    dx.1.call_sign,
-                    dx.1.grid_square.as_ref().unwrap_or(&"----".to_string()),
-                    dx.1.distance.unwrap_or(0.0),
-                    dx.1.snr
-                ))
-            })
-            .collect();
-
-        let dx_list = List::new(dx_items).block(
-            Block::default()
-                .title(" DX Stations ")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded),
-        );
-
-        f.render_widget(dx_list, chunks[0]);
-
-        // QSO Status
-        let qso_text = if app.qso_status.active {
-            format!(
-                "QSO with: {}\nTX: {} dB\nRX: {} dB\nExchanges: {}",
-                app.qso_status
-                    .call_sign
-                    .as_ref()
-                    .unwrap_or(&"Unknown".to_string()),
-                app.qso_status.snr_tx.unwrap_or(0),
-                app.qso_status.snr_rx.unwrap_or(0),
-                app.qso_status.exchange_count
-            )
-        } else {
-            "No active QSO".to_string()
-        };
-
-        let qso_status = Paragraph::new(qso_text)
-            .block(
-                Block::default()
-                    .title(" QSO Status ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            )
-            .wrap(Wrap { trim: true });
-
-        f.render_widget(qso_status, chunks[1]);
-    }
-
-    /// Render status bar
-    fn render_status_bar(&self, f: &mut Frame, area: Rect, app: &App) {
-        let status_text = format!(
-            " TX: {} | S-meter: {} | FPS: {} | F1:Help F2:CQ F5:Clear Q:Quit ",
-            if app.is_monitoring { "ON" } else { "OFF" },
-            app.audio_level as i32,
-            self.metrics.frames_rendered / self.last_render.elapsed().as_secs().max(1)
-        );
-
-        let status = Paragraph::new(status_text)
-            .style(Style::default().bg(Color::DarkGray).fg(Color::White))
-            .block(Block::default().borders(Borders::NONE));
-
-        f.render_widget(status, area);
     }
 
     /// Update performance metrics

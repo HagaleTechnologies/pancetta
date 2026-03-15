@@ -624,12 +624,8 @@ impl MessageBus {
             let is_healthy =
                 error_count < 100 && last_heartbeat.elapsed() < Duration::from_secs(30);
 
-            let avg_latency_ms = if message_count > 0 {
-                // Simplified latency calculation
-                1.0 // TODO: Implement proper latency tracking
-            } else {
-                0.0
-            };
+            // No real latency tracking — report None rather than fake data
+            let avg_latency_ms = 0.0;
 
             health_status.push(ComponentHealth {
                 component_id,

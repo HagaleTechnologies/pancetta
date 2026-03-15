@@ -269,6 +269,8 @@ impl ApplicationCoordinator {
         // Start auxiliary components
         #[cfg(feature = "pancetta-hamlib")]
         self.start_hamlib_component().await?;
+        #[cfg(not(feature = "pancetta-hamlib"))]
+        warn!("Hamlib feature is disabled — PTT safety watchdog is not active. Transmit at your own risk.");
         self.start_qso_component().await?;
         self.start_transmitter_component().await?;
         self.start_autonomous_component().await?;

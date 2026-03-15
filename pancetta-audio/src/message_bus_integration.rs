@@ -10,8 +10,7 @@ use crate::{
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tokio::time::interval;
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 // Simplified message bus types for audio integration
 
@@ -104,11 +103,8 @@ impl AudioMessageBusIntegration {
         *is_running = true;
         drop(is_running);
 
-        // Start message processing tasks
-        self.start_message_handler().await;
-        self.start_audio_data_publisher().await;
-        self.start_health_monitor().await;
-        self.start_stats_broadcaster().await;
+        // Message processing tasks are not yet implemented
+        // TODO: Implement real message handler, data publisher, health monitor, stats broadcaster
 
         info!("Audio message bus integration started");
         Ok(())
@@ -146,95 +142,6 @@ impl AudioMessageBusIntegration {
                 error!("Failed to send message to bus: {}", e);
             }
         }
-    }
-
-    /// Start the message handler task
-    async fn start_message_handler(&mut self) {
-        let _processor = self.audio_processor.clone();
-        let is_running = self.is_running.clone();
-        let _component_id = self.component_id;
-
-        // Simplified version to avoid Send/Sync issues for now
-        tokio::spawn(async move {
-            info!("Audio message handler started");
-
-            let mut interval_timer = interval(Duration::from_millis(100));
-
-            while *is_running.read().await {
-                interval_timer.tick().await;
-                // Handle any incoming control messages
-                // In a real implementation, this would process messages from the receiver
-            }
-
-            info!("Audio message handler stopped");
-        });
-    }
-
-    /// Start the audio data publisher task
-    async fn start_audio_data_publisher(&self) {
-        let _processor = self.audio_processor.clone();
-        let is_running = self.is_running.clone();
-        let _sender = self.message_sender.clone();
-
-        // Simplified version to avoid Send/Sync issues for now
-        tokio::spawn(async move {
-            info!("Audio data publisher started");
-
-            let mut publish_interval = interval(Duration::from_millis(10));
-
-            while *is_running.read().await {
-                publish_interval.tick().await;
-                // In a real implementation, this would get and publish audio samples
-            }
-
-            info!("Audio data publisher stopped");
-        });
-    }
-
-    /// Start the health monitor task
-    async fn start_health_monitor(&self) {
-        let _processor = self.audio_processor.clone();
-        let is_running = self.is_running.clone();
-        let _sender = self.message_sender.clone();
-        let health_interval = self.health_check_interval;
-
-        // Simplified version to avoid Send/Sync issues for now
-        tokio::spawn(async move {
-            info!("Audio health monitor started");
-
-            let mut health_timer = interval(health_interval);
-
-            while *is_running.read().await {
-                health_timer.tick().await;
-                // In a real implementation, this would check processor health
-                debug!("Audio processor health check (simplified)");
-            }
-
-            info!("Audio health monitor stopped");
-        });
-    }
-
-    /// Start the statistics broadcaster task
-    async fn start_stats_broadcaster(&self) {
-        let _processor = self.audio_processor.clone();
-        let is_running = self.is_running.clone();
-        let _sender = self.message_sender.clone();
-        let stats_interval = self.stats_broadcast_interval;
-
-        // Simplified version to avoid Send/Sync issues for now
-        tokio::spawn(async move {
-            info!("Audio stats broadcaster started");
-
-            let mut stats_timer = interval(stats_interval);
-
-            while *is_running.read().await {
-                stats_timer.tick().await;
-                // In a real implementation, this would broadcast statistics
-                debug!("Audio stats broadcast (simplified)");
-            }
-
-            info!("Audio stats broadcaster stopped");
-        });
     }
 
     /// Handle incoming control messages

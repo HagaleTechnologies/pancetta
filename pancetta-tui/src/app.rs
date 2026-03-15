@@ -462,18 +462,8 @@ impl App {
         let sum_squares: f32 = data.iter().map(|&x| x * x).sum();
         self.audio_level = (sum_squares / data.len() as f32).sqrt();
 
-        // TODO: Add to waterfall display
-        // For now, just store last N samples for waterfall
-        if self.waterfall_data.len() > 100 {
-            self.waterfall_data.remove(0);
-        }
-
-        // Simple frequency domain representation (placeholder)
-        let fft_data: Vec<f32> = (0..64)
-            .map(|i| (self.audio_level * (i as f32 / 64.0).sin()).abs())
-            .collect();
-
-        self.waterfall_data.push(fft_data);
+        // Waterfall data comes from the DSP pipeline via TuiMessage::WaterfallData
+        // We only compute audio level here, not fake FFT data
         Ok(())
     }
 

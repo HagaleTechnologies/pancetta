@@ -317,16 +317,16 @@ impl AudioStreamManager {
         let _ = comm.push_latency(latency_ns);
     }
 
-    /// Real-time output callback - generates monitoring audio
+    /// Real-time output callback for monitoring audio
+    ///
+    /// TX audio output is handled by a separate cpal stream in transmit.rs.
+    /// This output is for monitoring only (sidetone, RX audio playback).
+    /// TODO: Add an output ring buffer to AudioComm for monitoring audio.
     fn output_callback(data: &mut [f32], _comm: &Arc<AudioComm>) {
-        // For now, just generate silence for monitoring
-        // In a full implementation, this would play back received audio
+        // No monitoring audio source configured — output silence
         for sample in data.iter_mut() {
             *sample = 0.0;
         }
-
-        // Could also mix in tone or received audio for monitoring
-        // This is where you'd implement sidetone or audio monitoring
     }
 }
 

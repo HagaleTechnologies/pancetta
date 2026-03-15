@@ -253,8 +253,8 @@ impl Default for DxPriorityConfig {
 
 /// Main DX Hunter engine
 pub struct DxHunter {
-    pub dxcc: dxcc::DxccDatabase,
-    pub tracker: tracker::DxTracker,
+    pub dxcc: std::sync::Arc<dxcc::DxccDatabase>,
+    pub tracker: std::sync::Arc<tracker::DxTracker>,
     pub scorer: scorer::RarityScorer,
     pub priorities: priorities::PriorityManager,
     pub geography: geography::GeographyCalculator,
@@ -270,8 +270,8 @@ pub struct DxHunter {
 impl DxHunter {
     /// Create new DX Hunter instance
     pub async fn new(station_config: StationConfig, database_path: &str) -> Result<Self> {
-        let dxcc = dxcc::DxccDatabase::new().await?;
-        let tracker = tracker::DxTracker::new(database_path).await?;
+        let dxcc = std::sync::Arc::new(dxcc::DxccDatabase::new().await?);
+        let tracker = std::sync::Arc::new(tracker::DxTracker::new(database_path).await?);
         let scorer = scorer::RarityScorer::new(&tracker).await?;
         let priorities = priorities::PriorityManager::new(DxPriorityConfig::default());
         let geography =
@@ -280,10 +280,12 @@ impl DxHunter {
         let pskreporter = pskreporter::PskReporterClient::new();
         let cluster = cluster::DxClusterClient::new();
         let lotw = lotw::LotwClient::new(station_config.lotw_username.clone());
-        // SAFETY: These use unsafe ptr::read to create Arc-wrapped copies.
-        // This is a known issue - should be refactored to use proper Arc sharing.
-        let statistics = statistics::StatisticsEngine::new_from_ref(&tracker).await?;
-        let reports = reports::ReportGenerator::new_from_ref(&tracker, &dxcc).await?;
+        let statistics = statistics::StatisticsEngine::new(std::sync::Arc::clone(&tracker)).await?;
+        let reports = reports::ReportGenerator::new(
+            std::sync::Arc::clone(&tracker),
+            std::sync::Arc::clone(&dxcc),
+        )
+        .await?;
 
         Ok(Self {
             dxcc,

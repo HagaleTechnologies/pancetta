@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -68,14 +68,16 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     render_status_bar(f, chunks[2], app);
 
     // Render active panel highlight
+    // Indices map to ActivePanel enum order: BandActivity, QsoStatus, StationInfo, DxHunter
+    // left_chunks[1] (waterfall) is skipped — it's not a navigable panel
     render_active_panel_highlight(
         f,
         app,
         &[
-            left_chunks[0],
-            left_chunks[2],
-            right_chunks[0],
-            right_chunks[1],
+            left_chunks[0],  // BandActivity
+            left_chunks[2],  // QsoStatus
+            right_chunks[0], // StationInfo
+            right_chunks[1], // DxHunter
         ],
     );
 
@@ -296,7 +298,6 @@ fn render_active_panel_highlight(f: &mut Frame<'_>, app: &App, panel_areas: &[Re
             .add_modifier(Modifier::BOLD),
     );
 
-    f.render_widget(Clear, active_area); // Clear the area first
     f.render_widget(highlight_block, active_area);
 }
 

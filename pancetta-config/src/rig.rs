@@ -1047,44 +1047,44 @@ impl CatInterfaceConfig {
 }
 
 impl PttConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for PTT config merging
+    fn merge_with(&mut self, other: Self) {
+        *self = other;
     }
 }
 
 impl FrequencyConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for frequency config merging
+    fn merge_with(&mut self, other: Self) {
+        *self = other;
     }
 }
 
 impl BandSwitchingConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for band switching config merging
+    fn merge_with(&mut self, other: Self) {
+        *self = other;
     }
 }
 
 impl AntennaSwitchingConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for antenna switching config merging
+    fn merge_with(&mut self, other: Self) {
+        *self = other;
     }
 }
 
 impl PowerControlConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for power control config merging
+    fn merge_with(&mut self, other: Self) {
+        *self = other;
     }
 }
 
 impl ModeConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for mode config merging
+    fn merge_with(&mut self, other: Self) {
+        *self = other;
     }
 }
 
 impl TimingConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for timing config merging
+    fn merge_with(&mut self, other: Self) {
+        *self = other;
     }
 }
 

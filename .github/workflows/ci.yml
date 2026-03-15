@@ -56,6 +56,9 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace
 
+      - name: Test workspace
+        run: cargo test --workspace --features transmit
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -65,7 +68,7 @@ jobs:
           submodules: recursive
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -75,8 +78,8 @@ jobs:
         with:
           key: clippy
 
-      - name: Clippy (FT8)
-        run: cargo clippy --features transmit -p pancetta-ft8
+      - name: Clippy (workspace)
+        run: cargo clippy --workspace --features transmit
 
   fmt:
     name: Format

@@ -27,14 +27,3 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub async fn create_app(config: config::Config, audio_device: Option<String>) -> Result<App> {
     App::new(config, audio_device).await
 }
-
-/// Run the TUI application
-pub async fn run_tui(config: config::Config, audio_device: Option<String>) -> Result<()> {
-    let _app = create_app(config, audio_device).await?;
-
-    // TODO: Implement TUI main loop
-    // This would integrate with the main application coordinator
-    // For now, just return success
-
-    Ok(())
-}

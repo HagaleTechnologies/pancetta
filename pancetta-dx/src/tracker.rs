@@ -107,7 +107,7 @@ impl DxTracker {
 
         // QSOs table
         self.connection.execute(
-            "CREATE TABLE IF NOT EXISTS qsos (
+            "CREATE TABLE IF NOT EXISTS tracked_contacts (
                 id TEXT PRIMARY KEY,
                 callsign TEXT NOT NULL,
                 datetime TEXT NOT NULL,
@@ -152,25 +152,29 @@ impl DxTracker {
 
         // Indexes for performance
         self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_qsos_callsign ON qsos(callsign)",
+            "CREATE INDEX IF NOT EXISTS idx_tracked_contacts_callsign ON tracked_contacts(callsign)",
             [],
         )?;
 
         self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_qsos_dxcc_entity ON qsos(dxcc_entity)",
+            "CREATE INDEX IF NOT EXISTS idx_tracked_contacts_dxcc_entity ON tracked_contacts(dxcc_entity)",
             [],
         )?;
 
         self.connection.execute(
-            "CREATE INDEX IF NOT EXISTS idx_qsos_datetime ON qsos(datetime)",
+            "CREATE INDEX IF NOT EXISTS idx_tracked_contacts_datetime ON tracked_contacts(datetime)",
             [],
         )?;
 
-        self.connection
-            .execute("CREATE INDEX IF NOT EXISTS idx_qsos_band ON qsos(band)", [])?;
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracked_contacts_band ON tracked_contacts(band)",
+            [],
+        )?;
 
-        self.connection
-            .execute("CREATE INDEX IF NOT EXISTS idx_qsos_mode ON qsos(mode)", [])?;
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tracked_contacts_mode ON tracked_contacts(mode)",
+            [],
+        )?;
 
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_award_entity_band ON award_tracking(entity_code, band)",
@@ -182,7 +186,7 @@ impl DxTracker {
     }
 
     /// Add a new QSO
-    pub async fn add_qso(&mut self, mut qso: DxQso) -> Result<Uuid> {
+    pub async fn add_qso(&self, mut qso: DxQso) -> Result<Uuid> {
         if qso.id.is_none() {
             qso.id = Some(Uuid::new_v4());
         }
@@ -192,7 +196,7 @@ impl DxTracker {
         debug!("Adding QSO: {} on {} {}", qso.callsign, qso.band, qso.mode);
 
         self.connection.execute(
-            "INSERT INTO qsos (
+            "INSERT INTO tracked_contacts (
                 id, callsign, datetime, frequency, band, mode,
                 rst_sent, rst_received, grid_square, qth, name,
                 qsl_route, confirmation_status, confirmation_date,
@@ -227,7 +231,7 @@ impl DxTracker {
     }
 
     /// Update QSO record
-    pub async fn update_qso(&mut self, qso: &DxQso) -> Result<()> {
+    pub async fn update_qso(&self, qso: &DxQso) -> Result<()> {
         let Some(qso_id) = qso.id else {
             return Err(DxError::Configuration(
                 "QSO ID is required for update".to_string(),
@@ -237,7 +241,7 @@ impl DxTracker {
         debug!("Updating QSO: {}", qso_id);
 
         let rows_affected = self.connection.execute(
-            "UPDATE qsos SET
+            "UPDATE tracked_contacts SET
                 callsign = ?1, datetime = ?2, frequency = ?3, band = ?4, mode = ?5,
                 rst_sent = ?6, rst_received = ?7, grid_square = ?8, qth = ?9, name = ?10,
                 qsl_route = ?11, confirmation_status = ?12, confirmation_date = ?13,
@@ -275,7 +279,7 @@ impl DxTracker {
     }
 
     /// Update award tracking for a QSO
-    async fn update_award_tracking(&mut self, qso: &DxQso) -> Result<()> {
+    async fn update_award_tracking(&self, qso: &DxQso) -> Result<()> {
         // Check current award status
         let current_entry = self
             .get_award_entry(qso.dxcc_entity, qso.band, Some(&qso.mode))
@@ -325,7 +329,7 @@ impl DxTracker {
     }
 
     /// Create new award tracking entry
-    async fn create_award_entry(&mut self, qso: &DxQso, status: AwardStatus) -> Result<()> {
+    async fn create_award_entry(&self, qso: &DxQso, status: AwardStatus) -> Result<()> {
         let is_confirmed = status == AwardStatus::Confirmed;
 
         self.connection.execute(
@@ -368,7 +372,7 @@ impl DxTracker {
 
     /// Update existing award tracking entry
     async fn update_award_entry(
-        &mut self,
+        &self,
         qso: &DxQso,
         entry: &AwardEntry,
         new_status: AwardStatus,
@@ -561,7 +565,7 @@ impl DxTracker {
     pub async fn get_qso_statistics_by_entity(&self) -> Result<HashMap<u16, u32>> {
         let mut stmt = self.connection.prepare(
             "SELECT dxcc_entity, COUNT(*) as qso_count
-             FROM qsos
+             FROM tracked_contacts
              GROUP BY dxcc_entity",
         )?;
 
@@ -588,7 +592,7 @@ impl DxTracker {
     ) -> Result<HashMap<u16, u32>> {
         let mut stmt = self.connection.prepare(
             "SELECT dxcc_entity, COUNT(*) as qso_count
-             FROM qsos
+             FROM tracked_contacts
              WHERE datetime >= ?1
              GROUP BY dxcc_entity",
         )?;
@@ -613,7 +617,7 @@ impl DxTracker {
     pub async fn get_qso_statistics_by_band(&self, entity_code: u16) -> Result<HashMap<Band, u32>> {
         let mut stmt = self.connection.prepare(
             "SELECT band, COUNT(*) as qso_count
-             FROM qsos
+             FROM tracked_contacts
              WHERE dxcc_entity = ?1
              GROUP BY band",
         )?;
@@ -644,7 +648,7 @@ impl DxTracker {
     pub async fn get_qso_statistics_by_mode(&self, entity_code: u16) -> Result<HashMap<Mode, u32>> {
         let mut stmt = self.connection.prepare(
             "SELECT mode, COUNT(*) as qso_count
-             FROM qsos
+             FROM tracked_contacts
              WHERE dxcc_entity = ?1
              GROUP BY mode",
         )?;
@@ -677,7 +681,7 @@ impl DxTracker {
             .connection
             .query_row(
                 "SELECT MAX(datetime) as last_qso
-             FROM qsos
+             FROM tracked_contacts
              WHERE dxcc_entity = ?1",
                 [entity_code as i64],
                 |row| {

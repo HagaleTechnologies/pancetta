@@ -158,7 +158,6 @@ impl AudioResampler {
 
         // Extract available output samples
         let available_output = self.output_buffer.len();
-        let initial_output_len = output.len();
 
         for _ in 0..available_output {
             if let Some(sample) = self.output_buffer.pop_front() {
@@ -186,16 +185,15 @@ impl AudioResampler {
 
         // If we don't have enough output samples, return what we have
         if output.len() >= output_size {
-            output.truncate(output_size);
-
-            // Put remainder back in buffer
-            if output.len() < output.len() {
+            // Put remainder back in buffer before truncating
+            if output.len() > output_size {
                 let remainder: Vec<f32> = output.drain(output_size..).collect();
                 // Insert at front of output buffer
                 for sample in remainder.into_iter().rev() {
                     self.output_buffer.push_front(sample);
                 }
             }
+            output.truncate(output_size);
         }
 
         Ok(output)

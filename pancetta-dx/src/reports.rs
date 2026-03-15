@@ -4,7 +4,7 @@
 //! radio award progress tracking.
 
 use crate::{dxcc::DxccDatabase, tracker::DxTracker, Band, DxError, Mode, Result};
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -230,15 +230,6 @@ impl ReportGenerator {
         dxcc: std::sync::Arc<DxccDatabase>,
     ) -> Result<Self> {
         Ok(Self { tracker, dxcc })
-    }
-
-    /// Create new report generator from references (uses unsafe ptr::read)
-    /// TODO: Refactor callers to use Arc-based `new` instead
-    pub async fn new_from_ref(tracker: &DxTracker, dxcc: &DxccDatabase) -> Result<Self> {
-        Ok(Self {
-            tracker: std::sync::Arc::new(unsafe { std::ptr::read(tracker) }),
-            dxcc: std::sync::Arc::new(unsafe { std::ptr::read(dxcc) }),
-        })
     }
 
     /// Generate DXCC progress report
@@ -518,7 +509,7 @@ impl ReportGenerator {
     async fn calculate_overall_dxcc_status(&self) -> Result<DxccStatus> {
         let entity_stats = self.tracker.get_qso_statistics_by_entity().await?;
         let worked = entity_stats.len() as u32;
-        let confirmed = (worked as f64 * 0.7) as u32; // Assume 70% confirmed
+        let confirmed = 0_u32; // TODO: query award_tracking table for confirmed count
         let total_entities = self.dxcc.current_entity_count() as u32;
         let progress_percent = (confirmed as f64 / 100.0 * 100.0).min(100.0);
         let award_achieved = confirmed >= 100;
@@ -543,74 +534,14 @@ impl ReportGenerator {
 
     /// Calculate band-specific DXCC status
     async fn calculate_band_dxcc_status(&self) -> Result<HashMap<Band, DxccStatus>> {
-        let mut status_map = HashMap::new();
-
-        for &band in Band::all() {
-            // This would calculate actual band statistics
-            // For now, generate placeholder data
-            let worked = 50 + (band.to_id() % 50) as u32;
-            let confirmed = (worked as f64 * 0.7) as u32;
-            let total_entities = self.dxcc.current_entity_count() as u32;
-            let progress_percent = (confirmed as f64 / 100.0 * 100.0).min(100.0);
-            let award_achieved = confirmed >= 100;
-
-            status_map.insert(
-                band,
-                DxccStatus {
-                    total_entities,
-                    worked,
-                    confirmed,
-                    needed_for_award: 100,
-                    progress_percent,
-                    award_achieved,
-                    achievement_date: if award_achieved {
-                        Some(Utc::now())
-                    } else {
-                        None
-                    },
-                    continent_breakdown: HashMap::new(),
-                },
-            );
-        }
-
-        Ok(status_map)
+        // Not yet implemented — requires per-band entity tracking queries
+        Ok(HashMap::new())
     }
 
     /// Calculate mode-specific DXCC status
     async fn calculate_mode_dxcc_status(&self) -> Result<HashMap<Mode, DxccStatus>> {
-        let mut status_map = HashMap::new();
-
-        let modes = [Mode::CW, Mode::USB, Mode::FT8, Mode::RTTY, Mode::PSK31];
-
-        for mode in &modes {
-            // This would calculate actual mode statistics
-            // For now, generate placeholder data
-            let worked = 40 + (modes.len() % 40) as u32;
-            let confirmed = (worked as f64 * 0.65) as u32;
-            let total_entities = self.dxcc.current_entity_count() as u32;
-            let progress_percent = (confirmed as f64 / 100.0 * 100.0).min(100.0);
-            let award_achieved = confirmed >= 100;
-
-            status_map.insert(
-                mode.clone(),
-                DxccStatus {
-                    total_entities,
-                    worked,
-                    confirmed,
-                    needed_for_award: 100,
-                    progress_percent,
-                    award_achieved,
-                    achievement_date: if award_achieved {
-                        Some(Utc::now())
-                    } else {
-                        None
-                    },
-                    continent_breakdown: HashMap::new(),
-                },
-            );
-        }
-
-        Ok(status_map)
+        // Not yet implemented — requires per-mode entity tracking queries
+        Ok(HashMap::new())
     }
 
     /// Find entities still needed
@@ -651,107 +582,20 @@ impl ReportGenerator {
 
     /// Get recent entities worked
     async fn get_recent_entities(&self) -> Result<Vec<RecentEntity>> {
-        // This would query actual QSO history
-        // For now, return placeholder data
-
-        let mut recent = Vec::new();
-        let entities = self.dxcc.get_current_entities().take(10);
-
-        for (i, entity) in entities.enumerate() {
-            recent.push(RecentEntity {
-                entity_code: entity.entity_code,
-                entity_name: entity.name.clone(),
-                callsign: format!("{}1ABC", entity.prefix),
-                date_worked: Utc::now() - chrono::Duration::days(i as i64),
-                band: Band::Band20m,
-                mode: Mode::FT8,
-                confirmed: i % 2 == 0,
-                confirmation_date: if i % 2 == 0 { Some(Utc::now()) } else { None },
-                new_entity: i < 3,
-            });
-        }
-
-        Ok(recent)
+        // Not yet implemented — requires QSO history query with entity join
+        Ok(Vec::new())
     }
 
     /// Generate progress data for charts
     async fn generate_progress_data(&self) -> Result<ProgressData> {
-        let mut monthly_progress = Vec::new();
-        let mut yearly_totals = HashMap::new();
-        let mut confirmation_trends = Vec::new();
-
-        let now = Utc::now();
-
-        // Generate monthly progress for last 12 months
-        for i in 0..12 {
-            let date = now - chrono::Duration::days(i * 30);
-            let entities_worked = 50 + (i * 5) as u32;
-            let entities_confirmed = (entities_worked as f64 * 0.7) as u32;
-
-            monthly_progress.push(ProgressPoint {
-                date,
-                entities_worked,
-                entities_confirmed,
-            });
-
-            // Confirmation trends
-            let confirmation_rate = 65.0 + (i as f64 * 2.0);
-            confirmation_trends.push(ConfirmationPoint {
-                date,
-                confirmation_rate,
-                qsl_methods: [
-                    ("LoTW".to_string(), 30),
-                    ("eQSL".to_string(), 15),
-                    ("Paper QSL".to_string(), 10),
-                ]
-                .into(),
-            });
-        }
-
-        // Generate yearly totals
-        let current_year = now.year() as u32;
-        for year in (current_year - 5)..=current_year {
-            yearly_totals.insert(year, 100 + ((year - current_year + 5) * 20));
-        }
-
-        // Band comparison
-        let band_comparison = [
-            (Band::Band20m, 85),
-            (Band::Band40m, 72),
-            (Band::Band80m, 45),
-            (Band::Band15m, 60),
-            (Band::Band10m, 35),
-        ]
-        .into();
-
-        // Mode comparison
-        let mode_comparison = [
-            (Mode::FT8, 95),
-            (Mode::CW, 78),
-            (Mode::USB, 65),
-            (Mode::RTTY, 42),
-            (Mode::PSK31, 25),
-        ]
-        .into();
-
-        // Continent comparison
-        let continent_comparison = [
-            ("Europe".to_string(), 45),
-            ("North America".to_string(), 25),
-            ("Asia".to_string(), 35),
-            ("Africa".to_string(), 20),
-            ("South America".to_string(), 15),
-            ("Oceania".to_string(), 12),
-        ]
-        .into();
-
+        // Not yet implemented — requires historical tracking queries
         Ok(ProgressData {
-            monthly_progress,
-            yearly_totals,
-            band_comparison,
-            mode_comparison,
-            continent_comparison,
-            confirmation_trends,
+            monthly_progress: Vec::new(),
+            yearly_totals: HashMap::new(),
+            band_comparison: HashMap::new(),
+            mode_comparison: HashMap::new(),
+            continent_comparison: HashMap::new(),
+            confirmation_trends: Vec::new(),
         })
     }
 

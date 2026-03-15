@@ -3,7 +3,7 @@
 //! This module provides basic HF propagation prediction capabilities
 //! including solar indices, band conditions, and propagation forecasting.
 
-use crate::{Band, Result};
+use crate::{Band, DxError, Result};
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -232,29 +232,11 @@ impl PropagationPredictor {
 
     /// Fetch solar indices from NOAA
     async fn fetch_noaa_indices(&self) -> Result<SolarIndices> {
-        // This would fetch from actual NOAA APIs
-        // For now, return simulated data
-
-        info!("Simulating NOAA space weather data fetch");
-
-        // Simulate realistic solar indices
-        let current_time = Utc::now();
-        let sfi = 150.0
-            + 50.0 * (current_time.ordinal() as f64 / 365.0 * 2.0 * std::f64::consts::PI).sin();
-        let ssn = (sfi - 70.0).max(0.0) * 2.0;
-        let kp = 2.0 + 2.0 * 0.5; // Placeholder instead of random
-        let a_index = kp * kp * 5.0;
-        let boulder_k = kp + (0.3 - 0.5); // Placeholder instead of random
-
-        Ok(SolarIndices {
-            sfi,
-            ssn,
-            kp,
-            a_index,
-            boulder_k: boulder_k.max(0.0),
-            measurement_time: current_time,
-            forecast_hours: 24,
-        })
+        // TODO: Implement real NOAA API fetch (services.swpc.noaa.gov)
+        Err(
+            DxError::ExternalService("NOAA solar index fetch not yet implemented".to_string())
+                .into(),
+        )
     }
 
     /// Predict propagation for a specific path and time

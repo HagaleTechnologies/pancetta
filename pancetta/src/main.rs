@@ -352,30 +352,9 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
     }
 }
 
-async fn test_audio_command(args: TestAudioArgs) -> Result<()> {
-    info!("Testing audio configuration (stubbed)");
-
-    if args.list {
-        // TODO: Implement when AudioDeviceManager is available
-        println!("Available audio devices (stubbed):");
-        println!("  0: Default Audio Device (stub)");
-        println!("  1: Test Audio Device (stub)");
-        return Ok(());
-    }
-
-    if let Some(device_name) = args.device {
-        println!("Audio test results (stubbed):");
-        println!("  Device: {}", device_name);
-        println!("  Duration: {:.2}s", args.duration);
-        println!("  Sample rate: {} Hz", 48000);
-        println!("  Latency: {:.2}ms", 5.0);
-        println!("  Dropouts: {}", 0);
-        println!("  Status: PASS (stubbed)");
-    } else {
-        println!("No device specified for testing");
-    }
-
-    Ok(())
+async fn test_audio_command(_args: TestAudioArgs) -> Result<()> {
+    eprintln!("Error: audio testing is not yet implemented");
+    std::process::exit(1);
 }
 
 async fn config_command(args: ConfigArgs, cli: &Cli) -> Result<()> {
@@ -417,8 +396,6 @@ async fn info_command() -> Result<()> {
     println!("Pancetta System Information");
     println!("===========================");
     println!("Version: {}", env!("CARGO_PKG_VERSION"));
-    println!("Build: {}", "development"); // TODO: Add build info when available
-    println!("Rust: {}", "stable"); // TODO: Add rust version when available
     println!();
 
     // System information
@@ -428,42 +405,20 @@ async fn info_command() -> Result<()> {
     println!("  CPU cores: {}", num_cpus::get());
     println!();
 
-    // Audio capabilities (stubbed)
-    println!("Audio devices: 2 (stubbed)");
-    println!("  - Default Audio Device (stub)");
-    println!("  - Test Audio Device (stub)");
-    println!();
-
     // Component versions
     println!("Components:");
-    println!("  pancetta-audio: {}", "0.1.0"); // TODO: Use pancetta_audio::VERSION when available
     println!("  pancetta-dsp: {}", pancetta_dsp::VERSION);
-    println!("  pancetta-ft8: {}", env!("CARGO_PKG_VERSION")); // Will be available once ft8 crate exports it
-    println!("  pancetta-config: {}", env!("CARGO_PKG_VERSION"));
+    println!();
+
+    // Audio devices require the audio subsystem — use `pancetta test-audio --list` when implemented
+    println!("Audio devices: (use test-audio --list when implemented)");
 
     Ok(())
 }
 
-async fn benchmark_command(args: BenchmarkArgs) -> Result<()> {
-    info!("Running performance benchmarks");
-
-    if args.all || args.audio {
-        println!("Running audio benchmarks...");
-        // TODO: Implement audio benchmarks
-    }
-
-    if args.all || args.dsp {
-        println!("Running DSP benchmarks...");
-        // TODO: Implement DSP benchmarks
-    }
-
-    if args.all || args.ft8 {
-        println!("Running FT8 benchmarks...");
-        // TODO: Implement FT8 benchmarks
-    }
-
-    info!("Benchmarks completed");
-    Ok(())
+async fn benchmark_command(_args: BenchmarkArgs) -> Result<()> {
+    eprintln!("Error: benchmarks are not yet implemented");
+    std::process::exit(1);
 }
 
 async fn load_configuration(cli: &Cli) -> Result<Config> {

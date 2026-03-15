@@ -845,32 +845,32 @@ impl AudioProcessingConfig {
 }
 
 impl AgcConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for AGC config merging
+    fn merge_with(&mut self, other: Self) {
+        *self = other;
     }
 }
 
 impl NoiseReductionConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for noise reduction config merging
+    fn merge_with(&mut self, other: Self) {
+        *self = other;
     }
 }
 
 impl AudioRoutingConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for routing config merging
+    fn merge_with(&mut self, other: Self) {
+        *self = other;
     }
 }
 
 impl RecordingConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for recording config merging
+    fn merge_with(&mut self, other: Self) {
+        *self = other;
     }
 }
 
 impl AudioLevelsConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for levels config merging
+    fn merge_with(&mut self, other: Self) {
+        *self = other;
     }
 }
 
