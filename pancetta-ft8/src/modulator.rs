@@ -549,6 +549,101 @@ impl Ft8Modulator {
     }
 }
 
+/// A single transmit request for multi-TX summation
+pub struct MultiTxItem<'a> {
+    /// Symbol values for this message
+    pub symbols: &'a [u8],
+    /// Frequency offset in Hz for this message
+    pub frequency_offset: f64,
+    /// Protocol parameters for this message
+    pub params: &'a ProtocolParams,
+}
+
+/// Combine multiple transmission signals into a single audio buffer.
+///
+/// Each signal is modulated independently at its frequency offset, then all
+/// are summed sample-by-sample and normalized to prevent clipping.
+///
+/// # Arguments
+/// * `items` - Slice of transmit requests (message + frequency + protocol)
+/// * `sample_rate` - Audio sample rate
+/// * `base_frequency` - Base audio frequency (typically 1500 Hz)
+/// * `tx_power` - Transmission power level (0.0-1.0)
+///
+/// # Returns
+/// Combined audio samples with 0.95 headroom, or error if frequencies overlap.
+pub fn modulate_multi_tx(
+    items: &[MultiTxItem],
+    sample_rate: u32,
+    base_frequency: f64,
+    tx_power: f64,
+) -> Ft8Result<Vec<f32>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Verify minimum frequency separation between all signal pairs
+    for i in 0..items.len() {
+        for j in (i + 1)..items.len() {
+            let sep = (items[i].frequency_offset - items[j].frequency_offset).abs();
+            // Minimum separation: wider signal's bandwidth + 25 Hz guard
+            let bw_i = items[i].params.signal_bandwidth();
+            let bw_j = items[j].params.signal_bandwidth();
+            let min_sep = bw_i.max(bw_j) + 25.0;
+            if sep < min_sep {
+                return Err(Ft8Error::ConfigError(format!(
+                    "Frequency separation {:.1} Hz too small (minimum {:.1} Hz) \
+                     between signals at {:.1} and {:.1} Hz",
+                    sep, min_sep, items[i].frequency_offset, items[j].frequency_offset
+                )));
+            }
+        }
+    }
+
+    // Find the longest signal to determine output buffer size
+    let max_samples = items
+        .iter()
+        .map(|item| item.params.total_samples(sample_rate))
+        .max()
+        .unwrap_or(0);
+
+    // Modulate each signal independently
+    let mut signals: Vec<Vec<f32>> = Vec::with_capacity(items.len());
+    for item in items {
+        let mut modulator =
+            Ft8Modulator::new(sample_rate, base_frequency, tx_power)?;
+        let audio = modulator.modulate_symbols_protocol(
+            item.symbols,
+            item.frequency_offset,
+            item.params,
+        )?;
+        signals.push(audio);
+    }
+
+    // Sum all signals sample-by-sample
+    let mut combined = vec![0.0f32; max_samples];
+    for signal in &signals {
+        for (i, &s) in signal.iter().enumerate() {
+            if i < combined.len() {
+                combined[i] += s;
+            }
+        }
+    }
+
+    // Normalize: divide by signal count and apply headroom
+    let signal_count = signals.len() as f32;
+    let peak = combined.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
+    if peak > 0.0 {
+        let headroom = 0.95;
+        let scale = headroom / peak;
+        for sample in &mut combined {
+            *sample *= scale;
+        }
+    }
+
+    Ok(combined)
+}
+
 impl Default for Ft8Modulator {
     fn default() -> Self {
         Self::new_default().expect("Default modulator creation should not fail")
@@ -937,5 +1032,123 @@ mod tests {
             modulator.unwrap().get_config().pulse_shape,
             PulseShape::Rectangular
         );
+    }
+
+    // ================================================================
+    // Multi-TX tests
+    // ================================================================
+
+    #[test]
+    fn test_multi_tx_two_ft8_signals() {
+        use crate::protocol::ProtocolParams;
+
+        let params = ProtocolParams::ft8();
+        let symbols1 = [0u8; 79];
+        let symbols2 = [3u8; 79];
+
+        let items = vec![
+            MultiTxItem {
+                symbols: &symbols1,
+                frequency_offset: -100.0,
+                params: &params,
+            },
+            MultiTxItem {
+                symbols: &symbols2,
+                frequency_offset: 100.0,
+                params: &params,
+            },
+        ];
+
+        let combined = modulate_multi_tx(&items, SAMPLE_RATE, BASE_FREQUENCY, 0.5).unwrap();
+
+        // Output length = max of the two signals
+        assert_eq!(combined.len(), TOTAL_TRANSMISSION_SAMPLES);
+        // No clipping
+        assert!(combined.iter().all(|&s| s.abs() <= 1.0));
+    }
+
+    #[test]
+    fn test_multi_tx_frequency_guard() {
+        use crate::protocol::ProtocolParams;
+
+        let params = ProtocolParams::ft8();
+        let symbols = [0u8; 79];
+
+        // FT8 bandwidth = 50 Hz, guard = 25 Hz → minimum separation = 75 Hz
+        let items = vec![
+            MultiTxItem {
+                symbols: &symbols,
+                frequency_offset: 0.0,
+                params: &params,
+            },
+            MultiTxItem {
+                symbols: &symbols,
+                frequency_offset: 50.0, // Only 50 Hz apart — too close
+                params: &params,
+            },
+        ];
+
+        let result = modulate_multi_tx(&items, SAMPLE_RATE, BASE_FREQUENCY, 0.5);
+        assert!(result.is_err(), "Should reject signals too close together");
+    }
+
+    #[test]
+    fn test_multi_tx_sufficient_separation() {
+        use crate::protocol::ProtocolParams;
+
+        let params = ProtocolParams::ft8();
+        let symbols = [0u8; 79];
+
+        // 200 Hz separation is plenty for FT8 (min 75 Hz)
+        let items = vec![
+            MultiTxItem {
+                symbols: &symbols,
+                frequency_offset: -100.0,
+                params: &params,
+            },
+            MultiTxItem {
+                symbols: &symbols,
+                frequency_offset: 100.0,
+                params: &params,
+            },
+        ];
+
+        let result = modulate_multi_tx(&items, SAMPLE_RATE, BASE_FREQUENCY, 0.5);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_multi_tx_mixed_protocols() {
+        use crate::protocol::ProtocolParams;
+
+        let ft8_params = ProtocolParams::ft8();
+        let ft4_params = ProtocolParams::ft4();
+        let ft8_symbols = [0u8; 79];
+        let ft4_symbols = [0u8; 105];
+
+        let items = vec![
+            MultiTxItem {
+                symbols: &ft8_symbols,
+                frequency_offset: -200.0,
+                params: &ft8_params,
+            },
+            MultiTxItem {
+                symbols: &ft4_symbols,
+                frequency_offset: 200.0,
+                params: &ft4_params,
+            },
+        ];
+
+        let combined = modulate_multi_tx(&items, SAMPLE_RATE, BASE_FREQUENCY, 0.5).unwrap();
+        // Length should be max of FT8 (151680) and FT4 (60480)
+        assert_eq!(combined.len(), TOTAL_TRANSMISSION_SAMPLES);
+        assert!(combined.iter().all(|&s| s.abs() <= 1.0));
+    }
+
+    #[test]
+    fn test_multi_tx_empty() {
+        let items: Vec<MultiTxItem> = vec![];
+        let result = modulate_multi_tx(&items, SAMPLE_RATE, BASE_FREQUENCY, 0.5).unwrap();
+        assert!(result.is_empty());
     }
 }

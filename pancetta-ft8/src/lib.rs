@@ -86,7 +86,8 @@ pub use sync::{SyncResult, TimeSync};
 pub use encoder::{Ft8Encoder, Ft8EncodingConfig};
 #[cfg(feature = "transmit")]
 pub use modulator::{
-    convert_samples, AudioFormat, Ft8Modulator, ModulatorConfig, PulseShape, SampleType,
+    convert_samples, modulate_multi_tx, AudioFormat, Ft8Modulator, ModulatorConfig, MultiTxItem,
+    PulseShape, SampleType,
 };
 #[cfg(feature = "transmit")]
 pub use transmit::{

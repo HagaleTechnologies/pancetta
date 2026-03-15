@@ -492,3 +492,48 @@ fn test_ft4_round_trip_all_message_types() {
         "CQ DX should at least produce a decode candidate"
     );
 }
+
+// =========================================================================
+// Multi-TX round-trip tests
+// =========================================================================
+
+/// Test: two FT8 messages at different frequencies → decode both
+#[test]
+fn test_multi_tx_round_trip_two_ft8() {
+    use pancetta_ft8::{modulate_multi_tx, MultiTxItem, ProtocolParams};
+
+    let params = ProtocolParams::ft8();
+    let symbols1 = encode_message("CQ W1ABC FN42");
+    let symbols2 = encode_message("K1DEF W1ABC -12");
+
+    let items = vec![
+        MultiTxItem {
+            symbols: &symbols1,
+            frequency_offset: -100.0, // 1400 Hz
+            params: &params,
+        },
+        MultiTxItem {
+            symbols: &symbols2,
+            frequency_offset: 100.0, // 1600 Hz
+            params: &params,
+        },
+    ];
+
+    let mut combined =
+        modulate_multi_tx(&items, SAMPLE_RATE, 1500.0, 0.5).unwrap();
+    combined.resize(WINDOW_SAMPLES, 0.0);
+
+    let decoded = decode_audio(&combined);
+    let texts: Vec<&str> = decoded.iter().map(|m| m.text.as_str()).collect();
+
+    assert!(
+        texts.contains(&"CQ W1ABC FN42"),
+        "Should decode first message from multi-TX: got {:?}",
+        texts
+    );
+    assert!(
+        texts.contains(&"K1DEF W1ABC -12"),
+        "Should decode second message from multi-TX: got {:?}",
+        texts
+    );
+}
