@@ -609,19 +609,45 @@ impl TuiRunner {
 
     /// Static version of render_qso_status for use in closure
     fn render_qso_status_static(f: &mut Frame, area: Rect, app: &App) {
-        let qso_text = if app.qso_status.active {
+        let qso_text = if app.qso_statuses.is_empty() || !app.qso_status().active {
+            if app.qso_statuses.len() > 1 {
+                let active_count = app.qso_statuses.iter().filter(|q| q.active).count();
+                format!("{} active QSOs", active_count)
+            } else {
+                "No active QSO".to_string()
+            }
+        } else if app.qso_statuses.len() == 1 {
+            let qso = app.qso_status();
             format!(
                 "QSO with: {}\nTX: {} dB\nRX: {} dB\nExchanges: {}",
-                app.qso_status
-                    .call_sign
+                qso.call_sign
                     .as_ref()
                     .unwrap_or(&"Unknown".to_string()),
-                app.qso_status.snr_tx.unwrap_or(0),
-                app.qso_status.snr_rx.unwrap_or(0),
-                app.qso_status.exchange_count
+                qso.snr_tx.unwrap_or(0),
+                qso.snr_rx.unwrap_or(0),
+                qso.exchange_count
             )
         } else {
-            "No active QSO".to_string()
+            // Multi-QSO summary
+            let lines: Vec<String> = app
+                .qso_statuses
+                .iter()
+                .filter(|q| q.active)
+                .map(|q| {
+                    format!(
+                        "{} @ {:.0} Hz ({}dB)",
+                        q.call_sign.as_deref().unwrap_or("?"),
+                        q.frequency.unwrap_or(0.0),
+                        q.snr_rx.unwrap_or(0)
+                    )
+                })
+                .collect();
+            format!(
+                "{}/{} QSOs\n{}",
+                lines.len(),
+                app.qso_statuses.len(),
+                lines.join("\n")
+            )
         };
 
         let qso_status = Paragraph::new(qso_text)

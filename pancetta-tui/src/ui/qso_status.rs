@@ -12,39 +12,107 @@ use crate::app::{ActivePanel, App};
 
 pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let is_active = matches!(app.active_panel, ActivePanel::QsoStatus);
-    let block = create_panel_block("QSO Status", is_active, app);
+    let active_count = app.qso_statuses.iter().filter(|q| q.active).count();
 
-    // Split area into sections
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // QSO info
-            Constraint::Length(2), // TX/RX status
-            Constraint::Length(2), // SNR meters
-            Constraint::Min(1),    // Progress/timing
-        ])
-        .split(block.inner(area));
+    let title = if active_count > 1 {
+        format!("QSO Status ({}/{})", active_count, app.qso_statuses.len())
+    } else {
+        "QSO Status".to_string()
+    };
+    let block = create_panel_block(&title, is_active, app);
 
-    // Render the block border
-    f.render_widget(block, area);
+    if active_count > 1 {
+        // Multi-QSO table view
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        render_multi_qso_table(f, inner, app);
+    } else {
+        // Single QSO detail view (original layout)
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // QSO info
+                Constraint::Length(2), // TX/RX status
+                Constraint::Length(2), // SNR meters
+                Constraint::Min(1),    // Progress/timing
+            ])
+            .split(block.inner(area));
 
-    // QSO Information
-    render_qso_info(f, chunks[0], app);
+        f.render_widget(block, area);
 
-    // TX/RX Status
-    render_tx_rx_status(f, chunks[1], app);
-
-    // SNR Meters
-    render_snr_meters(f, chunks[2], app);
-
-    // Timing and Progress
-    render_timing_progress(f, chunks[3], app);
+        render_qso_info(f, chunks[0], app);
+        render_tx_rx_status(f, chunks[1], app);
+        render_snr_meters(f, chunks[2], app);
+        render_timing_progress(f, chunks[3], app);
+    }
 
     Ok(())
 }
 
+fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let mut lines = Vec::new();
+
+    // Header
+    lines.push(Line::from(vec![
+        Span::styled(
+            " Call       Freq     Mode  SNR  Exch ",
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Each active QSO
+    for qso in &app.qso_statuses {
+        if !qso.active {
+            continue;
+        }
+        let call = qso.call_sign.as_deref().unwrap_or("---");
+        let freq = qso
+            .frequency
+            .map_or("---".to_string(), |f| format!("{:.0}", f));
+        let mode = qso.mode.as_deref().unwrap_or("FT8");
+        let snr = qso.snr_rx.map_or("---".to_string(), |s| format!("{:+}", s));
+
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:<10}", call),
+                Style::default()
+                    .fg(app.theme.foreground_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:>7}  ", freq),
+                Style::default().fg(app.theme.warning_color()),
+            ),
+            Span::styled(
+                format!("{:<5}", mode),
+                Style::default().fg(app.theme.accent_color()),
+            ),
+            Span::styled(
+                format!("{:>4}  ", snr),
+                Style::default().fg(app.theme.success_color()),
+            ),
+            Span::styled(
+                format!("{:>3}", qso.exchange_count),
+                Style::default().fg(app.theme.foreground_color()),
+            ),
+        ]));
+    }
+
+    if lines.len() == 1 {
+        lines.push(Line::from(Span::styled(
+            " No active QSOs",
+            Style::default().fg(app.theme.muted_color()),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(paragraph, area);
+}
+
 fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let qso = &app.qso_status;
+    let qso = app.qso_status();
 
     let status_text = if qso.active { "ACTIVE QSO" } else { "STANDBY" };
 
@@ -101,7 +169,7 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let qso = &app.qso_status;
+    let qso = app.qso_status();
 
     let tx_status = if let Some(last_tx) = qso.last_tx {
         format!("TX: {}", format_time_ago(last_tx))
@@ -126,7 +194,7 @@ fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_snr_meters(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let qso = &app.qso_status;
+    let qso = app.qso_status();
 
     // Split into two columns for TX and RX SNR
     let chunks = Layout::default()
@@ -160,7 +228,7 @@ fn render_snr_meters(f: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_timing_progress(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let qso = &app.qso_status;
+    let qso = app.qso_status();
 
     if !qso.active {
         // Show general monitoring status
@@ -263,7 +331,7 @@ pub fn update_qso_from_message(app: &mut App, message: &crate::app::DecodedMessa
     if message_upper.contains(our_call) {
         // Extract the other station's call sign
         if let Some(other_call) = extract_other_callsign(&message_upper, our_call) {
-            let qso = &mut app.qso_status;
+            let qso = app.qso_status_mut();
 
             if !qso.active {
                 // Start new QSO

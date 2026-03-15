@@ -209,7 +209,8 @@ pub struct App {
 
     // Data
     pub decoded_messages: VecDeque<DecodedMessage>,
-    pub qso_status: QsoStatus,
+    /// Active QSOs (supports multiple concurrent QSOs).
+    pub qso_statuses: Vec<QsoStatus>,
     pub station_info: StationInfo,
     pub dx_stations: HashMap<String, DxStation>,
     pub band_activity_scroll: usize,
@@ -250,19 +251,6 @@ impl App {
             mode: "FT8".to_string(),
         };
 
-        let qso_status = QsoStatus {
-            active: false,
-            call_sign: None,
-            frequency: None,
-            mode: None,
-            snr_tx: None,
-            snr_rx: None,
-            started_at: None,
-            last_tx: None,
-            last_rx: None,
-            exchange_count: 0,
-        };
-
         let mut app = Self {
             config: config.clone(),
             should_quit: false,
@@ -271,7 +259,7 @@ impl App {
             status_message: "Pancetta TUI Ready".to_string(),
             theme: config.ui.theme,
             decoded_messages: VecDeque::with_capacity(1000),
-            qso_status,
+            qso_statuses: Vec::new(),
             station_info,
             dx_stations: HashMap::new(),
             band_activity_scroll: 0,
@@ -604,11 +592,48 @@ impl App {
         self.audio_level = strength;
     }
 
+    /// Get the primary (first) QSO status, or a default standby entry.
+    pub fn qso_status(&self) -> &QsoStatus {
+        static DEFAULT: std::sync::LazyLock<QsoStatus> = std::sync::LazyLock::new(|| QsoStatus {
+            active: false,
+            call_sign: None,
+            frequency: None,
+            mode: None,
+            snr_tx: None,
+            snr_rx: None,
+            started_at: None,
+            last_tx: None,
+            last_rx: None,
+            exchange_count: 0,
+        });
+        self.qso_statuses.first().unwrap_or(&DEFAULT)
+    }
+
+    /// Get a mutable reference to the primary QSO, creating one if needed.
+    pub fn qso_status_mut(&mut self) -> &mut QsoStatus {
+        if self.qso_statuses.is_empty() {
+            self.qso_statuses.push(QsoStatus {
+                active: false,
+                call_sign: None,
+                frequency: None,
+                mode: None,
+                snr_tx: None,
+                snr_rx: None,
+                started_at: None,
+                last_tx: None,
+                last_rx: None,
+                exchange_count: 0,
+            });
+        }
+        &mut self.qso_statuses[0]
+    }
+
     pub fn update_qso_state(&mut self, active: bool, callsign: Option<String>) {
-        self.qso_status.active = active;
-        self.qso_status.call_sign = callsign;
+        let qso = self.qso_status_mut();
+        qso.active = active;
+        qso.call_sign = callsign;
         if active {
-            self.qso_status.started_at = Some(Utc::now());
+            qso.started_at = Some(Utc::now());
         }
     }
 

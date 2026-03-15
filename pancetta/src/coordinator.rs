@@ -1782,32 +1782,34 @@ impl ApplicationCoordinator {
                 while !shutdown.load(Ordering::Relaxed) {
                     match tx_rx.try_recv() {
                         Ok(message) => {
-                            if let MessageType::TransmitRequest {
+                            // Helper: wait for slot boundary, assert PTT, TX audio, de-assert PTT.
+                            let wait_for_slot = || {
+                                use std::time::{SystemTime, UNIX_EPOCH};
+                                let now = SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default();
+                                let secs = now.as_secs();
+                                let slot_pos = secs % 15;
+                                let wait_secs = if slot_pos == 0 { 0 } else { 15 - slot_pos };
+                                let wait_ms = wait_secs * 1000
+                                    + (1000 - now.subsec_millis() as u64)
+                                    - 200; // 200ms guard for PTT latency
+                                Duration::from_millis(wait_ms.min(15000))
+                            };
+
+                            match message.message_type {
+                            MessageType::TransmitRequest {
                                 message_text,
                                 frequency_offset,
                                 qso_id,
-                            } = message.message_type
-                            {
+                            } => {
                                 info!(
                                     "Transmit request: '{}' at offset {:.0} Hz (qso: {:?})",
                                     message_text, frequency_offset, qso_id
                                 );
 
                                 // --- Step 1: Wait for next FT8 slot boundary ---
-                                // FT8 slots are 15 seconds long, starting at T=0,15,30,45.
-                                let slot_wait = {
-                                    use std::time::{SystemTime, UNIX_EPOCH};
-                                    let now = SystemTime::now()
-                                        .duration_since(UNIX_EPOCH)
-                                        .unwrap_or_default();
-                                    let secs = now.as_secs();
-                                    let slot_pos = secs % 15;
-                                    let wait_secs = if slot_pos == 0 { 0 } else { 15 - slot_pos };
-                                    let wait_ms = wait_secs * 1000
-                                        + (1000 - now.subsec_millis() as u64)
-                                        - 200; // 200ms guard for PTT latency
-                                    Duration::from_millis(wait_ms.min(15000))
-                                };
+                                let slot_wait = wait_for_slot();
 
                                 if slot_wait.as_millis() > 100 {
                                     info!(
@@ -1913,6 +1915,152 @@ impl ApplicationCoordinator {
                                 if let Err(e) = message_bus.send_message(complete_msg).await {
                                     warn!("Failed to send TransmitComplete: {}", e);
                                 }
+                            }
+
+                            MessageType::MultiTransmitRequest { items } => {
+                                info!(
+                                    "Multi-TX request: {} messages",
+                                    items.len()
+                                );
+
+                                // --- Step 1: Wait for slot boundary ---
+                                let slot_wait = wait_for_slot();
+                                if slot_wait.as_millis() > 100 {
+                                    info!(
+                                        "Waiting {:.1}s for next TX slot boundary",
+                                        slot_wait.as_secs_f64()
+                                    );
+                                    sleep(slot_wait).await;
+                                }
+
+                                // --- Step 2: Assert PTT ---
+                                let ptt_msg = ComponentMessage::new(
+                                    ComponentId::Ft8Transmitter,
+                                    ComponentId::Hamlib,
+                                    MessageType::RigControl(
+                                        crate::message_bus::RigControlMessage::SetPtt {
+                                            state: true,
+                                        },
+                                    ),
+                                    Instant::now(),
+                                );
+                                if let Err(e) = message_bus.send_message(ptt_msg).await {
+                                    debug!("PTT on failed (no rig?): {}", e);
+                                }
+                                sleep(Duration::from_millis(50)).await;
+
+                                // --- Step 3: Encode each message, build multi-TX items ---
+                                let ft8_params = pancetta_ft8::ProtocolParams::ft8();
+                                let mut multi_items = Vec::new();
+                                let mut symbol_sets: Vec<Vec<u8>> = Vec::new();
+                                let mut item_texts: Vec<String> = Vec::new();
+
+                                for item in &items {
+                                    match encoder.encode_message(&item.message_text, None) {
+                                        Ok(symbols) => {
+                                            item_texts.push(item.message_text.clone());
+                                            symbol_sets.push(symbols.to_vec());
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "Encoding failed for '{}': {}",
+                                                item.message_text, e
+                                            );
+                                        }
+                                    }
+                                }
+
+                                // Build MultiTxItem references
+                                for (i, symbols) in symbol_sets.iter().enumerate() {
+                                    multi_items.push(pancetta_ft8::MultiTxItem {
+                                        symbols: symbols.as_slice(),
+                                        frequency_offset: items[i].frequency_offset,
+                                        params: &ft8_params,
+                                    });
+                                }
+
+                                let (success, duration_ms) = if !multi_items.is_empty() {
+                                    match pancetta_ft8::modulate_multi_tx(
+                                        &multi_items,
+                                        12000,
+                                        1500.0,
+                                        0.5,
+                                    ) {
+                                        Ok(samples) => {
+                                            let duration = (samples.len() as f64
+                                                / 12000.0
+                                                * 1000.0)
+                                                as u64;
+                                            info!(
+                                                "Multi-TX: {} messages → {} samples ({:.1}s)",
+                                                multi_items.len(),
+                                                samples.len(),
+                                                duration as f64 / 1000.0
+                                            );
+
+                                            let audio_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Audio,
+                                                MessageType::AudioOutput {
+                                                    samples: samples.clone(),
+                                                    sample_rate: 12000,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(audio_msg).await
+                                            {
+                                                debug!("Audio output routing: {}", e);
+                                            }
+
+                                            sleep(Duration::from_millis(duration)).await;
+                                            (true, duration)
+                                        }
+                                        Err(e) => {
+                                            warn!("Multi-TX modulation failed: {}", e);
+                                            (false, 0)
+                                        }
+                                    }
+                                } else {
+                                    (false, 0)
+                                };
+
+                                // --- Step 5: De-assert PTT ---
+                                let ptt_off_msg = ComponentMessage::new(
+                                    ComponentId::Ft8Transmitter,
+                                    ComponentId::Hamlib,
+                                    MessageType::RigControl(
+                                        crate::message_bus::RigControlMessage::SetPtt {
+                                            state: false,
+                                        },
+                                    ),
+                                    Instant::now(),
+                                );
+                                if let Err(e) = message_bus.send_message(ptt_off_msg).await {
+                                    debug!("PTT off failed (no rig?): {}", e);
+                                }
+
+                                // --- Step 6: Send TransmitComplete for each item ---
+                                for text in item_texts {
+                                    let complete_msg = ComponentMessage::new(
+                                        ComponentId::Ft8Transmitter,
+                                        ComponentId::Autonomous,
+                                        MessageType::TransmitComplete {
+                                            success,
+                                            message_text: text,
+                                            duration_ms,
+                                        },
+                                        Instant::now(),
+                                    );
+                                    if let Err(e) =
+                                        message_bus.send_message(complete_msg).await
+                                    {
+                                        warn!("Failed to send TransmitComplete: {}", e);
+                                    }
+                                }
+                            }
+
+                            _ => {} // Ignore other message types
                             }
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {
@@ -2035,6 +2183,10 @@ impl ApplicationCoordinator {
                             let actions = op.decide();
                             drop(op);
 
+                            // Collect Transmit actions, then bundle into a
+                            // single MultiTransmitRequest (or single TransmitRequest).
+                            let mut tx_items: Vec<crate::message_bus::TransmitRequestItem> = Vec::new();
+
                             for action in actions {
                                 match action {
                                     pancetta_qso::OperatorAction::Transmit {
@@ -2042,19 +2194,11 @@ impl ApplicationCoordinator {
                                         frequency_offset,
                                         qso_id,
                                     } => {
-                                        let msg = ComponentMessage::new(
-                                            ComponentId::Autonomous,
-                                            ComponentId::Ft8Transmitter,
-                                            MessageType::TransmitRequest {
-                                                message_text,
-                                                frequency_offset,
-                                                qso_id,
-                                            },
-                                            Instant::now(),
-                                        );
-                                        if let Err(e) = message_bus.send_message(msg).await {
-                                            warn!("Failed to send TransmitRequest: {}", e);
-                                        }
+                                        tx_items.push(crate::message_bus::TransmitRequestItem {
+                                            message_text,
+                                            frequency_offset,
+                                            qso_id,
+                                        });
                                     }
                                     pancetta_qso::OperatorAction::ChangeBand { dial_frequency } => {
                                         let msg = ComponentMessage::new(
@@ -2100,6 +2244,35 @@ impl ApplicationCoordinator {
                                     pancetta_qso::OperatorAction::FrequencyShift { new_offset_hz } => {
                                         info!("Autonomous: TX offset shifted to {:.0} Hz", new_offset_hz);
                                     }
+                                }
+                            }
+
+                            // Bundle collected TX items into a single message.
+                            if tx_items.len() == 1 {
+                                let item = tx_items.remove(0);
+                                let msg = ComponentMessage::new(
+                                    ComponentId::Autonomous,
+                                    ComponentId::Ft8Transmitter,
+                                    MessageType::TransmitRequest {
+                                        message_text: item.message_text,
+                                        frequency_offset: item.frequency_offset,
+                                        qso_id: item.qso_id,
+                                    },
+                                    Instant::now(),
+                                );
+                                if let Err(e) = message_bus.send_message(msg).await {
+                                    warn!("Failed to send TransmitRequest: {}", e);
+                                }
+                            } else if tx_items.len() > 1 {
+                                info!("Bundling {} TX items into MultiTransmitRequest", tx_items.len());
+                                let msg = ComponentMessage::new(
+                                    ComponentId::Autonomous,
+                                    ComponentId::Ft8Transmitter,
+                                    MessageType::MultiTransmitRequest { items: tx_items },
+                                    Instant::now(),
+                                );
+                                if let Err(e) = message_bus.send_message(msg).await {
+                                    warn!("Failed to send MultiTransmitRequest: {}", e);
                                 }
                             }
                         }

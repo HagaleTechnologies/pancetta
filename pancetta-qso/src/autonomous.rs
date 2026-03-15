@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -563,6 +563,113 @@ impl BandStrategy {
 }
 
 // ---------------------------------------------------------------------------
+// Frequency allocator (multi-QSO support)
+// ---------------------------------------------------------------------------
+
+/// Manages frequency allocation for concurrent QSOs.
+///
+/// Tracks in-use frequencies (own QSOs + decoded signals) and allocates
+/// clear frequencies for new transmissions with minimum separation.
+#[derive(Debug, Clone)]
+pub struct FrequencyAllocator {
+    /// Frequencies currently in use by our own QSOs (offset_hz → qso_id).
+    own_frequencies: HashMap<String, f64>,
+    /// Frequencies seen in the last RX window (from decoded messages).
+    observed_frequencies: Vec<f64>,
+    /// Minimum separation between our own TX signals (Hz).
+    min_separation_hz: f64,
+    /// Frequency range for allocation (min, max) in Hz offset.
+    allocation_range: (f64, f64),
+}
+
+impl FrequencyAllocator {
+    pub fn new(min_separation_hz: f64, allocation_range: (f64, f64)) -> Self {
+        Self {
+            own_frequencies: HashMap::new(),
+            observed_frequencies: Vec::new(),
+            min_separation_hz,
+            allocation_range,
+        }
+    }
+
+    /// Update observed frequencies from the latest decode window.
+    pub fn update_observed(&mut self, decoded: &[DecodedMessageInfo]) {
+        self.observed_frequencies = decoded.iter().map(|m| m.frequency_hz).collect();
+    }
+
+    /// Register a frequency as in use by one of our QSOs.
+    pub fn register_qso_frequency(&mut self, qso_id: &str, frequency_hz: f64) {
+        self.own_frequencies
+            .insert(qso_id.to_string(), frequency_hz);
+    }
+
+    /// Remove a QSO's frequency allocation.
+    pub fn release_qso_frequency(&mut self, qso_id: &str) {
+        self.own_frequencies.remove(qso_id);
+    }
+
+    /// Check if a frequency is clear of our own TX signals.
+    pub fn is_clear_of_own(&self, frequency_hz: f64) -> bool {
+        self.own_frequencies
+            .values()
+            .all(|&f| (f - frequency_hz).abs() >= self.min_separation_hz)
+    }
+
+    /// Check if a frequency is reasonably clear of observed activity.
+    /// Uses a smaller tolerance since we want to reply on the caller's frequency.
+    pub fn is_clear_of_observed(&self, frequency_hz: f64, tolerance_hz: f64) -> bool {
+        self.observed_frequencies
+            .iter()
+            .filter(|&&f| (f - frequency_hz).abs() < tolerance_hz)
+            .count()
+            <= 1 // Allow the station we're replying to
+    }
+
+    /// Find a clear frequency for a new CQ, avoiding own QSOs and busy areas.
+    pub fn allocate_cq_frequency(&self) -> f64 {
+        let (min_f, max_f) = self.allocation_range;
+        let step = self.min_separation_hz;
+
+        // Try candidates from the middle outward
+        let center = (min_f + max_f) / 2.0;
+        let mut best = center;
+        let mut best_clearance = 0.0f64;
+
+        let mut freq = min_f;
+        while freq <= max_f {
+            let min_dist_own = self
+                .own_frequencies
+                .values()
+                .map(|&f| (f - freq).abs())
+                .min_by(|a, b| a.partial_cmp(b).unwrap())
+                .unwrap_or(f64::MAX);
+
+            let nearby_count = self
+                .observed_frequencies
+                .iter()
+                .filter(|&&f| (f - freq).abs() < 100.0)
+                .count();
+
+            // Clearance score: distance from own QSOs, penalize busy areas
+            let clearance = min_dist_own - (nearby_count as f64 * 20.0);
+            if clearance > best_clearance {
+                best_clearance = clearance;
+                best = freq;
+            }
+
+            freq += step;
+        }
+
+        best.clamp(min_f, max_f)
+    }
+
+    /// Get all own frequencies currently allocated.
+    pub fn own_frequencies(&self) -> &HashMap<String, f64> {
+        &self.own_frequencies
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The autonomous operator itself
 // ---------------------------------------------------------------------------
 
@@ -579,6 +686,7 @@ pub struct AutonomousOperator {
     slot_manager: SlotManager,
     collision_detector: CollisionDetector,
     band_strategy: BandStrategy,
+    frequency_allocator: FrequencyAllocator,
     state: OperatingState,
     idle_cycles: u32,
     our_callsign: String,
@@ -588,7 +696,8 @@ pub struct AutonomousOperator {
     /// Number of active QSOs (tracked externally, fed in).
     active_qso_count: u32,
     /// Messages to transmit from the auto-sequencer (fed in).
-    pending_sequencer_message: Option<(String, Option<String>)>,
+    /// Each entry: (message_text, frequency_offset, qso_id).
+    pending_sequencer_messages: Vec<(String, f64, Option<String>)>,
     /// Whether the user has paused autonomous operation.
     paused: bool,
 }
@@ -598,19 +707,22 @@ impl AutonomousOperator {
         let slot_manager = SlotManager::new(config.slot_parity, &config.listen_cycle);
         let collision_detector = CollisionDetector::new(config.tx_offset_hz, 50.0);
         let band_strategy = BandStrategy::new(config.band_hopping.clone());
+        // FT8 bandwidth: 8 tones * 6.25 Hz = 50 Hz, plus 25 Hz guard = 75 Hz min separation
+        let frequency_allocator = FrequencyAllocator::new(75.0, (200.0, 2800.0));
 
         Self {
             config,
             slot_manager,
             collision_detector,
             band_strategy,
+            frequency_allocator,
             state: OperatingState::Hunting,
             idle_cycles: 0,
             our_callsign,
             our_grid,
             pending_cqs: Vec::new(),
             active_qso_count: 0,
-            pending_sequencer_message: None,
+            pending_sequencer_messages: Vec::new(),
             paused: false,
         }
     }
@@ -631,6 +743,9 @@ impl AutonomousOperator {
 
         // Band-hopping activity tracking.
         self.band_strategy.record_activity(messages.len() as u32);
+
+        // Update frequency allocator with observed activity.
+        self.frequency_allocator.update_observed(messages);
 
         // Extract CQ candidates.
         self.pending_cqs.clear();
@@ -671,8 +786,38 @@ impl AutonomousOperator {
     }
 
     /// Feed a message the auto-sequencer wants to send this cycle.
+    /// For backward compatibility, replaces any pending messages.
     pub fn set_pending_sequencer_message(&mut self, message_text: String, qso_id: Option<String>) {
-        self.pending_sequencer_message = Some((message_text, qso_id));
+        self.pending_sequencer_messages.clear();
+        self.pending_sequencer_messages
+            .push((message_text, self.config.tx_offset_hz, qso_id));
+    }
+
+    /// Add a sequencer message for a specific QSO at a specific frequency.
+    /// Used for multi-QSO operation where each QSO has its own frequency.
+    pub fn add_pending_sequencer_message(
+        &mut self,
+        message_text: String,
+        frequency_offset: f64,
+        qso_id: Option<String>,
+    ) {
+        self.pending_sequencer_messages
+            .push((message_text, frequency_offset, qso_id));
+    }
+
+    /// Clear all pending sequencer messages (called after decide()).
+    pub fn clear_pending_sequencer_messages(&mut self) {
+        self.pending_sequencer_messages.clear();
+    }
+
+    /// Access the frequency allocator for external QSO frequency management.
+    pub fn frequency_allocator(&self) -> &FrequencyAllocator {
+        &self.frequency_allocator
+    }
+
+    /// Mutable access to the frequency allocator.
+    pub fn frequency_allocator_mut(&mut self) -> &mut FrequencyAllocator {
+        &mut self.frequency_allocator
     }
 
     pub fn pause(&mut self) {
@@ -758,35 +903,44 @@ impl AutonomousOperator {
             }
 
             SlotDecision::Transmit => {
-                // Step 2: active QSOs?
-                if self.active_qso_count > 0 {
-                    if let Some((msg, qso_id)) = self.pending_sequencer_message.take() {
-                        self.state = OperatingState::InQso {
-                            qso_count: self.active_qso_count,
-                        };
-                        self.idle_cycles = 0;
+                let mut tx_count = 0u32;
+
+                // Step 2: emit all pending sequencer messages (active QSOs).
+                if !self.pending_sequencer_messages.is_empty() {
+                    let messages: Vec<_> = self.pending_sequencer_messages.drain(..).collect();
+                    for (msg, freq, qso_id) in messages {
                         actions.push(OperatorAction::Transmit {
                             message_text: msg,
-                            frequency_offset: self.config.tx_offset_hz,
+                            frequency_offset: freq,
                             qso_id,
                         });
-                    } else {
-                        // Sequencer has nothing to send — just listen.
-                        actions.push(OperatorAction::Listen);
+                        tx_count += 1;
                     }
-                } else {
-                    // Step 3: any interesting CQs?
+                    self.state = OperatingState::InQso {
+                        qso_count: self.active_qso_count,
+                    };
+                    self.idle_cycles = 0;
+                }
+
+                // Step 3: if we have capacity, try to respond to a CQ or call CQ.
+                let can_add_new = tx_count < self.config.max_concurrent_qsos
+                    && self.active_qso_count < self.config.max_concurrent_qsos;
+
+                if can_add_new {
+                    // Try interesting CQs first.
                     let best_cq = self
                         .pending_cqs
-                        .first()
+                        .iter()
                         .filter(|cq| cq.dx_score >= self.config.min_dx_score)
+                        .find(|cq| self.frequency_allocator.is_clear_of_own(cq.frequency_hz))
                         .cloned();
 
                     if let Some(cq) = best_cq {
-                        self.state = OperatingState::Hunting;
+                        if tx_count == 0 {
+                            self.state = OperatingState::Hunting;
+                        }
                         self.idle_cycles = 0;
 
-                        // Build the CQ response message.
                         let grid_part = self
                             .our_grid
                             .as_deref()
@@ -798,8 +952,8 @@ impl AutonomousOperator {
                                 .to_string();
 
                         debug!(
-                            "Responding to CQ from {} (score={:.2}, snr={})",
-                            cq.callsign, cq.dx_score, cq.snr
+                            "Responding to CQ from {} (score={:.2}, snr={}) at {:.0} Hz",
+                            cq.callsign, cq.dx_score, cq.snr, cq.frequency_hz
                         );
 
                         actions.push(OperatorAction::Transmit {
@@ -807,13 +961,17 @@ impl AutonomousOperator {
                             frequency_offset: cq.frequency_hz,
                             qso_id: None,
                         });
-                    } else {
-                        // Step 4: idle long enough to CQ?
+                        tx_count += 1;
+                    } else if tx_count == 0 {
+                        // Step 4: no CQs worth answering and no active QSOs — CQ ourselves?
                         self.idle_cycles += 1;
 
                         if self.idle_cycles >= self.config.cq_after_idle_cycles {
                             self.state = OperatingState::CallingCq;
                             self.idle_cycles = 0;
+
+                            let cq_freq =
+                                self.frequency_allocator.allocate_cq_frequency();
 
                             let cq_text = if self.config.cq_direction.is_empty() {
                                 format!(
@@ -834,7 +992,7 @@ impl AutonomousOperator {
 
                             actions.push(OperatorAction::Transmit {
                                 message_text: cq_text,
-                                frequency_offset: self.config.tx_offset_hz,
+                                frequency_offset: cq_freq,
                                 qso_id: None,
                             });
                         } else {
@@ -842,6 +1000,11 @@ impl AutonomousOperator {
                             actions.push(OperatorAction::Listen);
                         }
                     }
+                }
+
+                // If we emitted sequencer messages but nothing else, no extra Listen needed.
+                if tx_count == 0 && actions.iter().all(|a| !matches!(a, OperatorAction::Listen | OperatorAction::Transmit { .. })) {
+                    actions.push(OperatorAction::Listen);
                 }
             }
         }
@@ -1170,5 +1333,181 @@ mod tests {
 
         op.resume();
         assert!(!op.is_paused());
+    }
+
+    // --- Frequency allocator tests ---
+
+    #[test]
+    fn test_frequency_allocator_basic() {
+        let alloc = FrequencyAllocator::new(75.0, (200.0, 2800.0));
+        assert!(alloc.is_clear_of_own(1500.0));
+    }
+
+    #[test]
+    fn test_frequency_allocator_own_separation() {
+        let mut alloc = FrequencyAllocator::new(75.0, (200.0, 2800.0));
+        alloc.register_qso_frequency("qso1", 1500.0);
+
+        // Too close
+        assert!(!alloc.is_clear_of_own(1550.0));
+        // Far enough
+        assert!(alloc.is_clear_of_own(1600.0));
+        // Exact boundary
+        assert!(alloc.is_clear_of_own(1575.0));
+
+        alloc.release_qso_frequency("qso1");
+        assert!(alloc.is_clear_of_own(1550.0));
+    }
+
+    #[test]
+    fn test_frequency_allocator_cq_avoids_own() {
+        let mut alloc = FrequencyAllocator::new(75.0, (200.0, 2800.0));
+        alloc.register_qso_frequency("qso1", 1500.0);
+
+        let freq = alloc.allocate_cq_frequency();
+        // Should be at least 75 Hz away from 1500
+        assert!(
+            (freq - 1500.0).abs() >= 75.0,
+            "CQ freq {:.0} too close to 1500",
+            freq
+        );
+    }
+
+    // --- Multi-QSO decision tests ---
+
+    #[test]
+    fn test_multi_qso_emit_multiple_transmits() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.max_concurrent_qsos = 3;
+        config.listen_cycle.initial_interval = 100;
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_active_qso_count(2);
+
+        // Feed two sequencer messages at different frequencies
+        op.add_pending_sequencer_message(
+            "K9ZZ W1ABC -12".into(),
+            1500.0,
+            Some("qso1".into()),
+        );
+        op.add_pending_sequencer_message(
+            "VE3ABC W1ABC R-15".into(),
+            1700.0,
+            Some("qso2".into()),
+        );
+
+        let even_ts: i64 = 0;
+        let actions = op.decide_at(even_ts);
+
+        let tx_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, OperatorAction::Transmit { .. }))
+            .collect();
+
+        assert_eq!(
+            tx_actions.len(),
+            2,
+            "Expected 2 Transmit actions, got {}",
+            tx_actions.len()
+        );
+    }
+
+    #[test]
+    fn test_multi_qso_respects_max_concurrent() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.max_concurrent_qsos = 2;
+        config.min_dx_score = 0.3;
+        config.listen_cycle.initial_interval = 100;
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_active_qso_count(2);
+
+        // Two active QSOs with pending messages
+        op.add_pending_sequencer_message(
+            "K9ZZ W1ABC -12".into(),
+            1500.0,
+            Some("qso1".into()),
+        );
+        op.add_pending_sequencer_message(
+            "VE3ABC W1ABC R-15".into(),
+            1700.0,
+            Some("qso2".into()),
+        );
+
+        // Feed a CQ too
+        let messages = vec![DecodedMessageInfo {
+            callsign: Some("JA1ABC".into()),
+            frequency_hz: 2000.0,
+            snr: -5,
+            message_text: "CQ JA1ABC PM95".into(),
+        }];
+        let evaluator = NullDxEvaluator;
+        op.feed_decoded_messages(&messages, &evaluator);
+
+        let even_ts: i64 = 0;
+        let actions = op.decide_at(even_ts);
+
+        let tx_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, OperatorAction::Transmit { .. }))
+            .collect();
+
+        // Should emit 2 (existing QSOs) but NOT respond to CQ (at max)
+        assert_eq!(
+            tx_actions.len(),
+            2,
+            "Expected 2 Transmit actions (at max), got {}",
+            tx_actions.len()
+        );
+    }
+
+    #[test]
+    fn test_multi_qso_adds_new_when_capacity() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.max_concurrent_qsos = 3;
+        config.min_dx_score = 0.3;
+        config.listen_cycle.initial_interval = 100;
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_active_qso_count(1);
+
+        // One active QSO
+        op.add_pending_sequencer_message(
+            "K9ZZ W1ABC -12".into(),
+            1500.0,
+            Some("qso1".into()),
+        );
+
+        // Feed a CQ at a different frequency
+        let messages = vec![DecodedMessageInfo {
+            callsign: Some("JA1ABC".into()),
+            frequency_hz: 2000.0,
+            snr: -5,
+            message_text: "CQ JA1ABC PM95".into(),
+        }];
+        let evaluator = NullDxEvaluator;
+        op.feed_decoded_messages(&messages, &evaluator);
+
+        let even_ts: i64 = 0;
+        let actions = op.decide_at(even_ts);
+
+        let tx_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, OperatorAction::Transmit { .. }))
+            .collect();
+
+        // Should emit 2: one sequencer message + one CQ response
+        assert_eq!(
+            tx_actions.len(),
+            2,
+            "Expected 2 Transmit actions (1 QSO + 1 new CQ response), got {}",
+            tx_actions.len()
+        );
     }
 }

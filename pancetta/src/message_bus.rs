@@ -140,6 +140,12 @@ pub enum MessageType {
     /// Autonomous operator status update
     AutonomousStatus(AutonomousStatusData),
 
+    /// Request to transmit multiple messages simultaneously (multi-TX).
+    /// Each item is encoded/modulated independently and summed into one waveform.
+    MultiTransmitRequest {
+        items: Vec<TransmitRequestItem>,
+    },
+
     /// Audio output samples for transmission
     AudioOutput { samples: Vec<f32>, sample_rate: u32 },
 
@@ -150,6 +156,14 @@ pub enum MessageType {
         /// Frequency range in Hz (min, max)
         freq_range: (f32, f32),
     },
+}
+
+/// A single transmit request item for multi-TX bundles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransmitRequestItem {
+    pub message_text: String,
+    pub frequency_offset: f64,
+    pub qso_id: Option<String>,
 }
 
 /// Status data from the autonomous operator for TUI consumption.
