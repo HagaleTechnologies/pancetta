@@ -481,15 +481,14 @@ fn test_ft4_round_trip_all_message_types() {
         );
     }
 
-    // CQ DX currently decodes as <Unknown> due to message parser limitations
-    // with the XOR scrambling interaction. This is tracked for future fix.
+    // CQ DX — verify it decodes correctly
     let cq_dx_symbols = encode_ft4("CQ DX W1ABC FN42");
     let cq_dx_audio = modulate_ft4(&cq_dx_symbols, 0.0);
     let cq_dx_decoded = decode_ft4_audio(&cq_dx_audio);
-    // At minimum, something should decode (even if parser returns <Unknown>)
     assert!(
-        !cq_dx_decoded.is_empty(),
-        "CQ DX should at least produce a decode candidate"
+        cq_dx_decoded.iter().any(|m| m.text == "CQ DX W1ABC FN42"),
+        "CQ DX FT4 round-trip failed: decoded {:?}",
+        cq_dx_decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
     );
 }
 

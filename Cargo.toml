@@ -84,7 +84,7 @@ geo = "0.28"
 geographiclib-rs = "0.2"
 
 # Database support
-rusqlite = { version = "0.30", features = ["bundled", "chrono"] }
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 
 # XML and CSV parsing
 quick-xml = "0.36"
