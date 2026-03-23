@@ -28,7 +28,7 @@ anyhow = "1.0"
 # Logging for debugging
 log = "0.4"
 # Serial port communication for PTT/CAT control
-serialport = { version = "4.7", optional = true }
+serialport = { version = "4.9", optional = true }
 # GPIO control for Raspberry Pi
 rppal = { version = "0.17", optional = true }
 # Audio output and control
