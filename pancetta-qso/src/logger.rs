@@ -198,7 +198,7 @@ pub struct BackupConfig {
 }
 
 /// Integration configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct IntegrationConfig {
     /// Ham Radio Deluxe integration
     pub ham_radio_deluxe: Option<HrdIntegration>,
@@ -1080,17 +1080,6 @@ impl Default for BackupConfig {
     }
 }
 
-impl Default for IntegrationConfig {
-    fn default() -> Self {
-        Self {
-            ham_radio_deluxe: None,
-            logger32: None,
-            lotw: None,
-            qrz: None,
-            eqsl: None,
-        }
-    }
-}
 
 impl Default for ValidationConfig {
     fn default() -> Self {

@@ -909,19 +909,19 @@ impl AdifProcessor {
         let freq_mhz = frequency_hz / 1_000_000.0;
 
         match freq_mhz {
-            f if f >= 1.8 && f <= 2.0 => "160M".to_string(),
-            f if f >= 3.5 && f <= 4.0 => "80M".to_string(),
-            f if f >= 5.3 && f <= 5.4 => "60M".to_string(),
-            f if f >= 7.0 && f <= 7.3 => "40M".to_string(),
-            f if f >= 10.1 && f <= 10.15 => "30M".to_string(),
-            f if f >= 14.0 && f <= 14.35 => "20M".to_string(),
-            f if f >= 18.068 && f <= 18.168 => "17M".to_string(),
-            f if f >= 21.0 && f <= 21.45 => "15M".to_string(),
-            f if f >= 24.89 && f <= 24.99 => "12M".to_string(),
-            f if f >= 28.0 && f <= 29.7 => "10M".to_string(),
-            f if f >= 50.0 && f <= 54.0 => "6M".to_string(),
-            f if f >= 144.0 && f <= 148.0 => "2M".to_string(),
-            f if f >= 420.0 && f <= 450.0 => "70CM".to_string(),
+            f if (1.8..=2.0).contains(&f) => "160M".to_string(),
+            f if (3.5..=4.0).contains(&f) => "80M".to_string(),
+            f if (5.3..=5.4).contains(&f) => "60M".to_string(),
+            f if (7.0..=7.3).contains(&f) => "40M".to_string(),
+            f if (10.1..=10.15).contains(&f) => "30M".to_string(),
+            f if (14.0..=14.35).contains(&f) => "20M".to_string(),
+            f if (18.068..=18.168).contains(&f) => "17M".to_string(),
+            f if (21.0..=21.45).contains(&f) => "15M".to_string(),
+            f if (24.89..=24.99).contains(&f) => "12M".to_string(),
+            f if (28.0..=29.7).contains(&f) => "10M".to_string(),
+            f if (50.0..=54.0).contains(&f) => "6M".to_string(),
+            f if (144.0..=148.0).contains(&f) => "2M".to_string(),
+            f if (420.0..=450.0).contains(&f) => "70CM".to_string(),
             _ => format!("{:.0}MHZ", freq_mhz),
         }
     }

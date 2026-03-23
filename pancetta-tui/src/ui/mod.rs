@@ -85,7 +85,9 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
 }
 
 fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let title = Line::from(vec![
+    let utc_clock = chrono::Utc::now().format("%H:%M:%S UTC").to_string();
+
+    let mut left_spans = vec![
         Span::styled(
             "Pancetta TUI",
             Style::default()
@@ -114,7 +116,34 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             &app.station_info.mode,
             Style::default().fg(app.theme.accent_color()),
         ),
-    ]);
+    ];
+
+    // TX indicator
+    if app.is_transmitting {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            " TX ",
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Calculate padding to right-align the UTC clock
+    let left_len: usize = left_spans.iter().map(|s| s.width()).sum();
+    let clock_len = utc_clock.len();
+    let padding = (area.width as usize).saturating_sub(left_len + clock_len);
+
+    left_spans.push(Span::raw(" ".repeat(padding)));
+    left_spans.push(Span::styled(
+        utc_clock,
+        Style::default()
+            .fg(app.theme.foreground_color())
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    let title = Line::from(left_spans);
 
     let paragraph = Paragraph::new(title).style(
         Style::default()

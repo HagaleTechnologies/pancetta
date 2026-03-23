@@ -5,13 +5,13 @@
 //! stream initialization, and real-time audio processing.
 
 use crate::{
-    AudioComm, AudioDeviceInfo, AudioDeviceManager, AudioError, AudioSample, AudioStreamManager,
-    LatencyMeasurer, LinearResampler, StreamConfig,
+    AudioCommShared, AudioConsumer, AudioDeviceInfo, AudioDeviceManager, AudioError,
+    AudioStreamManager, LatencyMeasurer, LinearResampler, StreamConfig,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Main audio manager that coordinates all audio components
 pub struct AudioManager {
@@ -21,8 +21,11 @@ pub struct AudioManager {
     /// Active audio stream (if running)
     stream: Option<AudioStreamManager>,
 
-    /// Shared ring buffer for audio communication
-    audio_comm: Arc<AudioComm>,
+    /// Consumer half of the lock-free ring buffer
+    consumer: Option<AudioConsumer>,
+
+    /// Shared atomic state (stop flag, counters)
+    shared: AudioCommShared,
 
     /// Latency monitor for tracking performance
     latency_monitor: LatencyMeasurer,
@@ -139,10 +142,11 @@ impl AudioManager {
         };
 
         // Create audio stream manager
-        let stream = AudioStreamManager::new(stream_config)?;
+        let mut stream = AudioStreamManager::new(stream_config)?;
 
-        // Get the shared AudioComm from the stream
-        let audio_comm = stream.get_comm();
+        // Take the consumer half from the stream manager
+        let consumer = stream.take_consumer();
+        let shared = stream.get_shared();
 
         // Create latency monitor (max 1000 measurements, target 1ms = 1_000_000ns)
         let latency_monitor = LatencyMeasurer::new(1000, 1_000_000);
@@ -161,7 +165,8 @@ impl AudioManager {
         Ok(Self {
             device_manager,
             stream: Some(stream),
-            audio_comm,
+            consumer,
+            shared,
             latency_monitor,
             converter,
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -191,40 +196,10 @@ impl AudioManager {
             info!("Starting audio stream");
             stream.start()?;
 
-            // Start processing task to apply gain and convert samples
-            let audio_comm = Arc::clone(&self.audio_comm);
-            let gain_db = self.config.input_gain_db;
-            let shutdown = Arc::clone(&self.shutdown);
+            // Grab the freshly-created consumer from the stream manager
+            self.consumer = stream.take_consumer();
+            self.shared = stream.get_shared();
 
-            let handle = tokio::spawn(async move {
-                let gain = 10.0_f32.powf(gain_db / 20.0);
-
-                loop {
-                    if shutdown.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    // Check for audio samples from the stream
-                    if let Some(sample) = audio_comm.pop_audio_sample() {
-                        // Apply gain to the samples
-                        let processed = AudioSample::new(
-                            sample.data.iter().map(|&s| s * gain).collect(),
-                            sample.sample_rate,
-                            sample.channels,
-                        );
-
-                        // Try to push back processed sample
-                        if let Err(_) = audio_comm.push_audio_sample(processed) {
-                            // Buffer full, sample dropped
-                        }
-                    } else {
-                        // No samples available, yield
-                        tokio::time::sleep(Duration::from_micros(100)).await;
-                    }
-                }
-            });
-
-            self.process_handle = Some(handle);
             info!("Audio stream started successfully");
         }
 
@@ -239,7 +214,6 @@ impl AudioManager {
 
             // Stop the processing task
             if let Some(handle) = self.process_handle.take() {
-                // Don't wait forever, just abort if it doesn't stop
                 let _ = tokio::time::timeout(Duration::from_secs(1), handle);
             }
 
@@ -251,22 +225,27 @@ impl AudioManager {
 
     /// Process audio data from ring buffer
     pub fn process_audio(&mut self) -> Result<Option<Vec<f32>>, AudioError> {
-        // Read samples from the shared AudioComm
-        let mut output_samples = Vec::new();
+        let consumer = match self.consumer {
+            Some(ref mut c) => c,
+            None => return Ok(None),
+        };
 
-        // Pop available samples (up to buffer_size)
-        for _ in 0..self.config.buffer_size {
-            if let Some(sample) = self.audio_comm.pop_audio_sample() {
-                output_samples.extend_from_slice(&sample.data);
-                self.stats.samples_processed += sample.data.len() as u64;
-            } else {
-                break;
-            }
+        let available = consumer.audio_samples_available();
+        if available == 0 {
+            return Ok(None);
         }
+
+        // Read up to buffer_size * channels samples
+        let to_read = available.min(self.config.buffer_size * self.config.channels as usize);
+        let mut output_samples = vec![0.0f32; to_read];
+        let read = consumer.pop_audio_slice(&mut output_samples);
+        output_samples.truncate(read);
 
         if output_samples.is_empty() {
             return Ok(None);
         }
+
+        self.stats.samples_processed += read as u64;
 
         // Update statistics
         self.stats.signal_level = calculate_rms(&output_samples);
@@ -280,9 +259,9 @@ impl AudioManager {
 
         // Update latency stats
         let stats = self.latency_monitor.get_stats();
-        self.stats.current_latency_us = stats.average_ns / 1000; // Convert ns to us
-        self.stats.avg_latency_us = stats.average_ms * 1000.0; // Convert ms to us
-        self.stats.peak_latency_us = stats.max_ns / 1000; // Convert ns to us
+        self.stats.current_latency_us = stats.average_ns / 1000;
+        self.stats.avg_latency_us = stats.average_ms * 1000.0;
+        self.stats.peak_latency_us = stats.max_ns / 1000;
 
         Ok(Some(output))
     }
@@ -299,7 +278,7 @@ impl AudioManager {
 
     /// Set input gain in dB
     pub fn set_gain(&mut self, gain_db: f32) -> Result<(), AudioError> {
-        if gain_db < -60.0 || gain_db > 20.0 {
+        if !(-60.0..=20.0).contains(&gain_db) {
             return Err(AudioError::Configuration {
                 message: format!("Gain must be between -60 and +20 dB, got {}", gain_db),
             });
@@ -315,47 +294,17 @@ impl AudioManager {
 
     /// Queue audio samples for output playback.
     ///
-    /// Resamples from `input_rate` to the output device rate if necessary,
-    /// then writes to the output ring buffer for the audio stream to consume.
+    /// NOTE: Output ring buffer is not yet implemented in the new split design.
+    /// This is a placeholder that logs the request.
     pub fn queue_output(&mut self, samples: &[f32], input_rate: u32) -> Result<(), AudioError> {
-        let output_samples = if input_rate != self.config.sample_rate {
-            // Resample to output device rate
-            let ratio = self.config.sample_rate as f64 / input_rate as f64;
-            let out_len = (samples.len() as f64 * ratio).ceil() as usize;
-            let mut resampled = Vec::with_capacity(out_len);
-            for i in 0..out_len {
-                let src_idx = i as f64 / ratio;
-                let idx0 = src_idx.floor() as usize;
-                let frac = (src_idx - idx0 as f64) as f32;
-                let s0 = samples.get(idx0).copied().unwrap_or(0.0);
-                let s1 = samples.get(idx0 + 1).copied().unwrap_or(s0);
-                resampled.push(s0 + frac * (s1 - s0));
-            }
-            resampled
-        } else {
-            samples.to_vec()
-        };
-
-        // Write to ring buffer for audio output stream in chunks
-        let chunk_size = self.config.buffer_size;
-        let mut written = 0;
-        for chunk in output_samples.chunks(chunk_size) {
-            let sample = AudioSample::new(
-                chunk.to_vec(),
-                self.config.sample_rate,
-                self.config.channels,
-            );
-            match self.audio_comm.push_audio_sample(sample) {
-                Ok(_) => written += chunk.len(),
-                Err(_) => {
-                    warn!("Audio output buffer full after {} samples", written);
-                    break;
-                }
-            }
-        }
-
-        self.stats.samples_processed += written as u64;
-        info!("Queued {} samples for audio output", written);
+        // TODO: Implement output ring buffer for monitoring/TX audio.
+        // For now, just count the samples.
+        self.stats.samples_processed += samples.len() as u64;
+        info!(
+            "queue_output called with {} samples at {}Hz (output ring buffer not yet wired)",
+            samples.len(),
+            input_rate
+        );
         Ok(())
     }
 

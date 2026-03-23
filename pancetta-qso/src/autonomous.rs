@@ -55,18 +55,13 @@ impl SlotParity {
 }
 
 /// How the operator picks its TX parity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SlotParityConfig {
     Even,
     Odd,
     /// Listen for a few slots and pick the quieter parity.
+    #[default]
     Auto,
-}
-
-impl Default for SlotParityConfig {
-    fn default() -> Self {
-        SlotParityConfig::Auto
-    }
 }
 
 /// Whether to transmit, listen, or skip the current slot.
@@ -970,8 +965,7 @@ impl AutonomousOperator {
                             self.state = OperatingState::CallingCq;
                             self.idle_cycles = 0;
 
-                            let cq_freq =
-                                self.frequency_allocator.allocate_cq_frequency();
+                            let cq_freq = self.frequency_allocator.allocate_cq_frequency();
 
                             let cq_text = if self.config.cq_direction.is_empty() {
                                 format!(
@@ -1003,7 +997,11 @@ impl AutonomousOperator {
                 }
 
                 // If we emitted sequencer messages but nothing else, no extra Listen needed.
-                if tx_count == 0 && actions.iter().all(|a| !matches!(a, OperatorAction::Listen | OperatorAction::Transmit { .. })) {
+                if tx_count == 0
+                    && actions.iter().all(|a| {
+                        !matches!(a, OperatorAction::Listen | OperatorAction::Transmit { .. })
+                    })
+                {
                     actions.push(OperatorAction::Listen);
                 }
             }
@@ -1387,16 +1385,8 @@ mod tests {
         op.set_active_qso_count(2);
 
         // Feed two sequencer messages at different frequencies
-        op.add_pending_sequencer_message(
-            "K9ZZ W1ABC -12".into(),
-            1500.0,
-            Some("qso1".into()),
-        );
-        op.add_pending_sequencer_message(
-            "VE3ABC W1ABC R-15".into(),
-            1700.0,
-            Some("qso2".into()),
-        );
+        op.add_pending_sequencer_message("K9ZZ W1ABC -12".into(), 1500.0, Some("qso1".into()));
+        op.add_pending_sequencer_message("VE3ABC W1ABC R-15".into(), 1700.0, Some("qso2".into()));
 
         let even_ts: i64 = 0;
         let actions = op.decide_at(even_ts);
@@ -1427,16 +1417,8 @@ mod tests {
         op.set_active_qso_count(2);
 
         // Two active QSOs with pending messages
-        op.add_pending_sequencer_message(
-            "K9ZZ W1ABC -12".into(),
-            1500.0,
-            Some("qso1".into()),
-        );
-        op.add_pending_sequencer_message(
-            "VE3ABC W1ABC R-15".into(),
-            1700.0,
-            Some("qso2".into()),
-        );
+        op.add_pending_sequencer_message("K9ZZ W1ABC -12".into(), 1500.0, Some("qso1".into()));
+        op.add_pending_sequencer_message("VE3ABC W1ABC R-15".into(), 1700.0, Some("qso2".into()));
 
         // Feed a CQ too
         let messages = vec![DecodedMessageInfo {
@@ -1478,11 +1460,7 @@ mod tests {
         op.set_active_qso_count(1);
 
         // One active QSO
-        op.add_pending_sequencer_message(
-            "K9ZZ W1ABC -12".into(),
-            1500.0,
-            Some("qso1".into()),
-        );
+        op.add_pending_sequencer_message("K9ZZ W1ABC -12".into(), 1500.0, Some("qso1".into()));
 
         // Feed a CQ at a different frequency
         let messages = vec![DecodedMessageInfo {

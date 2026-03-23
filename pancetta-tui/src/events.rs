@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{debug, error};
 
-use crate::app::DecodedMessage;
+use crate::app::DecodedMessageView;
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -14,7 +14,7 @@ pub enum Event {
     Mouse(MouseEvent),
     Resize(u16, u16),
     AudioData(Vec<f32>),
-    DecodedMessage(DecodedMessage),
+    DecodedMessage(DecodedMessageView),
 }
 
 pub struct EventHandler {
@@ -171,7 +171,7 @@ impl AudioEventHandler {
 // Decoder event handler for processing decoded messages
 pub struct DecoderEventHandler {
     event_tx: mpsc::UnboundedSender<Event>,
-    decoder_rx: Option<mpsc::UnboundedReceiver<DecodedMessage>>,
+    decoder_rx: Option<mpsc::UnboundedReceiver<DecodedMessageView>>,
 }
 
 impl DecoderEventHandler {
@@ -182,7 +182,7 @@ impl DecoderEventHandler {
         }
     }
 
-    pub fn set_decoder_receiver(&mut self, rx: mpsc::UnboundedReceiver<DecodedMessage>) {
+    pub fn set_decoder_receiver(&mut self, rx: mpsc::UnboundedReceiver<DecodedMessageView>) {
         self.decoder_rx = Some(rx);
     }
 

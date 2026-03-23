@@ -227,17 +227,28 @@ impl Ft8Transmitter {
         warn!("Emergency stop activated");
         self.emergency_stop.store(true, Ordering::Relaxed);
 
-        // Release PTT immediately
-        if let Ok(mut ptt) = self.ptt_controller.try_lock() {
-            if let Err(e) = ptt.release_ptt() {
-                error!("Failed to release PTT during emergency stop: {}", e);
+        // Release PTT immediately — MUST block, never skip.
+        // A skipped PTT release leaves the radio keyed up indefinitely.
+        match self.ptt_controller.lock() {
+            Ok(mut ptt) => {
+                if let Err(e) = ptt.release_ptt() {
+                    error!("Failed to release PTT during emergency stop: {}", e);
+                }
+            }
+            Err(e) => {
+                error!("CRITICAL: PTT lock poisoned during emergency stop: {}", e);
             }
         }
 
-        // Stop audio output
-        if let Ok(mut audio) = self.audio_output.try_lock() {
-            if let Err(e) = audio.stop_output() {
-                error!("Failed to stop audio during emergency stop: {}", e);
+        // Stop audio output — also must block
+        match self.audio_output.lock() {
+            Ok(mut audio) => {
+                if let Err(e) = audio.stop_output() {
+                    error!("Failed to stop audio during emergency stop: {}", e);
+                }
+            }
+            Err(e) => {
+                error!("Audio lock poisoned during emergency stop: {}", e);
             }
         }
 
@@ -389,10 +400,17 @@ impl Ft8Transmitter {
         let config = self.config.read();
         let audio_bytes = convert_samples(&audio_samples, config.audio_config.format);
 
-        // Start audio output
+        // Start audio output — release PTT on failure to prevent stuck transmitter
         {
             let mut audio = self.audio_output.lock().unwrap();
-            audio.start_transmission(&audio_bytes)?;
+            if let Err(e) = audio.start_transmission(&audio_bytes) {
+                error!("Audio start failed, releasing PTT: {}", e);
+                if let Ok(mut ptt) = self.ptt_controller.lock() {
+                    let _ = ptt.release_ptt();
+                }
+                *self.state.write() = TransmissionState::Idle;
+                return Err(e);
+            }
         }
 
         // Wait for transmission to complete
@@ -883,10 +901,10 @@ impl SafetyMonitor {
     }
 
     fn is_transmission_allowed(&self) -> bool {
-        let total_tx_seconds = self.total_tx_time.load(Ordering::Relaxed);
+        let total_tx_ms = self.total_tx_time.load(Ordering::Relaxed);
 
-        // Check 6-minute rule
-        if total_tx_seconds >= MAX_TX_TIME_SECONDS {
+        // Check 6-minute rule (total_tx_time is now in milliseconds)
+        if total_tx_ms >= MAX_TX_TIME_SECONDS * 1000 {
             warn!("Transmission blocked: 6-minute limit reached");
             return false;
         }
@@ -922,9 +940,11 @@ impl SafetyMonitor {
             }
         }
 
-        // Update total transmission time
-        let tx_seconds = duration.as_secs();
-        self.total_tx_time.fetch_add(tx_seconds, Ordering::Relaxed);
+        // Update total transmission time in milliseconds for accuracy.
+        // FT8 transmissions are 12.64s; truncating to integer seconds loses
+        // 640ms per TX, allowing the 6-minute safety limit to be exceeded.
+        let tx_ms = duration.as_millis() as u64;
+        self.total_tx_time.fetch_add(tx_ms, Ordering::Relaxed);
 
         debug!("Recorded transmission: {:?}", duration);
     }
@@ -941,7 +961,8 @@ impl SafetyMonitor {
     }
 
     fn get_statistics(&self) -> TransmissionStatistics {
-        let total_tx_time = self.total_tx_time.load(Ordering::Relaxed);
+        let total_tx_ms = self.total_tx_time.load(Ordering::Relaxed);
+        let total_tx_seconds = total_tx_ms / 1000;
         let transmission_count = if let Ok(log) = self.transmission_log.lock() {
             log.len()
         } else {
@@ -956,8 +977,8 @@ impl SafetyMonitor {
 
         TransmissionStatistics {
             total_transmissions: transmission_count,
-            total_tx_time_seconds: total_tx_time,
-            remaining_tx_time_seconds: MAX_TX_TIME_SECONDS.saturating_sub(total_tx_time),
+            total_tx_time_seconds: total_tx_seconds,
+            remaining_tx_time_seconds: MAX_TX_TIME_SECONDS.saturating_sub(total_tx_seconds),
             time_since_reset,
             transmission_allowed: self.is_transmission_allowed(),
         }
@@ -965,7 +986,7 @@ impl SafetyMonitor {
 }
 
 /// Transmission configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TransmissionConfig {
     pub frequency_config: FrequencyConfig,
     pub power_config: PowerConfig,
@@ -974,17 +995,6 @@ pub struct TransmissionConfig {
     pub safety_config: SafetyConfig,
 }
 
-impl Default for TransmissionConfig {
-    fn default() -> Self {
-        Self {
-            frequency_config: FrequencyConfig::default(),
-            power_config: PowerConfig::default(),
-            audio_config: AudioConfig::default(),
-            ptt_config: PttConfig::default(),
-            safety_config: SafetyConfig::default(),
-        }
-    }
-}
 
 /// Frequency configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

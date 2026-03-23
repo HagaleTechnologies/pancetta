@@ -8,14 +8,14 @@ use crate::{
     error::{AudioError, AudioResult},
     latency::CallbackTimer,
     ringbuffer_comm::{
-        AudioComm, AudioSample, DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE,
+        audio_comm_pair, AudioCommShared, AudioConsumer, DEFAULT_AUDIO_BUFFER_SIZE,
+        DEFAULT_LATENCY_BUFFER_SIZE,
     },
 };
 use cpal::{
     traits::{DeviceTrait, StreamTrait},
     InputCallbackInfo, OutputCallbackInfo, Stream,
 };
-use std::sync::Arc;
 
 /// Audio stream configuration for FT8 processing
 #[derive(Debug, Clone)]
@@ -89,7 +89,10 @@ pub struct AudioStreamManager {
     config: StreamConfig,
     input_stream: Option<Stream>,
     output_stream: Option<Stream>,
-    comm: Arc<AudioComm>,
+    /// Consumer half — owned by the processing thread
+    consumer: Option<AudioConsumer>,
+    /// Shared atomic state (stop flag, counters)
+    shared: AudioCommShared,
     is_running: bool,
 }
 
@@ -97,24 +100,32 @@ impl AudioStreamManager {
     /// Create a new audio stream manager
     pub fn new(config: StreamConfig) -> AudioResult<Self> {
         let device_manager = AudioDeviceManager::new()?;
-        let comm = Arc::new(AudioComm::new(
-            DEFAULT_AUDIO_BUFFER_SIZE,
-            DEFAULT_LATENCY_BUFFER_SIZE,
-        ));
+        let (_producer, consumer) =
+            audio_comm_pair(DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
+        let shared = consumer.shared.clone();
 
         Ok(Self {
             device_manager,
             config,
             input_stream: None,
             output_stream: None,
-            comm,
+            consumer: Some(consumer),
+            shared,
             is_running: false,
         })
     }
 
-    /// Get the communication channel for audio data
-    pub fn get_comm(&self) -> Arc<AudioComm> {
-        self.comm.clone()
+    /// Take the consumer half out of this manager.
+    ///
+    /// This is intended to be called once after construction so the processing
+    /// thread can own the consumer. Returns `None` if already taken.
+    pub fn take_consumer(&mut self) -> Option<AudioConsumer> {
+        self.consumer.take()
+    }
+
+    /// Get the shared atomic state (stop flag, counters).
+    pub fn get_shared(&self) -> AudioCommShared {
+        self.shared.clone()
     }
 
     /// Get the current configuration
@@ -142,7 +153,7 @@ impl AudioStreamManager {
         // Refresh device list
         self.device_manager.refresh_devices()?;
 
-        // Create input stream
+        // Create input stream (moves the producer into the callback)
         self.create_input_stream()?;
 
         // Create output stream if monitoring is enabled
@@ -170,7 +181,7 @@ impl AudioStreamManager {
         }
 
         // Signal stop to communication channel
-        self.comm.stop();
+        self.shared.stop();
 
         // Drop streams (this automatically stops them)
         self.input_stream = None;
@@ -187,18 +198,40 @@ impl AudioStreamManager {
 
     /// Get current stream statistics
     pub fn get_statistics(&self) -> StreamStatistics {
-        let buffer_stats = self.comm.get_buffer_stats();
+        // If the consumer is still held here we can query it; otherwise use shared counters.
+        let (audio_buffer_used, audio_buffer_capacity) = if let Some(ref consumer) = self.consumer {
+            (
+                consumer.audio_samples_available(),
+                consumer.audio_buffer_capacity(),
+            )
+        } else {
+            (0, 0)
+        };
+
+        let dropped = self.shared.dropped_samples();
+        let processed = self.shared.processed_samples();
+        let total = dropped + processed;
+        let drop_rate = if total > 0 {
+            (dropped as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        let usage_pct = if audio_buffer_capacity > 0 {
+            (audio_buffer_used as f64 / audio_buffer_capacity as f64) * 100.0
+        } else {
+            0.0
+        };
 
         StreamStatistics {
             is_running: self.is_running,
             config: self.config.clone(),
             theoretical_latency_ms: self.config.theoretical_latency_ms(),
-            audio_samples_buffered: buffer_stats.audio_buffer_used,
-            buffer_usage_percent: buffer_stats.audio_buffer_usage_percent,
-            samples_dropped: buffer_stats.dropped_samples,
-            samples_processed: buffer_stats.processed_samples,
-            drop_rate_percent: buffer_stats.drop_rate_percent(),
-            has_buffer_overruns: buffer_stats.has_buffer_overruns(),
+            audio_samples_buffered: audio_buffer_used,
+            buffer_usage_percent: usage_pct,
+            samples_dropped: dropped,
+            samples_processed: processed,
+            drop_rate_percent: drop_rate,
+            has_buffer_overruns: dropped > 0,
         }
     }
 
@@ -228,16 +261,25 @@ impl AudioStreamManager {
             true, // is_input
         )?;
 
-        // Create the input stream
-        let comm = self.comm.clone();
-        let config = self.config.clone();
-        let actual_sample_rate = stream_config.sample_rate().0;
-        let actual_channels = stream_config.channels();
+        // Create a fresh producer/consumer pair for this stream session.
+        let (mut producer, consumer) =
+            audio_comm_pair(DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
+        // Copy the shared state so external code can observe stop/counters.
+        self.shared = producer.shared.clone();
+        self.consumer = Some(consumer);
 
+        // Build the input stream — the producer is *moved* into the closure so
+        // no Arc/Mutex is needed: the ringbuf producer is already Send.
         let stream = input_device.build_input_stream(
             &stream_config.into(),
             move |data: &[f32], _info: &InputCallbackInfo| {
-                Self::input_callback(data, &comm, actual_sample_rate, actual_channels, &config);
+                // Push raw f32 samples directly — zero allocation.
+                producer.push_audio_slice(data);
+
+                // Record callback latency (best-effort).
+                let timer = CallbackTimer::start();
+                let latency_ns = timer.elapsed_ns();
+                let _ = producer.push_latency(latency_ns);
             },
             |err| {
                 eprintln!("Input stream error: {}", err);
@@ -276,12 +318,13 @@ impl AudioStreamManager {
         )?;
 
         // Create the output stream
-        let comm = self.comm.clone();
-
         let stream = output_device.build_output_stream(
             &stream_config.into(),
             move |data: &mut [f32], _info: &OutputCallbackInfo| {
-                Self::output_callback(data, &comm);
+                // No monitoring audio source configured — output silence
+                for sample in data.iter_mut() {
+                    *sample = 0.0;
+                }
             },
             |err| {
                 eprintln!("Output stream error: {}", err);
@@ -291,42 +334,6 @@ impl AudioStreamManager {
 
         self.output_stream = Some(stream);
         Ok(())
-    }
-
-    /// Real-time input callback - processes incoming audio
-    fn input_callback(
-        data: &[f32],
-        comm: &Arc<AudioComm>,
-        sample_rate: u32,
-        channels: u16,
-        _config: &StreamConfig,
-    ) {
-        let timer = CallbackTimer::start();
-
-        // Create audio sample from input data
-        let audio_sample = AudioSample::new(data.to_vec(), sample_rate, channels);
-
-        // Try to push to the ring buffer (non-blocking)
-        if let Err(_) = comm.push_audio_sample(audio_sample) {
-            // Buffer is full - this indicates the processing chain is too slow
-            // The dropped sample counter will be incremented automatically
-        }
-
-        // Record callback latency
-        let latency_ns = timer.elapsed_ns();
-        let _ = comm.push_latency(latency_ns);
-    }
-
-    /// Real-time output callback for monitoring audio
-    ///
-    /// TX audio output is handled by a separate cpal stream in transmit.rs.
-    /// This output is for monitoring only (sidetone, RX audio playback).
-    /// TODO: Add an output ring buffer to AudioComm for monitoring audio.
-    fn output_callback(data: &mut [f32], _comm: &Arc<AudioComm>) {
-        // No monitoring audio source configured — output silence
-        for sample in data.iter_mut() {
-            *sample = 0.0;
-        }
     }
 }
 

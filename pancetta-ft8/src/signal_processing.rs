@@ -16,24 +16,19 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 
 /// Window function types for spectral analysis
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 pub enum WindowFunction {
     /// Rectangular window (no tapering)
     Rectangle,
     /// Hamming window (good side-lobe suppression)
     Hamming,
     /// Hann window (better spectral resolution)
+    #[default]
     Hann,
     /// Blackman window (excellent side-lobe suppression)
     Blackman,
     /// Kaiser window with beta parameter
     Kaiser(f64),
-}
-
-impl Default for WindowFunction {
-    fn default() -> Self {
-        WindowFunction::Hann
-    }
 }
 
 /// High-performance FFT processor with reusable buffers

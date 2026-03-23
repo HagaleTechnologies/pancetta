@@ -5,10 +5,11 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Operating mode enumeration - centralized definition
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Mode {
     /// Upper Sideband
+    #[default]
     USB,
     /// Lower Sideband
     LSB,
@@ -167,11 +168,6 @@ impl FromStr for Mode {
     }
 }
 
-impl Default for Mode {
-    fn default() -> Self {
-        Mode::USB
-    }
-}
 
 #[cfg(test)]
 mod tests {

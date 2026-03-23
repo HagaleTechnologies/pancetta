@@ -8,8 +8,13 @@ use tracing::{debug, info};
 
 use crate::config::{Config, Theme};
 
+/// View model for decoded messages in the TUI.
+/// This is NOT the domain type from pancetta-ft8; it is a display-oriented
+/// struct tailored for the UI layer.  If pancetta-ft8 is added as a dependency
+/// in the future, add a `From<pancetta_ft8::message::DecodedMessage>` impl
+/// instead of duplicating fields.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DecodedMessage {
+pub struct DecodedMessageView {
     pub timestamp: DateTime<Utc>,
     pub frequency: f64,
     pub mode: String,
@@ -208,7 +213,7 @@ pub struct App {
     pub theme: Theme,
 
     // Data
-    pub decoded_messages: VecDeque<DecodedMessage>,
+    pub decoded_messages: VecDeque<DecodedMessageView>,
     /// Active QSOs (supports multiple concurrent QSOs).
     pub qso_statuses: Vec<QsoStatus>,
     pub station_info: StationInfo,
@@ -235,7 +240,7 @@ pub struct App {
     pub tx_frequency_offset: f64,
 
     // Communication channels
-    pub message_rx: Option<mpsc::UnboundedReceiver<DecodedMessage>>,
+    pub message_rx: Option<mpsc::UnboundedReceiver<DecodedMessageView>>,
     pub audio_rx: Option<mpsc::UnboundedReceiver<Vec<f32>>>,
 }
 
@@ -326,11 +331,13 @@ impl App {
     pub async fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
         match key.code {
             // Global shortcuts
-            KeyCode::Char('q') | KeyCode::Esc => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) || key.code == KeyCode::Esc {
-                    self.should_quit = true;
-                    return Ok(true);
-                }
+            KeyCode::Esc => {
+                self.should_quit = true;
+                return Ok(true);
+            }
+            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.should_quit = true;
+                return Ok(true);
             }
 
             // Panel navigation
@@ -413,7 +420,7 @@ impl App {
         self.process_audio_data(data).await
     }
 
-    pub async fn handle_decoded_message(&mut self, message: DecodedMessage) -> Result<()> {
+    pub async fn handle_decoded_message(&mut self, message: DecodedMessageView) -> Result<()> {
         self.add_decoded_message(message).await
     }
 
@@ -455,7 +462,7 @@ impl App {
         Ok(())
     }
 
-    pub async fn add_decoded_message(&mut self, message: DecodedMessage) -> Result<()> {
+    pub async fn add_decoded_message(&mut self, message: DecodedMessageView) -> Result<()> {
         debug!("Adding decoded message: {}", message.message);
 
         // Add to band activity
@@ -488,7 +495,7 @@ impl App {
         Ok(())
     }
 
-    fn calculate_dx_priority(&self, message: &DecodedMessage) -> u32 {
+    fn calculate_dx_priority(&self, message: &DecodedMessageView) -> u32 {
         let mut score = 0u32;
 
         // Higher SNR gets more points

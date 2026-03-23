@@ -195,7 +195,7 @@ impl GridSquare {
                 };
 
                 // Skip if latitude is out of bounds
-                if adj_lat < -90.0 || adj_lat > 90.0 {
+                if !(-90.0..=90.0).contains(&adj_lat) {
                     continue;
                 }
 
@@ -318,13 +318,13 @@ pub fn coordinates_to_grid(
     longitude: f64,
     precision: GridPrecision,
 ) -> Result<String> {
-    if latitude < -90.0 || latitude > 90.0 {
+    if !(-90.0..=90.0).contains(&latitude) {
         return Err(DxError::InvalidGridSquare(format!(
             "Invalid latitude: {}",
             latitude
         )));
     }
-    if longitude < -180.0 || longitude > 180.0 {
+    if !(-180.0..=180.0).contains(&longitude) {
         return Err(DxError::InvalidGridSquare(format!(
             "Invalid longitude: {}",
             longitude

@@ -40,7 +40,6 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 mod logging;
 
 use pancetta_lib::coordinator::ApplicationCoordinator;
-use pancetta_lib::runtime::{PancettaRuntime, RuntimeConfig};
 
 /// Pancetta - High-Performance Amateur Radio FT8 Processing Application
 #[derive(Clone, Parser)]
@@ -270,7 +269,7 @@ async fn run_application(cli: Cli) -> Result<()> {
             match signal {
                 SIGINT => {
                     info!("Received SIGINT, initiating graceful shutdown");
-                    shutdown_clone.store(true, Ordering::Relaxed);
+                    shutdown_clone.store(true, Ordering::Release);
                     break;
                 }
                 _ => {}
@@ -282,24 +281,8 @@ async fn run_application(cli: Cli) -> Result<()> {
     tokio::spawn(async move {
         signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
         warn!("Received Ctrl+C, initiating graceful shutdown");
-        shutdown_for_signals.store(true, Ordering::Relaxed);
+        shutdown_for_signals.store(true, Ordering::Release);
     });
-
-    // Create runtime with optimized settings
-    let runtime_config = RuntimeConfig {
-        worker_threads: num_cpus::get(),
-        enable_io: true,
-        enable_time: true,
-        max_blocking_threads: 512,
-        thread_stack_size: Some(2 * 1024 * 1024), // 2MB stack
-        thread_name: "pancetta-worker".to_string(),
-        enable_tls: true,
-        cpu_affinity: None,
-        realtime_priority: None,
-        enable_metrics: true,
-    };
-
-    let pancetta_runtime = PancettaRuntime::new(runtime_config)?;
 
     // Create application coordinator
     let coordinator = ApplicationCoordinator::new(
@@ -327,7 +310,7 @@ async fn run_application(cli: Cli) -> Result<()> {
         Err(e) => {
             error!("Application error: {}", e);
             // Ensure graceful shutdown even on error
-            shutdown.store(true, Ordering::Relaxed);
+            shutdown.store(true, Ordering::Release);
         }
     }
 

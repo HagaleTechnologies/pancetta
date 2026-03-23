@@ -53,14 +53,12 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut lines = Vec::new();
 
     // Header
-    lines.push(Line::from(vec![
-        Span::styled(
-            " Call       Freq     Mode  SNR  Exch ",
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        " Call       Freq     Mode  SNR  Exch ",
+        Style::default()
+            .fg(app.theme.accent_color())
+            .add_modifier(Modifier::BOLD),
+    )]));
 
     // Each active QSO
     for qso in &app.qso_statuses {
@@ -323,7 +321,7 @@ fn get_audio_level_color(level: f32, theme: &crate::config::Theme) -> ratatui::s
 }
 
 /// Update QSO status based on new message
-pub fn update_qso_from_message(app: &mut App, message: &crate::app::DecodedMessage) {
+pub fn update_qso_from_message(app: &mut App, message: &crate::app::DecodedMessageView) {
     let our_call = &app.station_info.call_sign.to_uppercase();
     let message_upper = message.message.to_uppercase();
 

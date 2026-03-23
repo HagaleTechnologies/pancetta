@@ -473,59 +473,8 @@ impl Default for HashTable {
     }
 }
 
-/// Callsign lookup table for standard encoding/decoding
-struct CallsignTable {
-    // Standard callsign cache for performance
-    standard_cache: HashMap<u32, String>,
-}
-
-impl CallsignTable {
-    fn new() -> Self {
-        Self {
-            standard_cache: HashMap::new(),
-        }
-    }
-
-    /// Encode standard callsign to 28-bit value
-    pub fn encode_standard_callsign(&self, callsign: &str) -> Ft8Result<u32> {
-        const CALLSIGN_CHARS: &[u8] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-
-        if callsign.len() > 6 {
-            return Err(Ft8Error::MessageDecodingError(
-                "Callsign too long".to_string(),
-            ));
-        }
-
-        let mut value = 0u32;
-        // Pad with leading spaces to 6 characters
-        let padded = format!("{:>6}", callsign);
-
-        for ch in padded.chars() {
-            let ch_upper = ch.to_ascii_uppercase();
-            let pos = CALLSIGN_CHARS
-                .iter()
-                .position(|&c| c == ch_upper as u8)
-                .ok_or_else(|| {
-                    Ft8Error::MessageDecodingError(format!("Invalid character in callsign: {}", ch))
-                })?;
-
-            value = value * 37 + pos as u32;
-        }
-
-        if value >= 262_144_000 {
-            return Err(Ft8Error::MessageDecodingError(
-                "Callsign encoding overflow".to_string(),
-            ));
-        }
-
-        Ok(value)
-    }
-}
-
 /// FT8 message parser
 pub struct MessageParser {
-    /// Callsign validation table
-    callsign_table: CallsignTable,
     /// Hash table for worked stations (10/12/22-bit hashes)
     hash_table: HashTable,
 }
@@ -534,7 +483,6 @@ impl MessageParser {
     /// Create a new message parser
     pub fn new() -> Self {
         Self {
-            callsign_table: CallsignTable::new(),
             hash_table: HashTable::new(),
         }
     }
@@ -1057,70 +1005,6 @@ impl MessageParser {
         }
     }
 
-    /// Parse Type 1 extended callsign messages
-    fn parse_extended_message(
-        &self,
-        payload: &BitSlice,
-        message: &mut Ft8Message,
-    ) -> Ft8Result<()> {
-        // Type 1 messages support callsigns with prefixes/suffixes
-        // Extract base callsign (28 bits)
-        let base_call = self.unpack28(bits_to_u32(&payload[0..28]));
-
-        // Extract prefix/suffix encoding (variable)
-        let ext_bits = &payload[28..];
-
-        if ext_bits.len() >= 22 {
-            let ext_value = bits_to_u32(&ext_bits[0..22]);
-
-            // Decode prefix or suffix
-            let extension = self.decode_callsign_extension(ext_value)?;
-
-            if let (Some(mut call), Some(ext)) = (base_call.to_callsign(), extension) {
-                if ext.starts_with('/') {
-                    // Suffix
-                    call.push_str(&ext);
-                } else {
-                    // Prefix
-                    call = format!("{}/{}", ext, call);
-                }
-                message.from_callsign = Some(call);
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Parse Type 2 contest messages
-    fn parse_contest_message(&self, payload: &BitSlice, message: &mut Ft8Message) -> Ft8Result<()> {
-        // Extract callsigns
-        let call1 = self.decode_callsign_28bit(&payload[0..28])?;
-        let call2 = self.decode_callsign_28bit(&payload[28..56]);
-
-        message.to_callsign = call1;
-        message.from_callsign = call2.unwrap_or(None);
-
-        // Extract contest exchange (remaining bits)
-        if payload.len() > 56 {
-            let exchange_bits = &payload[56..];
-            let exchange_value = bits_to_u32(exchange_bits);
-
-            // Contest exchange formats vary:
-            // - Serial number (0001-9999)
-            // - Grid square + serial
-            // - Section/state abbreviation
-
-            if exchange_value < 10000 {
-                // Serial number
-                message.contest_exchange = Some(format!("{:04}", exchange_value));
-            } else {
-                // Complex exchange - decode based on contest type
-                message.contest_exchange = Some(format!("<{:06X}>", exchange_value));
-            }
-        }
-
-        Ok(())
-    }
 
     // =========================================================================
     // i3=0 sub-type parsers (n3 field determines format)
@@ -1332,37 +1216,6 @@ impl MessageParser {
         Ok(())
     }
 
-    /// Decode callsign from 28-bit field — delegates to unpack28.
-    /// Kept for compatibility with contest/field day/DXpedition parsers.
-    fn decode_callsign_28bit(&self, bits: &BitSlice) -> Ft8Result<Option<String>> {
-        let n28 = bits_to_u32(bits);
-        Ok(self.unpack28(n28).to_callsign())
-    }
-
-    /// Decode callsign extension (prefix/suffix)
-    fn decode_callsign_extension(&self, value: u32) -> Ft8Result<Option<String>> {
-        if value == 0 {
-            return Ok(None);
-        }
-
-        // Extension encoding varies by type
-        if value < 1024 {
-            // Numeric suffix (/0-/9, /P, /M, /MM, /AM, /QRP, etc.)
-            match value {
-                1..=10 => Ok(Some(format!("/{}", value - 1))),
-                11 => Ok(Some("/P".to_string())),
-                12 => Ok(Some("/M".to_string())),
-                13 => Ok(Some("/MM".to_string())),
-                14 => Ok(Some("/AM".to_string())),
-                15 => Ok(Some("/QRP".to_string())),
-                _ => Ok(Some(format!("/{}", value))),
-            }
-        } else {
-            // Prefix encoding (country/region codes)
-            let prefix_code = value - 1024;
-            Ok(Some(self.decode_prefix_code(prefix_code)?))
-        }
-    }
 
     /// Decode grid square from 15-bit field using Maidenhead system
     fn decode_grid_square_15bit(&self, grid_value: u32) -> Ft8Result<Option<String>> {

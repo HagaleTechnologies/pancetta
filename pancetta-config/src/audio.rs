@@ -331,7 +331,7 @@ pub struct WienerFilterConfig {
 }
 
 /// Audio routing configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AudioRoutingConfig {
     /// Input routing matrix
     pub input_routing: Vec<AudioRoute>,
@@ -657,16 +657,6 @@ impl Default for WienerFilterConfig {
     }
 }
 
-impl Default for AudioRoutingConfig {
-    fn default() -> Self {
-        Self {
-            input_routing: vec![],
-            output_routing: vec![],
-            monitor_routing: MonitorConfig::default(),
-            sidetone: SidetoneConfig::default(),
-        }
-    }
-}
 
 impl Default for MonitorConfig {
     fn default() -> Self {

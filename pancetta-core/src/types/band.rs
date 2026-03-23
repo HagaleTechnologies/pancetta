@@ -5,7 +5,7 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Amateur radio band enumeration - centralized definition
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Band {
     /// 160 meters (1.8-2.0 MHz)
     #[serde(rename = "160m")]
@@ -23,6 +23,7 @@ pub enum Band {
     #[serde(rename = "30m")]
     Band30m,
     /// 20 meters (14.0-14.35 MHz)
+    #[default]
     #[serde(rename = "20m")]
     Band20m,
     /// 17 meters (18.068-18.168 MHz)
@@ -210,11 +211,6 @@ impl fmt::Display for Band {
     }
 }
 
-impl Default for Band {
-    fn default() -> Self {
-        Band::Band20m
-    }
-}
 
 impl FromStr for Band {
     type Err = String;

@@ -404,13 +404,9 @@ fn modulate_ft4(symbols: &[u8], frequency_offset: f64) -> Vec<f32> {
     // Use rectangular pulse shaping for decode compatibility.
     // GFSK BT=1.0 is the standard for FT4 OTA but our decoder uses raw DFT
     // which works best with rectangular/CPFSK modulation.
-    let mut modulator = Ft8Modulator::with_pulse_shape(
-        SAMPLE_RATE,
-        BASE_FREQUENCY,
-        0.5,
-        PulseShape::Rectangular,
-    )
-    .unwrap();
+    let mut modulator =
+        Ft8Modulator::with_pulse_shape(SAMPLE_RATE, BASE_FREQUENCY, 0.5, PulseShape::Rectangular)
+            .unwrap();
     let mut audio = modulator
         .modulate_symbols_protocol(symbols, frequency_offset, &params)
         .unwrap();
@@ -515,13 +511,8 @@ fn test_ft2_encode_modulate_basic() {
     assert!(symbols.iter().all(|&s| s < 8));
 
     // Modulate
-    let mut modulator = Ft8Modulator::with_pulse_shape(
-        SAMPLE_RATE,
-        1500.0,
-        0.5,
-        PulseShape::Rectangular,
-    )
-    .unwrap();
+    let mut modulator =
+        Ft8Modulator::with_pulse_shape(SAMPLE_RATE, 1500.0, 0.5, PulseShape::Rectangular).unwrap();
     let audio = modulator
         .modulate_symbols_protocol(&symbols, 0.0, &params)
         .unwrap();
@@ -542,13 +533,8 @@ fn test_ft2_round_trip() {
         .encode_message_protocol("CQ W1ABC FN42", None)
         .unwrap();
 
-    let mut modulator = Ft8Modulator::with_pulse_shape(
-        SAMPLE_RATE,
-        1500.0,
-        0.5,
-        PulseShape::Rectangular,
-    )
-    .unwrap();
+    let mut modulator =
+        Ft8Modulator::with_pulse_shape(SAMPLE_RATE, 1500.0, 0.5, PulseShape::Rectangular).unwrap();
     let mut audio = modulator
         .modulate_symbols_protocol(&symbols, 0.0, &params)
         .unwrap();
@@ -591,8 +577,7 @@ fn test_multi_tx_round_trip_two_ft8() {
         },
     ];
 
-    let mut combined =
-        modulate_multi_tx(&items, SAMPLE_RATE, 1500.0, 0.5).unwrap();
+    let mut combined = modulate_multi_tx(&items, SAMPLE_RATE, 1500.0, 0.5).unwrap();
     combined.resize(WINDOW_SAMPLES, 0.0);
 
     let decoded = decode_audio(&combined);

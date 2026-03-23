@@ -485,7 +485,7 @@ pub fn calculate_sun_times(
     let sunset_hour = solar_noon + hour_angle_deg / 15.0;
 
     // Convert to UTC DateTime
-    let sunrise = if sunrise_hour >= 0.0 && sunrise_hour < 24.0 {
+    let sunrise = if (0.0..24.0).contains(&sunrise_hour) {
         let hour = sunrise_hour as u32;
         let minute = ((sunrise_hour % 1.0) * 60.0) as u32;
         let second = (((sunrise_hour % 1.0) * 60.0 % 1.0) * 60.0) as u32;
@@ -513,7 +513,7 @@ pub fn calculate_sun_times(
             .and_utc()
     };
 
-    let sunset = if sunset_hour >= 0.0 && sunset_hour < 24.0 {
+    let sunset = if (0.0..24.0).contains(&sunset_hour) {
         let hour = sunset_hour as u32;
         let minute = ((sunset_hour % 1.0) * 60.0) as u32;
         let second = (((sunset_hour % 1.0) * 60.0 % 1.0) * 60.0) as u32;
@@ -555,26 +555,26 @@ fn mgrs_from_coordinate(lat: f64, lon: f64) -> Result<String> {
 
     // Zone letter (latitude bands)
     let zone_letter = match lat {
-        lat if lat >= -80.0 && lat < -72.0 => 'C',
-        lat if lat >= -72.0 && lat < -64.0 => 'D',
-        lat if lat >= -64.0 && lat < -56.0 => 'E',
-        lat if lat >= -56.0 && lat < -48.0 => 'F',
-        lat if lat >= -48.0 && lat < -40.0 => 'G',
-        lat if lat >= -40.0 && lat < -32.0 => 'H',
-        lat if lat >= -32.0 && lat < -24.0 => 'J',
-        lat if lat >= -24.0 && lat < -16.0 => 'K',
-        lat if lat >= -16.0 && lat < -8.0 => 'L',
-        lat if lat >= -8.0 && lat < 0.0 => 'M',
-        lat if lat >= 0.0 && lat < 8.0 => 'N',
-        lat if lat >= 8.0 && lat < 16.0 => 'P',
-        lat if lat >= 16.0 && lat < 24.0 => 'Q',
-        lat if lat >= 24.0 && lat < 32.0 => 'R',
-        lat if lat >= 32.0 && lat < 40.0 => 'S',
-        lat if lat >= 40.0 && lat < 48.0 => 'T',
-        lat if lat >= 48.0 && lat < 56.0 => 'U',
-        lat if lat >= 56.0 && lat < 64.0 => 'V',
-        lat if lat >= 64.0 && lat < 72.0 => 'W',
-        lat if lat >= 72.0 && lat <= 84.0 => 'X',
+        lat if (-80.0..-72.0).contains(&lat) => 'C',
+        lat if (-72.0..-64.0).contains(&lat) => 'D',
+        lat if (-64.0..-56.0).contains(&lat) => 'E',
+        lat if (-56.0..-48.0).contains(&lat) => 'F',
+        lat if (-48.0..-40.0).contains(&lat) => 'G',
+        lat if (-40.0..-32.0).contains(&lat) => 'H',
+        lat if (-32.0..-24.0).contains(&lat) => 'J',
+        lat if (-24.0..-16.0).contains(&lat) => 'K',
+        lat if (-16.0..-8.0).contains(&lat) => 'L',
+        lat if (-8.0..0.0).contains(&lat) => 'M',
+        lat if (0.0..8.0).contains(&lat) => 'N',
+        lat if (8.0..16.0).contains(&lat) => 'P',
+        lat if (16.0..24.0).contains(&lat) => 'Q',
+        lat if (24.0..32.0).contains(&lat) => 'R',
+        lat if (32.0..40.0).contains(&lat) => 'S',
+        lat if (40.0..48.0).contains(&lat) => 'T',
+        lat if (48.0..56.0).contains(&lat) => 'U',
+        lat if (56.0..64.0).contains(&lat) => 'V',
+        lat if (64.0..72.0).contains(&lat) => 'W',
+        lat if (72.0..=84.0).contains(&lat) => 'X',
         _ => return Err(DxError::Geography("Latitude out of MGRS range".to_string())),
     };
 
@@ -620,7 +620,7 @@ fn coordinate_from_mgrs(mgrs: &str) -> Result<Coordinate> {
         .parse()
         .map_err(|_| DxError::Geography("Invalid MGRS zone".to_string()))?;
 
-    if zone < 1 || zone > 60 {
+    if !(1..=60).contains(&zone) {
         return Err(DxError::Geography("MGRS zone out of range".to_string()));
     }
 

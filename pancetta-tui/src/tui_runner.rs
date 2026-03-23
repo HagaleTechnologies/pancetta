@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::app::{App, DecodedMessage, DevicePanel, DeviceSelectionState};
+use crate::app::{App, DecodedMessageView, DevicePanel, DeviceSelectionState};
 use crate::config::Config;
 
 /// TUI runner that manages the terminal interface
@@ -54,7 +54,7 @@ pub struct TuiRunner {
 #[derive(Debug, Clone)]
 pub enum TuiMessage {
     /// Decoded FT8 message
-    DecodedMessage(DecodedMessage),
+    DecodedMessage(DecodedMessageView),
     /// Frequency update
     FrequencyUpdate { vfo: u8, frequency: u64 },
     /// Signal strength update
@@ -620,9 +620,7 @@ impl TuiRunner {
             let qso = app.qso_status();
             format!(
                 "QSO with: {}\nTX: {} dB\nRX: {} dB\nExchanges: {}",
-                qso.call_sign
-                    .as_ref()
-                    .unwrap_or(&"Unknown".to_string()),
+                qso.call_sign.as_ref().unwrap_or(&"Unknown".to_string()),
                 qso.snr_tx.unwrap_or(0),
                 qso.snr_rx.unwrap_or(0),
                 qso.exchange_count

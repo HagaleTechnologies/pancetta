@@ -569,7 +569,10 @@ mod tests {
         let mut predictor = PropagationPredictor::new();
         // NOAA fetch is not yet implemented — verify it returns an error
         let result = predictor.get_solar_indices().await;
-        assert!(result.is_err(), "Expected Err from unimplemented NOAA fetch");
+        assert!(
+            result.is_err(),
+            "Expected Err from unimplemented NOAA fetch"
+        );
     }
 
     #[tokio::test]
@@ -587,7 +590,10 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_err(), "Expected Err from unimplemented NOAA fetch");
+        assert!(
+            result.is_err(),
+            "Expected Err from unimplemented NOAA fetch"
+        );
     }
 
     #[test]
@@ -620,8 +626,14 @@ mod tests {
         let result_high = predictor.predict_aurora(65.0).await;
         let result_low = predictor.predict_aurora(30.0).await;
 
-        assert!(result_high.is_err(), "Expected Err from unimplemented NOAA fetch");
-        assert!(result_low.is_err(), "Expected Err from unimplemented NOAA fetch");
+        assert!(
+            result_high.is_err(),
+            "Expected Err from unimplemented NOAA fetch"
+        );
+        assert!(
+            result_low.is_err(),
+            "Expected Err from unimplemented NOAA fetch"
+        );
     }
 
     #[test]

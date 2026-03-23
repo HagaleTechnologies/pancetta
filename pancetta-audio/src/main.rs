@@ -119,16 +119,8 @@ async fn run_audio_latency_test(
 
     while test_start.elapsed().as_secs() < test_duration_seconds {
         // Process any available samples
-        let samples = processor.get_processed_samples().await?;
-
-        if !samples.is_empty() {
-            println!("Processed {} audio samples", samples.len());
-
-            // Calculate processing latency for each sample
-            for sample in samples {
-                let latency_ns = sample.timestamp.elapsed().as_nanos() as u64;
-                latency_measurer.record_latency(latency_ns);
-            }
+        if let Some(samples) = processor.get_processed_samples().await? {
+            println!("Processed {} raw audio samples", samples.len());
         }
 
         // Print statistics every 5 seconds

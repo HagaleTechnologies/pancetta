@@ -43,7 +43,7 @@ pub enum DatabaseError {
 }
 
 /// Database query filters
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct QsoFilter {
     /// Filter by callsign pattern
     pub callsign_pattern: Option<String>,
@@ -1045,23 +1045,6 @@ impl Default for QueryOptions {
     }
 }
 
-impl Default for QsoFilter {
-    fn default() -> Self {
-        Self {
-            callsign_pattern: None,
-            date_range: None,
-            frequency_range: None,
-            band: None,
-            mode: None,
-            grid_pattern: None,
-            contest_id: None,
-            qsl_status: None,
-            confirmed: None,
-            min_signal_strength: None,
-            custom_where: None,
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {

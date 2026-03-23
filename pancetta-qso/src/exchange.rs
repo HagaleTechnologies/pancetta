@@ -222,7 +222,7 @@ impl MessageExchange {
 
     /// Validate a signal report
     pub fn validate_report(&self, report: i8) -> Result<(), ExchangeError> {
-        if report < -50 || report > 50 {
+        if !(-50..=50).contains(&report) {
             return Err(ExchangeError::InvalidReport {
                 report: report.to_string(),
             });

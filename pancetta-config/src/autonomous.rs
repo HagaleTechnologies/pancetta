@@ -7,18 +7,13 @@ use crate::{ConfigError, ConfigResult, ConfigSection};
 use serde::{Deserialize, Serialize};
 
 /// How the operator picks its TX slot parity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SlotParitySetting {
     Even,
     Odd,
+    #[default]
     Auto,
-}
-
-impl Default for SlotParitySetting {
-    fn default() -> Self {
-        SlotParitySetting::Auto
-    }
 }
 
 /// Adaptive listen-cycle configuration.

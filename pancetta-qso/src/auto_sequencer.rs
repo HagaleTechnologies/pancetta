@@ -10,6 +10,7 @@ use crate::states::*;
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{sleep, Duration};
@@ -40,7 +41,7 @@ pub enum AutoSequencerError {
 }
 
 /// Auto sequencer configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AutoSequencerConfig {
     /// Enable automatic sequencing
     pub enabled: bool,
@@ -304,7 +305,10 @@ impl AutoSequencer {
     }
 
     /// Start the auto sequencer
-    pub async fn start(&self) -> Result<(), AutoSequencerError> {
+    ///
+    /// Takes an `Arc<Self>` so that all background tasks share the same state.
+    /// Previously, `self.clone()` created independent state maps per task.
+    pub async fn start(self: &Arc<Self>) -> Result<(), AutoSequencerError> {
         if !self.config.enabled {
             return Err(AutoSequencerError::NotEnabled);
         }
@@ -315,18 +319,18 @@ impl AutoSequencer {
         let receiver = self.qso_manager.subscribe();
         *self.event_receiver.write().await = Some(receiver);
 
-        // Start background tasks
-        let sequencer = self.clone();
+        // Start background tasks — all share the same Arc'd state
+        let sequencer = Arc::clone(self);
         tokio::spawn(async move {
             sequencer.event_loop().await;
         });
 
-        let sequencer = self.clone();
+        let sequencer = Arc::clone(self);
         tokio::spawn(async move {
             sequencer.cq_loop().await;
         });
 
-        let sequencer = self.clone();
+        let sequencer = Arc::clone(self);
         tokio::spawn(async move {
             sequencer.timeout_check_loop().await;
         });
@@ -758,11 +762,15 @@ impl AutoSequencer {
                 Some(SequenceAction::SendReport { qso_id, report })
             }
 
-            QsoState::SendingReport { .. }
-                if self.config.response_behavior.auto_send_confirmations =>
-            {
-                let report = self.get_received_snr(qso_id).await.unwrap_or(-15);
-                Some(SequenceAction::SendReportAck { qso_id, report })
+            // SendingReport means we sent our report (e.g., "K1DEF W1ABC -05").
+            // The correct next step is to WAIT for their R-report acknowledgment,
+            // NOT to send RR73 immediately. The old code sent RR73 here, skipping
+            // the R-report exchange entirely and completing QSOs prematurely.
+            QsoState::SendingReport { .. } => {
+                // No action — wait for the other station's R-report reply.
+                // When we receive it, the state will transition to
+                // WaitingForConfirmation, which is handled below.
+                None
             }
 
             QsoState::WaitingForConfirmation { .. }
@@ -980,37 +988,12 @@ impl AutoSequencer {
     }
 }
 
-impl Clone for AutoSequencer {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            qso_manager: self.qso_manager.clone(),
-            message_exchange: MessageExchange::new("".to_string()), // Will be reconfigured
-            active_sequences: RwLock::new(HashMap::new()),
-            event_receiver: RwLock::new(None),
-            cq_state: RwLock::new(CqState {
-                calling: false,
-                frequency: None,
-                call_count: 0,
-                last_cq_time: None,
-                cq_qso_id: None,
-            }),
-        }
-    }
-}
+// NOTE: AutoSequencer must NOT be cloned for spawning background tasks.
+// The old Clone impl created independent state for each clone, meaning
+// spawned tasks (event_loop, cq_loop, timeout_check_loop) would operate
+// on completely separate state maps. Use Arc<AutoSequencer> instead.
+// Clone is intentionally not implemented.
 
-impl Default for AutoSequencerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            cq_behavior: CqBehaviorConfig::default(),
-            response_behavior: ResponseBehaviorConfig::default(),
-            contest_behavior: None,
-            timing: SequenceTiming::default(),
-            signal_thresholds: SignalThresholds::default(),
-        }
-    }
-}
 
 impl Default for CqBehaviorConfig {
     fn default() -> Self {

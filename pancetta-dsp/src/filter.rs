@@ -208,14 +208,28 @@ impl IirFilter {
     }
 
     /// Design biquad coefficients for a filter section
-    fn design_biquad_section(config: &FilterConfig, _section: usize) -> Result<Coefficients<f32>> {
+    ///
+    /// For cascaded Butterworth filters, each section k (0-indexed) uses a different
+    /// pole angle: theta_k = PI * (2*k + 1) / (2 * order), giving Q = 1 / (2 * cos(theta_k)).
+    /// This ensures the overall cascade produces the correct Butterworth response.
+    fn design_biquad_section(config: &FilterConfig, section: usize) -> Result<Coefficients<f32>> {
         let fs = config.sample_rate.hz();
+
+        // Compute the per-section Q factor for Butterworth cascaded design.
+        // For an Nth-order Butterworth split into N/2 biquad sections,
+        // section k uses pole angle theta_k = PI * (2*k + 1) / (2 * N),
+        // and Q_k = 1 / (2 * cos(theta_k)).
+        let section_q = {
+            let order = config.order;
+            let theta_k = std::f32::consts::PI * (2 * section + 1) as f32 / (2 * order) as f32;
+            1.0 / (2.0 * theta_k.cos())
+        };
 
         match config.filter_type {
             FilterType::LowPass => {
                 let cutoff = config.cutoff_high.unwrap().hz();
                 Ok(
-                    Coefficients::<f32>::from_params(Type::LowPass, fs, cutoff, config.q_factor)
+                    Coefficients::<f32>::from_params(Type::LowPass, fs, cutoff, section_q)
                         .map_err(|e| FilterError::DesignFailed {
                             message: format!("Lowpass design failed: {:?}", e),
                         })?,
@@ -224,16 +238,18 @@ impl IirFilter {
             FilterType::HighPass => {
                 let cutoff = config.cutoff_high.unwrap().hz();
                 Ok(
-                    Coefficients::<f32>::from_params(Type::HighPass, fs, cutoff, config.q_factor)
+                    Coefficients::<f32>::from_params(Type::HighPass, fs, cutoff, section_q)
                         .map_err(|e| FilterError::DesignFailed {
-                        message: format!("Highpass design failed: {:?}", e),
-                    })?,
+                            message: format!("Highpass design failed: {:?}", e),
+                        })?,
                 )
             }
             FilterType::BandPass => {
                 let center_freq = (config.cutoff_low.unwrap() * config.cutoff_high.unwrap()).sqrt();
                 let bandwidth = config.cutoff_high.unwrap() - config.cutoff_low.unwrap();
-                let q = center_freq / bandwidth;
+                // Scale the bandwidth-derived Q by the per-section Butterworth Q factor
+                let base_q = center_freq / bandwidth;
+                let q = base_q * section_q / Q_BUTTERWORTH_F32;
 
                 Ok(
                     Coefficients::<f32>::from_params(Type::BandPass, fs, center_freq.hz(), q)
@@ -245,7 +261,9 @@ impl IirFilter {
             FilterType::BandStop => {
                 let center_freq = (config.cutoff_low.unwrap() * config.cutoff_high.unwrap()).sqrt();
                 let bandwidth = config.cutoff_high.unwrap() - config.cutoff_low.unwrap();
-                let q = center_freq / bandwidth;
+                // Scale the bandwidth-derived Q by the per-section Butterworth Q factor
+                let base_q = center_freq / bandwidth;
+                let q = base_q * section_q / Q_BUTTERWORTH_F32;
 
                 Ok(
                     Coefficients::<f32>::from_params(Type::Notch, fs, center_freq.hz(), q)
@@ -257,7 +275,7 @@ impl IirFilter {
             FilterType::AllPass => {
                 let cutoff = config.cutoff_high.unwrap_or(1000.0).hz();
                 Ok(
-                    Coefficients::<f32>::from_params(Type::AllPass, fs, cutoff, config.q_factor)
+                    Coefficients::<f32>::from_params(Type::AllPass, fs, cutoff, section_q)
                         .map_err(|e| FilterError::DesignFailed {
                             message: format!("Allpass design failed: {:?}", e),
                         })?,

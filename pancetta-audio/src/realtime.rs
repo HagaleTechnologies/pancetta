@@ -7,12 +7,11 @@ use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, Host, Stream, SupportedStreamConfig,
 };
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use crate::latency::CallbackTimer;
-use crate::ringbuffer_comm::AudioComm;
+use crate::ringbuffer_comm::{audio_comm_pair, AudioCommShared};
 
 /// Real-time audio processor configuration
 #[derive(Debug, Clone)]
@@ -83,39 +82,53 @@ impl RealtimeAudioProcessor {
     /// Start the real-time audio processing stream
     ///
     /// # Parameters
-    /// - `comm`: Lock-free communication channel for coordination with main thread
+    /// - `shared`: Shared atomic state for coordination with main thread
     ///
     /// # Returns
     /// Result indicating success or failure of stream initialization
-    pub fn start(&mut self, comm: Arc<AudioComm>) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn start(&mut self, shared: AudioCommShared) -> Result<(), Box<dyn std::error::Error>> {
         // Get supported stream configurations
-        let input_config = self.get_input_config()?;
+        let _input_config = self.get_input_config()?;
         let output_config = self.get_output_config()?;
 
         println!(
             "Using config - Sample Rate: {}Hz, Buffer Size: {} frames",
-            input_config.sample_rate().0,
+            output_config.sample_rate().0,
             self.config.buffer_size
         );
 
-        // Create the real-time audio callback
-        let comm_clone = comm.clone();
+        // Create the real-time audio callback.
+        // Phase is captured as a local variable in the closure — no static mut needed.
+        let shared_clone = shared.clone();
+        let sample_rate = self.config.sample_rate as f32;
+
+        // Create a latency producer for this output stream.
+        let (mut latency_producer, _latency_consumer) = audio_comm_pair(64, 256);
+
+        let mut phase: f32 = 0.0;
+
         let stream = self.output_device.build_output_stream(
             &output_config.into(),
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 // Start latency measurement
                 let timer = CallbackTimer::start();
 
-                // Process audio in real-time (currently pass-through)
-                Self::process_audio_callback(data);
+                // Generate simple test tone (1kHz sine wave)
+                let phase_increment = 2.0 * std::f32::consts::PI * 1000.0 / sample_rate;
+                for sample in data.iter_mut() {
+                    *sample = phase.sin() * 0.1; // Low amplitude test tone
+                    phase += phase_increment;
+                    if phase >= 2.0 * std::f32::consts::PI {
+                        phase -= 2.0 * std::f32::consts::PI;
+                    }
+                }
 
                 // Record latency measurement
                 let latency_ns = timer.elapsed_ns();
-                // Use non-blocking latency recording
-                let _ = comm_clone.push_latency(latency_ns);
+                let _ = latency_producer.push_latency(latency_ns);
 
                 // Check for shutdown signal
-                if comm_clone.should_stop() {
+                if shared_clone.should_stop() {
                     return;
                 }
             },
@@ -138,29 +151,6 @@ impl RealtimeAudioProcessor {
         if let Some(stream) = self.stream.take() {
             drop(stream);
             println!("Audio stream stopped");
-        }
-    }
-
-    /// Real-time audio processing callback (allocation-free)
-    ///
-    /// This is the critical path that must complete in <1ms.
-    /// No allocations, no blocking operations, minimal processing.
-    fn process_audio_callback(output: &mut [f32]) {
-        // Currently implement simple pass-through for POC
-        // In the future, this will process FT8 signals
-
-        // Generate simple test tone for now (1kHz sine wave)
-        static mut PHASE: f32 = 0.0;
-        let phase_increment = 2.0 * std::f32::consts::PI * 1000.0 / 48000.0; // 1kHz at 48kHz
-
-        unsafe {
-            for sample in output.iter_mut() {
-                *sample = PHASE.sin() * 0.1; // Low amplitude test tone
-                PHASE += phase_increment;
-                if PHASE >= 2.0 * std::f32::consts::PI {
-                    PHASE -= 2.0 * std::f32::consts::PI;
-                }
-            }
         }
     }
 
@@ -219,7 +209,8 @@ pub fn run_latency_stress_test(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use crate::latency::LatencyMeasurer;
 
-    let comm = Arc::new(AudioComm::new(128, 1000));
+    let (_producer, mut consumer) = audio_comm_pair(8192, 1000);
+    let shared = consumer.shared.clone();
     let mut latency_measurer = LatencyMeasurer::new(1000, 1_000_000); // 1ms target
 
     println!(
@@ -232,13 +223,13 @@ pub fn run_latency_stress_test(
     );
 
     // Start audio processing
-    processor.start(comm.clone())?;
+    processor.start(shared.clone())?;
 
     // Collect latency measurements
     let test_start = std::time::Instant::now();
     while test_start.elapsed().as_secs() < test_duration_seconds {
         // Collect latency measurements from the ringbuffer
-        while let Some(latency_ns) = comm.pop_latency() {
+        while let Some(latency_ns) = consumer.pop_latency() {
             latency_measurer.record_latency(latency_ns);
         }
 
@@ -258,11 +249,11 @@ pub fn run_latency_stress_test(
     }
 
     // Stop audio and collect final measurements
-    comm.stop();
+    shared.stop();
     processor.stop();
 
     // Collect any remaining measurements
-    while let Some(latency_ns) = comm.pop_latency() {
+    while let Some(latency_ns) = consumer.pop_latency() {
         latency_measurer.record_latency(latency_ns);
     }
 
@@ -272,10 +263,10 @@ pub fn run_latency_stress_test(
 
     // Validate if we meet the <1ms requirement
     if final_stats.meeting_target {
-        println!("\n✅ SUCCESS: Audio system consistently achieves <1ms latency!");
+        println!("\nSUCCESS: Audio system consistently achieves <1ms latency!");
         println!("   The Pancetta real-time architecture is VIABLE.");
     } else {
-        println!("\n❌ FAILURE: Audio system does not consistently achieve <1ms latency.");
+        println!("\nFAILURE: Audio system does not consistently achieve <1ms latency.");
         println!("   The Pancetta architecture needs fundamental changes.");
         return Err("Latency requirement not met".into());
     }

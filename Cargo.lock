@@ -3029,7 +3029,6 @@ dependencies = [
  "anyhow",
  "approx",
  "bitvec",
- "bumpalo",
  "cc",
  "chrono",
  "cpal",

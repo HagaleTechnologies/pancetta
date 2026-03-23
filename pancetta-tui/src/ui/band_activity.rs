@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use super::{create_panel_block, format_distance, get_snr_color};
-use crate::app::{ActivePanel, App, DecodedMessage};
+use crate::app::{ActivePanel, App, DecodedMessageView};
 
 pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let is_active = matches!(app.active_panel, ActivePanel::BandActivity);
@@ -116,7 +116,7 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
     Ok(())
 }
 
-fn create_message_row<'a>(msg: &'a DecodedMessage, app: &App) -> Row<'a> {
+fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
     let time_str = app.config.ui.time_format.format_time(msg.timestamp);
     let time_short = if time_str.len() > 8 {
         time_str[time_str.len() - 8..].to_string()
@@ -177,7 +177,7 @@ fn create_message_row<'a>(msg: &'a DecodedMessage, app: &App) -> Row<'a> {
 }
 
 /// Helper to determine if a message is interesting (CQ, directed to us, etc.)
-pub fn is_interesting_message(msg: &DecodedMessage, our_call: &str) -> bool {
+pub fn is_interesting_message(msg: &DecodedMessageView, our_call: &str) -> bool {
     let message_upper = msg.message.to_uppercase();
     let our_call_upper = our_call.to_uppercase();
 

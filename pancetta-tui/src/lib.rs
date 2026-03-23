@@ -12,7 +12,7 @@ pub mod widgets;
 
 // Re-export main types for convenience
 pub use app::{
-    ActivePanel, App, AutonomousStatus, DecodedMessage, DevicePanel, DeviceSelectionState,
+    ActivePanel, App, AutonomousStatus, DecodedMessageView, DevicePanel, DeviceSelectionState,
     DxStation, QsoStatus, StationInfo,
 };
 pub use config::{Config, Theme};

@@ -142,7 +142,7 @@ impl Ft8Encoder {
         from_callsign: &str,
         report_db: i8,
     ) -> Ft8Result<[u8; NUM_SYMBOLS]> {
-        if report_db < MIN_SIGNAL_REPORT || report_db > MAX_SIGNAL_REPORT {
+        if !(MIN_SIGNAL_REPORT..=MAX_SIGNAL_REPORT).contains(&report_db) {
             return Err(Ft8Error::MessageDecodingError(format!(
                 "Signal report {} dB out of range ({} to {})",
                 report_db, MIN_SIGNAL_REPORT, MAX_SIGNAL_REPORT
@@ -484,7 +484,7 @@ impl Ft8Encoder {
         class_letter: char,
         section: &str,
     ) -> Ft8Result<[u8; NUM_SYMBOLS]> {
-        if n_transmitters < 1 || n_transmitters > 32 {
+        if !(1..=32).contains(&n_transmitters) {
             return Err(Ft8Error::MessageDecodingError(format!(
                 "Field Day transmitter count must be 1-32, got {}",
                 n_transmitters
@@ -738,7 +738,7 @@ pub fn pack28(callsign: &str) -> Ft8Result<(u32, u8)> {
 /// - Positions 3-5: " ABCDEFGHIJKLMNOPQRSTUVWXYZ" (27)
 fn pack_basecall(callsign: &str) -> Option<u32> {
     let length = callsign.len();
-    if length < 3 || length > 6 {
+    if !(3..=6).contains(&length) {
         return None;
     }
 
@@ -1537,11 +1537,16 @@ mod tests {
     #[test]
     fn test_ft4_encode_cq() {
         let mut encoder = Ft8Encoder::with_protocol(ProtocolParams::ft4());
-        let symbols = encoder.encode_message_protocol("CQ W1ABC FN42", None).unwrap();
+        let symbols = encoder
+            .encode_message_protocol("CQ W1ABC FN42", None)
+            .unwrap();
 
         // FT4: 105 symbols, values 0-3
         assert_eq!(symbols.len(), 105);
-        assert!(symbols.iter().all(|&s| s < 4), "All FT4 symbols must be 0-3");
+        assert!(
+            symbols.iter().all(|&s| s < 4),
+            "All FT4 symbols must be 0-3"
+        );
 
         // Verify sync arrays at correct positions
         // Sync group 0 at positions 1-4: [0, 1, 3, 2]
@@ -1561,7 +1566,9 @@ mod tests {
     #[test]
     fn test_ft4_encode_sample_count() {
         let mut encoder = Ft8Encoder::with_protocol(ProtocolParams::ft4());
-        let symbols = encoder.encode_message_protocol("CQ W1ABC FN42", None).unwrap();
+        let symbols = encoder
+            .encode_message_protocol("CQ W1ABC FN42", None)
+            .unwrap();
 
         // Modulate and verify sample count
         let mut modulator = crate::modulator::Ft8Modulator::with_pulse_shape(
@@ -1586,8 +1593,8 @@ mod tests {
     fn test_ft4_xor_symmetry() {
         // Verify that XOR scrambling → CRC → LDPC → decode → un-XOR → parse
         // gives back the original message for various message types.
-        use crate::protocol::{FT4_XOR_SEQUENCE, ProtocolParams};
-        use crate::message::{PAYLOAD_BITS, CRC_BITS, calculate_crc14};
+        use crate::message::{calculate_crc14, CRC_BITS, PAYLOAD_BITS};
+        use crate::protocol::{ProtocolParams, FT4_XOR_SEQUENCE};
 
         let mut encoder = Ft8Encoder::new(); // FT8 encoder to get raw payloads
 
@@ -1602,7 +1609,8 @@ mod tests {
 
         for msg in &messages {
             // Get the raw 77-bit payload (as 10 bytes, without XOR)
-            let payload = encoder.try_encode_standard(msg)
+            let payload = encoder
+                .try_encode_standard(msg)
                 .or_else(|_| encoder.encode_free_text(msg))
                 .unwrap();
 
@@ -1645,13 +1653,19 @@ mod tests {
 
             assert_eq!(
                 unscrambled_bits, original_bits,
-                "XOR round-trip failed for '{}'", msg
+                "XOR round-trip failed for '{}'",
+                msg
             );
 
             // Also verify the message parser can parse the unscrambled payload
             let parser = crate::message::MessageParser::new();
             let parsed = parser.parse_payload(&unscrambled_bits);
-            assert!(parsed.is_ok(), "Failed to parse unscrambled payload for '{}': {:?}", msg, parsed);
+            assert!(
+                parsed.is_ok(),
+                "Failed to parse unscrambled payload for '{}': {:?}",
+                msg,
+                parsed
+            );
         }
     }
 

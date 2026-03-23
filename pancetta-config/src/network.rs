@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Network services configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct NetworkConfig {
     /// PSKReporter service configuration
     pub psk_reporter: PskReporterConfig,
@@ -124,7 +124,7 @@ pub struct PskReporterFilters {
 }
 
 /// Geographic filtering configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct GeographicFilters {
     /// Include specific DXCC entities
     pub include_dxcc: Vec<u16>,
@@ -263,7 +263,7 @@ pub struct QrzLogbookConfig {
 }
 
 /// ARRL Logbook of the World configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct LotwConfig {
     /// Enable LOTW integration
     pub enabled: bool,
@@ -288,7 +288,7 @@ pub struct LotwConfig {
 }
 
 /// LOTW certificate configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct LotwCertificateConfig {
     /// Certificate file path
     pub cert_file: Option<String>,
@@ -379,7 +379,7 @@ pub struct LotwDownloadConfig {
 }
 
 /// TQSL (Trusted QSL) integration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct TqslConfig {
     /// TQSL executable path
     pub executable_path: Option<String>,
@@ -462,7 +462,7 @@ pub enum ImageQuality {
 }
 
 /// eQSL card configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct EqslCardConfig {
     /// Default card template
     pub default_template: Option<String>,
@@ -676,7 +676,7 @@ pub struct WsprFilteringConfig {
 }
 
 /// WSPR analysis configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct WsprAnalysisConfig {
     /// Propagation analysis
     pub propagation_analysis: bool,
@@ -692,7 +692,7 @@ pub struct WsprAnalysisConfig {
 }
 
 /// DX Cluster configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct DxClusterConfig {
     /// Enable DX cluster connection
     pub enabled: bool,
@@ -1226,25 +1226,6 @@ pub struct CustomAuthConfig {
     pub credentials: HashMap<String, String>,
 }
 
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            psk_reporter: PskReporterConfig::default(),
-            qrz: QrzConfig::default(),
-            lotw: LotwConfig::default(),
-            eqsl: EqslConfig::default(),
-            clublog: ClublogConfig::default(),
-            wspr: WsprConfig::default(),
-            dx_cluster: DxClusterConfig::default(),
-            web_api: WebApiConfig::default(),
-            proxy: ProxyConfig::default(),
-            tls: TlsConfig::default(),
-            rate_limiting: RateLimitingConfig::default(),
-            reliability: ReliabilityConfig::default(),
-            custom_services: HashMap::new(),
-        }
-    }
-}
 
 impl Default for PskReporterConfig {
     fn default() -> Self {
@@ -1296,19 +1277,6 @@ impl Default for PskReporterFilters {
     }
 }
 
-impl Default for GeographicFilters {
-    fn default() -> Self {
-        Self {
-            include_dxcc: vec![],
-            exclude_dxcc: vec![],
-            include_itu_zones: vec![],
-            exclude_itu_zones: vec![],
-            include_cq_zones: vec![],
-            exclude_cq_zones: vec![],
-            distance: DistanceFilters::default(),
-        }
-    }
-}
 
 impl Default for DistanceFilters {
     fn default() -> Self {
@@ -1390,30 +1358,7 @@ impl Default for QrzLogbookConfig {
     }
 }
 
-impl Default for LotwConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            username: None,
-            password_encrypted: None,
-            certificate: LotwCertificateConfig::default(),
-            upload: LotwUploadConfig::default(),
-            download: LotwDownloadConfig::default(),
-            tqsl: TqslConfig::default(),
-        }
-    }
-}
 
-impl Default for LotwCertificateConfig {
-    fn default() -> Self {
-        Self {
-            cert_file: None,
-            key_file: None,
-            password_encrypted: None,
-            auto_renewal: CertRenewalConfig::default(),
-        }
-    }
-}
 
 impl Default for CertRenewalConfig {
     fn default() -> Self {
@@ -1458,16 +1403,6 @@ impl Default for LotwDownloadConfig {
     }
 }
 
-impl Default for TqslConfig {
-    fn default() -> Self {
-        Self {
-            executable_path: None,
-            station_location: None,
-            command_options: vec![],
-            working_directory: None,
-        }
-    }
-}
 
 impl Default for EqslConfig {
     fn default() -> Self {
@@ -1505,15 +1440,6 @@ impl Default for EqslDownloadConfig {
     }
 }
 
-impl Default for EqslCardConfig {
-    fn default() -> Self {
-        Self {
-            default_template: None,
-            customization: CardCustomizationConfig::default(),
-            storage: CardStorageConfig::default(),
-        }
-    }
-}
 
 impl Default for CardCustomizationConfig {
     fn default() -> Self {
@@ -1620,28 +1546,7 @@ impl Default for WsprFilteringConfig {
     }
 }
 
-impl Default for WsprAnalysisConfig {
-    fn default() -> Self {
-        Self {
-            propagation_analysis: false,
-            band_comparison: false,
-            antenna_analysis: false,
-            export_analysis: false,
-        }
-    }
-}
 
-impl Default for DxClusterConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            servers: vec![],
-            connection: ClusterConnectionConfig::default(),
-            filtering: ClusterFilteringConfig::default(),
-            alerts: ClusterAlertConfig::default(),
-        }
-    }
-}
 
 impl Default for ClusterConnectionConfig {
     fn default() -> Self {

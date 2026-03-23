@@ -164,6 +164,7 @@ pub mod states;
 pub mod statistics;
 
 // Common error type for the entire library
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Common error types for the QSO library
@@ -301,7 +302,11 @@ impl QsoSystemBuilder {
             let mut auto_config = self.auto_config.unwrap_or_default();
             auto_config.enabled = true;
             let our_callsign = "W1ABC".to_string(); // TODO: Get from qso_manager
-            let sequencer = AutoSequencer::new(auto_config, qso_manager.clone(), our_callsign);
+            let sequencer = Arc::new(AutoSequencer::new(
+                auto_config,
+                qso_manager.clone(),
+                our_callsign,
+            ));
             sequencer.start().await?;
             Some(sequencer)
         } else {
@@ -337,7 +342,7 @@ pub struct QsoSystem {
     pub qso_manager: QsoManager,
 
     /// Auto sequencer instance (if enabled)
-    pub auto_sequencer: Option<AutoSequencer>,
+    pub auto_sequencer: Option<Arc<AutoSequencer>>,
 
     /// Logger instance (if enabled)
     pub logger: Option<QsoLogger>,

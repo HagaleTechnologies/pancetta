@@ -246,7 +246,7 @@ pub struct FrequencyConfig {
 }
 
 /// Memory channel configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct MemoryChannelConfig {
     /// Enable memory channel control
     pub enabled: bool,
@@ -657,7 +657,7 @@ pub struct TimingConfig {
 }
 
 /// Rig-specific parameters
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct RigParametersConfig {
     /// Rig identification string
     pub rig_id: Option<String>,
@@ -676,7 +676,7 @@ pub struct RigParametersConfig {
 }
 
 /// Calibration configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CalibrationConfig {
     /// Frequency calibration offset in Hz
     pub frequency_offset: i32,
@@ -705,7 +705,7 @@ pub struct CalibrationPoint {
 }
 
 /// Rig quirks and workarounds
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct QuirksConfig {
     /// Commands that need special handling
     pub special_commands: HashMap<String, String>,
@@ -793,16 +793,6 @@ impl Default for FrequencyConfig {
     }
 }
 
-impl Default for MemoryChannelConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            auto_save: false,
-            database_file: None,
-            quick_memories: vec![],
-        }
-    }
-}
 
 impl Default for FrequencyLimitsConfig {
     fn default() -> Self {
@@ -926,38 +916,8 @@ impl Default for TimingConfig {
     }
 }
 
-impl Default for RigParametersConfig {
-    fn default() -> Self {
-        Self {
-            rig_id: None,
-            firmware_version: None,
-            extended_features: vec![],
-            calibration: CalibrationConfig::default(),
-            quirks: QuirksConfig::default(),
-        }
-    }
-}
 
-impl Default for CalibrationConfig {
-    fn default() -> Self {
-        Self {
-            frequency_offset: 0,
-            power_calibration: vec![],
-            s_meter_calibration: vec![],
-            swr_calibration: vec![],
-        }
-    }
-}
 
-impl Default for QuirksConfig {
-    fn default() -> Self {
-        Self {
-            special_commands: HashMap::new(),
-            workarounds: vec![],
-            timing_adjustments: HashMap::new(),
-        }
-    }
-}
 
 impl ConfigSection for RigConfig {
     fn validate_section(&self) -> ConfigResult<()> {

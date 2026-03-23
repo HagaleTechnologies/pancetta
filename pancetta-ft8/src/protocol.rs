@@ -100,12 +100,7 @@ pub const FT4_COSTAS_2: [u8; 4] = [2, 3, 1, 0];
 pub const FT4_COSTAS_3: [u8; 4] = [3, 2, 0, 1];
 
 /// FT4 Costas arrays (four different patterns)
-static FT4_COSTAS_ARRAYS: [&[u8]; 4] = [
-    &FT4_COSTAS_0,
-    &FT4_COSTAS_1,
-    &FT4_COSTAS_2,
-    &FT4_COSTAS_3,
-];
+static FT4_COSTAS_ARRAYS: [&[u8]; 4] = [&FT4_COSTAS_0, &FT4_COSTAS_1, &FT4_COSTAS_2, &FT4_COSTAS_3];
 
 /// FT4 sync positions: 1-4, 34-37, 67-70, 100-103
 /// Full layout: R S4₀ D29 S4₁ D29 S4₂ D29 S4₃ R
@@ -117,9 +112,7 @@ static FT4_COSTAS_POSITIONS: [usize; 4] = [1, 34, 67, 100];
 static FT4_DATA_RANGES: [Range<usize>; 3] = [5..34, 38..67, 71..100];
 
 /// FT4 XOR scrambling sequence (applied to payload before CRC)
-pub const FT4_XOR_SEQUENCE: [u8; 10] = [
-    0x4A, 0x5E, 0x89, 0xB4, 0xB0, 0x8A, 0x79, 0x55, 0xBE, 0x28,
-];
+pub const FT4_XOR_SEQUENCE: [u8; 10] = [0x4A, 0x5E, 0x89, 0xB4, 0xB0, 0x8A, 0x79, 0x55, 0xBE, 0x28];
 
 // ============================================================================
 // FT2 constants (experimental — Decodium layout)

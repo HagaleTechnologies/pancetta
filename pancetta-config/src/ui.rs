@@ -623,7 +623,7 @@ pub struct PanelVisibilityConfig {
 }
 
 /// Accessibility configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct AccessibilityConfig {
     /// High contrast mode
     pub high_contrast: bool,
@@ -719,7 +719,7 @@ pub struct SoundFeedbackConfig {
 }
 
 /// Motion sensitivity configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct MotionSensitivityConfig {
     /// Reduce animations
     pub reduce_animations: bool,
@@ -821,7 +821,7 @@ pub struct AnimationPerformanceConfig {
 }
 
 /// Toolbar configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ToolbarConfig {
     /// Available toolbars
     pub toolbars: Vec<ToolbarDefinition>,
@@ -1664,19 +1664,6 @@ impl Default for PanelVisibilityConfig {
     }
 }
 
-impl Default for AccessibilityConfig {
-    fn default() -> Self {
-        Self {
-            high_contrast: false,
-            large_fonts: false,
-            screen_reader: false,
-            keyboard_navigation: KeyboardNavigationConfig::default(),
-            visual_indicators: VisualIndicatorConfig::default(),
-            sound_feedback: SoundFeedbackConfig::default(),
-            motion_sensitivity: MotionSensitivityConfig::default(),
-        }
-    }
-}
 
 impl Default for KeyboardNavigationConfig {
     fn default() -> Self {
@@ -1714,16 +1701,6 @@ impl Default for SoundFeedbackConfig {
     }
 }
 
-impl Default for MotionSensitivityConfig {
-    fn default() -> Self {
-        Self {
-            reduce_animations: false,
-            disable_auto_scroll: false,
-            disable_parallax: false,
-            static_backgrounds: false,
-        }
-    }
-}
 
 impl Default for AnimationConfig {
     fn default() -> Self {
@@ -1771,15 +1748,6 @@ impl Default for AnimationPerformanceConfig {
     }
 }
 
-impl Default for ToolbarConfig {
-    fn default() -> Self {
-        Self {
-            toolbars: vec![],
-            visibility: ToolbarVisibilityConfig::default(),
-            customization: ToolbarCustomizationConfig::default(),
-        }
-    }
-}
 
 impl Default for ToolbarVisibilityConfig {
     fn default() -> Self {

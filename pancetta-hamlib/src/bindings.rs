@@ -4,6 +4,7 @@
 //! These bindings are wrapped by higher-level safe interfaces in other modules.
 
 #![allow(missing_docs)]
+#![allow(clippy::missing_safety_doc)]
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_long, c_longlong, c_uint, c_void};

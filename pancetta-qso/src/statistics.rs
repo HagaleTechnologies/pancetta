@@ -2176,16 +2176,16 @@ impl StatisticsCalculator {
         let freq_mhz = frequency / 1_000_000.0;
 
         match band {
-            "20M" => freq_mhz >= 14.0 && freq_mhz <= 14.35,
-            "40M" => freq_mhz >= 7.0 && freq_mhz <= 7.3,
-            "80M" => freq_mhz >= 3.5 && freq_mhz <= 4.0,
-            "160M" => freq_mhz >= 1.8 && freq_mhz <= 2.0,
-            "10M" => freq_mhz >= 28.0 && freq_mhz <= 29.7,
-            "15M" => freq_mhz >= 21.0 && freq_mhz <= 21.45,
-            "17M" => freq_mhz >= 18.068 && freq_mhz <= 18.168,
-            "12M" => freq_mhz >= 24.89 && freq_mhz <= 24.99,
-            "6M" => freq_mhz >= 50.0 && freq_mhz <= 54.0,
-            "2M" => freq_mhz >= 144.0 && freq_mhz <= 148.0,
+            "20M" => (14.0..=14.35).contains(&freq_mhz),
+            "40M" => (7.0..=7.3).contains(&freq_mhz),
+            "80M" => (3.5..=4.0).contains(&freq_mhz),
+            "160M" => (1.8..=2.0).contains(&freq_mhz),
+            "10M" => (28.0..=29.7).contains(&freq_mhz),
+            "15M" => (21.0..=21.45).contains(&freq_mhz),
+            "17M" => (18.068..=18.168).contains(&freq_mhz),
+            "12M" => (24.89..=24.99).contains(&freq_mhz),
+            "6M" => (50.0..=54.0).contains(&freq_mhz),
+            "2M" => (144.0..=148.0).contains(&freq_mhz),
             _ => true, // Unknown band, assume valid
         }
     }

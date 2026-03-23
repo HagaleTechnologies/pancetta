@@ -7,13 +7,13 @@ use crate::{
     converter::{ResamplerFactory, SampleRateConverter},
     device::AudioDeviceManager,
     error::{AudioError, AudioResult},
-    ringbuffer_comm::{AudioComm, AudioSample},
+    ringbuffer_comm::{AudioCommShared, AudioConsumer},
     stream::{AudioStreamManager, StreamConfig, StreamStatistics},
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Audio processor configuration
 #[derive(Debug, Clone)]
@@ -122,7 +122,10 @@ pub struct AudioProcessor {
     stream_manager: AudioStreamManager,
     resampler: Option<Box<dyn SampleRateConverter + Send>>,
     device_manager: AudioDeviceManager,
-    comm: Arc<AudioComm>,
+    /// Consumer half of the lock-free ring buffer
+    consumer: Option<AudioConsumer>,
+    /// Shared atomic state
+    shared: AudioCommShared,
     statistics: Arc<RwLock<AudioProcessingStats>>,
     start_time: Option<Instant>,
 }
@@ -132,7 +135,7 @@ impl AudioProcessor {
     pub async fn new(config: AudioProcessorConfig) -> AudioResult<Self> {
         let device_manager = AudioDeviceManager::new()?;
         let stream_manager = AudioStreamManager::new(config.stream_config.clone())?;
-        let comm = stream_manager.get_comm();
+        let shared = stream_manager.get_shared();
 
         // Create sample rate converter if needed
         let resampler = if ResamplerFactory::needs_conversion(
@@ -172,7 +175,8 @@ impl AudioProcessor {
             stream_manager,
             resampler,
             device_manager,
-            comm,
+            consumer: None,
+            shared,
             statistics,
             start_time: None,
         })
@@ -188,6 +192,11 @@ impl AudioProcessor {
 
         // Start audio streams
         self.stream_manager.start()?;
+
+        // Take the consumer from the stream manager (it was recreated in start)
+        self.consumer = self.stream_manager.take_consumer();
+        self.shared = self.stream_manager.get_shared();
+
         self.start_time = Some(Instant::now());
 
         // Start statistics update task if enabled
@@ -225,50 +234,44 @@ impl AudioProcessor {
         self.stream_manager.is_running()
     }
 
-    /// Get processed audio samples
+    /// Get processed audio samples as raw f32 vectors.
     ///
-    /// Returns samples converted to the target sample rate and ready for DSP processing
-    pub async fn get_processed_samples(&mut self) -> AudioResult<Vec<AudioSample>> {
-        let mut processed_samples = Vec::new();
+    /// Returns samples converted to the target sample rate and ready for DSP processing.
+    pub async fn get_processed_samples(&mut self) -> AudioResult<Option<Vec<f32>>> {
+        let consumer = match self.consumer {
+            Some(ref mut c) => c,
+            None => return Ok(None),
+        };
 
-        // Get raw samples from stream
-        while let Some(raw_sample) = self.comm.pop_audio_sample() {
-            // Apply sample rate conversion if needed
-            let converted_sample = if let Some(ref mut resampler) = self.resampler {
-                let start_time = Instant::now();
-                let converted_data = resampler.process(&raw_sample.data)?;
-                let conversion_time = start_time.elapsed();
-
-                // Update conversion statistics
-                self.update_conversion_stats(
-                    raw_sample.data.len() as u64,
-                    conversion_time.as_micros() as u64,
-                )
-                .await;
-
-                AudioSample {
-                    data: converted_data,
-                    timestamp: raw_sample.timestamp,
-                    sample_rate: self.config.target_sample_rate,
-                    channels: raw_sample.channels,
-                }
-            } else {
-                raw_sample
-            };
-
-            // Check buffer latency
-            let sample_latency_ms = converted_sample.timestamp.elapsed().as_millis() as f64;
-            if sample_latency_ms > self.config.max_buffer_latency_ms {
-                warn!(
-                    "High buffer latency: {:.2}ms > {:.2}ms",
-                    sample_latency_ms, self.config.max_buffer_latency_ms
-                );
-            }
-
-            processed_samples.push(converted_sample);
+        let available = consumer.audio_samples_available();
+        if available == 0 {
+            return Ok(None);
         }
 
-        Ok(processed_samples)
+        // Read all available samples into a temporary buffer
+        let mut raw = vec![0.0f32; available];
+        let read = consumer.pop_audio_slice(&mut raw);
+        raw.truncate(read);
+
+        if raw.is_empty() {
+            return Ok(None);
+        }
+
+        // Apply sample rate conversion if needed
+        let output = if let Some(ref mut resampler) = self.resampler {
+            let start_time = Instant::now();
+            let converted = resampler.process(&raw)?;
+            let conversion_time = start_time.elapsed();
+
+            self.update_conversion_stats(raw.len() as u64, conversion_time.as_micros() as u64)
+                .await;
+
+            converted
+        } else {
+            raw
+        };
+
+        Ok(Some(output))
     }
 
     /// Get current processing statistics
@@ -344,11 +347,8 @@ impl AudioProcessor {
             loop {
                 interval_timer.tick().await;
 
-                // This is a simplified version - in a real implementation,
-                // you'd get updated stats from the stream manager
                 let mut stats = statistics.write().await;
                 stats.last_update = Instant::now();
-                // Update other statistics here
             }
         });
     }
@@ -374,8 +374,6 @@ impl AudioProcessor {
 
 impl Drop for AudioProcessor {
     fn drop(&mut self) {
-        // Best effort to stop streams in drop
-        // Note: This is simplified to avoid async in Drop
         let _ = self.stream_manager.stop();
     }
 }

@@ -7,9 +7,8 @@
 //! - Real-time audio generation with precise timing
 
 use crate::{
-    protocol::ProtocolParams,
-    Ft8Error, Ft8Result, BASE_FREQUENCY, MESSAGE_DURATION, NUM_SYMBOLS, NUM_TONES, SAMPLE_RATE,
-    SYMBOL_DURATION, TONE_SPACING,
+    protocol::ProtocolParams, Ft8Error, Ft8Result, BASE_FREQUENCY, MESSAGE_DURATION, NUM_SYMBOLS,
+    NUM_TONES, SAMPLE_RATE, SYMBOL_DURATION, TONE_SPACING,
 };
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -30,22 +29,16 @@ pub const MAX_FREQUENCY_DEVIATION: f64 = 2500.0;
 pub const DEFAULT_BT: f64 = 2.0;
 
 /// Pulse shaping mode for FT8 modulation
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum PulseShape {
-    /// Rectangular pulse (pure CPFSK, no smoothing)
+    /// Rectangular pulse (pure CPFSK, no smoothing).
+    /// Default for decoder compatibility; GFSK produces cleaner spectral
+    /// output but requires a matched decoder (not yet implemented).
+    #[default]
     Rectangular,
     /// Gaussian pulse shaping with configurable BT product
     /// BT=2.0 is the FT8 standard (close to rectangular but with smooth transitions)
     Gaussian { bt: f64 },
-}
-
-impl Default for PulseShape {
-    fn default() -> Self {
-        // Rectangular is the default for decoder compatibility.
-        // GFSK produces cleaner spectral output but requires a
-        // matched decoder (not yet implemented).
-        PulseShape::Rectangular
-    }
 }
 
 /// FT8 audio modulator for generating transmission signals
@@ -91,14 +84,14 @@ impl Ft8Modulator {
             )));
         }
 
-        if base_frequency < 200.0 || base_frequency > 4000.0 {
+        if !(200.0..=4000.0).contains(&base_frequency) {
             return Err(Ft8Error::ConfigError(format!(
                 "Base frequency {} Hz out of range (200-4000 Hz)",
                 base_frequency
             )));
         }
 
-        if tx_power < 0.0 || tx_power > 1.0 {
+        if !(0.0..=1.0).contains(&tx_power) {
             return Err(Ft8Error::ConfigError(format!(
                 "TX power {} out of range (0.0-1.0)",
                 tx_power
@@ -197,9 +190,7 @@ impl Ft8Modulator {
         for (i, &freq) in freq_trajectory.iter().enumerate() {
             let angular_freq = 2.0 * PI * freq / self.sample_rate as f64;
             self.phase_accumulator += angular_freq;
-            if self.phase_accumulator > 2.0 * PI {
-                self.phase_accumulator -= 2.0 * PI;
-            }
+            self.phase_accumulator %= 2.0 * PI;
 
             let mut sample = (self.tx_power * self.phase_accumulator.sin()) as f32;
 
@@ -263,9 +254,7 @@ impl Ft8Modulator {
         for (i, &freq) in freq_trajectory.iter().enumerate() {
             let angular_freq = 2.0 * PI * freq / self.sample_rate as f64;
             self.phase_accumulator += angular_freq;
-            if self.phase_accumulator > 2.0 * PI {
-                self.phase_accumulator -= 2.0 * PI;
-            }
+            self.phase_accumulator %= 2.0 * PI;
 
             let mut sample = (self.tx_power * self.phase_accumulator.sin()) as f32;
 
@@ -476,7 +465,7 @@ impl Ft8Modulator {
 
     /// Set transmission power level
     pub fn set_tx_power(&mut self, power: f64) -> Ft8Result<()> {
-        if power < 0.0 || power > 1.0 {
+        if !(0.0..=1.0).contains(&power) {
             return Err(Ft8Error::ConfigError(format!(
                 "TX power {} out of range (0.0-1.0)",
                 power
@@ -488,7 +477,7 @@ impl Ft8Modulator {
 
     /// Set base frequency offset
     pub fn set_base_frequency(&mut self, frequency: f64) -> Ft8Result<()> {
-        if frequency < 200.0 || frequency > 4000.0 {
+        if !(200.0..=4000.0).contains(&frequency) {
             return Err(Ft8Error::ConfigError(format!(
                 "Base frequency {} Hz out of range (200-4000 Hz)",
                 frequency
@@ -610,8 +599,7 @@ pub fn modulate_multi_tx(
     // Modulate each signal independently
     let mut signals: Vec<Vec<f32>> = Vec::with_capacity(items.len());
     for item in items {
-        let mut modulator =
-            Ft8Modulator::new(sample_rate, base_frequency, tx_power)?;
+        let mut modulator = Ft8Modulator::new(sample_rate, base_frequency, tx_power)?;
         let audio = modulator.modulate_symbols_protocol(
             item.symbols,
             item.frequency_offset,

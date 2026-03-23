@@ -12,8 +12,6 @@ rustfft = "6.4"
 # Numeric operations with SIMD optimization
 num-complex = "0.4"
 num-traits = "0.2"
-# Memory management and allocation control
-bumpalo = "3.20"
 # Bit manipulation for FT8 protocol
 bitvec = "1.0"
 # Time handling

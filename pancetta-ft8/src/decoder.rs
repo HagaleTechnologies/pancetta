@@ -12,13 +12,11 @@
 use crate::{
     message::{calculate_crc14, DecodedMessage, MessageParser, CRC_BITS, PAYLOAD_BITS},
     protocol::ProtocolParams,
-    signal_processing::{BandpassFilter, FftProcessor, SymbolCorrelator, WindowFunction},
-    sync::TimeSync,
+    signal_processing::{FftProcessor, WindowFunction},
     DecodingMetrics, Ft8Error, Ft8Result, MessageHandler, NullMessageHandler, Protocol,
-    NUM_SYMBOLS, NUM_TONES, SAMPLE_RATE, SYMBOL_DURATION, TONE_SPACING, WINDOW_SAMPLES,
+    NUM_TONES, SAMPLE_RATE, SYMBOL_DURATION,
 };
 use bitvec::prelude::*;
-use bumpalo::Bump;
 use num_complex::Complex;
 use rustfft::FftPlanner;
 use std::collections::HashSet;
@@ -178,23 +176,11 @@ pub struct Ft8Decoder {
     /// FFT processor for waterfall display
     fft_processor: FftProcessor,
 
-    /// Bandpass filter (kept for API compatibility)
-    bandpass_filter: BandpassFilter,
-
-    /// Symbol correlator (kept for API compatibility)
-    symbol_correlator: SymbolCorrelator,
-
-    /// Time synchronization engine (kept for API compatibility)
-    time_sync: TimeSync,
-
     /// Message parser
     message_parser: MessageParser,
 
     /// LDPC decoder
     ldpc_decoder: LdpcDecoder,
-
-    /// Allocator for zero-allocation hot path
-    allocator: Bump,
 
     /// Message handler for callbacks
     message_handler: Box<dyn MessageHandler + Send>,
@@ -229,23 +215,15 @@ impl Ft8Decoder {
         };
 
         let fft_processor = FftProcessor::new(4096, WindowFunction::Hann)?;
-        let bandpass_filter = BandpassFilter::new(1500.0, 400.0, 65)?;
-        let symbol_correlator = SymbolCorrelator::new()?;
-        let time_sync = TimeSync::new()?;
         let message_parser = MessageParser::new();
         let ldpc_decoder = LdpcDecoder::new(config.ldpc_iterations)?;
-        let allocator = Bump::with_capacity(1024 * 1024);
 
         Ok(Self {
             config,
             protocol_params,
             fft_processor,
-            bandpass_filter,
-            symbol_correlator,
-            time_sync,
             message_parser,
             ldpc_decoder,
-            allocator,
             message_handler,
             last_metrics: DecodingMetrics::default(),
         })
@@ -272,8 +250,6 @@ impl Ft8Decoder {
                 actual: samples.len(),
             });
         }
-
-        self.allocator.reset();
 
         let max_passes = self.config.max_decode_passes.max(1);
 
@@ -376,7 +352,7 @@ impl Ft8Decoder {
                 all_decoded_messages.iter().map(|m| m.snr_db).sum::<f32>()
                     / all_decoded_messages.len() as f32
             },
-            peak_memory_bytes: self.allocator.allocated_bytes(),
+            peak_memory_bytes: 0,
             sync_quality: (best_sync_score / 12.0).min(1.0) as f32,
             timestamp: SystemTime::now(),
         };
@@ -596,9 +572,7 @@ impl Ft8Decoder {
         let pp = &self.protocol_params;
 
         // A full message occupies num_symbols * 2 half-symbol steps.
-        let max_time_step = spectrogram
-            .num_steps
-            .saturating_sub(pp.num_symbols * 2 + 1);
+        let max_time_step = spectrogram.num_steps.saturating_sub(pp.num_symbols * 2 + 1);
 
         // Frequency range: need bins f0..f0+num_tones to all be valid
         let max_freq_bin = spectrogram.num_bins.saturating_sub(pp.num_tones);
@@ -998,12 +972,9 @@ impl Ft8Decoder {
                         a.max(b).max(c.max(d))
                     }
 
-                    let llr0 = max4(s2[4], s2[5], s2[6], s2[7])
-                        - max4(s2[0], s2[1], s2[2], s2[3]);
-                    let llr1 = max4(s2[2], s2[3], s2[6], s2[7])
-                        - max4(s2[0], s2[1], s2[4], s2[5]);
-                    let llr2 = max4(s2[1], s2[3], s2[5], s2[7])
-                        - max4(s2[0], s2[2], s2[4], s2[6]);
+                    let llr0 = max4(s2[4], s2[5], s2[6], s2[7]) - max4(s2[0], s2[1], s2[2], s2[3]);
+                    let llr1 = max4(s2[2], s2[3], s2[6], s2[7]) - max4(s2[0], s2[1], s2[4], s2[5]);
+                    let llr2 = max4(s2[1], s2[3], s2[5], s2[7]) - max4(s2[0], s2[2], s2[4], s2[6]);
 
                     llrs.push(-llr0 as f32);
                     llrs.push(-llr1 as f32);
@@ -1054,51 +1025,6 @@ impl Ft8Decoder {
     }
 
     // ========================================================================
-    // Demodulation (Gray code de-mapping)
-    // ========================================================================
-
-    /// Demodulate data symbols to bit sequence with Gray code de-mapping.
-    ///
-    /// FT8 layout: S7 D29 S7 D29 S7 (79 symbols total).
-    /// Only the 58 data symbols (positions 7..36 and 43..72) are demodulated.
-    /// Costas sync symbols at positions 0..7, 36..43, 72..79 are skipped.
-    fn demodulate_symbols(&self, symbols: &[u8]) -> Ft8Result<BitVec> {
-        let pp = &self.protocol_params;
-        if symbols.len() != pp.num_symbols {
-            return Err(Ft8Error::MessageDecodingError(format!(
-                "Expected {} symbols, got {}",
-                pp.num_symbols,
-                symbols.len()
-            )));
-        }
-
-        let mut bits = BitVec::with_capacity(174);
-
-        for i_tone in 0..pp.num_symbols {
-            if !pp.is_data_symbol(i_tone) {
-                continue;
-            }
-
-            match pp.bits_per_symbol {
-                3 => {
-                    let binary_value = gray_to_binary(symbols[i_tone]);
-                    bits.push((binary_value & 4) != 0);
-                    bits.push((binary_value & 2) != 0);
-                    bits.push((binary_value & 1) != 0);
-                }
-                2 => {
-                    let binary_value = crate::ldpc::gray_to_binary_4fsk(symbols[i_tone]);
-                    bits.push((binary_value & 2) != 0);
-                    bits.push((binary_value & 1) != 0);
-                }
-                _ => unreachable!("Unsupported bits_per_symbol"),
-            }
-        }
-
-        Ok(bits)
-    }
-
-    // ========================================================================
     // Waterfall display
     // ========================================================================
 
@@ -1119,7 +1045,7 @@ impl Ft8Decoder {
         let freq_resolution = SAMPLE_RATE as f64 / window_size as f64;
         for i in 0..=window_size / 2 {
             let freq = i as f64 * freq_resolution;
-            if freq >= 200.0 && freq <= 4000.0 {
+            if (200.0..=4000.0).contains(&freq) {
                 waterfall_data.frequency_bins.push(freq);
             }
         }
@@ -1138,7 +1064,7 @@ impl Ft8Decoder {
             let mut window_powers = Vec::new();
             for (i, &power) in psd.iter().enumerate() {
                 let freq = i as f64 * freq_resolution;
-                if freq >= 200.0 && freq <= 4000.0 {
+                if (200.0..=4000.0).contains(&freq) {
                     let power_db = 10.0 * power.log10();
                     window_powers.push(power_db);
                     waterfall_data.min_power = waterfall_data.min_power.min(power_db);
@@ -1166,7 +1092,9 @@ impl Ft8Decoder {
 
     /// Check if decoder is synchronized
     pub fn is_synchronized(&self) -> bool {
-        self.time_sync.is_synchronized()
+        // TimeSync was removed as dead code; sync is implicitly achieved
+        // via Costas array correlation during decode_window
+        true
     }
 }
 
@@ -1440,7 +1368,7 @@ impl LdpcDecoder {
     }
 }
 
-use crate::ldpc::{gray_to_binary, ParityCheckMatrix};
+use crate::ldpc::ParityCheckMatrix;
 
 // ============================================================================
 // Tests
@@ -1449,6 +1377,7 @@ use crate::ldpc::{gray_to_binary, ParityCheckMatrix};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{NUM_SYMBOLS, TONE_SPACING, WINDOW_SAMPLES};
     use approx::assert_relative_eq;
     use std::f64::consts::PI;
 

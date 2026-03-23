@@ -18,7 +18,7 @@
 //! can send to any other component through the bus.
 
 use anyhow::Result;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use pancetta_ft8::DecodedMessage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -142,9 +142,7 @@ pub enum MessageType {
 
     /// Request to transmit multiple messages simultaneously (multi-TX).
     /// Each item is encoded/modulated independently and summed into one waveform.
-    MultiTransmitRequest {
-        items: Vec<TransmitRequestItem>,
-    },
+    MultiTransmitRequest { items: Vec<TransmitRequestItem> },
 
     /// Audio output samples for transmission
     AudioOutput { samples: Vec<f32>, sample_rate: u32 },
@@ -513,7 +511,7 @@ impl MessageBus {
             ));
         }
 
-        let (sender, receiver) = unbounded();
+        let (sender, receiver) = bounded(self.config.max_queue_size);
 
         let channel = ComponentChannel {
             sender: sender.clone(),
