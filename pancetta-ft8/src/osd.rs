@@ -12,9 +12,12 @@
 //! This module provides the GF(2) matrix primitives and Gaussian elimination
 //! needed for OSD. The LDPC code is (174, 91): 91 information bits and 83 parity bits.
 
+use bitvec::prelude::*;
+
 use crate::ldpc::{
     LDPC_CODEWORD_BITS, LDPC_GENERATOR, LDPC_INFO_BITS, LDPC_PARITY_BITS,
 };
+use crate::message::{calculate_crc14, CRC_BITS, PAYLOAD_BITS};
 
 /// Number of bytes needed to pack a full 174-bit codeword row (ceil(174/8)).
 const PACKED_BYTES: usize = 22;
