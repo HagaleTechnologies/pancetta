@@ -39,7 +39,7 @@ pub const LDPC_NUM_VARIABLES: usize = 174;
 /// Each row is 12 bytes (96 bits, but only the first 91 are meaningful).
 /// Row i defines which info bits contribute to parity bit i.
 /// Encoding: parity[i] = dot_product(message, generator[i]) mod 2
-const LDPC_GENERATOR: [[u8; 12]; 83] = [
+pub(crate) const LDPC_GENERATOR: [[u8; 12]; 83] = [
     [
         0x83, 0x29, 0xce, 0x11, 0xbf, 0x31, 0xea, 0xf5, 0x09, 0xf2, 0x7f, 0xc0,
     ],
