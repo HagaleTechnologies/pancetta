@@ -5,6 +5,7 @@
 
 #![allow(non_camel_case_types)]
 
+#[cfg(not(ft8lib_stub))]
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 
@@ -122,6 +123,8 @@ pub struct ftx_message_offsets_t {
     pub offsets: [i16; 3],
 }
 
+// Real FFI symbols — only when the C library was actually compiled.
+#[cfg(not(ft8lib_stub))]
 extern "C" {
     // Encoding
     pub fn ft8_encode(payload: *const u8, tones: *mut u8);
@@ -166,12 +169,15 @@ extern "C" {
 // Hash interface callbacks (no-op — we don't maintain a hash table)
 // ============================================================================
 
+#[cfg(not(ft8lib_stub))]
 unsafe extern "C" fn noop_lookup_hash(_hash_type: i32, _hash: u32, _callsign: *mut c_char) -> bool {
     false
 }
 
+#[cfg(not(ft8lib_stub))]
 unsafe extern "C" fn noop_save_hash(_callsign: *const c_char, _n22: u32) {}
 
+#[cfg(not(ft8lib_stub))]
 fn make_hash_interface() -> ftx_callsign_hash_interface_t {
     ftx_callsign_hash_interface_t {
         lookup_hash: Some(noop_lookup_hash),
@@ -184,6 +190,7 @@ fn make_hash_interface() -> ftx_callsign_hash_interface_t {
 // ============================================================================
 
 /// Encode a message string to 79 FT8 tones using ft8_lib.
+#[cfg(not(ft8lib_stub))]
 pub fn ft8lib_encode(message: &str) -> Option<[u8; 79]> {
     let c_msg = CString::new(message).ok()?;
     let mut msg: ftx_message_t = unsafe { std::mem::zeroed() };
@@ -204,6 +211,7 @@ pub fn ft8lib_encode(message: &str) -> Option<[u8; 79]> {
 }
 
 /// Encode a message string to 10-byte payload using ft8_lib.
+#[cfg(not(ft8lib_stub))]
 pub fn ft8lib_encode_payload(message: &str) -> Option<[u8; 10]> {
     let c_msg = CString::new(message).ok()?;
     let mut msg: ftx_message_t = unsafe { std::mem::zeroed() };
@@ -220,6 +228,7 @@ pub fn ft8lib_encode_payload(message: &str) -> Option<[u8; 10]> {
 }
 
 /// Decode a 10-byte payload to message text using ft8_lib.
+#[cfg(not(ft8lib_stub))]
 pub fn ft8lib_decode_payload(payload: &[u8; 10]) -> Option<String> {
     let msg = ftx_message_t {
         payload: *payload,
@@ -249,6 +258,7 @@ pub fn ft8lib_decode_payload(payload: &[u8; 10]) -> Option<String> {
 
 /// Decode audio samples to FT8 messages using ft8_lib's full pipeline.
 /// Returns a vector of (message_text, frequency_hz, time_sec, ldpc_errors).
+#[cfg(not(ft8lib_stub))]
 pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
     let cfg = monitor_config_t {
         f_min: 100.0,
@@ -326,4 +336,31 @@ pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
     unsafe { monitor_free(&mut mon) };
 
     messages
+}
+
+// ============================================================================
+// Stub implementations — used when ft8_lib C library is not compiled.
+// These return empty/None so code compiles and unit tests can run without
+// the C dependency present (e.g. in CI or fresh checkouts without submodules).
+// ============================================================================
+
+#[cfg(ft8lib_stub)]
+pub fn ft8lib_encode(_message: &str) -> Option<[u8; 79]> {
+    None
+}
+
+#[cfg(ft8lib_stub)]
+pub fn ft8lib_encode_payload(_message: &str) -> Option<[u8; 10]> {
+    None
+}
+
+#[cfg(ft8lib_stub)]
+pub fn ft8lib_decode_payload(_payload: &[u8; 10]) -> Option<String> {
+    None
+}
+
+/// Stub: returns empty results when ft8_lib C library is not available.
+#[cfg(ft8lib_stub)]
+pub fn ft8lib_decode_audio(_samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
+    Vec::new()
 }

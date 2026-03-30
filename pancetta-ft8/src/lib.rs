@@ -64,6 +64,9 @@ pub mod sync;
 // ft8_lib reference implementation (FFI)
 pub mod ft8_lib_ffi;
 
+// Benchmark harness for decoder comparison
+pub mod benchmark;
+
 // FT8 transmission modules
 #[cfg(feature = "transmit")]
 pub mod encoder;

@@ -1,4 +1,6 @@
 fn main() {
+    // Declare the custom cfg key so Rust doesn't warn about it.
+    println!("cargo::rustc-check-cfg=cfg(ft8lib_stub)");
     let ft8_dir = "vendor/ft8_lib";
     let constants_path = format!("{}/ft8/constants.c", ft8_dir);
 
@@ -24,6 +26,8 @@ fn main() {
             .compile("ft8_lib");
     } else {
         println!("cargo:warning=ft8_lib vendor sources not found, skipping C FFI compilation");
+        // Signal to the Rust code that stubs should be used instead of real FFI.
+        println!("cargo:rustc-cfg=ft8lib_stub");
     }
 
     println!("cargo:rerun-if-changed={}", ft8_dir);
