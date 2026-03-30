@@ -33,3 +33,46 @@ with empty or garbage text) and genuine misses (ft8_lib-only decodes).
 - Fine frequency/time estimation to improve decode quality on marginal signals
 - OSD to recover the 9 ft8_lib-only decodes (likely weak signals where BP failed)
 - Performance: 8-30s per 15s window is too slow for real-time use
+
+---
+
+## Results (post fine-freq + time + subtraction + FFT perf improvement)
+
+### Date: 2026-03-30
+
+Cross-validation totals (9 WAV files): Pancetta=50, ft8_lib=38
+Overall ratio: 131.6%
+
+| File | Pancetta | ft8_lib |
+|------|----------|---------|
+| jtdx/000000_000001.wav | 1 | 0 |
+| jtdx/190227_155815.wav | 22 | 22 |
+| wsjt/210703_133430.wav | 6 | 8 |
+| wsjt/181201_180245.wav | 15 | 8 |
+| wsjt/170709_135615.wav | 2 | 0 |
+| basicft8/170923_082000.wav | 1 | 0 |
+| basicft8/170923_082015.wav | 1 | 0 |
+| basicft8/170923_082030.wav | 1 | 0 |
+| basicft8/170923_082045.wav | 1 | 0 |
+| **TOTAL** | **50** | **38** |
+
+### Improvements Applied
+
+1. **FFT-based symbol extraction** — 5× decode speedup (86ms→16ms per candidate)
+2. **Sub-bin frequency refinement** — half-bin steps (3→5 freq trials)
+3. **Finer time search** — eighth-symbol steps (5→9 time trials)
+4. **Cross-correlation signal subtraction** — better amplitude estimation for multi-pass
+
+### Improvement Summary
+
+| Metric | Before | After | Change |
+|--------|--------|-------|--------|
+| Pancetta decodes | 47 | 50 | +6.4% |
+| Decode speed | 86ms/candidate | 16ms/candidate | 5.4× faster |
+| Per-file best parity | JTDX 20/22 | JTDX 22/22 | Perfect match |
+
+### Remaining Gaps
+
+- `wsjt/210703_133430.wav`: 6 vs ft8_lib's 8 (2 still missed)
+- Empty/unknown message false positives still present
+- OSD not yet implemented (Phase 3)
