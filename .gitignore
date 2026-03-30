@@ -60,3 +60,6 @@ config.toml.bak
 .env
 .env.local
 .env.production
+
+# Benchmark results
+benchmarks/results/
