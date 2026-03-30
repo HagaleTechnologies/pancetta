@@ -145,7 +145,7 @@ fn gaussian_eliminate(
                         break;
                     }
                 }
-                if let Some(_) = donor_row {
+                if donor_row.is_some() {
                     // Swap columns `pivot` and `swap_col` in the matrix
                     for row in 0..LDPC_INFO_BITS {
                         let a = get_bit(&matrix[row], pivot);
@@ -196,6 +196,43 @@ fn gaussian_eliminate(
     }
 
     Some(())
+}
+
+/// Compute CRC-14 directly from a slice of u8 bits (each 0 or 1), without allocating a BitVec.
+///
+/// This is equivalent to `calculate_crc14()` from `message.rs` but avoids the BitSlice
+/// requirement, which would force a heap allocation in the OSD trial loop (~4000 calls).
+fn crc14_from_u8_bits(bits: &[u8]) -> u16 {
+    const CRC_WIDTH: u32 = 14;
+    const POLY: u16 = 0x2757;
+    const TOPBIT: u16 = 1u16 << (CRC_WIDTH - 1); // 0x2000
+    const NUM_BITS: usize = 82; // 77 payload + 5 zero padding
+
+    // Pack bits into bytes (MSB first), zero-extending to 82 bits
+    let mut bytes = [0u8; 11];
+    for (i, &b) in bits.iter().enumerate().take(77) {
+        if b != 0 {
+            bytes[i / 8] |= 0x80u8 >> (i % 8);
+        }
+    }
+    bytes[9] &= 0xF8;
+
+    let mut remainder: u16 = 0;
+    let mut idx_byte: usize = 0;
+
+    for idx_bit in 0..NUM_BITS {
+        if idx_bit % 8 == 0 {
+            remainder ^= (bytes[idx_byte] as u16) << (CRC_WIDTH - 8);
+            idx_byte += 1;
+        }
+        if remainder & TOPBIT != 0 {
+            remainder = (remainder << 1) ^ POLY;
+        } else {
+            remainder <<= 1;
+        }
+    }
+
+    remainder & ((TOPBIT << 1) - 1)
 }
 
 /// OSD decoder that attempts to decode LLRs using ordered statistics decoding
@@ -348,12 +385,8 @@ impl OsdDecoder {
             codeword[final_perm[LDPC_INFO_BITS + p]] = parity[p];
         }
 
-        // Extract payload (bits 0..77) as BitVec for CRC calculation
-        let payload_bitvec: BitVec = codeword[..PAYLOAD_BITS]
-            .iter()
-            .map(|&b| b == 1)
-            .collect();
-        let calculated_crc = calculate_crc14(&payload_bitvec);
+        // Compute CRC-14 directly on codeword bytes (avoids BitVec allocation in hot loop)
+        let calculated_crc = crc14_from_u8_bits(&codeword[..PAYLOAD_BITS]);
 
         // Extract received CRC from bits 77..91
         let mut received_crc = 0u16;
