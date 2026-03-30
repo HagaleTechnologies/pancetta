@@ -126,6 +126,8 @@ enum Commands {
     Info,
     /// Run benchmarks for performance testing
     Benchmark(BenchmarkArgs),
+    /// Benchmark decoder against ft8_lib reference
+    BenchmarkDecode(BenchmarkDecodeArgs),
 }
 
 #[derive(Clone, Args)]
@@ -171,6 +173,17 @@ struct ConfigArgs {
     /// Generate default configuration file
     #[arg(short, long)]
     generate: Option<PathBuf>,
+}
+
+#[derive(Clone, Args)]
+struct BenchmarkDecodeArgs {
+    /// Path to a WAV file or directory of WAV files
+    #[arg(required = true)]
+    path: String,
+
+    /// Output format: "text" or "json"
+    #[arg(long, default_value = "text")]
+    format: String,
 }
 
 #[derive(Clone, Args)]
@@ -332,6 +345,7 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         Commands::Config(args) => config_command(args, cli).await,
         Commands::Info => info_command().await,
         Commands::Benchmark(args) => benchmark_command(args).await,
+        Commands::BenchmarkDecode(args) => benchmark_decode_command(args).await,
     }
 }
 
@@ -402,6 +416,94 @@ async fn info_command() -> Result<()> {
 async fn benchmark_command(_args: BenchmarkArgs) -> Result<()> {
     eprintln!("Error: benchmarks are not yet implemented");
     std::process::exit(1);
+}
+
+async fn benchmark_decode_command(args: BenchmarkDecodeArgs) -> Result<()> {
+    use pancetta_ft8::benchmark::{compare_results, decode_wav_to_results, BenchmarkResult};
+    use std::path::Path;
+
+    let path = Path::new(&args.path);
+
+    // Collect WAV files to process
+    let wav_files: Vec<String> = if path.is_dir() {
+        let mut files: Vec<String> = std::fs::read_dir(path)
+            .with_context(|| format!("Cannot read directory: {}", args.path))?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("wav") {
+                    p.to_str().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        files.sort();
+        files
+    } else {
+        vec![args.path.clone()]
+    };
+
+    if wav_files.is_empty() {
+        eprintln!("No WAV files found at: {}", args.path);
+        std::process::exit(1);
+    }
+
+    // Decode each file
+    let mut results: Vec<BenchmarkResult> = Vec::new();
+    for wav_path in &wav_files {
+        eprint!("Decoding {} ...", wav_path);
+        match decode_wav_to_results(wav_path) {
+            Ok(result) => {
+                eprintln!(
+                    " pancetta={} ft8lib={} ({:.0}ms)",
+                    result.pancetta_decodes.len(),
+                    result.ft8lib_decodes.len(),
+                    result.processing_time_ms
+                );
+                results.push(result);
+            }
+            Err(e) => {
+                eprintln!(" ERROR: {}", e);
+            }
+        }
+    }
+
+    // Aggregate and report
+    let summary = compare_results(&results);
+
+    match args.format.as_str() {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        _ => {
+            println!();
+            println!("=== Decoder Benchmark Summary ===");
+            println!("Files processed : {}", summary.total_files);
+            println!("Pancetta decodes: {}", summary.pancetta_total);
+            println!("ft8_lib decodes : {}", summary.ft8lib_total);
+            println!("Both decoded    : {}", summary.both_decoded);
+            println!("Pancetta only   : {}", summary.pancetta_only);
+            println!("ft8_lib only    : {}", summary.ft8lib_only);
+            println!("Parity          : {:.1}%", summary.parity_percent);
+
+            if !summary.per_file.is_empty() {
+                println!();
+                println!("Per-file breakdown:");
+                for r in &summary.per_file {
+                    println!(
+                        "  {} — pancetta={} ft8lib={} ({:.0}ms)",
+                        r.file_path,
+                        r.pancetta_decodes.len(),
+                        r.ft8lib_decodes.len(),
+                        r.processing_time_ms
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn load_configuration(cli: &Cli) -> Result<Config> {
