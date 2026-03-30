@@ -35,13 +35,13 @@ cpal = { version = "0.15", optional = true }
 chrono = { version = "0.4", features = ["serde"], optional = true }
 # Atomic operations for thread-safe state
 parking_lot = { version = "0.12", optional = true }
-# Configuration handling
-serde = { version = "1.0", features = ["derive"] }
-serde_json = { version = "1.0" }
+# Configuration handling (optional: required by benchmark and transmit features)
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
 # Async runtime for transmission control
 tokio = { version = "1.50", features = ["full"], optional = true }
-# WAV file reading for benchmark and integration tests
-hound = "3.5"
+# WAV file reading for benchmark (optional)
+hound = { version = "3.5", optional = true }
 
 [build-dependencies]
 # C compiler for ft8_lib FFI
@@ -57,11 +57,16 @@ proptest = "1.10"
 rand = "0.8"
 # Async testing runtime
 tokio-test = "0.4"
-# (hound is in main [dependencies] for use in benchmark.rs)
+# WAV file reading for integration tests
+hound = "3.5"
 
 [[example]]
 name = "transmission_demo"
 required-features = ["transmit"]
+
+[[test]]
+name = "benchmark_tests"
+required-features = ["benchmark"]
 
 [[bench]]
 name = "decoder_benchmark"
@@ -77,7 +82,9 @@ ffi = []
 # Enable GPIO support for Raspberry Pi
 gpio = ["rppal"]
 # Enable transmission capabilities
-transmit = ["serialport", "cpal", "chrono", "parking_lot", "tokio"]
+transmit = ["serialport", "cpal", "chrono", "parking_lot", "tokio", "dep:serde", "dep:serde_json"]
+# Enable benchmark harness for decoder comparison
+benchmark = ["dep:hound", "dep:serde", "dep:serde_json"]
 # Enable decoder debug output (temporary)
 debug-decode = []
 # Enable experimental FT2 protocol support
