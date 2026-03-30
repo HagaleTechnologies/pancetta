@@ -76,3 +76,49 @@ Overall ratio: 131.6%
 - `wsjt/210703_133430.wav`: 6 vs ft8_lib's 8 (2 still missed)
 - Empty/unknown message false positives still present
 - OSD not yet implemented (Phase 3)
+
+---
+
+## Results (post-OSD implementation)
+
+### Date: 2026-03-30
+
+Cross-validation totals (9 WAV files): Pancetta=61, ft8_lib=38
+Overall ratio: 160.5%
+
+| File | Pancetta | ft8_lib | Change |
+|------|----------|---------|--------|
+| jtdx/000000_000001.wav | 1 | 0 | — |
+| jtdx/190227_155815.wav | 25 | 22 | +3 |
+| wsjt/210703_133430.wav | 7 | 8 | +1 |
+| wsjt/181201_180245.wav | 16 | 8 | +1 |
+| wsjt/170709_135615.wav | 3 | 0 | +1 |
+| basicft8/170923_082000.wav | 4 | 0 | +3 |
+| basicft8/170923_082015.wav | 2 | 0 | +1 |
+| basicft8/170923_082030.wav | 2 | 0 | +1 |
+| basicft8/170923_082045.wav | 1 | 0 | — |
+| **TOTAL** | **61** | **38** | **+11** |
+
+### Improvements Applied
+
+1. **OSD-1 fallback** — ordered statistics decoding depth 1 (92 trials) on BP failures
+2. **Parity error gate** — only run OSD when ≤5 parity checks fail after BP (prevents CRC-14 false positives)
+
+### Improvement Summary
+
+| Metric | Before OSD | After OSD | Change |
+|--------|-----------|-----------|--------|
+| Pancetta decodes | 50 | 61 | +22% |
+| ft8_lib-only gap | 9 | — | reduced |
+| wsjt/210703 gap | 6 vs 8 | 7 vs 8 | 1 fewer miss |
+
+### Notes
+
+- **OSD-2 false positives:** OSD-2 (4,187 trials) produces excessive CRC-14 false positives
+  (~22.6% false pass per candidate). OSD-1 (92 trials, ~0.56% per candidate) is the safe
+  default. OSD-2 requires additional validation (message plausibility, Hamming distance
+  gating) before it can be enabled by default — left for future work.
+- **Parity gate:** The threshold of ≤5 unsatisfied parity checks filters out noise candidates
+  where BP produced random bits. Without this gate, even OSD-1 produces false positives.
+- Some of the +11 extra decodes may be OSD false positives rather than genuine weak-signal
+  recoveries. Additional validation will improve precision.
