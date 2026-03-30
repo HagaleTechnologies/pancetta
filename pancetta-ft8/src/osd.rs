@@ -17,7 +17,7 @@ use bitvec::prelude::*;
 use crate::ldpc::{
     LDPC_CODEWORD_BITS, LDPC_GENERATOR, LDPC_INFO_BITS, LDPC_PARITY_BITS,
 };
-use crate::message::{calculate_crc14, CRC_BITS, PAYLOAD_BITS};
+use crate::message::{CRC_BITS, PAYLOAD_BITS};
 
 /// Number of bytes needed to pack a full 174-bit codeword row (ceil(174/8)).
 const PACKED_BYTES: usize = 22;
@@ -54,12 +54,6 @@ fn set_bit(row: &mut PackedRow, col: usize) {
     row[col / 8] |= 1 << (7 - (col % 8));
 }
 
-/// Clear bit at position `col` to 0 in a packed row (MSB-first).
-#[inline]
-fn clear_bit(row: &mut PackedRow, col: usize) {
-    row[col / 8] &= !(1 << (7 - (col % 8)));
-}
-
 /// Flip bit at position `col` in a packed row (MSB-first).
 #[inline]
 fn flip_bit(row: &mut PackedRow, col: usize) {
@@ -83,6 +77,7 @@ fn xor_rows(dst: &mut PackedRow, src: &PackedRow) {
 /// - Columns 0..91: identity (bit k is set)
 /// - Columns 91..174: for each parity row p (0..83), if LDPC_GENERATOR[p] has bit k set,
 ///   then column (91 + p) is set in this row.
+#[allow(clippy::needless_range_loop)]
 fn build_systematic_generator() -> [PackedRow; LDPC_INFO_BITS] {
     let mut g = [[0u8; PACKED_BYTES]; LDPC_INFO_BITS];
 
@@ -111,6 +106,7 @@ fn build_systematic_generator() -> [PackedRow; LDPC_INFO_BITS] {
 /// the tail end). Updates `col_perm` to track all column swaps.
 ///
 /// Returns `Some(())` on success, `None` if the matrix is singular (rank < 91).
+#[allow(clippy::needless_range_loop)]
 fn gaussian_eliminate(
     matrix: &mut [PackedRow; LDPC_INFO_BITS],
     col_perm: &mut [u16; LDPC_CODEWORD_BITS],
@@ -173,9 +169,7 @@ fn gaussian_eliminate(
                     break;
                 }
             }
-            if found.is_none() {
-                return None;
-            }
+            found?;
         }
 
         let pivot_row = found.unwrap();
@@ -255,6 +249,7 @@ impl OsdDecoder {
     ///
     /// Returns `Some(BitVec)` of 174 bits if a valid codeword (passing CRC-14) is found,
     /// or `None` if no valid candidate is found at the configured depth.
+    #[allow(clippy::needless_range_loop)]
     pub fn decode(&self, llrs: &[f32; LDPC_CODEWORD_BITS]) -> Option<BitVec> {
         // 1. Sort indices by descending |LLR| (most reliable first)
         let mut sorted_indices: [usize; LDPC_CODEWORD_BITS] = [0; LDPC_CODEWORD_BITS];
@@ -432,8 +427,8 @@ mod tests {
         set_bit(&mut row, 173);
         assert!(get_bit(&row, 173));
 
-        // Test clear
-        clear_bit(&mut row, 0);
+        // Test clear via flip (clear_bit removed as unused outside tests)
+        flip_bit(&mut row, 0); // was set, now cleared
         assert!(!get_bit(&row, 0));
         assert!(get_bit(&row, 7)); // unchanged
 
