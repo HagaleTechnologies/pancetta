@@ -188,6 +188,9 @@ pub struct Ft8Decoder {
     /// Pre-computed Hann window for symbol extraction (sps-length)
     symbol_window: Vec<f64>,
 
+    /// Reusable FFT buffer for symbol extraction (avoids per-call allocation)
+    symbol_fft_buffer: Vec<Complex<f64>>,
+
     /// Message handler for callbacks
     message_handler: Box<dyn MessageHandler + Send>,
 
@@ -233,6 +236,8 @@ impl Ft8Decoder {
             .map(|i| 0.5 * (1.0 - (pi2 * i as f64 / (sps - 1) as f64).cos()))
             .collect();
 
+        let symbol_fft_buffer = vec![Complex::new(0.0, 0.0); sps];
+
         Ok(Self {
             config,
             protocol_params,
@@ -241,6 +246,7 @@ impl Ft8Decoder {
             ldpc_decoder,
             symbol_fft,
             symbol_window,
+            symbol_fft_buffer,
             message_handler,
             last_metrics: DecodingMetrics::default(),
         })
@@ -757,12 +763,15 @@ impl Ft8Decoder {
     /// 6. CRC-14 verification
     /// 7. Message parsing
     fn decode_candidate(
-        &self,
+        &mut self,
         audio: &[f64],
         candidate: &CostasCandidate,
     ) -> Ft8Result<Option<DecodedMessage>> {
-        let pp = &self.protocol_params;
-        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        // Copy protocol params values to locals to avoid holding a borrow on self
+        // (decode_candidate is &mut self for buffer reuse in extract_symbols_complex)
+        let sps = self.protocol_params.samples_per_symbol(SAMPLE_RATE);
+        let tone_spacing = self.protocol_params.tone_spacing;
+        let xor_sequence = self.protocol_params.xor_sequence;
         let spec_step = sps / 2;
         let coarse_offset = candidate.time_step * spec_step;
 
@@ -788,7 +797,7 @@ impl Ft8Decoder {
         let freq_offsets: [f64; 5] = [0.0, -0.5, 0.5, -1.0, 1.0];
 
         // freq_sub shifts the base frequency by half a bin when freq_osr=2
-        let sub_bin_offset = candidate.freq_sub as f64 * (pp.tone_spacing / FREQ_OSR as f64);
+        let sub_bin_offset = candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
 
         // Find best (time_delta, freq_offset) by Costas correlation on extracted symbols
         let mut best_decode = None;
@@ -801,8 +810,8 @@ impl Ft8Decoder {
             let time_offset_samples = time_offset as usize;
 
             for &df in &freq_offsets {
-                let freq_hz = candidate.freq_bin as f64 * pp.tone_spacing + sub_bin_offset
-                    + df * pp.tone_spacing;
+                let freq_hz = candidate.freq_bin as f64 * tone_spacing + sub_bin_offset
+                    + df * tone_spacing;
                 if freq_hz < 0.0 {
                     continue;
                 }
@@ -846,7 +855,7 @@ impl Ft8Decoder {
                 eprintln!("    dt={:+4} df={:+.1}: CRC PASSED!", dt, df);
 
                 // For FT4, un-apply the XOR scrambling on the payload
-                let payload_bits = if let Some(xor_seq) = pp.xor_sequence {
+                let payload_bits = if let Some(xor_seq) = xor_sequence {
                     let mut bits = corrected_bits[0..PAYLOAD_BITS].to_owned();
                     for byte_idx in 0..10 {
                         let xor_byte = xor_seq[byte_idx];
@@ -900,7 +909,7 @@ impl Ft8Decoder {
     /// Returns the hard-decision symbols AND the per-tone magnitude vectors
     /// (needed for soft LLR computation).
     fn extract_symbols_complex(
-        &self,
+        &mut self,
         audio: &[f64],
         time_offset_samples: usize,
         base_frequency: f64,
@@ -922,15 +931,16 @@ impl Ft8Decoder {
         // We frequency-shift the signal so that base_frequency maps to DC (bin 0),
         // then tones 0..7 map to bins 0..7. This handles arbitrary base_frequency
         // values (including sub-bin offsets from freq_osr=2) without zero-padding.
-        let fft = &self.symbol_fft;
-        let window = &self.symbol_window;
-        let mut fft_buffer = vec![Complex::new(0.0, 0.0); sps];
-
         // Pre-compute complex rotation step for frequency shift.
         // Instead of calling sin_cos per sample, we compute the initial phase
         // per symbol and rotate by a fixed step = exp(-j*2*pi*base_freq/fs).
         let phase_step_angle = -pi2 * base_frequency / SAMPLE_RATE as f64;
         let phase_step = Complex::new(phase_step_angle.cos(), phase_step_angle.sin());
+
+        // Take the window and buffer out of self to avoid borrow conflicts in the loop
+        let mut fft_buffer = std::mem::take(&mut self.symbol_fft_buffer);
+        let window = &self.symbol_window;
+        let fft = &self.symbol_fft;
 
         let mut symbols = Vec::with_capacity(pp.num_symbols);
         let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
@@ -974,6 +984,9 @@ impl Ft8Decoder {
             symbols.push(best_tone);
             tone_magnitudes.push(mags);
         }
+
+        // Return the buffer to self for reuse
+        self.symbol_fft_buffer = fft_buffer;
 
         Ok((symbols, tone_magnitudes))
     }
@@ -1586,7 +1599,7 @@ mod tests {
     #[test]
     fn test_complex_dft_tone_detection() {
         let config = Ft8Config::default();
-        let decoder = Ft8Decoder::new(config).unwrap();
+        let mut decoder = Ft8Decoder::new(config).unwrap();
 
         // Generate a signal with a known tone at 1500 + 3*6.25 = 1518.75 Hz
         let base_freq = 1500.0;

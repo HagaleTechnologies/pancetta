@@ -9,9 +9,12 @@ use pancetta_ft8::benchmark::{BenchmarkResult, ComparisonSummary, DecodeResult, 
 /// expected fields populated for a known fixture WAV file.
 #[test]
 fn test_decode_wav_to_results_returns_structured_output() {
-    let wav_path = "tests/fixtures/wav/generated/ft8_cq.wav";
+    let wav_path = format!(
+        "{}/tests/fixtures/wav/generated/ft8_cq.wav",
+        env!("CARGO_MANIFEST_DIR")
+    );
 
-    let result = decode_wav_to_results(wav_path)
+    let result = decode_wav_to_results(&wav_path)
         .expect("decode_wav_to_results should succeed on a valid WAV file");
 
     // file_path should match what was passed in
