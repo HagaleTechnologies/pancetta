@@ -68,4 +68,34 @@ mod refinement {
             freq_error
         );
     }
+
+    #[test]
+    fn test_decode_with_time_offset() {
+        use pancetta_ft8::encoder::Ft8Encoder;
+        use pancetta_ft8::modulator::Ft8Modulator;
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder.encode_message("CQ W1ABC FN42", None).unwrap();
+        let mut modulator =
+            Ft8Modulator::new(SAMPLE_RATE, pancetta_ft8::BASE_FREQUENCY, 1.0).unwrap();
+        let signal = modulator.modulate_symbols(&symbols, 0.0).unwrap();
+
+        // Place signal with a 100-sample offset (8.3ms) from the start
+        // This tests that the time refinement can find signals not aligned to symbol boundaries
+        let offset = 100;
+        let mut samples = vec![0.0f32; WINDOW_SAMPLES];
+        for (i, &s) in signal.iter().enumerate() {
+            if i + offset < samples.len() {
+                samples[i + offset] = s;
+            }
+        }
+
+        let config = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(config).unwrap();
+        let decoded = decoder.decode_window(&samples).unwrap();
+        assert!(
+            !decoded.is_empty(),
+            "Should decode signal with 100-sample time offset"
+        );
+    }
 }

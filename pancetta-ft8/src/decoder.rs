@@ -745,7 +745,7 @@ impl Ft8Decoder {
     /// Attempt to decode a single Costas sync candidate.
     ///
     /// Pipeline:
-    /// 1. Fine timing search: refine coarse time offset (±half symbol, 5 steps)
+    /// 1. Fine timing search: refine coarse time offset (±half symbol, 9 steps at 1/8 symbol)
     /// 2. Frequency refinement: try ±1 bin
     /// 3. Extract symbols with complex DFT
     /// 4. Compute soft LLRs + normalize to target variance
@@ -762,14 +762,20 @@ impl Ft8Decoder {
         let spec_step = sps / 2;
         let coarse_offset = candidate.time_step * spec_step;
 
-        // Fine timing: search ±half symbol in sub-symbol steps.
-        let quarter_sym = (sps / 4) as isize;
-        let time_deltas: [isize; 5] = [
-            -2 * quarter_sym,
-            -quarter_sym,
+        // Fine timing: search ±half symbol in eighth-symbol steps.
+        // Finer time steps improve symbol extraction for signals not aligned to
+        // the coarse Costas sync grid. 9 steps at 1/8 symbol = 240 samples each.
+        let eighth_sym = (sps / 8) as isize;
+        let time_deltas: [isize; 9] = [
+            -4 * eighth_sym,
+            -3 * eighth_sym,
+            -2 * eighth_sym,
+            -eighth_sym,
             0,
-            quarter_sym,
-            2 * quarter_sym,
+            eighth_sym,
+            2 * eighth_sym,
+            3 * eighth_sym,
+            4 * eighth_sym,
         ];
 
         // Frequency refinement: try ±1 bin with half-bin sub-steps
