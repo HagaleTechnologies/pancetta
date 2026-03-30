@@ -198,6 +198,181 @@ fn gaussian_eliminate(
     Some(())
 }
 
+/// OSD decoder that attempts to decode LLRs using ordered statistics decoding
+/// at depths 0, 1, and 2 with CRC-14 validation.
+pub struct OsdDecoder {
+    config: OsdConfig,
+    generator: [PackedRow; LDPC_INFO_BITS],
+}
+
+impl OsdDecoder {
+    /// Create a new OSD decoder with the given configuration.
+    pub fn new(config: OsdConfig) -> Self {
+        Self {
+            config,
+            generator: build_systematic_generator(),
+        }
+    }
+
+    /// Attempt to decode 174 LLRs into a valid 174-bit codeword.
+    ///
+    /// Returns `Some(BitVec)` of 174 bits if a valid codeword (passing CRC-14) is found,
+    /// or `None` if no valid candidate is found at the configured depth.
+    pub fn decode(&self, llrs: &[f32; LDPC_CODEWORD_BITS]) -> Option<BitVec> {
+        // 1. Sort indices by descending |LLR| (most reliable first)
+        let mut sorted_indices: [usize; LDPC_CODEWORD_BITS] = [0; LDPC_CODEWORD_BITS];
+        for i in 0..LDPC_CODEWORD_BITS {
+            sorted_indices[i] = i;
+        }
+        sorted_indices.sort_by(|&a, &b| {
+            llrs[b]
+                .abs()
+                .partial_cmp(&llrs[a].abs())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // 2. Permute generator columns per reliability ranking
+        let mut matrix = [[0u8; PACKED_BYTES]; LDPC_INFO_BITS];
+        for row in 0..LDPC_INFO_BITS {
+            for new_col in 0..LDPC_CODEWORD_BITS {
+                let orig_col = sorted_indices[new_col];
+                if get_bit(&self.generator[row], orig_col) {
+                    set_bit(&mut matrix[row], new_col);
+                }
+            }
+        }
+
+        // 3. Gaussian eliminate
+        let mut elim_perm = [0u16; LDPC_CODEWORD_BITS];
+        gaussian_eliminate(&mut matrix, &mut elim_perm)?;
+
+        // 4. Compose permutations: final_perm[i] = sorted_indices[elim_perm[i]]
+        let mut final_perm = [0usize; LDPC_CODEWORD_BITS];
+        for i in 0..LDPC_CODEWORD_BITS {
+            final_perm[i] = sorted_indices[elim_perm[i] as usize];
+        }
+
+        // 5. OSD-0: hard-decide the 91 most reliable bits
+        let mut info_hard = [0u8; LDPC_INFO_BITS];
+        for i in 0..LDPC_INFO_BITS {
+            let orig_col = final_perm[i];
+            if llrs[orig_col] < 0.0 {
+                info_hard[i] = 1;
+            }
+        }
+
+        // Compute base parity
+        let mut base_parity = [0u8; LDPC_PARITY_BITS];
+        for p in 0..LDPC_PARITY_BITS {
+            let mut val = 0u8;
+            for i in 0..LDPC_INFO_BITS {
+                if info_hard[i] == 1 && get_bit(&matrix[i], LDPC_INFO_BITS + p) {
+                    val ^= 1;
+                }
+            }
+            base_parity[p] = val;
+        }
+
+        // Try OSD-0
+        if let Some(result) = self.try_solution(&info_hard, &base_parity, &final_perm) {
+            return Some(result);
+        }
+
+        if self.config.max_depth < 1 {
+            return None;
+        }
+
+        // 6. OSD-1: pre-compute parity columns
+        let mut parity_cols = [[false; LDPC_PARITY_BITS]; LDPC_INFO_BITS];
+        for i in 0..LDPC_INFO_BITS {
+            for p in 0..LDPC_PARITY_BITS {
+                parity_cols[i][p] = get_bit(&matrix[i], LDPC_INFO_BITS + p);
+            }
+        }
+
+        for flip in 0..LDPC_INFO_BITS {
+            let mut info = info_hard;
+            info[flip] ^= 1;
+            let mut parity = base_parity;
+            for p in 0..LDPC_PARITY_BITS {
+                if parity_cols[flip][p] {
+                    parity[p] ^= 1;
+                }
+            }
+            if let Some(result) = self.try_solution(&info, &parity, &final_perm) {
+                return Some(result);
+            }
+        }
+
+        if self.config.max_depth < 2 {
+            return None;
+        }
+
+        // 7. OSD-2: flip pairs
+        for i in 0..LDPC_INFO_BITS {
+            for j in (i + 1)..LDPC_INFO_BITS {
+                let mut info = info_hard;
+                info[i] ^= 1;
+                info[j] ^= 1;
+                let mut parity = base_parity;
+                for p in 0..LDPC_PARITY_BITS {
+                    if parity_cols[i][p] {
+                        parity[p] ^= 1;
+                    }
+                    if parity_cols[j][p] {
+                        parity[p] ^= 1;
+                    }
+                }
+                if let Some(result) = self.try_solution(&info, &parity, &final_perm) {
+                    return Some(result);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Un-permute info+parity bits into a codeword and check CRC-14.
+    fn try_solution(
+        &self,
+        info: &[u8; LDPC_INFO_BITS],
+        parity: &[u8; LDPC_PARITY_BITS],
+        final_perm: &[usize; LDPC_CODEWORD_BITS],
+    ) -> Option<BitVec> {
+        // Un-permute into codeword
+        let mut codeword = [0u8; LDPC_CODEWORD_BITS];
+        for i in 0..LDPC_INFO_BITS {
+            codeword[final_perm[i]] = info[i];
+        }
+        for p in 0..LDPC_PARITY_BITS {
+            codeword[final_perm[LDPC_INFO_BITS + p]] = parity[p];
+        }
+
+        // Extract payload (bits 0..77) as BitVec for CRC calculation
+        let payload_bitvec: BitVec = codeword[..PAYLOAD_BITS]
+            .iter()
+            .map(|&b| b == 1)
+            .collect();
+        let calculated_crc = calculate_crc14(&payload_bitvec);
+
+        // Extract received CRC from bits 77..91
+        let mut received_crc = 0u16;
+        for i in 0..CRC_BITS {
+            if codeword[PAYLOAD_BITS + i] == 1 {
+                received_crc |= 1 << (CRC_BITS - 1 - i);
+            }
+        }
+
+        if calculated_crc == received_crc {
+            // Return all 174 bits
+            let result: BitVec = codeword.iter().map(|&b| b == 1).collect();
+            Some(result)
+        } else {
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +497,137 @@ mod tests {
                 col_perm[i], i as u16,
                 "Column permutation changed at {} even though input was already systematic",
                 i
+            );
+        }
+    }
+
+    #[cfg(feature = "transmit")]
+    mod osd_decode_tests {
+        use super::*;
+        use crate::ldpc::LdpcEncoder;
+        use crate::message::{calculate_crc14, CRC_BITS, PAYLOAD_BITS};
+
+        /// Helper: create a valid 91-bit message with CRC and encode to 174-bit codeword.
+        /// Returns (message_91_bits as BitVec, codeword_174_bits as BitVec).
+        fn make_test_codeword() -> (BitVec, BitVec) {
+            // Create a 77-bit payload with a few bits set
+            let mut payload: BitVec = BitVec::repeat(false, PAYLOAD_BITS);
+            payload.set(3, true);
+            payload.set(10, true);
+            payload.set(25, true);
+            payload.set(50, true);
+            payload.set(70, true);
+
+            // Calculate CRC-14 over the payload
+            let crc = calculate_crc14(&payload);
+
+            // Build the full 91-bit message: 77 payload + 14 CRC (MSB first)
+            let mut message: BitVec = payload;
+            for i in 0..CRC_BITS {
+                message.push((crc >> (CRC_BITS - 1 - i)) & 1 == 1);
+            }
+            assert_eq!(message.len(), LDPC_INFO_BITS);
+
+            // LDPC encode to 174 bits
+            let encoder = LdpcEncoder::new();
+            let codeword = encoder.encode(&message).expect("LDPC encoding failed");
+            assert_eq!(codeword.len(), LDPC_CODEWORD_BITS);
+
+            (message, codeword)
+        }
+
+        /// Convert a codeword BitVec to LLRs: bit=1 -> -mag, bit=0 -> +mag
+        fn codeword_to_llrs(codeword: &BitVec, magnitude: f32) -> [f32; LDPC_CODEWORD_BITS] {
+            let mut llrs = [0.0f32; LDPC_CODEWORD_BITS];
+            for i in 0..LDPC_CODEWORD_BITS {
+                llrs[i] = if codeword[i] { -magnitude } else { magnitude };
+            }
+            llrs
+        }
+
+        #[test]
+        fn test_osd0_recovers_clean_codeword() {
+            let (_message, codeword) = make_test_codeword();
+            let llrs = codeword_to_llrs(&codeword, 4.0);
+
+            let decoder = OsdDecoder::new(OsdConfig { max_depth: 0 });
+            let result = decoder.decode(&llrs);
+
+            assert!(result.is_some(), "OSD-0 should decode a clean codeword");
+            let decoded = result.unwrap();
+            assert_eq!(decoded.len(), LDPC_CODEWORD_BITS);
+            assert_eq!(decoded, codeword, "Decoded codeword should match original");
+        }
+
+        #[test]
+        fn test_osd1_recovers_single_unreliable_bit() {
+            let (_message, codeword) = make_test_codeword();
+            let mut llrs = codeword_to_llrs(&codeword, 4.0);
+
+            // Make one bit wrong-signed and low magnitude (unreliable and incorrect)
+            llrs[5] = if codeword[5] { 0.1 } else { -0.1 };
+
+            // OSD-0 should fail
+            let decoder0 = OsdDecoder::new(OsdConfig { max_depth: 0 });
+            assert!(
+                decoder0.decode(&llrs).is_none(),
+                "OSD-0 should fail with one corrupted bit"
+            );
+
+            // OSD-1 should succeed
+            let decoder1 = OsdDecoder::new(OsdConfig { max_depth: 1 });
+            let result = decoder1.decode(&llrs);
+            assert!(result.is_some(), "OSD-1 should recover single unreliable bit");
+            assert_eq!(result.unwrap(), codeword);
+        }
+
+        #[test]
+        fn test_osd2_recovers_two_unreliable_bits() {
+            let (_message, codeword) = make_test_codeword();
+
+            // Try multiple pairs of bit positions to find one where OSD-1 fails
+            // but OSD-2 succeeds. Some pairs may land in parity positions after
+            // the reliability sort, allowing OSD-1 to succeed with a single flip.
+            let pairs = [
+                (5, 20),
+                (10, 30),
+                (40, 60),
+                (15, 45),
+                (2, 70),
+                (33, 77),
+                (8, 55),
+                (12, 88),
+            ];
+
+            let decoder1 = OsdDecoder::new(OsdConfig { max_depth: 1 });
+            let decoder2 = OsdDecoder::new(OsdConfig { max_depth: 2 });
+
+            let mut found_good_pair = false;
+            for &(a, b) in &pairs {
+                let mut llrs = codeword_to_llrs(&codeword, 4.0);
+                // Wrong-sign with small magnitude
+                llrs[a] = if codeword[a] { 0.05 } else { -0.05 };
+                llrs[b] = if codeword[b] { 0.05 } else { -0.05 };
+
+                let osd1_result = decoder1.decode(&llrs);
+                let osd2_result = decoder2.decode(&llrs);
+
+                if osd1_result.is_none() && osd2_result.is_some() {
+                    assert_eq!(
+                        osd2_result.unwrap(),
+                        codeword,
+                        "OSD-2 decoded wrong codeword for pair ({}, {})",
+                        a,
+                        b
+                    );
+                    found_good_pair = true;
+                    break;
+                }
+            }
+
+            assert!(
+                found_good_pair,
+                "Could not find a bit pair where OSD-1 fails but OSD-2 succeeds"
             );
         }
     }
