@@ -1306,8 +1306,8 @@ impl LdpcDecoder {
             let parity_errors = self.count_parity_errors(llr_arr);
 
             // Threshold: only try OSD if BP resolved most parity checks.
-            // WSJT-X uses a similar gate. With 83 total checks, a threshold
-            // of ~15 means BP was close but couldn't quite converge.
+            // With 83 total checks, a threshold of 5 means BP resolved
+            // nearly all checks but couldn't quite converge.
             const MAX_PARITY_ERRORS_FOR_OSD: usize = 5;
 
             if parity_errors <= MAX_PARITY_ERRORS_FOR_OSD {

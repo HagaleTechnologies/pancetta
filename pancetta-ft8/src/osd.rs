@@ -33,7 +33,9 @@ pub struct OsdConfig {
 
 impl Default for OsdConfig {
     fn default() -> Self {
-        Self { max_depth: 2 }
+        // OSD-1 is the safe default. OSD-2 (4,187 trials) has a high
+        // CRC-14 false positive rate without additional validation.
+        Self { max_depth: 1 }
     }
 }
 
@@ -525,6 +527,42 @@ mod tests {
                 col_perm[i], i as u16,
                 "Column permutation changed at {} even though input was already systematic",
                 i
+            );
+        }
+    }
+
+    #[test]
+    fn test_crc14_cross_validation() {
+        use crate::message::calculate_crc14;
+        use bitvec::prelude::*;
+
+        // Test several different payloads to ensure crc14_from_u8_bits matches calculate_crc14
+        let test_patterns: &[&[usize]] = &[
+            &[],                          // all zeros
+            &[0, 1, 2, 3],               // first few bits
+            &[3, 10, 25, 50, 70],         // sparse
+            &[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75], // dense
+            &[76],                        // last bit only
+        ];
+
+        for (idx, pattern) in test_patterns.iter().enumerate() {
+            // Build BitVec for calculate_crc14
+            let mut bv: BitVec = BitVec::repeat(false, PAYLOAD_BITS);
+            // Build u8 array for crc14_from_u8_bits
+            let mut u8_bits = [0u8; PAYLOAD_BITS];
+
+            for &bit_pos in *pattern {
+                bv.set(bit_pos, true);
+                u8_bits[bit_pos] = 1;
+            }
+
+            let crc_bitvec = calculate_crc14(&bv);
+            let crc_u8 = crc14_from_u8_bits(&u8_bits);
+
+            assert_eq!(
+                crc_bitvec, crc_u8,
+                "CRC-14 mismatch for pattern {}: bitvec={:#06x}, u8={:#06x}",
+                idx, crc_bitvec, crc_u8
             );
         }
     }
