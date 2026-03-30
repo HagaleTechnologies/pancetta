@@ -11,6 +11,7 @@
 
 use crate::{
     message::{calculate_crc14, DecodedMessage, MessageParser, CRC_BITS, PAYLOAD_BITS},
+    osd::{OsdConfig, OsdDecoder},
     protocol::ProtocolParams,
     signal_processing::{FftProcessor, WindowFunction},
     DecodingMetrics, Ft8Error, Ft8Result, MessageHandler, NullMessageHandler, Protocol,
@@ -98,6 +99,11 @@ pub struct Ft8Config {
 
     /// Maximum number of successive decoding passes (1 = no interference cancellation)
     pub max_decode_passes: usize,
+
+    /// OSD depth (0, 1, or 2). Set to None to disable OSD. Default: Some(1).
+    /// Note: OSD-2 (4,187 trials) has a high CRC-14 false positive rate without
+    /// additional validation. OSD-1 (92 trials) is the safe default.
+    pub osd_depth: Option<u8>,
 }
 
 impl Default for Ft8Config {
@@ -113,6 +119,7 @@ impl Default for Ft8Config {
             frequency_range: 200.0,
             time_range: 2.0,
             max_decode_passes: 3,
+            osd_depth: Some(1),
         }
     }
 }
@@ -225,7 +232,10 @@ impl Ft8Decoder {
 
         let fft_processor = FftProcessor::new(4096, WindowFunction::Hann)?;
         let message_parser = MessageParser::new();
-        let ldpc_decoder = LdpcDecoder::new(config.ldpc_iterations)?;
+        let ldpc_decoder = LdpcDecoder::new_with_osd(
+            config.ldpc_iterations,
+            config.osd_depth.map(|d| OsdConfig { max_depth: d }),
+        )?;
 
         // Pre-compute FFT plan and Hann window for symbol extraction
         let sps = protocol_params.samples_per_symbol(SAMPLE_RATE);
@@ -1217,6 +1227,8 @@ struct LdpcDecoder {
     var_positions: Vec<Vec<(usize, usize)>>,
     /// Min-sum normalization factor
     normalization_factor: f32,
+    /// Optional OSD fallback decoder
+    osd: Option<OsdDecoder>,
 }
 
 impl LdpcDecoder {
@@ -1246,7 +1258,14 @@ impl LdpcDecoder {
             parity_check_matrix,
             var_positions,
             normalization_factor: 0.75,
+            osd: None,
         })
+    }
+
+    fn new_with_osd(max_iterations: usize, osd_config: Option<OsdConfig>) -> Ft8Result<Self> {
+        let mut decoder = Self::new(max_iterations)?;
+        decoder.osd = osd_config.map(OsdDecoder::new);
+        Ok(decoder)
     }
 
     /// Decode using belief propagation with hard-decision input
@@ -1266,6 +1285,39 @@ impl LdpcDecoder {
         }
 
         let decoded_llrs = self.belief_propagation(llrs)?;
+
+        // Check if BP converged (syndrome = 0)
+        let bp_converged = {
+            let arr: &[f32; 174] = decoded_llrs[..174].try_into().unwrap();
+            self.check_syndrome_fast(arr)
+        };
+
+        if bp_converged {
+            return self.llrs_to_bits(&decoded_llrs);
+        }
+
+        // BP did not converge — try OSD fallback if available.
+        // Only run OSD when BP was close to converging (few parity errors).
+        // Without this gate, OSD-2's 4,187 trials per candidate × hundreds of
+        // noise candidates produces excessive CRC-14 false positives (~1/16384
+        // per trial).
+        if let Some(ref osd) = self.osd {
+            let llr_arr: &[f32; 174] = decoded_llrs[..174].try_into().unwrap();
+            let parity_errors = self.count_parity_errors(llr_arr);
+
+            // Threshold: only try OSD if BP resolved most parity checks.
+            // With 83 total checks, a threshold of 5 means BP resolved
+            // nearly all checks but couldn't quite converge.
+            const MAX_PARITY_ERRORS_FOR_OSD: usize = 5;
+
+            if parity_errors <= MAX_PARITY_ERRORS_FOR_OSD {
+                if let Some(codeword) = osd.decode(llr_arr) {
+                    return Ok(codeword);
+                }
+            }
+        }
+
+        // Return BP's best effort (caller will check CRC and likely reject)
         self.llrs_to_bits(&decoded_llrs)
     }
 
@@ -1419,6 +1471,25 @@ impl LdpcDecoder {
         }
 
         true
+    }
+
+    /// Count the number of unsatisfied parity checks (hard decisions from LLRs).
+    /// Used to gate OSD: only worth trying when BP was close to converging.
+    fn count_parity_errors(&self, llrs: &[f32; 174]) -> usize {
+        let mut errors = 0;
+        for check_idx in 0..self.parity_check_matrix.num_checks {
+            let connected_vars = self.parity_check_matrix.get_connected_variables(check_idx);
+            let mut parity = 0u8;
+            for &var_idx in connected_vars {
+                if llrs[var_idx] < 0.0 {
+                    parity ^= 1;
+                }
+            }
+            if parity != 0 {
+                errors += 1;
+            }
+        }
+        errors
     }
 }
 
@@ -1949,5 +2020,22 @@ mod tests {
         let sum: f32 = values.iter().sum();
         let sum2: f32 = values.iter().map(|&x| x * x).sum();
         (sum2 - sum * sum / n) / n
+    }
+
+    #[test]
+    fn test_ldpc_decode_soft_with_osd_fallback() {
+        use crate::osd::OsdConfig;
+
+        // Create decoder with OSD enabled (1 BP iteration = won't converge)
+        let decoder = LdpcDecoder::new_with_osd(1, Some(OsdConfig { max_depth: 2 })).unwrap();
+
+        // Create LLRs for a known valid codeword with 2 unreliable bits
+        // We need the encoder for this, so gate behind transmit feature
+        // For now, just verify construction works
+        assert!(decoder.osd.is_some());
+
+        // Verify the no-OSD path still works
+        let decoder_no_osd = LdpcDecoder::new(50).unwrap();
+        assert!(decoder_no_osd.osd.is_none());
     }
 }

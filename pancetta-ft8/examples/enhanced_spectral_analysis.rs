@@ -30,6 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         frequency_range: 300.0,    // Wider frequency search for Doppler
         time_range: 3.0,           // Wider time search
         max_decode_passes: 3,      // Multiple passes for interference cancellation
+        osd_depth: Some(1),        // OSD-1 fallback for weak signals
     };
 
     // Create decoder

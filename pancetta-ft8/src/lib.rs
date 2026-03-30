@@ -58,6 +58,7 @@ pub mod protocol;
 pub mod decoder;
 pub mod ldpc;
 pub mod message;
+pub mod osd;
 pub mod signal_processing;
 pub mod sync;
 
