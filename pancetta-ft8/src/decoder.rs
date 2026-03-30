@@ -772,8 +772,10 @@ impl Ft8Decoder {
             2 * quarter_sym,
         ];
 
-        // Frequency refinement: try ±1 bin
-        let freq_offsets: [isize; 3] = [0, -1, 1];
+        // Frequency refinement: try ±1 bin with half-bin sub-steps
+        // This gives 5 frequency trials: -1, -0.5, 0, +0.5, +1
+        // (in units of tone_spacing = 6.25 Hz, so steps are 3.125 Hz)
+        let freq_offsets: [f64; 5] = [0.0, -0.5, 0.5, -1.0, 1.0];
 
         // freq_sub shifts the base frequency by half a bin when freq_osr=2
         let sub_bin_offset = candidate.freq_sub as f64 * (pp.tone_spacing / FREQ_OSR as f64);
@@ -789,11 +791,12 @@ impl Ft8Decoder {
             let time_offset_samples = time_offset as usize;
 
             for &df in &freq_offsets {
-                let freq_bin = candidate.freq_bin as isize + df;
-                if freq_bin < 0 {
+                let freq_hz = candidate.freq_bin as f64 * pp.tone_spacing + sub_bin_offset
+                    + df * pp.tone_spacing;
+                if freq_hz < 0.0 {
                     continue;
                 }
-                let base_frequency = freq_bin as f64 * pp.tone_spacing + sub_bin_offset;
+                let base_frequency = freq_hz;
 
                 let (_symbols, tone_magnitudes) = match self.extract_symbols_complex(
                     audio,
@@ -814,7 +817,7 @@ impl Ft8Decoder {
                     let avg_abs_llr = llrs.iter().map(|l| l.abs()).sum::<f32>() / llrs.len() as f32;
                     let saturated = llrs.iter().filter(|&&l| l.abs() >= 24.9).count();
                     eprintln!(
-                        "    dt={:+4} df={:+2}: avg|LLR|={:.2}, sat={}/174",
+                        "    dt={:+4} df={:+.1}: avg|LLR|={:.2}, sat={}/174",
                         dt, df, avg_abs_llr, saturated
                     );
                 }
@@ -830,7 +833,7 @@ impl Ft8Decoder {
 
                 // CRC passed — parse message and return
                 #[cfg(feature = "debug-decode")]
-                eprintln!("    dt={:+4} df={:+2}: CRC PASSED!", dt, df);
+                eprintln!("    dt={:+4} df={:+.1}: CRC PASSED!", dt, df);
 
                 // For FT4, un-apply the XOR scrambling on the payload
                 let payload_bits = if let Some(xor_seq) = pp.xor_sequence {
