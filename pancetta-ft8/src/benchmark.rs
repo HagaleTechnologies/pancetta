@@ -112,11 +112,14 @@ pub fn read_wav_samples(path: &str) -> Result<Vec<f32>, String> {
             .collect::<Result<Vec<_>, _>>()?,
 
         hound::SampleFormat::Int => {
-            let max_val = (1_i64 << (spec.bits_per_sample - 1)) as f32;
+            // Read as i16 and normalize to [-1.0, 1.0].
+            // Note: hound's samples::<i32>() left-shifts values to fill the i32
+            // range, which would give incorrect normalization. Using i16 matches
+            // the approach in wav_decode_tests.rs.
             reader
-                .samples::<i32>()
+                .samples::<i16>()
                 .map(|s| {
-                    s.map(|v| v as f32 / max_val)
+                    s.map(|v| v as f32 / 32768.0)
                         .map_err(|e| format!("Read error in '{}': {}", path, e))
                 })
                 .collect::<Result<Vec<_>, _>>()?
@@ -141,11 +144,14 @@ pub fn read_wav_samples(path: &str) -> Result<Vec<f32>, String> {
 pub fn decode_wav_to_results(path: &str) -> Result<BenchmarkResult, String> {
     let samples = read_wav_samples(path)?;
 
-    // Clamp to one FT8 window (151 680 samples at 12 kHz).
-    let window: &[f32] = if samples.len() >= WINDOW_SAMPLES {
-        &samples[..WINDOW_SAMPLES]
+    // Pad to WINDOW_SAMPLES if needed, pass all samples if longer.
+    // The decoder needs at least WINDOW_SAMPLES but can handle more.
+    let buffer: Vec<f32> = if samples.len() >= WINDOW_SAMPLES {
+        samples.clone()
     } else {
-        &samples
+        let mut padded = samples.clone();
+        padded.resize(WINDOW_SAMPLES, 0.0);
+        padded
     };
 
     let start = Instant::now();
@@ -156,7 +162,7 @@ pub fn decode_wav_to_results(path: &str) -> Result<BenchmarkResult, String> {
         .map_err(|e| format!("Ft8Decoder::new failed: {}", e))?;
 
     let pancetta_raw = decoder
-        .decode_window(window)
+        .decode_window(&buffer)
         .map_err(|e| format!("decode_window failed: {}", e))?;
 
     let pancetta_decodes: Vec<DecodeResult> = pancetta_raw
@@ -170,7 +176,7 @@ pub fn decode_wav_to_results(path: &str) -> Result<BenchmarkResult, String> {
         .collect();
 
     // --- ft8_lib decode ---
-    let ft8lib_raw = ft8lib_decode_audio(window);
+    let ft8lib_raw = ft8lib_decode_audio(&buffer);
 
     let ft8lib_decodes: Vec<DecodeResult> = ft8lib_raw
         .into_iter()
