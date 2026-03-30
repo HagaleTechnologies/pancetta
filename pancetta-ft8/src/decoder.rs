@@ -434,23 +434,27 @@ impl Ft8Decoder {
                 return;
             }
 
-            let orig_energy: f64 = (0..signal_len)
+            // Estimate amplitude using cross-correlation (projection).
+            // dot(orig, recon) / dot(recon, recon) gives the least-squares
+            // amplitude estimate, which naturally handles phase alignment.
+            let dot_or: f64 = (0..signal_len)
                 .map(|i| {
-                    let s = audio[time_offset_samples + i] as f64;
-                    s * s
+                    audio[time_offset_samples + i] as f64 * reconstructed[i] as f64
                 })
                 .sum();
 
-            let recon_energy: f64 = (0..signal_len)
+            let dot_rr: f64 = (0..signal_len)
                 .map(|i| {
                     let s = reconstructed[i] as f64;
                     s * s
                 })
                 .sum();
 
-            // Scale with conservative factor (0.9) to avoid over-subtraction artifacts
-            let scale = if recon_energy > 1e-12 {
-                (orig_energy / recon_energy).sqrt() as f32 * 0.9
+            // Scale factor: projection of original onto reconstructed signal.
+            // Clamp to [0, 3] to avoid runaway subtraction from noise correlation.
+            // Apply conservative 0.9 factor to avoid over-subtraction artifacts.
+            let scale = if dot_rr > 1e-12 {
+                ((dot_or / dot_rr) as f32).clamp(0.0, 3.0) * 0.9
             } else {
                 0.0
             };
