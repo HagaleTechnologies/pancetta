@@ -182,7 +182,7 @@ impl SlotManager {
             );
             info!(
                 "Auto-detected TX parity: {:?} (even={}, odd={})",
-                self.our_slot.unwrap(),
+                self.our_slot.expect("just assigned above"),
                 self.auto_detect_even_activity,
                 self.auto_detect_odd_activity,
             );
@@ -636,7 +636,7 @@ impl FrequencyAllocator {
                 .own_frequencies
                 .values()
                 .map(|&f| (f - freq).abs())
-                .min_by(|a, b| a.partial_cmp(b).unwrap())
+                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
                 .unwrap_or(f64::MAX);
 
             let nearby_count = self
