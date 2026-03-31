@@ -28,6 +28,9 @@ pub enum ExchangeError {
 
     #[error("Message parsing error: {details}")]
     ParseError { details: String },
+
+    #[error("Missing capture group {group} in message: {message}")]
+    MissingCapture { group: usize, message: String },
 }
 
 /// FT8 message exchange handler
@@ -392,7 +395,13 @@ impl MessageExchange {
                 grid: None,
             })
         } else if captures.len() == 4 {
-            let third_field = captures.get(3).unwrap().as_str();
+            let third_field = captures
+                .get(3)
+                .ok_or_else(|| ExchangeError::MissingCapture {
+                    group: 3,
+                    message: message.to_string(),
+                })?
+                .as_str();
 
             // Check if it's a grid square
             if GRID_REGEX.is_match(third_field) {
@@ -438,8 +447,20 @@ impl MessageExchange {
             }
         } else if captures.len() == 5 {
             // Contest exchange format
-            let report_str = captures.get(3).unwrap().as_str();
-            let serial_str = captures.get(4).unwrap().as_str();
+            let report_str = captures
+                .get(3)
+                .ok_or_else(|| ExchangeError::MissingCapture {
+                    group: 3,
+                    message: message.to_string(),
+                })?
+                .as_str();
+            let serial_str = captures
+                .get(4)
+                .ok_or_else(|| ExchangeError::MissingCapture {
+                    group: 4,
+                    message: message.to_string(),
+                })?
+                .as_str();
 
             let report = (report_str
                 .parse::<u32>()
