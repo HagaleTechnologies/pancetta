@@ -281,6 +281,7 @@ mod transmission_tests {
     }
 
     #[tokio::test]
+    #[ignore] // Requires audio hardware (ALSA) — fails in CI
     async fn test_transmitter_system_test() {
         let config = TransmissionConfig::default();
         let mut transmitter = Ft8Transmitter::new(config).unwrap();
