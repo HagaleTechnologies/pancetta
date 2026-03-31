@@ -70,7 +70,7 @@ signal-hook = "0.3"
 signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 
 # Performance monitoring
-metrics = "0.23"
+metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.15", optional = true }
 
 # WAV file reading for playback mode
