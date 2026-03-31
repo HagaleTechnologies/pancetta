@@ -17,6 +17,7 @@
 //! and exits.
 
 use anyhow::Result;
+use geographiclib_rs::InverseGeodesic;
 use pancetta_audio::{AudioManager, AudioManagerConfig};
 use pancetta_config::Config;
 use pancetta_dsp::DspPipeline;
@@ -870,6 +871,20 @@ impl ApplicationCoordinator {
         let (tui_cmd_tx, tui_cmd_rx) =
             crossbeam_channel::unbounded::<pancetta_tui::tui_runner::TuiCommand>();
 
+        // Read initial operating frequency from config (no frequency_mhz field on StationConfig,
+        // so default to 20m FT8 = 14.074 MHz; will be updated by FrequencyResponse messages)
+        let operating_freq_mhz = 14.074_f64;
+        let operating_freq = Arc::new(std::sync::atomic::AtomicU64::new(
+            operating_freq_mhz.to_bits(),
+        ));
+        let operating_freq_relay = operating_freq.clone();
+
+        // Set up station coordinates for distance/bearing calculation
+        let station_coords = {
+            let config = self.config.read().await;
+            pancetta_dx::gridsquare::grid_to_coordinates(&config.station.grid_square).ok()
+        };
+
         // Task: relay decoded messages from point-to-point channel into TuiMessage channel
         let relay_shutdown = shutdown.clone();
         let tui_msg_tx_relay = tui_msg_tx.clone();
@@ -880,9 +895,26 @@ impl ApplicationCoordinator {
                         let call_sign = decoded_msg.message.from_callsign.clone();
                         let grid_square = decoded_msg.message.grid_square.clone();
 
+                        // Compute distance and bearing if both grids are available
+                        let (distance, bearing) = match (&grid_square, &station_coords) {
+                            (Some(remote_grid), Some((home_lat, home_lon))) => {
+                                match pancetta_dx::gridsquare::grid_to_coordinates(remote_grid) {
+                                    Ok((remote_lat, remote_lon)) => {
+                                        let geod = geographiclib_rs::Geodesic::wgs84();
+                                        let (dist_m, azi1, _azi2, _arc) =
+                                            geod.inverse(*home_lat, *home_lon, remote_lat, remote_lon);
+                                        let bearing_deg = if azi1 < 0.0 { azi1 + 360.0 } else { azi1 };
+                                        (Some(dist_m / 1000.0), Some(bearing_deg))
+                                    }
+                                    Err(_) => (None, None),
+                                }
+                            }
+                            _ => (None, None),
+                        };
+
                         let tui_decoded = pancetta_tui::DecodedMessageView {
                             timestamp: chrono::Utc::now(),
-                            frequency: 14.074,
+                            frequency: f64::from_bits(operating_freq_relay.load(Ordering::Relaxed)),
                             mode: "FT8".to_string(),
                             snr: decoded_msg.snr_db as i32,
                             delta_time: decoded_msg.time_offset as f32,
@@ -890,8 +922,8 @@ impl ApplicationCoordinator {
                             call_sign,
                             grid_square,
                             message: decoded_msg.text.clone(),
-                            distance: None,
-                            bearing: None,
+                            distance,
+                            bearing,
                         };
 
                         let _ = tui_msg_tx_relay.send(
@@ -923,6 +955,9 @@ impl ApplicationCoordinator {
                                     frequency,
                                 },
                             ) => {
+                                // Update operating frequency for decoded message enrichment
+                                let freq_mhz = frequency as f64 / 1_000_000.0;
+                                operating_freq_relay.store(freq_mhz.to_bits(), Ordering::Relaxed);
                                 let _ = tui_msg_tx_relay.send(
                                     pancetta_tui::tui_runner::TuiMessage::FrequencyUpdate {
                                         vfo,

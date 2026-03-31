@@ -27,6 +27,7 @@ pancetta-config = { path = "../pancetta-config" }
 pancetta-hamlib = { path = "../pancetta-hamlib", optional = true }
 pancetta-qso = { path = "../pancetta-qso" }
 pancetta-dx = { path = "../pancetta-dx" }
+geographiclib-rs = { workspace = true }
 
 # Async runtime and coordination
 tokio = { version = "1.50", features = ["full", "rt-multi-thread"] }
