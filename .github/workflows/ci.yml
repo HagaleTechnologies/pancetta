@@ -20,55 +20,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  ft8-tests:
-    name: FT8 Tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ft8-tests
-
-      - name: Check (no features)
-        run: cargo check -p pancetta-ft8
-
-      - name: Check (transmit feature)
-        run: cargo check --features transmit -p pancetta-ft8
-
-      - name: Run FT8 tests (all features)
-        run: cargo test --features transmit -p pancetta-ft8
-
-  workspace-check:
-    name: Workspace Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: recursive
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: workspace-check
-
-      - name: Check workspace
-        run: cargo check --workspace
-
-      - name: Test workspace
-        run: cargo test --workspace --features transmit
-
+  # Fast checks — run on every push and PR (~2 min)
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
@@ -103,3 +55,55 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  # Full test suite — only on PRs (~20 min)
+  ft8-tests:
+    name: FT8 Tests
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ft8-tests
+
+      - name: Check (no features)
+        run: cargo check -p pancetta-ft8
+
+      - name: Check (transmit feature)
+        run: cargo check --features transmit -p pancetta-ft8
+
+      - name: Run FT8 tests (all features)
+        run: cargo test --features transmit -p pancetta-ft8
+
+  workspace-check:
+    name: Workspace Check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: workspace-check
+
+      - name: Check workspace
+        run: cargo check --workspace
+
+      - name: Test workspace
+        run: cargo test --workspace --features transmit
