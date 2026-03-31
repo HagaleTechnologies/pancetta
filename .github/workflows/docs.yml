@@ -3,6 +3,10 @@ name: Docs
 on:
   push:
     branches: [main]
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '.github/workflows/docs.yml'
 
 jobs:
   build:
