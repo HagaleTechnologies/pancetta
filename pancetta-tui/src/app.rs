@@ -425,10 +425,13 @@ impl App {
     }
 
     async fn start_audio_monitoring(&mut self, _device: &str) -> Result<()> {
-        // TODO: Initialize audio processing pipeline
+        // Audio pipeline setup is handled by the coordinator, which creates
+        // audio → DSP → FT8 → TUI channels before launching the TUI.
+        // This method just sets the monitoring flag so the UI knows to expect data.
+        // Standalone TUI operation (without coordinator) is not yet supported.
         self.is_monitoring = true;
-        self.status_message = "Audio monitoring started".to_string();
-        info!("Started audio monitoring");
+        self.status_message = "Audio monitoring active (via coordinator)".to_string();
+        info!("Audio monitoring flag set — pipeline managed by coordinator");
         Ok(())
     }
 
