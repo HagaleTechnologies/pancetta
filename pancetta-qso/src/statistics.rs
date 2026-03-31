@@ -26,6 +26,9 @@ pub enum StatisticsError {
 
     #[error("Insufficient data: {message}")]
     InsufficientData { message: String },
+
+    #[error("Invalid date: year {year}")]
+    InvalidDate { year: i32 },
 }
 
 /// Comprehensive QSO statistics
@@ -1013,33 +1016,31 @@ impl StatisticsCalculator {
         self.calculate_statistics(Some(&filter)).await
     }
 
+    /// Safely construct a UTC DateTime from year/month/day/hour/min/sec.
+    fn make_utc(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        min: u32,
+        sec: u32,
+    ) -> Result<DateTime<Utc>, StatisticsError> {
+        chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|d| d.and_hms_opt(hour, min, sec))
+            .map(|dt| dt.and_utc())
+            .ok_or(StatisticsError::InvalidDate { year })
+    }
+
     /// Calculate year-over-year comparison
     pub async fn calculate_yearly_comparison(
         &self,
         year1: u32,
         year2: u32,
     ) -> Result<YearlyComparison, StatisticsError> {
-        let start1 = chrono::NaiveDate::from_ymd_opt(year1 as i32, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc();
-        let end1 = chrono::NaiveDate::from_ymd_opt(year1 as i32, 12, 31)
-            .unwrap()
-            .and_hms_opt(23, 59, 59)
-            .unwrap()
-            .and_utc();
-
-        let start2 = chrono::NaiveDate::from_ymd_opt(year2 as i32, 1, 1)
-            .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc();
-        let end2 = chrono::NaiveDate::from_ymd_opt(year2 as i32, 12, 31)
-            .unwrap()
-            .and_hms_opt(23, 59, 59)
-            .unwrap()
-            .and_utc();
+        let start1 = Self::make_utc(year1 as i32, 1, 1, 0, 0, 0)?;
+        let end1 = Self::make_utc(year1 as i32, 12, 31, 23, 59, 59)?;
+        let start2 = Self::make_utc(year2 as i32, 1, 1, 0, 0, 0)?;
+        let end2 = Self::make_utc(year2 as i32, 12, 31, 23, 59, 59)?;
 
         let stats1 = self.calculate_period_statistics(start1, end1).await?;
         let stats2 = self.calculate_period_statistics(start2, end2).await?;
@@ -1167,7 +1168,10 @@ impl StatisticsCalculator {
         let max_day = daily_counts
             .iter()
             .max_by_key(|(_, &count)| count)
-            .map(|(date, _)| chrono::Utc.from_utc_datetime(&date.and_hms_opt(0, 0, 0).unwrap()));
+            .and_then(|(date, _)| {
+                date.and_hms_opt(0, 0, 0)
+                    .map(|dt| chrono::Utc.from_utc_datetime(&dt))
+            });
         let activity_percentage = (active_days as f64 / total_days as f64) * 100.0;
 
         let daily = DailyStatistics {
@@ -1601,10 +1605,22 @@ impl StatisticsCalculator {
                     if !current_session.is_empty() {
                         session_qsos.push(current_session.len());
                         // Calculate session duration
-                        let session_start = current_session.first().unwrap().metadata.start_time;
-                        let session_end =
-                            current_session.last().unwrap().metadata.end_time.unwrap_or(
-                                current_session.last().unwrap().metadata.start_time
+                        let session_start = current_session
+                            .first()
+                            .expect("checked non-empty")
+                            .metadata
+                            .start_time;
+                        let session_end = current_session
+                            .last()
+                            .expect("checked non-empty")
+                            .metadata
+                            .end_time
+                            .unwrap_or(
+                                current_session
+                                    .last()
+                                    .expect("checked non-empty")
+                                    .metadata
+                                    .start_time
                                     + Duration::minutes(2),
                             );
                         session_durations
@@ -1619,10 +1635,24 @@ impl StatisticsCalculator {
 
         if !current_session.is_empty() {
             session_qsos.push(current_session.len());
-            let session_start = current_session.first().unwrap().metadata.start_time;
-            let session_end = current_session.last().unwrap().metadata.end_time.unwrap_or(
-                current_session.last().unwrap().metadata.start_time + Duration::minutes(2),
-            );
+            let session_start = current_session
+                .first()
+                .expect("checked non-empty")
+                .metadata
+                .start_time;
+            let session_end = current_session
+                .last()
+                .expect("checked non-empty")
+                .metadata
+                .end_time
+                .unwrap_or(
+                    current_session
+                        .last()
+                        .expect("checked non-empty")
+                        .metadata
+                        .start_time
+                        + Duration::minutes(2),
+                );
             session_durations.push((session_end - session_start).num_seconds() as f64 / 3600.0);
         }
 
