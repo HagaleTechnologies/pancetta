@@ -276,23 +276,31 @@ async fn run_application(cli: Cli) -> Result<()> {
     // Set up signal handlers
     let shutdown_for_signals = shutdown.clone();
     tokio::spawn(async move {
-        let mut signals = Signals::new(&[SIGINT]).expect("Failed to register signal handler");
-
-        while let Some(signal) = signals.next().await {
-            match signal {
-                SIGINT => {
-                    info!("Received SIGINT, initiating graceful shutdown");
-                    shutdown_clone.store(true, Ordering::Release);
-                    break;
+        match Signals::new(&[SIGINT]) {
+            Ok(mut signals) => {
+                while let Some(signal) = signals.next().await {
+                    match signal {
+                        SIGINT => {
+                            info!("Received SIGINT, initiating graceful shutdown");
+                            shutdown_clone.store(true, Ordering::Release);
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
+            }
+            Err(e) => {
+                error!("Failed to register signal handler: {}", e);
+                shutdown_clone.store(true, Ordering::Release);
             }
         }
     });
 
     // Alternative signal handler for Windows/cross-platform compatibility
     tokio::spawn(async move {
-        signal::ctrl_c().await.expect("Failed to listen for ctrl+c");
+        if let Err(e) = signal::ctrl_c().await {
+            error!("Failed to listen for ctrl+c: {}", e);
+        }
         warn!("Received Ctrl+C, initiating graceful shutdown");
         shutdown_for_signals.store(true, Ordering::Release);
     });
