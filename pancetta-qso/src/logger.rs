@@ -1080,7 +1080,6 @@ impl Default for BackupConfig {
     }
 }
 
-
 impl Default for ValidationConfig {
     fn default() -> Self {
         Self {

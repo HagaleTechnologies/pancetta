@@ -14,8 +14,8 @@ use crate::{
     osd::{OsdConfig, OsdDecoder},
     protocol::ProtocolParams,
     signal_processing::{FftProcessor, WindowFunction},
-    DecodingMetrics, Ft8Error, Ft8Result, MessageHandler, NullMessageHandler, Protocol,
-    NUM_TONES, SAMPLE_RATE, SYMBOL_DURATION,
+    DecodingMetrics, Ft8Error, Ft8Result, MessageHandler, NullMessageHandler, Protocol, NUM_TONES,
+    SAMPLE_RATE, SYMBOL_DURATION,
 };
 use bitvec::prelude::*;
 use num_complex::Complex;
@@ -454,9 +454,7 @@ impl Ft8Decoder {
             // dot(orig, recon) / dot(recon, recon) gives the least-squares
             // amplitude estimate, which naturally handles phase alignment.
             let dot_or: f64 = (0..signal_len)
-                .map(|i| {
-                    audio[time_offset_samples + i] as f64 * reconstructed[i] as f64
-                })
+                .map(|i| audio[time_offset_samples + i] as f64 * reconstructed[i] as f64)
                 .sum();
 
             let dot_rr: f64 = (0..signal_len)
@@ -820,8 +818,8 @@ impl Ft8Decoder {
             let time_offset_samples = time_offset as usize;
 
             for &df in &freq_offsets {
-                let freq_hz = candidate.freq_bin as f64 * tone_spacing + sub_bin_offset
-                    + df * tone_spacing;
+                let freq_hz =
+                    candidate.freq_bin as f64 * tone_spacing + sub_bin_offset + df * tone_spacing;
                 if freq_hz < 0.0 {
                     continue;
                 }

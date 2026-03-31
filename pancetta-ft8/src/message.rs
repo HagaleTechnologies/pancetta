@@ -1005,7 +1005,6 @@ impl MessageParser {
         }
     }
 
-
     // =========================================================================
     // i3=0 sub-type parsers (n3 field determines format)
     // =========================================================================
@@ -1215,7 +1214,6 @@ impl MessageParser {
 
         Ok(())
     }
-
 
     /// Decode grid square from 15-bit field using Maidenhead system
     fn decode_grid_square_15bit(&self, grid_value: u32) -> Ft8Result<Option<String>> {

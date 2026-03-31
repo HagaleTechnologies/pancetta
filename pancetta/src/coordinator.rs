@@ -901,9 +901,10 @@ impl ApplicationCoordinator {
                                 match pancetta_dx::gridsquare::grid_to_coordinates(remote_grid) {
                                     Ok((remote_lat, remote_lon)) => {
                                         let geod = geographiclib_rs::Geodesic::wgs84();
-                                        let (dist_m, azi1, _azi2, _arc) =
-                                            geod.inverse(*home_lat, *home_lon, remote_lat, remote_lon);
-                                        let bearing_deg = if azi1 < 0.0 { azi1 + 360.0 } else { azi1 };
+                                        let (dist_m, azi1, _azi2, _arc) = geod
+                                            .inverse(*home_lat, *home_lon, remote_lat, remote_lon);
+                                        let bearing_deg =
+                                            if azi1 < 0.0 { azi1 + 360.0 } else { azi1 };
                                         (Some(dist_m / 1000.0), Some(bearing_deg))
                                     }
                                     Err(_) => (None, None),

@@ -995,7 +995,6 @@ pub struct TransmissionConfig {
     pub safety_config: SafetyConfig,
 }
 
-
 /// Frequency configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrequencyConfig {

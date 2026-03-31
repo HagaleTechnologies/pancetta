@@ -14,9 +14,7 @@
 
 use bitvec::prelude::*;
 
-use crate::ldpc::{
-    LDPC_CODEWORD_BITS, LDPC_GENERATOR, LDPC_INFO_BITS, LDPC_PARITY_BITS,
-};
+use crate::ldpc::{LDPC_CODEWORD_BITS, LDPC_GENERATOR, LDPC_INFO_BITS, LDPC_PARITY_BITS};
 use crate::message::{CRC_BITS, PAYLOAD_BITS};
 
 /// Number of bytes needed to pack a full 174-bit codeword row (ceil(174/8)).
@@ -449,7 +447,7 @@ mod tests {
         set_bit(&mut b, 10);
         xor_rows(&mut a, &b);
         assert!(!get_bit(&a, 0)); // 1 ^ 1 = 0
-        assert!(get_bit(&a, 5));  // 1 ^ 0 = 1
+        assert!(get_bit(&a, 5)); // 1 ^ 0 = 1
         assert!(get_bit(&a, 10)); // 0 ^ 1 = 1
     }
 
@@ -538,11 +536,11 @@ mod tests {
 
         // Test several different payloads to ensure crc14_from_u8_bits matches calculate_crc14
         let test_patterns: &[&[usize]] = &[
-            &[],                          // all zeros
-            &[0, 1, 2, 3],               // first few bits
-            &[3, 10, 25, 50, 70],         // sparse
+            &[],                                                             // all zeros
+            &[0, 1, 2, 3],                                                   // first few bits
+            &[3, 10, 25, 50, 70],                                            // sparse
             &[0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75], // dense
-            &[76],                        // last bit only
+            &[76],                                                           // last bit only
         ];
 
         for (idx, pattern) in test_patterns.iter().enumerate() {
@@ -643,7 +641,10 @@ mod tests {
             // OSD-1 should succeed
             let decoder1 = OsdDecoder::new(OsdConfig { max_depth: 1 });
             let result = decoder1.decode(&llrs);
-            assert!(result.is_some(), "OSD-1 should recover single unreliable bit");
+            assert!(
+                result.is_some(),
+                "OSD-1 should recover single unreliable bit"
+            );
             assert_eq!(result.unwrap(), codeword);
         }
 

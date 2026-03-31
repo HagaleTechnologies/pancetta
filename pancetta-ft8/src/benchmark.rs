@@ -158,8 +158,8 @@ pub fn decode_wav_to_results(path: &str) -> Result<BenchmarkResult, String> {
 
     // --- Pancetta decode ---
     let config = Ft8Config::default();
-    let mut decoder = Ft8Decoder::new(config)
-        .map_err(|e| format!("Ft8Decoder::new failed: {}", e))?;
+    let mut decoder =
+        Ft8Decoder::new(config).map_err(|e| format!("Ft8Decoder::new failed: {}", e))?;
 
     let pancetta_raw = decoder
         .decode_window(&buffer)
@@ -215,8 +215,16 @@ pub fn compare_results(results: &[BenchmarkResult]) -> ComparisonSummary {
     let mut ft8lib_only = 0usize;
 
     for r in results {
-        let p_set: HashSet<&str> = r.pancetta_decodes.iter().map(|d| d.message.as_str()).collect();
-        let f_set: HashSet<&str> = r.ft8lib_decodes.iter().map(|d| d.message.as_str()).collect();
+        let p_set: HashSet<&str> = r
+            .pancetta_decodes
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
+        let f_set: HashSet<&str> = r
+            .ft8lib_decodes
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect();
 
         let intersection = p_set.intersection(&f_set).count();
         let p_only = p_set.difference(&f_set).count();

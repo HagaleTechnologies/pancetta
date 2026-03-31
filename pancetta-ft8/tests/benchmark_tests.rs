@@ -2,8 +2,9 @@
 ///
 /// These tests verify the structured output of `decode_wav_to_results` and
 /// `ComparisonSummary` serialization.
-
-use pancetta_ft8::benchmark::{BenchmarkResult, ComparisonSummary, DecodeResult, decode_wav_to_results, compare_results};
+use pancetta_ft8::benchmark::{
+    compare_results, decode_wav_to_results, BenchmarkResult, ComparisonSummary, DecodeResult,
+};
 
 /// Verify that `decode_wav_to_results` returns structured output with the
 /// expected fields populated for a known fixture WAV file.
@@ -45,11 +46,26 @@ fn test_decode_result_serializes_to_json() {
 
     let json = serde_json::to_string(&decode).expect("DecodeResult should serialize to JSON");
 
-    assert!(json.contains("\"message\""), "JSON should contain 'message' key");
-    assert!(json.contains("CQ W1ABC FN42"), "JSON should contain the message text");
-    assert!(json.contains("\"frequency_hz\""), "JSON should contain 'frequency_hz' key");
-    assert!(json.contains("\"time_offset_s\""), "JSON should contain 'time_offset_s' key");
-    assert!(json.contains("\"snr_db\""), "JSON should contain 'snr_db' key");
+    assert!(
+        json.contains("\"message\""),
+        "JSON should contain 'message' key"
+    );
+    assert!(
+        json.contains("CQ W1ABC FN42"),
+        "JSON should contain the message text"
+    );
+    assert!(
+        json.contains("\"frequency_hz\""),
+        "JSON should contain 'frequency_hz' key"
+    );
+    assert!(
+        json.contains("\"time_offset_s\""),
+        "JSON should contain 'time_offset_s' key"
+    );
+    assert!(
+        json.contains("\"snr_db\""),
+        "JSON should contain 'snr_db' key"
+    );
 
     // Round-trip: deserialize and check values
     let decoded: DecodeResult =
@@ -91,12 +107,25 @@ fn test_compare_results_computes_summary() {
     let r1 = BenchmarkResult {
         file_path: "a.wav".to_string(),
         pancetta_decodes: vec![
-            DecodeResult { message: "CQ W1ABC FN42".to_string(), frequency_hz: 1500.0, time_offset_s: 0.0, snr_db: -10.0 },
-            DecodeResult { message: "K1DEF W1ABC -12".to_string(), frequency_hz: 1600.0, time_offset_s: 0.0, snr_db: -8.0 },
+            DecodeResult {
+                message: "CQ W1ABC FN42".to_string(),
+                frequency_hz: 1500.0,
+                time_offset_s: 0.0,
+                snr_db: -10.0,
+            },
+            DecodeResult {
+                message: "K1DEF W1ABC -12".to_string(),
+                frequency_hz: 1600.0,
+                time_offset_s: 0.0,
+                snr_db: -8.0,
+            },
         ],
-        ft8lib_decodes: vec![
-            DecodeResult { message: "CQ W1ABC FN42".to_string(), frequency_hz: 1500.0, time_offset_s: 0.0, snr_db: -10.0 },
-        ],
+        ft8lib_decodes: vec![DecodeResult {
+            message: "CQ W1ABC FN42".to_string(),
+            frequency_hz: 1500.0,
+            time_offset_s: 0.0,
+            snr_db: -10.0,
+        }],
         processing_time_ms: 100.0,
     };
 
@@ -106,7 +135,10 @@ fn test_compare_results_computes_summary() {
     assert_eq!(summary.pancetta_total, 2);
     assert_eq!(summary.ft8lib_total, 1);
     assert_eq!(summary.both_decoded, 1, "one message decoded by both");
-    assert_eq!(summary.pancetta_only, 1, "one message decoded only by pancetta");
+    assert_eq!(
+        summary.pancetta_only, 1,
+        "one message decoded only by pancetta"
+    );
     assert_eq!(summary.ft8lib_only, 0, "ft8lib had no exclusive decodes");
     assert_eq!(summary.per_file.len(), 1);
 

@@ -1045,7 +1045,6 @@ impl Default for QueryOptions {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

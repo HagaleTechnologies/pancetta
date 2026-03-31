@@ -1664,7 +1664,6 @@ impl Default for PanelVisibilityConfig {
     }
 }
 
-
 impl Default for KeyboardNavigationConfig {
     fn default() -> Self {
         Self {
@@ -1700,7 +1699,6 @@ impl Default for SoundFeedbackConfig {
         }
     }
 }
-
 
 impl Default for AnimationConfig {
     fn default() -> Self {
@@ -1747,7 +1745,6 @@ impl Default for AnimationPerformanceConfig {
         }
     }
 }
-
 
 impl Default for ToolbarVisibilityConfig {
     fn default() -> Self {

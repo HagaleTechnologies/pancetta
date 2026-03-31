@@ -994,7 +994,6 @@ impl AutoSequencer {
 // on completely separate state maps. Use Arc<AutoSequencer> instead.
 // Clone is intentionally not implemented.
 
-
 impl Default for CqBehaviorConfig {
     fn default() -> Self {
         Self {

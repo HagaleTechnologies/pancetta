@@ -793,7 +793,6 @@ impl Default for FrequencyConfig {
     }
 }
 
-
 impl Default for FrequencyLimitsConfig {
     fn default() -> Self {
         Self {
@@ -915,9 +914,6 @@ impl Default for TimingConfig {
         }
     }
 }
-
-
-
 
 impl ConfigSection for RigConfig {
     fn validate_section(&self) -> ConfigResult<()> {

@@ -657,7 +657,6 @@ impl Default for WienerFilterConfig {
     }
 }
 
-
 impl Default for MonitorConfig {
     fn default() -> Self {
         Self {

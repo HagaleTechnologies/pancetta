@@ -445,11 +445,19 @@ pub fn calculate_magnetic_declination(
 }
 
 /// Safely create a NaiveDateTime, returning a fallback on invalid h/m/s.
-fn safe_hms(date: chrono::NaiveDate, h: u32, m: u32, s: u32, fallback_h: u32) -> chrono::NaiveDateTime {
-    date.and_hms_opt(h, m, s)
-        .unwrap_or_else(|| date.and_hms_opt(fallback_h, 0, 0)
-            .unwrap_or_else(|| date.and_hms_opt(0, 0, 0)
-                .expect("midnight is always valid on a valid NaiveDate")))
+fn safe_hms(
+    date: chrono::NaiveDate,
+    h: u32,
+    m: u32,
+    s: u32,
+    fallback_h: u32,
+) -> chrono::NaiveDateTime {
+    date.and_hms_opt(h, m, s).unwrap_or_else(|| {
+        date.and_hms_opt(fallback_h, 0, 0).unwrap_or_else(|| {
+            date.and_hms_opt(0, 0, 0)
+                .expect("midnight is always valid on a valid NaiveDate")
+        })
+    })
 }
 
 /// Calculate sunrise/sunset times for a given coordinate and date

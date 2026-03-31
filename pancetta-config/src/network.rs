@@ -1226,7 +1226,6 @@ pub struct CustomAuthConfig {
     pub credentials: HashMap<String, String>,
 }
 
-
 impl Default for PskReporterConfig {
     fn default() -> Self {
         Self {
@@ -1276,7 +1275,6 @@ impl Default for PskReporterFilters {
         }
     }
 }
-
 
 impl Default for DistanceFilters {
     fn default() -> Self {
@@ -1358,8 +1356,6 @@ impl Default for QrzLogbookConfig {
     }
 }
 
-
-
 impl Default for CertRenewalConfig {
     fn default() -> Self {
         Self {
@@ -1403,7 +1399,6 @@ impl Default for LotwDownloadConfig {
     }
 }
 
-
 impl Default for EqslConfig {
     fn default() -> Self {
         Self {
@@ -1439,7 +1434,6 @@ impl Default for EqslDownloadConfig {
         }
     }
 }
-
 
 impl Default for CardCustomizationConfig {
     fn default() -> Self {
@@ -1545,8 +1539,6 @@ impl Default for WsprFilteringConfig {
         }
     }
 }
-
-
 
 impl Default for ClusterConnectionConfig {
     fn default() -> Self {

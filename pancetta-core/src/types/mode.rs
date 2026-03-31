@@ -168,7 +168,6 @@ impl FromStr for Mode {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

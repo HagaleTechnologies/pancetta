@@ -211,7 +211,6 @@ impl fmt::Display for Band {
     }
 }
 
-
 impl FromStr for Band {
     type Err = String;
 
