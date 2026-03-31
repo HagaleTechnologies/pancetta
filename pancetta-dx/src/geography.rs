@@ -444,6 +444,14 @@ pub fn calculate_magnetic_declination(
     Ok(declination_deg)
 }
 
+/// Safely create a NaiveDateTime, returning a fallback on invalid h/m/s.
+fn safe_hms(date: chrono::NaiveDate, h: u32, m: u32, s: u32, fallback_h: u32) -> chrono::NaiveDateTime {
+    date.and_hms_opt(h, m, s)
+        .unwrap_or_else(|| date.and_hms_opt(fallback_h, 0, 0)
+            .unwrap_or_else(|| date.and_hms_opt(0, 0, 0)
+                .expect("midnight is always valid on a valid NaiveDate")))
+}
+
 /// Calculate sunrise/sunset times for a given coordinate and date
 pub fn calculate_sun_times(
     latitude: f64,
@@ -464,11 +472,11 @@ pub fn calculate_sun_times(
     // Check for polar day/night conditions
     if cos_hour_angle > 1.0 {
         // Polar night - sun never rises
-        let midnight = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+        let midnight = safe_hms(date, 0, 0, 0, 0).and_utc();
         return Ok((midnight, midnight));
     } else if cos_hour_angle < -1.0 {
         // Polar day - sun never sets
-        let noon = date.and_hms_opt(12, 0, 0).unwrap().and_utc();
+        let noon = safe_hms(date, 12, 0, 0, 12).and_utc();
         return Ok((noon, noon));
     }
 
@@ -489,9 +497,7 @@ pub fn calculate_sun_times(
         let hour = sunrise_hour as u32;
         let minute = ((sunrise_hour % 1.0) * 60.0) as u32;
         let second = (((sunrise_hour % 1.0) * 60.0 % 1.0) * 60.0) as u32;
-        date.and_hms_opt(hour, minute, second)
-            .unwrap_or_else(|| date.and_hms_opt(12, 0, 0).unwrap())
-            .and_utc()
+        safe_hms(date, hour, minute, second, 12).and_utc()
     } else {
         // Handle day boundary crossing
         let adjusted_hour = if sunrise_hour < 0.0 {
@@ -507,19 +513,14 @@ pub fn calculate_sun_times(
         } else {
             date + chrono::Duration::days(1)
         };
-        adjusted_date
-            .and_hms_opt(hour, minute, second)
-            .unwrap_or_else(|| date.and_hms_opt(6, 0, 0).unwrap())
-            .and_utc()
+        safe_hms(adjusted_date, hour, minute, second, 6).and_utc()
     };
 
     let sunset = if (0.0..24.0).contains(&sunset_hour) {
         let hour = sunset_hour as u32;
         let minute = ((sunset_hour % 1.0) * 60.0) as u32;
         let second = (((sunset_hour % 1.0) * 60.0 % 1.0) * 60.0) as u32;
-        date.and_hms_opt(hour, minute, second)
-            .unwrap_or_else(|| date.and_hms_opt(18, 0, 0).unwrap())
-            .and_utc()
+        safe_hms(date, hour, minute, second, 18).and_utc()
     } else {
         // Handle day boundary crossing
         let adjusted_hour = if sunset_hour < 0.0 {
@@ -535,10 +536,7 @@ pub fn calculate_sun_times(
         } else {
             date + chrono::Duration::days(1)
         };
-        adjusted_date
-            .and_hms_opt(hour, minute, second)
-            .unwrap_or_else(|| date.and_hms_opt(18, 0, 0).unwrap())
-            .and_utc()
+        safe_hms(adjusted_date, hour, minute, second, 18).and_utc()
     };
 
     Ok((sunrise, sunset))
