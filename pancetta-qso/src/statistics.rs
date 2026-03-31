@@ -1104,10 +1104,10 @@ impl StatisticsCalculator {
             *by_hour.entry(qso_time.time().hour() as u8).or_insert(0) += 1;
 
             // First/last QSO
-            if first_qso.is_none() || qso_time < first_qso.unwrap() {
+            if first_qso.map_or(true, |t| qso_time < t) {
                 first_qso = Some(qso_time);
             }
-            if last_qso.is_none() || qso_time > last_qso.unwrap() {
+            if last_qso.map_or(true, |t| qso_time > t) {
                 last_qso = Some(qso_time);
             }
 

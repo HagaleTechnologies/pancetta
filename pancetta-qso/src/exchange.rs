@@ -494,7 +494,9 @@ impl MessageExchange {
         current_state: &QsoState,
         received_message: &MessageType,
     ) -> Result<Option<MessageType>, ExchangeError> {
-        let contest_config = self.contest_mode.as_ref().unwrap();
+        let contest_config = self.contest_mode.as_ref().ok_or(ExchangeError::InvalidFormat {
+            message: "contest mode not configured".to_string(),
+        })?;
 
         match (current_state, received_message) {
             // Received contest exchange, send our exchange

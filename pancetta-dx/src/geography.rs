@@ -406,10 +406,10 @@ pub fn calculate_magnetic_declination(
     // Calculate decimal year from date
     let year = date.year() as f64;
     let day_of_year = date.ordinal() as f64;
-    let days_in_year = if chrono::NaiveDate::from_ymd_opt(date.year(), 12, 31).is_some() {
-        365.0
-    } else {
+    let days_in_year = if chrono::NaiveDate::from_ymd_opt(date.year(), 2, 29).is_some() {
         366.0
+    } else {
+        365.0
     };
     let decimal_year = year + (day_of_year - 1.0) / days_in_year;
 

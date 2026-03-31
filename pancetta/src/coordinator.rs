@@ -957,6 +957,7 @@ impl ApplicationCoordinator {
                             ) => {
                                 // Update operating frequency for decoded message enrichment
                                 let freq_mhz = frequency as f64 / 1_000_000.0;
+                                // Relaxed ordering is fine — this is a best-effort display value for the TUI
                                 operating_freq_relay.store(freq_mhz.to_bits(), Ordering::Relaxed);
                                 let _ = tui_msg_tx_relay.send(
                                     pancetta_tui::tui_runner::TuiMessage::FrequencyUpdate {
