@@ -594,3 +594,22 @@ fn test_multi_tx_round_trip_two_ft8() {
         texts
     );
 }
+
+/// Verify decoder handles silence (all-zero audio) without producing -inf or NaN
+#[test]
+fn test_decode_silence_no_panic_or_inf() {
+    let silence = vec![0.0f64; WINDOW_SAMPLES];
+    let config = pancetta_ft8::Ft8Config::default();
+    let mut decoder = pancetta_ft8::Ft8Decoder::new(config).unwrap();
+    let waterfall = decoder.generate_waterfall_data(&silence).unwrap();
+    assert!(
+        waterfall.min_power.is_finite(),
+        "Waterfall min_power should be finite, got {}",
+        waterfall.min_power
+    );
+    assert!(
+        waterfall.max_power.is_finite(),
+        "Waterfall max_power should be finite, got {}",
+        waterfall.max_power
+    );
+}

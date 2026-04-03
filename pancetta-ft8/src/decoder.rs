@@ -1127,7 +1127,7 @@ impl Ft8Decoder {
             for (i, &power) in psd.iter().enumerate() {
                 let freq = i as f64 * freq_resolution;
                 if (200.0..=4000.0).contains(&freq) {
-                    let power_db = 10.0 * power.log10();
+                    let power_db = 10.0 * (power + 1e-12).log10();
                     window_powers.push(power_db);
                     waterfall_data.min_power = waterfall_data.min_power.min(power_db);
                     waterfall_data.max_power = waterfall_data.max_power.max(power_db);
