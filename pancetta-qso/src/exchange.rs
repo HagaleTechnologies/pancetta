@@ -90,8 +90,8 @@ lazy_static! {
     static ref QSO_PATTERNS: Vec<Regex> = vec![
         // Response to CQ: "W1ABC K1DEF FN31"
         Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)(?:\s+([A-R]{2}[0-9]{2}(?:[A-X]{2})?))?$").unwrap(),
-        // Signal report: "K1DEF W1ABC -15" or "K1DEF W1ABC R-12"
-        Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)\s+R?([+-]?\d{1,2})$").unwrap(),
+        // Signal report: "K1DEF W1ABC -15" or "K1DEF W1ABC R-12" or "K1DEF W1ABC R -12"
+        Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)\s+(R? ?[+-]?\d{1,2})$").unwrap(),
         // Final confirmation: "W1ABC K1DEF RR73" or "W1ABC K1DEF 73"
         Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)\s+(RR73|73)$").unwrap(),
         // Contest exchange: "W1ABC K1DEF 599 001"
@@ -412,7 +412,7 @@ impl MessageExchange {
                 })
             }
             // Check if it's a signal report
-            else if let Ok(report) = third_field.trim_start_matches('R').parse::<i8>() {
+            else if let Ok(report) = third_field.trim_start_matches('R').trim().parse::<i8>() {
                 self.validate_report(report)?;
 
                 if third_field.starts_with('R') {
