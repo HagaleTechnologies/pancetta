@@ -408,3 +408,40 @@ async fn test_loopback_state_machine_driven_qso() {
         final_b.state
     );
 }
+
+#[test]
+fn test_loopback_two_simultaneous_signals() {
+    let mut station_a = Station::new("W1ABC", "FN42");
+    let mut station_b = Station::new("K2DEF", "FM18");
+    let mut station_c = Station::new("N3GHI", "EM73");
+
+    // Station A and Station B transmit simultaneously at different frequencies
+    let msg_a = "CQ W1ABC FN42";
+    let msg_b = "CQ K2DEF FM18";
+    let audio_a = station_a.encode_and_modulate(msg_a, 300.0);
+    let audio_b = station_b.encode_and_modulate(msg_b, 900.0);
+
+    // Sum the two signals (simulating two stations transmitting at once)
+    let combined: Vec<f32> = audio_a
+        .iter()
+        .zip(audio_b.iter())
+        .map(|(a, b)| a + b)
+        .collect();
+
+    // Station C decodes both
+    let decoded = station_c.decode(&combined);
+
+    let found_a = decoded.iter().any(|m| m.text == msg_a);
+    let found_b = decoded.iter().any(|m| m.text == msg_b);
+
+    assert!(
+        found_a,
+        "Should decode Station A's CQ. Got: {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+    assert!(
+        found_b,
+        "Should decode Station B's CQ. Got: {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+}
