@@ -1425,6 +1425,61 @@ impl ApplicationCoordinator {
                     our_callsign, our_grid
                 );
 
+                // Spawn a task to forward QSO auto-sequence TX requests to the transmitter
+                let mut qso_events = qso_manager.subscribe();
+                let tx_bus = message_bus.clone();
+                let tx_shutdown = shutdown.clone();
+                let tx_callsign = our_callsign.clone();
+                tokio::spawn(async move {
+                    while !tx_shutdown.load(Ordering::Acquire) {
+                        match qso_events.recv().await {
+                            Ok(pancetta_qso::QsoEvent::MessageToSend {
+                                qso_id,
+                                message,
+                                frequency,
+                            }) => {
+                                match pancetta_qso::utils::generate_ft8_message(
+                                    &message,
+                                    &tx_callsign,
+                                ) {
+                                    Ok(text) => {
+                                        info!(
+                                            "QSO auto-sequence sending: '{}' on {:.1} Hz (qso={})",
+                                            text, frequency, qso_id
+                                        );
+                                        let tx_msg = ComponentMessage::new(
+                                            ComponentId::Qso,
+                                            ComponentId::Ft8Transmitter,
+                                            MessageType::TransmitRequest {
+                                                message_text: text,
+                                                frequency_offset: frequency,
+                                                qso_id: Some(qso_id.to_string()),
+                                            },
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = tx_bus.send_message(tx_msg).await {
+                                            warn!("Failed to send auto-sequence TX: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to generate FT8 message for QSO {}: {}",
+                                            qso_id, e
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(_) => {} // Other events — ignore
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("QSO event subscriber lagged by {} events", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                break;
+                            }
+                        }
+                    }
+                });
+
                 while !shutdown.load(Ordering::Acquire) {
                     match qso_rx.try_recv() {
                         Ok(message) => {
