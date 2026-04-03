@@ -9,5 +9,6 @@ pub mod client;
 pub mod error;
 pub mod types;
 
+pub use client::CqdxClient;
 pub use error::{CqdxError, Result};
 pub use types::*;
