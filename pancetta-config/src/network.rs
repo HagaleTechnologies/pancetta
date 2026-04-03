@@ -46,6 +46,9 @@ pub struct NetworkConfig {
     /// Retry and timeout settings
     pub reliability: ReliabilityConfig,
 
+    /// cqdx.io integration configuration
+    pub cqdx: CqdxConfig,
+
     /// Custom service integrations
     #[serde(default)]
     pub custom_services: HashMap<String, CustomServiceConfig>,
@@ -1515,6 +1518,33 @@ impl Default for OqrsProcessingConfig {
     }
 }
 
+/// cqdx.io integration configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CqdxConfig {
+    /// Enable cqdx.io integration
+    pub enabled: bool,
+
+    /// cqdx.io base URL
+    pub base_url: String,
+
+    /// Personal Access Token for authentication
+    pub token: Option<String>,
+
+    /// Priority spot poll interval in seconds
+    pub poll_interval_secs: u64,
+}
+
+impl Default for CqdxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: "https://cqdx.io".to_string(),
+            token: None,
+            poll_interval_secs: 30,
+        }
+    }
+}
+
 impl Default for WsprConfig {
     fn default() -> Self {
         Self {
@@ -1776,6 +1806,20 @@ impl ConfigSection for NetworkConfig {
             }
         }
 
+        // cqdx.io validation
+        if self.cqdx.enabled {
+            if self.cqdx.token.is_none() || self.cqdx.token.as_ref().map_or(true, |t| t.is_empty()) {
+                return Err(ConfigError::Validation(
+                    "cqdx.io integration enabled but no PAT token configured".to_string(),
+                ));
+            }
+            if self.cqdx.poll_interval_secs < 10 {
+                return Err(ConfigError::Validation(
+                    "cqdx.io poll interval must be at least 10 seconds".to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -1918,5 +1962,48 @@ mod tests {
 
         assert_eq!(server.port, 7300);
         assert!(!server.auth_required);
+    }
+
+    #[test]
+    fn test_cqdx_defaults() {
+        let config = CqdxConfig::default();
+        assert!(!config.enabled);
+        assert_eq!(config.base_url, "https://cqdx.io");
+        assert!(config.token.is_none());
+        assert_eq!(config.poll_interval_secs, 30);
+    }
+
+    #[test]
+    fn test_cqdx_validation_enabled_without_token() {
+        let mut config = NetworkConfig::default();
+        config.cqdx.enabled = true;
+        config.cqdx.token = None;
+        assert!(config.validate_section().is_err());
+    }
+
+    #[test]
+    fn test_cqdx_validation_enabled_with_token() {
+        let mut config = NetworkConfig::default();
+        config.cqdx.enabled = true;
+        config.cqdx.token = Some("pat_abc123".to_string());
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_cqdx_validation_disabled_no_token_ok() {
+        let config = NetworkConfig::default();
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_cqdx_validation_poll_interval_bounds() {
+        let mut config = NetworkConfig::default();
+        config.cqdx.enabled = true;
+        config.cqdx.token = Some("pat_abc123".to_string());
+        config.cqdx.poll_interval_secs = 5; // too low
+        assert!(config.validate_section().is_err());
+
+        config.cqdx.poll_interval_secs = 30;
+        assert!(config.validate_section().is_ok());
     }
 }
