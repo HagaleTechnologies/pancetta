@@ -6,6 +6,7 @@ use reqwest::Client;
 use tracing::debug;
 
 /// HTTP client wrapping reqwest with Bearer token auth.
+#[derive(Clone)]
 pub struct CqdxClient {
     http: Client,
     base_url: String,
