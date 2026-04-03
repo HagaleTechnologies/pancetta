@@ -83,6 +83,67 @@ impl Default for BandHoppingConfig {
     }
 }
 
+/// Configurable weights for autonomous priority scoring.
+///
+/// Each decoded CQ is scored using these weights. Positive weights increase
+/// desirability; negative weights penalize. Final score is clamped to 0.0–1.0.
+///
+/// Corresponds to `[autonomous.priorities]` in the TOML config file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriorityWeightsConfig {
+    /// Weight for DXCC entities not yet worked.
+    pub needed_dxcc: f64,
+    /// Weight for needed grid/state/zone for award tracking.
+    pub needed_grid: f64,
+    /// Weight for POTA/SOTA activator detection.
+    pub pota_sota: f64,
+    /// Weight for callsign rarity (how rarely this prefix is seen).
+    pub rarity: f64,
+    /// Weight for signal strength (SNR). Stronger = more likely to complete.
+    pub signal_strength: f64,
+    /// Penalty for stations already worked on this band (should be negative).
+    pub duplicate_penalty: f64,
+    /// Penalty for stations recently called but QSO didn't complete (should be negative).
+    pub recent_failure_penalty: f64,
+}
+
+impl Default for PriorityWeightsConfig {
+    fn default() -> Self {
+        Self {
+            needed_dxcc: 0.35,
+            needed_grid: 0.20,
+            pota_sota: 0.15,
+            rarity: 0.10,
+            signal_strength: 0.05,
+            duplicate_penalty: -0.40,
+            recent_failure_penalty: -0.15,
+        }
+    }
+}
+
+impl PriorityWeightsConfig {
+    /// Validate that weights are within reasonable bounds.
+    pub fn validate(&self) -> ConfigResult<()> {
+        for (name, val) in [
+            ("needed_dxcc", self.needed_dxcc),
+            ("needed_grid", self.needed_grid),
+            ("pota_sota", self.pota_sota),
+            ("rarity", self.rarity),
+            ("signal_strength", self.signal_strength),
+            ("duplicate_penalty", self.duplicate_penalty),
+            ("recent_failure_penalty", self.recent_failure_penalty),
+        ] {
+            if val < -1.0 || val > 1.0 {
+                return Err(ConfigError::InvalidValue {
+                    field: format!("autonomous.priorities.{}", name),
+                    value: val.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Top-level autonomous operator configuration.
 ///
 /// Corresponds to the `[autonomous]` section in the TOML config file.
@@ -106,6 +167,8 @@ pub struct AutonomousConfig {
     pub listen_cycle: ListenCycleConfig,
     /// Band-hopping configuration.
     pub band_hopping: BandHoppingConfig,
+    /// Priority scoring weights for autonomous operator decisions.
+    pub priorities: PriorityWeightsConfig,
 }
 
 impl Default for AutonomousConfig {
@@ -120,6 +183,7 @@ impl Default for AutonomousConfig {
             cq_direction: String::new(),
             listen_cycle: ListenCycleConfig::default(),
             band_hopping: BandHoppingConfig::default(),
+            priorities: PriorityWeightsConfig::default(),
         }
     }
 }
@@ -150,6 +214,7 @@ impl ConfigSection for AutonomousConfig {
                 value: self.tx_offset_hz.to_string(),
             });
         }
+        self.priorities.validate()?;
         Ok(())
     }
 
@@ -163,6 +228,7 @@ impl ConfigSection for AutonomousConfig {
         self.cq_direction = other.cq_direction;
         self.listen_cycle = other.listen_cycle;
         self.band_hopping = other.band_hopping;
+        self.priorities = other.priorities;
     }
 }
 
@@ -192,5 +258,29 @@ mod tests {
         let deserialized: AutonomousConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.enabled, deserialized.enabled);
         assert_eq!(config.tx_offset_hz, deserialized.tx_offset_hz);
+    }
+
+    #[test]
+    fn test_default_priority_weights() {
+        let weights = PriorityWeightsConfig::default();
+        assert!(weights.validate().is_ok());
+        assert!(weights.needed_dxcc > 0.0);
+        assert!(weights.duplicate_penalty < 0.0);
+    }
+
+    #[test]
+    fn test_priority_weights_serialization() {
+        let weights = PriorityWeightsConfig::default();
+        let toml_str = toml::to_string(&weights).unwrap();
+        let deserialized: PriorityWeightsConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(weights.needed_dxcc, deserialized.needed_dxcc);
+        assert_eq!(weights.duplicate_penalty, deserialized.duplicate_penalty);
+    }
+
+    #[test]
+    fn test_autonomous_config_with_priorities() {
+        let config = AutonomousConfig::default();
+        assert!(config.validate_section().is_ok());
+        assert!(config.priorities.needed_dxcc > 0.0);
     }
 }
