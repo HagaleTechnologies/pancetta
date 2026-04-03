@@ -69,11 +69,16 @@ impl WorkedStationLookup for CachedStationLookup {
 
     fn is_needed_dxcc(&self, callsign: &str) -> bool {
         let needed = self.needed_dxcc.read().unwrap();
+        // Phase 2 conservative policy: when no DXCC filter is configured (empty set),
+        // treat every entity as needed. This adds a flat +needed_dxcc bonus to all
+        // scores until pancetta-dx is wired in Phase 4 with real DXCC entity tracking.
+        // Once populated, only entities in the set get the bonus.
         needed.is_empty() || needed.contains(&callsign.to_uppercase())
     }
 
     fn is_needed_grid(&self, grid: &str) -> bool {
         let needed = self.needed_grids.read().unwrap();
+        // Same conservative policy as is_needed_dxcc — see comment above.
         needed.is_empty() || needed.contains(&grid.to_uppercase())
     }
 }
