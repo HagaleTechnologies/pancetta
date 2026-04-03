@@ -11,6 +11,12 @@ use pancetta_qso::{
     AutoSequenceConfig, DuplicateCheckConfig, MessageType, QsoEvent, QsoManagerConfig, QsoState,
     TimeoutConfig,
 };
+use pancetta_qso::autonomous::{
+    AutonomousConfig, AutonomousOperator, DecodedMessageInfo, NullDxEvaluator, OperatorAction,
+    SlotParityConfig,
+};
+use pancetta_qso::priority::{NullLookup, PriorityScorer, PriorityWeights, WorkedStationLookup};
+use std::collections::HashSet;
 
 /// Station identity for the loopback test
 #[allow(dead_code)]
@@ -444,4 +450,297 @@ fn test_loopback_two_simultaneous_signals() {
         "Should decode Station B's CQ. Got: {:?}",
         decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Autonomous operator tests (Tasks 4, 5, 6)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_hunt_mode_picks_best_cq() {
+    let mut config = AutonomousConfig::default();
+    config.enabled = true;
+    config.slot_parity = SlotParityConfig::Even;
+    config.min_dx_score = 0.0;
+    config.listen_cycle.initial_interval = 100;
+    config.cq_after_idle_cycles = 100;
+
+    let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+    let evaluator = NullDxEvaluator;
+
+    let messages = vec![
+        DecodedMessageInfo {
+            callsign: Some("K9ZZ".into()),
+            frequency_hz: 1000.0,
+            snr: -5,
+            message_text: "CQ K9ZZ EM48".into(),
+        },
+        DecodedMessageInfo {
+            callsign: Some("JA1ABC".into()),
+            frequency_hz: 1500.0,
+            snr: -10,
+            message_text: "CQ JA1ABC PM95".into(),
+        },
+    ];
+
+    op.feed_decoded_messages(&messages, &evaluator);
+
+    let even_ts: i64 = 0;
+    let actions = op.decide_at(even_ts);
+
+    let tx_action = actions.iter().find(|a| matches!(a, OperatorAction::Transmit { .. }));
+    assert!(tx_action.is_some(), "Hunt mode should respond to a CQ");
+
+    if let Some(OperatorAction::Transmit { message_text, .. }) = tx_action {
+        assert!(message_text.contains("W1ABC"), "Response should contain our callsign: {}", message_text);
+    }
+}
+
+#[test]
+fn test_hunt_mode_response_survives_audio_roundtrip() {
+    let mut config = AutonomousConfig::default();
+    config.enabled = true;
+    config.slot_parity = SlotParityConfig::Even;
+    config.min_dx_score = 0.0;
+    config.listen_cycle.initial_interval = 100;
+
+    let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+    let evaluator = NullDxEvaluator;
+
+    let mut station_b = Station::new("K2DEF", "FM18");
+    let cq_text = "CQ K2DEF FM18";
+    let audio = station_b.encode_and_modulate(cq_text, 500.0);
+
+    let mut our_station = Station::new("W1ABC", "FN42");
+    let decoded = our_station.decode(&audio);
+    assert!(!decoded.is_empty(), "Should decode CQ from K2DEF");
+
+    // The FT8 decoder returns frequency_offset as an absolute audio frequency
+    // (e.g. ~2000 Hz for a signal encoded at offset 500 Hz above the 1500 Hz base).
+    // The Ft8Modulator's modulate_symbols() interprets its freq_offset parameter
+    // as relative to base_frequency (1500 Hz), so we must subtract the base here
+    // to produce a modulator-compatible offset.
+    let base_freq: f64 = 1500.0; // pancetta_ft8::BASE_FREQUENCY
+    let decoded_infos: Vec<DecodedMessageInfo> = decoded
+        .iter()
+        .map(|m| DecodedMessageInfo {
+            callsign: m.message.from_callsign.clone(),
+            // Store relative offset so the Transmit action's frequency_offset
+            // can be passed directly to encode_and_modulate().
+            frequency_hz: (m.frequency_offset - base_freq).clamp(-1000.0, 1000.0),
+            snr: m.snr_db as i32,
+            message_text: m.text.clone(),
+        })
+        .collect();
+    op.feed_decoded_messages(&decoded_infos, &evaluator);
+
+    let even_ts: i64 = 0;
+    let actions = op.decide_at(even_ts);
+
+    let tx_action = actions.iter().find_map(|a| {
+        if let OperatorAction::Transmit { message_text, frequency_offset, .. } = a {
+            Some((message_text.clone(), *frequency_offset))
+        } else {
+            None
+        }
+    });
+
+    let (response_text, response_freq) = tx_action.expect("Should produce a Transmit action");
+    assert!(response_text.contains("W1ABC"), "Response should contain our call");
+
+    let response_audio = our_station.encode_and_modulate(&response_text, response_freq);
+    let decoded_response = station_b.decode(&response_audio);
+    assert!(!decoded_response.is_empty(), "Station B should decode our response");
+    assert!(decoded_response[0].text.contains("W1ABC"),
+        "Decoded response should contain our callsign: {}", decoded_response[0].text);
+}
+
+#[test]
+fn test_cq_mode_after_idle_cycles() {
+    let mut config = AutonomousConfig::default();
+    config.enabled = true;
+    config.slot_parity = SlotParityConfig::Even;
+    config.cq_after_idle_cycles = 3;
+    config.listen_cycle.initial_interval = 100;
+
+    let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+    let even_ts: i64 = 0;
+
+    for _ in 0..2 {
+        let actions = op.decide_at(even_ts);
+        let has_cq = actions.iter().any(|a| {
+            matches!(a, OperatorAction::Transmit { message_text, .. } if message_text.starts_with("CQ"))
+        });
+        assert!(!has_cq, "Should not CQ yet");
+    }
+
+    let actions = op.decide_at(even_ts);
+    let cq_action = actions.iter().find_map(|a| {
+        if let OperatorAction::Transmit { message_text, frequency_offset, .. } = a {
+            if message_text.starts_with("CQ") {
+                Some((message_text.clone(), *frequency_offset))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    });
+
+    let (cq_text, cq_freq) = cq_action.expect("Should CQ after idle cycles");
+    assert!(cq_text.contains("W1ABC"), "CQ should contain our callsign");
+    assert!(cq_text.contains("FN42"), "CQ should contain our grid");
+
+    let mut our_station = Station::new("W1ABC", "FN42");
+    let audio = our_station.encode_and_modulate(&cq_text, cq_freq);
+    let mut remote_station = Station::new("K2DEF", "FM18");
+    let decoded = remote_station.decode(&audio);
+    assert!(!decoded.is_empty(), "Remote station should decode our CQ");
+    assert!(decoded[0].text.contains("W1ABC"),
+        "Decoded CQ should contain our callsign: {}", decoded[0].text);
+}
+
+#[test]
+fn test_cq_mode_directed_cq() {
+    let mut config = AutonomousConfig::default();
+    config.enabled = true;
+    config.slot_parity = SlotParityConfig::Even;
+    config.cq_after_idle_cycles = 1;
+    config.cq_direction = "DX".to_string();
+    config.listen_cycle.initial_interval = 100;
+
+    let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+    let even_ts: i64 = 0;
+
+    let actions = op.decide_at(even_ts);
+    let cq_text = actions.iter().find_map(|a| {
+        if let OperatorAction::Transmit { message_text, .. } = a {
+            if message_text.starts_with("CQ") { Some(message_text.clone()) } else { None }
+        } else {
+            None
+        }
+    });
+
+    let cq = cq_text.expect("Should produce CQ");
+    assert!(cq.starts_with("CQ DX"), "Should be directed CQ: {}", cq);
+    assert!(cq.contains("W1ABC"), "Should contain callsign: {}", cq);
+}
+
+struct TestDupLookup {
+    duplicates: HashSet<String>,
+}
+
+impl TestDupLookup {
+    fn with_duplicates(dups: &[&str]) -> Self {
+        Self { duplicates: dups.iter().map(|s| s.to_uppercase()).collect() }
+    }
+}
+
+impl WorkedStationLookup for TestDupLookup {
+    fn is_duplicate(&self, callsign: &str, _freq_hz: f64) -> bool {
+        self.duplicates.contains(&callsign.to_uppercase())
+    }
+    fn is_recent_failure(&self, _callsign: &str) -> bool { false }
+    fn is_needed_dxcc(&self, _callsign: &str) -> bool { false }
+    fn is_needed_grid(&self, _grid: &str) -> bool { false }
+}
+
+#[test]
+fn test_priority_scorer_skips_duplicate() {
+    let lookup = TestDupLookup::with_duplicates(&["K9ZZ"]);
+    let weights = PriorityWeights {
+        duplicate_penalty: -0.9,
+        ..PriorityWeights::default()
+    };
+    let scorer = PriorityScorer::new(weights, Box::new(lookup));
+
+    let mut config = AutonomousConfig::default();
+    config.enabled = true;
+    config.slot_parity = SlotParityConfig::Even;
+    config.min_dx_score = 0.01;
+    config.listen_cycle.initial_interval = 100;
+
+    let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+
+    let messages = vec![
+        DecodedMessageInfo {
+            callsign: Some("K9ZZ".into()),
+            frequency_hz: 1000.0,
+            snr: 0,
+            message_text: "CQ K9ZZ EM48".into(),
+        },
+        DecodedMessageInfo {
+            callsign: Some("JA1ABC".into()),
+            frequency_hz: 1500.0,
+            snr: -15,
+            message_text: "CQ JA1ABC PM95".into(),
+        },
+    ];
+
+    op.feed_decoded_messages(&messages, &scorer);
+
+    let even_ts: i64 = 0;
+    let actions = op.decide_at(even_ts);
+
+    let responded_to = actions.iter().find_map(|a| {
+        if let OperatorAction::Transmit { message_text, .. } = a {
+            if !message_text.starts_with("CQ") { Some(message_text.clone()) } else { None }
+        } else {
+            None
+        }
+    });
+
+    let response = responded_to.expect("Should respond to a CQ");
+    assert!(response.contains("JA1ABC") && response.contains("W1ABC"),
+        "Should respond to JA1ABC (non-duplicate), not K9ZZ. Got: {}", response);
+}
+
+#[test]
+fn test_priority_scorer_prefers_pota() {
+    let weights = PriorityWeights {
+        needed_dxcc: 0.0, needed_grid: 0.0, pota_sota: 0.5,
+        rarity: 0.0, signal_strength: 0.0, duplicate_penalty: 0.0,
+        recent_failure_penalty: 0.0,
+    };
+    let scorer = PriorityScorer::new(weights, Box::new(NullLookup));
+
+    let mut config = AutonomousConfig::default();
+    config.enabled = true;
+    config.slot_parity = SlotParityConfig::Even;
+    config.min_dx_score = 0.0;
+    config.listen_cycle.initial_interval = 100;
+
+    let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+
+    let messages = vec![
+        DecodedMessageInfo {
+            callsign: Some("K9ZZ".into()),
+            frequency_hz: 1000.0,
+            snr: 0,
+            message_text: "CQ K9ZZ EM48".into(),
+        },
+        DecodedMessageInfo {
+            callsign: Some("W5ABC/P".into()),
+            frequency_hz: 1500.0,
+            snr: -15,
+            message_text: "CQ W5ABC/P EM12".into(),
+        },
+    ];
+
+    op.feed_decoded_messages(&messages, &scorer);
+
+    let even_ts: i64 = 0;
+    let actions = op.decide_at(even_ts);
+
+    let responded_to = actions.iter().find_map(|a| {
+        if let OperatorAction::Transmit { message_text, .. } = a {
+            if !message_text.starts_with("CQ") { Some(message_text.clone()) } else { None }
+        } else {
+            None
+        }
+    });
+
+    let response = responded_to.expect("Should respond to a CQ");
+    assert!(response.contains("W5ABC/P"),
+        "Should prefer POTA station W5ABC/P. Got: {}", response);
 }
