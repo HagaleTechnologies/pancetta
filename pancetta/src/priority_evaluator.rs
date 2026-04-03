@@ -4,7 +4,7 @@
 //! duplicate checking and DXCC need lookups.
 
 use pancetta_qso::priority::WorkedStationLookup;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 /// Cached station lookup that holds a snapshot of worked stations.
@@ -21,6 +21,8 @@ pub struct CachedStationLookup {
     needed_dxcc: Arc<RwLock<HashSet<String>>>,
     /// Grid squares still needed for award tracking.
     needed_grids: Arc<RwLock<HashSet<String>>>,
+    /// Rarity scores from cqdx.io, keyed by uppercase callsign.
+    rarity_scores: Arc<RwLock<HashMap<String, f64>>>,
 }
 
 impl CachedStationLookup {
@@ -30,6 +32,7 @@ impl CachedStationLookup {
             recent_failures: Arc::new(RwLock::new(HashSet::new())),
             needed_dxcc: Arc::new(RwLock::new(HashSet::new())),
             needed_grids: Arc::new(RwLock::new(HashSet::new())),
+            rarity_scores: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -47,6 +50,19 @@ impl CachedStationLookup {
 
     pub fn update_needed_grids(&self, grids: HashSet<String>) {
         *self.needed_grids.write().unwrap() = grids;
+    }
+
+    pub fn update_rarity_scores(&self, scores: HashMap<String, f64>) {
+        *self.rarity_scores.write().unwrap() = scores;
+    }
+
+    pub fn rarity(&self, callsign: &str) -> f64 {
+        self.rarity_scores
+            .read()
+            .unwrap()
+            .get(&callsign.to_uppercase())
+            .copied()
+            .unwrap_or(0.5)
     }
 
     pub fn record_failure(&self, callsign: &str) {
@@ -80,5 +96,14 @@ impl WorkedStationLookup for CachedStationLookup {
         let needed = self.needed_grids.read().unwrap();
         // Same conservative policy as is_needed_dxcc — see comment above.
         needed.is_empty() || needed.contains(&grid.to_uppercase())
+    }
+
+    fn rarity(&self, callsign: &str) -> f64 {
+        self.rarity_scores
+            .read()
+            .unwrap()
+            .get(&callsign.to_uppercase())
+            .copied()
+            .unwrap_or(0.5)
     }
 }
