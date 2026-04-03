@@ -63,6 +63,13 @@ pub trait WorkedStationLookup: Send + Sync {
 
     /// Is this grid square needed for award tracking?
     fn is_needed_grid(&self, grid: &str) -> bool;
+
+    /// Get rarity score for a callsign (0.0 = common, 1.0 = rare).
+    /// Returns 0.5 as default if unknown.
+    fn rarity(&self, callsign: &str) -> f64 {
+        let _ = callsign;
+        0.5
+    }
 }
 
 /// No-op lookup that reports nothing is worked/needed.
@@ -117,7 +124,7 @@ impl PriorityScorer {
             _ => 0.0,
         };
         let pota_sota = if is_pota_sota_candidate(callsign) { 1.0 } else { 0.0 };
-        let rarity = 0.5; // Placeholder — Phase 4 will integrate pancetta-dx RarityScorer
+        let rarity = self.lookup.rarity(callsign);
         let signal_strength = normalize_snr(snr);
         let duplicate_penalty = if self.lookup.is_duplicate(callsign, freq_hz) { 1.0 } else { 0.0 };
         let recent_failure_penalty = if self.lookup.is_recent_failure(callsign) { 1.0 } else { 0.0 };
@@ -149,7 +156,7 @@ impl DxEvaluator for PriorityScorer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     struct TestLookup {
         duplicates: HashSet<String>,
@@ -303,5 +310,44 @@ mod tests {
         let trait_score = scorer.evaluate_cq("W1ABC", Some("FN42"), -10, 14074000.0);
         let detailed = scorer.score_cq_detailed("W1ABC", Some("FN42"), -10, 14074000.0);
         assert!((trait_score - detailed.total).abs() < f64::EPSILON, "Trait and detailed should match");
+    }
+
+    struct RarityLookup {
+        rarity_map: HashMap<String, f64>,
+    }
+
+    impl WorkedStationLookup for RarityLookup {
+        fn is_duplicate(&self, _callsign: &str, _freq_hz: f64) -> bool { false }
+        fn is_recent_failure(&self, _callsign: &str) -> bool { false }
+        fn is_needed_dxcc(&self, _callsign: &str) -> bool { false }
+        fn is_needed_grid(&self, _grid: &str) -> bool { false }
+        fn rarity(&self, callsign: &str) -> f64 {
+            self.rarity_map.get(callsign).copied().unwrap_or(0.5)
+        }
+    }
+
+    #[test]
+    fn test_rarity_affects_score() {
+        let mut rarity_map = HashMap::new();
+        rarity_map.insert("3Y0J".to_string(), 0.98);
+
+        let weights = PriorityWeights {
+            needed_dxcc: 0.0, needed_grid: 0.0, pota_sota: 0.0,
+            rarity: 1.0, signal_strength: 0.0, duplicate_penalty: 0.0,
+            recent_failure_penalty: 0.0,
+        };
+
+        let scorer_rare = PriorityScorer::new(weights.clone(), Box::new(RarityLookup {
+            rarity_map: rarity_map.clone(),
+        }));
+        let scorer_common = PriorityScorer::new(weights, Box::new(NullLookup));
+
+        let score_rare = scorer_rare.evaluate_cq("3Y0J", None, -10, 14074000.0);
+        let score_common = scorer_common.evaluate_cq("W1ABC", None, -10, 14074000.0);
+
+        assert!(score_rare > score_common,
+            "Rare station should score higher: {} vs {}", score_rare, score_common);
+        assert!((score_rare - 0.98).abs() < 0.01,
+            "Rarity-only score should be ~0.98, got {}", score_rare);
     }
 }
