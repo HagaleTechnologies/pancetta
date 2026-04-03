@@ -71,6 +71,9 @@ pub struct ApplicationCoordinator {
     /// WAV file playback path (if set, runs in playback mode)
     wav_path: Option<PathBuf>,
 
+    /// Cached station lookup for priority scoring (shared between QSO and autonomous components).
+    cached_lookup: std::sync::Arc<crate::priority_evaluator::CachedStationLookup>,
+
     /// Performance metrics
     message_count: Arc<std::sync::atomic::AtomicU64>,
     last_audio_timestamp: Arc<RwLock<Option<Instant>>>,
@@ -236,6 +239,7 @@ impl ApplicationCoordinator {
             enable_metrics,
             metrics_port,
             wav_path,
+            cached_lookup: std::sync::Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(RwLock::new(None)),
             last_decode_timestamp: Arc::new(RwLock::new(None)),
@@ -1375,6 +1379,7 @@ impl ApplicationCoordinator {
         };
         drop(config);
 
+        let qso_lookup = self.cached_lookup.clone();
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
 
@@ -1469,7 +1474,19 @@ impl ApplicationCoordinator {
                                     }
                                 }
                             }
-                            Ok(_) => {} // Other events — ignore
+                            Ok(pancetta_qso::QsoEvent::QsoCompleted { metadata, .. }) => {
+                                if let Some(ref their_call) = metadata.their_callsign {
+                                    info!("QSO completed with {}, marking as worked", their_call);
+                                    qso_lookup.record_worked(their_call);
+                                }
+                            }
+                            Ok(pancetta_qso::QsoEvent::QsoFailed { metadata, .. }) => {
+                                if let Some(ref their_call) = metadata.their_callsign {
+                                    info!("QSO failed with {}, adding backoff", their_call);
+                                    qso_lookup.record_failure(their_call);
+                                }
+                            }
+                            Ok(_) => {} // Other events (StateChanged, etc.)
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("QSO event subscriber lagged by {} events", n);
                             }
@@ -2267,9 +2284,7 @@ impl ApplicationCoordinator {
         };
         drop(config);
 
-        let cached_lookup = std::sync::Arc::new(
-            crate::priority_evaluator::CachedStationLookup::new(),
-        );
+        let cached_lookup = self.cached_lookup.clone();
 
         let operator = std::sync::Arc::new(tokio::sync::Mutex::new(
             pancetta_qso::AutonomousOperator::new(qso_auto_config, our_callsign, our_grid),
