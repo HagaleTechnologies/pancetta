@@ -2254,14 +2254,32 @@ impl ApplicationCoordinator {
         } else {
             Some(config.station.grid_square.clone())
         };
+
+        // Read priority weights before dropping config
+        let priority_weights = pancetta_qso::priority::PriorityWeights {
+            needed_dxcc: config.autonomous.priorities.needed_dxcc,
+            needed_grid: config.autonomous.priorities.needed_grid,
+            pota_sota: config.autonomous.priorities.pota_sota,
+            rarity: config.autonomous.priorities.rarity,
+            signal_strength: config.autonomous.priorities.signal_strength,
+            duplicate_penalty: config.autonomous.priorities.duplicate_penalty,
+            recent_failure_penalty: config.autonomous.priorities.recent_failure_penalty,
+        };
         drop(config);
+
+        let cached_lookup = std::sync::Arc::new(
+            crate::priority_evaluator::CachedStationLookup::new(),
+        );
 
         let operator = std::sync::Arc::new(tokio::sync::Mutex::new(
             pancetta_qso::AutonomousOperator::new(qso_auto_config, our_callsign, our_grid),
         ));
 
         let evaluator: std::sync::Arc<dyn pancetta_qso::DxEvaluator> =
-            std::sync::Arc::new(pancetta_qso::NullDxEvaluator);
+            std::sync::Arc::new(pancetta_qso::PriorityScorer::new(
+                priority_weights,
+                Box::new((*cached_lookup).clone()),
+            ));
 
         let (_auto_tx, auto_rx) = self
             .message_bus
