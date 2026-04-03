@@ -74,6 +74,9 @@ pub struct ApplicationCoordinator {
     /// Cached station lookup for priority scoring (shared between QSO and autonomous components).
     cached_lookup: std::sync::Arc<crate::priority_evaluator::CachedStationLookup>,
 
+    /// cqdx.io integration bridge (None = degraded mode).
+    cqdx_bridge: Option<std::sync::Arc<crate::cqdx_bridge::CqdxBridge>>,
+
     /// Performance metrics
     message_count: Arc<std::sync::atomic::AtomicU64>,
     last_audio_timestamp: Arc<RwLock<Option<Instant>>>,
@@ -240,6 +243,7 @@ impl ApplicationCoordinator {
             metrics_port,
             wav_path,
             cached_lookup: std::sync::Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
+            cqdx_bridge: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(RwLock::new(None)),
             last_decode_timestamp: Arc::new(RwLock::new(None)),
@@ -277,6 +281,36 @@ impl ApplicationCoordinator {
         #[cfg(not(feature = "pancetta-hamlib"))]
         warn!("Hamlib feature is disabled — PTT safety watchdog is not active. Transmit at your own risk.");
         self.start_qso_component().await?;
+
+        // Initialize cqdx.io integration (before autonomous, so rarity/needed data is available)
+        {
+            let config = self.config.read().await;
+            if let Some(bridge) = crate::cqdx_bridge::CqdxBridge::from_config(
+                &config.network.cqdx,
+                self.cached_lookup.clone(),
+            ) {
+                drop(config);
+                match bridge.startup().await {
+                    Ok(()) => {
+                        info!("cqdx.io integration initialized");
+                        let _poller_handle = bridge.spawn_priority_poller(
+                            self.shutdown_signal.clone(),
+                            self.last_decode_timestamp.clone(),
+                            None,
+                            None,
+                        );
+                        self.cqdx_bridge = Some(std::sync::Arc::new(bridge));
+                    }
+                    Err(e) => {
+                        warn!("cqdx.io startup failed, running in degraded mode: {}", e);
+                    }
+                }
+            } else {
+                drop(config);
+                info!("cqdx.io integration not configured, running in degraded mode");
+            }
+        }
+
         self.start_transmitter_component().await?;
         self.start_autonomous_component().await?;
         self.start_dx_cluster_component().await?;
@@ -1380,6 +1414,7 @@ impl ApplicationCoordinator {
         drop(config);
 
         let qso_lookup = self.cached_lookup.clone();
+        let cqdx_bridge = self.cqdx_bridge.clone();
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
 
@@ -1478,6 +1513,21 @@ impl ApplicationCoordinator {
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO completed with {}, marking as worked", their_call);
                                     qso_lookup.record_worked(their_call);
+
+                                    // Report QSO to cqdx.io
+                                    if let Some(ref bridge) = cqdx_bridge {
+                                        bridge.report_qso(pancetta_cqdx::QsoRecord {
+                                            callsign: their_call.clone(),
+                                            remote_grid: metadata.grids.theirs.clone(),
+                                            local_grid: metadata.grids.ours.clone(),
+                                            frequency: metadata.frequency as u64,
+                                            mode: metadata.mode.clone(),
+                                            rst_sent: metadata.reports.sent.map(|r| r.to_string()),
+                                            rst_received: metadata.reports.received.map(|r| r.to_string()),
+                                            start_time: metadata.start_time,
+                                            end_time: metadata.end_time.unwrap_or_else(chrono::Utc::now),
+                                        });
+                                    }
                                 }
                             }
                             Ok(pancetta_qso::QsoEvent::QsoFailed { metadata, .. }) => {
@@ -2286,6 +2336,8 @@ impl ApplicationCoordinator {
 
         let cached_lookup = self.cached_lookup.clone();
 
+        let spot_reporter_callsign = our_callsign.clone();
+        let spot_reporter_grid = our_grid.clone();
         let operator = std::sync::Arc::new(tokio::sync::Mutex::new(
             pancetta_qso::AutonomousOperator::new(qso_auto_config, our_callsign, our_grid),
         ));
@@ -2302,6 +2354,7 @@ impl ApplicationCoordinator {
             .await?;
         let message_bus = self.message_bus.clone();
 
+        let cqdx_bridge_for_auto = self.cqdx_bridge.clone();
         let auto_handle = {
             let shutdown = self.shutdown_signal.clone();
             let operator = operator.clone();
@@ -2316,6 +2369,26 @@ impl ApplicationCoordinator {
                 loop {
                     tokio::select! {
                         _ = slot_interval.tick() => {
+                            // Report decoded spots to cqdx.io
+                            if let Some(ref bridge) = cqdx_bridge_for_auto {
+                                let spot_reports: Vec<pancetta_cqdx::SpotReport> = slot_messages
+                                    .iter()
+                                    .filter_map(|msg| {
+                                        msg.callsign.as_ref().map(|call| pancetta_cqdx::SpotReport {
+                                            callsign: call.clone(),
+                                            grid: None,
+                                            frequency: msg.frequency_hz as u64,
+                                            mode: "FT8".to_string(),
+                                            snr: msg.snr,
+                                            timestamp: chrono::Utc::now(),
+                                            reporter: spot_reporter_callsign.clone(),
+                                            reporter_grid: spot_reporter_grid.clone(),
+                                        })
+                                    })
+                                    .collect();
+                                bridge.report_spots(spot_reports);
+                            }
+
                             let mut op = operator.lock().await;
                             op.feed_decoded_messages(&slot_messages, evaluator.as_ref());
                             slot_messages.clear();
