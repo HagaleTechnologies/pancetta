@@ -51,8 +51,9 @@ impl CqdxCache {
     }
 
     /// Update priority spots from latest poll. Also updates rarity cache.
+    /// Uses upsert (not clear) so callsigns that drop out of the top-N
+    /// retain their last-known rarity until replaced by a new poll result.
     pub fn update_priorities(&mut self, spots: Vec<PrioritySpot>) {
-        self.rarity_scores.clear();
         for spot in &spots {
             self.rarity_scores.insert(spot.callsign.to_uppercase(), spot.rarity);
         }

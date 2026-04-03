@@ -89,6 +89,8 @@ impl CqdxBridge {
             let mut timer = tokio::time::interval(interval);
             let mut consecutive_failures: u32 = 0;
             let mut polling_paused = false;
+            let backoff_interval = Duration::from_secs(5 * 60); // 5 min retry after failures
+            let mut last_backoff_attempt = std::time::Instant::now();
 
             loop {
                 timer.tick().await;
@@ -114,9 +116,13 @@ impl CqdxBridge {
                 }
                 drop(last);
 
-                // Stop polling after 3 consecutive failures
+                // After 3 consecutive failures, retry every 5 minutes
                 if consecutive_failures >= 3 {
-                    continue;
+                    if last_backoff_attempt.elapsed() < backoff_interval {
+                        continue;
+                    }
+                    info!("cqdx.io polling: retrying after backoff");
+                    last_backoff_attempt = std::time::Instant::now();
                 }
 
                 match client.fetch_priorities(

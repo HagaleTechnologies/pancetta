@@ -7,7 +7,6 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 pancetta-core = { path = "../pancetta-core" }
-pancetta-qso = { path = "../pancetta-qso" }
 
 tokio = { workspace = true }
 serde = { workspace = true }
