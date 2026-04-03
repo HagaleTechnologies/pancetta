@@ -63,3 +63,6 @@ config.toml.bak
 
 # Benchmark results
 benchmarks/results/
+
+# Git worktrees
+.worktrees/
