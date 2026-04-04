@@ -143,6 +143,7 @@
 pub use crate::adif::*;
 pub use crate::auto_sequencer::*;
 pub use crate::autonomous::*;
+pub use crate::frequency::*;
 pub use crate::database::*;
 pub use crate::priority::*;
 pub use crate::exchange::*;
@@ -157,6 +158,7 @@ pub mod async_database;
 pub mod async_logger;
 pub mod auto_sequencer;
 pub mod autonomous;
+pub mod frequency;
 pub mod database;
 pub mod priority;
 pub mod exchange;
