@@ -979,23 +979,35 @@ impl AutonomousOperator {
                 }
 
                 // Step 3: if we have capacity, try to respond to a CQ or call CQ.
-                let can_add_new = tx_count < self.config.max_concurrent_qsos
-                    && self.active_qso_count < self.config.max_concurrent_qsos;
+                // active_qso_count already includes QSOs with pending sequencer messages,
+                // so we don't add tx_count (that would double-count).
+                let total_active = self.active_qso_count.max(tx_count);
+                let can_add_new = total_active < self.config.max_concurrent_qsos;
 
                 if can_add_new {
-                    // Try interesting CQs first.
+                    // Choose threshold: first QSO uses min_dx_score,
+                    // additional QSOs use the higher min_multi_slot_score.
+                    let threshold = if total_active == 0 {
+                        self.config.min_dx_score
+                    } else {
+                        self.min_multi_slot_score
+                    };
+
                     let best_cq = self
                         .pending_cqs
                         .iter()
-                        .filter(|cq| cq.dx_score >= self.config.min_dx_score)
+                        .filter(|cq| cq.dx_score >= threshold)
                         .find(|cq| self.frequency_allocator.is_clear_of_own(cq.frequency_hz))
                         .cloned();
 
                     if let Some(cq) = best_cq {
-                        if tx_count == 0 {
+                        if tx_count == 0 && self.active_qso_count == 0 {
                             self.state = OperatingState::Hunting;
                         }
                         self.idle_cycles = 0;
+
+                        // Use smart allocator to find best TX frequency near the DX station
+                        let tx_freq = self.allocate_smart_frequency(Some(cq.frequency_hz));
 
                         let grid_part = self
                             .our_grid
@@ -1003,22 +1015,22 @@ impl AutonomousOperator {
                             .map(|g| format!(" {}", g))
                             .unwrap_or_default();
                         let message_text =
-                            format!("{} {} {}", cq.callsign, self.our_callsign, grid_part)
+                            format!("{} {}{}", cq.callsign, self.our_callsign, grid_part)
                                 .trim()
                                 .to_string();
 
                         debug!(
-                            "Responding to CQ from {} (score={:.2}, snr={}) at {:.0} Hz",
-                            cq.callsign, cq.dx_score, cq.snr, cq.frequency_hz
+                            "Responding to CQ from {} (score={:.2}, snr={}) at {:.0} Hz (TX at {:.0} Hz)",
+                            cq.callsign, cq.dx_score, cq.snr, cq.frequency_hz, tx_freq
                         );
 
                         actions.push(OperatorAction::Transmit {
                             message_text,
-                            frequency_offset: cq.frequency_hz,
+                            frequency_offset: tx_freq,
                             qso_id: None,
                         });
                         tx_count += 1;
-                    } else if tx_count == 0 {
+                    } else if tx_count == 0 && self.active_qso_count == 0 {
                         // Step 4: no CQs worth answering and no active QSOs — CQ ourselves?
                         self.idle_cycles += 1;
 
@@ -1026,7 +1038,7 @@ impl AutonomousOperator {
                             self.state = OperatingState::CallingCq;
                             self.idle_cycles = 0;
 
-                            let cq_freq = self.frequency_allocator.allocate_cq_frequency();
+                            let cq_freq = self.allocate_smart_frequency(None);
 
                             let cq_text = if self.config.cq_direction.is_empty() {
                                 format!(
@@ -1518,6 +1530,7 @@ mod tests {
         config.listen_cycle.initial_interval = 100;
 
         let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.min_multi_slot_score = 0.3; // Lower threshold so NullDxEvaluator (0.5) passes
         op.set_active_qso_count(1);
 
         // One active QSO
@@ -1548,5 +1561,139 @@ mod tests {
             "Expected 2 Transmit actions (1 QSO + 1 new CQ response), got {}",
             tx_actions.len()
         );
+    }
+
+    /// Test helper: evaluator that returns a fixed score
+    struct HighScoreEvaluator(f64);
+    impl DxEvaluator for HighScoreEvaluator {
+        fn evaluate_cq(&self, _: &str, _: Option<&str>, _: i8, _: f64) -> f64 {
+            self.0
+        }
+    }
+
+    #[test]
+    fn test_multi_slot_opens_for_high_score() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.max_concurrent_qsos = 2;
+        config.slot_parity = SlotParityConfig::Even;
+        config.listen_cycle.initial_interval = 100;
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
+        op.min_multi_slot_score = 0.5;
+
+        // Simulate one active QSO
+        op.set_active_qso_count(1);
+        op.add_pending_sequencer_message(
+            "K1XYZ W1ABC -10".to_string(),
+            1000.0,
+            Some("qso-1".to_string()),
+        );
+        op.frequency_allocator_mut().register_qso_frequency("qso-1", 1000.0);
+
+        // Feed a high-scoring CQ
+        let evaluator = HighScoreEvaluator(0.8);
+        op.feed_decoded_messages(
+            &[DecodedMessageInfo {
+                callsign: Some("3Y0J".to_string()),
+                frequency_hz: 1500.0,
+                snr: -5,
+                message_text: "CQ 3Y0J JD15".to_string(),
+            }],
+            &evaluator,
+        );
+
+        let even_ts: i64 = 0; // Even slot
+        let actions = op.decide_at(even_ts);
+
+        let tx_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, OperatorAction::Transmit { .. }))
+            .collect();
+
+        // Should have 2 transmissions: sequencer message + new CQ response
+        assert_eq!(tx_actions.len(), 2, "Expected 2 TX actions, got {:?}", tx_actions);
+    }
+
+    #[test]
+    fn test_multi_slot_blocked_by_low_score() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.max_concurrent_qsos = 2;
+        config.slot_parity = SlotParityConfig::Even;
+        config.listen_cycle.initial_interval = 100;
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
+        op.min_multi_slot_score = 0.9; // Very high threshold
+
+        op.set_active_qso_count(1);
+        op.add_pending_sequencer_message(
+            "K1XYZ W1ABC -10".to_string(),
+            1000.0,
+            Some("qso-1".to_string()),
+        );
+        op.frequency_allocator_mut().register_qso_frequency("qso-1", 1000.0);
+
+        // Feed a moderate-scoring CQ (below threshold)
+        let evaluator = HighScoreEvaluator(0.6);
+        op.feed_decoded_messages(
+            &[DecodedMessageInfo {
+                callsign: Some("VE3XYZ".to_string()),
+                frequency_hz: 1500.0,
+                snr: -10,
+                message_text: "CQ VE3XYZ FN03".to_string(),
+            }],
+            &evaluator,
+        );
+
+        let even_ts: i64 = 0;
+        let actions = op.decide_at(even_ts);
+
+        let tx_actions: Vec<_> = actions
+            .iter()
+            .filter(|a| matches!(a, OperatorAction::Transmit { .. }))
+            .collect();
+
+        // Should only have 1 transmission (existing QSO, not the new CQ)
+        assert_eq!(tx_actions.len(), 1, "Expected 1 TX action, got {:?}", tx_actions);
+    }
+
+    #[test]
+    fn test_max_concurrent_qsos_respected() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.max_concurrent_qsos = 2;
+        config.slot_parity = SlotParityConfig::Even;
+        config.listen_cycle.initial_interval = 100;
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
+        op.min_multi_slot_score = 0.3;
+
+        // Already at max QSOs
+        op.set_active_qso_count(2);
+        op.add_pending_sequencer_message("K1A W1ABC -10".to_string(), 1000.0, Some("q1".to_string()));
+        op.add_pending_sequencer_message("K2B W1ABC -12".to_string(), 1200.0, Some("q2".to_string()));
+
+        let evaluator = HighScoreEvaluator(0.95);
+        op.feed_decoded_messages(
+            &[DecodedMessageInfo {
+                callsign: Some("3Y0J".to_string()),
+                frequency_hz: 1500.0,
+                snr: -5,
+                message_text: "CQ 3Y0J JD15".to_string(),
+            }],
+            &evaluator,
+        );
+
+        let even_ts: i64 = 0;
+        let actions = op.decide_at(even_ts);
+
+        let tx_count = actions
+            .iter()
+            .filter(|a| matches!(a, OperatorAction::Transmit { .. }))
+            .count();
+
+        // Should NOT add a third QSO
+        assert_eq!(tx_count, 2, "Should not exceed max_concurrent_qsos");
     }
 }
