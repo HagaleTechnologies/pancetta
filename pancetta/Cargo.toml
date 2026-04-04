@@ -27,6 +27,7 @@ pancetta-config = { path = "../pancetta-config" }
 pancetta-hamlib = { path = "../pancetta-hamlib", optional = true }
 pancetta-qso = { path = "../pancetta-qso" }
 pancetta-dx = { path = "../pancetta-dx" }
+pancetta-cqdx = { path = "../pancetta-cqdx" }
 geographiclib-rs = { workspace = true }
 
 # Async runtime and coordination

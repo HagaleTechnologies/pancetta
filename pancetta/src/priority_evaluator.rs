@@ -4,7 +4,7 @@
 //! duplicate checking and DXCC need lookups.
 
 use pancetta_qso::priority::WorkedStationLookup;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 /// Cached station lookup that holds a snapshot of worked stations.
@@ -21,6 +21,8 @@ pub struct CachedStationLookup {
     needed_dxcc: Arc<RwLock<HashSet<String>>>,
     /// Grid squares still needed for award tracking.
     needed_grids: Arc<RwLock<HashSet<String>>>,
+    /// Rarity scores from cqdx.io, keyed by uppercase callsign.
+    rarity_scores: Arc<RwLock<HashMap<String, f64>>>,
 }
 
 impl CachedStationLookup {
@@ -30,6 +32,7 @@ impl CachedStationLookup {
             recent_failures: Arc::new(RwLock::new(HashSet::new())),
             needed_dxcc: Arc::new(RwLock::new(HashSet::new())),
             needed_grids: Arc::new(RwLock::new(HashSet::new())),
+            rarity_scores: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -47,6 +50,19 @@ impl CachedStationLookup {
 
     pub fn update_needed_grids(&self, grids: HashSet<String>) {
         *self.needed_grids.write().unwrap() = grids;
+    }
+
+    pub fn update_rarity_scores(&self, scores: HashMap<String, f64>) {
+        *self.rarity_scores.write().unwrap() = scores;
+    }
+
+    pub fn rarity(&self, callsign: &str) -> f64 {
+        self.rarity_scores
+            .read()
+            .unwrap()
+            .get(&callsign.to_uppercase())
+            .copied()
+            .unwrap_or(0.5)
     }
 
     pub fn record_failure(&self, callsign: &str) {
@@ -69,16 +85,29 @@ impl WorkedStationLookup for CachedStationLookup {
 
     fn is_needed_dxcc(&self, callsign: &str) -> bool {
         let needed = self.needed_dxcc.read().unwrap();
-        // Phase 2 conservative policy: when no DXCC filter is configured (empty set),
-        // treat every entity as needed. This adds a flat +needed_dxcc bonus to all
-        // scores until pancetta-dx is wired in Phase 4 with real DXCC entity tracking.
-        // Once populated, only entities in the set get the bonus.
-        needed.is_empty() || needed.contains(&callsign.to_uppercase())
+        // Conservative policy: when no DXCC filter is configured (empty set),
+        // treat every entity as needed.
+        if needed.is_empty() {
+            return true;
+        }
+        // The set contains DXCC prefixes (e.g., "3Y/B"), not full callsigns.
+        // Use prefix matching: callsign "3Y/B1234" matches prefix "3Y/B".
+        let upper = callsign.to_uppercase();
+        needed.iter().any(|prefix| upper.starts_with(prefix.as_str()))
     }
 
     fn is_needed_grid(&self, grid: &str) -> bool {
         let needed = self.needed_grids.read().unwrap();
         // Same conservative policy as is_needed_dxcc — see comment above.
         needed.is_empty() || needed.contains(&grid.to_uppercase())
+    }
+
+    fn rarity(&self, callsign: &str) -> f64 {
+        self.rarity_scores
+            .read()
+            .unwrap()
+            .get(&callsign.to_uppercase())
+            .copied()
+            .unwrap_or(0.5)
     }
 }

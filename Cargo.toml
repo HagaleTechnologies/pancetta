@@ -9,6 +9,7 @@ members = [
     "pancetta-qso",
     "pancetta-hamlib",
     "pancetta-dx",
+    "pancetta-cqdx",
     "pancetta",
 ]
 resolver = "2"
@@ -23,6 +24,7 @@ default-members = [
     "pancetta-config",
     "pancetta-qso",
     "pancetta-dx",
+    "pancetta-cqdx",
     "pancetta",
 ]
 
