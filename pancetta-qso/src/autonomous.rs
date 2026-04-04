@@ -10,6 +10,11 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use crate::frequency::{
+    DecodeHistory, DecodeRecord, FrequencyAllocatorConfig, SmartFrequencyAllocator,
+    SpectralSnapshot, TimeSlot,
+};
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -693,6 +698,14 @@ pub struct AutonomousOperator {
     /// Messages to transmit from the auto-sequencer (fed in).
     /// Each entry: (message_text, frequency_offset, qso_id).
     pending_sequencer_messages: Vec<(String, f64, Option<String>)>,
+    /// Rolling buffer of recent decode activity for frequency allocation.
+    decode_history: DecodeHistory,
+    /// Latest spectral snapshot from the waterfall data.
+    spectral_snapshot: Option<SpectralSnapshot>,
+    /// Smart frequency allocator (replaces simple FrequencyAllocator for new QSOs).
+    smart_allocator: SmartFrequencyAllocator,
+    /// Minimum score to open an additional QSO slot.
+    pub min_multi_slot_score: f64,
     /// Whether the user has paused autonomous operation.
     paused: bool,
 }
@@ -704,6 +717,8 @@ impl AutonomousOperator {
         let band_strategy = BandStrategy::new(config.band_hopping.clone());
         // FT8 bandwidth: 8 tones * 6.25 Hz = 50 Hz, plus 25 Hz guard = 75 Hz min separation
         let frequency_allocator = FrequencyAllocator::new(75.0, (200.0, 2800.0));
+        let decode_history = DecodeHistory::new(4);
+        let smart_allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
 
         Self {
             config,
@@ -718,6 +733,10 @@ impl AutonomousOperator {
             pending_cqs: Vec::new(),
             active_qso_count: 0,
             pending_sequencer_messages: Vec::new(),
+            decode_history,
+            spectral_snapshot: None,
+            smart_allocator,
+            min_multi_slot_score: 0.7,
             paused: false,
         }
     }
@@ -741,6 +760,21 @@ impl AutonomousOperator {
 
         // Update frequency allocator with observed activity.
         self.frequency_allocator.update_observed(messages);
+
+        // Record decode history for smart frequency allocation.
+        let current_slot = if SlotParity::current() == SlotParity::Even {
+            TimeSlot::First
+        } else {
+            TimeSlot::Second
+        };
+        let records: Vec<DecodeRecord> = messages
+            .iter()
+            .map(|m| DecodeRecord {
+                frequency_hz: m.frequency_hz,
+                time_slot: current_slot,
+            })
+            .collect();
+        self.decode_history.push_cycle(records);
 
         // Extract CQ candidates.
         self.pending_cqs.clear();
@@ -773,6 +807,33 @@ impl AutonomousOperator {
                 .partial_cmp(&a.dx_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+    }
+
+    /// Update the spectral snapshot from WaterfallData.
+    /// Call this each decode cycle with the latest power data.
+    pub fn update_spectral(&mut self, snapshot: SpectralSnapshot) {
+        self.spectral_snapshot = Some(snapshot);
+    }
+
+    /// Get the best frequency for a new QSO using the smart allocator.
+    /// Falls back to the legacy allocator if no spectral data is available.
+    fn allocate_smart_frequency(&self, dx_target_hz: Option<f64>) -> f64 {
+        let own_freqs: Vec<f64> = self.frequency_allocator.own_frequencies().values().copied().collect();
+
+        if let Some(ref spectral) = self.spectral_snapshot {
+            let candidates = self.smart_allocator.rank_candidates(
+                spectral,
+                &self.decode_history,
+                &own_freqs,
+                dx_target_hz,
+            );
+            if let Some(best) = candidates.first() {
+                return best.offset_hz;
+            }
+        }
+
+        // Fallback: legacy allocator
+        self.frequency_allocator.allocate_cq_frequency()
     }
 
     /// Tell the operator how many QSOs the auto-sequencer is currently managing.
