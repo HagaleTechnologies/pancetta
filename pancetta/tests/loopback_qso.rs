@@ -744,3 +744,217 @@ fn test_priority_scorer_prefers_pota() {
     assert!(response.contains("W5ABC/P"),
         "Should prefer POTA station W5ABC/P. Got: {}", response);
 }
+
+/// Two simultaneous FT8 QSOs decoded from a single summed audio buffer.
+///
+/// Proves that:
+/// 1. Two signals at different audio offsets can be modulated into one buffer
+/// 2. The decoder extracts both signals from the summed audio
+/// 3. Each QSO can run independently to completion
+#[test]
+fn test_two_simultaneous_qsos_loopback() {
+    use pancetta_ft8::{modulate_multi_tx, MultiTxItem, ProtocolParams};
+
+    let mut our_station = Station::new("W1ABC", "FN42");
+    let mut dx_station_1 = Station::new("K2DEF", "FM18");
+    let mut dx_station_2 = Station::new("JA1XYZ", "PM95");
+
+    let freq_1 = 300.0;  // QSO 1 at base+300 Hz
+    let freq_2 = 900.0;  // QSO 2 at base+900 Hz (600 Hz separation)
+    let base_freq = 1500.0;
+    let ft8_params = ProtocolParams::ft8();
+
+    // === Round 1: Both DX stations send CQ simultaneously ===
+    let symbols_1 = dx_station_1.encoder.encode_message("CQ K2DEF FM18", None).unwrap();
+    let symbols_2 = dx_station_2.encoder.encode_message("CQ JA1XYZ PM95", None).unwrap();
+
+    let items = vec![
+        MultiTxItem {
+            symbols: &symbols_1,
+            frequency_offset: freq_1,
+            params: &ft8_params,
+        },
+        MultiTxItem {
+            symbols: &symbols_2,
+            frequency_offset: freq_2,
+            params: &ft8_params,
+        },
+    ];
+    let mut combined_audio = modulate_multi_tx(&items, 12000, base_freq, 0.5).unwrap();
+    combined_audio.resize(WINDOW_SAMPLES, 0.0);
+
+    let decoded = our_station.decode(&combined_audio);
+    assert!(
+        find_message(&decoded, "CQ K2DEF FM18").is_some(),
+        "Should decode CQ from K2DEF. Got: {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+    assert!(
+        find_message(&decoded, "CQ JA1XYZ PM95").is_some(),
+        "Should decode CQ from JA1XYZ. Got: {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+
+    // === Round 2: We respond to both simultaneously ===
+    let resp_1_symbols = our_station.encoder.encode_message("K2DEF W1ABC FN42", None).unwrap();
+    let resp_2_symbols = our_station.encoder.encode_message("JA1XYZ W1ABC FN42", None).unwrap();
+
+    let items = vec![
+        MultiTxItem {
+            symbols: &resp_1_symbols,
+            frequency_offset: freq_1,
+            params: &ft8_params,
+        },
+        MultiTxItem {
+            symbols: &resp_2_symbols,
+            frequency_offset: freq_2,
+            params: &ft8_params,
+        },
+    ];
+    let mut combined_audio = modulate_multi_tx(&items, 12000, base_freq, 0.5).unwrap();
+    combined_audio.resize(WINDOW_SAMPLES, 0.0);
+
+    // DX station 1 decodes our response
+    let decoded_1 = dx_station_1.decode(&combined_audio);
+    assert!(
+        find_message(&decoded_1, "K2DEF W1ABC FN42").is_some(),
+        "DX1 should decode response. Got: {:?}",
+        decoded_1.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+
+    // DX station 2 decodes our response
+    let decoded_2 = dx_station_2.decode(&combined_audio);
+    assert!(
+        find_message(&decoded_2, "JA1XYZ W1ABC FN42").is_some(),
+        "DX2 should decode response. Got: {:?}",
+        decoded_2.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+
+    // === Round 3: Both DX stations send signal reports simultaneously ===
+    let rpt_1_symbols = dx_station_1.encoder.encode_message("W1ABC K2DEF -10", None).unwrap();
+    let rpt_2_symbols = dx_station_2.encoder.encode_message("W1ABC JA1XYZ -14", None).unwrap();
+
+    let items = vec![
+        MultiTxItem {
+            symbols: &rpt_1_symbols,
+            frequency_offset: freq_1,
+            params: &ft8_params,
+        },
+        MultiTxItem {
+            symbols: &rpt_2_symbols,
+            frequency_offset: freq_2,
+            params: &ft8_params,
+        },
+    ];
+    let mut combined_audio = modulate_multi_tx(&items, 12000, base_freq, 0.5).unwrap();
+    combined_audio.resize(WINDOW_SAMPLES, 0.0);
+
+    let decoded = our_station.decode(&combined_audio);
+    assert!(
+        find_message(&decoded, "W1ABC K2DEF -10").is_some(),
+        "Should decode report from K2DEF. Got: {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+    assert!(
+        find_message(&decoded, "W1ABC JA1XYZ -14").is_some(),
+        "Should decode report from JA1XYZ. Got: {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+
+    // === Round 4: We send R+reports to both simultaneously ===
+    let r_rpt_1_symbols = our_station.encoder.encode_message("K2DEF W1ABC R-12", None).unwrap();
+    let r_rpt_2_symbols = our_station.encoder.encode_message("JA1XYZ W1ABC R-08", None).unwrap();
+
+    let items = vec![
+        MultiTxItem {
+            symbols: &r_rpt_1_symbols,
+            frequency_offset: freq_1,
+            params: &ft8_params,
+        },
+        MultiTxItem {
+            symbols: &r_rpt_2_symbols,
+            frequency_offset: freq_2,
+            params: &ft8_params,
+        },
+    ];
+    let mut combined_audio = modulate_multi_tx(&items, 12000, base_freq, 0.5).unwrap();
+    combined_audio.resize(WINDOW_SAMPLES, 0.0);
+
+    let decoded_1 = dx_station_1.decode(&combined_audio);
+    assert!(
+        find_message(&decoded_1, "K2DEF W1ABC R-12").is_some()
+            || find_message(&decoded_1, "K2DEF W1ABC R -12").is_some(),
+        "DX1 should decode R+report. Got: {:?}",
+        decoded_1.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+    let decoded_2 = dx_station_2.decode(&combined_audio);
+    assert!(
+        find_message(&decoded_2, "JA1XYZ W1ABC R-08").is_some()
+            || find_message(&decoded_2, "JA1XYZ W1ABC R -08").is_some(),
+        "DX2 should decode R+report. Got: {:?}",
+        decoded_2.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+
+    // === Round 5: Both DX stations send RR73 simultaneously ===
+    let rr73_1_symbols = dx_station_1.encoder.encode_message("W1ABC K2DEF RR73", None).unwrap();
+    let rr73_2_symbols = dx_station_2.encoder.encode_message("W1ABC JA1XYZ RR73", None).unwrap();
+
+    let items = vec![
+        MultiTxItem {
+            symbols: &rr73_1_symbols,
+            frequency_offset: freq_1,
+            params: &ft8_params,
+        },
+        MultiTxItem {
+            symbols: &rr73_2_symbols,
+            frequency_offset: freq_2,
+            params: &ft8_params,
+        },
+    ];
+    let mut combined_audio = modulate_multi_tx(&items, 12000, base_freq, 0.5).unwrap();
+    combined_audio.resize(WINDOW_SAMPLES, 0.0);
+
+    let decoded = our_station.decode(&combined_audio);
+    assert!(
+        find_message(&decoded, "W1ABC K2DEF RR73").is_some(),
+        "Should decode RR73 from K2DEF. Got: {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+    assert!(
+        find_message(&decoded, "W1ABC JA1XYZ RR73").is_some(),
+        "Should decode RR73 from JA1XYZ. Got: {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+
+    // === Round 6: We send 73 to both simultaneously ===
+    let s73_1_symbols = our_station.encoder.encode_message("K2DEF W1ABC 73", None).unwrap();
+    let s73_2_symbols = our_station.encoder.encode_message("JA1XYZ W1ABC 73", None).unwrap();
+
+    let items = vec![
+        MultiTxItem {
+            symbols: &s73_1_symbols,
+            frequency_offset: freq_1,
+            params: &ft8_params,
+        },
+        MultiTxItem {
+            symbols: &s73_2_symbols,
+            frequency_offset: freq_2,
+            params: &ft8_params,
+        },
+    ];
+    let mut combined_audio = modulate_multi_tx(&items, 12000, base_freq, 0.5).unwrap();
+    combined_audio.resize(WINDOW_SAMPLES, 0.0);
+
+    let decoded_1 = dx_station_1.decode(&combined_audio);
+    assert!(
+        find_message(&decoded_1, "K2DEF W1ABC 73").is_some(),
+        "DX1 should decode 73. Got: {:?}",
+        decoded_1.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+    let decoded_2 = dx_station_2.decode(&combined_audio);
+    assert!(
+        find_message(&decoded_2, "JA1XYZ W1ABC 73").is_some(),
+        "DX2 should decode 73. Got: {:?}",
+        decoded_2.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+}
