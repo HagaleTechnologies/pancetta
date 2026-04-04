@@ -324,4 +324,180 @@ mod tests {
         assert!((best.offset_hz - 1500.0).abs() < 200.0,
             "Expected near center, got {}", best.offset_hz);
     }
+
+    #[test]
+    fn test_avoids_noisy_frequency() {
+        // Make center bins (around 1500 Hz) noisy
+        let mut spectral = empty_spectral();
+        // bin_width = (2800 - 200) / 140 = ~18.57 Hz/bin
+        // index for 1500 Hz = (1500 - 200) / 18.57 ≈ 70
+        let center_bin = 70usize;
+        let radius = 5usize;
+        for i in center_bin.saturating_sub(radius)..=(center_bin + radius).min(139) {
+            spectral.power_bins[i] = 0.9;
+        }
+
+        let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let candidates = allocator.rank_candidates(&spectral, &empty_history(), &[], None);
+
+        assert!(!candidates.is_empty());
+        let best = &candidates[0];
+        assert!(
+            (best.offset_hz - 1500.0).abs() > 100.0,
+            "Expected best candidate >100 Hz from noisy center, got {} Hz",
+            best.offset_hz
+        );
+    }
+
+    #[test]
+    fn test_avoids_occupied_frequency() {
+        // Put decode activity at 1500 Hz in both slots
+        let mut history = empty_history();
+        history.push_cycle(vec![
+            DecodeRecord { frequency_hz: 1500.0, time_slot: TimeSlot::First },
+            DecodeRecord { frequency_hz: 1500.0, time_slot: TimeSlot::Second },
+        ]);
+
+        let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let candidates = allocator.rank_candidates(&empty_spectral(), &history, &[], None);
+
+        assert!(!candidates.is_empty());
+        let best = &candidates[0];
+        assert!(
+            (best.offset_hz - 1500.0).abs() > 50.0,
+            "Expected best candidate >50 Hz from occupied 1500 Hz, got {} Hz",
+            best.offset_hz
+        );
+    }
+
+    #[test]
+    fn test_prefers_dx_proximity() {
+        let dx_target = 1000.0;
+        let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let candidates =
+            allocator.rank_candidates(&empty_spectral(), &empty_history(), &[], Some(dx_target));
+
+        assert!(!candidates.is_empty());
+        let best = &candidates[0];
+        let dist = (best.offset_hz - dx_target).abs();
+        assert!(
+            dist >= 50.0 && dist <= 200.0,
+            "Expected best candidate 50–200 Hz from DX at {} Hz, got {} Hz (dist {})",
+            dx_target,
+            best.offset_hz,
+            dist
+        );
+    }
+
+    #[test]
+    fn test_avoids_own_frequencies() {
+        let own = vec![1500.0];
+        let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let candidates =
+            allocator.rank_candidates(&empty_spectral(), &empty_history(), &own, None);
+
+        assert!(!candidates.is_empty());
+        let best = &candidates[0];
+        assert!(
+            (best.offset_hz - 1500.0).abs() >= 75.0,
+            "Expected best candidate ≥75 Hz from own frequency 1500 Hz, got {} Hz",
+            best.offset_hz
+        );
+    }
+
+    #[test]
+    fn test_clear_both_slots_preferred() {
+        // Activity at 1500 Hz in first slot only
+        let mut history = empty_history();
+        history.push_cycle(vec![DecodeRecord {
+            frequency_hz: 1500.0,
+            time_slot: TimeSlot::First,
+        }]);
+
+        let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let candidates = allocator.rank_candidates(&empty_spectral(), &history, &[], None);
+
+        assert!(!candidates.is_empty());
+        let best = &candidates[0];
+        assert!(
+            best.clear_both_slots,
+            "Expected best candidate to have clear_both_slots=true, got offset={} Hz",
+            best.offset_hz
+        );
+    }
+
+    #[test]
+    fn test_crowded_band_still_returns_candidates() {
+        // Activity at every 100 Hz across the band
+        let mut history = empty_history();
+        let mut records = Vec::new();
+        let mut f = 200.0f64;
+        while f <= 2800.0 {
+            records.push(DecodeRecord { frequency_hz: f, time_slot: TimeSlot::First });
+            records.push(DecodeRecord { frequency_hz: f, time_slot: TimeSlot::Second });
+            f += 100.0;
+        }
+        history.push_cycle(records);
+
+        let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let candidates = allocator.rank_candidates(&empty_spectral(), &history, &[], None);
+
+        assert!(
+            !candidates.is_empty(),
+            "Expected candidates even on a crowded band"
+        );
+    }
+
+    #[test]
+    fn test_decode_history_rolling_buffer() {
+        // max-2 buffer: push 3 cycles, oldest should be dropped
+        let mut history = DecodeHistory::new(2);
+
+        history.push_cycle(vec![DecodeRecord {
+            frequency_hz: 1000.0,
+            time_slot: TimeSlot::First,
+        }]);
+        history.push_cycle(vec![DecodeRecord {
+            frequency_hz: 1200.0,
+            time_slot: TimeSlot::First,
+        }]);
+        // After these two pushes activity at 1000 Hz should be 1
+        assert_eq!(history.activity_near(1000.0, 10.0), 1);
+
+        // Third push should evict the first cycle (1000 Hz)
+        history.push_cycle(vec![DecodeRecord {
+            frequency_hz: 1400.0,
+            time_slot: TimeSlot::First,
+        }]);
+        assert_eq!(
+            history.activity_near(1000.0, 10.0),
+            0,
+            "Oldest cycle should have been evicted"
+        );
+        assert_eq!(history.activity_near(1200.0, 10.0), 1);
+        assert_eq!(history.activity_near(1400.0, 10.0), 1);
+    }
+
+    #[test]
+    fn test_spectral_snapshot_power_near() {
+        let mut spectral = empty_spectral();
+        // bin_width ≈ 18.57 Hz; bin 70 ≈ 1500 Hz
+        spectral.power_bins[70] = 0.8;
+
+        // Should detect the high power bin near 1500 Hz
+        let power_at_1500 = spectral.power_near(1500.0, 30.0);
+        assert!(
+            power_at_1500 > 0.1,
+            "Expected elevated power near 1500 Hz, got {}",
+            power_at_1500
+        );
+
+        // Should be quiet far away (e.g. near 600 Hz — bin ~21)
+        let power_at_600 = spectral.power_near(600.0, 30.0);
+        assert!(
+            power_at_600 < 0.01,
+            "Expected quiet power near 600 Hz, got {}",
+            power_at_600
+        );
+    }
 }
