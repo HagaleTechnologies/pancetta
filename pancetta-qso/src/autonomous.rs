@@ -455,10 +455,15 @@ pub struct AutonomousConfig {
     pub tx_offset_hz: f64,
     /// 0.0–1.0 threshold for DX score when deciding whether to answer a CQ.
     pub min_dx_score: f64,
+    /// Minimum DX score required to open an additional QSO slot (0.0–1.0).
+    /// Only applies to second+ concurrent QSOs. First QSO uses min_dx_score.
+    pub min_multi_slot_score: f64,
     /// Directed CQ text (e.g. "DX", "NA", or empty).
     pub cq_direction: String,
     pub listen_cycle: ListenCycleConfig,
     pub band_hopping: BandHoppingConfig,
+    /// Frequency allocator settings for smart TX offset selection.
+    pub frequency: FrequencyAllocatorConfig,
 }
 
 impl Default for AutonomousConfig {
@@ -470,9 +475,11 @@ impl Default for AutonomousConfig {
             max_concurrent_qsos: 1,
             tx_offset_hz: 1500.0,
             min_dx_score: 0.3,
+            min_multi_slot_score: 0.7,
             cq_direction: String::new(),
             listen_cycle: ListenCycleConfig::default(),
             band_hopping: BandHoppingConfig::default(),
+            frequency: FrequencyAllocatorConfig::default(),
         }
     }
 }
@@ -704,8 +711,6 @@ pub struct AutonomousOperator {
     spectral_snapshot: Option<SpectralSnapshot>,
     /// Smart frequency allocator (replaces simple FrequencyAllocator for new QSOs).
     smart_allocator: SmartFrequencyAllocator,
-    /// Minimum score to open an additional QSO slot.
-    pub min_multi_slot_score: f64,
     /// Whether the user has paused autonomous operation.
     paused: bool,
 }
@@ -717,8 +722,8 @@ impl AutonomousOperator {
         let band_strategy = BandStrategy::new(config.band_hopping.clone());
         // FT8 bandwidth: 8 tones * 6.25 Hz = 50 Hz, plus 25 Hz guard = 75 Hz min separation
         let frequency_allocator = FrequencyAllocator::new(75.0, (200.0, 2800.0));
-        let decode_history = DecodeHistory::new(4);
-        let smart_allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let decode_history = DecodeHistory::new(config.frequency.decode_history_cycles);
+        let smart_allocator = SmartFrequencyAllocator::new(config.frequency.clone());
 
         Self {
             config,
@@ -736,7 +741,6 @@ impl AutonomousOperator {
             decode_history,
             spectral_snapshot: None,
             smart_allocator,
-            min_multi_slot_score: 0.7,
             paused: false,
         }
     }
@@ -990,7 +994,7 @@ impl AutonomousOperator {
                     let threshold = if total_active == 0 {
                         self.config.min_dx_score
                     } else {
-                        self.min_multi_slot_score
+                        self.config.min_multi_slot_score
                     };
 
                     let best_cq = self
@@ -1527,10 +1531,10 @@ mod tests {
         config.slot_parity = SlotParityConfig::Even;
         config.max_concurrent_qsos = 3;
         config.min_dx_score = 0.3;
+        config.min_multi_slot_score = 0.3; // Lower threshold so NullDxEvaluator (0.5) passes
         config.listen_cycle.initial_interval = 100;
 
         let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
-        op.min_multi_slot_score = 0.3; // Lower threshold so NullDxEvaluator (0.5) passes
         op.set_active_qso_count(1);
 
         // One active QSO
@@ -1577,10 +1581,10 @@ mod tests {
         config.enabled = true;
         config.max_concurrent_qsos = 2;
         config.slot_parity = SlotParityConfig::Even;
+        config.min_multi_slot_score = 0.5;
         config.listen_cycle.initial_interval = 100;
 
         let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
-        op.min_multi_slot_score = 0.5;
 
         // Simulate one active QSO
         op.set_active_qso_count(1);
@@ -1621,10 +1625,10 @@ mod tests {
         config.enabled = true;
         config.max_concurrent_qsos = 2;
         config.slot_parity = SlotParityConfig::Even;
+        config.min_multi_slot_score = 0.9; // Very high threshold
         config.listen_cycle.initial_interval = 100;
 
         let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
-        op.min_multi_slot_score = 0.9; // Very high threshold
 
         op.set_active_qso_count(1);
         op.add_pending_sequencer_message(
@@ -1664,10 +1668,10 @@ mod tests {
         config.enabled = true;
         config.max_concurrent_qsos = 2;
         config.slot_parity = SlotParityConfig::Even;
+        config.min_multi_slot_score = 0.3;
         config.listen_cycle.initial_interval = 100;
 
         let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
-        op.min_multi_slot_score = 0.3;
 
         // Already at max QSOs
         op.set_active_qso_count(2);

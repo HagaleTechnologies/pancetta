@@ -2300,6 +2300,7 @@ impl ApplicationCoordinator {
             max_concurrent_qsos: config.autonomous.max_concurrent_qsos,
             tx_offset_hz: config.autonomous.tx_offset_hz,
             min_dx_score: config.autonomous.min_dx_score,
+            min_multi_slot_score: config.autonomous.min_multi_slot_score,
             cq_direction: config.autonomous.cq_direction.clone(),
             listen_cycle: pancetta_qso::autonomous::ListenCycleConfig {
                 initial_interval: config.autonomous.listen_cycle.initial_interval,
@@ -2322,6 +2323,15 @@ impl ApplicationCoordinator {
                     })
                     .collect(),
             },
+            frequency: pancetta_qso::frequency::FrequencyAllocatorConfig {
+                decode_history_cycles: config.autonomous.frequency.decode_history_cycles,
+                center_bias_hz: config.autonomous.frequency.center_bias_hz,
+                dx_proximity_min_hz: config.autonomous.frequency.dx_proximity_min_hz,
+                dx_proximity_max_hz: config.autonomous.frequency.dx_proximity_max_hz,
+                min_separation_hz: config.autonomous.frequency.min_separation_hz,
+                neighbor_guard_hz: config.autonomous.frequency.neighbor_guard_hz,
+                ..Default::default()
+            },
         };
 
         let our_callsign = config.station.callsign.clone();
@@ -2341,7 +2351,6 @@ impl ApplicationCoordinator {
             duplicate_penalty: config.autonomous.priorities.duplicate_penalty,
             recent_failure_penalty: config.autonomous.priorities.recent_failure_penalty,
         };
-        let config_snapshot_min_multi_slot_score = config.autonomous.min_multi_slot_score;
         drop(config);
 
         let cached_lookup = self.cached_lookup.clone();
@@ -2355,11 +2364,6 @@ impl ApplicationCoordinator {
         let (waterfall_to_auto_tx, waterfall_to_auto_rx) =
             crossbeam_channel::bounded::<Vec<Vec<f32>>>(2);
         self.waterfall_to_auto_tx = Some(waterfall_to_auto_tx);
-
-        {
-            let mut op = operator.blocking_lock();
-            op.min_multi_slot_score = config_snapshot_min_multi_slot_score;
-        }
 
         let evaluator: std::sync::Arc<dyn pancetta_qso::DxEvaluator> =
             std::sync::Arc::new(pancetta_qso::PriorityScorer::new(
