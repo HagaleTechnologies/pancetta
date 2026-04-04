@@ -77,6 +77,9 @@ pub struct ApplicationCoordinator {
     /// cqdx.io integration bridge (None = degraded mode).
     cqdx_bridge: Option<std::sync::Arc<crate::cqdx_bridge::CqdxBridge>>,
 
+    /// Sender for waterfall data to the autonomous operator.
+    waterfall_to_auto_tx: Option<crossbeam_channel::Sender<Vec<Vec<f32>>>>,
+
     /// Performance metrics
     message_count: Arc<std::sync::atomic::AtomicU64>,
     last_audio_timestamp: Arc<RwLock<Option<Instant>>>,
@@ -244,6 +247,7 @@ impl ApplicationCoordinator {
             wav_path,
             cached_lookup: std::sync::Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
             cqdx_bridge: None,
+            waterfall_to_auto_tx: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(RwLock::new(None)),
             last_decode_timestamp: Arc::new(RwLock::new(None)),
@@ -777,6 +781,7 @@ impl ApplicationCoordinator {
         let shutdown = self.shutdown_signal.clone();
         let last_decode_timestamp = self.last_decode_timestamp.clone();
         let message_bus = self.message_bus.clone();
+        let self_waterfall_to_auto_tx = self.waterfall_to_auto_tx.clone();
 
         let handle = tokio::spawn(async move {
             while !shutdown.load(Ordering::Acquire) {
@@ -804,7 +809,11 @@ impl ApplicationCoordinator {
                                             .map(|row| vec![0.0f32; row.len()])
                                             .collect()
                                     };
-                                    let _ = waterfall_tx.send(rows);
+                                    let _ = waterfall_tx.send(rows.clone());
+                                    // Also send to autonomous operator for frequency allocation
+                                    if let Some(ref auto_wf_tx) = self_waterfall_to_auto_tx {
+                                        let _ = auto_wf_tx.try_send(rows);
+                                    }
                                 }
                                 Err(e) => {
                                     debug!("Waterfall generation error: {}", e);
@@ -2332,6 +2341,7 @@ impl ApplicationCoordinator {
             duplicate_penalty: config.autonomous.priorities.duplicate_penalty,
             recent_failure_penalty: config.autonomous.priorities.recent_failure_penalty,
         };
+        let config_snapshot_min_multi_slot_score = config.autonomous.min_multi_slot_score;
         drop(config);
 
         let cached_lookup = self.cached_lookup.clone();
@@ -2341,6 +2351,15 @@ impl ApplicationCoordinator {
         let operator = std::sync::Arc::new(tokio::sync::Mutex::new(
             pancetta_qso::AutonomousOperator::new(qso_auto_config, our_callsign, our_grid),
         ));
+
+        let (waterfall_to_auto_tx, waterfall_to_auto_rx) =
+            crossbeam_channel::bounded::<Vec<Vec<f32>>>(2);
+        self.waterfall_to_auto_tx = Some(waterfall_to_auto_tx);
+
+        {
+            let mut op = operator.blocking_lock();
+            op.min_multi_slot_score = config_snapshot_min_multi_slot_score;
+        }
 
         let evaluator: std::sync::Arc<dyn pancetta_qso::DxEvaluator> =
             std::sync::Arc::new(pancetta_qso::PriorityScorer::new(
@@ -2390,6 +2409,29 @@ impl ApplicationCoordinator {
                             }
 
                             let mut op = operator.lock().await;
+
+                            // Update spectral data from waterfall
+                            if let Ok(rows) = waterfall_to_auto_rx.try_recv() {
+                                if let Some(first_row) = rows.first() {
+                                    let num_bins = first_row.len();
+                                    let mut avg = vec![0.0f32; num_bins];
+                                    for row in &rows {
+                                        for (i, &v) in row.iter().enumerate().take(num_bins) {
+                                            avg[i] += v;
+                                        }
+                                    }
+                                    let n = rows.len() as f32;
+                                    for v in &mut avg {
+                                        *v /= n;
+                                    }
+                                    op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
+                                        power_bins: avg,
+                                        freq_min_hz: 200.0,
+                                        freq_max_hz: 4000.0,
+                                    });
+                                }
+                            }
+
                             op.feed_decoded_messages(&slot_messages, evaluator.as_ref());
                             slot_messages.clear();
                             let actions = op.decide();
@@ -2402,14 +2444,20 @@ impl ApplicationCoordinator {
                             for action in actions {
                                 match action {
                                     pancetta_qso::OperatorAction::Transmit {
-                                        message_text,
+                                        ref message_text,
                                         frequency_offset,
-                                        qso_id,
+                                        ref qso_id,
                                     } => {
+                                        if qso_id.is_none() {
+                                            info!(
+                                                "Autonomous: opening slot at {:.0} Hz: {}",
+                                                frequency_offset, message_text
+                                            );
+                                        }
                                         tx_items.push(crate::message_bus::TransmitRequestItem {
-                                            message_text,
+                                            message_text: message_text.clone(),
                                             frequency_offset,
-                                            qso_id,
+                                            qso_id: qso_id.clone(),
                                         });
                                     }
                                     pancetta_qso::OperatorAction::ChangeBand { dial_frequency } => {
