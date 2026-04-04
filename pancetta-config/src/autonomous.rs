@@ -144,6 +144,36 @@ impl PriorityWeightsConfig {
     }
 }
 
+/// Frequency allocator configuration for multi-QSO support.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrequencyAllocatorConfig {
+    /// How many recent decode cycles to consider for occupancy.
+    pub decode_history_cycles: usize,
+    /// Center of passband preference in Hz.
+    pub center_bias_hz: f64,
+    /// Minimum preferred offset from DX station in Hz.
+    pub dx_proximity_min_hz: f64,
+    /// Maximum preferred offset from DX station in Hz.
+    pub dx_proximity_max_hz: f64,
+    /// Minimum separation between own QSO frequencies in Hz.
+    pub min_separation_hz: f64,
+    /// Avoid strong signals within this range in Hz.
+    pub neighbor_guard_hz: f64,
+}
+
+impl Default for FrequencyAllocatorConfig {
+    fn default() -> Self {
+        Self {
+            decode_history_cycles: 4,
+            center_bias_hz: 1500.0,
+            dx_proximity_min_hz: 50.0,
+            dx_proximity_max_hz: 200.0,
+            min_separation_hz: 75.0,
+            neighbor_guard_hz: 100.0,
+        }
+    }
+}
+
 /// Top-level autonomous operator configuration.
 ///
 /// Corresponds to the `[autonomous]` section in the TOML config file.
@@ -161,6 +191,11 @@ pub struct AutonomousConfig {
     pub tx_offset_hz: f64,
     /// Minimum DX score (0.0–1.0) required to respond to a CQ.
     pub min_dx_score: f64,
+    /// Minimum DX score required to open an additional QSO slot (0.0–1.0).
+    /// Only applies to second+ concurrent QSOs. First QSO uses min_dx_score.
+    pub min_multi_slot_score: f64,
+    /// Frequency allocator settings for smart TX offset selection.
+    pub frequency: FrequencyAllocatorConfig,
     /// Directed CQ text (e.g. "DX", "NA", or empty for general CQ).
     pub cq_direction: String,
     /// Listen-cycle adaptive policy configuration.
@@ -180,6 +215,8 @@ impl Default for AutonomousConfig {
             max_concurrent_qsos: 1,
             tx_offset_hz: 1500.0,
             min_dx_score: 0.3,
+            min_multi_slot_score: 0.7,
+            frequency: FrequencyAllocatorConfig::default(),
             cq_direction: String::new(),
             listen_cycle: ListenCycleConfig::default(),
             band_hopping: BandHoppingConfig::default(),
@@ -208,6 +245,12 @@ impl ConfigSection for AutonomousConfig {
                 value: self.min_dx_score.to_string(),
             });
         }
+        if !(0.0..=1.0).contains(&self.min_multi_slot_score) {
+            return Err(ConfigError::InvalidValue {
+                field: "autonomous.min_multi_slot_score".into(),
+                value: self.min_multi_slot_score.to_string(),
+            });
+        }
         if self.tx_offset_hz < 100.0 || self.tx_offset_hz > 3000.0 {
             return Err(ConfigError::InvalidValue {
                 field: "autonomous.tx_offset_hz".into(),
@@ -225,6 +268,8 @@ impl ConfigSection for AutonomousConfig {
         self.max_concurrent_qsos = other.max_concurrent_qsos;
         self.tx_offset_hz = other.tx_offset_hz;
         self.min_dx_score = other.min_dx_score;
+        self.min_multi_slot_score = other.min_multi_slot_score;
+        self.frequency = other.frequency;
         self.cq_direction = other.cq_direction;
         self.listen_cycle = other.listen_cycle;
         self.band_hopping = other.band_hopping;
@@ -282,5 +327,27 @@ mod tests {
         let config = AutonomousConfig::default();
         assert!(config.validate_section().is_ok());
         assert!(config.priorities.needed_dxcc > 0.0);
+    }
+
+    #[test]
+    fn test_multi_slot_score_validation() {
+        let mut config = AutonomousConfig::default();
+        config.min_multi_slot_score = 0.7;
+        assert!(config.validate_section().is_ok());
+
+        config.min_multi_slot_score = 1.5;
+        assert!(config.validate_section().is_err());
+    }
+
+    #[test]
+    fn test_frequency_config_serialization() {
+        let config = AutonomousConfig::default();
+        let toml_str = toml::to_string(&config).unwrap();
+        let deserialized: AutonomousConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.min_multi_slot_score, deserialized.min_multi_slot_score);
+        assert_eq!(
+            config.frequency.center_bias_hz,
+            deserialized.frequency.center_bias_hz
+        );
     }
 }
