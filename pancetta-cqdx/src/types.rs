@@ -7,14 +7,22 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DxccEntity {
-    pub id: u32,
-    pub name: String,
+    #[serde(rename = "adifNumber")]
+    pub adif_number: u32,
+    #[serde(rename = "entityName")]
+    pub entity_name: String,
     pub prefix: String,
     pub continent: String,
     #[serde(rename = "cqZone")]
     pub cq_zone: u8,
     #[serde(rename = "ituZone")]
     pub itu_zone: u8,
+    #[serde(rename = "rarityRank")]
+    pub rarity_rank: Option<u32>,
+    #[serde(rename = "rarityTier")]
+    pub rarity_tier: String,
+    #[serde(rename = "isDeleted")]
+    pub is_deleted: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -37,30 +45,52 @@ pub struct NeededResponse {
     pub needed: Vec<NeededEntity>,
 }
 
-// --- Priority Spots ---
+// --- Live Spot Groups ---
 
+/// A spot group from the cqdx.io live feed, aggregated by (dxCall, band, mode).
 #[derive(Debug, Clone, Deserialize)]
-pub struct PrioritySpot {
-    pub callsign: String,
-    pub grid: Option<String>,
-    pub frequency: u64,
+pub struct SpotGroup {
+    #[serde(rename = "dxCall")]
+    pub dx_call: String,
+    pub band: String,
     pub mode: String,
-    pub snr: Option<i32>,
-    pub entity: Option<String>,
-    pub rarity: f64,
-    pub needed: bool,
-    #[serde(rename = "lastSpotted")]
-    pub last_spotted: DateTime<Utc>,
-    #[serde(rename = "spotCount")]
-    pub spot_count: u32,
+    #[serde(rename = "dxDxcc")]
+    pub dx_dxcc: u32,
+    #[serde(rename = "dxEntityName")]
+    pub dx_entity_name: String,
+    #[serde(rename = "dxContinent")]
+    pub dx_continent: String,
+    #[serde(rename = "dxCqZone")]
+    pub dx_cq_zone: u8,
+    #[serde(rename = "dxGrid")]
+    pub dx_grid: Option<String>,
+    #[serde(rename = "rarityRank")]
+    pub rarity_rank: Option<u32>,
+    #[serde(rename = "rarityTier")]
+    pub rarity_tier: String,
+    pub frequency: u64,
+    #[serde(rename = "bestSnr")]
+    pub best_snr: Option<i32>,
+    #[serde(rename = "reporterCount")]
+    pub reporter_count: u32,
+    pub sources: Vec<String>,
+    #[serde(rename = "firstSeen")]
+    pub first_seen: i64,
+    #[serde(rename = "lastSeen")]
+    pub last_seen: i64,
+    pub confidence: f64,
+    #[serde(rename = "isNotable", default)]
+    pub is_notable: bool,
+    #[serde(rename = "notableType")]
+    pub notable_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PrioritiesResponse {
-    pub priorities: Vec<PrioritySpot>,
+pub struct LiveSpotsResponse {
+    pub groups: Vec<SpotGroup>,
 }
 
-// --- Spot Ingest ---
+// --- Spot Reporting ---
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SpotReport {
@@ -76,7 +106,7 @@ pub struct SpotReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct SpotIngestRequest {
+pub struct SpotReportRequest {
     pub spots: Vec<SpotReport>,
 }
 
@@ -105,4 +135,33 @@ pub struct QsoRecord {
 pub struct QsoReportRequest {
     pub version: u32,
     pub qso: QsoRecord,
+}
+
+// --- Utilities ---
+
+/// Convert a CQDX rarityRank (1=rarest, ~340=most common) to a 0.0–1.0 float
+/// where 1.0 = rarest. Returns 0.5 (neutral) if rank is None.
+pub fn rank_to_rarity(rank: Option<u32>) -> f64 {
+    match rank {
+        Some(r) => 1.0 - (r.saturating_sub(1) as f64) / 339.0,
+        None => 0.5,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rank_to_rarity_boundaries() {
+        assert!((rank_to_rarity(Some(1)) - 1.0).abs() < f64::EPSILON);
+        assert!((rank_to_rarity(Some(340)) - 0.0).abs() < 0.01);
+        assert!((rank_to_rarity(None) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_rank_to_rarity_midpoint() {
+        let mid = rank_to_rarity(Some(170));
+        assert!(mid > 0.4 && mid < 0.6);
+    }
 }

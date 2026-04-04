@@ -46,35 +46,36 @@ impl CqdxClient {
         Ok(body.needed)
     }
 
-    pub async fn fetch_priorities(
+    /// Fetch live spot groups from the cqdx.io Durable Object snapshot.
+    /// Edge-cached with 10s TTL — safe to poll every 30s.
+    pub async fn fetch_live_spots(
         &self,
         band: Option<&str>,
         mode: Option<&str>,
-        limit: u32,
-    ) -> Result<Vec<PrioritySpot>> {
-        let mut params = vec![("limit", limit.to_string())];
+    ) -> Result<Vec<SpotGroup>> {
+        let mut params = vec![("live", "true".to_string())];
         if let Some(b) = band {
             params.push(("band", b.to_string()));
         }
         if let Some(m) = mode {
             params.push(("mode", m.to_string()));
         }
-        let url = format!("{}/api/v1/spots/priorities", self.base_url);
-        debug!("Fetching priority spots from {}", url);
+        let url = format!("{}/api/v1/spots", self.base_url);
+        debug!("Fetching live spots from {}", url);
         let resp = self.http.get(&url)
             .bearer_auth(&self.token)
             .query(&params)
             .send()
             .await?;
         let resp = self.check_status(resp).await?;
-        let body: PrioritiesResponse = resp.json().await?;
-        Ok(body.priorities)
+        let body: LiveSpotsResponse = resp.json().await?;
+        Ok(body.groups)
     }
 
     pub async fn report_spots(&self, spots: Vec<SpotReport>) -> Result<()> {
-        let url = format!("{}/api/v1/spots/ingest", self.base_url);
+        let url = format!("{}/api/v1/spots/report", self.base_url);
         debug!("Reporting {} spots to {}", spots.len(), url);
-        let req = SpotIngestRequest { spots };
+        let req = SpotReportRequest { spots };
         let resp = self.http.post(&url)
             .bearer_auth(&self.token)
             .json(&req)
@@ -131,12 +132,15 @@ mod tests {
             .and(header("Authorization", "Bearer pat_test_token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "entities": [{
-                    "id": 291,
-                    "name": "United States",
+                    "adifNumber": 291,
+                    "entityName": "United States",
                     "prefix": "K",
                     "continent": "NA",
                     "cqZone": 5,
-                    "ituZone": 8
+                    "ituZone": 8,
+                    "rarityRank": 340,
+                    "rarityTier": "common",
+                    "isDeleted": false
                 }]
             })))
             .mount(&server)
@@ -146,7 +150,10 @@ mod tests {
         let entities = client.fetch_entities().await.unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].prefix, "K");
-        assert_eq!(entities[0].id, 291);
+        assert_eq!(entities[0].adif_number, 291);
+        assert_eq!(entities[0].entity_name, "United States");
+        assert_eq!(entities[0].rarity_rank, Some(340));
+        assert!(!entities[0].is_deleted);
     }
 
     #[tokio::test]
@@ -172,41 +179,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fetch_priorities() {
+    async fn test_fetch_live_spots() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/api/v1/spots/priorities"))
+            .and(path("/api/v1/spots"))
+            .and(query_param("live", "true"))
             .and(query_param("band", "20m"))
-            .and(query_param("limit", "10"))
+            .and(header("Authorization", "Bearer pat_test_token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "priorities": [{
-                    "callsign": "3Y0J",
-                    "grid": "JD15",
-                    "frequency": 14074000_u64,
+                "groups": [{
+                    "dxCall": "3Y0J",
+                    "band": "20m",
                     "mode": "FT8",
-                    "snr": -12,
-                    "entity": "Bouvet Island",
-                    "rarity": 0.98,
-                    "needed": true,
-                    "lastSpotted": "2026-04-03T14:22:00Z",
-                    "spotCount": 5
+                    "dxDxcc": 327,
+                    "dxEntityName": "Bouvet Island",
+                    "dxContinent": "AF",
+                    "dxCqZone": 38,
+                    "dxGrid": "JD15",
+                    "rarityRank": 1,
+                    "rarityTier": "legendary",
+                    "frequency": 14074000_u64,
+                    "bestSnr": -12,
+                    "reporterCount": 5,
+                    "sources": ["pskreporter"],
+                    "firstSeen": 1743688920_i64,
+                    "lastSeen": 1743689040_i64,
+                    "confidence": 4.2
                 }]
             })))
             .mount(&server)
             .await;
 
         let client = test_client(&server.uri());
-        let spots = client.fetch_priorities(Some("20m"), None, 10).await.unwrap();
-        assert_eq!(spots.len(), 1);
-        assert_eq!(spots[0].callsign, "3Y0J");
-        assert!((spots[0].rarity - 0.98).abs() < f64::EPSILON);
+        let groups = client.fetch_live_spots(Some("20m"), None).await.unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].dx_call, "3Y0J");
+        assert_eq!(groups[0].rarity_rank, Some(1));
+        assert_eq!(groups[0].reporter_count, 5);
+        assert_eq!(groups[0].best_snr, Some(-12));
     }
 
     #[tokio::test]
     async fn test_report_spots() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/v1/spots/ingest"))
+            .and(path("/api/v1/spots/report"))
             .and(header("Authorization", "Bearer pat_test_token"))
             .respond_with(ResponseTemplate::new(202))
             .mount(&server)

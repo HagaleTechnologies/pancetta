@@ -1,10 +1,10 @@
 //! Coordinator-level wiring for cqdx.io integration.
 //!
-//! Handles startup (fetch entities + needed), periodic priority polling,
+//! Handles startup (fetch entities + needed), periodic live spot polling,
 //! and fire-and-forget spot/QSO reporting.
 
 use crate::priority_evaluator::CachedStationLookup;
-use pancetta_cqdx::{CqdxClient, CqdxCache, SpotReport, QsoRecord};
+use pancetta_cqdx::{CqdxClient, CqdxCache, SpotReport, QsoRecord, rank_to_rarity};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -70,9 +70,9 @@ impl CqdxBridge {
         Ok(())
     }
 
-    /// Spawn a background task that polls priority spots every N seconds.
+    /// Spawn a background task that polls live spot groups every N seconds.
     /// Stops polling if no decode activity for 2 hours (watchdog).
-    pub fn spawn_priority_poller(
+    pub fn spawn_spot_poller(
         &self,
         shutdown: Arc<AtomicBool>,
         last_decode: Arc<RwLock<Option<Instant>>>,
@@ -125,30 +125,29 @@ impl CqdxBridge {
                     last_backoff_attempt = std::time::Instant::now();
                 }
 
-                match client.fetch_priorities(
+                match client.fetch_live_spots(
                     band.as_deref(),
                     mode.as_deref(),
-                    20,
                 ).await {
-                    Ok(spots) => {
+                    Ok(groups) => {
                         consecutive_failures = 0;
-                        debug!("Polled {} priority spots from cqdx.io", spots.len());
+                        debug!("Polled {} spot groups from cqdx.io", groups.len());
 
                         // Update rarity scores in CachedStationLookup
-                        let rarity_map: HashMap<String, f64> = spots
+                        let rarity_map: HashMap<String, f64> = groups
                             .iter()
-                            .map(|s| (s.callsign.to_uppercase(), s.rarity))
+                            .map(|g| (g.dx_call.to_uppercase(), rank_to_rarity(g.rarity_rank)))
                             .collect();
                         cached_lookup.update_rarity_scores(rarity_map);
 
                         // Update cache
                         let mut c = cache.write().await;
-                        c.update_priorities(spots);
+                        c.update_spot_groups(groups);
                     }
                     Err(e) => {
                         consecutive_failures += 1;
                         warn!(
-                            "cqdx.io priority poll failed ({}/3): {}",
+                            "cqdx.io live spot poll failed ({}/3): {}",
                             consecutive_failures, e
                         );
                         if consecutive_failures >= 3 {

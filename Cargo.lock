@@ -2928,6 +2928,7 @@ dependencies = [
  "num_cpus",
  "pancetta-audio",
  "pancetta-config",
+ "pancetta-cqdx",
  "pancetta-dsp",
  "pancetta-dx",
  "pancetta-ft8",

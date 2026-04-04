@@ -1,9 +1,9 @@
 //! In-memory session cache for cqdx.io data.
 //!
-//! Holds DXCC entities, needed status, rarity scores, and priority spots.
+//! Holds DXCC entities, needed status, rarity scores, and live spot groups.
 //! Populated on startup from cqdx.io API, refreshed by polling.
 
-use crate::types::{DxccEntity, NeededEntity, PrioritySpot};
+use crate::types::{rank_to_rarity, DxccEntity, NeededEntity, SpotGroup};
 use std::collections::{HashMap, HashSet};
 
 /// In-memory cache of cqdx.io data for the current session.
@@ -11,14 +11,14 @@ use std::collections::{HashMap, HashSet};
 pub struct CqdxCache {
     /// All DXCC entities indexed by prefix (longest-prefix-first for matching).
     prefixes: Vec<(String, u32)>,
-    /// Entity details by ID.
+    /// Entity details by ADIF number.
     entities: HashMap<u32, DxccEntity>,
     /// Entity IDs the user still needs. None = no data loaded (conservative: everything needed).
     needed_entity_ids: Option<HashSet<u32>>,
-    /// Rarity scores from priority spots, keyed by uppercase callsign.
+    /// Rarity scores from live spot groups, keyed by uppercase callsign.
     rarity_scores: HashMap<String, f64>,
-    /// Latest priority spot poll results.
-    priorities: Vec<PrioritySpot>,
+    /// Latest live spot group poll results.
+    spot_groups: Vec<SpotGroup>,
 }
 
 impl CqdxCache {
@@ -28,7 +28,7 @@ impl CqdxCache {
             entities: HashMap::new(),
             needed_entity_ids: None,
             rarity_scores: HashMap::new(),
-            priorities: Vec::new(),
+            spot_groups: Vec::new(),
         }
     }
 
@@ -37,8 +37,8 @@ impl CqdxCache {
         self.entities.clear();
         self.prefixes.clear();
         for entity in &entities {
-            self.entities.insert(entity.id, entity.clone());
-            self.prefixes.push((entity.prefix.to_uppercase(), entity.id));
+            self.entities.insert(entity.adif_number, entity.clone());
+            self.prefixes.push((entity.prefix.to_uppercase(), entity.adif_number));
         }
         // Sort longest prefix first so "3Y/B" matches before "3Y"
         self.prefixes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
@@ -50,17 +50,18 @@ impl CqdxCache {
         self.needed_entity_ids = Some(ids);
     }
 
-    /// Update priority spots from latest poll. Also updates rarity cache.
-    /// Uses upsert (not clear) so callsigns that drop out of the top-N
+    /// Update live spot groups from latest poll. Also updates rarity cache.
+    /// Uses upsert (not clear) so callsigns that drop out of the current window
     /// retain their last-known rarity until replaced by a new poll result.
-    pub fn update_priorities(&mut self, spots: Vec<PrioritySpot>) {
-        for spot in &spots {
-            self.rarity_scores.insert(spot.callsign.to_uppercase(), spot.rarity);
+    pub fn update_spot_groups(&mut self, groups: Vec<SpotGroup>) {
+        for group in &groups {
+            let rarity = rank_to_rarity(group.rarity_rank);
+            self.rarity_scores.insert(group.dx_call.to_uppercase(), rarity);
         }
-        self.priorities = spots;
+        self.spot_groups = groups;
     }
 
-    /// Resolve a callsign to its DXCC entity ID using longest-prefix matching.
+    /// Resolve a callsign to its DXCC entity ADIF number using longest-prefix matching.
     pub fn resolve_entity(&self, callsign: &str) -> Option<u32> {
         let upper = callsign.to_uppercase();
         for (prefix, id) in &self.prefixes {
@@ -93,9 +94,9 @@ impl CqdxCache {
         }
     }
 
-    /// Get current priority spots for frequency nudge decisions.
-    pub fn priority_spots(&self) -> &[PrioritySpot] {
-        &self.priorities
+    /// Get current live spot groups for frequency nudge decisions.
+    pub fn spot_groups(&self) -> &[SpotGroup] {
+        &self.spot_groups
     }
 }
 
@@ -107,18 +108,45 @@ mod tests {
     fn sample_entities() -> Vec<DxccEntity> {
         vec![
             DxccEntity {
-                id: 291, name: "United States".to_string(), prefix: "K".to_string(),
+                adif_number: 291, entity_name: "United States".to_string(), prefix: "K".to_string(),
                 continent: "NA".to_string(), cq_zone: 5, itu_zone: 8,
+                rarity_rank: Some(340), rarity_tier: "common".to_string(), is_deleted: false,
             },
             DxccEntity {
-                id: 339, name: "Japan".to_string(), prefix: "JA".to_string(),
+                adif_number: 339, entity_name: "Japan".to_string(), prefix: "JA".to_string(),
                 continent: "AS".to_string(), cq_zone: 25, itu_zone: 45,
+                rarity_rank: Some(300), rarity_tier: "common".to_string(), is_deleted: false,
             },
             DxccEntity {
-                id: 327, name: "Bouvet Island".to_string(), prefix: "3Y/B".to_string(),
+                adif_number: 327, entity_name: "Bouvet Island".to_string(), prefix: "3Y/B".to_string(),
                 continent: "AF".to_string(), cq_zone: 38, itu_zone: 67,
+                rarity_rank: Some(1), rarity_tier: "legendary".to_string(), is_deleted: false,
             },
         ]
+    }
+
+    fn sample_spot_group(dx_call: &str, rarity_rank: Option<u32>) -> SpotGroup {
+        SpotGroup {
+            dx_call: dx_call.to_string(),
+            band: "20m".to_string(),
+            mode: "FT8".to_string(),
+            dx_dxcc: 327,
+            dx_entity_name: "Bouvet Island".to_string(),
+            dx_continent: "AF".to_string(),
+            dx_cq_zone: 38,
+            dx_grid: Some("JD15".to_string()),
+            rarity_rank,
+            rarity_tier: "legendary".to_string(),
+            frequency: 14074000,
+            best_snr: Some(-12),
+            reporter_count: 5,
+            sources: vec!["pskreporter".to_string()],
+            first_seen: 1743688920,
+            last_seen: 1743689040,
+            confidence: 4.2,
+            is_notable: false,
+            notable_type: None,
+        }
     }
 
     #[test]
@@ -144,28 +172,33 @@ mod tests {
     }
 
     #[test]
-    fn test_rarity_from_priorities() {
+    fn test_rarity_from_spot_groups() {
         let mut cache = CqdxCache::new();
         cache.load_entities(sample_entities());
-        cache.update_priorities(vec![PrioritySpot {
-            callsign: "3Y0J".to_string(),
-            grid: Some("JD15".to_string()),
-            frequency: 14074000,
-            mode: "FT8".to_string(),
-            snr: Some(-12),
-            entity: Some("Bouvet Island".to_string()),
-            rarity: 0.98,
-            needed: true,
-            last_spotted: chrono::Utc::now(),
-            spot_count: 5,
-        }]);
-        assert!((cache.rarity("3Y0J") - 0.98).abs() < f64::EPSILON);
+        cache.update_spot_groups(vec![sample_spot_group("3Y0J", Some(1))]);
+        // rank 1 → rarity 1.0
+        assert!((cache.rarity("3Y0J") - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_rarity_common_station() {
+        let mut cache = CqdxCache::new();
+        cache.update_spot_groups(vec![sample_spot_group("K1ABC", Some(340))]);
+        // rank 340 → rarity ~0.0
+        assert!(cache.rarity("K1ABC") < 0.01);
     }
 
     #[test]
     fn test_rarity_unknown_callsign_returns_default() {
         let cache = CqdxCache::new();
         assert!((cache.rarity("W1ABC") - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_rarity_null_rank_returns_default() {
+        let mut cache = CqdxCache::new();
+        cache.update_spot_groups(vec![sample_spot_group("XX9XX", None)]);
+        assert!((cache.rarity("XX9XX") - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -191,21 +224,10 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_spots_accessor() {
+    fn test_spot_groups_accessor() {
         let mut cache = CqdxCache::new();
-        assert!(cache.priority_spots().is_empty());
-        cache.update_priorities(vec![PrioritySpot {
-            callsign: "3Y0J".to_string(),
-            grid: None,
-            frequency: 14074000,
-            mode: "FT8".to_string(),
-            snr: None,
-            entity: None,
-            rarity: 0.9,
-            needed: true,
-            last_spotted: chrono::Utc::now(),
-            spot_count: 1,
-        }]);
-        assert_eq!(cache.priority_spots().len(), 1);
+        assert!(cache.spot_groups().is_empty());
+        cache.update_spot_groups(vec![sample_spot_group("3Y0J", Some(1))]);
+        assert_eq!(cache.spot_groups().len(), 1);
     }
 }

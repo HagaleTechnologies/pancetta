@@ -293,7 +293,7 @@ impl ApplicationCoordinator {
                 match bridge.startup().await {
                     Ok(()) => {
                         info!("cqdx.io integration initialized");
-                        let _poller_handle = bridge.spawn_priority_poller(
+                        let _poller_handle = bridge.spawn_spot_poller(
                             self.shutdown_signal.clone(),
                             self.last_decode_timestamp.clone(),
                             None,

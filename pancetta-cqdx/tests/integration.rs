@@ -2,7 +2,7 @@
 
 use pancetta_cqdx::{CqdxClient, CqdxCache};
 use pancetta_cqdx::types::*;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Full startup flow: fetch entities, fetch needed, verify cache state.
@@ -15,9 +15,21 @@ async fn test_startup_flow_entities_and_needed() {
         .and(header("Authorization", "Bearer pat_test"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "entities": [
-                { "id": 291, "name": "United States", "prefix": "K", "continent": "NA", "cqZone": 5, "ituZone": 8 },
-                { "id": 339, "name": "Japan", "prefix": "JA", "continent": "AS", "cqZone": 25, "ituZone": 45 },
-                { "id": 327, "name": "Bouvet Island", "prefix": "3Y/B", "continent": "AF", "cqZone": 38, "ituZone": 67 }
+                {
+                    "adifNumber": 291, "entityName": "United States", "prefix": "K",
+                    "continent": "NA", "cqZone": 5, "ituZone": 8,
+                    "rarityRank": 340, "rarityTier": "common", "isDeleted": false
+                },
+                {
+                    "adifNumber": 339, "entityName": "Japan", "prefix": "JA",
+                    "continent": "AS", "cqZone": 25, "ituZone": 45,
+                    "rarityRank": 300, "rarityTier": "common", "isDeleted": false
+                },
+                {
+                    "adifNumber": 327, "entityName": "Bouvet Island", "prefix": "3Y/B",
+                    "continent": "AF", "cqZone": 38, "ituZone": 67,
+                    "rarityRank": 1, "rarityTier": "legendary", "isDeleted": false
+                }
             ]
         })))
         .mount(&server)
@@ -38,6 +50,8 @@ async fn test_startup_flow_entities_and_needed() {
 
     let entities = client.fetch_entities().await.unwrap();
     assert_eq!(entities.len(), 3);
+    assert_eq!(entities[0].adif_number, 291);
+    assert_eq!(entities[0].entity_name, "United States");
     cache.load_entities(entities);
 
     let needed = client.fetch_needed().await.unwrap();
@@ -49,35 +63,53 @@ async fn test_startup_flow_entities_and_needed() {
     assert!(!cache.is_needed_dxcc("JA1XYZ"));
 }
 
-/// Priority poll updates rarity scores in cache.
+/// Live spot poll updates rarity scores in cache.
 #[tokio::test]
-async fn test_priority_poll_updates_rarity() {
+async fn test_live_spot_poll_updates_rarity() {
     let server = MockServer::start().await;
 
     Mock::given(method("GET"))
-        .and(path("/api/v1/spots/priorities"))
+        .and(path("/api/v1/spots"))
+        .and(query_param("live", "true"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "priorities": [
+            "groups": [
                 {
-                    "callsign": "3Y0J",
-                    "grid": "JD15",
-                    "frequency": 14074000_u64,
+                    "dxCall": "3Y0J",
+                    "band": "20m",
                     "mode": "FT8",
-                    "snr": -12,
-                    "entity": "Bouvet Island",
-                    "rarity": 0.98,
-                    "needed": true,
-                    "lastSpotted": "2026-04-03T14:22:00Z",
-                    "spotCount": 5
+                    "dxDxcc": 327,
+                    "dxEntityName": "Bouvet Island",
+                    "dxContinent": "AF",
+                    "dxCqZone": 38,
+                    "dxGrid": "JD15",
+                    "rarityRank": 1,
+                    "rarityTier": "legendary",
+                    "frequency": 14074000_u64,
+                    "bestSnr": -12,
+                    "reporterCount": 5,
+                    "sources": ["pskreporter"],
+                    "firstSeen": 1743688920_i64,
+                    "lastSeen": 1743689040_i64,
+                    "confidence": 4.2
                 },
                 {
-                    "callsign": "K1ABC",
-                    "frequency": 14074000_u64,
+                    "dxCall": "K1ABC",
+                    "band": "20m",
                     "mode": "FT8",
-                    "rarity": 0.02,
-                    "needed": false,
-                    "lastSpotted": "2026-04-03T14:22:00Z",
-                    "spotCount": 1
+                    "dxDxcc": 291,
+                    "dxEntityName": "United States",
+                    "dxContinent": "NA",
+                    "dxCqZone": 5,
+                    "dxGrid": null,
+                    "rarityRank": 340,
+                    "rarityTier": "common",
+                    "frequency": 14074000_u64,
+                    "bestSnr": null,
+                    "reporterCount": 1,
+                    "sources": ["pskreporter"],
+                    "firstSeen": 1743688920_i64,
+                    "lastSeen": 1743689040_i64,
+                    "confidence": 1.5
                 }
             ]
         })))
@@ -87,11 +119,14 @@ async fn test_priority_poll_updates_rarity() {
     let client = CqdxClient::new(server.uri(), "pat_test".to_string());
     let mut cache = CqdxCache::new();
 
-    let spots = client.fetch_priorities(None, None, 20).await.unwrap();
-    cache.update_priorities(spots);
+    let groups = client.fetch_live_spots(None, None).await.unwrap();
+    cache.update_spot_groups(groups);
 
-    assert!((cache.rarity("3Y0J") - 0.98).abs() < f64::EPSILON);
-    assert!((cache.rarity("K1ABC") - 0.02).abs() < f64::EPSILON);
+    // rank 1 → rarity 1.0
+    assert!((cache.rarity("3Y0J") - 1.0).abs() < f64::EPSILON);
+    // rank 340 → rarity ~0.0
+    assert!(cache.rarity("K1ABC") < 0.01);
+    // unknown → default 0.5
     assert!((cache.rarity("UNKNOWN") - 0.5).abs() < f64::EPSILON);
 }
 
@@ -101,7 +136,7 @@ async fn test_spot_and_qso_reporting() {
     let server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/api/v1/spots/ingest"))
+        .and(path("/api/v1/spots/report"))
         .respond_with(ResponseTemplate::new(202))
         .mount(&server)
         .await;
@@ -147,5 +182,5 @@ fn test_degraded_mode_defaults() {
     assert_eq!(cache.resolve_entity("K1ABC"), None);
     assert!(cache.is_needed_dxcc("K1ABC"));
     assert!((cache.rarity("K1ABC") - 0.5).abs() < f64::EPSILON);
-    assert!(cache.priority_spots().is_empty());
+    assert!(cache.spot_groups().is_empty());
 }
