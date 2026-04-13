@@ -26,7 +26,7 @@ anyhow = "1.0"
 # Logging for debugging
 log = "0.4"
 # Serial port communication for PTT/CAT control
-serialport = { version = "4.7", optional = true }
+serialport = { version = "4.9", optional = true }
 # GPIO control for Raspberry Pi
 rppal = { version = "0.17", optional = true }
 # Audio output and control
@@ -52,7 +52,7 @@ cc = "1.2"
 criterion = { version = "0.5", features = ["html_reports"] }
 approx = "0.5"
 # Property-based testing
-proptest = "1.10"
+proptest = "1.11"
 # Random number generation for tests
 rand = "0.8"
 # Async testing runtime
