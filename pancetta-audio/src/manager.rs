@@ -151,16 +151,9 @@ impl AudioManager {
         // Create latency monitor (max 1000 measurements, target 1ms = 1_000_000ns)
         let latency_monitor = LatencyMeasurer::new(1000, 1_000_000);
 
-        // Initialize sample rate converter if needed
-        let converter = if config.sample_rate != 12000 {
-            Some(LinearResampler::new(
-                config.sample_rate,
-                12000, // FT8 requires 12kHz
-                config.channels,
-            )?)
-        } else {
-            None
-        };
+        // Skip resampling here — let the DSP pipeline handle it properly
+        // with anti-aliasing. Pass raw samples at the input sample rate.
+        let converter: Option<LinearResampler> = None;
 
         Ok(Self {
             device_manager,
@@ -225,14 +218,30 @@ impl AudioManager {
 
     /// Process audio data from ring buffer
     pub fn process_audio(&mut self) -> Result<Option<Vec<f32>>, AudioError> {
+        // Check if the audio stream has reported an error (e.g. device disconnect)
+        if self.shared.has_stream_error() {
+            warn!("Audio device error detected — stream may be disconnected");
+            return Err(AudioError::stream(
+                "Audio device error detected — stream may be disconnected",
+            ));
+        }
+
         let consumer = match self.consumer {
             Some(ref mut c) => c,
-            None => return Ok(None),
+            None => {
+                tracing::trace!("process_audio: no consumer");
+                return Ok(None);
+            }
         };
 
         let available = consumer.audio_samples_available();
         if available == 0 {
             return Ok(None);
+        }
+
+        // Log first time we get samples
+        if self.stats.samples_processed == 0 {
+            tracing::info!("First audio samples received: {} available", available);
         }
 
         // Read up to buffer_size * channels samples

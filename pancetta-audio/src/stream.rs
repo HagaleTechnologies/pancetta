@@ -196,6 +196,11 @@ impl AudioStreamManager {
         self.is_running
     }
 
+    /// Check if the audio stream has reported an error (e.g. device disconnect)
+    pub fn is_error(&self) -> bool {
+        self.shared.has_stream_error()
+    }
+
     /// Get current stream statistics
     pub fn get_statistics(&self) -> StreamStatistics {
         // If the consumer is still held here we can query it; otherwise use shared counters.
@@ -304,6 +309,10 @@ impl AudioStreamManager {
         let sample_format = stream_config.sample_format();
         let config: cpal::StreamConfig = stream_config.into();
 
+        // Clone shared state for the error callbacks so they can set the error flag.
+        let err_shared_f32 = self.shared.clone();
+        let err_shared_i16 = self.shared.clone();
+
         let stream = match sample_format {
             cpal::SampleFormat::F32 => input_device.build_input_stream(
                 &config,
@@ -312,7 +321,10 @@ impl AudioStreamManager {
                     let timer = CallbackTimer::start();
                     let _ = producer.push_latency(timer.elapsed_ns());
                 },
-                |err| eprintln!("Input stream error: {}", err),
+                move |err| {
+                    eprintln!("Input stream error: {}", err);
+                    err_shared_f32.set_stream_error();
+                },
                 None,
             )?,
             cpal::SampleFormat::I16 => input_device.build_input_stream(
@@ -326,7 +338,10 @@ impl AudioStreamManager {
                     let timer = CallbackTimer::start();
                     let _ = producer.push_latency(timer.elapsed_ns());
                 },
-                |err| eprintln!("Input stream error: {}", err),
+                move |err| {
+                    eprintln!("Input stream error: {}", err);
+                    err_shared_i16.set_stream_error();
+                },
                 None,
             )?,
             format => {

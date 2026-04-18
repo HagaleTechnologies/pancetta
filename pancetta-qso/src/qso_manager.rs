@@ -3,6 +3,7 @@
 //! This module provides the core QSO management functionality including
 //! state transitions, timeout handling, and QSO lifecycle management.
 
+use crate::async_database::AsyncQsoDatabase;
 use crate::states::*;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -240,6 +241,9 @@ pub struct QsoManager {
 
     /// Cleanup interval timer
     cleanup_interval: Arc<RwLock<Option<Interval>>>,
+
+    /// Optional database for persistent duplicate checking
+    database: Option<Arc<AsyncQsoDatabase>>,
 }
 
 impl QsoManager {
@@ -259,7 +263,15 @@ impl QsoManager {
             event_sender,
             next_serial: Arc::new(RwLock::new(next_serial)),
             cleanup_interval: Arc::new(RwLock::new(None)),
+            database: None,
         }
+    }
+
+    /// Create a new QSO manager with a database for persistent duplicate checking
+    pub fn with_database(config: QsoManagerConfig, database: Arc<AsyncQsoDatabase>) -> Self {
+        let mut manager = Self::new(config);
+        manager.database = Some(database);
+        manager
     }
 
     /// Get the configuration
@@ -297,6 +309,14 @@ impl QsoManager {
 
     /// Start a new CQ call
     pub async fn start_cq(&self, frequency: f64) -> Result<QsoId, QsoManagerError> {
+        if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
+            return Err(QsoManagerError::Configuration {
+                message: format!(
+                    "Cannot transmit with placeholder callsign '{}'. Configure your callsign first.",
+                    self.config.our_callsign
+                ),
+            });
+        }
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
 
@@ -357,6 +377,14 @@ impl QsoManager {
         target_callsign: String,
         frequency: f64,
     ) -> Result<QsoId, QsoManagerError> {
+        if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
+            return Err(QsoManagerError::Configuration {
+                message: format!(
+                    "Cannot transmit with placeholder callsign '{}'. Configure your callsign first.",
+                    self.config.our_callsign
+                ),
+            });
+        }
         // Check for duplicate
         if self.check_duplicate(&target_callsign, frequency).await? {
             return Err(QsoManagerError::DuplicateQso {
@@ -736,6 +764,7 @@ impl QsoManager {
             return Ok(false);
         }
 
+        // Check in-memory active/recent QSOs first
         let qsos_by_callsign = self.qsos_by_callsign.read().await;
         if let Some(qso_ids) = qsos_by_callsign.get(callsign) {
             let qsos = self.qsos.read().await;
@@ -755,6 +784,34 @@ impl QsoManager {
 
                         return Ok(true);
                     }
+                }
+            }
+        }
+        drop(qsos_by_callsign);
+
+        // Also check the persistent database (catches duplicates after restart
+        // or after cleanup_completed_qsos has removed them from memory)
+        if let Some(ref db) = self.database {
+            let now = Utc::now();
+            match db
+                .check_duplicate(
+                    callsign,
+                    frequency,
+                    now,
+                    self.config.duplicate_checking.time_window_hours,
+                )
+                .await
+            {
+                Ok(Some(_qso_id)) => {
+                    debug!(
+                        "Duplicate QSO for {} found in database (not in memory)",
+                        callsign
+                    );
+                    return Ok(true);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    warn!("Database duplicate check failed, relying on in-memory only: {}", e);
                 }
             }
         }
@@ -911,6 +968,7 @@ impl Clone for QsoManager {
             event_sender: self.event_sender.clone(),
             next_serial: Arc::clone(&self.next_serial),
             cleanup_interval: Arc::clone(&self.cleanup_interval),
+            database: self.database.clone(),
         }
     }
 }

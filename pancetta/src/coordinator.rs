@@ -84,6 +84,9 @@ pub struct ApplicationCoordinator {
     /// Sender for waterfall data to the autonomous operator.
     waterfall_to_auto_tx: Option<crossbeam_channel::Sender<Vec<Vec<f32>>>>,
 
+    /// TUI relay OS thread handle (joined on shutdown)
+    tui_relay_handle: Option<std::thread::JoinHandle<()>>,
+
     /// Performance metrics
     message_count: Arc<std::sync::atomic::AtomicU64>,
     last_audio_timestamp: Arc<RwLock<Option<Instant>>>,
@@ -263,6 +266,7 @@ impl ApplicationCoordinator {
             cached_lookup: std::sync::Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
             cqdx_bridge: None,
             waterfall_to_auto_tx: None,
+            tui_relay_handle: None,
             #[cfg(feature = "pancetta-hamlib")]
             rigctld_process: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -314,12 +318,18 @@ impl ApplicationCoordinator {
                 match bridge.startup().await {
                     Ok(()) => {
                         info!("cqdx.io integration initialized");
-                        let _poller_handle = bridge.spawn_spot_poller(
+                        let poller_handle = bridge.spawn_spot_poller(
                             self.shutdown_signal.clone(),
                             self.last_decode_timestamp.clone(),
                             None,
                             None,
                         );
+                        // Wrap the JoinHandle<()> into JoinHandle<Result<()>> for named_task_handles
+                        let wrapped = tokio::spawn(async move {
+                            poller_handle.await.map_err(|e| anyhow::anyhow!("cqdx poller join error: {}", e))?;
+                            Ok(())
+                        });
+                        self.named_task_handles.push((ComponentId::DxCluster, wrapped));
                         self.cqdx_bridge = Some(std::sync::Arc::new(bridge));
                     }
                     Err(e) => {
@@ -542,6 +552,19 @@ impl ApplicationCoordinator {
                 Ok(())
             });
             self.named_task_handles.push((ComponentId::Tui, handle));
+
+            // Drain waterfall channel in headless mode to prevent unbounded growth
+            let drain_shutdown = self.shutdown_signal.clone();
+            let drain_handle = tokio::spawn(async move {
+                while !drain_shutdown.load(Ordering::Acquire) {
+                    match waterfall_rx.try_recv() {
+                        Ok(_) => {} // discard
+                        Err(_) => tokio::task::yield_now().await,
+                    }
+                }
+                Ok(())
+            });
+            self.named_task_handles.push((ComponentId::Tui, drain_handle));
         }
 
         Ok(())
@@ -1026,15 +1049,19 @@ impl ApplicationCoordinator {
                                         warn!("TUI channel disconnected");
                                     }
 
-                                    // Forward to other components via message bus
+                                    // Forward to other components via message bus (fire-and-forget
+                                    // to avoid stalling the decoder thread with block_on)
                                     let auto_msg = ComponentMessage::new(
                                         ComponentId::Ft8Decoder,
                                         ComponentId::Autonomous,
                                         MessageType::DecodedMessage(decoded_msg.clone()),
                                         Instant::now(),
                                     );
-                                    rt.block_on(async {
-                                        let _ = message_bus.send_message(auto_msg).await;
+                                    let bus1 = message_bus.clone();
+                                    rt.spawn(async move {
+                                        if let Err(e) = bus1.send_message(auto_msg).await {
+                                            debug!("Failed to forward decoded message to Autonomous: {}", e);
+                                        }
                                     });
 
                                     let qso_msg = ComponentMessage::new(
@@ -1043,8 +1070,11 @@ impl ApplicationCoordinator {
                                         MessageType::DecodedMessage(decoded_msg.clone()),
                                         Instant::now(),
                                     );
-                                    rt.block_on(async {
-                                        let _ = message_bus.send_message(qso_msg).await;
+                                    let bus2 = message_bus.clone();
+                                    rt.spawn(async move {
+                                        if let Err(e) = bus2.send_message(qso_msg).await {
+                                            debug!("Failed to forward decoded message to QSO: {}", e);
+                                        }
                                     });
 
                                     let psk_msg = ComponentMessage::new(
@@ -1053,8 +1083,11 @@ impl ApplicationCoordinator {
                                         MessageType::DecodedMessage(decoded_msg),
                                         Instant::now(),
                                     );
-                                    rt.block_on(async {
-                                        let _ = message_bus.send_message(psk_msg).await;
+                                    let bus3 = message_bus.clone();
+                                    rt.spawn(async move {
+                                        if let Err(e) = bus3.send_message(psk_msg).await {
+                                            debug!("Failed to forward decoded message to PSKReporter: {}", e);
+                                        }
                                     });
                                 }
                             }
@@ -1120,7 +1153,7 @@ impl ApplicationCoordinator {
         // (tokio::spawn was causing starvation — same pattern as DSP/FT8 fixes)
         let relay_shutdown = shutdown.clone();
         let tui_msg_tx_relay = tui_msg_tx.clone();
-        std::thread::Builder::new()
+        let tui_relay_jh = std::thread::Builder::new()
             .name("tui-relay".to_string())
             .spawn(move || {
             let mut ft8_disconnected = false;
@@ -1246,6 +1279,7 @@ impl ApplicationCoordinator {
             }
             info!("TUI relay thread stopped");
         }).expect("Failed to spawn TUI relay thread");
+        self.tui_relay_handle = Some(tui_relay_jh);
 
         // Task: relay TUI commands (e.g. SendMessage) to message bus as TransmitRequests
         let cmd_shutdown = self.shutdown_signal.clone();
@@ -1562,11 +1596,13 @@ impl ApplicationCoordinator {
 
                 tokio::spawn(async move {
                     let mut poll_interval = interval(Duration::from_millis(500));
+                    let mut consecutive_failures: u32 = 0;
+                    const CRASH_WARN_THRESHOLD: u32 = 10; // 5 seconds of failures
 
                     while !shutdown_for_polling.load(Ordering::Acquire) {
                         poll_interval.tick().await;
 
-                        if let Ok(status) = rig_for_polling.get_status().await {
+                        let poll_ok = if let Ok(status) = rig_for_polling.get_status().await {
                             if status.connection_state
                                 == pancetta_hamlib::ConnectionState::Connected
                             {
@@ -1586,7 +1622,27 @@ impl ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     let _ = message_bus.send_message(message).await;
+                                    true
+                                } else {
+                                    false
                                 }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+
+                        if poll_ok {
+                            consecutive_failures = 0;
+                        } else {
+                            consecutive_failures += 1;
+                            if consecutive_failures == CRASH_WARN_THRESHOLD {
+                                warn!(
+                                    "Rig polling has failed {} consecutive times — rigctld may have crashed. \
+                                     Check rigctld process and restart Pancetta if needed.",
+                                    consecutive_failures
+                                );
                             }
                         }
                     }
@@ -2943,12 +2999,12 @@ impl ApplicationCoordinator {
     /// Start the health monitor task.
     ///
     /// Runs every `health_check_interval` (5s) and:
-    /// 1. Checks each named task handle with `is_finished()`
-    /// 2. If a task finished unexpectedly, logs the appropriate degradation message
-    /// 3. Sends a health status summary to the TUI via the message bus
+    /// 1. Reads the component_status map (populated by `check_task_handles()`)
+    /// 2. Sends a health status summary to the TUI via the message bus
     ///
-    /// No component failure crashes the whole application — the coordinator
-    /// continues running in degraded mode.
+    /// Note: heartbeat checking via `message_bus.get_component_health()` was
+    /// removed because no component ever sends heartbeat messages. Failure
+    /// detection is handled by `check_task_handles()` in the main loop.
     async fn start_health_monitor(&self) -> JoinHandle<Result<()>> {
         let message_bus = self.message_bus.clone();
         let shutdown = self.shutdown_signal.clone();
@@ -2959,18 +3015,8 @@ impl ApplicationCoordinator {
             while !shutdown.load(Ordering::Acquire) {
                 health_interval.tick().await;
 
-                // Check message bus level health (heartbeats, error counts)
-                let bus_health = message_bus.get_component_health().await;
-                for health in &bus_health {
-                    if !health.is_healthy {
-                        warn!(
-                            "Component {} is unhealthy: {} errors",
-                            health.component_id, health.error_count
-                        );
-                    }
-                }
-
                 // Build a status summary from the component_status map
+                // (populated by check_task_handles in the main loop)
                 let status_map = component_status.read().await;
                 let mut summary_parts: Vec<String> = Vec::new();
                 let mut any_failed = false;
@@ -3175,6 +3221,14 @@ impl ApplicationCoordinator {
                 Err(_) => {
                     debug!("Task {} ({}) timed out, aborting", index, component_id);
                 }
+            }
+        }
+
+        // Join the TUI relay OS thread
+        if let Some(handle) = self.tui_relay_handle.take() {
+            debug!("Joining TUI relay thread");
+            if let Err(e) = handle.join() {
+                warn!("TUI relay thread panicked: {:?}", e);
             }
         }
 

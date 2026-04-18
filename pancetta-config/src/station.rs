@@ -162,32 +162,34 @@ impl ConfigSection for StationConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        // Merge non-default values from other configuration
-        if other.callsign != "N0CALL" {
+        // Always take the other value — the layered config system ensures
+        // higher-priority sources override lower ones. We only skip truly
+        // empty/unset values (empty strings, zero numerics, None).
+        if !other.callsign.is_empty() {
             self.callsign = other.callsign;
         }
 
-        if other.grid_square != "AA00aa" {
+        if !other.grid_square.is_empty() {
             self.grid_square = other.grid_square;
         }
 
-        if other.power_watts != 100 {
+        if other.power_watts != 0 {
             self.power_watts = other.power_watts;
         }
 
-        if other.qth != "Unknown" {
+        if !other.qth.is_empty() {
             self.qth = other.qth;
         }
 
-        if other.dxcc_entity != 291 {
+        if other.dxcc_entity != 0 {
             self.dxcc_entity = other.dxcc_entity;
         }
 
-        if other.itu_zone != 8 {
+        if other.itu_zone != 0 {
             self.itu_zone = other.itu_zone;
         }
 
-        if other.cq_zone != 5 {
+        if other.cq_zone != 0 {
             self.cq_zone = other.cq_zone;
         }
 

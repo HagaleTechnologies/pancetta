@@ -1996,20 +1996,19 @@ impl ConfigSection for UiConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        // Merge non-default values
-        if other.theme != "default" {
+        // Always take the other value — only skip empty/zero
+        if !other.theme.is_empty() {
             self.theme = other.theme;
         }
 
-        if other.layout != "standard" {
+        if !other.layout.is_empty() {
             self.layout = other.layout;
         }
 
-        // Merge complex structures (simplified for brevity)
-        if other.window.width != 1200 {
+        if other.window.width != 0 {
             self.window.width = other.window.width;
         }
-        if other.window.height != 800 {
+        if other.window.height != 0 {
             self.window.height = other.window.height;
         }
 

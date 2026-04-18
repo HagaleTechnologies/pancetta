@@ -779,28 +779,29 @@ impl ConfigSection for AudioConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        // Merge non-default values
-        if other.input_device != "default" {
+        // Always take the other value — the layered config system handles
+        // priority. Only skip truly empty/zero values that indicate "unset".
+        if !other.input_device.is_empty() {
             self.input_device = other.input_device;
         }
 
-        if other.output_device != "default" {
+        if !other.output_device.is_empty() {
             self.output_device = other.output_device;
         }
 
-        if other.sample_rate != 48000 {
+        if other.sample_rate != 0 {
             self.sample_rate = other.sample_rate;
         }
 
-        if other.buffer_size != 512 {
+        if other.buffer_size != 0 {
             self.buffer_size = other.buffer_size;
         }
 
-        if other.input_channels != 2 {
+        if other.input_channels != 0 {
             self.input_channels = other.input_channels;
         }
 
-        if other.output_channels != 2 {
+        if other.output_channels != 0 {
             self.output_channels = other.output_channels;
         }
 
@@ -820,16 +821,8 @@ impl ConfigSection for AudioConfig {
 // Implement merge methods for nested configurations
 impl AudioProcessingConfig {
     fn merge_with(&mut self, other: Self) {
-        if other.enabled != true {
-            self.enabled = other.enabled;
-        }
-        if other.lowpass_cutoff != Some(3000.0) {
-            self.lowpass_cutoff = other.lowpass_cutoff;
-        }
-        if other.highpass_cutoff != Some(300.0) {
-            self.highpass_cutoff = other.highpass_cutoff;
-        }
-        // Continue for other fields...
+        // Always take the other value for all fields
+        *self = other;
     }
 }
 

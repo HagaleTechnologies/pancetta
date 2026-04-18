@@ -965,8 +965,8 @@ impl ConfigSection for RigConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        // Merge non-default values
-        if other.model != "Generic" {
+        // Always take the other value — only skip empty strings
+        if !other.model.is_empty() {
             self.model = other.model;
         }
 
@@ -989,16 +989,14 @@ impl ConfigSection for RigConfig {
 // Implement merge methods for nested configurations
 impl CatInterfaceConfig {
     fn merge_with(&mut self, other: Self) {
-        if other.port != "/dev/ttyUSB0" {
+        // Always take the other value — only skip empty/zero
+        if !other.port.is_empty() {
             self.port = other.port;
         }
-        if other.baud_rate != 9600 {
+        if other.baud_rate != 0 {
             self.baud_rate = other.baud_rate;
         }
-        if other.enabled {
-            self.enabled = other.enabled;
-        }
-        // Continue for other fields...
+        self.enabled = other.enabled;
     }
 }
 

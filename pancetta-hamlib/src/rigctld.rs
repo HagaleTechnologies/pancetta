@@ -391,6 +391,11 @@ impl RigControl for RigctldClient {
         self.send_command_with_retry(&format!("F {}", frequency))
             .await?;
 
+        // Restore to VFO A after operating on a non-current VFO
+        if !matches!(vfo, Vfo::Current | Vfo::A) {
+            let _ = self.send_command_with_retry("V VFOA").await;
+        }
+
         // Update cached value
         let mut state = self.state.write().await;
         state.last_frequency = frequency;
@@ -406,6 +411,11 @@ impl RigControl for RigctldClient {
         }
         let response = self.send_command_with_retry("f").await?;
         let frequency = Self::parse_frequency(&response)?;
+
+        // Restore to VFO A after operating on a non-current VFO
+        if !matches!(vfo, Vfo::Current | Vfo::A) {
+            let _ = self.send_command_with_retry("V VFOA").await;
+        }
 
         // Update cached value
         let mut state = self.state.write().await;

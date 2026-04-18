@@ -23,6 +23,8 @@ pub const MAX_AUDIO_BUFFER_SIZE: usize = 65536; // Hard limit to prevent excessi
 pub struct AudioCommShared {
     /// Atomic flag for clean shutdown
     pub should_stop: Arc<Atomic<bool>>,
+    /// Atomic flag set when the audio stream reports an error (e.g. device disconnect)
+    pub stream_error: Arc<Atomic<bool>>,
     /// Atomic counter for dropped samples (individual f32 values)
     pub dropped_samples: Arc<Atomic<u64>>,
     /// Atomic counter for processed samples (individual f32 values)
@@ -33,6 +35,7 @@ impl AudioCommShared {
     fn new() -> Self {
         Self {
             should_stop: Arc::new(Atomic::new(false)),
+            stream_error: Arc::new(Atomic::new(false)),
             dropped_samples: Arc::new(Atomic::new(0)),
             processed_samples: Arc::new(Atomic::new(0)),
         }
@@ -46,6 +49,16 @@ impl AudioCommShared {
     /// Check if the audio thread should stop processing
     pub fn should_stop(&self) -> bool {
         self.should_stop.load(Ordering::Acquire)
+    }
+
+    /// Set the stream error flag (called from the audio error callback)
+    pub fn set_stream_error(&self) {
+        self.stream_error.store(true, Ordering::Release);
+    }
+
+    /// Check whether the audio stream has reported an error (e.g. device disconnect)
+    pub fn has_stream_error(&self) -> bool {
+        self.stream_error.load(Ordering::Acquire)
     }
 
     /// Get the number of dropped samples
