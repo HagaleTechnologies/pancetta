@@ -203,6 +203,12 @@ pub struct Ft8Decoder {
     /// Reusable FFT buffer for symbol extraction (avoids per-call allocation)
     symbol_fft_buffer: Vec<Complex<f64>>,
 
+    /// Pre-computed FFT plan for spectrogram (nfft = 2 * sps)
+    spectrogram_fft: std::sync::Arc<dyn rustfft::Fft<f64>>,
+
+    /// Pre-computed Hann window for spectrogram (nfft length)
+    spectrogram_window: Vec<f64>,
+
     /// Message handler for callbacks
     message_handler: Box<dyn MessageHandler + Send>,
 
@@ -253,6 +259,13 @@ impl Ft8Decoder {
 
         let symbol_fft_buffer = vec![Complex::new(0.0, 0.0); sps];
 
+        // Pre-compute FFT plan and Hann window for spectrogram
+        let spec_nfft = sps * FREQ_OSR; // 3840
+        let spectrogram_fft = planner.plan_fft_forward(spec_nfft);
+        let spectrogram_window: Vec<f64> = (0..spec_nfft)
+            .map(|i| 0.5 * (1.0 - (pi2 * i as f64 / (spec_nfft - 1) as f64).cos()))
+            .collect();
+
         Ok(Self {
             config,
             protocol_params,
@@ -262,6 +275,8 @@ impl Ft8Decoder {
             symbol_fft,
             symbol_window,
             symbol_fft_buffer,
+            spectrogram_fft,
+            spectrogram_window,
             message_handler,
             last_metrics: DecodingMetrics::default(),
         })
@@ -305,7 +320,13 @@ impl Ft8Decoder {
             let spectrogram = self.compute_spectrogram(&audio)?;
 
             // Step 2: Find candidates via Costas sync pattern search
-            let sync_candidates = self.costas_sync_search(&spectrogram)?;
+            let mut sync_candidates = self.costas_sync_search(&spectrogram)?;
+
+            // On passes 2+, reduce candidate count — strong signals are already
+            // decoded and subtracted, so fewer candidates need evaluation.
+            if pass > 0 {
+                sync_candidates.truncate(40);
+            }
 
             if pass == 0 {
                 best_sync_score = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
@@ -534,15 +555,14 @@ impl Ft8Decoder {
 
         // Fine frequency and time search to precisely match the actual signal.
         // The spectrogram has 3.125 Hz resolution, so sub-Hz precision is essential.
-        // Frequency: +/-3.0 Hz in 0.25 Hz steps (25 freq trials)
+        // Frequency: +/-1.5 Hz in 0.5 Hz steps (7 freq trials)
         // Time: +/-480 samples (1/4 symbol) in 120-sample steps (9 time trials)
-        // Optimization: reuse the same I/Q signal across time offsets.
         let mut best_energy = 0.0f64;
         let mut best_freq = nominal_freq;
         let mut best_time = nominal_time;
 
-        for di in -12i32..=12 {
-            let try_freq = nominal_freq + di as f64 * 0.25;
+        for di in -3i32..=3 {
+            let try_freq = nominal_freq + di as f64 * 0.5;
             let (ri, rq) = Self::generate_cpfsk_iq(symbols, try_freq, sps);
             for dt in -4i32..=4 {
                 let try_time = nominal_time + dt as isize * 120;
@@ -676,32 +696,32 @@ impl Ft8Decoder {
             });
         }
 
-        let num_steps = (audio.len() - block_size) / step + 1;
+        // Zero-pad audio by nfft samples to ensure the spectrogram has enough
+        // time steps to cover a full FT8 message at TIME_OSR=2.
+        // Without padding, num_steps < num_symbols * steps_per_symbol, so the
+        // Costas search is limited to t0=0.
+        let mut padded = audio.to_vec();
+        padded.resize(audio.len() + nfft, 0.0);
+
+        let num_steps = (padded.len() - nfft) / step + 1;
         // Number of frequency bins in 6.25 Hz units (= block_size/2 + 1)
         let num_bins = block_size / 2 + 1; // 961
 
-        // FFT plan
-        let mut planner = FftPlanner::<f64>::new();
-        let fft = planner.plan_fft_forward(nfft);
-
-        // Hann window of length nfft
-        let window: Vec<f64> = (0..nfft)
-            .map(|i| {
-                0.5 * (1.0 - (2.0 * std::f64::consts::PI * i as f64 / (nfft - 1) as f64).cos())
-            })
-            .collect();
+        // Use pre-computed FFT plan and Hann window
+        let fft = &self.spectrogram_fft;
+        let window = &self.spectrogram_window;
 
         let mut power = Vec::with_capacity(num_steps);
         let mut fft_buffer = vec![Complex::new(0.0, 0.0); nfft];
 
         for t in 0..num_steps {
             let start = t * step;
-            let end = (start + nfft).min(audio.len());
+            let end = (start + nfft).min(padded.len());
 
             // Apply window and load into FFT buffer, zero-pad if needed
             for i in 0..nfft {
                 if start + i < end {
-                    fft_buffer[i] = Complex::new(audio[start + i] * window[i], 0.0);
+                    fft_buffer[i] = Complex::new(padded[start + i] * window[i], 0.0);
                 } else {
                     fft_buffer[i] = Complex::new(0.0, 0.0);
                 }
@@ -758,7 +778,8 @@ impl Ft8Decoder {
 
         // A full message occupies num_symbols * (2 * TIME_OSR) time steps.
         let steps_per_symbol = 2 * TIME_OSR;
-        let max_time_step = spectrogram.num_steps.saturating_sub(pp.num_symbols * steps_per_symbol + 1);
+        let msg_span = pp.num_symbols * steps_per_symbol;
+        let max_time_step = spectrogram.num_steps.saturating_sub(msg_span + 1);
 
         // Frequency range: need bins f0..f0+num_tones to all be valid
         let max_freq_bin = spectrogram.num_bins.saturating_sub(pp.num_tones);
@@ -1055,14 +1076,17 @@ impl Ft8Decoder {
             }
         }
 
-        // ---- Always try fine-timing FFT-based extraction too ----
+        // ---- Fine-timing FFT-based extraction (expensive: 9×5 = 45 FFT trials) ----
+        // Only attempt for strong candidates — weak ones rarely decode via this path
+        // if the spectrogram path already failed.
+        if candidate.sync_score < 3.5 {
+            return Ok(None);
+        }
 
-        // Fine timing: search ±half symbol in eighth-symbol steps.
-        // Finer time steps improve symbol extraction for signals not aligned to
-        // the coarse Costas sync grid. 9 steps at 1/8 symbol = 240 samples each.
+        // Fine timing: search ±3/8 symbol in eighth-symbol steps.
+        // 7 steps at 1/8 symbol = 240 samples each.
         let eighth_sym = (sps / 8) as isize;
-        let time_deltas: [isize; 9] = [
-            -4 * eighth_sym,
+        let time_deltas: [isize; 7] = [
             -3 * eighth_sym,
             -2 * eighth_sym,
             -eighth_sym,
@@ -1070,13 +1094,12 @@ impl Ft8Decoder {
             eighth_sym,
             2 * eighth_sym,
             3 * eighth_sym,
-            4 * eighth_sym,
         ];
 
-        // Frequency refinement: try ±1 bin with half-bin sub-steps
-        // This gives 5 frequency trials: -1, -0.5, 0, +0.5, +1
+        // Frequency refinement: try ±0.5 bin
+        // 3 frequency trials: -0.5, 0, +0.5
         // (in units of tone_spacing = 6.25 Hz, so steps are 3.125 Hz)
-        let freq_offsets: [f64; 5] = [0.0, -0.5, 0.5, -1.0, 1.0];
+        let freq_offsets: [f64; 3] = [0.0, -0.5, 0.5];
 
         // freq_sub shifts the base frequency by half a bin when freq_osr=2
         let sub_bin_offset = candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
