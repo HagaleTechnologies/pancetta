@@ -563,7 +563,7 @@ impl TuiRunner {
             .collect();
 
         let title = format!(
-            " Waterfall [/]: TX {:.0} Hz ",
+            " Waterfall TX {:.0} Hz ",
             app.tx_frequency_offset
         );
         let waterfall_block = Block::default()

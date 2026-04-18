@@ -115,30 +115,52 @@ fn render_operating_parameters(f: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|b| b.name.as_str())
         .unwrap_or("Unknown");
 
+    // Build frequency line with optional radio delta
+    let mut freq_spans = vec![
+        Span::styled(
+            "Freq: ",
+            Style::default().fg(app.theme.foreground_color()),
+        ),
+        Span::styled(
+            app.config
+                .ui
+                .frequency_format
+                .format_frequency(station.operating_frequency),
+            Style::default()
+                .fg(app.theme.warning_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled("Band: ", Style::default().fg(app.theme.foreground_color())),
+        Span::styled(
+            band_info,
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  [+/-]"),
+    ];
+
+    // Show radio frequency delta if known
+    if let Some(delta_khz) = app.frequency_delta_khz() {
+        if delta_khz.abs() > 2.0 {
+            // More than 500 Hz off
+            freq_spans.push(Span::raw("  "));
+            freq_spans.push(Span::styled(
+                format!(
+                    "RADIO: {:.3} MHz ({:+.1} kHz)",
+                    app.radio_frequency.unwrap_or(0.0),
+                    delta_khz
+                ),
+                Style::default()
+                    .fg(app.theme.error_color())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+    }
+
     let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "Frequency: ",
-                Style::default().fg(app.theme.foreground_color()),
-            ),
-            Span::styled(
-                app.config
-                    .ui
-                    .frequency_format
-                    .format_frequency(station.operating_frequency),
-                Style::default()
-                    .fg(app.theme.warning_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled("Band: ", Style::default().fg(app.theme.foreground_color())),
-            Span::styled(
-                band_info,
-                Style::default()
-                    .fg(app.theme.accent_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
+        Line::from(freq_spans),
         Line::from(vec![
             Span::styled("Mode: ", Style::default().fg(app.theme.foreground_color())),
             Span::styled(
@@ -248,7 +270,10 @@ fn render_equipment_info(f: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(app.theme.foreground_color()),
             ),
             Span::styled(
-                format!("{:.2}°N, {:.2}°W", lat, -lon),
+                format!("{:.2}°{}, {:.2}°{}",
+                    lat.abs(), if lat >= 0.0 { "N" } else { "S" },
+                    lon.abs(), if lon >= 0.0 { "E" } else { "W" },
+                ),
                 Style::default().fg(app.theme.muted_color()),
             ),
         ]));

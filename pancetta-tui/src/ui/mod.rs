@@ -204,33 +204,19 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     let help_line = Line::from(vec![
         Span::styled(
-            "Tab",
+            "Arrows",
             Style::default()
                 .fg(app.theme.accent_color())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(":Switch | "),
+        Span::raw(":TX | "),
         Span::styled(
-            "↑↓",
+            "+/-",
             Style::default()
                 .fg(app.theme.accent_color())
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(":Scroll | "),
-        Span::styled(
-            "M",
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(":Monitor | "),
-        Span::styled(
-            "T",
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(":Theme | "),
+        Span::raw(":Band | "),
         Span::styled(
             "Ctrl+Q",
             Style::default()

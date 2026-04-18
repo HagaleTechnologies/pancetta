@@ -239,6 +239,11 @@ pub struct App {
     pub is_transmitting: bool,
     pub tx_frequency_offset: f64,
 
+    // Band/frequency tracking
+    pub current_band_index: usize,
+    /// Frequency reported by the radio (via hamlib), if known. In MHz.
+    pub radio_frequency: Option<f64>,
+
     // Communication channels
     pub message_rx: Option<mpsc::UnboundedReceiver<DecodedMessageView>>,
     pub audio_rx: Option<mpsc::UnboundedReceiver<Vec<f32>>>,
@@ -255,6 +260,17 @@ impl App {
             operating_frequency: config.station.default_frequency,
             mode: "FT8".to_string(),
         };
+
+        // Find the band index matching the default frequency
+        let default_band_index = config
+            .bands
+            .bands
+            .iter()
+            .position(|b| {
+                station_info.operating_frequency >= b.frequency_range.0
+                    && station_info.operating_frequency <= b.frequency_range.1
+            })
+            .unwrap_or(5); // fallback to 20m
 
         let mut app = Self {
             config: config.clone(),
@@ -279,6 +295,8 @@ impl App {
             tx_input_cursor: 0,
             is_transmitting: false,
             tx_frequency_offset: 1500.0,
+            current_band_index: default_band_index,
+            radio_frequency: None,
             message_rx: None,
             audio_rx: None,
         };
@@ -456,6 +474,7 @@ impl App {
     }
 
     async fn process_audio_data(&mut self, data: Vec<f32>) -> Result<()> {
+        if data.is_empty() { return Ok(()); }
         // Calculate audio level (RMS)
         let sum_squares: f32 = data.iter().map(|&x| x * x).sum();
         self.audio_level = (sum_squares / data.len() as f32).sqrt();
@@ -592,10 +611,51 @@ impl App {
             .retain(|_, station| station.last_seen > cutoff);
     }
 
-    // Missing public methods for tui_runner
+    /// Called when the radio reports its actual frequency (via hamlib/rigctld).
+    /// Updates radio_frequency for delta display. Does NOT change our target operating frequency.
     pub fn update_frequency(&mut self, freq: u64) {
-        self.station_info.operating_frequency = freq as f64;
-        self.status_message = format!("Frequency: {} Hz", freq);
+        let freq_mhz = freq as f64 / 1_000_000.0;
+        self.radio_frequency = Some(freq_mhz);
+    }
+
+    /// Switch to the next band (higher frequency). Returns the new FT8 dial frequency in Hz.
+    pub fn band_up(&mut self) -> u64 {
+        let num_bands = self.config.bands.bands.len();
+        if num_bands == 0 {
+            return (self.station_info.operating_frequency * 1_000_000.0) as u64;
+        }
+        self.current_band_index = (self.current_band_index + 1) % num_bands;
+        self.apply_band_selection()
+    }
+
+    /// Switch to the previous band (lower frequency). Returns the new FT8 dial frequency in Hz.
+    pub fn band_down(&mut self) -> u64 {
+        let num_bands = self.config.bands.bands.len();
+        if num_bands == 0 {
+            return (self.station_info.operating_frequency * 1_000_000.0) as u64;
+        }
+        self.current_band_index = (self.current_band_index + num_bands - 1) % num_bands;
+        self.apply_band_selection()
+    }
+
+    /// Apply the current band selection, updating operating frequency.
+    /// Returns the FT8 dial frequency in Hz.
+    fn apply_band_selection(&mut self) -> u64 {
+        let band = &self.config.bands.bands[self.current_band_index];
+        self.station_info.operating_frequency = band.ft8_frequency;
+        self.status_message = format!("Band: {} — {:.3} MHz", band.name, band.ft8_frequency);
+        // Clear band activity when switching bands
+        self.decoded_messages.clear();
+        self.band_activity_scroll = 0;
+        (band.ft8_frequency * 1_000_000.0) as u64
+    }
+
+    /// Returns the frequency delta between our expected frequency and the radio, if known.
+    /// Positive means radio is higher than expected.
+    pub fn frequency_delta_khz(&self) -> Option<f64> {
+        self.radio_frequency.map(|radio_mhz| {
+            (radio_mhz - self.station_info.operating_frequency) * 1000.0
+        })
     }
 
     pub fn update_signal_strength(&mut self, strength: f32) {
@@ -673,7 +733,8 @@ impl App {
 
     /// Append waterfall rows from a decoded window, keeping last 30 windows of data.
     pub fn push_waterfall_rows(&mut self, rows: Vec<Vec<f32>>) {
-        const MAX_WATERFALL_ROWS: usize = 300;
+        // 4 rows per 15s FT8 cycle × 60 cycles = ~15 minutes of history
+        const MAX_WATERFALL_ROWS: usize = 240;
         self.waterfall_data.extend(rows);
         if self.waterfall_data.len() > MAX_WATERFALL_ROWS {
             let excess = self.waterfall_data.len() - MAX_WATERFALL_ROWS;
@@ -728,7 +789,7 @@ impl App {
             return None;
         }
         // Convert MHz frequency to Hz for QSO manager
-        let freq_hz = (msg.frequency * 1_000_000.0) as u64 + msg.delta_freq as u64;
+        let freq_hz = (msg.frequency * 1_000_000.0) as u64;
         Some((callsign.clone(), freq_hz))
     }
 

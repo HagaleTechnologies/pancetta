@@ -90,7 +90,7 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
         let scroll_info = format!("{}/{}", app.dx_hunter_scroll + 1, dx_list.len());
 
         let scroll_area = Rect {
-            x: area.x + area.width - scroll_info.len() as u16 - 2,
+            x: area.x + area.width.saturating_sub(scroll_info.len() as u16 + 2),
             y: area.y,
             width: scroll_info.len() as u16 + 1,
             height: 1,

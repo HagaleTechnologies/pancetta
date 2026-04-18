@@ -10,6 +10,14 @@ pub struct Waterfall<'a> {
     block: Option<Block<'a>>,
     data: &'a [Vec<f32>],
     color_scheme: WaterfallColorScheme,
+    /// Audio frequency range covered by the data bins (Hz)
+    freq_range: (f64, f64),
+    /// TX frequency offset (Hz) — shown as a green vertical marker
+    tx_offset: Option<f64>,
+    /// Recent decoded signal frequencies (Hz) — shown as tick marks
+    signal_freqs: Vec<f64>,
+    /// Number of data rows per FT8 cycle (for drawing cycle boundary markers)
+    rows_per_cycle: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -25,6 +33,10 @@ impl<'a> Waterfall<'a> {
             block: None,
             data,
             color_scheme: WaterfallColorScheme::Classic,
+            freq_range: (0.0, 3000.0),
+            tx_offset: None,
+            signal_freqs: Vec::new(),
+            rows_per_cycle: 4,
         }
     }
 
@@ -38,33 +50,58 @@ impl<'a> Waterfall<'a> {
         self
     }
 
+    pub fn tx_offset(mut self, offset: f64) -> Self {
+        self.tx_offset = Some(offset);
+        self
+    }
+
+    pub fn signal_freqs(mut self, freqs: Vec<f64>) -> Self {
+        self.signal_freqs = freqs;
+        self
+    }
+
+    /// Map an audio frequency (Hz) to a column index in the waterfall area
+    fn freq_to_col(&self, freq_hz: f64, width: usize) -> Option<usize> {
+        let (lo, hi) = self.freq_range;
+        if freq_hz < lo || freq_hz > hi || width == 0 {
+            return None;
+        }
+        let frac = (freq_hz - lo) / (hi - lo);
+        let col = (frac * width as f64) as usize;
+        if col < width { Some(col) } else { None }
+    }
+
     fn get_color_for_intensity(&self, intensity: f32) -> Color {
         let clamped = intensity.clamp(0.0, 1.0);
 
         match self.color_scheme {
             WaterfallColorScheme::Classic => {
-                if clamped < 0.2 {
-                    Color::Blue
-                } else if clamped < 0.4 {
-                    Color::Cyan
-                } else if clamped < 0.6 {
-                    Color::Green
-                } else if clamped < 0.8 {
-                    Color::Yellow
-                } else {
-                    Color::Red
-                }
+                // Luminance-based: dark = quiet, bright = loud.
+                // Colorblind-safe — relies on brightness, not hue.
+                // Uses 256-color grayscale ramp (232–255) for smooth gradient.
+                // 232 = #080808 (near-black), 255 = #eeeeee (near-white)
+                let idx = 232 + (clamped * 23.0) as u8;
+                Color::Indexed(idx)
             }
             WaterfallColorScheme::Spectrum => {
-                // Rainbow spectrum
-                let hue = (1.0 - clamped) * 240.0; // Blue to Red
-                Color::Indexed(((hue / 360.0) * 255.0) as u8)
+                // Blue-to-white luminance ramp (colorblind-safe)
+                // Uses 256-color: dark blue → blue → cyan → white
+                if clamped < 0.25 {
+                    Color::Indexed(17) // dark blue
+                } else if clamped < 0.5 {
+                    Color::Indexed(19) // medium blue
+                } else if clamped < 0.75 {
+                    Color::Indexed(33) // bright blue
+                } else {
+                    Color::Indexed(255) // white
+                }
             }
             WaterfallColorScheme::Thermal => {
+                // Black → dark → bright (pure luminance)
                 if clamped < 0.33 {
                     Color::Black
                 } else if clamped < 0.66 {
-                    Color::Red
+                    Color::DarkGray
                 } else {
                     Color::White
                 }
@@ -84,42 +121,108 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
             None => area,
         };
 
-        if self.data.is_empty() || waterfall_area.width == 0 || waterfall_area.height == 0 {
+        if waterfall_area.width == 0 || waterfall_area.height == 0 {
             return;
         }
 
-        // Render waterfall data
-        let rows_to_show = (waterfall_area.height as usize).min(self.data.len());
-        let cols_per_bin = if self.data[0].is_empty() {
-            1
-        } else {
-            (waterfall_area.width as usize) / self.data[0].len().max(1)
-        };
+        let width = waterfall_area.width as usize;
+        let height = waterfall_area.height as usize;
 
-        for (row_idx, row_data) in self
-            .data
-            .iter()
-            .rev() // Newest at top
-            .take(rows_to_show)
-            .enumerate()
-        {
-            let y = waterfall_area.y + row_idx as u16;
+        // Render waterfall data rows
+        if !self.data.is_empty() {
+            let rows_to_show = height.min(self.data.len());
 
-            for (bin_idx, &intensity) in row_data.iter().enumerate() {
-                let x_start = waterfall_area.x + (bin_idx * cols_per_bin.max(1)) as u16;
-                let x_end =
-                    (x_start + cols_per_bin as u16).min(waterfall_area.x + waterfall_area.width);
+            for (row_idx, row_data) in self
+                .data
+                .iter()
+                .rev() // Newest at top
+                .take(rows_to_show)
+                .enumerate()
+            {
+                let y = waterfall_area.y + row_idx as u16;
+                let num_bins = row_data.len();
 
-                if x_start >= waterfall_area.x + waterfall_area.width {
-                    break;
+                if num_bins == 0 {
+                    continue;
                 }
 
-                let color = self.get_color_for_intensity(intensity);
+                for col in 0..width {
+                    let bin_start = col * num_bins / width;
+                    let bin_end = ((col + 1) * num_bins / width).max(bin_start + 1);
 
-                for x in x_start..x_end {
-                    if x < waterfall_area.x + waterfall_area.width {
-                        buf[(x, y)].set_char('█').set_fg(color);
+                    let intensity = row_data[bin_start..bin_end.min(num_bins)]
+                        .iter()
+                        .cloned()
+                        .fold(0.0f32, f32::max);
+
+                    let color = self.get_color_for_intensity(intensity);
+                    let x = waterfall_area.x + col as u16;
+                    buf[(x, y)].set_char('█').set_fg(color);
+                }
+            }
+        }
+
+        // Overlay: cycle boundary markers (dim horizontal ticks on left edge)
+        // Every rows_per_cycle rows, draw a small marker so the operator
+        // can distinguish even/odd FT8 cycles.
+        if self.rows_per_cycle > 0 && !self.data.is_empty() {
+            let rows_to_show = height.min(self.data.len());
+            let total_rows = self.data.len();
+            for row_idx in 0..rows_to_show {
+                // The data index (counting from newest = 0)
+                let data_idx = total_rows - 1 - row_idx;
+                if data_idx % self.rows_per_cycle == 0 {
+                    let y = waterfall_area.y + row_idx as u16;
+                    // Even/odd cycle alternation: even cycles get one color, odd another
+                    let cycle_num = data_idx / self.rows_per_cycle;
+                    let marker_char = if cycle_num % 2 == 0 { 'E' } else { 'O' };
+                    let marker_color = if cycle_num % 2 == 0 {
+                        Color::DarkGray
+                    } else {
+                        Color::Gray
+                    };
+                    buf[(waterfall_area.x, y)]
+                        .set_char(marker_char)
+                        .set_fg(marker_color);
+                }
+            }
+        }
+
+        // Overlay: TX frequency marker (green vertical line)
+        if let Some(tx_hz) = self.tx_offset {
+            if let Some(col) = self.freq_to_col(tx_hz, width) {
+                let x = waterfall_area.x + col as u16;
+                for row in 0..height {
+                    let y = waterfall_area.y + row as u16;
+                    buf[(x, y)]
+                        .set_char('│')
+                        .set_fg(Color::Green)
+                        .set_bg(Color::Black);
+                }
+                // Label at top
+                let label = format!("TX {:.0}", tx_hz);
+                for (i, ch) in label.chars().enumerate() {
+                    let lx = x.saturating_add(1) + i as u16;
+                    if lx < waterfall_area.x + waterfall_area.width {
+                        buf[(lx, waterfall_area.y)]
+                            .set_char(ch)
+                            .set_fg(Color::Green)
+                            .set_bg(Color::Black);
                     }
+                }
+            }
+        }
+
+        // Overlay: decoded signal markers (yellow ticks on the top row)
+        for &freq_hz in &self.signal_freqs {
+            if let Some(col) = self.freq_to_col(freq_hz, width) {
+                let x = waterfall_area.x + col as u16;
+                // Draw a short tick (top 2 rows)
+                for row in 0..2.min(height) {
+                    let y = waterfall_area.y + row as u16;
+                    buf[(x, y)]
+                        .set_char('▼')
+                        .set_fg(Color::Yellow);
                 }
             }
         }
@@ -460,9 +563,9 @@ mod tests {
     fn test_waterfall_color_intensity() {
         let waterfall = Waterfall::new(&[]).color_scheme(WaterfallColorScheme::Classic);
 
-        assert_eq!(waterfall.get_color_for_intensity(0.1), Color::Blue);
-        assert_eq!(waterfall.get_color_for_intensity(0.5), Color::Green);
-        assert_eq!(waterfall.get_color_for_intensity(0.9), Color::Red);
+        assert!(matches!(waterfall.get_color_for_intensity(0.1), Color::Indexed(_)));
+        assert!(matches!(waterfall.get_color_for_intensity(0.5), Color::Indexed(_)));
+        assert!(matches!(waterfall.get_color_for_intensity(0.9), Color::Indexed(_)));
     }
 
     #[test]

@@ -854,7 +854,7 @@ impl ApplicationCoordinator {
                         const LIVE_WF_INTERVAL: usize = 12000; // 1 second at 12kHz
                         const LIVE_WF_FFT_SIZE: usize = 2048;
                         if ft8_buffer.len() >= LIVE_WF_FFT_SIZE {
-                            let samples_since_last = ft8_buffer.len() - last_live_wf_samples;
+                            let samples_since_last = ft8_buffer.len().saturating_sub(last_live_wf_samples);
                             if samples_since_last >= LIVE_WF_INTERVAL {
                                 last_live_wf_samples = ft8_buffer.len();
 
@@ -912,7 +912,10 @@ impl ApplicationCoordinator {
                                 return Ok(());
                             }
                             // Schedule next window at the next 15-second boundary
-                            next_window_time = next_window_time + chrono::Duration::seconds(15);
+                            let now_resync = chrono::Utc::now();
+                            let secs_past = now_resync.timestamp() % 15;
+                            let wait_secs = if secs_past == 0 { 15 } else { 15 - secs_past };
+                            next_window_time = now_resync + chrono::Duration::seconds(wait_secs);
                         }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}

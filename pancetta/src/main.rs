@@ -36,8 +36,6 @@ use tokio::signal;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-mod logging;
-
 use pancetta_lib::coordinator::ApplicationCoordinator;
 
 /// Pancetta - High-Performance Amateur Radio FT8 Processing Application
