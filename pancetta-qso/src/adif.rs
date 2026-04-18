@@ -390,16 +390,8 @@ impl AdifProcessor {
             qso_date: metadata.start_time,
             qso_date_off: metadata.end_time,
             call: metadata.their_callsign.clone().unwrap_or_default(),
-            mode: if metadata.mode == "FT8" {
-                "DATA".to_string()
-            } else {
-                metadata.mode.clone()
-            },
-            submode: if metadata.mode == "FT8" {
-                Some("FT8".to_string())
-            } else {
-                None
-            },
+            mode: metadata.mode.clone(),
+            submode: None,
             freq: freq_mhz,
             band,
             rst_sent: metadata.reports.sent.map(|r| self.signal_report_to_rst(r)),
@@ -749,7 +741,7 @@ impl AdifProcessor {
         &self,
         field_spec: &str,
         chars: &mut std::iter::Peekable<std::str::Chars>,
-        line_num: usize,
+        _line_num: usize,
     ) -> Result<AdifField, AdifError> {
         let parts: Vec<&str> = field_spec.split(':').collect();
 
@@ -798,7 +790,7 @@ impl AdifProcessor {
         }
 
         Ok(format!(
-            "<{}:{}>{}",
+            "<{}:{}>{} ",
             name.to_uppercase(),
             value.len(),
             value
@@ -927,27 +919,13 @@ impl AdifProcessor {
     }
 
     fn signal_report_to_rst(&self, signal_report: SignalReport) -> String {
-        // Convert FT8 signal report to RST format
-        if signal_report >= -10 {
-            "599".to_string()
-        } else if signal_report >= -15 {
-            "579".to_string()
-        } else if signal_report >= -20 {
-            "559".to_string()
-        } else {
-            "539".to_string()
-        }
+        // FT8 stores raw SNR dB values directly (ADIF 3.1 supports this)
+        format!("{:+03}", signal_report)
     }
 
     fn rst_to_signal_report(&self, rst: &str) -> Option<SignalReport> {
-        // Simple conversion from RST to estimated signal report
-        match rst {
-            "599" => Some(-10),
-            "579" => Some(-15),
-            "559" => Some(-20),
-            "539" => Some(-25),
-            _ => rst.parse::<SignalReport>().ok(),
-        }
+        // Parse raw SNR dB value (e.g., "-15", "+03")
+        rst.parse::<SignalReport>().ok()
     }
 }
 
@@ -1053,12 +1031,14 @@ ADIF Export for Test Program
     fn test_signal_report_conversion() {
         let processor = AdifProcessor::new();
 
-        assert_eq!(processor.signal_report_to_rst(-5), "599");
-        assert_eq!(processor.signal_report_to_rst(-15), "579");
-        assert_eq!(processor.signal_report_to_rst(-20), "559");
-        assert_eq!(processor.signal_report_to_rst(-25), "539");
+        assert_eq!(processor.signal_report_to_rst(-5), "-05");
+        assert_eq!(processor.signal_report_to_rst(-15), "-15");
+        assert_eq!(processor.signal_report_to_rst(-20), "-20");
+        assert_eq!(processor.signal_report_to_rst(-25), "-25");
+        assert_eq!(processor.signal_report_to_rst(3), "+03");
 
-        assert_eq!(processor.rst_to_signal_report("599"), Some(-10));
-        assert_eq!(processor.rst_to_signal_report("579"), Some(-15));
+        // rst_to_signal_report should parse raw SNR values
+        assert_eq!(processor.rst_to_signal_report("-15"), Some(-15));
+        assert_eq!(processor.rst_to_signal_report("+03"), Some(3));
     }
 }

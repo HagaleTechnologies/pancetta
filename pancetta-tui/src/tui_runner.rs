@@ -449,51 +449,18 @@ impl TuiRunner {
         let app = self.app.read().await;
 
         self.terminal.draw(|f| {
-            let size = f.area();
-
-            // Main layout
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(3), // Header
-                    Constraint::Min(10),   // Main content
-                    Constraint::Length(3), // Status bar
-                ])
-                .split(size);
-
-            // Render header inline
-            let band_name = app
-                .config
-                .get_current_band(app.station_info.operating_frequency)
-                .map(|b| b.name.as_str())
-                .unwrap_or("??");
-            let header_text = format!(
-                " Pancetta FT8 | {} | {:.3} MHz {} | {} ",
-                app.station_info.call_sign,
-                app.station_info.operating_frequency,
-                band_name,
-                app.station_info.mode
-            );
-            let header = Paragraph::new(header_text)
-                .style(Style::default().bg(Color::Blue).fg(Color::White));
-            f.render_widget(header, chunks[0]);
-
-            // Render main content inline
-            TuiRunner::render_main_content_static(f, chunks[1], &app);
-
-            // Render status bar inline
-            let status_text = format!(
-                " Decoded: {} | TX {:.0}Hz | </>:TXfreq +/-:Band F1:Help F2:CQ D:Dev Ctrl+Q:Quit ",
-                app.decoded_messages.len(),
-                app.tx_frequency_offset,
-            );
-            let status = Paragraph::new(status_text)
-                .style(Style::default().bg(Color::Gray).fg(Color::White));
-            f.render_widget(status, chunks[2]);
+            // Use the rich ui::draw for the full frame
+            if let Err(e) = crate::ui::draw(f, &app) {
+                // Fallback: render a minimal error message
+                let error_text = format!("Render error: {}", e);
+                let paragraph = Paragraph::new(error_text)
+                    .style(Style::default().fg(Color::Red));
+                f.render_widget(paragraph, f.area());
+            }
 
             // Render device selection modal overlay if visible
             if app.device_selection.visible {
-                TuiRunner::render_device_selection_modal(f, size, &app.device_selection);
+                TuiRunner::render_device_selection_modal(f, f.area(), &app.device_selection);
             }
         })?;
 

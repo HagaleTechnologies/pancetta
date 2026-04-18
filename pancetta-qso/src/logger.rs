@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{interval, Duration};
@@ -340,13 +341,13 @@ pub struct QsoLogger {
     qso_manager: QsoManager,
 
     /// Event subscription
-    event_receiver: RwLock<Option<broadcast::Receiver<QsoEvent>>>,
+    event_receiver: Arc<RwLock<Option<broadcast::Receiver<QsoEvent>>>>,
 
     /// Export history
-    export_history: RwLock<Vec<ExportResult>>,
+    export_history: Arc<RwLock<Vec<ExportResult>>>,
 
     /// Import history
-    import_history: RwLock<Vec<ImportResult>>,
+    import_history: Arc<RwLock<Vec<ImportResult>>>,
 }
 
 impl QsoLogger {
@@ -372,9 +373,9 @@ impl QsoLogger {
             database,
             adif_processor: AdifProcessor::new(),
             qso_manager,
-            event_receiver: RwLock::new(None),
-            export_history: RwLock::new(Vec::new()),
-            import_history: RwLock::new(Vec::new()),
+            event_receiver: Arc::new(RwLock::new(None)),
+            export_history: Arc::new(RwLock::new(Vec::new())),
+            import_history: Arc::new(RwLock::new(Vec::new())),
         };
 
         Ok(logger)
@@ -781,7 +782,7 @@ impl QsoLogger {
     async fn handle_qso_completed(
         &self,
         qso_id: QsoId,
-        metadata: QsoMetadata,
+        _metadata: QsoMetadata,
     ) -> Result<(), LoggerError> {
         // Get the completed QSO from the manager
         let progress = self
@@ -1013,9 +1014,9 @@ impl Clone for QsoLogger {
             database: self.database.clone(), // AsyncQsoDatabase supports Clone
             adif_processor: AdifProcessor::new(),
             qso_manager: self.qso_manager.clone(),
-            event_receiver: RwLock::new(None),
-            export_history: RwLock::new(Vec::new()),
-            import_history: RwLock::new(Vec::new()),
+            event_receiver: Arc::clone(&self.event_receiver),
+            export_history: Arc::clone(&self.export_history),
+            import_history: Arc::clone(&self.import_history),
         }
     }
 }

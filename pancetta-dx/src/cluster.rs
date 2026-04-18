@@ -4,7 +4,7 @@
 //! DX spot monitoring and posting.
 
 use crate::{Band, DxError, DxSpot, Mode, Result};
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -224,6 +224,7 @@ impl DxClusterClient {
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<String>();
         let (spot_tx, spot_rx) = mpsc::unbounded_channel::<DxSpot>();
 
+        let login_cmd_tx = cmd_tx.clone();
         self.command_sender = Some(cmd_tx);
         self.spot_receiver = Some(spot_rx);
 
@@ -276,9 +277,10 @@ impl DxClusterClient {
                                 || line.contains("callsign:")
                                 || line.contains("Please enter your call")
                             {
-                                // Login prompt detected - this would be handled by command sender
-                                info!("Login prompt detected");
-                                // The actual login would be initiated by the calling code
+                                info!("Login prompt detected — sending callsign");
+                                if let Err(e) = login_cmd_tx.send(callsign.clone()) {
+                                    error!("Failed to send callsign for login: {}", e);
+                                }
                             } else if line.contains("Hello") || line.contains("Welcome") {
                                 logged_in = true;
                                 *status.lock().await = ConnectionStatus::Connected;

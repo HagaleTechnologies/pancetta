@@ -7,6 +7,7 @@ use crate::states::*;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{interval, Duration as TokioDuration, Interval};
@@ -226,19 +227,19 @@ pub struct QsoManager {
     config: QsoManagerConfig,
 
     /// Active QSOs by ID
-    qsos: RwLock<HashMap<QsoId, QsoProgress>>,
+    qsos: Arc<RwLock<HashMap<QsoId, QsoProgress>>>,
 
     /// QSOs by callsign for duplicate checking
-    qsos_by_callsign: RwLock<HashMap<String, Vec<QsoId>>>,
+    qsos_by_callsign: Arc<RwLock<HashMap<String, Vec<QsoId>>>>,
 
     /// Event broadcaster
     event_sender: broadcast::Sender<QsoEvent>,
 
     /// Next contest serial number
-    next_serial: RwLock<SerialNumber>,
+    next_serial: Arc<RwLock<SerialNumber>>,
 
     /// Cleanup interval timer
-    cleanup_interval: RwLock<Option<Interval>>,
+    cleanup_interval: Arc<RwLock<Option<Interval>>>,
 }
 
 impl QsoManager {
@@ -253,11 +254,11 @@ impl QsoManager {
 
         Self {
             config,
-            qsos: RwLock::new(HashMap::new()),
-            qsos_by_callsign: RwLock::new(HashMap::new()),
+            qsos: Arc::new(RwLock::new(HashMap::new())),
+            qsos_by_callsign: Arc::new(RwLock::new(HashMap::new())),
             event_sender,
-            next_serial: RwLock::new(next_serial),
-            cleanup_interval: RwLock::new(None),
+            next_serial: Arc::new(RwLock::new(next_serial)),
+            cleanup_interval: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -905,11 +906,11 @@ impl Clone for QsoManager {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
-            qsos: RwLock::new(HashMap::new()),
-            qsos_by_callsign: RwLock::new(HashMap::new()),
+            qsos: Arc::clone(&self.qsos),
+            qsos_by_callsign: Arc::clone(&self.qsos_by_callsign),
             event_sender: self.event_sender.clone(),
-            next_serial: RwLock::new(1),
-            cleanup_interval: RwLock::new(None),
+            next_serial: Arc::clone(&self.next_serial),
+            cleanup_interval: Arc::clone(&self.cleanup_interval),
         }
     }
 }
