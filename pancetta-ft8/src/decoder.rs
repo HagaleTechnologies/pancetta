@@ -335,7 +335,7 @@ impl Ft8Decoder {
                     break;
                 }
 
-                match self.decode_candidate(&audio, candidate) {
+                match self.decode_candidate(&audio, candidate, &spectrogram) {
                     Ok(Some(msg)) => {
                         // Deduplicate using HashSet for O(1) lookup
                         if seen_messages.insert(msg.text.clone()) {
@@ -806,6 +806,7 @@ impl Ft8Decoder {
         &mut self,
         audio: &[f64],
         candidate: &CostasCandidate,
+        spectrogram: &Spectrogram,
     ) -> Ft8Result<Option<DecodedMessage>> {
         // Copy protocol params values to locals to avoid holding a borrow on self
         // (decode_candidate is &mut self for buffer reuse in extract_symbols_complex)
@@ -814,6 +815,92 @@ impl Ft8Decoder {
         let xor_sequence = self.protocol_params.xor_sequence;
         let spec_step = sps / 2;
         let coarse_offset = candidate.time_step * spec_step;
+
+        // ---- Fast path: try spectrogram-based symbol extraction first ----
+        // The spectrogram uses a 3840-pt FFT (3.125 Hz resolution), which
+        // avoids the spectral leakage of the 1920-pt independent FFT.
+        {
+            let tone_magnitudes = self.extract_symbols_from_spectrogram(spectrogram, candidate);
+            let mut llrs = self.compute_soft_llrs_db(&tone_magnitudes);
+            normalize_llrs(&mut llrs);
+
+            if let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) {
+                if self.verify_crc(&corrected_bits) {
+                    // CRC passed — compute frequency and time for the message
+                    let sub_bin_offset =
+                        candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+                    let base_frequency =
+                        candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
+                    let time_offset_samples = coarse_offset;
+
+                    // For FT4, un-apply the XOR scrambling on the payload
+                    let payload_bits = if let Some(xor_seq) = xor_sequence {
+                        let mut bits = corrected_bits[0..PAYLOAD_BITS].to_owned();
+                        for byte_idx in 0..10 {
+                            let xor_byte = xor_seq[byte_idx];
+                            for bit_pos in 0..8 {
+                                let global_bit = byte_idx * 8 + bit_pos;
+                                if global_bit >= PAYLOAD_BITS {
+                                    break;
+                                }
+                                if (xor_byte >> (7 - bit_pos)) & 1 == 1 {
+                                    let cur = bits[global_bit];
+                                    bits.set(global_bit, !cur);
+                                }
+                            }
+                        }
+                        bits
+                    } else {
+                        corrected_bits[0..PAYLOAD_BITS].to_owned()
+                    };
+                    let ft8_message = self.message_parser.parse_payload(&payload_bits)?;
+
+                    // SNR estimate from spectrogram magnitudes (dB domain)
+                    let snr_db = {
+                        let data_positions = self.protocol_params.data_symbol_indices();
+                        let mut signal_sum = 0.0f64;
+                        let mut noise_sum = 0.0f64;
+                        let mut count = 0usize;
+                        for &sym_idx in &data_positions {
+                            let mags = &tone_magnitudes[sym_idx];
+                            let best = mags.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                            let worst = mags.iter().cloned().fold(f64::INFINITY, f64::min);
+                            signal_sum += best;
+                            noise_sum += worst;
+                            count += 1;
+                        }
+                        if count > 0 {
+                            let avg_signal_db = signal_sum / count as f64;
+                            let avg_noise_db = noise_sum / count as f64;
+                            let snr_bin_db = avg_signal_db - avg_noise_db;
+                            let bw_correction = 10.0 * (2500.0f64 / 6.25).log10();
+                            (snr_bin_db - bw_correction) as f32
+                        } else {
+                            -24.0f32
+                        }
+                    };
+                    let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
+
+                    let decoded_message = DecodedMessage::new(
+                        ft8_message,
+                        snr_db,
+                        confidence,
+                        base_frequency,
+                        time_offset_samples as f64 / SAMPLE_RATE as f64,
+                    );
+
+                    #[cfg(feature = "debug-decode")]
+                    eprintln!(
+                        "    spectrogram path: CRC PASSED for t={} f={}",
+                        candidate.time_step, candidate.freq_bin
+                    );
+
+                    return Ok(Some(decoded_message));
+                }
+            }
+        }
+
+        // ---- Fallback: fine-timing FFT-based extraction ----
 
         // Fine timing: search ±half symbol in eighth-symbol steps.
         // Finer time steps improve symbol extraction for signals not aligned to
@@ -1056,8 +1143,126 @@ impl Ft8Decoder {
     }
 
     // ========================================================================
+    // Spectrogram-based symbol extraction
+    // ========================================================================
+
+    /// Extract all 79 symbols from the pre-computed spectrogram.
+    ///
+    /// Instead of running an independent FFT per symbol, read tone magnitudes
+    /// directly from the spectrogram which was computed with freq_osr=2 (3840-pt
+    /// FFT, 3.125 Hz resolution). This eliminates ~2-4 dB of spectral leakage
+    /// for sub-bin signals.
+    ///
+    /// For each symbol, averages both half-symbol time steps for improved SNR.
+    /// Returns magnitudes already in dB (matching spectrogram storage).
+    fn extract_symbols_from_spectrogram(
+        &self,
+        spectrogram: &Spectrogram,
+        candidate: &CostasCandidate,
+    ) -> Vec<[f64; NUM_TONES]> {
+        let pp = &self.protocol_params;
+        let t0 = candidate.time_step;
+        let f0 = candidate.freq_bin;
+        let fs = candidate.freq_sub;
+
+        let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
+
+        for sym_idx in 0..pp.num_symbols {
+            let mut mags = [-120.0f64; NUM_TONES];
+
+            // Each symbol spans 2 half-symbol time steps
+            let t_step_a = t0 + sym_idx * 2;
+            let t_step_b = t_step_a + 1;
+
+            for tone in 0..pp.num_tones {
+                let freq_bin = f0 + tone;
+
+                // Guard against out-of-bounds
+                if freq_bin >= spectrogram.num_bins || fs >= spectrogram.freq_osr {
+                    continue;
+                }
+
+                // Average both half-symbol steps (in dB domain — close enough
+                // for the LLR max-log approximation, and avoids costly dB→linear→dB)
+                let db_a = if t_step_a < spectrogram.num_steps {
+                    spectrogram.power[t_step_a][fs][freq_bin]
+                } else {
+                    -120.0
+                };
+                let db_b = if t_step_b < spectrogram.num_steps {
+                    spectrogram.power[t_step_b][fs][freq_bin]
+                } else {
+                    -120.0
+                };
+
+                mags[tone] = (db_a + db_b) / 2.0;
+            }
+
+            tone_magnitudes.push(mags);
+        }
+
+        tone_magnitudes
+    }
+
+    // ========================================================================
     // Soft LLR computation (Bug 1.3 fix)
     // ========================================================================
+
+    /// Compute soft LLRs from tone magnitudes that are already in dB.
+    ///
+    /// This is the spectrogram path: values come from `extract_symbols_from_spectrogram`
+    /// and are already in dB, so we skip the `10*log10(1e-12 + mag^2)` conversion.
+    fn compute_soft_llrs_db(&self, tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<f32> {
+        let pp = &self.protocol_params;
+        let mut llrs = Vec::with_capacity(174);
+        let data_positions = pp.data_symbol_indices();
+
+        for &sym_idx in &data_positions {
+            let mags = &tone_magnitudes[sym_idx];
+
+            match pp.bits_per_symbol {
+                3 => {
+                    // 8-FSK (FT8/FT2): 3 LLRs per symbol
+                    // Values are already in dB — use directly
+                    let mut s2 = [0.0f64; 8];
+                    for j in 0..8 {
+                        let tone_idx = crate::ldpc::binary_to_gray(j as u8) as usize;
+                        s2[j] = mags[tone_idx];
+                    }
+
+                    fn max4(a: f64, b: f64, c: f64, d: f64) -> f64 {
+                        a.max(b).max(c.max(d))
+                    }
+
+                    let llr0 = max4(s2[4], s2[5], s2[6], s2[7]) - max4(s2[0], s2[1], s2[2], s2[3]);
+                    let llr1 = max4(s2[2], s2[3], s2[6], s2[7]) - max4(s2[0], s2[1], s2[4], s2[5]);
+                    let llr2 = max4(s2[1], s2[3], s2[5], s2[7]) - max4(s2[0], s2[2], s2[4], s2[6]);
+
+                    llrs.push(-llr0 as f32);
+                    llrs.push(-llr1 as f32);
+                    llrs.push(-llr2 as f32);
+                }
+                2 => {
+                    // 4-FSK (FT4): 2 LLRs per symbol
+                    let mut s2 = [0.0f64; 4];
+                    for j in 0..4 {
+                        let tone_idx = crate::ldpc::binary_to_gray_4fsk(j as u8) as usize;
+                        s2[j] = mags[tone_idx];
+                    }
+
+                    let llr0 = s2[2].max(s2[3]) - s2[0].max(s2[1]);
+                    let llr1 = s2[1].max(s2[3]) - s2[0].max(s2[2]);
+
+                    llrs.push(-llr0 as f32);
+                    llrs.push(-llr1 as f32);
+                }
+                _ => unreachable!("Unsupported bits_per_symbol"),
+            }
+        }
+
+        debug_assert_eq!(llrs.len(), 174);
+        llrs
+    }
 
     /// Compute soft log-likelihood ratios from per-symbol tone magnitudes.
     ///
