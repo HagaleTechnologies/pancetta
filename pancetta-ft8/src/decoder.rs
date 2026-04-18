@@ -53,10 +53,10 @@ const LLR_TARGET_VARIANCE: f32 = 24.0;
 const MIN_SYNC_SCORE: f64 = 3.5;
 
 /// Maximum candidates from sync search before NMS
-const MAX_SYNC_CANDIDATES: usize = 80;
+const MAX_SYNC_CANDIDATES: usize = 100;
 
-/// Minimum frequency bin for FT8 search (~200 Hz / 6.25 Hz)
-const MIN_FREQ_BIN: usize = 32;
+/// Minimum frequency bin for FT8 search (16 bins × 6.25 Hz = 100 Hz)
+const MIN_FREQ_BIN: usize = 16;
 
 /// Non-maximum suppression radius in time steps (half-symbols)
 const NMS_TIME_RADIUS: usize = 4;
@@ -1617,9 +1617,10 @@ impl LdpcDecoder {
             let llr_arr: &[f32; 174] = decoded_llrs[..174].try_into().unwrap();
             let parity_errors = self.count_parity_errors(llr_arr);
 
-            // Threshold: only try OSD if BP resolved most parity checks.
-            // With 83 total checks, a threshold of 5 means BP resolved
-            // nearly all checks but couldn't quite converge.
+            // Threshold: only try OSD if BP nearly converged.
+            // OSD-1 has 91 trials × 1/16384 CRC false positive rate per
+            // candidate ≈ 0.6% per candidate. With 100 candidates that's
+            // ~0.6 false positives per window — acceptable.
             const MAX_PARITY_ERRORS_FOR_OSD: usize = 5;
 
             if parity_errors <= MAX_PARITY_ERRORS_FOR_OSD {
