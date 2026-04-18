@@ -50,7 +50,7 @@ const FREQ_OSR: usize = 2;
 const LLR_TARGET_VARIANCE: f32 = 24.0;
 
 /// Minimum Costas sync score to consider a candidate (dB difference, neighbor comparison)
-const MIN_SYNC_SCORE: f64 = 3.5;
+const MIN_SYNC_SCORE: f64 = 3.0;
 
 /// Maximum candidates from sync search before NMS
 const MAX_SYNC_CANDIDATES: usize = 100;
@@ -816,11 +816,19 @@ impl Ft8Decoder {
         let spec_step = sps / 2;
         let coarse_offset = candidate.time_step * spec_step;
 
-        // ---- Fast path: try spectrogram-based symbol extraction first ----
+        // ---- Spectrogram-based symbol extraction: try both freq_sub values ----
         // The spectrogram uses a 3840-pt FFT (3.125 Hz resolution), which
         // avoids the spectral leakage of the 1920-pt independent FFT.
-        {
-            let tone_magnitudes = self.extract_symbols_from_spectrogram(spectrogram, candidate);
+        // Signals on a bin boundary may decode better with the other sub-bin.
+        let freq_sub_trials = [candidate.freq_sub, if candidate.freq_sub == 0 { 1 } else { 0 }];
+        for &trial_freq_sub in &freq_sub_trials {
+            let trial_candidate = CostasCandidate {
+                time_step: candidate.time_step,
+                freq_bin: candidate.freq_bin,
+                freq_sub: trial_freq_sub,
+                sync_score: candidate.sync_score,
+            };
+            let tone_magnitudes = self.extract_symbols_from_spectrogram(spectrogram, &trial_candidate);
             let mut llrs = self.compute_soft_llrs_db(&tone_magnitudes);
             normalize_llrs(&mut llrs);
 
@@ -828,7 +836,7 @@ impl Ft8Decoder {
                 if self.verify_crc(&corrected_bits) {
                     // CRC passed — compute frequency and time for the message
                     let sub_bin_offset =
-                        candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+                        trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
                     let base_frequency =
                         candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
                     let time_offset_samples = coarse_offset;
@@ -891,8 +899,8 @@ impl Ft8Decoder {
 
                     #[cfg(feature = "debug-decode")]
                     eprintln!(
-                        "    spectrogram path: CRC PASSED for t={} f={}",
-                        candidate.time_step, candidate.freq_bin
+                        "    spectrogram path (freq_sub={}): CRC PASSED for t={} f={}",
+                        trial_freq_sub, candidate.time_step, candidate.freq_bin
                     );
 
                     return Ok(Some(decoded_message));
@@ -900,7 +908,7 @@ impl Ft8Decoder {
             }
         }
 
-        // ---- Fallback: fine-timing FFT-based extraction ----
+        // ---- Always try fine-timing FFT-based extraction too ----
 
         // Fine timing: search ±half symbol in eighth-symbol steps.
         // Finer time steps improve symbol extraction for signals not aligned to
