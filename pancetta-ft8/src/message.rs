@@ -344,6 +344,9 @@ pub struct DecodedMessage {
     pub timestamp: SystemTime,
     /// Number of error corrections applied
     pub error_corrections: u8,
+    /// Tone symbols (79 values, 0-7) for signal reconstruction in multi-pass subtraction.
+    /// None if symbols were not preserved during decoding.
+    pub tone_symbols: Option<Vec<u8>>,
 }
 
 impl DecodedMessage {
@@ -365,6 +368,7 @@ impl DecodedMessage {
             time_offset,
             timestamp: SystemTime::now(),
             error_corrections: 0,
+            tone_symbols: None,
         }
     }
 }
@@ -1168,7 +1172,7 @@ impl MessageParser {
     fn parse_field_day_type0(
         &self,
         bits: &BitSlice,
-        n3: u32,
+        _n3: u32,
         message: &mut Ft8Message,
     ) -> Ft8Result<()> {
         let n28a = bits_to_u32(&bits[0..28]);
@@ -1372,7 +1376,7 @@ pub fn calculate_crc14(payload: &BitSlice) -> u16 {
     const NUM_BITS: usize = 82; // 77 payload + 5 zero padding
 
     // Pack payload bits into bytes (MSB first), zero-extending to 82 bits
-    let num_bytes = (NUM_BITS + 7) / 8; // 11 bytes
+    let _num_bytes = (NUM_BITS + 7) / 8; // 11 bytes
     let mut bytes = [0u8; 11];
     for (i, bit) in payload.iter().enumerate() {
         if *bit {

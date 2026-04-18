@@ -15,7 +15,7 @@ use crate::{
     protocol::ProtocolParams,
     signal_processing::{FftProcessor, WindowFunction},
     DecodingMetrics, Ft8Error, Ft8Result, MessageHandler, NullMessageHandler, Protocol, NUM_TONES,
-    SAMPLE_RATE, SYMBOL_DURATION,
+    NUM_SYMBOLS, SAMPLE_RATE, SYMBOL_DURATION, TONE_SPACING,
 };
 use bitvec::prelude::*;
 use num_complex::Complex;
@@ -407,90 +407,219 @@ impl Ft8Decoder {
         Ok(all_decoded_messages)
     }
 
+    /// Reconstruct FT8 tone symbols from LDPC codeword bits.
+    ///
+    /// This replicates the encoder's `generate_symbols` logic:
+    /// - Costas sync arrays at positions 0-6, 36-42, 72-78
+    /// - Data symbols from Gray-coded 3-bit groups at other positions
+    fn codeword_to_symbols(corrected_bits: &bitvec::prelude::BitSlice) -> Vec<u8> {
+        let mut symbols = vec![0u8; NUM_SYMBOLS];
+        let mut bit_idx = 0usize;
+
+        for i in 0..NUM_SYMBOLS {
+            if i < 7 {
+                symbols[i] = COSTAS[i];
+            } else if (36..43).contains(&i) {
+                symbols[i] = COSTAS[i - 36];
+            } else if i >= 72 {
+                symbols[i] = COSTAS[i - 72];
+            } else {
+                // Data symbol: 3 bits -> Gray code
+                let mut bits3 = 0u8;
+                if bit_idx < corrected_bits.len() && corrected_bits[bit_idx] {
+                    bits3 |= 4;
+                }
+                if bit_idx + 1 < corrected_bits.len() && corrected_bits[bit_idx + 1] {
+                    bits3 |= 2;
+                }
+                if bit_idx + 2 < corrected_bits.len() && corrected_bits[bit_idx + 2] {
+                    bits3 |= 1;
+                }
+                bit_idx += 3;
+                symbols[i] = crate::ldpc::binary_to_gray(bits3);
+            }
+        }
+
+        symbols
+    }
+
+    /// Generate CPFSK I/Q reference signals for given symbols and frequency.
+    fn generate_cpfsk_iq(
+        symbols: &[u8],
+        base_freq: f64,
+        sps: usize,
+    ) -> (Vec<f64>, Vec<f64>) {
+        use std::f64::consts::PI;
+        let total_len = symbols.len() * sps;
+        let mut recon_i = vec![0.0f64; total_len];
+        let mut recon_q = vec![0.0f64; total_len];
+        let mut phase = 0.0f64;
+        for (sym_idx, &sym) in symbols.iter().enumerate() {
+            let freq = base_freq + sym as f64 * TONE_SPACING;
+            let omega = 2.0 * PI * freq / SAMPLE_RATE as f64;
+            let start = sym_idx * sps;
+            for i in 0..sps {
+                recon_i[start + i] = phase.sin();
+                recon_q[start + i] = phase.cos();
+                phase += omega;
+            }
+            if phase > 1e6 {
+                phase %= 2.0 * PI;
+            }
+        }
+        (recon_i, recon_q)
+    }
+
+    /// Compute the correlation energy (amplitude^2) of a CPFSK signal at given
+    /// frequency against the audio. Used for fine frequency search.
+    fn correlation_energy(
+        audio: &[f32],
+        audio_start: usize,
+        recon_i: &[f64],
+        recon_q: &[f64],
+        recon_offset: usize,
+        signal_len: usize,
+    ) -> f64 {
+        let mut dot_ai = 0.0f64;
+        let mut dot_aq = 0.0f64;
+        let mut dot_ii = 0.0f64;
+        let mut dot_qq = 0.0f64;
+        let mut dot_iq = 0.0f64;
+        for i in 0..signal_len {
+            let a = audio[audio_start + i] as f64;
+            let ri = recon_i[recon_offset + i];
+            let rq = recon_q[recon_offset + i];
+            dot_ai += a * ri;
+            dot_aq += a * rq;
+            dot_ii += ri * ri;
+            dot_qq += rq * rq;
+            dot_iq += ri * rq;
+        }
+        let det = dot_ii * dot_qq - dot_iq * dot_iq;
+        if det.abs() > 1e-12 {
+            let ai = (dot_ai * dot_qq - dot_aq * dot_iq) / det;
+            let aq = (dot_aq * dot_ii - dot_ai * dot_iq) / det;
+            ai * ai + aq * aq
+        } else {
+            0.0
+        }
+    }
+
     /// Subtract a decoded signal from the audio buffer (time-domain interference cancellation).
     ///
-    /// Re-encodes the decoded message text to FT8 symbols, modulates them at the
-    /// detected frequency offset, and subtracts the reconstructed signal from the
-    /// audio. This removes strong signals so weaker ones underneath can be decoded
-    /// in subsequent passes.
+    /// Uses the tone symbols stored in the DecodedMessage to reconstruct the signal
+    /// via direct continuous-phase FSK synthesis, then subtracts it after estimating
+    /// amplitude and phase via least-squares projection. Includes fine frequency
+    /// and timing search to match the actual signal precisely.
     fn subtract_signal(&self, audio: &mut [f32], msg: &DecodedMessage) {
-        #[cfg(feature = "transmit")]
-        {
-            use crate::encoder::Ft8Encoder;
-            use crate::modulator::Ft8Modulator;
+        use std::f64::consts::PI;
 
-            let mut encoder = Ft8Encoder::new();
-            let symbols = match encoder.encode_message(&msg.text, None) {
-                Ok(s) => s,
-                Err(_e) => {
-                    #[cfg(feature = "debug-decode")]
-                    eprintln!("  [subtract] failed to re-encode '{}': {}", msg.text, _e);
-                    return;
-                }
-            };
-
-            let base_freq = crate::BASE_FREQUENCY;
-            let freq_offset = msg.frequency_offset - base_freq;
-
-            let mut modulator = match Ft8Modulator::new(SAMPLE_RATE, base_freq, 1.0) {
-                Ok(m) => m,
-                Err(_e) => {
-                    #[cfg(feature = "debug-decode")]
-                    eprintln!("  [subtract] modulator error: {}", _e);
-                    return;
-                }
-            };
-
-            let reconstructed = match modulator.modulate_symbols(&symbols, freq_offset) {
-                Ok(r) => r,
-                Err(_e) => {
-                    #[cfg(feature = "debug-decode")]
-                    eprintln!("  [subtract] modulation error: {}", _e);
-                    return;
-                }
-            };
-
-            let time_offset_samples = (msg.time_offset * SAMPLE_RATE as f64) as usize;
-            let signal_len = reconstructed
-                .len()
-                .min(audio.len().saturating_sub(time_offset_samples));
-            if signal_len == 0 {
+        let symbols = match &msg.tone_symbols {
+            Some(s) if s.len() == NUM_SYMBOLS => s,
+            _ => {
+                #[cfg(feature = "debug-decode")]
+                eprintln!("  [subtract] no tone symbols for '{}', skipping", msg.text);
                 return;
             }
+        };
 
-            // Estimate amplitude using cross-correlation (projection).
-            // dot(orig, recon) / dot(recon, recon) gives the least-squares
-            // amplitude estimate, which naturally handles phase alignment.
-            let dot_or: f64 = (0..signal_len)
-                .map(|i| audio[time_offset_samples + i] as f64 * reconstructed[i] as f64)
-                .sum();
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize; // 1920
+        let total_len = NUM_SYMBOLS * sps;
+        let nominal_freq = msg.frequency_offset;
+        let nominal_time = (msg.time_offset * SAMPLE_RATE as f64) as isize;
 
-            let dot_rr: f64 = (0..signal_len)
-                .map(|i| {
-                    let s = reconstructed[i] as f64;
-                    s * s
-                })
-                .sum();
+        // Fine frequency and time search to precisely match the actual signal.
+        // The spectrogram has 3.125 Hz resolution, so sub-Hz precision is essential.
+        // Frequency: +/-3.0 Hz in 0.25 Hz steps (25 freq trials)
+        // Time: +/-480 samples (1/4 symbol) in 120-sample steps (9 time trials)
+        // Optimization: reuse the same I/Q signal across time offsets.
+        let mut best_energy = 0.0f64;
+        let mut best_freq = nominal_freq;
+        let mut best_time = nominal_time;
 
-            // Scale factor: projection of original onto reconstructed signal.
-            // Clamp to [0, 3] to avoid runaway subtraction from noise correlation.
-            // Apply conservative 0.9 factor to avoid over-subtraction artifacts.
-            let scale = if dot_rr > 1e-12 {
-                ((dot_or / dot_rr) as f32).clamp(0.0, 3.0) * 0.9
-            } else {
-                0.0
-            };
-
-            for i in 0..signal_len {
-                audio[time_offset_samples + i] -= reconstructed[i] * scale;
+        for di in -12i32..=12 {
+            let try_freq = nominal_freq + di as f64 * 0.25;
+            let (ri, rq) = Self::generate_cpfsk_iq(symbols, try_freq, sps);
+            for dt in -4i32..=4 {
+                let try_time = nominal_time + dt as isize * 120;
+                let recon_start = try_time.max(0) as usize;
+                let recon_offset = (recon_start as isize - try_time) as usize;
+                let sig_len = (total_len.saturating_sub(recon_offset))
+                    .min(audio.len().saturating_sub(recon_start));
+                if sig_len == 0 { continue; }
+                let energy = Self::correlation_energy(
+                    audio, recon_start, &ri, &rq, recon_offset, sig_len,
+                );
+                if energy > best_energy {
+                    best_energy = energy;
+                    best_freq = try_freq;
+                    best_time = try_time;
+                }
             }
-
-            #[cfg(feature = "debug-decode")]
-            eprintln!(
-                "  [subtract] '{}' at {:.1} Hz, t={:.3}s, scale={:.3}",
-                msg.text, msg.frequency_offset, msg.time_offset, scale
-            );
         }
+
+        // Now subtract at the best frequency/time
+        let (recon_i, recon_q) = Self::generate_cpfsk_iq(symbols, best_freq, sps);
+        let recon_start = best_time.max(0) as usize;
+        let recon_offset = (recon_start as isize - best_time) as usize;
+        let signal_len = (total_len.saturating_sub(recon_offset))
+            .min(audio.len().saturating_sub(recon_start));
+
+        if signal_len == 0 {
+            return;
+        }
+
+        // Full 2x2 least-squares for amplitude and phase
+        let mut dot_ai = 0.0f64;
+        let mut dot_aq = 0.0f64;
+        let mut dot_ii = 0.0f64;
+        let mut dot_qq = 0.0f64;
+        let mut dot_iq = 0.0f64;
+        for i in 0..signal_len {
+            let a = audio[recon_start + i] as f64;
+            let ri = recon_i[recon_offset + i];
+            let rq = recon_q[recon_offset + i];
+            dot_ai += a * ri;
+            dot_aq += a * rq;
+            dot_ii += ri * ri;
+            dot_qq += rq * rq;
+            dot_iq += ri * rq;
+        }
+
+        let det = dot_ii * dot_qq - dot_iq * dot_iq;
+        let (amp_i, amp_q) = if det.abs() > 1e-12 {
+            let ai = (dot_ai * dot_qq - dot_aq * dot_iq) / det;
+            let aq = (dot_aq * dot_ii - dot_ai * dot_iq) / det;
+            (ai, aq)
+        } else {
+            (0.0, 0.0)
+        };
+
+        // Clamp total amplitude
+        let total_amp = (amp_i * amp_i + amp_q * amp_q).sqrt();
+        let max_amp = 3.0;
+        let (amp_i, amp_q) = if total_amp > max_amp {
+            let s = max_amp / total_amp;
+            (amp_i * s, amp_q * s)
+        } else {
+            (amp_i, amp_q)
+        };
+
+        // Subtract with 0.9 conservative factor
+        let scale = 0.9;
+        for i in 0..signal_len {
+            let subtracted = amp_i * recon_i[recon_offset + i]
+                + amp_q * recon_q[recon_offset + i];
+            audio[recon_start + i] -= (subtracted * scale) as f32;
+        }
+
+        #[cfg(feature = "debug-decode")]
+        eprintln!(
+            "  [subtract] '{}' at {:.2} Hz (nom {:.1}), t={:.4}s (nom {:.3}), amp={:.4}, phase={:.1}deg",
+            msg.text, best_freq, nominal_freq,
+            best_time as f64 / SAMPLE_RATE as f64, msg.time_offset,
+            total_amp, amp_q.atan2(amp_i).to_degrees()
+        );
     }
 
     /// Pre-process audio: convert to f64 and normalize
@@ -889,13 +1018,16 @@ impl Ft8Decoder {
                     };
                     let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
-                    let decoded_message = DecodedMessage::new(
+                    let mut decoded_message = DecodedMessage::new(
                         ft8_message,
                         snr_db,
                         confidence,
                         base_frequency,
                         time_offset_samples as f64 / SAMPLE_RATE as f64,
                     );
+                    // Store tone symbols for multi-pass signal subtraction
+                    decoded_message.tone_symbols =
+                        Some(Self::codeword_to_symbols(&corrected_bits));
 
                     #[cfg(feature = "debug-decode")]
                     eprintln!(
@@ -1039,13 +1171,16 @@ impl Ft8Decoder {
                 };
                 let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
-                let decoded_message = DecodedMessage::new(
+                let mut decoded_message = DecodedMessage::new(
                     ft8_message,
                     snr_db,
                     confidence,
                     base_frequency,
                     time_offset_samples as f64 / SAMPLE_RATE as f64,
                 );
+                // Store tone symbols for multi-pass signal subtraction
+                decoded_message.tone_symbols =
+                    Some(Self::codeword_to_symbols(&corrected_bits));
 
                 best_decode = Some(decoded_message);
                 return Ok(best_decode);
@@ -2372,5 +2507,87 @@ mod tests {
         // Verify the no-OSD path still works
         let decoder_no_osd = LdpcDecoder::new(50).unwrap();
         assert!(decoder_no_osd.osd.is_none());
+    }
+
+    #[test]
+    fn test_subtract_signal_removes_energy() {
+        // Generate a known CPFSK signal, add it to silence,
+        // then subtract and verify the energy is reduced.
+        let config = Ft8Config::default();
+        let decoder = Ft8Decoder::new(config).unwrap();
+
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
+        let base_freq = 1000.0;
+        let amplitude = 0.1f32;
+
+        // Create known tone symbols (all tone 3 for simplicity)
+        let symbols: Vec<u8> = (0..NUM_SYMBOLS).map(|i| {
+            if i < 7 { COSTAS[i] }
+            else if (36..43).contains(&i) { COSTAS[i - 36] }
+            else if i >= 72 { COSTAS[i - 72] }
+            else { 3 } // arbitrary data tone
+        }).collect();
+
+        // Generate the signal
+        let total_len = NUM_SYMBOLS * sps;
+        let time_offset_samples = 960usize; // 1 half-symbol offset
+        let mut audio = vec![0.0f32; WINDOW_SAMPLES];
+
+        let mut phase = 0.0f64;
+        for sym_idx in 0..NUM_SYMBOLS {
+            let freq = base_freq + symbols[sym_idx] as f64 * TONE_SPACING;
+            let omega = 2.0 * PI * freq / SAMPLE_RATE as f64;
+            let start = time_offset_samples + sym_idx * sps;
+            for i in 0..sps {
+                if start + i < audio.len() {
+                    audio[start + i] = (amplitude as f64 * phase.sin()) as f32;
+                }
+                phase += omega;
+            }
+        }
+
+        // Measure energy before subtraction
+        let energy_before: f64 = audio.iter().map(|&s| (s as f64) * (s as f64)).sum();
+
+        // Create a DecodedMessage with the known symbols
+        let msg = DecodedMessage {
+            message: crate::message::Ft8Message {
+                message_type: crate::message::MessageType::FreeText,
+                standard_type: None,
+                from_callsign: None,
+                to_callsign: None,
+                grid_square: None,
+                signal_report: None,
+                text: Some("TEST".to_string()),
+                contest_exchange: None,
+                special_operation: None,
+                payload_bits: bitvec![0; 77],
+                crc: 0,
+                crc_valid: false,
+                uses_hash_calls: false,
+            },
+            text: "TEST".to_string(),
+            snr_db: 0.0,
+            confidence: 1.0,
+            frequency_offset: base_freq,
+            time_offset: time_offset_samples as f64 / SAMPLE_RATE as f64,
+            timestamp: SystemTime::now(),
+            error_corrections: 0,
+            tone_symbols: Some(symbols),
+        };
+
+        decoder.subtract_signal(&mut audio, &msg);
+
+        // Measure energy after subtraction
+        let energy_after: f64 = audio.iter().map(|&s| (s as f64) * (s as f64)).sum();
+
+        let reduction = 1.0 - (energy_after / energy_before);
+        eprintln!("Energy before: {:.6}, after: {:.6}, reduction: {:.1}%",
+                  energy_before, energy_after, reduction * 100.0);
+
+        // Should remove at least 70% of the energy
+        assert!(reduction > 0.7,
+                "Signal subtraction only removed {:.1}% of energy (expected >70%)",
+                reduction * 100.0);
     }
 }

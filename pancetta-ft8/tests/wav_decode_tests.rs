@@ -212,8 +212,8 @@ fn test_cross_validate_against_ft8lib() {
         println!("Overall ratio: {:.1}%", overall_ratio * 100.0);
 
         assert!(
-            overall_ratio >= 0.85,
-            "REGRESSION: decode ratio {:.1}% dropped below 85% floor. Ours={}, ft8_lib={}.\nPer-file failures:\n{}",
+            overall_ratio >= 0.95,
+            "REGRESSION: decode ratio {:.1}% dropped below 95% floor. Ours={}, ft8_lib={}.\nPer-file failures:\n{}",
             overall_ratio * 100.0,
             total_ours,
             total_ft8lib,
