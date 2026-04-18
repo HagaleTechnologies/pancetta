@@ -1500,12 +1500,36 @@ fn estimate_noise_floor(psd: &[f64]) -> f64 {
 // LDPC decoder
 // ============================================================================
 
+/// Padé approximant for tanh, matching ft8_lib's approach.
+#[inline]
+fn fast_tanh(x: f32) -> f32 {
+    if x.abs() > 4.97 {
+        return if x > 0.0 { 1.0 } else { -1.0 };
+    }
+    let x2 = x * x;
+    let num = x * (135135.0 + x2 * (17325.0 + x2 * (378.0 + x2)));
+    let den = 135135.0 + x2 * (62370.0 + x2 * (3150.0 + x2 * 28.0));
+    num / den
+}
+
+#[inline]
+fn fast_atanh(x: f32) -> f32 {
+    let x = x.clamp(-0.9999999, 0.9999999);
+    0.5 * ((1.0 + x) / (1.0 - x)).ln()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LdpcAlgorithm {
+    MinSum { normalization_factor: f32 },
+    SumProduct,
+}
+
 /// FT8 LDPC(174,91) decoder with belief propagation
 ///
 /// Implements the LDPC decoder for FT8's (174,91) code:
 /// - 91 information bits (77 payload + 14 CRC)
 /// - 83 parity bits
-/// - Min-sum belief propagation algorithm
+/// - Sum-product or min-sum belief propagation algorithm
 struct LdpcDecoder {
     max_iterations: usize,
     /// Parity check matrix (83x174) - sparse representation
@@ -1513,8 +1537,8 @@ struct LdpcDecoder {
     /// For each variable node, the position index within each connected check node's list.
     /// var_positions[var_idx] = [(check_idx, position_in_check), ...] with exactly 3 entries.
     var_positions: Vec<Vec<(usize, usize)>>,
-    /// Min-sum normalization factor
-    normalization_factor: f32,
+    /// LDPC decoding algorithm
+    algorithm: LdpcAlgorithm,
     /// Optional OSD fallback decoder
     osd: Option<OsdDecoder>,
 }
@@ -1545,7 +1569,7 @@ impl LdpcDecoder {
             max_iterations,
             parity_check_matrix,
             var_positions,
-            normalization_factor: 0.75,
+            algorithm: LdpcAlgorithm::SumProduct,
             osd: None,
         })
     }
@@ -1666,40 +1690,54 @@ impl LdpcDecoder {
         }
 
         for _iteration in 0..self.max_iterations {
-            // Check node update (min-sum algorithm)
+            // Check node update
             for check_idx in 0..num_checks {
                 let connected_vars = self.parity_check_matrix.get_connected_variables(check_idx);
                 let degree = connected_vars.len();
 
-                // Compute sign product and find two smallest magnitudes across all edges
-                let mut total_sign: i8 = 1;
-                let mut min1_mag = f32::MAX;
-                let mut min2_mag = f32::MAX;
-                let mut min1_pos: usize = 0;
-                let mut signs = [1i8; 7];
-
-                for pos in 0..degree {
-                    let msg = v2c[check_idx][pos];
-                    let s = if msg < 0.0 { -1i8 } else { 1i8 };
-                    signs[pos] = s;
-                    total_sign *= s;
-
-                    let mag = msg.abs();
-                    if mag < min1_mag {
-                        min2_mag = min1_mag;
-                        min1_mag = mag;
-                        min1_pos = pos;
-                    } else if mag < min2_mag {
-                        min2_mag = mag;
+                match self.algorithm {
+                    LdpcAlgorithm::SumProduct => {
+                        for target_pos in 0..degree {
+                            let mut product = 1.0f32;
+                            for pos in 0..degree {
+                                if pos != target_pos {
+                                    product *= fast_tanh(v2c[check_idx][pos] / 2.0);
+                                }
+                            }
+                            c2v[check_idx][target_pos] = 2.0 * fast_atanh(product);
+                        }
                     }
-                }
+                    LdpcAlgorithm::MinSum { normalization_factor } => {
+                        // Compute sign product and find two smallest magnitudes across all edges
+                        let mut total_sign: i8 = 1;
+                        let mut min1_mag = f32::MAX;
+                        let mut min2_mag = f32::MAX;
+                        let mut min1_pos: usize = 0;
+                        let mut signs = [1i8; 7];
 
-                // Now compute check-to-variable messages
-                for pos in 0..degree {
-                    // Sign: product of all other signs = total_sign / this_sign
-                    let edge_sign = total_sign * signs[pos]; // removes this edge's sign
-                    let mag = if pos == min1_pos { min2_mag } else { min1_mag };
-                    c2v[check_idx][pos] = edge_sign as f32 * mag * self.normalization_factor;
+                        for pos in 0..degree {
+                            let msg = v2c[check_idx][pos];
+                            let s = if msg < 0.0 { -1i8 } else { 1i8 };
+                            signs[pos] = s;
+                            total_sign *= s;
+
+                            let mag = msg.abs();
+                            if mag < min1_mag {
+                                min2_mag = min1_mag;
+                                min1_mag = mag;
+                                min1_pos = pos;
+                            } else if mag < min2_mag {
+                                min2_mag = mag;
+                            }
+                        }
+
+                        // Now compute check-to-variable messages
+                        for pos in 0..degree {
+                            let edge_sign = total_sign * signs[pos];
+                            let mag = if pos == min1_pos { min2_mag } else { min1_mag };
+                            c2v[check_idx][pos] = edge_sign as f32 * mag * normalization_factor;
+                        }
+                    }
                 }
             }
 
@@ -2032,7 +2070,7 @@ mod tests {
 
         let ldpc = decoder.unwrap();
         assert_eq!(ldpc.max_iterations, 50);
-        assert_eq!(ldpc.normalization_factor, 0.75);
+        assert!(matches!(ldpc.algorithm, LdpcAlgorithm::SumProduct));
         // Early termination is always on (syndrome checked every iteration)
         assert!(!ldpc.var_positions.is_empty());
     }
