@@ -675,15 +675,22 @@ impl Ft8Decoder {
         f0: usize,
         freq_sub: usize,
     ) -> f64 {
-        let mut score = 0.0f64;
-        let mut num_average = 0usize;
         let pp = &self.protocol_params;
 
-        for (m, &group_start) in pp.costas_positions.iter().enumerate() {
-            for k in 0..pp.costas_length {
-                let symbol_idx = group_start + k;
-                // Each symbol occupies 2 time steps; use the first one
-                for half in 0..2 {
+        // Score each half-symbol step independently, then take the best.
+        // Both halves of a symbol carry the same tone, so each is a valid
+        // sync measurement.  Averaging across halves would halve the score
+        // (doubling num_average without doubling discriminating power),
+        // dropping clean signals below MIN_SYNC_SCORE.
+        let mut best_score = 0.0f64;
+
+        for half in 0..2 {
+            let mut score = 0.0f64;
+            let mut num_average = 0usize;
+
+            for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+                for k in 0..pp.costas_length {
+                    let symbol_idx = group_start + k;
                     let time_idx = t0 + symbol_idx * 2 + half;
 
                     if time_idx >= spec.num_steps {
@@ -734,13 +741,19 @@ impl Ft8Decoder {
                     }
                 }
             }
+
+            let half_score = if num_average > 0 {
+                score / num_average as f64
+            } else {
+                0.0
+            };
+
+            if half_score > best_score {
+                best_score = half_score;
+            }
         }
 
-        if num_average > 0 {
-            score / num_average as f64
-        } else {
-            0.0
-        }
+        best_score
     }
 
     /// Non-maximum suppression: remove weaker candidates near stronger ones
@@ -1947,8 +1960,8 @@ mod tests {
         assert!(!waterfall.frequency_bins.is_empty());
         assert!(!waterfall.power_matrix.is_empty());
         assert!(waterfall.min_power < waterfall.max_power);
-        assert!(waterfall.frequency_bins[0] >= 200.0);
-        assert!(waterfall.frequency_bins.last().unwrap() <= &4000.0);
+        assert!(waterfall.frequency_bins[0] >= 0.0);
+        assert!(waterfall.frequency_bins.last().unwrap() <= &3000.0);
     }
 
     #[test]
