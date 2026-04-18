@@ -22,6 +22,7 @@ use num_complex::Complex;
 use rustfft::FftPlanner;
 use std::collections::HashSet;
 use std::time::{Instant, SystemTime};
+use tracing::{debug, info};
 
 // ============================================================================
 // Constants
@@ -34,7 +35,7 @@ const MAX_DECODE_CANDIDATES: usize = 100;
 const MIN_DECODE_SNR: f32 = -25.0;
 
 /// LDPC decoder iterations
-const LDPC_MAX_ITERATIONS: usize = 100;
+const LDPC_MAX_ITERATIONS: usize = 25;
 
 /// FT8 Costas synchronization array
 const COSTAS: [u8; 7] = [3, 1, 4, 0, 6, 5, 2];
@@ -52,7 +53,7 @@ const LLR_TARGET_VARIANCE: f32 = 24.0;
 const MIN_SYNC_SCORE: f64 = 3.5;
 
 /// Maximum candidates from sync search before NMS
-const MAX_SYNC_CANDIDATES: usize = 200;
+const MAX_SYNC_CANDIDATES: usize = 80;
 
 /// Minimum frequency bin for FT8 search (~200 Hz / 6.25 Hz)
 const MIN_FREQ_BIN: usize = 32;
@@ -304,6 +305,13 @@ impl Ft8Decoder {
 
             if pass == 0 {
                 best_sync_score = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
+                info!(
+                    candidates = sync_candidates.len(),
+                    best_score = format!("{:.1}", best_sync_score),
+                    spec_steps = spectrogram.num_steps,
+                    spec_bins = spectrogram.num_bins,
+                    "FT8 sync search pass 0"
+                );
             }
 
             // Step 3: Decode each candidate
@@ -497,6 +505,15 @@ impl Ft8Decoder {
                 *sample *= scale;
             }
         }
+
+        // Log signal stats for diagnostics
+        let rms: f64 = (audio.iter().map(|x| x * x).sum::<f64>() / audio.len() as f64).sqrt();
+        debug!(
+            samples = samples.len(),
+            max_amplitude = format!("{:.6}", max_amplitude),
+            rms_after_norm = format!("{:.6}", rms),
+            "FT8 preprocess"
+        );
 
         Ok(audio)
     }
@@ -884,8 +901,32 @@ impl Ft8Decoder {
                 };
                 let ft8_message = self.message_parser.parse_payload(&payload_bits)?;
 
-                // sync_score is average dB difference between signal and neighbor bins
-                let snr_db = candidate.sync_score as f32;
+                // Estimate SNR from extracted tone magnitudes.
+                // Signal power: average squared magnitude of the best tone across data symbols.
+                // Noise power: average squared magnitude of the weakest tone across data symbols.
+                // This gives SNR in the 6.25 Hz bin width; correct to 2500 Hz reference BW.
+                let snr_db = {
+                    let data_positions = self.protocol_params.data_symbol_indices();
+                    let mut signal_power = 0.0f64;
+                    let mut noise_power = 0.0f64;
+                    let mut count = 0usize;
+                    for &sym_idx in &data_positions {
+                        let mags = &tone_magnitudes[sym_idx];
+                        let best = mags.iter().cloned().fold(0.0f64, f64::max);
+                        let worst = mags.iter().cloned().fold(f64::MAX, f64::min);
+                        signal_power += best * best;
+                        noise_power += worst * worst;
+                        count += 1;
+                    }
+                    if count > 0 && noise_power > 0.0 {
+                        let snr_linear = signal_power / noise_power;
+                        // Convert from bin BW (6.25 Hz) to reference BW (2500 Hz)
+                        let bw_correction = 10.0 * (2500.0f64 / 6.25).log10(); // = 26.02 dB
+                        (10.0 * snr_linear.log10() - bw_correction) as f32
+                    } else {
+                        -24.0f32 // fallback for degenerate case
+                    }
+                };
                 let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
                 let decoded_message = DecodedMessage::new(
@@ -1091,31 +1132,48 @@ impl Ft8Decoder {
     // ========================================================================
 
     /// Generate waterfall display data
+    /// Generate waterfall data for one FT8 decode window.
+    ///
+    /// Produces a small number of summary rows (target_rows) by averaging
+    /// multiple FFT frames, covering the 0–3000 Hz USB audio passband.
+    /// Each call = one FT8 cycle; the TUI stacks these vertically so the
+    /// operator can see activity across many cycles (odd/even).
     pub fn generate_waterfall_data(&mut self, audio: &[f64]) -> Ft8Result<WaterfallData> {
-        let window_size = 2048;
+        let fft_size = self.fft_processor.fft_size();
+        let window_size = fft_size.min(audio.len());
         let hop_size = window_size / 4;
-        let num_windows = (audio.len().saturating_sub(window_size)) / hop_size + 1;
+        let num_ffts = (audio.len().saturating_sub(window_size)) / hop_size + 1;
+
+        // Produce a small number of rows per FT8 cycle so they stack nicely.
+        // 4 rows per 15s cycle = ~3.75s per row, good granularity for even/odd.
+        let target_rows: usize = 4;
+        let ffts_per_row = (num_ffts / target_rows).max(1);
+
+        let freq_resolution = SAMPLE_RATE as f64 / fft_size as f64;
+
+        // FT8 USB passband: 0–3000 Hz
+        let bin_start = 0usize;
+        let bin_end = (3000.0 / freq_resolution).floor() as usize;
+        let bin_end = bin_end.min(fft_size / 2);
+        let num_bins = bin_end - bin_start + 1;
 
         let mut waterfall_data = WaterfallData {
             time_bins: Vec::new(),
-            frequency_bins: Vec::new(),
+            frequency_bins: (bin_start..=bin_end)
+                .map(|i| i as f64 * freq_resolution)
+                .collect(),
             power_matrix: Vec::new(),
             min_power: f64::MAX,
             max_power: f64::MIN,
         };
 
-        let freq_resolution = SAMPLE_RATE as f64 / window_size as f64;
-        for i in 0..=window_size / 2 {
-            let freq = i as f64 * freq_resolution;
-            if (200.0..=4000.0).contains(&freq) {
-                waterfall_data.frequency_bins.push(freq);
-            }
-        }
+        // Accumulate FFTs into summary rows
+        let mut accum: Vec<f64> = vec![0.0; num_bins];
+        let mut accum_count: usize = 0;
 
-        for window_idx in 0..num_windows {
-            let start = window_idx * hop_size;
+        for fft_idx in 0..num_ffts {
+            let start = fft_idx * hop_size;
             let end = (start + window_size).min(audio.len());
-
             if end - start < window_size {
                 break;
             }
@@ -1123,21 +1181,33 @@ impl Ft8Decoder {
             let window = &audio[start..end];
             let psd = self.fft_processor.power_spectral_density(window)?;
 
-            let mut window_powers = Vec::new();
-            for (i, &power) in psd.iter().enumerate() {
-                let freq = i as f64 * freq_resolution;
-                if (200.0..=4000.0).contains(&freq) {
-                    let power_db = 10.0 * (power + 1e-12).log10();
-                    window_powers.push(power_db);
-                    waterfall_data.min_power = waterfall_data.min_power.min(power_db);
-                    waterfall_data.max_power = waterfall_data.max_power.max(power_db);
-                }
+            for (j, i) in (bin_start..=bin_end.min(psd.len() - 1)).enumerate() {
+                accum[j] += psd[i];
             }
+            accum_count += 1;
 
-            waterfall_data.power_matrix.push(window_powers);
-            waterfall_data
-                .time_bins
-                .push(window_idx as f64 * hop_size as f64 / SAMPLE_RATE as f64);
+            // Emit a summary row when we've accumulated enough FFTs
+            if accum_count >= ffts_per_row || fft_idx == num_ffts - 1 {
+                let row: Vec<f64> = accum
+                    .iter()
+                    .map(|&sum| {
+                        let avg = sum / accum_count as f64;
+                        let db = 10.0 * (avg + 1e-12).log10();
+                        waterfall_data.min_power = waterfall_data.min_power.min(db);
+                        waterfall_data.max_power = waterfall_data.max_power.max(db);
+                        db
+                    })
+                    .collect();
+
+                waterfall_data.power_matrix.push(row);
+                waterfall_data.time_bins.push(
+                    (fft_idx as f64 - accum_count as f64 / 2.0) * hop_size as f64
+                        / SAMPLE_RATE as f64,
+                );
+
+                accum.fill(0.0);
+                accum_count = 0;
+            }
         }
 
         Ok(waterfall_data)

@@ -88,7 +88,7 @@ pub struct ConfigManager {
 
 /// Manager state
 #[derive(Debug)]
-struct ManagerState {
+pub struct ManagerState {
     /// Whether watching is active
     watching: bool,
 
@@ -565,7 +565,31 @@ impl ConfigLoader {
                                 cache.remove(&path);
                             }
 
-                            // Trigger reload callback
+                            // Reload config from disk BEFORE invoking the callback.
+                            // The old code passed the pre-reload config to listeners.
+                            let new_config = match fs::read_to_string(&path) {
+                                Ok(content) => {
+                                    let parsed = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                                        serde_json::from_str::<Config>(&content).ok()
+                                    } else {
+                                        toml::from_str::<Config>(&content).ok()
+                                    };
+                                    parsed
+                                }
+                                Err(e) => {
+                                    warn!("Failed to re-read config file {}: {}", path.display(), e);
+                                    None
+                                }
+                            };
+
+                            if let Some(config) = new_config {
+                                // Update current_config with the freshly-loaded value
+                                if let Ok(mut config_guard) = current_config.write() {
+                                    *config_guard = config;
+                                }
+                            }
+
+                            // Trigger reload callback with the now-updated config
                             if let Ok(callback_guard) = reload_callback.lock() {
                                 if let Some(ref callback) = *callback_guard {
                                     if let Ok(config_guard) = current_config.read() {

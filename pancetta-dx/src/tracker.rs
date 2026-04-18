@@ -87,7 +87,7 @@ pub struct EntityStats {
 
 /// DX Tracker database manager
 pub struct DxTracker {
-    connection: Connection,
+    connection: std::sync::Mutex<Connection>,
 }
 
 impl DxTracker {
@@ -95,7 +95,9 @@ impl DxTracker {
     pub async fn new(database_path: &str) -> Result<Self> {
         let connection = Connection::open(database_path)?;
 
-        let mut tracker = Self { connection };
+        let mut tracker = Self {
+            connection: std::sync::Mutex::new(connection),
+        };
         tracker.initialize_database().await?;
 
         Ok(tracker)
@@ -106,7 +108,7 @@ impl DxTracker {
         info!("Initializing DX tracker database schema");
 
         // QSOs table
-        self.connection.execute(
+        self.connection.lock().unwrap().execute(
             "CREATE TABLE IF NOT EXISTS tracked_contacts (
                 id TEXT PRIMARY KEY,
                 callsign TEXT NOT NULL,
@@ -132,7 +134,7 @@ impl DxTracker {
         )?;
 
         // Award tracking table
-        self.connection.execute(
+        self.connection.lock().unwrap().execute(
             "CREATE TABLE IF NOT EXISTS award_tracking (
                 entity_code INTEGER NOT NULL,
                 band TEXT NOT NULL,
@@ -151,32 +153,32 @@ impl DxTracker {
         )?;
 
         // Indexes for performance
-        self.connection.execute(
+        self.connection.lock().unwrap().execute(
             "CREATE INDEX IF NOT EXISTS idx_tracked_contacts_callsign ON tracked_contacts(callsign)",
             [],
         )?;
 
-        self.connection.execute(
+        self.connection.lock().unwrap().execute(
             "CREATE INDEX IF NOT EXISTS idx_tracked_contacts_dxcc_entity ON tracked_contacts(dxcc_entity)",
             [],
         )?;
 
-        self.connection.execute(
+        self.connection.lock().unwrap().execute(
             "CREATE INDEX IF NOT EXISTS idx_tracked_contacts_datetime ON tracked_contacts(datetime)",
             [],
         )?;
 
-        self.connection.execute(
+        self.connection.lock().unwrap().execute(
             "CREATE INDEX IF NOT EXISTS idx_tracked_contacts_band ON tracked_contacts(band)",
             [],
         )?;
 
-        self.connection.execute(
+        self.connection.lock().unwrap().execute(
             "CREATE INDEX IF NOT EXISTS idx_tracked_contacts_mode ON tracked_contacts(mode)",
             [],
         )?;
 
-        self.connection.execute(
+        self.connection.lock().unwrap().execute(
             "CREATE INDEX IF NOT EXISTS idx_award_entity_band ON award_tracking(entity_code, band)",
             [],
         )?;
@@ -195,7 +197,7 @@ impl DxTracker {
 
         debug!("Adding QSO: {} on {} {}", qso.callsign, qso.band, qso.mode);
 
-        self.connection.execute(
+        self.connection.lock().unwrap().execute(
             "INSERT INTO tracked_contacts (
                 id, callsign, datetime, frequency, band, mode,
                 rst_sent, rst_received, grid_square, qth, name,
@@ -240,7 +242,7 @@ impl DxTracker {
 
         debug!("Updating QSO: {}", qso_id);
 
-        let rows_affected = self.connection.execute(
+        let rows_affected = self.connection.lock().unwrap().execute(
             "UPDATE tracked_contacts SET
                 callsign = ?1, datetime = ?2, frequency = ?3, band = ?4, mode = ?5,
                 rst_sent = ?6, rst_received = ?7, grid_square = ?8, qth = ?9, name = ?10,
@@ -332,7 +334,7 @@ impl DxTracker {
     async fn create_award_entry(&self, qso: &DxQso, status: AwardStatus) -> Result<()> {
         let is_confirmed = status == AwardStatus::Confirmed;
 
-        self.connection.execute(
+        self.connection.lock().unwrap().execute(
             "INSERT INTO award_tracking (
                 entity_code, band, mode, status, first_worked, first_confirmed,
                 worked_qso_id, confirmed_qso_id, confirmation_method
@@ -379,7 +381,7 @@ impl DxTracker {
     ) -> Result<()> {
         let is_confirmed = new_status == AwardStatus::Confirmed;
 
-        self.connection.execute(
+        self.connection.lock().unwrap().execute(
             "UPDATE award_tracking SET
                 status = ?1,
                 first_confirmed = ?2,
@@ -431,8 +433,8 @@ impl DxTracker {
     ) -> Result<Option<AwardEntry>> {
         let mode_str = mode.map(|m| m.to_string());
 
-        let row = self
-            .connection
+        let conn = self.connection.lock().unwrap();
+        let row = conn
             .query_row(
                 "SELECT entity_code, band, mode, status, first_worked, first_confirmed,
                     worked_qso_id, confirmed_qso_id, confirmation_method
@@ -555,7 +557,7 @@ impl DxTracker {
     }
 
     /// Check if entity/band/mode combination is needed
-    pub async fn is_needed(&self, callsign: &str, band: Band, mode: &Mode) -> Result<bool> {
+    pub async fn is_needed(&self, _callsign: &str, _band: Band, _mode: &Mode) -> Result<bool> {
         // This would need DXCC lookup to get entity code from callsign
         // For now, return true as placeholder
         Ok(true)
@@ -563,7 +565,8 @@ impl DxTracker {
 
     /// Get QSO statistics by entity
     pub async fn get_qso_statistics_by_entity(&self) -> Result<HashMap<u16, u32>> {
-        let mut stmt = self.connection.prepare(
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT dxcc_entity, COUNT(*) as qso_count
              FROM tracked_contacts
              GROUP BY dxcc_entity",
@@ -590,7 +593,8 @@ impl DxTracker {
         &self,
         since: DateTime<Utc>,
     ) -> Result<HashMap<u16, u32>> {
-        let mut stmt = self.connection.prepare(
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT dxcc_entity, COUNT(*) as qso_count
              FROM tracked_contacts
              WHERE datetime >= ?1
@@ -615,7 +619,8 @@ impl DxTracker {
 
     /// Get QSO statistics by band for an entity
     pub async fn get_qso_statistics_by_band(&self, entity_code: u16) -> Result<HashMap<Band, u32>> {
-        let mut stmt = self.connection.prepare(
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT band, COUNT(*) as qso_count
              FROM tracked_contacts
              WHERE dxcc_entity = ?1
@@ -646,7 +651,8 @@ impl DxTracker {
 
     /// Get QSO statistics by mode for an entity
     pub async fn get_qso_statistics_by_mode(&self, entity_code: u16) -> Result<HashMap<Mode, u32>> {
-        let mut stmt = self.connection.prepare(
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT mode, COUNT(*) as qso_count
              FROM tracked_contacts
              WHERE dxcc_entity = ?1
@@ -677,8 +683,8 @@ impl DxTracker {
 
     /// Get last QSO date for an entity
     pub async fn get_last_qso_date(&self, entity_code: u16) -> Result<Option<DateTime<Utc>>> {
-        let result = self
-            .connection
+        let conn = self.connection.lock().unwrap();
+        let result = conn
             .query_row(
                 "SELECT MAX(datetime) as last_qso
              FROM tracked_contacts
@@ -736,8 +742,9 @@ impl DxTracker {
 
         let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
+        let conn = self.connection.lock().unwrap();
         let (worked_count, confirmed_count) =
-            self.connection
+            conn
                 .query_row(&query, param_refs.as_slice(), |row| {
                     Ok((
                         row.get::<_, i64>("worked_count")? as u32,
@@ -789,6 +796,8 @@ mod tests {
         let (tracker, _temp_file) = create_test_tracker().await;
         let result: i64 = tracker
             .connection
+            .lock()
+            .unwrap()
             .query_row("SELECT 1", [], |row| row.get(0))
             .unwrap();
         assert_eq!(result, 1);

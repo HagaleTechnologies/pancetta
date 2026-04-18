@@ -13,7 +13,7 @@ use sqlx::{
 use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
-use tracing::{debug, error, info};
+use tracing::{debug, info};
 use uuid::Uuid;
 
 /// Async database operation errors
@@ -85,6 +85,15 @@ impl AsyncQsoDatabase {
 
     /// Initialize database schema
     async fn initialize_schema(&mut self) -> Result<(), AsyncDatabaseError> {
+        // Enable WAL mode and relaxed synchronous for better concurrent performance.
+        // WAL mode allows readers and writers to operate concurrently without blocking.
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("PRAGMA synchronous = NORMAL")
+            .execute(&self.pool)
+            .await?;
+
         let schema = r#"
             CREATE TABLE IF NOT EXISTS qsos (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -310,26 +319,29 @@ impl AsyncQsoDatabase {
         format!("{:x}", hasher.finish())
     }
 
-    /// Create a backup of the database
+    /// Create a backup of the database using VACUUM INTO for atomic backup.
+    ///
+    /// This replaces the old export-reimport approach which was non-atomic and
+    /// could corrupt the backup on crash.
     pub async fn backup<P: AsRef<Path>>(&self, backup_path: P) -> Result<(), AsyncDatabaseError> {
-        // For SQLite with sqlx, we need to use a different approach
-        // We'll export all data and reimport
-        let all_qsos = self
-            .search_qsos(
-                &crate::database::QsoFilter::default(),
-                &crate::database::QueryOptions::default(),
-            )
-            .await?;
+        let backup_path_str = backup_path.as_ref().to_string_lossy().to_string();
+        let pool = self.pool.clone();
 
-        // Create backup database
-        let backup_db = Self::open(backup_path).await?;
+        // Use VACUUM INTO which atomically creates a complete copy of the database.
+        // This runs in a blocking task since it may take time for large databases.
+        tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                sqlx::query(&format!("VACUUM INTO '{}'", backup_path_str))
+                    .execute(&pool)
+                    .await
+            })
+        })
+        .await
+        .map_err(|e| AsyncDatabaseError::Sqlx(sqlx::Error::Protocol(e.to_string())))?
+        .map_err(AsyncDatabaseError::Sqlx)?;
 
-        // Insert all QSOs into backup
-        for qso in all_qsos {
-            backup_db.insert_qso(&qso).await?;
-        }
-
-        info!("Database backup completed");
+        info!("Database backup completed (VACUUM INTO)");
         Ok(())
     }
 
