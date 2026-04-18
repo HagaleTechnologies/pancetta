@@ -434,7 +434,7 @@ impl Default for MessageBusConfig {
     fn default() -> Self {
         Self {
             max_queue_size: 10000,
-            message_timeout_us: 1000, // 1ms timeout for real-time audio
+            message_timeout_us: 30_000_000, // 30s timeout for control messages
             health_check_interval: Duration::from_secs(5),
             enable_tracing: false,
             enable_metrics: true,

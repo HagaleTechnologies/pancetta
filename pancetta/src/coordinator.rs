@@ -56,6 +56,10 @@ pub struct ApplicationCoordinator {
     /// Component health status map (shared with health monitor task)
     component_status: Arc<RwLock<HashMap<ComponentId, ComponentStatus>>>,
 
+    /// Managed rigctld child process (killed on shutdown)
+    #[cfg(feature = "pancetta-hamlib")]
+    rigctld_process: Option<std::process::Child>,
+
     /// Application state
     is_running: Arc<AtomicBool>,
     shutdown_signal: Arc<AtomicBool>,
@@ -84,6 +88,17 @@ pub struct ApplicationCoordinator {
     message_count: Arc<std::sync::atomic::AtomicU64>,
     last_audio_timestamp: Arc<RwLock<Option<Instant>>>,
     last_decode_timestamp: Arc<RwLock<Option<Instant>>>,
+}
+
+#[cfg(feature = "pancetta-hamlib")]
+impl Drop for ApplicationCoordinator {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.rigctld_process.take() {
+            eprintln!("Pancetta: killing managed rigctld (PID {})", child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 /// Coordinator configuration
@@ -248,6 +263,8 @@ impl ApplicationCoordinator {
             cached_lookup: std::sync::Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
             cqdx_bridge: None,
             waterfall_to_auto_tx: None,
+            #[cfg(feature = "pancetta-hamlib")]
+            rigctld_process: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(RwLock::new(None)),
             last_decode_timestamp: Arc::new(RwLock::new(None)),
@@ -493,7 +510,7 @@ impl ApplicationCoordinator {
         self.start_audio_pipeline(audio_to_dsp_tx).await?;
 
         // --- DSP component ---
-        self.start_dsp_pipeline(audio_to_dsp_rx, dsp_to_ft8_tx)
+        self.start_dsp_pipeline(audio_to_dsp_rx, dsp_to_ft8_tx, waterfall_tx.clone())
             .await?;
 
         // --- FT8 decoder component ---
@@ -655,18 +672,27 @@ impl ApplicationCoordinator {
 
             // Async relay: tokio mpsc → crossbeam point-to-point
             let handle = tokio::spawn(async move {
+                let mut relay_count: u64 = 0;
                 while let Some(samples) = result_rx.recv().await {
                     {
                         let mut timestamp = last_timestamp.write().await;
                         *timestamp = Some(Instant::now());
                     }
 
+                    let len = samples.len();
                     if audio_to_dsp_tx.send(samples).is_err() {
+                        info!("Audio relay: DSP channel closed after {} sends", relay_count);
                         break;
+                    }
+                    relay_count += 1;
+                    if relay_count == 1 {
+                        info!("Audio relay: first batch sent ({} samples)", len);
+                    } else if relay_count % 1000 == 0 {
+                        info!("Audio relay: {} batches sent so far", relay_count);
                     }
                 }
 
-                info!("Audio relay task stopped");
+                info!("Audio relay task stopped (total: {} batches)", relay_count);
                 Ok(())
             });
 
@@ -678,83 +704,219 @@ impl ApplicationCoordinator {
     }
 
     /// Start DSP pipeline with point-to-point channels
+    ///
+    /// Simple direct pipeline: resample 48kHz→12kHz on a dedicated thread,
+    /// accumulate FT8-sized windows, and send to the decoder.
     async fn start_dsp_pipeline(
         &mut self,
         audio_rx: crossbeam_channel::Receiver<Vec<f32>>,
         dsp_to_ft8_tx: crossbeam_channel::Sender<Vec<f32>>,
+        live_waterfall_tx: crossbeam_channel::Sender<Vec<Vec<f32>>>,
     ) -> Result<()> {
         let span = span!(Level::INFO, "start_dsp");
         let _enter = span.enter();
 
         info!("Starting DSP component");
 
-        // Create FT8-optimized DSP pipeline
-        let (mut dsp_pipeline, dsp_input_tx, dsp_output_rx) =
-            pancetta_dsp::factory::create_ft8_pipeline()?;
-
-        let shutdown_input = self.shutdown_signal.clone();
-        let shutdown_output = self.shutdown_signal.clone();
+        let shutdown = self.shutdown_signal.clone();
         let message_count = self.message_count.clone();
 
-        let handle = tokio::spawn(async move {
-            // Start the DSP pipeline
-            let pipeline_task = tokio::spawn(async move {
-                if let Err(e) = dsp_pipeline.start().await {
-                    error!("DSP pipeline error: {}", e);
-                }
-            });
+        let config = self.config.read().await;
+        let input_rate = config.audio.sample_rate;
+        let input_channels = config.audio.input_channels as u16;
+        drop(config);
 
-            // Input: read from audio point-to-point channel, feed DSP
-            let input_task = tokio::spawn(async move {
-                while !shutdown_input.load(Ordering::Acquire) {
-                    match audio_rx.try_recv() {
-                        Ok(samples) => {
-                            message_count.fetch_add(1, Ordering::Relaxed);
-                            if let Err(e) = dsp_input_tx.send(samples) {
-                                warn!("Failed to send samples to DSP: {}", e);
-                            }
+        let handle = tokio::task::spawn_blocking(move || {
+            // FT8 timing: transmissions start at 0/15/30/45 second marks.
+            // We need 12.64 seconds of audio at 12kHz = 151,680 samples per window.
+            // We align window capture to UTC 15-second boundaries for best decode.
+            let decimation_factor = (input_rate / 12000) as usize;
+            const FT8_SAMPLE_RATE: usize = 12000;
+            const FT8_WINDOW_SECONDS: f64 = 12.64;
+            const FT8_WINDOW_SAMPLES: usize = (FT8_SAMPLE_RATE as f64 * FT8_WINDOW_SECONDS) as usize; // 151,680
+
+            // FIR low-pass filter for anti-aliased decimation.
+            // 65-tap Kaiser-windowed sinc (beta=8, ~80dB stopband attenuation).
+            // Cutoff at 0.125 * Nyquist = 6kHz (= 12kHz/2, the decimated Nyquist).
+            let fir_len = decimation_factor * 16 + 1; // 65 taps for factor=4
+            let beta = 8.0f32; // Kaiser beta for ~80dB stopband
+            let fir_coeffs: Vec<f32> = (0..fir_len)
+                .map(|i| {
+                    let n = i as f32 - (fir_len - 1) as f32 / 2.0;
+                    let cutoff = 1.0 / (2.0 * decimation_factor as f32);
+                    // Windowed sinc
+                    let sinc = if n.abs() < 1e-6 {
+                        2.0 * cutoff
+                    } else {
+                        (2.0 * std::f32::consts::PI * cutoff * n).sin() / (std::f32::consts::PI * n)
+                    };
+                    // Kaiser window: I0(beta * sqrt(1 - (2i/(N-1) - 1)^2)) / I0(beta)
+                    let m = (fir_len - 1) as f32;
+                    let x = 2.0 * i as f32 / m - 1.0;
+                    let arg = beta * (1.0 - x * x).max(0.0).sqrt();
+                    // Approximate I0 (modified Bessel) with series expansion
+                    let i0 = |v: f32| -> f32 {
+                        let mut sum = 1.0f32;
+                        let mut term = 1.0f32;
+                        for k in 1..20 {
+                            term *= (v / (2.0 * k as f32)) * (v / (2.0 * k as f32));
+                            sum += term;
+                            if term < 1e-10 { break; }
                         }
-                        Err(crossbeam_channel::TryRecvError::Empty) => {
-                            tokio::task::yield_now().await;
-                        }
-                        Err(crossbeam_channel::TryRecvError::Disconnected) => break,
-                    }
-                }
-            });
+                        sum
+                    };
+                    let window = i0(arg) / i0(beta);
+                    sinc * window
+                })
+                .collect();
+            // Normalize filter
+            let fir_sum: f32 = fir_coeffs.iter().sum();
+            let fir_coeffs: Vec<f32> = fir_coeffs.iter().map(|c| c / fir_sum).collect();
 
-            // Output: accumulate DSP output into FT8-sized windows, send to FT8
-            let output_task = tokio::spawn(async move {
-                const FT8_WINDOW_SIZE: usize = 151680; // 12.64s at 12 kHz
-                let mut ft8_buffer = Vec::with_capacity(FT8_WINDOW_SIZE);
+            let mut fir_buffer: Vec<f32> = vec![0.0; fir_len];
+            let mut fir_pos: usize = 0;
+            let mut decimate_counter: usize = 0;
 
-                while !shutdown_output.load(Ordering::Acquire) {
-                    match dsp_output_rx.try_recv() {
-                        Ok(processed_samples) => {
-                            ft8_buffer.extend_from_slice(&processed_samples);
+            let mut ft8_buffer: Vec<f32> = Vec::with_capacity(FT8_WINDOW_SAMPLES * 2);
+            let mut window_count: u64 = 0;
+            let mut batch_count: u64 = 0;
+            let _waiting_for_boundary = true;
 
-                            while ft8_buffer.len() >= FT8_WINDOW_SIZE {
-                                let window: Vec<f32> =
-                                    ft8_buffer.drain(..FT8_WINDOW_SIZE).collect();
-                                if dsp_to_ft8_tx.send(window).is_err() {
-                                    return;
+            // Live waterfall state
+            let mut last_live_wf_samples: usize = 0;
+            let mut live_wf_planner = rustfft::FftPlanner::<f32>::new();
+            let live_wf_fft = live_wf_planner.plan_fft_forward(2048);
+
+            info!(
+                "DSP: {}Hz/{}ch → {}Hz mono (decimate {}:1, {}-tap FIR), window={}",
+                input_rate, input_channels, FT8_SAMPLE_RATE, decimation_factor, fir_len, FT8_WINDOW_SAMPLES
+            );
+
+            // Continuously capture audio — don't wait for boundaries.
+            // FT8 has both even (0/30s) and odd (15/45s) time slots.
+            // We send overlapping windows: one at each 15-second mark.
+            // The decoder handles time alignment internally via Costas sync.
+            let mut next_window_time = {
+                let now = chrono::Utc::now();
+                let secs = now.timestamp() % 15;
+                // Next 15-second boundary
+                let wait_secs = if secs == 0 { 0 } else { 15 - secs };
+                now + chrono::Duration::seconds(wait_secs)
+            };
+            info!("DSP: first window at {}", next_window_time.format("%H:%M:%S"));
+
+            while !shutdown.load(Ordering::Acquire) {
+
+                match audio_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(samples) => {
+                        message_count.fetch_add(1, Ordering::Relaxed);
+                        batch_count += 1;
+
+                        // Extract mono from interleaved multi-channel.
+                        // Use left channel only (channel 0) to avoid phase cancellation
+                        // that can occur when averaging L+R from USB audio codecs.
+                        let mono: Vec<f32> = if input_channels > 1 {
+                            samples
+                                .chunks(input_channels as usize)
+                                .map(|ch| ch[0])
+                                .collect()
+                        } else {
+                            samples
+                        };
+
+                        // Anti-aliased decimation: FIR low-pass + downsample
+                        for &sample in &mono {
+                            fir_buffer[fir_pos] = sample;
+                            fir_pos = (fir_pos + 1) % fir_len;
+                            decimate_counter += 1;
+
+                            if decimate_counter >= decimation_factor {
+                                decimate_counter = 0;
+                                // Apply FIR filter (convolution)
+                                let mut sum = 0.0f32;
+                                for (j, &coeff) in fir_coeffs.iter().enumerate() {
+                                    let idx = (fir_pos + j) % fir_len;
+                                    sum += fir_buffer[idx] * coeff;
                                 }
-                                debug!("Sent FT8 window ({} samples) to decoder", FT8_WINDOW_SIZE);
+                                ft8_buffer.push(sum);
                             }
                         }
-                        Err(crossbeam_channel::TryRecvError::Empty) => {
-                            tokio::task::yield_now().await;
-                            continue;
+
+                        // Live waterfall: emit one spectrum row per second using rustfft.
+                        // We keep a simple sample counter to trigger every ~1 second.
+                        const LIVE_WF_INTERVAL: usize = 12000; // 1 second at 12kHz
+                        const LIVE_WF_FFT_SIZE: usize = 2048;
+                        if ft8_buffer.len() >= LIVE_WF_FFT_SIZE {
+                            let samples_since_last = ft8_buffer.len() - last_live_wf_samples;
+                            if samples_since_last >= LIVE_WF_INTERVAL {
+                                last_live_wf_samples = ft8_buffer.len();
+
+                                let wf_start = ft8_buffer.len() - LIVE_WF_FFT_SIZE;
+                                let wf_slice = &ft8_buffer[wf_start..];
+
+                                // Use rustfft for a quick spectrum
+                                let mut input: Vec<rustfft::num_complex::Complex<f32>> = wf_slice
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, &s)| {
+                                        // Apply Hann window
+                                        let w = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / LIVE_WF_FFT_SIZE as f32).cos());
+                                        rustfft::num_complex::Complex::new(s * w, 0.0)
+                                    })
+                                    .collect();
+                                live_wf_fft.process(&mut input);
+
+                                // Extract 0–3000 Hz bins and convert to dB
+                                let freq_res = FT8_SAMPLE_RATE as f32 / LIVE_WF_FFT_SIZE as f32;
+                                let bin_end = (3000.0 / freq_res) as usize;
+                                let bin_end = bin_end.min(LIVE_WF_FFT_SIZE / 2);
+
+                                let powers: Vec<f32> = (0..=bin_end)
+                                    .map(|i| 10.0 * (input[i].norm_sqr() / LIVE_WF_FFT_SIZE as f32 + 1e-12).log10())
+                                    .collect();
+
+                                let min_p = powers.iter().cloned().fold(f32::MAX, f32::min);
+                                let max_p = powers.iter().cloned().fold(f32::MIN, f32::max);
+                                let range = (max_p - min_p).max(1.0);
+                                let row: Vec<f32> = powers.iter().map(|&p| (p - min_p) / range).collect();
+                                let _ = live_waterfall_tx.try_send(vec![row]);
+                            }
                         }
-                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                            break;
+
+                        // Send FT8 window when we have enough samples AND
+                        // we've reached the next 15-second boundary
+                        let now = chrono::Utc::now();
+                        if ft8_buffer.len() >= FT8_WINDOW_SAMPLES && now >= next_window_time {
+                            // Take the most recent FT8_WINDOW_SAMPLES from the buffer
+                            let start = ft8_buffer.len() - FT8_WINDOW_SAMPLES;
+                            let window: Vec<f32> = ft8_buffer[start..].to_vec();
+                            // Keep some overlap for the next window (retain last 1s worth)
+                            let keep = FT8_SAMPLE_RATE; // 12000 samples = 1 second
+                            if ft8_buffer.len() > keep {
+                                ft8_buffer.drain(..ft8_buffer.len() - keep);
+                                last_live_wf_samples = ft8_buffer.len();
+                            }
+                            window_count += 1;
+                            let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
+                            info!("DSP: FT8 window #{} (RMS={:.4}) at {}",
+                                window_count, rms, now.format("%H:%M:%S.%3f"));
+                            if dsp_to_ft8_tx.send(window).is_err() {
+                                info!("DSP: FT8 channel closed");
+                                return Ok(());
+                            }
+                            // Schedule next window at the next 15-second boundary
+                            next_window_time = next_window_time + chrono::Duration::seconds(15);
                         }
                     }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        info!("DSP: audio channel disconnected after {} batches", batch_count);
+                        break;
+                    }
                 }
-            });
+            }
 
-            let _ = tokio::try_join!(pipeline_task, input_task, output_task);
-
-            info!("DSP component stopped");
+            info!("DSP stopped ({} batches, {} windows sent)", batch_count, window_count);
             Ok(())
         });
 
@@ -783,50 +945,63 @@ impl ApplicationCoordinator {
         let message_bus = self.message_bus.clone();
         let self_waterfall_to_auto_tx = self.waterfall_to_auto_tx.clone();
 
-        let handle = tokio::spawn(async move {
+        // Run FT8 decoder on a dedicated thread to avoid tokio starvation
+        let handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Handle::current();
+            info!("FT8 decoder thread started");
+
             while !shutdown.load(Ordering::Acquire) {
-                match ft8_rx.try_recv() {
+                match ft8_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                     Ok(window) => {
-                        // Generate waterfall data from this audio window
-                        {
-                            let audio_f64: Vec<f64> = window.iter().map(|&s| s as f64).collect();
-                            match decoder.generate_waterfall_data(&audio_f64) {
-                                Ok(wf) => {
-                                    // Normalize power_matrix to 0..1 range as Vec<Vec<f32>>
-                                    let range = wf.max_power - wf.min_power;
-                                    let rows: Vec<Vec<f32>> = if range > 0.0 {
-                                        wf.power_matrix
-                                            .iter()
-                                            .map(|row| {
-                                                row.iter()
-                                                    .map(|&p| ((p - wf.min_power) / range) as f32)
-                                                    .collect()
-                                            })
-                                            .collect()
-                                    } else {
-                                        wf.power_matrix
-                                            .iter()
-                                            .map(|row| vec![0.0f32; row.len()])
-                                            .collect()
-                                    };
-                                    let _ = waterfall_tx.send(rows.clone());
-                                    // Also send to autonomous operator for frequency allocation
-                                    if let Some(ref auto_wf_tx) = self_waterfall_to_auto_tx {
-                                        let _ = auto_wf_tx.try_send(rows);
-                                    }
+                        info!("FT8 decoder: received window ({} samples)", window.len());
+
+                        // Generate waterfall data
+                        let audio_f64: Vec<f64> = window.iter().map(|&s| s as f64).collect();
+                        match decoder.generate_waterfall_data(&audio_f64) {
+                            Ok(wf) => {
+                                let range = wf.max_power - wf.min_power;
+                                info!(
+                                    "Waterfall: {}x{} matrix, power range {:.1}..{:.1} dB",
+                                    wf.power_matrix.len(),
+                                    wf.power_matrix.first().map(|r| r.len()).unwrap_or(0),
+                                    wf.min_power,
+                                    wf.max_power,
+                                );
+                                let rows: Vec<Vec<f32>> = if range > 0.0 {
+                                    wf.power_matrix
+                                        .iter()
+                                        .map(|row| {
+                                            row.iter()
+                                                .map(|&p| ((p - wf.min_power) / range) as f32)
+                                                .collect()
+                                        })
+                                        .collect()
+                                } else {
+                                    wf.power_matrix
+                                        .iter()
+                                        .map(|row| vec![0.0f32; row.len()])
+                                        .collect()
+                                };
+                                let _ = waterfall_tx.send(rows.clone());
+                                if let Some(ref auto_wf_tx) = self_waterfall_to_auto_tx {
+                                    let _ = auto_wf_tx.try_send(rows);
                                 }
-                                Err(e) => {
-                                    debug!("Waterfall generation error: {}", e);
-                                }
+                            }
+                            Err(e) => {
+                                warn!("Waterfall generation error: {}", e);
                             }
                         }
 
+                        // Decode FT8 signals
                         match decoder.decode_window(&window) {
                             Ok(decoded_messages) => {
-                                {
+                                // Update decode timestamp
+                                rt.block_on(async {
                                     let mut timestamp = last_decode_timestamp.write().await;
                                     *timestamp = Some(Instant::now());
-                                }
+                                });
+
+                                info!("FT8 decoder: {} messages decoded", decoded_messages.len());
 
                                 for decoded_msg in decoded_messages {
                                     info!(
@@ -841,49 +1016,48 @@ impl ApplicationCoordinator {
                                         warn!("TUI channel disconnected");
                                     }
 
-                                    // Also send to Autonomous via message bus
+                                    // Forward to other components via message bus
                                     let auto_msg = ComponentMessage::new(
                                         ComponentId::Ft8Decoder,
                                         ComponentId::Autonomous,
                                         MessageType::DecodedMessage(decoded_msg.clone()),
                                         Instant::now(),
                                     );
-                                    if let Err(e) = message_bus.send_message(auto_msg).await {
-                                        debug!("Failed to send to Autonomous: {}", e);
-                                    }
+                                    rt.block_on(async {
+                                        let _ = message_bus.send_message(auto_msg).await;
+                                    });
 
-                                    // Send to QSO manager for state tracking and logging
                                     let qso_msg = ComponentMessage::new(
                                         ComponentId::Ft8Decoder,
                                         ComponentId::Qso,
                                         MessageType::DecodedMessage(decoded_msg.clone()),
                                         Instant::now(),
                                     );
-                                    if let Err(e) = message_bus.send_message(qso_msg).await {
-                                        debug!("Failed to send to QSO: {}", e);
-                                    }
+                                    rt.block_on(async {
+                                        let _ = message_bus.send_message(qso_msg).await;
+                                    });
 
-                                    // Send to PSKReporter for spot upload
                                     let psk_msg = ComponentMessage::new(
                                         ComponentId::Ft8Decoder,
                                         ComponentId::PskReporter,
                                         MessageType::DecodedMessage(decoded_msg),
                                         Instant::now(),
                                     );
-                                    if let Err(e) = message_bus.send_message(psk_msg).await {
-                                        debug!("Failed to send to PSKReporter: {}", e);
-                                    }
+                                    rt.block_on(async {
+                                        let _ = message_bus.send_message(psk_msg).await;
+                                    });
                                 }
                             }
                             Err(e) => {
-                                debug!("FT8 decode error: {}", e);
+                                warn!("FT8 decode error: {}", e);
                             }
                         }
                     }
-                    Err(crossbeam_channel::TryRecvError::Empty) => {
-                        tokio::task::yield_now().await;
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        info!("FT8 decoder: input channel disconnected");
+                        break;
                     }
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                 }
             }
 
@@ -932,56 +1106,70 @@ impl ApplicationCoordinator {
             pancetta_dx::gridsquare::grid_to_coordinates(&config.station.grid_square).ok()
         };
 
-        // Task: relay decoded messages from point-to-point channel into TuiMessage channel
+        // Relay decoded messages from FT8 → TUI on a dedicated thread
+        // (tokio::spawn was causing starvation — same pattern as DSP/FT8 fixes)
         let relay_shutdown = shutdown.clone();
         let tui_msg_tx_relay = tui_msg_tx.clone();
-        let relay_handle = tokio::spawn(async move {
+        std::thread::Builder::new()
+            .name("tui-relay".to_string())
+            .spawn(move || {
+            let mut ft8_disconnected = false;
             while !relay_shutdown.load(Ordering::Acquire) {
-                match ft8_to_tui_rx.try_recv() {
-                    Ok(decoded_msg) => {
-                        let call_sign = decoded_msg.message.from_callsign.clone();
-                        let grid_square = decoded_msg.message.grid_square.clone();
+                if !ft8_disconnected {
+                    match ft8_to_tui_rx.try_recv() {
+                        Ok(decoded_msg) => {
+                            let call_sign = decoded_msg.message.from_callsign.clone();
+                            let grid_square = decoded_msg.message.grid_square.clone();
 
-                        // Compute distance and bearing if both grids are available
-                        let (distance, bearing) = match (&grid_square, &station_coords) {
-                            (Some(remote_grid), Some((home_lat, home_lon))) => {
-                                match pancetta_dx::gridsquare::grid_to_coordinates(remote_grid) {
-                                    Ok((remote_lat, remote_lon)) => {
-                                        let geod = geographiclib_rs::Geodesic::wgs84();
-                                        let (dist_m, azi1, _azi2, _arc) = geod
-                                            .inverse(*home_lat, *home_lon, remote_lat, remote_lon);
-                                        let bearing_deg =
-                                            if azi1 < 0.0 { azi1 + 360.0 } else { azi1 };
-                                        (Some(dist_m / 1000.0), Some(bearing_deg))
+                            // Compute distance and bearing if both grids are available
+                            let (distance, bearing) = match (&grid_square, &station_coords) {
+                                (Some(remote_grid), Some((home_lat, home_lon))) => {
+                                    match pancetta_dx::gridsquare::grid_to_coordinates(remote_grid)
+                                    {
+                                        Ok((remote_lat, remote_lon)) => {
+                                            let geod = geographiclib_rs::Geodesic::wgs84();
+                                            let (dist_m, azi1, _azi2, _arc) = geod.inverse(
+                                                *home_lat, *home_lon, remote_lat, remote_lon,
+                                            );
+                                            let bearing_deg =
+                                                if azi1 < 0.0 { azi1 + 360.0 } else { azi1 };
+                                            (Some(dist_m / 1000.0), Some(bearing_deg))
+                                        }
+                                        Err(_) => (None, None),
                                     }
-                                    Err(_) => (None, None),
                                 }
+                                _ => (None, None),
+                            };
+
+                            let tui_decoded = pancetta_tui::DecodedMessageView {
+                                timestamp: chrono::Utc::now(),
+                                frequency: f64::from_bits(
+                                    operating_freq_relay.load(Ordering::Relaxed),
+                                ),
+                                mode: "FT8".to_string(),
+                                snr: decoded_msg.snr_db as i32,
+                                delta_time: decoded_msg.time_offset as f32,
+                                delta_freq: decoded_msg.frequency_offset as f32,
+                                call_sign,
+                                grid_square,
+                                message: decoded_msg.text.clone(),
+                                distance,
+                                bearing,
+                            };
+
+                            match tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::DecodedMessage(tui_decoded),
+                            ) {
+                                Ok(()) => info!("TUI relay: forwarded decoded message to TUI channel"),
+                                Err(e) => warn!("TUI relay: failed to send to TUI: {}", e),
                             }
-                            _ => (None, None),
-                        };
-
-                        let tui_decoded = pancetta_tui::DecodedMessageView {
-                            timestamp: chrono::Utc::now(),
-                            frequency: f64::from_bits(operating_freq_relay.load(Ordering::Relaxed)),
-                            mode: "FT8".to_string(),
-                            snr: decoded_msg.snr_db as i32,
-                            delta_time: decoded_msg.time_offset as f32,
-                            delta_freq: decoded_msg.frequency_offset as f32,
-                            call_sign,
-                            grid_square,
-                            message: decoded_msg.text.clone(),
-                            distance,
-                            bearing,
-                        };
-
-                        let _ = tui_msg_tx_relay.send(
-                            pancetta_tui::tui_runner::TuiMessage::DecodedMessage(tui_decoded),
-                        );
+                        }
+                        Err(crossbeam_channel::TryRecvError::Empty) => {}
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            warn!("FT8 decoder channel disconnected, TUI relay continuing without decode data");
+                            ft8_disconnected = true;
+                        }
                     }
-                    Err(crossbeam_channel::TryRecvError::Empty) => {
-                        tokio::task::yield_now().await;
-                    }
-                    Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                 }
 
                 // Also drain control messages from the message bus
@@ -1042,15 +1230,17 @@ impl ApplicationCoordinator {
                     }
                     Err(_) => {}
                 }
+
+                // Sleep to prevent busy-spinning
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            Ok(())
-        });
-        self.named_task_handles
-            .push((ComponentId::Tui, relay_handle));
+            info!("TUI relay thread stopped");
+        }).expect("Failed to spawn TUI relay thread");
 
         // Task: relay TUI commands (e.g. SendMessage) to message bus as TransmitRequests
         let cmd_shutdown = self.shutdown_signal.clone();
         let cmd_message_bus = self.message_bus.clone();
+        let cmd_operating_freq = operating_freq.clone();
         let cmd_handle = tokio::spawn(async move {
             while !cmd_shutdown.load(Ordering::Acquire) {
                 match tui_cmd_rx.try_recv() {
@@ -1088,6 +1278,31 @@ impl ApplicationCoordinator {
                             if let Err(e) = cmd_message_bus.send_message(msg).await {
                                 warn!("Failed to forward CallStation command: {}", e);
                             }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::SetFrequency { vfo, frequency } => {
+                            info!("TUI SetFrequency: VFO {} → {} Hz", vfo, frequency);
+                            let freq_mhz = frequency as f64 / 1_000_000.0;
+                            cmd_operating_freq.store(freq_mhz.to_bits(), Ordering::Relaxed);
+                            // Forward to hamlib if available
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Hamlib,
+                                MessageType::RigControl(
+                                    crate::message_bus::RigControlMessage::SetFrequency {
+                                        vfo,
+                                        frequency,
+                                    },
+                                ),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                debug!("Failed to forward SetFrequency to hamlib: {}", e);
+                            }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::Quit => {
+                            info!("TUI requested application quit");
+                            cmd_shutdown.store(true, Ordering::Release);
+                            break;
                         }
                         _ => {
                             debug!("Unhandled TUI command: {:?}", cmd);
@@ -1137,10 +1352,7 @@ impl ApplicationCoordinator {
                 aggressive_decode: true,
                 enable_averaging: false,
             },
-            bands: pancetta_tui::config::BandConfig {
-                bands: vec![],
-                default_band: "20m".to_string(),
-            },
+            bands: pancetta_tui::Config::default().bands,
         };
         drop(tui_config_lock);
 
@@ -1155,13 +1367,17 @@ impl ApplicationCoordinator {
             })
         });
 
-        // Wrap the JoinHandle<Result<()>> to match our named_task_handles type
+        // Wrap the JoinHandle and ensure shutdown is triggered when TUI exits
+        let tui_shutdown = self.shutdown_signal.clone();
         let tui_wrapper = tokio::spawn(async move {
-            match tui_handle.await {
+            let result = match tui_handle.await {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(anyhow::anyhow!("TUI task panicked: {}", e)),
-            }
+            };
+            // Always trigger shutdown when TUI exits (user quit, crash, etc.)
+            tui_shutdown.store(true, Ordering::Release);
+            result
         });
         self.named_task_handles
             .push((ComponentId::Tui, tui_wrapper));
@@ -1196,6 +1412,29 @@ impl ApplicationCoordinator {
     }
 
     /// Start Hamlib component for rig control
+    /// Map rig model name to hamlib model number.
+    /// See: https://github.com/Hamlib/Hamlib/wiki/Supported-Radios
+    #[cfg(feature = "pancetta-hamlib")]
+    fn hamlib_model_id(model: &str) -> Option<u32> {
+        match model.to_lowercase().replace(['-', ' '], "").as_str() {
+            "ftdx10" => Some(1042),
+            "ftdx101d" | "ftdx101mp" => Some(1040),
+            "ft991" | "ft991a" => Some(1036),
+            "ft710" => Some(1046),
+            "ft891" => Some(1038),
+            "ft857" | "ft857d" => Some(1022),
+            "ft817" | "ft817nd" => Some(1020),
+            "ic7300" => Some(3073),
+            "ic7610" => Some(3078),
+            "ic7851" => Some(3075),
+            "ic705" => Some(3085),
+            "ic9700" => Some(3081),
+            "ts890" | "ts890s" => Some(2029),
+            "ts590" | "ts590s" | "ts590sg" => Some(2026),
+            _ => None,
+        }
+    }
+
     #[cfg(feature = "pancetta-hamlib")]
     async fn start_hamlib_component(&mut self) -> Result<()> {
         let span = span!(Level::INFO, "start_hamlib");
@@ -1203,32 +1442,97 @@ impl ApplicationCoordinator {
 
         info!("Starting Hamlib component");
 
-        let (hamlib_tx, hamlib_rx) = self.message_bus.create_channel(ComponentId::Hamlib).await?;
+        let (_hamlib_tx, hamlib_rx) = self.message_bus.create_channel(ComponentId::Hamlib).await?;
         let message_bus = self.message_bus.clone();
+
+        // Read rig config before spawning
+        let rig_config = {
+            let config = self.config.read().await;
+            config.rig.clone()
+        };
+
+        // Use mock rig only if explicitly requested via env var
+        let use_mock = std::env::var("PANCETTA_MOCK_RIG")
+            .map(|v| v.to_lowercase() == "true" || v == "1")
+            .unwrap_or(false);
+        let rig_enabled = rig_config.interface.enabled && !use_mock;
+
+        // Spawn rigctld as a managed child process if rig is enabled
+        // and no external rigctld is already running
+        let rigctld_port: u16 = std::env::var("RIGCTLD_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(4532);
+        let rigctld_host =
+            std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+
+        if rig_enabled {
+            // Check if rigctld is already running
+            let already_running = tokio::net::TcpStream::connect(
+                format!("{}:{}", rigctld_host, rigctld_port),
+            )
+            .await
+            .is_ok();
+
+            if already_running {
+                info!("rigctld already running on {}:{}", rigctld_host, rigctld_port);
+            } else if let Some(model_id) = Self::hamlib_model_id(&rig_config.model) {
+                // rigctld knows the correct serial parameters (stop bits, parity,
+                // flow control) for each rig model — we only need to specify
+                // model, port, and baud rate.
+                info!(
+                    "Spawning rigctld: model={} (hamlib {}), port={}, baud={}",
+                    rig_config.model, model_id,
+                    rig_config.interface.port, rig_config.interface.baud_rate
+                );
+
+                match std::process::Command::new("rigctld")
+                    .args([
+                        "-m", &model_id.to_string(),
+                        "-r", &rig_config.interface.port,
+                        "-s", &rig_config.interface.baud_rate.to_string(),
+                        "-t", &rigctld_port.to_string(),
+                        "-T", &rigctld_host,
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(child) => {
+                        info!("rigctld spawned (PID {})", child.id());
+                        self.rigctld_process = Some(child);
+                        // Give rigctld time to bind the port and open the serial device
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to spawn rigctld: {}. Install hamlib: brew install hamlib",
+                            e
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    "Unknown rig model '{}' — cannot determine hamlib ID. \
+                     Set RIGCTLD_HOST/RIGCTLD_PORT to use an external rigctld.",
+                    rig_config.model
+                );
+            }
+        }
 
         let hamlib_handle = {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                let use_mock = std::env::var("PANCETTA_MOCK_RIG")
-                    .map(|v| v.to_lowercase() == "true" || v == "1")
-                    .unwrap_or(true);
-
-                let rig: Box<dyn pancetta_hamlib::RigControl + Send + Sync> = if use_mock {
-                    info!("Using mock rig");
+                let rig: Box<dyn pancetta_hamlib::RigControl + Send + Sync> = if !rig_enabled {
+                    info!("Rig control disabled, using mock rig");
                     Box::new(pancetta_hamlib::MockRig::default())
                 } else {
-                    info!("Using rigctld client");
-                    let host =
-                        std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-                    let port = std::env::var("RIGCTLD_PORT")
-                        .ok()
-                        .and_then(|p| p.parse::<u16>().ok())
-                        .unwrap_or(4532);
+                    info!("Connecting to rigctld at {}:{}", rigctld_host, rigctld_port);
 
                     let config = pancetta_hamlib::RigctldConfig {
-                        host,
-                        port,
+                        host: rigctld_host,
+                        port: rigctld_port,
                         ..Default::default()
                     };
                     Box::new(pancetta_hamlib::RigctldClient::new(config))
@@ -1308,20 +1612,26 @@ impl ApplicationCoordinator {
                                     "PTT SAFETY WATCHDOG: PTT has been on for >{} seconds — forcing OFF",
                                     PTT_SAFETY_TIMEOUT_SECS
                                 );
-                                if let Err(e) = rig_for_watchdog
+                                match rig_for_watchdog
                                     .set_ptt(
                                         pancetta_hamlib::Vfo::Current,
                                         pancetta_hamlib::PttState::Off,
                                     )
                                     .await
                                 {
-                                    error!("PTT SAFETY WATCHDOG: failed to force PTT off: {}", e);
-                                } else {
-                                    warn!("PTT SAFETY WATCHDOG: PTT forced off successfully");
+                                    Ok(_) => {
+                                        warn!("PTT SAFETY WATCHDOG: PTT forced off successfully");
+                                        // Only clear timer on success — retry on next tick if it fails
+                                        let mut guard = ptt_watchdog_tracker.write().await;
+                                        *guard = None;
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "PTT SAFETY WATCHDOG: failed to force PTT off: {} — will retry in 1s",
+                                            e
+                                        );
+                                    }
                                 }
-                                // Clear the tracker so we don't keep firing
-                                let mut guard = ptt_watchdog_tracker.write().await;
-                                *guard = None;
                             }
                         }
                     }
@@ -1452,7 +1762,7 @@ impl ApplicationCoordinator {
                     ..Default::default()
                 };
 
-                let logger = match QsoLogger::new(logger_config, qso_manager.clone()).await {
+                let _logger = match QsoLogger::new(logger_config, qso_manager.clone()).await {
                     Ok(l) => {
                         info!("QSO logger initialized with database at {:?}", db_path);
                         if let Err(e) = l.start().await {
@@ -2831,7 +3141,7 @@ impl ApplicationCoordinator {
     }
 
     /// Graceful shutdown of all components
-    async fn shutdown(self) -> Result<()> {
+    async fn shutdown(mut self) -> Result<()> {
         let span = span!(Level::INFO, "coordinator_shutdown");
         let _enter = span.enter();
 
@@ -2839,19 +3149,10 @@ impl ApplicationCoordinator {
         self.is_running.store(false, Ordering::Release);
         self.shutdown_signal.store(true, Ordering::Release);
 
-        let shutdown_timeout = Duration::from_secs(10);
-        let start_time = Instant::now();
+        let per_task_timeout = Duration::from_secs(1);
 
-        for (index, (component_id, handle)) in self.named_task_handles.into_iter().enumerate() {
-            let remaining_time = shutdown_timeout.saturating_sub(start_time.elapsed());
-
-            if remaining_time.is_zero() {
-                warn!("Shutdown timeout reached, aborting remaining tasks");
-                handle.abort();
-                continue;
-            }
-
-            match tokio::time::timeout(remaining_time, handle).await {
+        for (index, (component_id, handle)) in std::mem::take(&mut self.named_task_handles).into_iter().enumerate() {
+            match tokio::time::timeout(per_task_timeout, handle).await {
                 Ok(Ok(_)) => {
                     debug!("Task {} ({}) completed successfully", index, component_id);
                 }
@@ -2862,19 +3163,20 @@ impl ApplicationCoordinator {
                     );
                 }
                 Err(_) => {
-                    warn!(
-                        "Task {} ({}) timed out during shutdown",
-                        index, component_id
-                    );
+                    debug!("Task {} ({}) timed out, aborting", index, component_id);
                 }
             }
         }
 
-        let shutdown_duration = start_time.elapsed();
-        info!(
-            "Graceful shutdown completed in {:.2}s",
-            shutdown_duration.as_secs_f64()
-        );
+        // Kill managed rigctld process
+        #[cfg(feature = "pancetta-hamlib")]
+        if let Some(mut child) = self.rigctld_process.take() {
+            info!("Stopping managed rigctld (PID {})", child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        info!("Graceful shutdown completed");
 
         Ok(())
     }

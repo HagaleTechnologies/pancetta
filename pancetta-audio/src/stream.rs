@@ -237,19 +237,50 @@ impl AudioStreamManager {
 
     /// Create the input stream for audio capture
     fn create_input_stream(&mut self) -> AudioResult<()> {
+        // Log available input devices for diagnostics
+        let all_devices = self.device_manager.list_devices();
+        for (_, info) in all_devices.iter() {
+            if info.supports_input {
+                tracing::info!(
+                    "Available input: \"{}\" (ch={:?}, rates={:?}, default={})",
+                    info.name,
+                    info.input_channels,
+                    info.input_sample_rates,
+                    info.is_default_input,
+                );
+            }
+        }
+
         // Get input device
         let input_device = if let Some(ref device_name) = self.config.input_device_name {
-            // Find specific device by name
-            let devices = self.device_manager.list_devices();
-            devices
-                .iter()
-                .find(|(_, info)| info.name == *device_name && info.supports_input)
-                .map(|(device, _)| device)
-                .ok_or_else(|| {
-                    AudioError::device(format!("Input device '{}' not found", device_name))
-                })?
+            if device_name.eq_ignore_ascii_case("default") {
+                self.device_manager.get_best_ft8_input_device()?
+            } else {
+                // Find device by name — pick the one with actual input configs
+                // (some devices appear multiple times with the same name on macOS)
+                let devices = self.device_manager.list_devices();
+                let candidate = devices
+                    .iter()
+                    .filter(|(_, info)| info.name == *device_name && info.supports_input)
+                    .max_by_key(|(_, info)| info.input_channels.len() + info.input_sample_rates.len());
+                match candidate {
+                    Some((device, info)) => {
+                        tracing::info!(
+                            "Selected input device '{}' (ch={:?}, rates={:?})",
+                            info.name, info.input_channels, info.input_sample_rates,
+                        );
+                        device
+                    }
+                    None => {
+                        tracing::warn!(
+                            "Input device '{}' not found, falling back to best available",
+                            device_name
+                        );
+                        self.device_manager.get_best_ft8_input_device()?
+                    }
+                }
+            }
         } else {
-            // Use best available input device
             self.device_manager.get_best_ft8_input_device()?
         };
 
@@ -270,22 +301,40 @@ impl AudioStreamManager {
 
         // Build the input stream — the producer is *moved* into the closure so
         // no Arc/Mutex is needed: the ringbuf producer is already Send.
-        let stream = input_device.build_input_stream(
-            &stream_config.into(),
-            move |data: &[f32], _info: &InputCallbackInfo| {
-                // Push raw f32 samples directly — zero allocation.
-                producer.push_audio_slice(data);
+        let sample_format = stream_config.sample_format();
+        let config: cpal::StreamConfig = stream_config.into();
 
-                // Record callback latency (best-effort).
-                let timer = CallbackTimer::start();
-                let latency_ns = timer.elapsed_ns();
-                let _ = producer.push_latency(latency_ns);
-            },
-            |err| {
-                eprintln!("Input stream error: {}", err);
-            },
-            None,
-        )?;
+        let stream = match sample_format {
+            cpal::SampleFormat::F32 => input_device.build_input_stream(
+                &config,
+                move |data: &[f32], _info: &InputCallbackInfo| {
+                    producer.push_audio_slice(data);
+                    let timer = CallbackTimer::start();
+                    let _ = producer.push_latency(timer.elapsed_ns());
+                },
+                |err| eprintln!("Input stream error: {}", err),
+                None,
+            )?,
+            cpal::SampleFormat::I16 => input_device.build_input_stream(
+                &config,
+                move |data: &[i16], _info: &InputCallbackInfo| {
+                    let float_data: Vec<f32> = data
+                        .iter()
+                        .map(|&s| s as f32 / i16::MAX as f32)
+                        .collect();
+                    producer.push_audio_slice(&float_data);
+                    let timer = CallbackTimer::start();
+                    let _ = producer.push_latency(timer.elapsed_ns());
+                },
+                |err| eprintln!("Input stream error: {}", err),
+                None,
+            )?,
+            format => {
+                return Err(crate::AudioError::Stream {
+                    message: format!("Unsupported sample format: {:?}", format),
+                });
+            }
+        };
 
         self.input_stream = Some(stream);
         Ok(())
@@ -295,17 +344,26 @@ impl AudioStreamManager {
     fn create_output_stream(&mut self) -> AudioResult<()> {
         // Get output device
         let output_device = if let Some(ref device_name) = self.config.output_device_name {
-            // Find specific device by name
-            let devices = self.device_manager.list_devices();
-            devices
-                .iter()
-                .find(|(_, info)| info.name == *device_name && info.supports_output)
-                .map(|(device, _)| device)
-                .ok_or_else(|| {
-                    AudioError::device(format!("Output device '{}' not found", device_name))
-                })?
+            if device_name.eq_ignore_ascii_case("default") {
+                self.device_manager.get_best_output_device()?
+            } else {
+                let devices = self.device_manager.list_devices();
+                let candidate = devices
+                    .iter()
+                    .filter(|(_, info)| info.name == *device_name && info.supports_output)
+                    .max_by_key(|(_, info)| info.output_channels.len() + info.output_sample_rates.len());
+                match candidate {
+                    Some((device, _)) => device,
+                    None => {
+                        tracing::warn!(
+                            "Output device '{}' not found, falling back to best available",
+                            device_name
+                        );
+                        self.device_manager.get_best_output_device()?
+                    }
+                }
+            }
         } else {
-            // Use best available output device
             self.device_manager.get_best_output_device()?
         };
 
