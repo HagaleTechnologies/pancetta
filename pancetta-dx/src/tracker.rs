@@ -87,7 +87,7 @@ pub struct EntityStats {
 
 /// DX Tracker database manager
 pub struct DxTracker {
-    connection: std::sync::Mutex<Connection>,
+    pub(crate) connection: std::sync::Mutex<Connection>,
 }
 
 impl DxTracker {

@@ -464,44 +464,9 @@ impl StatisticsEngine {
     }
 
     /// Get activity timeline
-    pub async fn get_activity_timeline(&self, days: i64) -> Result<Vec<ActivityTimelineEntry>> {
-        let mut timeline = Vec::new();
-
-        // This would analyze QSO history for significant events
-        // For now, create some sample entries
-
-        let now = Utc::now();
-
-        timeline.push(ActivityTimelineEntry {
-            date: now - Duration::days(1),
-            event_type: "milestone".to_string(),
-            description: "Reached 1,000 QSOs".to_string(),
-            values: [("qso_count".to_string(), "1000".to_string())].into(),
-        });
-
-        timeline.push(ActivityTimelineEntry {
-            date: now - Duration::days(7),
-            event_type: "new_dxcc".to_string(),
-            description: "Worked new DXCC entity: Bhutan (A5)".to_string(),
-            values: [
-                ("entity_code".to_string(), "306".to_string()),
-                ("callsign".to_string(), "A51AA".to_string()),
-            ]
-            .into(),
-        });
-
-        timeline.push(ActivityTimelineEntry {
-            date: now - Duration::days(14),
-            event_type: "contest".to_string(),
-            description: "Participated in CQ WW DX Contest".to_string(),
-            values: [
-                ("contest".to_string(), "CQ-WW-DX".to_string()),
-                ("qsos".to_string(), "150".to_string()),
-            ]
-            .into(),
-        });
-
-        Ok(timeline)
+    pub async fn get_activity_timeline(&self, _days: i64) -> Result<Vec<ActivityTimelineEntry>> {
+        // Return empty vec rather than fake hardcoded data
+        Ok(Vec::new())
     }
 
     /// Get top worked entities
@@ -537,42 +502,139 @@ impl StatisticsEngine {
     // Helper methods for statistics calculation
 
     async fn calculate_band_breakdown(&self) -> Result<HashMap<Band, u32>> {
-        // Not yet implemented — requires aggregate query across all entities
-        Ok(HashMap::new())
+        let conn = self.tracker.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT band, COUNT(*) as cnt FROM tracked_contacts GROUP BY band",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let band_str: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((band_str, count as u32))
+        })?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (band_str, count) = row?;
+            if let Ok(band) = band_str.parse::<Band>() {
+                result.insert(band, count);
+            }
+        }
+        Ok(result)
     }
 
     async fn calculate_mode_breakdown(&self) -> Result<HashMap<Mode, u32>> {
-        // Not yet implemented — requires aggregate query across all entities
-        Ok(HashMap::new())
+        let conn = self.tracker.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT mode, COUNT(*) as cnt FROM tracked_contacts GROUP BY mode",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let mode_str: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((mode_str, count as u32))
+        })?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (mode_str, count) = row?;
+            if let Ok(mode) = serde_json::from_str::<Mode>(&format!("\"{}\"", mode_str)) {
+                result.insert(mode, count);
+            }
+        }
+        Ok(result)
     }
 
     async fn calculate_yearly_breakdown(&self) -> Result<HashMap<u32, u32>> {
-        // Not yet implemented — requires date-based aggregate query
-        Ok(HashMap::new())
+        let conn = self.tracker.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT strftime('%Y', datetime) as yr, COUNT(*) as cnt FROM tracked_contacts GROUP BY yr",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let year_str: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((year_str, count as u32))
+        })?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (year_str, count) = row?;
+            if let Ok(year) = year_str.parse::<u32>() {
+                result.insert(year, count);
+            }
+        }
+        Ok(result)
     }
 
     async fn calculate_monthly_breakdown(&self) -> Result<HashMap<String, u32>> {
-        // Not yet implemented — requires date-based aggregate query
-        Ok(HashMap::new())
+        let conn = self.tracker.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT strftime('%Y-%m', datetime) as ym, COUNT(*) as cnt
+             FROM tracked_contacts
+             WHERE datetime >= datetime('now', '-12 months')
+             GROUP BY ym
+             ORDER BY ym",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let ym: String = row.get(0)?;
+            let count: i64 = row.get(1)?;
+            Ok((ym, count as u32))
+        })?;
+        let mut result = HashMap::new();
+        for row in rows {
+            let (ym, count) = row?;
+            result.insert(ym, count);
+        }
+        Ok(result)
     }
 
     async fn calculate_avg_qsos_per_day(&self) -> Result<f64> {
-        // Not yet implemented — requires date-based query
-        Ok(0.0)
+        let (first, last) = self.get_qso_date_range().await?;
+        match (first, last) {
+            (Some(first_date), Some(last_date)) => {
+                let days = last_date.signed_duration_since(first_date).num_days().max(1);
+                let conn = self.tracker.connection.lock().unwrap();
+                let total: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM tracked_contacts",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(total as f64 / days as f64)
+            }
+            _ => Ok(0.0),
+        }
     }
 
     async fn get_qso_date_range(&self) -> Result<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)> {
-        // Not yet implemented — requires MIN/MAX datetime query
-        Ok((None, None))
+        let conn = self.tracker.connection.lock().unwrap();
+        let result = conn.query_row(
+            "SELECT MIN(datetime), MAX(datetime) FROM tracked_contacts",
+            [],
+            |row| {
+                let min_str: Option<String> = row.get(0)?;
+                let max_str: Option<String> = row.get(1)?;
+                Ok((min_str, max_str))
+            },
+        )?;
+        let first = result
+            .0
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        let last = result
+            .1
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+        Ok((first, last))
     }
 
     async fn calculate_unique_callsigns(&self) -> Result<u32> {
-        // Not yet implemented — requires COUNT(DISTINCT callsign) query
-        Ok(0)
+        let conn = self.tracker.connection.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT callsign) FROM tracked_contacts",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
     }
 
     async fn calculate_longest_distance(&self) -> Result<Option<f64>> {
-        // Not yet implemented — QSO table doesn't store distance
+        // The tracked_contacts table does not store distance_km,
+        // so we cannot compute this from the database alone.
         Ok(None)
     }
 
@@ -584,18 +646,53 @@ impl StatisticsEngine {
     }
 
     async fn calculate_countries_per_continent(&self) -> Result<HashMap<String, u32>> {
-        // Not yet implemented — requires DXCC database join
-        Ok(HashMap::new())
+        let conn = self.tracker.connection.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT dxcc_entity FROM tracked_contacts GROUP BY dxcc_entity",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let entity_code: i64 = row.get(0)?;
+            Ok(entity_code as u16)
+        })?;
+        let mut continent_counts: HashMap<String, std::collections::HashSet<u16>> = HashMap::new();
+        for row in rows {
+            let entity_code = row?;
+            if let Some(entity) = self.dxcc.get_entity(entity_code) {
+                continent_counts
+                    .entry(entity.continent.clone())
+                    .or_default()
+                    .insert(entity_code);
+            }
+        }
+        Ok(continent_counts
+            .into_iter()
+            .map(|(continent, entities)| (continent, entities.len() as u32))
+            .collect())
     }
 
     async fn calculate_confirmation_rate(&self) -> Result<f64> {
-        // Not yet implemented — requires confirmation tracking query
-        Ok(0.0)
+        let conn = self.tracker.connection.lock().unwrap();
+        let (total, confirmed): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), SUM(CASE WHEN confirmation_status != '\"None\"' THEN 1 ELSE 0 END)
+             FROM tracked_contacts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if total == 0 {
+            Ok(0.0)
+        } else {
+            Ok((confirmed as f64 / total as f64) * 100.0)
+        }
     }
 
     async fn count_confirmed_entities(&self) -> Result<u32> {
-        // Not yet implemented — requires award_tracking table query
-        Ok(0)
+        let conn = self.tracker.connection.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(DISTINCT entity_code) FROM award_tracking WHERE status = '\"Confirmed\"'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count as u32)
     }
 }
 
