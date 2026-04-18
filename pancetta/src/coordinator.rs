@@ -519,7 +519,7 @@ impl ApplicationCoordinator {
 
         // --- TUI component ---
         if !self.headless {
-            self.start_tui_pipeline(ft8_to_tui_rx, tui_bus_rx, waterfall_rx.clone())
+            self.start_tui_pipeline(ft8_to_tui_rx, tui_bus_rx, waterfall_rx)
                 .await?;
         } else {
             // In headless mode, just drain decoded messages and log them
@@ -731,6 +731,13 @@ impl ApplicationCoordinator {
             // We need 12.64 seconds of audio at 12kHz = 151,680 samples per window.
             // We align window capture to UTC 15-second boundaries for best decode.
             let decimation_factor = (input_rate / 12000) as usize;
+            if input_rate as usize != decimation_factor * 12000 {
+                return Err(anyhow::anyhow!(
+                    "Audio sample rate {} Hz is not evenly divisible by 12000 Hz. \
+                     Supported rates: 12000, 24000, 48000, 96000.",
+                    input_rate
+                ));
+            }
             const FT8_SAMPLE_RATE: usize = 12000;
             const FT8_WINDOW_SECONDS: f64 = 12.64;
             const FT8_WINDOW_SAMPLES: usize = (FT8_SAMPLE_RATE as f64 * FT8_WINDOW_SECONDS) as usize; // 151,680

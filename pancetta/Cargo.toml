@@ -33,7 +33,6 @@ geographiclib-rs = { workspace = true }
 # Async runtime and coordination
 tokio = { version = "1.50", features = ["full", "rt-multi-thread"] }
 tokio-util = "0.7"
-futures = "0.3"
 
 # Inter-process communication
 crossbeam-channel = "0.5"
@@ -60,15 +59,12 @@ thiserror = "1.0"
 anyhow = "1.0"
 
 # System utilities
+serialport = "4.7"
 libc = "0.2"
 uuid = { version = "1.22", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
 num_cpus = "1.0"
-
-# Signal handling
-signal-hook = "0.3"
-signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
 
 # Performance monitoring
 metrics = "0.23"
@@ -76,6 +72,9 @@ metrics-exporter-prometheus = { version = "0.15", optional = true }
 
 # WAV file reading for playback mode
 hound = "3.5"
+
+# FFT for live waterfall
+rustfft = "6.4"
 
 [dev-dependencies]
 tempfile = "3.27"
@@ -86,8 +85,9 @@ tracing-test = "0.2"
 sysinfo = "0.30"
 
 [features]
-default = ["metrics"]
+default = ["metrics", "pancetta-hamlib"]
 metrics = []
+pancetta-hamlib = ["dep:pancetta-hamlib"]
 prometheus = ["metrics-exporter-prometheus"]
 tracing-json = []
 

@@ -24,12 +24,11 @@
 //! - Memory usage: <100MB
 //! - CPU usage: <25% on modern hardware
 
+#![allow(dead_code, unused_imports)]
+
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
-use futures::StreamExt;
 use pancetta_config::Config;
-use signal_hook::consts::SIGINT;
-use signal_hook_tokio::Signals;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -128,6 +127,17 @@ enum Commands {
     Benchmark(BenchmarkArgs),
     /// Benchmark decoder against ft8_lib reference
     BenchmarkDecode(BenchmarkDecodeArgs),
+    /// Interactive setup wizard for station, audio, rig, and PTT
+    Setup,
+    /// Test rig connection (serial port, CAT, PTT)
+    TestRig(TestRigArgs),
+}
+
+#[derive(Clone, Args)]
+struct TestRigArgs {
+    /// Test PTT by keying TX for 1 second (use with caution!)
+    #[arg(long)]
+    ptt: bool,
 }
 
 #[derive(Clone, Args)]
@@ -241,7 +251,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging first
-    init_logging(&cli)?;
+    let _log_guard = init_logging(&cli, cli.headless)?;
 
     info!(
         "Starting Pancetta v{} - High-Performance Amateur Radio FT8 Processing",
@@ -271,37 +281,14 @@ async fn run_application(cli: Cli) -> Result<()> {
 
     // Create shutdown signal handler
     let shutdown = Arc::new(AtomicBool::new(false));
-    let shutdown_clone = shutdown.clone();
 
-    // Set up signal handlers
+    // Set up Ctrl+C signal handler
     let shutdown_for_signals = shutdown.clone();
-    tokio::spawn(async move {
-        match Signals::new(&[SIGINT]) {
-            Ok(mut signals) => {
-                while let Some(signal) = signals.next().await {
-                    match signal {
-                        SIGINT => {
-                            info!("Received SIGINT, initiating graceful shutdown");
-                            shutdown_clone.store(true, Ordering::Release);
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to register signal handler: {}", e);
-                shutdown_clone.store(true, Ordering::Release);
-            }
-        }
-    });
-
-    // Alternative signal handler for Windows/cross-platform compatibility
     tokio::spawn(async move {
         if let Err(e) = signal::ctrl_c().await {
             error!("Failed to listen for ctrl+c: {}", e);
         }
-        warn!("Received Ctrl+C, initiating graceful shutdown");
+        info!("Received Ctrl+C, initiating graceful shutdown");
         shutdown_for_signals.store(true, Ordering::Release);
     });
 
@@ -354,6 +341,8 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         Commands::Info => info_command().await,
         Commands::Benchmark(args) => benchmark_command(args).await,
         Commands::BenchmarkDecode(args) => benchmark_decode_command(args).await,
+        Commands::Setup => setup_command().await,
+        Commands::TestRig(args) => test_rig_command(args, cli).await,
     }
 }
 
@@ -535,8 +524,6 @@ async fn load_configuration(cli: &Cli) -> Result<Config> {
 /// Interactive first-run setup wizard.
 /// Prompts for callsign, grid square, and saves the config file.
 fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
-    use std::io::{self, Write};
-
     println!();
     println!("=== Pancetta First-Run Setup ===");
     println!();
@@ -544,61 +531,15 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
     println!("(Press Enter to skip any field and use the default.)");
     println!();
 
-    // Callsign
-    print!("Your callsign [N0CALL]: ");
-    io::stdout().flush()?;
-    let mut callsign = String::new();
-    io::stdin().read_line(&mut callsign)?;
-    let callsign = callsign.trim().to_uppercase();
-    let callsign = if callsign.is_empty() {
-        "N0CALL".to_string()
-    } else {
-        callsign
-    };
-
-    // Grid square
-    print!(
-        "Your Maidenhead grid square [{}]: ",
-        config.station.grid_square
-    );
-    io::stdout().flush()?;
-    let mut grid = String::new();
-    io::stdin().read_line(&mut grid)?;
-    let grid = grid.trim().to_string();
-    let grid = if grid.is_empty() {
-        config.station.grid_square.clone()
-    } else {
-        grid
-    };
-
-    // Power
-    print!("TX power in watts [{}]: ", config.station.power_watts);
-    io::stdout().flush()?;
-    let mut power_str = String::new();
-    io::stdin().read_line(&mut power_str)?;
-    let power: u32 = power_str
-        .trim()
-        .parse()
-        .unwrap_or(config.station.power_watts);
-
     let mut new_config = config.clone();
-    new_config.station.callsign = callsign.clone();
-    new_config.station.grid_square = grid.clone();
-    new_config.station.power_watts = power;
+    setup_station(&mut new_config)?;
 
-    // Save config
     let config_dir = dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".pancetta");
     let config_path = config_dir.join("pancetta.toml");
 
-    print!("\nSave configuration to {}? [Y/n]: ", config_path.display());
-    io::stdout().flush()?;
-    let mut save_choice = String::new();
-    io::stdin().read_line(&mut save_choice)?;
-    let save = save_choice.trim().is_empty() || save_choice.trim().to_lowercase().starts_with('y');
-
-    if save {
+    if prompt_yes_no(&format!("Save configuration to {}?", config_path.display()), true)? {
         std::fs::create_dir_all(&config_dir)?;
         new_config
             .save_to_file(&config_path)
@@ -607,14 +548,478 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
     }
 
     println!();
-    println!("Station: {} / {} / {}W", callsign, grid, power);
+    println!(
+        "Station: {} / {} / {}W",
+        new_config.station.callsign, new_config.station.grid_square, new_config.station.power_watts
+    );
     println!("Setup complete! Starting Pancetta...");
     println!();
 
     Ok(Some(new_config))
 }
 
-fn init_logging(cli: &Cli) -> Result<()> {
+// ---------------------------------------------------------------------------
+// Setup wizard helpers
+// ---------------------------------------------------------------------------
+
+fn prompt_line(prompt: &str) -> Result<String> {
+    use std::io::{self, Write};
+    print!("{}", prompt);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(input.trim().to_string())
+}
+
+fn prompt_yes_no(prompt: &str, default_yes: bool) -> Result<bool> {
+    let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
+    let input = prompt_line(&format!("{} {}: ", prompt, hint))?;
+    if input.is_empty() {
+        return Ok(default_yes);
+    }
+    Ok(input.to_lowercase().starts_with('y'))
+}
+
+fn prompt_choice(prompt: &str, max: usize) -> Result<Option<usize>> {
+    let input = prompt_line(prompt)?;
+    if input.is_empty() {
+        return Ok(None);
+    }
+    match input.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= max => Ok(Some(n)),
+        _ => {
+            println!("  Invalid choice, keeping current setting.");
+            Ok(None)
+        }
+    }
+}
+
+fn setup_station(config: &mut Config) -> Result<()> {
+    println!("--- Station ---");
+    println!();
+
+    let input = prompt_line(&format!("  Callsign [{}]: ", config.station.callsign))?;
+    if !input.is_empty() {
+        config.station.callsign = input.to_uppercase();
+    }
+
+    let input = prompt_line(&format!("  Grid square [{}]: ", config.station.grid_square))?;
+    if !input.is_empty() {
+        config.station.grid_square = input;
+    }
+
+    let input = prompt_line(&format!("  TX power watts [{}]: ", config.station.power_watts))?;
+    if !input.is_empty() {
+        if let Ok(p) = input.parse::<u32>() {
+            config.station.power_watts = p;
+        } else {
+            println!("  Invalid number, keeping {}W.", config.station.power_watts);
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+fn setup_audio(config: &mut Config) -> Result<()> {
+    println!("--- Audio Devices ---");
+    println!();
+
+    match pancetta_audio::device::AudioDeviceManager::new() {
+        Ok(mgr) => {
+            let devices = mgr.list_devices();
+
+            // Input devices
+            let inputs: Vec<_> = devices
+                .iter()
+                .filter(|(_, info)| info.supports_input)
+                .collect();
+            if inputs.is_empty() {
+                println!("  No input devices found.");
+            } else {
+                println!("  Input devices:");
+                for (i, (_, info)) in inputs.iter().enumerate() {
+                    let marker = if info.is_default_input { " (system default)" } else { "" };
+                    println!("    [{}] {}{}", i + 1, info.name, marker);
+                }
+                let current = &config.audio.input_device;
+                if let Some(choice) = prompt_choice(
+                    &format!("  Select input device [current: {}]: ", current),
+                    inputs.len(),
+                )? {
+                    config.audio.input_device = inputs[choice - 1].1.name.clone();
+                }
+            }
+            println!();
+
+            // Output devices
+            let outputs: Vec<_> = devices
+                .iter()
+                .filter(|(_, info)| info.supports_output)
+                .collect();
+            if outputs.is_empty() {
+                println!("  No output devices found.");
+            } else {
+                println!("  Output devices:");
+                for (i, (_, info)) in outputs.iter().enumerate() {
+                    let marker = if info.is_default_output { " (system default)" } else { "" };
+                    println!("    [{}] {}{}", i + 1, info.name, marker);
+                }
+                let current = &config.audio.output_device;
+                if let Some(choice) = prompt_choice(
+                    &format!("  Select output device [current: {}]: ", current),
+                    outputs.len(),
+                )? {
+                    config.audio.output_device = outputs[choice - 1].1.name.clone();
+                }
+            }
+        }
+        Err(e) => {
+            println!("  Could not enumerate audio devices: {}", e);
+            println!("  You can manually enter device names.");
+            let input = prompt_line(&format!(
+                "  Input device [{}]: ",
+                config.audio.input_device
+            ))?;
+            if !input.is_empty() {
+                config.audio.input_device = input;
+            }
+            let input = prompt_line(&format!(
+                "  Output device [{}]: ",
+                config.audio.output_device
+            ))?;
+            if !input.is_empty() {
+                config.audio.output_device = input;
+            }
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+fn setup_rig(config: &mut Config) -> Result<()> {
+    println!("--- Rig Control ---");
+    println!();
+
+    let currently_enabled = config.rig.interface.enabled;
+    if !prompt_yes_no("  Enable rig control?", currently_enabled)? {
+        config.rig.interface.enabled = false;
+        println!("  Rig control disabled.");
+        println!();
+        return Ok(());
+    }
+    config.rig.interface.enabled = true;
+
+    // Rig model
+    let input = prompt_line(&format!("  Rig model [{}]: ", config.rig.model))?;
+    if !input.is_empty() {
+        config.rig.model = input;
+    }
+
+    // Serial port
+    println!();
+    match serialport::available_ports() {
+        Ok(ports) if !ports.is_empty() => {
+            println!("  Available serial ports:");
+            for (i, port) in ports.iter().enumerate() {
+                let detail = match &port.port_type {
+                    serialport::SerialPortType::UsbPort(usb) => {
+                        let product = usb.product.as_deref().unwrap_or("Unknown");
+                        let mfg = usb.manufacturer.as_deref().unwrap_or("");
+                        if mfg.is_empty() {
+                            product.to_string()
+                        } else {
+                            format!("{} ({})", product, mfg)
+                        }
+                    }
+                    serialport::SerialPortType::BluetoothPort => "Bluetooth".to_string(),
+                    serialport::SerialPortType::PciPort => "PCI".to_string(),
+                    _ => String::new(),
+                };
+                if detail.is_empty() {
+                    println!("    [{}] {}", i + 1, port.port_name);
+                } else {
+                    println!("    [{}] {} — {}", i + 1, port.port_name, detail);
+                }
+            }
+            if let Some(choice) = prompt_choice(
+                &format!("  Select serial port [current: {}]: ", config.rig.interface.port),
+                ports.len(),
+            )? {
+                config.rig.interface.port = ports[choice - 1].port_name.clone();
+            }
+        }
+        _ => {
+            println!("  No serial ports detected (or enumeration failed).");
+            let input = prompt_line(&format!(
+                "  Serial port path [{}]: ",
+                config.rig.interface.port
+            ))?;
+            if !input.is_empty() {
+                config.rig.interface.port = input;
+            }
+        }
+    }
+
+    // Baud rate
+    println!();
+    let baud_rates = [4800u32, 9600, 19200, 38400, 57600, 115200];
+    println!("  Baud rates:");
+    for (i, rate) in baud_rates.iter().enumerate() {
+        let marker = if *rate == config.rig.interface.baud_rate {
+            " (current)"
+        } else {
+            ""
+        };
+        println!("    [{}] {}{}", i + 1, rate, marker);
+    }
+    if let Some(choice) = prompt_choice("  Select baud rate: ", baud_rates.len())? {
+        config.rig.interface.baud_rate = baud_rates[choice - 1];
+    }
+
+    println!();
+    Ok(())
+}
+
+fn setup_ptt(config: &mut Config) -> Result<()> {
+    use pancetta_config::rig::PttMethod;
+
+    println!("--- PTT Control ---");
+    println!();
+
+    let methods = [
+        (PttMethod::None, "None (no PTT control)"),
+        (PttMethod::Cat, "CAT (via rig control)"),
+        (PttMethod::Serial, "Serial (RTS/DTR)"),
+        (PttMethod::Vox, "VOX (voice-operated)"),
+    ];
+
+    for (i, (_, desc)) in methods.iter().enumerate() {
+        println!("    [{}] {}", i + 1, desc);
+    }
+
+    let current = format!("{:?}", config.rig.ptt.method);
+    if let Some(choice) = prompt_choice(
+        &format!("  Select PTT method [current: {}]: ", current),
+        methods.len(),
+    )? {
+        config.rig.ptt.method = methods[choice - 1].0.clone();
+    }
+
+    println!();
+    Ok(())
+}
+
+fn setup_frequency(config: &mut Config) -> Result<()> {
+    println!("--- Frequency Control ---");
+    println!();
+
+    config.rig.frequency.control_enabled =
+        prompt_yes_no("  Enable frequency control?", config.rig.frequency.control_enabled)?;
+
+    if config.rig.frequency.control_enabled {
+        config.rig.frequency.follow_rig =
+            prompt_yes_no("  Follow rig frequency?", config.rig.frequency.follow_rig)?;
+    }
+
+    println!();
+    Ok(())
+}
+
+async fn setup_command() -> Result<()> {
+    println!();
+    println!("=== Pancetta Setup Wizard ===");
+    println!("Press Enter to keep the current value for any field.");
+    println!();
+
+    // Load existing config or defaults
+    let config_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".pancetta");
+    let config_path = config_dir.join("pancetta.toml");
+    let mut config = if config_path.exists() {
+        Config::load_from_file(&config_path).unwrap_or_default()
+    } else {
+        Config::default()
+    };
+
+    setup_station(&mut config)?;
+    setup_audio(&mut config)?;
+    setup_rig(&mut config)?;
+    setup_ptt(&mut config)?;
+    setup_frequency(&mut config)?;
+
+    // Summary
+    println!("=== Summary ===");
+    println!("  Station:   {} / {} / {}W", config.station.callsign, config.station.grid_square, config.station.power_watts);
+    println!("  Audio in:  {}", config.audio.input_device);
+    println!("  Audio out: {}", config.audio.output_device);
+    if config.rig.interface.enabled {
+        println!("  Rig:       {} on {} @ {}", config.rig.model, config.rig.interface.port, config.rig.interface.baud_rate);
+        println!("  PTT:       {:?}", config.rig.ptt.method);
+        println!("  Freq ctrl: {}", if config.rig.frequency.control_enabled { "enabled" } else { "disabled" });
+    } else {
+        println!("  Rig:       disabled");
+    }
+    println!();
+
+    if prompt_yes_no(&format!("Save to {}?", config_path.display()), true)? {
+        std::fs::create_dir_all(&config_dir)?;
+        config
+            .save_to_file(&config_path)
+            .with_context(|| format!("Failed to save config to {}", config_path.display()))?;
+        println!("Configuration saved.");
+    }
+
+    println!();
+    Ok(())
+}
+
+async fn test_rig_command(args: TestRigArgs, cli: &Cli) -> Result<()> {
+    use std::time::Duration;
+
+    println!();
+    println!("=== Pancetta Rig Test ===");
+    println!();
+
+    // Load config to get rig settings
+    let config = load_configuration(cli).await?;
+
+    if !config.rig.interface.enabled {
+        println!("Rig control is disabled in configuration.");
+        println!("Run 'pancetta setup' to configure your rig, or set rig.interface.enabled = true");
+        return Ok(());
+    }
+
+    let port_name = &config.rig.interface.port;
+    let baud_rate = config.rig.interface.baud_rate;
+
+    println!("Rig model:  {}", config.rig.model);
+    println!("Port:       {}", port_name);
+    println!("Baud rate:  {}", baud_rate);
+    println!("PTT method: {:?}", config.rig.ptt.method);
+    println!();
+
+    // Step 1: Check serial port exists
+    print!("[1/4] Checking serial port... ");
+    match serialport::available_ports() {
+        Ok(ports) => {
+            let found = ports.iter().any(|p| p.port_name == *port_name);
+            if found {
+                println!("FOUND");
+            } else {
+                println!("NOT FOUND");
+                println!();
+                println!("  Available ports:");
+                if ports.is_empty() {
+                    println!("    (none detected)");
+                } else {
+                    for p in &ports {
+                        println!("    {}", p.port_name);
+                    }
+                }
+                println!();
+                println!("  Check your USB cable and run 'pancetta setup' to select the right port.");
+                return Ok(());
+            }
+        }
+        Err(e) => {
+            println!("ERROR ({})", e);
+            return Ok(());
+        }
+    }
+
+    // Step 2: Open serial port
+    print!("[2/4] Opening serial port... ");
+    let port = serialport::new(port_name, baud_rate)
+        .timeout(Duration::from_secs(2))
+        .open();
+
+    let mut port = match port {
+        Ok(p) => {
+            println!("OK");
+            p
+        }
+        Err(e) => {
+            println!("FAILED");
+            println!();
+            match e.kind() {
+                serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) => {
+                    println!("  Permission denied. You may need to add your user to the 'dialout' group");
+                    println!("  or check device permissions on {}.", port_name);
+                }
+                serialport::ErrorKind::Io(std::io::ErrorKind::NotFound) => {
+                    println!("  Device not found. The rig may be powered off or USB cable disconnected.");
+                }
+                _ => {
+                    println!("  Error: {}", e);
+                }
+            }
+            return Ok(());
+        }
+    };
+
+    // Step 3: Try reading from port (check if rig is sending data)
+    print!("[3/4] Listening for rig data (2s)... ");
+    let mut buf = vec![0u8; 256];
+    match port.read(&mut buf) {
+        Ok(n) => {
+            println!("OK ({} bytes received)", n);
+            // Show first few bytes as hex for debugging
+            let hex: Vec<String> = buf[..n.min(16)].iter().map(|b| format!("{:02X}", b)).collect();
+            println!("       Data: {}", hex.join(" "));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            println!("OK (no unsolicited data — normal for most rigs)");
+        }
+        Err(e) => {
+            println!("ERROR ({})", e);
+        }
+    }
+
+    // Step 4: PTT test (only if requested)
+    if args.ptt {
+        use pancetta_config::rig::PttMethod;
+
+        println!("[4/4] Testing PTT...");
+        match config.rig.ptt.method {
+            PttMethod::None => {
+                println!("       PTT method is 'none' — skipping. Configure PTT in 'pancetta setup'.");
+            }
+            PttMethod::Serial => {
+                println!("       Asserting RTS for 1 second...");
+                if let Err(e) = port.write_request_to_send(true) {
+                    println!("       RTS ON failed: {}", e);
+                } else {
+                    println!("       RTS ON — check your rig's TX indicator");
+                    std::thread::sleep(Duration::from_secs(1));
+                    let _ = port.write_request_to_send(false);
+                    println!("       RTS OFF");
+                }
+            }
+            PttMethod::Cat => {
+                println!("       CAT PTT requires hamlib — not yet implemented in test mode.");
+                println!("       Serial port connectivity looks good though.");
+            }
+            PttMethod::Vox => {
+                println!("       VOX is audio-triggered — no serial test needed.");
+                println!("       VOX will activate when audio is sent to the rig.");
+            }
+            other => {
+                println!("       PTT method {:?} not supported in test mode.", other);
+            }
+        }
+    } else {
+        println!("[4/4] PTT test: skipped (use --ptt to test)");
+    }
+
+    println!();
+    println!("Rig test complete.");
+    Ok(())
+}
+
+fn init_logging(cli: &Cli, headless: bool) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     let log_level = if cli.verbose {
         "trace"
     } else if cli.debug {
@@ -636,10 +1041,7 @@ fn init_logging(cli: &Cli) -> Result<()> {
     let _ = std::fs::create_dir_all(&log_dir);
 
     let file_appender = tracing_appender::rolling::daily(&log_dir, "pancetta.log");
-    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
-
-    // Keep the guard alive for the process lifetime
-    std::mem::forget(_guard);
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let file_layer = tracing_subscriber::fmt::layer()
         .with_writer(non_blocking)
@@ -647,12 +1049,18 @@ fn init_logging(cli: &Cli) -> Result<()> {
         .with_target(true)
         .with_thread_ids(true);
 
-    // Console layer — always text format for now (JSON would need separate branch)
-    let console_layer = tracing_subscriber::fmt::layer()
-        .with_target(false)
-        .with_thread_ids(true)
-        .with_file(cli.debug || cli.verbose)
-        .with_line_number(cli.debug || cli.verbose);
+    // Console layer — only when running headless (TUI owns stdout otherwise)
+    let console_layer = if headless {
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_thread_ids(true)
+                .with_file(cli.debug || cli.verbose)
+                .with_line_number(cli.debug || cli.verbose),
+        )
+    } else {
+        None
+    };
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -660,7 +1068,7 @@ fn init_logging(cli: &Cli) -> Result<()> {
         .with(file_layer)
         .init();
 
-    Ok(())
+    Ok(guard)
 }
 
 #[cfg(test)]

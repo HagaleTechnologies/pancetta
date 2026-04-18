@@ -683,52 +683,54 @@ impl Ft8Decoder {
             for k in 0..pp.costas_length {
                 let symbol_idx = group_start + k;
                 // Each symbol occupies 2 time steps; use the first one
-                let time_idx = t0 + symbol_idx * 2;
+                for half in 0..2 {
+                    let time_idx = t0 + symbol_idx * 2 + half;
 
-                if time_idx >= spec.num_steps {
-                    continue;
-                }
+                    if time_idx >= spec.num_steps {
+                        continue;
+                    }
 
-                let sm = pp.costas_arrays[m][k] as usize; // expected tone bin
-                let freq_idx = f0 + sm;
+                    let sm = pp.costas_arrays[m][k] as usize; // expected tone bin
+                    let freq_idx = f0 + sm;
 
-                if freq_idx >= spec.num_bins {
-                    continue;
-                }
+                    if freq_idx >= spec.num_bins {
+                        continue;
+                    }
 
-                let signal_mag = spec.power[time_idx][freq_sub][freq_idx];
+                    let signal_mag = spec.power[time_idx][freq_sub][freq_idx];
 
-                // Check frequency neighbor below
-                if sm > 0 && f0 + sm - 1 < spec.num_bins {
-                    let neighbor = spec.power[time_idx][freq_sub][f0 + sm - 1];
-                    score += signal_mag - neighbor;
-                    num_average += 1;
-                }
-
-                // Check frequency neighbor above
-                if sm + 1 < pp.num_tones && f0 + sm + 1 < spec.num_bins {
-                    let neighbor = spec.power[time_idx][freq_sub][f0 + sm + 1];
-                    score += signal_mag - neighbor;
-                    num_average += 1;
-                }
-
-                // Check time neighbor behind (previous symbol in this sync group)
-                if k > 0 && time_idx > 0 {
-                    let prev_time = time_idx - 2; // previous symbol's time step
-                    if prev_time < spec.num_steps {
-                        let neighbor = spec.power[prev_time][freq_sub][freq_idx];
+                    // Check frequency neighbor below
+                    if sm > 0 && f0 + sm - 1 < spec.num_bins {
+                        let neighbor = spec.power[time_idx][freq_sub][f0 + sm - 1];
                         score += signal_mag - neighbor;
                         num_average += 1;
                     }
-                }
 
-                // Check time neighbor ahead (next symbol in this sync group)
-                if k + 1 < pp.costas_length {
-                    let next_time = time_idx + 2; // next symbol's time step
-                    if next_time < spec.num_steps {
-                        let neighbor = spec.power[next_time][freq_sub][freq_idx];
+                    // Check frequency neighbor above
+                    if sm + 1 < pp.num_tones && f0 + sm + 1 < spec.num_bins {
+                        let neighbor = spec.power[time_idx][freq_sub][f0 + sm + 1];
                         score += signal_mag - neighbor;
                         num_average += 1;
+                    }
+
+                    // Check time neighbor behind (previous symbol in this sync group)
+                    if k > 0 && time_idx > 0 {
+                        let prev_time = time_idx - 2; // previous symbol's time step
+                        if prev_time < spec.num_steps {
+                            let neighbor = spec.power[prev_time][freq_sub][freq_idx];
+                            score += signal_mag - neighbor;
+                            num_average += 1;
+                        }
+                    }
+
+                    // Check time neighbor ahead (next symbol in this sync group)
+                    if k + 1 < pp.costas_length {
+                        let next_time = time_idx + 2; // next symbol's time step
+                        if next_time < spec.num_steps {
+                            let neighbor = spec.power[next_time][freq_sub][freq_idx];
+                            score += signal_mag - neighbor;
+                            num_average += 1;
+                        }
                     }
                 }
             }
