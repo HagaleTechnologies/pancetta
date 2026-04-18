@@ -481,7 +481,7 @@ impl AutoSequencer {
                 self.update_sequence_activity(qso_id).await;
             }
 
-            SequenceAction::SendReportAck { qso_id, report } => {
+            SequenceAction::SendReportAck { qso_id, report: _ } => {
                 let progress = self
                     .qso_manager
                     .get_qso(qso_id)
@@ -863,7 +863,9 @@ impl AutoSequencer {
                     return false;
                 }
             } else {
-                // Overnight restriction (e.g., 22:00 to 06:00)
+                // Overnight allowed window (e.g., start=22, end=6 means allowed 22-06 UTC).
+                // The disallowed hours are those BOTH before start AND after end,
+                // i.e., the gap in the middle of the day (e.g., 07-21 for start=22, end=6).
                 if hour < restrictions.start_hour && hour > restrictions.end_hour {
                     return false;
                 }

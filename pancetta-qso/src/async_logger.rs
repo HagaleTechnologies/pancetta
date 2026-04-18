@@ -208,7 +208,7 @@ impl AsyncQsoLogger {
         let adif_content = tokio::fs::read_to_string(&input_path).await?;
         let adif_file = self.adif_processor.parse_string(&adif_content)?;
 
-        let total_count = adif_file.records.len();
+        let _total_count = adif_file.records.len();
         let mut imported_count = 0;
         let mut duplicate_count = 0;
         let mut error_count = 0;
@@ -379,19 +379,26 @@ impl AsyncQsoLogger {
 
     async fn handle_qso_completed(
         &self,
-        qso_id: QsoId,
+        _qso_id: QsoId,
         metadata: QsoMetadata,
     ) -> Result<(), AsyncLoggerError> {
+        // Extract signal reports from metadata (populated during state transition)
+        let their_report = metadata.reports.received.unwrap_or(0);
+        let our_report = metadata.reports.sent.unwrap_or(0);
+        let grid_square = metadata.grids.theirs.clone();
+        let completed_at = metadata.end_time.unwrap_or_else(Utc::now);
+        let duration_seconds = (completed_at - metadata.start_time).num_seconds().max(0) as u32;
+
         // Create a QsoProgress from the metadata
         let progress = QsoProgress {
             state: QsoState::Completed {
                 their_callsign: metadata.their_callsign.clone().unwrap_or_default(),
-                their_report: 0,
-                our_report: 0,
+                their_report,
+                our_report,
                 frequency: metadata.frequency,
-                grid_square: None,
-                completed_at: Utc::now(),
-                duration_seconds: 0,
+                grid_square,
+                completed_at,
+                duration_seconds,
             },
             state_history: vec![],
             messages: vec![],

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{interval, Duration as TokioDuration, Interval};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// QSO management errors
@@ -533,6 +533,30 @@ impl QsoManager {
             .await?;
 
         if new_state != old_state {
+            // If transitioning to Completed, update metadata with signal reports and end time
+            if let QsoState::Completed {
+                their_report,
+                our_report,
+                grid_square,
+                ..
+            } = &new_state
+            {
+                progress.metadata.reports = SignalReports {
+                    sent: Some(*our_report),
+                    received: Some(*their_report),
+                };
+                progress.metadata.end_time = Some(Utc::now());
+                if let Some(grid) = grid_square {
+                    progress.metadata.grids.theirs = Some(grid.clone());
+                }
+            }
+
+            let completed_metadata = if matches!(&new_state, QsoState::Completed { .. }) {
+                Some(progress.metadata.clone())
+            } else {
+                None
+            };
+
             progress.state = new_state.clone();
             progress.state_history.push(StateTransition {
                 from_state: old_state.clone(),
@@ -542,6 +566,15 @@ impl QsoManager {
             });
 
             self.emit_state_change(qso_id, old_state, new_state).await;
+
+            // Emit QsoCompleted event so loggers can auto-log the QSO
+            if let Some(metadata) = completed_metadata {
+                self.emit_event(QsoEvent::QsoCompleted {
+                    qso_id,
+                    metadata,
+                })
+                .await;
+            }
         }
 
         self.emit_event(QsoEvent::MessageReceived { qso_id, message })
@@ -681,7 +714,7 @@ impl QsoManager {
 
             (
                 QsoState::RespondingToCq {
-                    target_callsign, ..
+                    target_callsign: _, ..
                 },
                 MessageType::SignalReport { to_station, .. },
             ) => to_station == &self.config.our_callsign,
