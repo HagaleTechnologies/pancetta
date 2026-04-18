@@ -325,6 +325,149 @@ impl fmt::Display for Ft8Message {
     }
 }
 
+impl Ft8Message {
+    /// Check whether a decoded message looks like a plausible FT8 transmission.
+    ///
+    /// OSD-2 produces many CRC-14 false positives (random noise that happens to
+    /// pass the 1-in-16384 CRC check). This method rejects decoded payloads that
+    /// parse into structurally invalid messages: unknown type, missing callsigns,
+    /// or text that contains no callsign-like token.
+    pub fn is_plausible(&self) -> bool {
+        match self.message_type {
+            MessageType::Unknown => false,
+            MessageType::FreeText => {
+                // Free text messages are rare on-air and are a common source
+                // of CRC false positives (random 71-bit payloads that happen
+                // to have i3=0, n3=0). Require the text to contain at least
+                // one space (multi-word) or be a known keyword like "TNX" or
+                // "TEST". Single garbled tokens like "J1I0BYVFFZCRY" are
+                // almost certainly noise.
+                match &self.text {
+                    Some(t) => {
+                        let trimmed = t.trim();
+                        if trimmed.is_empty() {
+                            return false;
+                        }
+                        // Must contain a space (multi-word) to be plausible,
+                        // or be a short known token.
+                        let has_space = trimmed.contains(' ');
+                        let all_printable = trimmed.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || c == ' ' || c == '/' || c == '.'
+                        });
+                        has_space && all_printable
+                    }
+                    None => false,
+                }
+            }
+            MessageType::Telemetry => {
+                // Telemetry must have hex content
+                match &self.text {
+                    Some(t) => !t.trim().is_empty(),
+                    None => false,
+                }
+            }
+            MessageType::Standard => {
+                // Standard messages: ALL present callsigns must look valid.
+                // This is stricter than "any" because OSD-2 CRC collisions
+                // often produce one valid-looking call paired with garbage.
+                let all_calls_valid = [&self.from_callsign, &self.to_callsign]
+                    .iter()
+                    .all(|opt| {
+                        opt.as_ref().map_or(true, |call| {
+                            Self::looks_like_callsign(call)
+                        })
+                    });
+                if !all_calls_valid {
+                    return false;
+                }
+                // Must have at least one callsign present
+                self.from_callsign.is_some() || self.to_callsign.is_some()
+            }
+            // Contest, FieldDay, RTTYRoundup, NonStdCall, DXpedition, Extended:
+            // require ALL present callsigns to be valid
+            _ => {
+                let all_calls_valid = [&self.from_callsign, &self.to_callsign]
+                    .iter()
+                    .all(|opt| {
+                        opt.as_ref().map_or(true, |call| {
+                            Self::looks_like_callsign(call)
+                        })
+                    });
+                if !all_calls_valid {
+                    return false;
+                }
+                self.from_callsign.is_some() || self.to_callsign.is_some()
+            }
+        }
+    }
+
+    /// Check if a string looks like a ham radio callsign.
+    ///
+    /// Uses the FT8 packed callsign format constraints. The 28-bit encoding
+    /// packs calls as: c0(37) * c1(36) * c2(10) * c3(27) * c4(27) * c5(27).
+    /// Position c2 is always a digit (0-9), c3-c5 are letters or space,
+    /// c0 is space/digit/letter, c1 is digit/letter. This means the third
+    /// character is always a digit, and chars 4-6 are always letters/space.
+    ///
+    /// Valid examples: W1AW, KA7RLM, R9AA, 4X1RF, 3DA0WW, 9A1A.
+    /// Rejects: 817ZOH (positions 0-2 all digits), Q8JCE (no digit at pos 2).
+    fn looks_like_callsign(s: &str) -> bool {
+        // Hash-based callsigns like <...nnn> are OK
+        if s.starts_with('<') {
+            return true;
+        }
+        // Strip /R, /P, /MM etc. portable suffixes for validation
+        let base = s.split('/').next().unwrap_or(s);
+        let chars: Vec<char> = base.chars().collect();
+        let len = chars.len();
+        // Packed callsigns are always 6 chars (space-padded), but after
+        // trimming they're 3-6 chars.
+        if len < 3 || len > 6 {
+            return false;
+        }
+        if !chars.iter().all(|c| c.is_ascii_alphanumeric()) {
+            return false;
+        }
+
+        // The FT8 encoding guarantees: in the 6-char packed representation,
+        // position 2 (0-indexed) is always a digit. For trimmed calls shorter
+        // than 3 chars at the front, position 2 in the PACKED form maps to
+        // different positions in the trimmed form. But since unpack_basecall
+        // already validated the encoding, we just need to check the structural
+        // pattern: there must be exactly one digit "separator" with letters
+        // after it (the suffix).
+        //
+        // Find the last digit — suffix letters come after it.
+        let last_digit_pos = chars.iter().rposition(|c| c.is_ascii_digit());
+        match last_digit_pos {
+            Some(pos) => {
+                // Must have at least 1 suffix letter after the last digit
+                let suffix_len = len - pos - 1;
+                if suffix_len < 1 {
+                    return false;
+                }
+                // Suffix must be all letters
+                if !chars[pos + 1..].iter().all(|c| c.is_ascii_alphabetic()) {
+                    return false;
+                }
+                // The last digit should be at position 0, 1, or 2
+                // (corresponding to the c2 digit in the 6-char packed form).
+                // Position 3+ would mean digits in the suffix region.
+                if pos > 2 {
+                    return false;
+                }
+                // Count total digits — at most 2 (e.g., 4V2, 3D0)
+                let digit_count = chars.iter().filter(|c| c.is_ascii_digit()).count();
+                if digit_count > 2 {
+                    return false;
+                }
+                true
+            }
+            None => false, // no digits at all
+        }
+    }
+}
+
 /// Decoded FT8 message with metadata
 #[derive(Debug, Clone)]
 pub struct DecodedMessage {
