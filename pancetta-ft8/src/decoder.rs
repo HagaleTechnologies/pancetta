@@ -46,6 +46,10 @@ const SAMPLES_PER_SYMBOL: usize = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usiz
 /// Frequency oversampling rate (2 = sub-bin resolution)
 const FREQ_OSR: usize = 2;
 
+/// Time oversampling rate (2 = half-sub-symbol resolution, matching ft8_lib)
+/// Each symbol occupies 2 * TIME_OSR time steps in the spectrogram.
+const TIME_OSR: usize = 2;
+
 /// Target LLR variance for normalization (matches ft8_lib's ftx_normalize_logl)
 const LLR_TARGET_VARIANCE: f32 = 24.0;
 
@@ -58,8 +62,8 @@ const MAX_SYNC_CANDIDATES: usize = 100;
 /// Minimum frequency bin for FT8 search (16 bins × 6.25 Hz = 100 Hz)
 const MIN_FREQ_BIN: usize = 16;
 
-/// Non-maximum suppression radius in time steps (half-symbols)
-const NMS_TIME_RADIUS: usize = 4;
+/// Non-maximum suppression radius in time steps (scaled with TIME_OSR)
+const NMS_TIME_RADIUS: usize = 4 * TIME_OSR;
 
 /// Non-maximum suppression radius in frequency bins
 const NMS_FREQ_RADIUS: usize = 2;
@@ -120,7 +124,7 @@ impl Default for Ft8Config {
             frequency_range: 200.0,
             time_range: 2.0,
             max_decode_passes: 3,
-            osd_depth: Some(1),
+            osd_depth: Some(2),
         }
     }
 }
@@ -144,7 +148,7 @@ struct Spectrogram {
 
 /// Costas sync search candidate
 struct CostasCandidate {
-    /// Time step in spectrogram (half-symbol units)
+    /// Time step in spectrogram (quarter-symbol units with TIME_OSR=2)
     time_step: usize,
     /// Base frequency bin in spectrogram (bin * 6.25 Hz)
     freq_bin: usize,
@@ -663,7 +667,7 @@ impl Ft8Decoder {
         let block_size = pp.samples_per_symbol(SAMPLE_RATE);
         let freq_osr = FREQ_OSR;
         let nfft = block_size * freq_osr;
-        let step = block_size / 2; // half-symbol time oversampling
+        let step = block_size / (2 * TIME_OSR); // TIME_OSR=2 → quarter-symbol steps
 
         if audio.len() < block_size {
             return Err(Ft8Error::InsufficientData {
@@ -752,8 +756,9 @@ impl Ft8Decoder {
         let mut candidates = Vec::new();
         let pp = &self.protocol_params;
 
-        // A full message occupies num_symbols * 2 half-symbol steps.
-        let max_time_step = spectrogram.num_steps.saturating_sub(pp.num_symbols * 2 + 1);
+        // A full message occupies num_symbols * (2 * TIME_OSR) time steps.
+        let steps_per_symbol = 2 * TIME_OSR;
+        let max_time_step = spectrogram.num_steps.saturating_sub(pp.num_symbols * steps_per_symbol + 1);
 
         // Frequency range: need bins f0..f0+num_tones to all be valid
         let max_freq_bin = spectrogram.num_bins.saturating_sub(pp.num_tones);
@@ -806,11 +811,10 @@ impl Ft8Decoder {
     ) -> f64 {
         let pp = &self.protocol_params;
 
-        // Score each half-symbol step independently, then take the best.
-        // Both halves of a symbol carry the same tone, so each is a valid
-        // sync measurement.  Averaging across halves would halve the score
-        // (doubling num_average without doubling discriminating power),
-        // dropping clean signals below MIN_SYNC_SCORE.
+        // With TIME_OSR>1, the outer t0 loop already iterates at sub-symbol
+        // resolution, so we only need to check 2 half-symbol offsets within
+        // each t0 position (as in the original TIME_OSR=1 code).
+        let steps_per_symbol = 2 * TIME_OSR;
         let mut best_score = 0.0f64;
 
         for half in 0..2 {
@@ -820,7 +824,7 @@ impl Ft8Decoder {
             for (m, &group_start) in pp.costas_positions.iter().enumerate() {
                 for k in 0..pp.costas_length {
                     let symbol_idx = group_start + k;
-                    let time_idx = t0 + symbol_idx * 2 + half;
+                    let time_idx = t0 + symbol_idx * steps_per_symbol + half;
 
                     if time_idx >= spec.num_steps {
                         continue;
@@ -850,8 +854,8 @@ impl Ft8Decoder {
                     }
 
                     // Check time neighbor behind (previous symbol in this sync group)
-                    if k > 0 && time_idx > 0 {
-                        let prev_time = time_idx - 2; // previous symbol's time step
+                    if k > 0 && time_idx >= steps_per_symbol {
+                        let prev_time = time_idx - steps_per_symbol;
                         if prev_time < spec.num_steps {
                             let neighbor = spec.power[prev_time][freq_sub][freq_idx];
                             score += signal_mag - neighbor;
@@ -861,7 +865,7 @@ impl Ft8Decoder {
 
                     // Check time neighbor ahead (next symbol in this sync group)
                     if k + 1 < pp.costas_length {
-                        let next_time = time_idx + 2; // next symbol's time step
+                        let next_time = time_idx + steps_per_symbol;
                         if next_time < spec.num_steps {
                             let neighbor = spec.power[next_time][freq_sub][freq_idx];
                             score += signal_mag - neighbor;
@@ -942,7 +946,7 @@ impl Ft8Decoder {
         let sps = self.protocol_params.samples_per_symbol(SAMPLE_RATE);
         let tone_spacing = self.protocol_params.tone_spacing;
         let xor_sequence = self.protocol_params.xor_sequence;
-        let spec_step = sps / 2;
+        let spec_step = sps / (2 * TIME_OSR);
         let coarse_offset = candidate.time_step * spec_step;
 
         // ---- Spectrogram-based symbol extraction: try both freq_sub values ----
@@ -991,6 +995,17 @@ impl Ft8Decoder {
                         corrected_bits[0..PAYLOAD_BITS].to_owned()
                     };
                     let ft8_message = self.message_parser.parse_payload(&payload_bits)?;
+
+                    // Reject CRC false positives: verify the payload parses
+                    // into a structurally valid FT8 message (has callsigns, etc.)
+                    if !ft8_message.is_plausible() {
+                        #[cfg(feature = "debug-decode")]
+                        eprintln!(
+                            "    spectrogram path: CRC passed but message not plausible: {}",
+                            ft8_message
+                        );
+                        continue;
+                    }
 
                     // SNR estimate from spectrogram magnitudes (dB domain)
                     let snr_db = {
@@ -1142,6 +1157,17 @@ impl Ft8Decoder {
                     corrected_bits[0..PAYLOAD_BITS].to_owned()
                 };
                 let ft8_message = self.message_parser.parse_payload(&payload_bits)?;
+
+                // Reject CRC false positives: verify the payload parses
+                // into a structurally valid FT8 message (has callsigns, etc.)
+                if !ft8_message.is_plausible() {
+                    #[cfg(feature = "debug-decode")]
+                    eprintln!(
+                        "    fine-timing path: CRC passed but message not plausible: {}",
+                        ft8_message
+                    );
+                    continue;
+                }
 
                 // Estimate SNR from extracted tone magnitudes.
                 // Signal power: average squared magnitude of the best tone across data symbols.
@@ -1296,7 +1322,7 @@ impl Ft8Decoder {
     /// FFT, 3.125 Hz resolution). This eliminates ~2-4 dB of spectral leakage
     /// for sub-bin signals.
     ///
-    /// For each symbol, averages both half-symbol time steps for improved SNR.
+    /// For each symbol, averages all TIME_OSR*2 sub-steps for improved SNR.
     /// Returns magnitudes already in dB (matching spectrogram storage).
     fn extract_symbols_from_spectrogram(
         &self,
@@ -1310,12 +1336,13 @@ impl Ft8Decoder {
 
         let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
 
+        let steps_per_symbol = 2 * TIME_OSR;
+
         for sym_idx in 0..pp.num_symbols {
             let mut mags = [-120.0f64; NUM_TONES];
 
-            // Each symbol spans 2 half-symbol time steps
-            let t_step_a = t0 + sym_idx * 2;
-            let t_step_b = t_step_a + 1;
+            // Each symbol spans steps_per_symbol time steps
+            let t_base = t0 + sym_idx * steps_per_symbol;
 
             for tone in 0..pp.num_tones {
                 let freq_bin = f0 + tone;
@@ -1325,19 +1352,20 @@ impl Ft8Decoder {
                     continue;
                 }
 
-                // Average both half-symbol steps (in dB domain — close enough
-                // for the LLR max-log approximation, and avoids costly dB→linear→dB)
-                let db_a = if t_step_a < spectrogram.num_steps {
-                    spectrogram.power[t_step_a][fs][freq_bin]
+                // Average the first 2 sub-steps within this symbol (the
+                // center of the symbol window at the Costas-aligned offset).
+                // The finer time grid from TIME_OSR provides alignment via t0;
+                // we only need 2 adjacent steps for the actual magnitude.
+                let db_a = if t_base < spectrogram.num_steps {
+                    spectrogram.power[t_base][fs][freq_bin]
                 } else {
                     -120.0
                 };
-                let db_b = if t_step_b < spectrogram.num_steps {
-                    spectrogram.power[t_step_b][fs][freq_bin]
+                let db_b = if t_base + 1 < spectrogram.num_steps {
+                    spectrogram.power[t_base + 1][fs][freq_bin]
                 } else {
                     -120.0
                 };
-
                 mags[tone] = (db_a + db_b) / 2.0;
             }
 
@@ -1761,10 +1789,11 @@ impl LdpcDecoder {
             let parity_errors = self.count_parity_errors(llr_arr);
 
             // Threshold: only try OSD if BP nearly converged.
-            // OSD-1 has 91 trials × 1/16384 CRC false positive rate per
-            // candidate ≈ 0.6% per candidate. With 100 candidates that's
-            // ~0.6 false positives per window — acceptable.
-            const MAX_PARITY_ERRORS_FOR_OSD: usize = 5;
+            // OSD-2 has 4187 trials × 1/16384 CRC false-positive rate per
+            // candidate. Even with post-decode message validation, parity=5
+            // admits too many false positives with plausible-looking callsign
+            // structure. Parity=3 balances sensitivity and false-positive rate.
+            const MAX_PARITY_ERRORS_FOR_OSD: usize = 3;
 
             if parity_errors <= MAX_PARITY_ERRORS_FOR_OSD {
                 if let Some(codeword) = osd.decode(llr_arr) {
@@ -2091,7 +2120,8 @@ mod tests {
 
         // Create a spectrogram where Costas tones are present at t0=0, f0=240
         // Spectrogram stores log-magnitude (dB) values
-        let num_steps = 157;
+        let steps_per_symbol = 2 * TIME_OSR;
+        let num_steps = 79 * steps_per_symbol; // enough for 79 symbols
         let num_bins = SAMPLES_PER_SYMBOL / 2 + 1; // bins in 6.25 Hz units
         let freq_osr = FREQ_OSR;
         let noise_db = -40.0; // noise floor in dB
@@ -2101,13 +2131,16 @@ mod tests {
         let mut power = vec![vec![vec![noise_db; num_bins]; freq_osr]; num_steps];
 
         // Place Costas tones at the correct positions (freq_sub=0)
+        // Fill all sub-steps of each symbol with the signal
         for &group_start in &[0usize, 36, 72] {
             for j in 0..7 {
                 let sym = group_start + j;
-                let time_idx = sym * 2;
                 let tone = COSTAS[j] as usize;
-                if time_idx < num_steps && f0 + tone < num_bins {
-                    power[time_idx][0][f0 + tone] = signal_db;
+                for sub in 0..steps_per_symbol {
+                    let time_idx = sym * steps_per_symbol + sub;
+                    if time_idx < num_steps && f0 + tone < num_bins {
+                        power[time_idx][0][f0 + tone] = signal_db;
+                    }
                 }
             }
         }
