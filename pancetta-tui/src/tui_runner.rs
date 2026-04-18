@@ -7,7 +7,7 @@ use anyhow::Result;
 use chrono::Timelike;
 use crossbeam_channel::{Receiver, Sender};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -99,6 +99,8 @@ pub enum TuiCommand {
         input_device: Option<String>,
         output_device: Option<String>,
     },
+    /// User requested quit
+    Quit,
 }
 
 /// TUI performance metrics
@@ -159,10 +161,17 @@ impl TuiRunner {
 
             // Handle user input (with timeout)
             if event::poll(event_timeout)? {
-                if let Event::Key(key) = event::read()? {
-                    if !self.handle_key_event(key).await? {
-                        break; // User requested quit
+                match event::read()? {
+                    Event::Key(key) => {
+                        if !self.handle_key_event(key).await? {
+                            info!("TUI exit: user quit (key={:?})", key.code);
+                            break;
+                        }
                     }
+                    Event::FocusLost => {
+                        info!("TUI received FocusLost event");
+                    }
+                    _ => {}
                 }
             }
 
@@ -190,7 +199,7 @@ impl TuiRunner {
         }
 
         self.cleanup()?;
-        info!("TUI main loop completed");
+        info!("TUI main loop completed (frames={}, msgs={})", self.metrics.frames_rendered, self.metrics.messages_processed);
         Ok(())
     }
 
@@ -203,14 +212,17 @@ impl TuiRunner {
         while message_count < MAX_MESSAGES_PER_FRAME {
             match self.message_rx.try_recv() {
                 Ok(message) => {
+                    if matches!(message, TuiMessage::DecodedMessage(_)) {
+                        info!("TUI process_messages: received DecodedMessage");
+                    }
                     self.handle_message(message).await?;
                     message_count += 1;
                     self.metrics.messages_processed += 1;
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                    warn!("TUI message channel disconnected");
-                    return Ok(());
+                    warn!("TUI message channel disconnected — UI will continue without live data");
+                    break;
                 }
             }
         }
@@ -306,8 +318,9 @@ impl TuiRunner {
         }
 
         match key.code {
-            // Quit
-            KeyCode::Char('q') | KeyCode::Char('Q') => {
+            // Quit (Ctrl+Q)
+            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let _ = self.message_tx.send(TuiCommand::Quit);
                 return Ok(false);
             }
 
@@ -344,10 +357,12 @@ impl TuiRunner {
                 app.next_item();
             }
             KeyCode::Left => {
-                app.previous_page();
+                app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(100.0);
+                app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
             }
             KeyCode::Right => {
-                app.next_page();
+                app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(3000.0);
+                app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
             }
 
             // Function keys
@@ -371,6 +386,28 @@ impl TuiRunner {
             KeyCode::F(9) => {
                 // F9 - Toggle PTT
                 self.message_tx.send(TuiCommand::TogglePtt)?;
+            }
+
+            // TX frequency offset: [ = down 50 Hz, ] = up 50 Hz
+            KeyCode::Char('[') => {
+                app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(100.0);
+                app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+            }
+            KeyCode::Char(']') => {
+                app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(3000.0);
+                app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+            }
+
+            // Band switching: + = band up, - = band down
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                let freq_hz = app.band_up();
+                self.message_tx
+                    .send(TuiCommand::SetFrequency { vfo: 0, frequency: freq_hz })?;
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                let freq_hz = app.band_down();
+                self.message_tx
+                    .send(TuiCommand::SetFrequency { vfo: 0, frequency: freq_hz })?;
             }
 
             // Space - Select/activate (click-to-call)
@@ -410,8 +447,6 @@ impl TuiRunner {
     /// Render a frame
     async fn render_frame(&mut self) -> Result<()> {
         let app = self.app.read().await;
-        let metrics = self.metrics.clone();
-        let last_render = self.last_render;
 
         self.terminal.draw(|f| {
             let size = f.area();
@@ -427,10 +462,16 @@ impl TuiRunner {
                 .split(size);
 
             // Render header inline
+            let band_name = app
+                .config
+                .get_current_band(app.station_info.operating_frequency)
+                .map(|b| b.name.as_str())
+                .unwrap_or("??");
             let header_text = format!(
-                " Pancetta FT8 | {} | {} MHz | {} ",
+                " Pancetta FT8 | {} | {:.3} MHz {} | {} ",
                 app.station_info.call_sign,
-                app.station_info.operating_frequency / 1_000_000.0,
+                app.station_info.operating_frequency,
+                band_name,
                 app.station_info.mode
             );
             let header = Paragraph::new(header_text)
@@ -442,10 +483,9 @@ impl TuiRunner {
 
             // Render status bar inline
             let status_text = format!(
-                " TX: {} | S-meter: {} | FPS: {} | F1:Help F2:CQ F5:Clear D:Devices Q:Quit ",
-                if app.is_monitoring { "ON" } else { "OFF" },
-                app.audio_level as i32,
-                metrics.frames_rendered / last_render.elapsed().as_secs().max(1)
+                " Decoded: {} | TX {:.0}Hz | </>:TXfreq +/-:Band F1:Help F2:CQ D:Dev Ctrl+Q:Quit ",
+                app.decoded_messages.len(),
+                app.tx_frequency_offset,
             );
             let status = Paragraph::new(status_text)
                 .style(Style::default().bg(Color::Gray).fg(Color::White));
@@ -501,33 +541,73 @@ impl TuiRunner {
     fn render_waterfall_static(f: &mut Frame, area: Rect, app: &App) {
         use crate::widgets::Waterfall;
 
+        // Layout: frequency axis (top) + waterfall body
         let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(6), Constraint::Min(1)])
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
             .split(area);
 
-        // Frequency scale labels
-        let labels = [" 4000", " 3000", " 2000", " 1000", "  200"];
-        let usable_rows = chunks[0].height.saturating_sub(2) as usize;
-        let mut label_lines: Vec<ratatui::text::Line> = Vec::new();
-        for i in 0..usable_rows {
-            let idx = i * labels.len() / usable_rows.max(1);
-            let text = if idx < labels.len() {
-                labels[idx]
-            } else {
-                "     "
-            };
-            label_lines.push(ratatui::text::Line::from(text));
+        // Horizontal frequency axis: 0–3000 Hz
+        let axis_width = chunks[0].width as usize;
+        let axis_str;
+        if axis_width > 40 {
+            // Place tick labels at their proportional positions
+            let ticks: &[(f64, &str)] = &[
+                (0.0, "0"),
+                (500.0, "500"),
+                (1000.0, "1k"),
+                (1500.0, "1.5k"),
+                (2000.0, "2k"),
+                (2500.0, "2.5k"),
+                (3000.0, "3k"),
+            ];
+            let mut chars = vec![' '; axis_width];
+            // Draw a baseline
+            for c in chars.iter_mut() {
+                *c = '─';
+            }
+            for &(freq, label) in ticks {
+                let col = (freq / 3000.0 * (axis_width - 1) as f64) as usize;
+                if col < axis_width {
+                    chars[col] = '┬';
+                    for (i, ch) in label.chars().enumerate() {
+                        let pos = col + 1 + i;
+                        if pos < axis_width {
+                            chars[pos] = ch;
+                        }
+                    }
+                }
+            }
+            axis_str = chars.into_iter().collect();
+        } else {
+            axis_str = format!("{:─<width$}", "0 Hz ── 3000 Hz", width = axis_width);
         }
-        let label_block = Block::default().borders(Borders::RIGHT);
-        let label_paragraph = Paragraph::new(label_lines).block(label_block);
-        f.render_widget(label_paragraph, chunks[0]);
+        let axis_line = Paragraph::new(axis_str)
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(axis_line, chunks[0]);
 
+        // Collect recent decoded signal frequencies for overlay markers
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(30);
+        let signal_freqs: Vec<f64> = app
+            .decoded_messages
+            .iter()
+            .filter(|m| m.timestamp > cutoff)
+            .map(|m| m.frequency)
+            .collect();
+
+        let title = format!(
+            " Waterfall [/]: TX {:.0} Hz ",
+            app.tx_frequency_offset
+        );
         let waterfall_block = Block::default()
-            .title(" Waterfall ")
+            .title(title)
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded);
-        let waterfall = Waterfall::new(&app.waterfall_data).block(waterfall_block);
+
+        let waterfall = Waterfall::new(&app.waterfall_data)
+            .block(waterfall_block)
+            .tx_offset(app.tx_frequency_offset)
+            .signal_freqs(signal_freqs);
         f.render_widget(waterfall, chunks[1]);
     }
 

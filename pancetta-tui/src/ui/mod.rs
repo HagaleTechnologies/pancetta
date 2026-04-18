@@ -111,6 +111,16 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             format!("{:.3} MHz", app.station_info.operating_frequency),
             Style::default().fg(app.theme.warning_color()),
         ),
+        Span::raw(" "),
+        Span::styled(
+            app.config
+                .get_current_band(app.station_info.operating_frequency)
+                .map(|b| b.name.as_str())
+                .unwrap_or(""),
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(" | "),
         Span::styled(
             &app.station_info.mode,
@@ -222,7 +232,7 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         ),
         Span::raw(":Theme | "),
         Span::styled(
-            "Q",
+            "Ctrl+Q",
             Style::default()
                 .fg(app.theme.accent_color())
                 .add_modifier(Modifier::BOLD),
@@ -263,53 +273,29 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
-    // Split into frequency label column + waterfall display
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(6), Constraint::Min(1)])
-        .split(area);
+    // Collect recent decoded signal frequencies
+    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(30);
+    let signal_freqs: Vec<f64> = app
+        .decoded_messages
+        .iter()
+        .filter(|m| m.timestamp > cutoff)
+        .map(|m| m.frequency)
+        .collect();
 
-    // Frequency scale labels (200-4000 Hz range)
-    let freq_labels = vec![
-        " 4000", "     ", " 3000", "     ", " 2000", "     ", " 1000", "     ", "  200",
-    ];
-    let label_area = chunks[0];
-    let available_rows = label_area.height.saturating_sub(2) as usize; // minus borders
-    let mut label_lines: Vec<Line> = Vec::new();
-    if available_rows > 0 {
-        for i in 0..available_rows {
-            let label_idx = i * freq_labels.len() / available_rows;
-            let label = if label_idx < freq_labels.len() {
-                freq_labels[label_idx]
-            } else {
-                "     "
-            };
-            label_lines.push(Line::from(Span::styled(
-                label,
-                Style::default().fg(app.theme.muted_color()),
-            )));
-        }
-    }
-    let label_block = Block::default()
-        .title(Span::styled(
-            " Hz",
-            Style::default().fg(app.theme.muted_color()),
-        ))
-        .borders(Borders::RIGHT);
-    let label_paragraph = Paragraph::new(label_lines).block(label_block);
-    f.render_widget(label_paragraph, label_area);
-
-    // Waterfall display
+    let title = format!(" Waterfall [/]: TX {:.0} Hz ", app.tx_frequency_offset);
     let waterfall_block = Block::default()
         .title(Span::styled(
-            " Waterfall ",
+            title,
             Style::default().fg(app.theme.accent_color()),
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.border_color()));
 
-    let waterfall = Waterfall::new(&app.waterfall_data).block(waterfall_block);
-    f.render_widget(waterfall, chunks[1]);
+    let waterfall = Waterfall::new(&app.waterfall_data)
+        .block(waterfall_block)
+        .tx_offset(app.tx_frequency_offset)
+        .signal_freqs(signal_freqs);
+    f.render_widget(waterfall, area);
 }
 
 fn render_active_panel_highlight(f: &mut Frame<'_>, app: &App, panel_areas: &[Rect]) {

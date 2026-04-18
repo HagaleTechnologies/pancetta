@@ -58,12 +58,20 @@ struct RigctldState {
     last_signal_strength: i32,
 }
 
+/// A persistent connection to rigctld with a buffered reader.
+/// The BufReader must be kept alive across commands so that
+/// partially-read data isn't lost between calls.
+struct RigctldConnection {
+    reader: BufReader<tokio::io::ReadHalf<TcpStream>>,
+    writer: tokio::io::WriteHalf<TcpStream>,
+}
+
 /// Rigctld TCP client
 pub struct RigctldClient {
     /// Configuration
     config: RigctldConfig,
-    /// TCP stream (when connected)
-    stream: Arc<Mutex<Option<TcpStream>>>,
+    /// Persistent connection (reader + writer)
+    conn: Arc<Mutex<Option<RigctldConnection>>>,
     /// Internal state
     state: Arc<RwLock<RigctldState>>,
 }
@@ -73,7 +81,7 @@ impl RigctldClient {
     pub fn new(config: RigctldConfig) -> Self {
         Self {
             config,
-            stream: Arc::new(Mutex::new(None)),
+            conn: Arc::new(Mutex::new(None)),
             state: Arc::new(RwLock::new(RigctldState {
                 connected: false,
                 last_frequency: 0,
@@ -91,31 +99,37 @@ impl RigctldClient {
 
     /// Send a command and get response
     async fn send_command(&self, command: &str) -> Result<String> {
-        let mut stream_guard = self.stream.lock().await;
+        let mut conn_guard = self.conn.lock().await;
 
-        if let Some(stream) = stream_guard.as_mut() {
-            // Send command
+        if let Some(conn) = conn_guard.as_mut() {
             let cmd_with_newline = format!("{}\n", command);
             debug!("Sending rigctld command: {}", command);
 
-            stream.write_all(cmd_with_newline.as_bytes()).await?;
-            stream.flush().await?;
+            conn.writer
+                .write_all(cmd_with_newline.as_bytes())
+                .await?;
+            conn.writer.flush().await?;
 
-            // Read response
+            // Read response line (using persistent BufReader so buffered data isn't lost)
             let mut response = String::new();
-            let mut reader = BufReader::new(stream);
-
-            // Read with timeout
             match timeout(
                 Duration::from_millis(self.config.command_timeout_ms),
-                reader.read_line(&mut response),
+                conn.reader.read_line(&mut response),
             )
             .await
             {
+                Ok(Ok(0)) => {
+                    let mut state = self.state.write().await;
+                    state.connected = false;
+                    drop(state);
+                    drop(conn_guard);
+                    *self.conn.lock().await = None;
+                    Err(anyhow!("rigctld closed connection"))
+                }
                 Ok(Ok(_)) => {
                     response = response.trim().to_string();
 
-                    // Check for errors
+                    // Check for RPRT error/success codes
                     if response.starts_with("RPRT") {
                         let code = response
                             .split_whitespace()
@@ -127,17 +141,52 @@ impl RigctldClient {
                             return Err(anyhow!("Rigctld error code: {}", code));
                         }
 
-                        // Read actual data after RPRT 0
-                        response.clear();
-                        reader.read_line(&mut response).await?;
-                        response = response.trim().to_string();
+                        // RPRT 0 means success for set commands — no data follows
+                        debug!("Rigctld response: RPRT 0 (OK)");
+                        return Ok(String::new());
                     }
 
                     debug!("Rigctld response: {}", response);
                     Ok(response)
                 }
-                Ok(Err(e)) => Err(anyhow!("Failed to read response: {}", e)),
-                Err(_) => Err(anyhow!("Command timeout")),
+                Ok(Err(e)) => {
+                    let mut state = self.state.write().await;
+                    state.connected = false;
+                    drop(state);
+                    drop(conn_guard);
+                    *self.conn.lock().await = None;
+                    Err(anyhow!("Failed to read response: {}", e))
+                }
+                Err(_) => {
+                    let mut state = self.state.write().await;
+                    state.connected = false;
+                    drop(state);
+                    drop(conn_guard);
+                    *self.conn.lock().await = None;
+                    Err(anyhow!("Command timeout"))
+                }
+            }
+        } else {
+            Err(anyhow!("Not connected to rigctld"))
+        }
+    }
+
+    /// Read an additional line from the connection (for multi-line responses).
+    /// Must be called while the connection is still valid.
+    async fn read_extra_line(&self) -> Result<String> {
+        let mut conn_guard = self.conn.lock().await;
+        if let Some(conn) = conn_guard.as_mut() {
+            let mut line = String::new();
+            match timeout(
+                Duration::from_millis(self.config.command_timeout_ms),
+                conn.reader.read_line(&mut line),
+            )
+            .await
+            {
+                Ok(Ok(0)) => Err(anyhow!("rigctld closed connection (extra line)")),
+                Ok(Ok(_)) => Ok(line.trim().to_string()),
+                Ok(Err(e)) => Err(anyhow!("Failed to read extra line: {}", e)),
+                Err(_) => Err(anyhow!("Timeout reading extra line")),
             }
         } else {
             Err(anyhow!("Not connected to rigctld"))
@@ -176,7 +225,8 @@ impl RigctldClient {
             .map_err(|e| anyhow!("Failed to parse frequency: {}", e))
     }
 
-    /// Parse mode from response
+    /// Parse mode from response (mode + passband on one line, space-separated)
+    #[allow(dead_code)]
     fn parse_mode(response: &str) -> Result<(Mode, i32)> {
         let parts: Vec<&str> = response.split_whitespace().collect();
         if parts.len() >= 2 {
@@ -252,11 +302,14 @@ impl RigControl for RigctldClient {
 
         match connect_result {
             Ok(Ok(stream)) => {
-                // Set TCP keepalive
                 stream.set_nodelay(true)?;
 
-                // Store stream
-                *self.stream.lock().await = Some(stream);
+                // Split into reader/writer and wrap reader in BufReader
+                let (read_half, write_half) = tokio::io::split(stream);
+                *self.conn.lock().await = Some(RigctldConnection {
+                    reader: BufReader::new(read_half),
+                    writer: write_half,
+                });
 
                 // Update state
                 let mut state = self.state.write().await;
@@ -264,28 +317,19 @@ impl RigControl for RigctldClient {
 
                 info!("Successfully connected to rigctld");
 
-                // Test connection with a simple command
-                match timeout(
-                    Duration::from_millis(1000),
-                    self.send_command("\\dump_state"),
-                )
-                .await
-                {
-                    Ok(Ok(_)) => {
-                        info!("Rigctld connection verified");
+                // Verify with a simple frequency query
+                drop(state); // release write lock before send_command
+                match self.send_command("f").await {
+                    Ok(resp) => {
+                        info!("Rigctld connection verified (freq={})", resp);
                         Ok(())
                     }
-                    Ok(Err(e)) => {
+                    Err(e) => {
                         error!("Failed to verify connection: {}", e);
+                        let mut state = self.state.write().await;
                         state.connected = false;
-                        *self.stream.lock().await = None;
+                        *self.conn.lock().await = None;
                         Err(anyhow!("Connection verification failed: {}", e))
-                    }
-                    Err(_) => {
-                        error!("Connection verification timeout");
-                        state.connected = false;
-                        *self.stream.lock().await = None;
-                        Err(anyhow!("Connection verification timeout"))
                     }
                 }
             }
@@ -303,8 +347,8 @@ impl RigControl for RigctldClient {
     async fn disconnect(&self) -> Result<()> {
         info!("Disconnecting from rigctld");
 
-        // Close stream
-        *self.stream.lock().await = None;
+        // Close connection
+        *self.conn.lock().await = None;
 
         // Update state
         let mut state = self.state.write().await;
@@ -338,9 +382,14 @@ impl RigControl for RigctldClient {
 
     #[instrument(skip(self))]
     async fn set_frequency(&self, vfo: Vfo, frequency: u64) -> Result<()> {
-        // Rigctld expects frequency in Hz
-        let cmd = format!("\\set_freq {} {}", Self::vfo_to_string(vfo), frequency);
-        self.send_command_with_retry(&cmd).await?;
+        // Use short-form rigctld command: "F <freq>" sets current VFO frequency
+        // For non-current VFO, switch VFO first
+        if !matches!(vfo, Vfo::Current | Vfo::A) {
+            self.send_command_with_retry(&format!("V {}", Self::vfo_to_string(vfo)))
+                .await?;
+        }
+        self.send_command_with_retry(&format!("F {}", frequency))
+            .await?;
 
         // Update cached value
         let mut state = self.state.write().await;
@@ -350,8 +399,12 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_frequency(&self, vfo: Vfo) -> Result<u64> {
-        let cmd = format!("\\get_freq {}", Self::vfo_to_string(vfo));
-        let response = self.send_command_with_retry(&cmd).await?;
+        // Use short-form: "f" gets current VFO frequency
+        if !matches!(vfo, Vfo::Current | Vfo::A) {
+            self.send_command_with_retry(&format!("V {}", Self::vfo_to_string(vfo)))
+                .await?;
+        }
+        let response = self.send_command_with_retry("f").await?;
         let frequency = Self::parse_frequency(&response)?;
 
         // Update cached value
@@ -380,10 +433,13 @@ impl RigControl for RigctldClient {
         Ok(())
     }
 
-    async fn get_mode(&self, vfo: Vfo) -> Result<(Mode, i32)> {
-        let cmd = format!("\\get_mode {}", Self::vfo_to_string(vfo));
-        let response = self.send_command_with_retry(&cmd).await?;
-        let (mode, passband) = Self::parse_mode(&response)?;
+    async fn get_mode(&self, _vfo: Vfo) -> Result<(Mode, i32)> {
+        // Use short-form "m" which returns two lines: mode\npassband\n
+        // We must consume both lines to keep the BufReader in sync.
+        let mode_str = self.send_command_with_retry("m").await?;
+        let passband_str = self.read_extra_line().await.unwrap_or_default();
+        let mode = Self::string_to_mode(&mode_str);
+        let passband = passband_str.parse::<i32>().unwrap_or(0);
 
         // Update cached value
         let mut state = self.state.write().await;
@@ -515,8 +571,10 @@ impl RigControl for RigctldClient {
     }
 
     async fn get_info(&self) -> Result<String> {
-        // Get rig info from rigctld
-        let response = self.send_command_with_retry("\\dump_state").await?;
+        // NOTE: \dump_state returns dozens of lines and corrupts the BufReader
+        // stream. Use the single-line \get_info command instead which returns
+        // just the rig model/info string.
+        let response = self.send_command_with_retry("\\get_info").await?;
         Ok(response)
     }
 }
