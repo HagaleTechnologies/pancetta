@@ -74,6 +74,17 @@ Design spec: `docs/superpowers/specs/2026-04-02-end-to-end-qso-design.md`
 - `is_duplicate` ignores freq_hz (no band-aware dedup yet)
 - cqdx.io `GET /spots?live=true` response envelope key (`groups`) unverified against live API
 
+## Documentation Maintenance
+
+After completing significant work, update affected documentation:
+
+- **Inline docs**: Update `///` and `//!` comments on modified public items
+- **CLAUDE.md**: Update known gaps, build instructions, or project phases
+- **docs/ARCHITECTURE.md**: Update if crate relationships or data flows changed
+- **README.md / FEATURES.md**: Update if user-facing capabilities changed
+
+All crates have `#![warn(missing_docs)]` enabled — the compiler will flag undocumented public items.
+
 ## Build Hygiene
 
 The `target/` directory can balloon to 40-50GB with stale incremental compilation caches. Run periodically:
