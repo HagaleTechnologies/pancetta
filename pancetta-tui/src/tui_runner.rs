@@ -52,6 +52,25 @@ pub struct TuiRunner {
     metrics: TuiMetrics,
 }
 
+/// Lightweight spot info for TUI display (avoids pancetta-cqdx dependency)
+#[derive(Debug, Clone)]
+pub struct CqdxSpotInfo {
+    pub dx_call: String,
+    pub band: String,
+    pub mode: String,
+    pub frequency_hz: u64,
+    pub grid: Option<String>,
+    pub rarity_tier: String,
+    pub reporter_count: u32,
+    pub best_snr: Option<i32>,
+    pub confidence: f64,
+    pub first_seen: i64,
+    pub last_seen: i64,
+    pub is_notable: bool,
+    pub notable_type: Option<String>,
+    pub entity_name: String,
+}
+
 /// Messages received by the TUI
 #[derive(Debug, Clone)]
 pub enum TuiMessage {
@@ -75,6 +94,8 @@ pub enum TuiMessage {
     StatusUpdate { component: String, status: String },
     /// Waterfall display data (normalized power rows, each Vec<f32> is one time-slice)
     WaterfallUpdate { rows: Vec<Vec<f32>> },
+    /// Live spot groups from cqdx.io
+    SpotGroupUpdate { spots: Vec<CqdxSpotInfo> },
 }
 
 /// Commands sent from TUI
@@ -274,6 +295,9 @@ impl TuiRunner {
             }
             TuiMessage::WaterfallUpdate { rows } => {
                 app.push_waterfall_rows(rows);
+            }
+            TuiMessage::SpotGroupUpdate { spots } => {
+                app.merge_spot_groups(&spots);
             }
         }
 

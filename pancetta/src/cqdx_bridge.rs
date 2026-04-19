@@ -19,6 +19,8 @@ pub struct CqdxBridge {
     cache: Arc<RwLock<CqdxCache>>,
     cached_lookup: Arc<CachedStationLookup>,
     poll_interval: Duration,
+    /// Current band, updated by coordinator when radio frequency changes.
+    current_band: Arc<RwLock<Option<String>>>,
 }
 
 impl CqdxBridge {
@@ -42,6 +44,7 @@ impl CqdxBridge {
             cache: Arc::new(RwLock::new(CqdxCache::new())),
             cached_lookup,
             poll_interval: Duration::from_secs(config.poll_interval_secs),
+            current_band: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -68,19 +71,25 @@ impl CqdxBridge {
         Ok(())
     }
 
+    /// Update the current band filter for the spot poller.
+    pub async fn set_current_band(&self, band: Option<String>) {
+        *self.current_band.write().await = band;
+    }
+
     /// Spawn a background task that polls live spot groups every N seconds.
     /// Stops polling if no decode activity for 2 hours (watchdog).
     pub fn spawn_spot_poller(
         &self,
         shutdown: Arc<AtomicBool>,
         last_decode: Arc<RwLock<Option<Instant>>>,
-        band: Option<String>,
         mode: Option<String>,
+        tui_tx: Option<crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>>,
     ) -> tokio::task::JoinHandle<()> {
         let client = self.client.clone();
         let cache = self.cache.clone();
         let cached_lookup = self.cached_lookup.clone();
         let interval = self.poll_interval;
+        let current_band_ref = self.current_band.clone();
         let watchdog_timeout = std::time::Duration::from_secs(2 * 60 * 60); // 2 hours
 
         tokio::spawn(async move {
@@ -123,8 +132,9 @@ impl CqdxBridge {
                     last_backoff_attempt = std::time::Instant::now();
                 }
 
+                let current_band = current_band_ref.read().await.clone();
                 match client
-                    .fetch_live_spots(band.as_deref(), mode.as_deref())
+                    .fetch_live_spots(current_band.as_deref(), mode.as_deref())
                     .await
                 {
                     Ok(groups) => {
@@ -137,6 +147,58 @@ impl CqdxBridge {
                             .map(|g| (g.dx_call.to_uppercase(), rank_to_rarity(g.rarity_rank)))
                             .collect();
                         cached_lookup.update_rarity_scores(rarity_map);
+
+                        // Update notable callsigns
+                        let notables: std::collections::HashSet<String> = groups
+                            .iter()
+                            .filter(|g| g.is_notable)
+                            .map(|g| g.dx_call.to_uppercase())
+                            .collect();
+                        cached_lookup.update_notable_callsigns(notables);
+
+                        // Update network SNR data
+                        let snr_data: HashMap<String, (u32, i32)> = groups
+                            .iter()
+                            .filter_map(|g| {
+                                g.best_snr
+                                    .map(|snr| (g.dx_call.to_uppercase(), (g.reporter_count, snr)))
+                            })
+                            .collect();
+                        cached_lookup.update_network_snr(snr_data);
+
+                        // Update network last-seen timestamps
+                        let last_seen_data: HashMap<String, i64> = groups
+                            .iter()
+                            .map(|g| (g.dx_call.to_uppercase(), g.last_seen))
+                            .collect();
+                        cached_lookup.update_network_last_seen(last_seen_data);
+
+                        // Push spot groups to TUI
+                        if let Some(ref tx) = tui_tx {
+                            let spot_infos: Vec<pancetta_tui::tui_runner::CqdxSpotInfo> = groups
+                                .iter()
+                                .map(|g| pancetta_tui::tui_runner::CqdxSpotInfo {
+                                    dx_call: g.dx_call.clone(),
+                                    band: g.band.clone(),
+                                    mode: g.mode.clone(),
+                                    frequency_hz: g.frequency,
+                                    grid: g.dx_grid.clone(),
+                                    rarity_tier: g.rarity_tier.clone(),
+                                    reporter_count: g.reporter_count,
+                                    best_snr: g.best_snr,
+                                    confidence: g.confidence,
+                                    first_seen: g.first_seen,
+                                    last_seen: g.last_seen,
+                                    is_notable: g.is_notable,
+                                    notable_type: g.notable_type.clone(),
+                                    entity_name: g.dx_entity_name.clone(),
+                                })
+                                .collect();
+                            let _ =
+                                tx.send(pancetta_tui::tui_runner::TuiMessage::SpotGroupUpdate {
+                                    spots: spot_infos,
+                                });
+                        }
 
                         // Update cache
                         let mut c = cache.write().await;
@@ -178,6 +240,21 @@ impl CqdxBridge {
                 debug!("Failed to report QSO to cqdx.io: {}", e);
             }
         });
+    }
+
+    /// Get current spot frequencies and rarities for frequency nudging.
+    pub async fn spot_frequencies(&self) -> Vec<(f64, f64)> {
+        let cache = self.cache.read().await;
+        cache
+            .spot_groups()
+            .iter()
+            .map(|g| {
+                (
+                    g.frequency as f64,
+                    pancetta_cqdx::rank_to_rarity(g.rarity_rank),
+                )
+            })
+            .collect()
     }
 
     /// Get a clone of the cache for read access.

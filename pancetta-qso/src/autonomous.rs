@@ -713,6 +713,8 @@ pub struct AutonomousOperator {
     smart_allocator: SmartFrequencyAllocator,
     /// Whether the user has paused autonomous operation.
     paused: bool,
+    /// Live spot frequencies for frequency nudging: (frequency_hz, rarity 0.0-1.0)
+    live_spot_frequencies: Vec<(f64, f64)>,
 }
 
 impl AutonomousOperator {
@@ -742,6 +744,7 @@ impl AutonomousOperator {
             spectral_snapshot: None,
             smart_allocator,
             paused: false,
+            live_spot_frequencies: Vec::new(),
         }
     }
 
@@ -819,6 +822,11 @@ impl AutonomousOperator {
         self.spectral_snapshot = Some(snapshot);
     }
 
+    /// Update live spot frequencies from cqdx.io for frequency nudging.
+    pub fn update_live_spots(&mut self, spots: &[(f64, f64)]) {
+        self.live_spot_frequencies = spots.to_vec();
+    }
+
     /// Get the best frequency for a new QSO using the smart allocator.
     /// Falls back to the legacy allocator if no spectral data is available.
     fn allocate_smart_frequency(&self, dx_target_hz: Option<f64>) -> f64 {
@@ -830,12 +838,30 @@ impl AutonomousOperator {
             .collect();
 
         if let Some(ref spectral) = self.spectral_snapshot {
-            let candidates = self.smart_allocator.rank_candidates(
+            let mut candidates = self.smart_allocator.rank_candidates(
                 spectral,
                 &self.decode_history,
                 &own_freqs,
                 dx_target_hz,
             );
+
+            // When calling CQ, prefer frequencies near rare DX spots
+            if dx_target_hz.is_none() && !self.live_spot_frequencies.is_empty() {
+                for candidate in &mut candidates {
+                    for &(spot_freq, spot_rarity) in &self.live_spot_frequencies {
+                        let distance = (candidate.offset_hz - spot_freq).abs();
+                        if distance < 200.0 && spot_rarity > 0.7 {
+                            candidate.score += 0.2 * spot_rarity;
+                        }
+                    }
+                }
+                candidates.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+
             if let Some(best) = candidates.first() {
                 return best.offset_hz;
             }

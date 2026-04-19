@@ -23,6 +23,12 @@ pub struct CachedStationLookup {
     needed_grids: Arc<RwLock<HashSet<String>>>,
     /// Rarity scores from cqdx.io, keyed by uppercase callsign.
     rarity_scores: Arc<RwLock<HashMap<String, f64>>>,
+    /// Notable callsigns from cqdx.io spot groups.
+    notable_callsigns: Arc<RwLock<HashSet<String>>>,
+    /// Network SNR data: callsign -> (reporter_count, best_snr).
+    network_snr: Arc<RwLock<HashMap<String, (u32, i32)>>>,
+    /// Network last-seen timestamps: callsign -> unix timestamp.
+    network_last_seen: Arc<RwLock<HashMap<String, i64>>>,
 }
 
 impl CachedStationLookup {
@@ -33,6 +39,9 @@ impl CachedStationLookup {
             needed_dxcc: Arc::new(RwLock::new(HashSet::new())),
             needed_grids: Arc::new(RwLock::new(HashSet::new())),
             rarity_scores: Arc::new(RwLock::new(HashMap::new())),
+            notable_callsigns: Arc::new(RwLock::new(HashSet::new())),
+            network_snr: Arc::new(RwLock::new(HashMap::new())),
+            network_last_seen: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -54,6 +63,18 @@ impl CachedStationLookup {
 
     pub fn update_rarity_scores(&self, scores: HashMap<String, f64>) {
         *self.rarity_scores.write().unwrap() = scores;
+    }
+
+    pub fn update_notable_callsigns(&self, callsigns: HashSet<String>) {
+        *self.notable_callsigns.write().unwrap() = callsigns;
+    }
+
+    pub fn update_network_snr(&self, data: HashMap<String, (u32, i32)>) {
+        *self.network_snr.write().unwrap() = data;
+    }
+
+    pub fn update_network_last_seen(&self, data: HashMap<String, i64>) {
+        *self.network_last_seen.write().unwrap() = data;
     }
 
     pub fn rarity(&self, callsign: &str) -> f64 {
@@ -123,5 +144,28 @@ impl WorkedStationLookup for CachedStationLookup {
             .get(&callsign.to_uppercase())
             .copied()
             .unwrap_or(0.5)
+    }
+
+    fn is_notable(&self, callsign: &str) -> bool {
+        self.notable_callsigns
+            .read()
+            .unwrap()
+            .contains(&callsign.to_uppercase())
+    }
+
+    fn network_snr(&self, callsign: &str) -> Option<(u32, i32)> {
+        self.network_snr
+            .read()
+            .unwrap()
+            .get(&callsign.to_uppercase())
+            .copied()
+    }
+
+    fn network_last_seen(&self, callsign: &str) -> Option<i64> {
+        self.network_last_seen
+            .read()
+            .unwrap()
+            .get(&callsign.to_uppercase())
+            .copied()
     }
 }

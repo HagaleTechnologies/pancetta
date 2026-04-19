@@ -70,6 +70,21 @@ pub trait WorkedStationLookup: Send + Sync {
         let _ = callsign;
         0.5
     }
+
+    /// Is this callsign flagged as notable (rare/legendary activation)?
+    fn is_notable(&self, _callsign: &str) -> bool {
+        false
+    }
+
+    /// Get network SNR data: (reporter_count, best_snr).
+    fn network_snr(&self, _callsign: &str) -> Option<(u32, i32)> {
+        None
+    }
+
+    /// Get network last-seen timestamp (unix seconds).
+    fn network_last_seen(&self, _callsign: &str) -> Option<i64> {
+        None
+    }
 }
 
 /// No-op lookup that reports nothing is worked/needed.
@@ -159,13 +174,51 @@ impl PriorityScorer {
             0.0
         };
 
-        let raw_score = needed_dxcc * self.weights.needed_dxcc
+        // Notable station bonus
+        let notable_bonus = if self.lookup.is_notable(callsign) {
+            0.3
+        } else {
+            0.0
+        };
+
+        // Staleness multiplier: deprioritize stale network spots
+        let staleness = if let Some(last_seen) = self.lookup.network_last_seen(callsign) {
+            let now = chrono::Utc::now().timestamp();
+            let age_secs = (now - last_seen).max(0);
+            match age_secs {
+                0..=300 => 1.0,   // <5 min: fresh
+                301..=600 => 0.7, // 5-10 min: aging
+                601..=900 => 0.4, // 10-15 min: stale
+                _ => 0.2,         // >15 min: very stale
+            }
+        } else {
+            1.0 // no network data = no penalty
+        };
+
+        // Network SNR bonus/penalty
+        let snr_bonus = if let Some((reporter_count, best_snr)) = self.lookup.network_snr(callsign)
+        {
+            if reporter_count >= 5 && best_snr >= -20 {
+                0.1 // well-confirmed, likely workable
+            } else if reporter_count == 1 && best_snr < -25 {
+                -0.1 // uncertain, might not be workable
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        let raw_score = (needed_dxcc * self.weights.needed_dxcc
             + needed_grid * self.weights.needed_grid
             + pota_sota * self.weights.pota_sota
             + rarity * self.weights.rarity
             + signal_strength * self.weights.signal_strength
             + duplicate_penalty * self.weights.duplicate_penalty
-            + recent_failure_penalty * self.weights.recent_failure_penalty;
+            + recent_failure_penalty * self.weights.recent_failure_penalty
+            + notable_bonus
+            + snr_bonus)
+            * staleness;
 
         let total = raw_score.clamp(0.0, 1.0);
 

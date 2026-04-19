@@ -9,7 +9,7 @@ pub mod client;
 pub mod error;
 pub mod types;
 
-pub use cache::CqdxCache;
+pub use cache::{frequency_to_band, CqdxCache};
 pub use client::CqdxClient;
 pub use error::{CqdxError, Result};
 pub use types::*;

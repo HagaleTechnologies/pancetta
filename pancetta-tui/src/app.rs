@@ -53,6 +53,26 @@ pub struct StationInfo {
     pub mode: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpotSource {
+    /// Decoded by our receiver
+    Local,
+    /// From cqdx.io live spots
+    Network,
+    /// Seen locally AND in network
+    Both,
+}
+
+impl std::fmt::Display for SpotSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpotSource::Local => write!(f, "RX"),
+            SpotSource::Network => write!(f, "NET"),
+            SpotSource::Both => write!(f, "RX+N"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DxStation {
     pub call_sign: String,
@@ -65,6 +85,15 @@ pub struct DxStation {
     pub bearing: Option<f64>,
     pub worked_before: bool,
     pub priority_score: u32,
+    // CQDX network metadata
+    pub source: SpotSource,
+    pub rarity_tier: Option<String>,
+    pub reporter_count: Option<u32>,
+    pub is_notable: bool,
+    pub notable_type: Option<String>,
+    pub confidence: Option<f64>,
+    pub best_snr_network: Option<i32>,
+    pub last_seen_network: Option<i64>,
 }
 
 /// Status data received from the autonomous operator.
@@ -510,6 +539,14 @@ impl App {
                 bearing: message.bearing,
                 worked_before: false, // TODO: Check logbook
                 priority_score: self.calculate_dx_priority(&message),
+                source: SpotSource::Local,
+                rarity_tier: None,
+                reporter_count: None,
+                is_notable: false,
+                notable_type: None,
+                confidence: None,
+                best_snr_network: None,
+                last_seen_network: None,
             };
 
             self.dx_stations.insert(call_sign.clone(), dx_station);
@@ -720,6 +757,14 @@ impl App {
             bearing: None,
             worked_before: false,
             priority_score: 0,
+            source: SpotSource::Local,
+            rarity_tier: None,
+            reporter_count: None,
+            is_notable: false,
+            notable_type: None,
+            confidence: None,
+            best_snr_network: None,
+            last_seen_network: None,
         };
         self.dx_stations.insert(callsign, dx_station);
     }
@@ -850,6 +895,48 @@ impl App {
             );
         } else {
             self.status_message = "Autonomous mode not available".to_string();
+        }
+    }
+
+    /// Merge live spot groups from cqdx.io into the DX station list.
+    pub fn merge_spot_groups(&mut self, spots: &[crate::tui_runner::CqdxSpotInfo]) {
+        for spot in spots {
+            let entry = self
+                .dx_stations
+                .entry(spot.dx_call.clone())
+                .or_insert_with(|| DxStation {
+                    call_sign: spot.dx_call.clone(),
+                    grid_square: spot.grid.clone(),
+                    frequency: spot.frequency_hz as f64 / 1_000_000.0,
+                    mode: spot.mode.clone(),
+                    last_seen: chrono::Utc::now(),
+                    snr: spot.best_snr.unwrap_or(0),
+                    distance: None,
+                    bearing: None,
+                    worked_before: false,
+                    priority_score: 0,
+                    source: SpotSource::Network,
+                    rarity_tier: Some(spot.rarity_tier.clone()),
+                    reporter_count: Some(spot.reporter_count),
+                    is_notable: spot.is_notable,
+                    notable_type: spot.notable_type.clone(),
+                    confidence: Some(spot.confidence),
+                    best_snr_network: spot.best_snr,
+                    last_seen_network: Some(spot.last_seen),
+                });
+
+            // If already exists from local decode, upgrade source
+            if entry.source == SpotSource::Local {
+                entry.source = SpotSource::Both;
+            }
+            // Always update network metadata
+            entry.rarity_tier = Some(spot.rarity_tier.clone());
+            entry.reporter_count = Some(spot.reporter_count);
+            entry.is_notable = spot.is_notable;
+            entry.notable_type = spot.notable_type.clone();
+            entry.confidence = Some(spot.confidence);
+            entry.best_snr_network = spot.best_snr;
+            entry.last_seen_network = Some(spot.last_seen);
         }
     }
 

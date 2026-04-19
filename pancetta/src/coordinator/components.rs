@@ -885,6 +885,11 @@ impl super::ApplicationCoordinator {
                                 }
                             }
 
+                            if let Some(ref bridge) = cqdx_bridge_for_auto {
+                                let spot_freqs = bridge.spot_frequencies().await;
+                                op.update_live_spots(&spot_freqs);
+                            }
+
                             op.feed_decoded_messages(&slot_messages, evaluator.as_ref());
                             slot_messages.clear();
                             let actions = op.decide();

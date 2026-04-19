@@ -15,6 +15,7 @@ use tracing_subscriber;
 mod app;
 mod config;
 mod events;
+mod tui_runner;
 mod ui;
 mod widgets;
 

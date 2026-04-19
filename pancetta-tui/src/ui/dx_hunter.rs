@@ -15,15 +15,17 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
     let block = create_panel_block("DX Hunter", is_active, app);
 
     // Prepare table data
-    let header_cells = ["Call", "Grid", "Freq", "SNR", "Dist", "Bear", "Last", "Pri"]
-        .iter()
-        .map(|h| {
-            Cell::from(*h).style(
-                Style::default()
-                    .fg(app.theme.accent_color())
-                    .add_modifier(Modifier::BOLD),
-            )
-        });
+    let header_cells = [
+        "Src", "Call", "Grid", "Freq", "SNR", "Rarity", "Rpt", "Last", "Pri",
+    ]
+    .iter()
+    .map(|h| {
+        Cell::from(*h).style(
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        )
+    });
 
     let header = Row::new(header_cells).height(1).bottom_margin(0);
 
@@ -45,6 +47,7 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
             [
                 Cell::from(""),
                 Cell::from(""),
+                Cell::from(""),
                 Cell::from("No DX"),
                 Cell::from(""),
                 Cell::from(""),
@@ -61,14 +64,15 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
     }
 
     let widths = [
-        Constraint::Length(8), // Call
+        Constraint::Length(4), // Src
+        Constraint::Min(8),    // Call
         Constraint::Length(4), // Grid
-        Constraint::Length(7), // Freq
+        Constraint::Length(9), // Freq
         Constraint::Length(4), // SNR
-        Constraint::Length(6), // Dist
-        Constraint::Length(4), // Bear
+        Constraint::Length(7), // Rarity
+        Constraint::Length(3), // Rpt
         Constraint::Length(5), // Last
-        Constraint::Length(3), // Pri
+        Constraint::Length(4), // Pri
     ];
 
     let table = Table::new(rows, widths)
@@ -109,19 +113,45 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
 }
 
 fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
-    let call_str = &station.call_sign;
-    let grid_str = station.grid_square.as_deref().unwrap_or("---");
-    let freq_str = format!("{:.3}", station.frequency);
-    let snr_str = format!("{:+}", station.snr);
-    let dist_str = format_distance(station.distance);
-    let bear_str = format_bearing(station.bearing);
-    let last_str = format_time_ago(station.last_seen);
-    let pri_str = format!("{}", station.priority_score);
+    use crate::app::SpotSource;
 
-    // Color coding based on various factors
-    let call_style = if station.worked_before {
+    // Source indicator
+    let src_str = station.source.to_string();
+    let src_style = match station.source {
+        SpotSource::Local => Style::default().fg(app.theme.success_color()),
+        SpotSource::Network => Style::default().fg(app.theme.accent_color()),
+        SpotSource::Both => Style::default().fg(ratatui::style::Color::Cyan),
+    };
+
+    // Callsign with notable prefix
+    let call_display = if station.is_notable {
+        format!("★{}", station.call_sign)
+    } else {
+        station.call_sign.clone()
+    };
+
+    // Staleness check for network-only spots
+    let is_stale = if station.source != SpotSource::Local {
+        station
+            .last_seen_network
+            .map(|ts| {
+                let age = chrono::Utc::now().timestamp() - ts;
+                age > 600 // >10 minutes
+            })
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let call_style = if is_stale {
         Style::default().fg(app.theme.muted_color())
-    } else if is_rare_dx(&station.call_sign) {
+    } else if station.is_notable {
+        Style::default()
+            .fg(ratatui::style::Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else if station.worked_before {
+        Style::default().fg(app.theme.muted_color())
+    } else if is_rare_dx_from_tier(station) {
         Style::default()
             .fg(app.theme.error_color())
             .add_modifier(Modifier::BOLD)
@@ -135,6 +165,34 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
             .add_modifier(Modifier::BOLD)
     };
 
+    let grid_str = station.grid_square.as_deref().unwrap_or("---").to_string();
+    let freq_str = format!("{:.3}", station.frequency);
+    let snr_str = format!("{:+}", station.snr);
+    let rarity_str = station.rarity_tier.as_deref().unwrap_or("-").to_string();
+    let rpt_str = station
+        .reporter_count
+        .map(|r| r.to_string())
+        .unwrap_or_default();
+    let last_str = format_time_ago(station.last_seen);
+    let pri_str = format!("{}", station.priority_score);
+
+    let dim = if is_stale {
+        Style::default().fg(app.theme.muted_color())
+    } else {
+        Style::default().fg(app.theme.foreground_color())
+    };
+
+    let rarity_style = match station.rarity_tier.as_deref() {
+        Some("legendary") => Style::default()
+            .fg(ratatui::style::Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+        Some("very_rare") => Style::default()
+            .fg(app.theme.error_color())
+            .add_modifier(Modifier::BOLD),
+        Some("rare") => Style::default().fg(app.theme.warning_color()),
+        _ => dim,
+    };
+
     let snr_style = Style::default().fg(get_snr_color(station.snr, &app.theme));
 
     let priority_style = match station.priority_score {
@@ -144,17 +202,18 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
         score if score > 50 => Style::default()
             .fg(app.theme.warning_color())
             .add_modifier(Modifier::BOLD),
-        _ => Style::default().fg(app.theme.foreground_color()),
+        _ => dim,
     };
 
     Row::new([
-        Cell::from(call_str.as_str()).style(call_style),
-        Cell::from(grid_str).style(Style::default().fg(app.theme.foreground_color())),
+        Cell::from(src_str).style(src_style),
+        Cell::from(call_display).style(call_style),
+        Cell::from(grid_str).style(dim),
         Cell::from(freq_str).style(Style::default().fg(app.theme.accent_color())),
         Cell::from(snr_str).style(snr_style),
-        Cell::from(dist_str).style(Style::default().fg(app.theme.foreground_color())),
-        Cell::from(bear_str).style(Style::default().fg(app.theme.foreground_color())),
-        Cell::from(last_str).style(Style::default().fg(app.theme.muted_color())),
+        Cell::from(rarity_str).style(rarity_style),
+        Cell::from(rpt_str).style(dim),
+        Cell::from(last_str).style(dim),
         Cell::from(pri_str).style(priority_style),
     ])
 }
@@ -167,16 +226,24 @@ fn get_snr_color(snr: i32, theme: &crate::config::Theme) -> ratatui::style::Colo
     }
 }
 
-/// Check if a callsign represents rare DX
-fn is_rare_dx(call_sign: &str) -> bool {
-    // Basic check for some rare prefixes
+/// Check if a station is rare DX using cqdx.io rarity tier (preferred)
+/// or fallback hardcoded prefix list.
+fn is_rare_dx_from_tier(station: &DxStation) -> bool {
+    match station.rarity_tier.as_deref() {
+        Some("legendary") | Some("very_rare") => true,
+        Some(_) => false,
+        None => is_rare_dx_fallback(&station.call_sign),
+    }
+}
+
+/// Fallback rare DX check when cqdx.io data is unavailable.
+fn is_rare_dx_fallback(call_sign: &str) -> bool {
     let rare_prefixes = [
         "1A", "3Y", "4U", "7O", "8Q", "9Q", "BS7", "BV9", "BY9", "CY0", "CY9", "E3", "E4", "EK0",
         "FT/G", "FT/J", "FT/W", "FT/X", "FT/Z", "H40", "HK0", "P5", "S0", "T31", "T32", "T33",
         "VK0H", "VK0M", "VK9C", "VK9L", "VK9M", "VK9N", "VK9W", "VK9X", "VP8G", "VP8H", "VP8O",
         "VP8S", "XF4", "XU", "XW", "XX9", "YJ0", "Z2", "ZS8",
     ];
-
     rare_prefixes
         .iter()
         .any(|&prefix| call_sign.starts_with(prefix))
@@ -265,9 +332,17 @@ pub fn calculate_dx_priority(
         score += 100; // New band
     }
 
-    // Rare DX bonus
-    if is_rare_dx(&station.call_sign) {
-        score += 150;
+    // Rarity-tier-based DX bonus
+    match station.rarity_tier.as_deref() {
+        Some("legendary") => score += 200,
+        Some("very_rare") => score += 150,
+        Some("rare") => score += 100,
+        Some("uncommon") => score += 50,
+        _ => {
+            if is_rare_dx_fallback(&station.call_sign) {
+                score += 150;
+            }
+        }
     }
 
     // Penalty for already worked
@@ -295,11 +370,11 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn test_is_rare_dx() {
-        assert!(is_rare_dx("3Y0X"));
-        assert!(is_rare_dx("VP8STI"));
-        assert!(!is_rare_dx("W1ABC"));
-        assert!(!is_rare_dx("G0XYZ"));
+    fn test_is_rare_dx_fallback() {
+        assert!(is_rare_dx_fallback("3Y0X"));
+        assert!(is_rare_dx_fallback("VP8STI"));
+        assert!(!is_rare_dx_fallback("W1ABC"));
+        assert!(!is_rare_dx_fallback("G0XYZ"));
     }
 
     #[test]
@@ -334,6 +409,14 @@ mod tests {
             bearing: Some(45.0),
             worked_before: false,
             priority_score: 0,
+            source: crate::app::SpotSource::Local,
+            rarity_tier: None,
+            reporter_count: None,
+            is_notable: false,
+            notable_type: None,
+            confidence: None,
+            best_snr_network: None,
+            last_seen_network: None,
         };
 
         let score = calculate_dx_priority(&station, "FN20", false, true, false);

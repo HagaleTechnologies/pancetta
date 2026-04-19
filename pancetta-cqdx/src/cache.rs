@@ -102,6 +102,24 @@ impl CqdxCache {
     }
 }
 
+/// Derive ham radio band name from frequency in Hz.
+pub fn frequency_to_band(freq_hz: u64) -> Option<String> {
+    match freq_hz / 1_000_000 {
+        1..=2 => Some("160m".to_string()),
+        3..=4 => Some("80m".to_string()),
+        5..=6 => Some("60m".to_string()),
+        7..=8 => Some("40m".to_string()),
+        10..=11 => Some("30m".to_string()),
+        14..=15 => Some("20m".to_string()),
+        18..=19 => Some("17m".to_string()),
+        21..=22 => Some("15m".to_string()),
+        24..=25 => Some("12m".to_string()),
+        28..=30 => Some("10m".to_string()),
+        50..=54 => Some("6m".to_string()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

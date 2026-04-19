@@ -335,7 +335,7 @@ impl ApplicationCoordinator {
                             self.shutdown_signal.clone(),
                             self.last_decode_timestamp.clone(),
                             None,
-                            None,
+                            None, // TUI tx — set up later in pipeline if available
                         );
                         // Wrap the JoinHandle<()> into JoinHandle<Result<()>> for named_task_handles
                         let wrapped = tokio::spawn(async move {
