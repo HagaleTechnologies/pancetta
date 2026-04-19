@@ -303,4 +303,27 @@ mod tests {
         let result = client.fetch_entities().await;
         assert!(matches!(result, Err(CqdxError::Server { status: 500, .. })));
     }
+
+    #[tokio::test]
+    #[ignore] // Run manually: cargo test -p pancetta-cqdx test_live_spots_envelope -- --ignored
+    async fn test_live_spots_envelope() {
+        // Requires CQDX_TOKEN env var
+        let token = std::env::var("CQDX_TOKEN")
+            .expect("Set CQDX_TOKEN to run this test");
+        let client = CqdxClient::new("https://cqdx.io".to_string(), token);
+
+        // Try fetching live spots — this validates the real envelope
+        match client.fetch_live_spots(Some("20m"), Some("FT8")).await {
+            Ok(groups) => {
+                println!("SUCCESS: Got {} spot groups", groups.len());
+                for g in groups.iter().take(3) {
+                    println!("  {} on {} @ {} Hz (rarity: {:?})",
+                        g.dx_call, g.band, g.frequency, g.rarity_rank);
+                }
+            }
+            Err(e) => {
+                panic!("FAILED: Spots endpoint returned error: {}", e);
+            }
+        }
+    }
 }
