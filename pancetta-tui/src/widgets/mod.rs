@@ -138,31 +138,33 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
         // Render waterfall data rows with vertical compression.
         // Each display row combines `compression` data rows (max intensity).
         let comp = self.compression.max(1);
-        if !self.data.is_empty() {
-            let effective_rows = self.data.len() / comp;
+        let data_len = self.data.len();
+        if data_len >= comp {
+            let effective_rows = data_len / comp;
             let rows_to_show = height.min(effective_rows);
 
             for display_row in 0..rows_to_show {
                 let y = waterfall_area.y + display_row as u16;
 
                 // Source data rows for this display row (newest first)
-                let start = self.data.len() - (display_row + 1) * comp;
-                let end = start + comp;
+                let end = data_len - display_row * comp;
+                let start = end.saturating_sub(comp);
                 let source_rows = &self.data[start..end];
 
-                let num_bins = source_rows[0].len();
+                // Use the minimum bin count across compressed rows for safety
+                let num_bins = source_rows.iter().map(|r| r.len()).min().unwrap_or(0);
                 if num_bins == 0 {
                     continue;
                 }
 
                 for col in 0..width {
                     let bin_start = col * num_bins / width;
-                    let bin_end = ((col + 1) * num_bins / width).max(bin_start + 1);
+                    let bin_end = ((col + 1) * num_bins / width).max(bin_start + 1).min(num_bins);
 
                     // Max intensity across both the bin range and all compressed rows
                     let mut intensity = 0.0f32;
                     for row_data in source_rows {
-                        for &val in &row_data[bin_start..bin_end.min(row_data.len())] {
+                        for &val in &row_data[bin_start..bin_end] {
                             intensity = intensity.max(val);
                         }
                     }
@@ -177,12 +179,12 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
         // Overlay: cycle boundary markers (dim horizontal ticks on left edge)
         // Every rows_per_cycle data rows, draw a small marker so the operator
         // can distinguish even/odd FT8 cycles.  Accounts for compression.
-        if self.rows_per_cycle > 0 && !self.data.is_empty() {
-            let effective_rows = self.data.len() / comp;
+        if self.rows_per_cycle > 0 && data_len >= comp {
+            let effective_rows = data_len / comp;
             let rows_to_show = height.min(effective_rows);
             for display_row in 0..rows_to_show {
                 // Map display row back to data index
-                let data_idx = self.data.len() - 1 - display_row * comp;
+                let data_idx = data_len - 1 - display_row * comp;
                 if data_idx % self.rows_per_cycle == 0 {
                     let y = waterfall_area.y + display_row as u16;
                     let cycle_num = data_idx / self.rows_per_cycle;
