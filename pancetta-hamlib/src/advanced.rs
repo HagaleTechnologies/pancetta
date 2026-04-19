@@ -5,6 +5,7 @@
 
 use crate::models::{Band, Mode, Vfo};
 use crate::rig::{PttState, Rig, RigControl, RigStatus};
+use crate::rigctld::RigctldClient;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -323,6 +324,8 @@ impl Default for ScanStatus {
 pub struct AdvancedRig {
     /// Base rig control
     rig: Arc<Rig>,
+    /// Optional direct rigctld connection for commands not exposed via Rig
+    rigctld: Option<Arc<RigctldClient>>,
     /// Memory channels cache
     memory_channels: RwLock<HashMap<i32, MemoryChannel>>,
     /// Band plans
@@ -343,6 +346,22 @@ impl AdvancedRig {
     pub fn new(rig: Arc<Rig>) -> Self {
         Self {
             rig,
+            rigctld: None,
+            memory_channels: RwLock::new(HashMap::new()),
+            band_plans: BandPlan::standard_bands(),
+            scan_status: Arc::new(RwLock::new(ScanStatus::default())),
+            monitoring_tx: RwLock::new(None),
+            monitoring_handle: RwLock::new(None),
+            scan_handle: RwLock::new(None),
+        }
+    }
+
+    /// Create new advanced rig control with a direct rigctld client for antenna control
+    /// and other commands not exposed through the hamlib C API wrapper.
+    pub fn new_with_rigctld(rig: Arc<Rig>, rigctld: Arc<RigctldClient>) -> Self {
+        Self {
+            rig,
+            rigctld: Some(rigctld),
             memory_channels: RwLock::new(HashMap::new()),
             band_plans: BandPlan::standard_bands(),
             scan_status: Arc::new(RwLock::new(ScanStatus::default())),
@@ -894,20 +913,81 @@ impl AdvancedRigControl for AdvancedRig {
     }
 
     async fn get_antenna(&self) -> Result<u32> {
-        // This would be implemented using rig_get_level with RIG_LEVEL_ANT
-        // For now, return default antenna 1
-        Ok(1)
+        if let Some(rigctld) = &self.rigctld {
+            // rigctld short command "y" → get_ant → returns the antenna number
+            let response = rigctld.send_raw_command("y").await?;
+            let antenna = response.trim().parse::<u32>().map_err(|_| {
+                anyhow!(
+                    "Failed to parse antenna number from rigctld response: {:?}",
+                    response
+                )
+            })?;
+            debug!("get_antenna: rigctld returned {}", antenna);
+            Ok(antenna)
+        } else {
+            // No rigctld connection — return safe default
+            debug!("get_antenna: no rigctld client, returning default antenna 1");
+            Ok(1)
+        }
     }
 
     async fn set_antenna(&self, antenna: u32) -> Result<()> {
-        // This would be implemented using rig_set_level with RIG_LEVEL_ANT
-        info!("Set antenna to position {}", antenna);
+        if let Some(rigctld) = &self.rigctld {
+            // rigctld short command "Y <ant>" → set_ant
+            let cmd = format!("Y {}", antenna);
+            rigctld.send_raw_command(&cmd).await?;
+            info!("set_antenna: switched to antenna {}", antenna);
+        } else {
+            // No rigctld connection — log and continue silently
+            warn!(
+                "set_antenna: no rigctld client available, ignoring request for antenna {}",
+                antenna
+            );
+        }
         Ok(())
     }
 
     async fn list_antennas(&self) -> Result<Vec<u32>> {
-        // Return available antenna positions based on rig capabilities
-        Ok(vec![1, 2])
+        if let Some(rigctld) = &self.rigctld {
+            // rigctld has no dedicated "list antennas" command. Probe antennas 1-4:
+            // if get_ant succeeds after set_ant, the position is supported.
+            // We query the current antenna first to restore it afterwards.
+            let original = rigctld
+                .send_raw_command("y")
+                .await
+                .ok()
+                .and_then(|r| r.trim().parse::<u32>().ok());
+
+            let mut available = Vec::new();
+            for ant in 1u32..=4 {
+                let set_cmd = format!("Y {}", ant);
+                if rigctld.send_raw_command(&set_cmd).await.is_ok() {
+                    // Confirm the rig accepted the position
+                    if let Ok(resp) = rigctld.send_raw_command("y").await {
+                        if resp.trim().parse::<u32>().ok() == Some(ant) {
+                            available.push(ant);
+                        }
+                    }
+                }
+            }
+
+            // Restore original antenna
+            if let Some(orig) = original {
+                let restore_cmd = format!("Y {}", orig);
+                let _ = rigctld.send_raw_command(&restore_cmd).await;
+            }
+
+            if available.is_empty() {
+                // Couldn't probe — return the current antenna as the only known position
+                debug!("list_antennas: probe returned no results, falling back to [1]");
+                Ok(vec![1])
+            } else {
+                Ok(available)
+            }
+        } else {
+            // No rigctld connection — return a conservative default
+            Ok(vec![1])
+        }
     }
 }
 

@@ -1,4 +1,6 @@
 use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type, Q_BUTTERWORTH_F32};
+use num_complex::Complex;
+use realfft::RealFftPlanner;
 use std::collections::VecDeque;
 use thiserror::Error;
 use tracing::{debug, trace};
@@ -391,13 +393,13 @@ pub struct NoiseReductionFilter {
     frame_size: usize,
     /// Overlap factor
     overlap_factor: f32,
-    /// Noise estimate
+    /// Noise estimate (power spectrum, frame_size/2 + 1 bins)
     noise_estimate: Vec<f32>,
     /// Signal estimate
     signal_estimate: Vec<f32>,
     /// Spectral subtraction factor
     alpha: f32,
-    /// Over-subtraction factor
+    /// Spectral floor (minimum gain)
     beta: f32,
     /// Input buffer
     input_buffer: VecDeque<f32>,
@@ -405,32 +407,53 @@ pub struct NoiseReductionFilter {
     output_buffer: VecDeque<f32>,
     /// Window function
     window: Vec<f32>,
-    /// FFT workspace
+    /// FFT workspace (real-valued, frame_size samples)
     fft_workspace: Vec<f32>,
+    /// Complex FFT output workspace (frame_size/2 + 1 bins)
+    fft_complex: Vec<Complex<f32>>,
+    /// Forward FFT plan
+    fft_forward: std::sync::Arc<dyn realfft::RealToComplex<f32>>,
+    /// Inverse FFT plan
+    fft_inverse: std::sync::Arc<dyn realfft::ComplexToReal<f32>>,
+    /// Number of frames processed (first CALIBRATION_FRAMES are noise-only)
+    frames_processed: usize,
 }
+
+/// Number of initial frames used for noise-only calibration
+const CALIBRATION_FRAMES: usize = 10;
 
 impl NoiseReductionFilter {
     /// Create a new noise reduction filter
     pub fn new(sample_rate: f32, frame_size: usize, overlap_factor: f32) -> Self {
         let window = Self::create_hann_window(frame_size);
+        let num_bins = frame_size / 2 + 1;
+
+        let mut planner = RealFftPlanner::<f32>::new();
+        let fft_forward = planner.plan_fft_forward(frame_size);
+        let fft_inverse = planner.plan_fft_inverse(frame_size);
+        let fft_complex = vec![Complex::new(0.0f32, 0.0); num_bins];
 
         debug!(
-            "Created noise reduction filter: fs={}Hz, frame_size={}, overlap={}",
-            sample_rate, frame_size, overlap_factor
+            "Created noise reduction filter: fs={}Hz, frame_size={}, overlap={}, bins={}",
+            sample_rate, frame_size, overlap_factor, num_bins
         );
 
         Self {
             sample_rate,
             frame_size,
             overlap_factor,
-            noise_estimate: vec![0.001; frame_size / 2 + 1], // Initial noise floor
-            signal_estimate: vec![0.0; frame_size / 2 + 1],
+            noise_estimate: vec![0.0; num_bins],
+            signal_estimate: vec![0.0; num_bins],
             alpha: 2.0, // Spectral subtraction factor
-            beta: 0.01, // Over-subtraction factor
+            beta: 0.01, // Spectral floor (minimum gain)
             input_buffer: VecDeque::new(),
             output_buffer: VecDeque::new(),
             window,
-            fft_workspace: vec![0.0; frame_size * 2],
+            fft_workspace: vec![0.0; frame_size],
+            fft_complex,
+            fft_forward,
+            fft_inverse,
+            frames_processed: 0,
         }
     }
 
@@ -488,23 +511,84 @@ impl NoiseReductionFilter {
         Ok(())
     }
 
-    /// Process a single frame (simplified version)
+    /// Process a single frame with FFT-based spectral subtraction
+    ///
+    /// Steps:
+    /// 1. Copy windowed frame into FFT workspace
+    /// 2. Forward FFT (real-to-complex)
+    /// 3. Compute power spectrum |X[k]|^2
+    /// 4. Update noise estimate (calibration or slow tracking)
+    /// 5. Spectral subtraction: gain[k] = max(1 - alpha * noise[k] / power[k], beta)
+    /// 6. Apply gain to complex spectrum
+    /// 7. Inverse FFT
+    /// 8. Apply synthesis window and scale
     fn process_frame(&mut self, frame: &mut [f32]) -> Result<()> {
-        // This is a simplified implementation
-        // A full implementation would use FFT for spectral processing
+        let num_bins = self.frame_size / 2 + 1;
+        let fft_size = self.frame_size;
 
-        // Calculate frame energy
-        let energy: f32 = frame.iter().map(|&x| x * x).sum();
-        let rms = (energy / frame.len() as f32).sqrt();
+        // (a) Copy input frame into FFT workspace (already windowed by caller)
+        self.fft_workspace[..fft_size].copy_from_slice(&frame[..fft_size]);
 
-        // Update noise estimate (very simple VAD)
-        let noise_threshold = 0.01;
-        if rms < noise_threshold {
-            // Likely noise - update noise estimate
-            for sample in frame.iter_mut() {
-                *sample *= 0.1; // Simple noise reduction
+        // (b) Forward FFT: real -> complex
+        self.fft_forward
+            .process(&mut self.fft_workspace, &mut self.fft_complex)
+            .map_err(|e| FilterError::ProcessingFailed {
+                message: format!("Forward FFT failed: {}", e),
+            })?;
+
+        // (c) Compute power spectrum: |X[k]|^2
+        let mut power_spectrum = vec![0.0f32; num_bins];
+        for k in 0..num_bins {
+            power_spectrum[k] = self.fft_complex[k].norm_sqr();
+        }
+
+        // (d) Update noise estimate
+        if self.frames_processed < CALIBRATION_FRAMES {
+            // Calibration phase: accumulate average power spectrum
+            for k in 0..num_bins {
+                self.noise_estimate[k] += power_spectrum[k] / CALIBRATION_FRAMES as f32;
+            }
+        } else {
+            // Slow tracking: exponential moving average with small alpha
+            let tracking_alpha = 0.02f32;
+            for k in 0..num_bins {
+                self.noise_estimate[k] = (1.0 - tracking_alpha) * self.noise_estimate[k]
+                    + tracking_alpha * power_spectrum[k].min(self.noise_estimate[k] * 4.0);
             }
         }
+
+        // (e-f) Spectral subtraction and gain application
+        // During calibration, pass through with unity gain (we're still learning noise)
+        if self.frames_processed >= CALIBRATION_FRAMES {
+            for k in 0..num_bins {
+                let gain = if power_spectrum[k] > 1e-30 {
+                    (1.0 - self.alpha * self.noise_estimate[k] / power_spectrum[k]).max(self.beta)
+                } else {
+                    self.beta
+                };
+                self.fft_complex[k] *= gain;
+            }
+        }
+
+        // (g) Inverse FFT: complex -> real
+        self.fft_inverse
+            .process(&mut self.fft_complex, &mut self.fft_workspace)
+            .map_err(|e| FilterError::ProcessingFailed {
+                message: format!("Inverse FFT failed: {}", e),
+            })?;
+
+        // (h) Apply synthesis window and scale by 1/fft_size
+        let scale = 1.0 / fft_size as f32;
+        for i in 0..fft_size {
+            frame[i] = self.fft_workspace[i] * self.window[i] * scale;
+        }
+
+        self.frames_processed += 1;
+        trace!(
+            "Processed frame {}, calibration={}",
+            self.frames_processed,
+            self.frames_processed <= CALIBRATION_FRAMES
+        );
 
         Ok(())
     }
@@ -513,8 +597,9 @@ impl NoiseReductionFilter {
     pub fn reset(&mut self) {
         self.input_buffer.clear();
         self.output_buffer.clear();
-        self.noise_estimate.fill(0.001);
+        self.noise_estimate.fill(0.0);
         self.signal_estimate.fill(0.0);
+        self.frames_processed = 0;
     }
 
     /// Set noise reduction parameters

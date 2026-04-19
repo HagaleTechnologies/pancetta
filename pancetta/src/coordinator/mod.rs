@@ -97,6 +97,11 @@ pub struct ApplicationCoordinator {
     /// TUI relay OS thread handle (joined on shutdown)
     tui_relay_handle: Option<std::thread::JoinHandle<()>>,
 
+    /// Current operating frequency in Hz, shared across components.
+    /// Updated by the hamlib polling task; read by cqdx.io and PSKReporter
+    /// to compute absolute RF frequency from audio offsets.
+    operating_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
+
     /// Performance metrics
     message_count: Arc<std::sync::atomic::AtomicU64>,
     last_audio_timestamp: Arc<RwLock<Option<Instant>>>,
@@ -280,6 +285,7 @@ impl ApplicationCoordinator {
             waterfall_to_auto_tx: None,
             active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(None)),
             tui_relay_handle: None,
+            operating_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
             #[cfg(feature = "pancetta-hamlib")]
             rigctld_process: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),

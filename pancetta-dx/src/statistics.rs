@@ -293,37 +293,244 @@ impl StatisticsEngine {
     }
 
     /// Get statistics for specific band
-    ///
-    /// TODO: Implement band-specific statistics by querying tracked_contacts
-    /// filtered by band, computing unique callsigns, entity counts, RST
-    /// averages, hourly activity, and confirmation rates.
     pub async fn get_band_statistics(&self, band: Band) -> Result<BandStatistics> {
-        tracing::warn!(
-            "get_band_statistics({}): not yet implemented — returning empty stats",
-            band
-        );
+        let band_str = band.to_string();
+        let conn = self.tracker.connection.lock().unwrap();
 
-        Err(DxError::Configuration(format!(
-            "Band statistics for {} not yet implemented",
-            band
-        )))
+        // Basic counts
+        let total_qsos: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracked_contacts WHERE band = ?1",
+                [&band_str],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u32;
+
+        let unique_callsigns: u32 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT callsign) FROM tracked_contacts WHERE band = ?1",
+                [&band_str],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u32;
+
+        let entities_worked: u32 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT dxcc_entity) FROM tracked_contacts WHERE band = ?1",
+                [&band_str],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u32;
+
+        let entities_confirmed: u32 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT entity_code) FROM award_tracking WHERE band = ?1 AND status = '\"Confirmed\"'",
+                [&band_str],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u32;
+
+        // QSOs by mode on this band
+        let mut qsos_by_mode = HashMap::new();
+        if let Ok(mut stmt) = conn
+            .prepare("SELECT mode, COUNT(*) FROM tracked_contacts WHERE band = ?1 GROUP BY mode")
+        {
+            if let Ok(rows) = stmt.query_map([&band_str], |row| {
+                let mode_str: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((mode_str, count as u32))
+            }) {
+                for row in rows.flatten() {
+                    if let Ok(mode) = serde_json::from_str::<Mode>(&format!("\"{}\"", row.0)) {
+                        qsos_by_mode.insert(mode, row.1);
+                    }
+                }
+            }
+        }
+
+        // QSOs by continent (via dxcc_entity lookup)
+        let mut qsos_by_continent = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT dxcc_entity, COUNT(*) FROM tracked_contacts WHERE band = ?1 GROUP BY dxcc_entity",
+        ) {
+            if let Ok(rows) = stmt.query_map([&band_str], |row| {
+                let entity: i64 = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((entity as u16, count as u32))
+            }) {
+                for row in rows.flatten() {
+                    if let Some(entity) = self.dxcc.get_entity(row.0) {
+                        *qsos_by_continent.entry(entity.continent.clone()).or_insert(0) += row.1;
+                    }
+                }
+            }
+        }
+
+        // Average RST sent/received
+        let (avg_rst_sent, avg_rst_received) = conn
+            .query_row(
+                "SELECT AVG(CAST(rst_sent AS REAL)), AVG(CAST(rst_received AS REAL)) FROM tracked_contacts WHERE band = ?1",
+                [&band_str],
+                |row| {
+                    let sent: f64 = row.get::<_, Option<f64>>(0)?.unwrap_or(0.0);
+                    let recv: f64 = row.get::<_, Option<f64>>(1)?.unwrap_or(0.0);
+                    Ok((sent, recv))
+                },
+            )
+            .unwrap_or((0.0, 0.0));
+
+        // Activity by hour
+        let mut activity_by_hour: HashMap<u8, u32> = HashMap::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT CAST(strftime('%H', datetime) AS INTEGER) as hr, COUNT(*) FROM tracked_contacts WHERE band = ?1 GROUP BY hr",
+        ) {
+            if let Ok(rows) = stmt.query_map([&band_str], |row| {
+                let hour: i64 = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((hour as u8, count as u32))
+            }) {
+                for row in rows.flatten() {
+                    activity_by_hour.insert(row.0, row.1);
+                }
+            }
+        }
+
+        let most_active_hour = activity_by_hour
+            .iter()
+            .max_by_key(|(_, &count)| count)
+            .map(|(&hour, _)| hour);
+
+        // Confirmation rate
+        let confirmation_rate = if total_qsos > 0 {
+            let confirmed: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tracked_contacts WHERE band = ?1 AND confirmation_status != '\"None\"'",
+                    [&band_str],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            (confirmed as f64 / total_qsos as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        Ok(BandStatistics {
+            band,
+            total_qsos,
+            unique_callsigns,
+            entities_worked,
+            entities_confirmed,
+            qsos_by_mode,
+            qsos_by_continent,
+            avg_rst_sent,
+            avg_rst_received,
+            most_active_hour,
+            activity_by_hour,
+            longest_distance_km: None, // no distance column in table
+            confirmation_rate,
+        })
     }
 
     /// Get statistics for specific mode
-    ///
-    /// TODO: Implement mode-specific statistics by querying tracked_contacts
-    /// filtered by mode, computing unique callsigns, entity counts, RST
-    /// averages, band breakdown, and confirmation rates.
     pub async fn get_mode_statistics(&self, mode: &Mode) -> Result<ModeStatistics> {
-        tracing::warn!(
-            "get_mode_statistics({}): not yet implemented — returning empty stats",
-            mode
-        );
+        let mode_str = mode.to_string();
+        let conn = self.tracker.connection.lock().unwrap();
 
-        Err(DxError::Configuration(format!(
-            "Mode statistics for {} not yet implemented",
-            mode
-        )))
+        // Basic counts
+        let total_qsos: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracked_contacts WHERE mode = ?1",
+                [&mode_str],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u32;
+
+        let unique_callsigns: u32 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT callsign) FROM tracked_contacts WHERE mode = ?1",
+                [&mode_str],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u32;
+
+        let entities_worked: u32 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT dxcc_entity) FROM tracked_contacts WHERE mode = ?1",
+                [&mode_str],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u32;
+
+        let entities_confirmed: u32 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT entity_code) FROM award_tracking WHERE mode = ?1 AND status = '\"Confirmed\"'",
+                [&mode_str],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u32;
+
+        // QSOs by band in this mode
+        let mut qsos_by_band = HashMap::new();
+        if let Ok(mut stmt) = conn
+            .prepare("SELECT band, COUNT(*) FROM tracked_contacts WHERE mode = ?1 GROUP BY band")
+        {
+            if let Ok(rows) = stmt.query_map([&mode_str], |row| {
+                let band_str: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((band_str, count as u32))
+            }) {
+                for row in rows.flatten() {
+                    if let Ok(band) = row.0.parse::<Band>() {
+                        qsos_by_band.insert(band, row.1);
+                    }
+                }
+            }
+        }
+
+        let most_active_band = qsos_by_band
+            .iter()
+            .max_by_key(|(_, &count)| count)
+            .map(|(&band, _)| band);
+
+        // Average RST sent/received
+        let (avg_rst_sent, avg_rst_received) = conn
+            .query_row(
+                "SELECT AVG(CAST(rst_sent AS REAL)), AVG(CAST(rst_received AS REAL)) FROM tracked_contacts WHERE mode = ?1",
+                [&mode_str],
+                |row| {
+                    let sent: f64 = row.get::<_, Option<f64>>(0)?.unwrap_or(0.0);
+                    let recv: f64 = row.get::<_, Option<f64>>(1)?.unwrap_or(0.0);
+                    Ok((sent, recv))
+                },
+            )
+            .unwrap_or((0.0, 0.0));
+
+        // Confirmation rate
+        let confirmation_rate = if total_qsos > 0 {
+            let confirmed: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tracked_contacts WHERE mode = ?1 AND confirmation_status != '\"None\"'",
+                    [&mode_str],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            (confirmed as f64 / total_qsos as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        Ok(ModeStatistics {
+            mode: mode.clone(),
+            total_qsos,
+            unique_callsigns,
+            entities_worked,
+            entities_confirmed,
+            qsos_by_band,
+            most_active_band,
+            avg_rst_sent,
+            avg_rst_received,
+            confirmation_rate,
+        })
     }
 
     /// Get all achievements

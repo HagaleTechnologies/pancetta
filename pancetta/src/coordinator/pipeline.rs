@@ -896,6 +896,7 @@ impl super::ApplicationCoordinator {
         let cmd_shutdown = self.shutdown_signal.clone();
         let cmd_message_bus = self.message_bus.clone();
         let cmd_operating_freq = operating_freq.clone();
+        let cmd_operating_freq_hz = self.operating_frequency_hz.clone();
         let cmd_handle = tokio::spawn(async move {
             while !cmd_shutdown.load(Ordering::Acquire) {
                 match tui_cmd_rx.try_recv() {
@@ -938,6 +939,7 @@ impl super::ApplicationCoordinator {
                             info!("TUI SetFrequency: VFO {} -> {} Hz", vfo, frequency);
                             let freq_mhz = frequency as f64 / 1_000_000.0;
                             cmd_operating_freq.store(freq_mhz.to_bits(), Ordering::Relaxed);
+                            cmd_operating_freq_hz.store(frequency, Ordering::Relaxed);
                             // Forward to hamlib if available
                             let msg = ComponentMessage::new(
                                 ComponentId::Tui,

@@ -575,9 +575,6 @@ impl LotwClient {
 
     /// Parse upload response HTML
     fn parse_upload_response(&self, html: &str) -> Result<LotwUploadResponse> {
-        // This is a simplified parser for LoTW's HTML response
-        // A full implementation would use an HTML parser
-
         let status = if html.contains("Upload successful") || html.contains("File uploaded") {
             "success".to_string()
         } else if html.contains("Error") || html.contains("Failed") {
@@ -586,18 +583,37 @@ impl LotwClient {
             "unknown".to_string()
         };
 
-        // Try to extract counts from HTML
         let mut processed = None;
-        let accepted = None;
-        let rejected = None;
+        let mut accepted = None;
+        let mut rejected = None;
+        let mut errors: Vec<String> = Vec::new();
 
-        // Simple regex-like extraction (in real implementation, use proper HTML parser)
-        if let Some(start) = html.find("processed") {
-            if let Some(num_start) = html[..start].rfind(char::is_numeric) {
-                if let Some(num_end) = html[num_start..start].find(char::is_whitespace) {
-                    if let Ok(num) = html[num_start..num_start + num_end].parse::<u32>() {
-                        processed = Some(num);
-                    }
+        // Strip HTML tags so we work on plain text, then scan line by line.
+        let plain = strip_html_tags(html);
+
+        for line in plain.lines() {
+            let lower = line.to_lowercase();
+
+            // "N records were processed" | "processed N records" | "processed N"
+            if lower.contains("processed") && processed.is_none() {
+                processed = extract_count(line, "processed");
+            }
+
+            // "N QSOs were accepted" | "accepted N"
+            if lower.contains("accepted") && accepted.is_none() {
+                accepted = extract_count(line, "accepted");
+            }
+
+            // "N QSOs were rejected" | "rejected N"
+            if lower.contains("rejected") && rejected.is_none() {
+                rejected = extract_count(line, "rejected");
+            }
+
+            // Collect error lines (but not lines that are just counts)
+            if lower.contains("error") || lower.contains("invalid") || lower.contains("failed") {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() {
+                    errors.push(trimmed);
                 }
             }
         }
@@ -607,7 +623,11 @@ impl LotwClient {
             processed,
             accepted,
             rejected,
-            errors: None,
+            errors: if errors.is_empty() {
+                None
+            } else {
+                Some(errors)
+            },
         })
     }
 
@@ -621,6 +641,59 @@ impl LotwClient {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Helpers for parse_upload_response
+// ---------------------------------------------------------------------------
+
+/// Remove HTML tags from `s`, returning plain text.
+///
+/// Each closing `>` is turned into a newline so that content from different
+/// HTML block elements ends up on separate lines, which makes per-line keyword
+/// scanning reliable even when the HTML has no whitespace between tags.
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                // newline keeps block elements on separate lines
+                out.push('\n');
+            }
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Search `line` for a decimal number that appears adjacent to `keyword` (case-
+/// insensitive).  Handles both orderings:
+///   "42 QSOs were accepted"  →  number before keyword
+///   "accepted 42"            →  number after keyword
+/// Returns the first number found on the line when the keyword is present.
+pub fn extract_count(line: &str, keyword: &str) -> Option<u32> {
+    let lower = line.to_lowercase();
+    if !lower.contains(&keyword.to_lowercase()) {
+        return None;
+    }
+
+    // Collect all whitespace-delimited tokens; try to parse each as u32.
+    // We return the first numeric token found on the line, which works for
+    // both "N ... keyword" and "keyword N ..." layouts.
+    for token in line.split_whitespace() {
+        // Strip any trailing punctuation (comma, period, colon, parentheses)
+        let trimmed = token.trim_matches(|c: char| !c.is_ascii_digit());
+        if let Ok(n) = trimmed.parse::<u32>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 
 /// ADIF field structure
 #[derive(Debug)]
@@ -746,6 +819,105 @@ mod tests {
         assert_eq!(fields[1].value, "20230101");
         assert_eq!(fields[2].tag, "TIME_ON");
         assert_eq!(fields[2].value, "1234");
+    }
+
+    // --- extract_count ---
+
+    #[test]
+    fn test_extract_count_number_before_keyword() {
+        assert_eq!(extract_count("42 QSOs were accepted", "accepted"), Some(42));
+    }
+
+    #[test]
+    fn test_extract_count_number_after_keyword() {
+        assert_eq!(extract_count("accepted 7", "accepted"), Some(7));
+    }
+
+    #[test]
+    fn test_extract_count_processed_phrase() {
+        assert_eq!(
+            extract_count("3 records were processed", "processed"),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn test_extract_count_keyword_absent() {
+        assert_eq!(extract_count("42 QSOs were accepted", "rejected"), None);
+    }
+
+    #[test]
+    fn test_extract_count_no_number() {
+        assert_eq!(extract_count("no records accepted", "accepted"), None);
+    }
+
+    #[test]
+    fn test_extract_count_trailing_punctuation() {
+        // e.g. "accepted: 5," — comma stripped
+        assert_eq!(extract_count("accepted: 5,", "accepted"), Some(5));
+    }
+
+    // --- strip_html_tags ---
+
+    #[test]
+    fn test_strip_html_tags_basic() {
+        let html = "<p>42 QSOs were <b>accepted</b></p>";
+        let plain = strip_html_tags(html);
+        assert!(!plain.contains('<'));
+        assert!(plain.contains("42"));
+        assert!(plain.contains("accepted"));
+    }
+
+    // --- parse_upload_response ---
+
+    #[test]
+    fn test_parse_upload_response_success_counts() {
+        let client = LotwClient::new(None);
+        let html = "<html><body>\
+            <p>Upload successful</p>\
+            <p>10 records were processed</p>\
+            <p>8 QSOs were accepted</p>\
+            <p>2 QSOs were rejected</p>\
+            </body></html>";
+
+        let resp = client.parse_upload_response(html).unwrap();
+        assert_eq!(resp.status, "success");
+        assert_eq!(resp.processed, Some(10));
+        assert_eq!(resp.accepted, Some(8));
+        assert_eq!(resp.rejected, Some(2));
+        assert!(resp.errors.is_none());
+    }
+
+    #[test]
+    fn test_parse_upload_response_empty() {
+        let client = LotwClient::new(None);
+        let resp = client.parse_upload_response("").unwrap();
+        assert_eq!(resp.status, "unknown");
+        assert_eq!(resp.processed, None);
+        assert_eq!(resp.accepted, None);
+        assert_eq!(resp.rejected, None);
+    }
+
+    #[test]
+    fn test_parse_upload_response_error_message() {
+        let client = LotwClient::new(None);
+        let html = "<html><body><p>Error: invalid certificate</p></body></html>";
+        let resp = client.parse_upload_response(html).unwrap();
+        assert_eq!(resp.status, "error");
+        assert!(resp.errors.is_some());
+        let errs = resp.errors.unwrap();
+        assert!(errs.iter().any(|e| e.contains("invalid certificate")));
+    }
+
+    #[test]
+    fn test_parse_upload_response_reverse_word_order() {
+        // "processed N" layout (keyword before number)
+        let client = LotwClient::new(None);
+        let html = "processed 5 records\naccepted 3\nrejected 2";
+        let resp = client.parse_upload_response(html).unwrap();
+        assert_eq!(resp.processed, Some(5));
+        assert_eq!(resp.accepted, Some(3));
+        assert_eq!(resp.rejected, Some(2));
     }
 
     #[test]

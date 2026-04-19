@@ -7,7 +7,7 @@ use crate::{Band, ConfirmationStatus, DxError, DxQso, Mode, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -556,15 +556,49 @@ impl DxTracker {
         })
     }
 
-    /// Check if entity/band/mode combination is needed
+    /// Check if an entity/band/mode combination is needed for awards.
     ///
-    /// TODO: Implement proper needed-entity check. Requires DXCC lookup to
-    /// resolve callsign to entity code, then query the award_tracking table
-    /// to see if that entity/band/mode combination is already confirmed.
+    /// Returns `true` if no confirmed entry exists in `award_tracking` for the
+    /// given entity code, band, and mode — meaning this QSO would be new.
+    /// If the table query fails (e.g. schema not yet created), returns `true`
+    /// as a conservative default (never suppress a possibly-needed QSO).
+    pub async fn is_entity_needed(
+        &self,
+        entity_code: u16,
+        band: Band,
+        mode: &Mode,
+    ) -> Result<bool> {
+        let band_str = band.to_string();
+        let mode_str = mode.to_string();
+
+        let conn = self.connection.lock().unwrap();
+        let count: i64 = match conn.query_row(
+            "SELECT COUNT(*) FROM award_tracking
+             WHERE entity_code = ?1 AND band = ?2 AND mode = ?3 AND status = '\"Confirmed\"'",
+            params![entity_code as i64, band_str, mode_str],
+            |row| row.get(0),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(
+                    "is_entity_needed: query failed ({}), returning true (conservative)",
+                    e
+                );
+                return Ok(true);
+            }
+        };
+
+        Ok(count == 0)
+    }
+
+    /// Convenience wrapper that takes a callsign instead of an entity code.
+    ///
+    /// Since `DxTracker` does not own a `DxccDatabase`, callers with access to
+    /// DXCC lookup should prefer `is_entity_needed()` directly. This method
+    /// always returns `true` with a debug log — use the `DxHunter`-level
+    /// `is_needed()` for proper callsign resolution.
     pub async fn is_needed(&self, _callsign: &str, _band: Band, _mode: &Mode) -> Result<bool> {
-        // This would need DXCC lookup to get entity code from callsign,
-        // then check the award_tracking table for existing confirmations.
-        debug!("is_needed: stub — always returns true (award tracking not yet wired)");
+        debug!("is_needed: callsign lookup requires DxccDatabase — use is_entity_needed() for precise checks");
         Ok(true)
     }
 
@@ -712,6 +746,50 @@ impl DxTracker {
         }
     }
 
+    /// Get the set of confirmed entity codes from the award_tracking table.
+    ///
+    /// Optionally filtered by band and/or mode. Returns a `HashSet` for fast
+    /// set-difference against the full DXCC entity list.
+    pub fn get_confirmed_entity_codes(
+        &self,
+        band: Option<&Band>,
+        mode: Option<&Mode>,
+    ) -> Result<HashSet<u16>> {
+        let mut where_conditions = vec!["status = '\"Confirmed\"'".to_string()];
+        let mut param_values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(b) = band {
+            where_conditions.push(format!("band = ?{}", param_values.len() + 1));
+            param_values.push(Box::new(b.to_string()));
+        }
+        if let Some(m) = mode {
+            where_conditions.push(format!("mode = ?{}", param_values.len() + 1));
+            param_values.push(Box::new(m.to_string()));
+        }
+
+        let query = format!(
+            "SELECT DISTINCT entity_code FROM award_tracking WHERE {}",
+            where_conditions.join(" AND ")
+        );
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let conn = self.connection.lock().unwrap();
+        let mut stmt = conn.prepare(&query)?;
+        let rows = stmt.query_map(
+            param_refs.as_slice(),
+            |row| Ok(row.get::<_, i64>(0)? as u16),
+        )?;
+
+        let mut confirmed = HashSet::new();
+        for row in rows {
+            confirmed.insert(row?);
+        }
+
+        Ok(confirmed)
+    }
+
     /// Get award summary for DXCC
     pub async fn get_dxcc_summary(
         &self,
@@ -775,8 +853,44 @@ impl DxTracker {
             total_entities,
             worked_percentage: (worked_count as f64 / total_entities as f64) * 100.0,
             confirmed_percentage: (confirmed_count as f64 / total_entities as f64) * 100.0,
-            needed_entities: Vec::new(), // Would be populated with actual needed entities
+            needed_entities: Vec::new(), // Use get_dxcc_summary_with_entities() for populated list
         })
+    }
+
+    /// Get award summary for DXCC with the needed-entities list populated.
+    ///
+    /// `all_entity_codes` is the full set of current DXCC entity codes (from
+    /// `DxccDatabase::get_current_entities()`). The needed list is computed as
+    /// all_entity_codes minus confirmed entity codes.
+    pub async fn get_dxcc_summary_with_entities(
+        &self,
+        band: Option<Band>,
+        mode: Option<Mode>,
+        all_entity_codes: &[u16],
+    ) -> Result<AwardSummary> {
+        let mut summary = self.get_dxcc_summary(band, mode).await?;
+
+        // Update total_entities to match the actual DXCC list size
+        summary.total_entities = all_entity_codes.len() as u32;
+
+        // Recalculate percentages with accurate total
+        if summary.total_entities > 0 {
+            summary.worked_percentage =
+                (summary.worked_count as f64 / summary.total_entities as f64) * 100.0;
+            summary.confirmed_percentage =
+                (summary.confirmed_count as f64 / summary.total_entities as f64) * 100.0;
+        }
+
+        // Compute needed = all entities minus confirmed
+        let confirmed = self.get_confirmed_entity_codes(band.as_ref(), mode.as_ref())?;
+
+        summary.needed_entities = all_entity_codes
+            .iter()
+            .filter(|code| !confirmed.contains(code))
+            .copied()
+            .collect();
+
+        Ok(summary)
     }
 }
 

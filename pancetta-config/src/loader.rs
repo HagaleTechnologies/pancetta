@@ -493,8 +493,18 @@ impl ConfigLoader {
 
     /// Load configuration from remote URL
     fn load_from_remote(&self, url: &str) -> ConfigResult<Config> {
+        // Validate URL format (basic check: must start with http:// or https://)
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(ConfigError::Validation(format!(
+                "Invalid remote URL format: '{}'. URL must start with http:// or https://. \
+                 As a workaround, download the config file manually and place it at ~/.pancetta/pancetta.toml",
+                url
+            )));
+        }
+
         Err(ConfigError::Validation(format!(
-            "Remote configuration loading not implemented (url: {})",
+            "Remote configuration loading is not yet implemented for: {}. \
+             Download the config file manually and place it at ~/.pancetta/pancetta.toml",
             url
         )))
     }

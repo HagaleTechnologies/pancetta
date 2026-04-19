@@ -609,6 +609,41 @@ impl QsoDatabase {
         Ok(None)
     }
 
+    /// Return distinct callsigns worked on the given band.
+    ///
+    /// Band should be an ADIF-style string such as `"20m"` or `"40m"`.
+    /// If the database is empty or the band has no QSOs, an empty `Vec` is returned.
+    /// Errors (e.g. missing table on a fresh DB) are swallowed and logged so that
+    /// callers always get a usable (possibly empty) result.
+    pub fn get_worked_callsigns(&self, band: &str) -> Vec<String> {
+        let result: rusqlite::Result<Vec<String>> = (|| {
+            let mut stmt = self.connection.prepare(
+                "SELECT DISTINCT json_extract(metadata, '$.their_callsign') \
+                 FROM qsos \
+                 WHERE json_extract(adif_data, '$.band') = ?1 \
+                   AND json_extract(metadata, '$.their_callsign') IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![band], |row| row.get::<_, String>(0))?;
+            let mut callsigns = Vec::new();
+            for row in rows {
+                callsigns.push(row?);
+            }
+            Ok(callsigns)
+        })();
+
+        match result {
+            Ok(callsigns) => callsigns,
+            Err(e) => {
+                tracing::warn!(
+                    "get_worked_callsigns: query failed (band={}): {} — treating as empty",
+                    band,
+                    e
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Vacuum database to reclaim space
     pub fn vacuum(&mut self) -> Result<(), DatabaseError> {
         info!("Vacuuming database");

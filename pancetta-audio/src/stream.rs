@@ -8,7 +8,7 @@ use crate::{
     error::{AudioError, AudioResult},
     latency::CallbackTimer,
     ringbuffer_comm::{
-        audio_comm_pair, AudioCommShared, AudioConsumer, DEFAULT_AUDIO_BUFFER_SIZE,
+        audio_comm_pair, AudioCommShared, AudioConsumer, AudioProducer, DEFAULT_AUDIO_BUFFER_SIZE,
         DEFAULT_LATENCY_BUFFER_SIZE,
     },
 };
@@ -91,6 +91,10 @@ pub struct AudioStreamManager {
     output_stream: Option<Stream>,
     /// Consumer half — owned by the processing thread
     consumer: Option<AudioConsumer>,
+    /// Producer half for output audio — caller pushes TX samples here
+    output_producer: Option<AudioProducer>,
+    /// Consumer half for output audio — moved into the output stream callback
+    output_consumer: Option<AudioConsumer>,
     /// Shared atomic state (stop flag, counters)
     shared: AudioCommShared,
     is_running: bool,
@@ -104,12 +108,18 @@ impl AudioStreamManager {
             audio_comm_pair(DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
         let shared = consumer.shared.clone();
 
+        // Create output ring buffer pair for TX audio
+        let (output_producer, output_consumer) =
+            audio_comm_pair(DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
+
         Ok(Self {
             device_manager,
             config,
             input_stream: None,
             output_stream: None,
             consumer: Some(consumer),
+            output_producer: Some(output_producer),
+            output_consumer: Some(output_consumer),
             shared,
             is_running: false,
         })
@@ -121,6 +131,13 @@ impl AudioStreamManager {
     /// thread can own the consumer. Returns `None` if already taken.
     pub fn take_consumer(&mut self) -> Option<AudioConsumer> {
         self.consumer.take()
+    }
+
+    /// Take the output producer half so the AudioManager can push TX samples.
+    ///
+    /// Returns `None` if already taken.
+    pub fn take_output_producer(&mut self) -> Option<AudioProducer> {
+        self.output_producer.take()
     }
 
     /// Get the shared atomic state (stop flag, counters).
@@ -155,6 +172,12 @@ impl AudioStreamManager {
 
         // Create input stream (moves the producer into the callback)
         self.create_input_stream()?;
+
+        // Recreate output ring buffer pair for this session
+        let (output_producer, output_consumer) =
+            audio_comm_pair(DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
+        self.output_producer = Some(output_producer);
+        self.output_consumer = Some(output_consumer);
 
         // Create output stream if monitoring is enabled
         if self.config.enable_monitoring {
@@ -412,12 +435,19 @@ impl AudioStreamManager {
             false, // is_input
         )?;
 
-        // Create the output stream
+        // Take the output consumer — move into the callback closure
+        let mut output_consumer = self
+            .output_consumer
+            .take()
+            .ok_or_else(|| AudioError::stream("Output consumer already taken"))?;
+
+        // Create the output stream — drain TX samples from the ring buffer
         let stream = output_device.build_output_stream(
             &stream_config.into(),
             move |data: &mut [f32], _info: &OutputCallbackInfo| {
-                // No monitoring audio source configured — output silence
-                for sample in data.iter_mut() {
+                let read = output_consumer.pop_audio_slice(data);
+                // Fill any remaining samples with silence (underrun is normal when not transmitting)
+                for sample in data[read..].iter_mut() {
                     *sample = 0.0;
                 }
             },

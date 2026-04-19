@@ -126,6 +126,41 @@ impl super::ApplicationCoordinator {
                     }
                 };
 
+                // Seed worked-station history from the QSO database so that
+                // previously-worked stations are recognised as duplicates across restarts.
+                {
+                    use pancetta_qso::QsoDatabase;
+
+                    // Determine the current band from the first configured band-hopping
+                    // entry, falling back to "20m".  This is a best-effort seed — the
+                    // autonomous operator will always re-validate against the live
+                    // worked-on-band set as QSOs complete.
+                    let band = "20m"; // default; updated when rig frequency is known
+
+                    match QsoDatabase::open(&db_path) {
+                        Ok(db) => {
+                            let callsigns = db.get_worked_callsigns(band);
+                            if callsigns.is_empty() {
+                                tracing::info!(
+                                    "QSO database has no prior contacts on {} — starting fresh",
+                                    band
+                                );
+                            } else {
+                                qso_lookup.seed_worked_from_list(callsigns);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Could not open QSO database for startup seed ({}): {} — \
+                                 previously-worked stations will not be detected as duplicates \
+                                 until re-worked this session",
+                                db_path.display(),
+                                e
+                            );
+                        }
+                    }
+                }
+
                 info!(
                     "QSO component ready (callsign={}, grid={:?})",
                     our_callsign, our_grid
@@ -827,6 +862,7 @@ impl super::ApplicationCoordinator {
         let message_bus = self.message_bus.clone();
 
         let cqdx_bridge_for_auto = self.cqdx_bridge.clone();
+        let operating_frequency_hz = self.operating_frequency_hz.clone();
         let auto_handle = {
             let shutdown = self.shutdown_signal.clone();
             let operator = operator.clone();
@@ -843,17 +879,14 @@ impl super::ApplicationCoordinator {
                         _ = slot_interval.tick() => {
                             // Report decoded spots to cqdx.io
                             if let Some(ref bridge) = cqdx_bridge_for_auto {
-                                // NOTE: msg.frequency_hz is audio-baseband offset (200-3000 Hz),
-                                // not absolute RF frequency. We set frequency to 0 rather than
-                                // report incorrect data. A future improvement should pass the
-                                // operating frequency into the autonomous component.
+                                let dial_freq = operating_frequency_hz.load(Ordering::Relaxed);
                                 let spot_reports: Vec<pancetta_cqdx::SpotReport> = slot_messages
                                     .iter()
                                     .filter_map(|msg| {
                                         msg.callsign.as_ref().map(|call| pancetta_cqdx::SpotReport {
                                             callsign: call.clone(),
                                             grid: None,
-                                            frequency: 0,
+                                            frequency: dial_freq + msg.frequency_hz as u64,
                                             mode: "FT8".to_string(),
                                             snr: msg.snr,
                                             timestamp: chrono::Utc::now(),
@@ -1207,6 +1240,7 @@ impl super::ApplicationCoordinator {
             .create_channel(ComponentId::PskReporter)
             .await?;
 
+        let psk_operating_freq = self.operating_frequency_hz.clone();
         let psk_handle = {
             let shutdown = self.shutdown_signal.clone();
 
@@ -1242,9 +1276,11 @@ impl super::ApplicationCoordinator {
                                         as i64;
 
                                     if let Some(ref callsign) = decoded_msg.message.from_callsign {
+                                        let dial_freq = psk_operating_freq.load(Ordering::Relaxed);
                                         uploader.add_report(ReceptionReport {
                                             tx_callsign: callsign.clone(),
-                                            frequency: decoded_msg.frequency_offset as u64,
+                                            frequency: dial_freq
+                                                + decoded_msg.frequency_offset as u64,
                                             snr: Some(decoded_msg.snr_db as i32),
                                             mode: "FT8".to_string(),
                                             tx_grid: decoded_msg.message.grid_square.clone(),

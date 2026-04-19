@@ -33,13 +33,6 @@ pub struct CachedStationLookup {
 
 impl CachedStationLookup {
     pub fn new() -> Self {
-        // TODO: Seed worked_on_band from the QSO database (~/.pancetta/qso.db)
-        // so that previously-worked stations are recognized across restarts.
-        // Until this is implemented, all stations appear as "new" after restart.
-        tracing::warn!(
-            "CachedStationLookup: worked-station history is not persisted across restarts. \
-             Previously-worked stations will not be detected as duplicates until re-worked."
-        );
         Self {
             worked_on_band: Arc::new(RwLock::new(HashSet::new())),
             recent_failures: Arc::new(RwLock::new(HashSet::new())),
@@ -50,6 +43,20 @@ impl CachedStationLookup {
             network_snr: Arc::new(RwLock::new(HashMap::new())),
             network_last_seen: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Seed `worked_on_band` from a list of callsigns loaded out-of-band
+    /// (e.g. from the QSO database at startup).  Callsigns are uppercased
+    /// for consistent comparison.
+    pub fn seed_worked_from_list(&self, callsigns: Vec<String>) {
+        let mut set = self.worked_on_band.write().unwrap();
+        for call in callsigns {
+            set.insert(call.to_uppercase());
+        }
+        tracing::info!(
+            "CachedStationLookup: seeded {} worked station(s) from QSO database",
+            set.len()
+        );
     }
 
     pub fn update_worked_on_band(&self, callsigns: HashSet<String>) {

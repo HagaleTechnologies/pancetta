@@ -126,6 +126,8 @@ impl super::ApplicationCoordinator {
             }
         }
 
+        let operating_frequency_hz = self.operating_frequency_hz.clone();
+
         let hamlib_handle = {
             let shutdown = self.shutdown_signal.clone();
 
@@ -155,6 +157,7 @@ impl super::ApplicationCoordinator {
                 let rig_poll = Arc::new(rig);
                 let rig_for_polling = Arc::clone(&rig_poll);
                 let shutdown_for_polling = shutdown.clone();
+                let op_freq_for_polling = operating_frequency_hz.clone();
                 let mut spawned_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
                 spawned_handles.push(tokio::spawn(async move {
@@ -173,6 +176,8 @@ impl super::ApplicationCoordinator {
                                     .get_frequency(pancetta_hamlib::Vfo::Current)
                                     .await
                                 {
+                                    // Update shared operating frequency for spot reporters
+                                    op_freq_for_polling.store(freq, Ordering::Relaxed);
                                     let message = ComponentMessage::new(
                                         ComponentId::Hamlib,
                                         ComponentId::Tui,

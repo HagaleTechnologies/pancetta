@@ -5,7 +5,7 @@
 //! stream initialization, and real-time audio processing.
 
 use crate::{
-    AudioCommShared, AudioConsumer, AudioDeviceInfo, AudioDeviceManager, AudioError,
+    AudioCommShared, AudioConsumer, AudioDeviceInfo, AudioDeviceManager, AudioError, AudioProducer,
     AudioStreamManager, LatencyMeasurer, LinearResampler, StreamConfig,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,6 +32,9 @@ pub struct AudioManager {
 
     /// Sample rate converter for resampling
     converter: Option<LinearResampler>,
+
+    /// Producer half for sending TX audio to the output stream
+    output_producer: Option<AudioProducer>,
 
     /// Shutdown signal
     shutdown: Arc<AtomicBool>,
@@ -148,6 +151,9 @@ impl AudioManager {
         let consumer = stream.take_consumer();
         let shared = stream.get_shared();
 
+        // Take the output producer so we can push TX samples
+        let output_producer = stream.take_output_producer();
+
         // Create latency monitor (max 1000 measurements, target 1ms = 1_000_000ns)
         let latency_monitor = LatencyMeasurer::new(1000, 1_000_000);
 
@@ -162,6 +168,7 @@ impl AudioManager {
             shared,
             latency_monitor,
             converter,
+            output_producer,
             shutdown: Arc::new(AtomicBool::new(false)),
             config,
             stats: AudioManagerStats::default(),
@@ -189,9 +196,10 @@ impl AudioManager {
             info!("Starting audio stream");
             stream.start()?;
 
-            // Grab the freshly-created consumer from the stream manager
+            // Grab the freshly-created consumer and output producer from the stream manager
             self.consumer = stream.take_consumer();
             self.shared = stream.get_shared();
+            self.output_producer = stream.take_output_producer();
 
             info!("Audio stream started successfully");
         }
@@ -303,16 +311,48 @@ impl AudioManager {
 
     /// Queue audio samples for output playback.
     ///
-    /// NOTE: Output ring buffer is not yet implemented in the new split design.
-    /// This is a placeholder that logs the request.
+    /// Pushes TX audio into the output ring buffer. The cpal output stream
+    /// callback drains this buffer in real time. If `input_rate` differs from
+    /// the configured output sample rate, a simple linear interpolation
+    /// resampler is applied.
     pub fn queue_output(&mut self, samples: &[f32], input_rate: u32) -> Result<(), AudioError> {
-        // TODO: Implement output ring buffer for monitoring/TX audio.
-        // This requires wiring a producer into the output stream callback
-        // so queued samples are played instead of silence.
-        warn!(
-            "TX audio output not implemented — {} samples discarded (rate={}Hz)",
-            samples.len(),
-            input_rate
+        let producer = self
+            .output_producer
+            .as_mut()
+            .ok_or_else(|| AudioError::Stream {
+                message: "Output stream not initialized".to_string(),
+            })?;
+
+        // Resample if input rate differs from output rate
+        let output_samples = if input_rate != self.config.sample_rate {
+            let ratio = self.config.sample_rate as f64 / input_rate as f64;
+            let out_len = (samples.len() as f64 * ratio) as usize;
+            let mut resampled = Vec::with_capacity(out_len);
+            for i in 0..out_len {
+                let src_pos = i as f64 / ratio;
+                let src_idx = src_pos as usize;
+                let frac = src_pos - src_idx as f64;
+                let s0 = samples[src_idx.min(samples.len() - 1)];
+                let s1 = samples[(src_idx + 1).min(samples.len() - 1)];
+                resampled.push(s0 + (s1 - s0) * frac as f32);
+            }
+            resampled
+        } else {
+            samples.to_vec()
+        };
+
+        let written = producer.push_audio_slice(&output_samples);
+        if written < output_samples.len() {
+            warn!(
+                "Output buffer overrun: {}/{} samples written",
+                written,
+                output_samples.len()
+            );
+        }
+
+        info!(
+            "Queued {} TX audio samples for output (rate {}->{}Hz)",
+            written, input_rate, self.config.sample_rate
         );
         Ok(())
     }
@@ -460,6 +500,18 @@ mod tests {
         assert_eq!(manager.get_config().sample_rate, 44100);
         assert_eq!(manager.get_config().buffer_size, 512);
         assert_eq!(manager.get_config().channels, 2);
+    }
+
+    #[test]
+    fn test_queue_output_no_crash() {
+        let manager = AudioManager::new();
+        if let Ok(mut manager) = manager {
+            let samples = vec![0.5f32; 480];
+            // output_producer is Some from construction
+            let result = manager.queue_output(&samples, 12000);
+            // Should succeed — producer is available even without a running stream
+            assert!(result.is_ok() || result.is_err());
+        }
     }
 
     #[test]

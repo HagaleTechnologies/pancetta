@@ -976,22 +976,50 @@ impl DxccDatabase {
     }
 
     /// Load DXCC data from CTY.DAT file format
+    ///
+    /// CTY.DAT records span multiple lines and are terminated by semicolons.
+    /// Each record has a header line with colon-separated fields, followed by
+    /// one or more lines of comma-separated alias prefixes ending with a semicolon.
     pub async fn load_cty_dat(&mut self, cty_data: &str) -> Result<()> {
         info!("Loading DXCC data from CTY.DAT format");
 
-        let mut entities_loaded = 0;
-        let mut prefixes_loaded = 0;
+        let mut entities_loaded: usize = 0;
+        let mut prefixes_loaded: usize = 0;
+        let mut next_entity_code: u16 = 1000; // Start above hand-coded entities
+
+        // Accumulate lines into semicolon-delimited records
+        let mut current_record = String::new();
 
         for line in cty_data.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+            // Skip comment lines
+            if line.trim_start().starts_with('#') {
                 continue;
             }
 
-            if let Ok((entity, prefix_count)) = self.parse_cty_line(line) {
-                self.add_entity(entity);
-                entities_loaded += 1;
-                prefixes_loaded += prefix_count;
+            current_record.push_str(line);
+            current_record.push('\n');
+
+            // A record is complete when we see a semicolon
+            if line.trim_end().ends_with(';') {
+                let record = current_record.trim().to_string();
+                current_record.clear();
+
+                if record.is_empty() {
+                    continue;
+                }
+
+                match self.parse_cty_record(&record, next_entity_code) {
+                    Ok((entity, prefix_count)) => {
+                        self.add_entity(entity);
+                        entities_loaded += 1;
+                        prefixes_loaded += prefix_count;
+                        next_entity_code += 1;
+                    }
+                    Err(e) => {
+                        let preview: String = record.chars().take(60).collect();
+                        warn!("Failed to parse CTY.DAT record '{}...': {}", preview, e);
+                    }
+                }
             }
         }
 
@@ -1005,11 +1033,197 @@ impl DxccDatabase {
         Ok(())
     }
 
-    /// Parse a single line from CTY.DAT format (simplified)
-    fn parse_cty_line(&mut self, _line: &str) -> Result<(DxccEntity, usize)> {
-        Err(DxError::Parse(
-            "CTY.DAT parsing not fully implemented".to_string(),
-        ))
+    /// Parse a complete CTY.DAT record (header line + alias lines).
+    ///
+    /// Record format:
+    /// ```text
+    /// Entity Name:  CQ:  ITU:  Continent:  Lat:  Lon:  GMT Offset:  Primary Prefix:
+    ///     alias1,alias2(CQ),(ITU),...;
+    /// ```
+    fn parse_cty_record(&mut self, record: &str, entity_code: u16) -> Result<(DxccEntity, usize)> {
+        // Split into lines; the first line is the header, the rest are alias lines
+        let mut lines = record.lines();
+        let header_line = lines
+            .next()
+            .ok_or_else(|| DxError::Parse("Empty CTY.DAT record".to_string()))?;
+
+        // Parse the header: 8 colon-separated fields
+        let fields: Vec<&str> = header_line.split(':').collect();
+        if fields.len() < 8 {
+            return Err(DxError::Parse(format!(
+                "CTY.DAT header needs 8 colon-separated fields, got {}: '{}'",
+                fields.len(),
+                header_line
+            )));
+        }
+
+        let name = fields[0].trim().to_string();
+        let cq_zone: u8 = fields[1]
+            .trim()
+            .parse()
+            .map_err(|_| DxError::Parse(format!("Invalid CQ zone: '{}'", fields[1].trim())))?;
+        let itu_zone: u8 = fields[2]
+            .trim()
+            .parse()
+            .map_err(|_| DxError::Parse(format!("Invalid ITU zone: '{}'", fields[2].trim())))?;
+        let continent = fields[3].trim().to_string();
+        let latitude: f64 = fields[4]
+            .trim()
+            .parse()
+            .map_err(|_| DxError::Parse(format!("Invalid latitude: '{}'", fields[4].trim())))?;
+        // CTY.DAT longitude sign convention is opposite of standard: west is positive
+        let raw_longitude: f64 = fields[5]
+            .trim()
+            .parse()
+            .map_err(|_| DxError::Parse(format!("Invalid longitude: '{}'", fields[5].trim())))?;
+        let longitude = -raw_longitude; // Convert to standard sign convention
+        let utc_offset: f32 = fields[6]
+            .trim()
+            .parse()
+            .map_err(|_| DxError::Parse(format!("Invalid UTC offset: '{}'", fields[6].trim())))?;
+        let primary_prefix = fields[7].trim().to_string();
+
+        // Determine if this is a deleted entity (name starts with '*')
+        let (clean_name, status) = if name.starts_with('*') {
+            (name[1..].to_string(), DxccStatus::Deleted)
+        } else {
+            (name, DxccStatus::Current)
+        };
+
+        // Register the primary prefix as a regex pattern
+        let escaped_prefix = regex::escape(&primary_prefix);
+        let pattern = format!("^{}", escaped_prefix);
+        if let Err(e) = self.add_prefix_pattern(&pattern, entity_code, 3) {
+            warn!("Failed to add primary prefix pattern '{}': {}", pattern, e);
+        }
+
+        // Collect remaining lines as alias data, stripping the trailing semicolon
+        let mut alias_text = String::new();
+        for line in lines {
+            alias_text.push_str(line);
+        }
+        // Remove trailing semicolon
+        if alias_text.ends_with(';') {
+            alias_text.pop();
+        }
+
+        // Parse alias prefixes
+        let mut prefix_count: usize = 1; // Count the primary prefix
+        if !alias_text.trim().is_empty() {
+            for alias_raw in alias_text.split(',') {
+                let alias = alias_raw.trim();
+                if alias.is_empty() {
+                    continue;
+                }
+
+                // Strip override annotations like (CQ), (ITU), [zone], {zone}, etc.
+                // Also handle exact-match callsigns prefixed with '='
+                let clean_alias = Self::strip_cty_annotations(alias);
+                if clean_alias.is_empty() {
+                    continue;
+                }
+
+                let is_exact = alias.starts_with('=');
+                let escaped = regex::escape(&clean_alias);
+                let pat = if is_exact {
+                    format!("^{}$", escaped)
+                } else {
+                    format!("^{}", escaped)
+                };
+
+                let priority = if is_exact { 1 } else { 4 };
+                if let Err(e) = self.add_prefix_pattern(&pat, entity_code, priority) {
+                    debug!("Failed to add alias pattern '{}': {}", pat, e);
+                }
+                prefix_count += 1;
+            }
+        }
+
+        let entity = DxccEntity {
+            entity_code,
+            name: clean_name.clone(),
+            prefix: primary_prefix,
+            itu_zone,
+            cq_zone,
+            continent,
+            latitude,
+            longitude,
+            utc_offset,
+            country: clean_name,
+            status,
+            start_date: None,
+            end_date: None,
+            notes: None,
+        };
+
+        Ok((entity, prefix_count))
+    }
+
+    /// Strip CTY.DAT annotation markers from an alias prefix.
+    ///
+    /// Annotations include:
+    /// - `(CQ)` or `(nn)` — CQ zone override
+    /// - `[ITU]` or `[nn]` — ITU zone override
+    /// - `{continent}` — continent override (e.g., `{AF}`)
+    /// - `<lat/lon>` — lat/lon override
+    /// - `~offset~` — UTC offset override
+    /// - Leading `=` for exact-match callsigns
+    fn strip_cty_annotations(alias: &str) -> String {
+        let mut result = String::with_capacity(alias.len());
+        let mut depth_paren = 0u32;
+        let mut depth_bracket = 0u32;
+        let mut depth_brace = 0u32;
+        let mut in_angle = false;
+        let mut in_tilde = false;
+
+        for ch in alias.chars() {
+            match ch {
+                '=' => continue, // strip leading '=' (exact match marker)
+                '(' => {
+                    depth_paren += 1;
+                    continue;
+                }
+                ')' => {
+                    depth_paren = depth_paren.saturating_sub(1);
+                    continue;
+                }
+                '[' => {
+                    depth_bracket += 1;
+                    continue;
+                }
+                ']' => {
+                    depth_bracket = depth_bracket.saturating_sub(1);
+                    continue;
+                }
+                '{' => {
+                    depth_brace += 1;
+                    continue;
+                }
+                '}' => {
+                    depth_brace = depth_brace.saturating_sub(1);
+                    continue;
+                }
+                '<' => {
+                    in_angle = true;
+                    continue;
+                }
+                '>' => {
+                    in_angle = false;
+                    continue;
+                }
+                '~' => {
+                    in_tilde = !in_tilde;
+                    continue;
+                }
+                _ => {}
+            }
+            if depth_paren == 0 && depth_bracket == 0 && depth_brace == 0 && !in_angle && !in_tilde
+            {
+                result.push(ch);
+            }
+        }
+
+        result
     }
 
     /// Export entities to JSON format
@@ -1133,5 +1347,146 @@ mod tests {
         let eu_entities = db.get_entities_by_continent("EU");
         assert_eq!(eu_entities.len(), 1);
         assert_eq!(eu_entities[0].entity_code, 2);
+    }
+
+    #[tokio::test]
+    async fn test_cty_dat_basic_record() {
+        let mut db = DxccDatabase {
+            entities: HashMap::new(),
+            prefixes: Vec::new(),
+            callsign_overrides: HashMap::new(),
+        };
+
+        let cty_data = "United States:                05:  08:  NA:   38.00:   97.00:    -5.0:  K:\n    AA,AB,AC,W,N;";
+
+        db.load_cty_dat(cty_data).await.unwrap();
+
+        assert_eq!(db.entity_count(), 1);
+        let entity = db.entities.values().next().unwrap();
+        assert_eq!(entity.name, "United States");
+        assert_eq!(entity.cq_zone, 5);
+        assert_eq!(entity.itu_zone, 8);
+        assert_eq!(entity.continent, "NA");
+        assert_eq!(entity.latitude, 38.0);
+        // CTY.DAT west-positive -> standard negative
+        assert_eq!(entity.longitude, -97.0);
+        assert_eq!(entity.utc_offset, -5.0);
+        assert_eq!(entity.prefix, "K");
+        assert_eq!(entity.status, DxccStatus::Current);
+    }
+
+    #[tokio::test]
+    async fn test_cty_dat_multiple_records() {
+        let mut db = DxccDatabase {
+            entities: HashMap::new(),
+            prefixes: Vec::new(),
+            callsign_overrides: HashMap::new(),
+        };
+
+        let cty_data = "\
+Canada:                       04:  09:  NA:   45.00:   75.00:    -5.0:  VE:
+    VA,VB,VC;
+United States:                05:  08:  NA:   38.00:   97.00:    -5.0:  K:
+    W,N,AA,AB;
+";
+
+        db.load_cty_dat(cty_data).await.unwrap();
+        assert_eq!(db.entity_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cty_dat_deleted_entity() {
+        let mut db = DxccDatabase {
+            entities: HashMap::new(),
+            prefixes: Vec::new(),
+            callsign_overrides: HashMap::new(),
+        };
+
+        let cty_data = "*Czechoslovakia:              15:  28:  EU:   50.00:  -14.00:    -1.0:  OK:
+    OL;";
+
+        db.load_cty_dat(cty_data).await.unwrap();
+
+        let entity = db.entities.values().next().unwrap();
+        assert_eq!(entity.name, "Czechoslovakia");
+        assert_eq!(entity.status, DxccStatus::Deleted);
+    }
+
+    #[tokio::test]
+    async fn test_cty_dat_annotations_stripped() {
+        let mut db = DxccDatabase {
+            entities: HashMap::new(),
+            prefixes: Vec::new(),
+            callsign_overrides: HashMap::new(),
+        };
+
+        let cty_data =
+            "Guantanamo Bay:               08:  11:  NA:   20.00:   75.00:     5.0:  KG4:
+    =KG4AA(8)[11],=KG4BB;";
+
+        db.load_cty_dat(cty_data).await.unwrap();
+
+        assert_eq!(db.entity_count(), 1);
+        // Should have prefix patterns for KG4, KG4AA (exact), KG4BB (exact)
+        assert!(db.prefixes.len() >= 3);
+    }
+
+    #[test]
+    fn test_strip_cty_annotations() {
+        assert_eq!(DxccDatabase::strip_cty_annotations("AA"), "AA");
+        assert_eq!(
+            DxccDatabase::strip_cty_annotations("=KG4AA(8)[11]"),
+            "KG4AA"
+        );
+        assert_eq!(DxccDatabase::strip_cty_annotations("VP2E{NA}"), "VP2E");
+        assert_eq!(DxccDatabase::strip_cty_annotations("UA9(17)"), "UA9");
+        assert_eq!(
+            DxccDatabase::strip_cty_annotations("R1FJ<80.00/50.00>~-3.0~"),
+            "R1FJ"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cty_dat_comment_and_empty_lines() {
+        let mut db = DxccDatabase {
+            entities: HashMap::new(),
+            prefixes: Vec::new(),
+            callsign_overrides: HashMap::new(),
+        };
+
+        let cty_data = "\
+# This is a comment
+Canada:                       04:  09:  NA:   45.00:   75.00:    -5.0:  VE:
+    VA,VB;
+# Another comment
+
+United States:                05:  08:  NA:   38.00:   97.00:    -5.0:  K:
+    W;
+";
+
+        db.load_cty_dat(cty_data).await.unwrap();
+        assert_eq!(db.entity_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cty_dat_callsign_lookup() {
+        let mut db = DxccDatabase {
+            entities: HashMap::new(),
+            prefixes: Vec::new(),
+            callsign_overrides: HashMap::new(),
+        };
+
+        let cty_data = "United States:                05:  08:  NA:   38.00:   97.00:    -5.0:  K:
+    W,N,AA,AB,AC;";
+
+        db.load_cty_dat(cty_data).await.unwrap();
+
+        // The primary prefix K should match K-prefixed calls
+        let entity = db.lookup_callsign("K5ARH").await.unwrap();
+        assert_eq!(entity.name, "United States");
+
+        // Alias prefix W should also match
+        let entity = db.lookup_callsign("W1AW").await.unwrap();
+        assert_eq!(entity.name, "United States");
     }
 }

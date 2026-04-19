@@ -264,6 +264,14 @@ impl RigctldClient {
         }
     }
 
+    /// Send a raw command to rigctld and return the response string.
+    ///
+    /// This is a public escape hatch for commands that don't have a
+    /// higher-level wrapper (e.g. antenna control via `y` / `Y`).
+    pub async fn send_raw_command(&self, cmd: &str) -> Result<String> {
+        self.send_command_with_retry(cmd).await
+    }
+
     /// Convert VFO enum to rigctld string
     fn vfo_to_string(vfo: Vfo) -> &'static str {
         match vfo {

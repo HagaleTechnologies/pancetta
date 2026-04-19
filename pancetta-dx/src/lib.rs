@@ -350,8 +350,22 @@ impl DxHunter {
     }
 
     /// Check if a QSO would be needed for awards
+    ///
+    /// Resolves the callsign to a DXCC entity code via the DXCC database,
+    /// then queries the award_tracking table for an existing confirmation.
+    /// Returns `true` (needed) if the callsign cannot be resolved — conservative.
     pub async fn is_needed(&self, callsign: &str, band: Band, mode: &Mode) -> Result<bool> {
-        self.tracker.is_needed(callsign, band, mode).await
+        match self.dxcc.lookup_callsign(callsign).await {
+            Ok(entity) => {
+                self.tracker
+                    .is_entity_needed(entity.entity_code, band, mode)
+                    .await
+            }
+            Err(_) => {
+                // Can't resolve callsign — assume needed (conservative)
+                Ok(true)
+            }
+        }
     }
 
     /// Record a new QSO

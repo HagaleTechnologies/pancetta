@@ -191,6 +191,10 @@ impl TuiRunner {
                             break;
                         }
                     }
+                    Event::Mouse(mouse_event) => {
+                        let mut app = self.app.write().await;
+                        app.handle_mouse_event(mouse_event).await?;
+                    }
                     Event::FocusLost => {
                         info!("TUI received FocusLost event");
                     }
@@ -308,6 +312,17 @@ impl TuiRunner {
     async fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
         let mut app = self.app.write().await;
 
+        // If help overlay is visible, route keys to help handler
+        if app.help_visible {
+            match key.code {
+                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => {
+                    app.toggle_help();
+                }
+                _ => {} // swallow all other keys while help is open
+            }
+            return Ok(true);
+        }
+
         // If device selection modal is visible, route keys there
         if app.device_selection.visible {
             match key.code {
@@ -395,8 +410,8 @@ impl TuiRunner {
             }
 
             // Function keys
-            KeyCode::F(1) => {
-                // F1 - Help
+            KeyCode::F(1) | KeyCode::Char('?') => {
+                // F1 / ? - Help
                 app.toggle_help();
             }
             KeyCode::F(2) => {
@@ -493,6 +508,11 @@ impl TuiRunner {
             // Render device selection modal overlay if visible
             if app.device_selection.visible {
                 TuiRunner::render_device_selection_modal(f, f.area(), &app.device_selection);
+            }
+
+            // Render help overlay if visible
+            if app.help_visible {
+                TuiRunner::render_help_overlay(f, f.area());
             }
         })?;
 
@@ -623,6 +643,84 @@ impl TuiRunner {
             Paragraph::new(" Tab: switch panel | Up/Down: select | Enter: confirm | Esc: cancel")
                 .style(Style::default().fg(Color::DarkGray));
         f.render_widget(footer, vert_chunks[1]);
+    }
+
+    /// Render help overlay as a centered modal
+    fn render_help_overlay(f: &mut Frame, area: Rect) {
+        let lines: &[(&str, &str)] = &[
+            ("Ctrl+Q", "Quit"),
+            ("F1 / ?", "Toggle help"),
+            ("Tab / Shift+Tab", "Switch panel"),
+            ("Up / Down", "Scroll list"),
+            ("Left / Right", "TX frequency offset"),
+            ("[ / ]", "TX frequency offset"),
+            ("+ / -", "Band up / down"),
+            ("Space", "Call selected station"),
+            ("Enter", "Send TX message"),
+            ("F2 / F3", "Start / stop CQ"),
+            ("F5", "Clear messages"),
+            ("F9", "Toggle PTT"),
+            ("D", "Device selection"),
+            ("A", "Toggle autonomous mode"),
+            ("P", "Pause / resume autonomous"),
+            ("M", "Toggle audio monitoring"),
+            ("T", "Toggle theme"),
+        ];
+
+        // Modal sizing: wide enough for content, tall enough for all lines
+        let modal_width: u16 = 52;
+        let modal_height = lines.len() as u16 + 5; // lines + title + 2 blank + footer + borders
+
+        let modal_width = modal_width.min(area.width.saturating_sub(4));
+        let modal_height = modal_height.min(area.height.saturating_sub(4));
+
+        let modal_area = Rect {
+            x: (area.width.saturating_sub(modal_width)) / 2,
+            y: (area.height.saturating_sub(modal_height)) / 2,
+            width: modal_width,
+            height: modal_height,
+        };
+
+        // Clear the area behind the modal
+        f.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let outer_block = Block::default()
+            .title(" Pancetta Help ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(Color::Black).fg(Color::Cyan));
+
+        let inner = outer_block.inner(modal_area);
+        f.render_widget(outer_block, modal_area);
+
+        // Build lines for the Paragraph: blank, bindings, blank, footer
+        use ratatui::text::{Line, Span, Text};
+
+        let mut text_lines: Vec<Line> = Vec::new();
+        text_lines.push(Line::from(""));
+
+        for (key, desc) in lines {
+            let key_span = Span::styled(
+                format!("  {:<20}", key),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+            let desc_span = Span::styled(*desc, Style::default().fg(Color::White));
+            text_lines.push(Line::from(vec![key_span, desc_span]));
+        }
+
+        text_lines.push(Line::from(""));
+        text_lines.push(Line::from(vec![Span::styled(
+            "  Press Escape, F1, or ? to close",
+            Style::default().fg(Color::DarkGray),
+        )]));
+
+        let paragraph = Paragraph::new(Text::from(text_lines))
+            .style(Style::default().bg(Color::Black))
+            .wrap(Wrap { trim: false });
+
+        f.render_widget(paragraph, inner);
     }
 
     /// Update performance metrics

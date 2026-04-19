@@ -262,6 +262,9 @@ pub struct App {
     // Device selection modal
     pub device_selection: DeviceSelectionState,
 
+    // Help overlay
+    pub help_visible: bool,
+
     // TX input
     pub tx_input_buffer: String,
     pub tx_input_cursor: usize,
@@ -320,6 +323,7 @@ impl App {
             waterfall_data: Vec::new(),
             autonomous_status: None,
             device_selection: DeviceSelectionState::new(),
+            help_visible: false,
             tx_input_buffer: String::new(),
             tx_input_cursor: 0,
             is_transmitting: false,
@@ -376,6 +380,17 @@ impl App {
     }
 
     pub async fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
+        // When help is visible, consume Escape/F1/? to close it and swallow all other keys
+        if self.help_visible {
+            match key.code {
+                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => {
+                    self.toggle_help();
+                }
+                _ => {} // swallow all other keys
+            }
+            return Ok(false);
+        }
+
         match key.code {
             // Global shortcuts
             KeyCode::Esc => {
@@ -452,8 +467,17 @@ impl App {
         Ok(false)
     }
 
-    pub async fn handle_mouse_event(&mut self, _mouse: MouseEvent) -> Result<()> {
-        // TODO: Implement mouse handling for scrolling and panel selection
+    pub async fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {
+        use crossterm::event::MouseEventKind;
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_up();
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_down();
+            }
+            _ => {}
+        }
         Ok(())
     }
 
@@ -817,8 +841,12 @@ impl App {
     }
 
     pub fn toggle_help(&mut self) {
-        // TODO: Implement help panel toggle
-        self.status_message = "Help not yet implemented".to_string();
+        self.help_visible = !self.help_visible;
+        if self.help_visible {
+            self.status_message = "Help — press Escape or F1 to close".to_string();
+        } else {
+            self.status_message = "Pancetta TUI Ready".to_string();
+        }
     }
 
     /// Get the callsign and frequency of the currently selected band activity entry.
