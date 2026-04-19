@@ -293,6 +293,20 @@ impl Ft8Decoder {
 
     /// Decode a 12.64-second window of audio samples
     pub fn decode_window(&mut self, samples: &[f32]) -> Ft8Result<Vec<DecodedMessage>> {
+        self.decode_window_with_ap(samples, &crate::ap::ApContext::default())
+    }
+
+    /// Decode a 12.64-second window of audio samples with A Priori (AP) context.
+    ///
+    /// When `ap_context` contains known callsigns or an active QSO, candidates
+    /// that fail standard (AP0) decoding are retried with progressively stronger
+    /// AP injection levels (AP1 through AP4). This improves decode success at
+    /// low SNR without affecting candidates that decode at AP0.
+    pub fn decode_window_with_ap(
+        &mut self,
+        samples: &[f32],
+        ap_context: &crate::ap::ApContext,
+    ) -> Ft8Result<Vec<DecodedMessage>> {
         let start_time = Instant::now();
         self.message_handler.on_window_start(SystemTime::now());
 
@@ -305,6 +319,9 @@ impl Ft8Decoder {
         }
 
         let max_passes = self.config.max_decode_passes.max(1);
+
+        // Check whether AP is active (any known information available)
+        let ap_active = ap_context.my_call.is_some();
 
         // Working copy of audio that we subtract decoded signals from
         let mut residual_samples: Vec<f32> = samples.to_vec();
@@ -355,31 +372,58 @@ impl Ft8Decoder {
                     i, c.time_step, c.freq_bin, c.sync_score
                 );
             }
+
+            // Collect already-decoded callsigns for AP2 short-circuit
+            let mut decoded_calls: HashSet<String> = all_decoded_messages
+                .iter()
+                .filter_map(|m| m.message.from_callsign.clone())
+                .collect();
+
             for candidate in &sync_candidates {
                 if all_decoded_messages.len() + pass_decoded.len() >= self.config.max_candidates {
                     break;
                 }
 
+                // First try standard AP0 decode (identical to non-AP path)
                 match self.decode_candidate(&audio, candidate, &spectrogram) {
                     Ok(Some(msg)) => {
                         // Deduplicate using HashSet for O(1) lookup
                         if seen_messages.insert(msg.text.clone()) {
+                            if let Some(ref call) = msg.message.from_callsign {
+                                decoded_calls.insert(call.clone());
+                            }
                             pass_decoded.push(msg);
                         }
+                        continue;
                     }
-                    Ok(None) => {
-                        #[cfg(feature = "debug-decode")]
-                        eprintln!(
-                            "  candidate t={} f={}: no decode",
-                            candidate.time_step, candidate.freq_bin
-                        );
-                    }
+                    Ok(None) => {}
                     Err(_e) => {
                         #[cfg(feature = "debug-decode")]
                         eprintln!(
                             "  candidate t={} f={}: error {}",
                             candidate.time_step, candidate.freq_bin, _e
                         );
+                        continue;
+                    }
+                }
+
+                // AP0 failed — try AP-enhanced decoding if AP is active
+                if !ap_active {
+                    continue;
+                }
+
+                if let Some(msg) = self.try_ap_decode(
+                    candidate,
+                    &spectrogram,
+                    ap_context,
+                    &decoded_calls,
+                    pass,
+                )? {
+                    if seen_messages.insert(msg.text.clone()) {
+                        if let Some(ref call) = msg.message.from_callsign {
+                            decoded_calls.insert(call.clone());
+                        }
+                        pass_decoded.push(msg);
                     }
                 }
             }
@@ -948,6 +992,243 @@ impl Ft8Decoder {
 
     /// Attempt to decode a single Costas sync candidate.
     ///
+    // ========================================================================
+    // A Priori (AP) enhanced decoding helpers
+    // ========================================================================
+
+    /// Try AP-enhanced decoding for a candidate that failed standard AP0 decode.
+    ///
+    /// Extracts LLRs from the spectrogram path (cheaper than fine-timing FFT),
+    /// then tries AP1 (own callsign as called station), AP2 (recent callers),
+    /// AP3 (both calls known), and AP4 (AP3 + message type constraint).
+    fn try_ap_decode(
+        &self,
+        candidate: &CostasCandidate,
+        spectrogram: &Spectrogram,
+        ap_context: &crate::ap::ApContext,
+        decoded_calls: &HashSet<String>,
+        _pass: usize,
+    ) -> Ft8Result<Option<DecodedMessage>> {
+        let tone_spacing = self.protocol_params.tone_spacing;
+        let sps = self.protocol_params.samples_per_symbol(SAMPLE_RATE);
+        let spec_step = sps / (2 * TIME_OSR);
+        let coarse_offset = candidate.time_step * spec_step;
+
+        // Try both freq_sub values, same as the spectrogram path in decode_candidate
+        let freq_sub_trials = [candidate.freq_sub, if candidate.freq_sub == 0 { 1 } else { 0 }];
+
+        for &trial_freq_sub in &freq_sub_trials {
+            let trial_candidate = CostasCandidate {
+                time_step: candidate.time_step,
+                freq_bin: candidate.freq_bin,
+                freq_sub: trial_freq_sub,
+                sync_score: candidate.sync_score,
+            };
+            let tone_magnitudes = self.extract_symbols_from_spectrogram(spectrogram, &trial_candidate);
+            let base_llrs = self.compute_soft_llrs_db(&tone_magnitudes);
+
+            // Compute frequency and time for building DecodedMessage
+            let sub_bin_offset = trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+            let base_frequency = candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
+            let time_offset_s = coarse_offset as f64 / SAMPLE_RATE as f64;
+
+            // SNR estimate (reused across AP trials for this candidate)
+            let snr_db = self.estimate_snr_spectrogram(&tone_magnitudes);
+            let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
+
+            // --- AP1: inject own callsign at bits 28-55 (called station) ---
+            if ap_context.my_call.is_some() {
+                if let Some(msg) = self.try_ldpc_with_ap(
+                    &base_llrs,
+                    crate::ap::ApLevel::Ap1,
+                    ap_context,
+                    None,
+                    snr_db,
+                    confidence,
+                    base_frequency,
+                    time_offset_s,
+                )? {
+                    return Ok(Some(msg));
+                }
+            }
+
+            // --- AP2: inject each recent caller at bits 0-27 + AP1 ---
+            if ap_context.my_call.is_some() {
+                for recent in &ap_context.recent_calls {
+                    // Short-circuit: skip calls already decoded this window
+                    if decoded_calls.contains(&recent.callsign) {
+                        continue;
+                    }
+                    if let Some(msg) = self.try_ldpc_with_ap(
+                        &base_llrs,
+                        crate::ap::ApLevel::Ap2,
+                        ap_context,
+                        Some(recent),
+                        snr_db,
+                        confidence,
+                        base_frequency,
+                        time_offset_s,
+                    )? {
+                        return Ok(Some(msg));
+                    }
+                }
+            }
+
+            // --- AP3: both callsigns known (active QSO) ---
+            if ap_context.active_qso.is_some() && ap_context.my_call.is_some() {
+                if let Some(msg) = self.try_ldpc_with_ap(
+                    &base_llrs,
+                    crate::ap::ApLevel::Ap3,
+                    ap_context,
+                    None,
+                    snr_db,
+                    confidence,
+                    base_frequency,
+                    time_offset_s,
+                )? {
+                    return Ok(Some(msg));
+                }
+
+                // --- AP4: AP3 + message type constraint ---
+                if let Some(ref qso) = ap_context.active_qso {
+                    if matches!(qso.progress, crate::ap::QsoApProgress::WaitingForConfirmation) {
+                        if let Some(msg) = self.try_ldpc_with_ap(
+                            &base_llrs,
+                            crate::ap::ApLevel::Ap4,
+                            ap_context,
+                            None,
+                            snr_db,
+                            confidence,
+                            base_frequency,
+                            time_offset_s,
+                        )? {
+                            return Ok(Some(msg));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Try LDPC decode with AP injection at a specific level.
+    ///
+    /// Clones the base LLRs, injects AP bits, normalizes, runs LDPC + CRC,
+    /// and returns a DecodedMessage on success.
+    fn try_ldpc_with_ap(
+        &self,
+        base_llrs: &[f32],
+        ap_level: crate::ap::ApLevel,
+        ap_context: &crate::ap::ApContext,
+        caller_override: Option<&crate::ap::RecentCallAp>,
+        snr_db: f32,
+        confidence: f32,
+        base_frequency: f64,
+        time_offset_s: f64,
+    ) -> Ft8Result<Option<DecodedMessage>> {
+        let mut llrs = base_llrs.to_vec();
+        let xor_sequence = self.protocol_params.xor_sequence;
+
+        // Inject AP bits according to level
+        match ap_level {
+            crate::ap::ApLevel::Ap0 => {} // no injection
+            crate::ap::ApLevel::Ap1 => {
+                crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context);
+            }
+            crate::ap::ApLevel::Ap2 => {
+                // First inject AP1 (our call as called station)
+                crate::ap::inject_ap_llrs(&mut llrs, crate::ap::ApLevel::Ap1, ap_context);
+                // Then inject the specific caller at bits 0-27
+                if let Some(caller) = caller_override {
+                    crate::ap::inject_ap2_caller(&mut llrs, caller);
+                }
+            }
+            crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
+                crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context);
+            }
+        }
+
+        normalize_llrs(&mut llrs);
+
+        let corrected_bits = match self.ldpc_decoder.decode_soft(&llrs) {
+            Ok(bits) => bits,
+            Err(_) => return Ok(None),
+        };
+
+        if !self.verify_crc(&corrected_bits) {
+            return Ok(None);
+        }
+
+        // For FT4, un-apply the XOR scrambling on the payload
+        let payload_bits = if let Some(xor_seq) = xor_sequence {
+            let mut bits = corrected_bits[0..PAYLOAD_BITS].to_owned();
+            for byte_idx in 0..10 {
+                let xor_byte = xor_seq[byte_idx];
+                for bit_pos in 0..8 {
+                    let global_bit = byte_idx * 8 + bit_pos;
+                    if global_bit >= PAYLOAD_BITS {
+                        break;
+                    }
+                    if (xor_byte >> (7 - bit_pos)) & 1 == 1 {
+                        let cur = bits[global_bit];
+                        bits.set(global_bit, !cur);
+                    }
+                }
+            }
+            bits
+        } else {
+            corrected_bits[0..PAYLOAD_BITS].to_owned()
+        };
+
+        let ft8_message = self.message_parser.parse_payload(&payload_bits)?;
+
+        // Reject CRC false positives
+        if !ft8_message.is_plausible() {
+            return Ok(None);
+        }
+
+        let mut decoded_message = DecodedMessage::new(
+            ft8_message,
+            snr_db,
+            confidence,
+            base_frequency,
+            time_offset_s,
+        );
+        decoded_message.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
+
+        Ok(Some(decoded_message))
+    }
+
+    /// Estimate SNR from spectrogram tone magnitudes (dB domain).
+    fn estimate_snr_spectrogram(&self, tone_magnitudes: &[[f64; NUM_TONES]]) -> f32 {
+        let data_positions = self.protocol_params.data_symbol_indices();
+        let mut signal_sum = 0.0f64;
+        let mut noise_sum = 0.0f64;
+        let mut count = 0usize;
+        for &sym_idx in &data_positions {
+            let mags = &tone_magnitudes[sym_idx];
+            let best = mags.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let worst = mags.iter().cloned().fold(f64::INFINITY, f64::min);
+            signal_sum += best;
+            noise_sum += worst;
+            count += 1;
+        }
+        if count > 0 {
+            let avg_signal_db = signal_sum / count as f64;
+            let avg_noise_db = noise_sum / count as f64;
+            let snr_bin_db = avg_signal_db - avg_noise_db;
+            let bw_correction = 10.0 * (2500.0f64 / 6.25).log10();
+            (snr_bin_db - bw_correction) as f32
+        } else {
+            -24.0f32
+        }
+    }
+
+    // ========================================================================
+    // Candidate decoding (AP0 — standard path)
+    // ========================================================================
+
     /// Pipeline:
     /// 1. Fine timing search: refine coarse time offset (±half symbol, 9 steps at 1/8 symbol)
     /// 2. Frequency refinement: try ±1 bin
