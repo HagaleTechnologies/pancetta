@@ -447,6 +447,13 @@ impl Ft8Decoder {
                         if !ctx.ap_active {
                             return None;
                         }
+                        // Only attempt AP decoding on candidates with reasonable sync quality.
+                        // Sync scores below 4.0 are likely noise — AP injection on noise produces
+                        // false decodes by forcing the user's callsign into random bit patterns.
+                        const MIN_SYNC_SCORE_FOR_AP: f64 = 3.0;
+                        if candidate.sync_score < MIN_SYNC_SCORE_FOR_AP {
+                            return None;
+                        }
                         par_try_ap_decode(&ctx, candidate, ldpc, &decoded_calls, pass)
                     },
                 )
@@ -1355,6 +1362,23 @@ impl Ft8Decoder {
             return Ok(None);
         }
 
+        // AP decodes at very low sync quality are suspect — require the decoded
+        // message to pass stricter validation
+        let ap_level_num = match ap_level {
+            crate::ap::ApLevel::Ap0 => 0u8,
+            crate::ap::ApLevel::Ap1 => 1,
+            crate::ap::ApLevel::Ap2 => 2,
+            crate::ap::ApLevel::Ap3 => 3,
+            crate::ap::ApLevel::Ap4 => 4,
+        };
+        if ap_level_num > 0 && confidence < (6.0_f64 / 12.0) as f32 {
+            // For weak AP decodes, reject freetext — freetext AP decodes at low SNR
+            // are almost always false positives from random bit patterns
+            if ft8_message.message_type == crate::message::MessageType::FreeText {
+                return Ok(None);
+            }
+        }
+
         let mut decoded_message = DecodedMessage::new(
             ft8_message,
             snr_db,
@@ -1363,6 +1387,7 @@ impl Ft8Decoder {
             time_offset_s,
         );
         decoded_message.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
+        decoded_message.ap_level = ap_level_num;
 
         Ok(Some(decoded_message))
     }
@@ -2459,6 +2484,23 @@ fn par_try_ldpc_with_ap(
         return None;
     }
 
+    // AP decodes at very low sync quality are suspect — require the decoded
+    // message to pass stricter validation
+    let ap_level_num = match ap_level {
+        crate::ap::ApLevel::Ap0 => 0u8,
+        crate::ap::ApLevel::Ap1 => 1,
+        crate::ap::ApLevel::Ap2 => 2,
+        crate::ap::ApLevel::Ap3 => 3,
+        crate::ap::ApLevel::Ap4 => 4,
+    };
+    if ap_level_num > 0 && confidence < (6.0_f64 / 12.0) as f32 {
+        // For weak AP decodes, reject freetext — freetext AP decodes at low SNR
+        // are almost always false positives from random bit patterns
+        if ft8_message.message_type == crate::message::MessageType::FreeText {
+            return None;
+        }
+    }
+
     let mut decoded_message = DecodedMessage::new(
         ft8_message,
         snr_db,
@@ -2467,6 +2509,7 @@ fn par_try_ldpc_with_ap(
         time_offset_s,
     );
     decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
+    decoded_message.ap_level = ap_level_num;
 
     Some(decoded_message)
 }
@@ -2916,9 +2959,11 @@ impl LdpcDecoder {
             let llr_arr: &[f32; 174] = decoded_llrs[..174].try_into().unwrap();
             let parity_errors = self.count_parity_errors(llr_arr);
 
-            // With neural ordering, we can afford a more generous gate since
-            // the neural model targets the right bits in ~200 trials.
-            const MAX_PARITY_ERRORS_FOR_OSD: usize = 5;
+            // Parity gate for OSD: allow up to 4 parity errors before attempting
+            // OSD. Widening to 5 lets too many noise candidates through, and
+            // CRC-14 collision rate turns those into false positives. Gate of 4
+            // balances false positive reduction with decode sensitivity.
+            const MAX_PARITY_ERRORS_FOR_OSD: usize = 4;
 
             if parity_errors <= MAX_PARITY_ERRORS_FOR_OSD {
                 // Compute neural ordering if trajectory is available
@@ -3856,6 +3901,7 @@ mod tests {
             timestamp: SystemTime::now(),
             error_corrections: 0,
             tone_symbols: Some(symbols),
+            ap_level: 0,
         };
 
         decoder.subtract_signal(&mut audio, &msg);

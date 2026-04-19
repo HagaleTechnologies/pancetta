@@ -147,6 +147,8 @@ fn test_cross_validate_against_ft8lib() {
     let mut total_ours = 0usize;
     let mut total_ft8lib = 0usize;
     let mut files_below_threshold = Vec::new();
+    let mut false_positive_candidates = 0usize;
+    let mut unique_to_ours = 0usize;
 
     for file in &files {
         let path = fixture(file);
@@ -191,16 +193,43 @@ fn test_cross_validate_against_ft8lib() {
 
         // Print decoded messages for comparison
         for m in &our_decoded {
-            println!("  [ours]   {:6.1} dB  {}", m.snr_db, m.text);
+            let ap_tag = if m.ap_level > 0 {
+                format!(" [AP{}]", m.ap_level)
+            } else {
+                String::new()
+            };
+            println!("  [ours]   {:6.1} dB  {}{}", m.snr_db, m.text, ap_tag);
         }
         for (text, freq, _time, _ldpc) in &ft8lib_decoded {
             println!("  [ft8lib] {:6.1} Hz  {}", freq, text);
+        }
+
+        // Count decodes unique to our decoder that look like false positives
+        let ft8lib_texts: std::collections::HashSet<&str> = ft8lib_decoded
+            .iter()
+            .map(|(text, _, _, _)| text.as_str())
+            .collect();
+        for m in &our_decoded {
+            if !ft8lib_texts.contains(m.text.as_str()) {
+                unique_to_ours += 1;
+                // Flag suspect decodes: AP-assisted, or freetext with no
+                // recognizable FT8 structure
+                let is_suspect =
+                    m.ap_level > 0 || m.message.message_type == pancetta_ft8::MessageType::FreeText;
+                if is_suspect {
+                    false_positive_candidates += 1;
+                }
+            }
         }
     }
 
     println!(
         "\nCross-validation totals: ours={}, ft8_lib={}",
         total_ours, total_ft8lib
+    );
+    println!(
+        "False positive candidates: {}/{} unique to our decoder",
+        false_positive_candidates, unique_to_ours
     );
 
     // Overall assertion: we should decode at least as many messages as ft8_lib.

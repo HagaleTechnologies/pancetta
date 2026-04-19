@@ -756,6 +756,8 @@ pub struct DecodedMessage {
     /// Tone symbols (79 values, 0-7) for signal reconstruction in multi-pass subtraction.
     /// None if symbols were not preserved during decoding.
     pub tone_symbols: Option<Vec<u8>>,
+    /// AP (A Priori) level used for this decode: 0 = no AP, 1-4 = AP level used.
+    pub ap_level: u8,
 }
 
 impl DecodedMessage {
@@ -778,6 +780,7 @@ impl DecodedMessage {
             timestamp: SystemTime::now(),
             error_corrections: 0,
             tone_symbols: None,
+            ap_level: 0,
         }
     }
 }
