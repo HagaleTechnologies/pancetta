@@ -138,7 +138,8 @@ impl super::ApplicationCoordinator {
                     // worked-on-band set as QSOs complete.
                     let freq_hz = operating_frequency_hz.load(std::sync::atomic::Ordering::Relaxed);
                     let band = pancetta_cqdx::frequency_to_band(freq_hz)
-                        .unwrap_or_else(|| "20m".to_string());
+                        .unwrap_or_else(|| "20m".to_string())
+                        .to_uppercase();
 
                     match QsoDatabase::open(&db_path) {
                         Ok(db) => {
@@ -149,7 +150,7 @@ impl super::ApplicationCoordinator {
                                     band
                                 );
                             } else {
-                                qso_lookup.seed_worked_from_list(callsigns);
+                                qso_lookup.seed_worked_from_list(&band, callsigns);
                             }
                         }
                         Err(e) => {
@@ -258,7 +259,8 @@ impl super::ApplicationCoordinator {
                                 }
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO completed with {}, marking as worked", their_call);
-                                    qso_lookup.record_worked(their_call);
+                                    let band = pancetta_qso::utils::frequency_to_band(metadata.frequency);
+                                    qso_lookup.record_worked(their_call, &band);
 
                                     // Report QSO to cqdx.io
                                     if let Some(ref bridge) = cqdx_bridge {

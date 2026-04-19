@@ -13,8 +13,9 @@ use std::sync::{Arc, RwLock};
 /// this synchronously via the `WorkedStationLookup` trait.
 #[derive(Debug, Clone)]
 pub struct CachedStationLookup {
-    /// Callsigns worked on the current band.
-    worked_on_band: Arc<RwLock<HashSet<String>>>,
+    /// Callsigns worked per band.  Key = uppercase band name (e.g. "20M"),
+    /// value = set of uppercased callsigns worked on that band.
+    worked_on_band: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     /// Callsigns where a recent QSO attempt failed.
     recent_failures: Arc<RwLock<HashSet<String>>>,
     /// DXCC entities still needed.
@@ -34,7 +35,7 @@ pub struct CachedStationLookup {
 impl CachedStationLookup {
     pub fn new() -> Self {
         Self {
-            worked_on_band: Arc::new(RwLock::new(HashSet::new())),
+            worked_on_band: Arc::new(RwLock::new(HashMap::new())),
             recent_failures: Arc::new(RwLock::new(HashSet::new())),
             needed_dxcc: Arc::new(RwLock::new(HashSet::new())),
             needed_grids: Arc::new(RwLock::new(HashSet::new())),
@@ -45,22 +46,20 @@ impl CachedStationLookup {
         }
     }
 
-    /// Seed `worked_on_band` from a list of callsigns loaded out-of-band
-    /// (e.g. from the QSO database at startup).  Callsigns are uppercased
-    /// for consistent comparison.
-    pub fn seed_worked_from_list(&self, callsigns: Vec<String>) {
-        let mut set = self.worked_on_band.write().unwrap();
+    /// Seed `worked_on_band` for `band` from a list of callsigns loaded out-of-band
+    /// (e.g. from the QSO database at startup).  Both the band key and callsigns
+    /// are uppercased for consistent comparison.
+    pub fn seed_worked_from_list(&self, band: &str, callsigns: Vec<String>) {
+        let mut map = self.worked_on_band.write().unwrap();
+        let set = map.entry(band.to_uppercase()).or_default();
         for call in callsigns {
             set.insert(call.to_uppercase());
         }
         tracing::info!(
-            "CachedStationLookup: seeded {} worked station(s) from QSO database",
-            set.len()
+            "CachedStationLookup: seeded {} worked station(s) on {} from QSO database",
+            set.len(),
+            band
         );
-    }
-
-    pub fn update_worked_on_band(&self, callsigns: HashSet<String>) {
-        *self.worked_on_band.write().unwrap() = callsigns;
     }
 
     pub fn update_recent_failures(&self, callsigns: HashSet<String>) {
@@ -107,20 +106,23 @@ impl CachedStationLookup {
             .insert(callsign.to_uppercase());
     }
 
-    pub fn record_worked(&self, callsign: &str) {
+    pub fn record_worked(&self, callsign: &str, band: &str) {
         self.worked_on_band
             .write()
             .unwrap()
+            .entry(band.to_uppercase())
+            .or_default()
             .insert(callsign.to_uppercase());
     }
 }
 
 impl WorkedStationLookup for CachedStationLookup {
-    fn is_duplicate(&self, callsign: &str, _freq_hz: f64) -> bool {
-        self.worked_on_band
-            .read()
-            .unwrap()
-            .contains(&callsign.to_uppercase())
+    fn is_duplicate(&self, callsign: &str, freq_hz: f64) -> bool {
+        let band = pancetta_qso::utils::frequency_to_band(freq_hz).to_uppercase();
+        let worked = self.worked_on_band.read().unwrap();
+        worked
+            .get(&band)
+            .map_or(false, |set| set.contains(&callsign.to_uppercase()))
     }
 
     fn is_recent_failure(&self, callsign: &str) -> bool {
@@ -181,5 +183,55 @@ impl WorkedStationLookup for CachedStationLookup {
             .unwrap()
             .get(&callsign.to_uppercase())
             .copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_band_aware_duplicate() {
+        let lookup = CachedStationLookup::new();
+
+        // Work K9ZZ on 20m
+        lookup.record_worked("K9ZZ", "20m");
+
+        // Should be duplicate on 20m
+        assert!(lookup.is_duplicate("K9ZZ", 14_074_000.0));
+
+        // Should NOT be duplicate on 40m
+        assert!(!lookup.is_duplicate("K9ZZ", 7_074_000.0));
+
+        // Should NOT be duplicate on 15m
+        assert!(!lookup.is_duplicate("K9ZZ", 21_074_000.0));
+
+        // Work K9ZZ on 40m too
+        lookup.record_worked("K9ZZ", "40m");
+
+        // Now duplicate on both bands
+        assert!(lookup.is_duplicate("K9ZZ", 14_074_000.0));
+        assert!(lookup.is_duplicate("K9ZZ", 7_074_000.0));
+
+        // Still not on 15m
+        assert!(!lookup.is_duplicate("K9ZZ", 21_074_000.0));
+    }
+
+    #[test]
+    fn test_unknown_frequency_not_duplicate() {
+        let lookup = CachedStationLookup::new();
+        lookup.record_worked("K9ZZ", "20M");
+        // freq_hz=0.0 (uninitialized) should not match any band
+        assert!(!lookup.is_duplicate("K9ZZ", 0.0));
+    }
+
+    #[test]
+    fn test_seed_worked_from_list() {
+        let lookup = CachedStationLookup::new();
+        lookup.seed_worked_from_list("20m", vec!["W1ABC".into(), "K2DEF".into()]);
+
+        assert!(lookup.is_duplicate("W1ABC", 14_074_000.0));
+        assert!(lookup.is_duplicate("K2DEF", 14_074_000.0));
+        assert!(!lookup.is_duplicate("W1ABC", 7_074_000.0)); // not on 40m
     }
 }
