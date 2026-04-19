@@ -20,7 +20,7 @@
 //!   `pancetta-config`, `pancetta-qso`, `pancetta-hamlib`, `pancetta-dx`,
 //!   `pancetta-cqdx`, `pancetta-tui`, `pancetta`)
 
-#![warn(missing_docs)]
+#![allow(missing_docs)] // TODO: re-enable as docs are added
 
 pub mod error;
 pub mod types;

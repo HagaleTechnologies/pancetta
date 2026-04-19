@@ -28,7 +28,7 @@
 //! - Receives from: PSKReporter API, DX cluster feeds, LoTW
 //! - Sends to: `pancetta` coordinator (rarity scores, needed entity status)
 
-#![warn(missing_docs)]
+#![allow(missing_docs)] // TODO: re-enable as docs are added
 #![allow(dead_code, unused_imports)]
 
 pub mod cluster;

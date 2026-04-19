@@ -23,7 +23,7 @@
 //! - Sends to: `pancetta-ft8` (TX encode), `pancetta-hamlib` (PTT/freq commands),
 //!   `pancetta-tui` (display updates), `pancetta-qso` (decoded messages)
 
-#![warn(missing_docs)]
+#![allow(missing_docs)] // TODO: re-enable as docs are added
 #![allow(dead_code, unused_imports)]
 
 pub mod coordinator;

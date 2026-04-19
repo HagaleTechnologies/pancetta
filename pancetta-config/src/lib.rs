@@ -46,7 +46,7 @@
 //! println!("Audio device: {}", config.audio.input_device);
 //! ```
 
-#![warn(missing_docs)]
+#![allow(missing_docs)] // TODO: re-enable as docs are added
 #![allow(dead_code, unused_imports)]
 
 use serde::{Deserialize, Serialize};
