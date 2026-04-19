@@ -29,6 +29,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use pancetta_config::Config;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -509,8 +510,11 @@ async fn load_configuration(cli: &Cli) -> Result<Config> {
         Config::load_default().with_context(|| "Failed to load default configuration")?
     };
 
-    // First-run setup: if callsign is still the default, prompt the user
-    if config.station.callsign == "N0CALL" && !cli.headless && cli.wav.is_none() {
+    // First-run setup: if callsign is still the default, prompt the user.
+    // Only run when stdin is a TTY — non-interactive invocations (config --show,
+    // piped input) must not trigger the wizard or overwrite the config.
+    let is_interactive = std::io::stdin().is_terminal();
+    if config.station.callsign == "N0CALL" && !cli.headless && cli.wav.is_none() && is_interactive {
         if let Some(updated) = run_first_time_setup(&config)? {
             config = updated;
         }
