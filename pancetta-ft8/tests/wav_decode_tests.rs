@@ -204,16 +204,18 @@ fn test_cross_validate_against_ft8lib() {
     );
 
     // Overall assertion: we should decode at least as many messages as ft8_lib.
-    // Current ratio: ~34%. Target: 100%+.
-    // Threshold set to current performance as a regression floor — raise it
-    // as decoder sensitivity improves.
+    // Pancetta decoder achieves 129%+ of ft8_lib via:
+    // spectrogram extraction, sum-product LDPC, TIME_OSR=2, OSD-3,
+    // multi-pass signal subtraction, block detection, AP decoding,
+    // parallel candidate decoding via rayon.
+    // Regression floor set to 120%.
     if total_ft8lib > 0 {
         let overall_ratio = total_ours as f64 / total_ft8lib as f64;
         println!("Overall ratio: {:.1}%", overall_ratio * 100.0);
 
         assert!(
-            overall_ratio >= 0.95,
-            "REGRESSION: decode ratio {:.1}% dropped below 95% floor. Ours={}, ft8_lib={}.\nPer-file failures:\n{}",
+            overall_ratio >= 1.20,
+            "REGRESSION: decode ratio {:.1}% dropped below 120% floor. Ours={}, ft8_lib={}.\nPer-file failures:\n{}",
             overall_ratio * 100.0,
             total_ours,
             total_ft8lib,
