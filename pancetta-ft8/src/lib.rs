@@ -60,6 +60,10 @@ pub mod protocol;
 pub mod ap;
 pub use ap::{ApContext, ApLevel, MyCallAp, QsoAp, QsoApProgress, RecentCallAp};
 
+// Parallel decode configuration
+pub mod parallel;
+pub use parallel::{DecodeConfig, Parallelism, BudgetTracker};
+
 // Core FT8 decoding modules
 pub mod decoder;
 pub mod ldpc;
