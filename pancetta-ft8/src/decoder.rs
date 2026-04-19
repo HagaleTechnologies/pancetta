@@ -124,7 +124,7 @@ impl Default for Ft8Config {
             frequency_range: 200.0,
             time_range: 2.0,
             max_decode_passes: 3,
-            osd_depth: Some(2),
+            osd_depth: Some(3),
         }
     }
 }
@@ -345,6 +345,17 @@ impl Ft8Decoder {
                 sync_candidates.truncate(40);
             }
 
+            // Re-rank candidates by block score (better than sync-only ranking)
+            let mut scored: Vec<(f64, CostasCandidate)> = sync_candidates
+                .into_iter()
+                .map(|c| {
+                    let bs = self.block_score(&spectrogram, &c);
+                    (bs, c)
+                })
+                .collect();
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            let sync_candidates: Vec<CostasCandidate> = scored.into_iter().map(|(_, c)| c).collect();
+
             if pass == 0 {
                 best_sync_score = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
                 info!(
@@ -443,7 +454,7 @@ impl Ft8Decoder {
             // Subtract decoded signals from residual audio for next pass
             if pass + 1 < max_passes {
                 for msg in &pass_decoded {
-                    self.subtract_signal(&mut residual_samples, msg);
+                    self.subtract_with_sidelobes(&mut residual_samples, msg);
                 }
             }
 
@@ -690,6 +701,77 @@ impl Ft8Decoder {
         );
     }
 
+    /// Subtract a decoded signal with sidelobe cancellation at ±1 tone spacing.
+    ///
+    /// After main signal subtraction, removes first sidelobes of the Hann window
+    /// at ±6.25 Hz (one tone spacing). Hann first sidelobe is ~15% (-16 dB) of
+    /// the main lobe, so we use a 0.15 scale factor for the sidelobe subtraction.
+    fn subtract_with_sidelobes(&self, audio: &mut [f32], msg: &DecodedMessage) {
+        use std::f64::consts::PI;
+
+        // Main signal subtraction
+        self.subtract_signal(audio, msg);
+
+        // Sidelobe cancellation requires tone symbols
+        let symbols = match &msg.tone_symbols {
+            Some(s) if s.len() == NUM_SYMBOLS => s,
+            _ => return,
+        };
+
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
+        let total_len = NUM_SYMBOLS * sps;
+        let base_freq = msg.frequency_offset;
+        let nominal_time = (msg.time_offset * SAMPLE_RATE as f64) as isize;
+        let tone_spacing = TONE_SPACING as f64;
+        let sidelobe_scale = 0.15 * 0.9; // 15% sidelobe × 0.9 conservative factor
+
+        // For each sidelobe offset (+1 and -1 tone spacing)
+        for &freq_offset in &[tone_spacing, -tone_spacing] {
+            let shifted_freq = base_freq + freq_offset;
+            if shifted_freq < 0.0 { continue; }
+
+            let (recon_i, recon_q) = Self::generate_cpfsk_iq(symbols, shifted_freq, sps);
+            let recon_start = nominal_time.max(0) as usize;
+            let recon_offset = (recon_start as isize - nominal_time) as usize;
+            let signal_len = (total_len.saturating_sub(recon_offset))
+                .min(audio.len().saturating_sub(recon_start));
+            if signal_len == 0 { continue; }
+
+            // Estimate amplitude via projection (same as subtract_signal)
+            let mut dot_ai = 0.0f64;
+            let mut dot_aq = 0.0f64;
+            let mut dot_ii = 0.0f64;
+            let mut dot_qq = 0.0f64;
+            let mut dot_iq = 0.0f64;
+            for i in 0..signal_len {
+                let a = audio[recon_start + i] as f64;
+                let ri = recon_i[recon_offset + i];
+                let rq = recon_q[recon_offset + i];
+                dot_ai += a * ri;
+                dot_aq += a * rq;
+                dot_ii += ri * ri;
+                dot_qq += rq * rq;
+                dot_iq += ri * rq;
+            }
+
+            let det = dot_ii * dot_qq - dot_iq * dot_iq;
+            let (amp_i, amp_q) = if det.abs() > 1e-12 {
+                let ai = (dot_ai * dot_qq - dot_aq * dot_iq) / det;
+                let aq = (dot_aq * dot_ii - dot_ai * dot_iq) / det;
+                (ai, aq)
+            } else {
+                continue;
+            };
+
+            // Subtract sidelobe at reduced amplitude
+            for i in 0..signal_len {
+                let subtracted = amp_i * recon_i[recon_offset + i]
+                    + amp_q * recon_q[recon_offset + i];
+                audio[recon_start + i] -= (subtracted * sidelobe_scale) as f32;
+            }
+        }
+    }
+
     /// Pre-process audio: convert to f64 and normalize
     fn preprocess_audio(&self, samples: &[f32]) -> Ft8Result<Vec<f64>> {
         let mut audio: Vec<f64> = samples.iter().map(|&s| s as f64).collect();
@@ -812,6 +894,48 @@ impl Ft8Decoder {
     /// Search for FT8 signals by correlating the Costas sync pattern
     /// against the spectrogram in 2D (time offset, frequency offset).
     ///
+    /// Compute block detection score by evaluating all 79 symbol positions.
+    /// Finds the strongest tone at each position and compares signal vs noise
+    /// across the full frame. More robust than Costas-only sync scoring.
+    fn block_score(&self, spec: &Spectrogram, candidate: &CostasCandidate) -> f64 {
+        let pp = &self.protocol_params;
+        let steps_per_symbol = 2 * TIME_OSR;
+        let mut signal_sum = 0.0f64;
+        let mut noise_sum = 0.0f64;
+        let mut signal_count = 0usize;
+        let mut noise_count = 0usize;
+
+        for sym_idx in 0..pp.num_symbols {
+            let t = candidate.time_step + sym_idx * steps_per_symbol;
+            if t >= spec.num_steps { break; }
+
+            let mut best_power = f64::MIN;
+            let mut best_tone = 0usize;
+            for tone in 0..pp.num_tones {
+                let f = candidate.freq_bin + tone;
+                if f >= spec.num_bins { continue; }
+                let power = spec.power[t][candidate.freq_sub][f];
+                if power > best_power {
+                    best_power = power;
+                    best_tone = tone;
+                }
+            }
+            signal_sum += best_power;
+            signal_count += 1;
+
+            for tone in 0..pp.num_tones {
+                if tone == best_tone { continue; }
+                let f = candidate.freq_bin + tone;
+                if f >= spec.num_bins { continue; }
+                noise_sum += spec.power[t][candidate.freq_sub][f];
+                noise_count += 1;
+            }
+        }
+
+        if signal_count == 0 || noise_count == 0 { return 0.0; }
+        (signal_sum / signal_count as f64) - (noise_sum / noise_count as f64)
+    }
+
     /// The Costas array [3,1,4,0,6,5,2] appears at symbol positions 0-6,
     /// 36-42, and 72-78. For each candidate (t0, f0, freq_sub), we check
     /// all 21 Costas positions and score using neighbor comparison (ft8_lib style).
