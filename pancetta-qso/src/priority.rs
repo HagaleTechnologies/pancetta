@@ -110,16 +110,7 @@ impl WorkedStationLookup for NullLookup {
 /// Detect POTA/SOTA activators from callsign patterns.
 pub fn is_pota_sota_candidate(callsign: &str) -> bool {
     let upper = callsign.to_uppercase();
-    if upper.ends_with("/P") {
-        return true;
-    }
-    if upper.ends_with("/QRP") {
-        return true;
-    }
-    if upper.contains('/') {
-        return true;
-    }
-    false
+    upper.ends_with("/P") || upper.ends_with("/QRP")
 }
 
 /// Normalize SNR from typical FT8 range (-24 to +10) to 0.0–1.0.
@@ -282,9 +273,22 @@ mod tests {
 
     #[test]
     fn test_pota_sota_detection() {
+        // Portable suffixes — should match
         assert!(is_pota_sota_candidate("W1ABC/P"));
         assert!(is_pota_sota_candidate("K2DEF/QRP"));
-        assert!(is_pota_sota_candidate("VE3/W1ABC"));
+        assert!(is_pota_sota_candidate("w1abc/p")); // case insensitive
+
+        // Prefix-style calls — should NOT match
+        assert!(!is_pota_sota_candidate("VE3/W1ABC"));  // operating from VE3
+        assert!(!is_pota_sota_candidate("DL/K5ARH"));   // operating from Germany
+        assert!(!is_pota_sota_candidate("F/W1ABC"));     // operating from France
+
+        // Other suffixes — should NOT match
+        assert!(!is_pota_sota_candidate("W1ABC/M"));     // mobile
+        assert!(!is_pota_sota_candidate("W1ABC/MM"));    // maritime mobile
+        assert!(!is_pota_sota_candidate("W1ABC/LGT"));   // lighthouse
+
+        // Regular calls — should NOT match
         assert!(!is_pota_sota_candidate("W1ABC"));
         assert!(!is_pota_sota_candidate("K2DEF"));
     }
