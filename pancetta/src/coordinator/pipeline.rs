@@ -8,6 +8,126 @@ use std::time::{Duration, Instant};
 use tokio::time::interval;
 use tracing::{debug, error, info, span, warn, Level};
 
+/// Maximum total disk space for WAV recordings (bytes).
+const WAV_RECORDING_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
+
+/// Manage WAV recording of 12kHz mono FT8 windows for decoder validation.
+///
+/// Writes one WAV file per FT8 window (12.64 seconds @ 12kHz mono i16).
+/// Each file is ~303 KB.  When total usage exceeds [`WAV_RECORDING_MAX_BYTES`],
+/// the oldest files are deleted to make room.
+struct WavRecorder {
+    dir: std::path::PathBuf,
+    total_bytes: u64,
+}
+
+impl WavRecorder {
+    fn new() -> Result<Self> {
+        let dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".pancetta")
+            .join("recordings");
+        std::fs::create_dir_all(&dir)?;
+
+        // Sum existing recording sizes
+        let total_bytes = Self::dir_size(&dir);
+        info!(
+            "WAV recorder: dir={}, existing={:.1} MB, cap={:.1} GB",
+            dir.display(),
+            total_bytes as f64 / 1_048_576.0,
+            WAV_RECORDING_MAX_BYTES as f64 / 1_073_741_824.0,
+        );
+        Ok(Self { dir, total_bytes })
+    }
+
+    fn dir_size(dir: &std::path::Path) -> u64 {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.metadata().ok())
+                    .map(|m| m.len())
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Write a 12kHz mono f32 window to a timestamped WAV file.
+    fn write_window(&mut self, samples: &[f32], timestamp: &chrono::DateTime<chrono::Utc>) {
+        // Enforce cap by deleting oldest files
+        while self.total_bytes >= WAV_RECORDING_MAX_BYTES {
+            if !self.delete_oldest() {
+                warn!("WAV recorder: cannot free space, skipping write");
+                return;
+            }
+        }
+
+        let filename = format!("ft8_{}.wav", timestamp.format("%Y%m%d_%H%M%S"));
+        let path = self.dir.join(&filename);
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 12000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        match hound::WavWriter::create(&path, spec) {
+            Ok(mut writer) => {
+                for &s in samples {
+                    let _ = writer.write_sample((s * i16::MAX as f32) as i16);
+                }
+                if let Err(e) = writer.finalize() {
+                    warn!("WAV recorder: finalize error: {}", e);
+                    return;
+                }
+                let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                self.total_bytes += file_size;
+                debug!(
+                    "WAV recorded: {} ({:.0} KB, total {:.1} MB)",
+                    filename,
+                    file_size as f64 / 1024.0,
+                    self.total_bytes as f64 / 1_048_576.0,
+                );
+            }
+            Err(e) => {
+                warn!("WAV recorder: create error: {}", e);
+            }
+        }
+    }
+
+    /// Delete the oldest WAV file to free space. Returns false if no files remain.
+    fn delete_oldest(&mut self) -> bool {
+        let mut entries: Vec<_> = std::fs::read_dir(&self.dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .map_or(false, |ext| ext == "wav")
+            })
+            .collect();
+
+        entries.sort_by_key(|e| e.file_name());
+
+        if let Some(oldest) = entries.first() {
+            let size = oldest.metadata().map(|m| m.len()).unwrap_or(0);
+            if std::fs::remove_file(oldest.path()).is_ok() {
+                self.total_bytes = self.total_bytes.saturating_sub(size);
+                info!(
+                    "WAV recorder: deleted {} ({:.0} KB) to free space",
+                    oldest.file_name().to_string_lossy(),
+                    size as f64 / 1024.0,
+                );
+                return true;
+            }
+        }
+        false
+    }
+}
+
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
 impl super::ApplicationCoordinator {
@@ -338,6 +458,15 @@ impl super::ApplicationCoordinator {
             let mut batch_count: u64 = 0;
             let _waiting_for_boundary = true;
 
+            // WAV recorder for decoder validation
+            let mut wav_recorder = match WavRecorder::new() {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    warn!("WAV recorder disabled: {}", e);
+                    None
+                }
+            };
+
             // Live waterfall state
             let mut last_live_wf_samples: usize = 0;
             let mut live_wf_planner = rustfft::FftPlanner::<f32>::new();
@@ -479,6 +608,12 @@ impl super::ApplicationCoordinator {
                                 rms,
                                 now.format("%H:%M:%S.%3f")
                             );
+
+                            // Record window to WAV for decoder validation
+                            if let Some(ref mut recorder) = wav_recorder {
+                                recorder.write_window(&window, &now);
+                            }
+
                             if dsp_to_ft8_tx.send(window).is_err() {
                                 info!("DSP: FT8 channel closed");
                                 return Ok(());
