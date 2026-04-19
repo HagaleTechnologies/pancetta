@@ -65,3 +65,17 @@ benchmarks/results/
 
 # Git worktrees
 .worktrees/
+
+# Python virtual environments
+.venv/
+__pycache__/
+*.pyc
+
+# Training artifacts (regenerate with training/neural_osd/README.md)
+training/neural_osd/data/
+training/neural_osd/data_test/
+training/neural_osd/model.pt
+*.npy
+
+# Database backups
+backups/
