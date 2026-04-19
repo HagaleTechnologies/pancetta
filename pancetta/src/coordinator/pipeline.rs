@@ -497,10 +497,25 @@ impl super::ApplicationCoordinator {
         let message_bus = self.message_bus.clone();
         let self_waterfall_to_auto_tx = self.waterfall_to_auto_tx.clone();
 
+        // Read station callsign for AP decoding before moving into the thread
+        let station_callsign = {
+            let config = self.config.read().await;
+            config.station.callsign.clone()
+        };
+
         // Run FT8 decoder on a dedicated thread to avoid tokio starvation
         let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
             info!("FT8 decoder thread started");
+
+            // Create persistent AP state for enhanced decoding
+            let my_call_ap = pancetta_ft8::MyCallAp::new(&station_callsign);
+            if my_call_ap.is_none() {
+                warn!("AP decoding: could not encode station callsign '{}', AP1+ disabled", station_callsign);
+            } else {
+                info!("AP decoding: station callsign '{}' encoded for AP injection", station_callsign);
+            }
+            let mut recent_pool: Vec<pancetta_ft8::RecentCallAp> = Vec::new();
 
             while !shutdown.load(Ordering::Acquire) {
                 match ft8_rx.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -544,8 +559,15 @@ impl super::ApplicationCoordinator {
                             }
                         }
 
-                        // Decode FT8 signals
-                        match decoder.decode_window(&window) {
+                        // Build AP context for this decode window
+                        let ap_context = pancetta_ft8::ApContext {
+                            my_call: my_call_ap.clone(),
+                            recent_calls: recent_pool.clone(),
+                            active_qso: None, // QSO AP wiring is future work
+                        };
+
+                        // Decode FT8 signals with AP-enhanced decoding
+                        match decoder.decode_window_with_ap(&window, &ap_context) {
                             Ok(decoded_messages) => {
                                 // Update decode timestamp
                                 rt.block_on(async {
@@ -555,7 +577,7 @@ impl super::ApplicationCoordinator {
 
                                 info!("FT8 decoder: {} messages decoded", decoded_messages.len());
 
-                                for decoded_msg in decoded_messages {
+                                for decoded_msg in &decoded_messages {
                                     info!(
                                         "FT8 decoded: {} (SNR: {:.0}, freq: {:.1})",
                                         decoded_msg.text,
@@ -599,7 +621,7 @@ impl super::ApplicationCoordinator {
                                     let psk_msg = ComponentMessage::new(
                                         ComponentId::Ft8Decoder,
                                         ComponentId::PskReporter,
-                                        MessageType::DecodedMessage(decoded_msg),
+                                        MessageType::DecodedMessage(decoded_msg.clone()),
                                         Instant::now(),
                                     );
                                     let bus3 = message_bus.clone();
@@ -609,6 +631,24 @@ impl super::ApplicationCoordinator {
                                         }
                                     });
                                 }
+
+                                // Update AP recent_pool with newly decoded callsigns
+                                for msg in &decoded_messages {
+                                    if let Some(ref call) = msg.message.from_callsign {
+                                        if !recent_pool.iter().any(|r| r.callsign == *call) {
+                                            if let Some(ap) = pancetta_ft8::RecentCallAp::new(call, msg.snr_db) {
+                                                recent_pool.push(ap);
+                                            }
+                                        }
+                                    }
+                                }
+                                // Keep strongest 20, prune weak entries
+                                recent_pool.sort_by(|a, b| {
+                                    b.last_snr
+                                        .partial_cmp(&a.last_snr)
+                                        .unwrap_or(std::cmp::Ordering::Equal)
+                                });
+                                recent_pool.truncate(20);
                             }
                             Err(e) => {
                                 warn!("FT8 decode error: {}", e);
