@@ -1,538 +1,171 @@
-# Pancetta System Architecture
+# Pancetta Architecture
 
-## Executive Summary
+Pancetta is an autonomous FT8 ham radio station written as an 11-crate Cargo workspace.
+The coordinator orchestrates a real-time pipeline from audio input through FT8 decode,
+autonomous decision-making, and transmission — completing full CQ-to-73 QSO exchanges
+without operator intervention.
 
-Pancetta is a modern ham radio digital mode terminal designed with a clean, layered architecture that enables cross-platform support, comprehensive testing, and future UI flexibility. The system follows Domain-Driven Design principles with clear separation between business logic, infrastructure, and presentation layers.
+---
 
-## Architecture Overview
-
-### Design Philosophy
-
-1. **Hexagonal Architecture** - Core business logic isolated from external dependencies
-2. **Domain-Driven Design** - Rich domain models representing ham radio concepts
-3. **Event-Driven Communication** - Loosely coupled components via event bus
-4. **Dependency Injection** - Testable, modular design with interface-based dependencies
-5. **CQRS Pattern** - Separate read and write operations for clarity
-
-### High-Level Architecture
+## Crate Dependency Graph
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                     Presentation Layer                        │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
-│  │   TUI    │  │   CLI    │  │  Web UI  │  │  Mobile  │   │
-│  │ (Ratatui)│  │  (Clap)  │  │ (Future) │  │ (Future) │   │
-│  └─────┬────┘  └─────┬────┘  └─────┬────┘  └─────┬────┘   │
-│        └──────────────┴──────────────┴──────────────┘        │
-│                             │                                 │
-│                    ┌────────▼────────┐                       │
-│                    │   REST/WS API   │                       │
-│                    └────────┬────────┘                       │
-└────────────────────────────┼─────────────────────────────────┘
-                             │
-┌────────────────────────────▼─────────────────────────────────┐
-│                    Application Layer                          │
-│  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐       │
-│  │  Commands   │  │   Queries    │  │  Event Bus   │       │
-│  │  Handlers   │  │   Handlers   │  │              │       │
-│  └──────┬──────┘  └──────┬───────┘  └──────┬───────┘       │
-│         └─────────────────┴──────────────────┘               │
-│                            │                                  │
-└────────────────────────────┼─────────────────────────────────┘
-                             │
-┌────────────────────────────▼─────────────────────────────────┐
-│                      Core Domain Layer                        │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │ Digital Mode │  │  DX Hunter   │  │     QSO      │      │
-│  │    Engine    │  │    Engine    │  │   Manager    │      │
-│  └──────────────┘  └──────────────┘  └──────────────┘      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │   Station    │  │   Contact    │  │   Logging    │      │
-│  │   Manager    │  │   Database   │  │   Service    │      │
-│  └──────────────┘  └──────────────┘  └──────────────┘      │
-└────────────────────────────────────────────────────────────┘
-                             │
-┌────────────────────────────▼─────────────────────────────────┐
-│                   Infrastructure Layer                        │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │    Audio     │  │  Rig Control │  │   Network    │      │
-│  │   Service    │  │   (Hamlib)   │  │   Services   │      │
-│  └──────────────┘  └──────────────┘  └──────────────┘      │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐      │
-│  │  Persistence │  │    File      │  │   External   │      │
-│  │   (SQLite)   │  │    System    │  │     APIs     │      │
-│  └──────────────┘  └──────────────┘  └──────────────┘      │
-└───────────────────────────────────────────────────────────────┘
+Layer 0 — no internal deps:
+  pancetta-core    — shared types, error handling
+  pancetta-audio   — real-time audio I/O (cpal + ringbuf)
+  pancetta-ft8     — FT8 encoder/decoder/modulator/OSD
+  pancetta-dsp     — DSP pipeline (FFT, filtering, resampling)
+  pancetta-tui     — terminal UI (ratatui)
+  pancetta-config  — configuration with hot-reload
+
+Layer 1 — depends on core/ft8:
+  pancetta-qso     — QSO management, priority scoring, autonomous operator
+  pancetta-hamlib  — Hamlib CAT control FFI
+  pancetta-dx      — DX hunting, DXCC, PSKReporter
+  pancetta-cqdx    — cqdx.io HTTP client, cache, types
+
+Layer 2 — orchestrator:
+  pancetta         — coordinator, message bus, runtime (depends on all above)
 ```
 
-## Layer Descriptions
+All crates are pure Rust. There is no REST API, Web UI, or mobile layer.
 
-### Core Domain Layer
+---
 
-The heart of Pancetta containing all business logic, isolated from external dependencies.
-
-#### Components
-
-1. **Digital Mode Engine**
-   - FT8/FT4 codec implementation
-   - Message encoding/decoding
-   - Protocol state machines
-   - Extensible codec interface for future modes
-
-2. **DX Hunter Engine**
-   - DXCC entity management
-   - Rarity scoring algorithms
-   - Priority queue management
-   - Contact history analysis
-
-3. **QSO Manager**
-   - QSO state machine implementation
-   - Message sequencing logic
-   - Automatic response generation
-   - Manual override handling
-
-4. **Station Manager**
-   - Station configuration
-   - Capabilities management
-   - Band plan enforcement
-   - Power and mode settings
-
-5. **Contact Database**
-   - In-memory contact cache
-   - Query optimization
-   - Statistics generation
-   - Export/import logic
-
-6. **Logging Service**
-   - ADIF format handling
-   - QSO validation
-   - Log entry enrichment
-   - Backup management
-
-#### Domain Models
-
-```rust
-// Example domain models (language-agnostic representation)
-struct Station {
-    callsign: Callsign,
-    grid_square: GridSquare,
-    power_level: Power,
-    capabilities: RigCapabilities,
-}
-
-struct QSO {
-    id: QsoId,
-    local_station: Station,
-    remote_station: Station,
-    mode: DigitalMode,
-    frequency: Frequency,
-    start_time: DateTime,
-    end_time: Option<DateTime>,
-    exchanges: Vec<Message>,
-    state: QsoState,
-}
-
-struct DXEntity {
-    prefix: String,
-    country: String,
-    continent: Continent,
-    cq_zone: u8,
-    itu_zone: u8,
-    latitude: f64,
-    longitude: f64,
-}
-```
-
-### Application Layer
-
-Orchestrates use cases and coordinates between domain and infrastructure layers.
-
-#### Components
-
-1. **Command Handlers**
-   - StartQso, SendMessage, AbortQso
-   - SetFrequency, SetMode, SetPower
-   - ConfigureStation, SaveSettings
-
-2. **Query Handlers**
-   - GetHeardStations, GetQsoHistory
-   - GetDXStatistics, GetBandActivity
-   - GetConfiguration, GetRigStatus
-
-3. **Event Bus**
-   - MessageDecoded, QsoStarted, QsoCompleted
-   - StationHeard, DXSpotted, ConfigChanged
-   - RigStatusChanged, AudioLevelChanged
-
-### Infrastructure Layer
-
-Handles all external dependencies and I/O operations.
-
-#### Components
-
-1. **Audio Service**
-   - Cross-platform audio abstraction (cpal/PortAudio)
-   - Sample rate conversion
-   - Level monitoring and AGC
-   - Device enumeration and selection
-
-2. **Rig Control**
-   - Hamlib integration wrapper
-   - CAT command abstraction
-   - PTT control (multiple methods)
-   - Frequency/mode synchronization
-
-3. **Network Services**
-   - PSKReporter client
-   - QRZ.com API client (optional)
-   - Time synchronization check
-   - Future cloud services
-
-4. **Persistence**
-   - SQLite for contact database
-   - Configuration file management
-   - ADIF file I/O
-   - Backup/restore operations
-
-### Presentation Layer
-
-Multiple UI implementations sharing the same application layer.
-
-#### Initial TUI Implementation
+## End-to-End Data Flow
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Pancetta v1.0.0                          │
-├─────────────────────────────────────────────────────────────┤
-│ Band Activity                  │ QSO Status                 │
-│ ┌────────────────────────────┐ │ ┌─────────────────────────┤
-│ │Time  SNR  Δt   Freq  Call  │ │ │State: CALLING           │
-│ │0845  -12  0.2  1245  W1AW  │ │ │Remote: EA8/G0KTN       │
-│ │0845  +03  0.1  1456  JA1ABC│ │ │Sent: -06               │
-│ │0845  -18  0.3  1789  VK2DEF│ │ │Rcvd: R-08              │
-│ └────────────────────────────┘ │ └─────────────────────────┤
-├─────────────────────────────────┴─────────────────────────────┤
-│ DX Hunter                      │ Station Info               │
-│ ┌────────────────────────────┐ │ ┌─────────────────────────┤
-│ │Score Call      Grid   Dist │ │ │14.074.000 USB  FT8     │
-│ │ 95  ZD8W      II22    8453 │ │ │TX: IDLE  RX: ACTIVE    │
-│ │ 89  3B9FR     MH10   11234 │ │ │Audio: 65% █████░░░░    │
-│ │ 78  VP8LP     GD18   13567 │ │ │Time: ✓ +0.1s           │
-│ └────────────────────────────┘ │ └─────────────────────────┤
-├─────────────────────────────────────────────────────────────┤
-│ [F1]Band [F2]Mode [F3]QSO [F4]Config [F5]Log [ESC]Menu      │
-└─────────────────────────────────────────────────────────────┘
+Audio In (USB codec, 48kHz stereo)
+  |
+  v
+pancetta-audio  (AudioManager, cpal + ringbuf)
+  | raw f32 samples via crossbeam channel
+  v
+pancetta-dsp  (DspPipeline)
+  | decimate 4:1 -> 12kHz mono, bandpass filter, 15-sec window extraction
+  v
+pancetta-ft8  (Ft8Decoder)
+  | LDPC decode, OSD, AP injection -> Vec<DecodedMessage>
+  v
+Coordinator  (pipeline.rs)
+  | routes decoded messages
+  |------> pancetta-tui  (waterfall, band activity, DX hunter)
+  v
+pancetta-qso  (AutonomousOperator + PriorityScorer)
+  | score stations, pick best, generate response message
+  v
+pancetta-ft8  (Ft8Encoder)
+  | encode -> 8-GFSK modulate -> f32 audio samples
+  v
+pancetta-audio  -> Audio Out (USB codec)
+  |
+pancetta-hamlib -> PTT control via rigctld (Yaesu FTdx10)
 ```
 
-## Data Flow
+Each FT8 slot is 15 seconds. The pipeline must decode and decide within the slot boundary.
+Multi-stream TX is supported: N simultaneous FT8 signals can be encoded into a single slot
+at different audio frequencies.
 
-### Receive Path
+---
 
-```
-Audio Input → Audio Service → Digital Mode Engine → Message Decoder
-    ↓              ↓                   ↓                  ↓
-Device Buffer → Samples → FT8 Decoder → Decoded Message → Event Bus
-                                                              ↓
-                                        ┌─────────────────────┴────┐
-                                        ↓                          ↓
-                                  QSO Manager              DX Hunter Engine
-                                        ↓                          ↓
-                                  State Update              Priority Update
-                                        ↓                          ↓
-                                    UI Update              UI Notification
-```
+## Coordinator
 
-### Transmit Path
+The coordinator lives in `pancetta/src/coordinator/` and is decomposed into submodules:
 
-```
-User Command → Command Handler → QSO Manager → Message Generator
-      ↓              ↓                ↓              ↓
- UI Input → Validate → State Check → Create Message → Encode
-                                                         ↓
-                                              Digital Mode Engine
-                                                         ↓
-                                                 FT8 Encoder
-                                                         ↓
-                                              Audio Service → PTT Control
-                                                         ↓         ↓
-                                                 Audio Output → Transceiver
-```
+| File             | Role                                                         |
+|------------------|--------------------------------------------------------------|
+| `mod.rs`         | `ApplicationCoordinator` struct, startup sequencing          |
+| `pipeline.rs`    | audio/DSP/FT8 pipeline setup, crossbeam channel wiring       |
+| `components.rs`  | QSO engine, hamlib, cqdx.io component startup                |
+| `hamlib.rs`      | rigctld process management and TCP connection                 |
+| `health.rs`      | health checks and performance stats                          |
+| `shutdown.rs`    | graceful shutdown, task join                                 |
+| `wav_playback.rs`| WAV file playback mode for offline testing                   |
+| `util.rs`        | shared utilities (linear resampler, etc.)                    |
 
-## Interface Definitions
+**Communication model**: crossbeam channels carry point-to-point data (audio samples,
+decoded messages, waterfall frames). A `MessageBus` handles broadcast control events
+(frequency changes, QSO state transitions, DX spots, health signals).
 
-### Core Interfaces
-
-```rust
-// Digital Mode Codec Interface
-trait DigitalModeCodec {
-    fn decode(&self, samples: &[f32]) -> Result<Vec<DecodedMessage>>;
-    fn encode(&self, message: &Message) -> Result<Vec<f32>>;
-    fn get_mode_info(&self) -> ModeInfo;
-}
-
-// Repository Interfaces
-trait ContactRepository {
-    async fn save(&self, contact: Contact) -> Result<ContactId>;
-    async fn find_by_callsign(&self, call: &Callsign) -> Result<Option<Contact>>;
-    async fn get_worked_grids(&self) -> Result<Vec<GridSquare>>;
-}
-
-// External Service Interfaces
-trait RigControl {
-    async fn get_frequency(&self) -> Result<Frequency>;
-    async fn set_frequency(&self, freq: Frequency) -> Result<()>;
-    async fn set_ptt(&self, state: PttState) -> Result<()>;
-}
-
-trait AudioDevice {
-    fn start_capture(&self, callback: AudioCallback) -> Result<()>;
-    fn start_playback(&self, samples: &[f32]) -> Result<()>;
-    fn get_levels(&self) -> AudioLevels;
-}
-```
-
-## Concurrency Model
-
-### Thread Architecture
-
-1. **Main Thread** - UI event loop and user interaction
-2. **Audio Thread** - Real-time audio processing (high priority)
-3. **Decode Thread Pool** - Parallel FT8 decoding (CPU count - 1)
-4. **Network Thread** - Async I/O for reporting and APIs
-5. **Database Thread** - Background persistence operations
-
-### Synchronization
-
-- **Message Passing** - Channels for thread communication
-- **Lock-Free Queues** - Audio buffers and decode queues
-- **Event Bus** - Async event distribution
-- **State Machines** - Atomic state transitions
-
-## Error Handling Strategy
-
-### Error Categories
-
-1. **Recoverable Errors** - Logged, user notified, operation continues
-2. **Critical Errors** - Graceful shutdown with state preservation
-3. **Fatal Errors** - Emergency shutdown with crash report
-
-### Error Propagation
-
-```rust
-// Using Result types throughout
-type PancettaResult<T> = Result<T, PancettaError>;
-
-enum PancettaError {
-    Audio(AudioError),
-    Codec(CodecError),
-    Rig(RigError),
-    Network(NetworkError),
-    Database(DatabaseError),
-    Configuration(ConfigError),
-}
-```
-
-## Configuration Management
-
-### Configuration Hierarchy
-
-1. **Default Configuration** - Built-in defaults
-2. **System Configuration** - `/etc/pancetta/config.toml`
-3. **User Configuration** - `~/.config/pancetta/config.toml`
-4. **Environment Variables** - `PANCETTA_*` overrides
-5. **Command Line Arguments** - Highest priority
-
-### Configuration Schema
-
-```toml
-[station]
-callsign = "N0CALL"
-grid_square = "FN31"
-power = 10
-
-[audio]
-input_device = "default"
-output_device = "default"
-sample_rate = 48000
-buffer_size = 1024
-
-[rig]
-model = "Icom IC-7300"
-port = "/dev/ttyUSB0"
-baud_rate = 19200
-ptt_type = "CAT"
-
-[network]
-enable_pskreporter = true
-enable_qrz = false
-report_interval = 300
-
-[ui]
-theme = "dark"
-refresh_rate = 60
-show_waterfall = false
-```
-
-## Performance Considerations
-
-### Optimization Targets
-
-- **Audio Latency** < 50ms round-trip
-- **Decode Time** < 100ms per FT8 cycle
-- **UI Refresh** 60 FPS for smooth updates
-- **Memory Usage** < 100MB baseline
-- **CPU Usage** < 20% idle, < 80% active decode
-
-### Optimization Strategies
-
-1. **Zero-Copy Audio** - Direct buffer passing
-2. **SIMD Decoding** - Vectorized FFT operations
-3. **Memory Pools** - Pre-allocated buffers
-4. **Lazy Loading** - On-demand resource loading
-5. **Caching** - Computed values and API responses
-
-## Security Architecture
-
-### Security Principles
-
-1. **Least Privilege** - Minimal permissions required
-2. **Input Validation** - All external input sanitized
-3. **Secure Storage** - Sensitive data encrypted
-4. **Network Security** - TLS for external APIs
-5. **Audit Logging** - Security events tracked
-
-### Security Measures
-
-- **Sandboxing** - Platform-specific app sandboxing
-- **Code Signing** - Signed binaries for distribution
-- **API Keys** - Secure storage in system keychain
-- **Update Security** - Signed update packages
-- **Privacy** - No telemetry without consent
-
-## Extensibility Points
-
-### Plugin Architecture (Future)
-
-```rust
-trait PancettaPlugin {
-    fn name(&self) -> &str;
-    fn version(&self) -> Version;
-    fn initialize(&mut self, context: PluginContext) -> Result<()>;
-    fn on_message_decoded(&self, message: &DecodedMessage);
-    fn on_qso_completed(&self, qso: &QSO);
-}
-```
-
-### Extension Points
-
-1. **Custom Digital Modes** - New codec implementations
-2. **UI Themes** - Custom color schemes and layouts
-3. **External Services** - Additional logging/spotting services
-4. **Hardware Interfaces** - Custom PTT methods
-5. **Data Exporters** - Custom log formats
-
-## Testing Architecture
-
-### Test Pyramid
+The core channel topology established in `pipeline.rs`:
 
 ```
-         ╱╲
-        ╱E2E╲        5%  - End-to-end tests
-       ╱──────╲
-      ╱ Integr.╲     15% - Integration tests
-     ╱───────────╲
-    ╱   Component ╲  30% - Component tests
-   ╱─────────────────╲
-  ╱     Unit Tests    ╲ 50% - Unit tests
- ╱──────────────────────╲
+audio_to_dsp_tx  ->  audio_to_dsp_rx   (Vec<f32>, bounded 100)
+dsp_to_ft8_tx    ->  dsp_to_ft8_rx     (Vec<f32>, bounded 2)
+ft8_to_tui_tx    ->  ft8_to_tui_rx     (DecodedMessage, unbounded)
+waterfall_tx     ->  waterfall_rx       (Vec<Vec<f32>>, unbounded)
 ```
 
-### Test Infrastructure
+---
 
-- **Test Doubles** - Mocks for external dependencies
-- **Test Fixtures** - Sample audio files and messages
-- **Property Testing** - Fuzzing for codec robustness
-- **Benchmark Suite** - Performance regression detection
-- **Integration Harness** - Hardware-in-loop testing
+## Key Abstractions
 
-## Deployment Architecture
+### `WorkedStationLookup` (pancetta-qso)
 
-### Distribution Packages
+Trait interface used by `PriorityScorer` for synchronous station queries: duplicate
+detection, rarity lookup, and needed DXCC/grid checks. Decouples scoring logic from
+the coordinator's data sources.
 
-1. **Native Packages**
-   - `.deb` for Debian/Ubuntu
-   - `.rpm` for Fedora/RHEL
-   - `.pkg` for macOS
-   - `.msi` for Windows
-
-2. **Universal Packages**
-   - Flatpak for Linux
-   - Snap for Ubuntu
-   - AppImage for portable Linux
-
-3. **Container Images**
-   - Docker for testing/CI
-   - Development environments
-
-### Update Mechanism
-
-- **Semantic Versioning** - Clear version progression
-- **Delta Updates** - Minimize download size
-- **Rollback Support** - Previous version retention
-- **Update Channels** - Stable, Beta, Nightly
-
-## Monitoring and Observability
-
-### Metrics Collection
-
-- **Application Metrics** - Decode rate, QSO count
-- **Performance Metrics** - CPU, memory, latency
-- **Error Metrics** - Error rates by category
-- **Usage Metrics** - Feature adoption (opt-in)
-
-### Logging Strategy
-
-```rust
-// Structured logging with levels
-log::info!("QSO started"; 
-    "remote_callsign" => qso.remote.callsign,
-    "frequency" => qso.frequency,
-    "mode" => qso.mode
-);
+```
+pancetta_qso::priority::WorkedStationLookup
+  - is_duplicate(callsign, band) -> bool
+  - get_rarity(callsign) -> f64
+  - is_needed_dxcc(entity) -> bool
+  - is_needed_grid(grid) -> bool
 ```
 
-## Architecture Decision Records
+### `PriorityScorer` (pancetta-qso)
 
-Key architectural decisions are documented in separate ADRs:
+Takes a slice of `DecodedMessage` plus a `&dyn WorkedStationLookup`, returns a
+priority-ranked station list. Scoring weights: needed DXCC > needed grid > POTA/SOTA
+> rarity score > general activity. Applies duplicate suppression and failure backoff.
+Configured via `pancetta-config`.
 
-- [ADR-001: Language Selection](DECISIONS/ADR-001-language.md)
-- [ADR-002: UI Framework](DECISIONS/ADR-002-ui-framework.md)
-- [ADR-003: Audio Library](DECISIONS/ADR-003-audio.md)
-- [ADR-004: Database Choice](DECISIONS/ADR-004-database.md)
-- [ADR-005: Testing Strategy](DECISIONS/ADR-005-testing.md)
+### `AutonomousOperator` (pancetta-qso)
 
-## Future Architecture Evolution
+Decision engine operating in one of three modes:
+- **Hunt**: pounce on rare stations identified by `PriorityScorer`
+- **CQ**: call CQ and answer inbound callers by priority
+- **Hybrid**: hunt when rare targets are present, CQ otherwise
 
-### Phase 1: Core Foundation (Current)
-- Terminal UI implementation
-- Core digital mode support
-- Basic ham radio features
+Manages per-QSO state machines (CALLING -> EXCHANGING -> CONFIRMING -> COMPLETE).
+Hands off completed exchanges to the QSO log.
 
-### Phase 2: Enhanced Features
-- Web UI via WASM
-- Additional digital modes
-- Advanced DX features
+### `SmartFrequencyAllocator` (pancetta-qso)
 
-### Phase 3: Platform Expansion
-- Mobile applications
-- Cloud synchronization
-- Remote operation
+Selects TX audio frequency for each new QSO using 7 soft-scored criteria:
+avoid QRM from active signals, maintain minimum spacing between simultaneous TX streams,
+prefer clear channels, align with band segment conventions. Enables parallel QSOs
+within a single 15-second slot.
 
-### Phase 4: Ecosystem
-- Plugin marketplace
-- Community extensions
-- Hardware partnerships
+### `CachedStationLookup` (pancetta / priority_evaluator.rs)
 
-## Conclusion
+Coordinator-level implementation of `WorkedStationLookup`. Holds in-memory snapshots
+of worked stations (per band), recent failures, needed DXCC entities, needed grids,
+rarity scores from cqdx.io, notable callsigns, and network SNR data. Refreshed
+periodically by the coordinator from cqdx.io and the QSO log.
 
-The Pancetta architecture provides a solid foundation for a modern ham radio application that can evolve from a terminal application to a comprehensive multi-platform solution while maintaining clean separation of concerns, testability, and performance.
+---
+
+## FT8 Protocol Notes
+
+- Slot duration: 15 seconds (TX starts at 0s or 15s boundary)
+- Audio passband: ~200–3000 Hz above suppressed carrier
+- Modulation: 8-GFSK, 6.25 Hz tone spacing, 12000 samples/sec
+- Coding: LDPC (174,87) + 12-bit CRC
+- Message types: CQ, directed (call/grid/report/RR73/73), ARRL contest, free-text
+- OSD (Ordered Statistics Decoding) extends decode depth beyond standard LDPC
+
+`pancetta-ft8` is bit-exact with ft8_lib and WSJT-X (~200 tests).
+
+---
+
+## Known Gaps
+
+- Grid "needed" set never populated (`update_needed_grids()` not called)
+- POTA/SOTA detection has false positives on callsigns with `/` suffix
+- `is_duplicate` ignores `freq_hz` (no band-aware dedup yet)
+- TUI scaffold exists but is not wired to the live pipeline
+- cqdx.io `GET /spots?live=true` response envelope key (`groups`) unverified against live API
+- Coordinator decomposition ongoing (~2,700 lines in `mod.rs` prior to split)
+- Phase 4 (hardware integration) in progress: hamlib bindings complete, on-air TX pending
