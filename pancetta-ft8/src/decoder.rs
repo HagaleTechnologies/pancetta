@@ -1373,7 +1373,7 @@ impl Ft8Decoder {
         // noise produce structurally valid messages with low sync scores.
         // Empirical data: real decodes ≥0.84 confidence, FPs ≤0.37.
         // Threshold 0.45 (sync_score ~5.4) gives safe margin.
-        const MIN_DECODE_CONFIDENCE: f32 = 0.36;
+        const MIN_DECODE_CONFIDENCE: f32 = 0.40;
         if confidence < MIN_DECODE_CONFIDENCE {
             return Ok(None);
         }
@@ -2206,7 +2206,7 @@ fn par_decode_candidate(
 
                 // Minimum confidence floor — CRC-14 collisions on noise
                 // produce structurally valid messages with low sync scores.
-                const MIN_DECODE_CONFIDENCE: f32 = 0.36;
+                const MIN_DECODE_CONFIDENCE: f32 = 0.40;
                 if confidence < MIN_DECODE_CONFIDENCE {
                     continue;
                 }
@@ -2298,7 +2298,7 @@ fn par_decode_candidate(
             let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
             // Minimum confidence floor (same as spectrogram path)
-            const MIN_DECODE_CONFIDENCE: f32 = 0.36;
+            const MIN_DECODE_CONFIDENCE: f32 = 0.40;
             if confidence < MIN_DECODE_CONFIDENCE {
                 continue;
             }
@@ -2504,7 +2504,7 @@ fn par_try_ldpc_with_ap(
         crate::ap::ApLevel::Ap4 => 4,
     };
     // Minimum confidence floor for ALL decodes (same as primary path).
-    const MIN_DECODE_CONFIDENCE: f32 = 0.36;
+    const MIN_DECODE_CONFIDENCE: f32 = 0.40;
     if confidence < MIN_DECODE_CONFIDENCE {
         return None;
     }

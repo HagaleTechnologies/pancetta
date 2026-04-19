@@ -372,31 +372,40 @@ impl Ft8Message {
                 // Reject unconditionally.
                 false
             }
-            MessageType::Standard => {
-                // Standard messages: ALL present callsigns must look valid.
-                // This is stricter than "any" because OSD-2 CRC collisions
-                // often produce one valid-looking call paired with garbage.
-                let all_calls_valid = [&self.from_callsign, &self.to_callsign].iter().all(|opt| {
-                    opt.as_ref()
-                        .map_or(true, |call| Self::looks_like_callsign(call))
-                });
-                if !all_calls_valid {
+            MessageType::Standard
+            | MessageType::Contest
+            | MessageType::FieldDay
+            | MessageType::RTTYRoundup
+            | MessageType::NonStdCall
+            | MessageType::DXpedition
+            | MessageType::Extended => {
+                // ALL present callsigns must look valid.
+                let calls: Vec<&str> = [&self.from_callsign, &self.to_callsign]
+                    .iter()
+                    .filter_map(|opt| opt.as_deref())
+                    .collect();
+
+                if calls.is_empty() {
                     return false;
                 }
-                // Must have at least one callsign present
-                self.from_callsign.is_some() || self.to_callsign.is_some()
-            }
-            // Contest, FieldDay, RTTYRoundup, NonStdCall, DXpedition, Extended:
-            // require ALL present callsigns to be valid
-            _ => {
-                let all_calls_valid = [&self.from_callsign, &self.to_callsign].iter().all(|opt| {
-                    opt.as_ref()
-                        .map_or(true, |call| Self::looks_like_callsign(call))
-                });
-                if !all_calls_valid {
+
+                if !calls.iter().all(|call| Self::looks_like_callsign(call)) {
                     return false;
                 }
-                self.from_callsign.is_some() || self.to_callsign.is_some()
+
+                // Both callsigns having /R suffix is extremely rare in real
+                // traffic but common in CRC-14 collisions on noise (the
+                // packed encoding makes /R a low-cost bit pattern).
+                if calls.len() == 2 {
+                    let both_portable = calls.iter().all(|c| {
+                        c.contains('/')
+                    });
+                    if both_portable {
+                        return false;
+                    }
+                }
+
+                true
             }
         }
     }
