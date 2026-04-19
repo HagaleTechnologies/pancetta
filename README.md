@@ -1,147 +1,70 @@
-# 🎚️ Pancetta
+# Pancetta
 
-**High-Performance Amateur Radio FT8 Processing Application**
+Autonomous FT8 ham radio station written in Rust.
 
-[![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)](https://www.rust-lang.org/)
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)](https://github.com/yourusername/pancetta)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+## What It Does
 
-Pancetta is a blazing-fast, real-time FT8 decoder and amateur radio application built in Rust. It provides professional-grade digital signal processing with sub-millisecond latency, capable of decoding 50+ simultaneous FT8 signals with >95% accuracy.
+- **FT8 decoding**: LDPC error correction, OSD (Ordered Statistics Decoding), AP decoding — bit-exact with WSJT-X
+- **Autonomous QSO operation**: Hunt mode (pounce on rare stations), CQ mode (answer callers), hybrid mode
+- **Priority-based station selection**: Weighted scoring — needed DXCC > needed grid > POTA/SOTA > rarity, with duplicate suppression and failure backoff
+- **Multi-stream TX**: N simultaneous FT8 signals in a single 15-second slot via SmartFrequencyAllocator
+- **Real-time TUI**: Terminal interface with waterfall display (scaffold, not yet wired to live pipeline)
 
-## 🚀 Features
+## Workspace Structure
 
-- **Real-time FT8 Decoding**: Decode multiple FT8 signals simultaneously with high accuracy
-- **Ultra-Low Latency**: <1ms audio processing latency for real-time operation
-- **Efficient Resource Usage**: <100MB memory footprint, optimized CPU usage
-- **Professional DSP Pipeline**: Resampling, filtering, noise reduction, and AGC
-- **Hamlib Integration**: Full CAT control via rigctld for any supported radio
-- **Interactive TUI**: Real-time terminal interface with waterfall display
-- **QSO Logging**: SQLite database for contact logging with ADIF export
-- **Cross-Platform**: Runs on Linux, macOS, and Windows
+11-crate Cargo workspace:
 
-## 📊 Performance
+| Crate | Purpose | Status |
+|-------|---------|--------|
+| `pancetta-ft8` | FT8 encoder/decoder/modulator/OSD | Production-grade, ~200 tests, bit-exact with ft8_lib/WSJT-X |
+| `pancetta-audio` | Real-time audio I/O (cpal + ringbuf) | Functional |
+| `pancetta-dsp` | DSP pipeline (FFT, filtering, resampling) | Functional |
+| `pancetta-config` | Configuration with hot-reload | Production-ready, ~59 tests |
+| `pancetta-qso` | QSO management, priority scoring, frequency allocation, autonomous operator | Core logic, ~81 tests |
+| `pancetta-dx` | DX hunting, DXCC, PSKReporter | Partial implementation |
+| `pancetta-hamlib` | Hamlib CAT control FFI | Bindings done, integration stub |
+| `pancetta-cqdx` | cqdx.io HTTP client, cache, types | Delta-adapted, needs live API validation |
+| `pancetta-tui` | Terminal UI | Scaffold, not wired to pipeline |
+| `pancetta-core` | Shared types, error handling | Stable |
+| `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 
-| Metric | Target | Achieved |
-|--------|--------|----------|
-| Audio Latency | <1ms | ✅ 0.5ms |
-| Memory Usage | <100MB | ✅ 10-22MB |
-| FT8 Accuracy | >95% @ -20dB | ✅ Achieved |
-| Simultaneous Decodes | 50+ | ✅ Supported |
-| Startup Time | <1s | ✅ 504ms |
+## Quick Start
 
-## 🛠️ Quick Start
-
-### Prerequisites
-
-- Rust 1.70+ (install from [rustup.rs](https://rustup.rs/))
-- Hamlib (optional, for radio control)
-- ALSA/PulseAudio (Linux) or CoreAudio (macOS)
-
-### Installation
+Prerequisites: Rust (install from [rustup.rs](https://rustup.rs/))
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/pancetta.git
-cd pancetta
+# Build the workspace
+cargo build
 
-# Build in release mode
-cargo build --release
-
-# Run the application
-./target/release/pancetta
-```
-
-### Basic Usage
-
-```bash
-# Run with default settings (TUI mode)
-./target/release/pancetta
-
-# Run in headless mode (no UI)
-./target/release/pancetta --headless
-
-# Use with rigctld for radio control
-rigctld -m 1001 -r /dev/ttyUSB0 &
-PANCETTA_MOCK_RIG=false ./target/release/pancetta
-
-# Adjust worker threads for lower CPU usage
-PANCETTA_WORKER_THREADS=2 ./target/release/pancetta
-```
-
-## 🎛️ Configuration
-
-Pancetta can be configured through multiple methods (in order of precedence):
-1. Command-line arguments
-2. Environment variables
-3. Configuration file (`~/.config/pancetta/config.toml`)
-4. Default values
-
-### Key Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `RUST_LOG` | Log level (error/warn/info/debug/trace) | info |
-| `PANCETTA_WORKER_THREADS` | Number of worker threads | 2 |
-| `PANCETTA_MOCK_RIG` | Use mock rig instead of rigctld | true |
-| `PANCETTA_STUB_AUDIO` | Use stub audio for testing | false |
-| `RIGCTLD_HOST` | rigctld host address | 127.0.0.1 |
-| `RIGCTLD_PORT` | rigctld port | 4532 |
-
-## 🏗️ Architecture
-
-Pancetta uses a modular, message-driven architecture:
-
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   Audio In  │────▶│     DSP     │────▶│ FT8 Decoder │
-└─────────────┘     └─────────────┘     └─────────────┘
-                            │                    │
-                            ▼                    ▼
-                    ┌─────────────┐     ┌─────────────┐
-                    │ Message Bus │◀────│   QSO Log   │
-                    └─────────────┘     └─────────────┘
-                            │
-                    ┌───────┴────────┐
-                    ▼                ▼
-            ┌─────────────┐  ┌─────────────┐
-            │     TUI     │  │   Hamlib    │
-            └─────────────┘  └─────────────┘
-```
-
-## 📚 Documentation
-
-- [Installation Guide](docs/INSTALL.md) - Detailed installation instructions
-- [User Guide](docs/USER_GUIDE.md) - Complete user manual
-- [Configuration](docs/CONFIG.md) - All configuration options
-- [Architecture](docs/ARCHITECTURE.md) - System design and internals
-- [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues and solutions
-
-## 🧪 Testing
-
-```bash
-# Run unit tests
+# Run all workspace tests
 cargo test
 
-# Run integration tests
-./run_integration_tests.sh
+# FT8 tests including encoder (feature-gated behind `transmit`)
+cargo test --features transmit -p pancetta-ft8
 
-# Run performance benchmarks
-./run_performance_tests.sh
+# Loopback integration tests (end-to-end QSO through encode→modulate→decode)
+cargo test -p pancetta --test loopback_qso
 
-# Run stability test (1 hour)
-./run_stability_test.sh 3600
+# Run the application
+cargo run
 ```
 
-## 📝 License
+Note: `pancetta-hamlib` hangs in workspace builds due to tokio runtime conflicts. Test it separately:
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+```bash
+cargo test -p pancetta-hamlib --lib -- --test-threads=1
+```
 
-## 🙏 Acknowledgments
+## Configuration
 
-- [WSJT-X](https://wsjt.sourceforge.io/) for FT8 protocol specification
-- [Hamlib](https://hamlib.github.io/) for radio control
-- The amateur radio community for testing and feedback
+Config lives at `~/.pancetta/config.toml`. See `docs/CONFIG.md` for all options.
 
----
+## Documentation
 
-**73 de Pancetta Team** 📻
+- `FEATURES.md` — capabilities and feature status
+- `docs/ARCHITECTURE.md` — system design and internals
+- `CLAUDE.md` — development instructions, known gaps, build hygiene
+
+## License
+
+MIT — see [LICENSE](LICENSE)
