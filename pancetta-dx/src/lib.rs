@@ -1,4 +1,6 @@
-//! # Pancetta DX Hunter
+//! # pancetta-dx
+//!
+//! DX hunting, DXCC entity data, rarity scoring, and PSKReporter integration.
 //!
 //! Advanced DX hunting and amateur radio award tracking system with real-time
 //! cluster integration, propagation analysis, and comprehensive DXCC management.
@@ -11,6 +13,20 @@
 //! - Propagation prediction integration
 //! - External service integrations (PSKReporter, DX clusters, LoTW)
 //! - Comprehensive statistics and progress reporting
+//!
+//! ## Data Flow
+//! external services (PSKReporter, DX clusters) -> **pancetta-dx** -> `pancetta` coordinator (rarity scores, entity lookups)
+//!
+//! ## Key Types
+//! - [`scorer::RarityScorer`] -- computes a 0.0–1.0 rarity score for a DXCC entity
+//! - [`dxcc::DxccDatabase`] -- DXCC entity database with callsign-to-entity lookup
+//! - [`tracker::DxTracker`] -- tracks worked/confirmed entities per band/mode
+//! - [`pskreporter::PskReporter`] -- submits spots to and retrieves spots from PSKReporter
+//! - [`DxError`] -- crate-level error type
+//!
+//! ## Crate Relationships
+//! - Receives from: PSKReporter API, DX cluster feeds, LoTW
+//! - Sends to: `pancetta` coordinator (rarity scores, needed entity status)
 
 #![allow(dead_code, unused_imports)]
 

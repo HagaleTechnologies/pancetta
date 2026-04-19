@@ -1,8 +1,25 @@
-//! # Pancetta DSP - High-Performance Digital Signal Processing for Amateur Radio
+//! # pancetta-dsp
+//!
+//! DSP pipeline: decimation (48kHz->12kHz), bandpass filter, AGC, and FT8 window extraction.
 //!
 //! This crate provides a comprehensive signal processing pipeline optimized for amateur radio
 //! applications, particularly FT8 digital mode processing. It connects real-time audio streaming
 //! with FT8 decoders through a sophisticated multi-stage processing chain.
+//!
+//! ## Data Flow
+//! `pancetta-audio` (48kHz raw samples) -> **pancetta-dsp** -> `pancetta-ft8` (12kHz FT8 windows)
+//!
+//! ## Key Types
+//! - [`DspPipeline`] -- async pipeline that owns all processing stages
+//! - [`PipelineBuilder`] -- fluent builder for configuring and constructing a [`DspPipeline`]
+//! - [`PipelineConfig`] -- full pipeline configuration (sample rates, stage enables)
+//! - [`AutomaticGainControl`] -- AGC with hang time, compression, and noise gating
+//! - [`IirFilter`] -- cascaded biquad IIR filter (bandpass, low-pass, etc.)
+//! - [`AudioRingBuffer`] -- lock-free ring buffer for continuous audio streaming
+//!
+//! ## Crate Relationships
+//! - Receives from: `pancetta-audio`
+//! - Sends to: `pancetta-ft8`
 //!
 //! ## Features
 //!

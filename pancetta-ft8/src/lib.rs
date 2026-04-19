@@ -1,4 +1,6 @@
-//! # Pancetta FT8 Codec
+//! # pancetta-ft8
+//!
+//! FT8 protocol encoder, decoder, modulator, and OSD — bit-exact with WSJT-X / ft8_lib.
 //!
 //! High-performance FT8 digital mode decoder and encoder optimized for real-time processing.
 //!
@@ -11,6 +13,23 @@
 //! - FT8 message encoding and transmission
 //! - PTT control and safety features
 //! - FCC Part 97 compliance
+//!
+//! ## Data Flow
+//! `pancetta-dsp` (12kHz FT8 windows) -> **pancetta-ft8** -> coordinator (decoded messages)
+//!
+//! TX path: coordinator (message text) -> **pancetta-ft8** encoder/modulator -> `pancetta-audio` (baseband samples)
+//!
+//! ## Key Types
+//! - [`Ft8Decoder`] -- decodes one 12.64-second audio window into [`DecodedMessage`] list
+//! - [`Ft8Config`] -- decoder configuration (SNR threshold, parallelism, AP decoding)
+//! - [`DecodedMessage`] -- single decoded FT8 message with SNR, frequency, and confidence
+//! - [`Ft8Message`] -- structured FT8 message content (callsigns, grid, report, etc.)
+//! - [`Ft8Encoder`] -- encodes message text into 174-bit LDPC codeword (feature `transmit`)
+//! - [`Ft8Modulator`] -- converts codeword to 8-GFSK audio samples (feature `transmit`)
+//!
+//! ## Crate Relationships
+//! - Receives from: `pancetta-dsp` (processed audio windows)
+//! - Sends to: `pancetta` coordinator (decoded messages, TX audio)
 //!
 //! ## Decoding Example
 //!

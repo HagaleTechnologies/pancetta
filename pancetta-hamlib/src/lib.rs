@@ -1,8 +1,27 @@
-//! Pancetta Hamlib Integration
+//! # pancetta-hamlib
+//!
+//! Hamlib CAT control via rigctld — frequency, mode, PTT for the Yaesu FTdx10 (and others).
 //!
 //! This crate provides safe, async Rust bindings for the Hamlib amateur radio
 //! control library, enabling comprehensive control of amateur radio transceivers
 //! through CAT (Computer Aided Transceiver) interfaces.
+//!
+//! ## Data Flow
+//! `pancetta` coordinator (PTT/frequency commands) -> **pancetta-hamlib** -> rig hardware (via rigctld)
+//!
+//! rig hardware state -> **pancetta-hamlib** -> `pancetta` coordinator (frequency, S-meter, etc.)
+//!
+//! ## Key Types
+//! - [`Rig`] -- connected rig handle (frequency, mode, PTT control)
+//! - [`RigControl`] -- trait defining the full CAT control interface
+//! - [`RigConfig`] -- rigctld host/port, baud rate, model number
+//! - [`RigModelType`] -- known rig models (Yaesu FTdx10, Icom IC-7300, etc.)
+//! - [`MockRig`] -- software mock for unit testing (feature `mock-rig`)
+//! - [`AdvancedRig`] -- band switching, memory channels, scanning, live S-meter monitoring
+//!
+//! ## Crate Relationships
+//! - Receives from: `pancetta` coordinator (PTT commands, frequency requests)
+//! - Sends to: `pancetta` coordinator (rig state: frequency, mode, connection status)
 //!
 //! # Features
 //!

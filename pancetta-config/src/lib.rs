@@ -1,8 +1,25 @@
-//! # Pancetta Configuration System
+//! # pancetta-config
+//!
+//! TOML-based configuration with hot-reload — used by all crates at startup.
 //!
 //! A comprehensive configuration management system for Pancetta amateur radio software
 //! that provides hierarchical configuration loading, hot-reload capability, and
 //! structured settings management.
+//!
+//! ## Data Flow
+//! config file (TOML) -> **pancetta-config** -> every other crate (read at startup / on file change)
+//!
+//! ## Key Types
+//! - [`Config`] -- top-level configuration struct (station, audio, rig, network, UI)
+//! - [`ConfigManager`] -- loads configuration and broadcasts hot-reload events
+//! - [`ConfigError`] -- configuration-specific error type
+//! - [`StationConfig`] -- callsign, grid square, operating preferences
+//! - [`AudioConfig`] -- input/output device selection, sample rates
+//!
+//! ## Crate Relationships
+//! - Receives from: filesystem (TOML config files)
+//! - Sends to: all crates (`pancetta-audio`, `pancetta-ft8`, `pancetta-dsp`,
+//!   `pancetta-qso`, `pancetta-hamlib`, `pancetta-dx`, `pancetta-cqdx`, `pancetta`)
 //!
 //! ## Features
 //!

@@ -1,8 +1,24 @@
-//! # Pancetta QSO Management Library
+//! # pancetta-qso
+//!
+//! QSO management: autonomous operator, priority scorer, frequency allocator, state machine, ADIF logging.
 //!
 //! A comprehensive QSO (contact) management and logging library for FT8 amateur radio communications.
 //! This library provides state machine-based QSO tracking, automatic sequencing, ADIF import/export,
 //! SQLite-based storage, and comprehensive statistics and analytics.
+//!
+//! ## Data Flow
+//! `pancetta` coordinator (decoded FT8 messages) -> **pancetta-qso** -> `pancetta` coordinator (TX decisions)
+//!
+//! ## Key Types
+//! - [`AutonomousOperator`] -- decision engine: hunt rare DX, answer CQ callers, hybrid mode
+//! - [`PriorityScorer`] -- weighted scorer (needed DXCC > needed grid > POTA/SOTA > rarity)
+//! - [`SmartFrequencyAllocator`] -- selects TX audio frequency for parallel QSOs
+//! - [`QsoManager`] -- QSO lifecycle state machine (calling -> exchanging -> logging)
+//! - [`QsoManagerConfig`] -- operator callsign, grid, autonomous mode settings
+//!
+//! ## Crate Relationships
+//! - Receives from: `pancetta` coordinator (decoded messages, band state)
+//! - Sends to: `pancetta` coordinator (TX decisions, logged QSOs)
 //!
 //! ## Features
 //!

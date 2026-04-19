@@ -1,7 +1,24 @@
-//! Pancetta Core - Shared types and utilities for all Pancetta modules
+//! # pancetta-core
+//!
+//! Shared types, errors, and utilities used by every other crate in the workspace.
 //!
 //! This crate provides the fundamental types and utilities that are shared
 //! across all Pancetta modules, ensuring consistency and reducing duplication.
+//!
+//! ## Data Flow
+//! (no upstream) -> **pancetta-core** -> every other crate
+//!
+//! ## Key Types
+//! - [`Band`] -- amateur radio band (20m, 40m, etc.)
+//! - [`Mode`] -- operating mode (FT8, USB, etc.)
+//! - [`PancettaError`] -- unified error type
+//! - [`ComponentError`] -- per-component error with severity and context
+//!
+//! ## Crate Relationships
+//! - Receives from: nothing (foundational layer)
+//! - Sends to: all crates (`pancetta-audio`, `pancetta-ft8`, `pancetta-dsp`,
+//!   `pancetta-config`, `pancetta-qso`, `pancetta-hamlib`, `pancetta-dx`,
+//!   `pancetta-cqdx`, `pancetta-tui`, `pancetta`)
 
 pub mod error;
 pub mod types;
