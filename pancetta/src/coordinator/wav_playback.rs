@@ -93,13 +93,15 @@ impl super::ApplicationCoordinator {
                         let dt = msg.time_offset;
                         let text = &msg.text;
 
-                        // Print in WSJT-X style format
+                        // Print in WSJT-X style format with confidence and AP level
                         let slot_time = offset as f64 / target_rate as f64;
                         let mins = (slot_time / 60.0) as u32;
                         let secs = (slot_time % 60.0) as u32;
+                        let conf = msg.confidence;
+                        let ap = msg.ap_level;
                         println!(
-                            "{:02}:{:02}  {:>+4.0} {:>6.1} {:>+5.1}  {}",
-                            mins, secs, snr, freq_hz, dt, text
+                            "{:02}:{:02}  {:>+4.0} {:>6.1} {:>+5.1}  conf={:.2} ap={}  {}",
+                            mins, secs, snr, freq_hz, dt, conf, ap, text
                         );
                     }
                     all_decoded.extend(messages);
