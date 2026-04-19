@@ -69,13 +69,10 @@ Design spec: `docs/superpowers/specs/2026-04-02-end-to-end-qso-design.md`
 
 ## Known Gaps and TODOs
 
-- Rarity factor hardcoded to 0.5 (needs pancetta-dx RarityScorer or cqdx.io integration)
-- DXCC/grid "needed" sets default to empty (treats everything as needed)
-- POTA/SOTA detection has false positives on callsigns with `/` suffix
+- Grid "needed" set never populated (DXCC needed works via cqdx.io, grid `update_needed_grids()` never called)
+- POTA/SOTA detection has false positives on callsigns with `/` suffix (`contains('/')` too broad)
 - `is_duplicate` ignores freq_hz (no band-aware dedup yet)
-- TUI not wired to live pipeline
 - cqdx.io `GET /spots?live=true` response envelope key (`groups`) unverified against live API
-- Coordinator decomposition needed (~2,700 lines)
 
 ## Build Hygiene
 
