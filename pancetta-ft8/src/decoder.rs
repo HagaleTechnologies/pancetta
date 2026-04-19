@@ -2853,7 +2853,8 @@ impl LdpcDecoder {
             });
         }
 
-        let decoded_llrs = self.belief_propagation(llrs)?;
+        // Use trajectory-collecting BP
+        let (decoded_llrs, trajectory) = self.belief_propagation_with_trajectory(llrs)?;
 
         // Check if BP converged (syndrome = 0)
         let bp_converged = {
@@ -2866,23 +2867,24 @@ impl LdpcDecoder {
         }
 
         // BP did not converge — try OSD fallback if available.
-        // Only run OSD when BP was close to converging (few parity errors).
-        // Without this gate, OSD-2's 4,187 trials per candidate × hundreds of
-        // noise candidates produces excessive CRC-14 false positives (~1/16384
-        // per trial).
         if let Some(ref osd) = self.osd {
             let llr_arr: &[f32; 174] = decoded_llrs[..174].try_into().unwrap();
             let parity_errors = self.count_parity_errors(llr_arr);
 
-            // Threshold: only try OSD if BP nearly converged.
-            // OSD-2 has 4187 trials × 1/16384 CRC false-positive rate per
-            // candidate. Even with post-decode message validation, parity=5
-            // admits too many false positives with plausible-looking callsign
-            // structure. Parity=3 balances sensitivity and false-positive rate.
-            const MAX_PARITY_ERRORS_FOR_OSD: usize = 3;
+            // With neural ordering, we can afford a more generous gate since
+            // the neural model targets the right bits in ~200 trials.
+            const MAX_PARITY_ERRORS_FOR_OSD: usize = 5;
 
             if parity_errors <= MAX_PARITY_ERRORS_FOR_OSD {
-                if let Some(codeword) = osd.decode(llr_arr) {
+                // Compute neural ordering if trajectory is available
+                let neural_ordering = trajectory.as_ref().map(|traj| {
+                    crate::neural_osd::predict_error_bits(traj)
+                });
+
+                if let Some(codeword) = osd.decode(
+                    llr_arr,
+                    neural_ordering.as_ref(),
+                ) {
                     return Ok(codeword);
                 }
             }
@@ -3025,6 +3027,114 @@ impl LdpcDecoder {
         }
 
         Ok(output_llrs.to_vec())
+    }
+
+    /// Belief propagation with per-iteration LLR trajectory collection.
+    /// Returns (final_llrs, Some(trajectory)) when BP fails to converge.
+    /// Returns (final_llrs, None) when BP converges (no trajectory needed).
+    fn belief_propagation_with_trajectory(
+        &self,
+        channel_llrs: &[f32],
+    ) -> Ft8Result<(Vec<f32>, Option<[[f32; 174]; 25]>)> {
+        let num_checks = self.parity_check_matrix.num_checks;
+        let num_vars = self.parity_check_matrix.num_variables;
+
+        let mut v2c = [[0.0f32; 7]; 83];
+        let mut c2v = [[0.0f32; 7]; 83];
+        let mut output_llrs = [0.0f32; 174];
+        output_llrs[..num_vars].copy_from_slice(&channel_llrs[..num_vars]);
+        let mut trajectory = [[0.0f32; 174]; 25];
+
+        for check_idx in 0..num_checks {
+            let connected_vars = self.parity_check_matrix.get_connected_variables(check_idx);
+            for (pos, &var_idx) in connected_vars.iter().enumerate() {
+                v2c[check_idx][pos] = channel_llrs[var_idx];
+            }
+        }
+
+        let max_iters = self.max_iterations.min(25);
+
+        for iteration in 0..self.max_iterations {
+            // Check node update (same as belief_propagation)
+            for check_idx in 0..num_checks {
+                let connected_vars = self.parity_check_matrix.get_connected_variables(check_idx);
+                let degree = connected_vars.len();
+
+                match self.algorithm {
+                    LdpcAlgorithm::SumProduct => {
+                        for target_pos in 0..degree {
+                            let mut product = 1.0f32;
+                            for pos in 0..degree {
+                                if pos != target_pos {
+                                    product *= fast_tanh(v2c[check_idx][pos] / 2.0);
+                                }
+                            }
+                            c2v[check_idx][target_pos] = 2.0 * fast_atanh(product);
+                        }
+                    }
+                    LdpcAlgorithm::MinSum { normalization_factor } => {
+                        let mut total_sign: i8 = 1;
+                        let mut min1_mag = f32::MAX;
+                        let mut min2_mag = f32::MAX;
+                        let mut min1_pos: usize = 0;
+                        let mut signs = [1i8; 7];
+
+                        for pos in 0..degree {
+                            let msg = v2c[check_idx][pos];
+                            let s = if msg < 0.0 { -1i8 } else { 1i8 };
+                            signs[pos] = s;
+                            total_sign *= s;
+
+                            let mag = msg.abs();
+                            if mag < min1_mag {
+                                min2_mag = min1_mag;
+                                min1_mag = mag;
+                                min1_pos = pos;
+                            } else if mag < min2_mag {
+                                min2_mag = mag;
+                            }
+                        }
+
+                        for pos in 0..degree {
+                            let edge_sign = total_sign * signs[pos];
+                            let mag = if pos == min1_pos { min2_mag } else { min1_mag };
+                            c2v[check_idx][pos] = edge_sign as f32 * mag * normalization_factor;
+                        }
+                    }
+                }
+            }
+
+            // Variable node update
+            for var_idx in 0..num_vars {
+                let positions = &self.var_positions[var_idx];
+                let mut total = channel_llrs[var_idx];
+                for &(check_idx, pos) in positions {
+                    total += c2v[check_idx][pos];
+                }
+                output_llrs[var_idx] = total;
+
+                for &(check_idx, pos) in positions {
+                    v2c[check_idx][pos] = total - c2v[check_idx][pos];
+                }
+            }
+
+            // Record trajectory (only first 25 iterations fit)
+            if iteration < max_iters {
+                trajectory[iteration] = output_llrs;
+            }
+
+            // Early termination on convergence — discard trajectory
+            if self.check_syndrome_fast(&output_llrs) {
+                return Ok((output_llrs.to_vec(), None));
+            }
+        }
+
+        // BP did not converge — fill any remaining trajectory slots
+        for i in self.max_iterations.min(25)..25 {
+            trajectory[i] = output_llrs;
+        }
+
+        Ok((output_llrs.to_vec(), Some(trajectory)))
     }
 
     /// Check if syndrome is zero (all parity checks satisfied).

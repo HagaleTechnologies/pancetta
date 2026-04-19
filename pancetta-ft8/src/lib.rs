@@ -68,6 +68,8 @@ pub use parallel::{DecodeConfig, Parallelism, BudgetTracker};
 pub mod decoder;
 pub mod ldpc;
 pub mod message;
+pub mod neural_osd;
+mod neural_osd_weights;
 pub mod osd;
 pub mod signal_processing;
 pub mod sync;

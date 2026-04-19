@@ -250,18 +250,42 @@ impl OsdDecoder {
     /// Returns `Some(BitVec)` of 174 bits if a valid codeword (passing CRC-14) is found,
     /// or `None` if no valid candidate is found at the configured depth.
     #[allow(clippy::needless_range_loop)]
-    pub fn decode(&self, llrs: &[f32; LDPC_CODEWORD_BITS]) -> Option<BitVec> {
-        // 1. Sort indices by descending |LLR| (most reliable first)
+    pub fn decode(
+        &self,
+        llrs: &[f32; LDPC_CODEWORD_BITS],
+        neural_ordering: Option<&[f32; LDPC_INFO_BITS]>,
+    ) -> Option<BitVec> {
+        // 1. Sort indices by reliability
         let mut sorted_indices: [usize; LDPC_CODEWORD_BITS] = [0; LDPC_CODEWORD_BITS];
         for i in 0..LDPC_CODEWORD_BITS {
             sorted_indices[i] = i;
         }
-        sorted_indices.sort_by(|&a, &b| {
-            llrs[b]
-                .abs()
-                .partial_cmp(&llrs[a].abs())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        if let Some(probs) = neural_ordering {
+            // Neural ordering: sort info bits by predicted error probability
+            // (highest probability first = least reliable), parity bits by |LLR|
+            sorted_indices.sort_by(|&a, &b| {
+                let key_a = if a < LDPC_INFO_BITS {
+                    -probs[a] // negative so highest prob sorts first (= most unreliable)
+                } else {
+                    -llrs[a].abs() // parity bits: high |LLR| = reliable, sort last
+                };
+                let key_b = if b < LDPC_INFO_BITS {
+                    -probs[b]
+                } else {
+                    -llrs[b].abs()
+                };
+                // Sort ascending (most negative = highest prob = least reliable = first)
+                key_b.partial_cmp(&key_a).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        } else {
+            // Original: sort by descending |LLR| (most reliable first)
+            sorted_indices.sort_by(|&a, &b| {
+                llrs[b]
+                    .abs()
+                    .partial_cmp(&llrs[a].abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        };
 
         // 2. Permute generator columns per reliability ranking
         let mut matrix = [[0u8; PACKED_BYTES]; LDPC_INFO_BITS];
@@ -615,7 +639,7 @@ mod tests {
             let llrs = codeword_to_llrs(&codeword, 4.0);
 
             let decoder = OsdDecoder::new(OsdConfig { max_depth: 0 });
-            let result = decoder.decode(&llrs);
+            let result = decoder.decode(&llrs, None);
 
             assert!(result.is_some(), "OSD-0 should decode a clean codeword");
             let decoded = result.unwrap();
@@ -634,13 +658,13 @@ mod tests {
             // OSD-0 should fail
             let decoder0 = OsdDecoder::new(OsdConfig { max_depth: 0 });
             assert!(
-                decoder0.decode(&llrs).is_none(),
+                decoder0.decode(&llrs, None).is_none(),
                 "OSD-0 should fail with one corrupted bit"
             );
 
             // OSD-1 should succeed
             let decoder1 = OsdDecoder::new(OsdConfig { max_depth: 1 });
-            let result = decoder1.decode(&llrs);
+            let result = decoder1.decode(&llrs, None);
             assert!(
                 result.is_some(),
                 "OSD-1 should recover single unreliable bit"
@@ -676,8 +700,8 @@ mod tests {
                 llrs[a] = if codeword[a] { 0.05 } else { -0.05 };
                 llrs[b] = if codeword[b] { 0.05 } else { -0.05 };
 
-                let osd1_result = decoder1.decode(&llrs);
-                let osd2_result = decoder2.decode(&llrs);
+                let osd1_result = decoder1.decode(&llrs, None);
+                let osd2_result = decoder2.decode(&llrs, None);
 
                 if osd1_result.is_none() && osd2_result.is_some() {
                     assert_eq!(
