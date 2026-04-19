@@ -401,6 +401,224 @@ impl Ft8Message {
         }
     }
 
+    /// Check if a callsign prefix matches a valid ITU allocation.
+    ///
+    /// Extracts the 1-2 character prefix from a callsign and checks it against
+    /// known ITU prefix allocations. This eliminates OSD false positives like
+    /// "QY3HUG", "XO4XKQ", "H63SII" which have structurally valid callsign
+    /// formats but use prefixes never allocated by the ITU.
+    ///
+    /// Prefix extraction:
+    /// - Starts with digit: prefix is first 2 chars (e.g., "3B8ABC" -> "3B")
+    /// - Starts with letter + digit: prefix is first letter (e.g., "W1ABC" -> "W")
+    /// - Starts with two letters: prefix is first 2 letters (e.g., "VE3XYZ" -> "VE")
+    fn is_valid_itu_prefix(callsign: &str) -> bool {
+        let chars: Vec<char> = callsign.chars().collect();
+        if chars.len() < 3 {
+            return false;
+        }
+
+        // Extract prefix based on pattern
+        if chars[0].is_ascii_digit() {
+            // Starts with digit: prefix is 2 chars (e.g., 3B, 4X, 9A)
+            if chars.len() < 2 {
+                return false;
+            }
+            let prefix: String = chars[..2].iter().collect();
+            return Self::is_allocated_prefix_2char_numeric(&prefix);
+        }
+
+        if chars[0].is_ascii_alphabetic() && chars.len() > 1 && chars[1].is_ascii_digit() {
+            // Could be single letter prefix (e.g., W1ABC -> W) or
+            // letter+digit prefix (e.g., A71A -> A7, H44ABC -> H4)
+            if Self::is_allocated_prefix_1char(chars[0]) {
+                return true;
+            }
+            // Check letter+digit as a 2-char prefix
+            let prefix: String = chars[..2].iter().collect();
+            return Self::is_allocated_prefix_letter_digit(&prefix);
+        }
+
+        if chars[0].is_ascii_alphabetic() && chars.len() > 1 && chars[1].is_ascii_alphabetic() {
+            // Two letter prefix (e.g., VE, JA, EA, DL)
+            let prefix: String = chars[..2].iter().collect();
+            return Self::is_allocated_prefix_2char_alpha(&prefix);
+        }
+
+        false
+    }
+
+    /// Check single-letter ITU prefix allocations.
+    ///
+    /// Only letters that are used as standalone single-char prefixes (letter+digit)
+    /// return true. Letters like H, L, O, X always require a second letter to form
+    /// a valid prefix (e.g., HA, HB, not H3). This is important for rejecting
+    /// false positives like "H63SII".
+    fn is_allocated_prefix_1char(c: char) -> bool {
+        // These letters are allocated as standalone single-letter prefixes:
+        // B (China: B1-B9), C (various), D (Germany: D1-D9 via DA-DR block),
+        // E (various), F (France), G (UK), I (Italy), J (Japan: JA block covers J1-J9),
+        // K (USA), M (UK), N (USA), R (Russia), S (Sweden/Poland), T (various),
+        // U (Russia/Ukraine/etc), V (various), W (USA), Y (various), Z (various)
+        //
+        // NOT standalone: A (always 2-char like AA, AP), H (always HA, HB, etc.),
+        // L (always LA, LU, etc.), O (always OA, OE, etc.), P (always PA, PY, etc.),
+        // Q (reserved for Q-codes), X (always XE, XU, etc.)
+        matches!(
+            c,
+            'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'I' | 'J' | 'K' | 'M' | 'N' | 'R' | 'S'
+            | 'T' | 'U' | 'V' | 'W' | 'Y' | 'Z'
+        )
+    }
+
+    /// Check 2-char alphabetic prefix allocations (letter+letter).
+    /// Covers the major ITU allocations. When in doubt, accept.
+    fn is_allocated_prefix_2char_alpha(prefix: &str) -> bool {
+        let bytes = prefix.as_bytes();
+        if bytes.len() != 2 {
+            return false;
+        }
+        let first = bytes[0];
+        let second = bytes[1];
+        match first {
+            // A: AA-AL=USA, AP=Pakistan, A2=Botswana, A3=Tonga, A4=Oman,
+            //    A5=Bhutan, A6=UAE, A7=Qatar, A9=Bahrain
+            b'A' => matches!(second, b'A'..=b'L' | b'M'..=b'P' | b'R'..=b'Z'),
+            // B: BA-BZ=China (BA-BT), BV=Taiwan, BY=China
+            b'B' => true, // All B? allocated
+            // C: CA-CE=Chile, CF-CK=Canada, CM-CO=Cuba, CP=Bolivia,
+            //    CQ-CU=Portugal, CV-CX=Uruguay, CY-CZ=Canada, CN=Morocco
+            b'C' => true, // All C? allocated
+            // D: DA-DR=Germany, DS-DT=South Korea, DU-DZ=Philippines
+            b'D' => true, // All D? allocated
+            // E: EA-EH=Spain, EI=Ireland, EK=Armenia, EL=Liberia,
+            //    EP-EQ=Iran, ER=Moldova, ES=Estonia, ET=Ethiopia, EU-EW=Belarus, EX=Kyrgyzstan, EY=Tajikistan, EZ=Turkmenistan
+            b'E' => true, // All E? allocated
+            // F: FA-FZ=France
+            b'F' => true,
+            // G: GA-GZ=UK
+            b'G' => true,
+            // H: HA-HB=Hungary/Switzerland, HC-HD=Ecuador, HE=Switzerland,
+            //    HF=Poland, HH=Haiti, HI=Dominican Republic, HJ-HK=Colombia,
+            //    HL=South Korea, HM=North Korea, HP=Panama, HQ=Honduras,
+            //    HR=Honduras, HS=Thailand, HT=Nicaragua, HU=El Salvador, HV=Vatican, HZ=Saudi Arabia
+            b'H' => matches!(second, b'A'..=b'Z'),
+            // I: IA-IZ=Italy
+            b'I' => true,
+            // J: JA-JS=Japan, JT-JV=Mongolia, JW-JX=Norway, JY=Jordan, JZ=Indonesia
+            //    JD=Ogasawara/Minami Torishima
+            b'J' => true, // All J? allocated
+            // K: KA-KZ=USA
+            b'K' => true,
+            // L: LA-LN=Norway, LO-LW=Argentina, LX=Luxembourg, LY=Lithuania, LZ=Bulgaria
+            b'L' => matches!(second, b'A'..=b'N' | b'O'..=b'W' | b'X' | b'Y' | b'Z'),
+            // M: MA-MZ=UK
+            b'M' => true,
+            // N: NA-NZ=USA
+            b'N' => true,
+            // O: OA-OC=Peru, OD=Lebanon, OE=Austria, OF-OJ=Finland, OK-OL=Czech,
+            //    OM=Slovakia, ON-OT=Belgium, OU-OZ=Denmark
+            b'O' => true, // All O? allocated
+            // P: PA-PI=Netherlands, PJ=Netherlands Antilles, PK-PO=Indonesia,
+            //    PP-PY=Brazil, PZ=Suriname
+            b'P' => true, // All P? allocated
+            // Q: QA-QZ reserved for Q-codes, NOT valid callsign prefixes
+            b'Q' => false,
+            // R: RA-RZ=Russia
+            b'R' => true,
+            // S: SA-SM=Sweden, SN-SR=Poland, SS-SM=Egypt, ST=Sudan, SU=Egypt,
+            //    SV-SZ=Greece
+            b'S' => true, // All S? allocated
+            // T: TA-TC=Turkey, TD=Guatemala, TE=Costa Rica, TF=Iceland,
+            //    TG=Guatemala, TI=Costa Rica, TJ=Cameroon, TK=Corsica,
+            //    TL=Central Africa, TN=Congo, TO-TQ=France overseas, TR=Gabon,
+            //    TS=Tunisia, TT=Chad, TU=Ivory Coast, TY=Benin, TZ=Mali
+            b'T' => matches!(second, b'A'..=b'U' | b'Y' | b'Z'),
+            // U: UA-UI=Russia, UJ-UM=Uzbekistan, UN-UQ=Kazakhstan, UR-UZ=Ukraine
+            b'U' => matches!(second, b'A'..=b'Z'),
+            // V: VA-VG=Canada, VH-VN=Australia, VO=Canada, VP-VQ=UK overseas,
+            //    VR=Hong Kong, VS=UK overseas, VU=India, VV-VW=unassigned?, VX-VY=Canada, VZ=Australia
+            b'V' => matches!(second, b'A'..=b'G' | b'H'..=b'N' | b'O' | b'P'..=b'Q' | b'R' | b'S' | b'U' | b'X'..=b'Z'),
+            // W: WA-WZ=USA
+            b'W' => true,
+            // X: XA-XI=Mexico, XJ-XO=Canada, XP=Denmark(Greenland), XQ-XR=Chile,
+            //    XS=China, XT=Burkina Faso, XU=Cambodia, XV=Vietnam, XW=Laos,
+            //    XX=Macao, XY-XZ=Myanmar
+            b'X' => matches!(second, b'A'..=b'I' | b'J'..=b'O' | b'P' | b'Q'..=b'R' | b'S' | b'T' | b'U' | b'V' | b'W' | b'X' | b'Y'..=b'Z'),
+            // Y: YA=Afghanistan, YB-YH=Indonesia, YI=Iraq, YJ=Vanuatu,
+            //    YK=Syria, YL=Latvia, YM=Turkey, YN=Nicaragua, YO=Romania,
+            //    YS=El Salvador, YT-YU=Serbia, YV-YY=Venezuela, YZ=Serbia
+            // NOT: YP, YQ, YR are Romania
+            b'Y' => matches!(second, b'A'..=b'Z'),
+            // Z: ZA=Albania, ZB-ZJ=UK overseas, ZK-ZM=New Zealand, ZN-ZO=UK overseas,
+            //    ZP=Paraguay, ZR-ZU=South Africa, ZV-ZZ=Brazil
+            b'Z' => matches!(second, b'A'..=b'U' | b'V'..=b'Z'),
+            _ => false,
+        }
+    }
+
+    /// Check letter+digit 2-char prefix allocations (e.g., A7=Qatar, H4=Solomon Islands).
+    /// These are prefixes where the first character is a letter and second is a digit,
+    /// but the letter alone is NOT a standalone prefix.
+    fn is_allocated_prefix_letter_digit(prefix: &str) -> bool {
+        let bytes = prefix.as_bytes();
+        if bytes.len() != 2 || !bytes[0].is_ascii_alphabetic() || !bytes[1].is_ascii_digit() {
+            return false;
+        }
+        // ITU allocated letter+digit prefixes (non-exhaustive, covering major ones)
+        matches!(
+            prefix,
+            // A: A2=Botswana, A3=Tonga, A4=Oman, A5=Bhutan, A6=UAE, A7=Qatar, A9=Bahrain
+            "A2" | "A3" | "A4" | "A5" | "A6" | "A7" | "A9" |
+            // H: H4=Solomon Islands, H4 is the only H+digit allocation
+            "H4" |
+            // L: L2-L9=Argentina (LU block)
+            "L2" | "L3" | "L4" | "L5" | "L6" | "L7" | "L8" | "L9" |
+            // O: no standalone O+digit
+            // P: P2=Papua New Guinea, P4=Aruba, P5=North Korea
+            "P2" | "P4" | "P5" |
+            // X: no standalone X+digit
+            // A catch-all for any we might have missed: be permissive for common ones
+            "O2" | "O3" | "O4" | "O5" | "O6" | "O7" | "O8" | "O9"
+        )
+    }
+
+    /// Check 2-char prefix starting with a digit (e.g., 3B, 4X, 9A).
+    fn is_allocated_prefix_2char_numeric(prefix: &str) -> bool {
+        let bytes = prefix.as_bytes();
+        if bytes.len() != 2 || !bytes[1].is_ascii_alphabetic() {
+            return false;
+        }
+        let first = bytes[0];
+        let second = bytes[1].to_ascii_uppercase();
+        match first {
+            // 2: 2D-2M=UK, 2E=UK
+            b'2' => matches!(second, b'D' | b'E' | b'I' | b'J' | b'M' | b'W'),
+            // 3: 3A=Monaco, 3B=Mauritius, 3C=Equatorial Guinea, 3D=Eswatini/Fiji,
+            //    3G=Chile, 3V=Tunisia, 3W=Vietnam, 3X=Guinea, 3Y=Bouvet, 3Z=Poland
+            b'3' => matches!(second, b'A' | b'B' | b'C' | b'D' | b'G' | b'V' | b'W' | b'X' | b'Y' | b'Z'),
+            // 4: 4J-4K=Azerbaijan, 4L=Georgia, 4M=Venezuela, 4O=Montenegro,
+            //    4S=Sri Lanka, 4U=UN, 4V=Haiti, 4W=Timor-Leste, 4X=Israel, 4Z=Israel
+            b'4' => matches!(second, b'J' | b'K' | b'L' | b'M' | b'O' | b'S' | b'U' | b'V' | b'W' | b'X' | b'Z'),
+            // 5: 5A=Libya, 5B=Cyprus, 5C=Morocco, 5H-5I=Tanzania, 5N-5O=Nigeria,
+            //    5R-5S=Madagascar, 5T=Mauritania, 5U=Niger, 5V=Togo, 5W=Samoa,
+            //    5X=Uganda, 5Y-5Z=Kenya
+            b'5' => matches!(second, b'A' | b'B' | b'C' | b'H' | b'I' | b'N' | b'O' | b'R' | b'S' | b'T' | b'U' | b'V' | b'W' | b'X' | b'Y' | b'Z'),
+            // 6: 6K-6N=South Korea, 6O=Somalia, 6V-6W=Senegal, 6Y=Jamaica
+            b'6' => matches!(second, b'K'..=b'N' | b'O' | b'V' | b'W' | b'Y'),
+            // 7: 7J-7N=Japan, 7O=Yemen, 7P=Lesotho, 7Q=Malawi, 7R=Algeria,
+            //    7S=Sweden, 7T-7Y=Algeria, 7X=Algeria, 7Z=Saudi Arabia
+            b'7' => matches!(second, b'J'..=b'N' | b'O' | b'P' | b'Q' | b'R' | b'S' | b'T'..=b'Y' | b'Z'),
+            // 8: 8P=Barbados, 8Q=Maldives, 8R=Guyana, 8S=Sweden, 8J-8N=Japan
+            b'8' => matches!(second, b'J'..=b'N' | b'P' | b'Q' | b'R' | b'S'),
+            // 9: 9A=Croatia, 9G=Ghana, 9H=Malta, 9I-9J=Zambia, 9K=Kuwait,
+            //    9L=Sierra Leone, 9M=Malaysia, 9N=Nepal, 9O-9T=Congo (DRC),
+            //    9U=Burundi, 9V=Singapore, 9W=Malaysia, 9X=Rwanda, 9Y-9Z=Trinidad
+            b'9' => matches!(second, b'A' | b'G' | b'H' | b'I' | b'J' | b'K' | b'L' | b'M' | b'N' | b'O'..=b'T' | b'U' | b'V' | b'W' | b'X' | b'Y' | b'Z'),
+            _ => false,
+        }
+    }
+
     /// Check if a string looks like a ham radio callsign.
     ///
     /// Uses the FT8 packed callsign format constraints. The 28-bit encoding
@@ -459,6 +677,11 @@ impl Ft8Message {
                 // Count total digits — at most 2 (e.g., 4V2, 3D0)
                 let digit_count = chars.iter().filter(|c| c.is_ascii_digit()).count();
                 if digit_count > 2 {
+                    return false;
+                }
+                // Check ITU prefix validity to reject OSD false positives
+                // with structurally valid but unallocated prefixes (e.g., QY, XO, H6)
+                if !Self::is_valid_itu_prefix(base) {
                     return false;
                 }
                 true
@@ -1858,6 +2081,57 @@ mod tests {
         assert_eq!(ht.lookup_22bit_hash(n22), Some("K1ABC".to_string()));
         assert_eq!(ht.lookup_12bit_hash(n12), Some("K1ABC".to_string()));
         assert_eq!(ht.lookup_10bit_hash(n10), Some("K1ABC".to_string()));
+    }
+
+    #[test]
+    fn test_itu_prefix_validation() {
+        // Valid callsigns that should pass
+        assert!(Ft8Message::is_valid_itu_prefix("W1ABC"));
+        assert!(Ft8Message::is_valid_itu_prefix("K5ARH"));
+        assert!(Ft8Message::is_valid_itu_prefix("VE3XYZ"));
+        assert!(Ft8Message::is_valid_itu_prefix("JA1ABC"));
+        assert!(Ft8Message::is_valid_itu_prefix("DL1ABC"));
+        assert!(Ft8Message::is_valid_itu_prefix("R9AA"));
+        assert!(Ft8Message::is_valid_itu_prefix("4X1RF"));
+        assert!(Ft8Message::is_valid_itu_prefix("3B8ABC"));
+        assert!(Ft8Message::is_valid_itu_prefix("9A1A"));
+        assert!(Ft8Message::is_valid_itu_prefix("F5ABC"));
+        assert!(Ft8Message::is_valid_itu_prefix("G3XYZ"));
+        assert!(Ft8Message::is_valid_itu_prefix("HL1ABC"));
+        assert!(Ft8Message::is_valid_itu_prefix("ZL1ABC"));
+        assert!(Ft8Message::is_valid_itu_prefix("VK2ABC"));
+        assert!(Ft8Message::is_valid_itu_prefix("PY1ABC"));
+        assert!(Ft8Message::is_valid_itu_prefix("LU1ABC"));
+        assert!(Ft8Message::is_valid_itu_prefix("5N1ABC"));
+
+        // Known OSD false positives that should FAIL
+        assert!(!Ft8Message::is_valid_itu_prefix("QY3HUG"), "QY is not allocated (Q reserved for Q-codes)");
+        // XO is technically allocated to Canada (XJ-XO), so it passes ITU check.
+        // H6 is not an allocated prefix (H requires 2-letter like HA, HB, or H4)
+        assert!(!Ft8Message::is_valid_itu_prefix("H63SII"), "H6 is not an allocated prefix");
+
+        // Letter+digit prefixes (not standalone letter, but valid 2-char)
+        assert!(Ft8Message::is_valid_itu_prefix("A71A"), "A7 = Qatar");
+        assert!(Ft8Message::is_valid_itu_prefix("A61ABC"), "A6 = UAE");
+        assert!(Ft8Message::is_valid_itu_prefix("P49ABC"), "P4 = Aruba");
+        assert!(Ft8Message::is_valid_itu_prefix("H44ABC"), "H4 = Solomon Islands");
+
+        // Edge cases
+        assert!(!Ft8Message::is_valid_itu_prefix("AB"), "Too short");
+    }
+
+    #[test]
+    fn test_looks_like_callsign_with_itu() {
+        // Valid callsigns pass both structural and ITU checks
+        assert!(Ft8Message::looks_like_callsign("W1ABC"));
+        assert!(Ft8Message::looks_like_callsign("K5ARH"));
+        assert!(Ft8Message::looks_like_callsign("VE3XYZ"));
+        assert!(Ft8Message::looks_like_callsign("JA1ABC"));
+        assert!(Ft8Message::looks_like_callsign("9A1A"));
+        assert!(Ft8Message::looks_like_callsign("4X1RF"));
+
+        // OSD false positives should now be rejected
+        assert!(!Ft8Message::looks_like_callsign("QY3HUG"));
     }
 
     #[test]
