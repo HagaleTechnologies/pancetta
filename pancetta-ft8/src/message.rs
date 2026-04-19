@@ -337,34 +337,40 @@ impl Ft8Message {
             MessageType::Unknown => false,
             MessageType::FreeText => {
                 // Free text messages are rare on-air and are a common source
-                // of CRC false positives (random 71-bit payloads that happen
-                // to have i3=0, n3=0). Require the text to contain at least
-                // one space (multi-word) or be a known keyword like "TNX" or
-                // "TEST". Single garbled tokens like "J1I0BYVFFZCRY" are
-                // almost certainly noise.
+                // of CRC false positives. Require: multi-word, all printable,
+                // and at least one word must be ≥2 alphabetic characters
+                // (rejects noise like "2 8E 1VL8S59B").
                 match &self.text {
                     Some(t) => {
                         let trimmed = t.trim();
                         if trimmed.is_empty() {
                             return false;
                         }
-                        // Must contain a space (multi-word) to be plausible,
-                        // or be a short known token.
-                        let has_space = trimmed.contains(' ');
                         let all_printable = trimmed
                             .chars()
                             .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '/' || c == '.');
-                        has_space && all_printable
+                        if !all_printable {
+                            return false;
+                        }
+                        let words: Vec<&str> = trimmed.split_whitespace().collect();
+                        if words.len() < 2 {
+                            return false;
+                        }
+                        // At least one word must be ≥2 chars and all-alphabetic
+                        // (a callsign fragment, "CQ", "TNX", etc.)
+                        words.iter().any(|w| {
+                            w.len() >= 2 && w.chars().all(|c| c.is_ascii_alphabetic())
+                        })
                     }
                     None => false,
                 }
             }
             MessageType::Telemetry => {
-                // Telemetry must have hex content
-                match &self.text {
-                    Some(t) => !t.trim().is_empty(),
-                    None => false,
-                }
+                // Telemetry is not used by pancetta and is the #1 source of
+                // CRC-14 false positives: random 71-bit noise payloads with
+                // i3=0/n3=5 produce valid-looking hex strings ~14% of the time.
+                // Reject unconditionally.
+                false
             }
             MessageType::Standard => {
                 // Standard messages: ALL present callsigns must look valid.

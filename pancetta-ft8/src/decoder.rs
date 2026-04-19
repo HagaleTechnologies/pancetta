@@ -1371,12 +1371,11 @@ impl Ft8Decoder {
             crate::ap::ApLevel::Ap3 => 3,
             crate::ap::ApLevel::Ap4 => 4,
         };
-        if ap_level_num > 0 && confidence < (6.0_f64 / 12.0) as f32 {
-            // For weak AP decodes, reject freetext — freetext AP decodes at low SNR
-            // are almost always false positives from random bit patterns
-            if ft8_message.message_type == crate::message::MessageType::FreeText {
-                return Ok(None);
-            }
+        // Reject ALL weak AP decodes (confidence < 0.5, i.e. sync_score < 6.0).
+        // AP injection on noise produces structurally valid but phantom messages
+        // across all message types, not just freetext.
+        if ap_level_num > 0 && confidence < 0.5 {
+            return Ok(None);
         }
 
         let mut decoded_message = DecodedMessage::new(
@@ -2493,12 +2492,9 @@ fn par_try_ldpc_with_ap(
         crate::ap::ApLevel::Ap3 => 3,
         crate::ap::ApLevel::Ap4 => 4,
     };
-    if ap_level_num > 0 && confidence < (6.0_f64 / 12.0) as f32 {
-        // For weak AP decodes, reject freetext — freetext AP decodes at low SNR
-        // are almost always false positives from random bit patterns
-        if ft8_message.message_type == crate::message::MessageType::FreeText {
-            return None;
-        }
+    // Reject ALL weak AP decodes (confidence < 0.5, i.e. sync_score < 6.0).
+    if ap_level_num > 0 && confidence < 0.5 {
+        return None;
     }
 
     let mut decoded_message = DecodedMessage::new(
