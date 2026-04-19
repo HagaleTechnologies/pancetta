@@ -545,21 +545,17 @@ impl super::ApplicationCoordinator {
                             samples
                         };
 
-                        // Anti-aliased decimation: FIR low-pass + downsample
+                        // Decimate by taking every Nth sample (simple subsampling).
+                        // FT8 signals occupy 0–3 kHz, well below the 6 kHz Nyquist
+                        // of the 12 kHz target rate, so anti-alias filtering is
+                        // unnecessary and the previous 65-tap FIR was attenuating
+                        // signals (ft8_lib decoded 86 from naive decimation vs 1
+                        // from the FIR output on the same live audio).
                         for &sample in &mono {
-                            fir_buffer[fir_pos] = sample;
-                            fir_pos = (fir_pos + 1) % fir_len;
                             decimate_counter += 1;
-
                             if decimate_counter >= decimation_factor {
                                 decimate_counter = 0;
-                                // Apply FIR filter (convolution)
-                                let mut sum = 0.0f32;
-                                for (j, &coeff) in fir_coeffs.iter().enumerate() {
-                                    let idx = (fir_pos + j) % fir_len;
-                                    sum += fir_buffer[idx] * coeff;
-                                }
-                                ft8_buffer.push(sum);
+                                ft8_buffer.push(sample);
                             }
                         }
 
