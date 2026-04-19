@@ -212,3 +212,21 @@ Standard HTTP status codes:
 - `POST /api/v1/spots/ingest` receives a batch every ~15 seconds — 202 quickly, process async
 - `GET /api/v1/entities` and `GET /api/v1/entities/needed` are called once on startup — can be slower
 - `POST /api/v1/qsos` is called infrequently (after each completed QSO) — not performance-critical
+
+### `GET /api/v1/grids/needed`
+
+Returns grid squares the user still needs for grid-chasing awards.
+
+**Response (200):**
+```json
+{
+  "grids": ["AA00", "AB01", "..."]
+}
+```
+
+**Notes:**
+- "Needed" means the user has NOT confirmed a QSO with this grid square
+- If the user has no log data, return ALL grids as needed
+- Pancetta fetches this on startup and caches it for the session
+- This drives the `needed_grids` scoring factor in pancetta's priority engine
+- **Priority:** Low — conservative fallback (treat all grids as needed) is acceptable until this endpoint exists.

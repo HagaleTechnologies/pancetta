@@ -68,6 +68,10 @@ impl CqdxBridge {
             needed.iter().map(|n| n.prefix.to_uppercase()).collect();
         self.cached_lookup.update_needed_dxcc(needed_prefixes);
 
+        // TODO: Populate needed_grids when cqdx.io adds a grid-needed endpoint.
+        // Until then, the conservative fallback treats all grids as needed.
+        // See: docs/cqdx-api-requirements.md
+
         Ok(())
     }
 
