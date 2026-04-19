@@ -196,8 +196,8 @@ impl PeakDetector {
         let input_abs = input.abs();
 
         if input_abs > self.peak {
-            // Attack: fast rise
-            self.peak = self.peak * self.attack_alpha + input_abs * (1.0 - self.attack_alpha);
+            // Attack: instant rise for FT8 bursts (standard peak detector behavior)
+            self.peak = input_abs;
         } else {
             // Decay: slow fall
             self.peak = self.peak * self.decay_alpha;

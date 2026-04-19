@@ -481,7 +481,7 @@ impl AutoSequencer {
                 self.update_sequence_activity(qso_id).await;
             }
 
-            SequenceAction::SendReportAck { qso_id, report: _ } => {
+            SequenceAction::SendReportAck { qso_id, report } => {
                 let progress = self
                     .qso_manager
                     .get_qso(qso_id)
@@ -496,15 +496,16 @@ impl AutoSequencer {
                         .unwrap_or(progress.metadata.frequency);
                     let their_call = their_callsign.to_string();
 
-                    let message = MessageType::FinalConfirmation {
+                    let message = MessageType::ReportAck {
                         to_station: their_call,
                         from_station: our_callsign,
+                        report,
                     };
 
                     self.qso_manager
                         .send_message(qso_id, message, frequency)
                         .await;
-                    info!("Sent RR73 for QSO {}", qso_id);
+                    info!("Sent R{:+} for QSO {}", report, qso_id);
                 }
 
                 self.update_sequence_activity(qso_id).await;

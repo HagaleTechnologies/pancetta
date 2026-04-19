@@ -317,6 +317,9 @@ impl AudioStreamManager {
         let err_shared_f32 = self.shared.clone();
         let err_shared_i16 = self.shared.clone();
 
+        // Clone shared state for the I32 error callback
+        let err_shared_i32 = self.shared.clone();
+
         let stream = match sample_format {
             cpal::SampleFormat::F32 => input_device.build_input_stream(
                 &config,
@@ -343,6 +346,21 @@ impl AudioStreamManager {
                 move |err| {
                     eprintln!("Input stream error: {}", err);
                     err_shared_i16.set_stream_error();
+                },
+                None,
+            )?,
+            cpal::SampleFormat::I32 => input_device.build_input_stream(
+                &config,
+                move |data: &[i32], _info: &InputCallbackInfo| {
+                    let float_data: Vec<f32> =
+                        data.iter().map(|&s| s as f32 / i32::MAX as f32).collect();
+                    producer.push_audio_slice(&float_data);
+                    let timer = CallbackTimer::start();
+                    let _ = producer.push_latency(timer.elapsed_ns());
+                },
+                move |err| {
+                    eprintln!("Input stream error: {}", err);
+                    err_shared_i32.set_stream_error();
                 },
                 None,
             )?,

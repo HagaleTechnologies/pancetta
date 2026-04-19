@@ -249,7 +249,7 @@ impl ConfigLoader {
         // Check cache first
         if let Some((cached_time, cached_config)) = self.get_cached_config(path)? {
             if let Ok(modified) = fs::metadata(path)?.modified() {
-                if modified <= cached_time {
+                if modified < cached_time {
                     debug!("Using cached configuration for: {}", path.display());
                     return Ok(cached_config);
                 }
@@ -492,13 +492,11 @@ impl ConfigLoader {
     }
 
     /// Load configuration from remote URL
-    fn load_from_remote(&self, _url: &str) -> ConfigResult<Config> {
-        debug!("Loading configuration from remote URL: {}", _url);
-
-        // TODO: Implement remote configuration loading
-        // This would typically use reqwest or similar to fetch remote config
-        warn!("Remote configuration loading not yet implemented");
-        Ok(Config::default())
+    fn load_from_remote(&self, url: &str) -> ConfigResult<Config> {
+        Err(ConfigError::Validation(format!(
+            "Remote configuration loading not implemented (url: {})",
+            url
+        )))
     }
 
     /// Parse TOML configuration
@@ -726,8 +724,8 @@ impl ConfigManager {
     pub fn start_watching(&mut self) -> ConfigResult<()> {
         info!("Starting configuration watching");
 
-        let mut loader = ConfigLoader::new()?;
-        loader.setup_watching()?;
+        self.loader.setup_watching()?;
+        let loader = &mut self.loader;
 
         // Set up reload callback
         let state = Arc::clone(&self.state);
@@ -737,8 +735,6 @@ impl ConfigManager {
             s.reload_count += 1;
             info!("Configuration reloaded (count: {})", s.reload_count);
         });
-
-        self.loader = loader;
 
         {
             let mut state = self.state.write().unwrap();

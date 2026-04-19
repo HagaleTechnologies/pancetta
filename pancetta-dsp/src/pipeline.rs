@@ -84,7 +84,10 @@ impl PipelineConfig {
             max_latency: 0.5, // 500ms max latency
             enable_agc: true,
             agc_config: AgcConfig::new_ft8_optimized(),
-            enable_noise_reduction: true,
+            // Noise reduction is disabled by default: the current NoiseReductionFilter
+            // is a passthrough stub (simplified spectral subtraction with no real FFT).
+            // Enabling it adds latency and buffer management overhead with no benefit.
+            enable_noise_reduction: false,
             enable_bandpass: true,
             bandpass_config: FilterConfig::new_ft8_bandpass(12000.0),
             block_size: 1024,
@@ -100,8 +103,8 @@ impl PipelineConfig {
             max_latency: 0.2, // 200ms max latency
             enable_agc: true,
             agc_config: AgcConfig::new_for_mode(crate::agc::AgcMode::Medium),
-            enable_noise_reduction: true,
-            enable_bandpass: false, // Wide bandwidth for general use
+            enable_noise_reduction: false, // Stub -- not implemented
+            enable_bandpass: false,        // Wide bandwidth for general use
             bandpass_config: FilterConfig::new_ft8_bandpass(24000.0),
             block_size: 512,
             num_threads: 1,

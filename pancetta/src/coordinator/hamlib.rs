@@ -155,8 +155,9 @@ impl super::ApplicationCoordinator {
                 let rig_poll = Arc::new(rig);
                 let rig_for_polling = Arc::clone(&rig_poll);
                 let shutdown_for_polling = shutdown.clone();
+                let mut spawned_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
-                tokio::spawn(async move {
+                spawned_handles.push(tokio::spawn(async move {
                     let mut poll_interval = interval(Duration::from_millis(500));
                     let mut consecutive_failures: u32 = 0;
                     const CRASH_WARN_THRESHOLD: u32 = 10; // 5 seconds of failures
@@ -208,7 +209,7 @@ impl super::ApplicationCoordinator {
                             }
                         }
                     }
-                });
+                }));
 
                 // PTT safety watchdog: track when PTT was turned on
                 // If PTT stays on for longer than PTT_SAFETY_TIMEOUT_SECS,
@@ -221,7 +222,7 @@ impl super::ApplicationCoordinator {
                 let rig_for_watchdog = Arc::clone(&rig_poll);
                 let ptt_watchdog_tracker = ptt_on_since.clone();
                 let shutdown_for_watchdog = shutdown.clone();
-                tokio::spawn(async move {
+                spawned_handles.push(tokio::spawn(async move {
                     let mut watchdog_interval = interval(Duration::from_secs(1));
                     loop {
                         watchdog_interval.tick().await;
@@ -263,7 +264,7 @@ impl super::ApplicationCoordinator {
                             }
                         }
                     }
-                });
+                }));
 
                 // Process messages
                 while !shutdown.load(Ordering::Acquire) {
@@ -320,10 +321,15 @@ impl super::ApplicationCoordinator {
                             }
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {
-                            tokio::task::yield_now().await;
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                         Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                     }
+                }
+
+                // Cancel spawned polling/watchdog tasks on shutdown
+                for handle in spawned_handles {
+                    handle.abort();
                 }
 
                 info!("Hamlib component stopped");

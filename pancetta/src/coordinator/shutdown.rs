@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 impl super::ApplicationCoordinator {
@@ -12,6 +12,30 @@ impl super::ApplicationCoordinator {
         info!("Starting graceful shutdown");
         self.is_running.store(false, Ordering::Release);
         self.shutdown_signal.store(true, Ordering::Release);
+
+        // Safety: send PTT-off before tearing down components to avoid
+        // leaving the rig transmitting if a TX was in progress.
+        {
+            use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+            let ptt_off = ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Hamlib,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                    state: false,
+                }),
+                Instant::now(),
+            );
+            match tokio::time::timeout(
+                Duration::from_millis(500),
+                self.message_bus.send_message(ptt_off),
+            )
+            .await
+            {
+                Ok(Ok(())) => info!("Shutdown: PTT-off sent via message bus"),
+                Ok(Err(e)) => warn!("Shutdown: PTT-off via message bus failed: {}", e),
+                Err(_) => warn!("Shutdown: PTT-off via message bus timed out"),
+            }
+        }
 
         let per_task_timeout = Duration::from_secs(1);
 

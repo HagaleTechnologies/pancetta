@@ -1825,42 +1825,17 @@ impl ConfigSection for NetworkConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        // Merge service configurations
-        if other.psk_reporter.enabled {
-            self.psk_reporter = other.psk_reporter;
-        }
-
-        if other.qrz.enabled {
-            self.qrz = other.qrz;
-        }
-
-        if other.lotw.enabled {
-            self.lotw = other.lotw;
-        }
-
-        if other.eqsl.enabled {
-            self.eqsl = other.eqsl;
-        }
-
-        if other.clublog.enabled {
-            self.clublog = other.clublog;
-        }
-
-        if other.wspr.enabled {
-            self.wspr = other.wspr;
-        }
-
-        if other.dx_cluster.enabled {
-            self.dx_cluster = other.dx_cluster;
-        }
-
-        if other.web_api.enabled {
-            self.web_api = other.web_api;
-        }
-
-        if other.proxy.enabled {
-            self.proxy = other.proxy;
-        }
+        // Merge service configurations unconditionally so that
+        // user configs can disable services enabled by the system config.
+        self.psk_reporter = other.psk_reporter;
+        self.qrz = other.qrz;
+        self.lotw = other.lotw;
+        self.eqsl = other.eqsl;
+        self.clublog = other.clublog;
+        self.wspr = other.wspr;
+        self.dx_cluster = other.dx_cluster;
+        self.web_api = other.web_api;
+        self.proxy = other.proxy;
 
         // Merge custom services
         self.custom_services.extend(other.custom_services);

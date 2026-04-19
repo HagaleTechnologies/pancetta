@@ -12,7 +12,7 @@ use validator::Validate;
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
 pub struct StationConfig {
     /// Amateur radio callsign (e.g., "N1ABC", "VK2DEF/P")
-    #[validate(length(min = 3, max = 15))]
+    #[validate(length(min = 3, max = 20))]
     pub callsign: String,
 
     /// Maidenhead grid square locator (e.g., "FN31pr", "JO65cx")

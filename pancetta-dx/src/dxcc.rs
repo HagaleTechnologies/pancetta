@@ -552,15 +552,15 @@ impl DxccDatabase {
         self.add_prefix_pattern("^M[0-9]", 223, 2)?;
         self.add_prefix_pattern("^2E[0-9]", 223, 2)?;
 
-        // Spain (14 - legacy)
-        self.add_prefix_pattern("^EA[0-9]", 14, 1)?;
-        self.add_prefix_pattern("^EB[0-9]", 14, 2)?;
-        self.add_prefix_pattern("^EC[0-9]", 14, 2)?;
-        self.add_prefix_pattern("^ED[0-9]", 14, 2)?;
-        self.add_prefix_pattern("^EE[0-9]", 14, 2)?;
-        self.add_prefix_pattern("^EF[0-9]", 14, 2)?;
-        self.add_prefix_pattern("^EG[0-9]", 14, 2)?;
-        self.add_prefix_pattern("^EH[0-9]", 14, 2)?;
+        // Spain (281 — correct ARRL DXCC code)
+        self.add_prefix_pattern("^EA[0-9]", 281, 1)?;
+        self.add_prefix_pattern("^EB[0-9]", 281, 2)?;
+        self.add_prefix_pattern("^EC[0-9]", 281, 2)?;
+        self.add_prefix_pattern("^ED[0-9]", 281, 2)?;
+        self.add_prefix_pattern("^EE[0-9]", 281, 2)?;
+        self.add_prefix_pattern("^EF[0-9]", 281, 2)?;
+        self.add_prefix_pattern("^EG[0-9]", 281, 2)?;
+        self.add_prefix_pattern("^EH[0-9]", 281, 2)?;
 
         // France (227)
         self.add_prefix_pattern("^F[0-9]", 227, 1)?;
@@ -654,23 +654,23 @@ impl DxccDatabase {
         self.add_prefix_pattern("^UX[0-9]", 288, 2)?;
         self.add_prefix_pattern("^UY[0-9]", 288, 2)?;
 
-        // Japan (61 - legacy)
-        self.add_prefix_pattern("^JA[0-9]", 61, 1)?;
-        self.add_prefix_pattern("^JE[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JF[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JG[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JH[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JI[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JJ[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JK[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JL[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JM[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JN[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JO[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JP[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JQ[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JR[0-9]", 61, 2)?;
-        self.add_prefix_pattern("^JS[0-9]", 61, 2)?;
+        // Japan (339 — correct ARRL DXCC code)
+        self.add_prefix_pattern("^JA[0-9]", 339, 1)?;
+        self.add_prefix_pattern("^JE[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JF[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JG[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JH[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JI[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JJ[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JK[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JL[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JM[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JN[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JO[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JP[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JQ[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JR[0-9]", 339, 2)?;
+        self.add_prefix_pattern("^JS[0-9]", 339, 2)?;
 
         // China (318)
         self.add_prefix_pattern("^BY[0-9]", 318, 1)?;
@@ -780,22 +780,22 @@ impl DxccDatabase {
         self.add_prefix_pattern("^5C[0-9]", 446, 2)?;
         self.add_prefix_pattern("^5D[0-9]", 446, 2)?;
 
-        // Germany (78 - legacy)
-        self.add_prefix_pattern("^DL[0-9]", 78, 1)?;
-        self.add_prefix_pattern("^DA[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DB[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DC[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DD[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DE[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DF[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DG[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DH[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DI[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DJ[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DK[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DM[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DN[0-9]", 78, 2)?;
-        self.add_prefix_pattern("^DO[0-9]", 78, 2)?;
+        // Germany (230 — correct ARRL DXCC code)
+        self.add_prefix_pattern("^DL[0-9]", 230, 1)?;
+        self.add_prefix_pattern("^DA[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DB[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DC[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DD[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DE[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DF[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DG[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DH[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DI[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DJ[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DK[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DM[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DN[0-9]", 230, 2)?;
+        self.add_prefix_pattern("^DO[0-9]", 230, 2)?;
 
         // Sort prefixes by priority for optimal matching
         self.prefixes.sort_by_key(|p| p.priority);

@@ -300,13 +300,14 @@ impl QsoSystemBuilder {
     /// Build the complete QSO system
     pub async fn build(self) -> QsoResult<QsoSystem> {
         let qso_config = self.qso_config.unwrap_or_default();
+        let our_callsign = qso_config.our_callsign.clone();
         let qso_manager = QsoManager::new(qso_config);
         qso_manager.start().await?;
 
         let auto_sequencer = if self.enable_auto_sequencer {
             let mut auto_config = self.auto_config.unwrap_or_default();
             auto_config.enabled = true;
-            let our_callsign = "W1ABC".to_string(); // TODO: Get from qso_manager
+            let our_callsign = our_callsign.clone();
             let sequencer = Arc::new(AutoSequencer::new(
                 auto_config,
                 qso_manager.clone(),

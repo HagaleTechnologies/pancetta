@@ -1021,15 +1021,17 @@ impl QsoDatabase {
     }
 
     fn calculate_checksum(metadata: &str, state: &str, adif: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        // FNV-1a 64-bit hash — deterministic across Rust versions unlike DefaultHasher
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
 
-        let mut hasher = DefaultHasher::new();
-        metadata.hash(&mut hasher);
-        state.hash(&mut hasher);
-        adif.hash(&mut hasher);
+        let mut hash = FNV_OFFSET;
+        for byte in metadata.bytes().chain(state.bytes()).chain(adif.bytes()) {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
 
-        format!("{:x}", hasher.finish())
+        format!("{:016x}", hash)
     }
 }
 

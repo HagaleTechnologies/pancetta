@@ -5,7 +5,7 @@
 
 use crate::adif::{AdifFile, AdifProcessor};
 use crate::async_database::{AsyncDatabaseError, AsyncQsoDatabase};
-use crate::database::{QsoFilter, QueryOptions};
+use crate::database::{QsoFilter, QueryOptions, SortOrder};
 use crate::logger::{ExportFormat, ExportResult, ImportResult, LoggerConfig};
 use crate::qso_manager::{QsoEvent, QsoManager};
 use crate::states::*;
@@ -269,19 +269,24 @@ impl AsyncQsoLogger {
 
         // Get date range
         let filter = QsoFilter::default();
-        let mut options = QueryOptions::default();
-        options.limit = Some(1);
+        let mut oldest_options = QueryOptions::default();
+        oldest_options.limit = Some(1);
+        oldest_options.sort_order = SortOrder::Ascending;
 
         let oldest = self
             .database
-            .search_qsos(&filter, &options)
+            .search_qsos(&filter, &oldest_options)
             .await?
             .first()
             .map(|q| q.metadata.start_time);
 
+        let mut newest_options = QueryOptions::default();
+        newest_options.limit = Some(1);
+        newest_options.sort_order = SortOrder::Descending;
+
         let newest = self
             .database
-            .search_qsos(&filter, &options)
+            .search_qsos(&filter, &newest_options)
             .await?
             .first()
             .map(|q| q.metadata.start_time);

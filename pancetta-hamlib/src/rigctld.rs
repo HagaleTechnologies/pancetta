@@ -117,11 +117,9 @@ impl RigctldClient {
             .await
             {
                 Ok(Ok(0)) => {
+                    *conn_guard = None;
                     let mut state = self.state.write().await;
                     state.connected = false;
-                    drop(state);
-                    drop(conn_guard);
-                    *self.conn.lock().await = None;
                     Err(anyhow!("rigctld closed connection"))
                 }
                 Ok(Ok(_)) => {
@@ -148,19 +146,15 @@ impl RigctldClient {
                     Ok(response)
                 }
                 Ok(Err(e)) => {
+                    *conn_guard = None;
                     let mut state = self.state.write().await;
                     state.connected = false;
-                    drop(state);
-                    drop(conn_guard);
-                    *self.conn.lock().await = None;
                     Err(anyhow!("Failed to read response: {}", e))
                 }
                 Err(_) => {
+                    *conn_guard = None;
                     let mut state = self.state.write().await;
                     state.connected = false;
-                    drop(state);
-                    drop(conn_guard);
-                    *self.conn.lock().await = None;
                     Err(anyhow!("Command timeout"))
                 }
             }
@@ -424,15 +418,22 @@ impl RigControl for RigctldClient {
 
     #[instrument(skip(self))]
     async fn set_mode(&self, vfo: Vfo, mode: Mode, passband: Option<i32>) -> Result<()> {
+        // Switch VFO first if needed (same pattern as set_frequency)
+        if !matches!(vfo, Vfo::Current | Vfo::A) {
+            self.send_command_with_retry(&format!("V {}", Self::vfo_to_string(vfo)))
+                .await?;
+        }
+
         let pb = passband.unwrap_or(0);
-        let cmd = format!(
-            "\\set_mode {} {} {}",
-            Self::vfo_to_string(vfo),
-            Self::mode_to_string(mode),
-            pb
-        );
+        // rigctld \set_mode takes only (mode, passband), NOT (vfo, mode, passband)
+        let cmd = format!("\\set_mode {} {}", Self::mode_to_string(mode), pb);
 
         self.send_command_with_retry(&cmd).await?;
+
+        // Restore to VFO A after operating on a non-current VFO
+        if !matches!(vfo, Vfo::Current | Vfo::A) {
+            let _ = self.send_command_with_retry("V VFOA").await;
+        }
 
         // Update cached value
         let mut state = self.state.write().await;

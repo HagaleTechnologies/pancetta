@@ -293,44 +293,37 @@ impl StatisticsEngine {
     }
 
     /// Get statistics for specific band
+    ///
+    /// TODO: Implement band-specific statistics by querying tracked_contacts
+    /// filtered by band, computing unique callsigns, entity counts, RST
+    /// averages, hourly activity, and confirmation rates.
     pub async fn get_band_statistics(&self, band: Band) -> Result<BandStatistics> {
-        info!("Calculating statistics for band {}", band);
+        tracing::warn!(
+            "get_band_statistics({}): not yet implemented — returning empty stats",
+            band
+        );
 
-        // Not yet implemented — return zeroed stats rather than fake data
-        Ok(BandStatistics {
-            band,
-            total_qsos: 0,
-            unique_callsigns: 0,
-            entities_worked: 0,
-            entities_confirmed: 0,
-            qsos_by_mode: HashMap::new(),
-            qsos_by_continent: HashMap::new(),
-            avg_rst_sent: 0.0,
-            avg_rst_received: 0.0,
-            most_active_hour: None,
-            activity_by_hour: HashMap::new(),
-            longest_distance_km: None,
-            confirmation_rate: 0.0,
-        })
+        Err(DxError::Configuration(format!(
+            "Band statistics for {} not yet implemented",
+            band
+        )))
     }
 
     /// Get statistics for specific mode
+    ///
+    /// TODO: Implement mode-specific statistics by querying tracked_contacts
+    /// filtered by mode, computing unique callsigns, entity counts, RST
+    /// averages, band breakdown, and confirmation rates.
     pub async fn get_mode_statistics(&self, mode: &Mode) -> Result<ModeStatistics> {
-        info!("Calculating statistics for mode {}", mode);
+        tracing::warn!(
+            "get_mode_statistics({}): not yet implemented — returning empty stats",
+            mode
+        );
 
-        // Not yet implemented — return zeroed stats rather than fake data
-        Ok(ModeStatistics {
-            mode: mode.clone(),
-            total_qsos: 0,
-            unique_callsigns: 0,
-            entities_worked: 0,
-            entities_confirmed: 0,
-            qsos_by_band: HashMap::new(),
-            most_active_band: None,
-            avg_rst_sent: 0.0,
-            avg_rst_received: 0.0,
-            confirmation_rate: 0.0,
-        })
+        Err(DxError::Configuration(format!(
+            "Mode statistics for {} not yet implemented",
+            mode
+        )))
     }
 
     /// Get all achievements

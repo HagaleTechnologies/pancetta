@@ -558,7 +558,7 @@ impl QsoManager {
 
         // Determine state transition based on current state and message
         let new_state = self
-            .determine_state_transition(&old_state, &message.message_type)
+            .determine_state_transition(&old_state, &message.message_type, message.signal_strength)
             .await?;
 
         if new_state != old_state {
@@ -613,6 +613,7 @@ impl QsoManager {
         &self,
         current_state: &QsoState,
         message_type: &MessageType,
+        signal_strength: Option<f32>,
     ) -> Result<QsoState, QsoManagerError> {
         match (current_state, message_type) {
             // CQ call received response
@@ -636,10 +637,14 @@ impl QsoManager {
                 },
                 MessageType::SignalReport { report, .. },
             ) => {
+                // Use received signal strength (SNR) as our report, default to received report
+                let our_report = signal_strength
+                    .map(|snr| (snr.round() as i8).max(-30).min(50))
+                    .unwrap_or(*report);
                 Ok(QsoState::SendingReport {
                     their_callsign: target_callsign.clone(),
                     their_report: Some(*report),
-                    our_report: -15, // Default report, should be calculated
+                    our_report,
                     frequency: *frequency,
                     started_at: Utc::now(),
                 })

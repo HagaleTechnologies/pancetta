@@ -19,8 +19,8 @@ impl super::ApplicationCoordinator {
     ///   ft8_tx   -> tui_rx  (decoded messages)
     pub(crate) async fn start_pipeline(&mut self) -> Result<()> {
         // Point-to-point channels for the data path
-        let (audio_to_dsp_tx, audio_to_dsp_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
-        let (dsp_to_ft8_tx, dsp_to_ft8_rx) = crossbeam_channel::unbounded::<Vec<f32>>();
+        let (audio_to_dsp_tx, audio_to_dsp_rx) = crossbeam_channel::bounded::<Vec<f32>>(100);
+        let (dsp_to_ft8_tx, dsp_to_ft8_rx) = crossbeam_channel::bounded::<Vec<f32>>(2);
         let (ft8_to_tui_tx, ft8_to_tui_rx) =
             crossbeam_channel::unbounded::<pancetta_ft8::DecodedMessage>();
         let (waterfall_tx, waterfall_rx) = crossbeam_channel::unbounded::<Vec<Vec<f32>>>();
@@ -63,7 +63,7 @@ impl super::ApplicationCoordinator {
                             );
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {
-                            tokio::task::yield_now().await;
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                         Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                     }
@@ -78,7 +78,7 @@ impl super::ApplicationCoordinator {
                 while !drain_shutdown.load(Ordering::Acquire) {
                     match waterfall_rx.try_recv() {
                         Ok(_) => {} // discard
-                        Err(_) => tokio::task::yield_now().await,
+                        Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
                     }
                 }
                 Ok(())
@@ -964,7 +964,7 @@ impl super::ApplicationCoordinator {
                         }
                     },
                     Err(crossbeam_channel::TryRecvError::Empty) => {
-                        tokio::task::yield_now().await;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                     Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                 }

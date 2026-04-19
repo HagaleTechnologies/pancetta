@@ -33,6 +33,13 @@ pub struct CachedStationLookup {
 
 impl CachedStationLookup {
     pub fn new() -> Self {
+        // TODO: Seed worked_on_band from the QSO database (~/.pancetta/qso.db)
+        // so that previously-worked stations are recognized across restarts.
+        // Until this is implemented, all stations appear as "new" after restart.
+        tracing::warn!(
+            "CachedStationLookup: worked-station history is not persisted across restarts. \
+             Previously-worked stations will not be detected as duplicates until re-worked."
+        );
         Self {
             worked_on_band: Arc::new(RwLock::new(HashSet::new())),
             recent_failures: Arc::new(RwLock::new(HashSet::new())),

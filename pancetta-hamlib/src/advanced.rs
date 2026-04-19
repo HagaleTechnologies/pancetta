@@ -328,8 +328,8 @@ pub struct AdvancedRig {
     /// Band plans
     #[allow(dead_code)]
     band_plans: Vec<BandPlan>,
-    /// Current scan status
-    scan_status: RwLock<ScanStatus>,
+    /// Current scan status (shared via Arc so spawned scan tasks can see stop signals)
+    scan_status: Arc<RwLock<ScanStatus>>,
     /// Monitoring broadcast channel
     monitoring_tx: RwLock<Option<broadcast::Sender<MonitoringData>>>,
     /// Monitoring task handle
@@ -345,7 +345,7 @@ impl AdvancedRig {
             rig,
             memory_channels: RwLock::new(HashMap::new()),
             band_plans: BandPlan::standard_bands(),
-            scan_status: RwLock::new(ScanStatus::default()),
+            scan_status: Arc::new(RwLock::new(ScanStatus::default())),
             monitoring_tx: RwLock::new(None),
             monitoring_handle: RwLock::new(None),
             scan_handle: RwLock::new(None),
@@ -806,12 +806,13 @@ impl AdvancedRigControl for AdvancedRig {
 
         // Clone the necessary components for the scan task
         let rig_clone = Arc::clone(&self.rig);
+        let scan_status_clone = Arc::clone(&self.scan_status);
 
-        // Create scan task
+        // Create scan task sharing the same scan_status so stop_scan can signal it
         let handle = tokio::spawn(async move {
-            // Create a simplified AdvancedRig for the scan task
-            // We don't need all the components for scanning
-            let temp_rig = AdvancedRig::new(rig_clone);
+            let mut temp_rig = AdvancedRig::new(rig_clone);
+            // Replace the temp_rig's scan_status with our shared one
+            temp_rig.scan_status = scan_status_clone;
 
             if let Err(e) = temp_rig.scan_loop(config).await {
                 error!("Scan loop error: {}", e);

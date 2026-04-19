@@ -10,6 +10,13 @@ use std::collections::VecDeque;
 ///
 /// Provides basic but efficient sample rate conversion suitable for
 /// real-time audio processing with minimal CPU usage.
+///
+/// WARNING: This resampler performs NO anti-aliasing filtering. When
+/// downsampling (e.g. 48kHz -> 12kHz), it will produce aliased output.
+/// For FT8 audio decimation, use the DSP pipeline's FIR anti-alias
+/// filter (pancetta-dsp pipeline.rs) instead of this converter.
+/// This utility is only suitable for non-critical paths such as
+/// monitoring or UI-level metering.
 pub struct LinearResampler {
     /// Source sample rate
     source_rate: u32,

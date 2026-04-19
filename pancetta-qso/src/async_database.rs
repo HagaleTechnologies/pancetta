@@ -325,21 +325,12 @@ impl AsyncQsoDatabase {
     /// could corrupt the backup on crash.
     pub async fn backup<P: AsRef<Path>>(&self, backup_path: P) -> Result<(), AsyncDatabaseError> {
         let backup_path_str = backup_path.as_ref().to_string_lossy().to_string();
-        let pool = self.pool.clone();
 
         // Use VACUUM INTO which atomically creates a complete copy of the database.
-        // This runs in a blocking task since it may take time for large databases.
-        tokio::task::spawn_blocking(move || {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
-                sqlx::query(&format!("VACUUM INTO '{}'", backup_path_str))
-                    .execute(&pool)
-                    .await
-            })
-        })
-        .await
-        .map_err(|e| AsyncDatabaseError::Sqlx(sqlx::Error::Protocol(e.to_string())))?
-        .map_err(AsyncDatabaseError::Sqlx)?;
+        sqlx::query(&format!("VACUUM INTO '{}'", backup_path_str))
+            .execute(&self.pool)
+            .await
+            .map_err(AsyncDatabaseError::Sqlx)?;
 
         info!("Database backup completed (VACUUM INTO)");
         Ok(())

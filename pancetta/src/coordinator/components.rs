@@ -366,7 +366,7 @@ impl super::ApplicationCoordinator {
                             }
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {
-                            tokio::task::yield_now().await;
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                         Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                     }
@@ -697,7 +697,7 @@ impl super::ApplicationCoordinator {
                             }
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {
-                            tokio::task::yield_now().await;
+                            tokio::time::sleep(Duration::from_millis(10)).await;
                         }
                         Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                     }
@@ -843,13 +843,17 @@ impl super::ApplicationCoordinator {
                         _ = slot_interval.tick() => {
                             // Report decoded spots to cqdx.io
                             if let Some(ref bridge) = cqdx_bridge_for_auto {
+                                // NOTE: msg.frequency_hz is audio-baseband offset (200-3000 Hz),
+                                // not absolute RF frequency. We set frequency to 0 rather than
+                                // report incorrect data. A future improvement should pass the
+                                // operating frequency into the autonomous component.
                                 let spot_reports: Vec<pancetta_cqdx::SpotReport> = slot_messages
                                     .iter()
                                     .filter_map(|msg| {
                                         msg.callsign.as_ref().map(|call| pancetta_cqdx::SpotReport {
                                             callsign: call.clone(),
                                             grid: None,
-                                            frequency: msg.frequency_hz as u64,
+                                            frequency: 0,
                                             mode: "FT8".to_string(),
                                             snr: msg.snr,
                                             timestamp: chrono::Utc::now(),

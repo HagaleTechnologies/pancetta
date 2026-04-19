@@ -127,7 +127,7 @@ impl Default for Ft8Config {
             frequency_range: 200.0,
             time_range: 2.0,
             max_decode_passes: 3,
-            osd_depth: Some(3),
+            osd_depth: Some(2),
         }
     }
 }
@@ -324,7 +324,7 @@ impl Ft8Decoder {
         let max_passes = self.config.max_decode_passes.max(1);
 
         // Check whether AP is active (any known information available)
-        let ap_active = ap_context.my_call.is_some();
+        let ap_active = ap_context.my_call.is_some() || ap_context.active_qso.is_some();
 
         // Budget tracker — stops decode passes when wall-clock time is exceeded
         let budget = BudgetTracker::new(self.config.osd_depth.map_or(2000, |d| {
@@ -561,8 +561,8 @@ impl Ft8Decoder {
             let omega = 2.0 * PI * freq / SAMPLE_RATE as f64;
             let start = sym_idx * sps;
             for i in 0..sps {
-                recon_i[start + i] = phase.sin();
-                recon_q[start + i] = phase.cos();
+                recon_i[start + i] = phase.cos();
+                recon_q[start + i] = phase.sin();
                 phase += omega;
             }
             if phase > 1e6 {

@@ -307,10 +307,10 @@ impl AudioManager {
     /// This is a placeholder that logs the request.
     pub fn queue_output(&mut self, samples: &[f32], input_rate: u32) -> Result<(), AudioError> {
         // TODO: Implement output ring buffer for monitoring/TX audio.
-        // For now, just count the samples.
-        self.stats.samples_processed += samples.len() as u64;
-        info!(
-            "queue_output called with {} samples at {}Hz (output ring buffer not yet wired)",
+        // This requires wiring a producer into the output stream callback
+        // so queued samples are played instead of silence.
+        warn!(
+            "TX audio output not implemented — {} samples discarded (rate={}Hz)",
             samples.len(),
             input_rate
         );

@@ -557,9 +557,14 @@ impl DxTracker {
     }
 
     /// Check if entity/band/mode combination is needed
+    ///
+    /// TODO: Implement proper needed-entity check. Requires DXCC lookup to
+    /// resolve callsign to entity code, then query the award_tracking table
+    /// to see if that entity/band/mode combination is already confirmed.
     pub async fn is_needed(&self, _callsign: &str, _band: Band, _mode: &Mode) -> Result<bool> {
-        // This would need DXCC lookup to get entity code from callsign
-        // For now, return true as placeholder
+        // This would need DXCC lookup to get entity code from callsign,
+        // then check the award_tracking table for existing confirmations.
+        debug!("is_needed: stub — always returns true (award tracking not yet wired)");
         Ok(true)
     }
 

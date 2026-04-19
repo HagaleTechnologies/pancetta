@@ -491,23 +491,21 @@ impl RigControl for Rig {
         // Initialize handle
         let handle = self.init_hamlib_handle()?;
 
-        // Open connection
-        let _raw_ptr = handle.as_ptr();
-        let result = self
-            .execute_operation(move || unsafe {
-                let result = rig_open(handle.as_ptr());
-                if is_hamlib_success(result) {
-                    Ok(())
-                } else {
-                    Err(anyhow!(
-                        "Failed to open rig: {}",
-                        hamlib_error_message(result)
-                    ))
-                }
-            })
-            .await;
+        // Open connection directly (not through execute_operation, which would
+        // recurse back into connect() when it sees we're not connected)
+        let open_result = unsafe {
+            let result = rig_open(handle.as_ptr());
+            if is_hamlib_success(result) {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "Failed to open rig: {}",
+                    hamlib_error_message(result)
+                ))
+            }
+        };
 
-        match result.result {
+        match open_result {
             Ok(()) => {
                 *self.handle.lock() = Some(handle);
                 self.connected.store(true, Ordering::Relaxed);

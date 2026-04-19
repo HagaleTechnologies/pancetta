@@ -640,7 +640,7 @@ impl FrequencyAllocator {
         // Try candidates from the middle outward
         let center = (min_f + max_f) / 2.0;
         let mut best = center;
-        let mut best_clearance = 0.0f64;
+        let mut best_clearance = f64::NEG_INFINITY;
 
         let mut freq = min_f;
         while freq <= max_f {
