@@ -80,6 +80,7 @@ impl super::ApplicationCoordinator {
         let qso_lookup = self.cached_lookup.clone();
         let cqdx_bridge = self.cqdx_bridge.clone();
         let active_qso_ap = self.active_qso_ap.clone();
+        let operating_frequency_hz = self.operating_frequency_hz.clone();
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
 
@@ -131,15 +132,17 @@ impl super::ApplicationCoordinator {
                 {
                     use pancetta_qso::QsoDatabase;
 
-                    // Determine the current band from the first configured band-hopping
-                    // entry, falling back to "20m".  This is a best-effort seed — the
+                    // Determine the current band from the rig's operating frequency,
+                    // falling back to "20m".  This is a best-effort seed — the
                     // autonomous operator will always re-validate against the live
                     // worked-on-band set as QSOs complete.
-                    let band = "20m"; // default; updated when rig frequency is known
+                    let freq_hz = operating_frequency_hz.load(std::sync::atomic::Ordering::Relaxed);
+                    let band = pancetta_cqdx::frequency_to_band(freq_hz)
+                        .unwrap_or_else(|| "20m".to_string());
 
                     match QsoDatabase::open(&db_path) {
                         Ok(db) => {
-                            let callsigns = db.get_worked_callsigns(band);
+                            let callsigns = db.get_worked_callsigns(&band);
                             if callsigns.is_empty() {
                                 tracing::info!(
                                     "QSO database has no prior contacts on {} — starting fresh",

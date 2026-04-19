@@ -189,16 +189,98 @@ impl IirFilter {
         let num_sections = config.order / 2;
         let mut sections = Vec::with_capacity(num_sections);
 
-        // Design cascaded biquad sections
-        for section in 0..num_sections {
-            let coeffs = Self::design_biquad_section(&config, section)?;
-            let biquad = DirectForm1::<f32>::new(coeffs);
-            sections.push(biquad);
+        match config.filter_type {
+            FilterType::BandPass => {
+                // A true Butterworth bandpass is built from a highpass at f_low
+                // cascaded with a lowpass at f_high, each of order N/2 per
+                // biquad section. For a 4th-order bandpass (2 biquad sections),
+                // we get one 2nd-order HP and one 2nd-order LP.
+                let f_low = config.cutoff_low.unwrap();
+                let f_high = config.cutoff_high.unwrap();
+                let fs = config.sample_rate.hz();
+
+                // Highpass sections at f_low
+                for section in 0..num_sections {
+                    let hp_order = num_sections * 2; // order of the HP sub-filter
+                    let theta_k =
+                        std::f32::consts::PI * (2 * section + 1) as f32 / (2 * hp_order) as f32;
+                    let section_q = 1.0 / (2.0 * theta_k.cos());
+                    let coeffs =
+                        Coefficients::<f32>::from_params(Type::HighPass, fs, f_low.hz(), section_q)
+                            .map_err(|e| FilterError::DesignFailed {
+                                message: format!("Bandpass HP design failed: {:?}", e),
+                            })?;
+                    sections.push(DirectForm1::<f32>::new(coeffs));
+                }
+
+                // Lowpass sections at f_high
+                for section in 0..num_sections {
+                    let lp_order = num_sections * 2; // order of the LP sub-filter
+                    let theta_k =
+                        std::f32::consts::PI * (2 * section + 1) as f32 / (2 * lp_order) as f32;
+                    let section_q = 1.0 / (2.0 * theta_k.cos());
+                    let coeffs =
+                        Coefficients::<f32>::from_params(Type::LowPass, fs, f_high.hz(), section_q)
+                            .map_err(|e| FilterError::DesignFailed {
+                                message: format!("Bandpass LP design failed: {:?}", e),
+                            })?;
+                    sections.push(DirectForm1::<f32>::new(coeffs));
+                }
+            }
+            FilterType::BandStop => {
+                // A Butterworth bandstop is built from a lowpass at f_low
+                // cascaded with a highpass at f_high.
+                let f_low = config.cutoff_low.unwrap();
+                let f_high = config.cutoff_high.unwrap();
+                let fs = config.sample_rate.hz();
+
+                // Lowpass sections at f_low
+                for section in 0..num_sections {
+                    let lp_order = num_sections * 2;
+                    let theta_k =
+                        std::f32::consts::PI * (2 * section + 1) as f32 / (2 * lp_order) as f32;
+                    let section_q = 1.0 / (2.0 * theta_k.cos());
+                    let coeffs =
+                        Coefficients::<f32>::from_params(Type::LowPass, fs, f_low.hz(), section_q)
+                            .map_err(|e| FilterError::DesignFailed {
+                                message: format!("Bandstop LP design failed: {:?}", e),
+                            })?;
+                    sections.push(DirectForm1::<f32>::new(coeffs));
+                }
+
+                // Highpass sections at f_high
+                for section in 0..num_sections {
+                    let hp_order = num_sections * 2;
+                    let theta_k =
+                        std::f32::consts::PI * (2 * section + 1) as f32 / (2 * hp_order) as f32;
+                    let section_q = 1.0 / (2.0 * theta_k.cos());
+                    let coeffs = Coefficients::<f32>::from_params(
+                        Type::HighPass,
+                        fs,
+                        f_high.hz(),
+                        section_q,
+                    )
+                    .map_err(|e| FilterError::DesignFailed {
+                        message: format!("Bandstop HP design failed: {:?}", e),
+                    })?;
+                    sections.push(DirectForm1::<f32>::new(coeffs));
+                }
+            }
+            _ => {
+                // LowPass, HighPass, AllPass: standard cascaded biquad design
+                for section in 0..num_sections {
+                    let coeffs = Self::design_biquad_section(&config, section)?;
+                    sections.push(DirectForm1::<f32>::new(coeffs));
+                }
+            }
         }
 
         debug!(
             "Created IIR filter: {:?}, order={}, sections={}, fs={}Hz",
-            config.filter_type, config.order, num_sections, config.sample_rate
+            config.filter_type,
+            config.order,
+            sections.len(),
+            config.sample_rate
         );
 
         Ok(Self {
@@ -246,33 +328,10 @@ impl IirFilter {
                         })?,
                 )
             }
-            FilterType::BandPass => {
-                let center_freq = (config.cutoff_low.unwrap() * config.cutoff_high.unwrap()).sqrt();
-                let bandwidth = config.cutoff_high.unwrap() - config.cutoff_low.unwrap();
-                // Scale the bandwidth-derived Q by the per-section Butterworth Q factor
-                let base_q = center_freq / bandwidth;
-                let q = base_q * section_q / Q_BUTTERWORTH_F32;
-
-                Ok(
-                    Coefficients::<f32>::from_params(Type::BandPass, fs, center_freq.hz(), q)
-                        .map_err(|e| FilterError::DesignFailed {
-                            message: format!("Bandpass design failed: {:?}", e),
-                        })?,
-                )
-            }
-            FilterType::BandStop => {
-                let center_freq = (config.cutoff_low.unwrap() * config.cutoff_high.unwrap()).sqrt();
-                let bandwidth = config.cutoff_high.unwrap() - config.cutoff_low.unwrap();
-                // Scale the bandwidth-derived Q by the per-section Butterworth Q factor
-                let base_q = center_freq / bandwidth;
-                let q = base_q * section_q / Q_BUTTERWORTH_F32;
-
-                Ok(
-                    Coefficients::<f32>::from_params(Type::Notch, fs, center_freq.hz(), q)
-                        .map_err(|e| FilterError::DesignFailed {
-                            message: format!("Bandstop design failed: {:?}", e),
-                        })?,
-                )
+            FilterType::BandPass | FilterType::BandStop => {
+                // Handled directly in IirFilter::new() via HP+LP cascade;
+                // this path should never be reached.
+                unreachable!("BandPass/BandStop sections are built in IirFilter::new()")
             }
             FilterType::AllPass => {
                 let cutoff = config.cutoff_high.unwrap_or(1000.0).hz();

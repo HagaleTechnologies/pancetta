@@ -36,6 +36,7 @@ pancetta-ft8 = { path = "../pancetta-ft8" }
 # Utilities
 regex = "1.12"
 lazy_static = "1.4"
+dirs = "5.0"
 
 [dev-dependencies]
 tokio-test = "0.4"

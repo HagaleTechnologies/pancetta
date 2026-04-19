@@ -6,6 +6,7 @@
 use crate::states::*;
 use lazy_static::lazy_static;
 use regex::Regex;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Message parsing and generation errors
@@ -43,6 +44,9 @@ pub struct MessageExchange {
 
     /// Next contest serial number (incremented on each use)
     contest_serial: std::sync::atomic::AtomicU32,
+
+    /// Path for persisting the contest serial number across restarts
+    serial_persist_path: Option<PathBuf>,
 }
 
 /// Contest exchange configuration
@@ -103,13 +107,52 @@ lazy_static! {
 }
 
 impl MessageExchange {
-    /// Create a new message exchange handler
+    /// Create a new message exchange handler.
+    ///
+    /// The contest serial number is loaded from `~/.pancetta/contest_serial.txt`
+    /// if that file exists, so it persists across restarts.
     pub fn new(our_callsign: String) -> Self {
+        let serial_persist_path: Option<PathBuf> = dirs::home_dir().map(|mut p| {
+            p.push(".pancetta");
+            p.push("contest_serial.txt");
+            p
+        });
+
+        let starting_serial = serial_persist_path
+            .as_deref()
+            .map(Self::load_serial)
+            .unwrap_or(1);
+
         Self {
             our_callsign,
             contest_mode: None,
-            contest_serial: std::sync::atomic::AtomicU32::new(1),
+            contest_serial: std::sync::atomic::AtomicU32::new(starting_serial),
+            serial_persist_path,
         }
+    }
+
+    /// Save the current contest serial number to the persistence file.
+    ///
+    /// Silently ignores I/O errors so a missing or unwritable file never
+    /// disrupts normal operation.
+    fn save_serial(&self, serial: u32) {
+        if let Some(ref path) = self.serial_persist_path {
+            // Best-effort: create parent directory if needed
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(path, serial.to_string());
+        }
+    }
+
+    /// Load a contest serial number from `path`.
+    ///
+    /// Returns 1 if the file does not exist or cannot be parsed.
+    fn load_serial(path: &Path) -> u32 {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(1)
     }
 
     /// Enable contest mode
@@ -522,6 +565,8 @@ impl MessageExchange {
                 let serial = self
                     .contest_serial
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Persist the next serial (serial + 1) so a restart picks up where we left off.
+                self.save_serial(serial + 1);
                 Ok(Some(MessageType::ContestExchange {
                     to_station: target_callsign.clone(),
                     from_station: self.our_callsign.clone(),
