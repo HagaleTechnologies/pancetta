@@ -5,7 +5,53 @@ use std::time::{Duration, Instant};
 use tokio::time::{interval, sleep};
 use tracing::{debug, error, info, span, warn, Level};
 
-use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
+
+/// Guard that sends PTT-off when dropped, ensuring PTT is released
+/// even if the transmitter task is cancelled mid-transmission.
+struct PttGuard {
+    message_bus: MessageBus,
+    armed: bool,
+}
+
+impl PttGuard {
+    fn new(message_bus: MessageBus) -> Self {
+        Self {
+            message_bus,
+            armed: true,
+        }
+    }
+
+    /// Disarm the guard after PTT-off has been sent normally.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PttGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let bus = self.message_bus.clone();
+            // Spawn a fire-and-forget task to send PTT-off.
+            // This runs even if the parent task was cancelled.
+            let _ = tokio::task::spawn(async move {
+                let ptt_off_msg = ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Hamlib,
+                    MessageType::RigControl(
+                        crate::message_bus::RigControlMessage::SetPtt { state: false },
+                    ),
+                    Instant::now(),
+                );
+                if let Err(e) = bus.send_message(ptt_off_msg).await {
+                    tracing::error!("PTT GUARD: failed to force PTT off on drop: {}", e);
+                } else {
+                    tracing::warn!("PTT GUARD: forced PTT off due to task cancellation");
+                }
+            });
+        }
+    }
+}
 
 impl super::ApplicationCoordinator {
     /// Start QSO management component
@@ -65,6 +111,7 @@ impl super::ApplicationCoordinator {
                 let _logger = match QsoLogger::new(logger_config, qso_manager.clone()).await {
                     Ok(l) => {
                         info!("QSO logger initialized with database at {:?}", db_path);
+                        let l = std::sync::Arc::new(l);
                         if let Err(e) = l.start().await {
                             warn!("QSO logger background tasks failed to start: {}", e);
                         }
@@ -393,6 +440,7 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 2: Assert PTT ---
+                                    let mut ptt_guard = PttGuard::new(message_bus.clone());
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -474,6 +522,7 @@ impl super::ApplicationCoordinator {
                                     if let Err(e) = message_bus.send_message(ptt_off_msg).await {
                                         debug!("PTT off failed (no rig?): {}", e);
                                     }
+                                    ptt_guard.disarm();
 
                                     // --- Step 6: Send TransmitComplete ---
                                     let complete_msg = ComponentMessage::new(
@@ -505,6 +554,7 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 2: Assert PTT ---
+                                    let mut ptt_guard = PttGuard::new(message_bus.clone());
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -609,6 +659,7 @@ impl super::ApplicationCoordinator {
                                     if let Err(e) = message_bus.send_message(ptt_off_msg).await {
                                         debug!("PTT off failed (no rig?): {}", e);
                                     }
+                                    ptt_guard.disarm();
 
                                     // --- Step 6: Send TransmitComplete for each item ---
                                     for text in item_texts {

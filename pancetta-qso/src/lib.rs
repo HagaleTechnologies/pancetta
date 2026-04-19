@@ -320,7 +320,9 @@ impl QsoSystemBuilder {
 
         let logger = if self.enable_logger {
             let logger_config = self.logger_config.unwrap_or_default();
-            let qso_logger = QsoLogger::new(logger_config, qso_manager.clone()).await?;
+            let qso_logger = std::sync::Arc::new(
+                QsoLogger::new(logger_config, qso_manager.clone()).await?,
+            );
             qso_logger.start().await?;
             Some(qso_logger)
         } else {
@@ -350,7 +352,7 @@ pub struct QsoSystem {
     pub auto_sequencer: Option<Arc<AutoSequencer>>,
 
     /// Logger instance (if enabled)
-    pub logger: Option<QsoLogger>,
+    pub logger: Option<std::sync::Arc<QsoLogger>>,
 }
 
 impl QsoSystem {

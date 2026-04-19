@@ -382,16 +382,16 @@ impl QsoLogger {
     }
 
     /// Start the logger
-    pub async fn start(&self) -> Result<(), LoggerError> {
+    pub async fn start(self: &std::sync::Arc<Self>) -> Result<(), LoggerError> {
         info!("Starting QSO logger");
 
         // Subscribe to QSO events
         let receiver = self.qso_manager.subscribe();
         *self.event_receiver.write().await = Some(receiver);
 
-        // Start background tasks
+        // Start background tasks — share via Arc, not Clone
         if self.config.auto_logging.enabled {
-            let logger = self.clone();
+            let logger = std::sync::Arc::clone(self);
             tokio::spawn(async move {
                 logger.auto_logging_loop().await;
             });
@@ -399,7 +399,7 @@ impl QsoLogger {
         }
 
         if self.config.backup.enabled {
-            let logger = self.clone();
+            let logger = std::sync::Arc::clone(self);
             tokio::spawn(async move {
                 logger.backup_loop().await;
             });
@@ -1007,19 +1007,6 @@ impl QsoLogger {
     }
 }
 
-impl Clone for QsoLogger {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            database: self.database.clone(), // AsyncQsoDatabase supports Clone
-            adif_processor: AdifProcessor::new(),
-            qso_manager: self.qso_manager.clone(),
-            event_receiver: Arc::clone(&self.event_receiver),
-            export_history: Arc::clone(&self.export_history),
-            import_history: Arc::clone(&self.import_history),
-        }
-    }
-}
 
 /// Import record result
 #[derive(Debug, Clone, PartialEq)]
