@@ -310,3 +310,145 @@ fn test_decode_within_realtime_budget() {
         );
     }
 }
+
+// Diagnostic tests below — require WAV fixtures not checked into git.
+// Copy WAV files to tests/fixtures/wav/basicft8/ to enable.
+
+#[test]
+fn test_live_20m_wav() {
+    let wav_path = format!(
+        "{}/tests/fixtures/wav/basicft8/live_test.wav",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    if !std::path::Path::new(&wav_path).exists() {
+        eprintln!("Skipping: {} not found", wav_path);
+        return;
+    }
+
+    let mut reader = hound::WavReader::open(&wav_path).unwrap();
+    let spec = reader.spec();
+    let samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader.samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f32 / max).collect()
+        }
+        hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+    };
+    eprintln!("WAV: {}ch {}Hz {} samples", spec.channels, spec.sample_rate, samples.len());
+    
+    // ft8_lib
+    let ft8lib = ft8lib_decode_audio(&samples);
+    eprintln!("ft8_lib: {} decodes", ft8lib.len());
+    for (msg, freq, snr, _) in &ft8lib {
+        eprintln!("  [ft8_lib] {:+.0} dB  {:.1} Hz  {}", snr, freq, msg);
+    }
+    
+    // Ours
+    let config = Ft8Config::default();
+    let mut decoder = Ft8Decoder::new(config).unwrap();
+    let ours = decoder.decode_window(&samples).unwrap_or_default();
+    eprintln!("ours: {} decodes", ours.len());
+    for msg in &ours {
+        eprintln!("  [ours]   {:+.0} dB  {:.1} Hz  conf={:.2}  {}", msg.snr_db, msg.frequency_offset, msg.confidence, msg.text);
+    }
+    
+    eprintln!("\nft8_lib={}, ours={}", ft8lib.len(), ours.len());
+}
+
+#[test]
+fn test_raw_vs_dsp_decimated() {
+    let base = env!("CARGO_MANIFEST_DIR");
+
+    // Test each audio source with ft8_lib
+    for (label, filename) in &[
+        ("raw-decimated", "raw_decimated_12khz.wav"),
+        ("raw-subsampled", "raw_subsampled_12khz.wav"),
+        ("dsp-decimated", "dsp_decimated.wav"),
+    ] {
+        let path = format!("{}/tests/fixtures/wav/basicft8/{}", base, filename);
+        if !std::path::Path::new(&path).exists() {
+            eprintln!("Skipping {}: not found", filename);
+            continue;
+        }
+
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        let spec = reader.spec();
+        let all_samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Int => {
+                let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+                reader.samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f32 / max).collect()
+            }
+            hound::SampleFormat::Float => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+        };
+
+        eprintln!("\n=== {} ({}, {}Hz, {} samples, {:.1}s) ===",
+            label, filename, spec.sample_rate, all_samples.len(),
+            all_samples.len() as f64 / spec.sample_rate as f64);
+
+        // Process in 12.64-second windows with 50% overlap
+        let window_size = SAMPLE_RATE as usize * 1264 / 100; // 151680
+        let step = window_size / 2;
+        let mut total_ft8lib = 0;
+        let mut total_ours = 0;
+        let mut offset = 0;
+        let mut window_num = 0;
+
+        while offset + window_size <= all_samples.len() {
+            let window = &all_samples[offset..offset + window_size];
+
+            let ft8lib = ft8lib_decode_audio(window);
+            let config = Ft8Config::default();
+            let mut decoder = Ft8Decoder::new(config).unwrap();
+            let ours = decoder.decode_window(window).unwrap_or_default();
+
+            if !ft8lib.is_empty() || !ours.is_empty() {
+                eprintln!("  window {} (offset {}): ft8_lib={}, ours={}",
+                    window_num, offset, ft8lib.len(), ours.len());
+                for (msg, freq, snr, _) in &ft8lib {
+                    eprintln!("    [ft8_lib] {:+.0} dB  {:.1} Hz  {}", snr, freq, msg);
+                }
+                for msg in &ours {
+                    eprintln!("    [ours]   {:+.0} dB  {:.1} Hz  conf={:.2}  {}",
+                        msg.snr_db, msg.frequency_offset, msg.confidence, msg.text);
+                }
+            }
+
+            total_ft8lib += ft8lib.len();
+            total_ours += ours.len();
+            offset += step;
+            window_num += 1;
+        }
+
+        eprintln!("  TOTAL: ft8_lib={}, ours={}", total_ft8lib, total_ours);
+    }
+}
+
+#[test]
+fn test_python_fir_vs_naive() {
+    let base = env!("CARGO_MANIFEST_DIR");
+    for (label, filename) in &[
+        ("python-FIR", "python_fir_decimated.wav"),
+        ("naive-avg", "raw_decimated_12khz.wav"),
+    ] {
+        let path = format!("{}/tests/fixtures/wav/basicft8/{}", base, filename);
+        if !std::path::Path::new(&path).exists() { continue; }
+        let mut reader = hound::WavReader::open(&path).unwrap();
+        let spec = reader.spec();
+        let all: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Int => {
+                let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+                reader.samples::<i32>().filter_map(|s| s.ok()).map(|s| s as f32 / max).collect()
+            }
+            _ => unreachable!(),
+        };
+        let window_size = SAMPLE_RATE as usize * 1264 / 100;
+        let step = window_size / 2;
+        let mut total = 0;
+        let mut offset = 0;
+        while offset + window_size <= all.len() {
+            total += ft8lib_decode_audio(&all[offset..offset+window_size]).len();
+            offset += step;
+        }
+        eprintln!("{}: ft8_lib decoded {} total", label, total);
+    }
+}

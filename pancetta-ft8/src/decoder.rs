@@ -380,6 +380,13 @@ impl Ft8Decoder {
                     spec_bins = spectrogram.num_bins,
                     "FT8 sync search pass 0"
                 );
+                #[cfg(feature = "debug-decode")]
+                for (i, c) in sync_candidates.iter().take(10).enumerate() {
+                    eprintln!(
+                        "  ours candidate {}: score={:.1} time={} freq={} fsub={}",
+                        i, c.sync_score, c.time_step, c.freq_bin, c.freq_sub
+                    );
+                }
             }
 
             #[cfg(feature = "debug-decode")]
@@ -855,12 +862,20 @@ impl Ft8Decoder {
             });
         }
 
-        // Zero-pad audio by nfft samples to ensure the spectrogram has enough
-        // time steps to cover a full FT8 message at TIME_OSR=2.
-        // Without padding, num_steps < num_symbols * steps_per_symbol, so the
-        // Costas search is limited to t0=0.
+        // Zero-pad audio so the spectrogram has enough time steps for the
+        // Costas search to scan a range of starting positions (not just t0=0).
+        // FT8 signals can start up to ~2s before/after the nominal slot
+        // boundary. With step=480 (quarter-symbol), we need ~50 extra steps
+        // beyond the 316-step message span to cover ±2s of timing uncertainty.
+        let steps_per_symbol = 2 * TIME_OSR;
+        let msg_span = self.protocol_params.num_symbols * steps_per_symbol;
+        let search_margin = 50; // ~25 steps each side ≈ ±2s
+        let min_steps = msg_span + search_margin;
+        let min_padded_len = (min_steps - 1) * step + nfft;
         let mut padded = audio.to_vec();
-        padded.resize(audio.len() + nfft, 0.0);
+        if padded.len() < min_padded_len {
+            padded.resize(min_padded_len, 0.0);
+        }
 
         let num_steps = (padded.len() - nfft) / step + 1;
         // Number of frequency bins in 6.25 Hz units (= block_size/2 + 1)

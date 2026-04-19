@@ -336,10 +336,39 @@ impl super::ApplicationCoordinator {
             // Async relay: tokio mpsc -> crossbeam point-to-point
             let handle = tokio::spawn(async move {
                 let mut relay_count: u64 = 0;
+                // Record 90 seconds of raw 48kHz stereo audio for diagnostics
+                // (covers ~6 FT8 windows regardless of boundary alignment)
+                let raw_capture_samples = 48000 * 2 * 90; // 90s stereo
+                let mut raw_recorder: Option<Vec<f32>> = Some(Vec::with_capacity(raw_capture_samples));
                 while let Some(samples) = result_rx.recv().await {
                     {
                         let mut timestamp = last_timestamp.write().await;
                         *timestamp = Some(Instant::now());
+                    }
+
+                    // Capture raw 48kHz for diagnostic comparison
+                    if let Some(ref mut buf) = raw_recorder {
+                        buf.extend_from_slice(&samples);
+                        if buf.len() >= raw_capture_samples {
+                            let raw_path = dirs::home_dir()
+                                .unwrap_or_default()
+                                .join(".pancetta/recordings/raw_48khz_diagnostic.wav");
+                            let spec = hound::WavSpec {
+                                channels: 2,
+                                sample_rate: 48000,
+                                bits_per_sample: 16,
+                                sample_format: hound::SampleFormat::Int,
+                            };
+                            if let Ok(mut w) = hound::WavWriter::create(&raw_path, spec) {
+                                for &s in buf.iter() {
+                                    let _ = w.write_sample((s * i16::MAX as f32) as i16);
+                                }
+                                let _ = w.finalize();
+                                info!("Raw 48kHz diagnostic WAV saved: {} ({} samples, {:.0}s stereo)",
+                                    raw_path.display(), buf.len() / 2, buf.len() as f64 / (48000.0 * 2.0));
+                            }
+                            raw_recorder = None; // only once
+                        }
                     }
 
                     let len = samples.len();
