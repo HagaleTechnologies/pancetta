@@ -33,6 +33,7 @@ impl super::ApplicationCoordinator {
 
         let qso_lookup = self.cached_lookup.clone();
         let cqdx_bridge = self.cqdx_bridge.clone();
+        let active_qso_ap = self.active_qso_ap.clone();
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
 
@@ -84,13 +85,43 @@ impl super::ApplicationCoordinator {
                 );
 
                 // Spawn a task to forward QSO auto-sequence TX requests to the transmitter
+                // and update AP decoding state for the FT8 decoder thread.
                 let mut qso_events = qso_manager.subscribe();
                 let tx_bus = message_bus.clone();
                 let tx_shutdown = shutdown.clone();
                 let tx_callsign = our_callsign.clone();
+                let ap_state = active_qso_ap;
                 tokio::spawn(async move {
                     while !tx_shutdown.load(Ordering::Acquire) {
                         match qso_events.recv().await {
+                            Ok(pancetta_qso::QsoEvent::StateChanged {
+                                new_state,
+                                ..
+                            }) => {
+                                // Map QSO state to AP context for AP3/AP4 decoding
+                                let new_ap = match &new_state {
+                                    pancetta_qso::QsoState::RespondingToCq { target_callsign, .. }
+                                    | pancetta_qso::QsoState::WaitingForReport { their_callsign: target_callsign, .. }
+                                    | pancetta_qso::QsoState::SendingReport { their_callsign: target_callsign, .. } => {
+                                        pancetta_ft8::QsoAp::new(
+                                            target_callsign,
+                                            pancetta_ft8::QsoApProgress::WaitingForReport,
+                                        )
+                                    }
+                                    pancetta_qso::QsoState::WaitingForConfirmation { their_callsign, .. }
+                                    | pancetta_qso::QsoState::SendingConfirmation { their_callsign, .. } => {
+                                        pancetta_ft8::QsoAp::new(
+                                            their_callsign,
+                                            pancetta_ft8::QsoApProgress::WaitingForConfirmation,
+                                        )
+                                    }
+                                    // Terminal or idle states clear the AP context
+                                    _ => None,
+                                };
+                                if let Ok(mut guard) = ap_state.write() {
+                                    *guard = new_ap;
+                                }
+                            }
                             Ok(pancetta_qso::QsoEvent::MessageToSend {
                                 qso_id,
                                 message,
@@ -128,6 +159,10 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                             Ok(pancetta_qso::QsoEvent::QsoCompleted { metadata, .. }) => {
+                                // Clear AP state on QSO completion
+                                if let Ok(mut guard) = ap_state.write() {
+                                    *guard = None;
+                                }
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO completed with {}, marking as worked", their_call);
                                     qso_lookup.record_worked(their_call);
@@ -149,6 +184,10 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                             Ok(pancetta_qso::QsoEvent::QsoFailed { metadata, .. }) => {
+                                // Clear AP state on QSO failure
+                                if let Ok(mut guard) = ap_state.write() {
+                                    *guard = None;
+                                }
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO failed with {}, adding backoff", their_call);
                                     qso_lookup.record_failure(their_call);

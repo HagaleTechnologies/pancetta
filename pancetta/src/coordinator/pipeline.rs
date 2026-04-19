@@ -503,6 +503,9 @@ impl super::ApplicationCoordinator {
             config.station.callsign.clone()
         };
 
+        // Shared AP state updated by the QSO component
+        let active_qso_ap = self.active_qso_ap.clone();
+
         // Run FT8 decoder on a dedicated thread to avoid tokio starvation
         let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -560,10 +563,14 @@ impl super::ApplicationCoordinator {
                         }
 
                         // Build AP context for this decode window
+                        let current_qso_ap = active_qso_ap
+                            .read()
+                            .ok()
+                            .and_then(|guard| guard.clone());
                         let ap_context = pancetta_ft8::ApContext {
                             my_call: my_call_ap.clone(),
                             recent_calls: recent_pool.clone(),
-                            active_qso: None, // QSO AP wiring is future work
+                            active_qso: current_qso_ap,
                         };
 
                         // Decode FT8 signals with AP-enhanced decoding

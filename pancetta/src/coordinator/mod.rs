@@ -90,6 +90,10 @@ pub struct ApplicationCoordinator {
     /// Sender for waterfall data to the autonomous operator.
     waterfall_to_auto_tx: Option<crossbeam_channel::Sender<Vec<Vec<f32>>>>,
 
+    /// Shared active QSO AP state for FT8 AP3/AP4 decoding.
+    /// Updated by the QSO component, read by the FT8 decoder thread.
+    active_qso_ap: std::sync::Arc<std::sync::RwLock<Option<pancetta_ft8::QsoAp>>>,
+
     /// TUI relay OS thread handle (joined on shutdown)
     tui_relay_handle: Option<std::thread::JoinHandle<()>>,
 
@@ -272,6 +276,7 @@ impl ApplicationCoordinator {
             cached_lookup: std::sync::Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
             cqdx_bridge: None,
             waterfall_to_auto_tx: None,
+            active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(None)),
             tui_relay_handle: None,
             #[cfg(feature = "pancetta-hamlib")]
             rigctld_process: None,
