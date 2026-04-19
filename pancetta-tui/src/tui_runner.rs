@@ -7,7 +7,9 @@ use anyhow::Result;
 use chrono::Timelike;
 use crossbeam_channel::{Receiver, Sender};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -199,7 +201,10 @@ impl TuiRunner {
         }
 
         self.cleanup()?;
-        info!("TUI main loop completed (frames={}, msgs={})", self.metrics.frames_rendered, self.metrics.messages_processed);
+        info!(
+            "TUI main loop completed (frames={}, msgs={})",
+            self.metrics.frames_rendered, self.metrics.messages_processed
+        );
         Ok(())
     }
 
@@ -401,13 +406,17 @@ impl TuiRunner {
             // Band switching: + = band up, - = band down
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 let freq_hz = app.band_up();
-                self.message_tx
-                    .send(TuiCommand::SetFrequency { vfo: 0, frequency: freq_hz })?;
+                self.message_tx.send(TuiCommand::SetFrequency {
+                    vfo: 0,
+                    frequency: freq_hz,
+                })?;
             }
             KeyCode::Char('-') | KeyCode::Char('_') => {
                 let freq_hz = app.band_down();
-                self.message_tx
-                    .send(TuiCommand::SetFrequency { vfo: 0, frequency: freq_hz })?;
+                self.message_tx.send(TuiCommand::SetFrequency {
+                    vfo: 0,
+                    frequency: freq_hz,
+                })?;
             }
 
             // Space - Select/activate (click-to-call)
@@ -453,8 +462,7 @@ impl TuiRunner {
             if let Err(e) = crate::ui::draw(f, &app) {
                 // Fallback: render a minimal error message
                 let error_text = format!("Render error: {}", e);
-                let paragraph = Paragraph::new(error_text)
-                    .style(Style::default().fg(Color::Red));
+                let paragraph = Paragraph::new(error_text).style(Style::default().fg(Color::Red));
                 f.render_widget(paragraph, f.area());
             }
 
@@ -467,7 +475,6 @@ impl TuiRunner {
         self.metrics.frames_rendered += 1;
         Ok(())
     }
-
 
     /// Render device selection modal as an overlay
     fn render_device_selection_modal(f: &mut Frame, area: Rect, state: &DeviceSelectionState) {

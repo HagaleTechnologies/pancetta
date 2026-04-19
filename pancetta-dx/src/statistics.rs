@@ -503,9 +503,8 @@ impl StatisticsEngine {
 
     async fn calculate_band_breakdown(&self) -> Result<HashMap<Band, u32>> {
         let conn = self.tracker.connection.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT band, COUNT(*) as cnt FROM tracked_contacts GROUP BY band",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT band, COUNT(*) as cnt FROM tracked_contacts GROUP BY band")?;
         let rows = stmt.query_map([], |row| {
             let band_str: String = row.get(0)?;
             let count: i64 = row.get(1)?;
@@ -523,9 +522,8 @@ impl StatisticsEngine {
 
     async fn calculate_mode_breakdown(&self) -> Result<HashMap<Mode, u32>> {
         let conn = self.tracker.connection.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT mode, COUNT(*) as cnt FROM tracked_contacts GROUP BY mode",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT mode, COUNT(*) as cnt FROM tracked_contacts GROUP BY mode")?;
         let rows = stmt.query_map([], |row| {
             let mode_str: String = row.get(0)?;
             let count: i64 = row.get(1)?;
@@ -587,13 +585,15 @@ impl StatisticsEngine {
         let (first, last) = self.get_qso_date_range().await?;
         match (first, last) {
             (Some(first_date), Some(last_date)) => {
-                let days = last_date.signed_duration_since(first_date).num_days().max(1);
+                let days = last_date
+                    .signed_duration_since(first_date)
+                    .num_days()
+                    .max(1);
                 let conn = self.tracker.connection.lock().unwrap();
-                let total: i64 = conn.query_row(
-                    "SELECT COUNT(*) FROM tracked_contacts",
-                    [],
-                    |row| row.get(0),
-                )?;
+                let total: i64 =
+                    conn.query_row("SELECT COUNT(*) FROM tracked_contacts", [], |row| {
+                        row.get(0)
+                    })?;
                 Ok(total as f64 / days as f64)
             }
             _ => Ok(0.0),
@@ -647,9 +647,8 @@ impl StatisticsEngine {
 
     async fn calculate_countries_per_continent(&self) -> Result<HashMap<String, u32>> {
         let conn = self.tracker.connection.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT dxcc_entity FROM tracked_contacts GROUP BY dxcc_entity",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT dxcc_entity FROM tracked_contacts GROUP BY dxcc_entity")?;
         let rows = stmt.query_map([], |row| {
             let entity_code: i64 = row.get(0)?;
             Ok(entity_code as u16)

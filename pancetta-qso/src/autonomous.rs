@@ -822,7 +822,12 @@ impl AutonomousOperator {
     /// Get the best frequency for a new QSO using the smart allocator.
     /// Falls back to the legacy allocator if no spectral data is available.
     fn allocate_smart_frequency(&self, dx_target_hz: Option<f64>) -> f64 {
-        let own_freqs: Vec<f64> = self.frequency_allocator.own_frequencies().values().copied().collect();
+        let own_freqs: Vec<f64> = self
+            .frequency_allocator
+            .own_frequencies()
+            .values()
+            .copied()
+            .collect();
 
         if let Some(ref spectral) = self.spectral_snapshot {
             let candidates = self.smart_allocator.rank_candidates(
@@ -1593,7 +1598,8 @@ mod tests {
             1000.0,
             Some("qso-1".to_string()),
         );
-        op.frequency_allocator_mut().register_qso_frequency("qso-1", 1000.0);
+        op.frequency_allocator_mut()
+            .register_qso_frequency("qso-1", 1000.0);
 
         // Feed a high-scoring CQ
         let evaluator = HighScoreEvaluator(0.8);
@@ -1616,7 +1622,12 @@ mod tests {
             .collect();
 
         // Should have 2 transmissions: sequencer message + new CQ response
-        assert_eq!(tx_actions.len(), 2, "Expected 2 TX actions, got {:?}", tx_actions);
+        assert_eq!(
+            tx_actions.len(),
+            2,
+            "Expected 2 TX actions, got {:?}",
+            tx_actions
+        );
     }
 
     #[test]
@@ -1636,7 +1647,8 @@ mod tests {
             1000.0,
             Some("qso-1".to_string()),
         );
-        op.frequency_allocator_mut().register_qso_frequency("qso-1", 1000.0);
+        op.frequency_allocator_mut()
+            .register_qso_frequency("qso-1", 1000.0);
 
         // Feed a moderate-scoring CQ (below threshold)
         let evaluator = HighScoreEvaluator(0.6);
@@ -1659,7 +1671,12 @@ mod tests {
             .collect();
 
         // Should only have 1 transmission (existing QSO, not the new CQ)
-        assert_eq!(tx_actions.len(), 1, "Expected 1 TX action, got {:?}", tx_actions);
+        assert_eq!(
+            tx_actions.len(),
+            1,
+            "Expected 1 TX action, got {:?}",
+            tx_actions
+        );
     }
 
     #[test]
@@ -1675,8 +1692,16 @@ mod tests {
 
         // Already at max QSOs
         op.set_active_qso_count(2);
-        op.add_pending_sequencer_message("K1A W1ABC -10".to_string(), 1000.0, Some("q1".to_string()));
-        op.add_pending_sequencer_message("K2B W1ABC -12".to_string(), 1200.0, Some("q2".to_string()));
+        op.add_pending_sequencer_message(
+            "K1A W1ABC -10".to_string(),
+            1000.0,
+            Some("q1".to_string()),
+        );
+        op.add_pending_sequencer_message(
+            "K2B W1ABC -12".to_string(),
+            1200.0,
+            Some("q2".to_string()),
+        );
 
         let evaluator = HighScoreEvaluator(0.95);
         op.feed_decoded_messages(

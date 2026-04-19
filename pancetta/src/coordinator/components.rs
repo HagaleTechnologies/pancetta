@@ -38,9 +38,9 @@ impl Drop for PttGuard {
                 let ptt_off_msg = ComponentMessage::new(
                     ComponentId::Ft8Transmitter,
                     ComponentId::Hamlib,
-                    MessageType::RigControl(
-                        crate::message_bus::RigControlMessage::SetPtt { state: false },
-                    ),
+                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                        state: false,
+                    }),
                     Instant::now(),
                 );
                 if let Err(e) = bus.send_message(ptt_off_msg).await {
@@ -141,27 +141,35 @@ impl super::ApplicationCoordinator {
                 tokio::spawn(async move {
                     while !tx_shutdown.load(Ordering::Acquire) {
                         match qso_events.recv().await {
-                            Ok(pancetta_qso::QsoEvent::StateChanged {
-                                new_state,
-                                ..
-                            }) => {
+                            Ok(pancetta_qso::QsoEvent::StateChanged { new_state, .. }) => {
                                 // Map QSO state to AP context for AP3/AP4 decoding
                                 let new_ap = match &new_state {
-                                    pancetta_qso::QsoState::RespondingToCq { target_callsign, .. }
-                                    | pancetta_qso::QsoState::WaitingForReport { their_callsign: target_callsign, .. }
-                                    | pancetta_qso::QsoState::SendingReport { their_callsign: target_callsign, .. } => {
-                                        pancetta_ft8::QsoAp::new(
-                                            target_callsign,
-                                            pancetta_ft8::QsoApProgress::WaitingForReport,
-                                        )
+                                    pancetta_qso::QsoState::RespondingToCq {
+                                        target_callsign,
+                                        ..
                                     }
-                                    pancetta_qso::QsoState::WaitingForConfirmation { their_callsign, .. }
-                                    | pancetta_qso::QsoState::SendingConfirmation { their_callsign, .. } => {
-                                        pancetta_ft8::QsoAp::new(
-                                            their_callsign,
-                                            pancetta_ft8::QsoApProgress::WaitingForConfirmation,
-                                        )
+                                    | pancetta_qso::QsoState::WaitingForReport {
+                                        their_callsign: target_callsign,
+                                        ..
                                     }
+                                    | pancetta_qso::QsoState::SendingReport {
+                                        their_callsign: target_callsign,
+                                        ..
+                                    } => pancetta_ft8::QsoAp::new(
+                                        target_callsign,
+                                        pancetta_ft8::QsoApProgress::WaitingForReport,
+                                    ),
+                                    pancetta_qso::QsoState::WaitingForConfirmation {
+                                        their_callsign,
+                                        ..
+                                    }
+                                    | pancetta_qso::QsoState::SendingConfirmation {
+                                        their_callsign,
+                                        ..
+                                    } => pancetta_ft8::QsoAp::new(
+                                        their_callsign,
+                                        pancetta_ft8::QsoApProgress::WaitingForConfirmation,
+                                    ),
                                     // Terminal or idle states clear the AP context
                                     _ => None,
                                 };
@@ -223,9 +231,14 @@ impl super::ApplicationCoordinator {
                                             frequency: metadata.frequency as u64,
                                             mode: metadata.mode.clone(),
                                             rst_sent: metadata.reports.sent.map(|r| r.to_string()),
-                                            rst_received: metadata.reports.received.map(|r| r.to_string()),
+                                            rst_received: metadata
+                                                .reports
+                                                .received
+                                                .map(|r| r.to_string()),
                                             start_time: metadata.start_time,
-                                            end_time: metadata.end_time.unwrap_or_else(chrono::Utc::now),
+                                            end_time: metadata
+                                                .end_time
+                                                .unwrap_or_else(chrono::Utc::now),
                                         });
                                     }
                                 }
@@ -803,11 +816,9 @@ impl super::ApplicationCoordinator {
             crossbeam_channel::bounded::<Vec<Vec<f32>>>(2);
         self.waterfall_to_auto_tx = Some(waterfall_to_auto_tx);
 
-        let evaluator: std::sync::Arc<dyn pancetta_qso::DxEvaluator> =
-            std::sync::Arc::new(pancetta_qso::PriorityScorer::new(
-                priority_weights,
-                Box::new((*cached_lookup).clone()),
-            ));
+        let evaluator: std::sync::Arc<dyn pancetta_qso::DxEvaluator> = std::sync::Arc::new(
+            pancetta_qso::PriorityScorer::new(priority_weights, Box::new((*cached_lookup).clone())),
+        );
 
         let (_auto_tx, auto_rx) = self
             .message_bus

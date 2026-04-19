@@ -78,18 +78,32 @@ pub trait WorkedStationLookup: Send + Sync {
 pub struct NullLookup;
 
 impl WorkedStationLookup for NullLookup {
-    fn is_duplicate(&self, _callsign: &str, _freq_hz: f64) -> bool { false }
-    fn is_recent_failure(&self, _callsign: &str) -> bool { false }
-    fn is_needed_dxcc(&self, _callsign: &str) -> bool { false }
-    fn is_needed_grid(&self, _grid: &str) -> bool { false }
+    fn is_duplicate(&self, _callsign: &str, _freq_hz: f64) -> bool {
+        false
+    }
+    fn is_recent_failure(&self, _callsign: &str) -> bool {
+        false
+    }
+    fn is_needed_dxcc(&self, _callsign: &str) -> bool {
+        false
+    }
+    fn is_needed_grid(&self, _grid: &str) -> bool {
+        false
+    }
 }
 
 /// Detect POTA/SOTA activators from callsign patterns.
 pub fn is_pota_sota_candidate(callsign: &str) -> bool {
     let upper = callsign.to_uppercase();
-    if upper.ends_with("/P") { return true; }
-    if upper.ends_with("/QRP") { return true; }
-    if upper.contains('/') { return true; }
+    if upper.ends_with("/P") {
+        return true;
+    }
+    if upper.ends_with("/QRP") {
+        return true;
+    }
+    if upper.contains('/') {
+        return true;
+    }
     false
 }
 
@@ -118,16 +132,32 @@ impl PriorityScorer {
         snr: i8,
         freq_hz: f64,
     ) -> ScoreBreakdown {
-        let needed_dxcc = if self.lookup.is_needed_dxcc(callsign) { 1.0 } else { 0.0 };
+        let needed_dxcc = if self.lookup.is_needed_dxcc(callsign) {
+            1.0
+        } else {
+            0.0
+        };
         let needed_grid = match grid {
             Some(g) if self.lookup.is_needed_grid(g) => 1.0,
             _ => 0.0,
         };
-        let pota_sota = if is_pota_sota_candidate(callsign) { 1.0 } else { 0.0 };
+        let pota_sota = if is_pota_sota_candidate(callsign) {
+            1.0
+        } else {
+            0.0
+        };
         let rarity = self.lookup.rarity(callsign);
         let signal_strength = normalize_snr(snr);
-        let duplicate_penalty = if self.lookup.is_duplicate(callsign, freq_hz) { 1.0 } else { 0.0 };
-        let recent_failure_penalty = if self.lookup.is_recent_failure(callsign) { 1.0 } else { 0.0 };
+        let duplicate_penalty = if self.lookup.is_duplicate(callsign, freq_hz) {
+            1.0
+        } else {
+            0.0
+        };
+        let recent_failure_penalty = if self.lookup.is_recent_failure(callsign) {
+            1.0
+        } else {
+            0.0
+        };
 
         let raw_score = needed_dxcc * self.weights.needed_dxcc
             + needed_grid * self.weights.needed_grid
@@ -141,8 +171,14 @@ impl PriorityScorer {
 
         ScoreBreakdown {
             callsign: callsign.to_string(),
-            needed_dxcc, needed_grid, pota_sota, rarity,
-            signal_strength, duplicate_penalty, recent_failure_penalty, total,
+            needed_dxcc,
+            needed_grid,
+            pota_sota,
+            rarity,
+            signal_strength,
+            duplicate_penalty,
+            recent_failure_penalty,
+            total,
         }
     }
 }
@@ -213,8 +249,16 @@ mod tests {
     fn test_null_lookup_baseline_score() {
         let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(NullLookup));
         let score = scorer.evaluate_cq("W1ABC", Some("FN42"), -10, 14074000.0);
-        assert!(score > 0.0, "Baseline score should be positive, got {}", score);
-        assert!(score < 0.5, "Baseline score should be modest, got {}", score);
+        assert!(
+            score > 0.0,
+            "Baseline score should be positive, got {}",
+            score
+        );
+        assert!(
+            score < 0.5,
+            "Baseline score should be modest, got {}",
+            score
+        );
     }
 
     #[test]
@@ -227,8 +271,12 @@ mod tests {
         let scorer_null = PriorityScorer::new(PriorityWeights::default(), Box::new(NullLookup));
         let score_not_needed = scorer_null.evaluate_cq("JA1ABC", Some("PM95"), -10, 14074000.0);
 
-        assert!(score_needed > score_not_needed,
-            "Needed DXCC should boost score: {} vs {}", score_needed, score_not_needed);
+        assert!(
+            score_needed > score_not_needed,
+            "Needed DXCC should boost score: {} vs {}",
+            score_needed,
+            score_not_needed
+        );
     }
 
     #[test]
@@ -241,8 +289,12 @@ mod tests {
         let scorer_null = PriorityScorer::new(PriorityWeights::default(), Box::new(NullLookup));
         let score_fresh = scorer_null.evaluate_cq("K1DEF", Some("FN31"), -10, 14074000.0);
 
-        assert!(score_dup < score_fresh,
-            "Duplicate should reduce score: {} vs {}", score_dup, score_fresh);
+        assert!(
+            score_dup < score_fresh,
+            "Duplicate should reduce score: {} vs {}",
+            score_dup,
+            score_fresh
+        );
     }
 
     #[test]
@@ -250,8 +302,12 @@ mod tests {
         let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(NullLookup));
         let score_regular = scorer.evaluate_cq("W1ABC", Some("FN42"), -10, 14074000.0);
         let score_portable = scorer.evaluate_cq("W1ABC/P", Some("FN42"), -10, 14074000.0);
-        assert!(score_portable > score_regular,
-            "POTA/SOTA portable should boost score: {} vs {}", score_portable, score_regular);
+        assert!(
+            score_portable > score_regular,
+            "POTA/SOTA portable should boost score: {} vs {}",
+            score_portable,
+            score_regular
+        );
     }
 
     #[test]
@@ -259,8 +315,12 @@ mod tests {
         let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(NullLookup));
         let score_weak = scorer.evaluate_cq("W1ABC", Some("FN42"), -20, 14074000.0);
         let score_strong = scorer.evaluate_cq("W1ABC", Some("FN42"), 5, 14074000.0);
-        assert!(score_strong > score_weak,
-            "Stronger signal should be slightly preferred: {} vs {}", score_strong, score_weak);
+        assert!(
+            score_strong > score_weak,
+            "Stronger signal should be slightly preferred: {} vs {}",
+            score_strong,
+            score_weak
+        );
     }
 
     #[test]
@@ -270,29 +330,49 @@ mod tests {
         lookup.duplicates.insert("ZL1ABC".to_string());
         let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
         let breakdown = scorer.score_cq_detailed("ZL1ABC", Some("RF73"), -10, 14074000.0);
-        assert!(breakdown.duplicate_penalty > 0.0, "Duplicate factor should be active");
-        assert!(breakdown.needed_dxcc > 0.0, "Needed DXCC factor should be active");
+        assert!(
+            breakdown.duplicate_penalty > 0.0,
+            "Duplicate factor should be active"
+        );
+        assert!(
+            breakdown.needed_dxcc > 0.0,
+            "Needed DXCC factor should be active"
+        );
     }
 
     #[test]
     fn test_custom_weights() {
         let weights = PriorityWeights {
-            needed_dxcc: 0.0, needed_grid: 0.0, pota_sota: 1.0,
-            rarity: 0.0, signal_strength: 0.0, duplicate_penalty: 0.0,
+            needed_dxcc: 0.0,
+            needed_grid: 0.0,
+            pota_sota: 1.0,
+            rarity: 0.0,
+            signal_strength: 0.0,
+            duplicate_penalty: 0.0,
             recent_failure_penalty: 0.0,
         };
         let scorer = PriorityScorer::new(weights, Box::new(NullLookup));
         let score_regular = scorer.evaluate_cq("W1ABC", None, -10, 14074000.0);
         let score_portable = scorer.evaluate_cq("W1ABC/P", None, -10, 14074000.0);
-        assert!((score_regular - 0.0).abs() < 0.01, "Non-portable should score ~0 with pota-only weights");
-        assert!((score_portable - 1.0).abs() < 0.01, "Portable should score ~1.0 with pota-only weights");
+        assert!(
+            (score_regular - 0.0).abs() < 0.01,
+            "Non-portable should score ~0 with pota-only weights"
+        );
+        assert!(
+            (score_portable - 1.0).abs() < 0.01,
+            "Portable should score ~1.0 with pota-only weights"
+        );
     }
 
     #[test]
     fn test_score_clamped_to_0_1() {
         let weights = PriorityWeights {
-            needed_dxcc: 1.0, needed_grid: 1.0, pota_sota: 1.0,
-            rarity: 1.0, signal_strength: 1.0, duplicate_penalty: 0.0,
+            needed_dxcc: 1.0,
+            needed_grid: 1.0,
+            pota_sota: 1.0,
+            rarity: 1.0,
+            signal_strength: 1.0,
+            duplicate_penalty: 0.0,
             recent_failure_penalty: 0.0,
         };
         let mut lookup = TestLookup::new();
@@ -300,8 +380,16 @@ mod tests {
         lookup.needed_grids.insert("FN42".to_string());
         let scorer = PriorityScorer::new(weights, Box::new(lookup));
         let score = scorer.evaluate_cq("W1ABC/P", Some("FN42"), 10, 14074000.0);
-        assert!(score <= 1.0, "Score should be clamped to 1.0, got {}", score);
-        assert!(score >= 0.0, "Score should be clamped to 0.0, got {}", score);
+        assert!(
+            score <= 1.0,
+            "Score should be clamped to 1.0, got {}",
+            score
+        );
+        assert!(
+            score >= 0.0,
+            "Score should be clamped to 0.0, got {}",
+            score
+        );
     }
 
     #[test]
@@ -309,7 +397,10 @@ mod tests {
         let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(NullLookup));
         let trait_score = scorer.evaluate_cq("W1ABC", Some("FN42"), -10, 14074000.0);
         let detailed = scorer.score_cq_detailed("W1ABC", Some("FN42"), -10, 14074000.0);
-        assert!((trait_score - detailed.total).abs() < f64::EPSILON, "Trait and detailed should match");
+        assert!(
+            (trait_score - detailed.total).abs() < f64::EPSILON,
+            "Trait and detailed should match"
+        );
     }
 
     struct RarityLookup {
@@ -317,10 +408,18 @@ mod tests {
     }
 
     impl WorkedStationLookup for RarityLookup {
-        fn is_duplicate(&self, _callsign: &str, _freq_hz: f64) -> bool { false }
-        fn is_recent_failure(&self, _callsign: &str) -> bool { false }
-        fn is_needed_dxcc(&self, _callsign: &str) -> bool { false }
-        fn is_needed_grid(&self, _grid: &str) -> bool { false }
+        fn is_duplicate(&self, _callsign: &str, _freq_hz: f64) -> bool {
+            false
+        }
+        fn is_recent_failure(&self, _callsign: &str) -> bool {
+            false
+        }
+        fn is_needed_dxcc(&self, _callsign: &str) -> bool {
+            false
+        }
+        fn is_needed_grid(&self, _grid: &str) -> bool {
+            false
+        }
         fn rarity(&self, callsign: &str) -> f64 {
             self.rarity_map.get(callsign).copied().unwrap_or(0.5)
         }
@@ -332,22 +431,36 @@ mod tests {
         rarity_map.insert("3Y0J".to_string(), 0.98);
 
         let weights = PriorityWeights {
-            needed_dxcc: 0.0, needed_grid: 0.0, pota_sota: 0.0,
-            rarity: 1.0, signal_strength: 0.0, duplicate_penalty: 0.0,
+            needed_dxcc: 0.0,
+            needed_grid: 0.0,
+            pota_sota: 0.0,
+            rarity: 1.0,
+            signal_strength: 0.0,
+            duplicate_penalty: 0.0,
             recent_failure_penalty: 0.0,
         };
 
-        let scorer_rare = PriorityScorer::new(weights.clone(), Box::new(RarityLookup {
-            rarity_map: rarity_map.clone(),
-        }));
+        let scorer_rare = PriorityScorer::new(
+            weights.clone(),
+            Box::new(RarityLookup {
+                rarity_map: rarity_map.clone(),
+            }),
+        );
         let scorer_common = PriorityScorer::new(weights, Box::new(NullLookup));
 
         let score_rare = scorer_rare.evaluate_cq("3Y0J", None, -10, 14074000.0);
         let score_common = scorer_common.evaluate_cq("W1ABC", None, -10, 14074000.0);
 
-        assert!(score_rare > score_common,
-            "Rare station should score higher: {} vs {}", score_rare, score_common);
-        assert!((score_rare - 0.98).abs() < 0.01,
-            "Rarity-only score should be ~0.98, got {}", score_rare);
+        assert!(
+            score_rare > score_common,
+            "Rare station should score higher: {} vs {}",
+            score_rare,
+            score_common
+        );
+        assert!(
+            (score_rare - 0.98).abs() < 0.01,
+            "Rarity-only score should be ~0.98, got {}",
+            score_rare
+        );
     }
 }

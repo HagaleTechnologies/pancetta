@@ -132,67 +132,375 @@ impl DxccDatabase {
         // =====================================================
 
         // --- North America ---
-        self.add_default_entity(1, "CANADA", "VE", 9, 5, "NA", 45.0, -75.0, -5.0, "Canada", None);
-        self.add_default_entity(291, "UNITED STATES", "W", 8, 5, "NA", 40.0, -95.0, -6.0, "United States", None);
-        self.add_default_entity(50, "MEXICO", "XE", 10, 6, "NA", 19.4, -99.1, -6.0, "Mexico", None);
-        self.add_default_entity(202, "PUERTO RICO", "KP4", 11, 8, "NA", 18.2, -66.5, -4.0, "Puerto Rico", None);
+        self.add_default_entity(
+            1, "CANADA", "VE", 9, 5, "NA", 45.0, -75.0, -5.0, "Canada", None,
+        );
+        self.add_default_entity(
+            291,
+            "UNITED STATES",
+            "W",
+            8,
+            5,
+            "NA",
+            40.0,
+            -95.0,
+            -6.0,
+            "United States",
+            None,
+        );
+        self.add_default_entity(
+            50, "MEXICO", "XE", 10, 6, "NA", 19.4, -99.1, -6.0, "Mexico", None,
+        );
+        self.add_default_entity(
+            202,
+            "PUERTO RICO",
+            "KP4",
+            11,
+            8,
+            "NA",
+            18.2,
+            -66.5,
+            -4.0,
+            "Puerto Rico",
+            None,
+        );
 
         // Legacy entity codes kept for backward compatibility with existing QSO databases
-        self.add_default_entity(14, "SPAIN", "EA", 37, 14, "EU", 40.0, -4.0, 1.0, "Spain", Some("Legacy entity code; correct ARRL code is 281"));
-        self.add_default_entity(61, "JAPAN", "JA", 45, 25, "AS", 36.0, 138.0, 9.0, "Japan", Some("Legacy entity code; correct ARRL code is 339"));
-        self.add_default_entity(78, "FEDERAL REPUBLIC OF GERMANY", "DL", 28, 14, "EU", 51.0, 9.0, 1.0, "Germany", Some("Legacy entity code; correct ARRL code is 230"));
+        self.add_default_entity(
+            14,
+            "SPAIN",
+            "EA",
+            37,
+            14,
+            "EU",
+            40.0,
+            -4.0,
+            1.0,
+            "Spain",
+            Some("Legacy entity code; correct ARRL code is 281"),
+        );
+        self.add_default_entity(
+            61,
+            "JAPAN",
+            "JA",
+            45,
+            25,
+            "AS",
+            36.0,
+            138.0,
+            9.0,
+            "Japan",
+            Some("Legacy entity code; correct ARRL code is 339"),
+        );
+        self.add_default_entity(
+            78,
+            "FEDERAL REPUBLIC OF GERMANY",
+            "DL",
+            28,
+            14,
+            "EU",
+            51.0,
+            9.0,
+            1.0,
+            "Germany",
+            Some("Legacy entity code; correct ARRL code is 230"),
+        );
 
         // --- Europe ---
-        self.add_default_entity(223, "ENGLAND", "G", 27, 14, "EU", 51.5, -0.1, 0.0, "England", None);
-        self.add_default_entity(230, "FEDERAL REPUBLIC OF GERMANY", "DL", 28, 14, "EU", 51.0, 9.0, 1.0, "Germany", Some("Correct ARRL DXCC code"));
-        self.add_default_entity(227, "FRANCE", "F", 27, 14, "EU", 48.9, 2.3, 1.0, "France", None);
-        self.add_default_entity(248, "ITALY", "I", 28, 15, "EU", 41.9, 12.5, 1.0, "Italy", None);
-        self.add_default_entity(281, "SPAIN", "EA", 37, 14, "EU", 40.0, -4.0, 1.0, "Spain", Some("Correct ARRL DXCC code"));
-        self.add_default_entity(263, "NETHERLANDS", "PA", 27, 14, "EU", 52.4, 4.9, 1.0, "Netherlands", None);
-        self.add_default_entity(209, "BELGIUM", "ON", 27, 14, "EU", 50.8, 4.4, 1.0, "Belgium", None);
-        self.add_default_entity(287, "SWITZERLAND", "HB", 28, 14, "EU", 46.9, 7.4, 1.0, "Switzerland", None);
-        self.add_default_entity(269, "POLAND", "SP", 28, 15, "EU", 52.2, 21.0, 1.0, "Poland", None);
-        self.add_default_entity(503, "CZECH REPUBLIC", "OK", 28, 15, "EU", 50.1, 14.4, 1.0, "Czech Republic", None);
-        self.add_default_entity(284, "SWEDEN", "SM", 18, 14, "EU", 59.3, 18.1, 1.0, "Sweden", None);
-        self.add_default_entity(266, "NORWAY", "LA", 18, 14, "EU", 59.9, 10.7, 1.0, "Norway", None);
-        self.add_default_entity(222, "FINLAND", "OH", 18, 15, "EU", 60.2, 24.9, 2.0, "Finland", None);
-        self.add_default_entity(221, "DENMARK", "OZ", 18, 14, "EU", 55.7, 12.6, 1.0, "Denmark", None);
-        self.add_default_entity(206, "AUSTRIA", "OE", 28, 15, "EU", 48.2, 16.4, 1.0, "Austria", None);
-        self.add_default_entity(272, "PORTUGAL", "CT", 37, 14, "EU", 38.7, -9.1, 0.0, "Portugal", None);
-        self.add_default_entity(245, "IRELAND", "EI", 27, 14, "EU", 53.3, -6.3, 0.0, "Ireland", None);
-        self.add_default_entity(279, "SCOTLAND", "GM", 27, 14, "EU", 55.9, -3.2, 0.0, "Scotland", None);
-        self.add_default_entity(294, "WALES", "GW", 27, 14, "EU", 51.5, -3.2, 0.0, "Wales", None);
-        self.add_default_entity(15, "ASIATIC RUSSIA", "UA", 30, 16, "AS", 55.8, 37.6, 3.0, "Russia", Some("Asiatic Russia DXCC entity"));
-        self.add_default_entity(54, "EUROPEAN RUSSIA", "UA", 29, 16, "EU", 55.8, 37.6, 3.0, "European Russia", None);
-        self.add_default_entity(288, "UKRAINE", "UR", 29, 16, "EU", 50.4, 30.5, 2.0, "Ukraine", None);
+        self.add_default_entity(
+            223, "ENGLAND", "G", 27, 14, "EU", 51.5, -0.1, 0.0, "England", None,
+        );
+        self.add_default_entity(
+            230,
+            "FEDERAL REPUBLIC OF GERMANY",
+            "DL",
+            28,
+            14,
+            "EU",
+            51.0,
+            9.0,
+            1.0,
+            "Germany",
+            Some("Correct ARRL DXCC code"),
+        );
+        self.add_default_entity(
+            227, "FRANCE", "F", 27, 14, "EU", 48.9, 2.3, 1.0, "France", None,
+        );
+        self.add_default_entity(
+            248, "ITALY", "I", 28, 15, "EU", 41.9, 12.5, 1.0, "Italy", None,
+        );
+        self.add_default_entity(
+            281,
+            "SPAIN",
+            "EA",
+            37,
+            14,
+            "EU",
+            40.0,
+            -4.0,
+            1.0,
+            "Spain",
+            Some("Correct ARRL DXCC code"),
+        );
+        self.add_default_entity(
+            263,
+            "NETHERLANDS",
+            "PA",
+            27,
+            14,
+            "EU",
+            52.4,
+            4.9,
+            1.0,
+            "Netherlands",
+            None,
+        );
+        self.add_default_entity(
+            209, "BELGIUM", "ON", 27, 14, "EU", 50.8, 4.4, 1.0, "Belgium", None,
+        );
+        self.add_default_entity(
+            287,
+            "SWITZERLAND",
+            "HB",
+            28,
+            14,
+            "EU",
+            46.9,
+            7.4,
+            1.0,
+            "Switzerland",
+            None,
+        );
+        self.add_default_entity(
+            269, "POLAND", "SP", 28, 15, "EU", 52.2, 21.0, 1.0, "Poland", None,
+        );
+        self.add_default_entity(
+            503,
+            "CZECH REPUBLIC",
+            "OK",
+            28,
+            15,
+            "EU",
+            50.1,
+            14.4,
+            1.0,
+            "Czech Republic",
+            None,
+        );
+        self.add_default_entity(
+            284, "SWEDEN", "SM", 18, 14, "EU", 59.3, 18.1, 1.0, "Sweden", None,
+        );
+        self.add_default_entity(
+            266, "NORWAY", "LA", 18, 14, "EU", 59.9, 10.7, 1.0, "Norway", None,
+        );
+        self.add_default_entity(
+            222, "FINLAND", "OH", 18, 15, "EU", 60.2, 24.9, 2.0, "Finland", None,
+        );
+        self.add_default_entity(
+            221, "DENMARK", "OZ", 18, 14, "EU", 55.7, 12.6, 1.0, "Denmark", None,
+        );
+        self.add_default_entity(
+            206, "AUSTRIA", "OE", 28, 15, "EU", 48.2, 16.4, 1.0, "Austria", None,
+        );
+        self.add_default_entity(
+            272, "PORTUGAL", "CT", 37, 14, "EU", 38.7, -9.1, 0.0, "Portugal", None,
+        );
+        self.add_default_entity(
+            245, "IRELAND", "EI", 27, 14, "EU", 53.3, -6.3, 0.0, "Ireland", None,
+        );
+        self.add_default_entity(
+            279, "SCOTLAND", "GM", 27, 14, "EU", 55.9, -3.2, 0.0, "Scotland", None,
+        );
+        self.add_default_entity(
+            294, "WALES", "GW", 27, 14, "EU", 51.5, -3.2, 0.0, "Wales", None,
+        );
+        self.add_default_entity(
+            15,
+            "ASIATIC RUSSIA",
+            "UA",
+            30,
+            16,
+            "AS",
+            55.8,
+            37.6,
+            3.0,
+            "Russia",
+            Some("Asiatic Russia DXCC entity"),
+        );
+        self.add_default_entity(
+            54,
+            "EUROPEAN RUSSIA",
+            "UA",
+            29,
+            16,
+            "EU",
+            55.8,
+            37.6,
+            3.0,
+            "European Russia",
+            None,
+        );
+        self.add_default_entity(
+            288, "UKRAINE", "UR", 29, 16, "EU", 50.4, 30.5, 2.0, "Ukraine", None,
+        );
 
         // --- Asia ---
-        self.add_default_entity(339, "JAPAN", "JA", 45, 25, "AS", 36.0, 138.0, 9.0, "Japan", Some("Correct ARRL DXCC code"));
-        self.add_default_entity(318, "CHINA", "BY", 44, 24, "AS", 39.9, 116.4, 8.0, "China", None);
-        self.add_default_entity(386, "TAIWAN", "BV", 44, 24, "AS", 25.0, 121.5, 8.0, "Taiwan", None);
-        self.add_default_entity(137, "REPUBLIC OF KOREA", "HL", 44, 25, "AS", 37.6, 127.0, 9.0, "South Korea", None);
-        self.add_default_entity(324, "INDIA", "VU", 41, 22, "AS", 28.6, 77.2, 5.5, "India", None);
-        self.add_default_entity(387, "THAILAND", "HS", 49, 26, "AS", 13.8, 100.5, 7.0, "Thailand", None);
-        self.add_default_entity(375, "PHILIPPINES", "DU", 50, 27, "AS", 14.6, 121.0, 8.0, "Philippines", None);
-        self.add_default_entity(327, "INDONESIA", "YB", 51, 28, "AS", -6.2, 106.8, 7.0, "Indonesia", None);
+        self.add_default_entity(
+            339,
+            "JAPAN",
+            "JA",
+            45,
+            25,
+            "AS",
+            36.0,
+            138.0,
+            9.0,
+            "Japan",
+            Some("Correct ARRL DXCC code"),
+        );
+        self.add_default_entity(
+            318, "CHINA", "BY", 44, 24, "AS", 39.9, 116.4, 8.0, "China", None,
+        );
+        self.add_default_entity(
+            386, "TAIWAN", "BV", 44, 24, "AS", 25.0, 121.5, 8.0, "Taiwan", None,
+        );
+        self.add_default_entity(
+            137,
+            "REPUBLIC OF KOREA",
+            "HL",
+            44,
+            25,
+            "AS",
+            37.6,
+            127.0,
+            9.0,
+            "South Korea",
+            None,
+        );
+        self.add_default_entity(
+            324, "INDIA", "VU", 41, 22, "AS", 28.6, 77.2, 5.5, "India", None,
+        );
+        self.add_default_entity(
+            387, "THAILAND", "HS", 49, 26, "AS", 13.8, 100.5, 7.0, "Thailand", None,
+        );
+        self.add_default_entity(
+            375,
+            "PHILIPPINES",
+            "DU",
+            50,
+            27,
+            "AS",
+            14.6,
+            121.0,
+            8.0,
+            "Philippines",
+            None,
+        );
+        self.add_default_entity(
+            327,
+            "INDONESIA",
+            "YB",
+            51,
+            28,
+            "AS",
+            -6.2,
+            106.8,
+            7.0,
+            "Indonesia",
+            None,
+        );
 
         // --- South America ---
-        self.add_default_entity(108, "BRAZIL", "PY", 15, 11, "SA", -23.5, -46.6, -3.0, "Brazil", None);
-        self.add_default_entity(100, "ARGENTINA", "LU", 14, 13, "SA", -34.6, -58.4, -3.0, "Argentina", None);
-        self.add_default_entity(112, "CHILE", "CE", 14, 12, "SA", -33.4, -70.7, -4.0, "Chile", None);
-        self.add_default_entity(116, "COLOMBIA", "HK", 12, 9, "SA", 4.6, -74.1, -5.0, "Colombia", None);
-        self.add_default_entity(148, "VENEZUELA", "YV", 12, 9, "SA", 10.5, -66.9, -4.0, "Venezuela", None);
+        self.add_default_entity(
+            108, "BRAZIL", "PY", 15, 11, "SA", -23.5, -46.6, -3.0, "Brazil", None,
+        );
+        self.add_default_entity(
+            100,
+            "ARGENTINA",
+            "LU",
+            14,
+            13,
+            "SA",
+            -34.6,
+            -58.4,
+            -3.0,
+            "Argentina",
+            None,
+        );
+        self.add_default_entity(
+            112, "CHILE", "CE", 14, 12, "SA", -33.4, -70.7, -4.0, "Chile", None,
+        );
+        self.add_default_entity(
+            116, "COLOMBIA", "HK", 12, 9, "SA", 4.6, -74.1, -5.0, "Colombia", None,
+        );
+        self.add_default_entity(
+            148,
+            "VENEZUELA",
+            "YV",
+            12,
+            9,
+            "SA",
+            10.5,
+            -66.9,
+            -4.0,
+            "Venezuela",
+            None,
+        );
 
         // --- Oceania ---
-        self.add_default_entity(150, "AUSTRALIA", "VK", 59, 30, "OC", -33.9, 151.2, 10.0, "Australia", None);
-        self.add_default_entity(170, "NEW ZEALAND", "ZL", 60, 32, "OC", -41.3, 174.8, 12.0, "New Zealand", None);
-        self.add_default_entity(110, "HAWAII", "KH6", 61, 31, "OC", 21.3, -157.8, -10.0, "Hawaii", None);
+        self.add_default_entity(
+            150,
+            "AUSTRALIA",
+            "VK",
+            59,
+            30,
+            "OC",
+            -33.9,
+            151.2,
+            10.0,
+            "Australia",
+            None,
+        );
+        self.add_default_entity(
+            170,
+            "NEW ZEALAND",
+            "ZL",
+            60,
+            32,
+            "OC",
+            -41.3,
+            174.8,
+            12.0,
+            "New Zealand",
+            None,
+        );
+        self.add_default_entity(
+            110, "HAWAII", "KH6", 61, 31, "OC", 21.3, -157.8, -10.0, "Hawaii", None,
+        );
 
         // --- Africa ---
-        self.add_default_entity(462, "SOUTH AFRICA", "ZS", 57, 38, "AF", -33.9, 18.4, 2.0, "South Africa", None);
-        self.add_default_entity(450, "NIGERIA", "5N", 46, 35, "AF", 6.5, 3.4, 1.0, "Nigeria", None);
-        self.add_default_entity(430, "KENYA", "5Z", 48, 37, "AF", -1.3, 36.8, 3.0, "Kenya", None);
-        self.add_default_entity(446, "MOROCCO", "CN", 37, 33, "AF", 33.6, -7.6, 1.0, "Morocco", None);
+        self.add_default_entity(
+            462,
+            "SOUTH AFRICA",
+            "ZS",
+            57,
+            38,
+            "AF",
+            -33.9,
+            18.4,
+            2.0,
+            "South Africa",
+            None,
+        );
+        self.add_default_entity(
+            450, "NIGERIA", "5N", 46, 35, "AF", 6.5, 3.4, 1.0, "Nigeria", None,
+        );
+        self.add_default_entity(
+            430, "KENYA", "5Z", 48, 37, "AF", -1.3, 36.8, 3.0, "Kenya", None,
+        );
+        self.add_default_entity(
+            446, "MOROCCO", "CN", 37, 33, "AF", 33.6, -7.6, 1.0, "Morocco", None,
+        );
 
         // =====================================================
         // Prefix patterns for callsign lookup

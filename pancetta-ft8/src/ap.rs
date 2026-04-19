@@ -289,7 +289,11 @@ pub struct ApContext {
 #[inline]
 fn inject_bit(llrs: &mut [f32], pos: usize, bit: bool) {
     if pos < llrs.len() {
-        llrs[pos] = if bit { -AP_LLR_MAGNITUDE } else { AP_LLR_MAGNITUDE };
+        llrs[pos] = if bit {
+            -AP_LLR_MAGNITUDE
+        } else {
+            AP_LLR_MAGNITUDE
+        };
     }
 }
 
@@ -442,8 +446,7 @@ mod tests {
     #[test]
     fn test_inject_ap3() {
         let my_call = MyCallAp::new("K5ARH").expect("K5ARH should encode");
-        let qso = QsoAp::new("W1AW", QsoApProgress::WaitingForReport)
-            .expect("W1AW should encode");
+        let qso = QsoAp::new("W1AW", QsoApProgress::WaitingForReport).expect("W1AW should encode");
         let ctx = ApContext {
             my_call: Some(my_call.clone()),
             recent_calls: vec![],

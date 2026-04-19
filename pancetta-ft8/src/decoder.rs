@@ -14,8 +14,8 @@ use crate::{
     osd::{OsdConfig, OsdDecoder},
     protocol::ProtocolParams,
     signal_processing::{FftProcessor, WindowFunction},
-    DecodingMetrics, Ft8Error, Ft8Result, MessageHandler, NullMessageHandler, Protocol, NUM_TONES,
-    NUM_SYMBOLS, SAMPLE_RATE, SYMBOL_DURATION, TONE_SPACING,
+    DecodingMetrics, Ft8Error, Ft8Result, MessageHandler, NullMessageHandler, Protocol,
+    NUM_SYMBOLS, NUM_TONES, SAMPLE_RATE, SYMBOL_DURATION, TONE_SPACING,
 };
 use bitvec::prelude::*;
 use num_complex::Complex;
@@ -368,7 +368,8 @@ impl Ft8Decoder {
                 })
                 .collect();
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            let sync_candidates: Vec<CostasCandidate> = scored.into_iter().map(|(_, c)| c).collect();
+            let sync_candidates: Vec<CostasCandidate> =
+                scored.into_iter().map(|(_, c)| c).collect();
 
             if pass == 0 {
                 best_sync_score = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
@@ -432,7 +433,8 @@ impl Ft8Decoder {
                         let ldpc = LdpcDecoder::new_with_osd(
                             ctx.ldpc_iterations,
                             ctx.osd_depth.map(|d| OsdConfig { max_depth: d }),
-                        ).expect("LDPC decoder init failed");
+                        )
+                        .expect("LDPC decoder init failed");
                         let fft_buffer = vec![Complex::new(0.0, 0.0); sps];
                         (ldpc, fft_buffer)
                     },
@@ -548,11 +550,7 @@ impl Ft8Decoder {
     }
 
     /// Generate CPFSK I/Q reference signals for given symbols and frequency.
-    fn generate_cpfsk_iq(
-        symbols: &[u8],
-        base_freq: f64,
-        sps: usize,
-    ) -> (Vec<f64>, Vec<f64>) {
+    fn generate_cpfsk_iq(symbols: &[u8], base_freq: f64, sps: usize) -> (Vec<f64>, Vec<f64>) {
         use std::f64::consts::PI;
         let total_len = symbols.len() * sps;
         let mut recon_i = vec![0.0f64; total_len];
@@ -649,10 +647,11 @@ impl Ft8Decoder {
                 let recon_offset = (recon_start as isize - try_time) as usize;
                 let sig_len = (total_len.saturating_sub(recon_offset))
                     .min(audio.len().saturating_sub(recon_start));
-                if sig_len == 0 { continue; }
-                let energy = Self::correlation_energy(
-                    audio, recon_start, &ri, &rq, recon_offset, sig_len,
-                );
+                if sig_len == 0 {
+                    continue;
+                }
+                let energy =
+                    Self::correlation_energy(audio, recon_start, &ri, &rq, recon_offset, sig_len);
                 if energy > best_energy {
                     best_energy = energy;
                     best_freq = try_freq;
@@ -665,8 +664,8 @@ impl Ft8Decoder {
         let (recon_i, recon_q) = Self::generate_cpfsk_iq(symbols, best_freq, sps);
         let recon_start = best_time.max(0) as usize;
         let recon_offset = (recon_start as isize - best_time) as usize;
-        let signal_len = (total_len.saturating_sub(recon_offset))
-            .min(audio.len().saturating_sub(recon_start));
+        let signal_len =
+            (total_len.saturating_sub(recon_offset)).min(audio.len().saturating_sub(recon_start));
 
         if signal_len == 0 {
             return;
@@ -711,8 +710,7 @@ impl Ft8Decoder {
         // Subtract with 0.9 conservative factor
         let scale = 0.9;
         for i in 0..signal_len {
-            let subtracted = amp_i * recon_i[recon_offset + i]
-                + amp_q * recon_q[recon_offset + i];
+            let subtracted = amp_i * recon_i[recon_offset + i] + amp_q * recon_q[recon_offset + i];
             audio[recon_start + i] -= (subtracted * scale) as f32;
         }
 
@@ -752,14 +750,18 @@ impl Ft8Decoder {
         // For each sidelobe offset (+1 and -1 tone spacing)
         for &freq_offset in &[tone_spacing, -tone_spacing] {
             let shifted_freq = base_freq + freq_offset;
-            if shifted_freq < 0.0 { continue; }
+            if shifted_freq < 0.0 {
+                continue;
+            }
 
             let (recon_i, recon_q) = Self::generate_cpfsk_iq(symbols, shifted_freq, sps);
             let recon_start = nominal_time.max(0) as usize;
             let recon_offset = (recon_start as isize - nominal_time) as usize;
             let signal_len = (total_len.saturating_sub(recon_offset))
                 .min(audio.len().saturating_sub(recon_start));
-            if signal_len == 0 { continue; }
+            if signal_len == 0 {
+                continue;
+            }
 
             // Estimate amplitude via projection (same as subtract_signal)
             let mut dot_ai = 0.0f64;
@@ -789,8 +791,8 @@ impl Ft8Decoder {
 
             // Subtract sidelobe at reduced amplitude
             for i in 0..signal_len {
-                let subtracted = amp_i * recon_i[recon_offset + i]
-                    + amp_q * recon_q[recon_offset + i];
+                let subtracted =
+                    amp_i * recon_i[recon_offset + i] + amp_q * recon_q[recon_offset + i];
                 audio[recon_start + i] -= (subtracted * sidelobe_scale) as f32;
             }
         }
@@ -931,13 +933,17 @@ impl Ft8Decoder {
 
         for sym_idx in 0..pp.num_symbols {
             let t = candidate.time_step + sym_idx * steps_per_symbol;
-            if t >= spec.num_steps { break; }
+            if t >= spec.num_steps {
+                break;
+            }
 
             let mut best_power = f64::MIN;
             let mut best_tone = 0usize;
             for tone in 0..pp.num_tones {
                 let f = candidate.freq_bin + tone;
-                if f >= spec.num_bins { continue; }
+                if f >= spec.num_bins {
+                    continue;
+                }
                 let power = spec.power[t][candidate.freq_sub][f];
                 if power > best_power {
                     best_power = power;
@@ -948,15 +954,21 @@ impl Ft8Decoder {
             signal_count += 1;
 
             for tone in 0..pp.num_tones {
-                if tone == best_tone { continue; }
+                if tone == best_tone {
+                    continue;
+                }
                 let f = candidate.freq_bin + tone;
-                if f >= spec.num_bins { continue; }
+                if f >= spec.num_bins {
+                    continue;
+                }
                 noise_sum += spec.power[t][candidate.freq_sub][f];
                 noise_count += 1;
             }
         }
 
-        if signal_count == 0 || noise_count == 0 { return 0.0; }
+        if signal_count == 0 || noise_count == 0 {
+            return 0.0;
+        }
         (signal_sum / signal_count as f64) - (noise_sum / noise_count as f64)
     }
 
@@ -1163,7 +1175,10 @@ impl Ft8Decoder {
         let coarse_offset = candidate.time_step * spec_step;
 
         // Try both freq_sub values, same as the spectrogram path in decode_candidate
-        let freq_sub_trials = [candidate.freq_sub, if candidate.freq_sub == 0 { 1 } else { 0 }];
+        let freq_sub_trials = [
+            candidate.freq_sub,
+            if candidate.freq_sub == 0 { 1 } else { 0 },
+        ];
 
         for &trial_freq_sub in &freq_sub_trials {
             let trial_candidate = CostasCandidate {
@@ -1172,7 +1187,8 @@ impl Ft8Decoder {
                 freq_sub: trial_freq_sub,
                 sync_score: candidate.sync_score,
             };
-            let tone_magnitudes = self.extract_symbols_from_spectrogram(spectrogram, &trial_candidate);
+            let tone_magnitudes =
+                self.extract_symbols_from_spectrogram(spectrogram, &trial_candidate);
             let base_llrs = self.compute_soft_llrs_db(&tone_magnitudes);
 
             // Compute frequency and time for building DecodedMessage
@@ -1239,7 +1255,10 @@ impl Ft8Decoder {
 
                 // --- AP4: AP3 + message type constraint ---
                 if let Some(ref qso) = ap_context.active_qso {
-                    if matches!(qso.progress, crate::ap::QsoApProgress::WaitingForConfirmation) {
+                    if matches!(
+                        qso.progress,
+                        crate::ap::QsoApProgress::WaitingForConfirmation
+                    ) {
                         if let Some(msg) = self.try_ldpc_with_ap(
                             &base_llrs,
                             crate::ap::ApLevel::Ap4,
@@ -1403,7 +1422,10 @@ impl Ft8Decoder {
         // The spectrogram uses a 3840-pt FFT (3.125 Hz resolution), which
         // avoids the spectral leakage of the 1920-pt independent FFT.
         // Signals on a bin boundary may decode better with the other sub-bin.
-        let freq_sub_trials = [candidate.freq_sub, if candidate.freq_sub == 0 { 1 } else { 0 }];
+        let freq_sub_trials = [
+            candidate.freq_sub,
+            if candidate.freq_sub == 0 { 1 } else { 0 },
+        ];
         for &trial_freq_sub in &freq_sub_trials {
             let trial_candidate = CostasCandidate {
                 time_step: candidate.time_step,
@@ -1411,17 +1433,16 @@ impl Ft8Decoder {
                 freq_sub: trial_freq_sub,
                 sync_score: candidate.sync_score,
             };
-            let tone_magnitudes = self.extract_symbols_from_spectrogram(spectrogram, &trial_candidate);
+            let tone_magnitudes =
+                self.extract_symbols_from_spectrogram(spectrogram, &trial_candidate);
             let mut llrs = self.compute_soft_llrs_db(&tone_magnitudes);
             normalize_llrs(&mut llrs);
 
             if let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) {
                 if self.verify_crc(&corrected_bits) {
                     // CRC passed — compute frequency and time for the message
-                    let sub_bin_offset =
-                        trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
-                    let base_frequency =
-                        candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
+                    let sub_bin_offset = trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+                    let base_frequency = candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
                     let time_offset_samples = coarse_offset;
 
                     // For FT4, un-apply the XOR scrambling on the payload
@@ -1491,8 +1512,7 @@ impl Ft8Decoder {
                         time_offset_samples as f64 / SAMPLE_RATE as f64,
                     );
                     // Store tone symbols for multi-pass signal subtraction
-                    decoded_message.tone_symbols =
-                        Some(Self::codeword_to_symbols(&corrected_bits));
+                    decoded_message.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
 
                     #[cfg(feature = "debug-decode")]
                     eprintln!(
@@ -1657,8 +1677,7 @@ impl Ft8Decoder {
                     time_offset_samples as f64 / SAMPLE_RATE as f64,
                 );
                 // Store tone symbols for multi-pass signal subtraction
-                decoded_message.tone_symbols =
-                    Some(Self::codeword_to_symbols(&corrected_bits));
+                decoded_message.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
 
                 best_decode = Some(decoded_message);
                 return Ok(best_decode);
@@ -2123,7 +2142,10 @@ fn par_decode_candidate(
     let coarse_offset = candidate.time_step * spec_step;
 
     // ---- Spectrogram-based symbol extraction: try both freq_sub values ----
-    let freq_sub_trials = [candidate.freq_sub, if candidate.freq_sub == 0 { 1 } else { 0 }];
+    let freq_sub_trials = [
+        candidate.freq_sub,
+        if candidate.freq_sub == 0 { 1 } else { 0 },
+    ];
     for &trial_freq_sub in &freq_sub_trials {
         let trial_candidate = CostasCandidate {
             time_step: candidate.time_step,
@@ -2132,17 +2154,17 @@ fn par_decode_candidate(
             sync_score: candidate.sync_score,
         };
         let tone_magnitudes = par_extract_symbols_from_spectrogram(
-            ctx.protocol_params, ctx.spectrogram, &trial_candidate,
+            ctx.protocol_params,
+            ctx.spectrogram,
+            &trial_candidate,
         );
         let mut llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes);
         normalize_llrs(&mut llrs);
 
         if let Ok(corrected_bits) = ldpc.decode_soft(&llrs) {
             if par_verify_crc(&corrected_bits) {
-                let sub_bin_offset =
-                    trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
-                let base_frequency =
-                    candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
+                let sub_bin_offset = trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+                let base_frequency = candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
                 let time_offset_samples = coarse_offset;
 
                 let payload_bits = par_apply_xor(xor_sequence, &corrected_bits);
@@ -2251,8 +2273,7 @@ fn par_decode_candidate(
                 base_frequency,
                 time_offset_samples as f64 / SAMPLE_RATE as f64,
             );
-            decoded_message.tone_symbols =
-                Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
+            decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
 
             return Some(decoded_message);
         }
@@ -2274,7 +2295,10 @@ fn par_try_ap_decode(
     let spec_step = sps / (2 * TIME_OSR);
     let coarse_offset = candidate.time_step * spec_step;
 
-    let freq_sub_trials = [candidate.freq_sub, if candidate.freq_sub == 0 { 1 } else { 0 }];
+    let freq_sub_trials = [
+        candidate.freq_sub,
+        if candidate.freq_sub == 0 { 1 } else { 0 },
+    ];
 
     for &trial_freq_sub in &freq_sub_trials {
         let trial_candidate = CostasCandidate {
@@ -2284,7 +2308,9 @@ fn par_try_ap_decode(
             sync_score: candidate.sync_score,
         };
         let tone_magnitudes = par_extract_symbols_from_spectrogram(
-            ctx.protocol_params, ctx.spectrogram, &trial_candidate,
+            ctx.protocol_params,
+            ctx.spectrogram,
+            &trial_candidate,
         );
         let base_llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes);
 
@@ -2298,12 +2324,16 @@ fn par_try_ap_decode(
         // --- AP1: inject own callsign at bits 28-55 (called station) ---
         if ctx.ap_context.my_call.is_some() {
             if let Some(msg) = par_try_ldpc_with_ap(
-                ctx, ldpc,
+                ctx,
+                ldpc,
                 &base_llrs,
                 crate::ap::ApLevel::Ap1,
                 ctx.ap_context,
                 None,
-                snr_db, confidence, base_frequency, time_offset_s,
+                snr_db,
+                confidence,
+                base_frequency,
+                time_offset_s,
             ) {
                 return Some(msg);
             }
@@ -2316,12 +2346,16 @@ fn par_try_ap_decode(
                     continue;
                 }
                 if let Some(msg) = par_try_ldpc_with_ap(
-                    ctx, ldpc,
+                    ctx,
+                    ldpc,
                     &base_llrs,
                     crate::ap::ApLevel::Ap2,
                     ctx.ap_context,
                     Some(recent),
-                    snr_db, confidence, base_frequency, time_offset_s,
+                    snr_db,
+                    confidence,
+                    base_frequency,
+                    time_offset_s,
                 ) {
                     return Some(msg);
                 }
@@ -2331,26 +2365,37 @@ fn par_try_ap_decode(
         // --- AP3: both callsigns known (active QSO) ---
         if ctx.ap_context.active_qso.is_some() && ctx.ap_context.my_call.is_some() {
             if let Some(msg) = par_try_ldpc_with_ap(
-                ctx, ldpc,
+                ctx,
+                ldpc,
                 &base_llrs,
                 crate::ap::ApLevel::Ap3,
                 ctx.ap_context,
                 None,
-                snr_db, confidence, base_frequency, time_offset_s,
+                snr_db,
+                confidence,
+                base_frequency,
+                time_offset_s,
             ) {
                 return Some(msg);
             }
 
             // --- AP4: AP3 + message type constraint ---
             if let Some(ref qso) = ctx.ap_context.active_qso {
-                if matches!(qso.progress, crate::ap::QsoApProgress::WaitingForConfirmation) {
+                if matches!(
+                    qso.progress,
+                    crate::ap::QsoApProgress::WaitingForConfirmation
+                ) {
                     if let Some(msg) = par_try_ldpc_with_ap(
-                        ctx, ldpc,
+                        ctx,
+                        ldpc,
                         &base_llrs,
                         crate::ap::ApLevel::Ap4,
                         ctx.ap_context,
                         None,
-                        snr_db, confidence, base_frequency, time_offset_s,
+                        snr_db,
+                        confidence,
+                        base_frequency,
+                        time_offset_s,
                     ) {
                         return Some(msg);
                     }
@@ -2877,14 +2922,11 @@ impl LdpcDecoder {
 
             if parity_errors <= MAX_PARITY_ERRORS_FOR_OSD {
                 // Compute neural ordering if trajectory is available
-                let neural_ordering = trajectory.as_ref().map(|traj| {
-                    crate::neural_osd::predict_error_bits(traj)
-                });
+                let neural_ordering = trajectory
+                    .as_ref()
+                    .map(|traj| crate::neural_osd::predict_error_bits(traj));
 
-                if let Some(codeword) = osd.decode(
-                    llr_arr,
-                    neural_ordering.as_ref(),
-                ) {
+                if let Some(codeword) = osd.decode(llr_arr, neural_ordering.as_ref()) {
                     return Ok(codeword);
                 }
             }
@@ -2968,7 +3010,9 @@ impl LdpcDecoder {
                             c2v[check_idx][target_pos] = 2.0 * fast_atanh(product);
                         }
                     }
-                    LdpcAlgorithm::MinSum { normalization_factor } => {
+                    LdpcAlgorithm::MinSum {
+                        normalization_factor,
+                    } => {
                         // Compute sign product and find two smallest magnitudes across all edges
                         let mut total_sign: i8 = 1;
                         let mut min1_mag = f32::MAX;
@@ -3072,7 +3116,9 @@ impl LdpcDecoder {
                             c2v[check_idx][target_pos] = 2.0 * fast_atanh(product);
                         }
                     }
-                    LdpcAlgorithm::MinSum { normalization_factor } => {
+                    LdpcAlgorithm::MinSum {
+                        normalization_factor,
+                    } => {
                         let mut total_sign: i8 = 1;
                         let mut min1_mag = f32::MAX;
                         let mut min2_mag = f32::MAX;
@@ -3750,12 +3796,19 @@ mod tests {
         let amplitude = 0.1f32;
 
         // Create known tone symbols (all tone 3 for simplicity)
-        let symbols: Vec<u8> = (0..NUM_SYMBOLS).map(|i| {
-            if i < 7 { COSTAS[i] }
-            else if (36..43).contains(&i) { COSTAS[i - 36] }
-            else if i >= 72 { COSTAS[i - 72] }
-            else { 3 } // arbitrary data tone
-        }).collect();
+        let symbols: Vec<u8> = (0..NUM_SYMBOLS)
+            .map(|i| {
+                if i < 7 {
+                    COSTAS[i]
+                } else if (36..43).contains(&i) {
+                    COSTAS[i - 36]
+                } else if i >= 72 {
+                    COSTAS[i - 72]
+                } else {
+                    3
+                } // arbitrary data tone
+            })
+            .collect();
 
         // Generate the signal
         let total_len = NUM_SYMBOLS * sps;
@@ -3811,12 +3864,18 @@ mod tests {
         let energy_after: f64 = audio.iter().map(|&s| (s as f64) * (s as f64)).sum();
 
         let reduction = 1.0 - (energy_after / energy_before);
-        eprintln!("Energy before: {:.6}, after: {:.6}, reduction: {:.1}%",
-                  energy_before, energy_after, reduction * 100.0);
+        eprintln!(
+            "Energy before: {:.6}, after: {:.6}, reduction: {:.1}%",
+            energy_before,
+            energy_after,
+            reduction * 100.0
+        );
 
         // Should remove at least 70% of the energy
-        assert!(reduction > 0.7,
-                "Signal subtraction only removed {:.1}% of energy (expected >70%)",
-                reduction * 100.0);
+        assert!(
+            reduction > 0.7,
+            "Signal subtraction only removed {:.1}% of energy (expected >70%)",
+            reduction * 100.0
+        );
     }
 }

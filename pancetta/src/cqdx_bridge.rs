@@ -4,10 +4,10 @@
 //! and fire-and-forget spot/QSO reporting.
 
 use crate::priority_evaluator::CachedStationLookup;
-use pancetta_cqdx::{CqdxClient, CqdxCache, SpotReport, QsoRecord, rank_to_rarity};
+use pancetta_cqdx::{rank_to_rarity, CqdxCache, CqdxClient, QsoRecord, SpotReport};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 use tokio::time::Duration;
@@ -61,10 +61,8 @@ impl CqdxBridge {
         cache.load_needed(needed.clone());
 
         // Update CachedStationLookup needed_dxcc with prefix strings
-        let needed_prefixes: std::collections::HashSet<String> = needed
-            .iter()
-            .map(|n| n.prefix.to_uppercase())
-            .collect();
+        let needed_prefixes: std::collections::HashSet<String> =
+            needed.iter().map(|n| n.prefix.to_uppercase()).collect();
         self.cached_lookup.update_needed_dxcc(needed_prefixes);
 
         Ok(())
@@ -125,10 +123,10 @@ impl CqdxBridge {
                     last_backoff_attempt = std::time::Instant::now();
                 }
 
-                match client.fetch_live_spots(
-                    band.as_deref(),
-                    mode.as_deref(),
-                ).await {
+                match client
+                    .fetch_live_spots(band.as_deref(), mode.as_deref())
+                    .await
+                {
                     Ok(groups) => {
                         consecutive_failures = 0;
                         debug!("Polled {} spot groups from cqdx.io", groups.len());

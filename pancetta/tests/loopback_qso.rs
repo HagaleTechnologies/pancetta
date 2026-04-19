@@ -7,15 +7,15 @@
 use pancetta_ft8::{
     DecodedMessage, Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES,
 };
-use pancetta_qso::{
-    AutoSequenceConfig, DuplicateCheckConfig, MessageType, QsoEvent, QsoManagerConfig, QsoState,
-    TimeoutConfig,
-};
 use pancetta_qso::autonomous::{
     AutonomousConfig, AutonomousOperator, DecodedMessageInfo, NullDxEvaluator, OperatorAction,
     SlotParityConfig,
 };
 use pancetta_qso::priority::{NullLookup, PriorityScorer, PriorityWeights, WorkedStationLookup};
+use pancetta_qso::{
+    AutoSequenceConfig, DuplicateCheckConfig, MessageType, QsoEvent, QsoManagerConfig, QsoState,
+    TimeoutConfig,
+};
 use std::collections::HashSet;
 
 /// Station identity for the loopback test
@@ -62,7 +62,9 @@ impl Station {
 /// Helper: find a decoded message containing expected text (case-insensitive match)
 fn find_message<'a>(decoded: &'a [DecodedMessage], expected: &str) -> Option<&'a DecodedMessage> {
     let expected_upper = expected.to_uppercase();
-    decoded.iter().find(|m| m.text.to_uppercase() == expected_upper)
+    decoded
+        .iter()
+        .find(|m| m.text.to_uppercase() == expected_upper)
 }
 
 #[test]
@@ -154,7 +156,6 @@ fn test_loopback_full_qso_cq_to_73() {
         decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
     );
 }
-
 
 /// State-machine-driven QSO exchange: the QsoManager drives message generation,
 /// and the FT8 encoder/modulator/decoder pipeline carries messages between stations.
@@ -263,7 +264,10 @@ async fn test_loopback_state_machine_driven_qso() {
     );
 
     // Station B responds to the CQ
-    let qso_id_b = manager_b.respond_to_cq("W1ABC".to_string(), freq).await.unwrap();
+    let qso_id_b = manager_b
+        .respond_to_cq("W1ABC".to_string(), freq)
+        .await
+        .unwrap();
 
     // Receive Station B's MessageToSend event
     let response_message_type = loop {
@@ -364,10 +368,7 @@ async fn test_loopback_state_machine_driven_qso() {
 
     let audio = station_b_codec.encode_and_modulate(&r_report_text, freq);
     let decoded = station_a_codec.decode(&audio);
-    assert!(
-        !decoded.is_empty(),
-        "Station A should decode the R+report"
-    );
+    assert!(!decoded.is_empty(), "Station A should decode the R+report");
     let decoded_r_report = &decoded[0].text;
 
     // The parser now handles the decoder's "R -12" format (with space)
@@ -488,11 +489,17 @@ fn test_hunt_mode_picks_best_cq() {
     let even_ts: i64 = 0;
     let actions = op.decide_at(even_ts);
 
-    let tx_action = actions.iter().find(|a| matches!(a, OperatorAction::Transmit { .. }));
+    let tx_action = actions
+        .iter()
+        .find(|a| matches!(a, OperatorAction::Transmit { .. }));
     assert!(tx_action.is_some(), "Hunt mode should respond to a CQ");
 
     if let Some(OperatorAction::Transmit { message_text, .. }) = tx_action {
-        assert!(message_text.contains("W1ABC"), "Response should contain our callsign: {}", message_text);
+        assert!(
+            message_text.contains("W1ABC"),
+            "Response should contain our callsign: {}",
+            message_text
+        );
     }
 }
 
@@ -538,7 +545,12 @@ fn test_hunt_mode_response_survives_audio_roundtrip() {
     let actions = op.decide_at(even_ts);
 
     let tx_action = actions.iter().find_map(|a| {
-        if let OperatorAction::Transmit { message_text, frequency_offset, .. } = a {
+        if let OperatorAction::Transmit {
+            message_text,
+            frequency_offset,
+            ..
+        } = a
+        {
             Some((message_text.clone(), *frequency_offset))
         } else {
             None
@@ -546,13 +558,22 @@ fn test_hunt_mode_response_survives_audio_roundtrip() {
     });
 
     let (response_text, response_freq) = tx_action.expect("Should produce a Transmit action");
-    assert!(response_text.contains("W1ABC"), "Response should contain our call");
+    assert!(
+        response_text.contains("W1ABC"),
+        "Response should contain our call"
+    );
 
     let response_audio = our_station.encode_and_modulate(&response_text, response_freq);
     let decoded_response = station_b.decode(&response_audio);
-    assert!(!decoded_response.is_empty(), "Station B should decode our response");
-    assert!(decoded_response[0].text.contains("W1ABC"),
-        "Decoded response should contain our callsign: {}", decoded_response[0].text);
+    assert!(
+        !decoded_response.is_empty(),
+        "Station B should decode our response"
+    );
+    assert!(
+        decoded_response[0].text.contains("W1ABC"),
+        "Decoded response should contain our callsign: {}",
+        decoded_response[0].text
+    );
 }
 
 #[test]
@@ -576,7 +597,12 @@ fn test_cq_mode_after_idle_cycles() {
 
     let actions = op.decide_at(even_ts);
     let cq_action = actions.iter().find_map(|a| {
-        if let OperatorAction::Transmit { message_text, frequency_offset, .. } = a {
+        if let OperatorAction::Transmit {
+            message_text,
+            frequency_offset,
+            ..
+        } = a
+        {
             if message_text.starts_with("CQ") {
                 Some((message_text.clone(), *frequency_offset))
             } else {
@@ -596,8 +622,11 @@ fn test_cq_mode_after_idle_cycles() {
     let mut remote_station = Station::new("K2DEF", "FM18");
     let decoded = remote_station.decode(&audio);
     assert!(!decoded.is_empty(), "Remote station should decode our CQ");
-    assert!(decoded[0].text.contains("W1ABC"),
-        "Decoded CQ should contain our callsign: {}", decoded[0].text);
+    assert!(
+        decoded[0].text.contains("W1ABC"),
+        "Decoded CQ should contain our callsign: {}",
+        decoded[0].text
+    );
 }
 
 #[test]
@@ -615,7 +644,11 @@ fn test_cq_mode_directed_cq() {
     let actions = op.decide_at(even_ts);
     let cq_text = actions.iter().find_map(|a| {
         if let OperatorAction::Transmit { message_text, .. } = a {
-            if message_text.starts_with("CQ") { Some(message_text.clone()) } else { None }
+            if message_text.starts_with("CQ") {
+                Some(message_text.clone())
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -632,7 +665,9 @@ struct TestDupLookup {
 
 impl TestDupLookup {
     fn with_duplicates(dups: &[&str]) -> Self {
-        Self { duplicates: dups.iter().map(|s| s.to_uppercase()).collect() }
+        Self {
+            duplicates: dups.iter().map(|s| s.to_uppercase()).collect(),
+        }
     }
 }
 
@@ -640,9 +675,15 @@ impl WorkedStationLookup for TestDupLookup {
     fn is_duplicate(&self, callsign: &str, _freq_hz: f64) -> bool {
         self.duplicates.contains(&callsign.to_uppercase())
     }
-    fn is_recent_failure(&self, _callsign: &str) -> bool { false }
-    fn is_needed_dxcc(&self, _callsign: &str) -> bool { false }
-    fn is_needed_grid(&self, _grid: &str) -> bool { false }
+    fn is_recent_failure(&self, _callsign: &str) -> bool {
+        false
+    }
+    fn is_needed_dxcc(&self, _callsign: &str) -> bool {
+        false
+    }
+    fn is_needed_grid(&self, _grid: &str) -> bool {
+        false
+    }
 }
 
 #[test]
@@ -684,22 +725,33 @@ fn test_priority_scorer_skips_duplicate() {
 
     let responded_to = actions.iter().find_map(|a| {
         if let OperatorAction::Transmit { message_text, .. } = a {
-            if !message_text.starts_with("CQ") { Some(message_text.clone()) } else { None }
+            if !message_text.starts_with("CQ") {
+                Some(message_text.clone())
+            } else {
+                None
+            }
         } else {
             None
         }
     });
 
     let response = responded_to.expect("Should respond to a CQ");
-    assert!(response.contains("JA1ABC") && response.contains("W1ABC"),
-        "Should respond to JA1ABC (non-duplicate), not K9ZZ. Got: {}", response);
+    assert!(
+        response.contains("JA1ABC") && response.contains("W1ABC"),
+        "Should respond to JA1ABC (non-duplicate), not K9ZZ. Got: {}",
+        response
+    );
 }
 
 #[test]
 fn test_priority_scorer_prefers_pota() {
     let weights = PriorityWeights {
-        needed_dxcc: 0.0, needed_grid: 0.0, pota_sota: 0.5,
-        rarity: 0.0, signal_strength: 0.0, duplicate_penalty: 0.0,
+        needed_dxcc: 0.0,
+        needed_grid: 0.0,
+        pota_sota: 0.5,
+        rarity: 0.0,
+        signal_strength: 0.0,
+        duplicate_penalty: 0.0,
         recent_failure_penalty: 0.0,
     };
     let scorer = PriorityScorer::new(weights, Box::new(NullLookup));
@@ -734,15 +786,22 @@ fn test_priority_scorer_prefers_pota() {
 
     let responded_to = actions.iter().find_map(|a| {
         if let OperatorAction::Transmit { message_text, .. } = a {
-            if !message_text.starts_with("CQ") { Some(message_text.clone()) } else { None }
+            if !message_text.starts_with("CQ") {
+                Some(message_text.clone())
+            } else {
+                None
+            }
         } else {
             None
         }
     });
 
     let response = responded_to.expect("Should respond to a CQ");
-    assert!(response.contains("W5ABC/P"),
-        "Should prefer POTA station W5ABC/P. Got: {}", response);
+    assert!(
+        response.contains("W5ABC/P"),
+        "Should prefer POTA station W5ABC/P. Got: {}",
+        response
+    );
 }
 
 /// Two simultaneous FT8 QSOs decoded from a single summed audio buffer.
@@ -759,14 +818,20 @@ fn test_two_simultaneous_qsos_loopback() {
     let mut dx_station_1 = Station::new("K2DEF", "FM18");
     let mut dx_station_2 = Station::new("JA1XYZ", "PM95");
 
-    let freq_1 = 300.0;  // QSO 1 at base+300 Hz
-    let freq_2 = 900.0;  // QSO 2 at base+900 Hz (600 Hz separation)
+    let freq_1 = 300.0; // QSO 1 at base+300 Hz
+    let freq_2 = 900.0; // QSO 2 at base+900 Hz (600 Hz separation)
     let base_freq = 1500.0;
     let ft8_params = ProtocolParams::ft8();
 
     // === Round 1: Both DX stations send CQ simultaneously ===
-    let symbols_1 = dx_station_1.encoder.encode_message("CQ K2DEF FM18", None).unwrap();
-    let symbols_2 = dx_station_2.encoder.encode_message("CQ JA1XYZ PM95", None).unwrap();
+    let symbols_1 = dx_station_1
+        .encoder
+        .encode_message("CQ K2DEF FM18", None)
+        .unwrap();
+    let symbols_2 = dx_station_2
+        .encoder
+        .encode_message("CQ JA1XYZ PM95", None)
+        .unwrap();
 
     let items = vec![
         MultiTxItem {
@@ -796,8 +861,14 @@ fn test_two_simultaneous_qsos_loopback() {
     );
 
     // === Round 2: We respond to both simultaneously ===
-    let resp_1_symbols = our_station.encoder.encode_message("K2DEF W1ABC FN42", None).unwrap();
-    let resp_2_symbols = our_station.encoder.encode_message("JA1XYZ W1ABC FN42", None).unwrap();
+    let resp_1_symbols = our_station
+        .encoder
+        .encode_message("K2DEF W1ABC FN42", None)
+        .unwrap();
+    let resp_2_symbols = our_station
+        .encoder
+        .encode_message("JA1XYZ W1ABC FN42", None)
+        .unwrap();
 
     let items = vec![
         MultiTxItem {
@@ -831,8 +902,14 @@ fn test_two_simultaneous_qsos_loopback() {
     );
 
     // === Round 3: Both DX stations send signal reports simultaneously ===
-    let rpt_1_symbols = dx_station_1.encoder.encode_message("W1ABC K2DEF -10", None).unwrap();
-    let rpt_2_symbols = dx_station_2.encoder.encode_message("W1ABC JA1XYZ -14", None).unwrap();
+    let rpt_1_symbols = dx_station_1
+        .encoder
+        .encode_message("W1ABC K2DEF -10", None)
+        .unwrap();
+    let rpt_2_symbols = dx_station_2
+        .encoder
+        .encode_message("W1ABC JA1XYZ -14", None)
+        .unwrap();
 
     let items = vec![
         MultiTxItem {
@@ -862,8 +939,14 @@ fn test_two_simultaneous_qsos_loopback() {
     );
 
     // === Round 4: We send R+reports to both simultaneously ===
-    let r_rpt_1_symbols = our_station.encoder.encode_message("K2DEF W1ABC R-12", None).unwrap();
-    let r_rpt_2_symbols = our_station.encoder.encode_message("JA1XYZ W1ABC R-08", None).unwrap();
+    let r_rpt_1_symbols = our_station
+        .encoder
+        .encode_message("K2DEF W1ABC R-12", None)
+        .unwrap();
+    let r_rpt_2_symbols = our_station
+        .encoder
+        .encode_message("JA1XYZ W1ABC R-08", None)
+        .unwrap();
 
     let items = vec![
         MultiTxItem {
@@ -896,8 +979,14 @@ fn test_two_simultaneous_qsos_loopback() {
     );
 
     // === Round 5: Both DX stations send RR73 simultaneously ===
-    let rr73_1_symbols = dx_station_1.encoder.encode_message("W1ABC K2DEF RR73", None).unwrap();
-    let rr73_2_symbols = dx_station_2.encoder.encode_message("W1ABC JA1XYZ RR73", None).unwrap();
+    let rr73_1_symbols = dx_station_1
+        .encoder
+        .encode_message("W1ABC K2DEF RR73", None)
+        .unwrap();
+    let rr73_2_symbols = dx_station_2
+        .encoder
+        .encode_message("W1ABC JA1XYZ RR73", None)
+        .unwrap();
 
     let items = vec![
         MultiTxItem {
@@ -927,8 +1016,14 @@ fn test_two_simultaneous_qsos_loopback() {
     );
 
     // === Round 6: We send 73 to both simultaneously ===
-    let s73_1_symbols = our_station.encoder.encode_message("K2DEF W1ABC 73", None).unwrap();
-    let s73_2_symbols = our_station.encoder.encode_message("JA1XYZ W1ABC 73", None).unwrap();
+    let s73_1_symbols = our_station
+        .encoder
+        .encode_message("K2DEF W1ABC 73", None)
+        .unwrap();
+    let s73_2_symbols = our_station
+        .encoder
+        .encode_message("JA1XYZ W1ABC 73", None)
+        .unwrap();
 
     let items = vec![
         MultiTxItem {

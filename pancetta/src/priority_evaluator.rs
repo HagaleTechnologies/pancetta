@@ -66,21 +66,33 @@ impl CachedStationLookup {
     }
 
     pub fn record_failure(&self, callsign: &str) {
-        self.recent_failures.write().unwrap().insert(callsign.to_uppercase());
+        self.recent_failures
+            .write()
+            .unwrap()
+            .insert(callsign.to_uppercase());
     }
 
     pub fn record_worked(&self, callsign: &str) {
-        self.worked_on_band.write().unwrap().insert(callsign.to_uppercase());
+        self.worked_on_band
+            .write()
+            .unwrap()
+            .insert(callsign.to_uppercase());
     }
 }
 
 impl WorkedStationLookup for CachedStationLookup {
     fn is_duplicate(&self, callsign: &str, _freq_hz: f64) -> bool {
-        self.worked_on_band.read().unwrap().contains(&callsign.to_uppercase())
+        self.worked_on_band
+            .read()
+            .unwrap()
+            .contains(&callsign.to_uppercase())
     }
 
     fn is_recent_failure(&self, callsign: &str) -> bool {
-        self.recent_failures.read().unwrap().contains(&callsign.to_uppercase())
+        self.recent_failures
+            .read()
+            .unwrap()
+            .contains(&callsign.to_uppercase())
     }
 
     fn is_needed_dxcc(&self, callsign: &str) -> bool {
@@ -93,7 +105,9 @@ impl WorkedStationLookup for CachedStationLookup {
         // The set contains DXCC prefixes (e.g., "3Y/B"), not full callsigns.
         // Use prefix matching: callsign "3Y/B1234" matches prefix "3Y/B".
         let upper = callsign.to_uppercase();
-        needed.iter().any(|prefix| upper.starts_with(prefix.as_str()))
+        needed
+            .iter()
+            .any(|prefix| upper.starts_with(prefix.as_str()))
     }
 
     fn is_needed_grid(&self, grid: &str) -> bool {

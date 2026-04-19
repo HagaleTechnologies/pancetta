@@ -19,16 +19,17 @@ impl CqdxClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to build reqwest client");
-        Self { http, base_url, token }
+        Self {
+            http,
+            base_url,
+            token,
+        }
     }
 
     pub async fn fetch_entities(&self) -> Result<Vec<DxccEntity>> {
         let url = format!("{}/api/v1/entities", self.base_url);
         debug!("Fetching DXCC entities from {}", url);
-        let resp = self.http.get(&url)
-            .bearer_auth(&self.token)
-            .send()
-            .await?;
+        let resp = self.http.get(&url).bearer_auth(&self.token).send().await?;
         let resp = self.check_status(resp).await?;
         let body: EntitiesResponse = resp.json().await?;
         Ok(body.entities)
@@ -37,10 +38,7 @@ impl CqdxClient {
     pub async fn fetch_needed(&self) -> Result<Vec<NeededEntity>> {
         let url = format!("{}/api/v1/entities/needed", self.base_url);
         debug!("Fetching needed entities from {}", url);
-        let resp = self.http.get(&url)
-            .bearer_auth(&self.token)
-            .send()
-            .await?;
+        let resp = self.http.get(&url).bearer_auth(&self.token).send().await?;
         let resp = self.check_status(resp).await?;
         let body: NeededResponse = resp.json().await?;
         Ok(body.needed)
@@ -62,7 +60,9 @@ impl CqdxClient {
         }
         let url = format!("{}/api/v1/spots", self.base_url);
         debug!("Fetching live spots from {}", url);
-        let resp = self.http.get(&url)
+        let resp = self
+            .http
+            .get(&url)
             .bearer_auth(&self.token)
             .query(&params)
             .send()
@@ -76,7 +76,9 @@ impl CqdxClient {
         let url = format!("{}/api/v1/spots/report", self.base_url);
         debug!("Reporting {} spots to {}", spots.len(), url);
         let req = SpotReportRequest { spots };
-        let resp = self.http.post(&url)
+        let resp = self
+            .http
+            .post(&url)
             .bearer_auth(&self.token)
             .json(&req)
             .send()
@@ -89,7 +91,9 @@ impl CqdxClient {
         let url = format!("{}/api/v1/qsos", self.base_url);
         debug!("Reporting QSO with {} to {}", qso.callsign, url);
         let req = QsoReportRequest { version: 1, qso };
-        let resp = self.http.post(&url)
+        let resp = self
+            .http
+            .post(&url)
             .bearer_auth(&self.token)
             .json(&req)
             .send()

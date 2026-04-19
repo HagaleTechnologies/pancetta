@@ -144,11 +144,11 @@
 pub use crate::adif::*;
 pub use crate::auto_sequencer::*;
 pub use crate::autonomous::*;
-pub use crate::frequency::*;
 pub use crate::database::*;
-pub use crate::priority::*;
 pub use crate::exchange::*;
+pub use crate::frequency::*;
 pub use crate::logger::*;
+pub use crate::priority::*;
 pub use crate::qso_manager::*;
 pub use crate::states::*;
 pub use crate::statistics::*;
@@ -159,11 +159,11 @@ pub mod async_database;
 pub mod async_logger;
 pub mod auto_sequencer;
 pub mod autonomous;
-pub mod frequency;
 pub mod database;
-pub mod priority;
 pub mod exchange;
+pub mod frequency;
 pub mod logger;
+pub mod priority;
 pub mod qso_manager;
 pub mod states;
 pub mod statistics;
@@ -320,9 +320,8 @@ impl QsoSystemBuilder {
 
         let logger = if self.enable_logger {
             let logger_config = self.logger_config.unwrap_or_default();
-            let qso_logger = std::sync::Arc::new(
-                QsoLogger::new(logger_config, qso_manager.clone()).await?,
-            );
+            let qso_logger =
+                std::sync::Arc::new(QsoLogger::new(logger_config, qso_manager.clone()).await?);
             qso_logger.start().await?;
             Some(qso_logger)
         } else {

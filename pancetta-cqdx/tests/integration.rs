@@ -1,7 +1,7 @@
 //! Integration tests for the cqdx.io client + cache interaction.
 
-use pancetta_cqdx::{CqdxClient, CqdxCache};
 use pancetta_cqdx::types::*;
+use pancetta_cqdx::{CqdxCache, CqdxClient};
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

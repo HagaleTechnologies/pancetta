@@ -68,7 +68,11 @@ impl<'a> Waterfall<'a> {
         }
         let frac = (freq_hz - lo) / (hi - lo);
         let col = (frac * width as f64) as usize;
-        if col < width { Some(col) } else { None }
+        if col < width {
+            Some(col)
+        } else {
+            None
+        }
     }
 
     fn get_color_for_intensity(&self, intensity: f32) -> Color {
@@ -220,9 +224,7 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
                 // Draw a short tick (top 2 rows)
                 for row in 0..2.min(height) {
                     let y = waterfall_area.y + row as u16;
-                    buf[(x, y)]
-                        .set_char('▼')
-                        .set_fg(Color::Yellow);
+                    buf[(x, y)].set_char('▼').set_fg(Color::Yellow);
                 }
             }
         }
@@ -563,9 +565,18 @@ mod tests {
     fn test_waterfall_color_intensity() {
         let waterfall = Waterfall::new(&[]).color_scheme(WaterfallColorScheme::Classic);
 
-        assert!(matches!(waterfall.get_color_for_intensity(0.1), Color::Indexed(_)));
-        assert!(matches!(waterfall.get_color_for_intensity(0.5), Color::Indexed(_)));
-        assert!(matches!(waterfall.get_color_for_intensity(0.9), Color::Indexed(_)));
+        assert!(matches!(
+            waterfall.get_color_for_intensity(0.1),
+            Color::Indexed(_)
+        ));
+        assert!(matches!(
+            waterfall.get_color_for_intensity(0.5),
+            Color::Indexed(_)
+        ));
+        assert!(matches!(
+            waterfall.get_color_for_intensity(0.9),
+            Color::Indexed(_)
+        ));
     }
 
     #[test]

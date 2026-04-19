@@ -344,7 +344,10 @@ mod tests {
         let config = AutonomousConfig::default();
         let toml_str = toml::to_string(&config).unwrap();
         let deserialized: AutonomousConfig = toml::from_str(&toml_str).unwrap();
-        assert_eq!(config.min_multi_slot_score, deserialized.min_multi_slot_score);
+        assert_eq!(
+            config.min_multi_slot_score,
+            deserialized.min_multi_slot_score
+        );
         assert_eq!(
             config.frequency.center_bias_hz,
             deserialized.frequency.center_bias_hz

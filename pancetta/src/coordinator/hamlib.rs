@@ -65,31 +65,40 @@ impl super::ApplicationCoordinator {
 
         if rig_enabled {
             // Check if rigctld is already running
-            let already_running = tokio::net::TcpStream::connect(
-                format!("{}:{}", rigctld_host, rigctld_port),
-            )
-            .await
-            .is_ok();
+            let already_running =
+                tokio::net::TcpStream::connect(format!("{}:{}", rigctld_host, rigctld_port))
+                    .await
+                    .is_ok();
 
             if already_running {
-                info!("rigctld already running on {}:{}", rigctld_host, rigctld_port);
+                info!(
+                    "rigctld already running on {}:{}",
+                    rigctld_host, rigctld_port
+                );
             } else if let Some(model_id) = Self::hamlib_model_id(&rig_config.model) {
                 // rigctld knows the correct serial parameters (stop bits, parity,
                 // flow control) for each rig model -- we only need to specify
                 // model, port, and baud rate.
                 info!(
                     "Spawning rigctld: model={} (hamlib {}), port={}, baud={}",
-                    rig_config.model, model_id,
-                    rig_config.interface.port, rig_config.interface.baud_rate
+                    rig_config.model,
+                    model_id,
+                    rig_config.interface.port,
+                    rig_config.interface.baud_rate
                 );
 
                 match std::process::Command::new("rigctld")
                     .args([
-                        "-m", &model_id.to_string(),
-                        "-r", &rig_config.interface.port,
-                        "-s", &rig_config.interface.baud_rate.to_string(),
-                        "-t", &rigctld_port.to_string(),
-                        "-T", &rigctld_host,
+                        "-m",
+                        &model_id.to_string(),
+                        "-r",
+                        &rig_config.interface.port,
+                        "-s",
+                        &rig_config.interface.baud_rate.to_string(),
+                        "-t",
+                        &rigctld_port.to_string(),
+                        "-T",
+                        &rigctld_host,
                     ])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())

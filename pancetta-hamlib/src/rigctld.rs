@@ -105,9 +105,7 @@ impl RigctldClient {
             let cmd_with_newline = format!("{}\n", command);
             debug!("Sending rigctld command: {}", command);
 
-            conn.writer
-                .write_all(cmd_with_newline.as_bytes())
-                .await?;
+            conn.writer.write_all(cmd_with_newline.as_bytes()).await?;
             conn.writer.flush().await?;
 
             // Read response line (using persistent BufReader so buffered data isn't lost)

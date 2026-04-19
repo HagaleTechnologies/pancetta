@@ -474,7 +474,9 @@ impl App {
     }
 
     async fn process_audio_data(&mut self, data: Vec<f32>) -> Result<()> {
-        if data.is_empty() { return Ok(()); }
+        if data.is_empty() {
+            return Ok(());
+        }
         // Calculate audio level (RMS)
         let sum_squares: f32 = data.iter().map(|&x| x * x).sum();
         self.audio_level = (sum_squares / data.len() as f32).sqrt();
@@ -653,9 +655,8 @@ impl App {
     /// Returns the frequency delta between our expected frequency and the radio, if known.
     /// Positive means radio is higher than expected.
     pub fn frequency_delta_khz(&self) -> Option<f64> {
-        self.radio_frequency.map(|radio_mhz| {
-            (radio_mhz - self.station_info.operating_frequency) * 1000.0
-        })
+        self.radio_frequency
+            .map(|radio_mhz| (radio_mhz - self.station_info.operating_frequency) * 1000.0)
     }
 
     pub fn update_signal_strength(&mut self, strength: f32) {

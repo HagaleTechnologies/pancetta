@@ -273,7 +273,9 @@ impl ApplicationCoordinator {
             enable_metrics,
             metrics_port,
             wav_path,
-            cached_lookup: std::sync::Arc::new(crate::priority_evaluator::CachedStationLookup::new()),
+            cached_lookup: std::sync::Arc::new(
+                crate::priority_evaluator::CachedStationLookup::new(),
+            ),
             cqdx_bridge: None,
             waterfall_to_auto_tx: None,
             active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(None)),
@@ -337,10 +339,13 @@ impl ApplicationCoordinator {
                         );
                         // Wrap the JoinHandle<()> into JoinHandle<Result<()>> for named_task_handles
                         let wrapped = tokio::spawn(async move {
-                            poller_handle.await.map_err(|e| anyhow::anyhow!("cqdx poller join error: {}", e))?;
+                            poller_handle
+                                .await
+                                .map_err(|e| anyhow::anyhow!("cqdx poller join error: {}", e))?;
                             Ok(())
                         });
-                        self.named_task_handles.push((ComponentId::DxCluster, wrapped));
+                        self.named_task_handles
+                            .push((ComponentId::DxCluster, wrapped));
                         self.cqdx_bridge = Some(std::sync::Arc::new(bridge));
                     }
                     Err(e) => {

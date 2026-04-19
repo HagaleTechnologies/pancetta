@@ -62,7 +62,7 @@ pub use ap::{ApContext, ApLevel, MyCallAp, QsoAp, QsoApProgress, RecentCallAp};
 
 // Parallel decode configuration
 pub mod parallel;
-pub use parallel::{DecodeConfig, Parallelism, BudgetTracker};
+pub use parallel::{BudgetTracker, DecodeConfig, Parallelism};
 
 // Core FT8 decoding modules
 pub mod decoder;

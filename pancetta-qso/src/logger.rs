@@ -1007,7 +1007,6 @@ impl QsoLogger {
     }
 }
 
-
 /// Import record result
 #[derive(Debug, Clone, PartialEq)]
 enum ImportRecordResult {

@@ -148,12 +148,7 @@ impl DecodeHistory {
     }
 
     /// Count decodes near a frequency in a specific time slot.
-    pub fn activity_near_in_slot(
-        &self,
-        offset_hz: f64,
-        radius_hz: f64,
-        slot: TimeSlot,
-    ) -> usize {
+    pub fn activity_near_in_slot(&self, offset_hz: f64, radius_hz: f64, slot: TimeSlot) -> usize {
         self.cycles
             .iter()
             .flat_map(|c| c.iter())
@@ -205,7 +200,8 @@ impl SmartFrequencyAllocator {
 
         let mut freq = min_f;
         while freq <= max_f {
-            let score = self.score_candidate(freq, spectral, history, own_frequencies, dx_target_hz);
+            let score =
+                self.score_candidate(freq, spectral, history, own_frequencies, dx_target_hz);
             let noise = spectral.power_near(freq, 25.0);
             let clear = history.is_clear_both_slots(freq, 50.0);
 
@@ -219,7 +215,11 @@ impl SmartFrequencyAllocator {
             freq += step;
         }
 
-        candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         candidates
     }
 
@@ -264,9 +264,7 @@ impl SmartFrequencyAllocator {
         // 6. DX proximity bias (scale 0–8)
         if let Some(dx_freq) = dx_target_hz {
             let dist = (freq - dx_freq).abs();
-            if dist >= self.config.dx_proximity_min_hz
-                && dist <= self.config.dx_proximity_max_hz
-            {
+            if dist >= self.config.dx_proximity_min_hz && dist <= self.config.dx_proximity_max_hz {
                 // Sweet spot: nearby but not on top
                 score += 8.0;
             } else if dist < self.config.dx_proximity_min_hz && dist > 0.0 {
@@ -315,14 +313,17 @@ mod tests {
         let candidates = allocator.rank_candidates(
             &empty_spectral(),
             &empty_history(),
-            &[],    // no own frequencies
-            None,   // no DX target
+            &[],  // no own frequencies
+            None, // no DX target
         );
         assert!(!candidates.is_empty());
         // Best candidate should be near center (1500 Hz)
         let best = &candidates[0];
-        assert!((best.offset_hz - 1500.0).abs() < 200.0,
-            "Expected near center, got {}", best.offset_hz);
+        assert!(
+            (best.offset_hz - 1500.0).abs() < 200.0,
+            "Expected near center, got {}",
+            best.offset_hz
+        );
     }
 
     #[test]
@@ -354,8 +355,14 @@ mod tests {
         // Put decode activity at 1500 Hz in both slots
         let mut history = empty_history();
         history.push_cycle(vec![
-            DecodeRecord { frequency_hz: 1500.0, time_slot: TimeSlot::First },
-            DecodeRecord { frequency_hz: 1500.0, time_slot: TimeSlot::Second },
+            DecodeRecord {
+                frequency_hz: 1500.0,
+                time_slot: TimeSlot::First,
+            },
+            DecodeRecord {
+                frequency_hz: 1500.0,
+                time_slot: TimeSlot::Second,
+            },
         ]);
 
         let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
@@ -393,8 +400,7 @@ mod tests {
     fn test_avoids_own_frequencies() {
         let own = vec![1500.0];
         let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
-        let candidates =
-            allocator.rank_candidates(&empty_spectral(), &empty_history(), &own, None);
+        let candidates = allocator.rank_candidates(&empty_spectral(), &empty_history(), &own, None);
 
         assert!(!candidates.is_empty());
         let best = &candidates[0];
@@ -433,8 +439,14 @@ mod tests {
         let mut records = Vec::new();
         let mut f = 200.0f64;
         while f <= 2800.0 {
-            records.push(DecodeRecord { frequency_hz: f, time_slot: TimeSlot::First });
-            records.push(DecodeRecord { frequency_hz: f, time_slot: TimeSlot::Second });
+            records.push(DecodeRecord {
+                frequency_hz: f,
+                time_slot: TimeSlot::First,
+            });
+            records.push(DecodeRecord {
+                frequency_hz: f,
+                time_slot: TimeSlot::Second,
+            });
             f += 100.0;
         }
         history.push_cycle(records);

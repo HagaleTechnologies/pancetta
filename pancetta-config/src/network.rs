@@ -1808,7 +1808,8 @@ impl ConfigSection for NetworkConfig {
 
         // cqdx.io validation
         if self.cqdx.enabled {
-            if self.cqdx.token.is_none() || self.cqdx.token.as_ref().map_or(true, |t| t.is_empty()) {
+            if self.cqdx.token.is_none() || self.cqdx.token.as_ref().map_or(true, |t| t.is_empty())
+            {
                 return Err(ConfigError::Validation(
                     "cqdx.io integration enabled but no PAT token configured".to_string(),
                 ));

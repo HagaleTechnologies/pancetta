@@ -15,10 +15,9 @@ impl super::ApplicationCoordinator {
 
         let per_task_timeout = Duration::from_secs(1);
 
-        for (index, (component_id, handle)) in
-            std::mem::take(&mut self.named_task_handles)
-                .into_iter()
-                .enumerate()
+        for (index, (component_id, handle)) in std::mem::take(&mut self.named_task_handles)
+            .into_iter()
+            .enumerate()
         {
             match tokio::time::timeout(per_task_timeout, handle).await {
                 Ok(Ok(_)) => {

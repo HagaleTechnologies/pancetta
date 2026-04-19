@@ -275,7 +275,9 @@ impl OsdDecoder {
                     -llrs[b].abs()
                 };
                 // Sort ascending (most negative = highest prob = least reliable = first)
-                key_b.partial_cmp(&key_a).unwrap_or(std::cmp::Ordering::Equal)
+                key_b
+                    .partial_cmp(&key_a)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
         } else {
             // Original: sort by descending |LLR| (most reliable first)

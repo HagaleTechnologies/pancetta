@@ -537,7 +537,10 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
         .join(".pancetta");
     let config_path = config_dir.join("pancetta.toml");
 
-    if prompt_yes_no(&format!("Save configuration to {}?", config_path.display()), true)? {
+    if prompt_yes_no(
+        &format!("Save configuration to {}?", config_path.display()),
+        true,
+    )? {
         std::fs::create_dir_all(&config_dir)?;
         new_config
             .save_to_file(&config_path)
@@ -606,7 +609,10 @@ fn setup_station(config: &mut Config) -> Result<()> {
         config.station.grid_square = input;
     }
 
-    let input = prompt_line(&format!("  TX power watts [{}]: ", config.station.power_watts))?;
+    let input = prompt_line(&format!(
+        "  TX power watts [{}]: ",
+        config.station.power_watts
+    ))?;
     if !input.is_empty() {
         if let Ok(p) = input.parse::<u32>() {
             config.station.power_watts = p;
@@ -637,7 +643,11 @@ fn setup_audio(config: &mut Config) -> Result<()> {
             } else {
                 println!("  Input devices:");
                 for (i, (_, info)) in inputs.iter().enumerate() {
-                    let marker = if info.is_default_input { " (system default)" } else { "" };
+                    let marker = if info.is_default_input {
+                        " (system default)"
+                    } else {
+                        ""
+                    };
                     println!("    [{}] {}{}", i + 1, info.name, marker);
                 }
                 let current = &config.audio.input_device;
@@ -660,7 +670,11 @@ fn setup_audio(config: &mut Config) -> Result<()> {
             } else {
                 println!("  Output devices:");
                 for (i, (_, info)) in outputs.iter().enumerate() {
-                    let marker = if info.is_default_output { " (system default)" } else { "" };
+                    let marker = if info.is_default_output {
+                        " (system default)"
+                    } else {
+                        ""
+                    };
                     println!("    [{}] {}{}", i + 1, info.name, marker);
                 }
                 let current = &config.audio.output_device;
@@ -675,10 +689,7 @@ fn setup_audio(config: &mut Config) -> Result<()> {
         Err(e) => {
             println!("  Could not enumerate audio devices: {}", e);
             println!("  You can manually enter device names.");
-            let input = prompt_line(&format!(
-                "  Input device [{}]: ",
-                config.audio.input_device
-            ))?;
+            let input = prompt_line(&format!("  Input device [{}]: ", config.audio.input_device))?;
             if !input.is_empty() {
                 config.audio.input_device = input;
             }
@@ -742,7 +753,10 @@ fn setup_rig(config: &mut Config) -> Result<()> {
                 }
             }
             if let Some(choice) = prompt_choice(
-                &format!("  Select serial port [current: {}]: ", config.rig.interface.port),
+                &format!(
+                    "  Select serial port [current: {}]: ",
+                    config.rig.interface.port
+                ),
                 ports.len(),
             )? {
                 config.rig.interface.port = ports[choice - 1].port_name.clone();
@@ -813,8 +827,10 @@ fn setup_frequency(config: &mut Config) -> Result<()> {
     println!("--- Frequency Control ---");
     println!();
 
-    config.rig.frequency.control_enabled =
-        prompt_yes_no("  Enable frequency control?", config.rig.frequency.control_enabled)?;
+    config.rig.frequency.control_enabled = prompt_yes_no(
+        "  Enable frequency control?",
+        config.rig.frequency.control_enabled,
+    )?;
 
     if config.rig.frequency.control_enabled {
         config.rig.frequency.follow_rig =
@@ -850,13 +866,26 @@ async fn setup_command() -> Result<()> {
 
     // Summary
     println!("=== Summary ===");
-    println!("  Station:   {} / {} / {}W", config.station.callsign, config.station.grid_square, config.station.power_watts);
+    println!(
+        "  Station:   {} / {} / {}W",
+        config.station.callsign, config.station.grid_square, config.station.power_watts
+    );
     println!("  Audio in:  {}", config.audio.input_device);
     println!("  Audio out: {}", config.audio.output_device);
     if config.rig.interface.enabled {
-        println!("  Rig:       {} on {} @ {}", config.rig.model, config.rig.interface.port, config.rig.interface.baud_rate);
+        println!(
+            "  Rig:       {} on {} @ {}",
+            config.rig.model, config.rig.interface.port, config.rig.interface.baud_rate
+        );
         println!("  PTT:       {:?}", config.rig.ptt.method);
-        println!("  Freq ctrl: {}", if config.rig.frequency.control_enabled { "enabled" } else { "disabled" });
+        println!(
+            "  Freq ctrl: {}",
+            if config.rig.frequency.control_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
     } else {
         println!("  Rig:       disabled");
     }
@@ -918,7 +947,9 @@ async fn test_rig_command(args: TestRigArgs, cli: &Cli) -> Result<()> {
                     }
                 }
                 println!();
-                println!("  Check your USB cable and run 'pancetta setup' to select the right port.");
+                println!(
+                    "  Check your USB cable and run 'pancetta setup' to select the right port."
+                );
                 return Ok(());
             }
         }
@@ -944,11 +975,15 @@ async fn test_rig_command(args: TestRigArgs, cli: &Cli) -> Result<()> {
             println!();
             match e.kind() {
                 serialport::ErrorKind::Io(std::io::ErrorKind::PermissionDenied) => {
-                    println!("  Permission denied. You may need to add your user to the 'dialout' group");
+                    println!(
+                        "  Permission denied. You may need to add your user to the 'dialout' group"
+                    );
                     println!("  or check device permissions on {}.", port_name);
                 }
                 serialport::ErrorKind::Io(std::io::ErrorKind::NotFound) => {
-                    println!("  Device not found. The rig may be powered off or USB cable disconnected.");
+                    println!(
+                        "  Device not found. The rig may be powered off or USB cable disconnected."
+                    );
                 }
                 _ => {
                     println!("  Error: {}", e);
@@ -965,7 +1000,10 @@ async fn test_rig_command(args: TestRigArgs, cli: &Cli) -> Result<()> {
         Ok(n) => {
             println!("OK ({} bytes received)", n);
             // Show first few bytes as hex for debugging
-            let hex: Vec<String> = buf[..n.min(16)].iter().map(|b| format!("{:02X}", b)).collect();
+            let hex: Vec<String> = buf[..n.min(16)]
+                .iter()
+                .map(|b| format!("{:02X}", b))
+                .collect();
             println!("       Data: {}", hex.join(" "));
         }
         Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
@@ -983,7 +1021,9 @@ async fn test_rig_command(args: TestRigArgs, cli: &Cli) -> Result<()> {
         println!("[4/4] Testing PTT...");
         match config.rig.ptt.method {
             PttMethod::None => {
-                println!("       PTT method is 'none' — skipping. Configure PTT in 'pancetta setup'.");
+                println!(
+                    "       PTT method is 'none' — skipping. Configure PTT in 'pancetta setup'."
+                );
             }
             PttMethod::Serial => {
                 println!("       Asserting RTS for 1 second...");

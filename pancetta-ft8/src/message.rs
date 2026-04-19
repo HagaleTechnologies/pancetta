@@ -351,9 +351,9 @@ impl Ft8Message {
                         // Must contain a space (multi-word) to be plausible,
                         // or be a short known token.
                         let has_space = trimmed.contains(' ');
-                        let all_printable = trimmed.chars().all(|c| {
-                            c.is_ascii_alphanumeric() || c == ' ' || c == '/' || c == '.'
-                        });
+                        let all_printable = trimmed
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '/' || c == '.');
                         has_space && all_printable
                     }
                     None => false,
@@ -370,13 +370,10 @@ impl Ft8Message {
                 // Standard messages: ALL present callsigns must look valid.
                 // This is stricter than "any" because OSD-2 CRC collisions
                 // often produce one valid-looking call paired with garbage.
-                let all_calls_valid = [&self.from_callsign, &self.to_callsign]
-                    .iter()
-                    .all(|opt| {
-                        opt.as_ref().map_or(true, |call| {
-                            Self::looks_like_callsign(call)
-                        })
-                    });
+                let all_calls_valid = [&self.from_callsign, &self.to_callsign].iter().all(|opt| {
+                    opt.as_ref()
+                        .map_or(true, |call| Self::looks_like_callsign(call))
+                });
                 if !all_calls_valid {
                     return false;
                 }
@@ -386,13 +383,10 @@ impl Ft8Message {
             // Contest, FieldDay, RTTYRoundup, NonStdCall, DXpedition, Extended:
             // require ALL present callsigns to be valid
             _ => {
-                let all_calls_valid = [&self.from_callsign, &self.to_callsign]
-                    .iter()
-                    .all(|opt| {
-                        opt.as_ref().map_or(true, |call| {
-                            Self::looks_like_callsign(call)
-                        })
-                    });
+                let all_calls_valid = [&self.from_callsign, &self.to_callsign].iter().all(|opt| {
+                    opt.as_ref()
+                        .map_or(true, |call| Self::looks_like_callsign(call))
+                });
                 if !all_calls_valid {
                     return false;
                 }
@@ -466,8 +460,24 @@ impl Ft8Message {
         // Q (reserved for Q-codes), X (always XE, XU, etc.)
         matches!(
             c,
-            'B' | 'C' | 'D' | 'E' | 'F' | 'G' | 'I' | 'J' | 'K' | 'M' | 'N' | 'R' | 'S'
-            | 'T' | 'U' | 'V' | 'W' | 'Y' | 'Z'
+            'B' | 'C'
+                | 'D'
+                | 'E'
+                | 'F'
+                | 'G'
+                | 'I'
+                | 'J'
+                | 'K'
+                | 'M'
+                | 'N'
+                | 'R'
+                | 'S'
+                | 'T'
+                | 'U'
+                | 'V'
+                | 'W'
+                | 'Y'
+                | 'Z'
         )
     }
 
@@ -538,13 +548,17 @@ impl Ft8Message {
             b'U' => matches!(second, b'A'..=b'Z'),
             // V: VA-VG=Canada, VH-VN=Australia, VO=Canada, VP-VQ=UK overseas,
             //    VR=Hong Kong, VS=UK overseas, VU=India, VV-VW=unassigned?, VX-VY=Canada, VZ=Australia
-            b'V' => matches!(second, b'A'..=b'G' | b'H'..=b'N' | b'O' | b'P'..=b'Q' | b'R' | b'S' | b'U' | b'X'..=b'Z'),
+            b'V' => {
+                matches!(second, b'A'..=b'G' | b'H'..=b'N' | b'O' | b'P'..=b'Q' | b'R' | b'S' | b'U' | b'X'..=b'Z')
+            }
             // W: WA-WZ=USA
             b'W' => true,
             // X: XA-XI=Mexico, XJ-XO=Canada, XP=Denmark(Greenland), XQ-XR=Chile,
             //    XS=China, XT=Burkina Faso, XU=Cambodia, XV=Vietnam, XW=Laos,
             //    XX=Macao, XY-XZ=Myanmar
-            b'X' => matches!(second, b'A'..=b'I' | b'J'..=b'O' | b'P' | b'Q'..=b'R' | b'S' | b'T' | b'U' | b'V' | b'W' | b'X' | b'Y'..=b'Z'),
+            b'X' => {
+                matches!(second, b'A'..=b'I' | b'J'..=b'O' | b'P' | b'Q'..=b'R' | b'S' | b'T' | b'U' | b'V' | b'W' | b'X' | b'Y'..=b'Z')
+            }
             // Y: YA=Afghanistan, YB-YH=Indonesia, YI=Iraq, YJ=Vanuatu,
             //    YK=Syria, YL=Latvia, YM=Turkey, YN=Nicaragua, YO=Romania,
             //    YS=El Salvador, YT-YU=Serbia, YV-YY=Venezuela, YZ=Serbia
@@ -596,25 +610,54 @@ impl Ft8Message {
             b'2' => matches!(second, b'D' | b'E' | b'I' | b'J' | b'M' | b'W'),
             // 3: 3A=Monaco, 3B=Mauritius, 3C=Equatorial Guinea, 3D=Eswatini/Fiji,
             //    3G=Chile, 3V=Tunisia, 3W=Vietnam, 3X=Guinea, 3Y=Bouvet, 3Z=Poland
-            b'3' => matches!(second, b'A' | b'B' | b'C' | b'D' | b'G' | b'V' | b'W' | b'X' | b'Y' | b'Z'),
+            b'3' => matches!(
+                second,
+                b'A' | b'B' | b'C' | b'D' | b'G' | b'V' | b'W' | b'X' | b'Y' | b'Z'
+            ),
             // 4: 4J-4K=Azerbaijan, 4L=Georgia, 4M=Venezuela, 4O=Montenegro,
             //    4S=Sri Lanka, 4U=UN, 4V=Haiti, 4W=Timor-Leste, 4X=Israel, 4Z=Israel
-            b'4' => matches!(second, b'J' | b'K' | b'L' | b'M' | b'O' | b'S' | b'U' | b'V' | b'W' | b'X' | b'Z'),
+            b'4' => matches!(
+                second,
+                b'J' | b'K' | b'L' | b'M' | b'O' | b'S' | b'U' | b'V' | b'W' | b'X' | b'Z'
+            ),
             // 5: 5A=Libya, 5B=Cyprus, 5C=Morocco, 5H-5I=Tanzania, 5N-5O=Nigeria,
             //    5R-5S=Madagascar, 5T=Mauritania, 5U=Niger, 5V=Togo, 5W=Samoa,
             //    5X=Uganda, 5Y-5Z=Kenya
-            b'5' => matches!(second, b'A' | b'B' | b'C' | b'H' | b'I' | b'N' | b'O' | b'R' | b'S' | b'T' | b'U' | b'V' | b'W' | b'X' | b'Y' | b'Z'),
+            b'5' => matches!(
+                second,
+                b'A' | b'B'
+                    | b'C'
+                    | b'H'
+                    | b'I'
+                    | b'N'
+                    | b'O'
+                    | b'R'
+                    | b'S'
+                    | b'T'
+                    | b'U'
+                    | b'V'
+                    | b'W'
+                    | b'X'
+                    | b'Y'
+                    | b'Z'
+            ),
             // 6: 6K-6N=South Korea, 6O=Somalia, 6V-6W=Senegal, 6Y=Jamaica
             b'6' => matches!(second, b'K'..=b'N' | b'O' | b'V' | b'W' | b'Y'),
             // 7: 7J-7N=Japan, 7O=Yemen, 7P=Lesotho, 7Q=Malawi, 7R=Algeria,
             //    7S=Sweden, 7T-7Y=Algeria, 7X=Algeria, 7Z=Saudi Arabia
-            b'7' => matches!(second, b'J'..=b'N' | b'O' | b'P' | b'Q' | b'R' | b'S' | b'T'..=b'Y' | b'Z'),
+            b'7' => {
+                matches!(second, b'J'..=b'N' | b'O' | b'P' | b'Q' | b'R' | b'S' | b'T'..=b'Y' | b'Z')
+            }
             // 8: 8P=Barbados, 8Q=Maldives, 8R=Guyana, 8S=Sweden, 8J-8N=Japan
             b'8' => matches!(second, b'J'..=b'N' | b'P' | b'Q' | b'R' | b'S'),
             // 9: 9A=Croatia, 9G=Ghana, 9H=Malta, 9I-9J=Zambia, 9K=Kuwait,
             //    9L=Sierra Leone, 9M=Malaysia, 9N=Nepal, 9O-9T=Congo (DRC),
             //    9U=Burundi, 9V=Singapore, 9W=Malaysia, 9X=Rwanda, 9Y-9Z=Trinidad
-            b'9' => matches!(second, b'A' | b'G' | b'H' | b'I' | b'J' | b'K' | b'L' | b'M' | b'N' | b'O'..=b'T' | b'U' | b'V' | b'W' | b'X' | b'Y' | b'Z'),
+            b'9' => matches!(
+                second,
+                b'A' | b'G' | b'H' | b'I' | b'J' | b'K' | b'L' | b'M' | b'N' | b'O'
+                    ..=b'T' | b'U' | b'V' | b'W' | b'X' | b'Y' | b'Z'
+            ),
             _ => false,
         }
     }
@@ -2105,16 +2148,25 @@ mod tests {
         assert!(Ft8Message::is_valid_itu_prefix("5N1ABC"));
 
         // Known OSD false positives that should FAIL
-        assert!(!Ft8Message::is_valid_itu_prefix("QY3HUG"), "QY is not allocated (Q reserved for Q-codes)");
+        assert!(
+            !Ft8Message::is_valid_itu_prefix("QY3HUG"),
+            "QY is not allocated (Q reserved for Q-codes)"
+        );
         // XO is technically allocated to Canada (XJ-XO), so it passes ITU check.
         // H6 is not an allocated prefix (H requires 2-letter like HA, HB, or H4)
-        assert!(!Ft8Message::is_valid_itu_prefix("H63SII"), "H6 is not an allocated prefix");
+        assert!(
+            !Ft8Message::is_valid_itu_prefix("H63SII"),
+            "H6 is not an allocated prefix"
+        );
 
         // Letter+digit prefixes (not standalone letter, but valid 2-char)
         assert!(Ft8Message::is_valid_itu_prefix("A71A"), "A7 = Qatar");
         assert!(Ft8Message::is_valid_itu_prefix("A61ABC"), "A6 = UAE");
         assert!(Ft8Message::is_valid_itu_prefix("P49ABC"), "P4 = Aruba");
-        assert!(Ft8Message::is_valid_itu_prefix("H44ABC"), "H4 = Solomon Islands");
+        assert!(
+            Ft8Message::is_valid_itu_prefix("H44ABC"),
+            "H4 = Solomon Islands"
+        );
 
         // Edge cases
         assert!(!Ft8Message::is_valid_itu_prefix("AB"), "Too short");

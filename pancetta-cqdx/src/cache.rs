@@ -38,7 +38,8 @@ impl CqdxCache {
         self.prefixes.clear();
         for entity in &entities {
             self.entities.insert(entity.adif_number, entity.clone());
-            self.prefixes.push((entity.prefix.to_uppercase(), entity.adif_number));
+            self.prefixes
+                .push((entity.prefix.to_uppercase(), entity.adif_number));
         }
         // Sort longest prefix first so "3Y/B" matches before "3Y"
         self.prefixes.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
@@ -56,7 +57,8 @@ impl CqdxCache {
     pub fn update_spot_groups(&mut self, groups: Vec<SpotGroup>) {
         for group in &groups {
             let rarity = rank_to_rarity(group.rarity_rank);
-            self.rarity_scores.insert(group.dx_call.to_uppercase(), rarity);
+            self.rarity_scores
+                .insert(group.dx_call.to_uppercase(), rarity);
         }
         self.spot_groups = groups;
     }
@@ -108,19 +110,37 @@ mod tests {
     fn sample_entities() -> Vec<DxccEntity> {
         vec![
             DxccEntity {
-                adif_number: 291, entity_name: "United States".to_string(), prefix: "K".to_string(),
-                continent: "NA".to_string(), cq_zone: 5, itu_zone: 8,
-                rarity_rank: Some(340), rarity_tier: "common".to_string(), is_deleted: false,
+                adif_number: 291,
+                entity_name: "United States".to_string(),
+                prefix: "K".to_string(),
+                continent: "NA".to_string(),
+                cq_zone: 5,
+                itu_zone: 8,
+                rarity_rank: Some(340),
+                rarity_tier: "common".to_string(),
+                is_deleted: false,
             },
             DxccEntity {
-                adif_number: 339, entity_name: "Japan".to_string(), prefix: "JA".to_string(),
-                continent: "AS".to_string(), cq_zone: 25, itu_zone: 45,
-                rarity_rank: Some(300), rarity_tier: "common".to_string(), is_deleted: false,
+                adif_number: 339,
+                entity_name: "Japan".to_string(),
+                prefix: "JA".to_string(),
+                continent: "AS".to_string(),
+                cq_zone: 25,
+                itu_zone: 45,
+                rarity_rank: Some(300),
+                rarity_tier: "common".to_string(),
+                is_deleted: false,
             },
             DxccEntity {
-                adif_number: 327, entity_name: "Bouvet Island".to_string(), prefix: "3Y/B".to_string(),
-                continent: "AF".to_string(), cq_zone: 38, itu_zone: 67,
-                rarity_rank: Some(1), rarity_tier: "legendary".to_string(), is_deleted: false,
+                adif_number: 327,
+                entity_name: "Bouvet Island".to_string(),
+                prefix: "3Y/B".to_string(),
+                continent: "AF".to_string(),
+                cq_zone: 38,
+                itu_zone: 67,
+                rarity_rank: Some(1),
+                rarity_tier: "legendary".to_string(),
+                is_deleted: false,
             },
         ]
     }
@@ -211,7 +231,7 @@ mod tests {
             prefix: "3Y/B".to_string(),
         }]);
         assert!(cache.is_needed_dxcc("3Y/B1234")); // Bouvet is needed
-        assert!(!cache.is_needed_dxcc("K1ABC"));    // US is NOT needed
+        assert!(!cache.is_needed_dxcc("K1ABC")); // US is NOT needed
     }
 
     #[test]

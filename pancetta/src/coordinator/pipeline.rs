@@ -83,7 +83,8 @@ impl super::ApplicationCoordinator {
                 }
                 Ok(())
             });
-            self.named_task_handles.push((ComponentId::Tui, drain_handle));
+            self.named_task_handles
+                .push((ComponentId::Tui, drain_handle));
         }
 
         Ok(())
@@ -223,7 +224,10 @@ impl super::ApplicationCoordinator {
 
                     let len = samples.len();
                     if audio_to_dsp_tx.send(samples).is_err() {
-                        info!("Audio relay: DSP channel closed after {} sends", relay_count);
+                        info!(
+                            "Audio relay: DSP channel closed after {} sends",
+                            relay_count
+                        );
                         break;
                     }
                     relay_count += 1;
@@ -282,7 +286,8 @@ impl super::ApplicationCoordinator {
             }
             const FT8_SAMPLE_RATE: usize = 12000;
             const FT8_WINDOW_SECONDS: f64 = 12.64;
-            const FT8_WINDOW_SAMPLES: usize = (FT8_SAMPLE_RATE as f64 * FT8_WINDOW_SECONDS) as usize; // 151,680
+            const FT8_WINDOW_SAMPLES: usize =
+                (FT8_SAMPLE_RATE as f64 * FT8_WINDOW_SECONDS) as usize; // 151,680
 
             // FIR low-pass filter for anti-aliased decimation.
             // 65-tap Kaiser-windowed sinc (beta=8, ~80dB stopband attenuation).
@@ -310,7 +315,9 @@ impl super::ApplicationCoordinator {
                         for k in 1..20 {
                             term *= (v / (2.0 * k as f32)) * (v / (2.0 * k as f32));
                             sum += term;
-                            if term < 1e-10 { break; }
+                            if term < 1e-10 {
+                                break;
+                            }
                         }
                         sum
                     };
@@ -338,7 +345,12 @@ impl super::ApplicationCoordinator {
 
             info!(
                 "DSP: {}Hz/{}ch -> {}Hz mono (decimate {}:1, {}-tap FIR), window={}",
-                input_rate, input_channels, FT8_SAMPLE_RATE, decimation_factor, fir_len, FT8_WINDOW_SAMPLES
+                input_rate,
+                input_channels,
+                FT8_SAMPLE_RATE,
+                decimation_factor,
+                fir_len,
+                FT8_WINDOW_SAMPLES
             );
 
             // Continuously capture audio -- don't wait for boundaries.
@@ -352,10 +364,12 @@ impl super::ApplicationCoordinator {
                 let wait_secs = if secs == 0 { 0 } else { 15 - secs };
                 now + chrono::Duration::seconds(wait_secs)
             };
-            info!("DSP: first window at {}", next_window_time.format("%H:%M:%S"));
+            info!(
+                "DSP: first window at {}",
+                next_window_time.format("%H:%M:%S")
+            );
 
             while !shutdown.load(Ordering::Acquire) {
-
                 match audio_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                     Ok(samples) => {
                         message_count.fetch_add(1, Ordering::Relaxed);
@@ -396,7 +410,8 @@ impl super::ApplicationCoordinator {
                         const LIVE_WF_INTERVAL: usize = 12000; // 1 second at 12kHz
                         const LIVE_WF_FFT_SIZE: usize = 2048;
                         if ft8_buffer.len() >= LIVE_WF_FFT_SIZE {
-                            let samples_since_last = ft8_buffer.len().saturating_sub(last_live_wf_samples);
+                            let samples_since_last =
+                                ft8_buffer.len().saturating_sub(last_live_wf_samples);
                             if samples_since_last >= LIVE_WF_INTERVAL {
                                 last_live_wf_samples = ft8_buffer.len();
 
@@ -409,7 +424,11 @@ impl super::ApplicationCoordinator {
                                     .enumerate()
                                     .map(|(i, &s)| {
                                         // Apply Hann window
-                                        let w = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / LIVE_WF_FFT_SIZE as f32).cos());
+                                        let w = 0.5
+                                            * (1.0
+                                                - (2.0 * std::f32::consts::PI * i as f32
+                                                    / LIVE_WF_FFT_SIZE as f32)
+                                                    .cos());
                                         rustfft::num_complex::Complex::new(s * w, 0.0)
                                     })
                                     .collect();
@@ -421,13 +440,18 @@ impl super::ApplicationCoordinator {
                                 let bin_end = bin_end.min(LIVE_WF_FFT_SIZE / 2);
 
                                 let powers: Vec<f32> = (0..=bin_end)
-                                    .map(|i| 10.0 * (input[i].norm_sqr() / LIVE_WF_FFT_SIZE as f32 + 1e-12).log10())
+                                    .map(|i| {
+                                        10.0 * (input[i].norm_sqr() / LIVE_WF_FFT_SIZE as f32
+                                            + 1e-12)
+                                            .log10()
+                                    })
                                     .collect();
 
                                 let min_p = powers.iter().cloned().fold(f32::MAX, f32::min);
                                 let max_p = powers.iter().cloned().fold(f32::MIN, f32::max);
                                 let range = (max_p - min_p).max(1.0);
-                                let row: Vec<f32> = powers.iter().map(|&p| (p - min_p) / range).collect();
+                                let row: Vec<f32> =
+                                    powers.iter().map(|&p| (p - min_p) / range).collect();
                                 let _ = live_waterfall_tx.try_send(vec![row]);
                             }
                         }
@@ -446,9 +470,15 @@ impl super::ApplicationCoordinator {
                                 last_live_wf_samples = ft8_buffer.len();
                             }
                             window_count += 1;
-                            let rms = (window.iter().map(|s| s * s).sum::<f32>() / window.len() as f32).sqrt();
-                            info!("DSP: FT8 window #{} (RMS={:.4}) at {}",
-                                window_count, rms, now.format("%H:%M:%S.%3f"));
+                            let rms = (window.iter().map(|s| s * s).sum::<f32>()
+                                / window.len() as f32)
+                                .sqrt();
+                            info!(
+                                "DSP: FT8 window #{} (RMS={:.4}) at {}",
+                                window_count,
+                                rms,
+                                now.format("%H:%M:%S.%3f")
+                            );
                             if dsp_to_ft8_tx.send(window).is_err() {
                                 info!("DSP: FT8 channel closed");
                                 return Ok(());
@@ -462,13 +492,19 @@ impl super::ApplicationCoordinator {
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                        info!("DSP: audio channel disconnected after {} batches", batch_count);
+                        info!(
+                            "DSP: audio channel disconnected after {} batches",
+                            batch_count
+                        );
                         break;
                     }
                 }
             }
 
-            info!("DSP stopped ({} batches, {} windows sent)", batch_count, window_count);
+            info!(
+                "DSP stopped ({} batches, {} windows sent)",
+                batch_count, window_count
+            );
             Ok(())
         });
 
@@ -514,9 +550,15 @@ impl super::ApplicationCoordinator {
             // Create persistent AP state for enhanced decoding
             let my_call_ap = pancetta_ft8::MyCallAp::new(&station_callsign);
             if my_call_ap.is_none() {
-                warn!("AP decoding: could not encode station callsign '{}', AP1+ disabled", station_callsign);
+                warn!(
+                    "AP decoding: could not encode station callsign '{}', AP1+ disabled",
+                    station_callsign
+                );
             } else {
-                info!("AP decoding: station callsign '{}' encoded for AP injection", station_callsign);
+                info!(
+                    "AP decoding: station callsign '{}' encoded for AP injection",
+                    station_callsign
+                );
             }
             let mut recent_pool: Vec<pancetta_ft8::RecentCallAp> = Vec::new();
 
@@ -563,10 +605,8 @@ impl super::ApplicationCoordinator {
                         }
 
                         // Build AP context for this decode window
-                        let current_qso_ap = active_qso_ap
-                            .read()
-                            .ok()
-                            .and_then(|guard| guard.clone());
+                        let current_qso_ap =
+                            active_qso_ap.read().ok().and_then(|guard| guard.clone());
                         let ap_context = pancetta_ft8::ApContext {
                             my_call: my_call_ap.clone(),
                             recent_calls: recent_pool.clone(),
@@ -621,7 +661,10 @@ impl super::ApplicationCoordinator {
                                     let bus2 = message_bus.clone();
                                     rt.spawn(async move {
                                         if let Err(e) = bus2.send_message(qso_msg).await {
-                                            debug!("Failed to forward decoded message to QSO: {}", e);
+                                            debug!(
+                                                "Failed to forward decoded message to QSO: {}",
+                                                e
+                                            );
                                         }
                                     });
 
@@ -643,7 +686,9 @@ impl super::ApplicationCoordinator {
                                 for msg in &decoded_messages {
                                     if let Some(ref call) = msg.message.from_callsign {
                                         if !recent_pool.iter().any(|r| r.callsign == *call) {
-                                            if let Some(ap) = pancetta_ft8::RecentCallAp::new(call, msg.snr_db) {
+                                            if let Some(ap) =
+                                                pancetta_ft8::RecentCallAp::new(call, msg.snr_db)
+                                            {
                                                 recent_pool.push(ap);
                                             }
                                         }

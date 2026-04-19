@@ -569,7 +569,9 @@ impl ConfigLoader {
                             // The old code passed the pre-reload config to listeners.
                             let new_config = match fs::read_to_string(&path) {
                                 Ok(content) => {
-                                    let parsed = if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                                    let parsed = if path.extension().and_then(|e| e.to_str())
+                                        == Some("json")
+                                    {
                                         serde_json::from_str::<Config>(&content).ok()
                                     } else {
                                         toml::from_str::<Config>(&content).ok()
@@ -577,7 +579,11 @@ impl ConfigLoader {
                                     parsed
                                 }
                                 Err(e) => {
-                                    warn!("Failed to re-read config file {}: {}", path.display(), e);
+                                    warn!(
+                                        "Failed to re-read config file {}: {}",
+                                        path.display(),
+                                        e
+                                    );
                                     None
                                 }
                             };

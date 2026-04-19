@@ -267,12 +267,16 @@ impl AudioStreamManager {
                 let candidate = devices
                     .iter()
                     .filter(|(_, info)| info.name == *device_name && info.supports_input)
-                    .max_by_key(|(_, info)| info.input_channels.len() + info.input_sample_rates.len());
+                    .max_by_key(|(_, info)| {
+                        info.input_channels.len() + info.input_sample_rates.len()
+                    });
                 match candidate {
                     Some((device, info)) => {
                         tracing::info!(
                             "Selected input device '{}' (ch={:?}, rates={:?})",
-                            info.name, info.input_channels, info.input_sample_rates,
+                            info.name,
+                            info.input_channels,
+                            info.input_sample_rates,
                         );
                         device
                     }
@@ -330,10 +334,8 @@ impl AudioStreamManager {
             cpal::SampleFormat::I16 => input_device.build_input_stream(
                 &config,
                 move |data: &[i16], _info: &InputCallbackInfo| {
-                    let float_data: Vec<f32> = data
-                        .iter()
-                        .map(|&s| s as f32 / i16::MAX as f32)
-                        .collect();
+                    let float_data: Vec<f32> =
+                        data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
                     producer.push_audio_slice(&float_data);
                     let timer = CallbackTimer::start();
                     let _ = producer.push_latency(timer.elapsed_ns());
@@ -366,7 +368,9 @@ impl AudioStreamManager {
                 let candidate = devices
                     .iter()
                     .filter(|(_, info)| info.name == *device_name && info.supports_output)
-                    .max_by_key(|(_, info)| info.output_channels.len() + info.output_sample_rates.len());
+                    .max_by_key(|(_, info)| {
+                        info.output_channels.len() + info.output_sample_rates.len()
+                    });
                 match candidate {
                     Some((device, _)) => device,
                     None => {

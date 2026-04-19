@@ -598,11 +598,8 @@ impl QsoManager {
 
             // Emit QsoCompleted event so loggers can auto-log the QSO
             if let Some(metadata) = completed_metadata {
-                self.emit_event(QsoEvent::QsoCompleted {
-                    qso_id,
-                    metadata,
-                })
-                .await;
+                self.emit_event(QsoEvent::QsoCompleted { qso_id, metadata })
+                    .await;
             }
         }
 
@@ -811,7 +808,10 @@ impl QsoManager {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    warn!("Database duplicate check failed, relying on in-memory only: {}", e);
+                    warn!(
+                        "Database duplicate check failed, relying on in-memory only: {}",
+                        e
+                    );
                 }
             }
         }

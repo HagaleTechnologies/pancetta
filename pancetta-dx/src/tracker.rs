@@ -744,13 +744,12 @@ impl DxTracker {
 
         let conn = self.connection.lock().unwrap();
         let (worked_count, confirmed_count) =
-            conn
-                .query_row(&query, param_refs.as_slice(), |row| {
-                    Ok((
-                        row.get::<_, i64>("worked_count")? as u32,
-                        row.get::<_, i64>("confirmed_count")? as u32,
-                    ))
-                })?;
+            conn.query_row(&query, param_refs.as_slice(), |row| {
+                Ok((
+                    row.get::<_, i64>("worked_count")? as u32,
+                    row.get::<_, i64>("confirmed_count")? as u32,
+                ))
+            })?;
 
         // For DXCC, there are currently 340 entities
         let total_entities = 340u32;

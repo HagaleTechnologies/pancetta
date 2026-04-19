@@ -532,7 +532,11 @@ impl DspPipeline {
             let in_len = frame.samples.len();
             frame = stage.process(frame).await?;
             if self.frame_counter == 1 {
-                info!("DSP stage produced {} samples from {} input", frame.samples.len(), in_len);
+                info!(
+                    "DSP stage produced {} samples from {} input",
+                    frame.samples.len(),
+                    in_len
+                );
             }
         }
 

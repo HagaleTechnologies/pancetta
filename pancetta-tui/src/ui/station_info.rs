@@ -117,10 +117,7 @@ fn render_operating_parameters(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Build frequency line with optional radio delta
     let mut freq_spans = vec![
-        Span::styled(
-            "Freq: ",
-            Style::default().fg(app.theme.foreground_color()),
-        ),
+        Span::styled("Freq: ", Style::default().fg(app.theme.foreground_color())),
         Span::styled(
             app.config
                 .ui
@@ -270,9 +267,12 @@ fn render_equipment_info(f: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(app.theme.foreground_color()),
             ),
             Span::styled(
-                format!("{:.2}°{}, {:.2}°{}",
-                    lat.abs(), if lat >= 0.0 { "N" } else { "S" },
-                    lon.abs(), if lon >= 0.0 { "E" } else { "W" },
+                format!(
+                    "{:.2}°{}, {:.2}°{}",
+                    lat.abs(),
+                    if lat >= 0.0 { "N" } else { "S" },
+                    lon.abs(),
+                    if lon >= 0.0 { "E" } else { "W" },
                 ),
                 Style::default().fg(app.theme.muted_color()),
             ),
