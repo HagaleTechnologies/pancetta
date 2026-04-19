@@ -18,6 +18,8 @@ pub struct Waterfall<'a> {
     signal_freqs: Vec<f64>,
     /// Number of data rows per FT8 cycle (for drawing cycle boundary markers)
     rows_per_cycle: usize,
+    /// Number of data rows combined into each display row (vertical compression)
+    compression: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -37,6 +39,7 @@ impl<'a> Waterfall<'a> {
             tx_offset: None,
             signal_freqs: Vec::new(),
             rows_per_cycle: 4,
+            compression: 2,
         }
     }
 
@@ -132,20 +135,22 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
         let width = waterfall_area.width as usize;
         let height = waterfall_area.height as usize;
 
-        // Render waterfall data rows
+        // Render waterfall data rows with vertical compression.
+        // Each display row combines `compression` data rows (max intensity).
+        let comp = self.compression.max(1);
         if !self.data.is_empty() {
-            let rows_to_show = height.min(self.data.len());
+            let effective_rows = self.data.len() / comp;
+            let rows_to_show = height.min(effective_rows);
 
-            for (row_idx, row_data) in self
-                .data
-                .iter()
-                .rev() // Newest at top
-                .take(rows_to_show)
-                .enumerate()
-            {
-                let y = waterfall_area.y + row_idx as u16;
-                let num_bins = row_data.len();
+            for display_row in 0..rows_to_show {
+                let y = waterfall_area.y + display_row as u16;
 
+                // Source data rows for this display row (newest first)
+                let start = self.data.len() - (display_row + 1) * comp;
+                let end = start + comp;
+                let source_rows = &self.data[start..end];
+
+                let num_bins = source_rows[0].len();
                 if num_bins == 0 {
                     continue;
                 }
@@ -154,10 +159,13 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
                     let bin_start = col * num_bins / width;
                     let bin_end = ((col + 1) * num_bins / width).max(bin_start + 1);
 
-                    let intensity = row_data[bin_start..bin_end.min(num_bins)]
-                        .iter()
-                        .cloned()
-                        .fold(0.0f32, f32::max);
+                    // Max intensity across both the bin range and all compressed rows
+                    let mut intensity = 0.0f32;
+                    for row_data in source_rows {
+                        for &val in &row_data[bin_start..bin_end.min(row_data.len())] {
+                            intensity = intensity.max(val);
+                        }
+                    }
 
                     let color = self.get_color_for_intensity(intensity);
                     let x = waterfall_area.x + col as u16;
@@ -167,17 +175,16 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
         }
 
         // Overlay: cycle boundary markers (dim horizontal ticks on left edge)
-        // Every rows_per_cycle rows, draw a small marker so the operator
-        // can distinguish even/odd FT8 cycles.
+        // Every rows_per_cycle data rows, draw a small marker so the operator
+        // can distinguish even/odd FT8 cycles.  Accounts for compression.
         if self.rows_per_cycle > 0 && !self.data.is_empty() {
-            let rows_to_show = height.min(self.data.len());
-            let total_rows = self.data.len();
-            for row_idx in 0..rows_to_show {
-                // The data index (counting from newest = 0)
-                let data_idx = total_rows - 1 - row_idx;
+            let effective_rows = self.data.len() / comp;
+            let rows_to_show = height.min(effective_rows);
+            for display_row in 0..rows_to_show {
+                // Map display row back to data index
+                let data_idx = self.data.len() - 1 - display_row * comp;
                 if data_idx % self.rows_per_cycle == 0 {
-                    let y = waterfall_area.y + row_idx as u16;
-                    // Even/odd cycle alternation: even cycles get one color, odd another
+                    let y = waterfall_area.y + display_row as u16;
                     let cycle_num = data_idx / self.rows_per_cycle;
                     let marker_char = if cycle_num % 2 == 0 { 'E' } else { 'O' };
                     let marker_color = if cycle_num % 2 == 0 {

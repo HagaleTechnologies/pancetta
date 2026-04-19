@@ -54,7 +54,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
 
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
         .split(main_chunks[1]);
 
     // Render panels
