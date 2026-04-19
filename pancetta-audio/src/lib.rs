@@ -20,7 +20,7 @@
 //! - Receives from: system audio hardware (via `cpal`)
 //! - Sends to: `pancetta-dsp`
 
-// #![warn(missing_docs)] // TODO: Re-enable once documentation is complete
+#![warn(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code, unused_imports)]
 

@@ -131,6 +131,7 @@
 //! - **SSB**: 24kHz sample rate, wide bandwidth, slow AGC
 //! - **CW**: High sample rate, narrow filters, very fast AGC
 
+#![warn(missing_docs)]
 #![allow(dead_code, unused_imports)]
 
 pub mod agc;

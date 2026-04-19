@@ -46,6 +46,7 @@
 //! println!("Audio device: {}", config.audio.input_device);
 //! ```
 
+#![warn(missing_docs)]
 #![allow(dead_code, unused_imports)]
 
 use serde::{Deserialize, Serialize};

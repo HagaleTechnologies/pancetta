@@ -19,6 +19,8 @@
 //! - Receives from: cqdx.io REST API (HTTP)
 //! - Sends to: `pancetta` coordinator (entities, live spots, rarity scores)
 
+#![warn(missing_docs)]
+
 pub mod cache;
 pub mod client;
 pub mod error;

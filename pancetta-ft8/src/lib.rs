@@ -70,6 +70,7 @@
 //! # }
 //! ```
 
+#![warn(missing_docs)]
 #![allow(dead_code, unused_imports)]
 
 // Protocol abstraction layer (FT8/FT4/FT2)

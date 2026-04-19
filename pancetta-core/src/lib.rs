@@ -20,6 +20,8 @@
 //!   `pancetta-config`, `pancetta-qso`, `pancetta-hamlib`, `pancetta-dx`,
 //!   `pancetta-cqdx`, `pancetta-tui`, `pancetta`)
 
+#![warn(missing_docs)]
+
 pub mod error;
 pub mod types;
 
