@@ -35,12 +35,7 @@ fn main() {
             true
         }
         Err(_) => {
-            // hamlib not found - don't try to link it
-            println!("cargo:warning=hamlib library not found. Mock rig will be used instead.");
-            println!("cargo:warning=To use real hardware, install hamlib development packages:");
-            println!("cargo:warning=  Ubuntu/Debian: sudo apt-get install libhamlib-dev");
-            println!("cargo:warning=  Fedora/RHEL: sudo dnf install hamlib-devel");
-            println!("cargo:warning=  macOS: brew install hamlib");
+            // hamlib C library not found — this is fine, we use rigctld (TCP) instead.
             println!("cargo:rustc-cfg=feature=\"no-hamlib\"");
             false
         }
@@ -79,7 +74,7 @@ fn main() {
 fn generate_bindings() {
     let bindings = bindgen::Builder::default()
         .header("wrapper.h")
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks))
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         // Include only hamlib functions
         .allowlist_function("rig_.*")
         .allowlist_type("rig_.*")

@@ -29,6 +29,8 @@
 //! println!("Audio device: {}", config.audio.input_device);
 //! ```
 
+#![allow(dead_code, unused_imports)]
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;

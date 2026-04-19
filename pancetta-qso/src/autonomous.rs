@@ -4,9 +4,9 @@
 //! decisions: hunt for interesting CQs, call CQ when idle, manage even/odd slots,
 //! and periodically listen on our TX slot to detect doubling.
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 

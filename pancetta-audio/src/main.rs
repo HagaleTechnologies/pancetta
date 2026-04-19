@@ -108,7 +108,7 @@ async fn run_audio_latency_test(
     println!("Starting audio processor...");
     processor.start().await?;
 
-    let mut latency_measurer = LatencyMeasurer::new(1000, 1_000_000); // 1ms target
+    let latency_measurer = LatencyMeasurer::new(1000, 1_000_000); // 1ms target
     let mut last_stats_time = std::time::Instant::now();
     let test_start = std::time::Instant::now();
 

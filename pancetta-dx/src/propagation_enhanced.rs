@@ -224,7 +224,7 @@ impl EnhancedPropagation {
     ) -> PropagationPrediction {
         // Calculate path parameters
         let distance_km = self.calculate_distance(from_lat, from_lon, to_lat, to_lon);
-        let bearing = self.calculate_bearing(from_lat, from_lon, to_lat, to_lon);
+        let _bearing = self.calculate_bearing(from_lat, from_lon, to_lat, to_lon);
 
         // Calculate MUF/LUF/FOT
         let muf = self.calculate_muf(distance_km, time);
@@ -373,7 +373,7 @@ impl EnhancedPropagation {
         &self,
         freq_mhz: f64,
         distance_km: f64,
-        time: DateTime<Utc>,
+        _time: DateTime<Utc>,
     ) -> Vec<PropagationMode> {
         let mut modes = Vec::new();
 
@@ -492,8 +492,8 @@ impl EnhancedPropagation {
         &self,
         power_watts: f64,
         path_loss: f64,
-        freq_mhz: f64,
-        distance_km: f64,
+        _freq_mhz: f64,
+        _distance_km: f64,
     ) -> f64 {
         // Convert power to dBm
         let power_dbm = 10.0 * power_watts.log10() + 30.0;
@@ -513,7 +513,7 @@ impl EnhancedPropagation {
         muf: f64,
         luf: f64,
         solar_data: &SolarData,
-        time: DateTime<Utc>,
+        _time: DateTime<Utc>,
     ) -> f64 {
         // Frequency factor
         let freq_factor = if freq_mhz > muf {

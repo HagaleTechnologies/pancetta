@@ -25,7 +25,7 @@ fn main() {
             .opt_level(2)
             .compile("ft8_lib");
     } else {
-        println!("cargo:warning=ft8_lib vendor sources not found, skipping C FFI compilation");
+        // ft8_lib vendor sources not found — using pure-Rust decoder instead.
         // Signal to the Rust code that stubs should be used instead of real FFI.
         println!("cargo:rustc-cfg=ft8lib_stub");
     }

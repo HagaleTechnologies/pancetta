@@ -7,6 +7,7 @@
 
 // #![warn(missing_docs)] // TODO: Re-enable once documentation is complete
 #![deny(unsafe_op_in_unsafe_fn)]
+#![allow(dead_code, unused_imports)]
 
 pub mod converter;
 pub mod device;

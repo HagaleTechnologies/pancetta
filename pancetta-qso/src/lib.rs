@@ -138,6 +138,7 @@
 
 // #![warn(missing_docs)] // TODO: Re-enable once documentation is complete
 #![deny(unsafe_code)]
+#![allow(dead_code, unused_imports)]
 
 // Re-export all public types and functions for easy access
 pub use crate::adif::*;
@@ -476,7 +477,7 @@ impl QsoSystem {
     /// Get comprehensive statistics (requires logger)
     pub async fn get_statistics(&self) -> QsoResult<Option<crate::statistics::QsoStatistics>> {
         if let Some(ref logger) = self.logger {
-            let db_stats = logger.get_statistics().await?;
+            let _db_stats = logger.get_statistics().await?;
             // Convert database stats to comprehensive statistics would require access to the database
             // For now, return None if logger is not available with statistics calculator
             Ok(None)

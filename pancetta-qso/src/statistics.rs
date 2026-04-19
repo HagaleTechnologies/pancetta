@@ -1344,7 +1344,7 @@ impl StatisticsCalculator {
 
     async fn calculate_geographic_statistics(
         &self,
-        records: &[QsoDatabaseRecord],
+        _records: &[QsoDatabaseRecord],
     ) -> Result<GeographicStatistics, StatisticsError> {
         // Placeholder implementation - would need geographic data lookups
         let countries = CountryStatistics {

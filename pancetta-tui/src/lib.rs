@@ -3,6 +3,8 @@
 //! Terminal User Interface library for the Pancetta amateur radio application.
 //! Provides real-time display of FT8 decodes, band activity, and station information.
 
+#![allow(dead_code, unused_imports)]
+
 pub mod app;
 pub mod config;
 pub mod events;

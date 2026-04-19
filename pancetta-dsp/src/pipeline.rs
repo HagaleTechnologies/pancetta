@@ -5,12 +5,12 @@ use crate::{
     resampler::AudioResampler,
 };
 use async_trait::async_trait;
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::time::{sleep, Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 #[derive(Debug, Error)]
 pub enum PipelineError {
@@ -379,8 +379,8 @@ impl DspPipeline {
         config.validate()?;
 
         // Create channels for audio data
-        let (input_tx, input_rx) = bounded(config.num_threads * 4);
-        let (output_tx, output_rx) = bounded(config.num_threads * 4);
+        let (input_tx, input_rx) = crossbeam_channel::unbounded();
+        let (output_tx, output_rx) = crossbeam_channel::unbounded();
 
         // Create input buffer
         let input_buffer = AudioRingBuffer::new(config.input_sample_rate, config.max_latency)?;
@@ -459,8 +459,8 @@ impl DspPipeline {
         while *self.is_running.lock() {
             let start_time = Instant::now();
 
-            // Check for new input data
-            if let Ok(input_samples) = self.input_rx.try_recv() {
+            // Drain all available input data
+            while let Ok(input_samples) = self.input_rx.try_recv() {
                 self.process_input_samples(input_samples).await?;
             }
 
@@ -529,7 +529,19 @@ impl DspPipeline {
 
         // Process through all stages
         for stage in &mut self.stages {
+            let in_len = frame.samples.len();
             frame = stage.process(frame).await?;
+            if self.frame_counter == 1 {
+                info!("DSP stage produced {} samples from {} input", frame.samples.len(), in_len);
+            }
+        }
+
+        if self.frame_counter == 1 {
+            info!(
+                "DSP processed frame: {} output samples, window extractor position={}",
+                frame.samples.len(),
+                self.window_extractor.position(),
+            );
         }
 
         // Extract windows for FT8
@@ -539,6 +551,15 @@ impl DspPipeline {
                 warn!("Failed to send window to decoder: {}", e);
             }
         });
+
+        if self.frame_counter % 10000 == 0 {
+            info!(
+                "DSP pipeline: {} frames processed, window extractor at {}/{}",
+                self.frame_counter,
+                self.window_extractor.position(),
+                self.window_extractor.window_size(),
+            );
+        }
 
         self.stats.lock().frames_processed += 1;
         Ok(())

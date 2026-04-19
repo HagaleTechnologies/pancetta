@@ -619,7 +619,7 @@ pub fn modulate_multi_tx(
     }
 
     // Normalize: divide by signal count and apply headroom
-    let signal_count = signals.len() as f32;
+    let _signal_count = signals.len() as f32;
     let peak = combined.iter().map(|&s| s.abs()).fold(0.0f32, f32::max);
     if peak > 0.0 {
         let headroom = 0.95;

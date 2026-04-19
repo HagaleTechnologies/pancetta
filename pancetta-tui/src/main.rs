@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_imports)]
+
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
@@ -34,7 +36,7 @@ struct Cli {
     device: Option<String>,
 
     /// Enable debug logging
-    #[arg(short, long)]
+    #[arg(short = 'D', long)]
     debug: bool,
 
     /// Log file path

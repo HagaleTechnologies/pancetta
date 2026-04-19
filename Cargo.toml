@@ -127,6 +127,9 @@ opt-level = 1
 debug = true
 panic = "abort"
 
+[profile.dev.package.pancetta-ft8]
+opt-level = 3
+
 [profile.bench]
 # Optimized for benchmarking
 opt-level = 3

@@ -492,7 +492,7 @@ impl RigControl for Rig {
         let handle = self.init_hamlib_handle()?;
 
         // Open connection
-        let raw_ptr = handle.as_ptr();
+        let _raw_ptr = handle.as_ptr();
         let result = self
             .execute_operation(move || unsafe {
                 let result = rig_open(handle.as_ptr());
@@ -539,7 +539,7 @@ impl RigControl for Rig {
         };
 
         if let Some(handle) = handle {
-            let raw_ptr = handle.as_ptr();
+            let _raw_ptr = handle.as_ptr();
             let result = self
                 .execute_operation(move || unsafe {
                     let close_result = rig_close(handle.as_ptr());

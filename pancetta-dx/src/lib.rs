@@ -12,6 +12,8 @@
 //! - External service integrations (PSKReporter, DX clusters, LoTW)
 //! - Comprehensive statistics and progress reporting
 
+#![allow(dead_code, unused_imports)]
+
 pub mod cluster;
 pub mod dxcc;
 pub mod geography;
@@ -363,7 +365,7 @@ impl DxHunter {
     }
 
     /// Get priority spots based on current configuration
-    pub async fn get_priority_spots(&self, limit: usize) -> Result<Vec<DxSpot>> {
+    pub async fn get_priority_spots(&self, _limit: usize) -> Result<Vec<DxSpot>> {
         // This would integrate with various spot sources
         // For now, return empty vector as placeholder
         Ok(Vec::new())

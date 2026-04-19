@@ -326,6 +326,7 @@ pub struct AdvancedRig {
     /// Memory channels cache
     memory_channels: RwLock<HashMap<i32, MemoryChannel>>,
     /// Band plans
+    #[allow(dead_code)]
     band_plans: Vec<BandPlan>,
     /// Current scan status
     scan_status: RwLock<ScanStatus>,

@@ -73,6 +73,7 @@ struct MockRigState {
     /// Current memory channel for each VFO
     current_memory: HashMap<Vfo, i32>,
     /// Antenna position
+    #[allow(dead_code)]
     antenna: u32,
     /// Scanning state
     scanning: bool,

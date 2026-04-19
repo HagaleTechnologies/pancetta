@@ -259,7 +259,7 @@ impl MessageExchange {
                 QsoState::RespondingToCq {
                     target_callsign, ..
                 },
-                MessageType::SignalReport { report, .. },
+                MessageType::SignalReport { report: _, .. },
             ) => {
                 Ok(Some(MessageType::ReportAck {
                     to_station: target_callsign.clone(),
@@ -307,7 +307,7 @@ impl MessageExchange {
     }
 
     /// Extract frequency information from message
-    pub fn extract_frequency_info(&self, message: &str) -> Option<f64> {
+    pub fn extract_frequency_info(&self, _message: &str) -> Option<f64> {
         // FT8 messages don't typically contain frequency information
         // This would be determined by the receive frequency
         None
@@ -494,7 +494,7 @@ impl MessageExchange {
         current_state: &QsoState,
         received_message: &MessageType,
     ) -> Result<Option<MessageType>, ExchangeError> {
-        let contest_config = self
+        let _contest_config = self
             .contest_mode
             .as_ref()
             .ok_or(ExchangeError::InvalidFormat {
@@ -507,7 +507,7 @@ impl MessageExchange {
                 QsoState::RespondingToCq {
                     target_callsign, ..
                 },
-                MessageType::ContestExchange { serial, .. },
+                MessageType::ContestExchange { serial: _, .. },
             ) => {
                 Ok(Some(MessageType::ContestExchange {
                     to_station: target_callsign.clone(),

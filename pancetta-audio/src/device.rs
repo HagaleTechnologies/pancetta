@@ -219,34 +219,53 @@ impl AudioDeviceManager {
         target_sample_rate: u32,
         target_channels: u16,
     ) -> AudioResult<SupportedStreamConfig> {
-        let configs = device
+        let configs: Vec<_> = device
             .supported_input_configs()
-            .map_err(|e| AudioError::device(format!("Failed to get input configs: {}", e)))?;
+            .map_err(|e| AudioError::device(format!("Failed to get input configs: {}", e)))?
+            .collect();
+
+        tracing::info!(
+            "Input device has {} supported configs (want {}Hz/{}ch)",
+            configs.len(),
+            target_sample_rate,
+            target_channels,
+        );
+        for (i, config) in configs.iter().enumerate() {
+            tracing::info!(
+                "  config[{}]: {}ch, {}–{}Hz, {:?}",
+                i,
+                config.channels(),
+                config.min_sample_rate().0,
+                config.max_sample_rate().0,
+                config.sample_format(),
+            );
+        }
 
         let mut best_config = None;
-        let mut best_score = 0;
+        let mut best_score: i32 = 0;
 
-        for config in configs {
-            // Score configuration based on how well it matches our requirements
-            let mut score = 0;
+        for config in configs.iter() {
+            // Every config that supports audio is usable — start at 1
+            let mut score: i32 = 1;
 
             // Prefer exact sample rate match
             if config.min_sample_rate().0 <= target_sample_rate
                 && config.max_sample_rate().0 >= target_sample_rate
             {
                 score += 100;
+            } else if config.max_sample_rate().0 > target_sample_rate {
+                score += 50;
             } else {
-                // Prefer higher sample rates for better conversion quality
-                if config.max_sample_rate().0 > target_sample_rate {
-                    score += 50;
-                }
+                score += 10; // Still usable, DSP can resample
             }
 
-            // Prefer exact channel count match
+            // Prefer matching channel count, but mono is fine for FT8
             if config.channels() == target_channels {
                 score += 50;
             } else if config.channels() >= target_channels {
                 score += 25; // Can downmix
+            } else {
+                score += 10; // Mono input is fine — FT8 is mono anyway
             }
 
             // Prefer f32 sample format for processing
@@ -254,7 +273,7 @@ impl AudioDeviceManager {
                 SampleFormat::F32 => score += 30,
                 SampleFormat::I32 => score += 20,
                 SampleFormat::I16 => score += 10,
-                _ => {}
+                _ => score += 1,
             }
 
             if score > best_score {
@@ -275,12 +294,33 @@ impl AudioDeviceManager {
             }
         }
 
-        best_config.ok_or_else(|| {
-            AudioError::configuration(format!(
-                "No suitable input configuration found for {}Hz, {} channels",
-                target_sample_rate, target_channels
-            ))
-        })
+        if let Some(cfg) = best_config {
+            if cfg.channels() != target_channels || cfg.sample_rate().0 != target_sample_rate {
+                tracing::info!(
+                    "Input device config: {}Hz/{}ch (requested {}Hz/{}ch)",
+                    cfg.sample_rate().0,
+                    cfg.channels(),
+                    target_sample_rate,
+                    target_channels,
+                );
+            }
+            return Ok(cfg);
+        }
+
+        // Fallback: try the device's default input config
+        if let Ok(default_cfg) = device.default_input_config() {
+            tracing::warn!(
+                "No scored input config — using device default ({}Hz/{}ch)",
+                default_cfg.sample_rate().0,
+                default_cfg.channels(),
+            );
+            return Ok(default_cfg);
+        }
+
+        Err(AudioError::configuration(format!(
+            "No suitable input configuration found for {}Hz, {} channels",
+            target_sample_rate, target_channels
+        )))
     }
 
     /// Find optimal output configuration for a device
@@ -295,42 +335,38 @@ impl AudioDeviceManager {
             .map_err(|e| AudioError::device(format!("Failed to get output configs: {}", e)))?;
 
         let mut best_config = None;
-        let mut best_score = 0;
+        let mut best_score: i32 = 0;
 
         for config in configs {
-            // Score configuration based on how well it matches our requirements
-            let mut score = 0;
+            let mut score: i32 = 1;
 
-            // Prefer exact sample rate match
             if config.min_sample_rate().0 <= target_sample_rate
                 && config.max_sample_rate().0 >= target_sample_rate
             {
                 score += 100;
+            } else if config.max_sample_rate().0 > target_sample_rate {
+                score += 50;
             } else {
-                // Prefer higher sample rates for better conversion quality
-                if config.max_sample_rate().0 > target_sample_rate {
-                    score += 50;
-                }
+                score += 10;
             }
 
-            // Prefer exact channel count match
             if config.channels() == target_channels {
                 score += 50;
             } else if config.channels() >= target_channels {
-                score += 25; // Can downmix
+                score += 25;
+            } else {
+                score += 10;
             }
 
-            // Prefer f32 sample format for processing
             match config.sample_format() {
                 SampleFormat::F32 => score += 30,
                 SampleFormat::I32 => score += 20,
                 SampleFormat::I16 => score += 10,
-                _ => {}
+                _ => score += 1,
             }
 
             if score > best_score {
                 best_score = score;
-                // Use a sample rate that's within the supported range
                 let sample_rate = if target_sample_rate >= config.min_sample_rate().0
                     && target_sample_rate <= config.max_sample_rate().0
                 {
@@ -346,12 +382,33 @@ impl AudioDeviceManager {
             }
         }
 
-        best_config.ok_or_else(|| {
-            AudioError::configuration(format!(
-                "No suitable output configuration found for {}Hz, {} channels",
-                target_sample_rate, target_channels
-            ))
-        })
+        if let Some(cfg) = best_config {
+            if cfg.channels() != target_channels || cfg.sample_rate().0 != target_sample_rate {
+                tracing::info!(
+                    "Output device config: {}Hz/{}ch (requested {}Hz/{}ch)",
+                    cfg.sample_rate().0,
+                    cfg.channels(),
+                    target_sample_rate,
+                    target_channels,
+                );
+            }
+            return Ok(cfg);
+        }
+
+        // Fallback: try the device's default output config
+        if let Ok(default_cfg) = device.default_output_config() {
+            tracing::warn!(
+                "No scored output config — using device default ({}Hz/{}ch)",
+                default_cfg.sample_rate().0,
+                default_cfg.channels(),
+            );
+            return Ok(default_cfg);
+        }
+
+        Err(AudioError::configuration(format!(
+            "No suitable output configuration found for {}Hz, {} channels",
+            target_sample_rate, target_channels
+        )))
     }
 
     /// Get device information for a specific device
