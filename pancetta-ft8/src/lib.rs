@@ -51,8 +51,14 @@
 //! # }
 //! ```
 
+#![allow(dead_code, unused_imports)]
+
 // Protocol abstraction layer (FT8/FT4/FT2)
 pub mod protocol;
+
+// A Priori (AP) decoding support
+pub mod ap;
+pub use ap::{ApContext, ApLevel, MyCallAp, QsoAp, QsoApProgress, RecentCallAp};
 
 // Core FT8 decoding modules
 pub mod decoder;
