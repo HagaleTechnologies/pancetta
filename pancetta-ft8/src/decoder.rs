@@ -1371,10 +1371,12 @@ impl Ft8Decoder {
         };
         // Minimum confidence floor for ALL decodes.  CRC-14 collisions on
         // noise produce structurally valid messages with low sync scores.
-        // Empirical data: real decodes ≥0.84 confidence, FPs ≤0.37.
-        // Threshold 0.45 (sync_score ~5.4) gives safe margin.
-        const MIN_DECODE_CONFIDENCE: f32 = 0.40;
+        const MIN_DECODE_CONFIDENCE: f32 = 0.41;
+        const SCRUTINY_THRESHOLD: f32 = 0.65;
         if confidence < MIN_DECODE_CONFIDENCE {
+            return Ok(None);
+        }
+        if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
             return Ok(None);
         }
 
@@ -2204,10 +2206,15 @@ fn par_decode_candidate(
                 let snr_db = par_estimate_snr_spectrogram(ctx.protocol_params, &tone_magnitudes);
                 let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
-                // Minimum confidence floor — CRC-14 collisions on noise
-                // produce structurally valid messages with low sync scores.
-                const MIN_DECODE_CONFIDENCE: f32 = 0.40;
+                // Progressive confidence gate: hard floor + suspicion check.
+                // High confidence (≥0.65): accept if plausible.
+                // Low confidence (<0.65): apply extra scrutiny via suspicion score.
+                const MIN_DECODE_CONFIDENCE: f32 = 0.41;
+                const SCRUTINY_THRESHOLD: f32 = 0.65;
                 if confidence < MIN_DECODE_CONFIDENCE {
+                    continue;
+                }
+                if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
                     continue;
                 }
 
@@ -2297,9 +2304,12 @@ fn par_decode_candidate(
             let snr_db = par_estimate_snr_fft(ctx.protocol_params, &tone_magnitudes);
             let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
-            // Minimum confidence floor (same as spectrogram path)
-            const MIN_DECODE_CONFIDENCE: f32 = 0.40;
+            const MIN_DECODE_CONFIDENCE: f32 = 0.41;
+            const SCRUTINY_THRESHOLD: f32 = 0.65;
             if confidence < MIN_DECODE_CONFIDENCE {
+                continue;
+            }
+            if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
                 continue;
             }
 
@@ -2503,9 +2513,12 @@ fn par_try_ldpc_with_ap(
         crate::ap::ApLevel::Ap3 => 3,
         crate::ap::ApLevel::Ap4 => 4,
     };
-    // Minimum confidence floor for ALL decodes (same as primary path).
-    const MIN_DECODE_CONFIDENCE: f32 = 0.40;
+    const MIN_DECODE_CONFIDENCE: f32 = 0.41;
+    const SCRUTINY_THRESHOLD: f32 = 0.65;
     if confidence < MIN_DECODE_CONFIDENCE {
+        return None;
+    }
+    if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
         return None;
     }
 

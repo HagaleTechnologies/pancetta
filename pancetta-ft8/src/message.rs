@@ -410,6 +410,42 @@ impl Ft8Message {
         }
     }
 
+    /// Heuristic suspicion score (0 = normal, higher = more suspicious).
+    ///
+    /// Used for progressive validation: messages with low confidence AND
+    /// high suspicion are rejected, while either alone is acceptable.
+    pub fn suspicion_score(&self) -> u32 {
+        let mut score = 0u32;
+
+        let calls: Vec<&str> = [&self.from_callsign, &self.to_callsign]
+            .iter()
+            .filter_map(|opt| opt.as_deref())
+            .collect();
+
+        // Both callsigns exactly 6 characters (packed space-fill) — common
+        // in CRC collisions, uncommon in real QSOs
+        if calls.len() == 2 && calls.iter().all(|c| c.replace('/', "").len() == 6) {
+            score += 1;
+        }
+
+        // Any callsign has a portable suffix (/R, /P, etc.)
+        if calls.iter().any(|c| c.contains('/')) {
+            score += 1;
+        }
+
+        // CQ with non-standard modifier (not DX, NA, EU, RU, AS, AF, etc.)
+        if let Some(ref op) = self.special_operation {
+            let known = ["DX", "NA", "EU", "AS", "AF", "SA", "OC", "AN",
+                         "RU", "POTA", "SOTA", "QRP", "FD", "TU", "TEST"];
+            let is_numeric = op.chars().all(|c| c.is_ascii_digit());
+            if !known.contains(&op.as_str()) && !is_numeric {
+                score += 2;
+            }
+        }
+
+        score
+    }
+
     /// Check if a callsign prefix matches a valid ITU allocation.
     ///
     /// Extracts the 1-2 character prefix from a callsign and checks it against
