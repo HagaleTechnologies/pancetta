@@ -19,10 +19,13 @@ use crate::{
 };
 use bitvec::prelude::*;
 use num_complex::Complex;
+use rayon::prelude::*;
 use rustfft::FftPlanner;
 use std::collections::HashSet;
 use std::time::{Instant, SystemTime};
 use tracing::{debug, info};
+
+use crate::parallel::BudgetTracker;
 
 // ============================================================================
 // Constants
@@ -323,6 +326,12 @@ impl Ft8Decoder {
         // Check whether AP is active (any known information available)
         let ap_active = ap_context.my_call.is_some();
 
+        // Budget tracker — stops decode passes when wall-clock time is exceeded
+        let budget = BudgetTracker::new(self.config.osd_depth.map_or(2000, |d| {
+            // Allow more time for deeper OSD
+            2000 + d as u64 * 500
+        }));
+
         // Working copy of audio that we subtract decoded signals from
         let mut residual_samples: Vec<f32> = samples.to_vec();
         let mut all_decoded_messages: Vec<DecodedMessage> = Vec::new();
@@ -330,6 +339,11 @@ impl Ft8Decoder {
         let mut best_sync_score = 0.0f64;
 
         for pass in 0..max_passes {
+            if budget.expired() {
+                info!(pass, "Decode budget expired, stopping early");
+                break;
+            }
+
             // Convert to f64 and normalize
             let audio = self.preprocess_audio(&residual_samples)?;
 
@@ -367,80 +381,90 @@ impl Ft8Decoder {
                 );
             }
 
-            // Step 3: Decode each candidate
-            let mut pass_decoded: Vec<DecodedMessage> = Vec::new();
-            let _num_candidates = sync_candidates.len();
-            let _best_score = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
             #[cfg(feature = "debug-decode")]
-            eprintln!(
-                "[decode pass {}] {} sync candidates, best score={:.1}",
-                pass, _num_candidates, _best_score
-            );
-            #[cfg(feature = "debug-decode")]
-            for (i, c) in sync_candidates.iter().take(5).enumerate() {
+            {
+                let _num_candidates = sync_candidates.len();
+                let _best_score = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
                 eprintln!(
-                    "  [{}] t={} f={} score={:.1}",
-                    i, c.time_step, c.freq_bin, c.sync_score
+                    "[decode pass {}] {} sync candidates, best score={:.1}",
+                    pass, _num_candidates, _best_score
                 );
+                for (i, c) in sync_candidates.iter().take(5).enumerate() {
+                    eprintln!(
+                        "  [{}] t={} f={} score={:.1}",
+                        i, c.time_step, c.freq_bin, c.sync_score
+                    );
+                }
             }
 
             // Collect already-decoded callsigns for AP2 short-circuit
-            let mut decoded_calls: HashSet<String> = all_decoded_messages
+            let decoded_calls: HashSet<String> = all_decoded_messages
                 .iter()
                 .filter_map(|m| m.message.from_callsign.clone())
                 .collect();
 
-            for candidate in &sync_candidates {
-                if all_decoded_messages.len() + pass_decoded.len() >= self.config.max_candidates {
+            // Build the immutable decode context for parallel candidate processing
+            let ctx = DecodeContext {
+                protocol_params: &self.protocol_params,
+                message_parser: &self.message_parser,
+                spectrogram: &spectrogram,
+                audio: &audio,
+                ap_context,
+                ap_active,
+                symbol_fft: &self.symbol_fft,
+                symbol_window: &self.symbol_window,
+                xor_sequence: self.protocol_params.xor_sequence,
+                ldpc_iterations: self.config.ldpc_iterations,
+                osd_depth: self.config.osd_depth,
+            };
+
+            // Step 3: Decode candidates in parallel using rayon
+            // Each rayon worker gets its own LdpcDecoder and FFT buffer.
+            let max_candidates = self.config.max_candidates;
+            let already_decoded = all_decoded_messages.len();
+            let sps = self.protocol_params.samples_per_symbol(SAMPLE_RATE);
+
+            let pass_decoded: Vec<DecodedMessage> = sync_candidates
+                .par_iter()
+                .map_init(
+                    // Per-thread initialization: create an LDPC decoder and FFT buffer
+                    || {
+                        let ldpc = LdpcDecoder::new_with_osd(
+                            ctx.ldpc_iterations,
+                            ctx.osd_depth.map(|d| OsdConfig { max_depth: d }),
+                        ).expect("LDPC decoder init failed");
+                        let fft_buffer = vec![Complex::new(0.0, 0.0); sps];
+                        (ldpc, fft_buffer)
+                    },
+                    |(ldpc, fft_buffer), candidate| {
+                        // First try standard AP0 decode
+                        if let Some(msg) = par_decode_candidate(&ctx, candidate, ldpc, fft_buffer) {
+                            return Some(msg);
+                        }
+                        // AP0 failed — try AP-enhanced decoding if AP is active
+                        if !ctx.ap_active {
+                            return None;
+                        }
+                        par_try_ap_decode(&ctx, candidate, ldpc, &decoded_calls, pass)
+                    },
+                )
+                .flatten()
+                .collect();
+
+            // Deduplicate the parallel results (multiple candidates may decode to
+            // the same message text, and we also need to dedup against prior passes)
+            let mut pass_unique: Vec<DecodedMessage> = Vec::new();
+            for msg in pass_decoded {
+                if already_decoded + pass_unique.len() >= max_candidates {
                     break;
                 }
-
-                // First try standard AP0 decode (identical to non-AP path)
-                match self.decode_candidate(&audio, candidate, &spectrogram) {
-                    Ok(Some(msg)) => {
-                        // Deduplicate using HashSet for O(1) lookup
-                        if seen_messages.insert(msg.text.clone()) {
-                            if let Some(ref call) = msg.message.from_callsign {
-                                decoded_calls.insert(call.clone());
-                            }
-                            pass_decoded.push(msg);
-                        }
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(_e) => {
-                        #[cfg(feature = "debug-decode")]
-                        eprintln!(
-                            "  candidate t={} f={}: error {}",
-                            candidate.time_step, candidate.freq_bin, _e
-                        );
-                        continue;
-                    }
-                }
-
-                // AP0 failed — try AP-enhanced decoding if AP is active
-                if !ap_active {
-                    continue;
-                }
-
-                if let Some(msg) = self.try_ap_decode(
-                    candidate,
-                    &spectrogram,
-                    ap_context,
-                    &decoded_calls,
-                    pass,
-                )? {
-                    if seen_messages.insert(msg.text.clone()) {
-                        if let Some(ref call) = msg.message.from_callsign {
-                            decoded_calls.insert(call.clone());
-                        }
-                        pass_decoded.push(msg);
-                    }
+                if seen_messages.insert(msg.text.clone()) {
+                    pass_unique.push(msg);
                 }
             }
 
             // If no new messages decoded in this pass, stop iterating
-            if pass_decoded.is_empty() {
+            if pass_unique.is_empty() {
                 break;
             }
 
@@ -448,17 +472,17 @@ impl Ft8Decoder {
             eprintln!(
                 "[decode pass {}] decoded {} new messages",
                 pass,
-                pass_decoded.len()
+                pass_unique.len()
             );
 
             // Subtract decoded signals from residual audio for next pass
             if pass + 1 < max_passes {
-                for msg in &pass_decoded {
+                for msg in &pass_unique {
                     self.subtract_with_sidelobes(&mut residual_samples, msg);
                 }
             }
 
-            all_decoded_messages.extend(pass_decoded);
+            all_decoded_messages.extend(pass_unique);
         }
 
         // Metrics
@@ -2046,6 +2070,640 @@ impl Ft8Decoder {
         // TimeSync was removed as dead code; sync is implicitly achieved
         // via Costas array correlation during decode_window
         true
+    }
+}
+
+// ============================================================================
+// Parallel candidate decoding context and free functions
+// ============================================================================
+
+/// Immutable decode context shared across rayon threads.
+///
+/// Captures all the state from `Ft8Decoder` that candidate decoding reads
+/// but never writes. Each rayon worker gets a shared `&DecodeContext` plus
+/// its own thread-local `LdpcDecoder` and FFT buffers.
+struct DecodeContext<'a> {
+    protocol_params: &'a ProtocolParams,
+    message_parser: &'a MessageParser,
+    spectrogram: &'a Spectrogram,
+    audio: &'a [f64],
+    ap_context: &'a crate::ap::ApContext,
+    ap_active: bool,
+    /// Pre-computed FFT plan for symbol extraction (sps-length), Arc is Send+Sync
+    symbol_fft: &'a std::sync::Arc<dyn rustfft::Fft<f64>>,
+    /// Pre-computed Hann window for symbol extraction
+    symbol_window: &'a [f64],
+    /// XOR sequence for FT4
+    xor_sequence: Option<&'static [u8; 10]>,
+    /// OSD config for creating per-thread LDPC decoders
+    ldpc_iterations: usize,
+    osd_depth: Option<u8>,
+}
+
+/// Result from parallel candidate decoding (one candidate).
+struct ParDecodedCandidate {
+    msg: DecodedMessage,
+}
+
+/// Decode a single candidate in parallel — AP0 path (spectrogram + fine-timing FFT).
+///
+/// This is the free-function equivalent of `Ft8Decoder::decode_candidate`, but
+/// takes only immutable shared state via `DecodeContext` and a mutable
+/// per-thread `LdpcDecoder` and FFT buffer.
+fn par_decode_candidate(
+    ctx: &DecodeContext,
+    candidate: &CostasCandidate,
+    ldpc: &LdpcDecoder,
+    fft_buffer: &mut Vec<Complex<f64>>,
+) -> Option<DecodedMessage> {
+    let sps = ctx.protocol_params.samples_per_symbol(SAMPLE_RATE);
+    let tone_spacing = ctx.protocol_params.tone_spacing;
+    let xor_sequence = ctx.xor_sequence;
+    let spec_step = sps / (2 * TIME_OSR);
+    let coarse_offset = candidate.time_step * spec_step;
+
+    // ---- Spectrogram-based symbol extraction: try both freq_sub values ----
+    let freq_sub_trials = [candidate.freq_sub, if candidate.freq_sub == 0 { 1 } else { 0 }];
+    for &trial_freq_sub in &freq_sub_trials {
+        let trial_candidate = CostasCandidate {
+            time_step: candidate.time_step,
+            freq_bin: candidate.freq_bin,
+            freq_sub: trial_freq_sub,
+            sync_score: candidate.sync_score,
+        };
+        let tone_magnitudes = par_extract_symbols_from_spectrogram(
+            ctx.protocol_params, ctx.spectrogram, &trial_candidate,
+        );
+        let mut llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes);
+        normalize_llrs(&mut llrs);
+
+        if let Ok(corrected_bits) = ldpc.decode_soft(&llrs) {
+            if par_verify_crc(&corrected_bits) {
+                let sub_bin_offset =
+                    trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+                let base_frequency =
+                    candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
+                let time_offset_samples = coarse_offset;
+
+                let payload_bits = par_apply_xor(xor_sequence, &corrected_bits);
+                let ft8_message = match ctx.message_parser.parse_payload(&payload_bits) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                if !ft8_message.is_plausible() {
+                    continue;
+                }
+
+                let snr_db = par_estimate_snr_spectrogram(ctx.protocol_params, &tone_magnitudes);
+                let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
+
+                let mut decoded_message = DecodedMessage::new(
+                    ft8_message,
+                    snr_db,
+                    confidence,
+                    base_frequency,
+                    time_offset_samples as f64 / SAMPLE_RATE as f64,
+                );
+                decoded_message.tone_symbols =
+                    Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
+
+                return Some(decoded_message);
+            }
+        }
+    }
+
+    // ---- Fine-timing FFT-based extraction (expensive: 7×3 = 21 FFT trials) ----
+    if candidate.sync_score < 3.5 {
+        return None;
+    }
+
+    let eighth_sym = (sps / 8) as isize;
+    let time_deltas: [isize; 7] = [
+        -3 * eighth_sym,
+        -2 * eighth_sym,
+        -eighth_sym,
+        0,
+        eighth_sym,
+        2 * eighth_sym,
+        3 * eighth_sym,
+    ];
+    let freq_offsets: [f64; 3] = [0.0, -0.5, 0.5];
+    let sub_bin_offset = candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+
+    for &dt in &time_deltas {
+        let time_offset = coarse_offset as isize + dt;
+        if time_offset < 0 {
+            continue;
+        }
+        let time_offset_samples = time_offset as usize;
+
+        for &df in &freq_offsets {
+            let freq_hz =
+                candidate.freq_bin as f64 * tone_spacing + sub_bin_offset + df * tone_spacing;
+            if freq_hz < 0.0 {
+                continue;
+            }
+            let base_frequency = freq_hz;
+
+            let tone_magnitudes = match par_extract_symbols_complex(
+                ctx.protocol_params,
+                ctx.audio,
+                time_offset_samples,
+                base_frequency,
+                ctx.symbol_fft,
+                ctx.symbol_window,
+                fft_buffer,
+            ) {
+                Ok((_symbols, mags)) => mags,
+                Err(_) => continue,
+            };
+
+            let mut llrs = par_compute_soft_llrs(ctx.protocol_params, &tone_magnitudes);
+            normalize_llrs(&mut llrs);
+
+            let corrected_bits = match ldpc.decode_soft(&llrs) {
+                Ok(bits) => bits,
+                Err(_) => continue,
+            };
+
+            if !par_verify_crc(&corrected_bits) {
+                continue;
+            }
+
+            let payload_bits = par_apply_xor(xor_sequence, &corrected_bits);
+            let ft8_message = match ctx.message_parser.parse_payload(&payload_bits) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            if !ft8_message.is_plausible() {
+                continue;
+            }
+
+            let snr_db = par_estimate_snr_fft(ctx.protocol_params, &tone_magnitudes);
+            let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
+
+            let mut decoded_message = DecodedMessage::new(
+                ft8_message,
+                snr_db,
+                confidence,
+                base_frequency,
+                time_offset_samples as f64 / SAMPLE_RATE as f64,
+            );
+            decoded_message.tone_symbols =
+                Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
+
+            return Some(decoded_message);
+        }
+    }
+
+    None
+}
+
+/// Try AP-enhanced decoding for a single candidate (parallel-safe).
+fn par_try_ap_decode(
+    ctx: &DecodeContext,
+    candidate: &CostasCandidate,
+    ldpc: &LdpcDecoder,
+    decoded_calls: &HashSet<String>,
+    _pass: usize,
+) -> Option<DecodedMessage> {
+    let tone_spacing = ctx.protocol_params.tone_spacing;
+    let sps = ctx.protocol_params.samples_per_symbol(SAMPLE_RATE);
+    let spec_step = sps / (2 * TIME_OSR);
+    let coarse_offset = candidate.time_step * spec_step;
+
+    let freq_sub_trials = [candidate.freq_sub, if candidate.freq_sub == 0 { 1 } else { 0 }];
+
+    for &trial_freq_sub in &freq_sub_trials {
+        let trial_candidate = CostasCandidate {
+            time_step: candidate.time_step,
+            freq_bin: candidate.freq_bin,
+            freq_sub: trial_freq_sub,
+            sync_score: candidate.sync_score,
+        };
+        let tone_magnitudes = par_extract_symbols_from_spectrogram(
+            ctx.protocol_params, ctx.spectrogram, &trial_candidate,
+        );
+        let base_llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes);
+
+        let sub_bin_offset = trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+        let base_frequency = candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
+        let time_offset_s = coarse_offset as f64 / SAMPLE_RATE as f64;
+
+        let snr_db = par_estimate_snr_spectrogram(ctx.protocol_params, &tone_magnitudes);
+        let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
+
+        // --- AP1: inject own callsign at bits 28-55 (called station) ---
+        if ctx.ap_context.my_call.is_some() {
+            if let Some(msg) = par_try_ldpc_with_ap(
+                ctx, ldpc,
+                &base_llrs,
+                crate::ap::ApLevel::Ap1,
+                ctx.ap_context,
+                None,
+                snr_db, confidence, base_frequency, time_offset_s,
+            ) {
+                return Some(msg);
+            }
+        }
+
+        // --- AP2: inject each recent caller at bits 0-27 + AP1 ---
+        if ctx.ap_context.my_call.is_some() {
+            for recent in &ctx.ap_context.recent_calls {
+                if decoded_calls.contains(&recent.callsign) {
+                    continue;
+                }
+                if let Some(msg) = par_try_ldpc_with_ap(
+                    ctx, ldpc,
+                    &base_llrs,
+                    crate::ap::ApLevel::Ap2,
+                    ctx.ap_context,
+                    Some(recent),
+                    snr_db, confidence, base_frequency, time_offset_s,
+                ) {
+                    return Some(msg);
+                }
+            }
+        }
+
+        // --- AP3: both callsigns known (active QSO) ---
+        if ctx.ap_context.active_qso.is_some() && ctx.ap_context.my_call.is_some() {
+            if let Some(msg) = par_try_ldpc_with_ap(
+                ctx, ldpc,
+                &base_llrs,
+                crate::ap::ApLevel::Ap3,
+                ctx.ap_context,
+                None,
+                snr_db, confidence, base_frequency, time_offset_s,
+            ) {
+                return Some(msg);
+            }
+
+            // --- AP4: AP3 + message type constraint ---
+            if let Some(ref qso) = ctx.ap_context.active_qso {
+                if matches!(qso.progress, crate::ap::QsoApProgress::WaitingForConfirmation) {
+                    if let Some(msg) = par_try_ldpc_with_ap(
+                        ctx, ldpc,
+                        &base_llrs,
+                        crate::ap::ApLevel::Ap4,
+                        ctx.ap_context,
+                        None,
+                        snr_db, confidence, base_frequency, time_offset_s,
+                    ) {
+                        return Some(msg);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Try LDPC decode with AP injection at a specific level (parallel-safe).
+fn par_try_ldpc_with_ap(
+    ctx: &DecodeContext,
+    ldpc: &LdpcDecoder,
+    base_llrs: &[f32],
+    ap_level: crate::ap::ApLevel,
+    ap_context: &crate::ap::ApContext,
+    caller_override: Option<&crate::ap::RecentCallAp>,
+    snr_db: f32,
+    confidence: f32,
+    base_frequency: f64,
+    time_offset_s: f64,
+) -> Option<DecodedMessage> {
+    let mut llrs = base_llrs.to_vec();
+
+    match ap_level {
+        crate::ap::ApLevel::Ap0 => {}
+        crate::ap::ApLevel::Ap1 => {
+            crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context);
+        }
+        crate::ap::ApLevel::Ap2 => {
+            crate::ap::inject_ap_llrs(&mut llrs, crate::ap::ApLevel::Ap1, ap_context);
+            if let Some(caller) = caller_override {
+                crate::ap::inject_ap2_caller(&mut llrs, caller);
+            }
+        }
+        crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
+            crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context);
+        }
+    }
+
+    normalize_llrs(&mut llrs);
+
+    let corrected_bits = match ldpc.decode_soft(&llrs) {
+        Ok(bits) => bits,
+        Err(_) => return None,
+    };
+
+    if !par_verify_crc(&corrected_bits) {
+        return None;
+    }
+
+    let payload_bits = par_apply_xor(ctx.xor_sequence, &corrected_bits);
+    let ft8_message = match ctx.message_parser.parse_payload(&payload_bits) {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+
+    if !ft8_message.is_plausible() {
+        return None;
+    }
+
+    let mut decoded_message = DecodedMessage::new(
+        ft8_message,
+        snr_db,
+        confidence,
+        base_frequency,
+        time_offset_s,
+    );
+    decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
+
+    Some(decoded_message)
+}
+
+// ---- Parallel-safe helpers (free functions operating on shared state) ----
+
+fn par_extract_symbols_from_spectrogram(
+    pp: &ProtocolParams,
+    spectrogram: &Spectrogram,
+    candidate: &CostasCandidate,
+) -> Vec<[f64; NUM_TONES]> {
+    let t0 = candidate.time_step;
+    let f0 = candidate.freq_bin;
+    let fs = candidate.freq_sub;
+
+    let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
+    let steps_per_symbol = 2 * TIME_OSR;
+
+    for sym_idx in 0..pp.num_symbols {
+        let mut mags = [-120.0f64; NUM_TONES];
+        let t_base = t0 + sym_idx * steps_per_symbol;
+
+        for tone in 0..pp.num_tones {
+            let freq_bin = f0 + tone;
+            if freq_bin >= spectrogram.num_bins || fs >= spectrogram.freq_osr {
+                continue;
+            }
+            let db_a = if t_base < spectrogram.num_steps {
+                spectrogram.power[t_base][fs][freq_bin]
+            } else {
+                -120.0
+            };
+            let db_b = if t_base + 1 < spectrogram.num_steps {
+                spectrogram.power[t_base + 1][fs][freq_bin]
+            } else {
+                -120.0
+            };
+            mags[tone] = (db_a + db_b) / 2.0;
+        }
+
+        tone_magnitudes.push(mags);
+    }
+
+    tone_magnitudes
+}
+
+fn par_compute_soft_llrs_db(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<f32> {
+    let mut llrs = Vec::with_capacity(174);
+    let data_positions = pp.data_symbol_indices();
+
+    for &sym_idx in &data_positions {
+        let mags = &tone_magnitudes[sym_idx];
+
+        match pp.bits_per_symbol {
+            3 => {
+                let mut s2 = [0.0f64; 8];
+                for j in 0..8 {
+                    let tone_idx = crate::ldpc::binary_to_gray(j as u8) as usize;
+                    s2[j] = mags[tone_idx];
+                }
+
+                fn max4(a: f64, b: f64, c: f64, d: f64) -> f64 {
+                    a.max(b).max(c.max(d))
+                }
+
+                let llr0 = max4(s2[4], s2[5], s2[6], s2[7]) - max4(s2[0], s2[1], s2[2], s2[3]);
+                let llr1 = max4(s2[2], s2[3], s2[6], s2[7]) - max4(s2[0], s2[1], s2[4], s2[5]);
+                let llr2 = max4(s2[1], s2[3], s2[5], s2[7]) - max4(s2[0], s2[2], s2[4], s2[6]);
+
+                llrs.push(-llr0 as f32);
+                llrs.push(-llr1 as f32);
+                llrs.push(-llr2 as f32);
+            }
+            2 => {
+                let mut s2 = [0.0f64; 4];
+                for j in 0..4 {
+                    let tone_idx = crate::ldpc::binary_to_gray_4fsk(j as u8) as usize;
+                    s2[j] = mags[tone_idx];
+                }
+
+                let llr0 = s2[2].max(s2[3]) - s2[0].max(s2[1]);
+                let llr1 = s2[1].max(s2[3]) - s2[0].max(s2[2]);
+
+                llrs.push(-llr0 as f32);
+                llrs.push(-llr1 as f32);
+            }
+            _ => unreachable!("Unsupported bits_per_symbol"),
+        }
+    }
+
+    debug_assert_eq!(llrs.len(), 174);
+    llrs
+}
+
+fn par_compute_soft_llrs(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<f32> {
+    let mut llrs = Vec::with_capacity(174);
+    let data_positions = pp.data_symbol_indices();
+
+    for &sym_idx in &data_positions {
+        let mags = &tone_magnitudes[sym_idx];
+
+        match pp.bits_per_symbol {
+            3 => {
+                let mut s2 = [0.0f64; 8];
+                for j in 0..8 {
+                    let tone_idx = crate::ldpc::binary_to_gray(j as u8) as usize;
+                    s2[j] = (1e-12 + mags[tone_idx] * mags[tone_idx]).log10() * 10.0;
+                }
+
+                fn max4(a: f64, b: f64, c: f64, d: f64) -> f64 {
+                    a.max(b).max(c.max(d))
+                }
+
+                let llr0 = max4(s2[4], s2[5], s2[6], s2[7]) - max4(s2[0], s2[1], s2[2], s2[3]);
+                let llr1 = max4(s2[2], s2[3], s2[6], s2[7]) - max4(s2[0], s2[1], s2[4], s2[5]);
+                let llr2 = max4(s2[1], s2[3], s2[5], s2[7]) - max4(s2[0], s2[2], s2[4], s2[6]);
+
+                llrs.push(-llr0 as f32);
+                llrs.push(-llr1 as f32);
+                llrs.push(-llr2 as f32);
+            }
+            2 => {
+                let mut s2 = [0.0f64; 4];
+                for j in 0..4 {
+                    let tone_idx = crate::ldpc::binary_to_gray_4fsk(j as u8) as usize;
+                    s2[j] = (1e-12 + mags[tone_idx] * mags[tone_idx]).log10() * 10.0;
+                }
+
+                let llr0 = s2[2].max(s2[3]) - s2[0].max(s2[1]);
+                let llr1 = s2[1].max(s2[3]) - s2[0].max(s2[2]);
+
+                llrs.push(-llr0 as f32);
+                llrs.push(-llr1 as f32);
+            }
+            _ => unreachable!("Unsupported bits_per_symbol"),
+        }
+    }
+
+    debug_assert_eq!(llrs.len(), 174);
+    llrs
+}
+
+/// Extract symbols using per-thread FFT buffer (parallel-safe version of extract_symbols_complex).
+fn par_extract_symbols_complex(
+    pp: &ProtocolParams,
+    audio: &[f64],
+    time_offset_samples: usize,
+    base_frequency: f64,
+    symbol_fft: &std::sync::Arc<dyn rustfft::Fft<f64>>,
+    symbol_window: &[f64],
+    fft_buffer: &mut Vec<Complex<f64>>,
+) -> Ft8Result<(Vec<u8>, Vec<[f64; NUM_TONES]>)> {
+    let sps = pp.samples_per_symbol(SAMPLE_RATE);
+    let end_sample = time_offset_samples + pp.num_symbols * sps;
+    if end_sample > audio.len() {
+        return Err(Ft8Error::InsufficientData {
+            needed: end_sample,
+            available: audio.len(),
+        });
+    }
+
+    let pi2 = 2.0 * std::f64::consts::PI;
+    let phase_step_angle = -pi2 * base_frequency / SAMPLE_RATE as f64;
+    let phase_step = Complex::new(phase_step_angle.cos(), phase_step_angle.sin());
+
+    let mut symbols = Vec::with_capacity(pp.num_symbols);
+    let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
+
+    for sym_idx in 0..pp.num_symbols {
+        let sym_start = time_offset_samples + sym_idx * sps;
+        let symbol_audio = &audio[sym_start..sym_start + sps];
+
+        let initial_angle = -pi2 * base_frequency * sym_start as f64 / SAMPLE_RATE as f64;
+        let mut rotator = Complex::new(initial_angle.cos(), initial_angle.sin());
+
+        for i in 0..sps {
+            let w = symbol_window[i];
+            fft_buffer[i] = Complex::new(
+                symbol_audio[i] * w * rotator.re,
+                symbol_audio[i] * w * rotator.im,
+            );
+            rotator = rotator * phase_step;
+        }
+
+        symbol_fft.process(&mut fft_buffer[..sps]);
+
+        let mut mags = [0.0f64; NUM_TONES];
+        let mut best_tone = 0u8;
+        let mut best_mag = 0.0;
+
+        for tone in 0..pp.num_tones {
+            let magnitude = fft_buffer[tone].norm();
+            mags[tone] = magnitude;
+            if magnitude > best_mag {
+                best_mag = magnitude;
+                best_tone = tone as u8;
+            }
+        }
+
+        symbols.push(best_tone);
+        tone_magnitudes.push(mags);
+    }
+
+    Ok((symbols, tone_magnitudes))
+}
+
+fn par_verify_crc(bits: &BitVec) -> bool {
+    if bits.len() < PAYLOAD_BITS + CRC_BITS {
+        return false;
+    }
+    let payload = &bits[0..PAYLOAD_BITS];
+    let received_crc_bits = &bits[PAYLOAD_BITS..PAYLOAD_BITS + CRC_BITS];
+    let calculated_crc = calculate_crc14(payload);
+    let received_crc = bits_to_u16(received_crc_bits);
+    calculated_crc == received_crc
+}
+
+fn par_apply_xor(xor_sequence: Option<&'static [u8; 10]>, corrected_bits: &BitVec) -> BitVec {
+    if let Some(xor_seq) = xor_sequence {
+        let mut bits = corrected_bits[0..PAYLOAD_BITS].to_owned();
+        for byte_idx in 0..10 {
+            let xor_byte = xor_seq[byte_idx];
+            for bit_pos in 0..8 {
+                let global_bit = byte_idx * 8 + bit_pos;
+                if global_bit >= PAYLOAD_BITS {
+                    break;
+                }
+                if (xor_byte >> (7 - bit_pos)) & 1 == 1 {
+                    let cur = bits[global_bit];
+                    bits.set(global_bit, !cur);
+                }
+            }
+        }
+        bits
+    } else {
+        corrected_bits[0..PAYLOAD_BITS].to_owned()
+    }
+}
+
+fn par_estimate_snr_spectrogram(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES]]) -> f32 {
+    let data_positions = pp.data_symbol_indices();
+    let mut signal_sum = 0.0f64;
+    let mut noise_sum = 0.0f64;
+    let mut count = 0usize;
+    for &sym_idx in &data_positions {
+        let mags = &tone_magnitudes[sym_idx];
+        let best = mags.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let worst = mags.iter().cloned().fold(f64::INFINITY, f64::min);
+        signal_sum += best;
+        noise_sum += worst;
+        count += 1;
+    }
+    if count > 0 {
+        let avg_signal_db = signal_sum / count as f64;
+        let avg_noise_db = noise_sum / count as f64;
+        let snr_bin_db = avg_signal_db - avg_noise_db;
+        let bw_correction = 10.0 * (2500.0f64 / 6.25).log10();
+        (snr_bin_db - bw_correction) as f32
+    } else {
+        -24.0f32
+    }
+}
+
+fn par_estimate_snr_fft(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES]]) -> f32 {
+    let data_positions = pp.data_symbol_indices();
+    let mut signal_power = 0.0f64;
+    let mut noise_power = 0.0f64;
+    let mut count = 0usize;
+    for &sym_idx in &data_positions {
+        let mags = &tone_magnitudes[sym_idx];
+        let best = mags.iter().cloned().fold(0.0f64, f64::max);
+        let worst = mags.iter().cloned().fold(f64::MAX, f64::min);
+        signal_power += best * best;
+        noise_power += worst * worst;
+        count += 1;
+    }
+    if count > 0 && noise_power > 0.0 {
+        let snr_linear = signal_power / noise_power;
+        let bw_correction = 10.0 * (2500.0f64 / 6.25).log10();
+        (10.0 * snr_linear.log10() - bw_correction) as f32
+    } else {
+        -24.0f32
     }
 }
 
