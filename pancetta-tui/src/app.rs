@@ -856,22 +856,35 @@ impl App {
         }
     }
 
-    /// Get the callsign and frequency of the currently selected band activity entry.
+    /// Get the callsign and frequency of the currently selected station.
+    ///
+    /// Works from both Band Activity (decoded messages) and DX Hunter (spots).
     pub fn get_selected_station(&self) -> Option<(String, u64)> {
-        if self.active_panel != ActivePanel::BandActivity {
-            return None;
+        match self.active_panel {
+            ActivePanel::BandActivity => {
+                let msg = self
+                    .decoded_messages
+                    .iter()
+                    .nth(self.band_activity_scroll)?;
+                let callsign = msg.call_sign.as_ref()?;
+                if callsign.is_empty() {
+                    return None;
+                }
+                let freq_hz = (msg.frequency * 1_000_000.0) as u64;
+                Some((callsign.clone(), freq_hz))
+            }
+            ActivePanel::DxHunter => {
+                let mut stations: Vec<&DxStation> = self.dx_stations.values().collect();
+                stations.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+                let station = stations.get(self.dx_hunter_scroll)?;
+                if station.call_sign.is_empty() {
+                    return None;
+                }
+                let freq_hz = (station.frequency * 1_000_000.0) as u64;
+                Some((station.call_sign.clone(), freq_hz))
+            }
+            _ => None,
         }
-        let msg = self
-            .decoded_messages
-            .iter()
-            .nth(self.band_activity_scroll)?;
-        let callsign = msg.call_sign.as_ref()?;
-        if callsign.is_empty() {
-            return None;
-        }
-        // Convert MHz frequency to Hz for QSO manager
-        let freq_hz = (msg.frequency * 1_000_000.0) as u64;
-        Some((callsign.clone(), freq_hz))
     }
 
     pub fn activate_selected(&mut self) {
