@@ -418,7 +418,7 @@ impl super::ApplicationCoordinator {
 
         let config = self.config.read().await;
         let input_rate = config.audio.sample_rate;
-        let input_channels = config.audio.input_channels as u16;
+        let _input_channels = config.audio.input_channels as u16;
         drop(config);
 
         let handle = tokio::task::spawn_blocking(move || {
@@ -438,48 +438,6 @@ impl super::ApplicationCoordinator {
             const FT8_WINDOW_SAMPLES: usize =
                 (FT8_SAMPLE_RATE as f64 * FT8_WINDOW_SECONDS) as usize; // 151,680
 
-            // FIR low-pass filter for anti-aliased decimation.
-            // 65-tap Kaiser-windowed sinc (beta=8, ~80dB stopband attenuation).
-            // Cutoff at 0.125 * Nyquist = 6kHz (= 12kHz/2, the decimated Nyquist).
-            let fir_len = decimation_factor * 16 + 1; // 65 taps for factor=4
-            let beta = 8.0f32; // Kaiser beta for ~80dB stopband
-            let fir_coeffs: Vec<f32> = (0..fir_len)
-                .map(|i| {
-                    let n = i as f32 - (fir_len - 1) as f32 / 2.0;
-                    let cutoff = 1.0 / (2.0 * decimation_factor as f32);
-                    // Windowed sinc
-                    let sinc = if n.abs() < 1e-6 {
-                        2.0 * cutoff
-                    } else {
-                        (2.0 * std::f32::consts::PI * cutoff * n).sin() / (std::f32::consts::PI * n)
-                    };
-                    // Kaiser window: I0(beta * sqrt(1 - (2i/(N-1) - 1)^2)) / I0(beta)
-                    let m = (fir_len - 1) as f32;
-                    let x = 2.0 * i as f32 / m - 1.0;
-                    let arg = beta * (1.0 - x * x).max(0.0).sqrt();
-                    // Approximate I0 (modified Bessel) with series expansion
-                    let i0 = |v: f32| -> f32 {
-                        let mut sum = 1.0f32;
-                        let mut term = 1.0f32;
-                        for k in 1..20 {
-                            term *= (v / (2.0 * k as f32)) * (v / (2.0 * k as f32));
-                            sum += term;
-                            if term < 1e-10 {
-                                break;
-                            }
-                        }
-                        sum
-                    };
-                    let window = i0(arg) / i0(beta);
-                    sinc * window
-                })
-                .collect();
-            // Normalize filter
-            let fir_sum: f32 = fir_coeffs.iter().sum();
-            let fir_coeffs: Vec<f32> = fir_coeffs.iter().map(|c| c / fir_sum).collect();
-
-            let mut fir_buffer: Vec<f32> = vec![0.0; fir_len];
-            let mut fir_pos: usize = 0;
             let mut decimate_counter: usize = 0;
 
             let mut ft8_buffer: Vec<f32> = Vec::with_capacity(FT8_WINDOW_SAMPLES * 2);
@@ -502,12 +460,10 @@ impl super::ApplicationCoordinator {
             let live_wf_fft = live_wf_planner.plan_fft_forward(2048);
 
             info!(
-                "DSP: {}Hz/{}ch -> {}Hz mono (decimate {}:1, {}-tap FIR), window={}",
+                "DSP: {}Hz -> {}Hz mono (decimate {}:1, subsample), window={}",
                 input_rate,
-                input_channels,
                 FT8_SAMPLE_RATE,
                 decimation_factor,
-                fir_len,
                 FT8_WINDOW_SAMPLES
             );
 
