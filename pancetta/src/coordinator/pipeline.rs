@@ -146,8 +146,12 @@ impl super::ApplicationCoordinator {
         let (waterfall_tx, waterfall_rx) = crossbeam_channel::unbounded::<Vec<Vec<f32>>>();
         let (audio_level_tx, audio_level_rx) = crossbeam_channel::bounded::<f32>(1);
 
+        // TX audio channel: Ft8Transmitter -> Audio thread for playback
+        let (tx_audio_tx, tx_audio_rx) =
+            crossbeam_channel::bounded::<(Vec<f32>, u32)>(4);
+
         // Also create message bus channels for control messages (hamlib, autonomous, etc.)
-        let (_audio_bus_tx, _audio_bus_rx) =
+        let (_audio_bus_tx, audio_bus_rx) =
             self.message_bus.create_channel(ComponentId::Audio).await?;
         let (_dsp_bus_tx, _dsp_bus_rx) = self.message_bus.create_channel(ComponentId::Dsp).await?;
         let (_ft8_bus_tx, _ft8_bus_rx) = self
@@ -157,7 +161,42 @@ impl super::ApplicationCoordinator {
         let (_tui_bus_tx, tui_bus_rx) = self.message_bus.create_channel(ComponentId::Tui).await?;
 
         // --- Audio component ---
-        self.start_audio_pipeline(audio_to_dsp_tx).await?;
+        self.start_audio_pipeline(audio_to_dsp_tx, tx_audio_rx).await?;
+
+        // --- Audio TX relay: message bus AudioOutput -> audio thread ---
+        {
+            let shutdown = self.shutdown_signal.clone();
+            let handle = tokio::spawn(async move {
+                info!("Audio TX relay started");
+                while !shutdown.load(Ordering::Acquire) {
+                    match audio_bus_rx.try_recv() {
+                        Ok(message) => {
+                            if let MessageType::AudioOutput { samples, sample_rate } =
+                                message.message_type
+                            {
+                                info!(
+                                    "Audio TX relay: {} samples at {} Hz from {:?}",
+                                    samples.len(),
+                                    sample_rate,
+                                    message.source
+                                );
+                                if tx_audio_tx.send((samples, sample_rate)).is_err() {
+                                    warn!("Audio TX relay: audio thread channel closed");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(crossbeam_channel::TryRecvError::Empty) => {
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+                    }
+                }
+                info!("Audio TX relay stopped");
+                Ok(())
+            });
+            self.named_task_handles.push((ComponentId::Audio, handle));
+        }
 
         // --- DSP component ---
         self.start_dsp_pipeline(audio_to_dsp_rx, dsp_to_ft8_tx, waterfall_tx.clone(), audio_level_tx)
@@ -211,10 +250,11 @@ impl super::ApplicationCoordinator {
         Ok(())
     }
 
-    /// Start audio component with point-to-point output channel
+    /// Start audio component with point-to-point output channel and TX audio input
     pub(crate) async fn start_audio_pipeline(
         &mut self,
         audio_to_dsp_tx: crossbeam_channel::Sender<Vec<f32>>,
+        tx_audio_rx: crossbeam_channel::Receiver<(Vec<f32>, u32)>,
     ) -> Result<()> {
         if self.no_audio {
             info!("Audio processing disabled");
@@ -313,6 +353,20 @@ impl super::ApplicationCoordinator {
                 loop {
                     if shutdown.load(Ordering::Acquire) {
                         break;
+                    }
+
+                    // Check for TX audio to play out
+                    match tx_audio_rx.try_recv() {
+                        Ok((samples, sample_rate)) => {
+                            info!("Audio TX: queueing {} samples at {} Hz", samples.len(), sample_rate);
+                            if let Err(e) = audio_manager.queue_output(&samples, sample_rate) {
+                                error!("Audio TX output error: {}", e);
+                            }
+                        }
+                        Err(crossbeam_channel::TryRecvError::Empty) => {}
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            info!("Audio TX channel disconnected");
+                        }
                     }
 
                     match audio_manager.process_audio() {
@@ -1060,6 +1114,16 @@ impl super::ApplicationCoordinator {
         let cmd_message_bus = self.message_bus.clone();
         let cmd_operating_freq = operating_freq.clone();
         let cmd_operating_freq_hz = self.operating_frequency_hz.clone();
+        // Read station config for CQ generation
+        let cmd_station_call = {
+            let cfg = self.config.read().await;
+            cfg.station.callsign.clone()
+        };
+        let cmd_station_grid = {
+            let cfg = self.config.read().await;
+            cfg.station.grid_square.clone()
+        };
+        let cmd_ptt_state = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_handle = tokio::spawn(async move {
             while !cmd_shutdown.load(Ordering::Acquire) {
                 match tui_cmd_rx.try_recv() {
@@ -1123,6 +1187,47 @@ impl super::ApplicationCoordinator {
                             info!("TUI requested application quit");
                             cmd_shutdown.store(true, Ordering::Release);
                             break;
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::StartCq => {
+                            let cq_text = format!("CQ {} {}", cmd_station_call, cmd_station_grid);
+                            info!("TUI StartCq: '{}'", cq_text);
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Ft8Transmitter,
+                                MessageType::TransmitRequest {
+                                    message_text: cq_text,
+                                    frequency_offset: 1500.0,
+                                    qso_id: None,
+                                },
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to send CQ: {}", e);
+                            }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::StopCq => {
+                            info!("TUI StopCq");
+                            // No explicit stop needed — transmitter completes current
+                            // slot naturally and PTT is released by PttGuard
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::TogglePtt => {
+                            let current = cmd_ptt_state.load(Ordering::Acquire);
+                            let new_state = !current;
+                            cmd_ptt_state.store(new_state, Ordering::Release);
+                            info!("TUI TogglePtt: {} -> {}", current, new_state);
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Hamlib,
+                                MessageType::RigControl(
+                                    crate::message_bus::RigControlMessage::SetPtt {
+                                        state: new_state,
+                                    },
+                                ),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to toggle PTT: {}", e);
+                            }
                         }
                         _ => {
                             debug!("Unhandled TUI command: {:?}", cmd);
