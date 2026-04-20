@@ -2532,9 +2532,14 @@ fn par_try_ldpc_with_ap(
         crate::ap::ApLevel::Ap3 => 3,
         crate::ap::ApLevel::Ap4 => 4,
     };
+    // AP decodes need higher confidence than standard decodes because
+    // AP injection biases the LDPC solver toward our callsign, producing
+    // phantom messages (e.g., "HZ0DCR K5ARH AM16") from noise.
+    const MIN_AP_CONFIDENCE: f32 = 0.55;
     const MIN_DECODE_CONFIDENCE: f32 = 0.41;
     const SCRUTINY_THRESHOLD: f32 = 0.65;
-    if confidence < MIN_DECODE_CONFIDENCE {
+    let min_conf = if ap_level_num > 0 { MIN_AP_CONFIDENCE } else { MIN_DECODE_CONFIDENCE };
+    if confidence < min_conf {
         return None;
     }
     if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
