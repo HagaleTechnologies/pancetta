@@ -552,9 +552,16 @@ impl App {
 
         // Update DX stations list
         if let Some(ref call_sign) = message.call_sign {
+            // Preserve existing grid if new message doesn't have one
+            // (e.g., RR73/73 messages don't carry grid info)
+            let grid_square = message.grid_square.clone().or_else(|| {
+                self.dx_stations
+                    .get(call_sign)
+                    .and_then(|s| s.grid_square.clone())
+            });
             let dx_station = DxStation {
                 call_sign: call_sign.clone(),
-                grid_square: message.grid_square.clone(),
+                grid_square,
                 frequency: message.frequency,
                 mode: message.mode.clone(),
                 last_seen: message.timestamp,
