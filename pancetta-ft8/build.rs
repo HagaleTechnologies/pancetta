@@ -21,6 +21,11 @@ fn main() {
                 format!("{}/common/monitor.c", ft8_dir),
             ])
             .include(ft8_dir)
+            // Suppress ft8_lib's LOG() output that corrupts the TUI.
+            // monitor.c #defines LOG_LEVEL before #include debug.h, so we
+            // can't override it via -D. Instead, redefine LOG_PRINTF (the
+            // actual output macro) to a no-op before debug.h sees it.
+            .flag("-DLOG_PRINTF(...)=")
             .warnings(false)
             .opt_level(2)
             .compile("ft8_lib");
