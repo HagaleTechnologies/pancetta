@@ -144,6 +144,7 @@ impl super::ApplicationCoordinator {
         let (ft8_to_tui_tx, ft8_to_tui_rx) =
             crossbeam_channel::unbounded::<pancetta_ft8::DecodedMessage>();
         let (waterfall_tx, waterfall_rx) = crossbeam_channel::unbounded::<Vec<Vec<f32>>>();
+        let (audio_level_tx, audio_level_rx) = crossbeam_channel::bounded::<f32>(1);
 
         // Also create message bus channels for control messages (hamlib, autonomous, etc.)
         let (_audio_bus_tx, _audio_bus_rx) =
@@ -159,7 +160,7 @@ impl super::ApplicationCoordinator {
         self.start_audio_pipeline(audio_to_dsp_tx).await?;
 
         // --- DSP component ---
-        self.start_dsp_pipeline(audio_to_dsp_rx, dsp_to_ft8_tx, waterfall_tx.clone())
+        self.start_dsp_pipeline(audio_to_dsp_rx, dsp_to_ft8_tx, waterfall_tx.clone(), audio_level_tx)
             .await?;
 
         // --- FT8 decoder component ---
@@ -168,7 +169,7 @@ impl super::ApplicationCoordinator {
 
         // --- TUI component ---
         if !self.headless {
-            self.start_tui_pipeline(ft8_to_tui_rx, tui_bus_rx, waterfall_rx)
+            self.start_tui_pipeline(ft8_to_tui_rx, tui_bus_rx, waterfall_rx, audio_level_rx)
                 .await?;
         } else {
             // In headless mode, just drain decoded messages and log them
@@ -407,6 +408,7 @@ impl super::ApplicationCoordinator {
         audio_rx: crossbeam_channel::Receiver<Vec<f32>>,
         dsp_to_ft8_tx: crossbeam_channel::Sender<Vec<f32>>,
         live_waterfall_tx: crossbeam_channel::Sender<Vec<Vec<f32>>>,
+        audio_level_tx: crossbeam_channel::Sender<f32>,
     ) -> Result<()> {
         let span = span!(Level::INFO, "start_dsp");
         let _enter = span.enter();
@@ -573,6 +575,12 @@ impl super::ApplicationCoordinator {
                                 let row: Vec<f32> =
                                     powers.iter().map(|&p| (p - min_p) / range).collect();
                                 let _ = live_waterfall_tx.try_send(vec![row]);
+
+                                // Send audio level (RMS) to TUI — once per second
+                                let rms = (wf_slice.iter().map(|s| s * s).sum::<f32>()
+                                    / wf_slice.len() as f32)
+                                    .sqrt();
+                                let _ = audio_level_tx.try_send(rms);
                             }
                         }
 
@@ -738,7 +746,12 @@ impl super::ApplicationCoordinator {
                             }
                         }
 
-                        // Build AP context for this decode window
+                        // Primary decoder: ft8_lib (reference C implementation)
+                        // with full sliding-frame spectrogram — matches WSJT-X sensitivity
+                        let ft8lib_messages =
+                            pancetta_ft8::Ft8Decoder::decode_window_ft8lib(&window);
+
+                        // Secondary: our native decoder with AP enhancement
                         let current_qso_ap =
                             active_qso_ap.read().ok().and_then(|guard| guard.clone());
                         let ap_context = pancetta_ft8::ApContext {
@@ -746,100 +759,106 @@ impl super::ApplicationCoordinator {
                             recent_calls: recent_pool.clone(),
                             active_qso: current_qso_ap,
                         };
+                        let native_messages = decoder
+                            .decode_window_with_ap(&window, &ap_context)
+                            .unwrap_or_default();
 
-                        // Decode FT8 signals with AP-enhanced decoding
-                        match decoder.decode_window_with_ap(&window, &ap_context) {
-                            Ok(decoded_messages) => {
-                                // Update decode timestamp
-                                rt.block_on(async {
-                                    let mut timestamp = last_decode_timestamp.write().await;
-                                    *timestamp = Some(Instant::now());
-                                });
-
-                                info!("FT8 decoder: {} messages decoded", decoded_messages.len());
-
-                                for decoded_msg in &decoded_messages {
-                                    info!(
-                                        "FT8 decoded: {} (SNR: {:.0}, freq: {:.1})",
-                                        decoded_msg.text,
-                                        decoded_msg.snr_db,
-                                        decoded_msg.frequency_offset
-                                    );
-
-                                    // Send to TUI via point-to-point channel
-                                    if ft8_to_tui_tx.send(decoded_msg.clone()).is_err() {
-                                        warn!("TUI channel disconnected");
-                                    }
-
-                                    // Forward to other components via message bus (fire-and-forget
-                                    // to avoid stalling the decoder thread with block_on)
-                                    let auto_msg = ComponentMessage::new(
-                                        ComponentId::Ft8Decoder,
-                                        ComponentId::Autonomous,
-                                        MessageType::DecodedMessage(decoded_msg.clone()),
-                                        Instant::now(),
-                                    );
-                                    let bus1 = message_bus.clone();
-                                    rt.spawn(async move {
-                                        if let Err(e) = bus1.send_message(auto_msg).await {
-                                            debug!("Failed to forward decoded message to Autonomous: {}", e);
-                                        }
-                                    });
-
-                                    let qso_msg = ComponentMessage::new(
-                                        ComponentId::Ft8Decoder,
-                                        ComponentId::Qso,
-                                        MessageType::DecodedMessage(decoded_msg.clone()),
-                                        Instant::now(),
-                                    );
-                                    let bus2 = message_bus.clone();
-                                    rt.spawn(async move {
-                                        if let Err(e) = bus2.send_message(qso_msg).await {
-                                            debug!(
-                                                "Failed to forward decoded message to QSO: {}",
-                                                e
-                                            );
-                                        }
-                                    });
-
-                                    let psk_msg = ComponentMessage::new(
-                                        ComponentId::Ft8Decoder,
-                                        ComponentId::PskReporter,
-                                        MessageType::DecodedMessage(decoded_msg.clone()),
-                                        Instant::now(),
-                                    );
-                                    let bus3 = message_bus.clone();
-                                    rt.spawn(async move {
-                                        if let Err(e) = bus3.send_message(psk_msg).await {
-                                            debug!("Failed to forward decoded message to PSKReporter: {}", e);
-                                        }
-                                    });
-                                }
-
-                                // Update AP recent_pool with newly decoded callsigns
-                                for msg in &decoded_messages {
-                                    if let Some(ref call) = msg.message.from_callsign {
-                                        if !recent_pool.iter().any(|r| r.callsign == *call) {
-                                            if let Some(ap) =
-                                                pancetta_ft8::RecentCallAp::new(call, msg.snr_db)
-                                            {
-                                                recent_pool.push(ap);
-                                            }
-                                        }
-                                    }
-                                }
-                                // Keep strongest 20, prune weak entries
-                                recent_pool.sort_by(|a, b| {
-                                    b.last_snr
-                                        .partial_cmp(&a.last_snr)
-                                        .unwrap_or(std::cmp::Ordering::Equal)
-                                });
-                                recent_pool.truncate(20);
-                            }
-                            Err(e) => {
-                                warn!("FT8 decode error: {}", e);
+                        // Merge: start with ft8_lib results, add any native-only
+                        // decodes (e.g. from AP injection) that ft8_lib missed
+                        let mut seen_texts: std::collections::HashSet<String> =
+                            ft8lib_messages.iter().map(|m| m.text.clone()).collect();
+                        let mut decoded_messages = ft8lib_messages;
+                        for msg in native_messages {
+                            if seen_texts.insert(msg.text.clone()) {
+                                decoded_messages.push(msg);
                             }
                         }
+
+                        // Update decode timestamp
+                        rt.block_on(async {
+                            let mut timestamp = last_decode_timestamp.write().await;
+                            *timestamp = Some(Instant::now());
+                        });
+
+                        info!("FT8 decoder: {} messages decoded ({} ft8lib + native merge)", decoded_messages.len(), decoded_messages.len());
+
+                        for decoded_msg in &decoded_messages {
+                            info!(
+                                "FT8 decoded: {} (SNR: {:.0}, freq: {:.1})",
+                                decoded_msg.text,
+                                decoded_msg.snr_db,
+                                decoded_msg.frequency_offset
+                            );
+
+                            // Send to TUI via point-to-point channel
+                            if ft8_to_tui_tx.send(decoded_msg.clone()).is_err() {
+                                warn!("TUI channel disconnected");
+                            }
+
+                            // Forward to other components via message bus (fire-and-forget
+                            // to avoid stalling the decoder thread with block_on)
+                            let auto_msg = ComponentMessage::new(
+                                ComponentId::Ft8Decoder,
+                                ComponentId::Autonomous,
+                                MessageType::DecodedMessage(decoded_msg.clone()),
+                                Instant::now(),
+                            );
+                            let bus1 = message_bus.clone();
+                            rt.spawn(async move {
+                                if let Err(e) = bus1.send_message(auto_msg).await {
+                                    debug!("Failed to forward decoded message to Autonomous: {}", e);
+                                }
+                            });
+
+                            let qso_msg = ComponentMessage::new(
+                                ComponentId::Ft8Decoder,
+                                ComponentId::Qso,
+                                MessageType::DecodedMessage(decoded_msg.clone()),
+                                Instant::now(),
+                            );
+                            let bus2 = message_bus.clone();
+                            rt.spawn(async move {
+                                if let Err(e) = bus2.send_message(qso_msg).await {
+                                    debug!(
+                                        "Failed to forward decoded message to QSO: {}",
+                                        e
+                                    );
+                                }
+                            });
+
+                            let psk_msg = ComponentMessage::new(
+                                ComponentId::Ft8Decoder,
+                                ComponentId::PskReporter,
+                                MessageType::DecodedMessage(decoded_msg.clone()),
+                                Instant::now(),
+                            );
+                            let bus3 = message_bus.clone();
+                            rt.spawn(async move {
+                                if let Err(e) = bus3.send_message(psk_msg).await {
+                                    debug!("Failed to forward decoded message to PSKReporter: {}", e);
+                                }
+                            });
+                        }
+
+                        // Update AP recent_pool with newly decoded callsigns
+                        for msg in &decoded_messages {
+                            if let Some(ref call) = msg.message.from_callsign {
+                                if !recent_pool.iter().any(|r| r.callsign == *call) {
+                                    if let Some(ap) =
+                                        pancetta_ft8::RecentCallAp::new(call, msg.snr_db)
+                                    {
+                                        recent_pool.push(ap);
+                                    }
+                                }
+                            }
+                        }
+                        // Keep strongest 20, prune weak entries
+                        recent_pool.sort_by(|a, b| {
+                            b.last_snr
+                                .partial_cmp(&a.last_snr)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        recent_pool.truncate(20);
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -865,6 +884,7 @@ impl super::ApplicationCoordinator {
         ft8_to_tui_rx: crossbeam_channel::Receiver<pancetta_ft8::DecodedMessage>,
         tui_bus_rx: crossbeam_channel::Receiver<ComponentMessage>,
         waterfall_rx: crossbeam_channel::Receiver<Vec<Vec<f32>>>,
+        audio_level_rx: crossbeam_channel::Receiver<f32>,
     ) -> Result<()> {
         let span = span!(Level::INFO, "start_tui");
         let _enter = span.enter();
@@ -1015,6 +1035,15 @@ impl super::ApplicationCoordinator {
                     Ok(rows) => {
                         let _ = tui_msg_tx_relay
                             .send(pancetta_tui::tui_runner::TuiMessage::WaterfallUpdate { rows });
+                    }
+                    Err(_) => {}
+                }
+
+                // Relay audio level from DSP to TUI
+                match audio_level_rx.try_recv() {
+                    Ok(level) => {
+                        let _ = tui_msg_tx_relay
+                            .send(pancetta_tui::tui_runner::TuiMessage::AudioLevel { level });
                     }
                     Err(_) => {}
                 }

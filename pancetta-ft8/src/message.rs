@@ -834,6 +834,144 @@ impl DecodedMessage {
             ap_level: 0,
         }
     }
+
+    /// Create a DecodedMessage from ft8_lib FFI output.
+    ///
+    /// Parses the text string into an Ft8Message with best-effort field
+    /// extraction.  The SNR comes from ft8_lib's `status.time` field
+    /// (which is actually the SNR estimate in the C code), and frequency
+    /// from `status.freq`.
+    pub fn from_ft8lib(text: &str, freq_hz: f32, snr: f32, ldpc_errors: i32) -> Self {
+        let message = Ft8Message::from_text(text);
+        Self {
+            text: text.to_string(),
+            message,
+            snr_db: snr,
+            confidence: if ldpc_errors == 0 { 1.0 } else { 0.8 },
+            frequency_offset: freq_hz as f64,
+            time_offset: 0.0,
+            timestamp: SystemTime::now(),
+            error_corrections: ldpc_errors.clamp(0, 255) as u8,
+            tone_symbols: None,
+            ap_level: 0,
+        }
+    }
+}
+
+impl Ft8Message {
+    /// Parse an FT8 message from its text representation.
+    ///
+    /// Handles common formats produced by ft8_lib / WSJT-X:
+    /// - `CQ [DX|NA|...] <call> <grid>`
+    /// - `<to> <from> <grid>`
+    /// - `<to> <from> [R] <report>`
+    /// - `<to> <from> RR73|RRR|73`
+    pub fn from_text(text: &str) -> Self {
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        let mut msg = Ft8Message::default();
+        msg.message_type = MessageType::Standard;
+
+        if parts.is_empty() {
+            msg.message_type = MessageType::FreeText;
+            msg.text = Some(text.to_string());
+            return msg;
+        }
+
+        if parts[0] == "CQ" {
+            msg.standard_type = Some(StandardMessageType::Cq);
+            let mut idx = 1;
+            // Check for CQ modifier (DX, NA, POTA, etc.)
+            if idx < parts.len() && !Self::text_looks_like_callsign(parts[idx])
+                && !Self::text_looks_like_grid(parts[idx])
+            {
+                msg.special_operation = Some(parts[idx].to_string());
+                idx += 1;
+            }
+            if idx < parts.len() {
+                msg.from_callsign = Some(parts[idx].to_string());
+                idx += 1;
+            }
+            if idx < parts.len() && Self::text_looks_like_grid(parts[idx]) {
+                msg.grid_square = Some(parts[idx].to_string());
+            }
+            return msg;
+        }
+
+        // Two-callsign messages: <to> <from> <suffix>
+        if parts.len() >= 2 {
+            msg.to_callsign = Some(parts[0].to_string());
+            msg.from_callsign = Some(parts[1].to_string());
+
+            if parts.len() == 2 {
+                // Bare exchange — treat as reply
+                msg.standard_type = Some(StandardMessageType::Reply);
+                return msg;
+            }
+
+            let rest = &parts[2..];
+            match rest {
+                ["RR73"] => msg.standard_type = Some(StandardMessageType::RR73),
+                ["RRR"] => msg.standard_type = Some(StandardMessageType::Rrr),
+                ["73"] => msg.standard_type = Some(StandardMessageType::Final73),
+                ["R", grid] if Self::text_looks_like_grid(grid) => {
+                    msg.standard_type = Some(StandardMessageType::ReplyWithR);
+                    msg.grid_square = Some(grid.to_string());
+                }
+                ["R", report] if Self::text_looks_like_report(report) => {
+                    msg.standard_type = Some(StandardMessageType::ReportWithR);
+                    msg.signal_report = Self::text_parse_report(report);
+                }
+                [grid] if Self::text_looks_like_grid(grid) => {
+                    msg.standard_type = Some(StandardMessageType::Reply);
+                    msg.grid_square = Some(grid.to_string());
+                }
+                [report] if Self::text_looks_like_report(report) => {
+                    msg.standard_type = Some(StandardMessageType::Report);
+                    msg.signal_report = Self::text_parse_report(report);
+                }
+                _ => {
+                    // Unrecognized suffix — store as free text
+                    msg.standard_type = Some(StandardMessageType::Reply);
+                }
+            }
+            return msg;
+        }
+
+        // Fallback: free text
+        msg.message_type = MessageType::FreeText;
+        msg.text = Some(text.to_string());
+        msg
+    }
+
+    fn text_looks_like_callsign(s: &str) -> bool {
+        s.len() >= 3
+            && s.len() <= 10
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
+            && s.chars().any(|c| c.is_ascii_digit())
+    }
+
+    fn text_looks_like_grid(s: &str) -> bool {
+        if s.len() != 4 {
+            return false;
+        }
+        let b = s.as_bytes();
+        (b'A'..=b'R').contains(&b[0].to_ascii_uppercase())
+            && (b'A'..=b'R').contains(&b[1].to_ascii_uppercase())
+            && b[2].is_ascii_digit()
+            && b[3].is_ascii_digit()
+    }
+
+    fn text_looks_like_report(s: &str) -> bool {
+        if s.len() < 2 {
+            return false;
+        }
+        let first = s.as_bytes()[0];
+        (first == b'+' || first == b'-') && s[1..].chars().all(|c| c.is_ascii_digit())
+    }
+
+    fn text_parse_report(s: &str) -> Option<i8> {
+        s.parse::<i8>().ok()
+    }
 }
 
 impl fmt::Display for DecodedMessage {

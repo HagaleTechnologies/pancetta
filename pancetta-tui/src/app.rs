@@ -810,8 +810,8 @@ impl App {
 
     /// Append waterfall rows from a decoded window, keeping last 30 windows of data.
     pub fn push_waterfall_rows(&mut self, rows: Vec<Vec<f32>>) {
-        // 4 rows per 15s FT8 cycle × 60 cycles = ~15 minutes of history
-        const MAX_WATERFALL_ROWS: usize = 240;
+        // 15 rows per 15s FT8 cycle (1 row/sec) × 30 cycles = ~7.5 minutes of history
+        const MAX_WATERFALL_ROWS: usize = 450;
         self.waterfall_data.extend(rows);
         if self.waterfall_data.len() > MAX_WATERFALL_ROWS {
             let excess = self.waterfall_data.len() - MAX_WATERFALL_ROWS;

@@ -96,6 +96,8 @@ pub enum TuiMessage {
     WaterfallUpdate { rows: Vec<Vec<f32>> },
     /// Live spot groups from cqdx.io
     SpotGroupUpdate { spots: Vec<CqdxSpotInfo> },
+    /// Audio level update (RMS, 0.0-1.0)
+    AudioLevel { level: f32 },
 }
 
 /// Commands sent from TUI
@@ -302,6 +304,9 @@ impl TuiRunner {
             }
             TuiMessage::SpotGroupUpdate { spots } => {
                 app.merge_spot_groups(&spots);
+            }
+            TuiMessage::AudioLevel { level } => {
+                app.audio_level = level;
             }
         }
 

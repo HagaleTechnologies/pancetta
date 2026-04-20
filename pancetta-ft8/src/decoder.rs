@@ -50,7 +50,7 @@ const SAMPLES_PER_SYMBOL: usize = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usiz
 const FREQ_OSR: usize = 2;
 
 /// Time oversampling rate (2 = half-sub-symbol resolution, matching ft8_lib)
-/// Each symbol occupies 2 * TIME_OSR time steps in the spectrogram.
+/// Each symbol occupies TIME_OSR time steps in the spectrogram.
 const TIME_OSR: usize = 2;
 
 /// Target LLR variance for normalization (matches ft8_lib's ftx_normalize_logl)
@@ -262,11 +262,18 @@ impl Ft8Decoder {
 
         let symbol_fft_buffer = vec![Complex::new(0.0, 0.0); sps];
 
-        // Pre-compute FFT plan and Hann window for spectrogram
+        // Pre-compute FFT plan and Hann window for spectrogram.
+        // Bake in 2.0/nfft normalization to match ft8_lib's monitor.c:
+        //   window[i] = fft_norm * hann_i(i, nfft)
+        // where fft_norm = 2.0/nfft and hann_i(i,N) = sin²(π*i/N).
         let spec_nfft = sps * FREQ_OSR; // 3840
         let spectrogram_fft = planner.plan_fft_forward(spec_nfft);
+        let fft_norm = 2.0 / spec_nfft as f64;
         let spectrogram_window: Vec<f64> = (0..spec_nfft)
-            .map(|i| 0.5 * (1.0 - (pi2 * i as f64 / (spec_nfft - 1) as f64).cos()))
+            .map(|i| {
+                let x = (std::f64::consts::PI * i as f64 / spec_nfft as f64).sin();
+                fft_norm * x * x
+            })
             .collect();
 
         Ok(Self {
@@ -297,6 +304,21 @@ impl Ft8Decoder {
     /// Decode a 12.64-second window of audio samples
     pub fn decode_window(&mut self, samples: &[f32]) -> Ft8Result<Vec<DecodedMessage>> {
         self.decode_window_with_ap(samples, &crate::ap::ApContext::default())
+    }
+
+    /// Decode using ft8_lib's C decoder via FFI.
+    ///
+    /// This uses the reference C implementation which has full sliding-frame
+    /// spectrogram processing and matches WSJT-X sensitivity. The output
+    /// tuples are converted to our DecodedMessage type.
+    pub fn decode_window_ft8lib(samples: &[f32]) -> Vec<DecodedMessage> {
+        let tuples = crate::ft8_lib_ffi::ft8lib_decode_audio(samples);
+        tuples
+            .into_iter()
+            .map(|(text, freq, snr, ldpc_errors)| {
+                DecodedMessage::from_ft8lib(&text, freq, snr, ldpc_errors)
+            })
+            .collect()
     }
 
     /// Decode a 12.64-second window of audio samples with A Priori (AP) context.
@@ -845,19 +867,21 @@ impl Ft8Decoder {
     // Step 1: Spectrogram
     // ========================================================================
 
-    /// Compute power spectrogram of audio data with frequency oversampling.
+    /// Compute power spectrogram using ft8_lib's sliding-frame approach.
     ///
-    /// Uses FFT windows of 2× symbol period (3840 samples at 12 kHz) with
-    /// freq_osr=2, giving 3.125 Hz frequency resolution. The FFT bins are
-    /// then organized as freq_sub=0 (even bins: 0, 2, 4, ...) and
-    /// freq_sub=1 (odd bins: 1, 3, 5, ...), where each sub-bin set has
-    /// 6.25 Hz spacing. This matches ft8_lib's frequency oversampling approach.
+    /// Matches `monitor_process()` in ft8_lib/common/monitor.c:
+    /// - Persistent `last_frame` buffer of nfft samples
+    /// - Per symbol: loop time_osr times, each time shifting subblock_size
+    ///   new samples into the frame, then windowed FFT
+    /// - Window includes 2.0/nfft normalization (baked in at init)
+    /// - Frequency oversampling via freq_osr sub-bins
     fn compute_spectrogram(&self, audio: &[f64]) -> Ft8Result<Spectrogram> {
         let pp = &self.protocol_params;
-        let block_size = pp.samples_per_symbol(SAMPLE_RATE);
-        let freq_osr = FREQ_OSR;
-        let nfft = block_size * freq_osr;
-        let step = block_size / (2 * TIME_OSR); // TIME_OSR=2 → quarter-symbol steps
+        let block_size = pp.samples_per_symbol(SAMPLE_RATE); // 1920
+        let freq_osr = FREQ_OSR; // 2
+        let time_osr = TIME_OSR; // 2
+        let nfft = block_size * freq_osr; // 3840
+        let subblock_size = block_size / time_osr; // 960
 
         if audio.len() < block_size {
             return Err(Ft8Error::InsufficientData {
@@ -866,69 +890,85 @@ impl Ft8Decoder {
             });
         }
 
-        // Zero-pad audio so the spectrogram has enough time steps for the
-        // Costas search to scan a range of starting positions (not just t0=0).
-        // FT8 signals can start up to ~2s before/after the nominal slot
-        // boundary. With step=480 (quarter-symbol), we need ~50 extra steps
-        // beyond the 316-step message span to cover ±2s of timing uncertainty.
-        let steps_per_symbol = 2 * TIME_OSR;
-        let msg_span = self.protocol_params.num_symbols * steps_per_symbol;
-        let search_margin = 50; // ~25 steps each side ≈ ±2s
-        let min_steps = msg_span + search_margin;
-        let min_padded_len = (min_steps - 1) * step + nfft;
-        let mut padded = audio.to_vec();
-        if padded.len() < min_padded_len {
-            padded.resize(min_padded_len, 0.0);
-        }
-
-        let num_steps = (padded.len() - nfft) / step + 1;
-        // Number of frequency bins in 6.25 Hz units (= block_size/2 + 1)
+        // Number of frequency bins in 6.25 Hz units
         let num_bins = block_size / 2 + 1; // 961
 
-        // Use pre-computed FFT plan and Hann window
+        // How many complete symbols (blocks) fit in the audio?
+        let num_blocks = audio.len() / block_size;
+        // We need enough blocks for the Costas search span + margin.
+        // FT8: 79 symbols × 2 time_osr = 158 steps for the message, plus
+        // margin for ±2s timing uncertainty.
+        let steps_per_symbol = time_osr;
+        let msg_span = self.protocol_params.num_symbols * steps_per_symbol;
+        let search_margin = 50;
+        let min_steps = msg_span + search_margin;
+
+        // Pad audio if needed to get enough blocks
+        let min_blocks = (min_steps + time_osr - 1) / time_osr;
+        let padded;
+        let audio_ref = if num_blocks < min_blocks {
+            let min_len = min_blocks * block_size;
+            padded = {
+                let mut v = audio.to_vec();
+                v.resize(min_len, 0.0);
+                v
+            };
+            &padded[..]
+        } else {
+            audio
+        };
+        let num_blocks = audio_ref.len() / block_size;
+        let num_steps = num_blocks * time_osr;
+
         let fft = &self.spectrogram_fft;
         let window = &self.spectrogram_window;
 
         let mut power = Vec::with_capacity(num_steps);
         let mut fft_buffer = vec![Complex::new(0.0, 0.0); nfft];
+        // Persistent sliding frame buffer (matches ft8_lib's me->last_frame)
+        let mut last_frame = vec![0.0f64; nfft];
 
-        for t in 0..num_steps {
-            let start = t * step;
-            let end = (start + nfft).min(padded.len());
+        let mut frame_pos = 0usize;
 
-            // Apply window and load into FFT buffer, zero-pad if needed
-            for i in 0..nfft {
-                if start + i < end {
-                    fft_buffer[i] = Complex::new(padded[start + i] * window[i], 0.0);
-                } else {
-                    fft_buffer[i] = Complex::new(0.0, 0.0);
-                }
-            }
-
-            // Compute FFT in-place
-            fft.process(&mut fft_buffer);
-
-            // Organize into freq_osr sub-bins
-            // FFT bin k corresponds to frequency k * (sample_rate / nfft)
-            // = k * (12000 / 3840) = k * 3.125 Hz
-            // In 6.25 Hz units: bin_6hz = k / freq_osr, freq_sub = k % freq_osr
-            let mut sub_power = Vec::with_capacity(freq_osr);
-            for fs in 0..freq_osr {
-                let mut row = Vec::with_capacity(num_bins);
-                for bin in 0..num_bins {
-                    let src_bin = bin * freq_osr + fs;
-                    if src_bin < nfft / 2 + 1 {
-                        // Store log-magnitude (dB) like ft8_lib for neighbor scoring
-                        let mag2 = fft_buffer[src_bin].norm_sqr();
-                        let db = 10.0 * (1e-12f64 + mag2).log10();
-                        row.push(db);
+        for _block in 0..num_blocks {
+            for _time_sub in 0..time_osr {
+                // Shift old data left by subblock_size, append new data on right
+                // (exactly as monitor.c lines 146-154)
+                last_frame.copy_within(subblock_size.., 0);
+                let new_start = nfft - subblock_size;
+                for pos in 0..subblock_size {
+                    last_frame[new_start + pos] = if frame_pos < audio_ref.len() {
+                        audio_ref[frame_pos]
                     } else {
-                        row.push(-120.0);
-                    }
+                        0.0
+                    };
+                    frame_pos += 1;
                 }
-                sub_power.push(row);
+
+                // Apply window and FFT
+                for i in 0..nfft {
+                    fft_buffer[i] = Complex::new(window[i] * last_frame[i], 0.0);
+                }
+                fft.process(&mut fft_buffer);
+
+                // Organize into freq_osr sub-bins (matches monitor.c lines 164-188)
+                let mut sub_power = Vec::with_capacity(freq_osr);
+                for fs in 0..freq_osr {
+                    let mut row = Vec::with_capacity(num_bins);
+                    for bin in 0..num_bins {
+                        let src_bin = bin * freq_osr + fs;
+                        if src_bin < nfft / 2 + 1 {
+                            let mag2 = fft_buffer[src_bin].norm_sqr();
+                            let db = 10.0 * (1e-12f64 + mag2).log10();
+                            row.push(db);
+                        } else {
+                            row.push(-120.0);
+                        }
+                    }
+                    sub_power.push(row);
+                }
+                power.push(sub_power);
             }
-            power.push(sub_power);
         }
 
         Ok(Spectrogram {
@@ -951,7 +991,7 @@ impl Ft8Decoder {
     /// across the full frame. More robust than Costas-only sync scoring.
     fn block_score(&self, spec: &Spectrogram, candidate: &CostasCandidate) -> f64 {
         let pp = &self.protocol_params;
-        let steps_per_symbol = 2 * TIME_OSR;
+        let steps_per_symbol = TIME_OSR;
         let mut signal_sum = 0.0f64;
         let mut noise_sum = 0.0f64;
         let mut signal_count = 0usize;
@@ -1006,8 +1046,8 @@ impl Ft8Decoder {
         let mut candidates = Vec::new();
         let pp = &self.protocol_params;
 
-        // A full message occupies num_symbols * (2 * TIME_OSR) time steps.
-        let steps_per_symbol = 2 * TIME_OSR;
+        // A full message occupies num_symbols * TIME_OSR time steps.
+        let steps_per_symbol = TIME_OSR;
         let msg_span = pp.num_symbols * steps_per_symbol;
         let max_time_step = spectrogram.num_steps.saturating_sub(msg_span + 1);
 
@@ -1065,7 +1105,7 @@ impl Ft8Decoder {
         // With TIME_OSR>1, the outer t0 loop already iterates at sub-symbol
         // resolution, so we only need to check 2 half-symbol offsets within
         // each t0 position (as in the original TIME_OSR=1 code).
-        let steps_per_symbol = 2 * TIME_OSR;
+        let steps_per_symbol = TIME_OSR;
         let mut best_score = 0.0f64;
 
         for half in 0..2 {
@@ -1197,7 +1237,7 @@ impl Ft8Decoder {
     ) -> Ft8Result<Option<DecodedMessage>> {
         let tone_spacing = self.protocol_params.tone_spacing;
         let sps = self.protocol_params.samples_per_symbol(SAMPLE_RATE);
-        let spec_step = sps / (2 * TIME_OSR);
+        let spec_step = sps / TIME_OSR;
         let coarse_offset = candidate.time_step * spec_step;
 
         // Try both freq_sub values, same as the spectrogram path in decode_candidate
@@ -1460,7 +1500,7 @@ impl Ft8Decoder {
         let sps = self.protocol_params.samples_per_symbol(SAMPLE_RATE);
         let tone_spacing = self.protocol_params.tone_spacing;
         let xor_sequence = self.protocol_params.xor_sequence;
-        let spec_step = sps / (2 * TIME_OSR);
+        let spec_step = sps / TIME_OSR;
         let coarse_offset = candidate.time_step * spec_step;
 
         // ---- Spectrogram-based symbol extraction: try both freq_sub values ----
@@ -1852,7 +1892,7 @@ impl Ft8Decoder {
 
         let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
 
-        let steps_per_symbol = 2 * TIME_OSR;
+        let steps_per_symbol = TIME_OSR;
 
         for sym_idx in 0..pp.num_symbols {
             let mut mags = [-120.0f64; NUM_TONES];
@@ -2183,7 +2223,7 @@ fn par_decode_candidate(
     let sps = ctx.protocol_params.samples_per_symbol(SAMPLE_RATE);
     let tone_spacing = ctx.protocol_params.tone_spacing;
     let xor_sequence = ctx.xor_sequence;
-    let spec_step = sps / (2 * TIME_OSR);
+    let spec_step = sps / TIME_OSR;
     let coarse_offset = candidate.time_step * spec_step;
 
     // ---- Spectrogram-based symbol extraction: try both freq_sub values ----
@@ -2358,7 +2398,7 @@ fn par_try_ap_decode(
 ) -> Option<DecodedMessage> {
     let tone_spacing = ctx.protocol_params.tone_spacing;
     let sps = ctx.protocol_params.samples_per_symbol(SAMPLE_RATE);
-    let spec_step = sps / (2 * TIME_OSR);
+    let spec_step = sps / TIME_OSR;
     let coarse_offset = candidate.time_step * spec_step;
 
     let freq_sub_trials = [
@@ -2571,7 +2611,7 @@ fn par_extract_symbols_from_spectrogram(
     let fs = candidate.freq_sub;
 
     let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
-    let steps_per_symbol = 2 * TIME_OSR;
+    let steps_per_symbol = TIME_OSR;
 
     for sym_idx in 0..pp.num_symbols {
         let mut mags = [-120.0f64; NUM_TONES];
@@ -3452,7 +3492,7 @@ mod tests {
 
         // Create a spectrogram where Costas tones are present at t0=0, f0=240
         // Spectrogram stores log-magnitude (dB) values
-        let steps_per_symbol = 2 * TIME_OSR;
+        let steps_per_symbol = TIME_OSR;
         let num_steps = 79 * steps_per_symbol; // enough for 79 symbols
         let num_bins = SAMPLES_PER_SYMBOL / 2 + 1; // bins in 6.25 Hz units
         let freq_osr = FREQ_OSR;

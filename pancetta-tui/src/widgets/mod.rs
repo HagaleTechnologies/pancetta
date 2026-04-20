@@ -38,7 +38,7 @@ impl<'a> Waterfall<'a> {
             freq_range: (0.0, 3000.0),
             tx_offset: None,
             signal_freqs: Vec::new(),
-            rows_per_cycle: 4,
+            rows_per_cycle: 15,
             compression: 2,
         }
     }
