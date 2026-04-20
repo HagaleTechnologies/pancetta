@@ -1110,15 +1110,30 @@ impl MessageParser {
             message.to_callsign = call_a_str;
             message.from_callsign = call_b_str;
         } else if grid.is_some() {
-            // Grid square reply
-            if ir != 0 {
-                message.standard_type = Some(StandardMessageType::ReplyWithR);
+            // Grid square reply — but filter out grids that collide with
+            // known tokens (RR73 encodes as igrid4=32373, a valid grid in
+            // the Pacific, but in non-CQ context it's almost always a
+            // misinterpreted QSO completion token)
+            let grid_str = grid.as_deref().unwrap_or("");
+            if grid_str == "RR73" || grid_str == "RRR" {
+                // Treat as the corresponding token instead
+                match grid_str {
+                    "RR73" => message.standard_type = Some(StandardMessageType::RR73),
+                    "RRR" => message.standard_type = Some(StandardMessageType::Rrr),
+                    _ => message.standard_type = Some(StandardMessageType::Reply),
+                }
+                message.to_callsign = call_a_str;
+                message.from_callsign = call_b_str;
             } else {
-                message.standard_type = Some(StandardMessageType::Reply);
+                if ir != 0 {
+                    message.standard_type = Some(StandardMessageType::ReplyWithR);
+                } else {
+                    message.standard_type = Some(StandardMessageType::Reply);
+                }
+                message.to_callsign = call_a_str;
+                message.from_callsign = call_b_str;
+                message.grid_square = grid;
             }
-            message.to_callsign = call_a_str;
-            message.from_callsign = call_b_str;
-            message.grid_square = grid;
         } else {
             // No grid, no report, no token — blank exchange
             message.standard_type = Some(StandardMessageType::Reply);
