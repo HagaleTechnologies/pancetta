@@ -862,9 +862,11 @@ impl App {
     pub fn get_selected_station(&self) -> Option<(String, u64)> {
         match self.active_panel {
             ActivePanel::BandActivity => {
+                // Display is reversed (newest first), so index from the end
                 let msg = self
                     .decoded_messages
                     .iter()
+                    .rev()
                     .nth(self.band_activity_scroll)?;
                 let callsign = msg.call_sign.as_ref()?;
                 if callsign.is_empty() {

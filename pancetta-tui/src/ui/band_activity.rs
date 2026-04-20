@@ -29,13 +29,12 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
 
     let header = Row::new(header_cells).height(1).bottom_margin(0);
 
-    // Convert messages to table rows
+    // Convert all messages to table rows (newest first).
+    // Let ratatui's TableState handle viewport scrolling to the selected row.
     let mut rows: Vec<Row> = app
         .decoded_messages
         .iter()
         .rev() // Show newest first
-        .skip(app.band_activity_scroll)
-        .take((area.height as usize).saturating_sub(4)) // Account for borders and header
         .map(|msg| create_message_row(msg, app))
         .collect();
 

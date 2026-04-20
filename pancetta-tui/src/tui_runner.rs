@@ -187,7 +187,7 @@ impl TuiRunner {
             // Handle user input (with timeout)
             if event::poll(event_timeout)? {
                 match event::read()? {
-                    Event::Key(key) => {
+                    Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Press => {
                         if !self.handle_key_event(key).await? {
                             info!("TUI exit: user quit (key={:?})", key.code);
                             break;
