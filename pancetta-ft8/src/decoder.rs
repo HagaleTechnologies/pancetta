@@ -371,14 +371,18 @@ impl Ft8Decoder {
             let sync_candidates: Vec<CostasCandidate> =
                 scored.into_iter().map(|(_, c)| c).collect();
 
-            if pass == 0 {
-                best_sync_score = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
+            {
+                let pass_best = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
+                if pass == 0 {
+                    best_sync_score = pass_best;
+                }
                 info!(
+                    pass,
                     candidates = sync_candidates.len(),
-                    best_score = format!("{:.1}", best_sync_score),
+                    best_score = format!("{:.1}", pass_best),
                     spec_steps = spectrogram.num_steps,
                     spec_bins = spectrogram.num_bins,
-                    "FT8 sync search pass 0"
+                    "FT8 sync search"
                 );
                 #[cfg(feature = "debug-decode")]
                 for (i, c) in sync_candidates.iter().take(10).enumerate() {
