@@ -576,11 +576,15 @@ impl super::ApplicationCoordinator {
                         }
 
                         // Send FT8 window when we have enough samples AND
-                        // we've reached the next 15-second boundary
+                        // we've reached the next 15-second boundary.
+                        // Send 15.0 seconds (180000 samples) instead of 12.64s (151680)
+                        // to give the decoder real audio in the time-search margin
+                        // (signals can start up to ~2s before the slot boundary).
+                        const SEND_SAMPLES: usize = FT8_SAMPLE_RATE * 15; // 180000
                         let now = chrono::Utc::now();
-                        if ft8_buffer.len() >= FT8_WINDOW_SAMPLES && now >= next_window_time {
-                            // Take the most recent FT8_WINDOW_SAMPLES from the buffer
-                            let start = ft8_buffer.len() - FT8_WINDOW_SAMPLES;
+                        if ft8_buffer.len() >= SEND_SAMPLES && now >= next_window_time {
+                            // Take the most recent 15 seconds from the buffer
+                            let start = ft8_buffer.len() - SEND_SAMPLES;
                             let window: Vec<f32> = ft8_buffer[start..].to_vec();
                             // Keep some overlap for the next window (retain last 1s worth)
                             let keep = FT8_SAMPLE_RATE; // 12000 samples = 1 second

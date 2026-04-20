@@ -317,7 +317,7 @@ fn test_decode_within_realtime_budget() {
 #[test]
 fn test_live_20m_wav() {
     let wav_path = format!(
-        "{}/tests/fixtures/wav/basicft8/live_test.wav",
+        "{}/tests/fixtures/wav/basicft8/live_now.wav",
         env!("CARGO_MANIFEST_DIR")
     );
     if !std::path::Path::new(&wav_path).exists() {
@@ -343,11 +343,12 @@ fn test_live_20m_wav() {
         eprintln!("  [ft8_lib] {:+.0} dB  {:.1} Hz  {}", snr, freq, msg);
     }
     
-    // Ours
+    // Ours — try with confidence floor disabled to isolate the issue
     let config = Ft8Config::default();
     let mut decoder = Ft8Decoder::new(config).unwrap();
     let ours = decoder.decode_window(&samples).unwrap_or_default();
-    eprintln!("ours: {} decodes", ours.len());
+    let metrics = decoder.get_last_metrics();
+    eprintln!("ours: {} decodes, sync_quality={:.3}", ours.len(), metrics.sync_quality);
     for msg in &ours {
         eprintln!("  [ours]   {:+.0} dB  {:.1} Hz  conf={:.2}  {}", msg.snr_db, msg.frequency_offset, msg.confidence, msg.text);
     }
