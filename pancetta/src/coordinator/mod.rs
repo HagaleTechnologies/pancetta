@@ -285,7 +285,9 @@ impl ApplicationCoordinator {
             waterfall_to_auto_tx: None,
             active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(None)),
             tui_relay_handle: None,
-            operating_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(14_074_000)),
+            // Initialize to 0 — hamlib will read the actual rig frequency on startup.
+            // If hamlib isn't available, the TUI default (14.074) takes over.
+            operating_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(feature = "pancetta-hamlib")]
             rigctld_process: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),

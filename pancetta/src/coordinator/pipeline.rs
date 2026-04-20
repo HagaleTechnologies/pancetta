@@ -954,9 +954,14 @@ impl super::ApplicationCoordinator {
         let (tui_cmd_tx, tui_cmd_rx) =
             crossbeam_channel::unbounded::<pancetta_tui::tui_runner::TuiCommand>();
 
-        // Read initial operating frequency from config (no frequency_mhz field on StationConfig,
-        // so default to 20m FT8 = 14.074 MHz; will be updated by FrequencyResponse messages)
-        let operating_freq_mhz = 14.074_f64;
+        // Use the rig's current frequency if hamlib has already read it,
+        // otherwise fall back to 14.074 MHz. Updated by FrequencyResponse messages.
+        let current_hz = self.operating_frequency_hz.load(Ordering::Relaxed);
+        let operating_freq_mhz = if current_hz > 0 {
+            current_hz as f64 / 1_000_000.0
+        } else {
+            14.074_f64
+        };
         let operating_freq = Arc::new(std::sync::atomic::AtomicU64::new(
             operating_freq_mhz.to_bits(),
         ));

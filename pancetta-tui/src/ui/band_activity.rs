@@ -79,7 +79,14 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
         .header(header)
         .block(block)
         .column_spacing(1)
-        .style(Style::default().fg(app.theme.foreground_color()));
+        .style(Style::default().fg(app.theme.foreground_color()))
+        .row_highlight_style(
+            Style::default()
+                .bg(app.theme.accent_color())
+                .fg(ratatui::style::Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
 
     // Create table state for potential selection
     let mut table_state = TableState::default();

@@ -147,7 +147,21 @@ impl super::ApplicationCoordinator {
                 };
 
                 match rig.connect().await {
-                    Ok(_) => info!("Rig connected successfully"),
+                    Ok(_) => {
+                        info!("Rig connected successfully");
+                        // Read the rig's current frequency immediately so we start
+                        // on whatever band the radio is already tuned to, rather
+                        // than assuming 20m.
+                        match rig.get_frequency(pancetta_hamlib::Vfo::Current).await {
+                            Ok(freq) => {
+                                operating_frequency_hz.store(freq, Ordering::Relaxed);
+                                info!("Rig initial frequency: {} Hz ({:.3} MHz)", freq, freq as f64 / 1_000_000.0);
+                            }
+                            Err(e) => {
+                                warn!("Could not read initial rig frequency: {}", e);
+                            }
+                        }
+                    }
                     Err(e) => {
                         error!("Failed to connect to rig: {}. Continuing without.", e);
                     }
