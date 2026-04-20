@@ -1079,16 +1079,24 @@ impl MessageParser {
         let call_a_str = apply_suffix(call_a.to_callsign(), ipa);
         let call_b_str = apply_suffix(call_b.to_callsign(), ipb);
 
+        // Filter grid: only set grid_square on CQ messages, and never
+        // accept "RR73" as a grid (encodes to igrid4=32373, collides with
+        // the RR73 QSO-completion token at igrid4=32403).
+        let filtered_grid = if is_cq {
+            grid.as_ref().filter(|g| g.as_str() != "RR73").cloned()
+        } else {
+            None
+        };
+
         if is_cq {
             message.standard_type = Some(StandardMessageType::Cq);
-            // For CQ messages: call_a = CQ token, call_b = calling station
             if let CallsignField::Cq(modifier) = &call_a {
                 if let Some(m) = modifier {
                     message.special_operation = Some(m.clone());
                 }
             }
             message.from_callsign = call_b_str;
-            message.grid_square = grid;
+            message.grid_square = filtered_grid;
         } else if let Some(tok) = token {
             // Special tokens: RRR, RR73, 73
             match tok.as_str() {
@@ -1100,7 +1108,6 @@ impl MessageParser {
             message.to_callsign = call_a_str;
             message.from_callsign = call_b_str;
         } else if let Some(rpt) = report {
-            // Signal report
             message.signal_report = Some(rpt);
             if ir != 0 {
                 message.standard_type = Some(StandardMessageType::ReportWithR);
@@ -1110,30 +1117,14 @@ impl MessageParser {
             message.to_callsign = call_a_str;
             message.from_callsign = call_b_str;
         } else if grid.is_some() {
-            // Grid square reply — but filter out grids that collide with
-            // known tokens (RR73 encodes as igrid4=32373, a valid grid in
-            // the Pacific, but in non-CQ context it's almost always a
-            // misinterpreted QSO completion token)
-            let grid_str = grid.as_deref().unwrap_or("");
-            if grid_str == "RR73" || grid_str == "RRR" {
-                // Treat as the corresponding token instead
-                match grid_str {
-                    "RR73" => message.standard_type = Some(StandardMessageType::RR73),
-                    "RRR" => message.standard_type = Some(StandardMessageType::Rrr),
-                    _ => message.standard_type = Some(StandardMessageType::Reply),
-                }
-                message.to_callsign = call_a_str;
-                message.from_callsign = call_b_str;
+            // Non-CQ with grid — treat as reply (grid not stored)
+            if ir != 0 {
+                message.standard_type = Some(StandardMessageType::ReplyWithR);
             } else {
-                if ir != 0 {
-                    message.standard_type = Some(StandardMessageType::ReplyWithR);
-                } else {
-                    message.standard_type = Some(StandardMessageType::Reply);
-                }
-                message.to_callsign = call_a_str;
-                message.from_callsign = call_b_str;
-                message.grid_square = grid;
+                message.standard_type = Some(StandardMessageType::Reply);
             }
+            message.to_callsign = call_a_str;
+            message.from_callsign = call_b_str;
         } else {
             // No grid, no report, no token — blank exchange
             message.standard_type = Some(StandardMessageType::Reply);
