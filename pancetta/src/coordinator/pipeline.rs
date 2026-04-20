@@ -489,15 +489,26 @@ impl super::ApplicationCoordinator {
                         message_count.fetch_add(1, Ordering::Relaxed);
                         batch_count += 1;
 
-                        // Mono extraction.
-                        // The FTdx10 USB codec reports 2ch but cpal delivers mono
-                        // (48000 f32/sec, not 96000). Deinterleaving mono data
-                        // discards every other sample → 8:1 decimation instead of
-                        // 4:1, shifting all frequencies by 2x and breaking decoding.
-                        //
-                        // Auto-detect: accumulate samples for the first second, then
-                        // compare actual rate vs expected stereo rate.
-                        let mono: Vec<f32> = samples;
+                        // Extract left channel from interleaved stereo.
+                        // cpal delivers interleaved [L, R, L, R, ...] where
+                        // the right channel is near-silent on the FTdx10 USB codec.
+                        let mono: Vec<f32> = if _input_channels > 1 {
+                            samples
+                                .chunks(_input_channels as usize)
+                                .map(|ch| ch[0])
+                                .collect()
+                        } else {
+                            samples
+                        };
+
+                        // One-time diagnostic: log first batch stats
+                        if batch_count == 1 {
+                            let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len() as f32).sqrt();
+                            info!(
+                                "DSP first batch: {} samples, RMS={:.6}, first 5 values: {:?}",
+                                mono.len(), rms, &mono[..5.min(mono.len())]
+                            );
+                        }
 
                         // Decimate by taking every Nth sample (simple subsampling).
                         // FT8 signals occupy 0–3 kHz, well below the 6 kHz Nyquist
