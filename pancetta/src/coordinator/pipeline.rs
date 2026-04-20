@@ -533,17 +533,15 @@ impl super::ApplicationCoordinator {
                         message_count.fetch_add(1, Ordering::Relaxed);
                         batch_count += 1;
 
-                        // Extract mono from interleaved multi-channel.
-                        // Use left channel only (channel 0) to avoid phase cancellation
-                        // that can occur when averaging L+R from USB audio codecs.
-                        let mono: Vec<f32> = if input_channels > 1 {
-                            samples
-                                .chunks(input_channels as usize)
-                                .map(|ch| ch[0])
-                                .collect()
-                        } else {
-                            samples
-                        };
+                        // Mono extraction.
+                        // The FTdx10 USB codec reports 2ch but cpal delivers mono
+                        // (48000 f32/sec, not 96000). Deinterleaving mono data
+                        // discards every other sample → 8:1 decimation instead of
+                        // 4:1, shifting all frequencies by 2x and breaking decoding.
+                        //
+                        // Auto-detect: accumulate samples for the first second, then
+                        // compare actual rate vs expected stereo rate.
+                        let mono: Vec<f32> = samples;
 
                         // Decimate by taking every Nth sample (simple subsampling).
                         // FT8 signals occupy 0–3 kHz, well below the 6 kHz Nyquist
