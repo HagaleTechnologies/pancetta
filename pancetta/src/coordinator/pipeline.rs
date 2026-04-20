@@ -471,11 +471,12 @@ impl super::ApplicationCoordinator {
             // FT8 has both even (0/30s) and odd (15/45s) time slots.
             // We send overlapping windows: one at each 15-second mark.
             // The decoder handles time alignment internally via Costas sync.
+            // Schedule decode at 13s past the slot start (message ends at 12.64s).
+            // Slots start at :00/:15/:30/:45, so decode at :13/:28/:43/:58.
             let mut next_window_time = {
                 let now = chrono::Utc::now();
                 let secs = now.timestamp() % 15;
-                // Next 15-second boundary
-                let wait_secs = if secs == 0 { 0 } else { 15 - secs };
+                let wait_secs = if secs < 13 { 13 - secs } else { 15 - secs + 13 };
                 now + chrono::Duration::seconds(wait_secs)
             };
             info!(
@@ -575,19 +576,19 @@ impl super::ApplicationCoordinator {
                             }
                         }
 
-                        // Send FT8 window at each 15-second boundary.
-                        // Send up to 15.0s (180000 samples) for time-search margin,
-                        // but accept as few as 12.64s (151680) to avoid startup delay.
-                        // FT8 QSOs require responding in the next slot — we can't
-                        // afford to miss windows while the buffer fills.
+                        // Decode as early as possible after the FT8 message completes.
+                        // FT8 messages are 12.64s long, starting at :00/:15/:30/:45.
+                        // We trigger at 13s past the slot start (0.36s after message
+                        // end) to maximize response time for QSO management.
                         const IDEAL_SAMPLES: usize = FT8_SAMPLE_RATE * 15; // 180000
                         let now = chrono::Utc::now();
                         if ft8_buffer.len() >= FT8_WINDOW_SAMPLES && now >= next_window_time {
                             let send_len = ft8_buffer.len().min(IDEAL_SAMPLES);
                             let start = ft8_buffer.len() - send_len;
                             let window: Vec<f32> = ft8_buffer[start..].to_vec();
-                            // Keep some overlap for the next window (retain last 1s worth)
-                            let keep = FT8_SAMPLE_RATE; // 12000 samples = 1 second
+                            // Keep overlap for next window — retain enough for the
+                            // full 15s ideal window at the next boundary
+                            let keep = IDEAL_SAMPLES;
                             if ft8_buffer.len() > keep {
                                 ft8_buffer.drain(..ft8_buffer.len() - keep);
                                 last_live_wf_samples = ft8_buffer.len();
@@ -612,10 +613,14 @@ impl super::ApplicationCoordinator {
                                 info!("DSP: FT8 channel closed");
                                 return Ok(());
                             }
-                            // Schedule next window at the next 15-second boundary
+                            // Schedule next decode at 13s into the next slot
                             let now_resync = chrono::Utc::now();
                             let secs_past = now_resync.timestamp() % 15;
-                            let wait_secs = if secs_past == 0 { 15 } else { 15 - secs_past };
+                            let wait_secs = if secs_past < 13 {
+                                13 - secs_past
+                            } else {
+                                15 - secs_past + 13
+                            };
                             next_window_time = now_resync + chrono::Duration::seconds(wait_secs);
                         }
                     }
