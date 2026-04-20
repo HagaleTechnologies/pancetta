@@ -279,14 +279,14 @@ mod tests {
         assert!(is_pota_sota_candidate("w1abc/p")); // case insensitive
 
         // Prefix-style calls — should NOT match
-        assert!(!is_pota_sota_candidate("VE3/W1ABC"));  // operating from VE3
-        assert!(!is_pota_sota_candidate("DL/K5ARH"));   // operating from Germany
-        assert!(!is_pota_sota_candidate("F/W1ABC"));     // operating from France
+        assert!(!is_pota_sota_candidate("VE3/W1ABC")); // operating from VE3
+        assert!(!is_pota_sota_candidate("DL/K5ARH")); // operating from Germany
+        assert!(!is_pota_sota_candidate("F/W1ABC")); // operating from France
 
         // Other suffixes — should NOT match
-        assert!(!is_pota_sota_candidate("W1ABC/M"));     // mobile
-        assert!(!is_pota_sota_candidate("W1ABC/MM"));    // maritime mobile
-        assert!(!is_pota_sota_candidate("W1ABC/LGT"));   // lighthouse
+        assert!(!is_pota_sota_candidate("W1ABC/M")); // mobile
+        assert!(!is_pota_sota_candidate("W1ABC/MM")); // maritime mobile
+        assert!(!is_pota_sota_candidate("W1ABC/LGT")); // lighthouse
 
         // Regular calls — should NOT match
         assert!(!is_pota_sota_candidate("W1ABC"));

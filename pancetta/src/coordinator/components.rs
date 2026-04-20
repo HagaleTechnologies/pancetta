@@ -259,7 +259,8 @@ impl super::ApplicationCoordinator {
                                 }
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO completed with {}, marking as worked", their_call);
-                                    let band = pancetta_qso::utils::frequency_to_band(metadata.frequency);
+                                    let band =
+                                        pancetta_qso::utils::frequency_to_band(metadata.frequency);
                                     qso_lookup.record_worked(their_call, &band);
 
                                     // Report QSO to cqdx.io

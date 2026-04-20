@@ -103,11 +103,7 @@ impl WavRecorder {
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .map_or(false, |ext| ext == "wav")
-            })
+            .filter(|e| e.path().extension().map_or(false, |ext| ext == "wav"))
             .collect();
 
         entries.sort_by_key(|e| e.file_name());
@@ -147,8 +143,7 @@ impl super::ApplicationCoordinator {
         let (audio_level_tx, audio_level_rx) = crossbeam_channel::bounded::<f32>(1);
 
         // TX audio channel: Ft8Transmitter -> Audio thread for playback
-        let (tx_audio_tx, tx_audio_rx) =
-            crossbeam_channel::bounded::<(Vec<f32>, u32)>(4);
+        let (tx_audio_tx, tx_audio_rx) = crossbeam_channel::bounded::<(Vec<f32>, u32)>(4);
 
         // Also create message bus channels for control messages (hamlib, autonomous, etc.)
         let (_audio_bus_tx, audio_bus_rx) =
@@ -161,7 +156,8 @@ impl super::ApplicationCoordinator {
         let (_tui_bus_tx, tui_bus_rx) = self.message_bus.create_channel(ComponentId::Tui).await?;
 
         // --- Audio component ---
-        self.start_audio_pipeline(audio_to_dsp_tx, tx_audio_rx).await?;
+        self.start_audio_pipeline(audio_to_dsp_tx, tx_audio_rx)
+            .await?;
 
         // --- Audio TX relay: message bus AudioOutput -> audio thread ---
         {
@@ -171,8 +167,10 @@ impl super::ApplicationCoordinator {
                 while !shutdown.load(Ordering::Acquire) {
                     match audio_bus_rx.try_recv() {
                         Ok(message) => {
-                            if let MessageType::AudioOutput { samples, sample_rate } =
-                                message.message_type
+                            if let MessageType::AudioOutput {
+                                samples,
+                                sample_rate,
+                            } = message.message_type
                             {
                                 info!(
                                     "Audio TX relay: {} samples at {} Hz from {:?}",
@@ -199,8 +197,13 @@ impl super::ApplicationCoordinator {
         }
 
         // --- DSP component ---
-        self.start_dsp_pipeline(audio_to_dsp_rx, dsp_to_ft8_tx, waterfall_tx.clone(), audio_level_tx)
-            .await?;
+        self.start_dsp_pipeline(
+            audio_to_dsp_rx,
+            dsp_to_ft8_tx,
+            waterfall_tx.clone(),
+            audio_level_tx,
+        )
+        .await?;
 
         // --- FT8 decoder component ---
         self.start_ft8_pipeline(dsp_to_ft8_rx, ft8_to_tui_tx, waterfall_tx)
@@ -358,7 +361,11 @@ impl super::ApplicationCoordinator {
                     // Check for TX audio to play out
                     match tx_audio_rx.try_recv() {
                         Ok((samples, sample_rate)) => {
-                            info!("Audio TX: queueing {} samples at {} Hz", samples.len(), sample_rate);
+                            info!(
+                                "Audio TX: queueing {} samples at {} Hz",
+                                samples.len(),
+                                sample_rate
+                            );
                             if let Err(e) = audio_manager.queue_output(&samples, sample_rate) {
                                 error!("Audio TX output error: {}", e);
                             }
@@ -394,7 +401,8 @@ impl super::ApplicationCoordinator {
                 // Record 90 seconds of raw 48kHz stereo audio for diagnostics
                 // (covers ~6 FT8 windows regardless of boundary alignment)
                 let raw_capture_samples = 48000 * 2 * 90; // 90s stereo
-                let mut raw_recorder: Option<Vec<f32>> = Some(Vec::with_capacity(raw_capture_samples));
+                let mut raw_recorder: Option<Vec<f32>> =
+                    Some(Vec::with_capacity(raw_capture_samples));
                 while let Some(samples) = result_rx.recv().await {
                     {
                         let mut timestamp = last_timestamp.write().await;
@@ -517,10 +525,7 @@ impl super::ApplicationCoordinator {
 
             info!(
                 "DSP: {}Hz -> {}Hz mono (decimate {}:1, subsample), window={}",
-                input_rate,
-                FT8_SAMPLE_RATE,
-                decimation_factor,
-                FT8_WINDOW_SAMPLES
+                input_rate, FT8_SAMPLE_RATE, decimation_factor, FT8_WINDOW_SAMPLES
             );
 
             // Continuously capture audio -- don't wait for boundaries.
@@ -560,10 +565,13 @@ impl super::ApplicationCoordinator {
 
                         // One-time diagnostic: log first batch stats
                         if batch_count == 1 {
-                            let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len() as f32).sqrt();
+                            let rms = (mono.iter().map(|s| s * s).sum::<f32>() / mono.len() as f32)
+                                .sqrt();
                             info!(
                                 "DSP first batch: {} samples, RMS={:.6}, first 5 values: {:?}",
-                                mono.len(), rms, &mono[..5.min(mono.len())]
+                                mono.len(),
+                                rms,
+                                &mono[..5.min(mono.len())]
                             );
                         }
 
@@ -834,14 +842,16 @@ impl super::ApplicationCoordinator {
                             *timestamp = Some(Instant::now());
                         });
 
-                        info!("FT8 decoder: {} messages decoded ({} ft8lib + native merge)", decoded_messages.len(), decoded_messages.len());
+                        info!(
+                            "FT8 decoder: {} messages decoded ({} ft8lib + native merge)",
+                            decoded_messages.len(),
+                            decoded_messages.len()
+                        );
 
                         for decoded_msg in &decoded_messages {
                             info!(
                                 "FT8 decoded: {} (SNR: {:.0}, freq: {:.1})",
-                                decoded_msg.text,
-                                decoded_msg.snr_db,
-                                decoded_msg.frequency_offset
+                                decoded_msg.text, decoded_msg.snr_db, decoded_msg.frequency_offset
                             );
 
                             // Send to TUI via point-to-point channel
@@ -860,7 +870,10 @@ impl super::ApplicationCoordinator {
                             let bus1 = message_bus.clone();
                             rt.spawn(async move {
                                 if let Err(e) = bus1.send_message(auto_msg).await {
-                                    debug!("Failed to forward decoded message to Autonomous: {}", e);
+                                    debug!(
+                                        "Failed to forward decoded message to Autonomous: {}",
+                                        e
+                                    );
                                 }
                             });
 
@@ -873,10 +886,7 @@ impl super::ApplicationCoordinator {
                             let bus2 = message_bus.clone();
                             rt.spawn(async move {
                                 if let Err(e) = bus2.send_message(qso_msg).await {
-                                    debug!(
-                                        "Failed to forward decoded message to QSO: {}",
-                                        e
-                                    );
+                                    debug!("Failed to forward decoded message to QSO: {}", e);
                                 }
                             });
 
@@ -889,7 +899,10 @@ impl super::ApplicationCoordinator {
                             let bus3 = message_bus.clone();
                             rt.spawn(async move {
                                 if let Err(e) = bus3.send_message(psk_msg).await {
-                                    debug!("Failed to forward decoded message to PSKReporter: {}", e);
+                                    debug!(
+                                        "Failed to forward decoded message to PSKReporter: {}",
+                                        e
+                                    );
                                 }
                             });
                         }

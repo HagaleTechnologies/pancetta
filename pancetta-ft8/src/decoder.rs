@@ -2578,7 +2578,11 @@ fn par_try_ldpc_with_ap(
     const MIN_AP_CONFIDENCE: f32 = 0.55;
     const MIN_DECODE_CONFIDENCE: f32 = 0.41;
     const SCRUTINY_THRESHOLD: f32 = 0.65;
-    let min_conf = if ap_level_num > 0 { MIN_AP_CONFIDENCE } else { MIN_DECODE_CONFIDENCE };
+    let min_conf = if ap_level_num > 0 {
+        MIN_AP_CONFIDENCE
+    } else {
+        MIN_DECODE_CONFIDENCE
+    };
     if confidence < min_conf {
         return None;
     }

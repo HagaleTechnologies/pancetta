@@ -155,7 +155,11 @@ impl super::ApplicationCoordinator {
                         match rig.get_frequency(pancetta_hamlib::Vfo::Current).await {
                             Ok(freq) => {
                                 operating_frequency_hz.store(freq, Ordering::Relaxed);
-                                info!("Rig initial frequency: {} Hz ({:.3} MHz)", freq, freq as f64 / 1_000_000.0);
+                                info!(
+                                    "Rig initial frequency: {} Hz ({:.3} MHz)",
+                                    freq,
+                                    freq as f64 / 1_000_000.0
+                                );
                             }
                             Err(e) => {
                                 warn!("Could not read initial rig frequency: {}", e);

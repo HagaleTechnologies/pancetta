@@ -308,8 +308,7 @@ mod tests {
     #[ignore] // Run manually: cargo test -p pancetta-cqdx test_live_spots_envelope -- --ignored
     async fn test_live_spots_envelope() {
         // Requires CQDX_TOKEN env var
-        let token = std::env::var("CQDX_TOKEN")
-            .expect("Set CQDX_TOKEN to run this test");
+        let token = std::env::var("CQDX_TOKEN").expect("Set CQDX_TOKEN to run this test");
         let client = CqdxClient::new("https://cqdx.io".to_string(), token);
 
         // Try fetching live spots — this validates the real envelope
@@ -317,8 +316,10 @@ mod tests {
             Ok(groups) => {
                 println!("SUCCESS: Got {} spot groups", groups.len());
                 for g in groups.iter().take(3) {
-                    println!("  {} on {} @ {} Hz (rarity: {:?})",
-                        g.dx_call, g.band, g.frequency, g.rarity_rank);
+                    println!(
+                        "  {} on {} @ {} Hz (rarity: {:?})",
+                        g.dx_call, g.band, g.frequency, g.rarity_rank
+                    );
                 }
             }
             Err(e) => {

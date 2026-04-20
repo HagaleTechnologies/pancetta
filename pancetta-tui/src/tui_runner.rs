@@ -752,10 +752,7 @@ impl TuiRunner {
     /// Cleanup terminal on exit
     fn cleanup(&mut self) -> Result<()> {
         disable_raw_mode()?;
-        execute!(
-            self.terminal.backend_mut(),
-            LeaveAlternateScreen
-        )?;
+        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
         self.terminal.show_cursor()?;
 
         info!(

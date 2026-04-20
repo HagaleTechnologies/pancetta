@@ -224,7 +224,11 @@ fn test_synchronization_quality() {
 
     let decoded = result.unwrap();
     let metrics = decoder.get_last_metrics();
-    eprintln!("sync_quality={}, decoded={}", metrics.sync_quality, decoded.len());
+    eprintln!(
+        "sync_quality={}, decoded={}",
+        metrics.sync_quality,
+        decoded.len()
+    );
     // The signal should decode successfully; sync_quality depends on
     // spectrogram search range and may vary with padding.
     assert!(

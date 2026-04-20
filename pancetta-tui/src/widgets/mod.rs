@@ -159,7 +159,9 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
 
                 for col in 0..width {
                     let bin_start = col * num_bins / width;
-                    let bin_end = ((col + 1) * num_bins / width).max(bin_start + 1).min(num_bins);
+                    let bin_end = ((col + 1) * num_bins / width)
+                        .max(bin_start + 1)
+                        .min(num_bins);
 
                     // Max intensity across both the bin range and all compressed rows
                     let mut intensity = 0.0f32;

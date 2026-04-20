@@ -358,9 +358,9 @@ impl Ft8Message {
                         }
                         // At least one word must be ≥2 chars and all-alphabetic
                         // (a callsign fragment, "CQ", "TNX", etc.)
-                        words.iter().any(|w| {
-                            w.len() >= 2 && w.chars().all(|c| c.is_ascii_alphabetic())
-                        })
+                        words
+                            .iter()
+                            .any(|w| w.len() >= 2 && w.chars().all(|c| c.is_ascii_alphabetic()))
                     }
                     None => false,
                 }
@@ -397,9 +397,7 @@ impl Ft8Message {
                 // traffic but common in CRC-14 collisions on noise (the
                 // packed encoding makes /R a low-cost bit pattern).
                 if calls.len() == 2 {
-                    let both_portable = calls.iter().all(|c| {
-                        c.contains('/')
-                    });
+                    let both_portable = calls.iter().all(|c| c.contains('/'));
                     if both_portable {
                         return false;
                     }
@@ -435,8 +433,10 @@ impl Ft8Message {
 
         // CQ with non-standard modifier (not DX, NA, EU, RU, AS, AF, etc.)
         if let Some(ref op) = self.special_operation {
-            let known = ["DX", "NA", "EU", "AS", "AF", "SA", "OC", "AN",
-                         "RU", "POTA", "SOTA", "QRP", "FD", "TU", "TEST"];
+            let known = [
+                "DX", "NA", "EU", "AS", "AF", "SA", "OC", "AN", "RU", "POTA", "SOTA", "QRP", "FD",
+                "TU", "TEST",
+            ];
             let is_numeric = op.chars().all(|c| c.is_ascii_digit());
             if !known.contains(&op.as_str()) && !is_numeric {
                 score += 2;
@@ -881,7 +881,8 @@ impl Ft8Message {
             msg.standard_type = Some(StandardMessageType::Cq);
             let mut idx = 1;
             // Check for CQ modifier (DX, NA, POTA, etc.)
-            if idx < parts.len() && !Self::text_looks_like_callsign(parts[idx])
+            if idx < parts.len()
+                && !Self::text_looks_like_callsign(parts[idx])
                 && !Self::text_looks_like_grid(parts[idx])
             {
                 msg.special_operation = Some(parts[idx].to_string());
