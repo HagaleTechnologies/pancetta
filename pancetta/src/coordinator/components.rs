@@ -130,7 +130,7 @@ impl super::ApplicationCoordinator {
                 // Seed worked-station history from the QSO database so that
                 // previously-worked stations are recognised as duplicates across restarts.
                 {
-                    use pancetta_qso::QsoDatabase;
+                    use pancetta_qso::async_database::AsyncQsoDatabase;
 
                     // Determine the current band from the rig's operating frequency,
                     // falling back to "20m".  This is a best-effort seed — the
@@ -141,9 +141,9 @@ impl super::ApplicationCoordinator {
                         .unwrap_or_else(|| "20m".to_string())
                         .to_uppercase();
 
-                    match QsoDatabase::open(&db_path) {
+                    match AsyncQsoDatabase::open(&db_path).await {
                         Ok(db) => {
-                            let callsigns = db.get_worked_callsigns(&band);
+                            let callsigns = db.get_worked_callsigns(&band).await;
                             if callsigns.is_empty() {
                                 tracing::info!(
                                     "QSO database has no prior contacts on {} — starting fresh",
@@ -885,11 +885,16 @@ impl super::ApplicationCoordinator {
                 let mut slot_messages: Vec<pancetta_qso::DecodedMessageInfo> = Vec::new();
                 // Align slot timer to FT8 UTC boundaries (0/15/30/45 seconds)
                 let seconds_in_slot = chrono::Utc::now().timestamp() % 15;
-                let initial_delay = Duration::from_secs((15 - seconds_in_slot) as u64);
+                let initial_delay = if seconds_in_slot == 0 {
+                    Duration::ZERO
+                } else {
+                    Duration::from_secs((15 - seconds_in_slot) as u64)
+                };
                 let mut slot_interval = tokio::time::interval_at(
                     tokio::time::Instant::now() + initial_delay,
                     Duration::from_secs(15),
                 );
+                slot_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
                 loop {
                     tokio::select! {
@@ -945,6 +950,7 @@ impl super::ApplicationCoordinator {
                             }
 
                             op.feed_decoded_messages(&slot_messages, evaluator.as_ref());
+                            let listen_messages = slot_messages.clone();
                             slot_messages.clear();
                             let actions = op.decide();
                             drop(op);
@@ -1013,11 +1019,11 @@ impl super::ApplicationCoordinator {
                                     }
                                     pancetta_qso::OperatorAction::Listen => {}
                                     pancetta_qso::OperatorAction::CollisionListen => {
-                                        // Process collision listen to reset the listen-cycle counter.
-                                        // TODO: slot_messages was already cleared above; pass actual
-                                        // decoded messages once we restructure to retain them.
+                                        // Process collision listen with decoded messages from this slot
+                                        // to detect interference on our TX frequency.
                                         let mut op = operator.lock().await;
-                                        let collision_actions = op.process_collision_listen(&[]);
+                                        let collision_actions =
+                                            op.process_collision_listen(&listen_messages);
                                         drop(op);
                                         // Re-inject any resulting actions (e.g., FrequencyShift)
                                         for ca in collision_actions {

@@ -128,6 +128,7 @@ pub struct HamLibPort {
 /// returned by hamlib. The real struct has many more fields; using this as a
 /// value type will cause undefined behavior.
 #[repr(C)]
+#[allow(dead_code)]
 pub(crate) struct RigState {
     pub port: HamLibPort,
     pub comm_state: c_int,

@@ -26,7 +26,6 @@ mod wav_playback;
 
 use anyhow::Result;
 use pancetta_config::Config;
-use pancetta_dsp::DspPipeline;
 use pancetta_ft8::Ft8Decoder;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -53,7 +52,6 @@ pub struct ApplicationCoordinator {
     message_bus: MessageBus,
 
     /// Component managers
-    dsp_pipeline: Option<DspPipeline>,
     ft8_decoder: Option<Ft8Decoder>,
 
     /// Named component task handles for health monitoring
@@ -265,7 +263,6 @@ impl ApplicationCoordinator {
             id,
             config,
             message_bus,
-            dsp_pipeline: None,
             ft8_decoder: None,
             named_task_handles: Vec::new(),
             component_status: Arc::new(RwLock::new(HashMap::new())),

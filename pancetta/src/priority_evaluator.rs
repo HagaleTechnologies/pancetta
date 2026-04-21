@@ -144,8 +144,13 @@ impl WorkedStationLookup for CachedStationLookup {
 
     fn is_needed_grid(&self, grid: &str) -> bool {
         let needed = self.needed_grids.read();
-        // Same conservative policy as is_needed_dxcc — see comment above.
-        needed.is_empty() || needed.contains(&grid.to_uppercase())
+        // When the needed set is empty (no grid data available from cqdx.io),
+        // return false — "unknown" means "no bonus" rather than inflating all
+        // scores with the needed_grid weight.
+        if needed.is_empty() {
+            return false;
+        }
+        needed.contains(&grid.to_uppercase())
     }
 
     fn rarity(&self, callsign: &str) -> f64 {

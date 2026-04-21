@@ -75,7 +75,8 @@ impl CqdxBridge {
         self.cached_lookup.update_needed_dxcc(needed_prefixes);
 
         // TODO: Populate needed_grids when cqdx.io adds a grid-needed endpoint.
-        // Until then, the conservative fallback treats all grids as needed.
+        // Until then, is_needed_grid returns false when the set is empty —
+        // "unknown" means "no bonus" rather than inflating all priority scores.
         // See: docs/cqdx-api-requirements.md
 
         Ok(())

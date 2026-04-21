@@ -69,7 +69,7 @@ Design spec: `docs/superpowers/specs/2026-04-02-end-to-end-qso-design.md`
 
 ## Known Gaps and TODOs
 
-- Grid "needed" set never populated (DXCC needed works via cqdx.io, grid `update_needed_grids()` never called)
+- Grid "needed" set never populated (cqdx.io has no grid-needed endpoint yet); `is_needed_grid` returns `false` when empty to avoid inflating scores
 - cqdx.io `GET /api/v1/spots?live=true` response envelope key (`groups`) unverified against live API
 
 ## Documentation Maintenance

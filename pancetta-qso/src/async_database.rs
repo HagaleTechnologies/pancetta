@@ -520,6 +520,34 @@ impl AsyncQsoDatabase {
 
         Ok(records)
     }
+
+    /// Get distinct callsigns worked on a specific band.
+    ///
+    /// This is the async equivalent of `QsoDatabase::get_worked_callsigns`,
+    /// used at startup to seed the worked-station duplicate filter.
+    pub async fn get_worked_callsigns(&self, band: &str) -> Vec<String> {
+        let result: Result<Vec<String>, sqlx::Error> = sqlx::query_scalar(
+            "SELECT DISTINCT json_extract(metadata, '$.their_callsign') \
+             FROM qsos \
+             WHERE json_extract(adif_data, '$.band') = ? \
+               AND json_extract(metadata, '$.their_callsign') IS NOT NULL",
+        )
+        .bind(band)
+        .fetch_all(&self.pool)
+        .await;
+
+        match result {
+            Ok(callsigns) => callsigns,
+            Err(e) => {
+                tracing::warn!(
+                    "get_worked_callsigns: query failed (band={}): {} — treating as empty",
+                    band,
+                    e
+                );
+                Vec::new()
+            }
+        }
+    }
 }
 
 // AsyncQsoDatabase is automatically Send + Sync thanks to SqlitePool
