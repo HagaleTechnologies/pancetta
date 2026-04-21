@@ -147,6 +147,9 @@ struct Spectrogram {
     num_bins: usize,
     /// Frequency oversampling rate
     freq_osr: usize,
+    /// Number of time steps prepended for negative-time search. Subtract this from
+    /// candidate.time_step to get the real time offset relative to nominal slot start.
+    time_padding: usize,
 }
 
 /// Costas sync search candidate
@@ -976,6 +979,7 @@ impl Ft8Decoder {
             num_steps,
             num_bins,
             freq_osr,
+            time_padding: 0,
         })
     }
 
@@ -2224,7 +2228,8 @@ fn par_decode_candidate(
     let tone_spacing = ctx.protocol_params.tone_spacing;
     let xor_sequence = ctx.xor_sequence;
     let spec_step = sps / TIME_OSR;
-    let coarse_offset = candidate.time_step * spec_step;
+    let coarse_offset = (candidate.time_step as isize - ctx.spectrogram.time_padding as isize)
+        * spec_step as isize;
 
     // ---- Spectrogram-based symbol extraction: try both freq_sub values ----
     let freq_sub_trials = [
@@ -2250,7 +2255,6 @@ fn par_decode_candidate(
             if par_verify_crc(&corrected_bits) {
                 let sub_bin_offset = trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
                 let base_frequency = candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
-                let time_offset_samples = coarse_offset;
 
                 let payload_bits = par_apply_xor(xor_sequence, &corrected_bits);
                 let ft8_message = match ctx.message_parser.parse_payload(&payload_bits) {
@@ -2282,7 +2286,7 @@ fn par_decode_candidate(
                     snr_db,
                     confidence,
                     base_frequency,
-                    time_offset_samples as f64 / SAMPLE_RATE as f64,
+                    coarse_offset as f64 / SAMPLE_RATE as f64,
                 );
                 decoded_message.tone_symbols =
                     Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
@@ -2311,7 +2315,7 @@ fn par_decode_candidate(
     let sub_bin_offset = candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
 
     for &dt in &time_deltas {
-        let time_offset = coarse_offset as isize + dt;
+        let time_offset = coarse_offset + dt;
         if time_offset < 0 {
             continue;
         }
@@ -2399,7 +2403,8 @@ fn par_try_ap_decode(
     let tone_spacing = ctx.protocol_params.tone_spacing;
     let sps = ctx.protocol_params.samples_per_symbol(SAMPLE_RATE);
     let spec_step = sps / TIME_OSR;
-    let coarse_offset = candidate.time_step * spec_step;
+    let coarse_offset = (candidate.time_step as isize - ctx.spectrogram.time_padding as isize)
+        * spec_step as isize;
 
     let freq_sub_trials = [
         candidate.freq_sub,
