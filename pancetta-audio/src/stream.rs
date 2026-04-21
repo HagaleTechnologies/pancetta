@@ -284,28 +284,13 @@ impl AudioStreamManager {
             if device_name.eq_ignore_ascii_case("default") {
                 self.device_manager.get_best_ft8_input_device()?
             } else {
-                // Find device by name — pick the one with actual input configs
-                // (some devices appear multiple times with the same name on macOS)
-                let devices = self.device_manager.list_devices();
-                let candidate = devices
-                    .iter()
-                    .filter(|(_, info)| info.name == *device_name && info.supports_input)
-                    .max_by_key(|(_, info)| {
-                        info.input_channels.len() + info.input_sample_rates.len()
-                    });
-                match candidate {
-                    Some((device, info)) => {
-                        tracing::info!(
-                            "Selected input device '{}' (ch={:?}, rates={:?})",
-                            info.name,
-                            info.input_channels,
-                            info.input_sample_rates,
-                        );
-                        device
-                    }
-                    None => {
+                // Find device by name substring match (case-insensitive).
+                // Falls back to best available if no match found.
+                match self.device_manager.find_input_device_by_name(device_name) {
+                    Ok(device) => device,
+                    Err(_) => {
                         tracing::warn!(
-                            "Input device '{}' not found, falling back to best available",
+                            "Input device matching '{}' not found, falling back to best available",
                             device_name
                         );
                         self.device_manager.get_best_ft8_input_device()?
@@ -405,18 +390,13 @@ impl AudioStreamManager {
             if device_name.eq_ignore_ascii_case("default") {
                 self.device_manager.get_best_output_device()?
             } else {
-                let devices = self.device_manager.list_devices();
-                let candidate = devices
-                    .iter()
-                    .filter(|(_, info)| info.name == *device_name && info.supports_output)
-                    .max_by_key(|(_, info)| {
-                        info.output_channels.len() + info.output_sample_rates.len()
-                    });
-                match candidate {
-                    Some((device, _)) => device,
-                    None => {
+                // Find device by name substring match (case-insensitive).
+                // Falls back to best available if no match found.
+                match self.device_manager.find_output_device_by_name(device_name) {
+                    Ok(device) => device,
+                    Err(_) => {
                         tracing::warn!(
-                            "Output device '{}' not found, falling back to best available",
+                            "Output device matching '{}' not found, falling back to best available",
                             device_name
                         );
                         self.device_manager.get_best_output_device()?

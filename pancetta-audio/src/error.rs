@@ -40,6 +40,10 @@ pub enum AudioError {
     #[error("CPAL stream error: {message}")]
     CpalStream { message: String },
 
+    /// Device not found by name pattern
+    #[error("Audio device not found matching pattern: {pattern}")]
+    DeviceNotFound { pattern: String },
+
     /// General audio system failure
     #[error("Audio system failure: {message}")]
     System { message: String },
@@ -88,6 +92,13 @@ impl AudioError {
         }
     }
 
+    /// Create a device-not-found error
+    pub fn device_not_found(pattern: impl Into<String>) -> Self {
+        Self::DeviceNotFound {
+            pattern: pattern.into(),
+        }
+    }
+
     /// Create a system error
     pub fn system(message: impl Into<String>) -> Self {
         Self::System {
@@ -99,6 +110,7 @@ impl AudioError {
     pub fn is_recoverable(&self) -> bool {
         match self {
             AudioError::Device { .. } => false, // Device issues usually require restart
+            AudioError::DeviceNotFound { .. } => false, // Need correct device name
             AudioError::Stream { .. } => true,  // Streams can be recreated
             AudioError::Configuration { .. } => false, // Config errors need fixing
             AudioError::SampleRate { .. } => true, // Can fallback to different rates
@@ -114,6 +126,7 @@ impl AudioError {
     pub fn severity(&self) -> ErrorSeverity {
         match self {
             AudioError::Device { .. } => ErrorSeverity::Critical,
+            AudioError::DeviceNotFound { .. } => ErrorSeverity::Error,
             AudioError::Stream { .. } => ErrorSeverity::Warning,
             AudioError::Configuration { .. } => ErrorSeverity::Error,
             AudioError::SampleRate { .. } => ErrorSeverity::Warning,

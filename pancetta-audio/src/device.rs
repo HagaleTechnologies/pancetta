@@ -197,6 +197,87 @@ impl AudioDeviceManager {
         Ok(&compatible_devices[0].0)
     }
 
+    /// Find an input device by name substring match (case-insensitive).
+    ///
+    /// Searches all devices that support input for one whose name contains
+    /// `name_pattern`. When multiple devices match, the one with the richest
+    /// input capabilities (most channel/rate combos) is returned.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use pancetta_audio::AudioDeviceManager;
+    /// let mgr = AudioDeviceManager::new().unwrap();
+    /// let dev = mgr.find_input_device_by_name("FTdx10").unwrap();
+    /// ```
+    pub fn find_input_device_by_name(&self, name_pattern: &str) -> AudioResult<&Device> {
+        let pattern = name_pattern.to_lowercase();
+        let candidate = self
+            .devices
+            .iter()
+            .filter(|(_, info)| {
+                info.supports_input && info.name.to_lowercase().contains(&pattern)
+            })
+            .max_by_key(|(_, info)| info.input_channels.len() + info.input_sample_rates.len());
+
+        match candidate {
+            Some((device, info)) => {
+                tracing::info!(
+                    "Matched input device '{}' for pattern '{}'",
+                    info.name,
+                    name_pattern
+                );
+                Ok(device)
+            }
+            None => Err(AudioError::device_not_found(name_pattern.to_string())),
+        }
+    }
+
+    /// Find an output device by name substring match (case-insensitive).
+    ///
+    /// Searches all devices that support output for one whose name contains
+    /// `name_pattern`. When multiple devices match, the one with the richest
+    /// output capabilities (most channel/rate combos) is returned.
+    pub fn find_output_device_by_name(&self, name_pattern: &str) -> AudioResult<&Device> {
+        let pattern = name_pattern.to_lowercase();
+        let candidate = self
+            .devices
+            .iter()
+            .filter(|(_, info)| {
+                info.supports_output && info.name.to_lowercase().contains(&pattern)
+            })
+            .max_by_key(|(_, info)| info.output_channels.len() + info.output_sample_rates.len());
+
+        match candidate {
+            Some((device, info)) => {
+                tracing::info!(
+                    "Matched output device '{}' for pattern '{}'",
+                    info.name,
+                    name_pattern
+                );
+                Ok(device)
+            }
+            None => Err(AudioError::device_not_found(name_pattern.to_string())),
+        }
+    }
+
+    /// List all input device names.
+    pub fn list_input_devices(&self) -> Vec<String> {
+        self.devices
+            .iter()
+            .filter(|(_, info)| info.supports_input)
+            .map(|(_, info)| info.name.clone())
+            .collect()
+    }
+
+    /// List all output device names.
+    pub fn list_output_devices(&self) -> Vec<String> {
+        self.devices
+            .iter()
+            .filter(|(_, info)| info.supports_output)
+            .map(|(_, info)| info.name.clone())
+            .collect()
+    }
+
     /// Find optimal configuration for a device
     pub fn find_optimal_config(
         &self,
@@ -548,6 +629,81 @@ mod tests {
         println!("Found {} FT8-compatible devices", ft8_devices.len());
         for device in ft8_devices {
             println!("  {}", device.name);
+        }
+    }
+
+    #[test]
+    fn test_list_input_devices() {
+        let manager = AudioDeviceManager::new().unwrap();
+        let inputs = manager.list_input_devices();
+        println!("Input devices ({}):", inputs.len());
+        for name in &inputs {
+            println!("  {}", name);
+        }
+        // Most systems have at least one input device; CI may not
+        if inputs.is_empty() {
+            println!("  (none — headless environment?)");
+        }
+    }
+
+    #[test]
+    fn test_list_output_devices() {
+        let manager = AudioDeviceManager::new().unwrap();
+        let outputs = manager.list_output_devices();
+        println!("Output devices ({}):", outputs.len());
+        for name in &outputs {
+            println!("  {}", name);
+        }
+        if outputs.is_empty() {
+            println!("  (none — headless environment?)");
+        }
+    }
+
+    #[test]
+    fn test_enumerate_audio_devices() {
+        let host = cpal::default_host();
+        let inputs: Vec<String> = host
+            .input_devices()
+            .unwrap()
+            .filter_map(|d| d.name().ok())
+            .collect();
+        let outputs: Vec<String> = host
+            .output_devices()
+            .unwrap()
+            .filter_map(|d| d.name().ok())
+            .collect();
+        println!("Input devices: {:?}", inputs);
+        println!("Output devices: {:?}", outputs);
+        assert!(
+            !inputs.is_empty() || !outputs.is_empty(),
+            "No audio devices found"
+        );
+    }
+
+    #[test]
+    fn test_find_device_by_name_nonexistent() {
+        let manager = AudioDeviceManager::new().unwrap();
+        // A pattern that should never match any real device
+        let result = manager.find_input_device_by_name("ZZZ_NONEXISTENT_DEVICE_XYZ");
+        assert!(result.is_err());
+        let result = manager.find_output_device_by_name("ZZZ_NONEXISTENT_DEVICE_XYZ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_find_device_by_name_case_insensitive() {
+        let manager = AudioDeviceManager::new().unwrap();
+        let inputs = manager.list_input_devices();
+        if let Some(first) = inputs.first() {
+            // Search with uppercase version — should still match
+            let upper = first.to_uppercase();
+            let result = manager.find_input_device_by_name(&upper);
+            assert!(
+                result.is_ok(),
+                "Case-insensitive search for '{}' should match '{}'",
+                upper,
+                first
+            );
         }
     }
 }
