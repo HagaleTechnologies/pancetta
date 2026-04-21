@@ -1142,8 +1142,34 @@ impl super::ApplicationCoordinator {
             cfg.station.grid_square.clone()
         };
         let cmd_ptt_state = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cmd_cq_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_handle = tokio::spawn(async move {
+            let mut next_cq_time: Option<tokio::time::Instant> = None;
+
             while !cmd_shutdown.load(Ordering::Acquire) {
+                // Send repeating CQ every 15 seconds when active
+                if cmd_cq_active.load(Ordering::Relaxed) {
+                    let now = tokio::time::Instant::now();
+                    if next_cq_time.map_or(true, |t| now >= t) {
+                        let cq_text = format!("CQ {} {}", cmd_station_call, cmd_station_grid);
+                        info!("CQ repeat: '{}'", cq_text);
+                        let msg = ComponentMessage::new(
+                            ComponentId::Tui,
+                            ComponentId::Ft8Transmitter,
+                            MessageType::TransmitRequest {
+                                message_text: cq_text,
+                                frequency_offset: 1500.0,
+                                qso_id: None,
+                            },
+                            Instant::now(),
+                        );
+                        if let Err(e) = cmd_message_bus.send_message(msg).await {
+                            warn!("Failed to send repeating CQ: {}", e);
+                        }
+                        next_cq_time = Some(now + Duration::from_secs(15));
+                    }
+                }
+
                 match tui_cmd_rx.try_recv() {
                     Ok(cmd) => match cmd {
                         pancetta_tui::tui_runner::TuiCommand::SendMessage { text } => {
@@ -1207,26 +1233,15 @@ impl super::ApplicationCoordinator {
                             break;
                         }
                         pancetta_tui::tui_runner::TuiCommand::StartCq => {
-                            let cq_text = format!("CQ {} {}", cmd_station_call, cmd_station_grid);
-                            info!("TUI StartCq: '{}'", cq_text);
-                            let msg = ComponentMessage::new(
-                                ComponentId::Tui,
-                                ComponentId::Ft8Transmitter,
-                                MessageType::TransmitRequest {
-                                    message_text: cq_text,
-                                    frequency_offset: 1500.0,
-                                    qso_id: None,
-                                },
-                                Instant::now(),
-                            );
-                            if let Err(e) = cmd_message_bus.send_message(msg).await {
-                                warn!("Failed to send CQ: {}", e);
-                            }
+                            info!("TUI StartCq: enabling repeating CQ");
+                            cmd_cq_active.store(true, Ordering::Relaxed);
+                            // Send first CQ immediately by resetting the timer
+                            next_cq_time = None;
                         }
                         pancetta_tui::tui_runner::TuiCommand::StopCq => {
-                            info!("TUI StopCq");
-                            // No explicit stop needed — transmitter completes current
-                            // slot naturally and PTT is released by PttGuard
+                            info!("TUI StopCq: stopping repeating CQ");
+                            cmd_cq_active.store(false, Ordering::Relaxed);
+                            next_cq_time = None;
                         }
                         pancetta_tui::tui_runner::TuiCommand::TogglePtt => {
                             let current = cmd_ptt_state.load(Ordering::Acquire);

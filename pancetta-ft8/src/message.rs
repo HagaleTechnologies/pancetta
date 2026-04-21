@@ -1218,14 +1218,10 @@ impl MessageParser {
         let call_a_str = apply_suffix(call_a.to_callsign(), ipa);
         let call_b_str = apply_suffix(call_b.to_callsign(), ipb);
 
-        // Filter grid: only set grid_square on CQ messages, and never
-        // accept "RR73" as a grid (encodes to igrid4=32373, collides with
-        // the RR73 QSO-completion token at igrid4=32403).
-        let filtered_grid = if is_cq {
-            grid.as_ref().filter(|g| g.as_str() != "RR73").cloned()
-        } else {
-            None
-        };
+        // Filter "RR73" from grids — it's a QSO-completion token, not a
+        // Maidenhead locator (igrid4=32373 collides with the RR73 token at
+        // igrid4=32403). Allow grids on both CQ and reply messages.
+        let filtered_grid = grid.as_ref().filter(|g| g.as_str() != "RR73").cloned();
 
         if is_cq {
             message.standard_type = Some(StandardMessageType::Cq);
@@ -1256,7 +1252,7 @@ impl MessageParser {
             message.to_callsign = call_a_str;
             message.from_callsign = call_b_str;
         } else if grid.is_some() {
-            // Non-CQ with grid — treat as reply (grid not stored)
+            // Non-CQ with grid — reply carrying a grid locator
             if ir != 0 {
                 message.standard_type = Some(StandardMessageType::ReplyWithR);
             } else {
@@ -1264,6 +1260,7 @@ impl MessageParser {
             }
             message.to_callsign = call_a_str;
             message.from_callsign = call_b_str;
+            message.grid_square = filtered_grid;
         } else {
             // No grid, no report, no token — blank exchange
             message.standard_type = Some(StandardMessageType::Reply);
