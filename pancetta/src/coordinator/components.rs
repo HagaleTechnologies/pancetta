@@ -567,7 +567,8 @@ impl super::ApplicationCoordinator {
                                         }
                                     };
 
-                                    // --- Step 5: De-assert PTT ---
+                                    // --- Step 5: De-assert PTT (with tail delay for relay settling) ---
+                                    sleep(Duration::from_millis(50)).await;
                                     let ptt_off_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -704,7 +705,8 @@ impl super::ApplicationCoordinator {
                                         (false, 0)
                                     };
 
-                                    // --- Step 5: De-assert PTT ---
+                                    // --- Step 5: De-assert PTT (with tail delay for relay settling) ---
+                                    sleep(Duration::from_millis(50)).await;
                                     let ptt_off_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
