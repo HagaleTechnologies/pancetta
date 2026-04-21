@@ -145,6 +145,18 @@ impl super::ApplicationCoordinator {
         // TX audio channel: Ft8Transmitter -> Audio thread for playback
         let (tx_audio_tx, tx_audio_rx) = crossbeam_channel::bounded::<(Vec<f32>, u32)>(4);
 
+        // Pipeline health tracking (atomics shared across threads)
+        let health_dsp_windows = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let health_total_decodes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let health_last_rms = Arc::new(std::sync::atomic::AtomicU32::new(0)); // f32 bits
+        let health_audio_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        info!(
+            "Pipeline starting: ft8_lib={}, audio_device={}",
+            if pancetta_ft8::ft8lib_is_available() { "native-C" } else { "stub (pure-Rust only)" },
+            if self.headless { "stub" } else { "real" },
+        );
+
         // Also create message bus channels for control messages (hamlib, autonomous, etc.)
         let (_audio_bus_tx, audio_bus_rx) =
             self.message_bus.create_channel(ComponentId::Audio).await?;
@@ -156,7 +168,7 @@ impl super::ApplicationCoordinator {
         let (_tui_bus_tx, tui_bus_rx) = self.message_bus.create_channel(ComponentId::Tui).await?;
 
         // --- Audio component ---
-        self.start_audio_pipeline(audio_to_dsp_tx, tx_audio_rx)
+        self.start_audio_pipeline(audio_to_dsp_tx, tx_audio_rx, health_audio_alive.clone())
             .await?;
 
         // --- Audio TX relay: message bus AudioOutput -> audio thread ---
@@ -202,22 +214,32 @@ impl super::ApplicationCoordinator {
             dsp_to_ft8_tx,
             waterfall_tx.clone(),
             audio_level_tx,
+            health_dsp_windows.clone(),
+            health_last_rms.clone(),
         )
         .await?;
 
         // --- FT8 decoder component ---
-        self.start_ft8_pipeline(dsp_to_ft8_rx, ft8_to_tui_tx, waterfall_tx)
+        self.start_ft8_pipeline(dsp_to_ft8_rx, ft8_to_tui_tx, waterfall_tx, health_total_decodes.clone())
             .await?;
 
         // --- TUI component ---
         if !self.headless {
-            self.start_tui_pipeline(ft8_to_tui_rx, tui_bus_rx, waterfall_rx, audio_level_rx)
-                .await?;
+            self.start_tui_pipeline(
+                ft8_to_tui_rx, tui_bus_rx, waterfall_rx, audio_level_rx,
+                health_audio_alive.clone(), health_dsp_windows.clone(),
+                health_last_rms.clone(), health_total_decodes.clone(),
+            ).await?;
         } else {
-            // In headless mode, just drain decoded messages and log them
+            // In headless mode, drain decoded messages / waterfall and log health
             let shutdown = self.shutdown_signal.clone();
+            let health_audio_alive_hl = health_audio_alive.clone();
+            let health_dsp_windows_hl = health_dsp_windows.clone();
+            let health_total_decodes_hl = health_total_decodes.clone();
             let handle = tokio::spawn(async move {
+                let mut last_health_log = Instant::now();
                 while !shutdown.load(Ordering::Acquire) {
+                    // Drain decoded messages
                     match ft8_to_tui_rx.try_recv() {
                         Ok(msg) => {
                             info!(
@@ -225,29 +247,30 @@ impl super::ApplicationCoordinator {
                                 msg.text, msg.snr_db, msg.frequency_offset
                             );
                         }
-                        Err(crossbeam_channel::TryRecvError::Empty) => {
-                            tokio::time::sleep(Duration::from_millis(10)).await;
-                        }
+                        Err(crossbeam_channel::TryRecvError::Empty) => {}
                         Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                     }
+
+                    // Drain waterfall to prevent unbounded growth
+                    while waterfall_rx.try_recv().is_ok() {}
+
+                    // Periodic health logging (every 60 seconds)
+                    if last_health_log.elapsed() >= Duration::from_secs(60) {
+                        info!(
+                            "Pipeline health: ft8_lib={}, dsp_windows={}, total_decodes={}, audio={}",
+                            if pancetta_ft8::ft8lib_is_available() { "C" } else { "stub" },
+                            health_dsp_windows_hl.load(Ordering::Relaxed),
+                            health_total_decodes_hl.load(Ordering::Relaxed),
+                            if health_audio_alive_hl.load(Ordering::Relaxed) { "alive" } else { "no-data" },
+                        );
+                        last_health_log = Instant::now();
+                    }
+
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 Ok(())
             });
             self.named_task_handles.push((ComponentId::Tui, handle));
-
-            // Drain waterfall channel in headless mode to prevent unbounded growth
-            let drain_shutdown = self.shutdown_signal.clone();
-            let drain_handle = tokio::spawn(async move {
-                while !drain_shutdown.load(Ordering::Acquire) {
-                    match waterfall_rx.try_recv() {
-                        Ok(_) => {} // discard
-                        Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
-                    }
-                }
-                Ok(())
-            });
-            self.named_task_handles
-                .push((ComponentId::Tui, drain_handle));
         }
 
         Ok(())
@@ -258,6 +281,7 @@ impl super::ApplicationCoordinator {
         &mut self,
         audio_to_dsp_tx: crossbeam_channel::Sender<Vec<f32>>,
         tx_audio_rx: crossbeam_channel::Receiver<(Vec<f32>, u32)>,
+        health_audio_alive: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         if self.no_audio {
             info!("Audio processing disabled");
@@ -396,6 +420,7 @@ impl super::ApplicationCoordinator {
             });
 
             // Async relay: tokio mpsc -> crossbeam point-to-point
+            let health_audio_alive_relay = health_audio_alive.clone();
             let handle = tokio::spawn(async move {
                 let mut relay_count: u64 = 0;
                 // Record 90 seconds of raw 48kHz stereo audio for diagnostics
@@ -442,6 +467,7 @@ impl super::ApplicationCoordinator {
                         );
                         break;
                     }
+                    health_audio_alive_relay.store(true, Ordering::Relaxed);
                     relay_count += 1;
                     if relay_count == 1 {
                         info!("Audio relay: first batch sent ({} samples)", len);
@@ -471,6 +497,8 @@ impl super::ApplicationCoordinator {
         dsp_to_ft8_tx: crossbeam_channel::Sender<Vec<f32>>,
         live_waterfall_tx: crossbeam_channel::Sender<Vec<Vec<f32>>>,
         audio_level_tx: crossbeam_channel::Sender<f32>,
+        health_dsp_windows: Arc<std::sync::atomic::AtomicU64>,
+        health_last_rms: Arc<std::sync::atomic::AtomicU32>,
     ) -> Result<()> {
         let span = span!(Level::INFO, "start_dsp");
         let _enter = span.enter();
@@ -683,6 +711,8 @@ impl super::ApplicationCoordinator {
                                 info!("DSP: FT8 channel closed");
                                 return Ok(());
                             }
+                            health_dsp_windows.fetch_add(1, Ordering::Relaxed);
+                            health_last_rms.store(rms.to_bits(), Ordering::Relaxed);
                             // Schedule next decode at 13s into the next slot
                             let now_resync = chrono::Utc::now();
                             let secs_past = now_resync.timestamp() % 15;
@@ -723,6 +753,7 @@ impl super::ApplicationCoordinator {
         ft8_rx: crossbeam_channel::Receiver<Vec<f32>>,
         ft8_to_tui_tx: crossbeam_channel::Sender<pancetta_ft8::DecodedMessage>,
         waterfall_tx: crossbeam_channel::Sender<Vec<Vec<f32>>>,
+        health_total_decodes: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<()> {
         let span = span!(Level::INFO, "start_ft8");
         let _enter = span.enter();
@@ -842,6 +873,8 @@ impl super::ApplicationCoordinator {
                             *timestamp = Some(Instant::now());
                         });
 
+                        health_total_decodes.fetch_add(decoded_messages.len() as u64, Ordering::Relaxed);
+
                         info!(
                             "FT8 decoder: {} messages decoded ({} ft8lib + native merge)",
                             decoded_messages.len(),
@@ -952,6 +985,10 @@ impl super::ApplicationCoordinator {
         tui_bus_rx: crossbeam_channel::Receiver<ComponentMessage>,
         waterfall_rx: crossbeam_channel::Receiver<Vec<Vec<f32>>>,
         audio_level_rx: crossbeam_channel::Receiver<f32>,
+        health_audio_alive: Arc<std::sync::atomic::AtomicBool>,
+        health_dsp_windows: Arc<std::sync::atomic::AtomicU64>,
+        health_last_rms: Arc<std::sync::atomic::AtomicU32>,
+        health_total_decodes: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<()> {
         let span = span!(Level::INFO, "start_tui");
         let _enter = span.enter();
@@ -990,10 +1027,15 @@ impl super::ApplicationCoordinator {
         // (tokio::spawn was causing starvation -- same pattern as DSP/FT8 fixes)
         let relay_shutdown = shutdown.clone();
         let tui_msg_tx_relay = tui_msg_tx.clone();
+        let health_audio_alive_relay = health_audio_alive.clone();
+        let health_dsp_windows_relay = health_dsp_windows.clone();
+        let health_last_rms_relay = health_last_rms.clone();
+        let health_total_decodes_relay = health_total_decodes.clone();
         let tui_relay_jh = std::thread::Builder::new()
             .name("tui-relay".to_string())
             .spawn(move || {
             let mut ft8_disconnected = false;
+            let mut last_health_send = std::time::Instant::now();
             while !relay_shutdown.load(Ordering::Acquire) {
                 if !ft8_disconnected {
                     match ft8_to_tui_rx.try_recv() {
@@ -1122,6 +1164,21 @@ impl super::ApplicationCoordinator {
 
                 // Sleep to prevent busy-spinning
                 std::thread::sleep(std::time::Duration::from_millis(10));
+
+                // Send pipeline health to TUI every 2 seconds
+                if last_health_send.elapsed() >= std::time::Duration::from_secs(2) {
+                    let health = pancetta_tui::app::PipelineHealth {
+                        audio_alive: health_audio_alive_relay.load(Ordering::Relaxed),
+                        dsp_windows: health_dsp_windows_relay.load(Ordering::Relaxed),
+                        last_rms: f32::from_bits(health_last_rms_relay.load(Ordering::Relaxed)),
+                        ft8lib_available: pancetta_ft8::ft8lib_is_available(),
+                        total_decodes: health_total_decodes_relay.load(Ordering::Relaxed),
+                    };
+                    let _ = tui_msg_tx_relay.send(
+                        pancetta_tui::tui_runner::TuiMessage::PipelineHealth(health),
+                    );
+                    last_health_send = std::time::Instant::now();
+                }
             }
             info!("TUI relay thread stopped");
         }).expect("Failed to spawn TUI relay thread");
