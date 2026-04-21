@@ -19,13 +19,11 @@ time = "0.3"
 # High-precision mathematics
 nalgebra = "0.32"
 # Concurrency primitives
-crossbeam = "0.8"
 rayon = "1.10"
 # Error handling
 thiserror = "1.0"
 anyhow = "1.0"
-# Logging for debugging
-log = "0.4"
+# Logging/tracing
 tracing = "0.1"
 # Serial port communication for PTT/CAT control
 serialport = { version = "4.7", optional = true }

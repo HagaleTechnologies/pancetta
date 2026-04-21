@@ -537,7 +537,7 @@ impl RigControl for Rig {
         };
 
         if let Some(handle) = handle {
-            let _raw_ptr = handle.as_ptr();
+            let handle_for_restore = RigHandle::new(handle.as_ptr());
             let result = self
                 .execute_operation(move || unsafe {
                     let close_result = rig_close(handle.as_ptr());
@@ -559,6 +559,10 @@ impl RigControl for Rig {
 
             if let Err(e) = result.result {
                 warn!("Error during disconnect: {}", e);
+                // Restore the handle so it isn't leaked
+                let mut handle_guard = self.handle.lock();
+                *handle_guard = Some(handle_for_restore);
+                return Err(e);
             }
         }
 

@@ -884,10 +884,16 @@ pub fn packgrid(extra: &str) -> u16 {
     if bytes[0] == b'R' && bytes.len() >= 2 {
         // R prefix → ir=1
         if let Some(dd) = parse_report(&extra[1..]) {
+            if dd < -35 || dd > 30 {
+                return MAXGRID4 + 1; // out of range
+            }
             let irpt = (35 + dd) as u16;
             return (MAXGRID4 + irpt) | 0x8000; // ir=1
         }
     } else if let Some(dd) = parse_report(extra) {
+        if dd < -35 || dd > 30 {
+            return MAXGRID4 + 1; // out of range
+        }
         let irpt = (35 + dd) as u16;
         return MAXGRID4 + irpt; // ir=0
     }

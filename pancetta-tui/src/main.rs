@@ -9,6 +9,7 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
+use std::path::PathBuf;
 use tracing::{info, Level};
 use tracing_subscriber;
 
@@ -40,9 +41,9 @@ struct Cli {
     #[arg(short = 'D', long)]
     debug: bool,
 
-    /// Log file path
-    #[arg(short, long, default_value = "/tmp/pancetta-tui.log")]
-    log_file: String,
+    /// Log file path (defaults to <temp_dir>/pancetta-tui.log)
+    #[arg(short, long)]
+    log_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -52,7 +53,13 @@ async fn main() -> Result<()> {
     // Initialize logging
     let log_level = if cli.debug { Level::DEBUG } else { Level::INFO };
 
-    let file_appender = tracing_appender::rolling::never("/tmp", "pancetta-tui.log");
+    let log_path = cli
+        .log_file
+        .unwrap_or_else(|| std::env::temp_dir().join("pancetta-tui.log"));
+    let fallback_dir = std::env::temp_dir();
+    let log_dir = log_path.parent().unwrap_or(&fallback_dir);
+    let log_filename = log_path.file_name().unwrap_or("pancetta-tui.log".as_ref());
+    let file_appender = tracing_appender::rolling::never(log_dir, log_filename);
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::fmt()

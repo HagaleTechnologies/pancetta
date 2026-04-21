@@ -10,6 +10,8 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo::rustc-check-cfg=cfg(hamlib_found)");
+    println!("cargo::rustc-check-cfg=cfg(no_hamlib)");
 
     // Check for explicit hamlib path overrides
     if let Ok(lib_dir) = env::var("HAMLIB_LIB_DIR") {
@@ -25,7 +27,7 @@ fn main() {
         .probe("hamlib")
     {
         Ok(library) => {
-            println!("cargo:rustc-cfg=feature=\"hamlib-found\"");
+            println!("cargo:rustc-cfg=hamlib_found");
             for path in &library.link_paths {
                 println!("cargo:rustc-link-search=native={}", path.display());
             }
@@ -36,7 +38,7 @@ fn main() {
         }
         Err(_) => {
             // hamlib C library not found — this is fine, we use rigctld (TCP) instead.
-            println!("cargo:rustc-cfg=feature=\"no-hamlib\"");
+            println!("cargo:rustc-cfg=no_hamlib");
             false
         }
     };

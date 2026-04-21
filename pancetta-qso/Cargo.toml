@@ -28,10 +28,6 @@ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono"
 
 # Logging and tracing
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Audio and signal processing
-pancetta-ft8 = { path = "../pancetta-ft8" }
 
 # Utilities
 regex = "1.12"
@@ -42,6 +38,7 @@ dirs = "5.0"
 tokio-test = "0.4"
 tempfile = "3.27"
 proptest = "1.10"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
 default = ["sqlite"]

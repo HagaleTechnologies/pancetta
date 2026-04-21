@@ -4,8 +4,9 @@
 //! duplicate checking and DXCC need lookups.
 
 use pancetta_qso::priority::WorkedStationLookup;
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// Cached station lookup that holds a snapshot of worked stations.
 ///
@@ -50,7 +51,7 @@ impl CachedStationLookup {
     /// (e.g. from the QSO database at startup).  Both the band key and callsigns
     /// are uppercased for consistent comparison.
     pub fn seed_worked_from_list(&self, band: &str, callsigns: Vec<String>) {
-        let mut map = self.worked_on_band.write().unwrap();
+        let mut map = self.worked_on_band.write();
         let set = map.entry(band.to_uppercase()).or_default();
         for call in callsigns {
             set.insert(call.to_uppercase());
@@ -63,53 +64,48 @@ impl CachedStationLookup {
     }
 
     pub fn update_recent_failures(&self, callsigns: HashSet<String>) {
-        *self.recent_failures.write().unwrap() = callsigns;
+        *self.recent_failures.write() = callsigns;
     }
 
     pub fn update_needed_dxcc(&self, patterns: HashSet<String>) {
-        *self.needed_dxcc.write().unwrap() = patterns;
+        *self.needed_dxcc.write() = patterns;
     }
 
     pub fn update_needed_grids(&self, grids: HashSet<String>) {
-        *self.needed_grids.write().unwrap() = grids;
+        *self.needed_grids.write() = grids;
     }
 
     pub fn update_rarity_scores(&self, scores: HashMap<String, f64>) {
-        *self.rarity_scores.write().unwrap() = scores;
+        *self.rarity_scores.write() = scores;
     }
 
     pub fn update_notable_callsigns(&self, callsigns: HashSet<String>) {
-        *self.notable_callsigns.write().unwrap() = callsigns;
+        *self.notable_callsigns.write() = callsigns;
     }
 
     pub fn update_network_snr(&self, data: HashMap<String, (u32, i32)>) {
-        *self.network_snr.write().unwrap() = data;
+        *self.network_snr.write() = data;
     }
 
     pub fn update_network_last_seen(&self, data: HashMap<String, i64>) {
-        *self.network_last_seen.write().unwrap() = data;
+        *self.network_last_seen.write() = data;
     }
 
     pub fn rarity(&self, callsign: &str) -> f64 {
         self.rarity_scores
             .read()
-            .unwrap()
             .get(&callsign.to_uppercase())
             .copied()
             .unwrap_or(0.5)
     }
 
     pub fn record_failure(&self, callsign: &str) {
-        self.recent_failures
-            .write()
-            .unwrap()
-            .insert(callsign.to_uppercase());
+        self.recent_failures.write().insert(callsign.to_uppercase());
     }
 
     pub fn record_worked(&self, callsign: &str, band: &str) {
         self.worked_on_band
             .write()
-            .unwrap()
             .entry(band.to_uppercase())
             .or_default()
             .insert(callsign.to_uppercase());
@@ -119,7 +115,7 @@ impl CachedStationLookup {
 impl WorkedStationLookup for CachedStationLookup {
     fn is_duplicate(&self, callsign: &str, freq_hz: f64) -> bool {
         let band = pancetta_qso::utils::frequency_to_band(freq_hz).to_uppercase();
-        let worked = self.worked_on_band.read().unwrap();
+        let worked = self.worked_on_band.read();
         worked
             .get(&band)
             .map_or(false, |set| set.contains(&callsign.to_uppercase()))
@@ -128,12 +124,11 @@ impl WorkedStationLookup for CachedStationLookup {
     fn is_recent_failure(&self, callsign: &str) -> bool {
         self.recent_failures
             .read()
-            .unwrap()
             .contains(&callsign.to_uppercase())
     }
 
     fn is_needed_dxcc(&self, callsign: &str) -> bool {
-        let needed = self.needed_dxcc.read().unwrap();
+        let needed = self.needed_dxcc.read();
         // Conservative policy: when no DXCC filter is configured (empty set),
         // treat every entity as needed.
         if needed.is_empty() {
@@ -148,7 +143,7 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn is_needed_grid(&self, grid: &str) -> bool {
-        let needed = self.needed_grids.read().unwrap();
+        let needed = self.needed_grids.read();
         // Same conservative policy as is_needed_dxcc — see comment above.
         needed.is_empty() || needed.contains(&grid.to_uppercase())
     }
@@ -156,7 +151,6 @@ impl WorkedStationLookup for CachedStationLookup {
     fn rarity(&self, callsign: &str) -> f64 {
         self.rarity_scores
             .read()
-            .unwrap()
             .get(&callsign.to_uppercase())
             .copied()
             .unwrap_or(0.5)
@@ -165,14 +159,12 @@ impl WorkedStationLookup for CachedStationLookup {
     fn is_notable(&self, callsign: &str) -> bool {
         self.notable_callsigns
             .read()
-            .unwrap()
             .contains(&callsign.to_uppercase())
     }
 
     fn network_snr(&self, callsign: &str) -> Option<(u32, i32)> {
         self.network_snr
             .read()
-            .unwrap()
             .get(&callsign.to_uppercase())
             .copied()
     }
@@ -180,7 +172,6 @@ impl WorkedStationLookup for CachedStationLookup {
     fn network_last_seen(&self, callsign: &str) -> Option<i64> {
         self.network_last_seen
             .read()
-            .unwrap()
             .get(&callsign.to_uppercase())
             .copied()
     }

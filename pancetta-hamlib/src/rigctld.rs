@@ -268,7 +268,20 @@ impl RigctldClient {
     ///
     /// This is a public escape hatch for commands that don't have a
     /// higher-level wrapper (e.g. antenna control via `y` / `Y`).
+    ///
+    /// The command must contain only printable ASCII characters (0x20..=0x7E).
+    /// Embedded newlines (`\n`, `\r`) and non-printable bytes are rejected
+    /// to prevent protocol injection.
     pub async fn send_raw_command(&self, cmd: &str) -> Result<String> {
+        // Reject embedded newlines and non-printable ASCII to prevent injection
+        if cmd.bytes().any(|b| b == b'\n' || b == b'\r') {
+            return Err(anyhow!("raw command must not contain newline characters"));
+        }
+        if cmd.bytes().any(|b| !(0x20..=0x7E).contains(&b)) {
+            return Err(anyhow!(
+                "raw command must contain only printable ASCII characters (0x20-0x7E)"
+            ));
+        }
         self.send_command_with_retry(cmd).await
     }
 

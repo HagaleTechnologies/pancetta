@@ -13,17 +13,36 @@ pub struct CqdxClient {
     token: String,
 }
 
+/// Maximum response body size accepted from the API (10 MB).
+const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
+
 impl CqdxClient {
-    pub fn new(base_url: String, token: String) -> Self {
+    /// Create a new client for the given base URL and PAT token.
+    ///
+    /// The base URL must use `https://` or `http://localhost` (for development).
+    /// Returns an error if the URL scheme is not allowed.
+    pub fn new(base_url: String, token: String) -> Result<Self> {
+        // SSRF mitigation: only allow HTTPS or localhost HTTP
+        let url_lower = base_url.to_lowercase();
+        if !url_lower.starts_with("https://")
+            && !url_lower.starts_with("http://localhost")
+            && !url_lower.starts_with("http://127.0.0.1")
+        {
+            return Err(CqdxError::InvalidBaseUrl(format!(
+                "base_url must use https:// or http://localhost, got: {}",
+                base_url
+            )));
+        }
+
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to build reqwest client");
-        Self {
+        Ok(Self {
             http,
             base_url,
             token,
-        }
+        })
     }
 
     pub async fn fetch_entities(&self) -> Result<Vec<DxccEntity>> {
@@ -31,7 +50,7 @@ impl CqdxClient {
         debug!("Fetching DXCC entities from {}", url);
         let resp = self.http.get(&url).bearer_auth(&self.token).send().await?;
         let resp = self.check_status(resp).await?;
-        let body: EntitiesResponse = resp.json().await?;
+        let body: EntitiesResponse = self.checked_json(resp).await?;
         Ok(body.entities)
     }
 
@@ -40,7 +59,7 @@ impl CqdxClient {
         debug!("Fetching needed entities from {}", url);
         let resp = self.http.get(&url).bearer_auth(&self.token).send().await?;
         let resp = self.check_status(resp).await?;
-        let body: NeededResponse = resp.json().await?;
+        let body: NeededResponse = self.checked_json(resp).await?;
         Ok(body.needed)
     }
 
@@ -68,7 +87,7 @@ impl CqdxClient {
             .send()
             .await?;
         let resp = self.check_status(resp).await?;
-        let body: LiveSpotsResponse = resp.json().await?;
+        let body: LiveSpotsResponse = self.checked_json(resp).await?;
         Ok(body.groups)
     }
 
@@ -116,6 +135,25 @@ impl CqdxClient {
             message,
         })
     }
+
+    /// Deserialize a JSON response body with a size limit to prevent OOM.
+    async fn checked_json<T: serde::de::DeserializeOwned>(
+        &self,
+        resp: reqwest::Response,
+    ) -> Result<T> {
+        // Check Content-Length header first (fast reject)
+        if let Some(len) = resp.content_length() {
+            if len > MAX_RESPONSE_BYTES as u64 {
+                return Err(CqdxError::ResponseTooLarge(len));
+            }
+        }
+        // Read bytes with actual size check
+        let bytes = resp.bytes().await?;
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(CqdxError::ResponseTooLarge(bytes.len() as u64));
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
 }
 
 #[cfg(test)]
@@ -125,7 +163,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_client(base_url: &str) -> CqdxClient {
-        CqdxClient::new(base_url.to_string(), "pat_test_token".to_string())
+        CqdxClient::new(base_url.to_string(), "pat_test_token".to_string()).unwrap()
     }
 
     #[tokio::test]
@@ -309,7 +347,7 @@ mod tests {
     async fn test_live_spots_envelope() {
         // Requires CQDX_TOKEN env var
         let token = std::env::var("CQDX_TOKEN").expect("Set CQDX_TOKEN to run this test");
-        let client = CqdxClient::new("https://cqdx.io".to_string(), token);
+        let client = CqdxClient::new("https://cqdx.io".to_string(), token).unwrap();
 
         // Try fetching live spots — this validates the real envelope
         match client.fetch_live_spots(Some("20m"), Some("FT8")).await {

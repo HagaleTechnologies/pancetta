@@ -18,6 +18,12 @@ pub enum CqdxError {
 
     #[error("Not configured: no PAT token provided")]
     NotConfigured,
+
+    #[error("Response too large: {0} bytes")]
+    ResponseTooLarge(u64),
+
+    #[error("Invalid base URL: {0}")]
+    InvalidBaseUrl(String),
 }
 
 pub type Result<T> = std::result::Result<T, CqdxError>;

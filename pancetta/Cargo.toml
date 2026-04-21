@@ -32,12 +32,9 @@ geographiclib-rs = { workspace = true }
 
 # Async runtime and coordination
 tokio = { version = "1.50", features = ["full", "rt-multi-thread"] }
-tokio-util = "0.7"
 
 # Inter-process communication
 crossbeam-channel = "0.5"
-flume = "0.11"
-async-channel = "2.0"
 
 # Real-time coordination
 parking_lot = "0.12"

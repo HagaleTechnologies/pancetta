@@ -13,7 +13,6 @@ use crate::{
     modulator::{convert_samples, AudioFormat, Ft8Modulator},
     Ft8Error, Ft8Result,
 };
-use log::{debug, error, info, warn};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -21,6 +20,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::time::{Duration, Instant, SystemTime};
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "gpio")]
 use rppal::gpio::{Gpio, Level, OutputPin};

@@ -24,19 +24,9 @@ ndarray = "0.15"
 num-complex = "0.4"
 num-traits = "0.2"
 
-# Ring buffer and synchronization
-ringbuf = "0.3"
+# Synchronization
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
-
-# Optional optimizations
-[dependencies.simdeez]
-version = "1.0"
-optional = true
-
-[features]
-default = ["simd"]
-simd = ["simdeez"]
 
 [dev-dependencies]
 tracing-subscriber = "0.3"

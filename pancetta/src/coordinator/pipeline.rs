@@ -138,8 +138,8 @@ impl super::ApplicationCoordinator {
         let (audio_to_dsp_tx, audio_to_dsp_rx) = crossbeam_channel::bounded::<Vec<f32>>(100);
         let (dsp_to_ft8_tx, dsp_to_ft8_rx) = crossbeam_channel::bounded::<Vec<f32>>(2);
         let (ft8_to_tui_tx, ft8_to_tui_rx) =
-            crossbeam_channel::unbounded::<pancetta_ft8::DecodedMessage>();
-        let (waterfall_tx, waterfall_rx) = crossbeam_channel::unbounded::<Vec<Vec<f32>>>();
+            crossbeam_channel::bounded::<pancetta_ft8::DecodedMessage>(500);
+        let (waterfall_tx, waterfall_rx) = crossbeam_channel::bounded::<Vec<Vec<f32>>>(100);
         let (audio_level_tx, audio_level_rx) = crossbeam_channel::bounded::<f32>(1);
 
         // TX audio channel: Ft8Transmitter -> Audio thread for playback
@@ -963,9 +963,9 @@ impl super::ApplicationCoordinator {
 
         // Create TUI message/command channels for the TuiRunner
         let (tui_msg_tx, tui_msg_rx) =
-            crossbeam_channel::unbounded::<pancetta_tui::tui_runner::TuiMessage>();
+            crossbeam_channel::bounded::<pancetta_tui::tui_runner::TuiMessage>(1000);
         let (tui_cmd_tx, tui_cmd_rx) =
-            crossbeam_channel::unbounded::<pancetta_tui::tui_runner::TuiCommand>();
+            crossbeam_channel::bounded::<pancetta_tui::tui_runner::TuiCommand>(1000);
 
         // Use the rig's current frequency if hamlib has already read it,
         // otherwise fall back to 14.074 MHz. Updated by FrequencyResponse messages.

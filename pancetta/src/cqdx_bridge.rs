@@ -38,7 +38,13 @@ impl CqdxBridge {
             warn!("cqdx.io enabled but token is empty, skipping");
             return None;
         }
-        let client = CqdxClient::new(config.base_url.clone(), token.clone());
+        let client = match CqdxClient::new(config.base_url.clone(), token.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("cqdx.io client creation failed: {}", e);
+                return None;
+            }
+        };
         Some(Self {
             client,
             cache: Arc::new(RwLock::new(CqdxCache::new())),

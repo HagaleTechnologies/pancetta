@@ -12,11 +12,11 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 
 | Crate | Purpose | Status |
 |-------|---------|--------|
-| `pancetta-ft8` | FT8 encoder/decoder/modulator/OSD | Production-grade, ~200 tests, bit-exact with ft8_lib/WSJT-X |
+| `pancetta-ft8` | FT8 encoder/decoder/modulator/OSD | Production-grade, ~295 tests, bit-exact with ft8_lib/WSJT-X |
 | `pancetta-audio` | Real-time audio I/O (cpal + ringbuf) | Functional |
 | `pancetta-dsp` | DSP pipeline (FFT, filtering, resampling) | Functional |
 | `pancetta-config` | Configuration with hot-reload | Production-ready, ~59 tests |
-| `pancetta-qso` | QSO management, priority scoring, frequency allocation, autonomous operator | Core logic, ~81 tests |
+| `pancetta-qso` | QSO management, priority scoring, frequency allocation, autonomous operator | Core logic, ~60 tests |
 | `pancetta-dx` | DX hunting, DXCC, PSKReporter | Partial implementation |
 | `pancetta-hamlib` | Hamlib CAT control FFI | Bindings done, integration stub |
 | `pancetta-cqdx` | cqdx.io HTTP client, cache, types | Delta-adapted, needs live API validation |
@@ -34,7 +34,7 @@ cargo build
 cargo test
 
 # FT8 tests (encoder is feature-gated behind `transmit`)
-cargo test --features transmit -p pancetta-ft8    # all ~200 FT8 tests
+cargo test --features transmit -p pancetta-ft8    # all ~295 FT8 tests
 cargo test -p pancetta-ft8                         # LDPC/CRC tests only
 
 # Loopback integration tests (end-to-end QSO through encode→modulate→decode)
@@ -52,7 +52,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
 ## Architecture Highlights
 
-- **Coordinator** (`pancetta/src/coordinator.rs`): Central orchestrator, manages decode→decide→transmit pipeline. Large file (~2,700 lines), decomposition planned.
+- **Coordinator** (`pancetta/src/coordinator/`): Central orchestrator, manages decode→decide→transmit pipeline. Decomposed into submodules: `mod.rs`, `pipeline.rs`, `components.rs`, `health.rs`, `hamlib.rs`, `shutdown.rs`, `wav_playback.rs`, `util.rs`.
 - **Autonomous operator** (`pancetta-qso/src/autonomous.rs`): Decision engine — hunt mode (pounce on rare stations), CQ mode (answer callers), hybrid mode. Configurable priority weights.
 - **Priority scoring** (`pancetta-qso/src/priority.rs`): Weighted scoring — needed DXCC > needed grid > POTA/SOTA > rarity. Duplicate suppression and failure backoff.
 - **SmartFrequencyAllocator** (`pancetta-qso/src/frequency.rs`): 7 soft-scored criteria for TX frequency selection. Enables parallel QSOs at different audio frequencies.
@@ -70,9 +70,7 @@ Design spec: `docs/superpowers/specs/2026-04-02-end-to-end-qso-design.md`
 ## Known Gaps and TODOs
 
 - Grid "needed" set never populated (DXCC needed works via cqdx.io, grid `update_needed_grids()` never called)
-- POTA/SOTA detection has false positives on callsigns with `/` suffix (`contains('/')` too broad)
-- `is_duplicate` ignores freq_hz (no band-aware dedup yet)
-- cqdx.io `GET /spots?live=true` response envelope key (`groups`) unverified against live API
+- cqdx.io `GET /api/v1/spots?live=true` response envelope key (`groups`) unverified against live API
 
 ## Documentation Maintenance
 
@@ -83,7 +81,7 @@ After completing significant work, update affected documentation:
 - **docs/ARCHITECTURE.md**: Update if crate relationships or data flows changed
 - **README.md / FEATURES.md**: Update if user-facing capabilities changed
 
-All crates have `#![warn(missing_docs)]` enabled — the compiler will flag undocumented public items.
+All crates currently have `#![allow(missing_docs)]` with TODO comments to re-enable `#![warn(missing_docs)]`.
 
 ## Build Hygiene
 

@@ -245,8 +245,13 @@ impl super::ApplicationCoordinator {
                                         }
                                     }
                                     Err(e) => {
-                                        warn!(
-                                            "Failed to generate FT8 message for QSO {}: {}",
+                                        // BUG: This encode failure leaves the QSO state machine
+                                        // stuck waiting for a TX that will never happen. The QSO
+                                        // will eventually time out, but ideally we'd send a
+                                        // QsoFailed event here. The qso_manager is not accessible
+                                        // from this forwarding task.
+                                        error!(
+                                            "Failed to generate FT8 message for QSO {} — QSO state machine may be stuck: {}",
                                             qso_id, e
                                         );
                                     }
@@ -878,7 +883,13 @@ impl super::ApplicationCoordinator {
                 info!("Autonomous operator started");
 
                 let mut slot_messages: Vec<pancetta_qso::DecodedMessageInfo> = Vec::new();
-                let mut slot_interval = tokio::time::interval(Duration::from_secs(15));
+                // Align slot timer to FT8 UTC boundaries (0/15/30/45 seconds)
+                let seconds_in_slot = chrono::Utc::now().timestamp() % 15;
+                let initial_delay = Duration::from_secs((15 - seconds_in_slot) as u64);
+                let mut slot_interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + initial_delay,
+                    Duration::from_secs(15),
+                );
 
                 loop {
                     tokio::select! {
@@ -923,7 +934,7 @@ impl super::ApplicationCoordinator {
                                     op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
                                         power_bins: avg,
                                         freq_min_hz: 200.0,
-                                        freq_max_hz: 4000.0,
+                                        freq_max_hz: 3000.0,
                                     });
                                 }
                             }
@@ -1000,8 +1011,24 @@ impl super::ApplicationCoordinator {
                                             warn!("Failed to send AutonomousStatus: {}", e);
                                         }
                                     }
-                                    pancetta_qso::OperatorAction::Listen
-                                    | pancetta_qso::OperatorAction::CollisionListen => {}
+                                    pancetta_qso::OperatorAction::Listen => {}
+                                    pancetta_qso::OperatorAction::CollisionListen => {
+                                        // Process collision listen to reset the listen-cycle counter.
+                                        // TODO: slot_messages was already cleared above; pass actual
+                                        // decoded messages once we restructure to retain them.
+                                        let mut op = operator.lock().await;
+                                        let collision_actions = op.process_collision_listen(&[]);
+                                        drop(op);
+                                        // Re-inject any resulting actions (e.g., FrequencyShift)
+                                        for ca in collision_actions {
+                                            match ca {
+                                                pancetta_qso::OperatorAction::FrequencyShift { new_offset_hz } => {
+                                                    info!("Collision listen: TX offset shifted to {:.0} Hz", new_offset_hz);
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
                                     pancetta_qso::OperatorAction::FrequencyShift { new_offset_hz } => {
                                         info!("Autonomous: TX offset shifted to {:.0} Hz", new_offset_hz);
                                     }
