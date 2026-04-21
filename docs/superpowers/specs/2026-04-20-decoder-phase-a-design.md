@@ -1,15 +1,23 @@
 # Decoder Phase A: Reach ft8_lib Parity
 
 **Date:** 2026-04-20
-**Status:** Approved
+**Status:** Superseded — Phase A already complete
 **Builds on:** `2026-04-18-decoder-sensitivity-design.md`
-**Goal:** Raise decode rate from 34% to 100% of ft8_lib on reference WAV files
+**Goal:** ~~Raise decode rate from 34% to 100% of ft8_lib on reference WAV files~~ **ACHIEVED: 115.8% (44/38)**
 
-## Context
+## Status Update (2026-04-20)
 
-Pancetta's FT8 decoder currently decodes 13/38 signals (34% of ft8_lib) on real WAV recordings. The root cause analysis in the sensitivity design spec identified four gaps totaling 4-8 dB of lost sensitivity. Multi-pass infrastructure (signal subtraction, budget tracking, candidate reduction) is already operational but dormant — first-pass decodes are too few to produce useful residuals.
+Cross-validation benchmark shows **44/38 decodes (115.8% of ft8_lib) with 0 false positives**. The major Phase A fixes (spectrogram-based symbol extraction via `par_extract_symbols_from_spectrogram`, sum-product LDPC) are already implemented and working. Multi-pass with signal subtraction is operational.
 
-This spec covers **Phase A only**: four independent fixes to reach ft8_lib parity. Phase B (OSD-2/3, AP decoding, advanced subtraction) and subsequent sub-projects (hamlib integration, cqdx.io) follow in separate specs.
+**Remaining minor items** (folded into the combined implementation plan):
+- A4: `MIN_FREQ_BIN` still 16 (100 Hz) — lower to 0 for on-air coverage
+- A3: Sync search still starts at `t0 = 0` — extend for early-arriving signals
+
+## Original Context (for reference)
+
+Pancetta's FT8 decoder was at 13/38 signals (34% of ft8_lib) when this spec was written. The root cause analysis in the sensitivity design spec identified four gaps totaling 4-8 dB of lost sensitivity. These have since been addressed.
+
+This spec covered **Phase A only**. Phase B (AP decoding, advanced techniques) and subsequent sub-projects (hamlib integration, cqdx.io) follow in separate specs.
 
 ## Fixes
 
