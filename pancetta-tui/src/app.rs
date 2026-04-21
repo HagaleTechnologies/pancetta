@@ -8,6 +8,34 @@ use tracing::{debug, info};
 
 use crate::config::{Config, Theme};
 
+/// Terminal color support level, detected at startup
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorCapability {
+    /// 256-color (xterm-256color, COLORTERM=256color, etc.)
+    TwoFiftySix,
+    /// Basic 16-color (most terminals, including SSH defaults)
+    Basic,
+}
+
+impl ColorCapability {
+    pub fn detect() -> Self {
+        // COLORTERM=truecolor or 24bit implies 256-color support too
+        if let Ok(ct) = std::env::var("COLORTERM") {
+            let ct = ct.to_lowercase();
+            if ct == "truecolor" || ct == "24bit" || ct == "256color" {
+                return Self::TwoFiftySix;
+            }
+        }
+        // Check TERM for 256color suffix
+        if let Ok(term) = std::env::var("TERM") {
+            if term.contains("256color") {
+                return Self::TwoFiftySix;
+            }
+        }
+        Self::Basic
+    }
+}
+
 /// View model for decoded messages in the TUI.
 /// This is NOT the domain type from pancetta-ft8; it is a display-oriented
 /// struct tailored for the UI layer.  If pancetta-ft8 is added as a dependency
@@ -254,6 +282,7 @@ pub struct App {
     pub audio_device: Option<String>,
     pub is_monitoring: bool,
     pub audio_level: f32,
+    pub color_capability: ColorCapability,
     pub waterfall_data: Vec<Vec<f32>>,
 
     // Autonomous operator
@@ -320,6 +349,7 @@ impl App {
             audio_device,
             is_monitoring: false,
             audio_level: 0.0,
+            color_capability: ColorCapability::detect(),
             waterfall_data: Vec::new(),
             autonomous_status: None,
             device_selection: DeviceSelectionState::new(),
@@ -339,6 +369,7 @@ impl App {
             app.start_audio_monitoring(&device).await?;
         }
 
+        info!("Terminal color capability: {:?}", app.color_capability);
         info!(
             "App initialized with station {}",
             app.station_info.call_sign

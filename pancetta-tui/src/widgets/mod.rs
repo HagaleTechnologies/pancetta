@@ -5,6 +5,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 
+use crate::app::ColorCapability;
+
 /// Custom waterfall widget for displaying spectrum data
 pub struct Waterfall<'a> {
     block: Option<Block<'a>>,
@@ -20,6 +22,8 @@ pub struct Waterfall<'a> {
     rows_per_cycle: usize,
     /// Number of data rows combined into each display row (vertical compression)
     compression: usize,
+    /// Terminal color capability — controls waterfall color palette
+    color_capability: ColorCapability,
 }
 
 #[derive(Clone, Copy)]
@@ -40,6 +44,7 @@ impl<'a> Waterfall<'a> {
             signal_freqs: Vec::new(),
             rows_per_cycle: 15,
             compression: 2,
+            color_capability: ColorCapability::TwoFiftySix,
         }
     }
 
@@ -63,6 +68,11 @@ impl<'a> Waterfall<'a> {
         self
     }
 
+    pub fn color_capability(mut self, cap: ColorCapability) -> Self {
+        self.color_capability = cap;
+        self
+    }
+
     /// Map an audio frequency (Hz) to a column index in the waterfall area
     fn freq_to_col(&self, freq_hz: f64, width: usize) -> Option<usize> {
         let (lo, hi) = self.freq_range;
@@ -80,6 +90,26 @@ impl<'a> Waterfall<'a> {
 
     fn get_color_for_intensity(&self, intensity: f32) -> Color {
         let clamped = intensity.clamp(0.0, 1.0);
+
+        // Force basic colors if terminal doesn't support 256-color
+        if self.color_capability == ColorCapability::Basic {
+            // 7-step gradient using basic 16 colors — works everywhere
+            return if clamped < 0.15 {
+                Color::Black
+            } else if clamped < 0.30 {
+                Color::DarkGray
+            } else if clamped < 0.45 {
+                Color::Blue
+            } else if clamped < 0.60 {
+                Color::Cyan
+            } else if clamped < 0.75 {
+                Color::Gray
+            } else if clamped < 0.90 {
+                Color::White
+            } else {
+                Color::Yellow
+            };
+        }
 
         match self.color_scheme {
             WaterfallColorScheme::Classic => {

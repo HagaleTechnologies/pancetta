@@ -280,7 +280,8 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
     let waterfall = Waterfall::new(&app.waterfall_data)
         .block(waterfall_block)
         .tx_offset(app.tx_frequency_offset)
-        .signal_freqs(signal_freqs);
+        .signal_freqs(signal_freqs)
+        .color_capability(app.color_capability);
     f.render_widget(waterfall, area);
 }
 
