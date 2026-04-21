@@ -96,6 +96,7 @@ pub mod sync;
 
 // ft8_lib reference implementation (FFI)
 pub mod ft8_lib_ffi;
+pub use ft8_lib_ffi::ft8lib_is_available;
 
 // Benchmark harness for decoder comparison
 #[cfg(feature = "benchmark")]

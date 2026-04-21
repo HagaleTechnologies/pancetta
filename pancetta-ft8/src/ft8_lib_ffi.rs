@@ -364,3 +364,13 @@ pub fn ft8lib_decode_payload(_payload: &[u8; 10]) -> Option<String> {
 pub fn ft8lib_decode_audio(_samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
     Vec::new()
 }
+
+// ============================================================================
+// Availability detection
+// ============================================================================
+
+/// Returns `true` when the real ft8_lib C library is compiled in,
+/// `false` when using the pure-Rust stub fallback.
+pub fn ft8lib_is_available() -> bool {
+    cfg!(not(ft8lib_stub))
+}
