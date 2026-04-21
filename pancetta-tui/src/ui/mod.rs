@@ -265,7 +265,7 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
         .decoded_messages
         .iter()
         .filter(|m| m.timestamp > cutoff)
-        .map(|m| m.frequency)
+        .map(|m| m.delta_freq as f64)
         .collect();
 
     let title = format!(" Waterfall [/]: TX {:.0} Hz ", app.tx_frequency_offset);
