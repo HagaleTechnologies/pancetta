@@ -230,7 +230,7 @@ fn crc14_from_u8_bits(bits: &[u8]) -> u16 {
 }
 
 /// OSD decoder that attempts to decode LLRs using ordered statistics decoding
-/// at depths 0, 1, and 2 with CRC-14 validation.
+/// at depths 0, 1, 2, and 3 with CRC-14 validation.
 pub struct OsdDecoder {
     config: OsdConfig,
     generator: [PackedRow; LDPC_INFO_BITS],
@@ -383,6 +383,42 @@ impl OsdDecoder {
                 }
                 if let Some(result) = self.try_solution(&info, &parity, &final_perm) {
                     return Some(result);
+                }
+            }
+        }
+
+        if self.config.max_depth < 3 {
+            return None;
+        }
+
+        // 8. OSD-3: flip all triples — C(91, 3) = 125,580 trials.
+        // Each trial XORs 3 rows of the reduced generator matrix, then checks CRC-14.
+        for i in 0..LDPC_INFO_BITS {
+            for j in (i + 1)..LDPC_INFO_BITS {
+                // Pre-compute i+j parity update to avoid recomputing in innermost loop
+                let mut parity_ij = base_parity;
+                for p in 0..LDPC_PARITY_BITS {
+                    if parity_cols[i][p] {
+                        parity_ij[p] ^= 1;
+                    }
+                    if parity_cols[j][p] {
+                        parity_ij[p] ^= 1;
+                    }
+                }
+                for k in (j + 1)..LDPC_INFO_BITS {
+                    let mut info = info_hard;
+                    info[i] ^= 1;
+                    info[j] ^= 1;
+                    info[k] ^= 1;
+                    let mut parity = parity_ij;
+                    for p in 0..LDPC_PARITY_BITS {
+                        if parity_cols[k][p] {
+                            parity[p] ^= 1;
+                        }
+                    }
+                    if let Some(result) = self.try_solution(&info, &parity, &final_perm) {
+                        return Some(result);
+                    }
                 }
             }
         }
@@ -721,6 +757,68 @@ mod tests {
             assert!(
                 found_good_pair,
                 "Could not find a bit pair where OSD-1 fails but OSD-2 succeeds"
+            );
+        }
+
+        #[test]
+        fn test_osd3_recovers_three_unreliable_bits() {
+            let (_message, codeword) = make_test_codeword();
+
+            // Strategy: give all bits correct-sign at medium magnitude (4.0), then make
+            // 3 target bits VERY high magnitude but WRONG sign. They will sort to the
+            // top 3 positions (most "reliable" but incorrect), so they definitely land
+            // in the 91 info positions after any Gaussian elimination. OSD-2 tries all
+            // pairs of the 91 info bits, so with 3 wrong info bits it fails.
+            // OSD-3 tries all triples and finds the exact triple to flip.
+            //
+            // We test multiple triples because Gaussian elimination may occasionally
+            // re-order columns such that one of the 3 bits moves to a parity position
+            // (which is corrected automatically), reducing it to a 2-bit problem.
+            let triples = [
+                (5, 20, 40),
+                (10, 30, 60),
+                (2, 15, 70),
+                (1, 25, 50),
+                (3, 18, 65),
+                (7, 35, 80),
+                (0, 12, 45),
+                (4, 22, 55),
+                (6, 28, 73),
+                (9, 38, 85),
+            ];
+
+            let decoder2 = OsdDecoder::new(OsdConfig { max_depth: 2 });
+            let decoder3 = OsdDecoder::new(OsdConfig { max_depth: 3 });
+
+            let mut found_good_triple = false;
+            for &(a, b, c) in &triples {
+                let mut llrs = codeword_to_llrs(&codeword, 4.0);
+                // High-magnitude wrong-sign: these 3 bits sort to top of reliability
+                // ranking but have incorrect hard decisions.
+                llrs[a] = if codeword[a] { 8.0 } else { -8.0 };
+                llrs[b] = if codeword[b] { 8.0 } else { -8.0 };
+                llrs[c] = if codeword[c] { 8.0 } else { -8.0 };
+
+                let osd2_result = decoder2.decode(&llrs, None);
+                let osd3_result = decoder3.decode(&llrs, None);
+
+                if osd2_result.is_none() && osd3_result.is_some() {
+                    assert_eq!(
+                        osd3_result.unwrap(),
+                        codeword,
+                        "OSD-3 decoded wrong codeword for triple ({}, {}, {})",
+                        a,
+                        b,
+                        c
+                    );
+                    found_good_triple = true;
+                    break;
+                }
+            }
+
+            assert!(
+                found_good_triple,
+                "Could not find a bit triple where OSD-2 fails but OSD-3 succeeds"
             );
         }
     }

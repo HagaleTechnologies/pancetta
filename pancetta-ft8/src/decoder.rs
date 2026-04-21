@@ -3531,6 +3531,7 @@ mod tests {
             num_steps,
             num_bins,
             freq_osr,
+            time_padding: 0,
         };
 
         let score = decoder.compute_costas_score(&spec, 0, f0, 0);
