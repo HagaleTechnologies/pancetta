@@ -98,6 +98,8 @@ pub enum TuiMessage {
     SpotGroupUpdate { spots: Vec<CqdxSpotInfo> },
     /// Audio level update (RMS, 0.0-1.0)
     AudioLevel { level: f32 },
+    /// Pipeline health snapshot (sent periodically by coordinator)
+    PipelineHealth(crate::app::PipelineHealth),
 }
 
 /// Commands sent from TUI
@@ -307,6 +309,9 @@ impl TuiRunner {
             }
             TuiMessage::AudioLevel { level } => {
                 app.audio_level = level;
+            }
+            TuiMessage::PipelineHealth(health) => {
+                app.pipeline_health = Some(health);
             }
         }
 

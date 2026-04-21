@@ -165,29 +165,77 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let audio_status = if app.is_monitoring {
-        format!("MONITORING | Level: {:.1}%", app.audio_level * 100.0)
-    } else {
-        "STANDBY".to_string()
-    };
-
     let messages_count = app.decoded_messages.len();
     let dx_count = app.dx_stations.len();
 
+    // Pipeline health indicators
+    let (audio_indicator, dsp_indicator, decoder_indicator) = match &app.pipeline_health {
+        Some(health) => {
+            let audio = if health.audio_alive {
+                Span::styled(
+                    "AUD",
+                    Style::default()
+                        .fg(app.theme.success_color())
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::styled(
+                    "AUD",
+                    Style::default()
+                        .fg(app.theme.error_color())
+                        .add_modifier(Modifier::BOLD),
+                )
+            };
+            let dsp = if health.dsp_windows > 0 {
+                Span::styled(
+                    format!("DSP:{}", health.dsp_windows),
+                    Style::default().fg(app.theme.success_color()),
+                )
+            } else {
+                Span::styled(
+                    "DSP:0",
+                    Style::default().fg(app.theme.error_color()),
+                )
+            };
+            let dec_label = if health.ft8lib_available {
+                "FT8"
+            } else {
+                "FT8(native)"
+            };
+            let decoder = if health.total_decodes > 0 {
+                Span::styled(
+                    format!("{}:{}", dec_label, health.total_decodes),
+                    Style::default().fg(app.theme.success_color()),
+                )
+            } else {
+                Span::styled(
+                    format!("{}:0", dec_label),
+                    Style::default().fg(app.theme.warning_color()),
+                )
+            };
+            (audio, dsp, decoder)
+        }
+        None => (
+            Span::styled("AUD", Style::default().fg(app.theme.muted_color())),
+            Span::styled("DSP", Style::default().fg(app.theme.muted_color())),
+            Span::styled("FT8", Style::default().fg(app.theme.muted_color())),
+        ),
+    };
+
     let status_line = Line::from(vec![
+        audio_indicator,
+        Span::raw(" "),
+        dsp_indicator,
+        Span::raw(" "),
+        decoder_indicator,
+        Span::raw(" | "),
         Span::styled(
-            audio_status,
-            Style::default()
-                .fg(if app.is_monitoring {
-                    app.theme.success_color()
-                } else {
-                    app.theme.muted_color()
-                })
-                .add_modifier(Modifier::BOLD),
+            format!("Level: {:.1}%", app.audio_level * 100.0),
+            Style::default().fg(app.theme.foreground_color()),
         ),
         Span::raw(" | "),
         Span::styled(
-            format!("Messages: {}", messages_count),
+            format!("Msgs: {}", messages_count),
             Style::default().fg(app.theme.foreground_color()),
         ),
         Span::raw(" | "),

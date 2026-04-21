@@ -56,6 +56,21 @@ pub struct DecodedMessageView {
     pub bearing: Option<f64>,
 }
 
+/// Pipeline component health snapshot, forwarded from coordinator
+#[derive(Debug, Clone)]
+pub struct PipelineHealth {
+    /// Audio thread alive and producing samples
+    pub audio_alive: bool,
+    /// Number of DSP windows sent to decoder
+    pub dsp_windows: u64,
+    /// Audio RMS of last DSP window (0.0 = silence)
+    pub last_rms: f32,
+    /// Whether ft8_lib C decoder is compiled (vs stub)
+    pub ft8lib_available: bool,
+    /// Total messages decoded this session
+    pub total_decodes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct QsoStatus {
     pub active: bool,
@@ -282,6 +297,7 @@ pub struct App {
     pub audio_device: Option<String>,
     pub is_monitoring: bool,
     pub audio_level: f32,
+    pub pipeline_health: Option<PipelineHealth>,
     pub color_capability: ColorCapability,
     pub waterfall_data: Vec<Vec<f32>>,
 
@@ -349,6 +365,7 @@ impl App {
             audio_device,
             is_monitoring: false,
             audio_level: 0.0,
+            pipeline_health: None,
             color_capability: ColorCapability::detect(),
             waterfall_data: Vec::new(),
             autonomous_status: None,

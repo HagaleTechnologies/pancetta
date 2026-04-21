@@ -33,8 +33,8 @@ pub mod widgets;
 
 // Re-export main types for convenience
 pub use app::{
-    ActivePanel, App, AutonomousStatus, DecodedMessageView, DevicePanel, DeviceSelectionState,
-    DxStation, QsoStatus, StationInfo,
+    ActivePanel, App, AutonomousStatus, ColorCapability, DecodedMessageView, DevicePanel,
+    DeviceSelectionState, DxStation, PipelineHealth, QsoStatus, StationInfo,
 };
 pub use config::{Config, Theme};
 pub use events::{Event, EventHandler};
