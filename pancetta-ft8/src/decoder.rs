@@ -62,8 +62,8 @@ const MIN_SYNC_SCORE: f64 = 3.0;
 /// Maximum candidates from sync search before NMS
 const MAX_SYNC_CANDIDATES: usize = 100;
 
-/// Minimum frequency bin for FT8 search (16 bins × 6.25 Hz = 100 Hz)
-const MIN_FREQ_BIN: usize = 16;
+/// Minimum frequency bin for FT8 search (0 = full passband coverage)
+const MIN_FREQ_BIN: usize = 0;
 
 /// Non-maximum suppression radius in time steps (scaled with TIME_OSR)
 const NMS_TIME_RADIUS: usize = 4 * TIME_OSR;
