@@ -30,6 +30,10 @@ struct Args {
     #[arg(long, default_value_t = 0.5)]
     power: f64,
 
+    /// Output audio device name (substring match, case-insensitive)
+    #[arg(long)]
+    device: Option<String>,
+
     /// Enable PTT via rigctld (localhost:4532)
     #[arg(long)]
     ptt: bool,
@@ -117,9 +121,36 @@ fn main() {
         }
     }
 
-    let device = host
-        .default_output_device()
-        .expect("No default output device");
+    // Select output device. With --device, search ALL devices (not just
+    // output_devices) because some USB audio codecs don't enumerate output
+    // configs via cpal but can still be force-opened with a known config.
+    // When multiple devices match (e.g. two "USB AUDIO CODEC" entries),
+    // prefer the one that is NOT an input-only device.
+    let device = if let Some(ref name) = args.device {
+        let name_lower = name.to_lowercase();
+        let mut matches: Vec<_> = host
+            .devices()
+            .expect("Failed to enumerate devices")
+            .filter(|d| {
+                d.name()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(&name_lower)
+            })
+            .collect();
+        if matches.is_empty() {
+            eprintln!("No device matching '{}'", name);
+            std::process::exit(1);
+        }
+        // Prefer the device with NO input configs (i.e., the output side)
+        matches.sort_by_key(|d| {
+            d.supported_input_configs().map(|c| c.count()).unwrap_or(0)
+        });
+        matches.remove(0)
+    } else {
+        host.default_output_device()
+            .expect("No default output device")
+    };
     let dev_name = device.name().unwrap_or_else(|_| "unknown".into());
     println!("\nUsing output: {}", dev_name);
 
