@@ -72,9 +72,29 @@ fn main() {
 
     println!("\n=== Results ===");
     println!("Samples: {} ({:.2}s stereo)", n, n as f64 / (48000.0 * 2.0));
-    println!("Non-zero: {} ({:.1}%)", nonzero, nonzero as f64 / n as f64 * 100.0);
-    println!("RMS: {:.6} ({:.1} dBFS)", rms, if rms > 0.0 { 20.0 * rms.log10() } else { -999.0 });
-    println!("Peak: {:.6} ({:.1} dBFS)", peak, if peak > 0.0 { 20.0 * peak.log10() } else { -999.0 });
+    println!(
+        "Non-zero: {} ({:.1}%)",
+        nonzero,
+        nonzero as f64 / n as f64 * 100.0
+    );
+    println!(
+        "RMS: {:.6} ({:.1} dBFS)",
+        rms,
+        if rms > 0.0 {
+            20.0 * rms.log10()
+        } else {
+            -999.0
+        }
+    );
+    println!(
+        "Peak: {:.6} ({:.1} dBFS)",
+        peak,
+        if peak > 0.0 {
+            20.0 * peak.log10()
+        } else {
+            -999.0
+        }
+    );
 
     // Per-channel
     let left: Vec<f32> = data.iter().step_by(2).copied().collect();

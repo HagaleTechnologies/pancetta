@@ -2861,6 +2861,7 @@ dependencies = [
  "atomic",
  "chrono",
  "clap",
+ "cpal",
  "criterion",
  "crossbeam-channel",
  "dirs",

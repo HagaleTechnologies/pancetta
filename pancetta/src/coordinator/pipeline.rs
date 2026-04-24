@@ -153,7 +153,11 @@ impl super::ApplicationCoordinator {
 
         info!(
             "Pipeline starting: ft8_lib={}, audio_device={}",
-            if pancetta_ft8::ft8lib_is_available() { "native-C" } else { "stub (pure-Rust only)" },
+            if pancetta_ft8::ft8lib_is_available() {
+                "native-C"
+            } else {
+                "stub (pure-Rust only)"
+            },
             if self.headless { "stub" } else { "real" },
         );
 
@@ -220,16 +224,27 @@ impl super::ApplicationCoordinator {
         .await?;
 
         // --- FT8 decoder component ---
-        self.start_ft8_pipeline(dsp_to_ft8_rx, ft8_to_tui_tx, waterfall_tx, health_total_decodes.clone())
-            .await?;
+        self.start_ft8_pipeline(
+            dsp_to_ft8_rx,
+            ft8_to_tui_tx,
+            waterfall_tx,
+            health_total_decodes.clone(),
+        )
+        .await?;
 
         // --- TUI component ---
         if !self.headless {
             self.start_tui_pipeline(
-                ft8_to_tui_rx, tui_bus_rx, waterfall_rx, audio_level_rx,
-                health_audio_alive.clone(), health_dsp_windows.clone(),
-                health_last_rms.clone(), health_total_decodes.clone(),
-            ).await?;
+                ft8_to_tui_rx,
+                tui_bus_rx,
+                waterfall_rx,
+                audio_level_rx,
+                health_audio_alive.clone(),
+                health_dsp_windows.clone(),
+                health_last_rms.clone(),
+                health_total_decodes.clone(),
+            )
+            .await?;
         } else {
             // In headless mode, drain decoded messages / waterfall and log health
             let shutdown = self.shutdown_signal.clone();
@@ -873,7 +888,8 @@ impl super::ApplicationCoordinator {
                             *timestamp = Some(Instant::now());
                         });
 
-                        health_total_decodes.fetch_add(decoded_messages.len() as u64, Ordering::Relaxed);
+                        health_total_decodes
+                            .fetch_add(decoded_messages.len() as u64, Ordering::Relaxed);
 
                         info!(
                             "FT8 decoder: {} messages decoded ({} ft8lib + native merge)",

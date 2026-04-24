@@ -192,10 +192,7 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
                     Style::default().fg(app.theme.success_color()),
                 )
             } else {
-                Span::styled(
-                    "DSP:0",
-                    Style::default().fg(app.theme.error_color()),
-                )
+                Span::styled("DSP:0", Style::default().fg(app.theme.error_color()))
             };
             let dec_label = if health.ft8lib_available {
                 "FT8"

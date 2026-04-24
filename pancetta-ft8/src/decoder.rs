@@ -2228,8 +2228,8 @@ fn par_decode_candidate(
     let tone_spacing = ctx.protocol_params.tone_spacing;
     let xor_sequence = ctx.xor_sequence;
     let spec_step = sps / TIME_OSR;
-    let coarse_offset = (candidate.time_step as isize - ctx.spectrogram.time_padding as isize)
-        * spec_step as isize;
+    let coarse_offset =
+        (candidate.time_step as isize - ctx.spectrogram.time_padding as isize) * spec_step as isize;
 
     // ---- Spectrogram-based symbol extraction: try both freq_sub values ----
     let freq_sub_trials = [
@@ -2403,8 +2403,8 @@ fn par_try_ap_decode(
     let tone_spacing = ctx.protocol_params.tone_spacing;
     let sps = ctx.protocol_params.samples_per_symbol(SAMPLE_RATE);
     let spec_step = sps / TIME_OSR;
-    let coarse_offset = (candidate.time_step as isize - ctx.spectrogram.time_padding as isize)
-        * spec_step as isize;
+    let coarse_offset =
+        (candidate.time_step as isize - ctx.spectrogram.time_padding as isize) * spec_step as isize;
 
     let freq_sub_trials = [
         candidate.freq_sub,

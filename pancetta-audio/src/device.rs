@@ -214,9 +214,7 @@ impl AudioDeviceManager {
         let candidate = self
             .devices
             .iter()
-            .filter(|(_, info)| {
-                info.supports_input && info.name.to_lowercase().contains(&pattern)
-            })
+            .filter(|(_, info)| info.supports_input && info.name.to_lowercase().contains(&pattern))
             .max_by_key(|(_, info)| info.input_channels.len() + info.input_sample_rates.len());
 
         match candidate {
@@ -242,9 +240,7 @@ impl AudioDeviceManager {
         let candidate = self
             .devices
             .iter()
-            .filter(|(_, info)| {
-                info.supports_output && info.name.to_lowercase().contains(&pattern)
-            })
+            .filter(|(_, info)| info.supports_output && info.name.to_lowercase().contains(&pattern))
             .max_by_key(|(_, info)| info.output_channels.len() + info.output_sample_rates.len());
 
         match candidate {

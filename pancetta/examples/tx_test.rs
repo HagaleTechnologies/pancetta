@@ -51,7 +51,10 @@ fn main() {
     println!("Message:     \"{}\"", args.message);
     println!("Freq offset: {} Hz", args.freq_offset);
     println!("Power:       {:.1}%", args.power * 100.0);
-    println!("PTT:         {}", if args.ptt { "ENABLED" } else { "disabled" });
+    println!(
+        "PTT:         {}",
+        if args.ptt { "ENABLED" } else { "disabled" }
+    );
     println!();
 
     // --- Encode ---
@@ -68,8 +71,8 @@ fn main() {
     // --- Modulate at 12 kHz ---
     // base_frequency is the center of our signal; frequency_offset is additional shift.
     // We put everything in base_frequency and use 0.0 offset.
-    let mut modulator =
-        Ft8Modulator::new(FT8_SAMPLE_RATE, args.freq_offset, args.power).expect("modulator creation");
+    let mut modulator = Ft8Modulator::new(FT8_SAMPLE_RATE, args.freq_offset, args.power)
+        .expect("modulator creation");
     let samples_12k = modulator
         .modulate_symbols(&symbols, 0.0)
         .expect("modulation");
@@ -143,9 +146,7 @@ fn main() {
             std::process::exit(1);
         }
         // Prefer the device with NO input configs (i.e., the output side)
-        matches.sort_by_key(|d| {
-            d.supported_input_configs().map(|c| c.count()).unwrap_or(0)
-        });
+        matches.sort_by_key(|d| d.supported_input_configs().map(|c| c.count()).unwrap_or(0));
         matches.remove(0)
     } else {
         host.default_output_device()
@@ -164,7 +165,11 @@ fn main() {
     if !args.immediate {
         let now = Utc::now();
         let secs_in_slot = now.timestamp() % 15;
-        let wait = if secs_in_slot == 0 { 0 } else { 15 - secs_in_slot };
+        let wait = if secs_in_slot == 0 {
+            0
+        } else {
+            15 - secs_in_slot
+        };
         if wait > 0 {
             println!(
                 "\nWaiting {}s for next FT8 slot (:{:02})...",
@@ -257,10 +262,8 @@ fn rigctld_ptt(on: bool) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpStream;
 
-    let mut stream = TcpStream::connect_timeout(
-        &"127.0.0.1:4532".parse().unwrap(),
-        Duration::from_secs(2),
-    )?;
+    let mut stream =
+        TcpStream::connect_timeout(&"127.0.0.1:4532".parse().unwrap(), Duration::from_secs(2))?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
 
