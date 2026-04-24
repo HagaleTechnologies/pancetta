@@ -179,10 +179,9 @@ impl AudioStreamManager {
         self.output_producer = Some(output_producer);
         self.output_consumer = Some(output_consumer);
 
-        // Create output stream if monitoring is enabled
-        if self.config.enable_monitoring {
-            self.create_output_stream()?;
-        }
+        // Always create output stream — needed for TX audio playback.
+        // When not transmitting, the callback simply outputs silence (zero-fill).
+        self.create_output_stream()?;
 
         // Start streams
         if let Some(ref stream) = self.input_stream {
