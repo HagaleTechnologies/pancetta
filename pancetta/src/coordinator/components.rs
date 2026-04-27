@@ -456,26 +456,16 @@ impl super::ApplicationCoordinator {
                     }
                 };
 
+                // FT8 transmissions start at slot+500ms (the 0.5s pre-roll
+                // convention). We engage PTT 200ms earlier so the relay is
+                // settled when audio begins. Require at least 1s of total
+                // lead so we have headroom for both.
+                const PTT_LEAD: chrono::Duration = chrono::Duration::milliseconds(200);
+                const MIN_LEAD: chrono::Duration = chrono::Duration::seconds(1);
+
                 while !shutdown.load(Ordering::Acquire) {
                     match tx_rx.try_recv() {
                         Ok(message) => {
-                            // Helper: wait for slot boundary, assert PTT, TX audio, de-assert PTT.
-                            let wait_for_slot = || {
-                                use std::time::{SystemTime, UNIX_EPOCH};
-                                let now = SystemTime::now()
-                                    .duration_since(UNIX_EPOCH)
-                                    .unwrap_or_default();
-                                let secs = now.as_secs();
-                                let slot_pos = secs % 15;
-                                let wait_secs = if slot_pos == 0 { 0 } else { 15 - slot_pos };
-                                let sub_ms = now.subsec_millis() as u64;
-                                let wait_ms = wait_secs
-                                    .saturating_mul(1000)
-                                    .saturating_add(1000u64.saturating_sub(sub_ms))
-                                    .saturating_sub(200); // 200ms guard for PTT latency
-                                Duration::from_millis(wait_ms.min(15000))
-                            };
-
                             match message.message_type {
                                 MessageType::TransmitRequest {
                                     message_text,
@@ -487,18 +477,61 @@ impl super::ApplicationCoordinator {
                                         message_text, frequency_offset, qso_id
                                     );
 
-                                    // --- Step 1: Wait for next FT8 slot boundary ---
-                                    let slot_wait = wait_for_slot();
+                                    // --- Step 1: Encode + modulate up front ---
+                                    // Do this BEFORE any timing-critical work so encoding
+                                    // latency can't push us past the slot boundary.
+                                    let (samples, duration_ms) = match encoder
+                                        .encode_message(&message_text, None)
+                                        .and_then(|symbols| {
+                                            modulator.modulate_symbols(&symbols, frequency_offset)
+                                        }) {
+                                        Ok(s) => {
+                                            let dur = (s.len() as f64 / 12000.0 * 1000.0) as u64;
+                                            info!(
+                                                "TX: '{}' -> {} samples ({:.2}s)",
+                                                message_text,
+                                                s.len(),
+                                                dur as f64 / 1000.0
+                                            );
+                                            (s, dur)
+                                        }
+                                        Err(e) => {
+                                            warn!("Encode/modulate failed for '{}': {}", message_text, e);
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text,
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                            continue;
+                                        }
+                                    };
 
-                                    if slot_wait.as_millis() > 100 {
-                                        info!(
-                                            "Waiting {:.1}s for next TX slot boundary",
-                                            slot_wait.as_secs_f64()
+                                    // --- Step 2: Compute precise FT8 audio-start time ---
+                                    let target_audio_utc =
+                                        pancetta_core::slot::next_audio_start(
+                                            chrono::Utc::now(),
+                                            MIN_LEAD,
                                         );
-                                        sleep(slot_wait).await;
-                                    }
+                                    info!(
+                                        "TX scheduled: audio at {} (PTT 200ms earlier)",
+                                        target_audio_utc.format("%H:%M:%S%.3f UTC")
+                                    );
 
-                                    // --- Step 2: Assert PTT ---
+                                    // --- Step 3: Sleep until PTT engage instant (audio - 200ms) ---
+                                    let ptt_target_utc = target_audio_utc - PTT_LEAD;
+                                    let to_ptt = pancetta_core::slot::duration_until(
+                                        ptt_target_utc,
+                                        chrono::Utc::now(),
+                                    );
+                                    sleep(to_ptt).await;
+
+                                    // --- Step 4: Assert PTT ---
                                     let mut ptt_guard = PttGuard::new(message_bus.clone());
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
@@ -513,61 +546,33 @@ impl super::ApplicationCoordinator {
                                     if let Err(e) = message_bus.send_message(ptt_msg).await {
                                         debug!("PTT on failed (no rig?): {}", e);
                                     }
-                                    sleep(Duration::from_millis(50)).await;
 
-                                    // --- Step 3: Encode and modulate ---
-                                    let encode_result = encoder.encode_message(&message_text, None);
-                                    let (success, duration_ms) = match encode_result {
-                                        Ok(symbols) => {
-                                            match modulator
-                                                .modulate_symbols(&symbols, frequency_offset)
-                                            {
-                                                Ok(samples) => {
-                                                    let duration = (samples.len() as f64 / 12000.0
-                                                        * 1000.0)
-                                                        as u64;
-                                                    info!(
-                                                        "TX: '{}' -> {} samples ({:.1}s)",
-                                                        message_text,
-                                                        samples.len(),
-                                                        duration as f64 / 1000.0
-                                                    );
+                                    // --- Step 5: Sleep precisely until audio-start instant ---
+                                    let to_audio = pancetta_core::slot::duration_until(
+                                        target_audio_utc,
+                                        chrono::Utc::now(),
+                                    );
+                                    sleep(to_audio).await;
 
-                                                    // --- Step 4: Route audio to output ---
-                                                    let audio_msg = ComponentMessage::new(
-                                                        ComponentId::Ft8Transmitter,
-                                                        ComponentId::Audio,
-                                                        MessageType::AudioOutput {
-                                                            samples: samples.clone(),
-                                                            sample_rate: 12000,
-                                                        },
-                                                        Instant::now(),
-                                                    );
-                                                    if let Err(e) =
-                                                        message_bus.send_message(audio_msg).await
-                                                    {
-                                                        debug!("Audio output routing: {}", e);
-                                                    }
+                                    // --- Step 6: Route audio to output ---
+                                    let audio_msg = ComponentMessage::new(
+                                        ComponentId::Ft8Transmitter,
+                                        ComponentId::Audio,
+                                        MessageType::AudioOutput {
+                                            samples,
+                                            sample_rate: 12000,
+                                        },
+                                        Instant::now(),
+                                    );
+                                    if let Err(e) = message_bus.send_message(audio_msg).await {
+                                        debug!("Audio output routing: {}", e);
+                                    }
 
-                                                    sleep(Duration::from_millis(duration)).await;
-                                                    (true, duration)
-                                                }
-                                                Err(e) => {
-                                                    warn!(
-                                                        "Modulation failed for '{}': {}",
-                                                        message_text, e
-                                                    );
-                                                    (false, 0)
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            warn!("Encoding failed for '{}': {}", message_text, e);
-                                            (false, 0)
-                                        }
-                                    };
+                                    // --- Step 7: Wait for audio playback to complete ---
+                                    sleep(Duration::from_millis(duration_ms)).await;
+                                    let success = true;
 
-                                    // --- Step 5: De-assert PTT (with tail delay for relay settling) ---
+                                    // --- Step 8: De-assert PTT (with tail delay) ---
                                     sleep(Duration::from_millis(50)).await;
                                     let ptt_off_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
@@ -603,15 +608,24 @@ impl super::ApplicationCoordinator {
                                 MessageType::MultiTransmitRequest { items } => {
                                     info!("Multi-TX request: {} messages", items.len());
 
-                                    // --- Step 1: Wait for slot boundary ---
-                                    let slot_wait = wait_for_slot();
-                                    if slot_wait.as_millis() > 100 {
-                                        info!(
-                                            "Waiting {:.1}s for next TX slot boundary",
-                                            slot_wait.as_secs_f64()
+                                    // --- Step 1: Compute precise FT8 audio-start time ---
+                                    let target_audio_utc =
+                                        pancetta_core::slot::next_audio_start(
+                                            chrono::Utc::now(),
+                                            MIN_LEAD,
                                         );
-                                        sleep(slot_wait).await;
-                                    }
+                                    info!(
+                                        "Multi-TX scheduled: audio at {} (PTT 200ms earlier)",
+                                        target_audio_utc.format("%H:%M:%S%.3f UTC")
+                                    );
+
+                                    // --- Step 1a: Sleep until PTT engage instant (audio - 200ms) ---
+                                    let ptt_target_utc = target_audio_utc - PTT_LEAD;
+                                    let to_ptt = pancetta_core::slot::duration_until(
+                                        ptt_target_utc,
+                                        chrono::Utc::now(),
+                                    );
+                                    sleep(to_ptt).await;
 
                                     // --- Step 2: Assert PTT ---
                                     let mut ptt_guard = PttGuard::new(message_bus.clone());
@@ -628,7 +642,13 @@ impl super::ApplicationCoordinator {
                                     if let Err(e) = message_bus.send_message(ptt_msg).await {
                                         debug!("PTT on failed (no rig?): {}", e);
                                     }
-                                    sleep(Duration::from_millis(50)).await;
+
+                                    // --- Step 2a: Sleep precisely until audio-start instant ---
+                                    let to_audio = pancetta_core::slot::duration_until(
+                                        target_audio_utc,
+                                        chrono::Utc::now(),
+                                    );
+                                    sleep(to_audio).await;
 
                                     // --- Step 3: Encode each message, build multi-TX items ---
                                     let ft8_params = pancetta_ft8::ProtocolParams::ft8();

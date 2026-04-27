@@ -108,9 +108,16 @@ impl WorkedStationLookup for NullLookup {
 }
 
 /// Detect POTA/SOTA activators from callsign patterns.
+///
+/// POTA (Parks on the Air) stations use the `/P` portable suffix.
+/// SOTA (Summits on the Air) stations use the `/S` portable suffix.
+/// `/QRP` indicates low-power operation only — not a portable activation.
+///
+/// Only suffix-style indicators count; operating-area prefixes like
+/// `VE3/W1ABC` are not POTA/SOTA activations.
 pub fn is_pota_sota_candidate(callsign: &str) -> bool {
     let upper = callsign.to_uppercase();
-    upper.ends_with("/P") || upper.ends_with("/QRP")
+    upper.ends_with("/P") || upper.ends_with("/S")
 }
 
 /// Normalize SNR from typical FT8 range (-24 to +10) to 0.0–1.0.
@@ -273,17 +280,29 @@ mod tests {
 
     #[test]
     fn test_pota_sota_detection() {
-        // Portable suffixes — should match
+        // POTA portable suffix — should match
         assert!(is_pota_sota_candidate("W1ABC/P"));
-        assert!(is_pota_sota_candidate("K2DEF/QRP"));
+        assert!(is_pota_sota_candidate("K5ARH/P"));
         assert!(is_pota_sota_candidate("w1abc/p")); // case insensitive
 
-        // Prefix-style calls — should NOT match
+        // SOTA portable suffix — should match
+        assert!(is_pota_sota_candidate("W1ABC/S"));
+        assert!(is_pota_sota_candidate("K5ARH/S"));
+
+        // /QRP is low-power only — NOT a POTA/SOTA indicator
+        assert!(!is_pota_sota_candidate("K5ARH/QRP"));
+        assert!(!is_pota_sota_candidate("K2DEF/QRP"));
+
+        // Prefix-style calls — should NOT match (operating-area prefix, not POTA)
         assert!(!is_pota_sota_candidate("VE3/W1ABC")); // operating from VE3
         assert!(!is_pota_sota_candidate("DL/K5ARH")); // operating from Germany
         assert!(!is_pota_sota_candidate("F/W1ABC")); // operating from France
 
-        // Other suffixes — should NOT match
+        // Callsigns with 'P' or 'S' embedded — should NOT match (not a /P or /S suffix)
+        assert!(!is_pota_sota_candidate("PP5XX")); // 'P' is part of prefix, not a /P suffix
+        assert!(!is_pota_sota_candidate("PS7AB")); // 'S' is part of prefix, not a /S suffix
+
+        // Other portable/mobile suffixes — should NOT match
         assert!(!is_pota_sota_candidate("W1ABC/M")); // mobile
         assert!(!is_pota_sota_candidate("W1ABC/MM")); // maritime mobile
         assert!(!is_pota_sota_candidate("W1ABC/LGT")); // lighthouse
@@ -358,11 +377,25 @@ mod tests {
     fn test_pota_sota_callsign_boosts_score() {
         let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(NullLookup));
         let score_regular = scorer.evaluate_cq("W1ABC", Some("FN42"), -10, 14074000.0);
-        let score_portable = scorer.evaluate_cq("W1ABC/P", Some("FN42"), -10, 14074000.0);
+        let score_pota = scorer.evaluate_cq("W1ABC/P", Some("FN42"), -10, 14074000.0);
+        let score_sota = scorer.evaluate_cq("W1ABC/S", Some("FN42"), -10, 14074000.0);
+        let score_qrp = scorer.evaluate_cq("W1ABC/QRP", Some("FN42"), -10, 14074000.0);
         assert!(
-            score_portable > score_regular,
-            "POTA/SOTA portable should boost score: {} vs {}",
-            score_portable,
+            score_pota > score_regular,
+            "POTA /P suffix should boost score: {} vs {}",
+            score_pota,
+            score_regular
+        );
+        assert!(
+            score_sota > score_regular,
+            "SOTA /S suffix should boost score: {} vs {}",
+            score_sota,
+            score_regular
+        );
+        assert_eq!(
+            score_qrp, score_regular,
+            "/QRP should not boost score (low-power, not POTA/SOTA): {} vs {}",
+            score_qrp,
             score_regular
         );
     }
