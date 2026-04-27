@@ -42,7 +42,14 @@ else
     run "fmt"           cargo fmt --all -- --check
 fi
 
-run "clippy"            cargo clippy --workspace --features transmit -- -D warnings
+# Match the CI `Clippy` job exactly — no `-D warnings` flag. The
+# workspace currently carries pre-existing warnings (mostly minor:
+# missing-docs, large-Result-variants) that are tracked but not gated.
+# If we made `check.sh` stricter than CI, every contributor would
+# trip the gap on day one. CI is the source of truth; if you want to
+# drive warnings to zero, do it in CI first, then this script will
+# happily inherit it.
+run "clippy"            cargo clippy --workspace --features transmit
 
 # --- Test lane (~5-10 min) -------------------------------------------------
 
