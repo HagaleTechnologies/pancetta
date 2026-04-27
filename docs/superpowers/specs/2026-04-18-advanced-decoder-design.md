@@ -31,7 +31,7 @@ Five AP levels, run in order. Each level injects progressively more known bits i
 | Level | Known Bits | What's Injected | When | Sensitivity Gain |
 |-------|-----------|-----------------|------|-----------------|
 | AP0 | 0 | Nothing (standard decode) | Always | Baseline |
-| AP1 | 28 | Your callsign (K5ARH) | Always | +2-3 dB |
+| AP1 | 28 | Your callsign (K1ABC) | Always | +2-3 dB |
 | AP2 | 28 | Each recent callsign (excluding already-decoded) | Always | +2-3 dB per call |
 | AP3 | 56 | Both callsigns (you + QSO partner) | Active QSO | +3-4 dB |
 | AP4 | 65+ | Both calls + expected message type | Late QSO (expecting RR73/73) | +4+ dB |
@@ -344,8 +344,8 @@ This 3× subtraction cleans up spectral leakage that masks weak signals at adjac
 
 ### New Tests
 
-- `test_ap1_decode_at_minus_22db`: Encode "CQ K5ARH FN42" at -22 dB, verify AP1 decodes it
-- `test_ap3_decode_at_minus_26db`: Encode "W1ABC K5ARH -18" at -26 dB with both calls known, verify AP3 decodes
+- `test_ap1_decode_at_minus_22db`: Encode "CQ K1ABC FN42" at -22 dB, verify AP1 decodes it
+- `test_ap3_decode_at_minus_26db`: Encode "W1ABC K1ABC -18" at -26 dB with both calls known, verify AP3 decodes
 - `test_parallel_matches_serial`: Same input, same results regardless of parallelism mode
 - `test_budget_cutoff`: Force 100ms budget, verify partial results returned without panic
 - `test_sidelobe_subtraction`: Encode two signals 50 Hz apart, verify both decoded in multi-pass

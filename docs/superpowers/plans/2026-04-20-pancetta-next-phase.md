@@ -301,7 +301,7 @@ Based on Step 2, implement whichever levels are missing. The advanced decoder sp
 | Level | Known Bits | Injected | When |
 |-------|-----------|----------|------|
 | AP0 | 0 | Nothing | Always |
-| AP1 | 28 | Your callsign (K5ARH) | Always |
+| AP1 | 28 | Your callsign (K1ABC) | Always |
 | AP2 | 28 | Each recent callsign | Always |
 | AP3 | 56 | Both callsigns | Active QSO |
 | AP4 | 65+ | Both calls + message type | Late QSO |
@@ -315,10 +315,10 @@ Test AP1 with the user's callsign on a weak signal:
 ```rust
 #[test]
 fn test_ap1_decodes_with_own_callsign() {
-    // Generate a weak signal calling K5ARH, verify AP1 decodes it
+    // Generate a weak signal calling K1ABC, verify AP1 decodes it
     // where AP0 alone would fail
     let ap_context = ApContext {
-        my_call: Some(MyCallAp::new("K5ARH")),
+        my_call: Some(MyCallAp::new("K1ABC")),
         recent_calls: vec![],
         active_qso: None,
     };
@@ -591,7 +591,7 @@ Skip if already completed.
 
 - [ ] **Step 2: Fix POTA/SOTA false positives**
 
-Read `pancetta-qso/src/priority.rs` to find the POTA/SOTA detection logic. The issue is prefix vs. suffix detection — callsigns like "K5ARH/P" should match POTA, but prefix-based matching can false-positive on unrelated suffixes.
+Read `pancetta-qso/src/priority.rs` to find the POTA/SOTA detection logic. The issue is prefix vs. suffix detection — callsigns like "K1ABC/P" should match POTA, but prefix-based matching can false-positive on unrelated suffixes.
 
 Fix: require the POTA indicator to be a suffix (after `/`), not a prefix.
 

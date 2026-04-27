@@ -129,34 +129,12 @@ impl From<std::str::Utf8Error> for PancettaError {
 /// Convenience Result type using PancettaError
 pub type PancettaResult<T> = Result<T, PancettaError>;
 
-/// Helper trait for converting errors with context
-pub trait ErrorContext<T> {
-    /// Add context to an error
-    fn context<S: Into<String>>(self, msg: S) -> PancettaResult<T>;
-
-    /// Add context using a closure (lazy evaluation)
-    fn with_context<F, S>(self, f: F) -> PancettaResult<T>
-    where
-        F: FnOnce() -> S,
-        S: Into<String>;
-}
-
-impl<T, E> ErrorContext<T> for Result<T, E>
-where
-    E: Error + 'static,
-{
-    fn context<S: Into<String>>(self, msg: S) -> PancettaResult<T> {
-        self.map_err(|e| PancettaError::Other(format!("{}: {}", msg.into(), e)))
-    }
-
-    fn with_context<F, S>(self, f: F) -> PancettaResult<T>
-    where
-        F: FnOnce() -> S,
-        S: Into<String>,
-    {
-        self.map_err(|e| PancettaError::Other(format!("{}: {}", f().into(), e)))
-    }
-}
+// `ErrorContext` was previously defined here as a parallel context-adding
+// trait alongside `ResultExt` in pancetta-core/src/error.rs. The OSS audit
+// flagged the duplication and the trait had no external callers (only the
+// re-export from lib.rs), so it has been removed in favour of `ResultExt`,
+// which carries structured (component, operation) context all the way
+// through PancettaError::source instead of flattening to PancettaError::Other.
 
 #[cfg(test)]
 mod tests {
@@ -175,14 +153,8 @@ mod tests {
         assert!(matches!(pancetta_err, PancettaError::Io(_)));
     }
 
-    #[test]
-    fn test_error_context() {
-        let result: Result<i32, io::Error> = Err(io::Error::new(io::ErrorKind::NotFound, "test"));
-        let with_context = result.context("Failed to read file");
-        assert!(with_context.is_err());
-        assert!(with_context
-            .unwrap_err()
-            .to_string()
-            .contains("Failed to read file"));
-    }
+    // The `test_error_context` test that lived here exercised a now-removed
+    // `ErrorContext` trait that duplicated `crate::error::ResultExt`. The
+    // canonical context-adding API is in pancetta-core/src/error.rs and is
+    // covered by tests there.
 }

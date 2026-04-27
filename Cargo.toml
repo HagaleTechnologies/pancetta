@@ -132,7 +132,9 @@ debug-assertions = false
 # Fast compilation for development
 opt-level = 1
 debug = true
-panic = "abort"
+# panic = "unwind" so backtraces and panic catching work during testing —
+# release keeps "abort" for binary size and predictable failure semantics.
+panic = "unwind"
 
 [profile.dev.package.pancetta-ft8]
 opt-level = 3

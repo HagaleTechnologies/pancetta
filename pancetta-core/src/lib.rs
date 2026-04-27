@@ -31,12 +31,9 @@ pub use types::{Band, Mode, ModeValue, PancettaError, PancettaResult, StandardMo
 
 // Re-export error handling types
 pub use error::{
-    ComponentError, ErrorBuilder, ErrorContext as NewErrorContext, ErrorRecovery, ErrorSeverity,
+    ComponentError, ErrorBuilder, ErrorContext, ErrorRecovery, ErrorSeverity,
     PancettaError as UnifiedError, PancettaResult as UnifiedResult, ResultExt, RetryDelay,
 };
-
-// Re-export error context trait
-pub use types::error::ErrorContext;
 
 // Version information
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

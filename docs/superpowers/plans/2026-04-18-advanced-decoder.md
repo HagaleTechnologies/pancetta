@@ -249,8 +249,8 @@ mod tests {
 
     #[test]
     fn test_my_call_ap_creation() {
-        let ap = MyCallAp::new("K5ARH").unwrap();
-        assert_eq!(ap.callsign, "K5ARH");
+        let ap = MyCallAp::new("K1ABC").unwrap();
+        assert_eq!(ap.callsign, "K1ABC");
         assert_eq!(ap.bits.len(), 28);
         // Verify round-trip: bits back to packed value
         let mut repacked = 0u32;
@@ -264,7 +264,7 @@ mod tests {
     fn test_inject_ap1() {
         let mut llrs = vec![0.0f32; 174];
         let ctx = ApContext {
-            my_call: MyCallAp::new("K5ARH"),
+            my_call: MyCallAp::new("K1ABC"),
             ..Default::default()
         };
         inject_ap_llrs(&mut llrs, ApLevel::Ap1, &ctx);
@@ -280,7 +280,7 @@ mod tests {
     fn test_inject_ap3() {
         let mut llrs = vec![0.0f32; 174];
         let ctx = ApContext {
-            my_call: MyCallAp::new("K5ARH"),
+            my_call: MyCallAp::new("K1ABC"),
             active_qso: QsoAp::new("W1ABC", QsoApProgress::WaitingForReport),
             ..Default::default()
         };
@@ -509,8 +509,8 @@ fn test_ap1_decode_at_minus_22db() {
     let mut encoder = Ft8Encoder::new();
     let mut modulator = Ft8Modulator::new_default().unwrap();
 
-    // Encode "W1ABC K5ARH FN42" — a message TO our callsign
-    let text = "W1ABC K5ARH FN42";
+    // Encode "W1ABC K1ABC FN42" — a message TO our callsign
+    let text = "W1ABC K1ABC FN42";
     let symbols = encoder.encode_message(text, None).unwrap();
     let mut audio = modulator.modulate_symbols(&symbols, 1000.0).unwrap();
     audio.resize(WINDOW_SAMPLES, 0.0);
@@ -535,7 +535,7 @@ fn test_ap1_decode_at_minus_22db() {
 
     // AP1 decode (with our callsign) should succeed
     let ap_context = ApContext {
-        my_call: MyCallAp::new("K5ARH"),
+        my_call: MyCallAp::new("K1ABC"),
         ..Default::default()
     };
     let mut decoder2 = Ft8Decoder::new(Ft8Config::default()).unwrap();
