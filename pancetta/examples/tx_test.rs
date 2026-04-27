@@ -217,25 +217,51 @@ fn main() {
         buffer_size: cpal::BufferSize::Default,
     };
 
-    // --- Wait for FT8 slot boundary ---
-    if !args.immediate {
-        let now = Utc::now();
-        let secs_in_slot = now.timestamp() % 15;
-        let wait = if secs_in_slot == 0 {
-            0
-        } else {
-            15 - secs_in_slot
-        };
-        if wait > 0 {
-            println!(
-                "\nWaiting {}s for next FT8 slot (:{:02})...",
-                wait,
-                (now.timestamp() + wait) % 60
-            );
-            std::thread::sleep(Duration::from_secs(wait as u64));
-        }
-        println!("Slot started at {}", Utc::now().format("%H:%M:%S UTC"));
-    }
+    // --- Build the output stream NOW (before slot wait) ---
+    // Stream construction is non-trivial; doing it early keeps it out of the
+    // timing-critical path. cpal's CoreAudio backend invokes the callback
+    // even before .play(), so we gate sample emission with a `started` flag:
+    // the callback writes silence (and does NOT advance the cursor) until
+    // we flip the flag at the precise audio-start instant.
+    let samples = Arc::new(samples_48k);
+    let cursor = Arc::new(Mutex::new(0usize));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let started = Arc::new(AtomicBool::new(false));
+
+    let samples_cb = samples.clone();
+    let cursor_cb = cursor.clone();
+    let done_cb = done.clone();
+    let started_cb = started.clone();
+
+    let stream = device
+        .build_output_stream(
+            &stream_config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                if !started_cb.load(Ordering::Relaxed) {
+                    for sample in data.iter_mut() {
+                        *sample = 0.0;
+                    }
+                    return;
+                }
+                let mut pos = cursor_cb.lock().unwrap();
+                for sample in data.iter_mut() {
+                    if *pos < samples_cb.len() {
+                        *sample = samples_cb[*pos];
+                        *pos += 1;
+                    } else {
+                        *sample = 0.0;
+                        done_cb.store(true, Ordering::Relaxed);
+                    }
+                }
+            },
+            |err| eprintln!("Output stream error: {}", err),
+            None,
+        )
+        .expect("Failed to build output stream");
+
+    // Start the stream immediately so CoreAudio's IO unit is running; the
+    // callback emits silence until we flip `started`.
+    stream.play().expect("Failed to start playback");
 
     // --- Signal handler: release PTT on Ctrl-C / SIGTERM ---
     // Set up BEFORE engaging PTT so a kill between here and `engage()`
@@ -248,10 +274,61 @@ fn main() {
             .expect("register SIGTERM");
     }
 
-    // --- PTT ON (RAII-guarded, with watchdog) ---
-    let ptt_start = std::time::Instant::now();
+    // --- Compute precise FT8 timing ---
+    // FT8 convention: a transmission's audio begins 0.5s into a 15s slot and
+    // runs for 12.64s. We aim for the receiver to see DT≈0, so we need to:
+    //   1) align to the slot boundary with sub-second precision
+    //   2) engage PTT a couple hundred ms early so the relay is settled when
+    //      audio starts (instead of clipping the leading sync symbols)
+    //   3) call stream.play() at exactly slot+500ms
+    const PRE_ROLL_NS: i64 = 500_000_000; // FT8 leading silence
+    const PTT_LEAD_NS: i64 = 200_000_000; // engage PTT this much before audio
+    const SLOT_NS: i64 = 15_000_000_000;
+    const MIN_LEAD_NS: i64 = 1_000_000_000; // require at least 1s of headroom
+
+    let (target_audio_start, target_ptt_engage) = if args.immediate {
+        let now = std::time::Instant::now();
+        (now, now)
+    } else {
+        let now_utc_ns = Utc::now()
+            .timestamp_nanos_opt()
+            .expect("system clock out of i64 ns range");
+        let mut target_slot_ns = ((now_utc_ns / SLOT_NS) + 1) * SLOT_NS;
+        while target_slot_ns - now_utc_ns < MIN_LEAD_NS {
+            target_slot_ns += SLOT_NS;
+        }
+        let target_audio_ns = target_slot_ns + PRE_ROLL_NS;
+        let target_ptt_ns = target_audio_ns - PTT_LEAD_NS;
+
+        let now_inst = std::time::Instant::now();
+        let audio_in = Duration::from_nanos((target_audio_ns - now_utc_ns) as u64);
+        let ptt_in = Duration::from_nanos((target_ptt_ns - now_utc_ns) as u64);
+
+        let target_slot_secs = target_slot_ns / 1_000_000_000;
+        println!(
+            "\nWaiting for FT8 slot at :{:02} ({}s lead) — audio starts at slot+0.5s",
+            target_slot_secs % 60,
+            (target_audio_ns - now_utc_ns) / 1_000_000_000
+        );
+        (now_inst + audio_in, now_inst + ptt_in)
+    };
+
+    // --- PTT ON (slightly before audio start, for relay settle) ---
+    // ptt_start MUST be measured at the actual PTT engage time, not before
+    // the slot-wait sleep — otherwise the soft-cap check downstream sees an
+    // inflated elapsed time and cuts playback mid-transmission.
+    let ptt_start;
     let _ptt_guard = if args.ptt {
-        println!("PTT ON (watchdog: {:.1}s)", args.max_tx_secs);
+        let now = std::time::Instant::now();
+        if target_ptt_engage > now {
+            std::thread::sleep(target_ptt_engage - now);
+        }
+        ptt_start = std::time::Instant::now();
+        println!(
+            "PTT ON  at {}  (watchdog: {:.1}s)",
+            Utc::now().format("%H:%M:%S%.3f UTC"),
+            args.max_tx_secs
+        );
         match PttGuard::engage(args.max_tx_secs) {
             Ok(g) => Some(g),
             Err(e) => {
@@ -260,44 +337,22 @@ fn main() {
             }
         }
     } else {
+        ptt_start = std::time::Instant::now();
         None
     };
-    if args.ptt {
-        // TX settle delay
-        std::thread::sleep(Duration::from_millis(100));
+
+    // --- Sleep precisely until target audio start, then unmute the stream ---
+    let now = std::time::Instant::now();
+    if target_audio_start > now {
+        std::thread::sleep(target_audio_start - now);
     }
-
-    // --- Play audio ---
-    let samples = Arc::new(samples_48k);
-    let cursor = Arc::new(Mutex::new(0usize));
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    let samples_cb = samples.clone();
-    let cursor_cb = cursor.clone();
-    let done_cb = done.clone();
-
-    let stream = device
-        .build_output_stream(
-            &stream_config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let mut pos = cursor_cb.lock().unwrap();
-                for sample in data.iter_mut() {
-                    if *pos < samples_cb.len() {
-                        *sample = samples_cb[*pos];
-                        *pos += 1;
-                    } else {
-                        *sample = 0.0;
-                        done_cb.store(true, std::sync::atomic::Ordering::Relaxed);
-                    }
-                }
-            },
-            |err| eprintln!("Output stream error: {}", err),
-            None,
-        )
-        .expect("Failed to build output stream");
-
-    stream.play().expect("Failed to start playback");
-    println!("Playing audio...");
+    started.store(true, Ordering::Release);
+    println!(
+        "Audio  at {}  ({} samples, {:.2}s)",
+        Utc::now().format("%H:%M:%S%.3f UTC"),
+        samples.len(),
+        duration_secs
+    );
 
     // Wait for playback to complete (with a small margin) OR a termination
     // signal OR the soft TX-time cap. On any of those, we abort the stream
