@@ -173,8 +173,15 @@ pub struct QrzConfig {
     /// QRZ.com username
     pub username: Option<String>,
 
-    /// QRZ.com password (encrypted)
-    pub password_encrypted: Option<String>,
+    /// QRZ.com password.
+    ///
+    /// **WARNING: stored as plaintext on disk.** Despite the historical
+    /// "encrypted" naming, no encryption layer has ever been implemented.
+    /// Treat the config file as you would `~/.netrc`: chmod 600, do not
+    /// commit, do not share. A future release may add OS-keyring lookup;
+    /// until then, a missing/empty value is preferable to a real one for
+    /// most users. See SECURITY.md.
+    pub password: Option<String>,
 
     /// QRZ.com XML API key
     pub api_key: Option<String>,
@@ -274,8 +281,8 @@ pub struct LotwConfig {
     /// LOTW username
     pub username: Option<String>,
 
-    /// LOTW password (encrypted)
-    pub password_encrypted: Option<String>,
+    /// LOTW password (plaintext on disk — see SECURITY.md).
+    pub password: Option<String>,
 
     /// Certificate settings
     pub certificate: LotwCertificateConfig,
@@ -299,8 +306,8 @@ pub struct LotwCertificateConfig {
     /// Private key file path
     pub key_file: Option<String>,
 
-    /// Certificate password (encrypted)
-    pub password_encrypted: Option<String>,
+    /// Certificate password (plaintext on disk — see SECURITY.md).
+    pub password: Option<String>,
 
     /// Auto-renewal settings
     pub auto_renewal: CertRenewalConfig,
@@ -406,8 +413,8 @@ pub struct EqslConfig {
     /// eQSL username
     pub username: Option<String>,
 
-    /// eQSL password (encrypted)
-    pub password_encrypted: Option<String>,
+    /// eQSL password (plaintext on disk — see SECURITY.md).
+    pub password: Option<String>,
 
     /// eQSL API endpoint
     pub api_endpoint: String,
@@ -537,8 +544,8 @@ pub struct ClublogConfig {
     /// Clublog email
     pub email: Option<String>,
 
-    /// Clublog password (encrypted)
-    pub password_encrypted: Option<String>,
+    /// Clublog password (plaintext on disk — see SECURITY.md).
+    pub password: Option<String>,
 
     /// Clublog API key
     pub api_key: Option<String>,
@@ -1036,8 +1043,8 @@ pub struct ProxyAuth {
     /// Username
     pub username: String,
 
-    /// Password (encrypted)
-    pub password_encrypted: String,
+    /// Proxy password (plaintext on disk — see SECURITY.md).
+    pub password: String,
 }
 
 /// TLS/SSL configuration
@@ -1078,8 +1085,8 @@ pub struct ClientCertConfig {
     /// Private key file path
     pub key_file: String,
 
-    /// Key password (encrypted)
-    pub key_password_encrypted: Option<String>,
+    /// Private key password (plaintext on disk — see SECURITY.md).
+    pub key_password: Option<String>,
 }
 
 /// Rate limiting configuration
@@ -1294,7 +1301,7 @@ impl Default for QrzConfig {
         Self {
             enabled: false,
             username: None,
-            password_encrypted: None,
+            password: None,
             api_key: None,
             api_endpoint: "https://xmldata.qrz.com/xml/current/".to_string(),
             session: QrzSessionConfig::default(),
@@ -1407,7 +1414,7 @@ impl Default for EqslConfig {
         Self {
             enabled: false,
             username: None,
-            password_encrypted: None,
+            password: None,
             api_endpoint: "https://www.eqsl.cc/qslcard/ImportADIF.cfm".to_string(),
             upload: EqslUploadConfig::default(),
             download: EqslDownloadConfig::default(),
@@ -1477,7 +1484,7 @@ impl Default for ClublogConfig {
         Self {
             enabled: false,
             email: None,
-            password_encrypted: None,
+            password: None,
             api_key: None,
             api_endpoint: "https://clublog.org/realtime.php".to_string(),
             upload: ClublogUploadConfig::default(),
