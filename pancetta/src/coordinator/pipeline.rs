@@ -391,21 +391,68 @@ impl super::ApplicationCoordinator {
             // Audio thread sends samples via a tokio mpsc to an async relay
             let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(100);
 
+            // Audio runs on a dedicated std::thread (not tokio), but failures
+            // need to surface to the operator via the TUI — silent log-only
+            // failures were the root cause of "no decodes over SSH/tmux"
+            // type reports. Capture the bus + runtime handle so the audio
+            // thread can dispatch async sends without owning a runtime.
+            let audio_bus = self.message_bus.clone();
+            let runtime_handle = tokio::runtime::Handle::current();
+
             std::thread::spawn(move || {
+                let report_audio_error = {
+                    let bus = audio_bus.clone();
+                    let rt = runtime_handle.clone();
+                    move |msg: String| {
+                        let bus = bus.clone();
+                        rt.spawn(async move {
+                            let err_msg = ComponentMessage::new(
+                                ComponentId::Audio,
+                                ComponentId::Tui,
+                                MessageType::Error {
+                                    component_id: ComponentId::Audio,
+                                    error_message: msg,
+                                    error_code: None,
+                                },
+                                Instant::now(),
+                            );
+                            let _ = bus.send_message(err_msg).await;
+                        });
+                    }
+                };
+
                 let mut audio_manager = match AudioManager::with_config(audio_config) {
                     Ok(manager) => manager,
                     Err(e) => {
-                        error!("Failed to create AudioManager: {}", e);
+                        let msg = format!("Audio init failed: {}", e);
+                        error!("{}", msg);
+                        report_audio_error(msg);
                         return;
                     }
                 };
 
                 if let Err(e) = audio_manager.start() {
-                    error!("Failed to start audio stream: {}", e);
+                    let msg = format!("Audio stream start failed: {}", e);
+                    error!("{}", msg);
+                    report_audio_error(msg);
                     return;
                 }
 
                 info!("AudioManager started in dedicated thread");
+
+                // Rate-limit recurring runtime errors so a wedged device
+                // doesn't flood the TUI status with hundreds of identical
+                // messages per second. Init errors above are unconditional
+                // because they happen once.
+                let mut last_runtime_report =
+                    std::time::Instant::now() - std::time::Duration::from_secs(60);
+                let runtime_report_min_gap = std::time::Duration::from_secs(5);
+                let mut maybe_report_runtime = |kind: &str, e: String| {
+                    if last_runtime_report.elapsed() >= runtime_report_min_gap {
+                        report_audio_error(format!("Audio {}: {}", kind, e));
+                        last_runtime_report = std::time::Instant::now();
+                    }
+                };
 
                 loop {
                     if shutdown.load(Ordering::Acquire) {
@@ -421,7 +468,9 @@ impl super::ApplicationCoordinator {
                                 sample_rate
                             );
                             if let Err(e) = audio_manager.queue_output(&samples, sample_rate) {
-                                error!("Audio TX output error: {}", e);
+                                let s = e.to_string();
+                                error!("Audio TX output error: {}", s);
+                                maybe_report_runtime("TX output error", s);
                             }
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {}
@@ -440,7 +489,9 @@ impl super::ApplicationCoordinator {
                             std::thread::sleep(std::time::Duration::from_millis(1));
                         }
                         Err(e) => {
-                            error!("Audio processing error: {}", e);
+                            let s = e.to_string();
+                            error!("Audio processing error: {}", s);
+                            maybe_report_runtime("processing error", s);
                         }
                     }
                 }
@@ -1171,6 +1222,23 @@ impl super::ApplicationCoordinator {
                                     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                         component: format!("{}", bus_msg.source),
                                         status: text,
+                                    },
+                                );
+                            }
+                            MessageType::Error {
+                                component_id,
+                                ref error_message,
+                                ..
+                            } => {
+                                // Component-level errors (audio init failure, audio
+                                // device stalls, etc.) get surfaced to the TUI's error
+                                // log instead of dying silently in the log file. Without
+                                // this hop the audio thread can fail to start and the
+                                // user sees only an inert pipeline with no decodes.
+                                let _ = tui_msg_tx_relay.send(
+                                    pancetta_tui::tui_runner::TuiMessage::Error {
+                                        component: format!("{}", component_id),
+                                        message: error_message.clone(),
                                     },
                                 );
                             }
