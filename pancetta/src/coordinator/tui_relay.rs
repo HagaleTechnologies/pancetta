@@ -74,7 +74,7 @@ impl super::ApplicationCoordinator {
         // Set up station coordinates for distance/bearing calculation
         let station_coords = {
             let config = self.config.read().await;
-            pancetta_dx::gridsquare::grid_to_coordinates(&config.station.grid_square).ok()
+            pancetta_core::gridsquare::grid_to_coordinates(&config.station.grid_square).ok()
         };
 
         // Relay decoded messages from FT8 -> TUI on a dedicated thread
@@ -100,7 +100,7 @@ impl super::ApplicationCoordinator {
                             // Compute distance and bearing if both grids are available
                             let (distance, bearing) = match (&grid_square, &station_coords) {
                                 (Some(remote_grid), Some((home_lat, home_lon))) => {
-                                    match pancetta_dx::gridsquare::grid_to_coordinates(remote_grid)
+                                    match pancetta_core::gridsquare::grid_to_coordinates(remote_grid)
                                     {
                                         Ok((remote_lat, remote_lon)) => {
                                             let geod = geographiclib_rs::Geodesic::wgs84();
