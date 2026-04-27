@@ -19,6 +19,7 @@
 mod audio;
 mod components;
 mod dsp;
+mod ft8;
 mod hamlib;
 mod health;
 mod pipeline;
