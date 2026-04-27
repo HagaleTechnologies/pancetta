@@ -496,7 +496,10 @@ impl super::ApplicationCoordinator {
                                             (s, dur)
                                         }
                                         Err(e) => {
-                                            warn!("Encode/modulate failed for '{}': {}", message_text, e);
+                                            warn!(
+                                                "Encode/modulate failed for '{}': {}",
+                                                message_text, e
+                                            );
                                             let complete_msg = ComponentMessage::new(
                                                 ComponentId::Ft8Transmitter,
                                                 ComponentId::Autonomous,
@@ -513,11 +516,10 @@ impl super::ApplicationCoordinator {
                                     };
 
                                     // --- Step 2: Compute precise FT8 audio-start time ---
-                                    let target_audio_utc =
-                                        pancetta_core::slot::next_audio_start(
-                                            chrono::Utc::now(),
-                                            MIN_LEAD,
-                                        );
+                                    let target_audio_utc = pancetta_core::slot::next_audio_start(
+                                        chrono::Utc::now(),
+                                        MIN_LEAD,
+                                    );
                                     info!(
                                         "TX scheduled: audio at {} (PTT 200ms earlier)",
                                         target_audio_utc.format("%H:%M:%S%.3f UTC")
@@ -639,7 +641,10 @@ impl super::ApplicationCoordinator {
 
                                     let (samples_opt, duration_ms) = if !multi_items.is_empty() {
                                         match pancetta_ft8::modulate_multi_tx(
-                                            &multi_items, 12000, 1500.0, 0.5,
+                                            &multi_items,
+                                            12000,
+                                            1500.0,
+                                            0.5,
                                         ) {
                                             Ok(samples) => {
                                                 let dur = (samples.len() as f64 / 12000.0 * 1000.0)
@@ -675,18 +680,18 @@ impl super::ApplicationCoordinator {
                                                     },
                                                     Instant::now(),
                                                 );
-                                                let _ = message_bus.send_message(complete_msg).await;
+                                                let _ =
+                                                    message_bus.send_message(complete_msg).await;
                                             }
                                             continue;
                                         }
                                     };
 
                                     // --- Step 2: Compute precise FT8 audio-start time ---
-                                    let target_audio_utc =
-                                        pancetta_core::slot::next_audio_start(
-                                            chrono::Utc::now(),
-                                            MIN_LEAD,
-                                        );
+                                    let target_audio_utc = pancetta_core::slot::next_audio_start(
+                                        chrono::Utc::now(),
+                                        MIN_LEAD,
+                                    );
                                     info!(
                                         "Multi-TX scheduled: audio at {} (PTT 200ms earlier)",
                                         target_audio_utc.format("%H:%M:%S%.3f UTC")
@@ -925,10 +930,8 @@ impl super::ApplicationCoordinator {
                 // with sub-second precision. tokio::time::interval_at then
                 // keeps the cadence exact every 15s relative to that first tick.
                 let now_utc = chrono::Utc::now();
-                let next_slot = pancetta_core::slot::next_slot_start(
-                    now_utc,
-                    chrono::Duration::zero(),
-                );
+                let next_slot =
+                    pancetta_core::slot::next_slot_start(now_utc, chrono::Duration::zero());
                 let initial_delay = pancetta_core::slot::duration_until(next_slot, now_utc);
                 let mut slot_interval = tokio::time::interval_at(
                     tokio::time::Instant::now() + initial_delay,

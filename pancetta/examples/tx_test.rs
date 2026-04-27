@@ -171,13 +171,18 @@ fn main() {
             let name = d.name().unwrap_or_else(|_| "??".into());
             let in_count = d.supported_input_configs().map(|c| c.count()).unwrap_or(0);
             let out_count = d.supported_output_configs().map(|c| c.count()).unwrap_or(0);
-            let is_default_out = default_out_name.as_deref() == Some(name.as_str()) && out_count > 0;
+            let is_default_out =
+                default_out_name.as_deref() == Some(name.as_str()) && out_count > 0;
             println!(
                 "  {:50}  in={}  out={}{}",
                 name,
                 in_count,
                 out_count,
-                if is_default_out { "  <-- DEFAULT OUT" } else { "" }
+                if is_default_out {
+                    "  <-- DEFAULT OUT"
+                } else {
+                    ""
+                }
             );
         }
     }

@@ -473,9 +473,8 @@ mod tests {
             true,  // headless
             false, // metrics
             9090, None, // no WAV
-            None,  // no test-tx
-            1500.0,
-            shutdown,
+            None, // no test-tx
+            1500.0, shutdown,
         )
         .await;
 

@@ -66,7 +66,9 @@ pub fn next_audio_start(now: DateTime<Utc>, min_lead: Duration) -> DateTime<Utc>
 ///
 /// Panics if `offset >= 15s` (a phase past the end of the slot is meaningless).
 pub fn next_phase(now: DateTime<Utc>, offset: Duration) -> DateTime<Utc> {
-    let offset_ns = offset.num_nanoseconds().expect("offset out of i64 ns range");
+    let offset_ns = offset
+        .num_nanoseconds()
+        .expect("offset out of i64 ns range");
     assert!(
         offset_ns >= 0 && offset_ns < SLOT_NS,
         "phase offset must be in [0, 15s)"

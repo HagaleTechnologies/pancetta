@@ -395,8 +395,7 @@ mod tests {
         assert_eq!(
             score_qrp, score_regular,
             "/QRP should not boost score (low-power, not POTA/SOTA): {} vs {}",
-            score_qrp,
-            score_regular
+            score_qrp, score_regular
         );
     }
 

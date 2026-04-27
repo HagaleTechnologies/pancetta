@@ -577,10 +577,8 @@ impl super::ApplicationCoordinator {
             // The decoder handles time alignment internally via Costas sync.
             // Schedule decode at 13s past the slot start (message ends at 12.64s).
             // Slots start at :00/:15/:30/:45, so decode at :13/:28/:43/:58.
-            let mut next_window_time = pancetta_core::slot::next_phase(
-                chrono::Utc::now(),
-                chrono::Duration::seconds(13),
-            );
+            let mut next_window_time =
+                pancetta_core::slot::next_phase(chrono::Utc::now(), chrono::Duration::seconds(13));
             info!(
                 "DSP: first window at {}",
                 next_window_time.format("%H:%M:%S")
