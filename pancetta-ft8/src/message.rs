@@ -2326,7 +2326,7 @@ mod tests {
     fn test_itu_prefix_validation() {
         // Valid callsigns that should pass
         assert!(Ft8Message::is_valid_itu_prefix("W1ABC"));
-        assert!(Ft8Message::is_valid_itu_prefix("K5ARH"));
+        assert!(Ft8Message::is_valid_itu_prefix("K1ABC"));
         assert!(Ft8Message::is_valid_itu_prefix("VE3XYZ"));
         assert!(Ft8Message::is_valid_itu_prefix("JA1ABC"));
         assert!(Ft8Message::is_valid_itu_prefix("DL1ABC"));
@@ -2372,7 +2372,7 @@ mod tests {
     fn test_looks_like_callsign_with_itu() {
         // Valid callsigns pass both structural and ITU checks
         assert!(Ft8Message::looks_like_callsign("W1ABC"));
-        assert!(Ft8Message::looks_like_callsign("K5ARH"));
+        assert!(Ft8Message::looks_like_callsign("K1ABC"));
         assert!(Ft8Message::looks_like_callsign("VE3XYZ"));
         assert!(Ft8Message::looks_like_callsign("JA1ABC"));
         assert!(Ft8Message::looks_like_callsign("9A1A"));

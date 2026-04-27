@@ -394,8 +394,8 @@ mod tests {
 
     #[test]
     fn test_my_call_ap_creation() {
-        let ap = MyCallAp::new("K5ARH").expect("K5ARH should encode");
-        assert_eq!(ap.callsign, "K5ARH");
+        let ap = MyCallAp::new("K1ABC").expect("K1ABC should encode");
+        assert_eq!(ap.callsign, "K1ABC");
         // Verify round-trip: bits should reconstruct the packed value
         let mut reconstructed: u32 = 0;
         for (i, &b) in ap.bits.iter().enumerate() {
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_inject_ap1() {
-        let my_call = MyCallAp::new("K5ARH").expect("K5ARH should encode");
+        let my_call = MyCallAp::new("K1ABC").expect("K1ABC should encode");
         let ctx = ApContext {
             my_call: Some(my_call.clone()),
             recent_calls: vec![],
@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_inject_ap3() {
-        let my_call = MyCallAp::new("K5ARH").expect("K5ARH should encode");
+        let my_call = MyCallAp::new("K1ABC").expect("K1ABC should encode");
         let qso = QsoAp::new("W1AW", QsoApProgress::WaitingForReport).expect("W1AW should encode");
         let ctx = ApContext {
             my_call: Some(my_call.clone()),
@@ -467,7 +467,7 @@ mod tests {
             assert_eq!(llrs[i], expected_llr, "bit {} (their call) mismatch", i);
         }
 
-        // Bits 28-55: my callsign (K5ARH)
+        // Bits 28-55: my callsign (K1ABC)
         for i in 28..56 {
             let expected_bit = my_call.bits[i - 28];
             let expected_llr = if expected_bit {

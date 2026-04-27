@@ -2579,7 +2579,7 @@ fn par_try_ldpc_with_ap(
     };
     // AP decodes need higher confidence than standard decodes because
     // AP injection biases the LDPC solver toward our callsign, producing
-    // phantom messages (e.g., "HZ0DCR K5ARH AM16") from noise.
+    // phantom messages (e.g., "HZ0DCR K1ABC AM16") from noise.
     const MIN_AP_CONFIDENCE: f32 = 0.55;
     const MIN_DECODE_CONFIDENCE: f32 = 0.41;
     const SCRUTINY_THRESHOLD: f32 = 0.65;

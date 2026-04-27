@@ -1482,7 +1482,7 @@ United States:                05:  08:  NA:   38.00:   97.00:    -5.0:  K:
         db.load_cty_dat(cty_data).await.unwrap();
 
         // The primary prefix K should match K-prefixed calls
-        let entity = db.lookup_callsign("K5ARH").await.unwrap();
+        let entity = db.lookup_callsign("K1ABC").await.unwrap();
         assert_eq!(entity.name, "United States");
 
         // Alias prefix W should also match

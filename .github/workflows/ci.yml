@@ -105,8 +105,17 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace
 
+      - name: Build examples
+        run: cargo build --workspace --examples
+
       - name: Test workspace
         run: cargo test --workspace --features transmit
+
+      # pancetta-hamlib is excluded from the default workspace test run
+      # because tokio runtime conflicts cause the suite to hang; needs
+      # --test-threads=1 in its own invocation.
+      - name: Test pancetta-hamlib (single-threaded)
+        run: cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
   # Cross-platform compile check. Pancetta targets Linux/macOS/Windows
   # (development on Mac, production on Windows MiniPC), so a Linux-only
@@ -147,3 +156,14 @@ jobs:
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  # cargo-deny enforces broader policy than audit alone: license whitelist,
+  # banned crate sources, multi-version warnings. Configured in deny.toml.
+  deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources advisories

@@ -282,20 +282,20 @@ mod tests {
     fn test_pota_sota_detection() {
         // POTA portable suffix — should match
         assert!(is_pota_sota_candidate("W1ABC/P"));
-        assert!(is_pota_sota_candidate("K5ARH/P"));
+        assert!(is_pota_sota_candidate("K1ABC/P"));
         assert!(is_pota_sota_candidate("w1abc/p")); // case insensitive
 
         // SOTA portable suffix — should match
         assert!(is_pota_sota_candidate("W1ABC/S"));
-        assert!(is_pota_sota_candidate("K5ARH/S"));
+        assert!(is_pota_sota_candidate("K1ABC/S"));
 
         // /QRP is low-power only — NOT a POTA/SOTA indicator
-        assert!(!is_pota_sota_candidate("K5ARH/QRP"));
+        assert!(!is_pota_sota_candidate("K1ABC/QRP"));
         assert!(!is_pota_sota_candidate("K2DEF/QRP"));
 
         // Prefix-style calls — should NOT match (operating-area prefix, not POTA)
         assert!(!is_pota_sota_candidate("VE3/W1ABC")); // operating from VE3
-        assert!(!is_pota_sota_candidate("DL/K5ARH")); // operating from Germany
+        assert!(!is_pota_sota_candidate("DL/K1ABC")); // operating from Germany
         assert!(!is_pota_sota_candidate("F/W1ABC")); // operating from France
 
         // Callsigns with 'P' or 'S' embedded — should NOT match (not a /P or /S suffix)
