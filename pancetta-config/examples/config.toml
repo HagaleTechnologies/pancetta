@@ -596,91 +596,6 @@ comments = "Contest station"
 enabled_modes = ["PSK31", "PSK63", "FT8", "FT4", "JS8", "RTTY"]
 enabled_bands = ["80m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m"]
 
-# QRZ.com for callsign lookups
-[network.qrz]
-enabled = true
-username = "k1abc"                    # Your QRZ username
-api_endpoint = "https://xmldata.qrz.com/xml/current/"
-
-[network.qrz.lookup]
-auto_lookup = true
-timeout_seconds = 5
-fields = ["callsign", "name", "addr1", "addr2", "state", "country", "grid", "class", "trustee"]
-include_images = false
-include_bio = false
-
-[network.qrz.cache]
-enabled = true
-duration_hours = 48
-max_size_mb = 200
-auto_cleanup = true
-
-# LOTW for QSL confirmations
-[network.lotw]
-enabled = true
-username = "K1ABC"                    # Your ARRL username
-
-[network.lotw.certificate]
-cert_file = "~/.lotw/K1ABC.tq8"
-auto_renewal.enabled = true
-auto_renewal.renewal_days = 30
-auto_renewal.notifications = true
-
-[network.lotw.upload]
-auto_upload = true
-interval_hours = 6
-include_qsl_sent = true
-
-[network.lotw.upload.adif_export]
-version = "3.1.4"
-include_all_fields = true
-format = "adi"
-
-[network.lotw.download]
-auto_download = true
-interval_hours = 12
-incremental = true
-auto_process = true
-
-[network.lotw.tqsl]
-executable_path = "/usr/bin/tqsl"
-station_location = "K1ABC Home"
-command_options = ["-d", "-a", "compliant"]
-
-# eQSL for electronic QSLs
-[network.eqsl]
-enabled = true
-username = "K1ABC"                    # Your eQSL username
-
-[network.eqsl.upload]
-auto_upload = true
-batch_size = 100
-include_message = true
-default_message = "Thanks for the QSO! 73 de K1ABC"
-
-[network.eqsl.download]
-auto_download = true
-interval_hours = 24
-download_images = true
-image_quality = "high"
-
-[network.eqsl.cards.storage]
-directory = "~/Documents/Pancetta/eQSL_Cards"
-organize_by_year = true
-organize_by_band = true
-naming_pattern = "{callsign}_{band}_{date}_{time}"
-
-# Clublog for DXCC tracking
-[network.clublog]
-enabled = true
-email = "k1abc@example.com"          # Your Clublog email
-
-[network.clublog.upload]
-auto_upload = true
-batch_size = 200
-include_qsl_info = true
-upload_confirmations = true
-
 # DX Cluster for DX spots
 [network.dx_cluster]
 enabled = true
@@ -767,11 +682,6 @@ requests_per_hour = 7200
 requests_per_day = 172800
 
 # Service-specific rate limits
-[network.rate_limiting.services.qrz]
-requests_per_minute = 60
-burst_allowance = 10
-cooldown_seconds = 1
-
 [network.rate_limiting.services.psk_reporter]
 requests_per_minute = 30
 burst_allowance = 5
