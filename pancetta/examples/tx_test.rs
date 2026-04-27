@@ -12,8 +12,53 @@ use chrono::Utc;
 use clap::Parser;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use pancetta_ft8::{Ft8Encoder, Ft8Modulator, SAMPLE_RATE as FT8_SAMPLE_RATE};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+/// RAII guard that releases PTT on drop. Defense in depth:
+/// - Drop runs on normal exit, panic unwind, or early return.
+/// - SIGINT/SIGTERM are turned into a flag the main loop checks, then drops the guard.
+/// - An independent watchdog thread force-releases PTT if the deadline elapses,
+///   which catches main-thread hangs (e.g., CoreAudio stuck) that drop() can't.
+/// - SIGKILL / abort cannot be intercepted; PTT will leak in those cases.
+struct PttGuard {
+    active: Arc<AtomicBool>,
+}
+
+impl PttGuard {
+    fn engage(max_secs: f64) -> Result<Self, Box<dyn std::error::Error>> {
+        rigctld_ptt(true)?;
+        let active = Arc::new(AtomicBool::new(true));
+        let active_wd = active.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs_f64(max_secs));
+            if active_wd.swap(false, Ordering::SeqCst) {
+                eprintln!(
+                    "\nPTT WATCHDOG: max TX time {:.1}s exceeded — forcing PTT OFF",
+                    max_secs
+                );
+                if let Err(e) = rigctld_ptt(false) {
+                    eprintln!("watchdog: PTT release failed: {}", e);
+                }
+            }
+        });
+        Ok(Self { active })
+    }
+}
+
+impl Drop for PttGuard {
+    fn drop(&mut self) {
+        // swap-to-false makes this idempotent with the watchdog: whichever
+        // path reaches here first owns the release; the other becomes a no-op.
+        if self.active.swap(false, Ordering::SeqCst) {
+            eprintln!("PTT OFF (guard drop)");
+            if let Err(e) = rigctld_ptt(false) {
+                eprintln!("PTT release failed in drop: {}", e);
+            }
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "tx_test", about = "FT8 TX hardware validation")]
@@ -41,6 +86,12 @@ struct Args {
     /// Skip waiting for FT8 slot boundary
     #[arg(long)]
     immediate: bool,
+
+    /// Hard ceiling on PTT keying time (seconds). A watchdog thread forces
+    /// PTT OFF when this elapses, even if the main thread is stuck. FT8
+    /// transmissions are 12.64s and slots are 15s, so 14s is a safe default.
+    #[arg(long, default_value_t = 14.0)]
+    max_tx_secs: f64,
 }
 
 fn main() {
@@ -112,41 +163,46 @@ fn main() {
 
     // --- Open output device ---
     let host = cpal::default_host();
-    println!("\nOutput devices:");
-    if let Ok(devices) = host.output_devices() {
+    let default_out_name = host.default_output_device().and_then(|d| d.name().ok());
+
+    println!("\nAll devices (cpal sees):");
+    if let Ok(devices) = host.devices() {
         for d in devices {
             let name = d.name().unwrap_or_else(|_| "??".into());
-            let is_default = host
-                .default_output_device()
-                .map(|dd| dd.name().ok() == d.name().ok())
-                .unwrap_or(false);
-            println!("  {}{}", name, if is_default { " <-- DEFAULT" } else { "" });
+            let in_count = d.supported_input_configs().map(|c| c.count()).unwrap_or(0);
+            let out_count = d.supported_output_configs().map(|c| c.count()).unwrap_or(0);
+            let is_default_out = default_out_name.as_deref() == Some(name.as_str()) && out_count > 0;
+            println!(
+                "  {:50}  in={}  out={}{}",
+                name,
+                in_count,
+                out_count,
+                if is_default_out { "  <-- DEFAULT OUT" } else { "" }
+            );
         }
     }
 
     // Select output device. With --device, search ALL devices (not just
     // output_devices) because some USB audio codecs don't enumerate output
     // configs via cpal but can still be force-opened with a known config.
-    // When multiple devices match (e.g. two "USB AUDIO CODEC" entries),
-    // prefer the one that is NOT an input-only device.
+    // Match is case-insensitive and whitespace-normalized so that
+    // "USB AUDIO CODEC" matches the actual "USB AUDIO  CODEC" (double-space).
     let device = if let Some(ref name) = args.device {
-        let name_lower = name.to_lowercase();
+        let needle = normalize(name);
         let mut matches: Vec<_> = host
             .devices()
             .expect("Failed to enumerate devices")
-            .filter(|d| {
-                d.name()
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains(&name_lower)
-            })
+            .filter(|d| normalize(&d.name().unwrap_or_default()).contains(&needle))
             .collect();
         if matches.is_empty() {
             eprintln!("No device matching '{}'", name);
             std::process::exit(1);
         }
-        // Prefer the device with NO input configs (i.e., the output side)
-        matches.sort_by_key(|d| d.supported_input_configs().map(|c| c.count()).unwrap_or(0));
+        // Prefer the device that actually has output configs.
+        matches.sort_by_key(|d| {
+            let out = d.supported_output_configs().map(|c| c.count()).unwrap_or(0);
+            std::cmp::Reverse(out)
+        });
         matches.remove(0)
     } else {
         host.default_output_device()
@@ -181,13 +237,32 @@ fn main() {
         println!("Slot started at {}", Utc::now().format("%H:%M:%S UTC"));
     }
 
-    // --- PTT ON ---
+    // --- Signal handler: release PTT on Ctrl-C / SIGTERM ---
+    // Set up BEFORE engaging PTT so a kill between here and `engage()`
+    // returning still has a path to release if it raced.
+    let term_flag = Arc::new(AtomicBool::new(false));
     if args.ptt {
-        println!("PTT ON");
-        if let Err(e) = rigctld_ptt(true) {
-            eprintln!("PTT ON failed: {}", e);
-            std::process::exit(1);
+        signal_hook::flag::register(signal_hook::consts::SIGINT, term_flag.clone())
+            .expect("register SIGINT");
+        signal_hook::flag::register(signal_hook::consts::SIGTERM, term_flag.clone())
+            .expect("register SIGTERM");
+    }
+
+    // --- PTT ON (RAII-guarded, with watchdog) ---
+    let ptt_start = std::time::Instant::now();
+    let _ptt_guard = if args.ptt {
+        println!("PTT ON (watchdog: {:.1}s)", args.max_tx_secs);
+        match PttGuard::engage(args.max_tx_secs) {
+            Ok(g) => Some(g),
+            Err(e) => {
+                eprintln!("PTT ON failed: {}", e);
+                std::process::exit(1);
+            }
         }
+    } else {
+        None
+    };
+    if args.ptt {
         // TX settle delay
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -224,10 +299,25 @@ fn main() {
     stream.play().expect("Failed to start playback");
     println!("Playing audio...");
 
-    // Wait for playback to complete (with a small margin)
+    // Wait for playback to complete (with a small margin) OR a termination
+    // signal OR the soft TX-time cap. On any of those, we abort the stream
+    // early; the PttGuard drop will release PTT cleanly. The watchdog inside
+    // PttGuard is the hard cap that fires even if this loop is stuck.
     let playback_ms = (duration_secs * 1000.0) as u64 + 500;
+    let soft_max = Duration::from_secs_f64(args.max_tx_secs - 0.5);
     let start = std::time::Instant::now();
     while !done.load(std::sync::atomic::Ordering::Relaxed) {
+        if term_flag.load(Ordering::Relaxed) {
+            println!("\nSignal received — stopping playback, releasing PTT");
+            break;
+        }
+        if args.ptt && ptt_start.elapsed() >= soft_max {
+            println!(
+                "\nSoft TX cap reached ({:.1}s) — stopping playback",
+                soft_max.as_secs_f64()
+            );
+            break;
+        }
         std::thread::sleep(Duration::from_millis(10));
         if start.elapsed() > Duration::from_millis(playback_ms) {
             println!("Playback timeout — forcing stop");
@@ -235,17 +325,12 @@ fn main() {
         }
     }
 
-    // Let the tail settle
+    // Let the tail settle, then drop the stream
     std::thread::sleep(Duration::from_millis(100));
     drop(stream);
 
-    // --- PTT OFF ---
-    if args.ptt {
-        println!("PTT OFF");
-        if let Err(e) = rigctld_ptt(false) {
-            eprintln!("PTT OFF failed: {}", e);
-        }
-    }
+    // PTT release happens automatically via _ptt_guard's Drop impl on
+    // function return (or panic, or signal-driven early exit).
 
     let final_pos = *cursor.lock().unwrap();
     println!(
@@ -254,6 +339,14 @@ fn main() {
         samples.len(),
         final_pos as f64 / output_rate as f64
     );
+}
+
+/// Normalize device name for matching: lowercase + collapse whitespace.
+fn normalize(s: &str) -> String {
+    s.split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Send PTT command to rigctld via TCP (localhost:4532).

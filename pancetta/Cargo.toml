@@ -58,6 +58,7 @@ anyhow = "1.0"
 # System utilities
 serialport = "4.7"
 libc = "0.2"
+signal-hook = { workspace = true }
 uuid = { version = "1.22", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5.0"
