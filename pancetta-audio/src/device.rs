@@ -497,10 +497,24 @@ impl AudioDeviceManager {
             return Ok(default_cfg);
         }
 
-        Err(AudioError::configuration(format!(
-            "No suitable output configuration found for {}Hz, {} channels",
-            target_sample_rate, target_channels
-        )))
+        // Last-ditch fallback: synthesize a known-good config. Some USB
+        // audio CODECs (e.g., the FTdx10's BurrBrown chip on macOS)
+        // enumerate zero output configs and return Err from
+        // default_output_config(), but still accept stream creation with
+        // mono 48kHz F32. This mirrors what tx_test does. The
+        // SupportedStreamConfig type requires a buffer-size hint, but
+        // BufferSize::Default works on every backend we target.
+        tracing::warn!(
+            "Output device reports no enumerated configs and no default — \
+             synthesizing mono/48kHz/F32 fallback (typical for USB CODECs \
+             on macOS that accept stream creation despite empty enumeration)"
+        );
+        Ok(SupportedStreamConfig::new(
+            1,
+            SampleRate(48_000),
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::F32,
+        ))
     }
 
     /// Get device information for a specific device

@@ -408,13 +408,37 @@ impl AudioStreamManager {
             self.device_manager.get_best_output_device()?
         };
 
-        // Get optimal configuration
-        let stream_config = self.device_manager.find_optimal_config(
+        // FT8 audio is mono. Force mono regardless of what
+        // find_optimal_output_config returned — many USB CODECs report
+        // stereo capability but the TX path produces single-channel
+        // samples, and we don't want cpal to interpret our mono buffer
+        // as interleaved stereo. tx_test validated this pattern.
+        let target_rate = self.config.sample_rate;
+        let stream_config = cpal::StreamConfig {
+            channels: 1,
+            sample_rate: cpal::SampleRate(target_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+        // Probe the device for log visibility — failures here are non-fatal
+        // because we're force-opening with a known-good config.
+        match self.device_manager.find_optimal_config(
             output_device,
-            self.config.sample_rate,
-            self.config.output_channels,
-            false, // is_input
-        )?;
+            target_rate,
+            1, // mono
+            false,
+        ) {
+            Ok(probed) => tracing::info!(
+                "Output device probe: {}Hz/{}ch (forcing mono/{}Hz for TX stream)",
+                probed.sample_rate().0,
+                probed.channels(),
+                target_rate
+            ),
+            Err(e) => tracing::warn!(
+                "Output device probe failed ({}); force-opening mono/{}Hz",
+                e,
+                target_rate
+            ),
+        }
 
         // Take the output consumer — move into the callback closure
         let mut output_consumer = self
@@ -424,7 +448,7 @@ impl AudioStreamManager {
 
         // Create the output stream — drain TX samples from the ring buffer
         let stream = output_device.build_output_stream(
-            &stream_config.into(),
+            &stream_config,
             move |data: &mut [f32], _info: &OutputCallbackInfo| {
                 let read = output_consumer.pop_audio_slice(data);
                 // Fill any remaining samples with silence (underrun is normal when not transmitting)
