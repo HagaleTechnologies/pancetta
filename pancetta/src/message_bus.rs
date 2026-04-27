@@ -123,7 +123,12 @@ pub enum MessageType {
     /// Status update message
     StatusUpdate(String),
 
-    /// Request to transmit an FT8 message
+    /// Request to transmit an FT8 message.
+    ///
+    /// `frequency_offset` is the ABSOLUTE audio frequency in Hz (typically
+    /// 200-2500 within the FT8 passband), NOT a delta from any base. The
+    /// transmitter component sets the modulator's base_frequency to this
+    /// value before encoding.
     TransmitRequest {
         message_text: String,
         frequency_offset: f64,

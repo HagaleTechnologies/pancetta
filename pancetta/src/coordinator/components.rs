@@ -480,10 +480,35 @@ impl super::ApplicationCoordinator {
                                     // --- Step 1: Encode + modulate up front ---
                                     // Do this BEFORE any timing-critical work so encoding
                                     // latency can't push us past the slot boundary.
+                                    //
+                                    // TransmitRequest.frequency_offset is the ABSOLUTE audio
+                                    // frequency in Hz (200-4000), not a delta. The modulator
+                                    // adds its base_frequency to whatever we pass to
+                                    // modulate_symbols, so to honor the request we set the
+                                    // base to the requested frequency and pass 0 as the
+                                    // additional offset.
+                                    if let Err(e) = modulator.set_base_frequency(frequency_offset) {
+                                        warn!(
+                                            "Invalid TX frequency {} Hz for '{}': {}",
+                                            frequency_offset, message_text, e
+                                        );
+                                        let complete_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Autonomous,
+                                            MessageType::TransmitComplete {
+                                                success: false,
+                                                message_text,
+                                                duration_ms: 0,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus.send_message(complete_msg).await;
+                                        continue;
+                                    }
                                     let (samples, duration_ms) = match encoder
                                         .encode_message(&message_text, None)
                                         .and_then(|symbols| {
-                                            modulator.modulate_symbols(&symbols, frequency_offset)
+                                            modulator.modulate_symbols(&symbols, 0.0)
                                         }) {
                                         Ok(s) => {
                                             let dur = (s.len() as f64 / 12000.0 * 1000.0) as u64;
@@ -630,11 +655,19 @@ impl super::ApplicationCoordinator {
                                         }
                                     }
 
+                                    // TransmitRequestItem.frequency_offset is the ABSOLUTE
+                                    // audio frequency (matching TransmitRequest semantics).
+                                    // modulate_multi_tx wants per-item OFFSETS from a shared
+                                    // base. Use base=200 (lowest valid) so any audio frequency
+                                    // in the 200-2500 Hz FT8 passband maps to a non-negative
+                                    // per-item offset.
+                                    const MULTI_TX_BASE_HZ: f64 = 200.0;
                                     let mut multi_items = Vec::new();
                                     for (i, symbols) in symbol_sets.iter().enumerate() {
                                         multi_items.push(pancetta_ft8::MultiTxItem {
                                             symbols: symbols.as_slice(),
-                                            frequency_offset: items[i].frequency_offset,
+                                            frequency_offset: items[i].frequency_offset
+                                                - MULTI_TX_BASE_HZ,
                                             params: &ft8_params,
                                         });
                                     }
@@ -643,7 +676,7 @@ impl super::ApplicationCoordinator {
                                         match pancetta_ft8::modulate_multi_tx(
                                             &multi_items,
                                             12000,
-                                            1500.0,
+                                            MULTI_TX_BASE_HZ,
                                             0.5,
                                         ) {
                                             Ok(samples) => {
