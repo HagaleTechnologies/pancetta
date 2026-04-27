@@ -234,11 +234,12 @@ impl super::ApplicationCoordinator {
                     }
                 }));
 
-                // PTT safety watchdog: track when PTT was turned on
-                // If PTT stays on for longer than PTT_SAFETY_TIMEOUT_SECS,
-                // force it off to prevent accidental continuous transmission
-                // (e.g. if the TX pipeline crashes mid-transmission).
-                const PTT_SAFETY_TIMEOUT_SECS: u64 = 30;
+                // PTT safety watchdog: force PTT off if a transmission runs
+                // longer than expected. FT8 transmissions are 12.64s within a
+                // 15s slot, so 14s is a safe ceiling — long enough for any
+                // legitimate FT8 TX, short enough to never bleed into the
+                // next slot. Catches stuck/crashed pipelines.
+                const PTT_SAFETY_TIMEOUT_SECS: u64 = 14;
                 let ptt_on_since: Arc<RwLock<Option<Instant>>> = Arc::new(RwLock::new(None));
 
                 // Spawn the PTT watchdog as a background task
