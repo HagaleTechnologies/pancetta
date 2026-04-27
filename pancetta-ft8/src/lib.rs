@@ -88,8 +88,10 @@ pub use parallel::{BudgetTracker, DecodeConfig, Parallelism};
 pub mod decoder;
 pub mod ldpc;
 pub mod message;
+#[cfg(feature = "neural_osd")]
 pub mod neural_osd;
-mod neural_osd_weights;
+#[cfg(feature = "neural_osd")]
+pub mod neural_osd_weights;
 pub mod osd;
 pub mod signal_processing;
 pub mod sync;

@@ -74,7 +74,7 @@ name = "decoder_benchmark"
 harness = false
 
 [features]
-default = ["std"]
+default = ["std", "neural_osd"]
 std = []
 # Enable SIMD optimizations
 simd = []
@@ -90,3 +90,8 @@ benchmark = ["dep:hound", "dep:serde", "dep:serde_json"]
 debug-decode = []
 # Enable experimental FT2 protocol support
 ft2 = []
+# Neural-OSD model: bundles ~80KB of weight blob and the CNN inference
+# pass that biases OSD bit-flip ordering. ON by default — yields a 600x
+# reduction in OSD trials for failed-BP frames. Disable for minimal
+# builds where the weight blob and inference cost aren't acceptable.
+neural_osd = []

@@ -3060,10 +3060,19 @@ impl LdpcDecoder {
             const MAX_PARITY_ERRORS_FOR_OSD: usize = 4;
 
             if parity_errors <= MAX_PARITY_ERRORS_FOR_OSD {
-                // Compute neural ordering if trajectory is available
+                // Compute neural ordering if trajectory is available and the
+                // neural-OSD feature is compiled in. Without the feature,
+                // OSD falls back to |LLR|-based ordering at the cost of
+                // higher trial counts on weak signals.
+                #[cfg(feature = "neural_osd")]
                 let neural_ordering = trajectory
                     .as_ref()
                     .map(|traj| crate::neural_osd::predict_error_bits(traj));
+                #[cfg(not(feature = "neural_osd"))]
+                let neural_ordering: Option<[f32; 91]> = {
+                    let _ = trajectory;
+                    None
+                };
 
                 if let Some(codeword) = osd.decode(llr_arr, neural_ordering.as_ref()) {
                     return Ok(codeword);
