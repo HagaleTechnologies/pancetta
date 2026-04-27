@@ -67,7 +67,7 @@ impl super::ApplicationCoordinator {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                use pancetta_qso::{LoggerConfig, QsoLogger, QsoManager, QsoManagerConfig};
+                use pancetta_qso::{LoggerConfig, QsoManager, QsoManagerConfig};
 
                 let qso_config = QsoManagerConfig {
                     our_callsign: our_callsign.clone(),
@@ -86,23 +86,67 @@ impl super::ApplicationCoordinator {
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                     .join(".pancetta")
                     .join("qso.db");
+
+                // ADIF source-of-truth writer. Subscribes to QsoEvent::QsoCompleted
+                // and appends one ADIF record per completed QSO. Fail-soft: if open
+                // fails, we log but proceed with DB-only — every operator should at
+                // least get duplicate detection from the DB.
+                let adif_path = dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".pancetta")
+                    .join("qsos.adi");
+
+                let _adif_writer = match pancetta_qso::AdifLogWriter::open(&adif_path).await {
+                    Ok(w) => {
+                        info!("ADIF log open at {}", adif_path.display());
+                        let w = std::sync::Arc::new(w);
+                        start_adif_subscriber(
+                            w.clone(),
+                            qso_manager.subscribe(),
+                            shutdown.clone(),
+                        );
+                        Some(w)
+                    }
+                    Err(e) => {
+                        warn!(
+                            "ADIF writer init failed at {}: {} — continuing; QSOs this \
+                             session will be DB-only",
+                            adif_path.display(),
+                            e,
+                        );
+                        None
+                    }
+                };
+
+                // Async QSO logger — subscribes independently to QsoEvent::QsoCompleted
+                // and inserts into the rebuildable SQLite index. Comes AFTER the ADIF
+                // writer so that a crash between the two is recoverable by Task 5's
+                // startup replay (ADIF is source of truth; DB is cache).
                 let logger_config = LoggerConfig {
                     database_path: db_path.clone(),
                     ..Default::default()
                 };
 
-                let _logger = match QsoLogger::new(logger_config, qso_manager.clone()).await {
+                let _async_logger = match pancetta_qso::async_logger::AsyncQsoLogger::new(
+                    logger_config,
+                    qso_manager.clone(),
+                )
+                .await
+                {
                     Ok(l) => {
-                        info!("QSO logger initialized with database at {:?}", db_path);
+                        info!(
+                            "Async QSO logger initialized with database at {}",
+                            db_path.display()
+                        );
                         let l = std::sync::Arc::new(l);
                         if let Err(e) = l.start().await {
-                            warn!("QSO logger background tasks failed to start: {}", e);
+                            warn!("Async QSO logger background tasks failed to start: {}", e);
                         }
                         Some(l)
                     }
                     Err(e) => {
                         warn!(
-                            "Failed to initialize QSO logger (continuing without): {}",
+                            "Failed to initialize async QSO logger (continuing without): {}",
                             e
                         );
                         None
@@ -431,4 +475,41 @@ impl super::ApplicationCoordinator {
         info!("QSO component started");
         Ok(())
     }
+}
+
+/// Spawn a background task that listens for `QsoEvent::QsoCompleted` and
+/// appends one ADIF record to the durable log for each completed QSO.
+///
+/// ADIF is the source of truth: a failed write is logged at ERROR level because
+/// it indicates a real problem (disk full, permissions, etc.) that the operator
+/// should investigate. The task handles receiver lag and channel closure
+/// gracefully so it never blocks or panics.
+fn start_adif_subscriber(
+    writer: std::sync::Arc<pancetta_qso::AdifLogWriter>,
+    mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::spawn(async move {
+        while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            match events.recv().await {
+                Ok(pancetta_qso::QsoEvent::QsoCompleted { metadata, .. }) => {
+                    if let Err(e) = writer.append(&metadata).await {
+                        // ADIF is the source of truth. A failed write deserves
+                        // a loud signal — disk full, permissions, etc.
+                        tracing::error!(
+                            "ADIF append failed for QSO {} with {}: {}",
+                            metadata.qso_id,
+                            metadata.their_callsign.as_deref().unwrap_or("?"),
+                            e,
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!("ADIF subscriber lagged by {n} QSO events");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
