@@ -323,6 +323,35 @@ The CI workflow file (`.github/workflows/ci.yml`) is the source of truth
 for what gets gated. If you add a new check there, mirror it into
 `scripts/check.sh` so the local pre-flight stays honest.
 
+### Tests must not assume host capabilities
+
+CI runs on headless Linux containers — no audio devices, no serial
+ports, no rig. A test that asserts host-level resources exist (audio
+input device, a specific TTY, a network endpoint, the system clock
+within tolerance) will pass on your dev machine and break CI. Two
+kinds of tests, two policies:
+
+- **Capability-independent tests.** The vast majority. Code under
+  test is exercised with synthesized inputs. These run in every
+  `cargo test` invocation.
+- **Hardware/network-dependent tests.** These need a real device or
+  a live endpoint. Mark with `#[ignore]` and a comment explaining
+  what the operator must arrange:
+
+  ```rust
+  #[test]
+  #[ignore = "requires real cpal input device — run with --ignored on dev box"]
+  fn live_audio_capture_smoke() { … }
+  ```
+
+  Run them locally with `cargo test -- --ignored` when you have the
+  hardware available. They never block CI.
+
+When testing enumeration logic, assert on the **shape** of the result
+(returned `Ok`, the iterator yields without panicking) — never on
+*how many* items came back. `device::tests::test_enumerate_audio_devices`
+is the canonical example.
+
 ## Testing Requirements
 
 ### Unit Tests

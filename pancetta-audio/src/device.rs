@@ -686,23 +686,25 @@ mod tests {
 
     #[test]
     fn test_enumerate_audio_devices() {
+        // This test verifies that cpal device enumeration RETURNS cleanly,
+        // not that any specific hardware exists. CI runners are headless
+        // and routinely have zero devices — that's a valid runtime state,
+        // not a test failure. We just need `input_devices()` /
+        // `output_devices()` to return Ok and produce iterators we can
+        // walk without panicking.
         let host = cpal::default_host();
         let inputs: Vec<String> = host
             .input_devices()
-            .unwrap()
+            .expect("cpal input_devices() should not error")
             .filter_map(|d| d.name().ok())
             .collect();
         let outputs: Vec<String> = host
             .output_devices()
-            .unwrap()
+            .expect("cpal output_devices() should not error")
             .filter_map(|d| d.name().ok())
             .collect();
         println!("Input devices: {:?}", inputs);
         println!("Output devices: {:?}", outputs);
-        assert!(
-            !inputs.is_empty() || !outputs.is_empty(),
-            "No audio devices found"
-        );
     }
 
     #[test]
