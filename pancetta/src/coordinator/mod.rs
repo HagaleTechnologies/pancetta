@@ -17,6 +17,7 @@
 //! and exits.
 
 mod audio;
+mod autonomous;
 mod components;
 mod dsp;
 mod ft8;
