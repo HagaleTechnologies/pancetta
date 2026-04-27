@@ -13,7 +13,7 @@ use crate::{
     },
 };
 use cpal::{
-    traits::{DeviceTrait, StreamTrait},
+    traits::{DeviceTrait, HostTrait, StreamTrait},
     InputCallbackInfo, OutputCallbackInfo, Stream,
 };
 
@@ -383,30 +383,95 @@ impl AudioStreamManager {
         self.input_stream = Some(stream);
         Ok(())
     }
+}
 
+/// Direct cpal enumeration to find an output-capable device by name pattern.
+///
+/// Matches against the OS-reported device name with case-insensitive,
+/// whitespace-normalized substring comparison (handles macOS reporting
+/// "USB AUDIO  CODEC" with double-space). When multiple devices match,
+/// prefers the one with the most enumerated output configs; ties go to
+/// first-encountered, which mirrors tx_test's validated behavior of
+/// picking the output-side handle when both halves of a bidirectional
+/// codec report zero enumerated output configs.
+fn find_output_device_by_cpal(pattern: &str) -> AudioResult<cpal::Device> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let normalize = |s: &str| -> String {
+        s.split_whitespace()
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let needle = normalize(pattern);
+
+    let host = cpal::default_host();
+    let mut matches: Vec<cpal::Device> = host
+        .devices()
+        .map_err(|e| AudioError::device(format!("Failed to enumerate cpal devices: {}", e)))?
+        .filter(|d| {
+            d.name()
+                .map(|n| normalize(&n).contains(&needle))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if matches.is_empty() {
+        return Err(AudioError::device_not_found(pattern.to_string()));
+    }
+
+    // Sort by output-config count descending; stable sort means tie-broken
+    // by enumeration order (first match wins on ties — this picks the
+    // output-side handle of bidirectional CODECs that report 0 configs).
+    matches.sort_by_key(|d| {
+        let out_count = d.supported_output_configs().map(|c| c.count()).unwrap_or(0);
+        std::cmp::Reverse(out_count)
+    });
+
+    let chosen = matches.remove(0);
+    let chosen_name = chosen.name().unwrap_or_else(|_| "unknown".into());
+    tracing::info!(
+        "find_output_device_by_cpal: matched '{}' for pattern '{}'",
+        chosen_name,
+        pattern
+    );
+    Ok(chosen)
+}
+
+#[allow(dead_code)]
+impl AudioStreamManager {
     /// Create the output stream for audio monitoring
     fn create_output_stream(&mut self) -> AudioResult<()> {
-        // Get output device
-        let output_device = if let Some(ref device_name) = self.config.output_device_name {
+        // Output device discovery: bypass AudioDeviceManager and enumerate
+        // cpal directly, mirroring tx_test's validated pattern. The manager's
+        // cached `Device` references can refer to the input-side handle of a
+        // bidirectional USB CODEC (e.g., the FTdx10 BurrBrown chip), which
+        // accepts output stream creation on macOS but fails with "device no
+        // longer available". Re-enumerating per-call returns a fresh handle
+        // and lets us pick by output capability deterministically.
+        let cpal_output_device = if let Some(ref device_name) = self.config.output_device_name {
             if device_name.eq_ignore_ascii_case("default") {
-                self.device_manager.get_best_output_device()?
+                cpal::default_host()
+                    .default_output_device()
+                    .ok_or_else(|| AudioError::stream("No default output device available"))?
             } else {
-                // Find device by name substring match (case-insensitive).
-                // Falls back to best available if no match found.
-                match self.device_manager.find_output_device_by_name(device_name) {
-                    Ok(device) => device,
-                    Err(_) => {
-                        tracing::warn!(
-                            "Output device matching '{}' not found, falling back to best available",
-                            device_name
-                        );
-                        self.device_manager.get_best_output_device()?
-                    }
-                }
+                find_output_device_by_cpal(device_name).or_else(|e| {
+                    tracing::warn!(
+                        "Output device matching '{}' not found via cpal ({}), falling back to default",
+                        device_name,
+                        e
+                    );
+                    cpal::default_host().default_output_device().ok_or_else(|| {
+                        AudioError::stream("No default output device available")
+                    })
+                })?
             }
         } else {
-            self.device_manager.get_best_output_device()?
+            cpal::default_host()
+                .default_output_device()
+                .ok_or_else(|| AudioError::stream("No default output device available"))?
         };
+        let output_device = &cpal_output_device;
 
         // FT8 audio is mono. Force mono regardless of what
         // find_optimal_output_config returned — many USB CODECs report
