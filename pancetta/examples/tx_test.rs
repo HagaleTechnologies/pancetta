@@ -275,42 +275,29 @@ fn main() {
     }
 
     // --- Compute precise FT8 timing ---
-    // FT8 convention: a transmission's audio begins 0.5s into a 15s slot and
-    // runs for 12.64s. We aim for the receiver to see DT≈0, so we need to:
-    //   1) align to the slot boundary with sub-second precision
-    //   2) engage PTT a couple hundred ms early so the relay is settled when
-    //      audio starts (instead of clipping the leading sync symbols)
-    //   3) call stream.play() at exactly slot+500ms
-    const PRE_ROLL_NS: i64 = 500_000_000; // FT8 leading silence
-    const PTT_LEAD_NS: i64 = 200_000_000; // engage PTT this much before audio
-    const SLOT_NS: i64 = 15_000_000_000;
-    const MIN_LEAD_NS: i64 = 1_000_000_000; // require at least 1s of headroom
+    // Engage PTT 200ms before audio start so the relay is settled when
+    // symbols begin. Require at least 1s of total lead time so we have
+    // headroom for both the PTT engage AND the relay settle.
+    const PTT_LEAD: Duration = Duration::from_millis(200);
+    const MIN_LEAD: chrono::Duration = chrono::Duration::seconds(1);
 
     let (target_audio_start, target_ptt_engage) = if args.immediate {
         let now = std::time::Instant::now();
         (now, now)
     } else {
-        let now_utc_ns = Utc::now()
-            .timestamp_nanos_opt()
-            .expect("system clock out of i64 ns range");
-        let mut target_slot_ns = ((now_utc_ns / SLOT_NS) + 1) * SLOT_NS;
-        while target_slot_ns - now_utc_ns < MIN_LEAD_NS {
-            target_slot_ns += SLOT_NS;
-        }
-        let target_audio_ns = target_slot_ns + PRE_ROLL_NS;
-        let target_ptt_ns = target_audio_ns - PTT_LEAD_NS;
-
+        let now_utc = Utc::now();
+        let target_audio_utc = pancetta_core::slot::next_audio_start(now_utc, MIN_LEAD);
         let now_inst = std::time::Instant::now();
-        let audio_in = Duration::from_nanos((target_audio_ns - now_utc_ns) as u64);
-        let ptt_in = Duration::from_nanos((target_ptt_ns - now_utc_ns) as u64);
+        let audio_in = pancetta_core::slot::duration_until(target_audio_utc, now_utc);
 
-        let target_slot_secs = target_slot_ns / 1_000_000_000;
         println!(
-            "\nWaiting for FT8 slot at :{:02} ({}s lead) — audio starts at slot+0.5s",
-            target_slot_secs % 60,
-            (target_audio_ns - now_utc_ns) / 1_000_000_000
+            "\nWaiting for FT8 audio start at {} ({:.3}s)",
+            target_audio_utc.format("%H:%M:%S%.3f UTC"),
+            audio_in.as_secs_f64()
         );
-        (now_inst + audio_in, now_inst + ptt_in)
+        let target_audio = now_inst + audio_in;
+        let target_ptt = target_audio - PTT_LEAD;
+        (target_audio, target_ptt)
     };
 
     // --- PTT ON (slightly before audio start, for relay settle) ---

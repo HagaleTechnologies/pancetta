@@ -2873,6 +2873,7 @@ dependencies = [
  "num_cpus",
  "pancetta-audio",
  "pancetta-config",
+ "pancetta-core",
  "pancetta-cqdx",
  "pancetta-dsp",
  "pancetta-dx",
@@ -2938,6 +2939,7 @@ dependencies = [
 name = "pancetta-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

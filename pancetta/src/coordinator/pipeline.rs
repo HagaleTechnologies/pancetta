@@ -577,12 +577,10 @@ impl super::ApplicationCoordinator {
             // The decoder handles time alignment internally via Costas sync.
             // Schedule decode at 13s past the slot start (message ends at 12.64s).
             // Slots start at :00/:15/:30/:45, so decode at :13/:28/:43/:58.
-            let mut next_window_time = {
-                let now = chrono::Utc::now();
-                let secs = now.timestamp() % 15;
-                let wait_secs = if secs < 13 { 13 - secs } else { 15 - secs + 13 };
-                now + chrono::Duration::seconds(wait_secs)
-            };
+            let mut next_window_time = pancetta_core::slot::next_phase(
+                chrono::Utc::now(),
+                chrono::Duration::seconds(13),
+            );
             info!(
                 "DSP: first window at {}",
                 next_window_time.format("%H:%M:%S")
@@ -729,14 +727,10 @@ impl super::ApplicationCoordinator {
                             health_dsp_windows.fetch_add(1, Ordering::Relaxed);
                             health_last_rms.store(rms.to_bits(), Ordering::Relaxed);
                             // Schedule next decode at 13s into the next slot
-                            let now_resync = chrono::Utc::now();
-                            let secs_past = now_resync.timestamp() % 15;
-                            let wait_secs = if secs_past < 13 {
-                                13 - secs_past
-                            } else {
-                                15 - secs_past + 13
-                            };
-                            next_window_time = now_resync + chrono::Duration::seconds(wait_secs);
+                            next_window_time = pancetta_core::slot::next_phase(
+                                chrono::Utc::now(),
+                                chrono::Duration::seconds(13),
+                            );
                         }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}

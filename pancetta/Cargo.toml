@@ -19,6 +19,7 @@ path = "src/main.rs"
 
 [dependencies]
 # Local workspace dependencies
+pancetta-core = { path = "../pancetta-core" }
 pancetta-audio = { path = "../pancetta-audio" }
 pancetta-dsp = { path = "../pancetta-dsp" }
 pancetta-ft8 = { path = "../pancetta-ft8", features = ["transmit", "benchmark"] }

@@ -886,12 +886,14 @@ impl super::ApplicationCoordinator {
 
                 let mut slot_messages: Vec<pancetta_qso::DecodedMessageInfo> = Vec::new();
                 // Align slot timer to FT8 UTC boundaries (0/15/30/45 seconds)
-                let seconds_in_slot = chrono::Utc::now().timestamp() % 15;
-                let initial_delay = if seconds_in_slot == 0 {
-                    Duration::ZERO
-                } else {
-                    Duration::from_secs((15 - seconds_in_slot) as u64)
-                };
+                // with sub-second precision. tokio::time::interval_at then
+                // keeps the cadence exact every 15s relative to that first tick.
+                let now_utc = chrono::Utc::now();
+                let next_slot = pancetta_core::slot::next_slot_start(
+                    now_utc,
+                    chrono::Duration::zero(),
+                );
+                let initial_delay = pancetta_core::slot::duration_until(next_slot, now_utc);
                 let mut slot_interval = tokio::time::interval_at(
                     tokio::time::Instant::now() + initial_delay,
                     Duration::from_secs(15),
