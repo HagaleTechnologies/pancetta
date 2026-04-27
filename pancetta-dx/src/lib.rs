@@ -26,9 +26,7 @@
 #![allow(dead_code, unused_imports)]
 
 pub mod cluster;
-pub mod gridsquare;
 pub mod lotw;
-pub mod propagation;
 pub mod pskreporter;
 
 use chrono::{DateTime, Utc};
