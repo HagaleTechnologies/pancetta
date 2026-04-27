@@ -65,7 +65,8 @@ Design spec: `docs/superpowers/specs/2026-04-02-end-to-end-qso-design.md`
 - **Phase 1** (complete): Loopback QSO — CQ-to-73 exchange through full pipeline, state machine tests
 - **Phase 2** (complete): Autonomous operator + priority engine — configurable weighted scoring, POTA/SOTA detection
 - **Phase 3** (complete): Multi-stream TX — SmartFrequencyAllocator, multi-slot decision logic, dual QSO loopback test
-- **Phase 4** (next): Hardware integration — hamlib CAT control, real rig TX, on-air testing
+- **Phase 4** (complete, 2026-04-26): Hardware integration — hamlib CAT control via rigctld short-form commands, real rig TX validated on FTdx10 (DT 0.2, ALC clean), tail-end message decoded on PSKReporter across NA + EU
+- **Phase 5** (next): Full autonomous QSO loop — enable autonomous operator with antenna, complete a CQ→grid→report→RR73 exchange end-to-end
 
 ## Known Gaps and TODOs
 
