@@ -88,23 +88,42 @@ impl<'a> Waterfall<'a> {
         }
     }
 
+    /// Choose a glyph for the given intensity in Basic-color terminals
+    /// (xterm-style 16-color, often the case over SSH where COLORTERM and
+    /// the 256color TERM suffix don't propagate). The previous palette
+    /// returned `Color::Black` for the lowest band, which is identical to
+    /// the dark-theme background — the entire waterfall rendered invisible
+    /// over SSH/tmux even though the data was flowing. Encoding intensity
+    /// in the GLYPH (density blocks: ░ ▒ ▓ █) instead of (only) the color
+    /// guarantees the user sees signal vs. silence on any 16-color terminal.
+    fn glyph_for_intensity_basic(intensity: f32) -> char {
+        let c = intensity.clamp(0.0, 1.0);
+        if c < 0.10 {
+            ' '
+        } else if c < 0.30 {
+            '░'
+        } else if c < 0.55 {
+            '▒'
+        } else if c < 0.80 {
+            '▓'
+        } else {
+            '█'
+        }
+    }
+
     fn get_color_for_intensity(&self, intensity: f32) -> Color {
         let clamped = intensity.clamp(0.0, 1.0);
 
-        // Force basic colors if terminal doesn't support 256-color
+        // 16-color fallback: pair density glyphs (above) with a bright,
+        // always-visible foreground. Don't return Color::Black here — the
+        // glyph is what encodes intensity now, and we need the few cells
+        // that DO render (anything above 10%) to be unambiguously visible.
         if self.color_capability == ColorCapability::Basic {
-            // 7-step gradient using basic 16 colors — works everywhere
-            return if clamped < 0.15 {
-                Color::Black
-            } else if clamped < 0.30 {
-                Color::DarkGray
-            } else if clamped < 0.45 {
-                Color::Blue
-            } else if clamped < 0.60 {
-                Color::Cyan
-            } else if clamped < 0.75 {
+            return if clamped < 0.30 {
                 Color::Gray
-            } else if clamped < 0.90 {
+            } else if clamped < 0.55 {
+                Color::Cyan
+            } else if clamped < 0.80 {
                 Color::White
             } else {
                 Color::Yellow
@@ -202,8 +221,13 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
                     }
 
                     let color = self.get_color_for_intensity(intensity);
+                    let glyph = if self.color_capability == ColorCapability::Basic {
+                        Self::glyph_for_intensity_basic(intensity)
+                    } else {
+                        '█'
+                    };
                     let x = waterfall_area.x + col as u16;
-                    buf[(x, y)].set_char('█').set_fg(color);
+                    buf[(x, y)].set_char(glyph).set_fg(color);
                 }
             }
         }
