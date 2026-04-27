@@ -131,7 +131,14 @@ impl RigctldClient {
                             .split_whitespace()
                             .nth(1)
                             .and_then(|s| s.parse::<i32>().ok())
-                            .unwrap_or(-1);
+                            .unwrap_or_else(|| {
+                                tracing::warn!(
+                                    "rigctld: malformed RPRT response '{}', \
+                                     treating as error",
+                                    response
+                                );
+                                -1
+                            });
 
                         if code != 0 {
                             return Err(anyhow!("Rigctld error code: {}", code));
@@ -223,7 +230,14 @@ impl RigctldClient {
         let parts: Vec<&str> = response.split_whitespace().collect();
         if parts.len() >= 2 {
             let mode = Self::string_to_mode(parts[0]);
-            let passband = parts[1].parse::<i32>().unwrap_or(0);
+            let passband = parts[1].parse::<i32>().unwrap_or_else(|_| {
+                tracing::warn!(
+                    "rigctld: could not parse passband from '{}', \
+                     using 0 (disabled passband filter)",
+                    parts[1]
+                );
+                0
+            });
             Ok((mode, passband))
         } else {
             Err(anyhow!("Invalid mode response format"))
@@ -469,7 +483,13 @@ impl RigControl for RigctldClient {
         let mode_str = self.send_command_with_retry("m").await?;
         let passband_str = self.read_extra_line().await.unwrap_or_default();
         let mode = Self::string_to_mode(&mode_str);
-        let passband = passband_str.parse::<i32>().unwrap_or(0);
+        let passband = passband_str.parse::<i32>().unwrap_or_else(|_| {
+            tracing::warn!(
+                "rigctld: could not parse passband from '{}', using 0",
+                passband_str
+            );
+            0
+        });
 
         // Update cached value
         let mut state = self.state.write().await;
@@ -519,8 +539,17 @@ impl RigControl for RigctldClient {
         // Get signal strength
         let response = self.send_command_with_retry("\\get_level STRENGTH").await?;
 
-        // Parse as dBm (rigctld returns values like "-54")
-        let strength = response.trim().parse::<i32>().unwrap_or(-120);
+        // Parse as dBm (rigctld returns values like "-54"). On parse failure
+        // return an error rather than the silent -120 fallback that would
+        // be indistinguishable from a real "very weak signal" reading and
+        // poison the SNR / band-noise displays in the TUI.
+        let strength = response.trim().parse::<i32>().map_err(|e| {
+            anyhow!(
+                "rigctld: could not parse signal strength from '{}': {}",
+                response.trim(),
+                e
+            )
+        })?;
 
         // Update cached value
         let mut state = self.state.write().await;
@@ -560,7 +589,13 @@ impl RigControl for RigctldClient {
         let response = self.send_command_with_retry("\\get_level RFPOWER").await?;
 
         // Parse as fraction (0.0 - 1.0) and convert to watts
-        let level = response.trim().parse::<f32>().unwrap_or(0.0);
+        let level = response.trim().parse::<f32>().unwrap_or_else(|_| {
+            tracing::warn!(
+                "rigctld: could not parse power level from '{}', using 0.0",
+                response.trim()
+            );
+            0.0
+        });
 
         Ok(level * 100.0) // Convert to watts (assuming 100W max)
     }
@@ -569,8 +604,15 @@ impl RigControl for RigctldClient {
         // Get SWR reading
         let response = self.send_command_with_retry("\\get_level SWR").await?;
 
-        // Parse as SWR value
-        let swr = response.trim().parse::<f32>().unwrap_or(1.0);
+        // Parse as SWR value. 1.0 is a perfect-match fallback that masks
+        // a real high-SWR reading; warn so this is visible in logs.
+        let swr = response.trim().parse::<f32>().unwrap_or_else(|_| {
+            tracing::warn!(
+                "rigctld: could not parse SWR from '{}', using 1.0",
+                response.trim()
+            );
+            1.0
+        });
 
         Ok(swr)
     }

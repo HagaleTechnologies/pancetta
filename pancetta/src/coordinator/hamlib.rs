@@ -63,7 +63,49 @@ impl super::ApplicationCoordinator {
         let rigctld_host =
             std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
 
+        // SECURITY: rigctld talks to the radio over an unauthenticated TCP
+        // socket. The default 127.0.0.1 keeps it loopback-only; if the user
+        // explicitly sets RIGCTLD_HOST to a non-loopback address, anyone who
+        // can reach that port can drive the rig (key TX, change frequency,
+        // etc.). We don't outright block it because some operators have a
+        // legitimate reason to expose rigctld on a private network, but we
+        // do log a prominent warning so it's not silent.
+        if rigctld_host != "127.0.0.1" && rigctld_host != "localhost" && rigctld_host != "::1" {
+            warn!(
+                "RIGCTLD_HOST is set to a non-loopback address ({}). The \
+                 rigctld TCP port is unauthenticated; anyone who can reach \
+                 it can drive the radio. Use a firewall or revert to \
+                 127.0.0.1 if you didn't intend this.",
+                rigctld_host
+            );
+        }
+
         if rig_enabled {
+            // SECURITY: rig_config.interface.port is interpolated into the
+            // rigctld -r argument and identifies the serial device the
+            // daemon will open. Args are passed as a vec (no shell), so
+            // command-injection isn't a risk, but a hostile config could
+            // still ask rigctld to open an unrelated path. Restrict to the
+            // shapes that look like a real serial / network rig spec:
+            //   - /dev/tty*          (Linux/macOS USB-serial)
+            //   - /dev/cu.*          (macOS callout devices)
+            //   - COM<N>             (Windows)
+            //   - host:port          (rigctld's network rig syntax)
+            let port_field = &rig_config.interface.port;
+            let looks_safe = port_field.starts_with("/dev/tty")
+                || port_field.starts_with("/dev/cu.")
+                || port_field.starts_with("COM")
+                || port_field.contains(':');
+            if !looks_safe && !port_field.is_empty() {
+                warn!(
+                    "Refusing to spawn rigctld with suspicious port path \
+                     '{}'. Expected /dev/tty*, /dev/cu.*, COM<N>, or \
+                     host:port — adjust station.interface.port in config.",
+                    port_field
+                );
+                return Ok(());
+            }
+
             // Check if rigctld is already running
             let already_running =
                 tokio::net::TcpStream::connect(format!("{}:{}", rigctld_host, rigctld_port))
