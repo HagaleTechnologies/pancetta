@@ -158,6 +158,7 @@
 
 // Re-export all public types and functions for easy access
 pub use crate::adif::*;
+pub use crate::adif_log_writer::{AdifLogError, AdifLogResult, AdifLogWriter};
 pub use crate::auto_sequencer::*;
 pub use crate::autonomous::*;
 pub use crate::database::*;
@@ -171,6 +172,7 @@ pub use crate::statistics::*;
 
 // Module declarations
 pub mod adif;
+pub mod adif_log_writer;
 pub mod async_database;
 pub mod async_logger;
 pub mod auto_sequencer;

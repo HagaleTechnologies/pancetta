@@ -927,6 +927,43 @@ impl AdifProcessor {
         // Parse raw SNR dB value (e.g., "-15", "+03")
         rst.parse::<SignalReport>().ok()
     }
+
+    /// Generate a standalone ADIF file header string (ends with `<EOH>\n\n`).
+    ///
+    /// Used by [`crate::adif_log_writer::AdifLogWriter`] when creating a new log file.
+    /// The header is written exactly once; subsequent opens append records directly.
+    pub fn generate_header(&self) -> String {
+        let mut out = String::new();
+        out.push_str("ADIF Export by pancetta\n\n");
+        // Infallible — format_field only fails when value is empty, which won't happen here
+        out.push_str(&self.format_field("ADIF_VER", "3.1.0").unwrap_or_default());
+        out.push_str(&self.format_field("PROGRAMID", "pancetta").unwrap_or_default());
+        out.push_str(
+            &self
+                .format_field(
+                    "CREATED_TIMESTAMP",
+                    &chrono::Utc::now().format("%Y%m%d %H%M%S").to_string(),
+                )
+                .unwrap_or_default(),
+        );
+        out.push_str("\n<EOH>\n\n");
+        out
+    }
+
+    /// Generate a single ADIF record string for one QSO (ends with `<EOR>\n\n`).
+    ///
+    /// Used by [`crate::adif_log_writer::AdifLogWriter`] to append individual records.
+    /// The conversion from [`QsoMetadata`] is handled via [`Self::qso_to_adif`] and
+    /// [`Self::qso_to_record`] so no duplicate logic is introduced here.
+    pub fn generate_record(&self, qso: &AdifQso) -> Result<String, AdifError> {
+        let record = self.qso_to_record(qso);
+        let mut out = String::new();
+        for field in record.fields.values() {
+            out.push_str(&self.format_field(&field.name, &field.value)?);
+        }
+        out.push_str("<EOR>\n\n");
+        Ok(out)
+    }
 }
 
 impl Default for AdifProcessor {
