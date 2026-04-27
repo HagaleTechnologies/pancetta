@@ -23,6 +23,7 @@ mod ft8;
 mod hamlib;
 mod health;
 mod pipeline;
+mod qso;
 mod shutdown;
 mod tui_relay;
 mod util;
