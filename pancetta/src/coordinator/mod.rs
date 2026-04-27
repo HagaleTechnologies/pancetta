@@ -18,12 +18,13 @@
 
 mod audio;
 mod autonomous;
-mod components;
 mod dsp;
+mod dx_cluster;
 mod ft8;
 mod hamlib;
 mod health;
 mod pipeline;
+mod psk_reporter;
 mod qso;
 mod shutdown;
 mod tui_relay;
