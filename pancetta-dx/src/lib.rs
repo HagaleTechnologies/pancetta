@@ -1,49 +1,35 @@
 //! # pancetta-dx
 //!
-//! DX hunting, DXCC entity data, rarity scoring, and PSKReporter integration.
+//! Network integrations for amateur radio data sources that don't fit
+//! the cqdx.io HTTP client (`pancetta-cqdx`) — typically because they
+//! speak a non-cqdx protocol (DX cluster telnet) or because the call
+//! requires per-operator credentials we keep local on the pancetta
+//! host (LoTW upload, future eQSL/Clublog/QRZ).
 //!
-//! Advanced DX hunting and amateur radio award tracking system with real-time
-//! cluster integration, propagation analysis, and comprehensive DXCC management.
+//! ## Live integrations
 //!
-//! This crate provides:
-//! - DXCC entity database and lookup functionality
-//! - Rarity scoring algorithms for DX prioritization
-//! - Worked/confirmed tracking with multiple confirmation methods
-//! - Geographic calculations including distance and bearing
-//! - Propagation prediction integration
-//! - External service integrations (PSKReporter, DX clusters, LoTW)
-//! - Comprehensive statistics and progress reporting
+//! - [`cluster`] — traditional DX cluster telnet client, used by the
+//!   `dx_cluster` coordinator component to receive spots from human
+//!   operators worldwide.
+//! - [`pskreporter`] — uploads locally-decoded FT8 messages to the
+//!   global PSKReporter database for reciprocal spot visibility.
 //!
-//! ## Data Flow
-//! external services (PSKReporter, DX clusters) -> **pancetta-dx** -> `pancetta` coordinator (rarity scores, entity lookups)
+//! ## Scaffolding
 //!
-//! ## Key Types
-//! - [`scorer::RarityScorer`] -- computes a 0.0–1.0 rarity score for a DXCC entity
-//! - [`dxcc::DxccDatabase`] -- DXCC entity database with callsign-to-entity lookup
-//! - [`tracker::DxTracker`] -- tracks worked/confirmed entities per band/mode
-//! - [`pskreporter::PskReporter`] -- submits spots to and retrieves spots from PSKReporter
-//! - [`DxError`] -- crate-level error type
-//!
-//! ## Crate Relationships
-//! - Receives from: PSKReporter API, DX cluster feeds, LoTW
-//! - Sends to: `pancetta` coordinator (rarity scores, needed entity status)
+//! - [`lotw`] — ARRL LoTW client with login + ADIF upload + QSL download
+//!   wired but no caller yet. The credentialed-integration build-out is
+//!   tracked under `docs/superpowers/specs/`. Until then the module is
+//!   covered by the HTTPS scheme guard tests but isn't run from the
+//!   coordinator.
 
 #![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
 #![allow(dead_code, unused_imports)]
 
 pub mod cluster;
-pub mod dxcc;
-pub mod geography;
 pub mod gridsquare;
 pub mod lotw;
-pub mod priorities;
 pub mod propagation;
-pub mod propagation_enhanced;
 pub mod pskreporter;
-pub mod reports;
-pub mod scorer;
-pub mod statistics;
-pub mod tracker;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -59,9 +45,6 @@ pub type Result<T> = std::result::Result<T, DxError>;
 /// DX hunting specific errors
 #[derive(Error, Debug)]
 pub enum DxError {
-    #[error("Database error: {0}")]
-    Database(#[from] rusqlite::Error),
-
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
 
@@ -110,8 +93,6 @@ pub enum DxError {
     #[error("Format error: {0}")]
     Format(#[from] std::fmt::Error),
 }
-
-// Band and Mode types are now imported from pancetta-core
 
 /// QSO confirmation status
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,139 +248,6 @@ impl Default for DxPriorityConfig {
             blacklist: Vec::new(),
             whitelist: Vec::new(),
         }
-    }
-}
-
-/// Main DX Hunter engine
-pub struct DxHunter {
-    pub dxcc: std::sync::Arc<dxcc::DxccDatabase>,
-    pub tracker: std::sync::Arc<tracker::DxTracker>,
-    pub scorer: scorer::RarityScorer,
-    pub priorities: priorities::PriorityManager,
-    pub geography: geography::GeographyCalculator,
-    pub propagation: propagation::PropagationPredictor,
-    pub pskreporter: pskreporter::PskReporterClient,
-    pub cluster: cluster::DxClusterClient,
-    pub lotw: lotw::LotwClient,
-    pub statistics: statistics::StatisticsEngine,
-    pub reports: reports::ReportGenerator,
-    station_config: StationConfig,
-}
-
-impl DxHunter {
-    /// Create new DX Hunter instance
-    pub async fn new(station_config: StationConfig, database_path: &str) -> Result<Self> {
-        let dxcc = std::sync::Arc::new(dxcc::DxccDatabase::new().await?);
-        let tracker = std::sync::Arc::new(tracker::DxTracker::new(database_path).await?);
-        let scorer = scorer::RarityScorer::new(&tracker).await?;
-        let priorities = priorities::PriorityManager::new(DxPriorityConfig::default());
-        let geography =
-            geography::GeographyCalculator::new(station_config.latitude, station_config.longitude);
-        let propagation = propagation::PropagationPredictor::new();
-        let pskreporter = pskreporter::PskReporterClient::new();
-        let cluster = cluster::DxClusterClient::new();
-        let lotw = lotw::LotwClient::new(station_config.lotw_username.clone());
-        let statistics = statistics::StatisticsEngine::new(std::sync::Arc::clone(&tracker)).await?;
-        let reports = reports::ReportGenerator::new(
-            std::sync::Arc::clone(&tracker),
-            std::sync::Arc::clone(&dxcc),
-        )
-        .await?;
-
-        Ok(Self {
-            dxcc,
-            tracker,
-            scorer,
-            priorities,
-            geography,
-            propagation,
-            pskreporter,
-            cluster,
-            lotw,
-            statistics,
-            reports,
-            station_config,
-        })
-    }
-
-    /// Get station configuration
-    pub fn station_config(&self) -> &StationConfig {
-        &self.station_config
-    }
-
-    /// Update station configuration
-    pub fn update_station_config(&mut self, config: StationConfig) {
-        self.station_config = config;
-        self.geography = geography::GeographyCalculator::new(
-            self.station_config.latitude,
-            self.station_config.longitude,
-        );
-    }
-
-    /// Process a DX spot and calculate priority
-    pub async fn process_spot(&self, mut spot: DxSpot) -> Result<DxSpot> {
-        // Look up DXCC entity if not provided
-        if spot.dxcc_entity.is_none() {
-            if let Ok(entity) = self.dxcc.lookup_callsign(&spot.callsign).await {
-                spot.dxcc_entity = Some(entity.entity_code);
-            }
-        }
-
-        // Calculate geographic information if grid square is available
-        if let Some(grid) = &spot.grid_square {
-            if let Ok((lat, lon)) = gridsquare::grid_to_coordinates(grid) {
-                spot.distance_km = Some(self.geography.calculate_distance(lat, lon));
-                spot.bearing_degrees = Some(self.geography.calculate_bearing(lat, lon));
-            }
-        }
-
-        // Calculate rarity score
-        if let Some(entity_code) = spot.dxcc_entity {
-            let band = Band::from_frequency(spot.frequency);
-            spot.rarity_score = Some(
-                self.scorer
-                    .calculate_rarity_score(entity_code, band, spot.mode.as_ref())
-                    .await?,
-            );
-        }
-
-        Ok(spot)
-    }
-
-    /// Check if a QSO would be needed for awards
-    ///
-    /// Resolves the callsign to a DXCC entity code via the DXCC database,
-    /// then queries the award_tracking table for an existing confirmation.
-    /// Returns `true` (needed) if the callsign cannot be resolved — conservative.
-    pub async fn is_needed(&self, callsign: &str, band: Band, mode: &Mode) -> Result<bool> {
-        match self.dxcc.lookup_callsign(callsign).await {
-            Ok(entity) => {
-                self.tracker
-                    .is_entity_needed(entity.entity_code, band, mode)
-                    .await
-            }
-            Err(_) => {
-                // Can't resolve callsign — assume needed (conservative)
-                Ok(true)
-            }
-        }
-    }
-
-    /// Record a new QSO
-    pub async fn record_qso(&mut self, qso: DxQso) -> Result<uuid::Uuid> {
-        let qso_id = self.tracker.add_qso(qso).await?;
-
-        // Update statistics
-        self.statistics.update_statistics().await?;
-
-        Ok(qso_id)
-    }
-
-    /// Get priority spots based on current configuration
-    pub async fn get_priority_spots(&self, _limit: usize) -> Result<Vec<DxSpot>> {
-        // This would integrate with various spot sources
-        // For now, return empty vector as placeholder
-        Ok(Vec::new())
     }
 }
 
