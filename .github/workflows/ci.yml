@@ -107,3 +107,43 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --features transmit
+
+  # Cross-platform compile check. Pancetta targets Linux/macOS/Windows
+  # (development on Mac, production on Windows MiniPC), so a Linux-only
+  # CI lane silently lets platform regressions land. Check-only (not test)
+  # to keep wall-clock manageable.
+  cross-platform-check:
+    name: Cross-Platform Check (${{ matrix.os }})
+    if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-${{ matrix.os }}
+
+      # default-members excludes pancetta-hamlib; the rigctld TCP path is
+      # exercised on Linux and the bundled FFI bindings are dead code. The
+      # other crates must compile on all three platforms.
+      - name: Check workspace (default members)
+        run: cargo check
+
+  # Security advisories — RustSec database. Runs on every push to main and
+  # on PRs that touch Cargo.lock, so a vulnerable dep can't sneak in.
+  audit:
+    name: Cargo Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
