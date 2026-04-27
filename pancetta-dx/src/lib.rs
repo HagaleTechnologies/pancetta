@@ -59,9 +59,6 @@ pub enum DxError {
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
 
-    #[error("Invalid grid square: {0}")]
-    InvalidGridSquare(String),
-
     #[error("External service error: {0}")]
     ExternalService(String),
 
