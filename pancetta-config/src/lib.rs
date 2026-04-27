@@ -243,7 +243,7 @@ impl Config {
              - Audio: {} → {}\n\
              - Rig: {} @ {}\n\
              - UI: {} theme, {} layout\n\
-             - Network: PSKReporter={}, QRZ={}",
+             - Network: PSKReporter={}, cqdx.io={}",
             self.station.callsign,
             self.station.grid_square,
             self.audio.input_device,
@@ -257,7 +257,7 @@ impl Config {
             } else {
                 "disabled"
             },
-            if self.network.qrz.enabled {
+            if self.network.cqdx.enabled {
                 "enabled"
             } else {
                 "disabled"
