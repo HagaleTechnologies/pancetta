@@ -85,6 +85,25 @@ pub struct SpotGroup {
     pub notable_type: Option<String>,
 }
 
+/// Envelope for `GET /api/v1/spots?live=true`.
+///
+/// # Assumed response shape
+///
+/// ```json
+/// { "groups": [ { "dxCall": "3Y0J", "band": "20m", ... } ] }
+/// ```
+///
+/// The top-level key `groups` has **not** been verified against the live cqdx.io API.
+/// Run the `test_live_spots_envelope` integration test (requires `CQDX_TOKEN`) to confirm:
+///
+/// ```bash
+/// CQDX_TOKEN=pat_xxx cargo test -p pancetta-cqdx test_live_spots_envelope -- --ignored --nocapture
+/// ```
+///
+/// Note: the API requirements doc describes a `/spots/priorities` endpoint with a `priorities`
+/// envelope key and a simpler flat struct. This client instead calls `/spots?live=true` with
+/// richer `SpotGroup` objects — aligned with the Durable Object snapshot design, not the
+/// initial requirements doc. The server-side endpoint shape must match this struct.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LiveSpotsResponse {
     pub groups: Vec<SpotGroup>,
