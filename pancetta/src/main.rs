@@ -110,6 +110,16 @@ struct Cli {
     /// Metrics server port (requires --metrics)
     #[arg(long, default_value = "9090", global = true)]
     metrics_port: u16,
+
+    /// Inject a single TransmitRequest after startup, then shutdown when it
+    /// completes. For coordinator TX validation. Example:
+    ///   pancetta --headless --test-tx "K5ARH K5ARH 73"
+    #[arg(long, global = true)]
+    test_tx: Option<String>,
+
+    /// Audio frequency offset (Hz) for --test-tx
+    #[arg(long, default_value_t = 1500.0, global = true)]
+    test_tx_offset: f64,
 }
 
 #[derive(Clone, Subcommand)]
@@ -300,6 +310,8 @@ async fn run_application(cli: Cli) -> Result<()> {
         cli.metrics,
         cli.metrics_port,
         cli.wav,
+        cli.test_tx,
+        cli.test_tx_offset,
         shutdown.clone(),
     )
     .await?;

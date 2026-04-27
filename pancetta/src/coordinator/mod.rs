@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tracing::{info, span, warn, Level};
+use tracing::{error, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
 
@@ -78,6 +78,12 @@ pub struct ApplicationCoordinator {
 
     /// WAV file playback path (if set, runs in playback mode)
     wav_path: Option<PathBuf>,
+
+    /// One-shot test transmission. If Some, after startup the coordinator
+    /// injects a single TransmitRequest with this message text and shuts
+    /// down on TransmitComplete. Used for hardware bench validation.
+    test_tx: Option<String>,
+    test_tx_offset: f64,
 
     /// Cached station lookup for priority scoring (shared between QSO and autonomous components).
     cached_lookup: std::sync::Arc<crate::priority_evaluator::CachedStationLookup>,
@@ -242,6 +248,8 @@ impl ApplicationCoordinator {
         enable_metrics: bool,
         metrics_port: u16,
         wav_path: Option<PathBuf>,
+        test_tx: Option<String>,
+        test_tx_offset: f64,
         shutdown_signal: Arc<AtomicBool>,
     ) -> Result<Self> {
         let span = span!(Level::INFO, "coordinator_init");
@@ -275,6 +283,8 @@ impl ApplicationCoordinator {
             enable_metrics,
             metrics_port,
             wav_path,
+            test_tx,
+            test_tx_offset,
             cached_lookup: std::sync::Arc::new(
                 crate::priority_evaluator::CachedStationLookup::new(),
             ),
@@ -364,6 +374,46 @@ impl ApplicationCoordinator {
         }
 
         self.start_transmitter_component().await?;
+
+        // If --test-tx was passed, inject a single TransmitRequest after a
+        // brief settle period, then trigger shutdown after a generous window
+        // covering the worst-case TX cycle (slot wait + 12.64s TX + tail).
+        if let Some(test_tx_text) = self.test_tx.clone() {
+            let bus = self.message_bus.clone();
+            let shutdown = self.shutdown_signal.clone();
+            let offset = self.test_tx_offset;
+            tokio::spawn(async move {
+                // Settle: let hamlib spawn rigctld and connect.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+
+                info!(
+                    "TEST-TX: injecting TransmitRequest '{}' at offset {:.0} Hz",
+                    test_tx_text, offset
+                );
+
+                let req = crate::message_bus::ComponentMessage::new(
+                    crate::message_bus::ComponentId::Coordinator,
+                    crate::message_bus::ComponentId::Ft8Transmitter,
+                    crate::message_bus::MessageType::TransmitRequest {
+                        message_text: test_tx_text.clone(),
+                        frequency_offset: offset,
+                        qso_id: None,
+                    },
+                    Instant::now(),
+                );
+                if let Err(e) = bus.send_message(req).await {
+                    error!("TEST-TX: send TransmitRequest failed: {}", e);
+                    shutdown.store(true, Ordering::Release);
+                    return;
+                }
+
+                // Worst case: ≤16s slot wait + 12.64s TX + tail/settle = ~30s.
+                tokio::time::sleep(Duration::from_secs(35)).await;
+                info!("TEST-TX: cycle window elapsed — shutting down");
+                shutdown.store(true, Ordering::Release);
+            });
+        }
+
         self.start_autonomous_component().await?;
         self.start_dx_cluster_component().await?;
         self.start_pskreporter_component().await?;
@@ -423,6 +473,8 @@ mod tests {
             true,  // headless
             false, // metrics
             9090, None, // no WAV
+            None,  // no test-tx
+            1500.0,
             shutdown,
         )
         .await;
@@ -479,6 +531,8 @@ mod tests {
             false, // no metrics
             9090,
             Some(wav_path),
+            None, // no test-tx
+            1500.0,
             shutdown,
         )
         .await
