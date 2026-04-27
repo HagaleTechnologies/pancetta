@@ -155,6 +155,13 @@ impl super::ApplicationCoordinator {
 
                 // Seed worked-station history from the QSO database so that
                 // previously-worked stations are recognised as duplicates across restarts.
+                //
+                // Three-case startup decision:
+                //   1. Migration: ADIF missing but legacy DB exists → dump DB to ADIF first
+                //      so contacts are not lost; future runs use ADIF as source of truth.
+                //   2. Replay: index missing or older than ADIF → drop + replay so duplicate
+                //      detection sees every prior contact.
+                //   3. Open as-is: normal startup; index is current.
                 {
                     use pancetta_qso::async_database::AsyncQsoDatabase;
 
@@ -167,27 +174,101 @@ impl super::ApplicationCoordinator {
                         .unwrap_or_else(|| "20m".to_string())
                         .to_uppercase();
 
-                    match AsyncQsoDatabase::open(&db_path).await {
-                        Ok(db) => {
-                            let callsigns = db.get_worked_callsigns(&band).await;
-                            if callsigns.is_empty() {
-                                tracing::info!(
-                                    "QSO database has no prior contacts on {} — starting fresh",
-                                    band
+                    // Case 1: migration — ADIF missing but legacy DB exists.
+                    let adif_exists = tokio::fs::try_exists(&adif_path).await.unwrap_or(false);
+                    let db_exists = tokio::fs::try_exists(&db_path).await.unwrap_or(false);
+
+                    if !adif_exists && db_exists {
+                        info!(
+                            "ADIF missing but legacy DB present — migrating QSOs from {} to {}",
+                            db_path.display(),
+                            adif_path.display(),
+                        );
+                        match AsyncQsoDatabase::open(&db_path).await {
+                            Ok(db) => {
+                                if let Err(e) = db.export_to_adif(&adif_path).await {
+                                    warn!(
+                                        "DB→ADIF migration failed: {} — index continues to work, \
+                                         but ADIF source-of-truth will only contain QSOs logged \
+                                         from now on",
+                                        e,
+                                    );
+                                } else {
+                                    info!("DB→ADIF migration succeeded");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Could not open legacy DB for migration: {} — skipping",
+                                    e
                                 );
-                            } else {
-                                qso_lookup.seed_worked_from_list(&band, callsigns);
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Could not open QSO database for startup seed ({}): {} — \
-                                 previously-worked stations will not be detected as duplicates \
-                                 until re-worked this session",
-                                db_path.display(),
-                                e
+                    }
+
+                    // Case 2: replay — index missing or older than ADIF.
+                    let needs_replay = match (
+                        tokio::fs::metadata(&db_path).await.ok(),
+                        tokio::fs::metadata(&adif_path).await.ok(),
+                    ) {
+                        (None, Some(_)) => {
+                            info!(
+                                "Index missing at {} — replaying from ADIF",
+                                db_path.display()
                             );
+                            true
                         }
+                        (Some(db_meta), Some(adif_meta)) => {
+                            match (db_meta.modified().ok(), adif_meta.modified().ok()) {
+                                (Some(d), Some(a)) if a > d => {
+                                    info!(
+                                        "Index at {} is older than ADIF at {} — replaying",
+                                        db_path.display(),
+                                        adif_path.display(),
+                                    );
+                                    true
+                                }
+                                _ => false,
+                            }
+                        }
+                        // No ADIF and no DB: fresh install; coordinator creates both later.
+                        _ => false,
+                    };
+
+                    let db_for_seed = if needs_replay {
+                        match AsyncQsoDatabase::replay_from_adif(&db_path, &adif_path).await {
+                            Ok(db) => Some(db),
+                            Err(e) => {
+                                warn!(
+                                    "ADIF replay failed: {} — falling back to existing index \
+                                     (may be stale)",
+                                    e,
+                                );
+                                AsyncQsoDatabase::open(&db_path).await.ok()
+                            }
+                        }
+                    } else {
+                        // Case 3: open as-is.
+                        AsyncQsoDatabase::open(&db_path).await.ok()
+                    };
+
+                    if let Some(db) = db_for_seed {
+                        let callsigns = db.get_worked_callsigns(&band).await;
+                        if callsigns.is_empty() {
+                            info!(
+                                "QSO database has no prior contacts on {} — starting fresh",
+                                band
+                            );
+                        } else {
+                            qso_lookup.seed_worked_from_list(&band, callsigns);
+                        }
+                    } else {
+                        warn!(
+                            "Could not open QSO database for startup seed ({}) — \
+                             previously-worked stations will not be detected as duplicates \
+                             until re-worked this session",
+                            db_path.display(),
+                        );
                     }
                 }
 

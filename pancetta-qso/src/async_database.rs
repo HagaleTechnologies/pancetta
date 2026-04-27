@@ -39,6 +39,16 @@ pub enum AsyncDatabaseError {
 
     #[error("Schema validation failed: {message}")]
     SchemaValidation { message: String },
+
+    #[error("I/O at {path}: {source}")]
+    Io {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("ADIF replay failed: {0}")]
+    Replay(String),
 }
 
 /// Async QSO database using sqlx
@@ -548,6 +558,126 @@ impl AsyncQsoDatabase {
             }
         }
     }
+
+    /// Build a fresh index at `db_path` by replaying every record in `adif_path`.
+    ///
+    /// If `db_path` exists, it is deleted first — caller should only invoke this
+    /// when the DB is known to be stale or missing. Returns the new database
+    /// handle, ready for queries.
+    pub async fn replay_from_adif(
+        db_path: impl AsRef<std::path::Path>,
+        adif_path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, AsyncDatabaseError> {
+        let db_path = db_path.as_ref();
+        let adif_path = adif_path.as_ref();
+
+        // Drop any existing index so the rebuild is from scratch.
+        if tokio::fs::try_exists(db_path).await.unwrap_or(false) {
+            tokio::fs::remove_file(db_path)
+                .await
+                .map_err(|source| AsyncDatabaseError::Io {
+                    path: db_path.to_path_buf(),
+                    source,
+                })?;
+        }
+
+        let db = Self::open(db_path).await?;
+
+        let raw =
+            tokio::fs::read_to_string(adif_path)
+                .await
+                .map_err(|source| AsyncDatabaseError::Io {
+                    path: adif_path.to_path_buf(),
+                    source,
+                })?;
+
+        let processor = crate::adif::AdifProcessor::new();
+        let adif_file = processor
+            .parse_string(&raw)
+            .map_err(|e| AsyncDatabaseError::Replay(format!("ADIF parse failed: {e}")))?;
+
+        let mut inserted: u64 = 0;
+        for adif_record in &adif_file.records {
+            let adif_qso = processor
+                .record_to_qso(adif_record)
+                .map_err(|e| AsyncDatabaseError::Replay(format!("record→AdifQso failed: {e}")))?;
+            let metadata = processor.adif_to_qso(&adif_qso);
+
+            let progress = QsoProgress {
+                state: QsoState::Idle,
+                state_history: vec![],
+                messages: vec![],
+                metadata,
+            };
+
+            db.insert_qso(&progress).await?;
+            inserted += 1;
+        }
+
+        info!(
+            "Replayed {} records from {} into {}",
+            inserted,
+            adif_path.display(),
+            db_path.display(),
+        );
+        Ok(db)
+    }
+
+    /// Export all QSOs in the index to an ADIF file at `path`.
+    ///
+    /// Iterates every row in `qsos`, converts via `qso_to_adif`, and writes a
+    /// complete ADIF file. Intended for the DB→ADIF migration path at startup.
+    pub async fn export_to_adif(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), AsyncDatabaseError> {
+        use crate::adif::{AdifFile, AdifHeader};
+
+        let path = path.as_ref();
+
+        // Fetch all rows from the database as QsoProgress.
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT progress_data FROM qsos ORDER BY created_at ASC")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let processor = crate::adif::AdifProcessor::new();
+        let mut records = Vec::with_capacity(rows.len());
+        for (progress_json,) in &rows {
+            if let Ok(progress) = serde_json::from_str::<QsoProgress>(progress_json) {
+                let adif_qso = processor
+                    .qso_to_adif(&progress.metadata, progress.metadata.contest_info.as_ref());
+                records.push(processor.qso_to_record(&adif_qso));
+            }
+        }
+
+        let adif_file = AdifFile {
+            header: AdifHeader::default(),
+            records,
+        };
+
+        let content = processor
+            .generate_string(&adif_file)
+            .map_err(|e| AsyncDatabaseError::Replay(format!("ADIF generate failed: {e}")))?;
+
+        tokio::fs::write(path, content)
+            .await
+            .map_err(|source| AsyncDatabaseError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+
+        info!("Exported {} QSOs to {}", rows.len(), path.display());
+        Ok(())
+    }
+
+    /// Total number of QSOs in the index.
+    pub async fn count_qsos(&self) -> Result<u64, AsyncDatabaseError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM qsos")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count as u64)
+    }
 }
 
 // AsyncQsoDatabase is automatically Send + Sync thanks to SqlitePool
@@ -638,5 +768,45 @@ mod tests {
         // Verify update
         let retrieved = db.get_qso(progress.metadata.qso_id).await.unwrap();
         assert!(matches!(retrieved.state, QsoState::Completed { .. }));
+    }
+
+    #[tokio::test]
+    async fn replay_from_adif_round_trips_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adif_path = tmp.path().join("qsos.adi");
+        let db_path = tmp.path().join("qsos.db");
+
+        // Two records, valid ADIF
+        let adif_contents = "Pancetta ADIF round-trip test\n\
+            <ADIF_VER:5>3.1.4 <PROGRAMID:8>pancetta\n\
+            <EOH>\n\
+            \n\
+            <CALL:5>W1ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 \
+            <MODE:3>FT8 <FREQ:9>14.074000 <BAND:3>20m\n\
+            <EOR>\n\
+            \n\
+            <CALL:5>K9DEF <QSO_DATE:8>20250102 <TIME_ON:6>121500 \
+            <MODE:3>FT8 <FREQ:9>14.074000 <BAND:3>20m\n\
+            <EOR>\n";
+        tokio::fs::write(&adif_path, adif_contents).await.unwrap();
+
+        let db = AsyncQsoDatabase::replay_from_adif(&db_path, &adif_path)
+            .await
+            .unwrap();
+        let count = db.count_qsos().await.unwrap();
+        assert_eq!(count, 2, "expected 2 records replayed, got {}", count);
+
+        // frequency_to_band returns uppercase ("20M") — coordinator also uppercases.
+        let calls = db.get_worked_callsigns("20M").await;
+        assert!(
+            calls.contains(&"W1ABC".to_string()),
+            "missing W1ABC in {:?}",
+            calls
+        );
+        assert!(
+            calls.contains(&"K9DEF".to_string()),
+            "missing K9DEF in {:?}",
+            calls
+        );
     }
 }
