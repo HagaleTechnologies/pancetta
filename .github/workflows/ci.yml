@@ -56,10 +56,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  # Full test suite — only on PRs (~20 min)
+  # Full test suite — runs on every push to main and every PR. Previously
+  # gated on `pull_request` only, which let test regressions land via direct
+  # push without ever being exercised. Cross-platform-check stays on PR only
+  # because it's the slowest lane.
   ft8-tests:
     name: FT8 Tests
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -86,7 +88,6 @@ jobs:
 
   workspace-check:
     name: Workspace Check
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -146,19 +147,10 @@ jobs:
       - name: Check workspace (default members)
         run: cargo check
 
-  # Security advisories — RustSec database. Runs on every push to main and
-  # on PRs that touch Cargo.lock, so a vulnerable dep can't sneak in.
-  audit:
-    name: Cargo Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: rustsec/audit-check@v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-  # cargo-deny enforces broader policy than audit alone: license whitelist,
-  # banned crate sources, multi-version warnings. Configured in deny.toml.
+  # cargo-deny enforces license whitelist, banned-crate-source policy,
+  # multi-version warnings, AND RustSec advisories — the latter subsumes
+  # what cargo-audit would do separately. Single source of truth in
+  # deny.toml, including any documented advisory ignores.
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest

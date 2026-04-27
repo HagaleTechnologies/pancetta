@@ -295,6 +295,34 @@ document it — the lint is silenced for the existing backlog, not new
 work. As coverage grows, please flip the crate from `allow` → `warn`
 → `deny` and remove the TODO comment.
 
+## Pre-push verification
+
+Run [`scripts/check.sh`](scripts/check.sh) before every `git push`. It runs
+the same checks CI runs, in roughly the same order — formatting, clippy,
+the workspace tests (including hamlib's separate single-threaded suite),
+the examples build, and `cargo deny`. If it passes locally, CI will pass
+remotely.
+
+```bash
+scripts/check.sh            # full sweep, ~5–10 min
+scripts/check.sh --fast     # skip the full test lane (~30 sec)
+scripts/check.sh --fix      # auto-correct what fmt + clippy can fix
+```
+
+Recommended one-time setup:
+
+```bash
+# Get cargo-deny so the supply-chain lane runs locally:
+cargo install --locked cargo-deny
+
+# Hook the script into git so you can't push without running it:
+ln -s ../../scripts/check.sh .git/hooks/pre-push
+```
+
+The CI workflow file (`.github/workflows/ci.yml`) is the source of truth
+for what gets gated. If you add a new check there, mirror it into
+`scripts/check.sh` so the local pre-flight stays honest.
+
 ## Testing Requirements
 
 ### Unit Tests

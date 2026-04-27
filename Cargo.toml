@@ -34,6 +34,9 @@ edition = "2021"
 authors = ["Hagale Technologies, LLC"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/HagaleTechnologies/pancetta"
+# Pre-1.0: crates aren't published to crates.io. Flip to `true` and add
+# `version = "..."` to each path dep when ready to publish.
+publish = false
 
 [workspace.dependencies]
 # Real-time audio processing

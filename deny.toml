@@ -14,7 +14,27 @@ all-features = false
 [advisories]
 # Fail on any RustSec advisory in dependencies. Yanked crates also fail.
 yanked = "deny"
-ignore = []
+# Each ignore MUST come with a rationale comment so future-us can re-evaluate.
+# Re-check this list when bumping the affected crate's parent.
+ignore = [
+    # rsa crate's Marvin Attack timing sidechannel. No patch is available
+    # upstream as of 2026-04. We pull rsa transitively via sqlx, but only
+    # for MySQL/Postgres password authentication paths. Pancetta uses sqlx
+    # exclusively against SQLite; the rsa code is never executed at runtime.
+    # Re-check when sqlx 1.0 ships or when a constant-time rsa replacement
+    # lands and percolates into sqlx.
+    { id = "RUSTSEC-2023-0071", reason = "rsa is sqlx transitive dep for MySQL/Postgres auth; pancetta uses SQLite only" },
+
+    # `instant` 0.1 is unmaintained. Replacement is `web-time`. We pull
+    # instant transitively via tokio/cpal; both are working on migration.
+    # Nothing actionable at our layer.
+    { id = "RUSTSEC-2024-0384", reason = "transitive via tokio/cpal; upstream migration to web-time pending" },
+
+    # `paste` is unmaintained but is a proc-macro crate that runs only at
+    # compile time. No runtime code, no security surface from being
+    # unmaintained.
+    { id = "RUSTSEC-2024-0436", reason = "proc-macro only — runs at build time, no runtime exposure" },
+]
 
 [licenses]
 # Permissive licenses we accept for transitive deps. The workspace itself
@@ -33,6 +53,11 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "0BSD",
+    # CDLA-Permissive-2.0 is the Linux Foundation Community Data License
+    # Agreement, used by webpki-roots to publish the Mozilla CA bundle
+    # (it's data, not code). Permissive use, equivalent in effect to
+    # MIT for our purposes.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.93
 
@@ -41,7 +66,13 @@ confidence-threshold = 0.93
 # unless we explicitly allow it. Multiple-version skews are a common source
 # of bloat and behaviour drift.
 multiple-versions = "warn"
+# Wildcard external deps are a footgun (silent major-version bumps), but
+# our internal `path = "../pancetta-foo"` workspace edges resolve as
+# wildcards and that's normal Rust workspace shape. allow-wildcard-paths
+# permits the path case while still denying `version = "*"` on a
+# crates.io dep.
 wildcards = "deny"
+allow-wildcard-paths = true
 # Add explicit `deny = [...]` entries here if a banned crate ever creeps
 # in (e.g. unmaintained or compromised packages).
 
