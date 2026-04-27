@@ -201,7 +201,7 @@ never reaches up into an orchestrator.
 | `pancetta-qso` | QSO state machine, priority scoring, autonomous operator |
 | `pancetta-hamlib` | rigctld TCP client (CAT control) |
 | `pancetta-cqdx` | cqdx.io HTTP client and cache |
-| `pancetta-dx` | Legacy DXCC / PSKReporter / LoTW client |
+| `pancetta-dx` | DX cluster + PSKReporter + scaffolded LoTW |
 | `pancetta-tui` | Terminal UI (ratatui + crossterm) |
 | `pancetta` | Coordinator binary, message bus, runtime |
 

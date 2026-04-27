@@ -2,15 +2,15 @@
 //!
 //! Network integrations for amateur radio data sources that don't fit
 //! the cqdx.io HTTP client (`pancetta-cqdx`) — typically because they
-//! speak a non-cqdx protocol (DX cluster telnet) or because the call
-//! requires per-operator credentials we keep local on the pancetta
-//! host (LoTW upload, future eQSL/Clublog/QRZ).
+//! speak a non-cqdx protocol (DX cluster telnet/WebSocket) or because
+//! the call requires per-operator credentials we keep local on the
+//! pancetta host (LoTW upload, future eQSL/Clublog/QRZ).
 //!
 //! ## Live integrations
 //!
-//! - [`cluster`] — traditional DX cluster telnet client, used by the
-//!   `dx_cluster` coordinator component to receive spots from human
-//!   operators worldwide.
+//! - [`cluster`] — DX cluster client (telnet + WebSocket transports),
+//!   used by the `dx_cluster` coordinator component to receive spots
+//!   from human operators worldwide.
 //! - [`pskreporter`] — uploads locally-decoded FT8 messages to the
 //!   global PSKReporter database for reciprocal spot visibility.
 //!
@@ -21,9 +21,23 @@
 //!   tracked under `docs/superpowers/specs/`. Until then the module is
 //!   covered by the HTTPS scheme guard tests but isn't run from the
 //!   coordinator.
+//!
+//! ## What used to live here
+//!
+//! Several modules were deleted in 2026-04 because cqdx.io now serves
+//! the same data through `pancetta-cqdx`:
+//!
+//! | Removed module           | Replacement                                      |
+//! |--------------------------|--------------------------------------------------|
+//! | `dxcc.rs`                | `pancetta_cqdx::CqdxCache::resolve_entity`       |
+//! | `priorities.rs`          | `pancetta_qso::priority::PriorityScorer`         |
+//! | `propagation.rs` / `_enhanced` | (deferred — future cqdx.io feature)        |
+//! | `statistics.rs`          | `pancetta_cqdx::CqdxCache` + per-band rolling    |
+//! | `tracker.rs`             | `pancetta_qso::logger::QsoLogger`                |
+//! | `gridsquare.rs`          | `pancetta_core::gridsquare`                      |
+//! | `geography.rs`           | `geographiclib_rs::Geodesic` directly            |
 
 #![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
-#![allow(dead_code, unused_imports)]
 
 pub mod cluster;
 pub mod lotw;
@@ -31,7 +45,6 @@ pub mod pskreporter;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use thiserror::Error;
 
 // Re-export unified types from pancetta-core
@@ -46,20 +59,8 @@ pub enum DxError {
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
 
-    #[error("Geographic calculation error: {0}")]
-    Geography(String),
-
-    #[error("DXCC entity not found: {0}")]
-    DxccNotFound(String),
-
-    #[error("Invalid callsign format: {0}")]
-    InvalidCallsign(String),
-
     #[error("Invalid grid square: {0}")]
     InvalidGridSquare(String),
-
-    #[error("Propagation prediction error: {0}")]
-    Propagation(String),
 
     #[error("External service error: {0}")]
     ExternalService(String),
@@ -175,78 +176,6 @@ pub struct DxQso {
     pub contest_id: Option<String>,
     /// Additional notes
     pub notes: Option<String>,
-}
-
-/// Station configuration for DX operations
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StationConfig {
-    /// Home callsign
-    pub callsign: String,
-    /// Home grid square
-    pub grid_square: String,
-    /// Home QTH
-    pub qth: String,
-    /// Latitude in decimal degrees
-    pub latitude: f64,
-    /// Longitude in decimal degrees
-    pub longitude: f64,
-    /// DXCC entity of home station
-    pub dxcc_entity: u16,
-    /// Preferred QSL route
-    pub qsl_route: Option<String>,
-    /// LoTW username
-    pub lotw_username: Option<String>,
-    /// eQSL username
-    pub eqsl_username: Option<String>,
-    /// ClubLog username
-    pub clublog_username: Option<String>,
-}
-
-/// DX priority configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DxPriorityConfig {
-    /// Award tracking preferences
-    pub awards: HashMap<String, bool>,
-    /// Band priorities (higher = more priority)
-    pub band_priorities: HashMap<Band, u8>,
-    /// Mode priorities (higher = more priority)
-    pub mode_priorities: HashMap<Mode, u8>,
-    /// Minimum rarity score to consider
-    pub min_rarity_score: f64,
-    /// Maximum distance for VHF/UHF DX
-    pub max_vhf_distance_km: Option<f64>,
-    /// Enable automatic spot filtering
-    pub auto_filter: bool,
-    /// Blacklisted callsigns/prefixes
-    pub blacklist: Vec<String>,
-    /// Whitelist for priority callsigns/prefixes
-    pub whitelist: Vec<String>,
-}
-
-impl Default for DxPriorityConfig {
-    fn default() -> Self {
-        let mut band_priorities = HashMap::new();
-        for band in Band::all() {
-            band_priorities.insert(*band, 5); // Default medium priority
-        }
-
-        let mut mode_priorities = HashMap::new();
-        mode_priorities.insert(Mode::CW, 8);
-        mode_priorities.insert(Mode::USB, 7);
-        mode_priorities.insert(Mode::FT8, 6);
-        mode_priorities.insert(Mode::RTTY, 6);
-
-        Self {
-            awards: HashMap::new(),
-            band_priorities,
-            mode_priorities,
-            min_rarity_score: 0.0,
-            max_vhf_distance_km: Some(500.0),
-            auto_filter: true,
-            blacklist: Vec::new(),
-            whitelist: Vec::new(),
-        }
-    }
 }
 
 #[cfg(test)]

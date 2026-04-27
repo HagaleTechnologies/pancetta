@@ -21,7 +21,7 @@ Layer 0 — no internal deps:
 Layer 1 — depends on core/ft8:
   pancetta-qso     — QSO management, priority scoring, autonomous operator
   pancetta-hamlib  — Hamlib CAT control FFI
-  pancetta-dx      — DX hunting, DXCC, PSKReporter
+  pancetta-dx      — DX cluster + PSKReporter + scaffolded LoTW
   pancetta-cqdx    — cqdx.io HTTP client, cache, types
 
 Layer 2 — orchestrator:

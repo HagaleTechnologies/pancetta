@@ -135,8 +135,8 @@ pub struct LotwClient {
     client: Client,
     /// Configuration
     config: LotwConfig,
-    /// Authentication cookie
-    auth_cookie: Option<String>,
+    /// Authentication cookie (populated on login, used for subsequent requests)
+    _auth_cookie: Option<String>,
 }
 
 impl LotwClient {
@@ -156,7 +156,7 @@ impl LotwClient {
         Self {
             client,
             config,
-            auth_cookie: None,
+            _auth_cookie: None,
         }
     }
 
@@ -171,7 +171,7 @@ impl LotwClient {
         Self {
             client,
             config,
-            auth_cookie: None,
+            _auth_cookie: None,
         }
     }
 

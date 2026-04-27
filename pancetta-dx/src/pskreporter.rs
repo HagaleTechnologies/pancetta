@@ -68,8 +68,9 @@ struct PskReporterSpot {
     /// Transmitter locator (grid square)
     #[serde(rename = "transmitterLocator")]
     transmitter_locator: Option<String>,
-    /// Receiver locator (grid square)
+    /// Receiver locator (grid square) — captured for completeness; not used in spot conversion
     #[serde(rename = "receiverLocator")]
+    #[allow(dead_code)]
     receiver_locator: Option<String>,
 }
 
@@ -85,8 +86,9 @@ struct PskReporterResponse {
     /// Reception reports
     #[serde(rename = "receptionReport")]
     reception_reports: Option<Vec<PskReporterSpot>>,
-    /// Statistics
+    /// Statistics — present in API response but not yet consumed
     #[serde(rename = "statistics")]
+    #[allow(dead_code)]
     statistics: Option<HashMap<String, serde_json::Value>>,
 }
 
