@@ -358,9 +358,24 @@ impl super::ApplicationCoordinator {
             info!("Starting audio component with real AudioManager");
 
             let config = self.config.read().await;
+            // CLI --audio-device overrides BOTH input and output, since the
+            // typical ham-radio rig presents bidirectional USB audio (CODEC
+            // input == receiver output, CODEC output == modulator input).
+            let (input_dev, output_dev) = if let Some(ref dev) = self.audio_device {
+                info!(
+                    "--audio-device override: '{}' for both input and output",
+                    dev
+                );
+                (dev.clone(), dev.clone())
+            } else {
+                (
+                    config.audio.input_device.clone(),
+                    config.audio.output_device.clone(),
+                )
+            };
             let audio_config = AudioManagerConfig {
-                input_device: Some(config.audio.input_device.clone()),
-                output_device: Some(config.audio.output_device.clone()),
+                input_device: Some(input_dev),
+                output_device: Some(output_dev),
                 sample_rate: config.audio.sample_rate,
                 buffer_size: config.audio.buffer_size as usize,
                 channels: config.audio.input_channels as u16,

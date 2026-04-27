@@ -11,6 +11,17 @@ use cpal::{
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+/// Normalize a device name for substring matching: lowercase + collapse
+/// runs of whitespace to a single space. Lets a user pass "USB AUDIO CODEC"
+/// even when the OS reports the name with double-spaces ("USB AUDIO  CODEC"
+/// — observed on macOS for the FTdx10's BurrBrown CODEC).
+fn normalize_device_name(s: &str) -> String {
+    s.split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Audio device information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioDeviceInfo {
@@ -210,11 +221,13 @@ impl AudioDeviceManager {
     /// let dev = mgr.find_input_device_by_name("FTdx10").unwrap();
     /// ```
     pub fn find_input_device_by_name(&self, name_pattern: &str) -> AudioResult<&Device> {
-        let pattern = name_pattern.to_lowercase();
+        let pattern = normalize_device_name(name_pattern);
         let candidate = self
             .devices
             .iter()
-            .filter(|(_, info)| info.supports_input && info.name.to_lowercase().contains(&pattern))
+            .filter(|(_, info)| {
+                info.supports_input && normalize_device_name(&info.name).contains(&pattern)
+            })
             .max_by_key(|(_, info)| info.input_channels.len() + info.input_sample_rates.len());
 
         match candidate {
@@ -236,11 +249,13 @@ impl AudioDeviceManager {
     /// `name_pattern`. When multiple devices match, the one with the richest
     /// output capabilities (most channel/rate combos) is returned.
     pub fn find_output_device_by_name(&self, name_pattern: &str) -> AudioResult<&Device> {
-        let pattern = name_pattern.to_lowercase();
+        let pattern = normalize_device_name(name_pattern);
         let candidate = self
             .devices
             .iter()
-            .filter(|(_, info)| info.supports_output && info.name.to_lowercase().contains(&pattern))
+            .filter(|(_, info)| {
+                info.supports_output && normalize_device_name(&info.name).contains(&pattern)
+            })
             .max_by_key(|(_, info)| info.output_channels.len() + info.output_sample_rates.len());
 
         match candidate {
