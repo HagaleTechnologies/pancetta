@@ -24,6 +24,7 @@ mod hamlib;
 mod health;
 mod pipeline;
 mod shutdown;
+mod tui_relay;
 mod util;
 mod wav_playback;
 
