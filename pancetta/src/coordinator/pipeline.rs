@@ -1161,6 +1161,19 @@ impl super::ApplicationCoordinator {
                                     },
                                 );
                             }
+                            MessageType::StatusUpdate(text) => {
+                                // Free-form status emitted by other components (e.g. QSO
+                                // component reports respond_to_cq success/failure here so
+                                // Space-to-call surfaces "Calling X — TX queued" or the
+                                // actual rejection reason instead of just an optimistic
+                                // "Calling X..." that hides silent failures.
+                                let _ = tui_msg_tx_relay.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: format!("{}", bus_msg.source),
+                                        status: text,
+                                    },
+                                );
+                            }
                             _ => {}
                         }
                     }

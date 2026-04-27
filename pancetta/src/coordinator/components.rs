@@ -7,6 +7,20 @@ use tracing::{debug, error, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
 
+/// Send a free-form status string to the TUI status bar via the message bus.
+/// Used to surface QSO/TX state changes that the operator should see, even
+/// when nothing failed at the transport layer (e.g. duplicate suppression,
+/// QSO state-machine rejections).
+async fn emit_status(message_bus: &MessageBus, text: impl Into<String>) {
+    let msg = ComponentMessage::new(
+        ComponentId::Qso,
+        ComponentId::Tui,
+        MessageType::StatusUpdate(text.into()),
+        Instant::now(),
+    );
+    let _ = message_bus.send_message(msg).await;
+}
+
 /// Guard that sends PTT-off when dropped, ensuring PTT is released
 /// even if the transmitter task is cancelled mid-transmission.
 struct PttGuard {
@@ -378,7 +392,7 @@ impl super::ApplicationCoordinator {
                                                         ComponentId::Qso,
                                                         ComponentId::Ft8Transmitter,
                                                         MessageType::TransmitRequest {
-                                                            message_text: reply,
+                                                            message_text: reply.clone(),
                                                             frequency_offset: frequency as f64,
                                                             qso_id: Some(qso_id.to_string()),
                                                         },
@@ -391,6 +405,23 @@ impl super::ApplicationCoordinator {
                                                             "Failed to send QSO TX request: {}",
                                                             e
                                                         );
+                                                        emit_status(
+                                                            &message_bus,
+                                                            format!(
+                                                                "Call {}: TX bus send failed: {}",
+                                                                callsign, e
+                                                            ),
+                                                        )
+                                                        .await;
+                                                    } else {
+                                                        emit_status(
+                                                            &message_bus,
+                                                            format!(
+                                                                "Calling {} — TX queued ({} Hz)",
+                                                                callsign, frequency
+                                                            ),
+                                                        )
+                                                        .await;
                                                     }
                                                 }
                                                 Err(e) => {
@@ -398,6 +429,11 @@ impl super::ApplicationCoordinator {
                                                         "Failed to start QSO with {}: {}",
                                                         callsign, e
                                                     );
+                                                    emit_status(
+                                                        &message_bus,
+                                                        format!("Call {} failed: {}", callsign, e),
+                                                    )
+                                                    .await;
                                                 }
                                             }
                                         }
