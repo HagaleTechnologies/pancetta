@@ -113,7 +113,7 @@ struct Cli {
 
     /// Inject a single TransmitRequest after startup, then shutdown when it
     /// completes. For coordinator TX validation. Example:
-    ///   pancetta --headless --test-tx "K5ARH K5ARH 73"
+    ///   pancetta --headless --test-tx "N0CALL N0CALL 73"
     #[arg(long, global = true)]
     test_tx: Option<String>,
 

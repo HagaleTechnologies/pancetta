@@ -6,7 +6,7 @@
 //! Usage:
 //!   cargo run --example tx_test
 //!   cargo run --example tx_test -- --ptt
-//!   cargo run --example tx_test -- --message "CQ K5ARH EM10" --freq-offset 1200
+//!   cargo run --example tx_test -- --message "CQ N0CALL EM10" --freq-offset 1200
 
 use chrono::Utc;
 use clap::Parser;
@@ -63,8 +63,10 @@ impl Drop for PttGuard {
 #[derive(Parser)]
 #[command(name = "tx_test", about = "FT8 TX hardware validation")]
 struct Args {
-    /// FT8 message to transmit
-    #[arg(long, default_value = "K5ARH RR73")]
+    /// FT8 message to transmit. The default is intentionally a placeholder;
+    /// override with --message and your own callsign before keying the radio
+    /// (transmitting "N0CALL" on a real antenna is a Part 97 violation).
+    #[arg(long, default_value = "N0CALL RR73")]
     message: String,
 
     /// Audio frequency offset in Hz (within FT8 passband)
