@@ -904,7 +904,11 @@ impl App {
         }
     }
 
-    /// Get the callsign and frequency of the currently selected station.
+    /// Get the callsign and audio offset (Hz, within FT8 passband) of the
+    /// currently selected station. Returns the AUDIO frequency offset, not
+    /// the dial frequency — the TransmitRequest pipeline expects an absolute
+    /// audio frequency in 200-2500 Hz, and the modulator validates against
+    /// MAX_FREQUENCY_DEVIATION = 2500 Hz.
     ///
     /// Works from both Band Activity (decoded messages) and DX Hunter (spots).
     pub fn get_selected_station(&self) -> Option<(String, u64)> {
@@ -920,8 +924,11 @@ impl App {
                 if callsign.is_empty() {
                     return None;
                 }
-                let freq_hz = (msg.frequency * 1_000_000.0) as u64;
-                Some((callsign.clone(), freq_hz))
+                // delta_freq is the audio offset in Hz where the signal was
+                // decoded. Clamp into [200, 2500] since some decoders produce
+                // out-of-range values for split-VFO or reference markers.
+                let audio_hz = (msg.delta_freq as u64).clamp(200, 2500);
+                Some((callsign.clone(), audio_hz))
             }
             ActivePanel::DxHunter => {
                 let mut stations: Vec<&DxStation> = self.dx_stations.values().collect();
@@ -930,8 +937,11 @@ impl App {
                 if station.call_sign.is_empty() {
                     return None;
                 }
-                let freq_hz = (station.frequency * 1_000_000.0) as u64;
-                Some((station.call_sign.clone(), freq_hz))
+                // DX Hunter spots only carry the dial frequency, not where in
+                // the passband the station was. Default to the FT8 calling
+                // convention (1500 Hz). Tuning is the operator's job after
+                // the call kicks off.
+                Some((station.call_sign.clone(), 1500))
             }
             _ => None,
         }
