@@ -140,6 +140,8 @@ enum Commands {
     Setup,
     /// Test rig connection (serial port, CAT, PTT)
     TestRig(TestRigArgs),
+    /// Export logged QSOs to ADIF
+    Export(ExportArgs),
 }
 
 #[derive(Clone, Args)]
@@ -147,6 +149,21 @@ struct TestRigArgs {
     /// Test PTT by keying TX for 1 second (use with caution!)
     #[arg(long)]
     ptt: bool,
+}
+
+#[derive(Clone, Args)]
+struct ExportArgs {
+    /// Output file path for the ADIF export (.adi)
+    #[arg(short, long)]
+    output: PathBuf,
+
+    /// Override database path (default: ~/.pancetta/qso.db)
+    #[arg(long)]
+    database: Option<PathBuf>,
+
+    /// Filter by callsign substring (case-insensitive)
+    #[arg(long)]
+    callsign: Option<String>,
 }
 
 #[derive(Clone, Args)]
@@ -354,7 +371,74 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         Commands::BenchmarkDecode(args) => benchmark_decode_command(args).await,
         Commands::Setup => setup_command().await,
         Commands::TestRig(args) => test_rig_command(args, cli).await,
+        Commands::Export(args) => export_command(args).await,
     }
+}
+
+async fn export_command(args: ExportArgs) -> Result<()> {
+    use pancetta_qso::adif::AdifProcessor;
+    use pancetta_qso::async_database::AsyncQsoDatabase;
+    use pancetta_qso::database::{QsoFilter, QueryOptions};
+
+    let db_path = args.database.unwrap_or_else(|| {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".pancetta")
+            .join("qso.db")
+    });
+
+    if !db_path.exists() {
+        eprintln!("QSO database not found at {}", db_path.display());
+        eprintln!("Run pancetta to log some QSOs first.");
+        std::process::exit(1);
+    }
+
+    println!("Opening database: {}", db_path.display());
+    let db = AsyncQsoDatabase::open(&db_path)
+        .await
+        .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
+
+    let filter = QsoFilter {
+        callsign_pattern: args.callsign.clone(),
+        ..Default::default()
+    };
+    let options = QueryOptions::default();
+    let progresses = db
+        .search_qsos(&filter, &options)
+        .await
+        .context("Failed to search QSOs")?;
+
+    println!("Found {} QSO(s) in database", progresses.len());
+    if progresses.is_empty() {
+        println!("Nothing to export.");
+        return Ok(());
+    }
+
+    let processor = AdifProcessor::new();
+    let mut adif_file = pancetta_qso::adif::AdifFile {
+        header: Default::default(),
+        records: Vec::new(),
+    };
+    for progress in &progresses {
+        let adif_qso =
+            processor.qso_to_adif(&progress.metadata, progress.metadata.contest_info.as_ref());
+        let record = processor.qso_to_record(&adif_qso);
+        adif_file.records.push(record);
+    }
+    let content = processor
+        .generate_string(&adif_file)
+        .context("Failed to generate ADIF")?;
+    tokio::fs::write(&args.output, &content)
+        .await
+        .with_context(|| format!("Failed to write {}", args.output.display()))?;
+
+    println!(
+        "Exported {} QSO(s) to {} ({} bytes)",
+        progresses.len(),
+        args.output.display(),
+        content.len()
+    );
+    Ok(())
 }
 
 async fn test_audio_command(_args: TestAudioArgs) -> Result<()> {
