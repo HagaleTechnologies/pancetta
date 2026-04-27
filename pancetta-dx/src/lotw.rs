@@ -193,6 +193,19 @@ impl LotwClient {
             ));
         }
 
+        // Refuse to send credentials over plaintext. LoTW's real endpoint is
+        // HTTPS; an HTTP base_url is either a misconfiguration or a hostile
+        // override, and either way we should fail closed before transmitting
+        // username/password in form data.
+        let url_lower = self.config.base_url.to_lowercase();
+        if !url_lower.starts_with("https://") {
+            return Err(DxError::Configuration(format!(
+                "LoTW base_url must use https:// (got: {}). Refusing to \
+                 send credentials over an unencrypted connection.",
+                self.config.base_url
+            )));
+        }
+
         info!("Logging into LoTW as {}", self.config.username);
 
         let login_url = format!("{}/lotw/login", self.config.base_url);

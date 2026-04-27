@@ -3,14 +3,39 @@
 use crate::error::{CqdxError, Result};
 use crate::types::*;
 use reqwest::Client;
+use std::fmt;
 use tracing::debug;
+
+/// PAT token wrapped to prevent accidental leakage via Debug or Display.
+///
+/// Tokens are only ever exposed through [`PatToken::expose_secret`]; the
+/// `Debug` impl deliberately redacts the value so that derive(Debug) on
+/// containing structs (CqdxClient, etc.) doesn't surface the token in
+/// log output, panic messages, or error reports.
+#[derive(Clone)]
+pub struct PatToken(String);
+
+impl PatToken {
+    /// Borrow the underlying token string. Use sparingly — every call site
+    /// is a potential leak vector. Prefer keeping the `PatToken` wrapped
+    /// and reaching for this only at the network boundary.
+    pub(crate) fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for PatToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PatToken(***)")
+    }
+}
 
 /// HTTP client wrapping reqwest with Bearer token auth.
 #[derive(Clone)]
 pub struct CqdxClient {
     http: Client,
     base_url: String,
-    token: String,
+    token: PatToken,
 }
 
 /// Maximum response body size accepted from the API (10 MB).
@@ -34,21 +59,50 @@ impl CqdxClient {
             )));
         }
 
+        // PAT format validation. cqdx.io PATs are at least 16 chars and
+        // start with `pat_`. We tolerate short test fixtures by relaxing
+        // the prefix check in #[cfg(test)] only; production callers should
+        // see an early failure on a malformed token instead of a 401 at
+        // the first request.
+        if token.is_empty() {
+            return Err(CqdxError::InvalidToken("token is empty"));
+        }
+        #[cfg(not(test))]
+        {
+            if token.len() < 16 {
+                return Err(CqdxError::InvalidToken(
+                    "token is suspiciously short (< 16 chars)",
+                ));
+            }
+            if !token.starts_with("pat_") {
+                return Err(CqdxError::InvalidToken("token must start with `pat_`"));
+            }
+        }
+
+        // reqwest's Client::build can fail at runtime if the host TLS
+        // stack is misconfigured. Surface as a Result instead of panicking
+        // — pancetta runs as a long-lived daemon and a startup panic here
+        // takes the whole TUI down with no operator-visible reason.
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .expect("failed to build reqwest client");
+            .map_err(CqdxError::HttpInit)?;
         Ok(Self {
             http,
             base_url,
-            token,
+            token: PatToken(token),
         })
     }
 
     pub async fn fetch_entities(&self) -> Result<Vec<DxccEntity>> {
         let url = format!("{}/api/v1/entities", self.base_url);
         debug!("Fetching DXCC entities from {}", url);
-        let resp = self.http.get(&url).bearer_auth(&self.token).send().await?;
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(self.token.expose_secret())
+            .send()
+            .await?;
         let resp = self.check_status(resp).await?;
         let body: EntitiesResponse = self.checked_json(resp).await?;
         Ok(body.entities)
@@ -57,7 +111,12 @@ impl CqdxClient {
     pub async fn fetch_needed(&self) -> Result<Vec<NeededEntity>> {
         let url = format!("{}/api/v1/entities/needed", self.base_url);
         debug!("Fetching needed entities from {}", url);
-        let resp = self.http.get(&url).bearer_auth(&self.token).send().await?;
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(self.token.expose_secret())
+            .send()
+            .await?;
         let resp = self.check_status(resp).await?;
         let body: NeededResponse = self.checked_json(resp).await?;
         Ok(body.needed)
@@ -82,7 +141,7 @@ impl CqdxClient {
         let resp = self
             .http
             .get(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.expose_secret())
             .query(&params)
             .send()
             .await?;
@@ -98,7 +157,7 @@ impl CqdxClient {
         let resp = self
             .http
             .post(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.expose_secret())
             .json(&req)
             .send()
             .await?;
@@ -113,7 +172,7 @@ impl CqdxClient {
         let resp = self
             .http
             .post(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(self.token.expose_secret())
             .json(&req)
             .send()
             .await?;

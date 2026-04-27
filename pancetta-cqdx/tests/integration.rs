@@ -12,7 +12,7 @@ async fn test_startup_flow_entities_and_needed() {
 
     Mock::given(method("GET"))
         .and(path("/api/v1/entities"))
-        .and(header("Authorization", "Bearer pat_test"))
+        .and(header("Authorization", "Bearer pat_test_token_long_enough"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "entities": [
                 {
@@ -45,7 +45,7 @@ async fn test_startup_flow_entities_and_needed() {
         .mount(&server)
         .await;
 
-    let client = CqdxClient::new(server.uri(), "pat_test".to_string()).unwrap();
+    let client = CqdxClient::new(server.uri(), "pat_test_token_long_enough".to_string()).unwrap();
     let mut cache = CqdxCache::new();
 
     let entities = client.fetch_entities().await.unwrap();
@@ -116,7 +116,7 @@ async fn test_live_spot_poll_updates_rarity() {
         .mount(&server)
         .await;
 
-    let client = CqdxClient::new(server.uri(), "pat_test".to_string()).unwrap();
+    let client = CqdxClient::new(server.uri(), "pat_test_token_long_enough".to_string()).unwrap();
     let mut cache = CqdxCache::new();
 
     let groups = client.fetch_live_spots(None, None).await.unwrap();
@@ -147,7 +147,7 @@ async fn test_spot_and_qso_reporting() {
         .mount(&server)
         .await;
 
-    let client = CqdxClient::new(server.uri(), "pat_test".to_string()).unwrap();
+    let client = CqdxClient::new(server.uri(), "pat_test_token_long_enough".to_string()).unwrap();
 
     let spots = vec![SpotReport {
         callsign: "W1ABC".to_string(),

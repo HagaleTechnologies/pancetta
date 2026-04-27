@@ -24,6 +24,12 @@ pub enum CqdxError {
 
     #[error("Invalid base URL: {0}")]
     InvalidBaseUrl(String),
+
+    #[error("Invalid PAT token: {0}")]
+    InvalidToken(&'static str),
+
+    #[error("HTTP client init failed: {0}")]
+    HttpInit(reqwest::Error),
 }
 
 pub type Result<T> = std::result::Result<T, CqdxError>;
