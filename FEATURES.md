@@ -22,11 +22,11 @@ The DSP pipeline connects real-time audio input to the FT8 decoder through a mod
 
 ## Hardware Integration
 
-Hamlib CAT control is integrated via FFI bindings to rigctld, targeting the Yaesu FTdx10 (model 1042) connected by USB at 38400 baud. The integration covers frequency readback and PTT control, enabling the coordinator to command the rig into transmit at the correct moment and return to receive when the TX window closes. The hamlib crate is tested independently due to tokio runtime constraints (`cargo test -p pancetta-hamlib --lib -- --test-threads=1`).
+Hamlib CAT control is integrated via a TCP client to `rigctld`, targeting the Yaesu FTdx10 (model 1042) connected by USB at 38400 baud. The integration covers frequency readback and PTT control, enabling the coordinator to command the rig into transmit at the correct moment and return to receive when the TX window closes. End-to-end TX has been validated on real hardware with clean ALC and tail-end PSKReporter spots across NA + EU. Pancetta refuses to spawn rigctld with suspicious serial-port paths and warns when `RIGCTLD_HOST` points outside loopback. The hamlib crate is tested independently due to tokio runtime constraints (`cargo test -p pancetta-hamlib --lib -- --test-threads=1`).
 
 ## Terminal Interface
 
-The TUI is built on ratatui and provides a waterfall display, band-activity panel, DX hunter view, and QSO status pane. The scaffold is in place; full wiring to the live decode/transmit pipeline is in progress.
+The TUI is built on ratatui and crossterm. It exposes a live waterfall, a band-activity table of decoded messages, a DX hunter panel sourced from cqdx.io spots, a QSO status pane showing in-flight exchanges, and a station info / pipeline-health panel. Core controls — Space to call the selected station, `c` / `s` to start and stop auto-CQ, `D` for the audio device picker, `Tab` to cycle panels — are wired end-to-end through the coordinator. Audio init failures and QSO state-machine rejections surface in the status bar instead of dying silently in the log file. Density-glyph waterfall rendering keeps the panel visible on 16-color terminals when SSH'd in over slow links.
 
 ## cqdx.io Integration
 

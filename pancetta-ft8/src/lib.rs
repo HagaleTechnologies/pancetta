@@ -70,7 +70,7 @@
 //! # }
 //! ```
 
-#![allow(missing_docs)] // TODO: re-enable as docs are added
+#![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
 #![allow(dead_code, unused_imports)]
 
 // Protocol abstraction layer (FT8/FT4/FT2)

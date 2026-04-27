@@ -82,7 +82,14 @@ After completing significant work, update affected documentation:
 - **docs/ARCHITECTURE.md**: Update if crate relationships or data flows changed
 - **README.md / FEATURES.md**: Update if user-facing capabilities changed
 
-All crates currently have `#![allow(missing_docs)]` with TODO comments to re-enable `#![warn(missing_docs)]`.
+Documentation policy:
+
+- `pancetta-core` enforces `#![warn(missing_docs)]` (zero warnings as of
+  the last documentation pass).
+- `pancetta-hamlib` enforces `#![deny(missing_docs)]`.
+- All other crates carry `#![allow(missing_docs)] // TODO: documentation
+  pass pending — see CONTRIBUTING.md`. As docs land, switch each crate
+  to `warn` (and eventually `deny`) and clear the TODO.
 
 ## Build Hygiene
 

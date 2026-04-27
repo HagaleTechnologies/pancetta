@@ -152,7 +152,7 @@
 //! println!("Average signal: {:.1} dB", stats.technical.signal_reports.avg_received);
 //! ```
 
-#![allow(missing_docs)] // TODO: re-enable as docs are added
+#![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
 #![deny(unsafe_code)]
 #![allow(dead_code, unused_imports)]
 

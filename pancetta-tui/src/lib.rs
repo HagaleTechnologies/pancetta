@@ -21,7 +21,7 @@
 //! - Receives from: `pancetta` coordinator (live decode stream, QSO state)
 //! - Sends to: `pancetta` coordinator (user commands: start CQ, set frequency, etc.)
 
-#![allow(missing_docs)] // TODO: re-enable as docs are added
+#![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
 #![allow(dead_code, unused_imports)]
 
 pub mod app;

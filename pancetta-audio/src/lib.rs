@@ -20,7 +20,7 @@
 //! - Receives from: system audio hardware (via `cpal`)
 //! - Sends to: `pancetta-dsp`
 
-#![allow(missing_docs)] // TODO: re-enable as docs are added
+#![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(dead_code, unused_imports)]
 

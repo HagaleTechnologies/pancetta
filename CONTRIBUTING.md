@@ -252,13 +252,19 @@ if let Some(value) = optional_value {
 
 ### Documentation Standards
 
-All public APIs must be documented:
+Every public API surface should carry a doc comment that explains the
+*why*, not just the *what*. Names already convey what; docs exist to
+capture invariants, motivation, and the "gotcha" that a future reader
+will trip on.
 
 ```rust
 /// FT8 decoder with configurable parameters.
 ///
-/// This decoder implements the WSJT-X FT8 protocol with
-/// optimizations for weak signal decoding.
+/// Implements the WSJT-X FT8 protocol with optimizations for weak-signal
+/// decoding (Costas sync, soft LDPC, OSD second-pass, AP injection).
+/// The decoder is bit-exact with `ft8_lib` across the test corpus —
+/// behaviour-changing edits must be validated against `tests/wsjtx_corpus.rs`
+/// before landing.
 ///
 /// # Example
 ///
@@ -272,6 +278,22 @@ pub struct Decoder {
     // ...
 }
 ```
+
+**Per-crate documentation policy.** Each crate's `lib.rs` declares one of:
+
+- `#![deny(missing_docs)]` — every public item must be documented.
+  Currently: `pancetta-hamlib`.
+- `#![warn(missing_docs)]` — undocumented items emit warnings; CI
+  surfaces them but doesn't fail. Currently: `pancetta-core`.
+- `#![allow(missing_docs)] // TODO: documentation pass pending` — opt-in
+  policy: contributors are expected to document new items as they land,
+  but the existing surface isn't audited yet.
+
+When you add a new public item to a `warn` or `deny` crate, you must
+document it. When you add one to an `allow` crate, you should still
+document it — the lint is silenced for the existing backlog, not new
+work. As coverage grows, please flip the crate from `allow` → `warn`
+→ `deny` and remove the TODO comment.
 
 ## Testing Requirements
 

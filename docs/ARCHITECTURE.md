@@ -162,10 +162,30 @@ periodically by the coordinator from cqdx.io and the QSO log.
 
 ## Known Gaps
 
-- Grid "needed" set never populated (`update_needed_grids()` not called)
-- POTA/SOTA detection has false positives on callsigns with `/` suffix
-- `is_duplicate` ignores `freq_hz` (no band-aware dedup yet)
-- TUI scaffold exists but is not wired to the live pipeline
-- cqdx.io `GET /spots?live=true` response envelope key (`groups`) unverified against live API
-- Coordinator decomposition ongoing (~2,700 lines in `mod.rs` prior to split)
-- Phase 4 (hardware integration) in progress: hamlib bindings complete, on-air TX pending
+- Grid "needed" set is never populated. cqdx.io has no
+  `entities/needed-grids` endpoint yet; `is_needed_grid` returns
+  `false` when the local set is empty so the priority weight doesn't
+  inflate.
+- `is_duplicate` checks callsign + audio frequency proximity within a
+  configurable time window, but doesn't yet partition by band — a
+  station worked on 20m won't be flagged as a duplicate when worked
+  again on 40m. Set `[duplicate_checking].check_frequency = true` for
+  band-aware dedup until this is fixed natively.
+- cqdx.io `GET /api/v1/spots?live=true` response envelope key (`groups`)
+  is unverified against the live API. A gated live test exists:
+  `CQDX_TOKEN=pat_xxx cargo test -p pancetta-cqdx test_live_spots_envelope -- --ignored --nocapture`.
+
+## Recent Milestones
+
+- **Phase 1** — Loopback QSO. Full CQ-to-73 exchange through the
+  encode → modulate → decode pipeline, with state-machine tests.
+- **Phase 2** — Autonomous operator + priority engine. Configurable
+  weighted scoring, POTA/SOTA detection, hunt/CQ/hybrid modes.
+- **Phase 3** — Multi-stream TX. `SmartFrequencyAllocator` selects
+  audio frequencies; up to N parallel QSOs in one slot.
+- **Phase 4** — Hardware integration (complete, 2026-04-26). hamlib
+  CAT control via rigctld short-form commands; first real-rig TX
+  validated on a Yaesu FTdx10 with clean ALC and tail-end PSKReporter
+  spots across NA + EU.
+- **Phase 5** (current) — Full autonomous QSO loop on real hardware:
+  CQ → grid → report → RR73 end-to-end without operator intervention.

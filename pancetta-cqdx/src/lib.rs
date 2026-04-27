@@ -19,7 +19,7 @@
 //! - Receives from: cqdx.io REST API (HTTP)
 //! - Sends to: `pancetta` coordinator (entities, live spots, rarity scores)
 
-#![allow(missing_docs)] // TODO: re-enable as docs are added
+#![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
 
 pub mod cache;
 pub mod client;

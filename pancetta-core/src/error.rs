@@ -1,8 +1,10 @@
-// Unified Error Handling for Pancetta
-//
-// This module provides a standardized error handling approach across all Pancetta components.
-// It implements a hierarchical error system with context tracking, severity levels, and
-// automatic retry policies.
+//! Unified error handling for Pancetta.
+//!
+//! Provides a standardized error system shared across every crate in the
+//! workspace. Errors carry an `ErrorContext` (component, operation,
+//! timestamp) and an optional source chain. Severity levels and retry
+//! policies are encoded in the type so the coordinator can decide
+//! whether to surface, retry, or escalate without inspecting strings.
 
 use std::error::Error as StdError;
 use std::fmt;

@@ -1,428 +1,271 @@
-# Configuration Guide
-
-Pancetta offers flexible configuration through multiple methods. This guide covers all available options.
-
-## Configuration Hierarchy
-
-Configuration sources are applied in the following order (later sources override earlier ones):
-
-1. **Default values** (built into the application)
-2. **Configuration file** (`~/.config/pancetta/config.toml`)
-3. **Environment variables** (prefixed with `PANCETTA_`)
-4. **Command-line arguments** (highest priority)
-
-## Configuration File
-
-### Location
-
-- **Unix/Linux/macOS**: `~/.config/pancetta/config.toml`
-- **Windows**: `%APPDATA%\pancetta\config.toml`
-
-### Complete Example
-
-```toml
-# ~/.config/pancetta/config.toml
-
-# Audio Configuration
-[audio]
-# Audio device name (use "default" for system default)
-device_name = "default"
-
-# Sample rate in Hz (48000 or 44100 recommended)
-sample_rate = 48000
-
-# Buffer size in samples (lower = less latency, higher = more stable)
-# Powers of 2 recommended: 64, 128, 256, 512, 1024
-buffer_size = 512
-
-# Number of audio channels (1 = mono, 2 = stereo)
-channels = 1
-
-# Target latency in milliseconds
-latency_ms = 10
-
-# DSP Configuration
-[dsp]
-# DSP sample rate (12000 Hz for FT8)
-sample_rate = 12000
-
-# Enable noise reduction
-noise_reduction = true
-
-# Noise reduction strength (0.0 to 1.0)
-noise_reduction_strength = 0.5
-
-# Enable automatic gain control
-agc_enabled = true
-
-# AGC target level (-40 to 0 dB)
-agc_target_db = -20
-
-# Bandpass filter settings
-bandpass_low_freq = 200.0
-bandpass_high_freq = 3000.0
-
-# FT8 Decoder Configuration
-[ft8]
-# Decode depth (1-3, higher = more CPU but better weak signal decode)
-decode_depth = 3
-
-# Sensitivity threshold (0.0 to 1.0)
-sensitivity = 0.5
-
-# Maximum simultaneous decodes
-max_decodes = 50
-
-# Enable deep search
-deep_search = true
-
-# Time window tolerance in seconds
-time_tolerance = 2.0
-
-# Frequency tolerance in Hz
-frequency_tolerance = 50.0
-
-# Hamlib Configuration
-[hamlib]
-# rigctld host address
-host = "127.0.0.1"
-
-# rigctld port
-port = 4532
-
-# Connection timeout in milliseconds
-timeout_ms = 5000
-
-# Retry count for failed commands
-retry_count = 3
-
-# Use mock rig for testing
-use_mock = false
-
-# QSO Logging Configuration
-[qso]
-# Database file path
-database_path = "~/.local/share/pancetta/qsos.db"
-
-# Enable automatic logging
-auto_log = true
-
-# Station information
-my_callsign = "MYCALL"
-my_grid = "EM00aa"
-my_name = "Operator Name"
-
-# ADIF export settings
-adif_export_path = "~/Documents/pancetta_log.adi"
-
-# TUI Configuration
-[tui]
-# Enable terminal UI
-enabled = true
-
-# Refresh rate in milliseconds
-refresh_ms = 100
-
-# Color scheme ("dark", "light", "high_contrast")
-color_scheme = "dark"
-
-# Show waterfall display
-show_waterfall = true
-
-# Waterfall height in terminal lines
-waterfall_height = 10
-
-# Message list size
-message_list_size = 50
-
-# Logging Configuration
-[logging]
-# Log level: "error", "warn", "info", "debug", "trace"
-level = "info"
-
-# Enable file logging
-file_logging = false
-
-# Log file directory
-log_dir = "~/.cache/pancetta/logs"
-
-# Use JSON format for logs
-json_format = false
-
-# Show thread IDs in logs
-show_thread_ids = false
-
-# Runtime Configuration
-[runtime]
-# Number of worker threads (0 = auto-detect)
-worker_threads = 2
-
-# Enable performance metrics
-enable_metrics = true
-
-# Metrics export port (for Prometheus)
-metrics_port = 9090
-```
-
-## Environment Variables
-
-All configuration options can be set via environment variables. Use uppercase names with underscores, prefixed with `PANCETTA_`.
-
-### Common Environment Variables
-
-```bash
-# Logging
-export RUST_LOG=debug                    # Log level (error/warn/info/debug/trace)
-export PANCETTA_LOG_FILE=true           # Enable file logging
-
-# Runtime
-export PANCETTA_WORKER_THREADS=2        # Number of worker threads
-export PANCETTA_ENABLE_METRICS=true     # Enable performance metrics
-
-# Audio
-export PANCETTA_AUDIO_DEVICE="hw:1,0"   # Specific audio device
-export PANCETTA_STUB_AUDIO=true         # Use stub audio (testing)
-
-# Hamlib
-export PANCETTA_MOCK_RIG=false          # Use real rigctld
-export RIGCTLD_HOST=192.168.1.100       # Remote rigctld host
-export RIGCTLD_PORT=4532                # rigctld port
-
-# FT8
-export PANCETTA_FT8_DEPTH=3             # Decode depth
-export PANCETTA_FT8_SENSITIVITY=0.7     # Sensitivity threshold
-```
-
-### Setting Environment Variables
-
-#### Unix/Linux/macOS
-
-```bash
-# Temporary (current session only)
-export PANCETTA_WORKER_THREADS=2
-./pancetta
-
-# Or inline
-PANCETTA_WORKER_THREADS=2 ./pancetta
-
-# Permanent (add to ~/.bashrc or ~/.zshrc)
-echo 'export PANCETTA_WORKER_THREADS=2' >> ~/.bashrc
-source ~/.bashrc
-```
-
-#### Windows
-
-```powershell
-# Temporary (current session)
-$env:PANCETTA_WORKER_THREADS = "2"
-.\pancetta.exe
-
-# Permanent (user level)
-[System.Environment]::SetEnvironmentVariable("PANCETTA_WORKER_THREADS", "2", "User")
-```
-
-## Command-Line Arguments
-
-Command-line arguments override all other configuration sources.
-
-```bash
-# Basic options
-pancetta --help                    # Show help message
-pancetta --version                 # Show version
-pancetta --config /path/to/config  # Use specific config file
-
-# Audio options
-pancetta --audio-device "hw:1,0"   # Use specific audio device
-pancetta --buffer-size 256         # Set buffer size
-pancetta --sample-rate 48000       # Set sample rate
-
-# FT8 options
-pancetta --decode-depth 3          # Set decode depth
-pancetta --sensitivity 0.7         # Set sensitivity
-
-# UI options
-pancetta --headless                # Run without TUI
-pancetta --no-waterfall           # Disable waterfall display
-
-# Hamlib options
-pancetta --rig-host 192.168.1.100  # rigctld host
-pancetta --rig-port 4532           # rigctld port
-pancetta --mock-rig                # Use mock rig
-
-# Logging options
-pancetta --log-level debug         # Set log level
-pancetta --log-file                # Enable file logging
-```
-
-## Configuration Profiles
-
-You can create multiple configuration profiles for different scenarios:
-
-### Contest Configuration
-
-```toml
-# ~/.config/pancetta/contest.toml
-[ft8]
-decode_depth = 1          # Faster decoding
-max_decodes = 100         # More simultaneous decodes
-sensitivity = 0.3         # Only strong signals
-
-[runtime]
-worker_threads = 8        # Maximum performance
-
-[logging]
-level = "warn"           # Less logging overhead
-```
-
-### Weak Signal Configuration
-
-```toml
-# ~/.config/pancetta/weak_signal.toml
-[ft8]
-decode_depth = 3         # Maximum depth
-deep_search = true       # Enable deep search
-sensitivity = 0.9        # Maximum sensitivity
-time_tolerance = 3.0     # Wider time window
-
-[dsp]
-noise_reduction_strength = 0.8  # Strong noise reduction
-```
-
-### Load a Profile
-
-```bash
-pancetta --config ~/.config/pancetta/contest.toml
-```
-
-## Audio Device Selection
-
-### List Available Devices
-
-```bash
-# Pancetta will list devices on startup with debug logging
-RUST_LOG=debug pancetta --headless
-```
-
-### Device Names by Platform
-
-#### macOS
-```bash
-"Built-in Microphone"
-"Built-in Output"
-"USB Audio Device"
-```
-
-#### Linux (ALSA)
-```bash
-"default"                  # System default
-"hw:0,0"                  # Hardware device
-"plughw:1,0"              # USB device with format conversion
-"pulse"                   # PulseAudio
-```
-
-#### Windows
-```bash
-"Microphone (Realtek Audio)"
-"Speakers (Realtek Audio)"
-"Line In (USB Audio Device)"
-```
-
-## Performance Tuning
-
-### Low Latency Configuration
-
-```toml
-[audio]
-buffer_size = 64          # Minimum buffer
-latency_ms = 5           # Target 5ms
-
-[runtime]
-worker_threads = 2       # Fewer threads, less overhead
-
-[tui]
-refresh_ms = 200        # Slower UI updates
-```
-
-### High Reliability Configuration
-
-```toml
-[audio]
-buffer_size = 1024      # Large buffer
-latency_ms = 20        # Higher latency tolerance
-
-[hamlib]
-retry_count = 5        # More retries
-timeout_ms = 10000     # Longer timeout
-```
-
-### Low CPU Configuration
-
-```toml
-[runtime]
-worker_threads = 1      # Single worker thread
-
-[ft8]
-decode_depth = 1       # Shallow decode
-max_decodes = 10       # Limit simultaneous decodes
-
-[tui]
-enabled = false        # Disable TUI
-```
-
-## Validation
-
-Pancetta validates configuration on startup. Invalid values will produce warnings and fall back to defaults.
-
-```bash
-# Test configuration without running
-pancetta --validate-config
-
-# Show effective configuration
-RUST_LOG=debug pancetta --show-config
-```
-
-## Troubleshooting Configuration
-
-### Config File Not Loading
-
-1. Check file location:
-   ```bash
-   ls -la ~/.config/pancetta/config.toml
-   ```
-
-2. Validate TOML syntax:
-   ```bash
-   cat ~/.config/pancetta/config.toml | python3 -m tomli
-   ```
-
-### Environment Variables Not Working
-
-1. Check variable is exported:
-   ```bash
-   echo $PANCETTA_WORKER_THREADS
-   ```
-
-2. Check for typos (must be uppercase with underscores)
-
-### Performance Issues
-
-1. Start with default configuration
-2. Change one setting at a time
-3. Monitor with metrics:
-   ```bash
-   PANCETTA_ENABLE_METRICS=true pancetta
-   ```
-
-## Best Practices
-
-1. **Start with defaults** - Only change what you need
-2. **Use configuration file** for permanent settings
-3. **Use environment variables** for temporary overrides
-4. **Use command-line arguments** for one-off testing
-5. **Document your changes** with comments in config file
-6. **Backup your configuration** before major changes
-7. **Test incrementally** when tuning performance
+# Pancetta Configuration Reference
+
+Pancetta's configuration lives in a single TOML file at
+`~/.pancetta/config.toml`. The file is loaded at startup and watched for
+changes; most keys hot-reload without a restart.
+
+This document covers the keys you'll actually touch. The full schema —
+including hundreds of advanced knobs (DSP filter coefficients, contest
+categories, multi-antenna routing, etc.) — lives in
+[`pancetta-config/defaults.toml`](../pancetta-config/defaults.toml). Any
+key you don't set in your user config inherits the value from there.
+
+> **Security:** the config file is plaintext on disk. If you set any
+> integration password (LoTW, eQSL, Clublog, QRZ), `chmod 600` the file
+> and don't commit it. See [`SECURITY.md`](../SECURITY.md) for the full
+> threat model.
 
 ---
 
-For more help, see the [Troubleshooting Guide](TROUBLESHOOTING.md) or join our community chat.
+## Minimum viable config
+
+The fields you must set for Pancetta to do anything useful:
+
+```toml
+[station]
+callsign = "YOURCALL"        # Your FCC/ITU-issued callsign
+grid_square = "FN42"         # 4-character Maidenhead grid
+
+[audio]
+input_device = "USB Audio CODEC"
+output_device = "USB Audio CODEC"
+
+[rig.interface]
+enabled = true
+port = "/dev/tty.usbserial-A1"
+baud_rate = 38400
+
+[rig]
+model = "FTdx10"
+```
+
+That's enough to run the autonomous operator. Everything else has a
+sensible default in `defaults.toml`.
+
+---
+
+## `[station]` — your identity
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `callsign` | string | `"N0CALL"` | The license under which Pancetta will TX. **Required.** |
+| `grid_square` | string | `"AA00aa"` | Your Maidenhead grid (4 or 6 chars). Used in `CQ` and grid-report exchanges. |
+| `power_watts` | integer | `100` | Reported in spots; not used for actual rig power level. |
+| `qth` | string | `"Unknown"` | Free-text location label, surfaced in the TUI. |
+| `dxcc_entity` | integer | `291` | DXCC entity number (e.g. 291 = United States). |
+| `itu_zone` | integer | `8` | Used by some contest exchanges. |
+| `cq_zone` | integer | `5` | Same. |
+| `operator_name` | string | `""` | Your name (optional, for log export). |
+
+`station.antennas` is an array-of-tables; you can describe each antenna
+on the station and Pancetta will surface them in the TUI.
+
+```toml
+[[station.antennas]]
+id            = "20m_yagi"
+name          = "20m 5-element Yagi"
+antenna_type  = "yagi"
+bands         = ["20m"]
+gain_dbi      = 9.5
+pattern       = "directional"
+height_meters = 18.0
+active        = true
+```
+
+---
+
+## `[audio]` — the link to the radio
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `input_device` | string | `"default"` | Exact cpal device name. Run `pancetta --list-audio` to enumerate. |
+| `output_device` | string | `"default"` | Same. Most ham USB CODECs present input and output under the same name. |
+| `sample_rate` | integer | `48000` | Pancetta resamples internally to 12 kHz; 48 kHz is the recommended capture rate. |
+| `buffer_size` | integer | `512` | cpal frame size. 512 trades latency for stability. |
+| `input_channels` | integer | `2` | Most CODECs are 2-channel; Pancetta downmixes to mono. |
+| `output_channels` | integer | `2` | TX path will write mono into both channels. |
+
+The `[audio.processing]` block controls the DSP chain (bandpass filter,
+compression, AGC). The defaults are tuned for FT8 and most users won't
+need to touch them; see `defaults.toml` for the full key list.
+
+`[audio.levels].input_gain_db` applies a fixed gain at the resampler
+input. Negative values attenuate; useful when a hot CODEC saturates the
+ADC even with the rig's audio output turned all the way down.
+
+---
+
+## `[rig]` — CAT control
+
+```toml
+[rig]
+model = "FTdx10"            # Display name; Pancetta maps to a hamlib model ID
+
+[rig.interface]
+enabled = true              # false → mock rig, no real PTT or freq readback
+port = "/dev/tty.usbserial-A1"
+baud_rate = 38400
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `model` | string | `""` | Set to a name Pancetta knows (`FTdx10`, `IC-7300`, etc.) so it can resolve the hamlib model number. |
+| `interface.enabled` | bool | `false` | Master switch. When false, all CAT calls go to a mock rig and PTT is a no-op. |
+| `interface.port` | string | `""` | Serial device path. `/dev/tty.*` (macOS), `/dev/ttyUSB*` (Linux), `COM<N>` (Windows). `host:port` is also accepted (rigctld network rig syntax). |
+| `interface.baud_rate` | integer | `38400` | Must match the rig's CAT port setting. |
+
+> **Network mode:** setting environment variable `RIGCTLD_HOST` to a
+> non-loopback address tells Pancetta to talk to a remote `rigctld`.
+> The TCP port is unauthenticated; if you do this on anything other
+> than a trusted LAN, anyone who can reach the port can drive your rig.
+
+---
+
+## `[autonomous_operator]` — the brain
+
+```toml
+[autonomous_operator]
+enabled = false                 # Master enable. Off by default; opt-in to TX.
+mode = "hybrid"                 # "hunt", "cq", or "hybrid"
+slot_parity_preference = "auto" # "even", "odd", or "auto"
+max_concurrent_qsos = 4         # Cap on simultaneous in-flight QSOs
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | When false, Pancetta runs decode-only — no TX. |
+| `mode` | enum | `"hybrid"` | `hunt` = chase rare CQs only. `cq` = call CQ and answer callers. `hybrid` = hunt when a rare target is on; CQ otherwise. |
+| `slot_parity_preference` | enum | `"auto"` | FT8 alternates even/odd 15s slots; `auto` picks the parity with less local QRM. |
+| `max_concurrent_qsos` | integer | `4` | The `SmartFrequencyAllocator` caps simultaneous TX streams here. |
+
+### `[priority_weights]` — what to prioritize
+
+Each decoded CQ is scored against these criteria, weighted, and sorted.
+Tuning these is how you specialize Pancetta for DX chasing vs. grid
+hunting vs. contesting.
+
+```toml
+[priority_weights]
+needed_dxcc = 0.35
+needed_grid = 0.20
+pota_sota   = 0.15
+rarity      = 0.10
+snr         = 0.05
+```
+
+Weights need not sum to 1.0; they're combined linearly with the
+duplicate-and-failure penalty applied on top. Set any weight to `0.0`
+to disable that signal entirely.
+
+### `[duplicate_checking]` — don't call the same station twice
+
+```toml
+[duplicate_checking]
+enabled = true
+time_window_hours = 24
+check_frequency = false
+```
+
+`check_frequency = true` allows the same station to be called again on
+a different band. The default (`false`) is one-and-done per UTC day.
+The duplicate check is what makes Space-to-call return `Call X failed:
+duplicate QSO ...` for stations you've already worked.
+
+---
+
+## `[network]` — external services
+
+QRZ.com, LoTW, eQSL, Clublog, PSKReporter all live under `[network]`.
+Each has an `enabled` flag and a credentials block.
+
+> **All passwords are stored in plaintext on disk.** If you don't need
+> the integration, leave `enabled = false`. The fields used to be named
+> `password_encrypted`; despite the name no encryption was ever
+> implemented, so they have been renamed to `password` to be honest
+> about what's on disk.
+
+```toml
+[network.qrz]
+enabled  = false
+username = ""
+password = ""        # plaintext on disk
+
+[network.lotw]
+enabled  = false
+username = ""
+password = ""        # plaintext on disk
+
+[network.psk_reporter]
+enabled        = true   # Local-only spotter; no credentials
+report_decodes = true
+```
+
+`pskreporter` doesn't require credentials and is the only network
+integration enabled by default — your local copy contributes spots
+back to the global PSKReporter database, which makes you reciprocally
+visible for spot lookups.
+
+LoTW credential handling refuses to send the username/password unless
+`base_url` is `https://`. This matches the real LoTW endpoint
+(`https://lotw.arrl.org`) and protects you from a typo or hostile
+config override that would otherwise transmit credentials in cleartext.
+
+---
+
+## `[ui]` — TUI behaviour
+
+```toml
+[ui]
+theme       = "dark"   # "dark" or "light"
+time_format = "utc"    # "utc" or "local" — UTC strongly recommended for FT8
+target_fps  = 30       # Refresh rate; lower this on slow SSH links
+```
+
+The TUI also reads its layout, key bindings, and color scheme details
+from `[ui]`. The full set is in `defaults.toml`; the keys above are the
+ones with practical effect.
+
+---
+
+## Environment variables
+
+A small set of environment variables override config keys:
+
+| Variable | Effect |
+|---|---|
+| `PANCETTA_STUB_AUDIO=1` | Replace the cpal audio thread with a synthetic 1500 Hz tone generator. Useful for offline testing. |
+| `PANCETTA_MOCK_RIG=1` | Force `[rig.interface].enabled = false` regardless of config. |
+| `RIGCTLD_HOST` | Override the rigctld bind host. Default `127.0.0.1`. |
+| `RIGCTLD_PORT` | Override the rigctld TCP port. Default `4532`. |
+| `RUST_LOG` | Standard `tracing` filter. `info` is recommended; `debug` for triage. |
+
+CLI flags (e.g. `--audio-device`, `--no-rig`, `--no-audio`) take final
+priority over both config and environment.
+
+---
+
+## Hot reload
+
+Pancetta watches `~/.pancetta/config.toml` for changes. Most keys take
+effect within a second of save. Exceptions:
+
+- `[audio]` device names — require a TUI restart (cpal streams are bound
+  at startup).
+- `[rig.interface]` — same; rigctld is spawned once.
+- `[station].callsign` — never hot-reloaded (active QSOs would mid-flight
+  contradict their own metadata).
+
+When a hot-reload succeeds you'll see a TUI status line like
+`Config reloaded: 12 keys updated`. When it fails (typo, schema
+violation), the previous config stays active and the parse error shows
+in the TUI error log.
+
+---
+
+## Where to look next
+
+- The annotated source of truth is
+  [`pancetta-config/defaults.toml`](../pancetta-config/defaults.toml).
+- Rust types and validation logic live under `pancetta-config/src/`.
+- See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for how config flows
+  through the coordinator.

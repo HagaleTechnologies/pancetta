@@ -20,7 +20,7 @@
 //!   `pancetta-config`, `pancetta-qso`, `pancetta-hamlib`, `pancetta-dx`,
 //!   `pancetta-cqdx`, `pancetta-tui`, `pancetta`)
 
-#![allow(missing_docs)] // TODO: re-enable as docs are added
+#![warn(missing_docs)]
 
 pub mod error;
 pub mod slot;
@@ -35,10 +35,13 @@ pub use error::{
     PancettaError as UnifiedError, PancettaResult as UnifiedResult, ResultExt, RetryDelay,
 };
 
-// Version information
+/// Crate version, taken from `Cargo.toml` at compile time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Major version component (`0` until the first stable release).
 pub const VERSION_MAJOR: u32 = 0;
+/// Minor version component, bumped for backwards-compatible changes.
 pub const VERSION_MINOR: u32 = 1;
+/// Patch version component, bumped for backwards-compatible fixes.
 pub const VERSION_PATCH: u32 = 0;
 
 /// Get full version string with build metadata
