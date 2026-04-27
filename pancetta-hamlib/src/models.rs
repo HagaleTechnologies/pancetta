@@ -3,7 +3,6 @@
 //! This module defines the amateur radio transceiver models supported by hamlib
 //! and their specific capabilities for optimal integration.
 
-use crate::bindings::RigModel;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use string_cache::DefaultAtom as Atom;
@@ -82,56 +81,6 @@ pub enum HamlibMode {
 }
 
 impl HamlibMode {
-    /// Convert from hamlib mode constant
-    pub fn from_hamlib(mode: u32) -> Self {
-        use crate::bindings::*;
-        match mode {
-            RIG_MODE_AM => HamlibMode::AM,
-            RIG_MODE_CW => HamlibMode::CW,
-            RIG_MODE_USB => HamlibMode::USB,
-            RIG_MODE_LSB => HamlibMode::LSB,
-            RIG_MODE_RTTY => HamlibMode::RTTY,
-            RIG_MODE_FM => HamlibMode::FM,
-            RIG_MODE_WFM => HamlibMode::WFM,
-            RIG_MODE_CWR => HamlibMode::CWR,
-            RIG_MODE_RTTYR => HamlibMode::RTTYR,
-            RIG_MODE_AMS => HamlibMode::AMS,
-            RIG_MODE_PKTLSB => HamlibMode::PKTLSB,
-            RIG_MODE_PKTUSB => HamlibMode::PKTUSB,
-            RIG_MODE_PKTFM => HamlibMode::PKTFM,
-            RIG_MODE_ECSSUSB => HamlibMode::ECSSUSB,
-            RIG_MODE_ECSSLSB => HamlibMode::ECSSLSB,
-            RIG_MODE_FT8 => HamlibMode::FT8,
-            RIG_MODE_FT4 => HamlibMode::FT4,
-            _ => HamlibMode::Unknown,
-        }
-    }
-
-    /// Convert to hamlib mode constant
-    pub fn to_hamlib(&self) -> u32 {
-        use crate::bindings::*;
-        match self {
-            HamlibMode::AM => RIG_MODE_AM,
-            HamlibMode::CW => RIG_MODE_CW,
-            HamlibMode::USB => RIG_MODE_USB,
-            HamlibMode::LSB => RIG_MODE_LSB,
-            HamlibMode::RTTY => RIG_MODE_RTTY,
-            HamlibMode::FM => RIG_MODE_FM,
-            HamlibMode::WFM => RIG_MODE_WFM,
-            HamlibMode::CWR => RIG_MODE_CWR,
-            HamlibMode::RTTYR => RIG_MODE_RTTYR,
-            HamlibMode::AMS => RIG_MODE_AMS,
-            HamlibMode::PKTLSB => RIG_MODE_PKTLSB,
-            HamlibMode::PKTUSB => RIG_MODE_PKTUSB,
-            HamlibMode::PKTFM => RIG_MODE_PKTFM,
-            HamlibMode::ECSSUSB => RIG_MODE_ECSSUSB,
-            HamlibMode::ECSSLSB => RIG_MODE_ECSSLSB,
-            HamlibMode::FT8 => RIG_MODE_FT8,
-            HamlibMode::FT4 => RIG_MODE_FT4,
-            HamlibMode::Unknown => 0,
-        }
-    }
-
     /// Convert HamlibMode to unified Mode
     pub fn to_unified_mode(&self) -> Mode {
         match self {
@@ -162,14 +111,10 @@ impl HamlibMode {
 pub trait ModeExt {
     /// Convert unified Mode to HamlibMode (best match)
     fn to_hamlib_mode(&self) -> HamlibMode;
-    /// Convert to hamlib mode constant directly
-    fn to_hamlib(&self) -> u32;
     /// Get default passband width for this mode in Hz
     fn default_width(&self) -> Option<i32>;
     /// Get mode name
     fn name(&self) -> &'static str;
-    /// Convert from hamlib mode constant
-    fn from_hamlib(mode: u32) -> Self;
 }
 
 impl ModeExt for Mode {
@@ -195,11 +140,6 @@ impl ModeExt for Mode {
             // Map other digital modes to USB (most common)
             _ => HamlibMode::USB,
         }
-    }
-
-    /// Convert to hamlib mode constant directly
-    fn to_hamlib(&self) -> u32 {
-        self.to_hamlib_mode().to_hamlib()
     }
 
     /// Get default passband width for this mode in Hz
@@ -243,12 +183,6 @@ impl ModeExt for Mode {
             Mode::YSF => "YSF",
         }
     }
-
-    /// Convert from hamlib mode constant
-    fn from_hamlib(mode: u32) -> Self {
-        let hamlib_mode = HamlibMode::from_hamlib(mode);
-        hamlib_mode.to_unified_mode()
-    }
 }
 
 /// VFO (Variable Frequency Oscillator) designation
@@ -262,31 +196,6 @@ pub enum Vfo {
     B,
     /// Memory channel
     Memory,
-}
-
-impl Vfo {
-    /// Convert from hamlib VFO constant
-    pub fn from_hamlib(vfo: u32) -> Self {
-        use crate::bindings::*;
-        match vfo {
-            RIG_VFO_CURR => Vfo::Current,
-            RIG_VFO_A => Vfo::A,
-            RIG_VFO_B => Vfo::B,
-            RIG_VFO_MEM => Vfo::Memory,
-            _ => Vfo::Current,
-        }
-    }
-
-    /// Convert to hamlib VFO constant
-    pub fn to_hamlib(&self) -> u32 {
-        use crate::bindings::*;
-        match self {
-            Vfo::Current => RIG_VFO_CURR,
-            Vfo::A => RIG_VFO_A,
-            Vfo::B => RIG_VFO_B,
-            Vfo::Memory => RIG_VFO_MEM,
-        }
-    }
 }
 
 /// Rig capabilities and features
@@ -383,17 +292,19 @@ pub enum RigModelType {
     /// FlexRadio 6000 series
     FlexRadio6000,
     /// Unknown/unsupported model
-    Unknown(RigModel),
+    Unknown,
 }
 
 impl RigModelType {
-    /// Get hamlib model ID
-    pub fn hamlib_id(&self) -> RigModel {
-        use crate::bindings::*;
-        match self {
-            RigModelType::Dummy => RIG_MODEL_DUMMY,
-            RigModelType::NetRigctl => RIG_MODEL_NETRIGCTL,
-            // These would be defined in hamlib headers
+    /// Get the hamlib numeric model ID (used to spawn rigctld -m).
+    ///
+    /// Returns `None` for `Unknown`, since the unknown variant doesn't
+    /// know which model it is. Callers (the coordinator) treat that as
+    /// "fall back to manual rigctld config" rather than a hard failure.
+    pub fn hamlib_id(&self) -> Option<u32> {
+        Some(match self {
+            RigModelType::Dummy => 1,
+            RigModelType::NetRigctl => 2,
             RigModelType::YaesuFT991A => 1035,
             RigModelType::YaesuFTdx10 => 1045,
             RigModelType::YaesuFT818 => 1049,
@@ -405,29 +316,8 @@ impl RigModelType {
             RigModelType::ElecraftK3S => 2073,
             RigModelType::ElecraftKX3 => 2074,
             RigModelType::FlexRadio6000 => 2025,
-            RigModelType::Unknown(id) => *id,
-        }
-    }
-
-    /// Create from hamlib model ID
-    pub fn from_hamlib_id(id: RigModel) -> Self {
-        use crate::bindings::*;
-        match id {
-            RIG_MODEL_DUMMY => RigModelType::Dummy,
-            RIG_MODEL_NETRIGCTL => RigModelType::NetRigctl,
-            1035 => RigModelType::YaesuFT991A,
-            1045 => RigModelType::YaesuFTdx10,
-            1049 => RigModelType::YaesuFT818,
-            3074 => RigModelType::IcomIC7300,
-            3076 => RigModelType::IcomIC7610,
-            3085 => RigModelType::IcomIC705,
-            2030 => RigModelType::KenwoodTS590SG,
-            2042 => RigModelType::KenwoodTS890S,
-            2073 => RigModelType::ElecraftK3S,
-            2074 => RigModelType::ElecraftKX3,
-            2025 => RigModelType::FlexRadio6000,
-            other => RigModelType::Unknown(other),
-        }
+            RigModelType::Unknown => return None,
+        })
     }
 
     /// Get manufacturer name
@@ -442,7 +332,7 @@ impl RigModelType {
             RigModelType::KenwoodTS590SG | RigModelType::KenwoodTS890S => "Kenwood",
             RigModelType::ElecraftK3S | RigModelType::ElecraftKX3 => "Elecraft",
             RigModelType::FlexRadio6000 => "FlexRadio",
-            RigModelType::Unknown(_) => "Unknown",
+            RigModelType::Unknown => "Unknown",
         }
     }
 
@@ -462,7 +352,7 @@ impl RigModelType {
             RigModelType::ElecraftK3S => "K3S",
             RigModelType::ElecraftKX3 => "KX3",
             RigModelType::FlexRadio6000 => "6000 Series",
-            RigModelType::Unknown(_id) => "Unknown",
+            RigModelType::Unknown => "Unknown",
         }
     }
 
@@ -622,22 +512,10 @@ mod tests {
         // TODO: Add band frequency detection methods to BandExt trait
     }
 
-    #[test]
-    fn test_mode_conversion() {
-        use crate::models::ModeExt;
-        let mode = Mode::USB;
-        let hamlib_mode = mode.to_hamlib();
-        let converted_back = Mode::from_hamlib(hamlib_mode);
-        assert_eq!(mode, converted_back);
-    }
-
-    #[test]
-    fn test_vfo_conversion() {
-        let vfo = Vfo::A;
-        let hamlib_vfo = vfo.to_hamlib();
-        let converted_back = Vfo::from_hamlib(hamlib_vfo);
-        assert_eq!(vfo, converted_back);
-    }
+    // Mode/VFO round-trip-through-hamlib tests removed alongside the
+    // FFI bindings module they exercised. The rigctld TCP path uses
+    // string-form modes ("USB", "FT8", ...) and VFO names directly,
+    // not numeric hamlib constants.
 
     #[test]
     fn test_rig_model_registry() {

@@ -3,7 +3,6 @@
 //! This module provides structured error types, error recovery mechanisms,
 //! and detailed error reporting for all hamlib operations.
 
-use crate::bindings;
 use std::fmt;
 use thiserror::Error;
 
@@ -523,75 +522,13 @@ impl HamlibError {
         }
     }
 
-    /// Convert from hamlib error code
-    pub fn from_hamlib_code(code: i32, operation: &str) -> Self {
-        let message = bindings::hamlib_error_message(code);
-
-        match code {
-            bindings::RIG_EINVAL => Self::invalid_parameter(
-                "parameter",
-                &message,
-                Some("Check parameter values and ranges".to_string()),
-            ),
-            bindings::RIG_ECONF => {
-                Self::configuration(message, None, Some("Check rig configuration".to_string()))
-            }
-            bindings::RIG_ENOMEM => Self::internal(
-                "Out of memory",
-                None,
-                Some(format!("Operation: {}", operation)),
-            ),
-            bindings::RIG_ENIMPL => {
-                Self::not_supported(operation, None, Some("Check rig capabilities".to_string()))
-            }
-            bindings::RIG_ETIMEOUT => Self::timeout(operation, 0, true),
-            bindings::RIG_EIO => Self::communication(message, Some(code), 0),
-            bindings::RIG_EINTERNAL => {
-                Self::internal(message, None, Some(format!("Code: {}", code)))
-            }
-            bindings::RIG_EPROTO => {
-                Self::communication(format!("Protocol error: {}", message), Some(code), 0)
-            }
-            bindings::RIG_ERJCTED => {
-                Self::hardware(format!("Command rejected: {}", message), None, false)
-            }
-            bindings::RIG_ETRUNC => {
-                Self::communication(format!("Response truncated: {}", message), Some(code), 0)
-            }
-            bindings::RIG_ENAVAIL => Self::not_supported(operation, None, None),
-            bindings::RIG_ENTARGET => {
-                Self::connection(format!("No target: {}", message), Some(code), true)
-            }
-            bindings::RIG_BUSERROR => Self::hardware(
-                format!("Bus error: {}", message),
-                Some("Communication bus".to_string()),
-                true,
-            ),
-            bindings::RIG_BUSBUSY => {
-                Self::communication(format!("Bus busy: {}", message), Some(code), 0)
-            }
-            bindings::RIG_EARG => Self::invalid_parameter(
-                "argument",
-                &message,
-                Some("Check function arguments".to_string()),
-            ),
-            bindings::RIG_EVFO => Self::invalid_parameter(
-                "VFO",
-                &message,
-                Some("Use VFO A, B, or Current".to_string()),
-            ),
-            bindings::RIG_EDOM => Self::invalid_parameter(
-                "value",
-                &message,
-                Some("Value outside valid domain".to_string()),
-            ),
-            _ => Self::internal(
-                format!("Unknown hamlib error: {} ({})", message, code),
-                None,
-                Some(format!("Operation: {}, Code: {}", operation, code)),
-            ),
-        }
-    }
+    // `from_hamlib_code` was previously defined here as the conversion path
+    // from libhamlib FFI return codes into HamlibError variants. It was
+    // removed when the dead FFI bindings layer was deleted; the rigctld
+    // TCP path produces structured errors directly without going through
+    // RIG_E* numeric codes. If a future native-hamlib path is reintroduced,
+    // the conversion can be reimplemented against whatever new bindings
+    // surface ships with it.
 
     /// Get recovery suggestions
     pub fn recovery_suggestions(&self) -> Vec<String> {
@@ -894,17 +831,8 @@ mod tests {
         assert!(suggestions.iter().any(|s| s.contains("baud rate")));
     }
 
-    #[test]
-    fn test_hamlib_error_conversion() {
-        let error = HamlibError::from_hamlib_code(bindings::RIG_EINVAL, "set_frequency");
-
-        match error {
-            HamlibError::InvalidParameter { parameter, .. } => {
-                assert_eq!(parameter, "parameter");
-            }
-            _ => panic!("Expected InvalidParameter error"),
-        }
-    }
+    // test_hamlib_error_conversion removed — exercised the deleted
+    // from_hamlib_code conversion path.
 
     #[test]
     fn test_mode_error() {
