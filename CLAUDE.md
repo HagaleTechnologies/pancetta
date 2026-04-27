@@ -17,7 +17,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-dsp` | DSP pipeline (FFT, filtering, resampling) | Functional |
 | `pancetta-config` | Configuration with hot-reload | Production-ready, ~59 tests |
 | `pancetta-qso` | QSO management, priority scoring, frequency allocation, autonomous operator | Core logic, ~60 tests |
-| `pancetta-dx` | DX hunting, DXCC, PSKReporter | Partial implementation |
+| `pancetta-dx` | DX cluster + PSKReporter + scaffolded LoTW | Live + scaffolded |
 | `pancetta-hamlib` | Hamlib CAT control FFI | Bindings done, integration stub |
 | `pancetta-cqdx` | cqdx.io HTTP client, cache, types | Delta-adapted, needs live API validation |
 | `pancetta-tui` | Terminal UI | Scaffold, not wired to pipeline |
