@@ -26,6 +26,7 @@ mod pipeline;
 mod qso;
 mod shutdown;
 mod tui_relay;
+mod tx;
 mod util;
 mod wav_playback;
 
