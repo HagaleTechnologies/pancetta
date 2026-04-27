@@ -1,13 +1,13 @@
 [package]
 name = "pancetta"
-version = "0.1.0"
-edition = "2021"
-authors = ["Pancetta Team <team@pancetta.dev>"]
-description = "Pancetta - High-Performance Amateur Radio FT8 Processing Application"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/pancetta-team/pancetta"
+description = "Autonomous FT8 ham radio station"
 keywords = ["amateur-radio", "ft8", "dsp", "real-time", "ham-radio"]
 categories = ["science", "multimedia::audio", "network-programming"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "pancetta_lib"

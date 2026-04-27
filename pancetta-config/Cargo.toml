@@ -1,11 +1,11 @@
 [package]
 name = "pancetta-config"
-version = "0.1.0"
-edition = "2021"
-authors = ["Pancetta Team"]
-description = "Configuration management system for Pancetta amateur radio software"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/pancetta-team/pancetta"
+description = "Configuration management for Pancetta"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 # Configuration and serialization

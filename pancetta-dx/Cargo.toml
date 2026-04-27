@@ -1,13 +1,13 @@
 [package]
 name = "pancetta-dx"
-version = "0.1.0"
-edition = "2021"
-authors = ["Pancetta Team"]
 description = "DX hunting and amateur radio award tracking for Pancetta"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/thagale/pancetta"
 keywords = ["amateur-radio", "dx", "dxcc", "ham-radio", "contest"]
 categories = ["multimedia", "science"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 # Internal dependencies

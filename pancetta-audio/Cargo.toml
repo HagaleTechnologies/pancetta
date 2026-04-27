@@ -1,9 +1,11 @@
 [package]
 name = "pancetta-audio"
-version = "0.1.0"
-edition = "2021"
-authors = ["Pancetta Team"]
-description = "Real-time audio processing core for Pancetta - Week 0 Technical POC"
+description = "Real-time audio processing for Pancetta"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 # Use workspace dependencies for consistency

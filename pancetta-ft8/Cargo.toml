@@ -1,10 +1,11 @@
 [package]
 name = "pancetta-ft8"
-version = "0.1.0"
-edition = "2021"
 description = "High-performance FT8 digital mode decoder for Pancetta"
-authors = ["Pancetta Team"]
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 # DSP and FFT operations

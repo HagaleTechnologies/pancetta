@@ -1,9 +1,11 @@
 [package]
 name = "pancetta-cqdx"
-version = "0.1.0"
-edition = "2021"
 description = "cqdx.io API client and cache for Pancetta"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 pancetta-core = { path = "../pancetta-core" }

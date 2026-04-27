@@ -1,13 +1,13 @@
 [package]
 name = "pancetta-qso"
-version = "0.1.0"
-edition = "2021"
-authors = ["Pancetta Development Team"]
 description = "QSO management and logging system for FT8 communications"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/pancetta/pancetta-qso"
 keywords = ["ham-radio", "ft8", "qso", "adif", "logging"]
 categories = ["simulation", "science", "database"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 # Internal dependencies

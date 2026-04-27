@@ -1,11 +1,11 @@
 [package]
 name = "pancetta-hamlib"
-version = "0.1.0"
-edition = "2021"
-authors = ["Pancetta Team"]
 description = "Hamlib integration and CAT control for amateur radio transceivers"
-license = "MIT"
-repository = "https://github.com/thagale/pancetta"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 # Internal dependencies
