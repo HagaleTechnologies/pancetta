@@ -13,7 +13,7 @@ use sqlx::{
 use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 /// Async database operation errors
@@ -597,14 +597,52 @@ impl AsyncQsoDatabase {
             .map_err(|e| AsyncDatabaseError::Replay(format!("ADIF parse failed: {e}")))?;
 
         let mut inserted: u64 = 0;
+        let mut skipped: u64 = 0;
         for adif_record in &adif_file.records {
             let adif_qso = processor
                 .record_to_qso(adif_record)
                 .map_err(|e| AsyncDatabaseError::Replay(format!("record→AdifQso failed: {e}")))?;
             let metadata = processor.adif_to_qso(&adif_qso);
 
+            // ADIF records with no <CALL:N> field are semantically broken — skip
+            // them rather than inserting a record with no callsign.
+            let their_callsign = match metadata.their_callsign.clone() {
+                Some(c) => c,
+                None => {
+                    warn!(
+                        qso_id = %metadata.qso_id,
+                        "Skipping ADIF record with no CALL field"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            let completed_at = metadata.end_time.unwrap_or(metadata.start_time);
+            let duration_seconds = metadata
+                .end_time
+                .map(|end| {
+                    end.signed_duration_since(metadata.start_time)
+                        .num_seconds()
+                        .max(0) as u32
+                })
+                .unwrap_or(0);
+
+            // Signal reports default to -15 dB (middling FT8) when the source
+            // ADIF did not carry an RST field.
+            let their_report: SignalReport = metadata.reports.received.unwrap_or(-15);
+            let our_report: SignalReport = metadata.reports.sent.unwrap_or(-15);
+
             let progress = QsoProgress {
-                state: QsoState::Idle,
+                state: QsoState::Completed {
+                    their_callsign,
+                    their_report,
+                    our_report,
+                    frequency: metadata.frequency,
+                    grid_square: metadata.grids.theirs.clone(),
+                    completed_at,
+                    duration_seconds,
+                },
                 state_history: vec![],
                 messages: vec![],
                 metadata,
@@ -614,11 +652,18 @@ impl AsyncQsoDatabase {
             inserted += 1;
         }
 
+        if skipped > 0 {
+            warn!(
+                "Skipped {} ADIF records with no CALL field during replay",
+                skipped
+            );
+        }
         info!(
-            "Replayed {} records from {} into {}",
+            "Replayed {} records from {} into {} ({} skipped)",
             inserted,
             adif_path.display(),
             db_path.display(),
+            skipped,
         );
         Ok(db)
     }
