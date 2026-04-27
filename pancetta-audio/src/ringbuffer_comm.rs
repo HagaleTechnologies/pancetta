@@ -18,6 +18,13 @@ pub const DEFAULT_AUDIO_BUFFER_SIZE: usize = 8192; // ~170ms at 48kHz mono – e
 pub const DEFAULT_LATENCY_BUFFER_SIZE: usize = 256; // Enough for several seconds of latency measurements
 pub const MAX_AUDIO_BUFFER_SIZE: usize = 65536; // Hard limit to prevent excessive memory usage
 
+/// Buffer size for TX audio output. A full FT8 transmission is 12.64s of
+/// 48kHz mono = 606,720 samples. The output ring buffer must hold a complete
+/// transmission so `queue_output` can push the entire waveform in one call
+/// without dropping samples (the cpal callback drains in real time). Sized
+/// with ~3 seconds of cushion above the 12.64s TX duration.
+pub const OUTPUT_AUDIO_BUFFER_SIZE: usize = 786_432; // ~16s at 48kHz mono
+
 /// Shared atomic state accessible from both producer and consumer sides.
 #[derive(Clone)]
 pub struct AudioCommShared {

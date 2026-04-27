@@ -9,7 +9,7 @@ use crate::{
     latency::CallbackTimer,
     ringbuffer_comm::{
         audio_comm_pair, AudioCommShared, AudioConsumer, AudioProducer, DEFAULT_AUDIO_BUFFER_SIZE,
-        DEFAULT_LATENCY_BUFFER_SIZE,
+        DEFAULT_LATENCY_BUFFER_SIZE, OUTPUT_AUDIO_BUFFER_SIZE,
     },
 };
 use cpal::{
@@ -108,9 +108,11 @@ impl AudioStreamManager {
             audio_comm_pair(DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
         let shared = consumer.shared.clone();
 
-        // Create output ring buffer pair for TX audio
+        // Create output ring buffer pair for TX audio. Sized to hold a full
+        // FT8 transmission (12.64s) so queue_output can push the entire
+        // waveform in one call without overrun.
         let (output_producer, output_consumer) =
-            audio_comm_pair(DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
+            audio_comm_pair(OUTPUT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
 
         Ok(Self {
             device_manager,
@@ -173,9 +175,9 @@ impl AudioStreamManager {
         // Create input stream (moves the producer into the callback)
         self.create_input_stream()?;
 
-        // Recreate output ring buffer pair for this session
+        // Recreate output ring buffer pair for this session (TX-sized).
         let (output_producer, output_consumer) =
-            audio_comm_pair(DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
+            audio_comm_pair(OUTPUT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
         self.output_producer = Some(output_producer);
         self.output_consumer = Some(output_consumer);
 

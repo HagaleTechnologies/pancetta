@@ -479,13 +479,17 @@ impl RigControl for RigctldClient {
     }
 
     #[instrument(skip(self))]
-    async fn set_ptt(&self, vfo: Vfo, state: PttState) -> Result<()> {
+    async fn set_ptt(&self, _vfo: Vfo, state: PttState) -> Result<()> {
         let ptt_value = match state {
             PttState::On | PttState::OnMic | PttState::OnData => "1",
             PttState::Off => "0",
         };
 
-        let cmd = format!("\\set_ptt {} {}", Self::vfo_to_string(vfo), ptt_value);
+        // Use rigctld's short-form command `T <0|1>` (no VFO arg). The
+        // long-form `\set_ptt currVFO N` returns RPRT -1 (RIG_EINVAL) on
+        // some hamlib drivers (incl. the FTdx10's) — short form works
+        // reliably and matches tx_test's validated pattern.
+        let cmd = format!("T {}", ptt_value);
         self.send_command_with_retry(&cmd).await?;
 
         // Update cached value
