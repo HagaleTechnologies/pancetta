@@ -48,15 +48,3 @@ tracing-subscriber = { workspace = true }
 default = ["mock-rig"]
 # Mock rig implementation for testing without hardware
 mock-rig = []
-
-[[example]]
-name = "basic_rig_control"
-required-features = ["mock-rig"]
-
-[[example]]
-name = "frequency_scanner"
-required-features = ["mock-rig"]
-
-[[example]]
-name = "band_hopper"
-required-features = ["mock-rig"]
