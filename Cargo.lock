@@ -2883,7 +2883,6 @@ dependencies = [
 name = "pancetta-dx"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "approx",
  "chrono",
  "csv",
