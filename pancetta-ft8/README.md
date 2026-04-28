@@ -1,6 +1,48 @@
 # Pancetta FT8 - High-Performance FT8 Digital Mode Decoder
 
-A Rust implementation of a high-performance FT8 digital mode decoder optimized for real-time processing in amateur radio applications.
+A Rust implementation of FT8 digital-mode encoding, decoding, and
+modulation, optimized for real-time use inside Pancetta's autonomous
+station pipeline.
+
+## Implementation Provenance
+
+This crate is part `ft8_lib` (via FFI), part Rust port of `ft8_lib`,
+and part original work. The split:
+
+- **Vendored, used via FFI** — `vendor/ft8_lib/` is the unmodified
+  C source of [kgoba/ft8_lib](https://github.com/kgoba/ft8_lib) (MIT,
+  © 2018 Kārlis Goba). It is compiled by `build.rs` and invoked
+  through `src/ft8_lib_ffi.rs`. **`ft8_lib` is the primary runtime
+  decoder** — the Rust decoder runs alongside it as a secondary path
+  for AP-injected decodes that the reference doesn't catch.
+
+- **Native Rust, ported from `ft8_lib`** — `src/decoder.rs`,
+  `src/encoder.rs`, `src/ldpc.rs`, `src/message.rs`, and `src/osd.rs`
+  were written from scratch in Rust, but several algorithms and all
+  protocol constants are direct ports from `ft8_lib`. Specifically:
+  the LDPC(174,91) generator/parity tables, the CRC-14 byte-at-a-time
+  routine, the FT8 Gray-code lookup, the Costas-array neighbor-scoring
+  pattern, the sliding-frame spectrogram (`monitor_process` analogue),
+  the LLR variance-normalization, and the Padé `tanh` approximation.
+  Each port is attributed at its call site (search for `ft8_lib` in
+  those files).
+
+- **Original to Pancetta** — the neural-OSD bit-flip ordering CNN
+  (`src/neural_osd.rs`, ~80 KB of weights), active-QSO-aware AP
+  decoding (`src/ap.rs`), the multi-stream TX modulator
+  (`modulate_multi_tx` in `src/modulator.rs`), and the integration
+  surface (`Ft8Encoder` / `Ft8Decoder` Rust API, configuration types,
+  error model, and ~295 tests including cross-validation against
+  `ft8_lib` audio).
+
+The protocol itself — Costas sync arrays, LDPC code, CRC polynomial,
+Gray code, message payload layout — is the work of Joe Taylor (K1JT)
+and Steve Franke (K9AN), published in
+[*The FT4 and FT8 Communication Protocols*](https://wsjt.sourceforge.io/FT4_FT8_QEX.pdf).
+Pancetta does not link or copy any WSJT-X source code.
+
+See the repo-root [`THIRD-PARTY-NOTICES.md`](../THIRD-PARTY-NOTICES.md)
+for full license text.
 
 ## Features
 

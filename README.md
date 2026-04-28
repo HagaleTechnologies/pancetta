@@ -63,8 +63,9 @@ cargo build --release
 ```
 
 The first build will take 5–10 minutes (workspace is 11 crates and
-includes a vendored copy of `ft8_lib` for cross-validation tests). After
-that, incremental builds are sub-30s.
+compiles a vendored copy of `ft8_lib`, which Pancetta uses as its
+primary FT8 reference decoder via FFI — see [Acknowledgments](#acknowledgments)).
+After that, incremental builds are sub-30s.
 
 ### 3. Bootstrap your config
 
@@ -246,6 +247,35 @@ on every push to catch security advisories and license drift.
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes.
 
 API documentation: `cargo doc --workspace --no-deps --open`.
+
+---
+
+## Acknowledgments
+
+Pancetta stands on the shoulders of the FT8 community. In particular:
+
+- **Joe Taylor (K1JT) and Steve Franke (K9AN)** designed the FT8
+  protocol — the LDPC code, Costas sync arrays, modulation, and message
+  schema that this project implements. The protocol is documented in
+  [*The FT4 and FT8 Communication Protocols*](https://wsjt.sourceforge.io/FT4_FT8_QEX.pdf).
+- **Kārlis Goba (YL3JG)** authored
+  [`ft8_lib`](https://github.com/kgoba/ft8_lib), the MIT-licensed C
+  reference implementation that Pancetta vendors at
+  `pancetta-ft8/vendor/ft8_lib/` and uses as its primary decoder via
+  FFI. Pancetta's native Rust decoder also ports several algorithms
+  from `ft8_lib` (CRC-14, LDPC tables, Gray code mapping, sliding
+  spectrogram, LLR normalization) — these are attributed in the source
+  comments where they appear.
+- **The WSJT-X project** (GPL) is the de-facto reference FT8
+  application. Pancetta does **not** link or vendor any WSJT-X source;
+  it interoperates with WSJT-X through the published protocol only.
+
+What's specifically novel in Pancetta: the neural-OSD bit-flip
+re-ordering CNN, active-QSO-aware AP decoding, multi-stream TX
+modulation, the autonomous-operator priority engine, and integration
+with the cqdx.io spotting/scoring service. See
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) for full third-party
+license text.
 
 ---
 
