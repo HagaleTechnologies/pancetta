@@ -77,6 +77,14 @@ impl super::ApplicationCoordinator {
             while !shutdown.load(Ordering::Acquire) {
                 match ft8_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                     Ok(window) => {
+                        // Capture receipt time immediately — before any decode
+                        // work — so parity tagging is invariant under decode
+                        // latency. (If we captured now() after decode, a slow
+                        // slot on a loaded MiniPC could push us into slot N+1
+                        // and produce the wrong parity, causing the autonomous
+                        // operator to TX in the same slot as the DX.)
+                        let window_received_utc = chrono::Utc::now();
+
                         info!("FT8 decoder: received window ({} samples)", window.len());
 
                         // Generate waterfall data
@@ -159,16 +167,13 @@ impl super::ApplicationCoordinator {
                             decoded_messages.len()
                         );
 
-                        // The audio window the decoder just processed corresponds
-                        // to the slot that ended just before now. We'll use that
-                        // slot's start time to compute its parity, and stamp every
-                        // decoded message with it. (All messages in this batch came
-                        // from the same audio window, so they share parity.)
-                        let now_utc = chrono::Utc::now();
-                        let next_boundary =
-                            pancetta_core::slot::next_slot_start(now_utc, chrono::Duration::zero());
-                        let slot_start = next_boundary
-                            - chrono::Duration::nanoseconds(pancetta_core::slot::SLOT_NS);
+                        // Window's audio came from the slot that started 13s before
+                        // receipt; computing parity from the receipt timestamp keeps the
+                        // tag invariant under decode latency. (next_slot_start would
+                        // give the wrong slot if decode pushes us into the next slot
+                        // before we tag.)
+                        let slot_start =
+                            window_received_utc - chrono::Duration::seconds(13);
                         let window_parity = pancetta_core::slot::SlotParity::of(slot_start);
 
                         for decoded_msg in decoded_messages.iter_mut() {

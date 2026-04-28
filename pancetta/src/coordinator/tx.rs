@@ -762,4 +762,50 @@ mod schedule_tx_tests {
         assert_eq!(s.silent_pad_samples, 500 * 12);
         assert_eq!(s.cursor_offset_samples, 0);
     }
+
+    #[test]
+    fn resolve_required_parity_explicit_wins_over_config() {
+        use pancetta_config::station::TxSelfParity;
+        // tx_parity = Some(Even), config = Auto → returns Even
+        let p = resolve_required_parity(
+            Some(SlotParity::Even),
+            TxSelfParity::Auto,
+            at(5.0),
+        );
+        assert_eq!(p, SlotParity::Even);
+    }
+
+    #[test]
+    fn resolve_required_parity_explicit_wins_over_explicit_config() {
+        use pancetta_config::station::TxSelfParity;
+        // tx_parity = Some(Even), config = Odd → tx_parity wins → Even
+        let p = resolve_required_parity(
+            Some(SlotParity::Even),
+            TxSelfParity::Odd,
+            at(5.0),
+        );
+        assert_eq!(p, SlotParity::Even);
+    }
+
+    #[test]
+    fn resolve_required_parity_falls_back_to_config_when_none() {
+        use pancetta_config::station::TxSelfParity;
+        let p = resolve_required_parity(None, TxSelfParity::Even, at(5.0));
+        assert_eq!(p, SlotParity::Even);
+        let p = resolve_required_parity(None, TxSelfParity::Odd, at(5.0));
+        assert_eq!(p, SlotParity::Odd);
+    }
+
+    #[test]
+    fn resolve_required_parity_auto_picks_nearest_next_slot() {
+        use pancetta_config::station::TxSelfParity;
+        // now = :05 (in Even slot 0). Next Even = :30, next Odd = :15.
+        // Odd is closer → Auto picks Odd.
+        let p = resolve_required_parity(None, TxSelfParity::Auto, at(5.0));
+        assert_eq!(p, SlotParity::Odd);
+        // now = :20 (in Odd slot 1). Next Odd = :45, next Even = :30.
+        // Even is closer → Auto picks Even.
+        let p = resolve_required_parity(None, TxSelfParity::Auto, at(20.0));
+        assert_eq!(p, SlotParity::Even);
+    }
 }

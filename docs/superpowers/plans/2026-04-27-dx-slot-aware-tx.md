@@ -2506,6 +2506,8 @@ To be run by the operator after merging to main:
    - Rig PTT engages just before :15.0
    - Audio emits at slot boundary (no DT > 0.3s in any subsequent
      receiving station's spot)
+   - **PTT stays engaged for the full audio duration; audio plays
+     to completion before PTT releases (~12.7s + 50ms tail)**
    - PSKReporter spot appears within ~30s
 3. Wait for another Even-slot CQ. Press Space at slot+5s. Confirm:
    - TX still happens at :15 (current Odd slot), not :30
@@ -2513,3 +2515,9 @@ To be run by the operator after merging to main:
 4. Trigger autonomous mode (`c` key for auto-CQ); confirm at least
    one CQ → reply → response cycle completes without same-parity
    collision.
+5. **Self-decode sanity check.** Our own TX should appear in the next
+   decode window tagged with the parity we just transmitted. Confirm
+   the autonomous operator does NOT respond to its own callsign; if
+   it does, abort immediately and check the `our_callsign` filter in
+   `pancetta-qso/src/qso_manager.rs`. (A bug here would create an
+   infinite ping-pong on alternating parities.)
