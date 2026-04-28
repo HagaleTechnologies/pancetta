@@ -138,6 +138,14 @@ avoid QRM from active signals, maintain minimum spacing between simultaneous TX 
 prefer clear channels, align with band segment conventions. Enables parallel QSOs
 within a single 15-second slot.
 
+### TX Slot Scheduler (`pancetta/src/coordinator/tx.rs`)
+
+`TransmitRequest` carries an `Option<SlotParity>` set from the latched QSO metadata
+(or `None` for unsolicited CQ); the scheduler picks the next opposite-parity slot and
+uses silent-pad / cursor-offset to align audio to the slot boundary. Late-start
+tolerance is governed by `[station].tx_late_max_ms` (default 8 000 ms). See
+`docs/superpowers/specs/2026-04-27-dx-slot-aware-tx-design.md`.
+
 ### `CachedStationLookup` (pancetta / priority_evaluator.rs)
 
 Coordinator-level implementation of `WorkedStationLookup`. Holds in-memory snapshots

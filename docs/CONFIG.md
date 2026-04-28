@@ -56,6 +56,9 @@ sensible default in `defaults.toml`.
 | `itu_zone` | integer | `8` | Used by some contest exchanges. |
 | `cq_zone` | integer | `5` | Same. |
 | `operator_name` | string | `""` | Your name (optional, for log export). |
+| `tx_late_max_ms` | integer | `8000` | Maximum latency past the slot boundary at which the TX scheduler will still attempt a late-start TX via audio cursor skip-ahead. Beyond this, defers to the next opposite-parity slot (30s later). 8s leaves ~5s of audio on the air, which is enough for the receiver to lock onto the middle and end Costas sync arrays. |
+| `tx_self_parity` | string | `"auto"` | When calling CQ (no DX heard), pick TX slot parity by this rule. `"auto"` picks whichever next slot is closer; `"even"` / `"odd"` lock to the named parity. |
+| `ptt_lead_ms` | integer | `80` | PTT engage lead time before the slot boundary. Drop to 50ms for fast solid-state keying; bump up to 150–200ms for slow mechanical relays. |
 
 `station.antennas` is an array-of-tables; you can describe each antenna
 on the station and Pancetta will surface them in the TUI.

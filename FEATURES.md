@@ -20,6 +20,10 @@ The `SmartFrequencyAllocator` scores candidate TX frequencies across seven soft 
 
 The DSP pipeline connects real-time audio input to the FT8 decoder through a modular, async-friendly processing chain. Incoming 48 kHz stereo audio is decimated to 12 kHz mono using SINC-based resampling, then processed through cascaded biquad IIR bandpass filters tuned to the FT8 passband. Automatic gain control with hang time, compression, and noise gating prevents saturation and keeps signal levels stable across varying band conditions. Spectral subtraction provides adaptive noise reduction, and 12.64-second windows are extracted on FT8 slot boundaries for handoff to the decoder. Pipeline stages emit detailed performance metrics for runtime monitoring.
 
+## Slot-Parity-Aware TX Scheduling
+
+FT8 TX honors WSJT-X-style slot parity and supports late-start audio playback up to 8 seconds past the slot boundary (configurable via `[station].tx_late_max_ms`).
+
 ## Hardware Integration
 
 Hamlib CAT control is integrated via a TCP client to `rigctld`, targeting the Yaesu FTdx10 (model 1042) connected by USB at 38400 baud. The integration covers frequency readback and PTT control, enabling the coordinator to command the rig into transmit at the correct moment and return to receive when the TX window closes. End-to-end TX has been validated on real hardware with clean ALC and tail-end PSKReporter spots across NA + EU. Pancetta refuses to spawn rigctld with suspicious serial-port paths and warns when `RIGCTLD_HOST` points outside loopback. The hamlib crate is tested independently due to tokio runtime constraints (`cargo test -p pancetta-hamlib --lib -- --test-threads=1`).
