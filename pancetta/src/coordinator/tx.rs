@@ -273,8 +273,9 @@ impl super::ApplicationCoordinator {
                                     // --- Step 3: Build the audio buffer to ship ---
                                     // Pad zeros in front (early branch); skip cursor into
                                     // waveform (late branch); never both at the same time.
-                                    let mut audio_out: Vec<f32> =
-                                        Vec::with_capacity(schedule.silent_pad_samples + samples.len());
+                                    let mut audio_out: Vec<f32> = Vec::with_capacity(
+                                        schedule.silent_pad_samples + samples.len(),
+                                    );
                                     audio_out.resize(schedule.silent_pad_samples, 0.0f32);
                                     if schedule.cursor_offset_samples < samples.len() {
                                         audio_out.extend_from_slice(
@@ -299,7 +300,8 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
                                     let audio_duration_ms =
-                                        (audio_out.len() as f64 / sample_rate as f64 * 1000.0) as u64;
+                                        (audio_out.len() as f64 / sample_rate as f64 * 1000.0)
+                                            as u64;
 
                                     // --- Step 4: Sleep until PTT engage instant ---
                                     let ptt_target_utc = schedule.target_slot
@@ -427,7 +429,9 @@ impl super::ApplicationCoordinator {
                                         });
                                     }
 
-                                    let (samples_opt, _duration_ms_encode) = if !multi_items.is_empty() {
+                                    let (samples_opt, _duration_ms_encode) = if !multi_items
+                                        .is_empty()
+                                    {
                                         match pancetta_ft8::modulate_multi_tx(
                                             &multi_items,
                                             12000,
@@ -499,8 +503,9 @@ impl super::ApplicationCoordinator {
                                     );
 
                                     // --- Step 3: Build the audio buffer ---
-                                    let mut audio_out: Vec<f32> =
-                                        Vec::with_capacity(schedule.silent_pad_samples + samples.len());
+                                    let mut audio_out: Vec<f32> = Vec::with_capacity(
+                                        schedule.silent_pad_samples + samples.len(),
+                                    );
                                     audio_out.resize(schedule.silent_pad_samples, 0.0f32);
                                     if schedule.cursor_offset_samples < samples.len() {
                                         audio_out.extend_from_slice(
@@ -524,7 +529,8 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
                                     let audio_duration_ms =
-                                        (audio_out.len() as f64 / sample_rate as f64 * 1000.0) as u64;
+                                        (audio_out.len() as f64 / sample_rate as f64 * 1000.0)
+                                            as u64;
 
                                     // --- Step 4: Sleep until PTT engage instant ---
                                     let ptt_target_utc = schedule.target_slot

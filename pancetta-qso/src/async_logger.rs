@@ -559,7 +559,7 @@ impl AsyncQsoLogger {
 
         // Import each QSO
         for record in &adif_file.records {
-            match self.adif_processor.record_to_qso(&record) {
+            match self.adif_processor.record_to_qso(record) {
                 Ok(adif_qso) => {
                     // Convert to QsoProgress
                     let progress = self.adif_qso_to_progress(&adif_qso);
@@ -613,9 +613,11 @@ impl AsyncQsoLogger {
 
         // Get date range
         let filter = QsoFilter::default();
-        let mut oldest_options = QueryOptions::default();
-        oldest_options.limit = Some(1);
-        oldest_options.sort_order = SortOrder::Ascending;
+        let oldest_options = QueryOptions {
+            limit: Some(1),
+            sort_order: SortOrder::Ascending,
+            ..QueryOptions::default()
+        };
 
         let oldest = self
             .database
@@ -624,9 +626,11 @@ impl AsyncQsoLogger {
             .first()
             .map(|q| q.metadata.start_time);
 
-        let mut newest_options = QueryOptions::default();
-        newest_options.limit = Some(1);
-        newest_options.sort_order = SortOrder::Descending;
+        let newest_options = QueryOptions {
+            limit: Some(1),
+            sort_order: SortOrder::Descending,
+            ..QueryOptions::default()
+        };
 
         let newest = self
             .database
@@ -804,7 +808,7 @@ impl AsyncQsoLogger {
                     .as_ref()
                     .and_then(|r| r.parse().ok())
                     .unwrap_or(0),
-                frequency: (adif_qso.freq * 1_000_000.0) as f64,
+                frequency: adif_qso.freq * 1_000_000.0,
                 grid_square: adif_qso.gridsquare.clone(),
                 completed_at: adif_qso.qso_date_off.unwrap_or(adif_qso.qso_date),
                 duration_seconds: 0,
@@ -819,7 +823,7 @@ impl AsyncQsoLogger {
                     adif_qso.station_callsign.clone()
                 },
                 their_callsign: Some(adif_qso.call.clone()),
-                frequency: (adif_qso.freq * 1_000_000.0) as f64,
+                frequency: adif_qso.freq * 1_000_000.0,
                 mode: adif_qso.mode.clone(),
                 start_time: adif_qso.qso_date,
                 end_time: adif_qso.qso_date_off,

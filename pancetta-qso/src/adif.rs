@@ -714,7 +714,7 @@ impl AdifProcessor {
                 // Parse field
                 let mut field_spec = String::new();
 
-                while let Some(ch) = chars.next() {
+                for ch in chars.by_ref() {
                     if ch == '>' {
                         break;
                     }

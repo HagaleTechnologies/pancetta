@@ -175,8 +175,8 @@ pub struct DeviceSelectionState {
     pub visible: bool,
 }
 
-impl DeviceSelectionState {
-    pub fn new() -> Self {
+impl Default for DeviceSelectionState {
+    fn default() -> Self {
         Self {
             input_devices: Vec::new(),
             output_devices: Vec::new(),
@@ -185,6 +185,12 @@ impl DeviceSelectionState {
             active_panel: DevicePanel::Input,
             visible: false,
         }
+    }
+}
+
+impl DeviceSelectionState {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Get the currently selected index for the active panel.

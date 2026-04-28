@@ -241,11 +241,15 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
             for display_row in 0..rows_to_show {
                 // Map display row back to data index
                 let data_idx = data_len - 1 - display_row * comp;
-                if data_idx % self.rows_per_cycle == 0 {
+                if data_idx.is_multiple_of(self.rows_per_cycle) {
                     let y = waterfall_area.y + display_row as u16;
                     let cycle_num = data_idx / self.rows_per_cycle;
-                    let marker_char = if cycle_num % 2 == 0 { 'E' } else { 'O' };
-                    let marker_color = if cycle_num % 2 == 0 {
+                    let marker_char = if cycle_num.is_multiple_of(2) {
+                        'E'
+                    } else {
+                        'O'
+                    };
+                    let marker_color = if cycle_num.is_multiple_of(2) {
                         Color::DarkGray
                     } else {
                         Color::Gray

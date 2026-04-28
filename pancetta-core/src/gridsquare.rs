@@ -222,7 +222,7 @@ impl GridSquare {
     fn validate(&self) -> Result<()> {
         let chars: Vec<char> = self.grid.chars().collect();
 
-        if chars.is_empty() || chars.len() > 10 || chars.len() % 2 != 0 {
+        if chars.is_empty() || chars.len() > 10 || !chars.len().is_multiple_of(2) {
             return Err(PancettaError::InvalidInput(
                 "Grid square must have 2, 4, 6, 8, or 10 characters".to_string(),
             ));
@@ -405,7 +405,7 @@ pub fn grid_to_coordinates(grid: &str) -> Result<(f64, f64)> {
     let grid = grid.to_uppercase();
     let chars: Vec<char> = grid.chars().collect();
 
-    if chars.is_empty() || chars.len() > 10 || chars.len() % 2 != 0 {
+    if chars.is_empty() || chars.len() > 10 || !chars.len().is_multiple_of(2) {
         return Err(PancettaError::InvalidInput(
             "Invalid grid square length".to_string(),
         ));

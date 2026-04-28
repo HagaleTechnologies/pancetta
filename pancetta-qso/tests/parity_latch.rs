@@ -151,12 +151,7 @@ async fn four_message_qso_parity_latch_holds() {
     // Drain events and assert every MessageToSend carries tx_parity = Odd.
     let mut seen_message_to_send: u32 = 0;
     loop {
-        match tokio::time::timeout(
-            tokio::time::Duration::from_millis(200),
-            rx.recv(),
-        )
-        .await
-        {
+        match tokio::time::timeout(tokio::time::Duration::from_millis(200), rx.recv()).await {
             Ok(Ok(QsoEvent::MessageToSend { tx_parity, .. })) => {
                 assert_eq!(
                     tx_parity,

@@ -462,7 +462,11 @@ impl super::ApplicationCoordinator {
                                                 callsign, frequency
                                             );
                                             match qso_manager
-                                                .respond_to_cq(callsign.clone(), frequency as f64, dx_parity)
+                                                .respond_to_cq(
+                                                    callsign.clone(),
+                                                    frequency as f64,
+                                                    dx_parity,
+                                                )
                                                 .await
                                             {
                                                 Ok(qso_id) => {
@@ -484,7 +488,8 @@ impl super::ApplicationCoordinator {
                                                             message_text: reply.clone(),
                                                             frequency_offset: frequency as f64,
                                                             qso_id: Some(qso_id.to_string()),
-                                                            tx_parity: dx_parity.map(|p| p.opposite()),
+                                                            tx_parity: dx_parity
+                                                                .map(|p| p.opposite()),
                                                         },
                                                         Instant::now(),
                                                     );

@@ -674,7 +674,7 @@ impl QsoManager {
             ) => {
                 // Use received signal strength (SNR) as our report, default to received report
                 let our_report = signal_strength
-                    .map(|snr| (snr.round() as i8).max(-30).min(50))
+                    .map(|snr| (snr.round() as i8).clamp(-30, 50))
                     .unwrap_or(*report);
                 Ok(QsoState::SendingReport {
                     their_callsign: target_callsign.clone(),

@@ -131,7 +131,7 @@ pub fn next_phase(now: DateTime<Utc>, offset: Duration) -> DateTime<Utc> {
         .num_nanoseconds()
         .expect("offset out of i64 ns range");
     assert!(
-        offset_ns >= 0 && offset_ns < SLOT_NS,
+        (0..SLOT_NS).contains(&offset_ns),
         "phase offset must be in [0, 15s)"
     );
     let now_ns = now

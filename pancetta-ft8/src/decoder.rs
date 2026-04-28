@@ -1220,8 +1220,7 @@ impl Ft8Decoder {
     // Step 3: Decode a single candidate
     // ========================================================================
 
-    /// Attempt to decode a single Costas sync candidate.
-    ///
+    // Attempt to decode a single Costas sync candidate.
     // ========================================================================
     // A Priori (AP) enhanced decoding helpers
     // ========================================================================

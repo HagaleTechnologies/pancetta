@@ -448,7 +448,10 @@ impl QsoSystem {
 
     /// Respond to a CQ call
     pub async fn respond_to_cq(&self, callsign: String, frequency: f64) -> QsoResult<QsoId> {
-        Ok(self.qso_manager.respond_to_cq(callsign, frequency, None).await?)
+        Ok(self
+            .qso_manager
+            .respond_to_cq(callsign, frequency, None)
+            .await?)
     }
 
     /// Process an incoming message

@@ -1202,16 +1202,10 @@ fn extract_grid_from_cq(text: &str) -> Option<String> {
     if let Some(last) = parts.last() {
         if last.len() >= 4
             && last.len() <= 6
-            && last
-                .chars()
-                .nth(0)
-                .map_or(false, |c| c.is_ascii_alphabetic())
-            && last
-                .chars()
-                .nth(1)
-                .map_or(false, |c| c.is_ascii_alphabetic())
-            && last.chars().nth(2).map_or(false, |c| c.is_ascii_digit())
-            && last.chars().nth(3).map_or(false, |c| c.is_ascii_digit())
+            && last.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+            && last.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic())
+            && last.chars().nth(2).is_some_and(|c| c.is_ascii_digit())
+            && last.chars().nth(3).is_some_and(|c| c.is_ascii_digit())
         {
             return Some(last.to_uppercase());
         }

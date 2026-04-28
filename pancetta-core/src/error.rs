@@ -267,6 +267,7 @@ impl<E: StdError + Send + Sync + 'static> IntoPancettaError for E {
 }
 
 /// Extension trait for Result types
+#[allow(clippy::result_large_err)]
 pub trait ResultExt<T> {
     /// Add context to error
     fn with_context(

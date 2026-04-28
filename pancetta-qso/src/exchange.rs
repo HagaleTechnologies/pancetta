@@ -291,9 +291,7 @@ impl MessageExchange {
         snr: Option<f32>,
     ) -> Result<Option<MessageType>, ExchangeError> {
         // Compute signal report from SNR, defaulting to -10 if unavailable
-        let computed_report = snr
-            .map(|s| (s.round() as i8).max(-30).min(50))
-            .unwrap_or(-10);
+        let computed_report = snr.map(|s| (s.round() as i8).clamp(-30, 50)).unwrap_or(-10);
 
         match (current_state, received_message) {
             // Received response to our CQ
@@ -352,7 +350,7 @@ impl MessageExchange {
         let snr = signal_strength - noise_floor;
 
         // Convert SNR to FT8 report scale
-        let report = (snr.round() as i8).max(-30).min(50);
+        let report = (snr.round() as i8).clamp(-30, 50);
 
         // Round to nearest 3 dB for FT8 convention
         ((report + 1) / 3) * 3

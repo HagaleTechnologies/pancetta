@@ -299,55 +299,49 @@ impl StationConfig {
         let chars: Vec<char> = grid.chars().collect();
 
         // First two characters must be letters (A-R)
-        if chars.len() >= 2 {
-            if !chars[0].is_ascii_uppercase()
+        if chars.len() >= 2
+            && (!chars[0].is_ascii_uppercase()
                 || !chars[1].is_ascii_uppercase()
                 || chars[0] < 'A'
                 || chars[0] > 'R'
                 || chars[1] < 'A'
-                || chars[1] > 'R'
-            {
-                return Err(ConfigError::InvalidValue {
-                    field: "grid_square".to_string(),
-                    value: grid.clone(),
-                });
-            }
+                || chars[1] > 'R')
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "grid_square".to_string(),
+                value: grid.clone(),
+            });
         }
 
         // Next two characters must be digits (0-9)
-        if chars.len() >= 4 {
-            if !chars[2].is_ascii_digit() || !chars[3].is_ascii_digit() {
-                return Err(ConfigError::InvalidValue {
-                    field: "grid_square".to_string(),
-                    value: grid.clone(),
-                });
-            }
+        if chars.len() >= 4 && (!chars[2].is_ascii_digit() || !chars[3].is_ascii_digit()) {
+            return Err(ConfigError::InvalidValue {
+                field: "grid_square".to_string(),
+                value: grid.clone(),
+            });
         }
 
         // If 6 or 8 characters, next two must be lowercase letters (a-x)
-        if chars.len() >= 6 {
-            if !chars[4].is_ascii_lowercase()
+        if chars.len() >= 6
+            && (!chars[4].is_ascii_lowercase()
                 || !chars[5].is_ascii_lowercase()
                 || chars[4] < 'a'
                 || chars[4] > 'x'
                 || chars[5] < 'a'
-                || chars[5] > 'x'
-            {
-                return Err(ConfigError::InvalidValue {
-                    field: "grid_square".to_string(),
-                    value: grid.clone(),
-                });
-            }
+                || chars[5] > 'x')
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "grid_square".to_string(),
+                value: grid.clone(),
+            });
         }
 
         // If 8 characters, last two must be digits (0-9)
-        if chars.len() == 8 {
-            if !chars[6].is_ascii_digit() || !chars[7].is_ascii_digit() {
-                return Err(ConfigError::InvalidValue {
-                    field: "grid_square".to_string(),
-                    value: grid.clone(),
-                });
-            }
+        if chars.len() == 8 && (!chars[6].is_ascii_digit() || !chars[7].is_ascii_digit()) {
+            return Err(ConfigError::InvalidValue {
+                field: "grid_square".to_string(),
+                value: grid.clone(),
+            });
         }
 
         Ok(())

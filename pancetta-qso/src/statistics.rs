@@ -1105,10 +1105,10 @@ impl StatisticsCalculator {
             *by_hour.entry(qso_time.time().hour() as u8).or_insert(0) += 1;
 
             // First/last QSO
-            if first_qso.map_or(true, |t| qso_time < t) {
+            if first_qso.is_none_or(|t| qso_time < t) {
                 first_qso = Some(qso_time);
             }
-            if last_qso.map_or(true, |t| qso_time > t) {
+            if last_qso.is_none_or(|t| qso_time > t) {
                 last_qso = Some(qso_time);
             }
 
@@ -1449,7 +1449,7 @@ impl StatisticsCalculator {
         let most_used = frequency_groups
             .iter()
             .max_by_key(|(_, &count)| count)
-            .map(|(freq_str, &count)| (freq_str.parse().unwrap_or(0.0), count as u64));
+            .map(|(freq_str, &count)| (freq_str.parse().unwrap_or(0.0), count));
 
         let frequency_spread = if frequencies.len() > 1 {
             let min_freq = frequencies.iter().fold(f64::INFINITY, |a, &b| a.min(b));

@@ -165,10 +165,8 @@ impl super::ApplicationCoordinator {
                         // decoded message with it. (All messages in this batch came
                         // from the same audio window, so they share parity.)
                         let now_utc = chrono::Utc::now();
-                        let next_boundary = pancetta_core::slot::next_slot_start(
-                            now_utc,
-                            chrono::Duration::zero(),
-                        );
+                        let next_boundary =
+                            pancetta_core::slot::next_slot_start(now_utc, chrono::Duration::zero());
                         let slot_start = next_boundary
                             - chrono::Duration::nanoseconds(pancetta_core::slot::SLOT_NS);
                         let window_parity = pancetta_core::slot::SlotParity::of(slot_start);

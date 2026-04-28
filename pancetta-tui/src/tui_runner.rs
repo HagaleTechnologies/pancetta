@@ -538,7 +538,7 @@ impl TuiRunner {
     /// Render device selection modal as an overlay
     fn render_device_selection_modal(f: &mut Frame, area: Rect, state: &DeviceSelectionState) {
         // Modal dimensions: roughly 60% width, height to fit content
-        let modal_width = (area.width * 3 / 5).min(70).max(40);
+        let modal_width = (area.width * 3 / 5).clamp(40, 70);
         let modal_height = {
             let max_devices = state.input_devices.len().max(state.output_devices.len());
             // title(1) + border(2) + header(1) + devices + footer(2) + border
