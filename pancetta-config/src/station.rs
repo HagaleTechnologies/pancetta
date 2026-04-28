@@ -53,6 +53,45 @@ pub struct StationConfig {
     /// Custom fields for extensibility
     #[serde(default)]
     pub custom_fields: HashMap<String, String>,
+
+    /// Maximum latency past the slot boundary at which we still attempt
+    /// late-start TX via audio skip-ahead. Beyond this, defer to the
+    /// next opposite-parity slot. Default 8000ms — leaves ~5s of audio
+    /// on the air with two of three Costas sync arrays still in window.
+    #[serde(default = "default_tx_late_max_ms")]
+    pub tx_late_max_ms: u64,
+
+    /// When calling CQ (no DX context), prefer this parity. `Auto`
+    /// (default) lets the scheduler pick whichever next slot is closer.
+    #[serde(default)]
+    pub tx_self_parity: TxSelfParity,
+
+    /// PTT engage lead time before slot boundary, in milliseconds.
+    /// Default 80ms — enough for solid-state keying. Bump up for slow
+    /// mechanical relays.
+    #[serde(default = "default_ptt_lead_ms")]
+    pub ptt_lead_ms: u64,
+}
+
+fn default_tx_late_max_ms() -> u64 {
+    8000
+}
+
+fn default_ptt_lead_ms() -> u64 {
+    80
+}
+
+/// Self-parity preference when calling CQ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TxSelfParity {
+    /// Pick whichever next slot is closer, regardless of parity.
+    #[default]
+    Auto,
+    /// Lock CQ to even slots (`:00`, `:30`).
+    Even,
+    /// Lock CQ to odd slots (`:15`, `:45`).
+    Odd,
 }
 
 /// Geographic coordinates for the station
@@ -141,6 +180,9 @@ impl Default for StationConfig {
             operator_name: None,
             contest_category: None,
             custom_fields: HashMap::new(),
+            tx_late_max_ms: 8000,
+            tx_self_parity: TxSelfParity::Auto,
+            ptt_lead_ms: 80,
         }
     }
 }
@@ -498,5 +540,44 @@ mod tests {
 
         let antenna_80m = config.get_active_antenna_for_band("80m");
         assert!(antenna_80m.is_none());
+    }
+
+    #[test]
+    fn station_config_parses_new_tx_fields() {
+        let toml = r#"
+            callsign = "K5ARH"
+            grid_square = "EM10"
+            power_watts = 100
+            qth = "Test"
+            dxcc_entity = 291
+            itu_zone = 8
+            cq_zone = 4
+            antennas = []
+            tx_late_max_ms = 6000
+            tx_self_parity = "even"
+            ptt_lead_ms = 120
+        "#;
+        let cfg: StationConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.tx_late_max_ms, 6000);
+        assert_eq!(cfg.tx_self_parity, TxSelfParity::Even);
+        assert_eq!(cfg.ptt_lead_ms, 120);
+    }
+
+    #[test]
+    fn station_config_defaults_when_new_tx_fields_absent() {
+        let toml = r#"
+            callsign = "K5ARH"
+            grid_square = "EM10"
+            power_watts = 100
+            qth = "Test"
+            dxcc_entity = 291
+            itu_zone = 8
+            cq_zone = 4
+            antennas = []
+        "#;
+        let cfg: StationConfig = toml::from_str(toml).expect("parse");
+        assert_eq!(cfg.tx_late_max_ms, 8000);
+        assert_eq!(cfg.tx_self_parity, TxSelfParity::Auto);
+        assert_eq!(cfg.ptt_lead_ms, 80);
     }
 }
