@@ -910,14 +910,18 @@ impl App {
         }
     }
 
-    /// Get the callsign and audio offset (Hz, within FT8 passband) of the
-    /// currently selected station. Returns the AUDIO frequency offset, not
-    /// the dial frequency — the TransmitRequest pipeline expects an absolute
-    /// audio frequency in 200-2500 Hz, and the modulator validates against
-    /// MAX_FREQUENCY_DEVIATION = 2500 Hz.
+    /// Get the callsign, audio offset (Hz, within FT8 passband), and slot
+    /// parity of the currently selected station. Returns the AUDIO frequency
+    /// offset, not the dial frequency — the TransmitRequest pipeline expects
+    /// an absolute audio frequency in 200-2500 Hz, and the modulator validates
+    /// against MAX_FREQUENCY_DEVIATION = 2500 Hz. The slot parity is `Some`
+    /// when the station was decoded from a Band Activity message (so we know
+    /// which 15-second slot they transmit on), and `None` for DX cluster spots.
     ///
     /// Works from both Band Activity (decoded messages) and DX Hunter (spots).
-    pub fn get_selected_station(&self) -> Option<(String, u64)> {
+    pub fn get_selected_station(
+        &self,
+    ) -> Option<(String, u64, Option<pancetta_core::slot::SlotParity>)> {
         match self.active_panel {
             ActivePanel::BandActivity => {
                 // Display is reversed (newest first), so index from the end
@@ -934,7 +938,7 @@ impl App {
                 // decoded. Clamp into [200, 2500] since some decoders produce
                 // out-of-range values for split-VFO or reference markers.
                 let audio_hz = (msg.delta_freq as u64).clamp(200, 2500);
-                Some((callsign.clone(), audio_hz))
+                Some((callsign.clone(), audio_hz, msg.slot_parity))
             }
             ActivePanel::DxHunter => {
                 let mut stations: Vec<&DxStation> = self.dx_stations.values().collect();
@@ -946,15 +950,15 @@ impl App {
                 // DX Hunter spots only carry the dial frequency, not where in
                 // the passband the station was. Default to the FT8 calling
                 // convention (1500 Hz). Tuning is the operator's job after
-                // the call kicks off.
-                Some((station.call_sign.clone(), 1500))
+                // the call kicks off. No slot parity is available from spots.
+                Some((station.call_sign.clone(), 1500, None))
             }
             _ => None,
         }
     }
 
     pub fn activate_selected(&mut self) {
-        if let Some((callsign, _freq)) = self.get_selected_station() {
+        if let Some((callsign, _freq, _parity)) = self.get_selected_station() {
             self.status_message = format!("Calling {}...", callsign);
         } else {
             self.status_message = "No station selected".to_string();

@@ -116,7 +116,11 @@ pub enum TuiCommand {
     /// Toggle PTT
     TogglePtt,
     /// Call a station (click-to-call from band activity)
-    CallStation { callsign: String, frequency: u64 },
+    CallStation {
+        callsign: String,
+        frequency: u64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+    },
     /// Clear decoded messages
     ClearMessages,
     /// Request status
@@ -470,10 +474,11 @@ impl TuiRunner {
 
             // Space - Select/activate (click-to-call)
             KeyCode::Char(' ') => {
-                if let Some((callsign, frequency)) = app.get_selected_station() {
+                if let Some((callsign, frequency, dx_parity)) = app.get_selected_station() {
                     self.message_tx.send(TuiCommand::CallStation {
                         callsign,
                         frequency,
+                        dx_parity,
                     })?;
                 }
                 app.activate_selected();
