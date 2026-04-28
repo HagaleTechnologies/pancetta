@@ -13,20 +13,6 @@ members = [
     "pancetta",
 ]
 resolver = "2"
-# Note: pancetta-hamlib tests hang when run in workspace due to tokio runtime conflicts.
-# Test separately: cargo test -p pancetta-hamlib --lib -- --test-threads=1
-default-members = [
-    "pancetta-core",
-    "pancetta-audio",
-    "pancetta-ft8",
-    "pancetta-dsp",
-    "pancetta-tui",
-    "pancetta-config",
-    "pancetta-qso",
-    "pancetta-dx",
-    "pancetta-cqdx",
-    "pancetta",
-]
 
 [workspace.package]
 version = "0.1.0"

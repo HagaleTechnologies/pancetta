@@ -30,8 +30,8 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 # Full workspace build
 cargo build
 
-# Run all workspace tests (excludes pancetta-hamlib by default — see note)
-cargo test
+# Run all workspace tests
+cargo test --workspace --features transmit
 
 # FT8 tests (encoder is feature-gated behind `transmit`)
 cargo test --features transmit -p pancetta-ft8    # all ~295 FT8 tests
@@ -40,7 +40,7 @@ cargo test -p pancetta-ft8                         # LDPC/CRC tests only
 # Loopback integration tests (end-to-end QSO through encode→modulate→decode)
 cargo test -p pancetta --test loopback_qso
 
-# pancetta-hamlib hangs in workspace due to tokio runtime conflicts — test separately:
+# pancetta-hamlib (single-threaded for deterministic mock-rig tests)
 cargo test -p pancetta-hamlib --lib -- --test-threads=1
 ```
 
