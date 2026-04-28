@@ -133,6 +133,9 @@ pub enum MessageType {
         message_text: String,
         frequency_offset: f64,
         qso_id: Option<String>,
+        /// Required slot parity. `None` = no DX context (CQ);
+        /// the scheduler falls back to the configured self-parity.
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
     },
 
     /// Transmit completed notification
@@ -147,7 +150,13 @@ pub enum MessageType {
 
     /// Request to transmit multiple messages simultaneously (multi-TX).
     /// Each item is encoded/modulated independently and summed into one waveform.
-    MultiTransmitRequest { items: Vec<TransmitRequestItem> },
+    /// All items in a bundle share the same slot, so they share the same parity.
+    MultiTransmitRequest {
+        items: Vec<TransmitRequestItem>,
+        /// Required slot parity for the bundle. `None` = no DX context;
+        /// the scheduler falls back to the configured self-parity.
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+    },
 
     /// Audio output samples for transmission
     AudioOutput { samples: Vec<f32>, sample_rate: u32 },

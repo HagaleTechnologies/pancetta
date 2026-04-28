@@ -211,7 +211,7 @@ impl super::ApplicationCoordinator {
 
                             // Collect Transmit actions, then bundle into a
                             // single MultiTransmitRequest (or single TransmitRequest).
-                            let mut tx_items: Vec<crate::message_bus::TransmitRequestItem> = Vec::new();
+                            let mut tx_items: Vec<(crate::message_bus::TransmitRequestItem, Option<pancetta_core::slot::SlotParity>)> = Vec::new();
 
                             for action in actions {
                                 match action {
@@ -219,6 +219,7 @@ impl super::ApplicationCoordinator {
                                         ref message_text,
                                         frequency_offset,
                                         ref qso_id,
+                                        tx_parity,
                                     } => {
                                         if qso_id.is_none() {
                                             info!(
@@ -226,11 +227,14 @@ impl super::ApplicationCoordinator {
                                                 frequency_offset, message_text
                                             );
                                         }
-                                        tx_items.push(crate::message_bus::TransmitRequestItem {
-                                            message_text: message_text.clone(),
-                                            frequency_offset,
-                                            qso_id: qso_id.clone(),
-                                        });
+                                        tx_items.push((
+                                            crate::message_bus::TransmitRequestItem {
+                                                message_text: message_text.clone(),
+                                                frequency_offset,
+                                                qso_id: qso_id.clone(),
+                                            },
+                                            tx_parity,
+                                        ));
                                     }
                                     pancetta_qso::OperatorAction::ChangeBand { dial_frequency } => {
                                         let msg = ComponentMessage::new(
@@ -297,7 +301,7 @@ impl super::ApplicationCoordinator {
 
                             // Bundle collected TX items into a single message.
                             if tx_items.len() == 1 {
-                                let item = tx_items.remove(0);
+                                let (item, tx_parity) = tx_items.remove(0);
                                 let msg = ComponentMessage::new(
                                     ComponentId::Autonomous,
                                     ComponentId::Ft8Transmitter,
@@ -305,6 +309,7 @@ impl super::ApplicationCoordinator {
                                         message_text: item.message_text,
                                         frequency_offset: item.frequency_offset,
                                         qso_id: item.qso_id,
+                                        tx_parity,
                                     },
                                     Instant::now(),
                                 );
@@ -312,11 +317,25 @@ impl super::ApplicationCoordinator {
                                     warn!("Failed to send TransmitRequest: {}", e);
                                 }
                             } else if tx_items.len() > 1 {
-                                info!("Bundling {} TX items into MultiTransmitRequest", tx_items.len());
+                                let bundle_parity = tx_items[0].1;
+                                for (idx, (_, p)) in tx_items.iter().enumerate().skip(1) {
+                                    if *p != bundle_parity {
+                                        warn!(
+                                            "Multi-TX item {} has tx_parity {:?}, bundle is {:?}; \
+                                             using bundle parity",
+                                            idx, p, bundle_parity
+                                        );
+                                    }
+                                }
+                                let items: Vec<_> = tx_items.into_iter().map(|(it, _)| it).collect();
+                                info!("Bundling {} TX items into MultiTransmitRequest", items.len());
                                 let msg = ComponentMessage::new(
                                     ComponentId::Autonomous,
                                     ComponentId::Ft8Transmitter,
-                                    MessageType::MultiTransmitRequest { items: tx_items },
+                                    MessageType::MultiTransmitRequest {
+                                        items,
+                                        tx_parity: bundle_parity,
+                                    },
                                     Instant::now(),
                                 );
                                 if let Err(e) = message_bus.send_message(msg).await {
@@ -335,6 +354,7 @@ impl super::ApplicationCoordinator {
                                                 frequency_hz: decoded_msg.frequency_offset,
                                                 snr: decoded_msg.snr_db as i32,
                                                 message_text: decoded_msg.text.clone(),
+                                                slot_parity: decoded_msg.slot_parity,
                                             });
                                         }
                                     }

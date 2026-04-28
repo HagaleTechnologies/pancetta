@@ -233,6 +233,9 @@ pub struct DecodedMessageInfo {
     pub frequency_hz: f64,
     pub snr: i32,
     pub message_text: String,
+    /// The parity of the slot in which this message was decoded.
+    /// `None` if the slot parity was not tracked at decode time.
+    pub slot_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
 /// Result of a collision check on a listen slot.
@@ -310,6 +313,9 @@ pub struct CqCandidate {
     pub snr: i8,
     pub frequency_hz: f64,
     pub dx_score: f64,
+    /// The parity of the slot in which this CQ was heard.
+    /// Used to derive `tx_parity = slot_parity.opposite()` for our response.
+    pub slot_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
 // ---------------------------------------------------------------------------
@@ -351,6 +357,10 @@ pub enum OperatorAction {
         message_text: String,
         frequency_offset: f64,
         qso_id: Option<String>,
+        /// Required slot parity. `None` = no DX context (CQ or follow-up
+        /// without a latched heard-slot); the TX scheduler falls back to
+        /// the configured self-parity.
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
     },
     /// Listen (do not transmit this slot).
     Listen,
@@ -803,6 +813,7 @@ impl AutonomousOperator {
                         snr,
                         frequency_hz: msg.frequency_hz,
                         dx_score: score,
+                        slot_parity: msg.slot_parity,
                     });
                 }
             }
@@ -1004,6 +1015,8 @@ impl AutonomousOperator {
                             message_text: msg,
                             frequency_offset: freq,
                             qso_id,
+                            // TODO: thread parity from heard slot (Task 15)
+                            tx_parity: None,
                         });
                         tx_count += 1;
                     }
@@ -1063,6 +1076,8 @@ impl AutonomousOperator {
                             message_text,
                             frequency_offset: tx_freq,
                             qso_id: None,
+                            // We heard the CQ on cq.slot_parity; we respond on the opposite slot.
+                            tx_parity: cq.slot_parity.map(|p| p.opposite()),
                         });
                         tx_count += 1;
                     } else if tx_count == 0 && self.active_qso_count == 0 {
@@ -1096,6 +1111,8 @@ impl AutonomousOperator {
                                 message_text: cq_text,
                                 frequency_offset: cq_freq,
                                 qso_id: None,
+                                // Calling our own CQ — no DX context, scheduler uses config self-parity.
+                                tx_parity: None,
                             });
                         } else {
                             self.state = OperatingState::Hunting;
@@ -1266,6 +1283,7 @@ mod tests {
             frequency_hz: 800.0,
             snr: -10,
             message_text: "CQ K1DEF FN31".into(),
+            slot_parity: None,
         }];
 
         let result = detector.check_for_collision(&messages);
@@ -1280,6 +1298,7 @@ mod tests {
             frequency_hz: 1520.0,
             snr: -10,
             message_text: "CQ K1DEF FN31".into(),
+            slot_parity: None,
         }];
 
         let result = detector.check_for_collision(&messages);
@@ -1373,6 +1392,7 @@ mod tests {
             frequency_hz: 1500.0,
             snr: -5,
             message_text: "CQ K9ZZ EM48".into(),
+            slot_parity: None,
         }];
         let evaluator = NullDxEvaluator; // returns 0.5, above our 0.3 threshold
         op.feed_decoded_messages(&messages, &evaluator);
@@ -1534,6 +1554,7 @@ mod tests {
             frequency_hz: 2000.0,
             snr: -5,
             message_text: "CQ JA1ABC PM95".into(),
+            slot_parity: None,
         }];
         let evaluator = NullDxEvaluator;
         op.feed_decoded_messages(&messages, &evaluator);
@@ -1577,6 +1598,7 @@ mod tests {
             frequency_hz: 2000.0,
             snr: -5,
             message_text: "CQ JA1ABC PM95".into(),
+            slot_parity: None,
         }];
         let evaluator = NullDxEvaluator;
         op.feed_decoded_messages(&messages, &evaluator);
@@ -1635,6 +1657,7 @@ mod tests {
                 frequency_hz: 1500.0,
                 snr: -5,
                 message_text: "CQ 3Y0J JD15".to_string(),
+                slot_parity: None,
             }],
             &evaluator,
         );
@@ -1684,6 +1707,7 @@ mod tests {
                 frequency_hz: 1500.0,
                 snr: -10,
                 message_text: "CQ VE3XYZ FN03".to_string(),
+                slot_parity: None,
             }],
             &evaluator,
         );
@@ -1736,6 +1760,7 @@ mod tests {
                 frequency_hz: 1500.0,
                 snr: -5,
                 message_text: "CQ 3Y0J JD15".to_string(),
+                slot_parity: None,
             }],
             &evaluator,
         );

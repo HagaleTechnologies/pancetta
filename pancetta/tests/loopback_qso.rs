@@ -475,12 +475,14 @@ fn test_hunt_mode_picks_best_cq() {
             frequency_hz: 1000.0,
             snr: -5,
             message_text: "CQ K9ZZ EM48".into(),
+            slot_parity: None,
         },
         DecodedMessageInfo {
             callsign: Some("JA1ABC".into()),
             frequency_hz: 1500.0,
             snr: -10,
             message_text: "CQ JA1ABC PM95".into(),
+            slot_parity: None,
         },
     ];
 
@@ -537,6 +539,7 @@ fn test_hunt_mode_response_survives_audio_roundtrip() {
             frequency_hz: (m.frequency_offset - base_freq).clamp(-1000.0, 1000.0),
             snr: m.snr_db as i32,
             message_text: m.text.clone(),
+            slot_parity: None,
         })
         .collect();
     op.feed_decoded_messages(&decoded_infos, &evaluator);
@@ -709,12 +712,14 @@ fn test_priority_scorer_skips_duplicate() {
             frequency_hz: 1000.0,
             snr: 0,
             message_text: "CQ K9ZZ EM48".into(),
+            slot_parity: None,
         },
         DecodedMessageInfo {
             callsign: Some("JA1ABC".into()),
             frequency_hz: 1500.0,
             snr: -15,
             message_text: "CQ JA1ABC PM95".into(),
+            slot_parity: None,
         },
     ];
 
@@ -770,12 +775,14 @@ fn test_priority_scorer_prefers_pota() {
             frequency_hz: 1000.0,
             snr: 0,
             message_text: "CQ K9ZZ EM48".into(),
+            slot_parity: None,
         },
         DecodedMessageInfo {
             callsign: Some("W5ABC/P".into()),
             frequency_hz: 1500.0,
             snr: -15,
             message_text: "CQ W5ABC/P EM12".into(),
+            slot_parity: None,
         },
     ];
 

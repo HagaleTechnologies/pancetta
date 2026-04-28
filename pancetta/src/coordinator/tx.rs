@@ -108,7 +108,9 @@ impl super::ApplicationCoordinator {
                                     message_text,
                                     frequency_offset,
                                     qso_id,
+                                    tx_parity,
                                 } => {
+                                    let _tx_parity = tx_parity; // wired into scheduler in Task 11
                                     info!(
                                         "Transmit request: '{}' at offset {:.0} Hz (qso: {:?})",
                                         message_text, frequency_offset, qso_id
@@ -269,7 +271,8 @@ impl super::ApplicationCoordinator {
                                     }
                                 }
 
-                                MessageType::MultiTransmitRequest { items } => {
+                                MessageType::MultiTransmitRequest { items, tx_parity } => {
+                                    let _tx_parity = tx_parity; // wired into scheduler in Task 12
                                     info!("Multi-TX request: {} messages", items.len());
 
                                     // --- Step 1: Encode + modulate up front ---

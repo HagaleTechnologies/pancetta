@@ -406,6 +406,7 @@ impl ApplicationCoordinator {
                         message_text: test_tx_text.clone(),
                         frequency_offset: offset,
                         qso_id: None,
+                        tx_parity: None, // test-TX injection: no DX context
                     },
                     Instant::now(),
                 );

@@ -322,15 +322,14 @@ impl super::ApplicationCoordinator {
                                 frequency,
                                 tx_parity,
                             }) => {
-                                let _tx_parity = tx_parity; // wired into TransmitRequest in Task 8
                                 match pancetta_qso::utils::generate_ft8_message(
                                     &message,
                                     &tx_callsign,
                                 ) {
                                     Ok(text) => {
                                         info!(
-                                            "QSO auto-sequence sending: '{}' on {:.1} Hz (qso={})",
-                                            text, frequency, qso_id
+                                            "QSO auto-sequence sending: '{}' on {:.1} Hz (qso={}, tx_parity={:?})",
+                                            text, frequency, qso_id, tx_parity
                                         );
                                         let tx_msg = ComponentMessage::new(
                                             ComponentId::Qso,
@@ -339,6 +338,7 @@ impl super::ApplicationCoordinator {
                                                 message_text: text,
                                                 frequency_offset: frequency,
                                                 qso_id: Some(qso_id.to_string()),
+                                                tx_parity,
                                             },
                                             Instant::now(),
                                         );
@@ -470,9 +470,6 @@ impl super::ApplicationCoordinator {
                                                         "QSO started with {}: {}",
                                                         callsign, qso_id
                                                     );
-                                                    // Will use dx_parity to set TransmitRequest.tx_parity in Task 8.
-                                                    let _tx_parity_for_starter =
-                                                        dx_parity.map(|p| p.opposite());
                                                     // Send grid reply as TX request
                                                     let grid =
                                                         our_grid.as_deref().unwrap_or("AA00");
@@ -487,6 +484,7 @@ impl super::ApplicationCoordinator {
                                                             message_text: reply.clone(),
                                                             frequency_offset: frequency as f64,
                                                             qso_id: Some(qso_id.to_string()),
+                                                            tx_parity: dx_parity.map(|p| p.opposite()),
                                                         },
                                                         Instant::now(),
                                                     );

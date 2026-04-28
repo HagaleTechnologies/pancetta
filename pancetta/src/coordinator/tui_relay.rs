@@ -302,6 +302,7 @@ impl super::ApplicationCoordinator {
                                 message_text: cq_text,
                                 frequency_offset: 1500.0,
                                 qso_id: None,
+                                tx_parity: None, // TUI CQ repeat: no DX context
                             },
                             Instant::now(),
                         );
@@ -323,6 +324,7 @@ impl super::ApplicationCoordinator {
                                     message_text: text,
                                     frequency_offset: 1500.0,
                                     qso_id: None,
+                                    tx_parity: None, // TUI manual send: no DX context
                                 },
                                 Instant::now(),
                             );
