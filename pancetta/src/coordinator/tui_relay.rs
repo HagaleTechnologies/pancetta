@@ -335,10 +335,6 @@ impl super::ApplicationCoordinator {
                             frequency,
                             dx_parity,
                         } => {
-                            // dx_parity is plumbed into QsoMessage::StartQso in Task 6.
-                            // For now, bind it but don't use it yet — the next task will
-                            // forward it to the QSO layer.
-                            let _dx_parity = dx_parity;
                             info!("TUI CallStation: {} at {} Hz", callsign, frequency);
                             let msg = ComponentMessage::new(
                                 ComponentId::Tui,
@@ -346,6 +342,7 @@ impl super::ApplicationCoordinator {
                                 MessageType::QsoMessage(crate::message_bus::QsoMessage::StartQso {
                                     callsign,
                                     frequency,
+                                    dx_parity,
                                 }),
                                 Instant::now(),
                             );

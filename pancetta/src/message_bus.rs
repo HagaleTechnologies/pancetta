@@ -210,7 +210,11 @@ pub enum RigControlMessage {
 #[derive(Debug, Clone)]
 pub enum QsoMessage {
     /// Start new QSO
-    StartQso { callsign: String, frequency: u64 },
+    StartQso {
+        callsign: String,
+        frequency: u64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+    },
     /// End QSO
     EndQso { qso_id: String },
     /// Log QSO

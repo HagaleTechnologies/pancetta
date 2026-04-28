@@ -453,11 +453,14 @@ impl super::ApplicationCoordinator {
                                         crate::message_bus::QsoMessage::StartQso {
                                             callsign,
                                             frequency,
+                                            dx_parity,
                                         } => {
                                             info!(
                                                 "Starting QSO with {} on {} Hz",
                                                 callsign, frequency
                                             );
+                                            // dx_parity is wired into respond_to_cq in Task 7.
+                                            let _dx_parity = dx_parity;
                                             match qso_manager
                                                 .respond_to_cq(callsign.clone(), frequency as f64)
                                                 .await
@@ -467,6 +470,9 @@ impl super::ApplicationCoordinator {
                                                         "QSO started with {}: {}",
                                                         callsign, qso_id
                                                     );
+                                                    // Will use dx_parity to set TransmitRequest.tx_parity in Task 8.
+                                                    let _tx_parity_for_starter =
+                                                        dx_parity.map(|p| p.opposite());
                                                     // Send grid reply as TX request
                                                     let grid =
                                                         our_grid.as_deref().unwrap_or("AA00");
