@@ -20,6 +20,53 @@ pub const PRE_ROLL_NS: i64 = 500_000_000;
 /// FT8 transmission duration (79 symbols × 0.16s).
 pub const TX_DURATION_NS: i64 = 12_640_000_000;
 
+/// Returns the start of the slot that contains `t`. Used by the TX
+/// scheduler to detect "we're inside a viable slot, target it" vs.
+/// "current slot is wrong parity or already too late, advance."
+pub fn current_slot_start(t: DateTime<Utc>) -> DateTime<Utc> {
+    let ns = t
+        .timestamp_nanos_opt()
+        .expect("system clock out of i64 ns range");
+    let slot_ns = ns.div_euclid(SLOT_NS) * SLOT_NS;
+    DateTime::<Utc>::from_timestamp_nanos(slot_ns)
+}
+
+/// Parity of an FT8 slot. Even slots start at UTC seconds `:00` and
+/// `:30`; Odd at `:15` and `:45`. Two stations in QSO must transmit on
+/// opposite parities — same parity collides on air.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SlotParity {
+    /// Slot index (timestamp_ns / SLOT_NS) is even — boundaries at :00 and :30.
+    Even,
+    /// Slot index is odd — boundaries at :15 and :45.
+    Odd,
+}
+
+impl SlotParity {
+    /// Parity of the slot containing `t`. Computed as `(t.timestamp / 15) % 2`,
+    /// where the slot index is the floor — so any instant inside the slot
+    /// resolves to the same parity as the slot's start boundary.
+    pub fn of(t: DateTime<Utc>) -> SlotParity {
+        let ns = t
+            .timestamp_nanos_opt()
+            .expect("system clock out of i64 ns range");
+        let slot_index = ns.div_euclid(SLOT_NS);
+        if slot_index % 2 == 0 {
+            SlotParity::Even
+        } else {
+            SlotParity::Odd
+        }
+    }
+
+    /// The other parity. `Even <-> Odd`. Idempotent under double-flip.
+    pub fn opposite(self) -> SlotParity {
+        match self {
+            SlotParity::Even => SlotParity::Odd,
+            SlotParity::Odd => SlotParity::Even,
+        }
+    }
+}
+
 /// Returns the next 15-second slot boundary at or after `now + min_lead`.
 ///
 /// Use `min_lead = Duration::zero()` to allow returning `now` itself when it
@@ -231,5 +278,31 @@ mod tests {
         let future = at(2.5);
         let d = duration_until(future, now);
         assert_eq!(d.as_millis(), 2_500);
+    }
+
+    #[test]
+    fn slot_parity_even_at_boundary_zero() {
+        // 2026-01-01 00:00:00 UTC. timestamp() = 1767225600.
+        // 1767225600 / 15 = 117815040 (even index) → Even.
+        assert_eq!(SlotParity::of(at(0.0)), SlotParity::Even);
+    }
+
+    #[test]
+    fn slot_parity_odd_at_boundary_fifteen() {
+        // 15s later → 117815041 (odd index) → Odd.
+        assert_eq!(SlotParity::of(at(15.0)), SlotParity::Odd);
+    }
+
+    #[test]
+    fn slot_parity_within_slot_uses_floor() {
+        // 14.999s into slot 0 still resolves to that slot's parity.
+        assert_eq!(SlotParity::of(at(14.999)), SlotParity::Even);
+    }
+
+    #[test]
+    fn slot_parity_opposite_invariant() {
+        assert_eq!(SlotParity::Even.opposite(), SlotParity::Odd);
+        assert_eq!(SlotParity::Odd.opposite(), SlotParity::Even);
+        assert_eq!(SlotParity::Even.opposite().opposite(), SlotParity::Even);
     }
 }
