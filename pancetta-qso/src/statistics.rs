@@ -3,7 +3,7 @@
 //! This module provides comprehensive statistics and analytics for QSO data,
 //! including achievements, trends, contest analysis, and performance metrics.
 
-use crate::database::{QsoDatabase, QsoDatabaseRecord, QsoFilter, QueryOptions};
+use crate::async_database::{AsyncDatabaseError, AsyncQsoDatabase, DateRange, QsoDatabaseRecord, QsoFilter, QueryOptions};
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -15,7 +15,7 @@ use tracing::{debug, info};
 pub enum StatisticsError {
     #[error("Database error: {source}")]
     Database {
-        source: crate::database::DatabaseError,
+        source: AsyncDatabaseError,
     },
 
     #[error("Calculation error: {message}")]
@@ -941,12 +941,12 @@ pub struct PerformancePrediction {
 
 /// Statistics calculator
 pub struct StatisticsCalculator {
-    database: QsoDatabase,
+    database: AsyncQsoDatabase,
 }
 
 impl StatisticsCalculator {
     /// Create a new statistics calculator
-    pub fn new(database: QsoDatabase) -> Self {
+    pub fn new(database: AsyncQsoDatabase) -> Self {
         Self { database }
     }
 
@@ -964,7 +964,8 @@ impl StatisticsCalculator {
         // Get all QSO records
         let records = self
             .database
-            .search_qsos(filter, &options)
+            .search_qsos_records(filter, &options)
+            .await
             .map_err(|e| StatisticsError::Database { source: e })?;
 
         if records.is_empty() {
@@ -1009,7 +1010,7 @@ impl StatisticsCalculator {
         }
 
         let filter = QsoFilter {
-            date_range: Some(crate::database::DateRange { start, end }),
+            date_range: Some(DateRange { start, end }),
             ..Default::default()
         };
 
@@ -2259,7 +2260,7 @@ pub struct StatisticsDifferences {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::database::QsoDatabase;
+    use crate::async_database::AsyncQsoDatabase;
     use crate::states::*;
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -2354,11 +2355,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_statistics() {
-        // Create a temporary database file instead of in-memory to avoid initialization issues
-        let temp_path = std::env::temp_dir().join("test_basic_stats.db");
-        let _ = std::fs::remove_file(&temp_path); // Clean up if exists
-
-        let dummy_db = QsoDatabase::open(&temp_path).unwrap();
+        let dummy_db = AsyncQsoDatabase::new_in_memory().await.unwrap();
         let calculator = StatisticsCalculator::new(dummy_db);
         let records = create_test_records().await;
 
@@ -2374,17 +2371,11 @@ mod tests {
         assert!(basic.by_band.contains_key("20M"));
         assert!(basic.first_qso.is_some());
         assert!(basic.last_qso.is_some());
-
-        // Clean up
-        let _ = std::fs::remove_file(&temp_path);
     }
 
     #[tokio::test]
     async fn test_temporal_statistics() {
-        let temp_path = std::env::temp_dir().join("test_temporal_stats.db");
-        let _ = std::fs::remove_file(&temp_path);
-
-        let dummy_db = QsoDatabase::open(&temp_path).unwrap();
+        let dummy_db = AsyncQsoDatabase::new_in_memory().await.unwrap();
         let calculator = StatisticsCalculator::new(dummy_db);
         let records = create_test_records().await;
 
@@ -2398,16 +2389,11 @@ mod tests {
         assert!(temporal.patterns.peak_hour < 24);
         assert!(temporal.patterns.peak_day_of_week < 7);
         assert!(temporal.patterns.peak_month >= 1 && temporal.patterns.peak_month <= 12);
-
-        let _ = std::fs::remove_file(&temp_path);
     }
 
     #[tokio::test]
     async fn test_technical_statistics() {
-        let temp_path = std::env::temp_dir().join("test_technical_stats.db");
-        let _ = std::fs::remove_file(&temp_path);
-
-        let dummy_db = QsoDatabase::open(&temp_path).unwrap();
+        let dummy_db = AsyncQsoDatabase::new_in_memory().await.unwrap();
         let calculator = StatisticsCalculator::new(dummy_db);
         let records = create_test_records().await;
 
@@ -2422,8 +2408,6 @@ mod tests {
         assert!(!technical.signal_reports.received_distribution.is_empty());
         assert!(technical.frequencies.average_frequency > 0.0);
         assert_eq!(technical.completion_rates.overall_rate, 100.0);
-
-        let _ = std::fs::remove_file(&temp_path);
     }
 
     #[tokio::test]

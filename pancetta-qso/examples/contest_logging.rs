@@ -190,18 +190,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         let stats = logger.get_statistics().await?;
         println!("Total QSOs logged: {}", stats.total_qsos);
-        println!("Confirmed QSOs: {}", stats.confirmed_qsos);
         println!("Unique callsigns: {}", stats.unique_callsigns);
-
-        println!("\nQSOs by band:");
-        for (band, count) in &stats.qsos_by_band {
-            println!("  {}: {}", band, count);
-        }
-
-        println!("\nQSOs by mode:");
-        for (mode, count) in &stats.qsos_by_mode {
-            println!("  {}: {}", mode, count);
-        }
+        println!("Bands worked: {}", stats.bands_worked);
+        println!("Modes worked: {}", stats.modes_worked);
 
         // Export contest log to ADIF
         println!("\n=== Exporting Contest Log ===");
@@ -209,66 +200,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let adif_path = export_dir.join("contest_log.adi");
         let export_result = logger.export_adif(&adif_path, None).await?;
 
-        println!("✓ Exported {} QSOs to ADIF", export_result.qso_count);
+        println!("Exported {} QSOs to ADIF", export_result.qso_count);
         println!("  File: {:?}", adif_path);
         println!("  Size: {} bytes", export_result.file_size);
-
-        // Export to CSV as well
-        let csv_path = export_dir.join("contest_log.csv");
-        let csv_result = logger.export_csv(&csv_path, None).await?;
-
-        println!("✓ Exported {} QSOs to CSV", csv_result.qso_count);
-        println!("  File: {:?}", csv_path);
-
-        // Show export history
-        println!("\n=== Export History ===");
-        let export_history = logger.get_export_history().await;
-        for (i, export) in export_history.iter().enumerate() {
-            println!(
-                "{}. {:?} - {} QSOs - {} bytes - {}",
-                i + 1,
-                export.format,
-                export.qso_count,
-                export.file_size,
-                export.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
-            );
-        }
-
-        // Demonstrate contest-specific queries
-        println!("\n=== Contest Queries ===");
-
-        // Search for QSOs in a specific band
-        let band_filter = QsoFilter {
-            band: Some("20M".to_string()),
-            ..Default::default()
-        };
-
-        let band_qsos = logger
-            .search_qsos(&band_filter, &QueryOptions::default())
-            .await?;
-        println!("QSOs on 20M: {}", band_qsos.len());
-
-        // Search for QSOs above a certain signal strength
-        let strong_filter = QsoFilter {
-            min_signal_strength: Some(-15),
-            ..Default::default()
-        };
-
-        let strong_qsos = logger
-            .search_qsos(&strong_filter, &QueryOptions::default())
-            .await?;
-        println!("QSOs with signal ≥ -15 dB: {}", strong_qsos.len());
-
-        // Search for QSOs with specific grid pattern (FN grid)
-        let grid_filter = QsoFilter {
-            grid_pattern: Some("FN".to_string()),
-            ..Default::default()
-        };
-
-        let grid_qsos = logger
-            .search_qsos(&grid_filter, &QueryOptions::default())
-            .await?;
-        println!("QSOs in FN grid squares: {}", grid_qsos.len());
 
         // Read and display part of the exported ADIF file
         if adif_path.exists() {

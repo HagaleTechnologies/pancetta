@@ -4,18 +4,360 @@
 //! for tokio spawns, using the sqlx-based async database.
 
 use crate::adif::{AdifFile, AdifProcessor};
-use crate::async_database::{AsyncDatabaseError, AsyncQsoDatabase};
-use crate::database::{QsoFilter, QueryOptions, SortOrder};
-use crate::logger::{ExportFormat, ExportResult, ImportResult, LoggerConfig};
+use crate::async_database::{AsyncDatabaseError, AsyncQsoDatabase, QsoFilter, QueryOptions, SortOrder};
 use crate::qso_manager::{QsoEvent, QsoManager};
 use crate::states::*;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
+
+// ---------------------------------------------------------------------------
+// Logger configuration types (formerly in logger.rs, now the canonical location)
+// ---------------------------------------------------------------------------
+
+/// Logger configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggerConfig {
+    /// Database file path
+    pub database_path: PathBuf,
+
+    /// Automatic logging settings
+    pub auto_logging: AutoLoggingConfig,
+
+    /// Export/import settings
+    pub export_import: ExportImportConfig,
+
+    /// Backup settings
+    pub backup: BackupConfig,
+
+    /// Integration settings
+    pub integrations: IntegrationConfig,
+
+    /// Validation settings
+    pub validation: ValidationConfig,
+}
+
+/// Automatic logging configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoLoggingConfig {
+    /// Enable automatic logging of completed QSOs
+    pub enabled: bool,
+
+    /// Minimum QSO duration for automatic logging (seconds)
+    pub min_duration: u32,
+
+    /// Require both signal reports for logging
+    pub require_both_reports: bool,
+
+    /// Require grid squares for logging
+    pub require_grid_squares: bool,
+
+    /// Log incomplete QSOs (for analysis)
+    pub log_incomplete: bool,
+
+    /// Auto-export after logging
+    pub auto_export: bool,
+
+    /// Log frequency for QSOs (milliseconds)
+    pub log_interval: u64,
+}
+
+/// Export/import configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportImportConfig {
+    /// Default export directory
+    pub export_directory: PathBuf,
+
+    /// Export formats to generate
+    pub export_formats: Vec<ExportFormat>,
+
+    /// Export file naming pattern
+    pub file_naming: FileNamingPattern,
+
+    /// Include progress data in exports
+    pub include_progress_data: bool,
+
+    /// Compress exports
+    pub compress_exports: bool,
+
+    /// Import validation level
+    pub import_validation: ImportValidationLevel,
+}
+
+/// Export formats
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExportFormat {
+    /// ADIF 3.0 format
+    Adif,
+
+    /// Cabrillo contest format
+    Cabrillo,
+
+    /// CSV format
+    Csv,
+
+    /// JSON format
+    Json,
+
+    /// Ham Radio Deluxe XML
+    HrdXml,
+
+    /// Logger32 format
+    Logger32,
+}
+
+/// File naming patterns
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FileNamingPattern {
+    /// Use timestamp: YYYYMMDD_HHMMSS
+    Timestamp,
+
+    /// Use callsign and date: CALLSIGN_YYYYMMDD
+    CallsignDate,
+
+    /// Use contest name and date: CONTEST_YYYYMMDD
+    ContestDate,
+
+    /// Custom pattern with placeholders
+    Custom(String),
+}
+
+/// Import validation levels
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ImportValidationLevel {
+    /// Strict validation - reject any invalid data
+    Strict,
+
+    /// Lenient validation - attempt to fix minor issues
+    Lenient,
+
+    /// Minimal validation - import almost everything
+    Minimal,
+}
+
+/// Backup configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupConfig {
+    /// Enable automatic backups
+    pub enabled: bool,
+
+    /// Backup directory
+    pub backup_directory: PathBuf,
+
+    /// Backup interval (hours)
+    pub backup_interval: u32,
+
+    /// Number of backups to retain
+    pub retain_count: u32,
+
+    /// Compress backups
+    pub compress: bool,
+
+    /// Include ADIF exports in backups
+    pub include_exports: bool,
+}
+
+/// Integration configuration
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct IntegrationConfig {
+    /// Ham Radio Deluxe integration
+    pub ham_radio_deluxe: Option<HrdIntegration>,
+
+    /// Logger32 integration
+    pub logger32: Option<Logger32Integration>,
+
+    /// LOTW (Logbook of the World) integration
+    pub lotw: Option<LotwIntegration>,
+
+    /// QRZ.com integration
+    pub qrz: Option<QrzIntegration>,
+
+    /// eQSL integration
+    pub eqsl: Option<EqslIntegration>,
+}
+
+/// Ham Radio Deluxe integration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HrdIntegration {
+    pub enabled: bool,
+    pub database_path: PathBuf,
+    pub sync_interval: u32,
+}
+
+/// Logger32 integration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Logger32Integration {
+    pub enabled: bool,
+    pub database_path: PathBuf,
+    pub sync_interval: u32,
+}
+
+/// LOTW integration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LotwIntegration {
+    pub enabled: bool,
+    pub username: String,
+    pub password: String,
+    pub auto_upload: bool,
+}
+
+/// QRZ.com integration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QrzIntegration {
+    pub enabled: bool,
+    pub username: String,
+    pub password: String,
+    pub lookup_callsigns: bool,
+}
+
+/// eQSL integration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EqslIntegration {
+    pub enabled: bool,
+    pub username: String,
+    pub password: String,
+    pub auto_upload: bool,
+}
+
+/// Validation configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationConfig {
+    /// Validate callsigns against database
+    pub validate_callsigns: bool,
+
+    /// Validate grid squares
+    pub validate_grid_squares: bool,
+
+    /// Validate frequency assignments
+    pub validate_frequencies: bool,
+
+    /// Check for duplicates
+    pub check_duplicates: bool,
+
+    /// Duplicate check time window (hours)
+    pub duplicate_window_hours: u32,
+}
+
+/// Export result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportResult {
+    /// Export format
+    pub format: ExportFormat,
+
+    /// Output file path
+    pub file_path: PathBuf,
+
+    /// Number of QSOs exported
+    pub qso_count: usize,
+
+    /// Export timestamp
+    pub timestamp: DateTime<Utc>,
+
+    /// File size in bytes
+    pub file_size: u64,
+
+    /// Export duration in milliseconds
+    pub duration_ms: u64,
+}
+
+/// Import result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportResult {
+    /// Input file path
+    pub file_path: PathBuf,
+
+    /// Number of QSOs imported
+    pub imported_count: usize,
+
+    /// Number of QSOs skipped (duplicates)
+    pub skipped_count: usize,
+
+    /// Number of QSOs with errors
+    pub error_count: usize,
+
+    /// Import timestamp
+    pub timestamp: DateTime<Utc>,
+
+    /// Import duration in milliseconds
+    pub duration_ms: u64,
+
+    /// Validation errors
+    pub errors: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Default impls for config types
+// ---------------------------------------------------------------------------
+
+impl Default for LoggerConfig {
+    fn default() -> Self {
+        Self {
+            database_path: PathBuf::from("qso.db"),
+            auto_logging: AutoLoggingConfig::default(),
+            export_import: ExportImportConfig::default(),
+            backup: BackupConfig::default(),
+            integrations: IntegrationConfig::default(),
+            validation: ValidationConfig::default(),
+        }
+    }
+}
+
+impl Default for AutoLoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_duration: 30,
+            require_both_reports: true,
+            require_grid_squares: false,
+            log_incomplete: false,
+            auto_export: false,
+            log_interval: 5000,
+        }
+    }
+}
+
+impl Default for ExportImportConfig {
+    fn default() -> Self {
+        Self {
+            export_directory: PathBuf::from("exports"),
+            export_formats: vec![ExportFormat::Adif],
+            file_naming: FileNamingPattern::Timestamp,
+            include_progress_data: false,
+            compress_exports: false,
+            import_validation: ImportValidationLevel::Lenient,
+        }
+    }
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backup_directory: PathBuf::from("backups"),
+            backup_interval: 24,
+            retain_count: 7,
+            compress: false,
+            include_exports: true,
+        }
+    }
+}
+
+impl Default for ValidationConfig {
+    fn default() -> Self {
+        Self {
+            validate_callsigns: true,
+            validate_grid_squares: true,
+            validate_frequencies: true,
+            check_duplicates: true,
+            duplicate_window_hours: 24,
+        }
+    }
+}
 
 /// Database statistics
 #[derive(Debug, Clone)]

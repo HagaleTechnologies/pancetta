@@ -3,9 +3,10 @@
 //! This module provides async-safe persistent storage for QSO data using SQLite
 //! through the sqlx library, enabling proper Send/Sync support for tokio spawns.
 
-use crate::adif::AdifProcessor;
+use crate::adif::{AdifProcessor, AdifQso};
 use crate::states::*;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::{
     sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow},
     Row,
@@ -15,6 +16,190 @@ use std::path::Path;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+// ---------------------------------------------------------------------------
+// Shared query types (formerly in database.rs, now the canonical location)
+// ---------------------------------------------------------------------------
+
+/// Database query filters
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct QsoFilter {
+    /// Filter by callsign pattern
+    pub callsign_pattern: Option<String>,
+
+    /// Filter by date range
+    pub date_range: Option<DateRange>,
+
+    /// Filter by frequency range (Hz)
+    pub frequency_range: Option<FrequencyRange>,
+
+    /// Filter by band
+    pub band: Option<String>,
+
+    /// Filter by mode
+    pub mode: Option<String>,
+
+    /// Filter by grid square pattern
+    pub grid_pattern: Option<String>,
+
+    /// Filter by contest
+    pub contest_id: Option<String>,
+
+    /// Filter by QSL status
+    pub qsl_status: Option<QslStatus>,
+
+    /// Filter by confirmation status
+    pub confirmed: Option<bool>,
+
+    /// Include only QSOs with minimum signal strength
+    pub min_signal_strength: Option<i8>,
+
+    /// Custom SQL WHERE clause
+    pub custom_where: Option<String>,
+}
+
+/// Date range filter
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DateRange {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+}
+
+/// Frequency range filter (Hz)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrequencyRange {
+    pub min: f64,
+    pub max: f64,
+}
+
+/// QSL status filter
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum QslStatus {
+    Sent,
+    Received,
+    Confirmed,
+    Requested,
+    NotSent,
+    NotReceived,
+}
+
+/// Database query options
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryOptions {
+    /// Sort order
+    pub sort_by: Option<SortField>,
+
+    /// Sort direction
+    pub sort_order: SortOrder,
+
+    /// Limit number of results
+    pub limit: Option<u32>,
+
+    /// Skip number of results (pagination)
+    pub offset: Option<u32>,
+
+    /// Include related data
+    pub include_metadata: bool,
+}
+
+impl Default for QueryOptions {
+    fn default() -> Self {
+        Self {
+            sort_by: Some(SortField::QsoDate),
+            sort_order: SortOrder::Descending,
+            limit: None,
+            offset: None,
+            include_metadata: true,
+        }
+    }
+}
+
+/// Sort fields
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SortField {
+    QsoDate,
+    Callsign,
+    Frequency,
+    Mode,
+    Band,
+    SignalReport,
+    CreatedAt,
+}
+
+/// Sort order
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SortOrder {
+    Ascending,
+    Descending,
+}
+
+/// QSO database record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QsoDatabaseRecord {
+    /// Primary key
+    pub id: i64,
+
+    /// QSO unique identifier
+    pub qso_id: QsoId,
+
+    /// QSO metadata
+    pub metadata: QsoMetadata,
+
+    /// Final QSO state
+    pub final_state: QsoState,
+
+    /// QSO progress data (JSON)
+    pub progress_data: Option<String>,
+
+    /// ADIF data
+    pub adif_data: AdifQso,
+
+    /// Created timestamp
+    pub created_at: DateTime<Utc>,
+
+    /// Updated timestamp
+    pub updated_at: DateTime<Utc>,
+
+    /// Checksum for integrity verification
+    pub checksum: String,
+}
+
+/// Database statistics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseStats {
+    /// Total number of QSOs
+    pub total_qsos: u64,
+
+    /// Number of confirmed QSOs
+    pub confirmed_qsos: u64,
+
+    /// Number of unique callsigns worked
+    pub unique_callsigns: u64,
+
+    /// Number of countries worked
+    pub countries_worked: u64,
+
+    /// Number of grid squares worked
+    pub grid_squares_worked: u64,
+
+    /// QSOs by mode
+    pub qsos_by_mode: HashMap<String, u64>,
+
+    /// QSOs by band
+    pub qsos_by_band: HashMap<String, u64>,
+
+    /// QSOs by year
+    pub qsos_by_year: HashMap<u32, u64>,
+
+    /// First QSO date
+    pub first_qso: Option<DateTime<Utc>>,
+
+    /// Last QSO date
+    pub last_qso: Option<DateTime<Utc>>,
+
+    /// Database size in bytes
+    pub database_size: u64,
+}
 
 /// Async database operation errors
 #[derive(Debug, Error)]
@@ -259,8 +444,8 @@ impl AsyncQsoDatabase {
     /// Search QSOs with filters
     pub async fn search_qsos(
         &self,
-        filter: &crate::database::QsoFilter,
-        options: &crate::database::QueryOptions,
+        filter: &QsoFilter,
+        options: &QueryOptions,
     ) -> Result<Vec<QsoProgress>, AsyncDatabaseError> {
         // Build dynamic query based on filters
         let mut query = String::from("SELECT progress_data FROM qsos WHERE 1=1");
@@ -349,7 +534,7 @@ impl AsyncQsoDatabase {
     /// Get database statistics
     pub async fn get_statistics(
         &self,
-    ) -> Result<crate::database::DatabaseStats, AsyncDatabaseError> {
+    ) -> Result<DatabaseStats, AsyncDatabaseError> {
         let total_qsos: u64 = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM qsos")
             .fetch_one(&self.pool)
             .await? as u64;
@@ -393,7 +578,7 @@ impl AsyncQsoDatabase {
         .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
-        Ok(crate::database::DatabaseStats {
+        Ok(DatabaseStats {
             total_qsos,
             confirmed_qsos,
             unique_callsigns,
@@ -445,9 +630,9 @@ impl AsyncQsoDatabase {
     /// Search QSOs returning QsoDatabaseRecord format for compatibility
     pub async fn search_qsos_records(
         &self,
-        filter: &crate::database::QsoFilter,
-        options: &crate::database::QueryOptions,
-    ) -> Result<Vec<crate::database::QsoDatabaseRecord>, AsyncDatabaseError> {
+        filter: &QsoFilter,
+        options: &QueryOptions,
+    ) -> Result<Vec<QsoDatabaseRecord>, AsyncDatabaseError> {
         // Build dynamic query based on filters
         let mut query = String::from(
             "SELECT id, qso_id, metadata, final_state, progress_data, adif_data, 
@@ -514,7 +699,7 @@ impl AsyncQsoDatabase {
                 DateTime::parse_from_rfc3339(&created_at_str),
                 DateTime::parse_from_rfc3339(&updated_at_str),
             ) {
-                records.push(crate::database::QsoDatabaseRecord {
+                records.push(QsoDatabaseRecord {
                     id,
                     qso_id,
                     metadata,

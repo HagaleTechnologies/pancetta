@@ -159,12 +159,18 @@
 // Re-export all public types and functions for easy access
 pub use crate::adif::*;
 pub use crate::adif_log_writer::{AdifLogError, AdifLogResult, AdifLogWriter};
+pub use crate::async_database::{
+    AsyncQsoDatabase, DatabaseStats, DateRange, FrequencyRange, QslStatus, QsoDatabaseRecord,
+    QsoFilter, QueryOptions, SortField, SortOrder,
+};
+pub use crate::async_logger::{
+    AsyncQsoLogger, AutoLoggingConfig, BackupConfig, ExportFormat, ExportImportConfig,
+    ExportResult, ImportResult, IntegrationConfig, LoggerConfig, ValidationConfig,
+};
 pub use crate::auto_sequencer::*;
 pub use crate::autonomous::*;
-pub use crate::database::*;
 pub use crate::exchange::*;
 pub use crate::frequency::*;
-pub use crate::logger::*;
 pub use crate::priority::*;
 pub use crate::qso_manager::*;
 pub use crate::states::*;
@@ -177,16 +183,16 @@ pub mod async_database;
 pub mod async_logger;
 pub mod auto_sequencer;
 pub mod autonomous;
-pub mod database;
 pub mod exchange;
 pub mod frequency;
-pub mod logger;
 pub mod priority;
 pub mod qso_manager;
 pub mod states;
 pub mod statistics;
 
 // Common error type for the entire library
+use crate::async_database::AsyncDatabaseError;
+use crate::async_logger::AsyncLoggerError;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -225,14 +231,14 @@ pub enum QsoError {
     #[error("Database error: {source}")]
     Database {
         #[from]
-        source: DatabaseError,
+        source: AsyncDatabaseError,
     },
 
     /// Logging error
     #[error("Logging error: {source}")]
     Logger {
         #[from]
-        source: LoggerError,
+        source: AsyncLoggerError,
     },
 
     /// Statistics error
@@ -340,7 +346,7 @@ impl QsoSystemBuilder {
         let logger = if self.enable_logger {
             let logger_config = self.logger_config.unwrap_or_default();
             let qso_logger =
-                std::sync::Arc::new(QsoLogger::new(logger_config, qso_manager.clone()).await?);
+                std::sync::Arc::new(AsyncQsoLogger::new(logger_config, qso_manager.clone()).await?);
             qso_logger.start().await?;
             Some(qso_logger)
         } else {
@@ -370,7 +376,7 @@ pub struct QsoSystem {
     pub auto_sequencer: Option<Arc<AutoSequencer>>,
 
     /// Logger instance (if enabled)
-    pub logger: Option<std::sync::Arc<QsoLogger>>,
+    pub logger: Option<std::sync::Arc<AsyncQsoLogger>>,
 }
 
 impl QsoSystem {

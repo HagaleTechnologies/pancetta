@@ -24,7 +24,6 @@ thiserror = "1.0"
 anyhow = "1.0"
 
 # Database dependencies
-rusqlite = { version = "0.32", features = ["bundled", "chrono", "uuid", "backup"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
 
 # Logging and tracing

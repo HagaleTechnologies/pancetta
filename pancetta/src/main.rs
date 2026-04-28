@@ -377,8 +377,7 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
 
 async fn export_command(args: ExportArgs) -> Result<()> {
     use pancetta_qso::adif::AdifProcessor;
-    use pancetta_qso::async_database::AsyncQsoDatabase;
-    use pancetta_qso::database::{QsoFilter, QueryOptions};
+    use pancetta_qso::async_database::{AsyncQsoDatabase, QsoFilter, QueryOptions};
 
     let db_path = args.database.unwrap_or_else(|| {
         dirs::home_dir()
