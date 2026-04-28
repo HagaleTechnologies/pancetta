@@ -33,7 +33,7 @@
 //! | `priorities.rs`          | `pancetta_qso::priority::PriorityScorer`         |
 //! | `propagation.rs` / `_enhanced` | (deferred — future cqdx.io feature)        |
 //! | `statistics.rs`          | `pancetta_cqdx::CqdxCache` + per-band rolling    |
-//! | `tracker.rs`             | `pancetta_qso::logger::QsoLogger`                |
+//! | `tracker.rs`             | `pancetta_qso::async_logger::AsyncQsoLogger`     |
 //! | `gridsquare.rs`          | `pancetta_core::gridsquare`                      |
 //! | `geography.rs`           | `geographiclib_rs::Geodesic` directly            |
 

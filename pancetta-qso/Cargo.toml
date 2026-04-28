@@ -51,5 +51,5 @@ name = "basic_qso"
 path = "examples/basic_qso.rs"
 
 [[example]]
-name = "contest_logging"
-path = "examples/contest_logging.rs"
+name = "qso_logging"
+path = "examples/qso_logging.rs"

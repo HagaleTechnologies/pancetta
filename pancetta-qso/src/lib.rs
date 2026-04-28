@@ -70,8 +70,8 @@
 //! - [`exchange`]: FT8 message parsing and generation
 //! - [`auto_sequencer`]: Automatic QSO progression logic
 //! - [`adif`]: ADIF 3.0 format support for import/export
-//! - [`database`]: SQLite-based persistent storage
-//! - [`logger`]: QSO logging with automatic features
+//! - [`async_database`]: SQLite-based persistent storage
+//! - [`async_logger`]: QSO logging with automatic features
 //! - [`statistics`]: Comprehensive statistics and analytics
 //!
 //! ## Usage Examples
@@ -124,33 +124,13 @@
 //!
 //! ### ADIF Import/Export
 //!
-//! ```rust,ignore
-//! use pancetta_qso::*;
-//!
-//! // Export QSOs to ADIF
-//! let logger = QsoLogger::new(logger_config, qso_manager).await?;
-//! let result = logger.export_adif("my_qsos.adi", None).await?;
-//! println!("Exported {} QSOs", result.qso_count);
-//!
-//! // Import from ADIF
-//! let import_result = logger.import_adif("imported_qsos.adi").await?;
-//! println!("Imported {} QSOs", import_result.imported_count);
-//! ```
+//! Use [`AsyncQsoLogger`] to export logged QSOs to ADIF or import from an existing log file.
+//! See [`async_logger`] for the full API, including `export_adif` and `import_adif`.
 //!
 //! ### Statistics and Analytics
 //!
-//! ```rust,ignore
-//! use pancetta_qso::*;
-//!
-//! // Calculate comprehensive statistics
-//! let database = QsoDatabase::open("qso.db")?;
-//! let calculator = StatisticsCalculator::new(database);
-//! let stats = calculator.calculate_statistics(None).await?;
-//!
-//! println!("Total QSOs: {}", stats.basic.total_qsos);
-//! println!("Countries worked: {}", stats.geographic.countries.total_countries);
-//! println!("Average signal: {:.1} dB", stats.technical.signal_reports.avg_received);
-//! ```
+//! Use [`AsyncQsoDatabase`] to query the SQLite log and [`StatisticsCalculator`] to derive
+//! per-band, per-DXCC, and time-series metrics. See [`statistics`] for details.
 
 #![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
 #![deny(unsafe_code)]
