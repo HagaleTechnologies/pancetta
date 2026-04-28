@@ -281,8 +281,9 @@ impl MockRig {
             .min(3.0)
     }
 
-    /// Update last operation time
+    /// Update last operation time and increment operation counter
     fn update_operation_time(&self) {
+        self.operation_count.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.write();
         state.last_operation = Instant::now();
     }
@@ -439,22 +440,24 @@ impl RigControl for MockRig {
         self.simulate_failure("get_frequency")?;
         self.simulate_delay().await;
 
-        let state = self.state.read();
-        if !state.connected {
-            return Err(anyhow!("Mock rig not connected"));
-        }
+        let frequency = {
+            let state = self.state.read();
+            if !state.connected {
+                return Err(anyhow!("Mock rig not connected"));
+            }
 
-        let actual_vfo = if vfo == Vfo::Current {
-            state.current_vfo
-        } else {
-            vfo
+            let actual_vfo = if vfo == Vfo::Current {
+                state.current_vfo
+            } else {
+                vfo
+            };
+
+            state
+                .frequencies
+                .get(&actual_vfo)
+                .copied()
+                .ok_or_else(|| anyhow!("No frequency set for VFO {:?}", actual_vfo))?
         };
-
-        let frequency = state
-            .frequencies
-            .get(&actual_vfo)
-            .copied()
-            .ok_or_else(|| anyhow!("No frequency set for VFO {:?}", actual_vfo))?;
 
         self.update_operation_time();
         debug!(
@@ -501,22 +504,24 @@ impl RigControl for MockRig {
         self.simulate_failure("get_mode")?;
         self.simulate_delay().await;
 
-        let state = self.state.read();
-        if !state.connected {
-            return Err(anyhow!("Mock rig not connected"));
-        }
+        let (mode, width) = {
+            let state = self.state.read();
+            if !state.connected {
+                return Err(anyhow!("Mock rig not connected"));
+            }
 
-        let actual_vfo = if vfo == Vfo::Current {
-            state.current_vfo
-        } else {
-            vfo
+            let actual_vfo = if vfo == Vfo::Current {
+                state.current_vfo
+            } else {
+                vfo
+            };
+
+            state
+                .modes
+                .get(&actual_vfo)
+                .copied()
+                .ok_or_else(|| anyhow!("No mode set for VFO {:?}", actual_vfo))?
         };
-
-        let (mode, width) = state
-            .modes
-            .get(&actual_vfo)
-            .copied()
-            .ok_or_else(|| anyhow!("No mode set for VFO {:?}", actual_vfo))?;
 
         self.update_operation_time();
         debug!(
@@ -557,12 +562,14 @@ impl RigControl for MockRig {
         self.simulate_failure("get_vfo")?;
         self.simulate_delay().await;
 
-        let state = self.state.read();
-        if !state.connected {
-            return Err(anyhow!("Mock rig not connected"));
-        }
+        let vfo = {
+            let state = self.state.read();
+            if !state.connected {
+                return Err(anyhow!("Mock rig not connected"));
+            }
+            state.current_vfo
+        };
 
-        let vfo = state.current_vfo;
         self.update_operation_time();
         debug!("Mock rig get VFO: {:?}", vfo);
         Ok(vfo)
@@ -599,22 +606,24 @@ impl RigControl for MockRig {
         self.simulate_failure("get_ptt")?;
         self.simulate_delay().await;
 
-        let state = self.state.read();
-        if !state.connected {
-            return Err(anyhow!("Mock rig not connected"));
-        }
+        let ptt = {
+            let state = self.state.read();
+            if !state.connected {
+                return Err(anyhow!("Mock rig not connected"));
+            }
 
-        let actual_vfo = if vfo == Vfo::Current {
-            state.current_vfo
-        } else {
-            vfo
+            let actual_vfo = if vfo == Vfo::Current {
+                state.current_vfo
+            } else {
+                vfo
+            };
+
+            state
+                .ptt_states
+                .get(&actual_vfo)
+                .copied()
+                .unwrap_or(PttState::Off)
         };
-
-        let ptt = state
-            .ptt_states
-            .get(&actual_vfo)
-            .copied()
-            .unwrap_or(PttState::Off);
 
         self.update_operation_time();
         debug!("Mock rig get PTT: {:?} from VFO {:?}", ptt, vfo);
@@ -652,12 +661,14 @@ impl RigControl for MockRig {
         self.simulate_failure("get_power_level")?;
         self.simulate_delay().await;
 
-        let state = self.state.read();
-        if !state.connected {
-            return Err(anyhow!("Mock rig not connected"));
-        }
+        let level = {
+            let state = self.state.read();
+            if !state.connected {
+                return Err(anyhow!("Mock rig not connected"));
+            }
+            state.power_level
+        };
 
-        let level = state.power_level;
         self.update_operation_time();
         debug!("Mock rig get power level: {:.1}%", level * 100.0);
         Ok(level)
@@ -668,16 +679,17 @@ impl RigControl for MockRig {
         self.simulate_failure("get_s_meter")?;
         self.simulate_delay().await;
 
-        let state = self.state.read();
-        if !state.connected {
-            return Err(anyhow!("Mock rig not connected"));
-        }
-
-        let frequency = state
-            .frequencies
-            .get(&state.current_vfo)
-            .copied()
-            .unwrap_or(14_200_000);
+        let frequency = {
+            let state = self.state.read();
+            if !state.connected {
+                return Err(anyhow!("Mock rig not connected"));
+            }
+            state
+                .frequencies
+                .get(&state.current_vfo)
+                .copied()
+                .unwrap_or(14_200_000)
+        };
 
         let s_meter = self.simulate_s_meter(frequency);
         self.update_operation_time();
@@ -690,16 +702,17 @@ impl RigControl for MockRig {
         self.simulate_failure("get_swr")?;
         self.simulate_delay().await;
 
-        let state = self.state.read();
-        if !state.connected {
-            return Err(anyhow!("Mock rig not connected"));
-        }
-
-        let frequency = state
-            .frequencies
-            .get(&state.current_vfo)
-            .copied()
-            .unwrap_or(14_200_000);
+        let frequency = {
+            let state = self.state.read();
+            if !state.connected {
+                return Err(anyhow!("Mock rig not connected"));
+            }
+            state
+                .frequencies
+                .get(&state.current_vfo)
+                .copied()
+                .unwrap_or(14_200_000)
+        };
 
         let swr = self.simulate_swr(frequency);
         self.update_operation_time();
@@ -755,22 +768,24 @@ impl RigControl for MockRig {
         self.simulate_failure("get_memory_channel")?;
         self.simulate_delay().await;
 
-        let state = self.state.read();
-        if !state.connected {
-            return Err(anyhow!("Mock rig not connected"));
-        }
+        let channel = {
+            let state = self.state.read();
+            if !state.connected {
+                return Err(anyhow!("Mock rig not connected"));
+            }
 
-        let actual_vfo = if vfo == Vfo::Current {
-            state.current_vfo
-        } else {
-            vfo
+            let actual_vfo = if vfo == Vfo::Current {
+                state.current_vfo
+            } else {
+                vfo
+            };
+
+            state
+                .current_memory
+                .get(&actual_vfo)
+                .copied()
+                .ok_or_else(|| anyhow!("No memory channel selected for VFO {:?}", actual_vfo))?
         };
-
-        let channel = state
-            .current_memory
-            .get(&actual_vfo)
-            .copied()
-            .ok_or_else(|| anyhow!("No memory channel selected for VFO {:?}", actual_vfo))?;
 
         self.update_operation_time();
         debug!(
@@ -831,9 +846,9 @@ impl RigControl for MockRig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::Duration;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_connection() {
         let rig = MockRig::default();
 
@@ -852,7 +867,7 @@ mod tests {
         assert_eq!(status.connection_state, ConnectionState::Disconnected);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_frequency_control() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
@@ -870,7 +885,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_mode_control() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
@@ -889,7 +904,7 @@ mod tests {
         assert_eq!(width, 2400); // Default USB width
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_vfo_control() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
@@ -905,7 +920,7 @@ mod tests {
         assert_eq!(freq, 21_200_000);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_memory_channels() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
@@ -924,7 +939,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_ptt_control() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
@@ -940,7 +955,7 @@ mod tests {
         assert_eq!(ptt, PttState::Off);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_power_control() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
@@ -955,7 +970,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_monitoring() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
@@ -972,7 +987,7 @@ mod tests {
         assert!(swr <= 3.0);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_operation_delay() {
         let mut config = MockRigConfig::default();
         config.operation_delay_ms = 50;
@@ -987,7 +1002,7 @@ mod tests {
         assert!(duration >= Duration::from_millis(50));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_failure_simulation() {
         let mut config = MockRigConfig::default();
         config.failure_rate = 1.0; // 100% failure rate
@@ -1008,7 +1023,7 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_info() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
@@ -1019,7 +1034,7 @@ mod tests {
         assert!(info.contains("channels"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_mock_rig_operation_count() {
         let rig = MockRig::default();
         rig.connect().await.unwrap();
