@@ -4,7 +4,9 @@
 //! for tokio spawns, using the sqlx-based async database.
 
 use crate::adif::{AdifFile, AdifProcessor};
-use crate::async_database::{AsyncDatabaseError, AsyncQsoDatabase, QsoFilter, QueryOptions, SortOrder};
+use crate::async_database::{
+    AsyncDatabaseError, AsyncQsoDatabase, QsoFilter, QueryOptions, SortOrder,
+};
 use crate::qso_manager::{QsoEvent, QsoManager};
 use crate::states::*;
 use chrono::{DateTime, Utc};

@@ -100,11 +100,7 @@ impl super::ApplicationCoordinator {
                     Ok(w) => {
                         info!("ADIF log open at {}", adif_path.display());
                         let w = std::sync::Arc::new(w);
-                        start_adif_subscriber(
-                            w.clone(),
-                            qso_manager.subscribe(),
-                            shutdown.clone(),
-                        );
+                        start_adif_subscriber(w.clone(), qso_manager.subscribe(), shutdown.clone());
                         Some(w)
                     }
                     Err(e) => {
@@ -198,10 +194,7 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                             Err(e) => {
-                                warn!(
-                                    "Could not open legacy DB for migration: {} — skipping",
-                                    e
-                                );
+                                warn!("Could not open legacy DB for migration: {} — skipping", e);
                             }
                         }
                     }

@@ -937,7 +937,11 @@ impl AdifProcessor {
         out.push_str("ADIF Export by pancetta\n\n");
         // Infallible — format_field only fails when value is empty, which won't happen here
         out.push_str(&self.format_field("ADIF_VER", "3.1.0").unwrap_or_default());
-        out.push_str(&self.format_field("PROGRAMID", "pancetta").unwrap_or_default());
+        out.push_str(
+            &self
+                .format_field("PROGRAMID", "pancetta")
+                .unwrap_or_default(),
+        );
         out.push_str(
             &self
                 .format_field(

@@ -532,9 +532,7 @@ impl AsyncQsoDatabase {
     }
 
     /// Get database statistics
-    pub async fn get_statistics(
-        &self,
-    ) -> Result<DatabaseStats, AsyncDatabaseError> {
+    pub async fn get_statistics(&self) -> Result<DatabaseStats, AsyncDatabaseError> {
         let total_qsos: u64 = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM qsos")
             .fetch_one(&self.pool)
             .await? as u64;
@@ -768,13 +766,12 @@ impl AsyncQsoDatabase {
 
         let db = Self::open(db_path).await?;
 
-        let raw =
-            tokio::fs::read_to_string(adif_path)
-                .await
-                .map_err(|source| AsyncDatabaseError::Io {
-                    path: adif_path.to_path_buf(),
-                    source,
-                })?;
+        let raw = tokio::fs::read_to_string(adif_path)
+            .await
+            .map_err(|source| AsyncDatabaseError::Io {
+                path: adif_path.to_path_buf(),
+                source,
+            })?;
 
         let processor = crate::adif::AdifProcessor::new();
         let adif_file = processor

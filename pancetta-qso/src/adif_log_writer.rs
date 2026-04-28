@@ -71,12 +71,12 @@ impl AdifLogWriter {
         // Create parent directories if needed.
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                tokio::fs::create_dir_all(parent).await.map_err(|source| {
-                    AdifLogError::Io {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|source| AdifLogError::Io {
                         path: parent.to_path_buf(),
                         source,
-                    }
-                })?;
+                    })?;
             }
         }
 
@@ -114,12 +114,10 @@ impl AdifLogWriter {
                 path: self.path.clone(),
                 source,
             })?;
-        f.flush()
-            .await
-            .map_err(|source| AdifLogError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
+        f.flush().await.map_err(|source| AdifLogError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
         Ok(())
     }
 
@@ -127,9 +125,7 @@ impl AdifLogWriter {
     ///
     /// Thread-safe: the underlying file handle is guarded by a `Mutex`.
     pub async fn append(&self, qso: &QsoMetadata) -> AdifLogResult<()> {
-        let adif_qso: AdifQso = self
-            .processor
-            .qso_to_adif(qso, qso.contest_info.as_ref());
+        let adif_qso: AdifQso = self.processor.qso_to_adif(qso, qso.contest_info.as_ref());
         let record = self
             .processor
             .generate_record(&adif_qso)
@@ -142,12 +138,10 @@ impl AdifLogWriter {
                 path: self.path.clone(),
                 source,
             })?;
-        f.flush()
-            .await
-            .map_err(|source| AdifLogError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
+        f.flush().await.map_err(|source| AdifLogError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
         Ok(())
     }
 
@@ -199,11 +193,9 @@ mod tests {
         let contents = tokio::fs::read_to_string(&path).await.unwrap();
         let eor_count = contents.matches("<EOR>").count();
         assert_eq!(
-            eor_count,
-            2,
+            eor_count, 2,
             "expected 2 records, got {}\n--- file ---\n{}",
-            eor_count,
-            contents
+            eor_count, contents
         );
     }
 

@@ -3,7 +3,9 @@
 //! This module provides comprehensive statistics and analytics for QSO data,
 //! including achievements, trends, contest analysis, and performance metrics.
 
-use crate::async_database::{AsyncDatabaseError, AsyncQsoDatabase, DateRange, QsoDatabaseRecord, QsoFilter, QueryOptions};
+use crate::async_database::{
+    AsyncDatabaseError, AsyncQsoDatabase, DateRange, QsoDatabaseRecord, QsoFilter, QueryOptions,
+};
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -14,9 +16,7 @@ use tracing::{debug, info};
 #[derive(Debug, Error)]
 pub enum StatisticsError {
     #[error("Database error: {source}")]
-    Database {
-        source: AsyncDatabaseError,
-    },
+    Database { source: AsyncDatabaseError },
 
     #[error("Calculation error: {message}")]
     Calculation { message: String },
