@@ -57,6 +57,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - **Priority scoring** (`pancetta-qso/src/priority.rs`): Weighted scoring — needed DXCC > needed grid > POTA/SOTA > rarity. Duplicate suppression and failure backoff.
 - **SmartFrequencyAllocator** (`pancetta-qso/src/frequency.rs`): 7 soft-scored criteria for TX frequency selection. Enables parallel QSOs at different audio frequencies.
 - **Multi-stream TX**: Supports N simultaneous FT8 signals in a single 15-second slot.
+- **QSO logging — ADIF + SQLite hybrid**: `~/.pancetta/qsos.adi` is the durable, append-only ADIF source of truth (vendor-neutral; point WSJT-X / N1MM / LoTW / eQSL at this file directly). `~/.pancetta/qso.db` is a sqlx-backed queryable index rebuilt from the ADIF on startup if missing or stale — safe to delete. `AdifLogWriter` (pancetta-qso) writes ADIF records; `AsyncQsoLogger` (pancetta) persists to both stores. Existing operators auto-migrate: first startup after upgrade exports the legacy DB into a fresh ADIF before flipping over.
 
 ## Development Phases (End-to-End QSO Initiative)
 

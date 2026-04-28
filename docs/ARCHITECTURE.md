@@ -145,6 +145,25 @@ of worked stations (per band), recent failures, needed DXCC entities, needed gri
 rarity scores from cqdx.io, notable callsigns, and network SNR data. Refreshed
 periodically by the coordinator from cqdx.io and the QSO log.
 
+### `AdifLogWriter` (pancetta-qso)
+
+Writes completed QSO records to `~/.pancetta/qsos.adi` in ADIF format. The file is
+append-only and vendor-neutral — it can be imported directly into WSJT-X, N1MM+, LoTW,
+eQSL, or any logging application that accepts ADIF. This file is the durable
+source of truth; back it up.
+
+### `AsyncQsoLogger` (pancetta)
+
+Coordinator-level QSO persistence layer. On each completed QSO it writes to both the
+ADIF file (via `AdifLogWriter`) and to the sqlx-backed SQLite index
+(`~/.pancetta/qso.db`). The index is rebuilt from the ADIF on startup when missing or
+stale; it is safe to delete. The legacy sync rusqlite path is gone; pancetta-qso is
+async-only via sqlx.
+
+**Migration**: on the first startup after upgrade, if `qso.db` exists but `qsos.adi`
+does not, the coordinator auto-exports all rows from the old database into a fresh ADIF
+file before opening the new logging path.
+
 ---
 
 ## FT8 Protocol Notes
