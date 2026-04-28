@@ -86,7 +86,7 @@
 //! let manager = QsoManager::new(config);
 //!
 //! // Start CQ and handle responses
-//! let qso_id = manager.start_cq(14074000.0).await?;
+//! let qso_id = manager.start_cq(14074000.0, None).await?;
 //!
 //! // Process incoming messages
 //! manager.process_message(
