@@ -544,8 +544,14 @@ impl QsoManager {
         Ok(())
     }
 
-    /// Emit a MessageToSend event for a QSO (crate-internal use by auto_sequencer)
-    pub(crate) async fn send_message(&self, qso_id: QsoId, message: MessageType, frequency: f64) {
+    /// Emit a MessageToSend event for a QSO.
+    ///
+    /// Reads `tx_parity` from the QSO metadata so that every emission
+    /// carries the value latched at QSO start, regardless of when this
+    /// method is called.  Used by the auto_sequencer internally and
+    /// exposed as `pub` so integration tests can drive additional
+    /// MessageToSend events without going through the auto_sequencer.
+    pub async fn send_message(&self, qso_id: QsoId, message: MessageType, frequency: f64) {
         let tx_parity = self
             .qsos
             .read()
