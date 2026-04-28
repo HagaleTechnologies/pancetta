@@ -144,6 +144,17 @@ impl super::ApplicationCoordinator {
             .await?;
         let message_bus = self.message_bus.clone();
 
+        // Capture config snapshot for TX timing parameters.
+        let (tx_late_max_ms, tx_self_parity, ptt_lead_ms, sample_rate) = {
+            let cfg = self.config.read().await;
+            (
+                cfg.station.tx_late_max_ms,
+                cfg.station.tx_self_parity,
+                cfg.station.ptt_lead_ms,
+                12000u32, // FT8 sample rate
+            )
+        };
+
         let tx_handle = {
             let shutdown = self.shutdown_signal.clone();
 
@@ -159,13 +170,6 @@ impl super::ApplicationCoordinator {
                     }
                 };
 
-                // FT8 transmissions start at slot+500ms (the 0.5s pre-roll
-                // convention). We engage PTT 200ms earlier so the relay is
-                // settled when audio begins. Require at least 1s of total
-                // lead so we have headroom for both.
-                const PTT_LEAD: chrono::Duration = chrono::Duration::milliseconds(200);
-                const MIN_LEAD: chrono::Duration = chrono::Duration::seconds(1);
-
                 while !shutdown.load(Ordering::Acquire) {
                     match tx_rx.try_recv() {
                         Ok(message) => {
@@ -176,7 +180,6 @@ impl super::ApplicationCoordinator {
                                     qso_id,
                                     tx_parity,
                                 } => {
-                                    let _tx_parity = tx_parity; // wired into scheduler in Task 11
                                     info!(
                                         "Transmit request: '{}' at offset {:.0} Hz (qso: {:?})",
                                         message_text, frequency_offset, qso_id
@@ -210,7 +213,7 @@ impl super::ApplicationCoordinator {
                                         let _ = message_bus.send_message(complete_msg).await;
                                         continue;
                                     }
-                                    let (samples, duration_ms) = match encoder
+                                    let (samples, _duration_ms) = match encoder
                                         .encode_message(&message_text, None)
                                         .and_then(|symbols| {
                                             modulator.modulate_symbols(&symbols, 0.0)
@@ -245,25 +248,69 @@ impl super::ApplicationCoordinator {
                                         }
                                     };
 
-                                    // --- Step 2: Compute precise FT8 audio-start time ---
-                                    let target_audio_utc = pancetta_core::slot::next_audio_start(
+                                    // --- Step 2: Resolve required parity ---
+                                    let required_parity = resolve_required_parity(
+                                        tx_parity,
+                                        tx_self_parity,
                                         chrono::Utc::now(),
-                                        MIN_LEAD,
-                                    );
-                                    info!(
-                                        "TX scheduled: audio at {} (PTT 200ms earlier)",
-                                        target_audio_utc.format("%H:%M:%S%.3f UTC")
                                     );
 
-                                    // --- Step 3: Sleep until PTT engage instant (audio - 200ms) ---
-                                    let ptt_target_utc = target_audio_utc - PTT_LEAD;
+                                    let schedule = schedule_tx(
+                                        chrono::Utc::now(),
+                                        required_parity,
+                                        tx_late_max_ms,
+                                        sample_rate,
+                                    );
+
+                                    info!(
+                                        "TX scheduled: parity={:?} target_slot={} pad={} samples cursor={} samples",
+                                        required_parity,
+                                        schedule.target_slot.format("%H:%M:%S%.3f UTC"),
+                                        schedule.silent_pad_samples,
+                                        schedule.cursor_offset_samples,
+                                    );
+
+                                    // --- Step 3: Build the audio buffer to ship ---
+                                    // Pad zeros in front (early branch); skip cursor into
+                                    // waveform (late branch); never both at the same time.
+                                    let mut audio_out: Vec<f32> =
+                                        Vec::with_capacity(schedule.silent_pad_samples + samples.len());
+                                    audio_out.resize(schedule.silent_pad_samples, 0.0f32);
+                                    if schedule.cursor_offset_samples < samples.len() {
+                                        audio_out.extend_from_slice(
+                                            &samples[schedule.cursor_offset_samples..],
+                                        );
+                                    } else {
+                                        // Defensive: if cursor outran the waveform (shouldn't
+                                        // happen because too-late defers), emit nothing and
+                                        // skip TX.
+                                        warn!("schedule_tx cursor exceeded waveform length; skipping TX");
+                                        let complete_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Autonomous,
+                                            MessageType::TransmitComplete {
+                                                success: false,
+                                                message_text,
+                                                duration_ms: 0,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus.send_message(complete_msg).await;
+                                        continue;
+                                    }
+                                    let audio_duration_ms =
+                                        (audio_out.len() as f64 / sample_rate as f64 * 1000.0) as u64;
+
+                                    // --- Step 4: Sleep until PTT engage instant ---
+                                    let ptt_target_utc = schedule.target_slot
+                                        - chrono::Duration::milliseconds(ptt_lead_ms as i64);
                                     let to_ptt = pancetta_core::slot::duration_until(
                                         ptt_target_utc,
                                         chrono::Utc::now(),
                                     );
                                     sleep(to_ptt).await;
 
-                                    // --- Step 4: Assert PTT ---
+                                    // --- Step 5: Assert PTT ---
                                     let mut ptt_guard = PttGuard::new(message_bus.clone());
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
@@ -279,20 +326,22 @@ impl super::ApplicationCoordinator {
                                         debug!("PTT on failed (no rig?): {}", e);
                                     }
 
-                                    // --- Step 5: Sleep precisely until audio-start instant ---
-                                    let to_audio = pancetta_core::slot::duration_until(
-                                        target_audio_utc,
+                                    // --- Step 6: Sleep precisely until target slot start ---
+                                    // (audio_out itself includes any silent_pad needed past
+                                    // the slot boundary; we send it at the boundary.)
+                                    let to_slot = pancetta_core::slot::duration_until(
+                                        schedule.target_slot,
                                         chrono::Utc::now(),
                                     );
-                                    sleep(to_audio).await;
+                                    sleep(to_slot).await;
 
-                                    // --- Step 6: Route audio to output ---
+                                    // --- Step 7: Route audio to output ---
                                     let audio_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Audio,
                                         MessageType::AudioOutput {
-                                            samples,
-                                            sample_rate: 12000,
+                                            samples: audio_out,
+                                            sample_rate,
                                         },
                                         Instant::now(),
                                     );
@@ -300,11 +349,12 @@ impl super::ApplicationCoordinator {
                                         debug!("Audio output routing: {}", e);
                                     }
 
-                                    // --- Step 7: Wait for audio playback to complete ---
-                                    sleep(Duration::from_millis(duration_ms)).await;
+                                    // --- Step 8: Wait for audio playback to complete ---
+                                    sleep(Duration::from_millis(audio_duration_ms)).await;
                                     let success = true;
+                                    let duration_ms = audio_duration_ms;
 
-                                    // --- Step 8: De-assert PTT (with tail delay) ---
+                                    // --- Step 9: De-assert PTT (with tail delay) ---
                                     sleep(Duration::from_millis(50)).await;
                                     let ptt_off_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
@@ -321,7 +371,7 @@ impl super::ApplicationCoordinator {
                                     }
                                     ptt_guard.disarm();
 
-                                    // --- Step 6: Send TransmitComplete ---
+                                    // --- Step 10: Send TransmitComplete ---
                                     let complete_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Autonomous,
@@ -427,17 +477,21 @@ impl super::ApplicationCoordinator {
                                     };
 
                                     // --- Step 2: Compute precise FT8 audio-start time ---
+                                    // NOTE: MultiTransmitRequest will be migrated to
+                                    // schedule_tx in Task 12. For now use the legacy path.
                                     let target_audio_utc = pancetta_core::slot::next_audio_start(
                                         chrono::Utc::now(),
-                                        MIN_LEAD,
+                                        chrono::Duration::seconds(1),
                                     );
                                     info!(
-                                        "Multi-TX scheduled: audio at {} (PTT 200ms earlier)",
-                                        target_audio_utc.format("%H:%M:%S%.3f UTC")
+                                        "Multi-TX scheduled: audio at {} (PTT {}ms earlier)",
+                                        target_audio_utc.format("%H:%M:%S%.3f UTC"),
+                                        ptt_lead_ms,
                                     );
 
-                                    // --- Step 3: Sleep until PTT engage (audio - 200ms) ---
-                                    let ptt_target_utc = target_audio_utc - PTT_LEAD;
+                                    // --- Step 3: Sleep until PTT engage ---
+                                    let ptt_target_utc = target_audio_utc
+                                        - chrono::Duration::milliseconds(ptt_lead_ms as i64);
                                     let to_ptt = pancetta_core::slot::duration_until(
                                         ptt_target_utc,
                                         chrono::Utc::now(),
@@ -540,6 +594,34 @@ impl super::ApplicationCoordinator {
             .push((ComponentId::Ft8Transmitter, tx_handle));
         info!("FT8 transmitter component started");
         Ok(())
+    }
+}
+
+/// Resolve the slot parity to use for a given TX request, falling back
+/// to the configured self-parity (`Auto` picks whichever next slot is
+/// closer to `now`).
+pub fn resolve_required_parity(
+    tx_parity: Option<pancetta_core::slot::SlotParity>,
+    tx_self_parity: pancetta_config::station::TxSelfParity,
+    now: chrono::DateTime<chrono::Utc>,
+) -> pancetta_core::slot::SlotParity {
+    use pancetta_config::station::TxSelfParity;
+    use pancetta_core::slot::{next_slot_with_parity, SlotParity};
+    if let Some(p) = tx_parity {
+        return p;
+    }
+    match tx_self_parity {
+        TxSelfParity::Even => SlotParity::Even,
+        TxSelfParity::Odd => SlotParity::Odd,
+        TxSelfParity::Auto => {
+            let next_even = next_slot_with_parity(now, SlotParity::Even);
+            let next_odd = next_slot_with_parity(now, SlotParity::Odd);
+            if next_even <= next_odd {
+                SlotParity::Even
+            } else {
+                SlotParity::Odd
+            }
+        }
     }
 }
 
