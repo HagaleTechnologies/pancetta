@@ -87,6 +87,20 @@ pub fn next_slot_start(now: DateTime<Utc>, min_lead: Duration) -> DateTime<Utc> 
     DateTime::<Utc>::from_timestamp_nanos(target_ns)
 }
 
+/// Returns the next slot start whose parity equals `wanted`, strictly after `now`.
+///
+/// Always advances past the current slot (i.e., `now` falling on the start of a
+/// matching slot still returns the *next* matching slot). This matches the
+/// semantics of `next_slot_start`: callers want a future TX target, never the
+/// present one.
+pub fn next_slot_with_parity(now: DateTime<Utc>, wanted: SlotParity) -> DateTime<Utc> {
+    let mut candidate = next_slot_start(now, Duration::zero());
+    if SlotParity::of(candidate) != wanted {
+        candidate += Duration::nanoseconds(SLOT_NS);
+    }
+    candidate
+}
+
 /// Returns the next moment FT8 audio should begin (`next_slot_start + 500ms`).
 ///
 /// `min_lead` is measured from `now` to the audio-start instant, NOT to the
@@ -278,6 +292,45 @@ mod tests {
         let future = at(2.5);
         let d = duration_until(future, now);
         assert_eq!(d.as_millis(), 2_500);
+    }
+
+    #[test]
+    fn next_slot_with_parity_skips_same_parity() {
+        // now = :05 (in even slot 0). Asking for Odd → :15.
+        let now = at(5.0);
+        let target = next_slot_with_parity(now, SlotParity::Odd);
+        let delta = (target - at(0.0)).num_milliseconds();
+        assert_eq!(delta, 15_000);
+    }
+
+    #[test]
+    fn next_slot_with_parity_advances_two_slots_when_current_is_wanted() {
+        // now = :05 (even slot 0). Asking for Even → :30 (next even slot,
+        // skipping the odd one at :15).
+        let now = at(5.0);
+        let target = next_slot_with_parity(now, SlotParity::Even);
+        let delta = (target - at(0.0)).num_milliseconds();
+        assert_eq!(delta, 30_000);
+    }
+
+    #[test]
+    fn next_slot_with_parity_at_boundary_advances_to_next_match() {
+        // now = exactly :15.000 (odd slot start). Even slots are :00, :30...
+        // The current slot has already started, so next Odd is :45.
+        let now = at(15.0);
+        let target = next_slot_with_parity(now, SlotParity::Odd);
+        let delta = (target - at(0.0)).num_milliseconds();
+        assert_eq!(delta, 45_000);
+    }
+
+    #[test]
+    fn next_slot_with_parity_inside_wanted_slot_advances() {
+        // now = :05 (inside even slot 0). Asking for Even — current slot
+        // has already started, must advance. Next even is :30.
+        let now = at(5.0);
+        let target = next_slot_with_parity(now, SlotParity::Even);
+        let delta = (target - at(0.0)).num_milliseconds();
+        assert_eq!(delta, 30_000);
     }
 
     #[test]
