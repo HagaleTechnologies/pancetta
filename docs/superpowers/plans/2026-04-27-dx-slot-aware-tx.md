@@ -2493,3 +2493,23 @@ All 17 tasks complete. Spec acceptance criteria:
 2. Manual hardware validation pending (Task 17 Step 3 — post-merge operator action).
 3. ✅ Autonomous operator picks opposite parity (Task 8 wiring through `OperatorAction::Transmit.tx_parity`).
 4. Manual on-air observation pending (Task 17 Step 3).
+
+---
+
+## Manual hardware validation (post-merge)
+
+To be run by the operator after merging to main:
+
+1. With FTdx10 connected, run `pancetta` and listen on 20m FT8 (14.074 MHz).
+2. Wait for an Even-slot CQ. Press Space 1s into the slot. Confirm:
+   - TUI status: "Calling KXXXX — TX queued (Hz)"
+   - Rig PTT engages just before :15.0
+   - Audio emits at slot boundary (no DT > 0.3s in any subsequent
+     receiving station's spot)
+   - PSKReporter spot appears within ~30s
+3. Wait for another Even-slot CQ. Press Space at slot+5s. Confirm:
+   - TX still happens at :15 (current Odd slot), not :30
+   - PSKReporter spot appears (positive DT visible at the receiver)
+4. Trigger autonomous mode (`c` key for auto-CQ); confirm at least
+   one CQ → reply → response cycle completes without same-parity
+   collision.
