@@ -50,7 +50,7 @@
 //!     qso_manager.start().await?;
 //!     
 //!     // Start a CQ call
-//!     let qso_id = qso_manager.start_cq(14074000.0).await?;
+//!     let qso_id = qso_manager.start_cq(14074000.0, None).await?;
 //!     println!("Started CQ: {}", qso_id);
 //!     
 //!     // Get QSO status
@@ -443,12 +443,12 @@ impl QsoSystem {
 
     /// Start a CQ call
     pub async fn start_cq(&self, frequency: f64) -> QsoResult<QsoId> {
-        Ok(self.qso_manager.start_cq(frequency).await?)
+        Ok(self.qso_manager.start_cq(frequency, None).await?)
     }
 
     /// Respond to a CQ call
     pub async fn respond_to_cq(&self, callsign: String, frequency: f64) -> QsoResult<QsoId> {
-        Ok(self.qso_manager.respond_to_cq(callsign, frequency).await?)
+        Ok(self.qso_manager.respond_to_cq(callsign, frequency, None).await?)
     }
 
     /// Process an incoming message

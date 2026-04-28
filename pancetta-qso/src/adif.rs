@@ -472,6 +472,7 @@ impl AdifProcessor {
                 }),
             tags: adif_qso.additional_fields.clone(),
             notes: adif_qso.comment.clone(),
+            tx_parity: None,
         }
     }
 

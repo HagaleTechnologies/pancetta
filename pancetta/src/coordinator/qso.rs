@@ -320,7 +320,9 @@ impl super::ApplicationCoordinator {
                                 qso_id,
                                 message,
                                 frequency,
+                                tx_parity,
                             }) => {
+                                let _tx_parity = tx_parity; // wired into TransmitRequest in Task 8
                                 match pancetta_qso::utils::generate_ft8_message(
                                     &message,
                                     &tx_callsign,
@@ -459,10 +461,8 @@ impl super::ApplicationCoordinator {
                                                 "Starting QSO with {} on {} Hz",
                                                 callsign, frequency
                                             );
-                                            // dx_parity is wired into respond_to_cq in Task 7.
-                                            let _dx_parity = dx_parity;
                                             match qso_manager
-                                                .respond_to_cq(callsign.clone(), frequency as f64)
+                                                .respond_to_cq(callsign.clone(), frequency as f64, dx_parity)
                                                 .await
                                             {
                                                 Ok(qso_id) => {

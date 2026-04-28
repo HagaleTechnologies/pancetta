@@ -327,6 +327,14 @@ pub struct QsoMetadata {
 
     /// Notes
     pub notes: Option<String>,
+
+    /// Latched TX parity for this QSO. Set once at QSO creation
+    /// (respond_to_cq passes the DX's parity, which is flipped to
+    /// the opposite for our TX; start_cq passes our self-parity
+    /// directly). Every subsequent MessageToSend event for this QSO
+    /// carries the same value, ensuring all of our transmissions stay
+    /// on the slot the contra station expects.
+    pub tx_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
 /// Signal reports exchanged

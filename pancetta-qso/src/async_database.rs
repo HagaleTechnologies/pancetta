@@ -940,6 +940,7 @@ mod tests {
                 contest_info: None,
                 tags: HashMap::new(),
                 notes: None,
+                tx_parity: None,
             },
         };
 
@@ -973,6 +974,7 @@ mod tests {
                 contest_info: None,
                 tags: HashMap::new(),
                 notes: None,
+                tx_parity: None,
             },
         };
 

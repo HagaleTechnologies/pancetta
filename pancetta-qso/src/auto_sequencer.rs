@@ -424,7 +424,7 @@ impl AutoSequencer {
             SequenceAction::StartCq { frequency } => {
                 let qso_id = self
                     .qso_manager
-                    .start_cq(frequency)
+                    .start_cq(frequency, None)
                     .await
                     .map_err(|e| AutoSequencerError::QsoManager { source: e })?;
 
@@ -444,7 +444,7 @@ impl AutoSequencer {
             } => {
                 let qso_id = self
                     .qso_manager
-                    .respond_to_cq(callsign, frequency)
+                    .respond_to_cq(callsign, frequency, None)
                     .await
                     .map_err(|e| AutoSequencerError::QsoManager { source: e })?;
 

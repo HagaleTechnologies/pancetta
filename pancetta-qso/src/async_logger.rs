@@ -847,6 +847,7 @@ impl AsyncQsoLogger {
                 },
                 tags: std::collections::HashMap::new(),
                 notes: adif_qso.notes.clone(),
+                tx_parity: None,
             },
         }
     }

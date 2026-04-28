@@ -151,6 +151,7 @@ pub enum QsoEvent {
         qso_id: QsoId,
         message: MessageType,
         frequency: f64,
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
     },
 
     /// QSO completed
@@ -308,7 +309,17 @@ impl QsoManager {
     }
 
     /// Start a new CQ call
-    pub async fn start_cq(&self, frequency: f64) -> Result<QsoId, QsoManagerError> {
+    /// Start a CQ call.
+    ///
+    /// `tx_parity` is the parity we want our CQ to land on. `None`
+    /// lets the TX scheduler pick (using the configured self-parity
+    /// fallback). Callers driving auto-CQ from the autonomous operator
+    /// will typically supply a fixed parity to keep cycles consistent.
+    pub async fn start_cq(
+        &self,
+        frequency: f64,
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+    ) -> Result<QsoId, QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
                 message: format!(
@@ -342,6 +353,7 @@ impl QsoManager {
             contest_info: None,
             tags: HashMap::new(),
             notes: None,
+            tx_parity,
         };
 
         let progress = QsoProgress {
@@ -363,6 +375,7 @@ impl QsoManager {
             qso_id,
             message,
             frequency,
+            tx_parity,
         })
         .await;
 
@@ -372,10 +385,15 @@ impl QsoManager {
     }
 
     /// Respond to a CQ call
+    ///
+    /// `dx_parity` is the slot parity of the DX station's CQ, used to
+    /// derive our `tx_parity` (opposite of theirs). May be `None` if
+    /// the CQ came from a DX cluster spot rather than an on-air decode.
     pub async fn respond_to_cq(
         &self,
         target_callsign: String,
         frequency: f64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
     ) -> Result<QsoId, QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
@@ -395,6 +413,7 @@ impl QsoManager {
 
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
+        let tx_parity = dx_parity.map(|p| p.opposite());
 
         let state = QsoState::RespondingToCq {
             target_callsign: target_callsign.clone(),
@@ -418,6 +437,7 @@ impl QsoManager {
             contest_info: None,
             tags: HashMap::new(),
             notes: None,
+            tx_parity,
         };
 
         let progress = QsoProgress {
@@ -441,6 +461,7 @@ impl QsoManager {
             qso_id,
             message,
             frequency,
+            tx_parity,
         })
         .await;
 
@@ -525,10 +546,18 @@ impl QsoManager {
 
     /// Emit a MessageToSend event for a QSO (crate-internal use by auto_sequencer)
     pub(crate) async fn send_message(&self, qso_id: QsoId, message: MessageType, frequency: f64) {
+        let tx_parity = self
+            .qsos
+            .read()
+            .await
+            .get(&qso_id)
+            .map(|p| p.metadata.tx_parity)
+            .unwrap_or(None);
         self.emit_event(QsoEvent::MessageToSend {
             qso_id,
             message,
             frequency,
+            tx_parity,
         })
         .await;
     }
@@ -999,7 +1028,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_cq() {
         let manager = QsoManager::new(test_config());
-        let qso_id = manager.start_cq(14074000.0).await.unwrap();
+        let qso_id = manager.start_cq(14074000.0, None).await.unwrap();
 
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert!(matches!(progress.state, QsoState::CallingCq { .. }));
@@ -1010,7 +1039,7 @@ mod tests {
     async fn test_respond_to_cq() {
         let manager = QsoManager::new(test_config());
         let qso_id = manager
-            .respond_to_cq("K1DEF".to_string(), 14074000.0)
+            .respond_to_cq("K1DEF".to_string(), 14074000.0, None)
             .await
             .unwrap();
 

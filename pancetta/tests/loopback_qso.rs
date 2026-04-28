@@ -223,7 +223,7 @@ async fn test_loopback_state_machine_driven_qso() {
     let mut rx_b = manager_b.subscribe();
 
     // === Step 1: Station A calls CQ via state machine ===
-    let qso_id_a = manager_a.start_cq(freq).await.unwrap();
+    let qso_id_a = manager_a.start_cq(freq, None).await.unwrap();
 
     // Receive the MessageToSend event
     let cq_message_type = loop {
@@ -265,7 +265,7 @@ async fn test_loopback_state_machine_driven_qso() {
 
     // Station B responds to the CQ
     let qso_id_b = manager_b
-        .respond_to_cq("W1ABC".to_string(), freq)
+        .respond_to_cq("W1ABC".to_string(), freq, None)
         .await
         .unwrap();
 
