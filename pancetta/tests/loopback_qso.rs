@@ -1060,3 +1060,39 @@ fn test_two_simultaneous_qsos_loopback() {
         decoded_2.iter().map(|m| &m.text).collect::<Vec<_>>()
     );
 }
+
+/// At slot+5s past an Odd slot's start, with required parity = Odd, the
+/// scheduler picks THAT slot (not the next Odd 30s away) and produces a
+/// non-empty audio buffer with a cursor offset of 4500ms × sample_rate.
+#[test]
+fn schedule_tx_late_press_targets_current_opposite_slot() {
+    use chrono::TimeZone;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_lib::coordinator::schedule_tx;
+
+    let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let now = base + chrono::Duration::milliseconds(20_000); // :20.0
+    let s = schedule_tx(now, SlotParity::Odd, 8000, 12_000);
+    // The Odd slot at :15 ends at :30. We want to land in *that* slot.
+    assert_eq!((s.target_slot - base).num_seconds(), 15);
+    assert_eq!(s.cursor_offset_samples, 4_500 * 12);
+    assert_eq!(s.silent_pad_samples, 0);
+}
+
+/// Pressing Space at slot N + 14.6s with DX on Even must NOT pick the
+/// next Even slot — it must pick the Odd slot at :15. Regression test
+/// for the original bug.
+#[test]
+fn schedule_tx_no_collision_on_late_press_near_boundary() {
+    use chrono::TimeZone;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_lib::coordinator::schedule_tx;
+
+    let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let now = base + chrono::Duration::milliseconds(14_600); // :14.6
+    let s = schedule_tx(now, SlotParity::Odd, 8000, 12_000);
+    let secs = (s.target_slot - base).num_seconds();
+    // MUST be :15 (Odd), NOT :30 (Even — would collide with DX).
+    assert_eq!(secs, 15);
+    assert_ne!(secs, 30);
+}

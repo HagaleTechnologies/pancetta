@@ -32,6 +32,8 @@ mod tx;
 mod util;
 mod wav_playback;
 
+pub use tx::{schedule_tx, TxSchedule};
+
 use anyhow::Result;
 use pancetta_config::Config;
 use pancetta_ft8::Ft8Decoder;
