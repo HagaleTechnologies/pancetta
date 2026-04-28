@@ -388,7 +388,6 @@ impl super::ApplicationCoordinator {
                                 }
 
                                 MessageType::MultiTransmitRequest { items, tx_parity } => {
-                                    let _tx_parity = tx_parity; // wired into scheduler in Task 12
                                     info!("Multi-TX request: {} messages", items.len());
 
                                     // --- Step 1: Encode + modulate up front ---
@@ -428,7 +427,7 @@ impl super::ApplicationCoordinator {
                                         });
                                     }
 
-                                    let (samples_opt, duration_ms) = if !multi_items.is_empty() {
+                                    let (samples_opt, _duration_ms_encode) = if !multi_items.is_empty() {
                                         match pancetta_ft8::modulate_multi_tx(
                                             &multi_items,
                                             12000,
@@ -476,21 +475,59 @@ impl super::ApplicationCoordinator {
                                         }
                                     };
 
-                                    // --- Step 2: Compute precise FT8 audio-start time ---
-                                    // NOTE: MultiTransmitRequest will be migrated to
-                                    // schedule_tx in Task 12. For now use the legacy path.
-                                    let target_audio_utc = pancetta_core::slot::next_audio_start(
+                                    // --- Step 2: Resolve required parity ---
+                                    let required_parity = resolve_required_parity(
+                                        tx_parity,
+                                        tx_self_parity,
                                         chrono::Utc::now(),
-                                        chrono::Duration::seconds(1),
-                                    );
-                                    info!(
-                                        "Multi-TX scheduled: audio at {} (PTT {}ms earlier)",
-                                        target_audio_utc.format("%H:%M:%S%.3f UTC"),
-                                        ptt_lead_ms,
                                     );
 
-                                    // --- Step 3: Sleep until PTT engage ---
-                                    let ptt_target_utc = target_audio_utc
+                                    let schedule = schedule_tx(
+                                        chrono::Utc::now(),
+                                        required_parity,
+                                        tx_late_max_ms,
+                                        sample_rate,
+                                    );
+
+                                    info!(
+                                        "Multi-TX scheduled: parity={:?} target_slot={} pad={} samples cursor={} samples ({} items)",
+                                        required_parity,
+                                        schedule.target_slot.format("%H:%M:%S%.3f UTC"),
+                                        schedule.silent_pad_samples,
+                                        schedule.cursor_offset_samples,
+                                        item_texts.len(),
+                                    );
+
+                                    // --- Step 3: Build the audio buffer ---
+                                    let mut audio_out: Vec<f32> =
+                                        Vec::with_capacity(schedule.silent_pad_samples + samples.len());
+                                    audio_out.resize(schedule.silent_pad_samples, 0.0f32);
+                                    if schedule.cursor_offset_samples < samples.len() {
+                                        audio_out.extend_from_slice(
+                                            &samples[schedule.cursor_offset_samples..],
+                                        );
+                                    } else {
+                                        warn!("schedule_tx cursor exceeded multi-TX waveform; skipping");
+                                        for text in item_texts {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: text,
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
+                                        continue;
+                                    }
+                                    let audio_duration_ms =
+                                        (audio_out.len() as f64 / sample_rate as f64 * 1000.0) as u64;
+
+                                    // --- Step 4: Sleep until PTT engage instant ---
+                                    let ptt_target_utc = schedule.target_slot
                                         - chrono::Duration::milliseconds(ptt_lead_ms as i64);
                                     let to_ptt = pancetta_core::slot::duration_until(
                                         ptt_target_utc,
@@ -498,7 +535,7 @@ impl super::ApplicationCoordinator {
                                     );
                                     sleep(to_ptt).await;
 
-                                    // --- Step 4: Assert PTT ---
+                                    // --- Step 5: Assert PTT ---
                                     let mut ptt_guard = PttGuard::new(message_bus.clone());
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
@@ -514,20 +551,20 @@ impl super::ApplicationCoordinator {
                                         debug!("PTT on failed (no rig?): {}", e);
                                     }
 
-                                    // --- Step 5: Sleep precisely until audio-start ---
-                                    let to_audio = pancetta_core::slot::duration_until(
-                                        target_audio_utc,
+                                    // --- Step 6: Sleep precisely until target slot ---
+                                    let to_slot = pancetta_core::slot::duration_until(
+                                        schedule.target_slot,
                                         chrono::Utc::now(),
                                     );
-                                    sleep(to_audio).await;
+                                    sleep(to_slot).await;
 
-                                    // --- Step 6: Route audio to output ---
+                                    // --- Step 7: Route audio to output ---
                                     let audio_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Audio,
                                         MessageType::AudioOutput {
-                                            samples,
-                                            sample_rate: 12000,
+                                            samples: audio_out,
+                                            sample_rate,
                                         },
                                         Instant::now(),
                                     );
@@ -535,11 +572,12 @@ impl super::ApplicationCoordinator {
                                         debug!("Audio output routing: {}", e);
                                     }
 
-                                    // --- Step 7: Wait for playback to complete ---
-                                    sleep(Duration::from_millis(duration_ms)).await;
+                                    // --- Step 8: Wait for playback to complete ---
+                                    sleep(Duration::from_millis(audio_duration_ms)).await;
                                     let success = true;
+                                    let duration_ms = audio_duration_ms;
 
-                                    // --- Step 8: De-assert PTT (with tail delay) ---
+                                    // --- Step 9: De-assert PTT (with tail delay) ---
                                     sleep(Duration::from_millis(50)).await;
                                     let ptt_off_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
@@ -556,7 +594,7 @@ impl super::ApplicationCoordinator {
                                     }
                                     ptt_guard.disarm();
 
-                                    // --- Step 6: Send TransmitComplete for each item ---
+                                    // --- Step 10: Send TransmitComplete for each item ---
                                     for text in item_texts {
                                         let complete_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
