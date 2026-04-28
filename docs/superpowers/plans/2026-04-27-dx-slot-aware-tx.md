@@ -2305,7 +2305,10 @@ For each match that doesn't already pass the new parameter, add `, None`:
 
 ```bash
 touch pancetta-qso/src/auto_sequencer.rs
-cargo build --workspace --features transmit 2>&1 | tail -10
+# NEVER use --workspace here: pancetta-hamlib's tokio runtime conflict
+# hangs the test process indefinitely. Plain `cargo test` uses
+# `default-members` which excludes pancetta-hamlib for this reason.
+cargo build --features transmit 2>&1 | tail -10
 cargo test -p pancetta-qso 2>&1 | tail -10
 cargo test -p pancetta --test loopback_qso 2>&1 | tail -10
 ```
@@ -2424,8 +2427,14 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>"
 
 - [ ] **Step 1: Run every relevant test target.**
 
+> **Hard rule:** never run `cargo test --workspace` here. pancetta-hamlib has
+> a tokio runtime conflict that hangs the test process indefinitely (observed:
+> 1h 48min with no output). Plain `cargo test` uses `default-members` from the
+> workspace `Cargo.toml`, which excludes pancetta-hamlib. Test pancetta-hamlib
+> separately as shown below.
+
 ```bash
-cargo test --workspace --features transmit 2>&1 | tail -20
+cargo test --features transmit 2>&1 | tail -20
 cargo test -p pancetta-hamlib --lib -- --test-threads=1 2>&1 | tail -10
 cargo test -p pancetta --test loopback_qso 2>&1 | tail -10
 cargo test -p pancetta-qso --test parity_latch 2>&1 | tail -10
@@ -2436,7 +2445,8 @@ Expected: all green.
 - [ ] **Step 2: Run clippy and fmt.**
 
 ```bash
-cargo clippy --workspace --features transmit 2>&1 | tail -20
+# Same hard rule — no --workspace. Plain `cargo clippy` honours default-members.
+cargo clippy --features transmit 2>&1 | tail -20
 cargo fmt --all -- --check 2>&1 | tail -10
 ```
 
