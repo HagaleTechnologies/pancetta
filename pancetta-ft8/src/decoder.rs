@@ -4006,6 +4006,7 @@ mod tests {
             error_corrections: 0,
             tone_symbols: Some(symbols),
             ap_level: 0,
+            slot_parity: None,
         };
 
         decoder.subtract_signal(&mut audio, &msg);

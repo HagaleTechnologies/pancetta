@@ -809,6 +809,11 @@ pub struct DecodedMessage {
     pub tone_symbols: Option<Vec<u8>>,
     /// AP (A Priori) level used for this decode: 0 = no AP, 1-4 = AP level used.
     pub ap_level: u8,
+    /// Parity of the FT8 slot whose audio produced this decode. `None` until
+    /// the coordinator's decoder dispatch tags it (which it does for every
+    /// message routed to TUI / QSO / autonomous). Constructors leave it
+    /// unset because they don't have access to the slot timing.
+    pub slot_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
 impl DecodedMessage {
@@ -832,6 +837,7 @@ impl DecodedMessage {
             error_corrections: 0,
             tone_symbols: None,
             ap_level: 0,
+            slot_parity: None,
         }
     }
 
@@ -854,6 +860,7 @@ impl DecodedMessage {
             error_corrections: ldpc_errors.clamp(0, 255) as u8,
             tone_symbols: None,
             ap_level: 0,
+            slot_parity: None,
         }
     }
 }
@@ -2096,6 +2103,13 @@ mod tests {
         assert_eq!(decoded.confidence, 0.85);
         assert_eq!(decoded.frequency_offset, 1523.4);
         assert_eq!(decoded.time_offset, 2.1);
+    }
+
+    #[test]
+    fn decoded_message_default_slot_parity_is_none() {
+        let ft8_msg = Ft8Message::default();
+        let decoded = DecodedMessage::new(ft8_msg, -10.0, 0.9, 1500.0, 0.0);
+        assert_eq!(decoded.slot_parity, None);
     }
 
     #[test]

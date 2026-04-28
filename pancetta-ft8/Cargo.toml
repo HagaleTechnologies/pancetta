@@ -9,6 +9,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Shared types (SlotParity, etc.)
+pancetta-core = { path = "../pancetta-core" }
 # DSP and FFT operations
 rustfft = "6.4"
 # Numeric operations with SIMD optimization

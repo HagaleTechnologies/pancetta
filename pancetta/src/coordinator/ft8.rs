@@ -159,6 +159,24 @@ impl super::ApplicationCoordinator {
                             decoded_messages.len()
                         );
 
+                        // The audio window the decoder just processed corresponds
+                        // to the slot that ended just before now. We'll use that
+                        // slot's start time to compute its parity, and stamp every
+                        // decoded message with it. (All messages in this batch came
+                        // from the same audio window, so they share parity.)
+                        let now_utc = chrono::Utc::now();
+                        let next_boundary = pancetta_core::slot::next_slot_start(
+                            now_utc,
+                            chrono::Duration::zero(),
+                        );
+                        let slot_start = next_boundary
+                            - chrono::Duration::nanoseconds(pancetta_core::slot::SLOT_NS);
+                        let window_parity = pancetta_core::slot::SlotParity::of(slot_start);
+
+                        for decoded_msg in decoded_messages.iter_mut() {
+                            decoded_msg.slot_parity = Some(window_parity);
+                        }
+
                         for decoded_msg in &decoded_messages {
                             info!(
                                 "FT8 decoded: {} (SNR: {:.0}, freq: {:.1})",
