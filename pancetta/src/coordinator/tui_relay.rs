@@ -131,6 +131,7 @@ impl super::ApplicationCoordinator {
                                 message: decoded_msg.text.clone(),
                                 distance,
                                 bearing,
+                                slot_parity: decoded_msg.slot_parity,
                             };
 
                             match tui_msg_tx_relay.send(

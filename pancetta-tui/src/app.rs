@@ -54,6 +54,12 @@ pub struct DecodedMessageView {
     pub message: String,
     pub distance: Option<f64>,
     pub bearing: Option<f64>,
+    /// Which 15-second FT8 slot the message was decoded from.
+    /// `None` if the source did not tag the message with slot parity (e.g.
+    /// test fixtures or legacy code paths).  Used by the TUI Space-press
+    /// handler to tell the QSO layer which parity the remote station is
+    /// transmitting on so we can reply on the opposite parity.
+    pub slot_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
 /// Pipeline component health snapshot, forwarded from coordinator

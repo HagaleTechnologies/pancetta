@@ -41,9 +41,9 @@ clap = { version = "4.5", features = ["derive"] }
 # Additional utility crates
 dirs = "5.0"
 
-# Ham radio specific (will be implemented later)
+# Ham radio specific
 # ft8-lib = { path = "../ft8-lib" }
-# pancetta-core = { path = "../pancetta-core" }
+pancetta-core = { path = "../pancetta-core" }
 
 [dev-dependencies]
 tokio-test = "0.4"
