@@ -51,8 +51,8 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
             Constraint::Length(1), // Active-QSOs banner (always 1 row;
             // shows "(none)" placeholder when
             // no QSOs are in flight)
-            Constraint::Percentage(45), // Band activity
-            Constraint::Percentage(30), // Waterfall
+            Constraint::Percentage(35), // Band activity (was 45)
+            Constraint::Percentage(40), // Waterfall (was 30)
             Constraint::Percentage(25), // QSO status
         ])
         .split(main_chunks[0]);
@@ -320,6 +320,21 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|m| m.delta_freq as f64)
         .collect();
 
+    // Build (freq, parity, timestamp) tuples for the occupancy strip from
+    // recent decodes. Filter to last 60s; the widget further trims by column.
+    let cutoff = chrono::Utc::now() - chrono::Duration::seconds(60);
+    let decoded_for_occupancy: Vec<(
+        f64,
+        pancetta_core::slot::SlotParity,
+        chrono::DateTime<chrono::Utc>,
+    )> = app
+        .decoded_messages
+        .iter()
+        .filter(|m| m.timestamp >= cutoff)
+        .filter_map(|m| m.slot_parity.map(|p| (m.delta_freq as f64, p, m.timestamp)))
+        .collect();
+    let tx_parity = app.resolve_tx_parity();
+
     let title = format!(" Waterfall [/]: TX {:.0} Hz ", app.tx_frequency_offset);
     let waterfall_block = Block::default()
         .title(Span::styled(
@@ -333,7 +348,9 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
         .block(waterfall_block)
         .tx_offset(app.tx_frequency_offset)
         .signal_freqs(signal_freqs)
-        .color_capability(app.color_capability);
+        .color_capability(app.color_capability)
+        .decoded_for_occupancy(&decoded_for_occupancy)
+        .tx_parity(tx_parity);
     f.render_widget(waterfall, area);
 }
 
