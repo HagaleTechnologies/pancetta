@@ -115,6 +115,11 @@ pub enum TuiCommand {
     SendMessage { text: String },
     /// Toggle PTT
     TogglePtt,
+    /// Abort the in-flight TX without exiting pancetta. Operator-pressed F8.
+    /// Distinct from Ctrl-Q (whole-app shutdown) and StopCq (turn off
+    /// repeating CQ). Drops PTT within ~150ms via the same PttGuard
+    /// mechanism the shutdown path uses.
+    StopTx,
     /// Call a station (click-to-call from band activity)
     CallStation {
         callsign: String,
@@ -435,6 +440,12 @@ impl TuiRunner {
             KeyCode::F(3) => {
                 // F3 - Stop CQ
                 self.message_tx.send(TuiCommand::StopCq)?;
+            }
+            KeyCode::F(8) => {
+                // F8 - Halt current TX (matches WSJT-X muscle memory).
+                // Releases PTT within ~150ms; pancetta keeps running and
+                // listening. Distinct from Ctrl-Q (whole-app exit).
+                self.message_tx.send(TuiCommand::StopTx)?;
             }
             KeyCode::F(5) => {
                 // F5 - Clear messages

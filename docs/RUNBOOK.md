@@ -162,16 +162,24 @@ operator-supervised.
 
 ### Failure modes & abort
 
-- **Ctrl-Q at any time releases PTT within ~150ms.** Three independent
-  paths fire on shutdown: (1) coordinator sends a PTT-off via the
-  message bus to Hamlib, (2) coordinator opens a fresh rigctld TCP
-  connection and sends PTT-off directly (independent of the running
-  Hamlib component), (3) the in-flight TX worker's interruptible
-  sleeps wake within one 50ms poll chunk on shutdown, drop their
-  `PttGuard` (which sends a third PTT-off as RAII cleanup), and exit
-  the message arm. **Test this on dummy load before going live**: arm
-  a manual Space-bar TX, hit Ctrl-Q while audio is playing, confirm
-  PTT releases within ~200ms (rig display, ALC drops to zero).
+- **F8 halts the current TX without exiting.** Same ~150ms PTT-release
+  as Ctrl-Q (interruptible_sleep wakes the TX worker, drops PttGuard
+  → PTT-off), but pancetta keeps running and listening for the next
+  slot. F8 also stops repeating CQ (so you don't immediately re-arm).
+  Use F8 when you want to abort the *current* attempt — you misdialed,
+  the conditions changed, you saw a higher-priority decode mid-TX.
+  **Test this on dummy load before going live**: arm a manual Space-
+  bar TX, hit F8 while audio is playing, confirm PTT releases within
+  ~200ms and pancetta is still up.
+
+- **Ctrl-Q at any time releases PTT within ~150ms AND exits.** Three
+  independent paths fire on shutdown: (1) coordinator sends a PTT-off
+  via the message bus to Hamlib, (2) coordinator opens a fresh
+  rigctld TCP connection and sends PTT-off directly (independent of
+  the running Hamlib component), (3) the in-flight TX worker's
+  interruptible sleeps wake within one 50ms poll chunk on shutdown,
+  drop their `PttGuard` (which sends a third PTT-off as RAII cleanup),
+  and exit. Same dummy-load test applies; F8 is the lighter version.
 
 - **Ctrl-C** also works for emergency shutdown. The signal-hook task
   triggers the same coordinator shutdown path.

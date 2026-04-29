@@ -131,11 +131,13 @@ cargo run --release
 | `Tab` | Cycle active panel (Band Activity, DX Hunter, Waterfall, Station Info) |
 | `↑` / `↓` | Move selection within the active panel |
 | `Space` | Call the selected station (queues a TX for the next slot) |
-| `c` | Start auto-CQ (call CQ every cycle until stopped) |
-| `s` | Stop auto-CQ |
+| `F2` | Start repeating CQ |
+| `F3` | Stop repeating CQ |
+| `F8` | **Halt current TX** (drops PTT within ~150ms; pancetta keeps running) |
+| `F9` | Toggle PTT manually |
 | `D` | Open audio device picker |
 | `?` / `F1` | Toggle help overlay |
-| `q` / `Esc` | Quit |
+| `Ctrl-Q` / `Esc` | Quit (also halts any in-flight TX) |
 
 The status bar at the bottom shows live pipeline state, your TX queue,
 and any errors emitted by the audio / QSO components.

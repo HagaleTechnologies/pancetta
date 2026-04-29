@@ -84,26 +84,33 @@ pub fn schedule_tx(
     }
 }
 
-/// Sleep for `total` duration, but wake early (and return `true`) if the
-/// shutdown flag flips while we wait. Polled in 50ms chunks so the
-/// worst-case latency from `shutdown.store(true)` to wake is 50ms.
+/// Sleep for `total` duration, but wake early (return `true`) if EITHER
+/// the shutdown flag or the abort-current-tx flag flips while we wait.
+/// Polled in 50ms chunks so worst-case wake latency is ~50ms.
 ///
-/// Used inside the TX worker's per-message arm to guarantee Ctrl-Q during
-/// an in-flight TX takes effect within ~50ms — without this, each
-/// `sleep().await` was uninterruptible and the worker could continue
-/// driving PTT and audio for ~13 seconds after shutdown was requested.
+/// Used inside the TX worker's per-message arm to guarantee both Ctrl-Q
+/// (whole-app shutdown) and F8 (abort current TX, keep app running)
+/// take effect within ~50ms. Without this, each `sleep().await` was
+/// uninterruptible and the worker could continue driving PTT and audio
+/// for ~13 seconds after the operator asked it to stop.
+///
+/// The caller checks `shutdown.load()` after wake to distinguish:
+/// - shutdown set → break the outer worker loop
+/// - shutdown clear, abort set → reset abort, send TransmitComplete
+///   failure, `continue` to the next message
 async fn interruptible_sleep(
     total: Duration,
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    abort: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> bool {
     use std::sync::atomic::Ordering;
-    if shutdown.load(Ordering::Acquire) {
+    if shutdown.load(Ordering::Acquire) || abort.load(Ordering::Acquire) {
         return true;
     }
     let chunk = Duration::from_millis(50);
     let deadline = tokio::time::Instant::now() + total;
     while tokio::time::Instant::now() < deadline {
-        if shutdown.load(Ordering::Acquire) {
+        if shutdown.load(Ordering::Acquire) || abort.load(Ordering::Acquire) {
             return true;
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -185,6 +192,7 @@ impl super::ApplicationCoordinator {
 
         let tx_handle = {
             let shutdown = self.shutdown_signal.clone();
+            let abort_current_tx = self.abort_current_tx.clone();
 
             tokio::spawn(async move {
                 info!("FT8 transmitter component ready");
@@ -199,6 +207,10 @@ impl super::ApplicationCoordinator {
                 };
 
                 while !shutdown.load(Ordering::Acquire) {
+                    // Reset the per-message abort flag at the start of every
+                    // try_recv cycle. Keeps a stale F8 from earlier (when no
+                    // TX was in flight) from killing the next legitimate TX.
+                    abort_current_tx.store(false, Ordering::Release);
                     match tx_rx.try_recv() {
                         Ok(message) => {
                             match message.message_type {
@@ -338,9 +350,15 @@ impl super::ApplicationCoordinator {
                                         ptt_target_utc,
                                         chrono::Utc::now(),
                                     );
-                                    if interruptible_sleep(to_ptt, &shutdown).await {
-                                        info!("TX aborted before PTT engage by shutdown signal");
-                                        break;
+                                    if interruptible_sleep(to_ptt, &shutdown, &abort_current_tx)
+                                        .await
+                                    {
+                                        if shutdown.load(Ordering::Acquire) {
+                                            info!("TX aborted before PTT engage by shutdown");
+                                            break;
+                                        }
+                                        info!("TX aborted before PTT engage by operator (F8)");
+                                        continue;
                                     }
 
                                     // --- Step 5: Assert PTT ---
@@ -366,13 +384,17 @@ impl super::ApplicationCoordinator {
                                         schedule.target_slot,
                                         chrono::Utc::now(),
                                     );
-                                    if interruptible_sleep(to_slot, &shutdown).await {
-                                        info!(
-                                            "TX aborted between PTT engage and slot start; \
-                                             ptt_guard will drop PTT off"
-                                        );
-                                        // ptt_guard is in scope; drop on `break` fires PTT-off.
-                                        break;
+                                    if interruptible_sleep(to_slot, &shutdown, &abort_current_tx)
+                                        .await
+                                    {
+                                        // ptt_guard in scope — drop on `break`/`continue`
+                                        // fires PTT-off either way.
+                                        if shutdown.load(Ordering::Acquire) {
+                                            info!("TX aborted between PTT and slot by shutdown");
+                                            break;
+                                        }
+                                        info!("TX aborted between PTT and slot by operator (F8)");
+                                        continue;
                                     }
 
                                     // --- Step 7: Route audio to output ---
@@ -393,24 +415,34 @@ impl super::ApplicationCoordinator {
                                     if interruptible_sleep(
                                         Duration::from_millis(audio_duration_ms),
                                         &shutdown,
+                                        &abort_current_tx,
                                     )
                                     .await
                                     {
-                                        info!(
-                                            "TX aborted during audio playback; ptt_guard will \
-                                             drop PTT off"
-                                        );
-                                        break;
+                                        if shutdown.load(Ordering::Acquire) {
+                                            info!("TX aborted during playback by shutdown");
+                                            break;
+                                        }
+                                        info!("TX aborted during playback by operator (F8)");
+                                        continue;
                                     }
                                     let success = true;
                                     let duration_ms = audio_duration_ms;
 
                                     // --- Step 9: De-assert PTT (with tail delay) ---
-                                    if interruptible_sleep(Duration::from_millis(50), &shutdown)
-                                        .await
+                                    if interruptible_sleep(
+                                        Duration::from_millis(50),
+                                        &shutdown,
+                                        &abort_current_tx,
+                                    )
+                                    .await
                                     {
-                                        info!("TX aborted during 50ms tail; ptt_guard handles PTT off");
-                                        break;
+                                        if shutdown.load(Ordering::Acquire) {
+                                            info!("TX aborted during tail by shutdown");
+                                            break;
+                                        }
+                                        info!("TX aborted during tail by operator (F8)");
+                                        continue;
                                     }
                                     let ptt_off_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
@@ -593,11 +625,15 @@ impl super::ApplicationCoordinator {
                                         ptt_target_utc,
                                         chrono::Utc::now(),
                                     );
-                                    if interruptible_sleep(to_ptt, &shutdown).await {
-                                        info!(
-                                            "Multi-TX aborted before PTT engage by shutdown signal"
-                                        );
-                                        break;
+                                    if interruptible_sleep(to_ptt, &shutdown, &abort_current_tx)
+                                        .await
+                                    {
+                                        if shutdown.load(Ordering::Acquire) {
+                                            info!("Multi-TX aborted before PTT by shutdown");
+                                            break;
+                                        }
+                                        info!("Multi-TX aborted before PTT by operator (F8)");
+                                        continue;
                                     }
 
                                     // --- Step 5: Assert PTT ---
@@ -621,12 +657,17 @@ impl super::ApplicationCoordinator {
                                         schedule.target_slot,
                                         chrono::Utc::now(),
                                     );
-                                    if interruptible_sleep(to_slot, &shutdown).await {
-                                        info!(
-                                            "Multi-TX aborted between PTT engage and slot start; \
-                                             ptt_guard will drop PTT off"
-                                        );
-                                        break;
+                                    if interruptible_sleep(to_slot, &shutdown, &abort_current_tx)
+                                        .await
+                                    {
+                                        if shutdown.load(Ordering::Acquire) {
+                                            info!(
+                                                "Multi-TX aborted between PTT and slot by shutdown"
+                                            );
+                                            break;
+                                        }
+                                        info!("Multi-TX aborted between PTT and slot by operator (F8)");
+                                        continue;
                                     }
 
                                     // --- Step 7: Route audio to output ---
@@ -647,26 +688,34 @@ impl super::ApplicationCoordinator {
                                     if interruptible_sleep(
                                         Duration::from_millis(audio_duration_ms),
                                         &shutdown,
+                                        &abort_current_tx,
                                     )
                                     .await
                                     {
-                                        info!(
-                                            "Multi-TX aborted during audio playback; ptt_guard \
-                                             will drop PTT off"
-                                        );
-                                        break;
+                                        if shutdown.load(Ordering::Acquire) {
+                                            info!("Multi-TX aborted during playback by shutdown");
+                                            break;
+                                        }
+                                        info!("Multi-TX aborted during playback by operator (F8)");
+                                        continue;
                                     }
                                     let success = true;
                                     let duration_ms = audio_duration_ms;
 
                                     // --- Step 9: De-assert PTT (with tail delay) ---
-                                    if interruptible_sleep(Duration::from_millis(50), &shutdown)
-                                        .await
+                                    if interruptible_sleep(
+                                        Duration::from_millis(50),
+                                        &shutdown,
+                                        &abort_current_tx,
+                                    )
+                                    .await
                                     {
-                                        info!(
-                                            "Multi-TX aborted during 50ms tail; ptt_guard handles PTT off"
-                                        );
-                                        break;
+                                        if shutdown.load(Ordering::Acquire) {
+                                            info!("Multi-TX aborted during tail by shutdown");
+                                            break;
+                                        }
+                                        info!("Multi-TX aborted during tail by operator (F8)");
+                                        continue;
                                     }
                                     let ptt_off_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
@@ -889,10 +938,11 @@ mod schedule_tx_tests {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
         let shutdown = Arc::new(AtomicBool::new(false));
-        let interrupted = interruptible_sleep(Duration::from_millis(120), &shutdown).await;
+        let abort = Arc::new(AtomicBool::new(false));
+        let interrupted = interruptible_sleep(Duration::from_millis(120), &shutdown, &abort).await;
         assert!(
             !interrupted,
-            "should not flag interrupted when shutdown stays false"
+            "should not flag interrupted when both flags stay false"
         );
     }
 
@@ -901,14 +951,34 @@ mod schedule_tx_tests {
         use std::sync::atomic::AtomicBool;
         use std::sync::Arc;
         let shutdown = Arc::new(AtomicBool::new(true));
+        let abort = Arc::new(AtomicBool::new(false));
         let start = std::time::Instant::now();
-        let interrupted = interruptible_sleep(Duration::from_secs(60), &shutdown).await;
+        let interrupted = interruptible_sleep(Duration::from_secs(60), &shutdown, &abort).await;
         let elapsed = start.elapsed();
         assert!(
             interrupted,
             "must signal interrupted when shutdown is already set"
         );
-        // Should return without entering the sleep loop.
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "should return without sleeping (elapsed={:?})",
+            elapsed
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interruptible_sleep_returns_immediately_if_already_aborted() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(true));
+        let start = std::time::Instant::now();
+        let interrupted = interruptible_sleep(Duration::from_secs(60), &shutdown, &abort).await;
+        let elapsed = start.elapsed();
+        assert!(
+            interrupted,
+            "must signal interrupted when abort is already set"
+        );
         assert!(
             elapsed < Duration::from_millis(50),
             "should return without sleeping (elapsed={:?})",
@@ -921,6 +991,7 @@ mod schedule_tx_tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
         let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
         let s2 = shutdown.clone();
         // After 200ms, flip the shutdown flag.
         let setter = tokio::spawn(async move {
@@ -928,7 +999,7 @@ mod schedule_tx_tests {
             s2.store(true, Ordering::Release);
         });
         let start = std::time::Instant::now();
-        let interrupted = interruptible_sleep(Duration::from_secs(30), &shutdown).await;
+        let interrupted = interruptible_sleep(Duration::from_secs(30), &shutdown, &abort).await;
         let elapsed = start.elapsed();
         let _ = setter.await;
         assert!(

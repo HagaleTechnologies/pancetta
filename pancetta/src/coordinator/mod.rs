@@ -77,6 +77,12 @@ pub struct ApplicationCoordinator {
     /// Application state
     is_running: Arc<AtomicBool>,
     shutdown_signal: Arc<AtomicBool>,
+    /// Operator-requested abort of the in-flight TX without exiting.
+    /// F8 → TUI sets this true; the TX worker's interruptible_sleep wakes,
+    /// drops PttGuard (PTT-off), sends TransmitComplete failure, resets
+    /// the flag at the start of the next message, and continues.
+    /// Distinct from `shutdown_signal` (which means "stop the whole app").
+    abort_current_tx: Arc<AtomicBool>,
     startup_time: Instant,
 
     /// Configuration
@@ -286,6 +292,7 @@ impl ApplicationCoordinator {
             component_status: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(AtomicBool::new(false)),
             shutdown_signal,
+            abort_current_tx: Arc::new(AtomicBool::new(false)),
             startup_time,
             audio_device,
             no_audio,

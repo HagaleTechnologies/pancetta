@@ -285,6 +285,7 @@ impl super::ApplicationCoordinator {
         };
         let cmd_ptt_state = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_cq_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cmd_abort_current_tx = self.abort_current_tx.clone();
         let cmd_handle = tokio::spawn(async move {
             let mut next_cq_time: Option<tokio::time::Instant> = None;
 
@@ -386,6 +387,22 @@ impl super::ApplicationCoordinator {
                         }
                         pancetta_tui::tui_runner::TuiCommand::StopCq => {
                             info!("TUI StopCq: stopping repeating CQ");
+                            cmd_cq_active.store(false, Ordering::Relaxed);
+                            next_cq_time = None;
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::StopTx => {
+                            // Operator F8: abort the in-flight TX without
+                            // exiting. The TX worker's interruptible_sleep
+                            // wakes within ~50ms, drops PttGuard (PTT-off),
+                            // and continues to the next message. The flag
+                            // is reset by the worker at the start of each
+                            // try_recv cycle so a stale F8 doesn't kill
+                            // the next legitimate TX.
+                            //
+                            // Also stop the repeating-CQ loop so we don't
+                            // immediately re-arm a new TX in the next cycle.
+                            info!("TUI StopTx: halting current TX (F8)");
+                            cmd_abort_current_tx.store(true, Ordering::Release);
                             cmd_cq_active.store(false, Ordering::Relaxed);
                             next_cq_time = None;
                         }
