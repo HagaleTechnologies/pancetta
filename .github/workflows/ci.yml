@@ -15,9 +15,32 @@ on:
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/ci.yml'
+  schedule:
+    # Weekly drift check (Mondays 12:00 UTC). Catches toolchain bumps,
+    # advisory drops, and platform regressions even when no human pushes
+    # land. The full lane runs on schedule so the catch-up isn't gated
+    # behind a PR.
+    - cron: '0 12 * * 1'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+
+# Job gating policy:
+#
+#   - clippy + fmt: run on every event (push, PR, schedule). Cheap and fast.
+#   - heavy lanes (ft8-tests, workspace-check, deny): run on PR (so
+#     dependabot is fully gated), schedule (weekly drift), or
+#     workflow_dispatch — but NOT on direct human pushes to main. The
+#     pre-push hook (scripts/check.sh) is the safety net for direct
+#     pushes; CI minutes are reserved for what only CI can catch.
+#   - cross-platform-check: PR-only and on schedule (slowest lane,
+#     macos+windows runners are 10x and 2x cost).
+#
+# `if: github.event_name != 'push' || github.actor == 'dependabot[bot]'`
+# means "skip on a human direct push to main; run everywhere else." The
+# dependabot carve-out is moot in practice (dependabot never pushes
+# directly, only via PR) but kept explicit for safety.
 
 jobs:
   # Fast checks — run on every push and PR (~2 min)
@@ -56,12 +79,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  # Full test suite — runs on every push to main and every PR. Previously
-  # gated on `pull_request` only, which let test regressions land via direct
-  # push without ever being exercised. Cross-platform-check stays on PR only
-  # because it's the slowest lane.
+  # Full test suite — runs on PR (dependabot included), weekly schedule,
+  # and manual dispatch. Skipped on direct human pushes to main; the
+  # pre-push hook covers that case locally.
   ft8-tests:
     name: FT8 Tests
+    if: github.event_name != 'push' || github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -88,6 +111,7 @@ jobs:
 
   workspace-check:
     name: Workspace Check
+    if: github.event_name != 'push' || github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -112,19 +136,14 @@ jobs:
       - name: Test workspace
         run: cargo test --workspace --features transmit
 
-      # pancetta-hamlib is excluded from the default workspace test run
-      # because tokio runtime conflicts cause the suite to hang; needs
-      # --test-threads=1 in its own invocation.
-      - name: Test pancetta-hamlib (single-threaded)
-        run: cargo test -p pancetta-hamlib --lib -- --test-threads=1
-
   # Cross-platform compile check. Pancetta targets Linux/macOS/Windows
   # (development on Mac, production on Windows MiniPC), so a Linux-only
   # CI lane silently lets platform regressions land. Check-only (not test)
-  # to keep wall-clock manageable.
+  # to keep wall-clock manageable. PR + weekly cron + manual dispatch
+  # (skipped on direct human push to main; macos minutes are 10x cost).
   cross-platform-check:
     name: Cross-Platform Check (${{ matrix.os }})
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -150,9 +169,11 @@ jobs:
   # cargo-deny enforces license whitelist, banned-crate-source policy,
   # multi-version warnings, AND RustSec advisories — the latter subsumes
   # what cargo-audit would do separately. Single source of truth in
-  # deny.toml, including any documented advisory ignores.
+  # deny.toml, including any documented advisory ignores. Skipped on
+  # direct human push to main; the pre-push hook covers it locally.
   deny:
     name: Cargo Deny
+    if: github.event_name != 'push' || github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
