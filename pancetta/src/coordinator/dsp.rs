@@ -198,6 +198,10 @@ impl super::ApplicationCoordinator {
 
             // Live waterfall state
             let mut last_live_wf_samples: usize = 0;
+            const BIN_HISTORY_LEN: usize = 60;
+            const NOISE_FLOOR_DB_SCALE: f32 = 12.0;
+            const MIN_HISTORY_FOR_FLOOR: usize = 5;
+            let mut bin_history: Vec<std::collections::VecDeque<f32>> = Vec::new();
             let mut live_wf_planner = rustfft::FftPlanner::<f32>::new();
             let live_wf_fft = live_wf_planner.plan_fft_forward(2048);
 
@@ -305,11 +309,43 @@ impl super::ApplicationCoordinator {
                                     })
                                     .collect();
 
-                                let min_p = powers.iter().cloned().fold(f32::MAX, f32::min);
-                                let max_p = powers.iter().cloned().fold(f32::MIN, f32::max);
-                                let range = (max_p - min_p).max(1.0);
-                                let row: Vec<f32> =
-                                    powers.iter().map(|&p| (p - min_p) / range).collect();
+                                // Lazy-init history with the right number of bins on the first row
+                                // so we don't have to know `bin_end + 1` before the FFT runs.
+                                if bin_history.len() != powers.len() {
+                                    bin_history = (0..powers.len())
+                                        .map(|_| {
+                                            std::collections::VecDeque::with_capacity(
+                                                BIN_HISTORY_LEN,
+                                            )
+                                        })
+                                        .collect();
+                                }
+
+                                // Push current dB powers into per-bin history (drop oldest if full).
+                                for (i, &p) in powers.iter().enumerate() {
+                                    if bin_history[i].len() >= BIN_HISTORY_LEN {
+                                        bin_history[i].pop_front();
+                                    }
+                                    bin_history[i].push_back(p);
+                                }
+
+                                // Output row: signal-above-floor in 0..1 (0..NOISE_FLOOR_DB_SCALE dB above
+                                // the rolling per-bin median). Until each bin has MIN_HISTORY_FOR_FLOOR
+                                // samples, emit zero so the waterfall starts dim instead of with garbage.
+                                let row: Vec<f32> = powers
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, &p)| {
+                                        if bin_history[i].len() < MIN_HISTORY_FOR_FLOOR {
+                                            return 0.0;
+                                        }
+                                        let history: Vec<f32> =
+                                            bin_history[i].iter().copied().collect();
+                                        let median = rolling_median(&history);
+                                        ((p - median).max(0.0) / NOISE_FLOOR_DB_SCALE)
+                                            .clamp(0.0, 1.0)
+                                    })
+                                    .collect();
                                 let _ = live_waterfall_tx.try_send(vec![row]);
 
                                 // Send audio level (RMS) to TUI — once per second
