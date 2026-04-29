@@ -7,6 +7,58 @@ use ratatui::{
 
 use crate::app::ColorCapability;
 
+/// Color a column of the occupancy strip by recent decode activity.
+/// Red = decode within ±37.5 Hz in YOUR TX parity in the last 60s.
+/// Yellow = decode within ±37.5 Hz in the OTHER parity (or own-parity unknown).
+/// None = column is clear (no decodes nearby in the last 60s).
+///
+/// `decoded` is `(frequency_hz, parity, timestamp)`. `tx_parity = None`
+/// (operator's parity unknown — Auto + idle) collapses red→yellow because
+/// we can't say if a decode would collide.
+pub(crate) fn occupancy_color(
+    col: usize,
+    width: usize,
+    freq_range: (f64, f64),
+    decoded: &[(
+        f64,
+        pancetta_core::slot::SlotParity,
+        chrono::DateTime<chrono::Utc>,
+    )],
+    tx_parity: Option<pancetta_core::slot::SlotParity>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<ratatui::style::Color> {
+    if width == 0 {
+        return None;
+    }
+    let (lo, hi) = freq_range;
+    let bin_hz = (hi - lo) / width as f64;
+    let center = lo + (col as f64 + 0.5) * bin_hz;
+    let cutoff = now - chrono::Duration::seconds(60);
+
+    let in_band = |d: &(
+        f64,
+        pancetta_core::slot::SlotParity,
+        chrono::DateTime<chrono::Utc>,
+    )| { (d.0 - center).abs() <= 37.5 && d.2 >= cutoff };
+
+    let any_in_band = decoded.iter().any(in_band);
+    if !any_in_band {
+        return None;
+    }
+
+    match tx_parity {
+        Some(my_parity) => {
+            let busy_own = decoded.iter().any(|d| in_band(d) && d.1 == my_parity);
+            if busy_own {
+                Some(ratatui::style::Color::Red)
+            } else {
+                Some(ratatui::style::Color::Yellow)
+            }
+        }
+        None => Some(ratatui::style::Color::Yellow),
+    }
+}
+
 /// Custom waterfall widget for displaying spectrum data
 pub struct Waterfall<'a> {
     block: Option<Block<'a>>,
@@ -658,5 +710,61 @@ mod tests {
 
         let meter_high = SignalMeter::new(0.9).thresholds(0.3, 0.8);
         assert_eq!(meter_high.get_meter_color(), Color::Green);
+    }
+
+    #[test]
+    fn occupancy_red_when_decode_in_own_parity() {
+        use chrono::{Duration, Utc};
+        use pancetta_core::slot::SlotParity;
+        let now = Utc::now();
+        let decoded = vec![(1500.0, SlotParity::Even, now - Duration::seconds(10))];
+        let c = occupancy_color(40, 80, (0.0, 3000.0), &decoded, Some(SlotParity::Even), now);
+        assert_eq!(c, Some(Color::Red));
+    }
+
+    #[test]
+    fn occupancy_yellow_when_decode_in_other_parity_only() {
+        use chrono::{Duration, Utc};
+        use pancetta_core::slot::SlotParity;
+        let now = Utc::now();
+        let decoded = vec![(1500.0, SlotParity::Odd, now - Duration::seconds(10))];
+        let c = occupancy_color(40, 80, (0.0, 3000.0), &decoded, Some(SlotParity::Even), now);
+        assert_eq!(c, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn occupancy_drops_decodes_older_than_60s() {
+        use chrono::{Duration, Utc};
+        use pancetta_core::slot::SlotParity;
+        let now = Utc::now();
+        let decoded = vec![(1500.0, SlotParity::Even, now - Duration::seconds(120))];
+        let c = occupancy_color(40, 80, (0.0, 3000.0), &decoded, Some(SlotParity::Even), now);
+        // 60+s old decode should be excluded; column has no relevant decodes.
+        // With an empty band-overall (all decodes filtered), returns None.
+        assert_eq!(c, None);
+    }
+
+    #[test]
+    fn occupancy_drops_decodes_outside_band() {
+        use chrono::{Duration, Utc};
+        use pancetta_core::slot::SlotParity;
+        let now = Utc::now();
+        let decoded = vec![(2000.0, SlotParity::Even, now - Duration::seconds(10))];
+        // Column 40 in width 80 over (0,3000) = 1500 Hz ± 18.75. 2000 is well outside.
+        let c = occupancy_color(40, 80, (0.0, 3000.0), &decoded, Some(SlotParity::Even), now);
+        // Decode exists but not in this column's band — column itself has
+        // nothing nearby in either parity → None.
+        assert_eq!(c, None);
+    }
+
+    #[test]
+    fn occupancy_yellow_when_no_tx_parity_known() {
+        use chrono::{Duration, Utc};
+        use pancetta_core::slot::SlotParity;
+        let now = Utc::now();
+        let decoded = vec![(1500.0, SlotParity::Even, now - Duration::seconds(10))];
+        // tx_parity = None means we can't say "your" vs "their" — collapse to yellow.
+        let c = occupancy_color(40, 80, (0.0, 3000.0), &decoded, None, now);
+        assert_eq!(c, Some(Color::Yellow));
     }
 }
