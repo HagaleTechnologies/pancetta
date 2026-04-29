@@ -161,6 +161,16 @@ pub enum MessageType {
     /// Audio output samples for transmission
     AudioOutput { samples: Vec<f32>, sample_rate: u32 },
 
+    /// Single-tone tune transmission (operator pressed F4). Engages PTT,
+    /// emits a continuous sine wave at `tone_offset_hz` for `duration_secs`
+    /// or until aborted (F4-toggle, F8 halt, or shutdown). Bypasses the
+    /// slot-aware scheduler — tune happens immediately, no parity logic.
+    /// Amplitude is hardcoded at 0.5 (operator manages rig power).
+    TuneRequest {
+        duration_secs: u32,
+        tone_offset_hz: f64,
+    },
+
     /// Snapshot of in-progress QSOs, pushed by the QSO coordinator
     /// on every state change. tui_relay forwards this to the TUI as
     /// `TuiMessage::ActiveQsosUpdate`; the TUI replaces its previous

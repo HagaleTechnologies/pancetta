@@ -162,6 +162,16 @@ operator-supervised.
 
 ### Failure modes & abort
 
+- **F4 tunes the antenna.** Single 1500 Hz tone with PTT engaged for
+  12 seconds (matches WSJT-X's tune semantics, except WSJT-X has no
+  auto-stop; pancetta auto-stops to play nice with the 14-second
+  PTT safety watchdog). Amplitude is 0.5 (fixed in source); operator
+  is responsible for setting rig power *low* before pressing F4.
+  Press F4 again to abort early; F8 also halts; the auto-stop is the
+  third backstop. **Workflow**: dial rig power down to ~10W, press
+  F4, watch your antenna analyzer / SWR meter, optionally press F4
+  again when you're done. Re-press F4 to extend past 12s.
+
 - **F8 halts the current TX without exiting.** Same ~150ms PTT-release
   as Ctrl-Q (interruptible_sleep wakes the TX worker, drops PttGuard
   → PTT-off), but pancetta keeps running and listening for the next

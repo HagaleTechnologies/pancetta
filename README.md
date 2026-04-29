@@ -133,6 +133,7 @@ cargo run --release
 | `Space` | Call the selected station (queues a TX for the next slot) |
 | `F2` | Start repeating CQ |
 | `F3` | Stop repeating CQ |
+| `F4` | **Tune** — 12s single tone at 1500 Hz (PTT engaged). Press again to abort. |
 | `F8` | **Halt current TX** (drops PTT within ~150ms; pancetta keeps running) |
 | `F9` | Toggle PTT manually |
 | `D` | Open audio device picker |

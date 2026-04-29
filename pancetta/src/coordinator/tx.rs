@@ -751,6 +751,100 @@ impl super::ApplicationCoordinator {
                                     }
                                 }
 
+                                MessageType::TuneRequest {
+                                    duration_secs,
+                                    tone_offset_hz,
+                                } => {
+                                    info!("Tune: {}s tone at {} Hz", duration_secs, tone_offset_hz);
+
+                                    // Generate a continuous sine wave
+                                    // (single tone, zero-bandwidth on air).
+                                    // Amplitude 0.5 — operator manages rig
+                                    // power. WSJT-X uses peak amplitude;
+                                    // we run gentler so a forgotten rig
+                                    // power setting is less likely to
+                                    // overdrive.
+                                    let n_samples =
+                                        (duration_secs as usize) * (sample_rate as usize);
+                                    let omega = 2.0 * std::f64::consts::PI * tone_offset_hz
+                                        / sample_rate as f64;
+                                    let tone_samples: Vec<f32> = (0..n_samples)
+                                        .map(|i| ((i as f64) * omega).sin() as f32 * 0.5)
+                                        .collect();
+                                    let audio_duration_ms = (duration_secs as u64) * 1000;
+
+                                    // Engage PTT immediately. No slot
+                                    // scheduling: tune happens NOW.
+                                    let mut ptt_guard = PttGuard::new(message_bus.clone());
+                                    let ptt_msg = ComponentMessage::new(
+                                        ComponentId::Ft8Transmitter,
+                                        ComponentId::Hamlib,
+                                        MessageType::RigControl(
+                                            crate::message_bus::RigControlMessage::SetPtt {
+                                                state: true,
+                                            },
+                                        ),
+                                        Instant::now(),
+                                    );
+                                    if let Err(e) = message_bus.send_message(ptt_msg).await {
+                                        debug!("Tune: PTT on failed (no rig?): {}", e);
+                                    }
+
+                                    // Emit the audio buffer.
+                                    let audio_msg = ComponentMessage::new(
+                                        ComponentId::Ft8Transmitter,
+                                        ComponentId::Audio,
+                                        MessageType::AudioOutput {
+                                            samples: tone_samples,
+                                            sample_rate,
+                                        },
+                                        Instant::now(),
+                                    );
+                                    if let Err(e) = message_bus.send_message(audio_msg).await {
+                                        debug!("Tune: audio output routing: {}", e);
+                                    }
+
+                                    // Wait for the duration. F4-toggle-off
+                                    // and F8-halt both flip
+                                    // abort_current_tx and wake the sleep
+                                    // within 50ms; on wake, ptt_guard's
+                                    // Drop fires PTT-off and we exit the
+                                    // arm cleanly.
+                                    if interruptible_sleep(
+                                        Duration::from_millis(audio_duration_ms),
+                                        &shutdown,
+                                        &abort_current_tx,
+                                    )
+                                    .await
+                                    {
+                                        if shutdown.load(Ordering::Acquire) {
+                                            info!("Tune aborted by shutdown");
+                                            break;
+                                        }
+                                        info!("Tune aborted by operator");
+                                        // Drop ptt_guard via continue.
+                                        continue;
+                                    }
+
+                                    // Natural completion: explicit PTT-off
+                                    // (matches the regular TX path).
+                                    let ptt_off_msg = ComponentMessage::new(
+                                        ComponentId::Ft8Transmitter,
+                                        ComponentId::Hamlib,
+                                        MessageType::RigControl(
+                                            crate::message_bus::RigControlMessage::SetPtt {
+                                                state: false,
+                                            },
+                                        ),
+                                        Instant::now(),
+                                    );
+                                    if let Err(e) = message_bus.send_message(ptt_off_msg).await {
+                                        debug!("Tune: PTT off failed (no rig?): {}", e);
+                                    }
+                                    ptt_guard.disarm();
+                                    info!("Tune: complete");
+                                }
+
                                 _ => {} // Ignore other message types
                             }
                         }

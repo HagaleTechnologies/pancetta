@@ -333,6 +333,13 @@ impl super::ApplicationCoordinator {
         let cmd_ptt_state = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_cq_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_abort_current_tx = self.abort_current_tx.clone();
+        // F4 toggle state: Some(t) when a tune is in flight and expected
+        // to auto-stop at instant t. None when no tune is queued. The
+        // coordinator owns this — TUI just emits ToggleTune events.
+        let cmd_tune_until: std::sync::Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>> =
+            std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        const TUNE_DURATION_SECS: u32 = 12;
+        const TUNE_TONE_HZ: f64 = 1500.0;
         let cmd_handle = tokio::spawn(async move {
             let mut next_cq_time: Option<tokio::time::Instant> = None;
 
@@ -448,10 +455,48 @@ impl super::ApplicationCoordinator {
                             //
                             // Also stop the repeating-CQ loop so we don't
                             // immediately re-arm a new TX in the next cycle.
+                            // Clear the tune-until tracker so the F4 toggle
+                            // re-arms cleanly next press.
                             info!("TUI StopTx: halting current TX (F8)");
                             cmd_abort_current_tx.store(true, Ordering::Release);
                             cmd_cq_active.store(false, Ordering::Relaxed);
+                            *cmd_tune_until.write().await = None;
                             next_cq_time = None;
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::ToggleTune => {
+                            // F4 toggle. If a tune is already in flight,
+                            // abort it. Otherwise queue a new TuneRequest
+                            // and arm the auto-stop tracker.
+                            let now = tokio::time::Instant::now();
+                            let active = {
+                                let guard = cmd_tune_until.read().await;
+                                matches!(*guard, Some(t) if t > now)
+                            };
+                            if active {
+                                info!("TUI ToggleTune: aborting in-flight tune (F4)");
+                                cmd_abort_current_tx.store(true, Ordering::Release);
+                                *cmd_tune_until.write().await = None;
+                            } else {
+                                info!(
+                                    "TUI ToggleTune: starting {}s tone at {} Hz",
+                                    TUNE_DURATION_SECS, TUNE_TONE_HZ
+                                );
+                                let msg = ComponentMessage::new(
+                                    ComponentId::Tui,
+                                    ComponentId::Ft8Transmitter,
+                                    MessageType::TuneRequest {
+                                        duration_secs: TUNE_DURATION_SECS,
+                                        tone_offset_hz: TUNE_TONE_HZ,
+                                    },
+                                    Instant::now(),
+                                );
+                                if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                    warn!("Failed to send TuneRequest: {}", e);
+                                } else {
+                                    *cmd_tune_until.write().await =
+                                        Some(now + Duration::from_secs(TUNE_DURATION_SECS as u64));
+                                }
+                            }
                         }
                         pancetta_tui::tui_runner::TuiCommand::TogglePtt => {
                             let current = cmd_ptt_state.load(Ordering::Acquire);

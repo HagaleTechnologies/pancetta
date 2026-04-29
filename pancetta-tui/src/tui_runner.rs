@@ -127,6 +127,11 @@ pub enum TuiCommand {
     /// repeating CQ). Drops PTT within ~150ms via the same PttGuard
     /// mechanism the shutdown path uses.
     StopTx,
+    /// Toggle a single-tone tune transmission for antenna tuning. Maps
+    /// to F4. First press starts a 12-second tone; subsequent press while
+    /// a tune is active aborts it. F8 / Ctrl-Q also abort. Coordinator
+    /// owns the tone-active state; the TUI just sends the toggle.
+    ToggleTune,
     /// Call a station (click-to-call from band activity)
     CallStation {
         callsign: String,
@@ -450,6 +455,12 @@ impl TuiRunner {
             KeyCode::F(3) => {
                 // F3 - Stop CQ
                 self.message_tx.send(TuiCommand::StopCq)?;
+            }
+            KeyCode::F(4) => {
+                // F4 - Toggle single-tone tune (antenna tuning aid).
+                // First press: 12s tone at 1500 Hz with PTT engaged.
+                // Press again to abort early. F8 also halts.
+                self.message_tx.send(TuiCommand::ToggleTune)?;
             }
             KeyCode::F(8) => {
                 // F8 - Halt current TX (matches WSJT-X muscle memory).
