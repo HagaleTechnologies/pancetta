@@ -127,6 +127,12 @@ pub enum TuiCommand {
     /// repeating CQ). Drops PTT within ~150ms via the same PttGuard
     /// mechanism the shutdown path uses.
     StopTx,
+    /// Operator pressed `T` — find a clear TX audio offset and jump the
+    /// cursor there. TUI-local: the handler calls `App::find_clear_offset`
+    /// and updates `tx_frequency_offset` directly. No bus message needed.
+    #[allow(dead_code)]
+    // Part of the TuiCommand API for future remote-control or scripting use
+    FindClearOffset,
     /// Toggle a single-tone tune transmission for antenna tuning. Maps
     /// to F4. First press starts a 12-second tone; subsequent press while
     /// a tune is active aborts it. F8 / Ctrl-Q also abort. Coordinator
@@ -467,6 +473,21 @@ impl TuiRunner {
                 // Releases PTT within ~150ms; pancetta keeps running and
                 // listening. Distinct from Ctrl-Q (whole-app exit).
                 self.message_tx.send(TuiCommand::StopTx)?;
+            }
+            KeyCode::Char('T') | KeyCode::Char('t') => {
+                // T - Find clear TX offset and jump the cursor there.
+                // Scans the current parity's occupied offsets and picks
+                // the closest unoccupied slot. Updates the TX cursor
+                // locally; no coordinator message needed.
+                match app.find_clear_offset() {
+                    Some(hz) => {
+                        app.tx_frequency_offset = hz;
+                        app.status_message = format!("TX cursor → {:.0} Hz (clear)", hz);
+                    }
+                    None => {
+                        app.status_message = "No clear offset found in your parity".to_string();
+                    }
+                }
             }
             KeyCode::F(5) => {
                 // F5 - Clear messages
