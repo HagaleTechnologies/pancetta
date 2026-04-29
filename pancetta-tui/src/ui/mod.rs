@@ -10,11 +10,13 @@ use ratatui::{
 use crate::app::{ActivePanel, App};
 use crate::widgets::Waterfall;
 
+pub mod active_qsos;
 pub mod band_activity;
 pub mod dx_hunter;
 pub mod qso_status;
 pub mod station_info;
 
+use active_qsos::render_active_qsos;
 use band_activity::render_band_activity;
 use dx_hunter::render_dx_hunter;
 use qso_status::render_qso_status;
@@ -46,6 +48,9 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1), // Active-QSOs banner (always 1 row;
+            // shows "(none)" placeholder when
+            // no QSOs are in flight)
             Constraint::Percentage(45), // Band activity
             Constraint::Percentage(30), // Waterfall
             Constraint::Percentage(25), // QSO status
@@ -58,9 +63,10 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
         .split(main_chunks[1]);
 
     // Render panels
-    render_band_activity(f, left_chunks[0], app)?;
-    render_waterfall(f, left_chunks[1], app);
-    render_qso_status(f, left_chunks[2], app)?;
+    render_active_qsos(f, left_chunks[0], app);
+    render_band_activity(f, left_chunks[1], app)?;
+    render_waterfall(f, left_chunks[2], app);
+    render_qso_status(f, left_chunks[3], app)?;
     render_station_info(f, right_chunks[0], app)?;
     render_dx_hunter(f, right_chunks[1], app)?;
 
@@ -69,13 +75,14 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
 
     // Render active panel highlight
     // Indices map to ActivePanel enum order: BandActivity, QsoStatus, StationInfo, DxHunter
-    // left_chunks[1] (waterfall) is skipped — it's not a navigable panel
+    // left_chunks[0] is the active-QSOs banner (1-row, not navigable);
+    // left_chunks[2] (waterfall) is also skipped.
     render_active_panel_highlight(
         f,
         app,
         &[
-            left_chunks[0],  // BandActivity
-            left_chunks[2],  // QsoStatus
+            left_chunks[1],  // BandActivity
+            left_chunks[3],  // QsoStatus
             right_chunks[0], // StationInfo
             right_chunks[1], // DxHunter
         ],

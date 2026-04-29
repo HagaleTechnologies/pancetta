@@ -100,6 +100,13 @@ pub enum TuiMessage {
     AudioLevel { level: f32 },
     /// Pipeline health snapshot (sent periodically by coordinator)
     PipelineHealth(crate::app::PipelineHealth),
+    /// Snapshot of QSOs currently in progress, pushed by the QSO
+    /// coordinator on every state change. The TUI replaces its
+    /// previous active-QSOs list with this snapshot — sender
+    /// owns the truth, receiver is a passive renderer.
+    ActiveQsosUpdate {
+        qsos: Vec<crate::app::ActiveQsoBanner>,
+    },
 }
 
 /// Commands sent from TUI
@@ -321,6 +328,9 @@ impl TuiRunner {
             }
             TuiMessage::PipelineHealth(health) => {
                 app.pipeline_health = Some(health);
+            }
+            TuiMessage::ActiveQsosUpdate { qsos } => {
+                app.active_qsos = qsos;
             }
         }
 

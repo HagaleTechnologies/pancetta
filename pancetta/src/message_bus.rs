@@ -161,6 +161,12 @@ pub enum MessageType {
     /// Audio output samples for transmission
     AudioOutput { samples: Vec<f32>, sample_rate: u32 },
 
+    /// Snapshot of in-progress QSOs, pushed by the QSO coordinator
+    /// on every state change. tui_relay forwards this to the TUI as
+    /// `TuiMessage::ActiveQsosUpdate`; the TUI replaces its previous
+    /// active-QSOs list with the new snapshot.
+    ActiveQsosSnapshot { qsos: Vec<ActiveQsoSnapshotItem> },
+
     /// Waterfall spectrogram data for TUI display
     WaterfallData {
         /// Power values in dB, one row per time step
@@ -176,6 +182,22 @@ pub struct TransmitRequestItem {
     pub message_text: String,
     pub frequency_offset: f64,
     pub qso_id: Option<String>,
+}
+
+/// One item in a `MessageType::ActiveQsosSnapshot` payload — flattened
+/// view of an in-progress QSO with just the fields the TUI banner
+/// needs. Decoupled from `pancetta-qso::QsoState` so the TUI doesn't
+/// link the QSO crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveQsoSnapshotItem {
+    /// Other station's callsign.
+    pub their_callsign: String,
+    /// Human-readable state name (compact form: "wait rpt", "sending RR73").
+    pub state: String,
+    /// When this QSO started — TUI renders an elapsed timer from this.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Audio frequency in Hz where we're working this QSO.
+    pub frequency_hz: f64,
 }
 
 /// Status data from the autonomous operator for TUI consumption.

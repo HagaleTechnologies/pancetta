@@ -29,12 +29,14 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
 
     let header = Row::new(header_cells).height(1).bottom_margin(0);
 
-    // Convert all messages to table rows (newest first).
-    // Let ratatui's TableState handle viewport scrolling to the selected row.
-    let mut rows: Vec<Row> = app
-        .decoded_messages
+    // Walk the App's displayed-order iterator: directed-at-us decodes
+    // pinned to the top in newest-first order, then everything else in
+    // newest-first order. Both this renderer and App::get_selected_station
+    // walk the same ordering so the highlighted row matches the selected
+    // callsign on Space-press.
+    let displayed = app.displayed_messages();
+    let mut rows: Vec<Row> = displayed
         .iter()
-        .rev() // Show newest first
         .map(|msg| create_message_row(msg, app))
         .collect();
 
@@ -131,7 +133,13 @@ fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
     let dt_str = format!("{:+.1}", msg.delta_time);
     let df_str = format!("{:+.0}", msg.delta_freq);
 
-    let call_str = msg.call_sign.as_deref().unwrap_or("---");
+    // Lead the call column with "→" for directed-at-us decodes so even
+    // colorblind / monochrome terminals can spot them at a glance.
+    let call_str = match msg.call_sign.as_deref() {
+        Some(c) if msg.is_directed_at_us => format!("→ {}", c),
+        Some(c) => c.to_string(),
+        None => "---".to_string(),
+    };
     let grid_str = msg.grid_square.as_deref().unwrap_or("---");
     let dist_str = format_distance(msg.distance);
 
@@ -142,9 +150,22 @@ fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
         msg.message.clone()
     };
 
-    // Color coding based on content
-    let snr_style = Style::default().fg(get_snr_color(msg.snr, &app.theme));
-    let call_style = if msg.call_sign.is_some() {
+    // "Calling me" rows take priority over CQ highlighting; the entire row
+    // gets the selected_color background-equivalent treatment so they're
+    // visually distinct from CQs on the same screen.
+    let directed_style = Style::default()
+        .fg(app.theme.selected_color())
+        .add_modifier(Modifier::BOLD);
+
+    let snr_style = if msg.is_directed_at_us {
+        directed_style
+    } else {
+        Style::default().fg(get_snr_color(msg.snr, &app.theme))
+    };
+
+    let call_style = if msg.is_directed_at_us {
+        directed_style
+    } else if msg.call_sign.is_some() {
         Style::default()
             .fg(app.theme.success_color())
             .add_modifier(Modifier::BOLD)
@@ -152,28 +173,41 @@ fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
         Style::default().fg(app.theme.muted_color())
     };
 
-    let msg_style = if msg.message.contains("CQ") {
+    let msg_style = if msg.is_directed_at_us {
+        directed_style
+    } else if msg.message.contains("CQ") {
         Style::default()
             .fg(app.theme.warning_color())
-            .add_modifier(Modifier::BOLD)
-    } else if msg.message.contains(&app.station_info.call_sign) {
-        Style::default()
-            .fg(app.theme.selected_color())
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(app.theme.foreground_color())
     };
 
+    let neutral_style = if msg.is_directed_at_us {
+        directed_style
+    } else {
+        Style::default().fg(app.theme.foreground_color())
+    };
+    let muted_style = if msg.is_directed_at_us {
+        directed_style
+    } else {
+        Style::default().fg(app.theme.muted_color())
+    };
+
     Row::new([
-        Cell::from(time_short).style(Style::default().fg(app.theme.muted_color())),
-        Cell::from(freq_str).style(Style::default().fg(app.theme.accent_color())),
-        Cell::from(msg.mode.clone()).style(Style::default().fg(app.theme.foreground_color())),
+        Cell::from(time_short).style(muted_style),
+        Cell::from(freq_str).style(if msg.is_directed_at_us {
+            directed_style
+        } else {
+            Style::default().fg(app.theme.accent_color())
+        }),
+        Cell::from(msg.mode.clone()).style(neutral_style),
         Cell::from(snr_str).style(snr_style),
-        Cell::from(dt_str).style(Style::default().fg(app.theme.foreground_color())),
-        Cell::from(df_str).style(Style::default().fg(app.theme.foreground_color())),
+        Cell::from(dt_str).style(neutral_style),
+        Cell::from(df_str).style(neutral_style),
         Cell::from(call_str).style(call_style),
-        Cell::from(grid_str).style(Style::default().fg(app.theme.foreground_color())),
-        Cell::from(dist_str).style(Style::default().fg(app.theme.foreground_color())),
+        Cell::from(grid_str).style(neutral_style),
+        Cell::from(dist_str).style(neutral_style),
         Cell::from(msg_str).style(msg_style),
     ])
 }

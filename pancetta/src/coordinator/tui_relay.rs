@@ -76,6 +76,13 @@ impl super::ApplicationCoordinator {
             let config = self.config.read().await;
             pancetta_core::gridsquare::grid_to_coordinates(&config.station.grid_square).ok()
         };
+        // Our callsign — used to flag "calling me" decodes (to_callsign
+        // matches us). Cached at thread spawn so we don't take the config
+        // lock on every decode.
+        let our_callsign_for_relay = {
+            let config = self.config.read().await;
+            config.station.callsign.clone()
+        };
 
         // Relay decoded messages from FT8 -> TUI on a dedicated thread
         // (tokio::spawn was causing starvation -- same pattern as DSP/FT8 fixes)
@@ -96,6 +103,25 @@ impl super::ApplicationCoordinator {
                         Ok(decoded_msg) => {
                             let call_sign = decoded_msg.message.from_callsign.clone();
                             let grid_square = decoded_msg.message.grid_square.clone();
+                            // "Calling me" detection: the parser sets
+                            // to_callsign = our call when someone replies
+                            // to our CQ ("K5ARH F5ABC -10"). Match against
+                            // the bare callsign — strip any /R or /P suffix
+                            // on either side so "K5ARH/M" and "K5ARH" both
+                            // count.
+                            let is_directed_at_us = match decoded_msg.message.to_callsign.as_deref() {
+                                Some(to) => {
+                                    let to_base = to.split('/').next().unwrap_or(to);
+                                    let our_base = our_callsign_for_relay
+                                        .split('/')
+                                        .next()
+                                        .unwrap_or(&our_callsign_for_relay);
+                                    !to_base.is_empty()
+                                        && !our_base.is_empty()
+                                        && to_base.eq_ignore_ascii_case(our_base)
+                                }
+                                None => false,
+                            };
 
                             // Compute distance and bearing if both grids are available
                             let (distance, bearing) = match (&grid_square, &station_coords) {
@@ -132,6 +158,7 @@ impl super::ApplicationCoordinator {
                                 distance,
                                 bearing,
                                 slot_parity: decoded_msg.slot_parity,
+                                is_directed_at_us,
                             };
 
                             match tui_msg_tx_relay.send(
@@ -159,6 +186,26 @@ impl super::ApplicationCoordinator {
                                     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                         component: "Autonomous".to_string(),
                                         status: status.state.clone(),
+                                    },
+                                );
+                            }
+                            MessageType::ActiveQsosSnapshot { ref qsos } => {
+                                // Re-shape into the TUI's ActiveQsoBanner
+                                // (decoupled struct so the TUI doesn't link
+                                // pancetta_qso). Push as a TuiMessage; the
+                                // TUI replaces its previous list with this.
+                                let banner_qsos: Vec<pancetta_tui::app::ActiveQsoBanner> = qsos
+                                    .iter()
+                                    .map(|q| pancetta_tui::app::ActiveQsoBanner {
+                                        their_callsign: q.their_callsign.clone(),
+                                        state: q.state.clone(),
+                                        started_at: q.started_at,
+                                        frequency_hz: q.frequency_hz,
+                                    })
+                                    .collect();
+                                let _ = tui_msg_tx_relay.send(
+                                    pancetta_tui::tui_runner::TuiMessage::ActiveQsosUpdate {
+                                        qsos: banner_qsos,
                                     },
                                 );
                             }

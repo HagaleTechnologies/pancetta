@@ -213,6 +213,23 @@ operator-supervised.
 
 ---
 
+## Reading the TUI
+
+A few things to know about the Band Activity surface:
+
+- **The single-row banner above Band Activity** shows in-progress QSOs:
+  `QSO: K1ABC (wait rpt · 0:42 · 1500Hz)`. Updated live every time the
+  QSO state machine advances. Empty list shows `QSO: (none in progress)`.
+- **Decodes addressed to your callsign are pinned to the top of the
+  Band Activity table** (newest-first within the pinned region) and
+  shown in bold + accent color with a `→` prefix on the call column.
+  This is the "someone is calling me" surface — Space-pressing on a
+  pinned row calls them back.
+- **The highlight stays on whatever you targeted** even as new decodes
+  arrive each slot. Without that, Space-press would call the wrong
+  station every 15 seconds; the scroll position is bumped on insert
+  to track your selection.
+
 ## Day-to-day operation
 
 Once Phase 5 is verified, daily startup is just:

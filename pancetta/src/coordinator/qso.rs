@@ -277,6 +277,8 @@ impl super::ApplicationCoordinator {
                 let tx_shutdown = shutdown.clone();
                 let tx_callsign = our_callsign.clone();
                 let ap_state = active_qso_ap;
+                let snapshot_qso_manager = qso_manager.clone();
+                let snapshot_bus = tx_bus.clone();
                 tokio::spawn(async move {
                     while !tx_shutdown.load(Ordering::Acquire) {
                         match qso_events.recv().await {
@@ -314,6 +316,22 @@ impl super::ApplicationCoordinator {
                                 };
                                 if let Ok(mut guard) = ap_state.write() {
                                     *guard = new_ap;
+                                }
+
+                                // Push an updated snapshot of in-progress
+                                // QSOs to the TUI banner. The QSO state
+                                // machine is the source of truth; the TUI
+                                // replaces its list each push.
+                                let snapshot =
+                                    build_active_qso_snapshot(&snapshot_qso_manager).await;
+                                let snap_msg = ComponentMessage::new(
+                                    ComponentId::Qso,
+                                    ComponentId::Tui,
+                                    MessageType::ActiveQsosSnapshot { qsos: snapshot },
+                                    Instant::now(),
+                                );
+                                if let Err(e) = snapshot_bus.send_message(snap_msg).await {
+                                    debug!("Failed to push active-QSOs snapshot: {}", e);
                                 }
                             }
                             Ok(pancetta_qso::QsoEvent::MessageToSend {
@@ -364,6 +382,17 @@ impl super::ApplicationCoordinator {
                                 if let Ok(mut guard) = ap_state.write() {
                                     *guard = None;
                                 }
+                                // Push fresh snapshot so the banner drops
+                                // the just-completed QSO from the active list.
+                                let snapshot =
+                                    build_active_qso_snapshot(&snapshot_qso_manager).await;
+                                let snap_msg = ComponentMessage::new(
+                                    ComponentId::Qso,
+                                    ComponentId::Tui,
+                                    MessageType::ActiveQsosSnapshot { qsos: snapshot },
+                                    Instant::now(),
+                                );
+                                let _ = snapshot_bus.send_message(snap_msg).await;
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO completed with {}, marking as worked", their_call);
                                     let band =
@@ -396,6 +425,17 @@ impl super::ApplicationCoordinator {
                                 if let Ok(mut guard) = ap_state.write() {
                                     *guard = None;
                                 }
+                                // Push fresh snapshot so the banner drops
+                                // the failed QSO.
+                                let snapshot =
+                                    build_active_qso_snapshot(&snapshot_qso_manager).await;
+                                let snap_msg = ComponentMessage::new(
+                                    ComponentId::Qso,
+                                    ComponentId::Tui,
+                                    MessageType::ActiveQsosSnapshot { qsos: snapshot },
+                                    Instant::now(),
+                                );
+                                let _ = snapshot_bus.send_message(snap_msg).await;
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO failed with {}, adding backoff", their_call);
                                     qso_lookup.record_failure(their_call);
@@ -558,6 +598,54 @@ impl super::ApplicationCoordinator {
         info!("QSO component started");
         Ok(())
     }
+}
+
+/// Build a flat snapshot of in-progress QSOs from the QSO manager,
+/// suitable for `MessageType::ActiveQsosSnapshot`. The TUI banner uses
+/// this to render who's mid-conversation.
+async fn build_active_qso_snapshot(
+    qso_manager: &pancetta_qso::QsoManager,
+) -> Vec<crate::message_bus::ActiveQsoSnapshotItem> {
+    use pancetta_qso::QsoState;
+    let active = qso_manager.get_active_qsos().await;
+    active
+        .into_iter()
+        .filter_map(|(_id, progress)| {
+            let their = progress
+                .state
+                .their_callsign()
+                .map(str::to_string)
+                .or_else(|| progress.metadata.their_callsign.clone())?;
+            let frequency_hz = progress
+                .state
+                .frequency()
+                .unwrap_or(progress.metadata.frequency);
+            let state = match &progress.state {
+                QsoState::Idle => "idle",
+                QsoState::CallingCq { .. } => "calling CQ",
+                QsoState::RespondingToCq { .. } => "→ called",
+                QsoState::WaitingForReport { .. } => "wait rpt",
+                QsoState::SendingReport { .. } => "sending rpt",
+                QsoState::WaitingForConfirmation { .. } => "wait RR73",
+                QsoState::SendingConfirmation { .. } => "sending RR73",
+                QsoState::Completed { .. } => "done",
+                QsoState::Failed { .. } => "failed",
+                QsoState::Contest(pancetta_qso::ContestState::ExchangingInfo { .. }) => {
+                    "contest exch"
+                }
+                QsoState::Contest(pancetta_qso::ContestState::ContestCompleted { .. }) => {
+                    "contest done"
+                }
+            }
+            .to_string();
+            Some(crate::message_bus::ActiveQsoSnapshotItem {
+                their_callsign: their,
+                state,
+                started_at: progress.metadata.start_time,
+                frequency_hz,
+            })
+        })
+        .collect()
 }
 
 /// Spawn a background task that listens for `QsoEvent::QsoCompleted` and

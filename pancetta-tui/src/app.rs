@@ -60,6 +60,32 @@ pub struct DecodedMessageView {
     /// handler to tell the QSO layer which parity the remote station is
     /// transmitting on so we can reply on the opposite parity.
     pub slot_parity: Option<pancetta_core::slot::SlotParity>,
+    /// `true` if this decode's `to_callsign` matches our station callsign
+    /// (case-insensitive, stripping /R or /P suffixes). Computed at the
+    /// tui_relay layer where we have access to station config. The Band
+    /// Activity panel pins these to the top of the list and styles them
+    /// in bold + accent color so the operator can't miss someone calling
+    /// them. Defaults to `false` in test fixtures.
+    pub is_directed_at_us: bool,
+}
+
+/// One in-progress QSO surfaced to the operator. Coordinator-side QSO
+/// state machine is the source of truth; this struct is a flattened
+/// snapshot pushed to the TUI whenever the state changes (QsoEvent
+/// subscription). The banner widget above Band Activity renders all
+/// entries compactly so the operator sees who's mid-conversation
+/// without leaving the main view.
+#[derive(Debug, Clone)]
+pub struct ActiveQsoBanner {
+    /// Other station's callsign.
+    pub their_callsign: String,
+    /// Human-readable state ("CqResponse", "Waiting Report", "Sending RR73", etc.).
+    pub state: String,
+    /// When this QSO started (used to render an elapsed timer).
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// Audio frequency in Hz (200-2500 range, where the contra station was
+    /// heard / where we're transmitting back).
+    pub frequency_hz: f64,
 }
 
 /// Pipeline component health snapshot, forwarded from coordinator
@@ -300,6 +326,10 @@ pub struct App {
     pub decoded_messages: VecDeque<DecodedMessageView>,
     /// Active QSOs (supports multiple concurrent QSOs).
     pub qso_statuses: Vec<QsoStatus>,
+    /// Snapshot of in-progress QSOs pushed by the coordinator on every
+    /// QSO state change. Rendered in a 1-row banner above Band Activity
+    /// so operators see who they're mid-conversation with at all times.
+    pub active_qsos: Vec<ActiveQsoBanner>,
     pub station_info: StationInfo,
     pub dx_stations: HashMap<String, DxStation>,
     pub band_activity_scroll: usize,
@@ -370,6 +400,7 @@ impl App {
             theme: config.ui.theme,
             decoded_messages: VecDeque::with_capacity(1000),
             qso_statuses: Vec::new(),
+            active_qsos: Vec::new(),
             station_info,
             dx_stations: HashMap::new(),
             band_activity_scroll: 0,
@@ -932,6 +963,29 @@ impl App {
         }
     }
 
+    /// Decoded messages in display order: directed-at-us first (pinned),
+    /// then everything else in newest-first recency. Both the Band Activity
+    /// renderer and `get_selected_station` walk this same ordering so
+    /// scroll indices stay in sync between visible row and selected
+    /// callsign — without that, an arriving directed-at-us decode would
+    /// silently slide the highlight onto the wrong call.
+    pub fn displayed_messages(&self) -> Vec<&DecodedMessageView> {
+        let mut directed: Vec<&DecodedMessageView> = self
+            .decoded_messages
+            .iter()
+            .rev()
+            .filter(|m| m.is_directed_at_us)
+            .collect();
+        let others: Vec<&DecodedMessageView> = self
+            .decoded_messages
+            .iter()
+            .rev()
+            .filter(|m| !m.is_directed_at_us)
+            .collect();
+        directed.extend(others);
+        directed
+    }
+
     /// Get the callsign, audio offset (Hz, within FT8 passband), and slot
     /// parity of the currently selected station. Returns the AUDIO frequency
     /// offset, not the dial frequency — the TransmitRequest pipeline expects
@@ -946,12 +1000,10 @@ impl App {
     ) -> Option<(String, u64, Option<pancetta_core::slot::SlotParity>)> {
         match self.active_panel {
             ActivePanel::BandActivity => {
-                // Display is reversed (newest first), so index from the end
-                let msg = self
-                    .decoded_messages
-                    .iter()
-                    .rev()
-                    .nth(self.band_activity_scroll)?;
+                // Walk the same ordering the renderer does — directed-first,
+                // then by recency.
+                let displayed = self.displayed_messages();
+                let msg = displayed.get(self.band_activity_scroll)?;
                 let callsign = msg.call_sign.as_ref()?;
                 if callsign.is_empty() {
                     return None;
@@ -1115,7 +1167,15 @@ mod tests {
             distance: None,
             bearing: None,
             slot_parity: None,
+            is_directed_at_us: false,
         }
+    }
+
+    fn fixture_view_directed(call: &str, snr: i32) -> DecodedMessageView {
+        let mut v = fixture_view(call, snr);
+        v.is_directed_at_us = true;
+        v.message = format!("K5ARH {} -10", call);
+        v
     }
 
     async fn fixture_app() -> App {
@@ -1185,5 +1245,79 @@ mod tests {
         let post = app.get_selected_station().expect("SECOND selectable");
         assert_eq!(post.0, "SECOND");
         assert_eq!(app.band_activity_scroll, 0);
+    }
+
+    /// Directed-at-us decodes pin to the top of the displayed list,
+    /// regardless of when they arrived relative to non-directed decodes.
+    /// `get_selected_station` walks the same ordering, so scroll=0 lands
+    /// on the directed message.
+    #[tokio::test]
+    async fn directed_decodes_pin_to_top_of_display() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+
+        // Three plain decodes arrive first.
+        app.add_decoded_message(fixture_view("PLAIN1", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("PLAIN2", -8))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("PLAIN3", -6))
+            .await
+            .unwrap();
+
+        // Then a directed one arrives.
+        app.add_decoded_message(fixture_view_directed("CALLER1", -4))
+            .await
+            .unwrap();
+
+        // Display order: CALLER1 (directed, pinned top), then PLAIN3, PLAIN2,
+        // PLAIN1 in newest-first.
+        let displayed: Vec<&str> = app
+            .displayed_messages()
+            .iter()
+            .filter_map(|m| m.call_sign.as_deref())
+            .collect();
+        assert_eq!(displayed, vec!["CALLER1", "PLAIN3", "PLAIN2", "PLAIN1"]);
+
+        // band_activity_scroll was bumped from 0 → 1 by the prepend (CALLER1
+        // is the new "row 0", so the previous track-newest position now
+        // points one down). Move scroll back to 0 to highlight CALLER1.
+        app.band_activity_scroll = 0;
+        let selected = app.get_selected_station().expect("CALLER1 selectable");
+        assert_eq!(selected.0, "CALLER1");
+    }
+
+    /// Multiple directed decodes stack newest-first within the pinned
+    /// region. Plain decodes follow in their own newest-first ordering.
+    #[tokio::test]
+    async fn directed_decodes_stack_newest_first_among_themselves() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+
+        app.add_decoded_message(fixture_view_directed("DIR1", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("PLAIN1", -8))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view_directed("DIR2", -6))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("PLAIN2", -4))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view_directed("DIR3", -2))
+            .await
+            .unwrap();
+
+        let displayed: Vec<&str> = app
+            .displayed_messages()
+            .iter()
+            .filter_map(|m| m.call_sign.as_deref())
+            .collect();
+        // Pinned: DIR3, DIR2, DIR1 (newest-first); then PLAIN2, PLAIN1.
+        assert_eq!(displayed, vec!["DIR3", "DIR2", "DIR1", "PLAIN2", "PLAIN1"]);
     }
 }
