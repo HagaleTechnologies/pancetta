@@ -17,14 +17,6 @@ yanked = "deny"
 # Each ignore MUST come with a rationale comment so future-us can re-evaluate.
 # Re-check this list when bumping the affected crate's parent.
 ignore = [
-    # rsa crate's Marvin Attack timing sidechannel. No patch is available
-    # upstream as of 2026-04. We pull rsa transitively via sqlx, but only
-    # for MySQL/Postgres password authentication paths. Pancetta uses sqlx
-    # exclusively against SQLite; the rsa code is never executed at runtime.
-    # Re-check when sqlx 1.0 ships or when a constant-time rsa replacement
-    # lands and percolates into sqlx.
-    { id = "RUSTSEC-2023-0071", reason = "rsa is sqlx transitive dep for MySQL/Postgres auth; pancetta uses SQLite only" },
-
     # `instant` 0.1 is unmaintained. Replacement is `web-time`. We pull
     # instant transitively via tokio/cpal; both are working on migration.
     # Nothing actionable at our layer.
