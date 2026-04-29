@@ -2973,6 +2973,7 @@ dependencies = [
  "crossbeam-channel",
  "crossterm 0.28.1",
  "dirs",
+ "pancetta-config",
  "pancetta-core",
  "ratatui",
  "serde",

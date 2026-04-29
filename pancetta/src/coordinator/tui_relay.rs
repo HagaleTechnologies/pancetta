@@ -201,6 +201,7 @@ impl super::ApplicationCoordinator {
                                         state: q.state.clone(),
                                         started_at: q.started_at,
                                         frequency_hz: q.frequency_hz,
+                                        tx_parity: q.tx_parity,
                                     })
                                     .collect();
                                 let _ = tui_msg_tx_relay.send(
@@ -541,6 +542,7 @@ impl super::ApplicationCoordinator {
                 antenna: "Vertical".to_string(),
                 rig: tui_config_lock.rig.model.clone(),
                 default_frequency: 14.074,
+                tx_self_parity: tui_config_lock.station.tx_self_parity,
             },
             ui: pancetta_tui::config::UiConfig {
                 theme: pancetta_tui::Theme::Dark,

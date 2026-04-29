@@ -21,6 +21,9 @@ pub struct StationConfig {
     pub antenna: String,
     pub rig: String,
     pub default_frequency: f64,
+    /// Configured TX slot parity. `Auto` means no preference (waterfall
+    /// shows no persistent TX-cursor highlight when idle).
+    pub tx_self_parity: pancetta_config::station::TxSelfParity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +102,7 @@ impl Default for Config {
                 antenna: "Dipole".to_string(),
                 rig: "IC-7300".to_string(),
                 default_frequency: 14.074,
+                tx_self_parity: pancetta_config::station::TxSelfParity::Auto,
             },
             ui: UiConfig {
                 theme: Theme::Dark,

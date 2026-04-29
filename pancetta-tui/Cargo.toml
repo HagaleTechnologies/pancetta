@@ -44,6 +44,7 @@ dirs = "5.0"
 # Ham radio specific
 # ft8-lib = { path = "../ft8-lib" }
 pancetta-core = { path = "../pancetta-core" }
+pancetta-config = { path = "../pancetta-config" }
 
 [dev-dependencies]
 tokio-test = "0.4"

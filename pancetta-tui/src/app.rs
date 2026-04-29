@@ -86,6 +86,8 @@ pub struct ActiveQsoBanner {
     /// Audio frequency in Hz (200-2500 range, where the contra station was
     /// heard / where we're transmitting back).
     pub frequency_hz: f64,
+    /// Parity our station transmits in for this QSO. None when unknown.
+    pub tx_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
 /// Pipeline component health snapshot, forwarded from coordinator
@@ -1147,6 +1149,25 @@ impl App {
             }
         }
     }
+
+    /// The parity our station will TX in. Active QSO wins; otherwise fall
+    /// back to config (Even/Odd) or None for Auto.
+    pub fn resolve_tx_parity(&self) -> Option<pancetta_core::slot::SlotParity> {
+        if let Some(qso) = self.active_qsos.first() {
+            if let Some(p) = qso.tx_parity {
+                return Some(p);
+            }
+        }
+        match self.config.station.tx_self_parity {
+            pancetta_config::station::TxSelfParity::Even => {
+                Some(pancetta_core::slot::SlotParity::Even)
+            }
+            pancetta_config::station::TxSelfParity::Odd => {
+                Some(pancetta_core::slot::SlotParity::Odd)
+            }
+            pancetta_config::station::TxSelfParity::Auto => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1287,6 +1308,40 @@ mod tests {
         app.band_activity_scroll = 0;
         let selected = app.get_selected_station().expect("CALLER1 selectable");
         assert_eq!(selected.0, "CALLER1");
+    }
+
+    #[tokio::test]
+    async fn resolves_parity_from_active_qso_when_present() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.active_qsos = vec![ActiveQsoBanner {
+            their_callsign: "W1AW".into(),
+            state: "Calling".into(),
+            started_at: chrono::Utc::now(),
+            frequency_hz: 1234.0,
+            tx_parity: Some(pancetta_core::slot::SlotParity::Even),
+        }];
+        assert_eq!(
+            app.resolve_tx_parity(),
+            Some(pancetta_core::slot::SlotParity::Even)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_parity_from_config_when_idle() {
+        let mut config = Config::default();
+        config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
+        let app = App::new(config, None).await.unwrap();
+        assert_eq!(
+            app.resolve_tx_parity(),
+            Some(pancetta_core::slot::SlotParity::Even)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolves_none_when_auto_and_idle() {
+        let app = App::new(Config::default(), None).await.unwrap();
+        // Default tx_self_parity is Auto.
+        assert_eq!(app.resolve_tx_parity(), None);
     }
 
     /// Multiple directed decodes stack newest-first within the pinned

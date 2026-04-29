@@ -208,6 +208,10 @@ pub struct ActiveQsoSnapshotItem {
     pub started_at: chrono::DateTime<chrono::Utc>,
     /// Audio frequency in Hz where we're working this QSO.
     pub frequency_hz: f64,
+    /// Parity our station transmits in for this QSO. Used by the TUI
+    /// waterfall to color the occupancy strip and TX cursor by "is this
+    /// slot mine."
+    pub tx_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
 /// Status data from the autonomous operator for TUI consumption.

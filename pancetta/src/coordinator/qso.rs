@@ -643,6 +643,7 @@ async fn build_active_qso_snapshot(
                 state,
                 started_at: progress.metadata.start_time,
                 frequency_hz,
+                tx_parity: progress.metadata.tx_parity,
             })
         })
         .collect()
