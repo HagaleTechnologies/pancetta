@@ -366,54 +366,41 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
             }
         }
 
-        // Overlay: cycle boundary markers (dim horizontal ticks on left edge)
-        // Every rows_per_cycle data rows, draw a small marker so the operator
-        // can distinguish even/odd FT8 cycles.  Accounts for compression.
-        if self.rows_per_cycle > 0 && data_len >= comp {
-            let effective_rows = data_len / comp;
-            let rows_to_show = height.min(effective_rows);
-            for display_row in 0..rows_to_show {
-                // Map display row back to data index
-                let data_idx = data_len - 1 - display_row * comp;
-                if data_idx.is_multiple_of(self.rows_per_cycle) {
-                    let y = waterfall_area.y + display_row as u16;
-                    let cycle_num = data_idx / self.rows_per_cycle;
-                    let marker_char = if cycle_num.is_multiple_of(2) {
-                        'E'
-                    } else {
-                        'O'
-                    };
-                    let marker_color = if cycle_num.is_multiple_of(2) {
-                        Color::DarkGray
-                    } else {
-                        Color::Gray
-                    };
-                    buf[(waterfall_area.x, y)]
-                        .set_char(marker_char)
-                        .set_fg(marker_color);
-                }
-            }
-        }
-
-        // Overlay: TX frequency marker (green vertical line)
+        // Overlay: TX frequency marker (parity-aware vertical line)
         if let Some(tx_hz) = self.tx_offset {
             if let Some(col) = self.freq_to_col(tx_hz, width) {
                 let x = waterfall_area.x + col as u16;
+                let cursor_color = match occupancy_color(
+                    col,
+                    width,
+                    self.freq_range,
+                    self.decoded_for_occupancy,
+                    self.tx_parity,
+                    now,
+                ) {
+                    Some(Color::Red) => Color::Red,
+                    Some(Color::Yellow) => Color::Yellow,
+                    _ => Color::Green,
+                };
+                let suffix = match cursor_color {
+                    Color::Red => " ✗",
+                    Color::Yellow => " ⚠",
+                    _ => "",
+                };
                 for row in 0..height {
                     let y = waterfall_area.y + row as u16;
                     buf[(x, y)]
                         .set_char('│')
-                        .set_fg(Color::Green)
+                        .set_fg(cursor_color)
                         .set_bg(Color::Black);
                 }
-                // Label at top
-                let label = format!("TX {:.0}", tx_hz);
+                let label = format!("TX {:.0}{}", tx_hz, suffix);
                 for (i, ch) in label.chars().enumerate() {
                     let lx = x.saturating_add(1) + i as u16;
                     if lx < waterfall_area.x + waterfall_area.width {
                         buf[(lx, waterfall_area.y)]
                             .set_char(ch)
-                            .set_fg(Color::Green)
+                            .set_fg(cursor_color)
                             .set_bg(Color::Black);
                     }
                 }
@@ -891,5 +878,31 @@ mod tests {
         // tx_parity = None means we can't say "your" vs "their" — collapse to yellow.
         let c = occupancy_color(40, 80, (0.0, 3000.0), &decoded, None, now);
         assert_eq!(c, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn cursor_red_when_offset_overlaps_busy_own_parity() {
+        use chrono::{Duration, Utc};
+        use pancetta_core::slot::SlotParity;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+
+        let now = Utc::now();
+        let data: Vec<Vec<f32>> = vec![vec![0.0; 64]; 10];
+        let decoded = vec![(1500.0, SlotParity::Even, now - Duration::seconds(5))];
+        let area = Rect::new(0, 0, 80, 10);
+        let mut buf = Buffer::empty(area);
+
+        Waterfall::new(&data)
+            .tx_offset(1500.0)
+            .decoded_for_occupancy(&decoded)
+            .tx_parity(Some(SlotParity::Even))
+            .render(area, &mut buf);
+
+        // Cursor at col 40, mid-height. Red because busy in own parity.
+        let cell = &buf[(40, 5)];
+        assert_eq!(cell.symbol(), "│");
+        assert_eq!(cell.fg, Color::Red);
     }
 }
