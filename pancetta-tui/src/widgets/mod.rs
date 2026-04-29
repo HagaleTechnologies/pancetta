@@ -76,6 +76,14 @@ pub struct Waterfall<'a> {
     compression: usize,
     /// Terminal color capability — controls waterfall color palette
     color_capability: ColorCapability,
+    /// Recent decodes (frequency, parity, timestamp) for the occupancy strip.
+    decoded_for_occupancy: &'a [(
+        f64,
+        pancetta_core::slot::SlotParity,
+        chrono::DateTime<chrono::Utc>,
+    )],
+    /// Operator's resolved TX parity (None when Auto + idle).
+    tx_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
 #[derive(Clone, Copy)]
@@ -97,6 +105,8 @@ impl<'a> Waterfall<'a> {
             rows_per_cycle: 15,
             compression: 2,
             color_capability: ColorCapability::TwoFiftySix,
+            decoded_for_occupancy: &[],
+            tx_parity: None,
         }
     }
 
@@ -122,6 +132,23 @@ impl<'a> Waterfall<'a> {
 
     pub fn color_capability(mut self, cap: ColorCapability) -> Self {
         self.color_capability = cap;
+        self
+    }
+
+    pub fn decoded_for_occupancy(
+        mut self,
+        decoded: &'a [(
+            f64,
+            pancetta_core::slot::SlotParity,
+            chrono::DateTime<chrono::Utc>,
+        )],
+    ) -> Self {
+        self.decoded_for_occupancy = decoded;
+        self
+    }
+
+    pub fn tx_parity(mut self, parity: Option<pancetta_core::slot::SlotParity>) -> Self {
+        self.tx_parity = parity;
         self
     }
 
@@ -242,10 +269,12 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
         let data_len = self.data.len();
         if data_len >= comp {
             let effective_rows = data_len / comp;
-            let rows_to_show = height.min(effective_rows);
+            // Reserve top row for occupancy strip and bottom row for freq axis.
+            let data_rows_available = height.saturating_sub(2);
+            let rows_to_show = data_rows_available.min(effective_rows);
 
             for display_row in 0..rows_to_show {
-                let y = waterfall_area.y + display_row as u16;
+                let y = waterfall_area.y + 1 + display_row as u16;
 
                 // Source data rows for this display row (newest first)
                 let end = data_len - display_row * comp;
@@ -280,6 +309,59 @@ impl<'a> ratatui::widgets::Widget for Waterfall<'a> {
                     };
                     let x = waterfall_area.x + col as u16;
                     buf[(x, y)].set_char(glyph).set_fg(color);
+                }
+            }
+        }
+
+        // Compute `now` once per render for the occupancy strip + cursor color.
+        let now = chrono::Utc::now();
+
+        // Occupancy strip: top row of the waterfall.
+        for col in 0..width {
+            let x = waterfall_area.x + col as u16;
+            let strip_y = waterfall_area.y;
+            if let Some(color) = occupancy_color(
+                col,
+                width,
+                self.freq_range,
+                self.decoded_for_occupancy,
+                self.tx_parity,
+                now,
+            ) {
+                buf[(x, strip_y)].set_char('█').set_fg(color);
+            } else {
+                buf[(x, strip_y)]
+                    .set_char('·')
+                    .set_fg(ratatui::style::Color::DarkGray);
+            }
+        }
+
+        // Frequency axis: bottom row.
+        const TICK_FREQS: &[f64] = &[500.0, 1000.0, 1500.0, 2000.0, 2500.0];
+        let axis_y = waterfall_area.y + waterfall_area.height - 1;
+        for col in 0..width {
+            let x = waterfall_area.x + col as u16;
+            buf[(x, axis_y)]
+                .set_char('─')
+                .set_fg(ratatui::style::Color::DarkGray);
+        }
+        for &freq in TICK_FREQS {
+            if let Some(col) = self.freq_to_col(freq, width) {
+                let x = waterfall_area.x + col as u16;
+                buf[(x, axis_y)]
+                    .set_char('┴')
+                    .set_fg(ratatui::style::Color::Gray);
+                if waterfall_area.width >= 40 && axis_y > waterfall_area.y + 1 {
+                    let label = format!("{:.0}", freq);
+                    let label_x = x.saturating_sub((label.len() / 2) as u16);
+                    for (i, ch) in label.chars().enumerate() {
+                        let lx = label_x + i as u16;
+                        if lx < waterfall_area.x + waterfall_area.width {
+                            buf[(lx, axis_y - 1)]
+                                .set_char(ch)
+                                .set_fg(ratatui::style::Color::DarkGray);
+                        }
+                    }
                 }
             }
         }
@@ -755,6 +837,49 @@ mod tests {
         // Decode exists but not in this column's band — column itself has
         // nothing nearby in either parity → None.
         assert_eq!(c, None);
+    }
+
+    #[test]
+    fn waterfall_renders_occupancy_strip_top_row() {
+        use chrono::{Duration, Utc};
+        use pancetta_core::slot::SlotParity;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+
+        let now = Utc::now();
+        let data: Vec<Vec<f32>> = vec![vec![0.5; 64]; 30];
+        let decoded = vec![(1500.0, SlotParity::Even, now - Duration::seconds(5))];
+        let area = Rect::new(0, 0, 80, 10);
+        let mut buf = Buffer::empty(area);
+
+        Waterfall::new(&data)
+            .decoded_for_occupancy(&decoded)
+            .tx_parity(Some(SlotParity::Even))
+            .render(area, &mut buf);
+
+        // The column for 1500 Hz over (0,3000) and width 80 is column 40.
+        // Top row should show '█' colored Red because decode is in our parity.
+        let cell = &buf[(40, 0)];
+        assert_eq!(cell.symbol(), "█");
+        assert_eq!(cell.fg, ratatui::style::Color::Red);
+    }
+
+    #[test]
+    fn waterfall_renders_freq_axis_bottom_row() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::widgets::Widget;
+
+        let data: Vec<Vec<f32>> = vec![vec![0.0; 64]; 10];
+        let area = Rect::new(0, 0, 80, 10);
+        let mut buf = Buffer::empty(area);
+
+        Waterfall::new(&data).render(area, &mut buf);
+
+        // 1500 Hz tick at column 40 in the bottom row.
+        let tick = &buf[(40, 9)];
+        assert_eq!(tick.symbol(), "┴");
     }
 
     #[test]
