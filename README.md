@@ -110,10 +110,15 @@ model = "FTdx10"
 ### 4. Run
 
 ```bash
-# Decode-only mode (safe to run anywhere — no PTT)
-cargo run --release -- --no-rig
+# Decode-only mode (safe — no PTT). Achieved by leaving the rig
+# interface disabled in config (the default).
+cargo run --release
 
-# Full pipeline (decode + autonomous TX, requires rig + license)
+# Full pipeline (decode + manual / autonomous TX). Requires:
+#   [rig.interface] enabled = true   in ~/.pancetta/config.toml
+#   [autonomous]    enabled = true   for hands-off operation
+# and an actual antenna + license. See docs/RUNBOOK.md for the
+# Phase 5 (autonomous QSO loop) procedure.
 cargo run --release
 ```
 
@@ -217,10 +222,10 @@ Detailed component diagram and channel topology in
 # Full workspace build
 cargo build --workspace
 
-# Run all tests (excludes pancetta-hamlib due to tokio runtime conflicts)
+# Run all tests
 cargo test --workspace --features transmit
 
-# pancetta-hamlib must run single-threaded
+# pancetta-hamlib (single-threaded for deterministic mock-rig tests)
 cargo test -p pancetta-hamlib --lib -- --test-threads=1
 
 # Lint and format
