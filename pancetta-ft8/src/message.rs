@@ -403,9 +403,111 @@ impl Ft8Message {
                     }
                 }
 
+                // Validate fields THAT ARE PRESENT — don't require absent
+                // fields. CRC-collision noise lands wrong by either
+                // wrapping a signal_report into impossible territory or by
+                // setting grid_square to a malformed string. The protocol
+                // also defines a legitimate "empty exchange" code
+                // (MAXGRID4+1) which produces a Reply with no grid, used
+                // as a bare callsign-pair acknowledgement; we accept it as
+                // long as the calls themselves look valid.
+                if !self.has_plausible_payload() {
+                    return false;
+                }
+
                 true
             }
         }
+    }
+
+    /// Validate the SOMETHING field for Standard messages.
+    ///
+    /// Approach: validate fields that ARE PRESENT against protocol rules.
+    /// Reject only when a present field is malformed or out of range.
+    /// Don't require fields that the protocol allows to be absent.
+    ///
+    /// CRC-collision noise lands as either a wrapped-i8 signal_report
+    /// (e.g., +83 dB, impossible) or as a malformed grid string. Both
+    /// are caught here.
+    ///
+    /// The legitimate "empty exchange" protocol code (MAXGRID4+1)
+    /// produces a Reply with no grid — used as a bare callsign-pair
+    /// ack. We accept it; the both-calls-valid gate above already
+    /// filters the noise patterns most likely to land here.
+    fn has_plausible_payload(&self) -> bool {
+        // Non-Standard contest formats (RTTYRoundup, Contest, FieldDay,
+        // DXpedition, NonStdCall, Extended) carry their own format-
+        // specific fields (contest_exchange, etc.) and don't use
+        // standard_type. Accept them once both calls have already been
+        // validated by the caller.
+        if !matches!(self.message_type, MessageType::Standard) {
+            return true;
+        }
+
+        // CQ messages: parser sets to_callsign = None and from_callsign
+        // = the calling station, so the "two calls present" gate above
+        // sees only one call. They're identified by standard_type = Cq.
+        // (Some early text-path parses leave standard_type unset and
+        // mark to_callsign = "CQ" instead — accept that form too.)
+        if let Some(ref to) = self.to_callsign {
+            if to == "CQ" || to.starts_with("CQ ") {
+                return true;
+            }
+        }
+
+        let Some(stype) = self.standard_type else {
+            // Standard message with no recognized subtype = parser
+            // couldn't classify the payload. Reject as uninterpretable.
+            return false;
+        };
+
+        match stype {
+            // CQ / Token-based exchanges: protocol-defined, no field-level
+            // validation needed beyond what the parser already enforced.
+            StandardMessageType::Cq
+            | StandardMessageType::Rrr
+            | StandardMessageType::RR73
+            | StandardMessageType::Final73 => true,
+
+            // Reply / ReplyWithR: grid is optional (the "empty exchange"
+            // protocol code lands here with grid = None — a valid bare
+            // callsign-pair ack). When grid IS present, it must be a
+            // valid 4-char Maidenhead — a malformed grid string means
+            // the unpacker landed on garbage from a CRC collision.
+            StandardMessageType::Reply | StandardMessageType::ReplyWithR => {
+                match self.grid_square.as_deref() {
+                    Some(g) => Self::is_valid_4char_maidenhead(g),
+                    None => true,
+                }
+            }
+
+            // Report / ReportWithR: signal_report must be in the valid FT8
+            // range. The protocol packs reports as `igrid4 - MAXGRID4 - 35`
+            // cast to i8, so unallocated igrid4 values wrap to nonsense
+            // numbers (e.g., +83 dB). Accept only physically possible
+            // values; -50..+49 is generous (real-world FT8 reports are
+            // -30..+20, but allow margin for intentionally extreme tests).
+            StandardMessageType::Report | StandardMessageType::ReportWithR => {
+                match self.signal_report {
+                    Some(r) => (-50..=49).contains(&r),
+                    None => false,
+                }
+            }
+        }
+    }
+
+    /// Check that `g` is a valid 4-character Maidenhead grid (e.g., FN42).
+    /// First two chars in A-R, next two in 0-9. Used to filter wrap-induced
+    /// "grid" strings that pass mixed-radix bounds but aren't real locators.
+    fn is_valid_4char_maidenhead(g: &str) -> bool {
+        let chars: Vec<char> = g.chars().collect();
+        if chars.len() != 4 {
+            return false;
+        }
+        ('A'..='R').contains(&chars[0])
+            && ('A'..='R').contains(&chars[1])
+            && chars[2].is_ascii_digit()
+            && chars[3].is_ascii_digit()
     }
 
     /// Heuristic suspicion score (0 = normal, higher = more suspicious).
@@ -2423,5 +2525,136 @@ mod tests {
 
         assert_eq!(full_message.len(), TOTAL_MESSAGE_BITS);
         assert!(verify_crc14(&full_message));
+    }
+
+    // -------- has_plausible_payload / is_plausible: SOMETHING gate --------
+
+    fn standard_msg_with_grid(grid: &str) -> Ft8Message {
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::Reply);
+        m.from_callsign = Some("K1ABC".to_string());
+        m.to_callsign = Some("W1AW".to_string());
+        m.grid_square = Some(grid.to_string());
+        m
+    }
+
+    fn standard_msg_with_report(rpt: i8) -> Ft8Message {
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::Report);
+        m.from_callsign = Some("K1ABC".to_string());
+        m.to_callsign = Some("W1AW".to_string());
+        m.signal_report = Some(rpt);
+        m
+    }
+
+    #[test]
+    fn plausible_reply_with_real_grid_passes() {
+        let m = standard_msg_with_grid("FN42");
+        assert!(m.is_plausible(), "real grid should pass");
+    }
+
+    #[test]
+    fn plausible_reply_with_invalid_grid_letters_rejects() {
+        // Grids only allow A-R for the first two chars.
+        let m = standard_msg_with_grid("ZZ42");
+        assert!(!m.is_plausible(), "out-of-range grid letters must reject");
+    }
+
+    #[test]
+    fn plausible_reply_with_no_grid_passes() {
+        // The protocol "empty exchange" code (MAXGRID4+1) produces a
+        // Reply with grid = None — a bare callsign-pair ack. Legitimate.
+        let mut m = standard_msg_with_grid("FN42");
+        m.grid_square = None;
+        assert!(
+            m.is_plausible(),
+            "Reply with no grid is the empty-exchange code"
+        );
+    }
+
+    #[test]
+    fn plausible_rttyroundup_passes_without_standard_type() {
+        // RTTYRoundup messages don't use standard_type — they have their
+        // own format-specific fields. Both calls must already be valid
+        // (the outer gate handles that).
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::RTTYRoundup;
+        m.standard_type = None;
+        m.from_callsign = Some("K1ABC".to_string());
+        m.to_callsign = Some("W1AW".to_string());
+        assert!(m.is_plausible(), "RTTYRoundup with valid calls should pass");
+    }
+
+    #[test]
+    fn plausible_report_in_range_passes() {
+        for rpt in [-30i8, -10, 0, 5, 20] {
+            let m = standard_msg_with_report(rpt);
+            assert!(m.is_plausible(), "report {} should pass", rpt);
+        }
+    }
+
+    #[test]
+    fn plausible_report_out_of_range_rejects() {
+        // i8 wrap from corrupt unpackgrid lands as e.g. +83 or -89.
+        for rpt in [83i8, -89, 100, -100] {
+            let m = standard_msg_with_report(rpt);
+            assert!(!m.is_plausible(), "out-of-range report {} must reject", rpt);
+        }
+    }
+
+    #[test]
+    fn plausible_token_messages_pass() {
+        for stype in [
+            StandardMessageType::Rrr,
+            StandardMessageType::RR73,
+            StandardMessageType::Final73,
+        ] {
+            let mut m = Ft8Message::default();
+            m.message_type = MessageType::Standard;
+            m.standard_type = Some(stype);
+            m.from_callsign = Some("K1ABC".to_string());
+            m.to_callsign = Some("W1AW".to_string());
+            assert!(m.is_plausible(), "token msg {:?} should pass", stype);
+        }
+    }
+
+    #[test]
+    fn plausible_standard_with_no_subtype_rejects() {
+        // Parser couldn't classify the payload — uninterpretable, must reject.
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = None;
+        m.from_callsign = Some("K1ABC".to_string());
+        m.to_callsign = Some("W1AW".to_string());
+        assert!(
+            !m.is_plausible(),
+            "Standard message with no recognized subtype must reject"
+        );
+    }
+
+    #[test]
+    fn plausible_cq_passes_even_without_grid() {
+        // Real parsed CQ messages have standard_type = Cq, from_callsign set,
+        // to_callsign = None (the "CQ" lives in the standard_type, not as a
+        // call-shaped string in to_callsign). Some CQ messages omit the grid.
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::Cq);
+        m.from_callsign = Some("K1ABC".to_string());
+        // no to_callsign, no grid_square
+        assert!(m.is_plausible(), "bare CQ should pass plausibility");
+    }
+
+    #[test]
+    fn plausible_cq_with_grid_passes() {
+        // The standard form: CQ K1ABC FN42.
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::Cq);
+        m.from_callsign = Some("K1ABC".to_string());
+        m.grid_square = Some("FN42".to_string());
+        assert!(m.is_plausible(), "CQ + grid should pass plausibility");
     }
 }

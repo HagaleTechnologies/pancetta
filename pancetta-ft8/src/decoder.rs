@@ -1424,6 +1424,15 @@ impl Ft8Decoder {
             return Ok(None);
         }
 
+        // AP-injection survival check. When AP injects bits as priors and
+        // LDPC's parity constraints overrule them, the resulting codeword
+        // doesn't carry the AP-injected callsign. Such "successful" AP
+        // decodes are false positives — the AP hint didn't help, the
+        // codeword passed CRC by coincidence.
+        if !ap_injection_survived(ap_level, ap_context, &ft8_message) {
+            return Ok(None);
+        }
+
         let ap_level_num = match ap_level {
             crate::ap::ApLevel::Ap0 => 0u8,
             crate::ap::ApLevel::Ap1 => 1,
@@ -1431,11 +1440,23 @@ impl Ft8Decoder {
             crate::ap::ApLevel::Ap3 => 3,
             crate::ap::ApLevel::Ap4 => 4,
         };
-        // Minimum confidence floor for ALL decodes.  CRC-14 collisions on
-        // noise produce structurally valid messages with low sync scores.
+        // Minimum confidence floor. Two thresholds: AP0 decodes can land at
+        // sync_score ≥ 4.92 (the LDPC has no priors, so a CRC-valid output
+        // is strong evidence). AP1+ decodes biased the LDPC, so a successful
+        // result is weaker evidence — require sync_score ≥ 6.0 (confidence
+        // 0.50) to compensate. CRC-14 collisions on noise still produce
+        // structurally valid messages at low sync, especially under AP
+        // injection where the prior steers the codeword toward a
+        // pre-chosen callsign pattern.
         const MIN_DECODE_CONFIDENCE: f32 = 0.41;
+        const MIN_AP_DECODE_CONFIDENCE: f32 = 0.55;
         const SCRUTINY_THRESHOLD: f32 = 0.65;
-        if confidence < MIN_DECODE_CONFIDENCE {
+        let floor = if matches!(ap_level, crate::ap::ApLevel::Ap0) {
+            MIN_DECODE_CONFIDENCE
+        } else {
+            MIN_AP_DECODE_CONFIDENCE
+        };
+        if confidence < floor {
             return Ok(None);
         }
         if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
@@ -2569,6 +2590,14 @@ fn par_try_ldpc_with_ap(
         return None;
     }
 
+    // AP-injection survival check. If the LDPC parity overruled the AP
+    // bias and produced a codeword that doesn't carry the injected
+    // callsign, the AP didn't help — reject as a CRC-coincidence false
+    // positive.
+    if !ap_injection_survived(ap_level, ap_context, &ft8_message) {
+        return None;
+    }
+
     let ap_level_num = match ap_level {
         crate::ap::ApLevel::Ap0 => 0u8,
         crate::ap::ApLevel::Ap1 => 1,
@@ -2605,6 +2634,70 @@ fn par_try_ldpc_with_ap(
     decoded_message.ap_level = ap_level_num;
 
     Some(decoded_message)
+}
+
+/// Verify that the AP-injected callsign(s) survived the LDPC pass and
+/// landed in the parsed message. AP injection biases the LDPC priors but
+/// doesn't constrain them — the parity solver can overrule the bias and
+/// produce a CRC-valid codeword that ignores the injected hint. When that
+/// happens, the result is a false positive: the AP was wasted, the codeword
+/// happened to satisfy CRC by coincidence, and the message has someone
+/// else's callsign in the position we tried to fix.
+///
+/// Rejecting these prevents the most common AP-induced false-positive
+/// pattern: "K5ARH RANDOMCALL +X" decodes seen on a busy band when AP1
+/// (own callsign as called station) is enabled but the actual signal has
+/// nothing to do with us.
+///
+/// Returns `true` for `Ap0` unconditionally (no injection happened).
+pub(crate) fn ap_injection_survived(
+    ap_level: crate::ap::ApLevel,
+    ap_context: &crate::ap::ApContext,
+    msg: &crate::message::Ft8Message,
+) -> bool {
+    match ap_level {
+        // No injection happened — nothing to verify.
+        crate::ap::ApLevel::Ap0 => true,
+
+        // AP1 injects our callsign at bits 28-55 (the called-station slot).
+        // The parsed result must have our_call as to_callsign.
+        // AP2 also injects AP1 (our callsign as called) plus a recent caller
+        // at bits 0-27 (calling-station slot) — verify both.
+        crate::ap::ApLevel::Ap1 | crate::ap::ApLevel::Ap2 => {
+            let Some(ref my) = ap_context.my_call else {
+                return true; // No my_call to verify against — accept.
+            };
+            let to = msg.to_callsign.as_deref().unwrap_or("");
+            // Match against the bare callsign (no /R or /P suffix).
+            let to_base = to.split('/').next().unwrap_or(to);
+            if to_base != my.callsign {
+                return false;
+            }
+            true
+        }
+
+        // AP3/AP4 inject the active QSO partner at bits 0-27 (calling
+        // station) AND our callsign at bits 28-55 (called station). Both
+        // must survive in the parsed message.
+        crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
+            let Some(ref my) = ap_context.my_call else {
+                return true;
+            };
+            let to = msg.to_callsign.as_deref().unwrap_or("");
+            let to_base = to.split('/').next().unwrap_or(to);
+            if to_base != my.callsign {
+                return false;
+            }
+            if let Some(ref qso) = ap_context.active_qso {
+                let from = msg.from_callsign.as_deref().unwrap_or("");
+                let from_base = from.split('/').next().unwrap_or(from);
+                if from_base != qso.their_call {
+                    return false;
+                }
+            }
+            true
+        }
+    }
 }
 
 // ---- Parallel-safe helpers (free functions operating on shared state) ----
