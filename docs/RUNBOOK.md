@@ -162,9 +162,19 @@ operator-supervised.
 
 ### Failure modes & abort
 
-- **Ctrl-C or `q`** at any time releases PTT cleanly via the
-  `PttGuard` in `tx.rs` — even mid-transmission. The drop handler
-  spawns a fire-and-forget PTT-off message before the task exits.
+- **Ctrl-Q at any time releases PTT within ~150ms.** Three independent
+  paths fire on shutdown: (1) coordinator sends a PTT-off via the
+  message bus to Hamlib, (2) coordinator opens a fresh rigctld TCP
+  connection and sends PTT-off directly (independent of the running
+  Hamlib component), (3) the in-flight TX worker's interruptible
+  sleeps wake within one 50ms poll chunk on shutdown, drop their
+  `PttGuard` (which sends a third PTT-off as RAII cleanup), and exit
+  the message arm. **Test this on dummy load before going live**: arm
+  a manual Space-bar TX, hit Ctrl-Q while audio is playing, confirm
+  PTT releases within ~200ms (rig display, ALC drops to zero).
+
+- **Ctrl-C** also works for emergency shutdown. The signal-hook task
+  triggers the same coordinator shutdown path.
 - **TX into the DX's slot.** Should be impossible after the
   slot-aware-TX work, but if you ever observe it on a PSKReporter
   spot (DT > 5s on a DX you just answered), file a bug — that's a

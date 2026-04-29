@@ -84,6 +84,34 @@ pub fn schedule_tx(
     }
 }
 
+/// Sleep for `total` duration, but wake early (and return `true`) if the
+/// shutdown flag flips while we wait. Polled in 50ms chunks so the
+/// worst-case latency from `shutdown.store(true)` to wake is 50ms.
+///
+/// Used inside the TX worker's per-message arm to guarantee Ctrl-Q during
+/// an in-flight TX takes effect within ~50ms — without this, each
+/// `sleep().await` was uninterruptible and the worker could continue
+/// driving PTT and audio for ~13 seconds after shutdown was requested.
+async fn interruptible_sleep(
+    total: Duration,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> bool {
+    use std::sync::atomic::Ordering;
+    if shutdown.load(Ordering::Acquire) {
+        return true;
+    }
+    let chunk = Duration::from_millis(50);
+    let deadline = tokio::time::Instant::now() + total;
+    while tokio::time::Instant::now() < deadline {
+        if shutdown.load(Ordering::Acquire) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        sleep(remaining.min(chunk)).await;
+    }
+    false
+}
+
 /// Guard that sends PTT-off when dropped, ensuring PTT is released
 /// even if the transmitter task is cancelled mid-transmission.
 struct PttGuard {
@@ -310,7 +338,10 @@ impl super::ApplicationCoordinator {
                                         ptt_target_utc,
                                         chrono::Utc::now(),
                                     );
-                                    sleep(to_ptt).await;
+                                    if interruptible_sleep(to_ptt, &shutdown).await {
+                                        info!("TX aborted before PTT engage by shutdown signal");
+                                        break;
+                                    }
 
                                     // --- Step 5: Assert PTT ---
                                     let mut ptt_guard = PttGuard::new(message_bus.clone());
@@ -335,7 +366,14 @@ impl super::ApplicationCoordinator {
                                         schedule.target_slot,
                                         chrono::Utc::now(),
                                     );
-                                    sleep(to_slot).await;
+                                    if interruptible_sleep(to_slot, &shutdown).await {
+                                        info!(
+                                            "TX aborted between PTT engage and slot start; \
+                                             ptt_guard will drop PTT off"
+                                        );
+                                        // ptt_guard is in scope; drop on `break` fires PTT-off.
+                                        break;
+                                    }
 
                                     // --- Step 7: Route audio to output ---
                                     let audio_msg = ComponentMessage::new(
@@ -352,12 +390,28 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 8: Wait for audio playback to complete ---
-                                    sleep(Duration::from_millis(audio_duration_ms)).await;
+                                    if interruptible_sleep(
+                                        Duration::from_millis(audio_duration_ms),
+                                        &shutdown,
+                                    )
+                                    .await
+                                    {
+                                        info!(
+                                            "TX aborted during audio playback; ptt_guard will \
+                                             drop PTT off"
+                                        );
+                                        break;
+                                    }
                                     let success = true;
                                     let duration_ms = audio_duration_ms;
 
                                     // --- Step 9: De-assert PTT (with tail delay) ---
-                                    sleep(Duration::from_millis(50)).await;
+                                    if interruptible_sleep(Duration::from_millis(50), &shutdown)
+                                        .await
+                                    {
+                                        info!("TX aborted during 50ms tail; ptt_guard handles PTT off");
+                                        break;
+                                    }
                                     let ptt_off_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -539,7 +593,12 @@ impl super::ApplicationCoordinator {
                                         ptt_target_utc,
                                         chrono::Utc::now(),
                                     );
-                                    sleep(to_ptt).await;
+                                    if interruptible_sleep(to_ptt, &shutdown).await {
+                                        info!(
+                                            "Multi-TX aborted before PTT engage by shutdown signal"
+                                        );
+                                        break;
+                                    }
 
                                     // --- Step 5: Assert PTT ---
                                     let mut ptt_guard = PttGuard::new(message_bus.clone());
@@ -562,7 +621,13 @@ impl super::ApplicationCoordinator {
                                         schedule.target_slot,
                                         chrono::Utc::now(),
                                     );
-                                    sleep(to_slot).await;
+                                    if interruptible_sleep(to_slot, &shutdown).await {
+                                        info!(
+                                            "Multi-TX aborted between PTT engage and slot start; \
+                                             ptt_guard will drop PTT off"
+                                        );
+                                        break;
+                                    }
 
                                     // --- Step 7: Route audio to output ---
                                     let audio_msg = ComponentMessage::new(
@@ -579,12 +644,30 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 8: Wait for playback to complete ---
-                                    sleep(Duration::from_millis(audio_duration_ms)).await;
+                                    if interruptible_sleep(
+                                        Duration::from_millis(audio_duration_ms),
+                                        &shutdown,
+                                    )
+                                    .await
+                                    {
+                                        info!(
+                                            "Multi-TX aborted during audio playback; ptt_guard \
+                                             will drop PTT off"
+                                        );
+                                        break;
+                                    }
                                     let success = true;
                                     let duration_ms = audio_duration_ms;
 
                                     // --- Step 9: De-assert PTT (with tail delay) ---
-                                    sleep(Duration::from_millis(50)).await;
+                                    if interruptible_sleep(Duration::from_millis(50), &shutdown)
+                                        .await
+                                    {
+                                        info!(
+                                            "Multi-TX aborted during 50ms tail; ptt_guard handles PTT off"
+                                        );
+                                        break;
+                                    }
                                     let ptt_off_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -799,5 +882,66 @@ mod schedule_tx_tests {
         // Even is closer → Auto picks Even.
         let p = resolve_required_parity(None, TxSelfParity::Auto, at(20.0));
         assert_eq!(p, SlotParity::Even);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interruptible_sleep_completes_when_no_shutdown() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let interrupted = interruptible_sleep(Duration::from_millis(120), &shutdown).await;
+        assert!(
+            !interrupted,
+            "should not flag interrupted when shutdown stays false"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interruptible_sleep_returns_immediately_if_already_shutdown() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let start = std::time::Instant::now();
+        let interrupted = interruptible_sleep(Duration::from_secs(60), &shutdown).await;
+        let elapsed = start.elapsed();
+        assert!(
+            interrupted,
+            "must signal interrupted when shutdown is already set"
+        );
+        // Should return without entering the sleep loop.
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "should return without sleeping (elapsed={:?})",
+            elapsed
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn interruptible_sleep_wakes_within_one_chunk_when_shutdown_fires() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let s2 = shutdown.clone();
+        // After 200ms, flip the shutdown flag.
+        let setter = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            s2.store(true, Ordering::Release);
+        });
+        let start = std::time::Instant::now();
+        let interrupted = interruptible_sleep(Duration::from_secs(30), &shutdown).await;
+        let elapsed = start.elapsed();
+        let _ = setter.await;
+        assert!(
+            interrupted,
+            "should signal interrupted when flag flips mid-sleep"
+        );
+        // Polling chunk is 50ms, so wake latency from flag flip is at most one chunk.
+        // Total elapsed ≈ 200ms (when flag flipped) + ≤ 50ms (chunk poll) = ≤ 250ms.
+        // Allow 300ms slack for test-runner jitter.
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "wake latency exceeded one chunk (elapsed={:?})",
+            elapsed
+        );
     }
 }
