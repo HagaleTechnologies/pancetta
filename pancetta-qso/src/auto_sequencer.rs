@@ -199,11 +199,21 @@ pub enum SequenceDecision {
 /// Actions the sequencer can take
 #[derive(Debug, Clone, PartialEq)]
 pub enum SequenceAction {
-    /// Start calling CQ on frequency
-    StartCq { frequency: f64 },
+    /// Start calling CQ on frequency. `tx_parity = None` lets the TX
+    /// scheduler pick using `tx_self_parity` config (Auto/Even/Odd).
+    StartCq {
+        frequency: f64,
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+    },
 
-    /// Respond to CQ call
-    RespondToCq { callsign: String, frequency: f64 },
+    /// Respond to CQ call. `dx_parity` is the slot parity the CQ was
+    /// heard on; the QSO manager flips it to derive our latched
+    /// `tx_parity = opposite_of(dx_parity)`.
+    RespondToCq {
+        callsign: String,
+        frequency: f64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+    },
 
     /// Send signal report
     SendReport { qso_id: QsoId, report: SignalReport },
@@ -369,13 +379,22 @@ impl AutoSequencer {
         Ok(())
     }
 
-    /// Evaluate CQ call from another station
+    /// Evaluate CQ call from another station.
+    ///
+    /// `slot_parity` is the parity of the slot on which the CQ was heard
+    /// (from the originating `DecodedMessage`). It propagates into the
+    /// emitted `RespondToCq` action so the QSO state machine can latch
+    /// our `tx_parity` to the opposite. Pass `None` only when the parity
+    /// is genuinely unknown (e.g., DX cluster spot rather than an on-air
+    /// decode); the TX scheduler will fall back to `tx_self_parity` from
+    /// config.
     pub async fn evaluate_cq_call(
         &self,
         callsign: &str,
         frequency: f64,
         grid: Option<&str>,
         signal_strength: f32,
+        slot_parity: Option<pancetta_core::slot::SlotParity>,
     ) -> Result<SequenceDecision, AutoSequencerError> {
         if !self.config.response_behavior.auto_respond {
             return Ok(SequenceDecision::NoAction);
@@ -415,16 +434,20 @@ impl AutoSequencer {
         Ok(SequenceDecision::Action(SequenceAction::RespondToCq {
             callsign: callsign.to_string(),
             frequency,
+            dx_parity: slot_parity,
         }))
     }
 
     /// Execute a sequence action
     pub async fn execute_action(&self, action: SequenceAction) -> Result<(), AutoSequencerError> {
         match action {
-            SequenceAction::StartCq { frequency } => {
+            SequenceAction::StartCq {
+                frequency,
+                tx_parity,
+            } => {
                 let qso_id = self
                     .qso_manager
-                    .start_cq(frequency, None)
+                    .start_cq(frequency, tx_parity)
                     .await
                     .map_err(|e| AutoSequencerError::QsoManager { source: e })?;
 
@@ -441,10 +464,11 @@ impl AutoSequencer {
             SequenceAction::RespondToCq {
                 callsign,
                 frequency,
+                dx_parity,
             } => {
                 let qso_id = self
                     .qso_manager
-                    .respond_to_cq(callsign, frequency, None)
+                    .respond_to_cq(callsign, frequency, dx_parity)
                     .await
                     .map_err(|e| AutoSequencerError::QsoManager { source: e })?;
 
@@ -836,7 +860,12 @@ impl AutoSequencer {
         if let Some(frequency) = self.select_cq_frequency().await {
             info!("Starting auto CQ on {:.1} Hz", frequency);
 
-            let action = SequenceAction::StartCq { frequency };
+            // Auto-CQ doesn't carry a heard parity (we initiate); let
+            // the TX scheduler resolve via tx_self_parity config.
+            let action = SequenceAction::StartCq {
+                frequency,
+                tx_parity: None,
+            };
             self.execute_action(action).await?;
         }
 
@@ -1106,6 +1135,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_cq_evaluation() {
+        use pancetta_core::slot::SlotParity;
+
         let qso_manager = QsoManager::new(test_qso_manager_config());
         let sequencer = AutoSequencer::new(test_config(), qso_manager, "W1ABC".to_string());
 
@@ -1115,6 +1146,7 @@ mod tests {
                 14074000.0,
                 Some("FN31"),
                 -10.0, // Good signal
+                Some(SlotParity::Even),
             )
             .await
             .unwrap();
@@ -1123,9 +1155,11 @@ mod tests {
             SequenceDecision::Action(SequenceAction::RespondToCq {
                 callsign,
                 frequency,
+                dx_parity,
             }) => {
                 assert_eq!(callsign, "K1DEF");
                 assert_eq!(frequency, 14074000.0);
+                assert_eq!(dx_parity, Some(SlotParity::Even));
             }
             _ => panic!("Expected RespondToCq action"),
         }
