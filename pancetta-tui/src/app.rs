@@ -370,6 +370,28 @@ pub struct App {
     pub audio_rx: Option<mpsc::UnboundedReceiver<Vec<f32>>>,
 }
 
+/// Peak intensity in the latest waterfall row within ±radius_hz of center_hz.
+fn spectral_peak(row: &[f32], center_hz: f64, radius_hz: f64, range: (f64, f64)) -> f32 {
+    if row.is_empty() {
+        return 0.0;
+    }
+    let (lo, hi) = range;
+    let width = row.len() as f64;
+    let bin_hz = (hi - lo) / width;
+    if bin_hz <= 0.0 {
+        return 0.0;
+    }
+    let center_bin = ((center_hz - lo) / bin_hz) as isize;
+    let radius_bins = (radius_hz / bin_hz).ceil() as isize;
+    let lo_bin = center_bin.saturating_sub(radius_bins).max(0) as usize;
+    let hi_bin = (center_bin + radius_bins).max(0) as usize;
+    let hi_bin = hi_bin.min(row.len() - 1);
+    if lo_bin > hi_bin {
+        return 0.0;
+    }
+    row[lo_bin..=hi_bin].iter().copied().fold(0.0f32, f32::max)
+}
+
 impl App {
     pub async fn new(config: Config, audio_device: Option<String>) -> Result<Self> {
         let station_info = StationInfo {
@@ -1150,6 +1172,76 @@ impl App {
         }
     }
 
+    /// Find the best TX audio offset given current spectral activity and
+    /// recent decode history. Returns `None` if every candidate is occupied
+    /// in our parity. Caller updates `tx_frequency_offset` if Some.
+    ///
+    /// Scoring (lower = better):
+    ///   spectral_penalty = peak amplitude in latest waterfall row near offset
+    ///   decode_penalty   = N decodes within 37.5 Hz in our parity (last 60s)
+    ///   own_penalty      = 1.0 if any active QSO within 75 Hz else 0.0
+    ///   center_bias      = (|offset - 1500| / 1300) * 0.3   (small)
+    ///
+    /// Hard reject: any candidate with decode_penalty > 0 or own_penalty > 0.
+    /// Among the remaining, lowest spectral + center_bias wins.
+    pub fn find_clear_offset(&self) -> Option<f64> {
+        use pancetta_core::slot::SlotParity;
+
+        const MIN_HZ: f64 = 200.0;
+        const MAX_HZ: f64 = 2800.0;
+        const STEP_HZ: f64 = 25.0;
+        const SEPARATION_HZ: f64 = 75.0;
+        const NEIGHBOR_HZ: f64 = 37.5;
+        const SPECTRAL_RANGE_HZ: (f64, f64) = (0.0, 3000.0);
+
+        let tx_parity: Option<SlotParity> = self.resolve_tx_parity();
+        let now = chrono::Utc::now();
+        let cutoff = now - chrono::Duration::seconds(60);
+
+        let latest_row: Option<&Vec<f32>> = self.waterfall_data.last();
+
+        let own_freqs: Vec<f64> = self.active_qsos.iter().map(|q| q.frequency_hz).collect();
+
+        let recent_decodes_in_parity: Vec<f64> = self
+            .decoded_messages
+            .iter()
+            .filter(|m| m.timestamp >= cutoff)
+            .filter(|m| match (tx_parity, m.slot_parity) {
+                (Some(my), Some(theirs)) => my == theirs,
+                // tx_parity unknown → treat all decodes as blocking.
+                (None, _) => true,
+                // decode parity unknown → treat as blocking (safer default).
+                (Some(_), None) => true,
+            })
+            .map(|m| m.delta_freq as f64)
+            .collect();
+
+        let mut best: Option<(f64, f64)> = None; // (offset, score)
+        let mut hz = MIN_HZ;
+        while hz <= MAX_HZ {
+            let near_decode = recent_decodes_in_parity
+                .iter()
+                .any(|&f| (f - hz).abs() <= SEPARATION_HZ);
+            let near_own = own_freqs.iter().any(|&f| (f - hz).abs() <= SEPARATION_HZ);
+
+            if !near_decode && !near_own {
+                let spectral = if let Some(row) = latest_row {
+                    spectral_peak(row, hz, NEIGHBOR_HZ, SPECTRAL_RANGE_HZ)
+                } else {
+                    0.0
+                };
+                let center_bias = ((hz - 1500.0).abs() / 1300.0) * 0.3;
+                let score = spectral as f64 + center_bias;
+                best = match best {
+                    Some((_, prev)) if prev <= score => best,
+                    _ => Some((hz, score)),
+                };
+            }
+            hz += STEP_HZ;
+        }
+        best.map(|(hz, _)| hz)
+    }
+
     /// The parity our station will TX in. Active QSO wins; otherwise fall
     /// back to config (Even/Odd) or None for Auto.
     pub fn resolve_tx_parity(&self) -> Option<pancetta_core::slot::SlotParity> {
@@ -1374,5 +1466,83 @@ mod tests {
             .collect();
         // Pinned: DIR3, DIR2, DIR1 (newest-first); then PLAIN2, PLAIN1.
         assert_eq!(displayed, vec!["DIR3", "DIR2", "DIR1", "PLAIN2", "PLAIN1"]);
+    }
+
+    #[tokio::test]
+    async fn find_clear_offset_avoids_busy_parity() {
+        use chrono::{Duration, Utc};
+        use pancetta_core::slot::SlotParity;
+
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        // Set TX parity so the finder knows what to avoid.
+        app.config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
+
+        // Saturate the band 1400-1600 Hz with Even-parity decodes (busy for us).
+        let now = Utc::now();
+        for f in (1400..1600).step_by(50) {
+            app.decoded_messages.push_back(fixture_view_at(
+                "AB1CD",
+                f as f32,
+                SlotParity::Even,
+                now - Duration::seconds(5),
+            ));
+        }
+
+        // Latest waterfall row is mostly quiet except 1400-1600.
+        let mut row = vec![0.0f32; 100];
+        for i in 47..54 {
+            row[i] = 1.0;
+        }
+        app.waterfall_data.push(row);
+
+        let pick = app.find_clear_offset().expect("should find a clear spot");
+        // Should land outside 1400-1600 ± 75 Hz separation.
+        assert!(
+            pick < 1325.0 || pick > 1675.0,
+            "picked {} which is too close to busy band",
+            pick
+        );
+        // Should be in the allowed range (200..2800).
+        assert!(pick >= 200.0 && pick <= 2800.0);
+    }
+
+    #[tokio::test]
+    async fn find_clear_offset_returns_none_when_band_saturated() {
+        use chrono::{Duration, Utc};
+        use pancetta_core::slot::SlotParity;
+
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
+
+        // Decode every 25 Hz across the whole 200-2800 range in our parity.
+        let now = Utc::now();
+        for f in (200..=2800).step_by(25) {
+            app.decoded_messages.push_back(fixture_view_at(
+                "ZZZZZ",
+                f as f32,
+                SlotParity::Even,
+                now - Duration::seconds(5),
+            ));
+        }
+
+        let pick = app.find_clear_offset();
+        assert!(
+            pick.is_none(),
+            "should refuse to pick when nothing is clear"
+        );
+    }
+
+    // Helper for the tests above.
+    fn fixture_view_at(
+        call: &str,
+        delta_freq: f32,
+        parity: pancetta_core::slot::SlotParity,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> DecodedMessageView {
+        let mut v = fixture_view(call, -10);
+        v.delta_freq = delta_freq;
+        v.slot_parity = Some(parity);
+        v.timestamp = timestamp;
+        v
     }
 }
