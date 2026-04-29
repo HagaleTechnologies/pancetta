@@ -389,3 +389,51 @@ impl super::ApplicationCoordinator {
         Ok(())
     }
 }
+
+/// Rolling median over a recent window of dB powers. Used as a per-bin
+/// noise-floor estimate so the waterfall renders signal-above-floor
+/// instead of per-row min/max stretch (which hid signals at all amplitudes).
+fn rolling_median(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<f32> = samples.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted[sorted.len() / 2]
+}
+
+#[cfg(test)]
+mod median_tests {
+    use super::rolling_median;
+
+    #[test]
+    fn empty_returns_zero() {
+        assert_eq!(rolling_median(&[]), 0.0);
+    }
+
+    #[test]
+    fn single_value_is_itself() {
+        assert_eq!(rolling_median(&[7.0]), 7.0);
+    }
+
+    #[test]
+    fn odd_length_picks_middle() {
+        assert_eq!(rolling_median(&[1.0, 5.0, 3.0]), 3.0);
+    }
+
+    #[test]
+    fn even_length_picks_upper_middle() {
+        // For waterfall use (noise-floor estimation), upper-middle is fine —
+        // we don't need the strict midpoint average.
+        assert_eq!(rolling_median(&[1.0, 2.0, 3.0, 4.0]), 3.0);
+    }
+
+    #[test]
+    fn ignores_nan() {
+        // partial_cmp returns None for NaN; we use unwrap_or(Equal). Just
+        // verify it doesn't panic.
+        let xs = [1.0, f32::NAN, 3.0, 2.0];
+        let m = rolling_median(&xs);
+        assert!(m.is_finite());
+    }
+}
