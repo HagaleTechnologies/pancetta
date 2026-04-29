@@ -767,11 +767,7 @@ mod schedule_tx_tests {
     fn resolve_required_parity_explicit_wins_over_config() {
         use pancetta_config::station::TxSelfParity;
         // tx_parity = Some(Even), config = Auto → returns Even
-        let p = resolve_required_parity(
-            Some(SlotParity::Even),
-            TxSelfParity::Auto,
-            at(5.0),
-        );
+        let p = resolve_required_parity(Some(SlotParity::Even), TxSelfParity::Auto, at(5.0));
         assert_eq!(p, SlotParity::Even);
     }
 
@@ -779,11 +775,7 @@ mod schedule_tx_tests {
     fn resolve_required_parity_explicit_wins_over_explicit_config() {
         use pancetta_config::station::TxSelfParity;
         // tx_parity = Some(Even), config = Odd → tx_parity wins → Even
-        let p = resolve_required_parity(
-            Some(SlotParity::Even),
-            TxSelfParity::Odd,
-            at(5.0),
-        );
+        let p = resolve_required_parity(Some(SlotParity::Even), TxSelfParity::Odd, at(5.0));
         assert_eq!(p, SlotParity::Even);
     }
 

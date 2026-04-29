@@ -25,12 +25,17 @@ cd "$(git rev-parse --show-toplevel)"
 FAST=0
 FIX=0
 INSTALL_HOOK=0
+# When invoked as a git pre-push hook, git passes positional args
+# ($1=remote-name, $2=remote-url) and a list of refs on stdin. Detect
+# that case (script name is "pre-push" or first non-flag arg looks
+# like a remote name) and ignore positional args.
 for arg in "$@"; do
     case "$arg" in
         --fast)         FAST=1 ;;
         --fix)          FIX=1 ;;
         --install-hook) INSTALL_HOOK=1 ;;
-        *) echo "Unknown flag: $arg" >&2; exit 2 ;;
+        --*)            echo "Unknown flag: $arg" >&2; exit 2 ;;
+        *)              ;;  # positional arg — likely from pre-push hook context, ignore
     esac
 done
 

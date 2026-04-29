@@ -172,8 +172,7 @@ impl super::ApplicationCoordinator {
                         // tag invariant under decode latency. (next_slot_start would
                         // give the wrong slot if decode pushes us into the next slot
                         // before we tag.)
-                        let slot_start =
-                            window_received_utc - chrono::Duration::seconds(13);
+                        let slot_start = window_received_utc - chrono::Duration::seconds(13);
                         let window_parity = pancetta_core::slot::SlotParity::of(slot_start);
 
                         for decoded_msg in decoded_messages.iter_mut() {
