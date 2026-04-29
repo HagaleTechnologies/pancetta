@@ -605,7 +605,23 @@ impl App {
         // Add to band activity
         self.decoded_messages.push_back(message.clone());
 
-        // Limit message history
+        // Preserve operator's highlight position. The display reverses
+        // (newest first), and `band_activity_scroll` indexes into that
+        // reversed view. A push_back makes a new entry the new "row 0",
+        // so every previously-highlighted row's index shifts by one.
+        // Without this bump, the operator highlights a CQ, a new decode
+        // arrives ~15 seconds later, the highlight visually stays put
+        // but now points at the freshly-arrived decode — Space-press
+        // calls the wrong station. Bumping keeps them on the same
+        // logical message. Special case: scroll == 0 means "track the
+        // newest", which is what the operator wants — leave it alone.
+        if self.band_activity_scroll > 0 {
+            self.band_activity_scroll += 1;
+        }
+
+        // Limit message history. pop_front removes the oldest, which
+        // doesn't shift indices counted from the back, so the scroll
+        // position stays valid through pruning.
         while self.decoded_messages.len() > 1000 {
             self.decoded_messages.pop_front();
         }
@@ -1078,5 +1094,96 @@ impl App {
                 info!("Autonomous state: {}", status.state);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {
+        DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14_074_000.0,
+            mode: "FT8".to_string(),
+            snr,
+            delta_time: 0.0,
+            delta_freq: 1500.0,
+            call_sign: Some(call.to_string()),
+            grid_square: None,
+            message: format!("CQ {} FN42", call),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+        }
+    }
+
+    async fn fixture_app() -> App {
+        App::new(Config::default(), None)
+            .await
+            .expect("default Config should construct App")
+    }
+
+    /// Regression: highlighting a CQ at scroll>0, then a new decode arrives
+    /// via add_decoded_message, must not silently change which logical
+    /// message the operator's selector points at. Without the
+    /// scroll-bump-on-insert in add_decoded_message, Space-press would
+    /// call the wrong station every time a new slot's decodes landed.
+    #[tokio::test]
+    async fn add_decoded_message_preserves_highlight_on_arrival() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+
+        app.add_decoded_message(fixture_view("OLDONE", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("MIDONE", -5))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("NEWONE", 0))
+            .await
+            .unwrap();
+
+        // Reverse-order display: NEWONE (row 0), MIDONE (row 1), OLDONE (row 2).
+        // Operator scrolls down twice to highlight OLDONE.
+        app.band_activity_scroll = 2;
+        let pre = app.get_selected_station().expect("OLDONE selectable");
+        assert_eq!(pre.0, "OLDONE");
+
+        // New decode lands a slot later.
+        app.add_decoded_message(fixture_view("FRESH1", 3))
+            .await
+            .unwrap();
+
+        // Highlight must STILL point at OLDONE — not at whatever happens
+        // to be at row 2 after the prepend.
+        let post = app.get_selected_station().expect("OLDONE still selectable");
+        assert_eq!(
+            post.0, "OLDONE",
+            "highlight slid off-target after new decode arrived"
+        );
+    }
+
+    /// When the operator has NOT scrolled (scroll == 0, tracking newest),
+    /// add_decoded_message keeps them on row 0 — they want to see the
+    /// freshest decode. Don't bump in this case.
+    #[tokio::test]
+    async fn add_decoded_message_keeps_tracking_newest_when_unscrolled() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+
+        app.add_decoded_message(fixture_view("FIRST", -10))
+            .await
+            .unwrap();
+        let pre = app.get_selected_station().expect("FIRST selectable");
+        assert_eq!(pre.0, "FIRST");
+
+        app.add_decoded_message(fixture_view("SECOND", -5))
+            .await
+            .unwrap();
+
+        let post = app.get_selected_station().expect("SECOND selectable");
+        assert_eq!(post.0, "SECOND");
+        assert_eq!(app.band_activity_scroll, 0);
     }
 }
