@@ -131,6 +131,7 @@ cargo run --release
 | `Tab` | Cycle active panel (Band Activity, DX Hunter, Waterfall, Station Info) |
 | `↑` / `↓` | Move selection within the active panel |
 | `Space` | Call the selected station (queues a TX for the next slot) |
+| `T` | **Find clear TX offset** — auto-picks a 25 Hz candidate that's clear in your TX parity, jumps the cursor there. Status bar reports the chosen Hz or "No clear offset found." |
 | `F2` | Start repeating CQ |
 | `F3` | Stop repeating CQ |
 | `F4` | **Tune** — 12s single tone at 1500 Hz (PTT engaged). Press again to abort. |

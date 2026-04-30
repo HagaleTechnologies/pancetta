@@ -116,6 +116,14 @@ operator-supervised.
 
 ### Switch to antenna
 
+- **Pick a clean TX offset:** with the operator's TX parity selected
+  (Auto, Even, or Odd in `[station].tx_self_parity`), press `T` to
+  auto-pick a 25 Hz candidate. The waterfall's occupancy strip (top
+  row) shows the rationale: green/dim = clear, yellow = busy in
+  opposite parity (won't collide but courtesy concern), red = busy in
+  your parity. The TX cursor (`│`) recolors to match the column it's
+  on so manual `[`/`]` adjustments give live feedback.
+
 8. **Switch to antenna.** Disconnect dummy load, connect antenna,
    confirm SWR is sane on a brief tune-up tone. (Don't tune through
    pancetta — use the rig's tune button.) Pancetta does not currently
