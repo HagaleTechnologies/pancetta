@@ -321,7 +321,8 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
         .collect();
 
     // Build (freq, parity, timestamp) tuples for the occupancy strip from
-    // recent decodes. Filter to last 60s; the widget further trims by column.
+    // recent decodes. Filter to last 60s; the widget further trims per-column
+    // (±37.5 Hz of column center, and re-checks the 60s cutoff defensively).
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(60);
     let decoded_for_occupancy: Vec<(
         f64,
