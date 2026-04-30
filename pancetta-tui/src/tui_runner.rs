@@ -122,10 +122,10 @@ pub enum TuiCommand {
     SendMessage { text: String },
     /// Toggle PTT
     TogglePtt,
-    /// Abort the in-flight TX without exiting pancetta. Operator-pressed F8.
-    /// Distinct from Ctrl-Q (whole-app shutdown) and StopCq (turn off
-    /// repeating CQ). Drops PTT within ~150ms via the same PttGuard
-    /// mechanism the shutdown path uses.
+    /// Abort the in-flight TX without exiting pancetta. Operator-pressed `h`.
+    /// Distinct from `q` (whole-app shutdown, with confirm) and `s`/StopCq
+    /// (turn off repeating CQ). Drops PTT within ~150ms via the same
+    /// PttGuard mechanism the shutdown path uses.
     StopTx,
     /// Operator pressed `T` — find a clear TX audio offset and jump the
     /// cursor there. TUI-local: the handler calls `App::find_clear_offset`
@@ -134,9 +134,10 @@ pub enum TuiCommand {
     // Part of the TuiCommand API for future remote-control or scripting use
     FindClearOffset,
     /// Toggle a single-tone tune transmission for antenna tuning. Maps
-    /// to F4. First press starts a 12-second tone; subsequent press while
-    /// a tune is active aborts it. F8 / Ctrl-Q also abort. Coordinator
-    /// owns the tone-active state; the TUI just sends the toggle.
+    /// to Shift+T. First press starts a 12-second tone; subsequent press
+    /// while a tune is active aborts it. `h` (halt TX) also aborts.
+    /// Coordinator owns the tone-active state; the TUI just sends the
+    /// toggle.
     ToggleTune,
     /// Call a station (click-to-call from band activity)
     CallStation {
