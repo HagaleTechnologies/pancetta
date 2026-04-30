@@ -501,10 +501,10 @@ impl App {
     }
 
     pub async fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
-        // When help is visible, consume Escape/F1/? to close it and swallow all other keys
+        // When help is visible, consume Escape/? to close it and swallow all other keys
         if self.help_visible {
             match key.code {
-                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => {
+                KeyCode::Esc | KeyCode::Char('?') => {
                     self.toggle_help();
                 }
                 _ => {} // swallow all other keys
@@ -515,10 +515,6 @@ impl App {
         match key.code {
             // Global shortcuts
             KeyCode::Esc => {
-                self.should_quit = true;
-                return Ok(true);
-            }
-            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
                 return Ok(true);
             }
@@ -555,26 +551,6 @@ impl App {
                 for _ in 0..10 {
                     self.scroll_down();
                 }
-            }
-
-            // Theme switching
-            KeyCode::Char('t') => {
-                self.toggle_theme();
-            }
-
-            // Audio monitoring
-            KeyCode::Char('m') => {
-                self.toggle_monitoring().await?;
-            }
-
-            // Autonomous mode toggle
-            KeyCode::Char('a') => {
-                self.toggle_autonomous();
-            }
-
-            // Pause/resume autonomous
-            KeyCode::Char('p') => {
-                self.toggle_autonomous_pause();
             }
 
             // Clear messages
@@ -627,7 +603,7 @@ impl App {
         Ok(())
     }
 
-    async fn toggle_monitoring(&mut self) -> Result<()> {
+    pub async fn toggle_monitoring(&mut self) -> Result<()> {
         self.is_monitoring = !self.is_monitoring;
         self.status_message = if self.is_monitoring {
             "Audio monitoring enabled"
@@ -1099,7 +1075,7 @@ impl App {
         self.autonomous_status = Some(status);
     }
 
-    fn toggle_autonomous(&mut self) {
+    pub fn toggle_autonomous(&mut self) {
         if let Some(ref mut status) = self.autonomous_status {
             status.enabled = !status.enabled;
             self.status_message = if status.enabled {
@@ -1162,7 +1138,7 @@ impl App {
         }
     }
 
-    fn toggle_autonomous_pause(&mut self) {
+    pub fn toggle_autonomous_pause(&mut self) {
         if let Some(ref mut status) = self.autonomous_status {
             if status.enabled {
                 // Toggle paused state via the state string.

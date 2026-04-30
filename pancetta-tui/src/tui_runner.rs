@@ -196,6 +196,36 @@ impl TuiRunner {
         })
     }
 
+    /// Create a TUI runner for unit tests — bypasses `enable_raw_mode` so tests
+    /// can run headless (CI, tmux, or any environment without a real PTY).
+    /// The terminal is never rendered in key-event unit tests; it's only present
+    /// to satisfy the struct layout.
+    #[cfg(test)]
+    fn new_for_test(
+        app: Arc<RwLock<App>>,
+        config: Config,
+        message_rx: Receiver<TuiMessage>,
+        message_tx: Sender<TuiCommand>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        // Skip enable_raw_mode / EnterAlternateScreen — CrosstermBackend and
+        // Terminal::new are safe to construct without a real PTY.
+        let stdout = io::stdout();
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = Terminal::new(backend)?;
+        Ok(Self {
+            app,
+            config,
+            terminal,
+            message_rx,
+            message_tx,
+            shutdown,
+            last_render: Instant::now(),
+            target_fps: 30,
+            metrics: TuiMetrics::default(),
+        })
+    }
+
     /// Run the TUI main loop
     pub async fn run(mut self) -> Result<()> {
         info!("Starting TUI main loop");
@@ -352,10 +382,27 @@ impl TuiRunner {
     async fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
         let mut app = self.app.write().await;
 
+        // If quit-confirm modal is visible, route keys there
+        if app.quit_confirm_visible {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    app.quit_confirm_visible = false;
+                    let _ = self.message_tx.send(TuiCommand::Quit);
+                    return Ok(false);
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                    app.quit_confirm_visible = false;
+                    app.status_message = "Quit cancelled".to_string();
+                }
+                _ => {} // swallow all other keys
+            }
+            return Ok(true);
+        }
+
         // If help overlay is visible, route keys to help handler
         if app.help_visible {
             match key.code {
-                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('?') => {
+                KeyCode::Esc | KeyCode::Char('?') => {
                     app.toggle_help();
                 }
                 _ => {} // swallow all other keys while help is open
@@ -402,29 +449,6 @@ impl TuiRunner {
         }
 
         match key.code {
-            // Quit (Ctrl+Q)
-            KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let _ = self.message_tx.send(TuiCommand::Quit);
-                return Ok(false);
-            }
-
-            // Device selection modal
-            KeyCode::Char('D') => {
-                app.device_selection.visible = true;
-                // Device lists are populated by the coordinator via TuiMessage.
-                // If no devices have been reported, show empty list rather than fake data.
-                if app.device_selection.input_devices.is_empty()
-                    && app.device_selection.output_devices.is_empty()
-                {
-                    app.status_message =
-                        "No audio devices reported — check coordinator connection".to_string();
-                } else {
-                    app.status_message =
-                        "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"
-                            .to_string();
-                }
-            }
-
             // Panel navigation
             KeyCode::Tab => {
                 app.next_panel();
@@ -449,56 +473,6 @@ impl TuiRunner {
                 app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
             }
 
-            // Function keys
-            KeyCode::F(1) | KeyCode::Char('?') => {
-                // F1 / ? - Help
-                app.toggle_help();
-            }
-            KeyCode::F(2) => {
-                // F2 - Start CQ
-                self.message_tx.send(TuiCommand::StartCq)?;
-            }
-            KeyCode::F(3) => {
-                // F3 - Stop CQ
-                self.message_tx.send(TuiCommand::StopCq)?;
-            }
-            KeyCode::F(4) => {
-                // F4 - Toggle single-tone tune (antenna tuning aid).
-                // First press: 12s tone at 1500 Hz with PTT engaged.
-                // Press again to abort early. F8 also halts.
-                self.message_tx.send(TuiCommand::ToggleTune)?;
-            }
-            KeyCode::F(8) => {
-                // F8 - Halt current TX (matches WSJT-X muscle memory).
-                // Releases PTT within ~150ms; pancetta keeps running and
-                // listening. Distinct from Ctrl-Q (whole-app exit).
-                self.message_tx.send(TuiCommand::StopTx)?;
-            }
-            KeyCode::Char('T') | KeyCode::Char('t') => {
-                // T - Find clear TX offset and jump the cursor there.
-                // Scans the current parity's occupied offsets and picks
-                // the closest unoccupied slot. Updates the TX cursor
-                // locally; no coordinator message needed.
-                match app.find_clear_offset() {
-                    Some(hz) => {
-                        app.tx_frequency_offset = hz;
-                        app.status_message = format!("TX cursor → {:.0} Hz (clear)", hz);
-                    }
-                    None => {
-                        app.status_message = "No clear offset found in your parity".to_string();
-                    }
-                }
-            }
-            KeyCode::F(5) => {
-                // F5 - Clear messages
-                app.clear_messages();
-                self.message_tx.send(TuiCommand::ClearMessages)?;
-            }
-            KeyCode::F(9) => {
-                // F9 - Toggle PTT
-                self.message_tx.send(TuiCommand::TogglePtt)?;
-            }
-
             // TX frequency offset: [ = down 50 Hz, ] = up 50 Hz
             KeyCode::Char('[') => {
                 app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(100.0);
@@ -509,8 +483,9 @@ impl TuiRunner {
                 app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
             }
 
-            // Band switching: + = band up, - = band down
-            KeyCode::Char('+') | KeyCode::Char('=') => {
+            // Band switching: = = band up (+ dropped; Shift not required),
+            // - / _ = band down
+            KeyCode::Char('=') => {
                 let freq_hz = app.band_up();
                 self.message_tx.send(TuiCommand::SetFrequency {
                     vfo: 0,
@@ -523,6 +498,84 @@ impl TuiRunner {
                     vfo: 0,
                     frequency: freq_hz,
                 })?;
+            }
+
+            // === Quit (with confirm modal) ===
+            KeyCode::Char('q') => {
+                app.quit_confirm_visible = true;
+                app.status_message =
+                    "Quit pancetta? Press y/Enter to confirm, n/Esc/q to cancel".to_string();
+            }
+
+            // === Modal shortcuts ===
+            KeyCode::Char('d') => {
+                app.device_selection.visible = true;
+                if app.device_selection.input_devices.is_empty()
+                    && app.device_selection.output_devices.is_empty()
+                {
+                    app.status_message =
+                        "No audio devices reported — check coordinator connection".to_string();
+                } else {
+                    app.status_message =
+                        "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"
+                            .to_string();
+                }
+            }
+            KeyCode::Char('?') => {
+                app.toggle_help();
+            }
+
+            // === CQ + QSO actions ===
+            KeyCode::Char('c') => {
+                self.message_tx.send(TuiCommand::StartCq)?;
+            }
+            KeyCode::Char('s') => {
+                self.message_tx.send(TuiCommand::StopCq)?;
+            }
+            KeyCode::Char('h') => {
+                // h - Halt current TX. Releases PTT within ~150ms; pancetta
+                // keeps running and listening.
+                self.message_tx.send(TuiCommand::StopTx)?;
+            }
+            KeyCode::Char('p') => {
+                self.message_tx.send(TuiCommand::TogglePtt)?;
+            }
+
+            // === Tune / clear-offset (case-sensitive) ===
+            KeyCode::Char('T') => {
+                // Shift-T: 12-second single-tone tune. Shift requirement is a
+                // small barrier against accidental TX during keyboard fumbling.
+                self.message_tx.send(TuiCommand::ToggleTune)?;
+            }
+            KeyCode::Char('t') => {
+                // Lowercase t: find clear TX offset and jump the cursor there.
+                match app.find_clear_offset() {
+                    Some(hz) => {
+                        app.tx_frequency_offset = hz;
+                        app.status_message = format!("TX cursor → {:.0} Hz (clear)", hz);
+                    }
+                    None => {
+                        app.status_message = "No clear offset found in your parity".to_string();
+                    }
+                }
+            }
+
+            // === Autonomous controls ===
+            KeyCode::Char('a') => {
+                app.toggle_autonomous();
+            }
+            KeyCode::Char('P') => {
+                // Shift-P: pause/resume autonomous (uppercase to disambiguate from p=PTT).
+                app.toggle_autonomous_pause();
+            }
+            KeyCode::Char('m') => {
+                app.toggle_monitoring().await?;
+            }
+
+            // === Display / housekeeping ===
+            KeyCode::Char('x') => {
+                app.clear_messages();
+                self.message_tx.send(TuiCommand::ClearMessages)?;
             }
 
             // Space - Select/activate (click-to-call)
@@ -546,7 +599,7 @@ impl TuiRunner {
                 }
             }
 
-            // Text input
+            // Text input (catch-all — must come after all explicit Char arms)
             KeyCode::Char(c) => {
                 app.input_char(c);
             }
@@ -874,6 +927,216 @@ impl TuiRunner {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+    use crate::app::App;
+    use crate::config::Config;
+    use crossbeam_channel::unbounded;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    async fn make_runner() -> (
+        TuiRunner,
+        crossbeam_channel::Receiver<TuiCommand>,
+        Arc<RwLock<App>>,
+    ) {
+        let app = Arc::new(RwLock::new(
+            App::new(Config::default(), None).await.unwrap(),
+        ));
+        let (_tui_msg_tx, tui_msg_rx) = unbounded::<TuiMessage>();
+        let (cmd_tx, cmd_rx) = unbounded::<TuiCommand>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let runner = TuiRunner::new_for_test(
+            Arc::clone(&app),
+            Config::default(),
+            tui_msg_rx,
+            cmd_tx,
+            shutdown,
+        )
+        .unwrap();
+        (runner, cmd_rx, app)
+    }
+
+    fn key(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn key_shift(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    #[tokio::test]
+    async fn key_c_emits_start_cq() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key('c')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq)));
+    }
+
+    #[tokio::test]
+    async fn key_s_emits_stop_cq() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key('s')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::StopCq)));
+    }
+
+    #[tokio::test]
+    async fn key_h_emits_stop_tx() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key('h')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::StopTx)));
+    }
+
+    #[tokio::test]
+    async fn key_p_emits_toggle_ptt() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key('p')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::TogglePtt)));
+    }
+
+    #[tokio::test]
+    async fn key_uppercase_t_emits_toggle_tune() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key_shift('T')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::ToggleTune)));
+    }
+
+    #[tokio::test]
+    async fn key_lowercase_t_does_not_emit_toggle_tune() {
+        // Lowercase t is FindClearOffset (handled locally; no command sent).
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key('t')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn key_q_opens_modal_does_not_quit() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('q')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err(), "must not send Quit yet");
+        assert!(
+            app.read().await.quit_confirm_visible,
+            "modal must be visible"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_y_in_modal_confirms_quit() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.quit_confirm_visible = true;
+        r.handle_key_event(key('y')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::Quit)));
+    }
+
+    #[tokio::test]
+    async fn key_n_in_modal_dismisses() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.quit_confirm_visible = true;
+        r.handle_key_event(key('n')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err(), "must not Quit");
+        assert!(!app.read().await.quit_confirm_visible);
+    }
+
+    #[tokio::test]
+    async fn key_esc_in_modal_dismisses() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.quit_confirm_visible = true;
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(!app.read().await.quit_confirm_visible);
+    }
+
+    #[tokio::test]
+    async fn key_q_in_modal_dismisses() {
+        // Pressing q again while modal is up should dismiss.
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.quit_confirm_visible = true;
+        r.handle_key_event(key('q')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err());
+        assert!(!app.read().await.quit_confirm_visible);
+    }
+
+    #[tokio::test]
+    async fn key_enter_in_modal_confirms() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.quit_confirm_visible = true;
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::Quit)));
+    }
+
+    #[tokio::test]
+    async fn key_d_lowercase_opens_device_picker() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('d')).await.unwrap();
+        assert!(app.read().await.device_selection.visible);
+    }
+
+    #[tokio::test]
+    async fn key_d_uppercase_no_longer_opens_device_picker() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key_shift('D')).await.unwrap();
+        assert!(!app.read().await.device_selection.visible);
+    }
+
+    #[tokio::test]
+    async fn key_x_emits_clear_messages() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key('x')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::ClearMessages)));
+    }
+
+    #[tokio::test]
+    async fn key_f4_no_longer_does_anything() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn key_ctrl_q_no_longer_quits() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(cmd_rx.try_recv().is_err(), "Ctrl-Q must no longer quit");
+    }
+
+    #[tokio::test]
+    async fn key_esc_does_not_quit_when_no_modal() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn key_equals_emits_band_up() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key('=')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::SetFrequency { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn key_plus_no_longer_changes_band() {
+        // Spec drops `+` so we don't require Shift.
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key('+')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err());
     }
 }
 
