@@ -128,18 +128,25 @@ cargo run --release
 
 | Key | Action |
 |---|---|
-| `Tab` | Cycle active panel (Band Activity, DX Hunter, Waterfall, Station Info) |
-| `↑` / `↓` | Move selection within the active panel |
-| `Space` | Call the selected station (queues a TX for the next slot) |
-| `T` | **Find clear TX offset** — auto-picks a 25 Hz candidate that's clear in your TX parity, jumps the cursor there. Status bar reports the chosen Hz or "No clear offset found." |
-| `F2` | Start repeating CQ |
-| `F3` | Stop repeating CQ |
-| `F4` | **Tune** — 12s single tone at 1500 Hz (PTT engaged). Press again to abort. |
-| `F8` | **Halt current TX** (drops PTT within ~150ms; pancetta keeps running) |
-| `F9` | Toggle PTT manually |
-| `D` | Open audio device picker |
-| `?` / `F1` | Toggle help overlay |
-| `Ctrl-Q` / `Esc` | Quit (also halts any in-flight TX) |
+| `Tab` / `Shift+Tab` | Cycle active panel |
+| `↑` / `↓` | Move selection within active panel |
+| `←` / `→` or `[` / `]` | TX offset −/+ 50 Hz |
+| `=` / `-` | Band up / down |
+| `Space` | Call selected station |
+| `Enter` | Send the TX text in the input buffer |
+| `c` / `s` | Start / stop repeating CQ |
+| `t` | **Find clear TX offset** — auto-picks a 25 Hz candidate clear in your TX parity. |
+| `Shift+T` | **Tune** — 12 s single tone at TX offset (PTT engages). |
+| `h` | **Halt current TX** (drops PTT within ~150 ms) |
+| `p` | Toggle PTT manually |
+| `a` | Toggle autonomous mode |
+| `Shift+P` | Pause / resume autonomous |
+| `m` | Toggle audio monitoring |
+| `d` | Open audio device picker |
+| `x` | Clear decoded messages |
+| `?` | Toggle help overlay |
+| `q` | Quit (with `[y/N]` confirm) |
+| `Esc` | Dismiss any overlay / cancel modal |
 
 The status bar at the bottom shows live pipeline state, your TX queue,
 and any errors emitted by the audio / QSO components.

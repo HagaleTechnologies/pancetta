@@ -18,7 +18,7 @@ Pancetta has four operating modes, distinguished by config:
 |---|---|---|---|
 | **Decode-only** *(safe)* | `false` | (irrelevant) | RX + TUI; no PTT, no audio output. Safe to run anywhere. |
 | **Manual TX** | `true` | `false` | Decode + Space-bar to call selected stations. Operator drives every TX. |
-| **Auto-CQ** | `true` | `false` | Manual + F2 starts a repeating CQ. Still operator-initiated. |
+| **Auto-CQ** | `true` | `false` | Manual + `c` starts a repeating CQ. Still operator-initiated. |
 | **Autonomous** *(Phase 5)* | `true` | `true` | Decode + autonomous decision engine drives CQ, response, full QSO progression. |
 
 The autonomous-mode toggle is **config-only** — there is no runtime
@@ -170,34 +170,34 @@ operator-supervised.
 
 ### Failure modes & abort
 
-- **F4 tunes the antenna.** Single 1500 Hz tone with PTT engaged for
+- **Shift+T tunes the antenna.** Single tone at TX offset with PTT engaged for
   12 seconds (matches WSJT-X's tune semantics, except WSJT-X has no
   auto-stop; pancetta auto-stops to play nice with the 14-second
   PTT safety watchdog). Amplitude is 0.5 (fixed in source); operator
-  is responsible for setting rig power *low* before pressing F4.
-  Press F4 again to abort early; F8 also halts; the auto-stop is the
+  is responsible for setting rig power *low* before pressing Shift+T.
+  Press Shift+T again to abort early; `h` also halts; the auto-stop is the
   third backstop. **Workflow**: dial rig power down to ~10W, press
-  F4, watch your antenna analyzer / SWR meter, optionally press F4
-  again when you're done. Re-press F4 to extend past 12s.
+  Shift+T, watch your antenna analyzer / SWR meter, optionally press Shift+T
+  again when you're done. Re-press Shift+T to extend past 12s.
 
-- **F8 halts the current TX without exiting.** Same ~150ms PTT-release
-  as Ctrl-Q (interruptible_sleep wakes the TX worker, drops PttGuard
+- **`h` halts the current TX without exiting.** Same ~150ms PTT-release
+  as `q` (interruptible_sleep wakes the TX worker, drops PttGuard
   → PTT-off), but pancetta keeps running and listening for the next
-  slot. F8 also stops repeating CQ (so you don't immediately re-arm).
-  Use F8 when you want to abort the *current* attempt — you misdialed,
+  slot. `h` also stops repeating CQ (so you don't immediately re-arm).
+  Use `h` when you want to abort the *current* attempt — you misdialed,
   the conditions changed, you saw a higher-priority decode mid-TX.
   **Test this on dummy load before going live**: arm a manual Space-
-  bar TX, hit F8 while audio is playing, confirm PTT releases within
+  bar TX, hit `h` while audio is playing, confirm PTT releases within
   ~200ms and pancetta is still up.
 
-- **Ctrl-Q at any time releases PTT within ~150ms AND exits.** Three
+- **`q` at any time releases PTT within ~150ms AND exits (with `[y/N]` confirm).** Three
   independent paths fire on shutdown: (1) coordinator sends a PTT-off
   via the message bus to Hamlib, (2) coordinator opens a fresh
   rigctld TCP connection and sends PTT-off directly (independent of
   the running Hamlib component), (3) the in-flight TX worker's
   interruptible sleeps wake within one 50ms poll chunk on shutdown,
   drop their `PttGuard` (which sends a third PTT-off as RAII cleanup),
-  and exit. Same dummy-load test applies; F8 is the lighter version.
+  and exit. Same dummy-load test applies; `h` is the lighter version.
 
 - **Ctrl-C** also works for emergency shutdown. The signal-hook task
   triggers the same coordinator shutdown path.
