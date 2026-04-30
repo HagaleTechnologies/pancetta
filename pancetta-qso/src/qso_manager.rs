@@ -670,8 +670,22 @@ impl QsoManager {
                     frequency,
                     ..
                 },
-                MessageType::SignalReport { report, .. },
+                MessageType::SignalReport {
+                    from_station,
+                    to_station,
+                    report,
+                },
             ) => {
+                if from_station != target_callsign || to_station != &self.config.our_callsign {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %target_callsign,
+                        got_from = %from_station,
+                        got_to = %to_station,
+                        "spurious SignalReport ignored — sender does not match QSO target"
+                    );
+                    return Ok(current_state.clone());
+                }
                 // Use received signal strength (SNR) as our report, default to received report
                 let our_report = signal_strength
                     .map(|snr| (snr.round() as i8).clamp(-30, 50))
@@ -694,15 +708,31 @@ impl QsoManager {
                     frequency,
                     ..
                 },
-                MessageType::ReportAck { .. },
-            ) => Ok(QsoState::WaitingForConfirmation {
-                their_callsign: their_callsign.clone(),
-                their_report: their_report.unwrap_or(-15),
-                our_report: *our_report,
-                frequency: *frequency,
-                grid_square: None,
-                started_at: Utc::now(),
-            }),
+                MessageType::ReportAck {
+                    from_station,
+                    to_station,
+                    ..
+                },
+            ) => {
+                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %their_callsign,
+                        got_from = %from_station,
+                        got_to = %to_station,
+                        "spurious ReportAck ignored"
+                    );
+                    return Ok(current_state.clone());
+                }
+                Ok(QsoState::WaitingForConfirmation {
+                    their_callsign: their_callsign.clone(),
+                    their_report: their_report.unwrap_or(-15),
+                    our_report: *our_report,
+                    frequency: *frequency,
+                    grid_square: None,
+                    started_at: Utc::now(),
+                })
+            }
 
             // Received final confirmation
             (
@@ -714,8 +744,21 @@ impl QsoManager {
                     grid_square,
                     started_at,
                 },
-                MessageType::FinalConfirmation { .. },
+                MessageType::FinalConfirmation {
+                    from_station,
+                    to_station,
+                },
             ) => {
+                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %their_callsign,
+                        got_from = %from_station,
+                        got_to = %to_station,
+                        "spurious FinalConfirmation ignored"
+                    );
+                    return Ok(current_state.clone());
+                }
                 let duration = (Utc::now() - *started_at).num_seconds() as u32;
                 Ok(QsoState::Completed {
                     their_callsign: their_callsign.clone(),
@@ -761,16 +804,21 @@ impl QsoManager {
         message_type: &MessageType,
         frequency: f64,
     ) -> bool {
-        // Check frequency match (with tolerance)
+        // Frequency tolerance tightened from 50 Hz → 15 Hz to reduce
+        // cross-QSO message bleed-through in multi-QSO mode. FT8 frame-to-
+        // frame drift is typically < 6 Hz on a stable transceiver, so 15 Hz
+        // covers normal operation while shrinking the window an attacker
+        // can exploit. (Security review 2026-04-29 C-1.)
+        const FREQ_TOLERANCE_HZ: f64 = 15.0;
         if let Some(qso_freq) = state.frequency() {
-            if (qso_freq - frequency).abs() > 50.0 {
-                // 50 Hz tolerance
+            if (qso_freq - frequency).abs() > FREQ_TOLERANCE_HZ {
                 return false;
             }
         }
 
-        // Check message relevance based on state and message content
         match (state, message_type) {
+            // We're calling CQ. The responder's callsign is whoever is in the
+            // `responding_station` field; the message must be addressed to us.
             (
                 QsoState::CallingCq { .. },
                 MessageType::CqResponse {
@@ -778,15 +826,40 @@ impl QsoManager {
                 },
             ) => calling_station == &self.config.our_callsign,
 
+            // We responded to a CQ from `target_callsign` and are waiting for
+            // their report. Verify both directions: from THEM, to US.
             (
                 QsoState::RespondingToCq {
-                    target_callsign: _, ..
+                    target_callsign, ..
                 },
-                MessageType::SignalReport { to_station, .. },
-            ) => to_station == &self.config.our_callsign,
+                MessageType::SignalReport {
+                    to_station,
+                    from_station,
+                    ..
+                },
+            ) => from_station == target_callsign && to_station == &self.config.our_callsign,
+
+            // We sent the report and are waiting for the report-ack. Same check.
+            (
+                QsoState::SendingReport { their_callsign, .. },
+                MessageType::ReportAck {
+                    to_station,
+                    from_station,
+                    ..
+                },
+            ) => from_station == their_callsign && to_station == &self.config.our_callsign,
+
+            // Awaiting RR73 — verify both directions.
+            (
+                QsoState::WaitingForConfirmation { their_callsign, .. },
+                MessageType::FinalConfirmation {
+                    to_station,
+                    from_station,
+                },
+            ) => from_station == their_callsign && to_station == &self.config.our_callsign,
 
             _ => {
-                // Check if message is addressed to our callsign
+                // Anything else: only relevant if addressed to us.
                 message_type.is_addressed_to(&self.config.our_callsign)
             }
         }
@@ -1052,5 +1125,204 @@ mod tests {
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert!(matches!(progress.state, QsoState::RespondingToCq { .. }));
         assert_eq!(progress.metadata.their_callsign, Some("K1DEF".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod sender_verification_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn manager_with_call(our: &str) -> QsoManager {
+        let config = QsoManagerConfig {
+            our_callsign: our.into(),
+            our_grid: Some("FN42".into()),
+            timeouts: TimeoutConfig::default(),
+            contest_mode: None,
+            auto_sequence: AutoSequenceConfig::default(),
+            duplicate_checking: DuplicateCheckConfig::default(),
+        };
+        QsoManager::new(config)
+    }
+
+    #[tokio::test]
+    async fn spoofed_signal_report_does_not_advance_state() {
+        let manager = manager_with_call("K5ARH");
+        let state = QsoState::RespondingToCq {
+            target_callsign: "K9ZZ".into(),
+            frequency: 1500.0,
+            started_at: Utc::now(),
+        };
+        // Attacker sends a properly-addressed report from a DIFFERENT call.
+        let spoof = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "NF4KE".into(),
+            report: -12,
+        };
+        let new_state = manager
+            .determine_state_transition(&state, &spoof, None)
+            .await
+            .unwrap();
+        // State must NOT advance.
+        assert!(matches!(new_state, QsoState::RespondingToCq { .. }));
+    }
+
+    #[tokio::test]
+    async fn legitimate_signal_report_advances_state() {
+        let manager = manager_with_call("K5ARH");
+        let state = QsoState::RespondingToCq {
+            target_callsign: "K9ZZ".into(),
+            frequency: 1500.0,
+            started_at: Utc::now(),
+        };
+        let legit = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "K9ZZ".into(),
+            report: -12,
+        };
+        let new_state = manager
+            .determine_state_transition(&state, &legit, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(new_state, QsoState::SendingReport { .. }),
+            "expected SendingReport, got {:?}",
+            new_state
+        );
+    }
+
+    #[test]
+    fn is_message_relevant_rejects_spoofed_sender() {
+        let manager = manager_with_call("K5ARH");
+        let state = QsoState::RespondingToCq {
+            target_callsign: "K9ZZ".into(),
+            frequency: 1500.0,
+            started_at: Utc::now(),
+        };
+        let spoof = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "NF4KE".into(),
+            report: -12,
+        };
+        assert!(!manager.is_message_relevant(&state, &spoof, 1500.0));
+    }
+
+    #[test]
+    fn is_message_relevant_accepts_legitimate_sender() {
+        let manager = manager_with_call("K5ARH");
+        let state = QsoState::RespondingToCq {
+            target_callsign: "K9ZZ".into(),
+            frequency: 1500.0,
+            started_at: Utc::now(),
+        };
+        let legit = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "K9ZZ".into(),
+            report: -12,
+        };
+        assert!(manager.is_message_relevant(&state, &legit, 1500.0));
+    }
+
+    #[test]
+    fn is_message_relevant_rejects_offset_15hz_or_more() {
+        // Tightened from 50 Hz to 15 Hz.
+        let manager = manager_with_call("K5ARH");
+        let state = QsoState::RespondingToCq {
+            target_callsign: "K9ZZ".into(),
+            frequency: 1500.0,
+            started_at: Utc::now(),
+        };
+        let legit = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "K9ZZ".into(),
+            report: -12,
+        };
+        // 16 Hz off → should be rejected.
+        assert!(!manager.is_message_relevant(&state, &legit, 1516.0));
+        // 14 Hz off → should be accepted.
+        assert!(manager.is_message_relevant(&state, &legit, 1514.0));
+    }
+
+    #[test]
+    fn is_message_relevant_rejects_50hz_offset_now() {
+        // Regression guard: the old 50 Hz tolerance must be gone.
+        let manager = manager_with_call("K5ARH");
+        let state = QsoState::RespondingToCq {
+            target_callsign: "K9ZZ".into(),
+            frequency: 1500.0,
+            started_at: Utc::now(),
+        };
+        let legit = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "K9ZZ".into(),
+            report: -12,
+        };
+        assert!(!manager.is_message_relevant(&state, &legit, 1545.0));
+    }
+
+    #[tokio::test]
+    async fn spoofed_report_ack_does_not_advance_to_completion() {
+        let manager = manager_with_call("K5ARH");
+        let state = QsoState::SendingReport {
+            their_callsign: "K9ZZ".into(),
+            their_report: Some(-15),
+            our_report: -10,
+            frequency: 1500.0,
+            started_at: Utc::now(),
+        };
+        let spoof = MessageType::ReportAck {
+            to_station: "K5ARH".into(),
+            from_station: "NF4KE".into(),
+            report: -10,
+        };
+        let new_state = manager
+            .determine_state_transition(&state, &spoof, None)
+            .await
+            .unwrap();
+        assert!(matches!(new_state, QsoState::SendingReport { .. }));
+    }
+
+    #[tokio::test]
+    async fn spoofed_final_confirmation_does_not_complete_qso() {
+        let manager = manager_with_call("K5ARH");
+        let state = QsoState::WaitingForConfirmation {
+            their_callsign: "K9ZZ".into(),
+            their_report: -15,
+            our_report: -10,
+            frequency: 1500.0,
+            grid_square: None,
+            started_at: Utc::now(),
+        };
+        let spoof = MessageType::FinalConfirmation {
+            to_station: "K5ARH".into(),
+            from_station: "NF4KE".into(),
+        };
+        let new_state = manager
+            .determine_state_transition(&state, &spoof, None)
+            .await
+            .unwrap();
+        assert!(matches!(new_state, QsoState::WaitingForConfirmation { .. }));
+    }
+
+    #[tokio::test]
+    async fn legitimate_final_confirmation_completes_qso() {
+        let manager = manager_with_call("K5ARH");
+        let state = QsoState::WaitingForConfirmation {
+            their_callsign: "K9ZZ".into(),
+            their_report: -15,
+            our_report: -10,
+            frequency: 1500.0,
+            grid_square: None,
+            started_at: Utc::now(),
+        };
+        let legit = MessageType::FinalConfirmation {
+            to_station: "K5ARH".into(),
+            from_station: "K9ZZ".into(),
+        };
+        let new_state = manager
+            .determine_state_transition(&state, &legit, None)
+            .await
+            .unwrap();
+        assert!(matches!(new_state, QsoState::Completed { .. }));
     }
 }
