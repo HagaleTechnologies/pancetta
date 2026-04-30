@@ -963,7 +963,7 @@ impl App {
     pub fn toggle_help(&mut self) {
         self.help_visible = !self.help_visible;
         if self.help_visible {
-            self.status_message = "Help — press Escape or F1 to close".to_string();
+            self.status_message = "Help — press Escape or ? to close".to_string();
         } else {
             self.status_message = "Pancetta TUI Ready".to_string();
         }

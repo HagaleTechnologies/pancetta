@@ -774,23 +774,26 @@ impl TuiRunner {
     /// Render help overlay as a centered modal
     fn render_help_overlay(f: &mut Frame, area: Rect) {
         let lines: &[(&str, &str)] = &[
-            ("Ctrl+Q", "Quit"),
-            ("F1 / ?", "Toggle help"),
+            ("?", "Toggle this help"),
             ("Tab / Shift+Tab", "Switch panel"),
             ("Up / Down", "Scroll list"),
-            ("Left / Right", "TX frequency offset"),
-            ("[ / ]", "TX frequency offset"),
-            ("+ / -", "Band up / down"),
+            ("Left / Right", "TX offset −/+ 50 Hz"),
+            ("[ / ]", "TX offset −/+ 50 Hz"),
+            ("= / -", "Band up / down"),
             ("Space", "Call selected station"),
             ("Enter", "Send TX message"),
-            ("F2 / F3", "Start / stop CQ"),
-            ("F5", "Clear messages"),
-            ("F9", "Toggle PTT"),
-            ("D", "Device selection"),
-            ("A", "Toggle autonomous mode"),
-            ("P", "Pause / resume autonomous"),
-            ("M", "Toggle audio monitoring"),
-            ("T", "Toggle theme"),
+            ("c / s", "Start / stop CQ"),
+            ("t", "Find clear TX offset"),
+            ("Shift+T", "Tune (12 s tone)"),
+            ("h", "Halt current TX"),
+            ("p", "Toggle PTT"),
+            ("a", "Toggle autonomous mode"),
+            ("Shift+P", "Pause / resume autonomous"),
+            ("m", "Toggle audio monitoring"),
+            ("d", "Device picker"),
+            ("x", "Clear decoded messages"),
+            ("q", "Quit (with confirm)"),
+            ("Esc", "Dismiss overlay / cancel modal"),
         ];
 
         // Modal sizing: wide enough for content, tall enough for all lines
@@ -838,7 +841,7 @@ impl TuiRunner {
 
         text_lines.push(Line::from(""));
         text_lines.push(Line::from(vec![Span::styled(
-            "  Press Escape, F1, or ? to close",
+            "  Press Escape or ? to close",
             Style::default().fg(Color::DarkGray),
         )]));
 
