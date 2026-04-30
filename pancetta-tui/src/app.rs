@@ -354,6 +354,11 @@ pub struct App {
     // Help overlay
     pub help_visible: bool,
 
+    /// True while the operator-confirm-quit modal is visible. `q` opens
+    /// it; `y`/`Enter` confirms (sends `TuiCommand::Quit`); `n`/`Esc`/`q`
+    /// dismisses. Modal blocks all other keys while visible.
+    pub quit_confirm_visible: bool,
+
     // TX input
     pub tx_input_buffer: String,
     pub tx_input_cursor: usize,
@@ -438,6 +443,7 @@ impl App {
             autonomous_status: None,
             device_selection: DeviceSelectionState::new(),
             help_visible: false,
+            quit_confirm_visible: false,
             tx_input_buffer: String::new(),
             tx_input_cursor: 0,
             is_transmitting: false,
@@ -1400,6 +1406,12 @@ mod tests {
         app.band_activity_scroll = 0;
         let selected = app.get_selected_station().expect("CALLER1 selectable");
         assert_eq!(selected.0, "CALLER1");
+    }
+
+    #[tokio::test]
+    async fn quit_confirm_visible_defaults_false() {
+        let app = App::new(Config::default(), None).await.unwrap();
+        assert!(!app.quit_confirm_visible);
     }
 
     #[tokio::test]

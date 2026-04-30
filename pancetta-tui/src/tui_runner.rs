@@ -582,6 +582,11 @@ impl TuiRunner {
             if app.help_visible {
                 TuiRunner::render_help_overlay(f, f.area());
             }
+
+            // Render quit-confirm overlay if visible (drawn last so it sits on top)
+            if app.quit_confirm_visible {
+                TuiRunner::render_quit_confirm_overlay(f, f.area());
+            }
         })?;
 
         self.metrics.frames_rendered += 1;
@@ -789,6 +794,48 @@ impl TuiRunner {
             .wrap(Wrap { trim: false });
 
         f.render_widget(paragraph, inner);
+    }
+
+    /// Render quit-confirm overlay as a centered modal
+    fn render_quit_confirm_overlay(f: &mut Frame, area: Rect) {
+        use ratatui::text::{Line, Span};
+
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Quit pancetta?  [y/N]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  y / Enter = quit    n / Esc / q = cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+
+        let modal_width: u16 = 50;
+        let modal_height: u16 = lines.len() as u16 + 2;
+        let modal_width = modal_width.min(area.width.saturating_sub(4));
+        let modal_height = modal_height.min(area.height.saturating_sub(4));
+        let modal_area = Rect {
+            x: (area.width.saturating_sub(modal_width)) / 2,
+            y: (area.height.saturating_sub(modal_height)) / 2,
+            width: modal_width,
+            height: modal_height,
+        };
+
+        f.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let block = Block::default()
+            .title(" Confirm Quit ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(Color::Black).fg(Color::Red));
+
+        let para = Paragraph::new(lines).block(block);
+        f.render_widget(para, modal_area);
     }
 
     /// Update performance metrics
