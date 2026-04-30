@@ -690,6 +690,12 @@ impl FrequencyAllocator {
 // The autonomous operator itself
 // ---------------------------------------------------------------------------
 
+// Per-callsign rate-limit window. If we initiated a response to a
+// callsign within this duration we skip re-initiating. Defends against
+// an attacker spamming `CQ FAKECALL FN42` every cycle to flood
+// pancetta's QSO slots and log. (Security review 2026-04-29 I-1.)
+const RECENT_RESPONSE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The per-cycle decision-making brain.
 ///
 /// Each TX slot it runs a decision tree:
@@ -725,6 +731,12 @@ pub struct AutonomousOperator {
     paused: bool,
     /// Live spot frequencies for frequency nudging: (frequency_hz, rarity 0.0-1.0)
     live_spot_frequencies: Vec<(f64, f64)>,
+    /// Per-callsign rate limit: callsign → time we last initiated a
+    /// response. Skips re-initiating to the same callsign within
+    /// RECENT_RESPONSE_WINDOW. Defends against an attacker spamming `CQ
+    /// FAKECALL FN42` every cycle to flood pancetta's QSO slots and
+    /// log. (Security review 2026-04-29 I-1.)
+    recently_responded_to: HashMap<String, std::time::Instant>,
 }
 
 impl AutonomousOperator {
@@ -755,6 +767,7 @@ impl AutonomousOperator {
             smart_allocator,
             paused: false,
             live_spot_frequencies: Vec::new(),
+            recently_responded_to: HashMap::new(),
         }
     }
 
@@ -837,6 +850,29 @@ impl AutonomousOperator {
     pub fn update_live_spots(&mut self, spots: &[(f64, f64)]) {
         self.live_spot_frequencies = spots.to_vec();
     }
+
+    // -- per-callsign rate limit (I-1) ----------------------------------------
+
+    /// Returns `true` if we initiated a response to `callsign` within the
+    /// last [`RECENT_RESPONSE_WINDOW`] (60 s). Caller should skip the CQ.
+    pub fn is_recently_responded_to(&self, callsign: &str, now: std::time::Instant) -> bool {
+        self.recently_responded_to
+            .get(callsign)
+            .is_some_and(|t| now.duration_since(*t) < RECENT_RESPONSE_WINDOW)
+    }
+
+    /// Record that we just initiated a response to `callsign`. Also
+    /// opportunistically prunes entries older than 5 × the window so the
+    /// map doesn't grow unbounded.
+    fn mark_responded_to(&mut self, callsign: &str, now: std::time::Instant) {
+        let prune_cutoff = now.checked_sub(RECENT_RESPONSE_WINDOW * 5);
+        if let Some(cutoff) = prune_cutoff {
+            self.recently_responded_to.retain(|_, t| *t > cutoff);
+        }
+        self.recently_responded_to.insert(callsign.to_string(), now);
+    }
+
+    // -- frequency allocation -------------------------------------------------
 
     /// Get the best frequency for a new QSO using the smart allocator.
     /// Falls back to the legacy allocator if no spectral data is available.
@@ -1041,10 +1077,12 @@ impl AutonomousOperator {
                         self.config.min_multi_slot_score
                     };
 
+                    let now = std::time::Instant::now();
                     let best_cq = self
                         .pending_cqs
                         .iter()
                         .filter(|cq| cq.dx_score >= threshold)
+                        .filter(|cq| !self.is_recently_responded_to(&cq.callsign, now))
                         .find(|cq| self.frequency_allocator.is_clear_of_own(cq.frequency_hz))
                         .cloned();
 
@@ -1079,6 +1117,7 @@ impl AutonomousOperator {
                             // We heard the CQ on cq.slot_parity; we respond on the opposite slot.
                             tx_parity: cq.slot_parity.map(|p| p.opposite()),
                         });
+                        self.mark_responded_to(&cq.callsign, now);
                         tx_count += 1;
                     } else if tx_count == 0 && self.active_qso_count == 0 {
                         // Step 4: no CQs worth answering and no active QSOs — CQ ourselves?
@@ -1769,5 +1808,57 @@ mod tests {
 
         // Should NOT add a third QSO
         assert_eq!(tx_count, 2, "Should not exceed max_concurrent_qsos");
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn build_test_operator(our_call: &str) -> AutonomousOperator {
+        let config = AutonomousConfig {
+            enabled: true,
+            ..AutonomousConfig::default()
+        };
+        AutonomousOperator::new(config, our_call.into(), None)
+    }
+
+    #[test]
+    fn skips_recent_cq_from_same_callsign() {
+        let mut op = build_test_operator("K5ARH");
+        let now = std::time::Instant::now();
+
+        op.recently_responded_to.insert("AB1CD".to_string(), now);
+
+        assert!(
+            op.is_recently_responded_to("AB1CD", now + Duration::from_secs(30)),
+            "60s window not honored — should still be skipping"
+        );
+    }
+
+    #[test]
+    fn allows_cq_from_callsign_after_window() {
+        let mut op = build_test_operator("K5ARH");
+        let now = std::time::Instant::now();
+
+        op.recently_responded_to.insert("AB1CD".to_string(), now);
+
+        assert!(
+            !op.is_recently_responded_to("AB1CD", now + Duration::from_secs(70)),
+            "after 60s, should accept again"
+        );
+    }
+
+    #[test]
+    fn mark_responded_to_prunes_stale() {
+        let mut op = build_test_operator("K5ARH");
+        let stale = std::time::Instant::now() - Duration::from_secs(60 * 60); // 1 hour ago
+        op.recently_responded_to.insert("STALE".to_string(), stale);
+        let now = std::time::Instant::now();
+        op.mark_responded_to("FRESH", now);
+        // Stale should be pruned (older than 5 × 60s = 300s).
+        assert!(!op.recently_responded_to.contains_key("STALE"));
+        assert!(op.recently_responded_to.contains_key("FRESH"));
     }
 }
