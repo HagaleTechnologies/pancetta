@@ -13,3 +13,6 @@ pub mod scorecard;
 pub use scorecard::Scorecard;
 
 pub mod metrics;
+
+pub mod decoder;
+pub use decoder::{Decode, DecoderUnderTest};
