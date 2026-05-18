@@ -63,8 +63,8 @@ pub struct TierResult {
     pub snr_at_50pct_recovery_db: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snr_at_90pct_recovery_db: Option<f64>,
-    #[serde(default)]
-    pub false_positives_total: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub false_positives_total: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixtures_total: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -81,8 +81,8 @@ pub struct TierResult {
     pub truth_decodes_recovered: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decode_rate: Option<f64>,
-    #[serde(default)]
-    pub novel_decodes: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub novel_decodes: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wsjtx_decoded: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

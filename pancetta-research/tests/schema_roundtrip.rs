@@ -92,4 +92,6 @@ fn scorecard_json_omits_empty_optional_fields() {
     assert!(!json.contains("\"failures\":[]"));
     // Optional fields that are None should be skipped.
     assert!(!json.contains("\"truth_decodes_total\":null"));
+    assert!(!json.contains("\"false_positives_total\":"));
+    assert!(!json.contains("\"novel_decodes\":"));
 }
