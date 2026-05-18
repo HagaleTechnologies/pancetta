@@ -18,7 +18,7 @@ pancetta-ft8 = { path = "../pancetta-ft8" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }   # workspace doesn't enable serde feature; add locally
+chrono = { workspace = true }
 hound = "3.5"                            # WAV reader (already used in pancetta-ft8; not in workspace.dependencies)
 
 [dev-dependencies]
