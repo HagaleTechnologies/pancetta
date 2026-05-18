@@ -11,3 +11,5 @@ pub use mode::Mode;
 
 pub mod scorecard;
 pub use scorecard::Scorecard;
+
+pub mod metrics;
