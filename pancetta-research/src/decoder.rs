@@ -1,6 +1,8 @@
 use crate::Mode;
+use anyhow::Context;
 use serde::Serialize;
 use std::path::Path;
+use std::sync::Mutex;
 
 /// One decoded message from a single WAV. Mode-agnostic.
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -32,4 +34,92 @@ pub trait DecoderUnderTest: Send + Sync {
     /// Opaque JSON snapshot of effective config — serialized into the
     /// scorecard for reproducibility.
     fn config_snapshot(&self) -> serde_json::Value;
+}
+
+/// Wraps the production pancetta-ft8 decoder for use by the harness.
+///
+/// Holds an `Ft8Config` (the public config struct) and constructs a fresh
+/// `pancetta_ft8::Ft8Decoder` per call to `decode_wav`. The production
+/// decoder takes `&mut self` and we want this trait impl to be `Send + Sync`,
+/// so we don't keep the decoder around between calls — construction is cheap.
+pub struct Ft8Decoder {
+    config: pancetta_ft8::Ft8Config,
+    /// Used only so `config_snapshot` is stable across calls. Empty by
+    /// default; future plans may stash per-experiment overrides here.
+    _scratch: Mutex<()>,
+}
+
+impl Ft8Decoder {
+    /// Build with default pancetta-ft8 config (matches what production uses
+    /// on `main`).
+    pub fn with_default_config() -> Self {
+        Self {
+            config: pancetta_ft8::Ft8Config::default(),
+            _scratch: Mutex::new(()),
+        }
+    }
+}
+
+impl DecoderUnderTest for Ft8Decoder {
+    fn mode(&self) -> Mode {
+        Mode::Ft8
+    }
+
+    fn identity(&self) -> String {
+        format!("pancetta-ft8@{}", env!("CARGO_PKG_VERSION"))
+    }
+
+    fn decode_wav(&self, path: &Path) -> anyhow::Result<Vec<Decode>> {
+        // Load WAV via hound; pancetta-ft8 expects mono f32 samples at 12 kHz
+        // (FT8's canonical decode rate). The fixture and recording WAVs are
+        // already at 12 kHz mono; assert and bail if not.
+        let mut reader = hound::WavReader::open(path)
+            .with_context(|| format!("opening WAV {}", path.display()))?;
+        let spec = reader.spec();
+        anyhow::ensure!(
+            spec.channels == 1 && spec.sample_rate == 12000,
+            "WAV {} not 12kHz mono (got {} ch, {} Hz)",
+            path.display(),
+            spec.channels,
+            spec.sample_rate,
+        );
+        let samples: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Int => reader
+                .samples::<i32>()
+                .map(|s| s.map(|v| v as f32 / i32::MAX as f32))
+                .collect::<Result<Vec<_>, _>>()?,
+            hound::SampleFormat::Float => reader
+                .samples::<f32>()
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+
+        // Construct a fresh decoder per WAV. decode_window takes &mut self,
+        // and we want the outer trait impl to stay `&self`.
+        let mut decoder = pancetta_ft8::Ft8Decoder::new(self.config.clone())
+            .map_err(|e| anyhow::anyhow!("Ft8Decoder::new failed: {e}"))?;
+        let raw = decoder
+            .decode_window(&samples)
+            .map_err(|e| anyhow::anyhow!("decode_window failed for {}: {e}", path.display()))?;
+        Ok(raw
+            .into_iter()
+            .map(|d| Decode {
+                message: d.text.clone(),
+                freq_hz: d.frequency_offset,
+                dt_s: d.time_offset,
+                snr_db: d.snr_db as f64,
+                crc_valid: true, // pancetta returns CRC-valid only
+            })
+            .collect())
+    }
+
+    fn config_snapshot(&self) -> serde_json::Value {
+        // Prefer JSON-serialize; fall back to Debug-print if Ft8Config doesn't
+        // (yet) derive Serialize.
+        match serde_json::to_value(&self.config) {
+            Ok(v) => v,
+            Err(_) => serde_json::json!({
+                "debug_repr": format!("{:?}", self.config),
+            }),
+        }
+    }
 }

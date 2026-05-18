@@ -14,7 +14,7 @@ publish = false                          # never published; local-only research 
 research-eval = []
 
 [dependencies]
-pancetta-ft8 = { path = "../pancetta-ft8" }
+pancetta-ft8 = { path = "../pancetta-ft8", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

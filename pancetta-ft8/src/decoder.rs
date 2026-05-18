@@ -77,6 +77,7 @@ const NMS_FREQ_RADIUS: usize = 2;
 
 /// Decoder configuration for FT8/FT4/FT2 protocols
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Ft8Config {
     /// Sample rate (must be 12 kHz)
     pub sample_rate: u32,

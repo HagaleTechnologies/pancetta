@@ -89,6 +89,8 @@ gpio = ["rppal"]
 transmit = ["serialport", "cpal", "chrono", "parking_lot", "tokio", "dep:serde", "dep:serde_json"]
 # Enable benchmark harness for decoder comparison
 benchmark = ["dep:hound", "dep:serde", "dep:serde_json"]
+# Enable serde Serialize/Deserialize for config types (used by research harness)
+serde = ["dep:serde"]
 # Enable decoder debug output (temporary)
 debug-decode = []
 # Enable experimental FT2 protocol support
