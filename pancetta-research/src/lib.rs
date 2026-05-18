@@ -5,3 +5,6 @@
 //! `docs/superpowers/specs/2026-05-18-decoder-research-harness-design.md`.
 
 #![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
+
+pub mod mode;
+pub use mode::Mode;
