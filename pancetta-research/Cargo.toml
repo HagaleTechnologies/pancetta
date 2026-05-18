@@ -1,12 +1,12 @@
 [package]
 name = "pancetta-research"
-version = "0.1.0"
-edition = "2021"
+description = "Local-only decoder iteration harness (never published)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false                          # never published; local-only research crate
-
-[lib]
-name = "pancetta_research"
-path = "src/lib.rs"
 
 [features]
 # All eval-time corpus-touching tests gate on this feature so default test passes
@@ -15,11 +15,11 @@ research-eval = []
 
 [dependencies]
 pancetta-ft8 = { path = "../pancetta-ft8" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-anyhow = "1"
-chrono = { version = "0.4", features = ["serde"] }
-hound = "3.5"                            # WAV reader (already used in pancetta-ft8)
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }   # workspace doesn't enable serde feature; add locally
+hound = "3.5"                            # WAV reader (already used in pancetta-ft8; not in workspace.dependencies)
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3"                           # not in workspace.dependencies; keep inline
