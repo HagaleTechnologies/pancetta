@@ -44,10 +44,18 @@ pub fn compute_composite(
         .map(normalize_snr_db)
         .unwrap_or(0.0);
 
-    weights.get("real_decode_rate_hard_200").copied().unwrap_or(0.0) * real_rate
+    weights
+        .get("real_decode_rate_hard_200")
+        .copied()
+        .unwrap_or(0.0)
+        * real_rate
         + weights.get("snr_50pct_synth_clean").copied().unwrap_or(0.0) * snr_clean
         + weights.get("fixtures_pass_rate").copied().unwrap_or(0.0) * fixtures
-        + weights.get("snr_50pct_synth_doppler").copied().unwrap_or(0.0) * snr_doppler
+        + weights
+            .get("snr_50pct_synth_doppler")
+            .copied()
+            .unwrap_or(0.0)
+            * snr_doppler
 }
 
 /// Fill in the CompositeInfo on a scorecard from its tiers + the given weights.

@@ -88,9 +88,7 @@ impl DecoderUnderTest for Ft8Decoder {
                 .samples::<i16>()
                 .map(|s| s.map(|v| v as f32 / 32768.0))
                 .collect::<Result<Vec<_>, _>>()?,
-            hound::SampleFormat::Float => reader
-                .samples::<f32>()
-                .collect::<Result<Vec<_>, _>>()?,
+            hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<Vec<_>, _>>()?,
         };
 
         // Construct a fresh decoder per WAV. decode_window takes &mut self,

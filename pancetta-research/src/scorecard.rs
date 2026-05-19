@@ -48,7 +48,7 @@ pub struct HarnessInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConfigInfo {
-    pub decoder: Value,          // opaque snapshot of the decoder config
+    pub decoder: Value, // opaque snapshot of the decoder config
     pub seed: u64,
     pub tiers_run: Vec<String>,
 }
