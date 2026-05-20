@@ -237,7 +237,7 @@ Three tiers, distinct ground-truth schemes, partitioned by mode.
   Each fixture entry lists the expected decoded messages; the fixtures
   tier passes iff every expected message appears (or, for off-air WAVs
   where the decoder can't recover full content, the entry uses
-  `expect: "any-decode"` to require ≥1 message).
+  `expect: ["any-decode"]` to require ≥1 message).
 - **Role:** regression smoke test. Pass/fail per fixture. A candidate
   that drops fixture decodes is suspicious and must explain itself.
 
@@ -346,13 +346,13 @@ Single binary, no daemon. Exit 0 on success regardless of score — a
     },
     "synth-doppler": { /* same shape */ },
     "fixtures": {
-      "fixtures_total": 82,
-      "fixtures_passed": 80,
-      "fixtures_failed": 2,
+      "fixtures_total": 13,
+      "fixtures_passed": 12,
+      "fixtures_failed": 1,
       "failures": [
-        { "wav": "websdr_test14.wav", "expected": ["W1AW K1ABC FN20"], "got": [] }
+        { "wav": "wsjt/170709_135615.wav", "expected": ["any-decode"], "got": [] }
       ],
-      "pass_rate": 0.9756
+      "pass_rate": 0.9231
     },
     "curated-hard-200": {
       "wavs_processed": 200,
