@@ -20,6 +20,9 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 hound = "3.5"                            # WAV reader (already used in pancetta-ft8; not in workspace.dependencies)
+# Used by gen-synth binary for AWGN noise (Box-Muller via rand_distr).
+rand = "0.8"
+rand_distr = "0.4"
 
 [dev-dependencies]
 tempfile = "3"                           # not in workspace.dependencies; keep inline
