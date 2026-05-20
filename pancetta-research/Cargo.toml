@@ -1,0 +1,25 @@
+[package]
+name = "pancetta-research"
+description = "Local-only decoder iteration harness (never published)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false                          # never published; local-only research crate
+
+[features]
+# All eval-time corpus-touching tests gate on this feature so default test passes
+# do not require corpus files to exist.
+research-eval = []
+
+[dependencies]
+pancetta-ft8 = { path = "../pancetta-ft8", features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+hound = "3.5"                            # WAV reader (already used in pancetta-ft8; not in workspace.dependencies)
+
+[dev-dependencies]
+tempfile = "3"                           # not in workspace.dependencies; keep inline

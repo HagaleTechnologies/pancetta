@@ -83,6 +83,8 @@ fi
 # happily inherit it.
 run "clippy"            cargo clippy --workspace --features transmit
 
+run "research guard-ci" ./scripts/research-env.sh --guard-ci
+
 # --- Test lane (~5-10 min) -------------------------------------------------
 
 if [[ "$FAST" -eq 0 ]]; then

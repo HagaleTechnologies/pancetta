@@ -1,16 +1,30 @@
 [workspace]
 members = [
-    "pancetta-core",
-    "pancetta-audio",
-    "pancetta-ft8",
-    "pancetta-dsp",
-    "pancetta-tui",
-    "pancetta-config",
-    "pancetta-qso",
-    "pancetta-hamlib",
-    "pancetta-dx",
-    "pancetta-cqdx",
     "pancetta",
+    "pancetta-audio",
+    "pancetta-config",
+    "pancetta-core",
+    "pancetta-cqdx",
+    "pancetta-dsp",
+    "pancetta-dx",
+    "pancetta-ft8",
+    "pancetta-hamlib",
+    "pancetta-qso",
+    "pancetta-research",
+    "pancetta-tui",
+]
+default-members = [
+    "pancetta",
+    "pancetta-audio",
+    "pancetta-config",
+    "pancetta-core",
+    "pancetta-cqdx",
+    "pancetta-dsp",
+    "pancetta-dx",
+    "pancetta-ft8",
+    "pancetta-hamlib",
+    "pancetta-qso",
+    "pancetta-tui",
 ]
 resolver = "2"
 

@@ -79,3 +79,21 @@ training/neural_osd/model.pt
 
 # Database backups
 backups/
+
+# Decoder research harness — local-only artifacts
+# Spec: docs/superpowers/specs/2026-05-18-decoder-research-harness-design.md
+
+# Synth corpus WAVs are generated; manifests + generator are committed
+research/corpus/synth/wavs/
+
+# Generated training data (large .npy etc.)
+# Ignore contents, not the directory itself, so .gitkeep can stay tracked
+# (git won't descend into an ignored dir to apply negation rules)
+training/*/data/*
+training/*/data_test/*
+!training/*/data/.gitkeep
+!training/*/data_test/.gitkeep
+
+# Local research artifacts staging (if a script ever materializes weights
+# inside the repo by mistake, ignore them)
+research/corpus/curated/ft8/staged/
