@@ -1,5 +1,10 @@
 //! End-to-end: run the eval binary against the fixtures tier and verify the
 //! scorecard file lands on disk with a populated `fixtures` tier.
+//!
+//! Gated behind `--features research-eval` because it spawns `cargo run --release`
+//! and rebuilds the eval binary — slow + side-effecting test.
+
+#![cfg(feature = "research-eval")]
 
 use pancetta_research::scorecard::Scorecard;
 use std::process::Command;
