@@ -14,25 +14,43 @@ and `cargo test` from the repo root skip it entirely.
 # Build everything
 cargo build --release -p pancetta-research
 
-# Generate the synth corpus (60 WAVs: 6 messages × 10 SNR steps)
+# 1. Generate the synth corpus (60 WAVs: 6 messages × 10 SNR steps)
 cargo run --release -p pancetta-research --bin gen-synth -- \
     --config research/corpus/synth/manifests/clean.config.json \
     --output research/corpus/synth/manifests/clean.manifest.json
 
-# Cache jt9 baseline over fixtures + synth (once; tiny JSON per WAV; committed)
+# 2. Curate the operator's real-world WAVs into 3 ranked manifests
+cargo run --release -p pancetta-research --bin curate -- \
+    --source-dir ~/.pancetta/recordings \
+    --output-prefix research/corpus/curated/ft8
+
+# 3. Cache jt9 baseline over all tiers (one-time, ~45 min total)
 cargo run --release -p pancetta-research --bin baseline -- --tier fixtures --mode ft8
 cargo run --release -p pancetta-research --bin baseline -- --tier synth --mode ft8
+cargo run --release -p pancetta-research --bin baseline -- --tier curated-hard-200 --mode ft8
+cargo run --release -p pancetta-research --bin baseline -- --tier curated-hard-1000 --mode ft8
+cargo run --release -p pancetta-research --bin baseline -- --tier wild-50 --mode ft8
 
-# Score current decoder against all tiers
+# 4. Score the current decoder against all tiers
 cargo run --release -p pancetta-research --bin eval -- \
-    --tier fixtures,synth-clean --mode ft8 --output research/scorecards/main.json
+    --tier fixtures,synth-clean,curated-hard-200,curated-hard-1000,wild-50 \
+    --mode ft8 \
+    --output research/scorecards/main.json
 
-# Diff two scorecards
+# 5. Rank all scorecards in research/scorecards/
+cargo run --release -p pancetta-research --bin leaderboard
+
+# 6. Diff two scorecards
 cargo run --release -p pancetta-research --bin compare -- \
-    research/scorecards/main.json research/scorecards/experiment-X.json
+    research/scorecards/main.json research/scorecards/history/2026-05-20-experiment-X.json
 
-# Disk hygiene check
-./scripts/research-env.sh --preflight
+# Experiment lifecycle (research-env.sh)
+./scripts/research-env.sh --status              # list experiments + state
+./scripts/research-env.sh --pin <slug>          # protect artifacts from purge
+./scripts/research-env.sh --finalize <slug>     # move branch scorecard to history/
+./scripts/research-env.sh --cleanup             # dry-run purge of expired artifacts
+./scripts/research-env.sh --cleanup --execute   # actually purge
+./scripts/research-env.sh --preflight           # disk-cap check before eval
 ```
 
 WSJT-X must be installed locally for `baseline` to find `jt9`. On macOS,
@@ -55,4 +73,4 @@ See `docs/superpowers/specs/2026-05-18-decoder-research-harness-design.md`.
 
 - Plan 1 of 3 (foundations): `docs/superpowers/plans/2026-05-18-research-harness-1-foundations.md` — complete
 - Plan 2 of 3 (eval pipeline + corpus): `docs/superpowers/plans/2026-05-20-research-harness-2-eval-pipeline.md` — complete
-- Plan 3 of 3 (curation + leaderboard + lifecycle): written after plan 2 lands
+- Plan 3 of 3 (curation + leaderboard + lifecycle): `docs/superpowers/plans/2026-05-20-research-harness-3-iteration-loop.md` — complete
