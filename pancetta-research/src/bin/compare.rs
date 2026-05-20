@@ -137,6 +137,9 @@ fn main() -> anyhow::Result<()> {
                         delta,
                     ));
                 }
+                // TODO(plan-3): surface fixtures_skipped delta if it changed
+                // so promotions Skip → AnyDecode/Exact are visible in the report.
+
                 // Pass rate — higher is better.
                 if at.pass_rate != bt.pass_rate {
                     let delta = bt.pass_rate.unwrap_or(0.0) - at.pass_rate.unwrap_or(0.0);

@@ -53,6 +53,6 @@ See `docs/superpowers/specs/2026-05-18-decoder-research-harness-design.md`.
 
 ## Implementation plans
 
-- Plan 1 of 3 (foundations): `docs/superpowers/plans/2026-05-18-research-harness-1-foundations.md` — this one
-- Plan 2 of 3 (eval pipeline + corpus): written after plan 1 lands
+- Plan 1 of 3 (foundations): `docs/superpowers/plans/2026-05-18-research-harness-1-foundations.md` — complete
+- Plan 2 of 3 (eval pipeline + corpus): `docs/superpowers/plans/2026-05-20-research-harness-2-eval-pipeline.md` — complete
 - Plan 3 of 3 (curation + leaderboard + lifecycle): written after plan 2 lands

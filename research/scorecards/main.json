@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-05-20T15:01:52.241660Z",
+  "generated_at": "2026-05-20T15:22:42.865479Z",
   "mode": "ft8",
   "git": {
     "branch": "feature/research-harness-plan-2",
-    "head_sha": "50d9d4b043a67e46a31f0fb3c0cbd94261c6b342",
+    "head_sha": "72ea87cfa805c8ba0e7292a11448c6942e49cdd3",
     "main_merge_base": "86f84c86f4f05e2b670b68178265b00d523cd5b9",
-    "dirty": false
+    "dirty": true
   },
   "build": {
     "rustc_version": "rustc 1.94.1 (e408947bf 2026-03-25)",
@@ -19,7 +19,7 @@
     "harness_version": "0.1.0",
     "host": "macos/aarch64",
     "cores_used": 10,
-    "elapsed_seconds": 5.14299775
+    "elapsed_seconds": 5.1951875
   },
   "config": {
     "decoder": {
@@ -45,8 +45,9 @@
     "fixtures": {
       "wavs_processed": 13,
       "fixtures_total": 13,
-      "fixtures_passed": 13,
+      "fixtures_passed": 8,
       "fixtures_failed": 0,
+      "fixtures_skipped": 5,
       "pass_rate": 1.0
     },
     "synth-clean": {

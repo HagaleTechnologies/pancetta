@@ -91,6 +91,7 @@ fn run_fixtures_tier(
     let fixtures = load_ft8_fixtures(workspace)?;
     let total = fixtures.len() as u32;
     let mut passed = 0u32;
+    let mut skipped = 0u32;
     let mut failures = Vec::new();
     for f in &fixtures {
         let entry = truth.get(&f.display_name);
@@ -124,11 +125,10 @@ fn run_fixtures_tier(
                     }
                 }
                 FixtureCategory::Skip => {
-                    // Don't count toward pass/fail; just track.
-                    // Decrement implicit "total" to keep pass_rate honest.
-                    // But for simplicity, count Skip as a pass (no regression risk
-                    // since we explicitly chose not to gate this fixture).
-                    passed += 1;
+                    // Skipped fixtures are excluded from the pass_rate denominator.
+                    // Promoting a Skip → AnyDecode or Exact will widen the denominator
+                    // and produce a real metric movement.
+                    skipped += 1;
                 }
             },
             (Ok(decodes), None) => {
@@ -149,17 +149,19 @@ fn run_fixtures_tier(
             }),
         }
     }
-    let failed = total - passed;
-    let pass_rate = if total == 0 {
+    let failed = total - passed - skipped;
+    let gated = total - skipped;
+    let pass_rate = if gated == 0 {
         0.0
     } else {
-        passed as f64 / total as f64
+        passed as f64 / gated as f64
     };
     Ok(TierResult {
         wavs_processed: total,
         fixtures_total: Some(total),
         fixtures_passed: Some(passed),
         fixtures_failed: Some(failed),
+        fixtures_skipped: Some(skipped),
         failures,
         pass_rate: Some(pass_rate),
         ..Default::default()

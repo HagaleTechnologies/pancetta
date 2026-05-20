@@ -50,6 +50,7 @@ fn eval_fixtures_produces_valid_scorecard() {
         fixtures.pass_rate,
     );
     // We don't assert pass_rate == 1.0 because some fixtures may legitimately
-    // not be decodable by the default config; the smoke test only verifies the
-    // mechanics work. (Plan 2 will tighten this against truth.json.)
+    // not be decodable by the default config; this test only smokes the binary
+    // end-to-end. Truth-validated pass/fail accounting happens inside the eval
+    // binary via truth.json (FixtureCategory::Exact / AnyDecode / Skip).
 }

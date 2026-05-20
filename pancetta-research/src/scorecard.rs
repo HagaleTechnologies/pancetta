@@ -71,6 +71,8 @@ pub struct TierResult {
     pub fixtures_passed: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixtures_failed: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fixtures_skipped: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub failures: Vec<FixtureFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
