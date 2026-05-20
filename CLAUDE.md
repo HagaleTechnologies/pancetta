@@ -8,7 +8,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 
 ## Workspace Structure
 
-11-crate Cargo workspace:
+12-crate Cargo workspace:
 
 | Crate | Purpose | Status |
 |-------|---------|--------|
@@ -23,6 +23,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-tui` | Terminal UI | Scaffold, not wired to pipeline |
 | `pancetta-core` | Shared types, error handling | Stable |
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
+| `pancetta-research` | Local-only iteration harness for decoder improvements (scorecards, eval, hypothesis bank). **Excluded from CI; never builds in GitHub Actions.** | Plan 1 of 3 in progress |
 
 ## Building and Testing
 
@@ -59,6 +60,11 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - **Multi-stream TX**: Supports N simultaneous FT8 signals in a single 15-second slot.
 - **DX-slot-aware TX scheduling** (`pancetta/src/coordinator/tx.rs`): WSJT-X-style. Every `DecodedMessage` carries `slot_parity`; the QSO state machine latches `tx_parity = opposite_of(dx_parity)` at QSO start; the TX scheduler picks the next slot of that parity, padding silent samples if early or skip-ahead-cursoring into the modulated waveform if late (up to `tx_late_max_ms`, default 8s). Past that, defers 30s. Never collides with the DX's parity. See `docs/superpowers/specs/2026-04-27-dx-slot-aware-tx-design.md`.
 - **QSO logging — ADIF + SQLite hybrid**: `~/.pancetta/qsos.adi` is the durable, append-only ADIF source of truth (vendor-neutral; point WSJT-X / N1MM / LoTW / eQSL at this file directly). `~/.pancetta/qso.db` is a sqlx-backed queryable index rebuilt from the ADIF on startup if missing or stale — safe to delete. `AdifLogWriter` (pancetta-qso) writes ADIF records; `AsyncQsoLogger` (pancetta) persists to both stores. Existing operators auto-migrate: first startup after upgrade exports the legacy DB into a fresh ADIF before flipping over.
+- **Decoder research harness** (`pancetta-research/`, `research/`,
+  `scripts/research-env.sh`): a local-only iteration harness for improving
+  the decoder. Excluded from `default-members` and CI by construction.
+  Spec: `docs/superpowers/specs/2026-05-18-decoder-research-harness-design.md`.
+  Plan 1 of 3 (this scaffold) lands first.
 - **QSO sender verification**: The QSO state machine (`pancetta-qso/src/qso_manager.rs::determine_state_transition` and `is_message_relevant`) verifies `from_station == expected DX callsign` on every state-advance. Mismatches are logged at `warn!` level (`target: "qso.security"`) and discarded. Frequency tolerance is 15 Hz. The autonomous responder (`autonomous.rs`) tracks per-callsign response timestamps in `recently_responded_to` and skips CQs from callsigns it responded to within the last 60s. Both defenses landed 2026-04-29 in response to Security Review C-1 and I-1; see `docs/security-review-2026-04-29.md`.
 
 ## Development Phases (End-to-End QSO Initiative)
