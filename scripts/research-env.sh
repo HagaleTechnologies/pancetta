@@ -153,14 +153,248 @@ cmd_guard_ci() {
     echo "OK: no research references in .github/workflows"
 }
 
+# List experiments: their state (per-journal frontmatter), branch existence,
+# artifact disk usage. Reads research/experiments/*.md + git for branch info.
+cmd_status() {
+    local exp_dir="${RESEARCH_DIR}/experiments"
+    local artifacts_dir="${ARTIFACTS_DIR}/weights"
+    local total=0
+    local merged=0
+    local shelved=0
+    local in_progress=0
+    local deferred=0
+
+    echo "== Experiments =="
+    if [ ! -d "$exp_dir" ]; then
+        echo "  (no experiments dir yet)"
+        return
+    fi
+    # Each experiment has a YAML frontmatter block at the top of its .md;
+    # we parse just the `state:` line.
+    for f in "$exp_dir"/*.md; do
+        [ -f "$f" ] || continue
+        # Skip placeholder .gitkeep or non-frontmatter files.
+        head -1 "$f" | grep -q '^---' || continue
+        total=$((total + 1))
+        local slug
+        slug=$(basename "$f" .md)
+        local state
+        state=$(awk '/^state:/ { print $2; exit }' "$f")
+        local delta
+        delta=$(awk '/^delta_vs_main:/ { print $2; exit }' "$f")
+        local branch
+        branch=$(awk '/^branch:/ { print $2; exit }' "$f")
+        local branch_exists="-"
+        if [ -n "$branch" ] && git -C "$REPO_ROOT" rev-parse --verify "$branch" >/dev/null 2>&1; then
+            branch_exists="✓"
+        fi
+        local artifact_size="-"
+        if [ -d "$artifacts_dir/$slug" ]; then
+            artifact_size=$(du -sh "$artifacts_dir/$slug" 2>/dev/null | awk '{print $1}')
+        fi
+        printf "  [%s] %-40s  delta=%-10s branch=%s artifacts=%s\n" \
+            "${state:-?}" "$slug" "${delta:-?}" "$branch_exists" "$artifact_size"
+        case "$state" in
+            merged) merged=$((merged + 1)) ;;
+            shelved) shelved=$((shelved + 1)) ;;
+            evaluated|implementing|planned) in_progress=$((in_progress + 1)) ;;
+            deferred) deferred=$((deferred + 1)) ;;
+        esac
+    done
+    if [ "$total" -eq 0 ]; then
+        echo "  (no experiments yet — bootstrap the hypothesis bank to start)"
+    else
+        echo
+        printf "  Total: %d   merged: %d   shelved: %d   in-progress: %d   deferred: %d\n" \
+            "$total" "$merged" "$shelved" "$in_progress" "$deferred"
+    fi
+}
+
+# Mark an experiment's on-disk artifacts as "pinned" — exempt from default
+# retention purges. State recorded in a sidecar file under the artifact dir.
+# Usage: research-env.sh --pin <slug>
+cmd_pin() {
+    local slug="$1"
+    if [ -z "$slug" ]; then
+        echo "usage: research-env.sh --pin <slug>" >&2
+        exit 2
+    fi
+    local artifact_root="${ARTIFACTS_DIR}/weights/${slug}"
+    if [ ! -d "$artifact_root" ]; then
+        # Still allow pinning to "reserve" the slot for future artifacts.
+        mkdir -p "$artifact_root"
+        echo "(no artifacts yet for $slug; created reservation)"
+    fi
+    echo "pinned: $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$artifact_root/.pinned"
+    echo "Pinned $slug. Artifacts at $artifact_root will not be auto-purged."
+}
+
+# Purge expired artifacts: experiments shelved >14 days, merged-but-not-promoted
+# >30 days. Pinned dirs (.pinned file present) are always preserved.
+#
+# This is a dry-run by default. Pass --execute to actually delete.
+cmd_cleanup() {
+    local execute=0
+    if [ "${1:-}" = "--execute" ]; then
+        execute=1
+    fi
+    local artifact_root="${ARTIFACTS_DIR}/weights"
+    if [ ! -d "$artifact_root" ]; then
+        echo "no artifacts dir; nothing to clean"
+        return
+    fi
+    local now_epoch
+    now_epoch=$(date -u +%s)
+    local total_freed_kb=0
+    local count=0
+
+    for d in "$artifact_root"/*; do
+        [ -d "$d" ] || continue
+        local slug
+        slug=$(basename "$d")
+        # Skip pinned.
+        if [ -f "$d/.pinned" ]; then
+            continue
+        fi
+        # Look up the corresponding journal.
+        local journal=""
+        for cand in "${RESEARCH_DIR}/experiments/"*"${slug}.md"; do
+            [ -f "$cand" ] || continue
+            journal="$cand"
+            break
+        done
+        if [ -z "$journal" ]; then
+            # Orphan artifact — no journal. Default to keeping (operator may
+            # be mid-experiment with no journal yet).
+            continue
+        fi
+        local state
+        state=$(awk '/^state:/ { print $2; exit }' "$journal")
+        local last_updated
+        last_updated=$(awk '/^last_updated:/ { print $2; exit }' "$journal")
+        # Convert ISO timestamp to epoch. macOS BSD date uses -j -f; GNU uses -d.
+        local last_epoch
+        if last_epoch=$(date -j -f "%Y-%m-%dT%H:%M:%SZ" "$last_updated" "+%s" 2>/dev/null); then
+            :
+        elif last_epoch=$(date -d "$last_updated" "+%s" 2>/dev/null); then
+            :
+        else
+            # Couldn't parse — skip.
+            continue
+        fi
+        local age_days
+        age_days=$(( (now_epoch - last_epoch) / 86400 ))
+
+        local retention_days
+        case "$state" in
+            shelved) retention_days=14 ;;
+            merged) retention_days=30 ;;
+            *) continue ;;  # deferred / in-progress / planned: don't auto-purge
+        esac
+
+        if [ "$age_days" -ge "$retention_days" ]; then
+            local size_kb
+            size_kb=$(du -sk "$d" 2>/dev/null | awk '{print $1}')
+            size_kb=${size_kb:-0}
+            count=$((count + 1))
+            total_freed_kb=$((total_freed_kb + size_kb))
+            if [ "$execute" -eq 1 ]; then
+                rm -rf "$d"
+                printf "PURGED: %-50s (state=%s, age=%dd, %d KB)\n" \
+                    "$slug" "$state" "$age_days" "$size_kb"
+            else
+                printf "WOULD PURGE: %-50s (state=%s, age=%dd, %d KB)\n" \
+                    "$slug" "$state" "$age_days" "$size_kb"
+            fi
+        fi
+    done
+
+    local total_mb
+    total_mb=$(awk -v kb="$total_freed_kb" 'BEGIN { printf "%.1f", kb / 1024 }')
+    if [ "$execute" -eq 1 ]; then
+        echo
+        echo "Cleanup: purged $count artifact dir(s), freed ${total_mb} MB."
+    else
+        echo
+        echo "Cleanup (dry-run): would purge $count artifact dir(s), freeing ${total_mb} MB."
+        echo "Re-run with --execute to actually delete."
+    fi
+}
+
+# Finalize an experiment: rename its branch scorecard to history/<date>-<slug>.json,
+# update the experiment journal's `last_updated`, and (if the experiment is merged
+# or shelved) mark its branch eligible for cleanup. This is called as part of the
+# merge/shelve workflow.
+#
+# Usage: research-env.sh --finalize <slug>
+cmd_finalize() {
+    local slug="$1"
+    if [ -z "$slug" ]; then
+        echo "usage: research-env.sh --finalize <slug>" >&2
+        exit 2
+    fi
+    local journal=""
+    for cand in "${RESEARCH_DIR}/experiments/"*"${slug}.md"; do
+        [ -f "$cand" ] || continue
+        journal="$cand"
+        break
+    done
+    if [ -z "$journal" ]; then
+        echo "no journal found for slug '$slug' (expected research/experiments/*-${slug}.md)" >&2
+        exit 2
+    fi
+    local state
+    state=$(awk '/^state:/ { print $2; exit }' "$journal")
+    local branch
+    branch=$(awk '/^branch:/ { print $2; exit }' "$journal")
+
+    # Date prefix: take the slug's leading YYYY-MM-DD if present, else use today.
+    local date_prefix
+    if [[ "$slug" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2} ]]; then
+        date_prefix="${BASH_REMATCH[0]}"
+    else
+        date_prefix=$(date -u +%Y-%m-%d)
+    fi
+    # The journal might already have the date prefix in the slug (preferred).
+    # Strip it for the scorecard target name; if the journal slug = "synth-plateau",
+    # the scorecard target is "history/2026-05-20-synth-plateau.json".
+    local target_slug
+    target_slug="${slug#${date_prefix}-}"
+
+    # Move branch scorecard to history/, if it exists.
+    local branch_scorecard="${RESEARCH_DIR}/scorecards/${branch##*/}.json"
+    local history_scorecard="${RESEARCH_DIR}/scorecards/history/${date_prefix}-${target_slug}.json"
+    if [ -f "$branch_scorecard" ]; then
+        mkdir -p "${RESEARCH_DIR}/scorecards/history"
+        mv "$branch_scorecard" "$history_scorecard"
+        echo "moved: $branch_scorecard -> $history_scorecard"
+    else
+        echo "(no branch scorecard at $branch_scorecard — nothing to move)"
+    fi
+
+    # Update the journal's last_updated timestamp.
+    local now_iso
+    now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    # Use a portable sed in-place edit. On macOS, sed -i wants an empty backup arg.
+    if sed --version >/dev/null 2>&1; then
+        # GNU sed.
+        sed -i "s/^last_updated:.*/last_updated: ${now_iso}/" "$journal"
+    else
+        # BSD sed (macOS).
+        sed -i "" "s/^last_updated:.*/last_updated: ${now_iso}/" "$journal"
+    fi
+
+    echo "finalized $slug (state=$state, scorecard=$history_scorecard)"
+}
+
 case "$CMD" in
     --preflight) cmd_preflight ;;
     --audit) cmd_audit ;;
     --guard-ci) cmd_guard_ci ;;
-    --status|--cleanup|--pin|--finalize)
-        echo "Subcommand $CMD lands in plan 3 (iteration loop)."
-        exit 0
-        ;;
+    --status) cmd_status ;;
+    --pin) cmd_pin "$1" ;;
+    --cleanup) cmd_cleanup "$1" ;;
+    --finalize) cmd_finalize "$1" ;;
     -h|--help|"")
         sed -n '2,20p' "$0"
         ;;
