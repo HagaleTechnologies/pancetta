@@ -392,9 +392,9 @@ case "$CMD" in
     --audit) cmd_audit ;;
     --guard-ci) cmd_guard_ci ;;
     --status) cmd_status ;;
-    --pin) cmd_pin "$1" ;;
-    --cleanup) cmd_cleanup "$1" ;;
-    --finalize) cmd_finalize "$1" ;;
+    --pin) cmd_pin "${1:-}" ;;
+    --cleanup) cmd_cleanup "${1:-}" ;;
+    --finalize) cmd_finalize "${1:-}" ;;
     -h|--help|"")
         sed -n '2,20p' "$0"
         ;;
