@@ -41,7 +41,7 @@ string_cache = "0.8"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.27"
-proptest = "1.10"
+proptest = "1.11"
 tracing-subscriber = { workspace = true }
 
 [features]
