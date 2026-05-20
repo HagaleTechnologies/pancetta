@@ -16,3 +16,5 @@ pub mod metrics;
 
 pub mod decoder;
 pub use decoder::{Decode, DecoderUnderTest};
+
+pub mod corpus;
