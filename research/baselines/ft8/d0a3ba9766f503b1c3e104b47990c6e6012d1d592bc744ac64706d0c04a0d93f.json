@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC_RR73__-26.0dB.wav",
+  "wav_sha256": "d0a3ba9766f503b1c3e104b47990c6e6012d1d592bc744ac64706d0c04a0d93f",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [],
+  "elapsed_seconds": 2.620366458
+}
