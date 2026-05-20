@@ -33,5 +33,9 @@ path = "src/bin/gen_synth.rs"
 name = "baseline"
 path = "src/bin/baseline.rs"
 
+[[bin]]
+name = "compare"
+path = "src/bin/compare.rs"
+
 [dev-dependencies]
 tempfile = "3"                           # not in workspace.dependencies; keep inline
