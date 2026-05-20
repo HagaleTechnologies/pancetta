@@ -4,10 +4,12 @@
 use anyhow::Context;
 use chrono::Utc;
 use pancetta_research::corpus::{load_ft8_fixtures, load_synth_corpus};
+use pancetta_research::curated::{load_curated_corpus, CuratedEntry};
 use pancetta_research::decoder::{DecoderUnderTest, Ft8Decoder};
 use pancetta_research::metrics::{default_weights, populate_composite};
 use pancetta_research::scorecard::{
-    BuildInfo, ConfigInfo, GitInfo, HarnessInfo, RegressionFlags, Scorecard, SnrBin, TierResult,
+    BuildInfo, ConfigInfo, GitInfo, HarnessInfo, PerWavFailure, RegressionFlags, Scorecard, SnrBin,
+    TierResult,
 };
 use pancetta_research::truth::{FixtureCategory, FixtureTruth};
 use pancetta_research::Mode;
@@ -218,6 +220,110 @@ fn run_synth_tier(
     })
 }
 
+fn run_curated_tier(
+    decoder: &dyn DecoderUnderTest,
+    workspace: &std::path::Path,
+    manifest_path: &std::path::Path,
+) -> anyhow::Result<TierResult> {
+    let entries: Vec<CuratedEntry> = load_curated_corpus(manifest_path)?;
+    let total = entries.len() as u32;
+    if total == 0 {
+        return Ok(TierResult {
+            wavs_processed: 0,
+            ..Default::default()
+        });
+    }
+    let mut truth_decodes_total = 0u32;
+    let mut truth_recovered = 0u32;
+    let mut novel_decodes = 0u32;
+    let mut wsjtx_total = 0u32;
+    let mut per_wav_failures: Vec<PerWavFailure> = Vec::new();
+
+    for entry in &entries {
+        // Look up the jt9 baseline cache for this WAV's SHA.
+        let baseline_path = workspace
+            .join("research/baselines/ft8")
+            .join(format!("{}.json", entry.wav_sha256));
+        let baseline_decodes: Vec<String> = if baseline_path.exists() {
+            let s = std::fs::read_to_string(&baseline_path)?;
+            let cache: serde_json::Value = serde_json::from_str(&s)?;
+            cache
+                .get("decodes")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|d| d.get("message").and_then(|m| m.as_str()))
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            // No baseline cached — treat as 0 truth decodes for this WAV.
+            Vec::new()
+        };
+        wsjtx_total += baseline_decodes.len() as u32;
+        truth_decodes_total += baseline_decodes.len() as u32;
+
+        let our_decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        // Match: a baseline decode is "recovered" if we produced a message
+        // containing the same callsign tokens. Conservative substring check.
+        let mut recovered_here = 0u32;
+        for truth_msg in &baseline_decodes {
+            if our_decodes.iter().any(|d| d.message.trim() == truth_msg.trim()) {
+                recovered_here += 1;
+            }
+        }
+        truth_recovered += recovered_here;
+
+        // "Novel" decodes: ones in our output that aren't in baseline.
+        for ours in &our_decodes {
+            if !baseline_decodes.iter().any(|t| t.trim() == ours.message.trim()) {
+                novel_decodes += 1;
+            }
+        }
+
+        // Per-WAV failure tracking for the top 20 worst gaps.
+        let gap = baseline_decodes.len() as i64 - recovered_here as i64;
+        if gap > 0 {
+            per_wav_failures.push(PerWavFailure {
+                wav_hash: entry.wav_sha256.clone(),
+                truth: baseline_decodes.len() as u32,
+                recovered: recovered_here,
+                wsjtx: baseline_decodes.len() as u32,
+                jtdx: 0, // Plan 3 doesn't wire JTDX; field stays 0.
+            });
+        }
+    }
+
+    // Keep top-20 worst gaps for the per_wav_top_failures field.
+    per_wav_failures
+        .sort_by(|a, b| (b.truth - b.recovered).cmp(&(a.truth - a.recovered)));
+    per_wav_failures.truncate(20);
+
+    let decode_rate = if truth_decodes_total == 0 {
+        0.0
+    } else {
+        truth_recovered as f64 / truth_decodes_total as f64
+    };
+    let vs_wsjtx_pct = if wsjtx_total == 0 {
+        0.0
+    } else {
+        100.0 * truth_recovered as f64 / wsjtx_total as f64
+    };
+
+    Ok(TierResult {
+        wavs_processed: total,
+        truth_decodes_total: Some(truth_decodes_total),
+        truth_decodes_recovered: Some(truth_recovered),
+        decode_rate: Some(decode_rate),
+        novel_decodes: Some(novel_decodes),
+        wsjtx_decoded: Some(wsjtx_total),
+        vs_wsjtx_pct: Some(vs_wsjtx_pct),
+        per_wav_top_failures: per_wav_failures,
+        ..Default::default()
+    })
+}
+
 /// Lowest SNR (in dB) where recovery >= threshold. Bins must be sorted by SNR asc.
 fn first_threshold_db(bins: &[SnrBin], threshold: f64) -> Option<f64> {
     for bin in bins {
@@ -304,10 +410,23 @@ fn main() -> anyhow::Result<()> {
                 let result = run_synth_tier(decoder.as_ref(), &workspace, &manifest)?;
                 tiers.insert("synth-clean".to_string(), result);
             }
-            "curated-hard-200" | "curated-hard-1000" => {
-                eprintln!(
-                    "warn: tier '{tier_name}' is a stub in plan 2; populated in plan 3. Skipping."
+            "curated-hard-200" | "curated-hard-1000" | "wild-50" => {
+                let label = match tier_name.as_str() {
+                    "curated-hard-200" => "hard_200",
+                    "curated-hard-1000" => "hard_1000",
+                    "wild-50" => "wild_50",
+                    _ => unreachable!(),
+                };
+                let manifest = workspace
+                    .join("research/corpus/curated/ft8")
+                    .join(format!("{label}.manifest.json"));
+                anyhow::ensure!(
+                    manifest.exists(),
+                    "curated manifest missing at {}. Run: cargo run --release -p pancetta-research --bin curate -- --source-dir ~/.pancetta/recordings --output-prefix research/corpus/curated/ft8",
+                    manifest.display()
                 );
+                let result = run_curated_tier(decoder.as_ref(), &workspace, &manifest)?;
+                tiers.insert(tier_name.to_string(), result);
             }
             other => anyhow::bail!("unknown tier '{other}'"),
         }
