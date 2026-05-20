@@ -57,7 +57,7 @@ fn workspace_root() -> anyhow::Result<PathBuf> {
 ///
 /// Uses the real pancetta-ft8 public API (behind the `transmit` feature):
 ///   1. `Ft8Encoder::new().encode_message(text, None)` → [u8; 79] tone symbols
-///   2. `Ft8Modulator::new_default().modulate_symbols(&symbols, 0.0)` → Vec<f32>
+///   2. `Ft8Modulator::new(…).modulate_symbols(&symbols: &[u8; NUM_SYMBOLS], 0.0)` → Vec<f32>
 ///
 /// The modulator's default config is: sample_rate=12000, base_frequency=1500 Hz,
 /// tx_power=1.0. We pass frequency_offset=0.0 so the signal sits at exactly 1500 Hz.
@@ -139,11 +139,10 @@ fn main() -> anyhow::Result<()> {
     let output_dir = workspace.join(&config.output_dir);
     let mut entries = Vec::new();
     let mut total = 0usize;
-    for msg in &config.messages {
+    for (msg_idx, msg) in config.messages.iter().enumerate() {
         let base_samples = modulate_message(msg)?;
         for snr_db in &config.snr_steps_db {
             // Per-wav seed is deterministic from (top-level seed, msg index, snr_db).
-            let msg_idx = config.messages.iter().position(|m| m == msg).unwrap();
             let seed_for_this_wav = config
                 .seed
                 .wrapping_add(msg_idx as u64)
