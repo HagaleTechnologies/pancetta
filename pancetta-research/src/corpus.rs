@@ -47,3 +47,32 @@ pub fn load_ft8_fixtures(workspace_root: &Path) -> anyhow::Result<Vec<FixtureEnt
     out.sort_by(|a, b| a.display_name.cmp(&b.display_name));
     Ok(out)
 }
+
+use crate::synth::SynthManifest;
+
+/// One synth corpus entry, denormalized for the eval binary's convenience.
+#[derive(Clone, Debug)]
+pub struct SynthCorpusEntry {
+    pub wav_path: PathBuf,
+    pub encoded_message: String,
+    pub snr_db: f64,
+}
+
+/// Load a synth manifest from disk and resolve all wav paths relative to
+/// the workspace root.
+pub fn load_synth_corpus(
+    workspace_root: &Path,
+    manifest_path: &Path,
+) -> anyhow::Result<Vec<SynthCorpusEntry>> {
+    let manifest = SynthManifest::load(manifest_path)?;
+    let entries = manifest
+        .entries
+        .iter()
+        .map(|e| SynthCorpusEntry {
+            wav_path: workspace_root.join(&e.wav_path),
+            encoded_message: e.encoded_message.clone(),
+            snr_db: e.snr_db,
+        })
+        .collect();
+    Ok(entries)
+}
