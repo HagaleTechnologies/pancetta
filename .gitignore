@@ -97,3 +97,8 @@ training/*/data_test/*
 # Local research artifacts staging (if a script ever materializes weights
 # inside the repo by mistake, ignore them)
 research/corpus/curated/ft8/staged/
+
+# jt9 (WSJT-X CLI) side-effect files dropped into the working dir when
+# the baseline binary runs from the workspace root
+/decoded.txt
+/jt9_wisdom.dat
