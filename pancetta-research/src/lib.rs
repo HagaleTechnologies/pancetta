@@ -24,3 +24,5 @@ pub mod truth;
 pub mod synth;
 
 pub mod noise;
+
+pub mod curated;
