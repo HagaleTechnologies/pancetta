@@ -89,7 +89,14 @@ fn compare_detects_improvement() {
 
     let output = Command::new("cargo")
         .args([
-            "run", "--release", "-q", "-p", "pancetta-research", "--bin", "compare", "--",
+            "run",
+            "--release",
+            "-q",
+            "-p",
+            "pancetta-research",
+            "--bin",
+            "compare",
+            "--",
         ])
         .arg(a.path())
         .arg(b.path())
@@ -115,7 +122,14 @@ fn compare_detects_regression() {
 
     let output = Command::new("cargo")
         .args([
-            "run", "--release", "-q", "-p", "pancetta-research", "--bin", "compare", "--",
+            "run",
+            "--release",
+            "-q",
+            "-p",
+            "pancetta-research",
+            "--bin",
+            "compare",
+            "--",
         ])
         .arg(a.path())
         .arg(b.path())
@@ -125,5 +139,8 @@ fn compare_detects_regression() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("REGRESSIONS:"), "should report regressions");
-    assert!(stdout.contains("pass_rate"), "should mention pass_rate delta");
+    assert!(
+        stdout.contains("pass_rate"),
+        "should mention pass_rate delta"
+    );
 }

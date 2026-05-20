@@ -98,7 +98,11 @@ fn main() -> anyhow::Result<()> {
         args.b.display(),
         &b.git.head_sha[..8.min(b.git.head_sha.len())],
         fmt_pct(b.composite.score),
-        if b.composite.score >= a.composite.score { "+" } else { "" },
+        if b.composite.score >= a.composite.score {
+            "+"
+        } else {
+            ""
+        },
         fmt_pct(b.composite.score - a.composite.score),
     );
     println!();
@@ -107,14 +111,25 @@ fn main() -> anyhow::Result<()> {
     let mut regressions: Vec<String> = Vec::new();
 
     // Walk each tier present in both.
-    let tier_keys: Vec<&String> = a.tiers.keys().chain(b.tiers.keys()).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    let tier_keys: Vec<&String> = a
+        .tiers
+        .keys()
+        .chain(b.tiers.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
     for tier in tier_keys {
         match (a.tiers.get(tier), b.tiers.get(tier)) {
             (Some(at), Some(bt)) => {
                 // SNR @ 50% — lower is better.
                 if at.snr_at_50pct_recovery_db != bt.snr_at_50pct_recovery_db {
-                    let delta = bt.snr_at_50pct_recovery_db.unwrap_or(0.0) - at.snr_at_50pct_recovery_db.unwrap_or(0.0);
-                    let bucket = if delta < 0.0 { &mut wins } else { &mut regressions };
+                    let delta = bt.snr_at_50pct_recovery_db.unwrap_or(0.0)
+                        - at.snr_at_50pct_recovery_db.unwrap_or(0.0);
+                    let bucket = if delta < 0.0 {
+                        &mut wins
+                    } else {
+                        &mut regressions
+                    };
                     bucket.push(format!(
                         "  {tier:<20}  SNR@50%       {} → {}  ({:+.1} dB)",
                         fmt_snr(at.snr_at_50pct_recovery_db),
@@ -125,7 +140,11 @@ fn main() -> anyhow::Result<()> {
                 // Pass rate — higher is better.
                 if at.pass_rate != bt.pass_rate {
                     let delta = bt.pass_rate.unwrap_or(0.0) - at.pass_rate.unwrap_or(0.0);
-                    let bucket = if delta > 0.0 { &mut wins } else { &mut regressions };
+                    let bucket = if delta > 0.0 {
+                        &mut wins
+                    } else {
+                        &mut regressions
+                    };
                     bucket.push(format!(
                         "  {tier:<20}  pass_rate     {:.4} → {:.4}  ({:+.4})",
                         at.pass_rate.unwrap_or(0.0),
@@ -136,7 +155,11 @@ fn main() -> anyhow::Result<()> {
                 // Decode rate — higher is better.
                 if at.decode_rate != bt.decode_rate {
                     let delta = bt.decode_rate.unwrap_or(0.0) - at.decode_rate.unwrap_or(0.0);
-                    let bucket = if delta > 0.0 { &mut wins } else { &mut regressions };
+                    let bucket = if delta > 0.0 {
+                        &mut wins
+                    } else {
+                        &mut regressions
+                    };
                     bucket.push(format!(
                         "  {tier:<20}  decode_rate   {:.4} → {:.4}  ({:+.4})",
                         at.decode_rate.unwrap_or(0.0),

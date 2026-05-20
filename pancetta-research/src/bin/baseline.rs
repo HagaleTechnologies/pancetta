@@ -67,8 +67,11 @@ impl Args {
                     jt9_path = Some(iter.next().context("--jt9-path needs a value")?.into())
                 }
                 "--synth-manifest" => {
-                    synth_manifest =
-                        Some(iter.next().context("--synth-manifest needs a value")?.into())
+                    synth_manifest = Some(
+                        iter.next()
+                            .context("--synth-manifest needs a value")?
+                            .into(),
+                    )
                 }
                 "--force" => force = true,
                 "-h" | "--help" => {

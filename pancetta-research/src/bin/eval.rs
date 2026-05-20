@@ -150,7 +150,11 @@ fn run_fixtures_tier(
         }
     }
     let failed = total - passed;
-    let pass_rate = if total == 0 { 0.0 } else { passed as f64 / total as f64 };
+    let pass_rate = if total == 0 {
+        0.0
+    } else {
+        passed as f64 / total as f64
+    };
     Ok(TierResult {
         wavs_processed: total,
         fixtures_total: Some(total),
@@ -288,7 +292,8 @@ fn main() -> anyhow::Result<()> {
                 tiers.insert("fixtures".to_string(), result);
             }
             "synth-clean" => {
-                let manifest = workspace.join("research/corpus/synth/manifests/clean.manifest.json");
+                let manifest =
+                    workspace.join("research/corpus/synth/manifests/clean.manifest.json");
                 anyhow::ensure!(
                     manifest.exists(),
                     "synth manifest missing at {}; run `cargo run -p pancetta-research --bin gen-synth -- --config research/corpus/synth/manifests/clean.config.json --output research/corpus/synth/manifests/clean.manifest.json`",

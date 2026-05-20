@@ -80,9 +80,8 @@ fn modulate_message(text: &str) -> anyhow::Result<Vec<f32>> {
 fn add_awgn(samples: &mut [f32], snr_db: f64, rng_seed: u64) {
     let mut rng = rand::rngs::StdRng::seed_from_u64(rng_seed);
     // Signal RMS:
-    let signal_rms: f64 = (samples.iter().map(|&s| (s as f64).powi(2)).sum::<f64>()
-        / samples.len() as f64)
-        .sqrt();
+    let signal_rms: f64 =
+        (samples.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / samples.len() as f64).sqrt();
     // Target noise RMS so that 20*log10(signal_rms / noise_rms) = snr_db:
     let noise_rms = signal_rms / 10f64.powf(snr_db / 20.0);
     let normal = Normal::new(0.0_f64, noise_rms).expect("noise stddev must be finite");
