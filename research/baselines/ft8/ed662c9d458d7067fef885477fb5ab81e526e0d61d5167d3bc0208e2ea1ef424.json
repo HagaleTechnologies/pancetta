@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/raw_subsampled_12khz.wav",
+  "wav_sha256": "ed662c9d458d7067fef885477fb5ab81e526e0d61d5167d3bc0208e2ea1ef424",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [],
+  "elapsed_seconds": 7.723143542
+}
