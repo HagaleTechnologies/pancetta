@@ -1,0 +1,452 @@
+{
+  "schema_version": 1,
+  "config": {
+    "schema_version": 1,
+    "label": "clean",
+    "messages": [
+      "CQ K1ABC FN42",
+      "K1ABC W9XYZ EM48",
+      "W9XYZ K1ABC -10",
+      "K1ABC W9XYZ R-12",
+      "W9XYZ K1ABC RR73",
+      "K1ABC W9XYZ 73"
+    ],
+    "snr_steps_db": [
+      -28.0,
+      -26.0,
+      -24.0,
+      -22.0,
+      -20.0,
+      -18.0,
+      -16.0,
+      -14.0,
+      -12.0,
+      -10.0
+    ],
+    "channel": "awgn",
+    "seed": 42,
+    "output_dir": "research/corpus/synth/wavs/clean"
+  },
+  "entries": [
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/CQ_K1ABC_FN42__-28.0dB.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -28.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4729905508687863550
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/CQ_K1ABC_FN42__-26.0dB.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -26.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4725964859013914366
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/CQ_K1ABC_FN42__-24.0dB.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -24.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4722024209339965182
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/CQ_K1ABC_FN42__-22.0dB.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -22.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4718083559666015998
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/CQ_K1ABC_FN42__-20.0dB.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -20.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4714142909992066814
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/CQ_K1ABC_FN42__-18.0dB.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -18.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4710202260318117630
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/CQ_K1ABC_FN42__-16.0dB.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -16.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4706261610644168446
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/CQ_K1ABC_FN42__-14.0dB.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -14.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4698380311296270078
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/CQ_K1ABC_FN42__-12.0dB.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -12.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4690499011948371710
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/CQ_K1ABC_FN42__-10.0dB.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -10.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4682617712600473342
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_EM48__-28.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -28.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4729905508688863553
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_EM48__-26.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -26.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4725964859014914369
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_EM48__-24.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -24.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4722024209340965185
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_EM48__-22.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -22.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4718083559667016001
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_EM48__-20.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -20.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4714142909993066817
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_EM48__-18.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -18.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4710202260319117633
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_EM48__-16.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -16.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4706261610645168449
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_EM48__-14.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -14.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4698380311297270081
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_EM48__-12.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -12.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4690499011949371713
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_EM48__-10.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -10.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4682617712601473345
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC__10__-28.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -28.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4729905508689863556
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC__10__-26.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -26.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4725964859015914372
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC__10__-24.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -24.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4722024209341965188
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC__10__-22.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -22.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4718083559668016004
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC__10__-20.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -20.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4714142909994066820
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC__10__-18.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -18.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4710202260320117636
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC__10__-16.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -16.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4706261610646168452
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC__10__-14.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -14.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4698380311298270084
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC__10__-12.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -12.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4690499011950371716
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC__10__-10.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -10.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4682617712602473348
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_R_12__-28.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -28.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4729905508690863559
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_R_12__-26.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -26.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4725964859016914375
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_R_12__-24.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -24.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4722024209342965191
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_R_12__-22.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -22.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4718083559669016007
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_R_12__-20.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -20.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4714142909995066823
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_R_12__-18.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -18.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4710202260321117639
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_R_12__-16.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -16.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4706261610647168455
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_R_12__-14.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -14.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4698380311299270087
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_R_12__-12.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -12.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4690499011951371719
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_R_12__-10.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -10.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4682617712603473351
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC_RR73__-28.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -28.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4729905508691863562
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC_RR73__-26.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -26.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4725964859017914378
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC_RR73__-24.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -24.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4722024209343965194
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC_RR73__-22.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -22.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4718083559670016010
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC_RR73__-20.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -20.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4714142909996066826
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC_RR73__-18.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -18.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4710202260322117642
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC_RR73__-16.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -16.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4706261610648168458
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC_RR73__-14.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -14.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4698380311300270090
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC_RR73__-12.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -12.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4690499011952371722
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/W9XYZ_K1ABC_RR73__-10.0dB.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -10.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4682617712604473354
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_73__-28.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -28.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4729905508692863565
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_73__-26.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -26.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4725964859018914381
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_73__-24.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -24.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4722024209344965197
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_73__-22.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -22.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4718083559671016013
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_73__-20.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -20.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4714142909997066829
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_73__-18.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -18.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4710202260323117645
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_73__-16.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -16.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4706261610649168461
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_73__-14.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -14.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4698380311301270093
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_73__-12.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -12.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4690499011953371725
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_73__-10.0dB.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -10.0,
+      "channel": "awgn",
+      "seed_for_this_wav": 4682617712605473357
+    }
+  ]
+}

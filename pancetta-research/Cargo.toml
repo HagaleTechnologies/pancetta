@@ -14,7 +14,7 @@ publish = false                          # never published; local-only research 
 research-eval = []
 
 [dependencies]
-pancetta-ft8 = { path = "../pancetta-ft8", features = ["serde"] }
+pancetta-ft8 = { path = "../pancetta-ft8", features = ["serde", "transmit"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -23,6 +23,10 @@ hound = "3.5"                            # WAV reader (already used in pancetta-
 # Used by gen-synth binary for AWGN noise (Box-Muller via rand_distr).
 rand = "0.8"
 rand_distr = "0.4"
+
+[[bin]]
+name = "gen-synth"
+path = "src/bin/gen_synth.rs"
 
 [dev-dependencies]
 tempfile = "3"                           # not in workspace.dependencies; keep inline
