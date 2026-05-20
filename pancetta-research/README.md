@@ -11,18 +11,33 @@ and `cargo test` from the repo root skip it entirely.
 ## Quick start
 
 ```bash
-# Build the harness
+# Build everything
 cargo build --release -p pancetta-research
 
-# Run a fixtures-only eval (smoke test; ~10 s)
-cargo run --release -p pancetta-research --bin eval -- \
-    --tier fixtures \
-    --mode ft8 \
-    --output research/scorecards/main.json
+# Generate the synth corpus (60 WAVs: 6 messages × 10 SNR steps)
+cargo run --release -p pancetta-research --bin gen-synth -- \
+    --config research/corpus/synth/manifests/clean.config.json \
+    --output research/corpus/synth/manifests/clean.manifest.json
 
-# Run the disk hygiene check
+# Cache jt9 baseline over fixtures + synth (once; tiny JSON per WAV; committed)
+cargo run --release -p pancetta-research --bin baseline -- --tier fixtures --mode ft8
+cargo run --release -p pancetta-research --bin baseline -- --tier synth --mode ft8
+
+# Score current decoder against all tiers
+cargo run --release -p pancetta-research --bin eval -- \
+    --tier fixtures,synth-clean --mode ft8 --output research/scorecards/main.json
+
+# Diff two scorecards
+cargo run --release -p pancetta-research --bin compare -- \
+    research/scorecards/main.json research/scorecards/experiment-X.json
+
+# Disk hygiene check
 ./scripts/research-env.sh --preflight
 ```
+
+WSJT-X must be installed locally for `baseline` to find `jt9`. On macOS,
+the default expected path is `/Applications/wsjtx.app/Contents/MacOS/jt9`;
+override with `--jt9-path /path/to/jt9` if needed.
 
 ## Why this is local-only
 
