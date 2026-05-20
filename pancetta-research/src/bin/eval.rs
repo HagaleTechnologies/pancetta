@@ -158,12 +158,17 @@ fn main() -> anyhow::Result<()> {
         .arg("--preflight")
         .current_dir(workspace_root()?)
         .status();
-    if let Ok(status) = preflight {
-        if !status.success() {
+    match preflight {
+        Ok(status) if !status.success() => {
             anyhow::bail!("preflight failed; aborting eval");
         }
+        Ok(_) => {}
+        Err(e) => {
+            eprintln!(
+                "warn: preflight script not found or not executable ({e}); skipping disk check",
+            );
+        }
     }
-    // If the script isn't installed (early bootstrap), don't fail — just warn.
 
     let args = Args::parse()?;
     let workspace = workspace_root()?;
