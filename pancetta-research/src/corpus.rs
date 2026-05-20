@@ -21,10 +21,10 @@ pub struct FixtureEntry {
 /// message and not error."
 pub fn load_ft8_fixtures(workspace_root: &Path) -> anyhow::Result<Vec<FixtureEntry>> {
     let mut out = Vec::new();
-    // Plan 1 scans only generated/ and wsjt/ (6 WAVs total). The basicft8/
-    // and jtdx/ subdirs add 7 more WAVs; plan 2 extends this scan once
-    // truth.json is populated with expected messages for those fixtures.
-    for sub in ["generated", "wsjt"] {
+    // All four fixture subdirs: generated/ (our encoded test signals),
+    // wsjt/ (WSJT-X golden), basicft8/ (ft8_lib reference), jtdx/
+    // (JTDX-recorded off-air). Truth.json holds per-fixture expectations.
+    for sub in ["generated", "wsjt", "basicft8", "jtdx"] {
         let dir = workspace_root
             .join("pancetta-ft8/tests/fixtures/wav")
             .join(sub);
