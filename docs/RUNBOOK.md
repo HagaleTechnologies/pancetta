@@ -322,3 +322,70 @@ genuinely no-Rust commits.
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — crate layout, message bus, data flows.
 - [`docs/superpowers/specs/2026-04-27-dx-slot-aware-tx-design.md`](superpowers/specs/2026-04-27-dx-slot-aware-tx-design.md) — slot-aware TX design.
 - [`CLAUDE.md`](../CLAUDE.md) — project state, known gaps, development phases.
+
+---
+
+## Decoder Research Iteration Loop
+
+The research harness produces scorecards and tracks experiments. This
+loop is local-only (never in CI) and runs in normal Claude Code sessions
+(not headless).
+
+### First-time setup (one-shot)
+
+```bash
+# Build the research crate.
+cargo build --release -p pancetta-research
+
+# Generate the synth corpus.
+cargo run --release -p pancetta-research --bin gen-synth -- \
+    --config research/corpus/synth/manifests/clean.config.json \
+    --output research/corpus/synth/manifests/clean.manifest.json
+
+# Curate the operator's real-world WAVs.
+cargo run --release -p pancetta-research --bin curate -- \
+    --source-dir ~/.pancetta/recordings --output-prefix research/corpus/curated/ft8
+
+# Cache jt9 baseline for all tiers (~45 min total; one-time).
+for tier in fixtures synth curated-hard-200 curated-hard-1000 wild-50; do
+    cargo run --release -p pancetta-research --bin baseline -- --tier "$tier" --mode ft8
+done
+
+# Compute the main.json baseline.
+cargo run --release -p pancetta-research --bin eval -- \
+    --tier fixtures,synth-clean,curated-hard-200,curated-hard-1000,wild-50 \
+    --mode ft8 --output research/scorecards/main.json
+```
+
+### Running an experiment (Claude-driven)
+
+When you want to try an idea, ask Claude to:
+
+> Pick the highest-priority hypothesis from `research/hypothesis_bank.md`
+> and run a full experiment cycle.
+
+Claude will:
+1. Pick a hypothesis (respecting the wild-card budget ratio in the bank).
+2. Create a worktree + branch: `experiment/ft8/<slug>`.
+3. Write `research/experiments/<date>-<slug>.md` with hypothesis text.
+4. Implement the change on the branch.
+5. Run eval: `cargo run --bin eval -- --tier ... --output research/scorecards/<branch>.json`.
+6. Run compare: `cargo run --bin compare -- research/scorecards/main.json research/scorecards/<branch>.json`.
+7. Decide merge/shelve/defer based on composite delta + regression flags.
+8. If WIN: PR to main, scorecard moves to `history/`, journal updated, hypothesis-bank entry marked graduated.
+9. If LOSS: journal documents learnings, follow-ups added to bank, branch deleted, artifacts marked for 14-day purge.
+10. Report to operator and either continue (per `/loop`) or stop.
+
+### Checking on the loop's state
+
+```bash
+./scripts/research-env.sh --status           # what's in flight, what shelved, what merged
+cargo run --release -p pancetta-research --bin leaderboard   # ranked scorecards
+./scripts/research-env.sh --preflight        # disk-cap check
+```
+
+### Stopping or recovering
+
+- `Ctrl-C` an in-progress eval to abort (eval is idempotent; rerun resumes).
+- `./scripts/research-env.sh --pin <slug>` to protect a specific experiment's artifacts from purge.
+- `./scripts/research-env.sh --cleanup` (dry-run) shows what would be purged; add `--execute` to actually remove.

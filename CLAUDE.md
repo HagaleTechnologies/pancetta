@@ -64,7 +64,9 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
   `scripts/research-env.sh`): a local-only iteration harness for improving
   the decoder. Excluded from `default-members` and CI by construction.
   Spec: `docs/superpowers/specs/2026-05-18-decoder-research-harness-design.md`.
-  Plan 1 of 3 (this scaffold) lands first.
+  Plans 1-3 complete; the loop is operational. Run `./scripts/research-env.sh --status`
+  to see active experiments; read `research/hypothesis_bank.md` for the
+  current backlog.
 - **QSO sender verification**: The QSO state machine (`pancetta-qso/src/qso_manager.rs::determine_state_transition` and `is_message_relevant`) verifies `from_station == expected DX callsign` on every state-advance. Mismatches are logged at `warn!` level (`target: "qso.security"`) and discarded. Frequency tolerance is 15 Hz. The autonomous responder (`autonomous.rs`) tracks per-callsign response timestamps in `recently_responded_to` and skips CQs from callsigns it responded to within the last 60s. Both defenses landed 2026-04-29 in response to Security Review C-1 and I-1; see `docs/security-review-2026-04-29.md`.
 
 ## Development Phases (End-to-End QSO Initiative)

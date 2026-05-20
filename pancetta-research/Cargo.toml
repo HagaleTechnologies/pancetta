@@ -37,5 +37,13 @@ path = "src/bin/baseline.rs"
 name = "compare"
 path = "src/bin/compare.rs"
 
+[[bin]]
+name = "curate"
+path = "src/bin/curate.rs"
+
+[[bin]]
+name = "leaderboard"
+path = "src/bin/leaderboard.rs"
+
 [dev-dependencies]
 tempfile = "3"                           # not in workspace.dependencies; keep inline

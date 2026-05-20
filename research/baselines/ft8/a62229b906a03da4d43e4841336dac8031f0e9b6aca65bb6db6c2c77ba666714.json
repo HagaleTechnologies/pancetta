@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_022013.wav",
+  "wav_sha256": "a62229b906a03da4d43e4841336dac8031f0e9b6aca65bb6db6c2c77ba666714",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "W6ETE W5RTG R-12",
+      "freq_hz": 1495.0,
+      "dt_s": 1.6,
+      "snr_db": -20.0
+    },
+    {
+      "message": "DC5AJ K3HPA FN10",
+      "freq_hz": 1785.0,
+      "dt_s": 2.0,
+      "snr_db": -9.0
+    },
+    {
+      "message": "N8SLT W5RWD 73",
+      "freq_hz": 2833.0,
+      "dt_s": 1.7,
+      "snr_db": 19.0
+    },
+    {
+      "message": "W1CCO WA4MB R-03",
+      "freq_hz": 1010.0,
+      "dt_s": 1.6,
+      "snr_db": 11.0
+    },
+    {
+      "message": "HK3YL N0MR EN47",
+      "freq_hz": 1247.0,
+      "dt_s": 2.1,
+      "snr_db": -12.0
+    },
+    {
+      "message": "KC1UVP W8KNX RR73",
+      "freq_hz": 490.0,
+      "dt_s": 1.7,
+      "snr_db": -14.0
+    },
+    {
+      "message": "CQ KR4EOD FM05",
+      "freq_hz": 1857.0,
+      "dt_s": 1.6,
+      "snr_db": -9.0
+    },
+    {
+      "message": "E70A KQ4TGW EM55",
+      "freq_hz": 2596.0,
+      "dt_s": 1.6,
+      "snr_db": -5.0
+    },
+    {
+      "message": "N8SLT KK7MOK DM42",
+      "freq_hz": 440.0,
+      "dt_s": 1.6,
+      "snr_db": -10.0
+    },
+    {
+      "message": "CQ KE9ZZ EN52",
+      "freq_hz": 1629.0,
+      "dt_s": 1.4,
+      "snr_db": -21.0
+    },
+    {
+      "message": "CO2ER C6APS RR73",
+      "freq_hz": 2948.0,
+      "dt_s": 1.5,
+      "snr_db": 3.0
+    },
+    {
+      "message": "KO4MAQ KM4ZDM +01",
+      "freq_hz": 2152.0,
+      "dt_s": 0.6,
+      "snr_db": -5.0
+    },
+    {
+      "message": "N8SLT N4TFN EM73",
+      "freq_hz": 1939.0,
+      "dt_s": 1.6,
+      "snr_db": -5.0
+    },
+    {
+      "message": "AI7AZ KG5EIU EM13",
+      "freq_hz": 895.0,
+      "dt_s": 1.6,
+      "snr_db": -9.0
+    },
+    {
+      "message": "XE3K KE8RKY EN81",
+      "freq_hz": 398.0,
+      "dt_s": 1.7,
+      "snr_db": -15.0
+    },
+    {
+      "message": "CQ KN4DS EM82",
+      "freq_hz": 691.0,
+      "dt_s": 1.7,
+      "snr_db": -4.0
+    },
+    {
+      "message": "KZ7K KP2BH 73",
+      "freq_hz": 1315.0,
+      "dt_s": 1.6,
+      "snr_db": -13.0
+    },
+    {
+      "message": "W1JKN KA3ETI 73",
+      "freq_hz": 330.0,
+      "dt_s": 1.6,
+      "snr_db": -25.0
+    },
+    {
+      "message": "ER3ZW K4DV 73",
+      "freq_hz": 1907.0,
+      "dt_s": 1.6,
+      "snr_db": -9.0
+    },
+    {
+      "message": "K5DCW RR73; KA9VRX <...> -02",
+      "freq_hz": 682.0,
+      "dt_s": 1.6,
+      "snr_db": -12.0
+    },
+    {
+      "message": "HK3YL KJ5CYH R-10",
+      "freq_hz": 642.0,
+      "dt_s": 1.7,
+      "snr_db": -17.0
+    },
+    {
+      "message": "XE3K OH7KB KP33",
+      "freq_hz": 893.0,
+      "dt_s": 1.6,
+      "snr_db": -16.0
+    },
+    {
+      "message": "YO2LDU N2AJ FN30",
+      "freq_hz": 3001.0,
+      "dt_s": 1.6,
+      "snr_db": -5.0
+    },
+    {
+      "message": "KC5CPO AE6CH CM97",
+      "freq_hz": 1950.0,
+      "dt_s": 1.7,
+      "snr_db": -23.0
+    },
+    {
+      "message": "KC9RAX KU4HO -05",
+      "freq_hz": 1397.0,
+      "dt_s": 1.7,
+      "snr_db": -19.0
+    },
+    {
+      "message": "HK3YL WA4TED EM75",
+      "freq_hz": 966.0,
+      "dt_s": 1.5,
+      "snr_db": -4.0
+    },
+    {
+      "message": "CQ HA1BF JN86 a1",
+      "freq_hz": 1282.0,
+      "dt_s": 1.7,
+      "snr_db": -25.0
+    },
+    {
+      "message": "KC3EMA KI4QMB EL99",
+      "freq_hz": 2133.0,
+      "dt_s": 1.7,
+      "snr_db": -25.0
+    },
+    {
+      "message": "K1NRO VE3YRG EN92",
+      "freq_hz": 1453.0,
+      "dt_s": 1.6,
+      "snr_db": -25.0
+    },
+    {
+      "message": "W3EWL KQ4YVQ RRR",
+      "freq_hz": 966.0,
+      "dt_s": 1.7,
+      "snr_db": -7.0
+    },
+    {
+      "message": "KC0KVR AA4NP -12",
+      "freq_hz": 999.0,
+      "dt_s": 1.7,
+      "snr_db": -6.0
+    }
+  ],
+  "elapsed_seconds": 10.689354458
+}

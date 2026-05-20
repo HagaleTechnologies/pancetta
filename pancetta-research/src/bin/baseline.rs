@@ -41,6 +41,7 @@ struct Args {
     mode: Mode,
     jt9_path: PathBuf,
     synth_manifest: Option<PathBuf>,
+    manifest: Option<PathBuf>,
     force: bool,
 }
 
@@ -50,6 +51,7 @@ impl Args {
         let mut mode: Option<Mode> = None;
         let mut jt9_path: Option<PathBuf> = None;
         let mut synth_manifest: Option<PathBuf> = None;
+        let mut manifest: Option<PathBuf> = None;
         let mut force = false;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
@@ -73,9 +75,12 @@ impl Args {
                             .into(),
                     )
                 }
+                "--manifest" => {
+                    manifest = Some(iter.next().context("--manifest needs a value")?.into())
+                }
                 "--force" => force = true,
                 "-h" | "--help" => {
-                    eprintln!("usage: baseline --tier <fixtures|synth> --mode ft8 [--jt9-path PATH] [--synth-manifest PATH] [--force]");
+                    eprintln!("usage: baseline --tier <fixtures|synth|curated-hard-200|curated-hard-1000|wild-50> --mode ft8 [--jt9-path PATH] [--synth-manifest PATH] [--manifest PATH] [--force]");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -103,6 +108,7 @@ impl Args {
             mode: mode.context("--mode required")?,
             jt9_path,
             synth_manifest,
+            manifest,
             force,
         })
     }
@@ -232,15 +238,37 @@ fn main() -> anyhow::Result<()> {
             .map(|f| f.wav_path)
             .collect(),
         "synth" => {
-            let manifest = args.synth_manifest.clone().unwrap_or_else(|| {
-                workspace.join("research/corpus/synth/manifests/clean.manifest.json")
-            });
+            let manifest = args
+                .synth_manifest
+                .clone()
+                .unwrap_or_else(|| {
+                    workspace.join("research/corpus/synth/manifests/clean.manifest.json")
+                });
             load_synth_corpus(&workspace, &manifest)?
                 .into_iter()
                 .map(|e| e.wav_path)
                 .collect()
         }
-        other => anyhow::bail!("unknown tier '{other}'. Use 'fixtures' or 'synth'."),
+        "curated-hard-200" | "curated-hard-1000" | "wild-50" => {
+            let label = match args.tier.as_str() {
+                "curated-hard-200" => "hard_200",
+                "curated-hard-1000" => "hard_1000",
+                "wild-50" => "wild_50",
+                _ => unreachable!(),
+            };
+            let manifest = args.manifest.clone().unwrap_or_else(|| {
+                workspace
+                    .join("research/corpus/curated/ft8")
+                    .join(format!("{label}.manifest.json"))
+            });
+            pancetta_research::curated::load_curated_corpus(&manifest)?
+                .into_iter()
+                .map(|e| e.wav_path)
+                .collect()
+        }
+        other => anyhow::bail!(
+            "unknown tier '{other}'. Use 'fixtures', 'synth', 'curated-hard-200', 'curated-hard-1000', or 'wild-50'."
+        ),
     };
     println!(
         "baseline: processing {} WAVs (tier={}, mode={})",
