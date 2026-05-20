@@ -18,7 +18,13 @@ fn leaderboard_prints_table_with_main_json() {
     let workspace = workspace_root();
     let out = Command::new("cargo")
         .args([
-            "run", "--release", "-q", "-p", "pancetta-research", "--bin", "leaderboard",
+            "run",
+            "--release",
+            "-q",
+            "-p",
+            "pancetta-research",
+            "--bin",
+            "leaderboard",
         ])
         .current_dir(&workspace)
         .output()

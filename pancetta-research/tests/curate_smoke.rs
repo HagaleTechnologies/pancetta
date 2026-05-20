@@ -23,7 +23,10 @@ fn curate_produces_three_manifests() {
     if !source.exists() {
         // Synth corpus not generated yet. Skip rather than fail — the
         // operator can pre-populate by running gen-synth.
-        eprintln!("warn: synth wav dir missing at {}; skipping", source.display());
+        eprintln!(
+            "warn: synth wav dir missing at {}; skipping",
+            source.display()
+        );
         return;
     }
     let out_dir = tempfile::tempdir().expect("tempdir");

@@ -75,7 +75,9 @@ impl Args {
                             .into(),
                     )
                 }
-                "--manifest" => manifest = Some(iter.next().context("--manifest needs a value")?.into()),
+                "--manifest" => {
+                    manifest = Some(iter.next().context("--manifest needs a value")?.into())
+                }
                 "--force" => force = true,
                 "-h" | "--help" => {
                     eprintln!("usage: baseline --tier <fixtures|synth|curated-hard-200|curated-hard-1000|wild-50> --mode ft8 [--jt9-path PATH] [--synth-manifest PATH] [--manifest PATH] [--force]");

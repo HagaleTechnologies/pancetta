@@ -55,12 +55,8 @@ fn main() -> anyhow::Result<()> {
 
     println!("# Decoder Research Leaderboard");
     println!();
-    println!(
-        "| Rank | Score | Slug | Branch | Date | Pass | SNR@50 |"
-    );
-    println!(
-        "|------|-------|------|--------|------|------|--------|"
-    );
+    println!("| Rank | Score | Slug | Branch | Date | Pass | SNR@50 |");
+    println!("|------|-------|------|--------|------|------|--------|");
     for (i, (path, card)) in all.iter().enumerate() {
         let slug = path
             .file_name()

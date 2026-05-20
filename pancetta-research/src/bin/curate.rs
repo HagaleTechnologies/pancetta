@@ -51,7 +51,11 @@ impl Args {
                         Some(iter.next().context("--output-prefix needs a value")?.into())
                 }
                 "--sample-size" => {
-                    sample_size = Some(iter.next().context("--sample-size needs a value")?.parse()?)
+                    sample_size = Some(
+                        iter.next()
+                            .context("--sample-size needs a value")?
+                            .parse()?,
+                    )
                 }
                 "--seed" => seed = iter.next().context("--seed needs a value")?.parse()?,
                 "-h" | "--help" => {
@@ -174,7 +178,11 @@ fn main() -> anyhow::Result<()> {
 
     // 1. Discover WAVs.
     let mut wavs = discover_wavs(&args.source_dir)?;
-    println!("discovered {} WAVs in {}", wavs.len(), args.source_dir.display());
+    println!(
+        "discovered {} WAVs in {}",
+        wavs.len(),
+        args.source_dir.display()
+    );
     if let Some(n) = args.sample_size {
         let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed);
         wavs.shuffle(&mut rng);

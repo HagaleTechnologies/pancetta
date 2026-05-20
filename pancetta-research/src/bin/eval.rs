@@ -269,7 +269,10 @@ fn run_curated_tier(
         // containing the same callsign tokens. Conservative substring check.
         let mut recovered_here = 0u32;
         for truth_msg in &baseline_decodes {
-            if our_decodes.iter().any(|d| d.message.trim() == truth_msg.trim()) {
+            if our_decodes
+                .iter()
+                .any(|d| d.message.trim() == truth_msg.trim())
+            {
                 recovered_here += 1;
             }
         }
@@ -277,7 +280,10 @@ fn run_curated_tier(
 
         // "Novel" decodes: ones in our output that aren't in baseline.
         for ours in &our_decodes {
-            if !baseline_decodes.iter().any(|t| t.trim() == ours.message.trim()) {
+            if !baseline_decodes
+                .iter()
+                .any(|t| t.trim() == ours.message.trim())
+            {
                 novel_decodes += 1;
             }
         }
@@ -296,8 +302,7 @@ fn run_curated_tier(
     }
 
     // Keep top-20 worst gaps for the per_wav_top_failures field.
-    per_wav_failures
-        .sort_by(|a, b| (b.truth - b.recovered).cmp(&(a.truth - a.recovered)));
+    per_wav_failures.sort_by(|a, b| (b.truth - b.recovered).cmp(&(a.truth - a.recovered)));
     per_wav_failures.truncate(20);
 
     let decode_rate = if truth_decodes_total == 0 {
