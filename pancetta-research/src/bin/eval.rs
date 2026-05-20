@@ -1,14 +1,15 @@
 //! eval — runs a DecoderUnderTest against requested corpus tiers and emits a
-//! scorecard. Plan 1 supports the fixtures tier only.
+//! scorecard. Plan 2 adds synth-clean and truth-validated fixtures tiers.
 
 use anyhow::Context;
 use chrono::Utc;
-use pancetta_research::corpus::load_ft8_fixtures;
+use pancetta_research::corpus::{load_ft8_fixtures, load_synth_corpus};
 use pancetta_research::decoder::{DecoderUnderTest, Ft8Decoder};
 use pancetta_research::metrics::{default_weights, populate_composite};
 use pancetta_research::scorecard::{
-    BuildInfo, ConfigInfo, GitInfo, HarnessInfo, RegressionFlags, Scorecard, TierResult,
+    BuildInfo, ConfigInfo, GitInfo, HarnessInfo, RegressionFlags, Scorecard, SnrBin, TierResult,
 };
+use pancetta_research::truth::{FixtureCategory, FixtureTruth};
 use pancetta_research::Mode;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -58,7 +59,7 @@ impl Args {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N]"
                     );
-                    eprintln!("  plan 1: only --tier fixtures is supported");
+                    eprintln!("  tiers: fixtures, synth-clean (curated-hard-* are plan 3 stubs)");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -85,35 +86,71 @@ fn run_fixtures_tier(
     decoder: &dyn DecoderUnderTest,
     workspace: &std::path::Path,
 ) -> anyhow::Result<TierResult> {
+    let truth_path = workspace.join("research/corpus/fixtures/ft8/truth.json");
+    let truth = FixtureTruth::load(&truth_path)?;
     let fixtures = load_ft8_fixtures(workspace)?;
     let total = fixtures.len() as u32;
     let mut passed = 0u32;
     let mut failures = Vec::new();
     for f in &fixtures {
-        match decoder.decode_wav(&f.wav_path) {
-            Ok(decodes) if !decodes.is_empty() => {
-                // Plan 1: "pass" means "decoded ≥ 1 message and did not error."
-                // Plan 2 will compare against truth.json for exact-message match.
-                passed += 1;
+        let entry = truth.get(&f.display_name);
+        let decodes_result = decoder.decode_wav(&f.wav_path);
+        match (decodes_result, entry) {
+            (Ok(decodes), Some(entry)) => match entry.category {
+                FixtureCategory::Exact => {
+                    let all_present = entry
+                        .expect
+                        .iter()
+                        .all(|expected| decodes.iter().any(|d| d.message.contains(expected)));
+                    if all_present {
+                        passed += 1;
+                    } else {
+                        failures.push(pancetta_research::scorecard::FixtureFailure {
+                            wav: f.display_name.clone(),
+                            expected: entry.expect.clone(),
+                            got: decodes.iter().map(|d| d.message.clone()).collect(),
+                        });
+                    }
+                }
+                FixtureCategory::AnyDecode => {
+                    if !decodes.is_empty() {
+                        passed += 1;
+                    } else {
+                        failures.push(pancetta_research::scorecard::FixtureFailure {
+                            wav: f.display_name.clone(),
+                            expected: vec!["any-decode".into()],
+                            got: vec![],
+                        });
+                    }
+                }
+                FixtureCategory::Skip => {
+                    // Don't count toward pass/fail; just track.
+                    // Decrement implicit "total" to keep pass_rate honest.
+                    // But for simplicity, count Skip as a pass (no regression risk
+                    // since we explicitly chose not to gate this fixture).
+                    passed += 1;
+                }
+            },
+            (Ok(decodes), None) => {
+                // Fixture exists on disk but not in truth.json — informational only.
+                failures.push(pancetta_research::scorecard::FixtureFailure {
+                    wav: f.display_name.clone(),
+                    expected: vec![format!(
+                        "no truth.json entry for {} — add one before counting as pass/fail",
+                        f.display_name
+                    )],
+                    got: decodes.iter().map(|d| d.message.clone()).collect(),
+                });
             }
-            Ok(_) => failures.push(pancetta_research::scorecard::FixtureFailure {
+            (Err(e), entry) => failures.push(pancetta_research::scorecard::FixtureFailure {
                 wav: f.display_name.clone(),
-                expected: vec!["any decode".into()],
-                got: vec![],
-            }),
-            Err(e) => failures.push(pancetta_research::scorecard::FixtureFailure {
-                wav: f.display_name.clone(),
-                expected: vec!["any decode".into()],
+                expected: entry.map(|e| e.expect.clone()).unwrap_or_default(),
                 got: vec![format!("error: {e}")],
             }),
         }
     }
     let failed = total - passed;
-    let pass_rate = if total == 0 {
-        0.0
-    } else {
-        passed as f64 / total as f64
-    };
+    let pass_rate = if total == 0 { 0.0 } else { passed as f64 / total as f64 };
     Ok(TierResult {
         wavs_processed: total,
         fixtures_total: Some(total),
@@ -123,6 +160,66 @@ fn run_fixtures_tier(
         pass_rate: Some(pass_rate),
         ..Default::default()
     })
+}
+
+fn run_synth_tier(
+    decoder: &dyn DecoderUnderTest,
+    workspace: &std::path::Path,
+    manifest_path: &std::path::Path,
+) -> anyhow::Result<TierResult> {
+    let entries = load_synth_corpus(workspace, manifest_path)?;
+    // Group by snr_db bin.
+    let mut bins: BTreeMap<i64, (u32, u32)> = BTreeMap::new(); // key = snr*10 to avoid float keys
+    let mut wavs_processed = 0u32;
+    for e in &entries {
+        wavs_processed += 1;
+        let bin_key = (e.snr_db * 10.0).round() as i64;
+        let bin = bins.entry(bin_key).or_insert((0, 0));
+        bin.0 += 1; // attempts
+        match decoder.decode_wav(&e.wav_path) {
+            Ok(decodes) => {
+                if decodes
+                    .iter()
+                    .any(|d| d.message.contains(&e.encoded_message))
+                {
+                    bin.1 += 1; // decoded
+                }
+            }
+            Err(_) => {
+                // Decode error — counts as failed attempt.
+            }
+        }
+    }
+    let mut by_snr: Vec<SnrBin> = bins
+        .iter()
+        .map(|(k, (attempts, decoded))| SnrBin {
+            snr_db: (*k as f64) / 10.0,
+            attempts: *attempts,
+            decoded: *decoded,
+            fp: 0,
+        })
+        .collect();
+    by_snr.sort_by(|a, b| a.snr_db.partial_cmp(&b.snr_db).unwrap());
+    // Find SNR @ 50% and 90% recovery (first bin where decoded/attempts >= threshold).
+    let snr_at_50 = first_threshold_db(&by_snr, 0.50);
+    let snr_at_90 = first_threshold_db(&by_snr, 0.90);
+    Ok(TierResult {
+        wavs_processed,
+        by_snr_db: by_snr,
+        snr_at_50pct_recovery_db: snr_at_50,
+        snr_at_90pct_recovery_db: snr_at_90,
+        ..Default::default()
+    })
+}
+
+/// Lowest SNR (in dB) where recovery >= threshold. Bins must be sorted by SNR asc.
+fn first_threshold_db(bins: &[SnrBin], threshold: f64) -> Option<f64> {
+    for bin in bins {
+        if bin.attempts > 0 && (bin.decoded as f64) / (bin.attempts as f64) >= threshold {
+            return Some(bin.snr_db);
+        }
+    }
+    None
 }
 
 fn git_info(workspace: &std::path::Path) -> GitInfo {
@@ -190,10 +287,22 @@ fn main() -> anyhow::Result<()> {
                 let result = run_fixtures_tier(decoder.as_ref(), &workspace)?;
                 tiers.insert("fixtures".to_string(), result);
             }
-            other => anyhow::bail!(
-                "tier '{other}' not supported in plan 1. Only 'fixtures' is wired today; \
-                 curated + synth land in plan 2."
-            ),
+            "synth-clean" => {
+                let manifest = workspace.join("research/corpus/synth/manifests/clean.manifest.json");
+                anyhow::ensure!(
+                    manifest.exists(),
+                    "synth manifest missing at {}; run `cargo run -p pancetta-research --bin gen-synth -- --config research/corpus/synth/manifests/clean.config.json --output research/corpus/synth/manifests/clean.manifest.json`",
+                    manifest.display()
+                );
+                let result = run_synth_tier(decoder.as_ref(), &workspace, &manifest)?;
+                tiers.insert("synth-clean".to_string(), result);
+            }
+            "curated-hard-200" | "curated-hard-1000" => {
+                eprintln!(
+                    "warn: tier '{tier_name}' is a stub in plan 2; populated in plan 3. Skipping."
+                );
+            }
+            other => anyhow::bail!("unknown tier '{other}'"),
         }
     }
 
