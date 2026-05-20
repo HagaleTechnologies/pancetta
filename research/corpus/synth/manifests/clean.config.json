@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "label": "clean",
+  "messages": [
+    "CQ K1ABC FN42",
+    "K1ABC W9XYZ EM48",
+    "W9XYZ K1ABC -10",
+    "K1ABC W9XYZ R-12",
+    "W9XYZ K1ABC RR73",
+    "K1ABC W9XYZ 73"
+  ],
+  "snr_steps_db": [
+    -28.0, -26.0, -24.0, -22.0, -20.0, -18.0,
+    -16.0, -14.0, -12.0, -10.0
+  ],
+  "channel": "awgn",
+  "seed": 42,
+  "output_dir": "research/corpus/synth/wavs/clean"
+}
