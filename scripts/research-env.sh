@@ -103,11 +103,10 @@ cmd_audit() {
 }
 
 cmd_preflight() {
-    local total
-    total=$(usage_report | tail -n 1)
-    # Re-print the report for the user (idempotent — usage_report only reads disk).
-    # Strip the trailing total line with sed '$d' (macOS-portable; head -n -1 is GNU-only).
-    usage_report | sed '$d'
+    local report total
+    report=$(usage_report)
+    total=$(printf '%s\n' "$report" | tail -n 1)
+    printf '%s\n' "$report" | sed '$d'
     echo
 
     if awk -v t="$total" -v p="$PAUSE_GB" 'BEGIN { exit !(t >= p) }'; then
@@ -128,6 +127,11 @@ cmd_guard_ci() {
         local forbidden=(
             "pancetta-research"
             "research-env.sh"
+            "--bin eval"
+            "--bin compare"
+            "--bin leaderboard"
+            "--bin curate"
+            "--bin baseline"
             "research/scorecards"
             "research/experiments"
             "research/baselines"
@@ -158,7 +162,7 @@ case "$CMD" in
         exit 0
         ;;
     -h|--help|"")
-        sed -n '2,18p' "$0"
+        sed -n '2,20p' "$0"
         ;;
     *)
         echo "unknown subcommand: $CMD" >&2
