@@ -18,3 +18,7 @@ pub mod decoder;
 pub use decoder::{Decode, DecoderUnderTest};
 
 pub mod corpus;
+
+pub mod truth;
+
+pub mod synth;

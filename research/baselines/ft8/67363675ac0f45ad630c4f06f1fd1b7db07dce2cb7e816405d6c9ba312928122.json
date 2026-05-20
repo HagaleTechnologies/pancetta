@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "wav_path": "research/corpus/synth/wavs/clean/CQ_K1ABC_FN42__-28.0dB.wav",
+  "wav_sha256": "67363675ac0f45ad630c4f06f1fd1b7db07dce2cb7e816405d6c9ba312928122",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [],
+  "elapsed_seconds": 2.629368959
+}

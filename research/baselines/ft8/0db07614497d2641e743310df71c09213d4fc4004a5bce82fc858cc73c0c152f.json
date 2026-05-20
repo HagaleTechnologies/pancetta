@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "wav_path": "pancetta-ft8/tests/fixtures/wav/generated/ft8_cq.wav",
+  "wav_sha256": "0db07614497d2641e743310df71c09213d4fc4004a5bce82fc858cc73c0c152f",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "CQ K1ABC FN42",
+      "freq_hz": 1000.0,
+      "dt_s": 0.7,
+      "snr_db": 40.0
+    }
+  ],
+  "elapsed_seconds": 2.775571792
+}

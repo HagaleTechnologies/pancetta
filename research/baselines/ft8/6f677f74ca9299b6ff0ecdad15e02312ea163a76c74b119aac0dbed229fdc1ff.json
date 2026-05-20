@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "wav_path": "pancetta-ft8/tests/fixtures/wav/basicft8/170923_082030.wav",
+  "wav_sha256": "6f677f74ca9299b6ff0ecdad15e02312ea163a76c74b119aac0dbed229fdc1ff",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [],
+  "elapsed_seconds": 2.870291791
+}

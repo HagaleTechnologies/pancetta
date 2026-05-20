@@ -14,12 +14,28 @@ publish = false                          # never published; local-only research 
 research-eval = []
 
 [dependencies]
-pancetta-ft8 = { path = "../pancetta-ft8", features = ["serde"] }
+pancetta-ft8 = { path = "../pancetta-ft8", features = ["serde", "transmit"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 hound = "3.5"                            # WAV reader (already used in pancetta-ft8; not in workspace.dependencies)
+# Used by gen-synth binary for AWGN noise (Box-Muller via rand_distr).
+rand = "0.8"
+rand_distr = "0.4"
+sha2 = "0.10"                            # SHA-256 for WAV cache keying in baseline binary
+
+[[bin]]
+name = "gen-synth"
+path = "src/bin/gen_synth.rs"
+
+[[bin]]
+name = "baseline"
+path = "src/bin/baseline.rs"
+
+[[bin]]
+name = "compare"
+path = "src/bin/compare.rs"
 
 [dev-dependencies]
 tempfile = "3"                           # not in workspace.dependencies; keep inline

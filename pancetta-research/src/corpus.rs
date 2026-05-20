@@ -1,5 +1,5 @@
-//! Corpus loaders. Plan 1 covers the fixtures tier only; curated + synth
-//! land in plan 2.
+//! Corpus loaders. Plan 1 covers the fixtures tier; plan 2 adds synth-clean.
+//! Curated tiers land in plan 3.
 
 use std::path::{Path, PathBuf};
 
@@ -14,17 +14,15 @@ pub struct FixtureEntry {
 }
 
 /// Discover all fixture WAVs that ship with pancetta-ft8 (used by the
-/// regression test suite). Plan 1 returns just the paths with empty
-/// `expected_messages`; plan 2 will read a `research/corpus/fixtures/ft8/truth.json`
-/// to populate expected messages, but for plan 1 the fixtures tier is a
-/// build-and-decode smoke test only — "did decode return at least one
-/// message and not error."
+/// regression test suite). Returns entries with empty `expected_messages` —
+/// truth.json is read separately by the eval binary (`FixtureTruth::load`),
+/// which controls pass/fail categorization. This function returns paths only.
 pub fn load_ft8_fixtures(workspace_root: &Path) -> anyhow::Result<Vec<FixtureEntry>> {
     let mut out = Vec::new();
-    // Plan 1 scans only generated/ and wsjt/ (6 WAVs total). The basicft8/
-    // and jtdx/ subdirs add 7 more WAVs; plan 2 extends this scan once
-    // truth.json is populated with expected messages for those fixtures.
-    for sub in ["generated", "wsjt"] {
+    // All four fixture subdirs: generated/ (our encoded test signals),
+    // wsjt/ (WSJT-X golden), basicft8/ (ft8_lib reference), jtdx/
+    // (JTDX-recorded off-air). Truth.json holds per-fixture expectations.
+    for sub in ["generated", "wsjt", "basicft8", "jtdx"] {
         let dir = workspace_root
             .join("pancetta-ft8/tests/fixtures/wav")
             .join(sub);
@@ -46,4 +44,33 @@ pub fn load_ft8_fixtures(workspace_root: &Path) -> anyhow::Result<Vec<FixtureEnt
     }
     out.sort_by(|a, b| a.display_name.cmp(&b.display_name));
     Ok(out)
+}
+
+use crate::synth::SynthManifest;
+
+/// One synth corpus entry, denormalized for the eval binary's convenience.
+#[derive(Clone, Debug)]
+pub struct SynthCorpusEntry {
+    pub wav_path: PathBuf,
+    pub encoded_message: String,
+    pub snr_db: f64,
+}
+
+/// Load a synth manifest from disk and resolve all wav paths relative to
+/// the workspace root.
+pub fn load_synth_corpus(
+    workspace_root: &Path,
+    manifest_path: &Path,
+) -> anyhow::Result<Vec<SynthCorpusEntry>> {
+    let manifest = SynthManifest::load(manifest_path)?;
+    let entries = manifest
+        .entries
+        .iter()
+        .map(|e| SynthCorpusEntry {
+            wav_path: workspace_root.join(&e.wav_path),
+            encoded_message: e.encoded_message.clone(),
+            snr_db: e.snr_db,
+        })
+        .collect();
+    Ok(entries)
 }

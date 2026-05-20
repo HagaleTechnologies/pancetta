@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "wav_path": "research/corpus/synth/wavs/clean/K1ABC_W9XYZ_EM48__-12.0dB.wav",
+  "wav_sha256": "c93b3aa3973ba3f399cbe1d2f8639831f596c15c923910e87a069abfe7a3f66e",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "K1ABC W9XYZ EM48",
+      "freq_hz": 1500.0,
+      "dt_s": -0.5,
+      "snr_db": -9.0
+    }
+  ],
+  "elapsed_seconds": 0.974108292
+}

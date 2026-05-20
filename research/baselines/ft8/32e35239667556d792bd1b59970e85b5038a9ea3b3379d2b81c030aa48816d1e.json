@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "wav_path": "pancetta-ft8/tests/fixtures/wav/generated/ft8_report.wav",
+  "wav_sha256": "32e35239667556d792bd1b59970e85b5038a9ea3b3379d2b81c030aa48816d1e",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "K1DEF W1ABC -12",
+      "freq_hz": 1200.0,
+      "dt_s": 0.7,
+      "snr_db": 41.0
+    }
+  ],
+  "elapsed_seconds": 2.93745725
+}

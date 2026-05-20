@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "fixtures": {
+    "basicft8/170923_082000.wav": {
+      "category": "skip",
+      "expect": [],
+      "notes": "ft8_lib basicft8 set. Current decoder finds 0 messages — tracked but not gated."
+    },
+    "basicft8/170923_082015.wav": {
+      "category": "any-decode",
+      "expect": ["any-decode"],
+      "notes": "ft8_lib basicft8 set. Current decoder finds 1 message."
+    },
+    "basicft8/170923_082030.wav": {
+      "category": "skip",
+      "expect": [],
+      "notes": "ft8_lib basicft8 set. Current decoder finds 0 messages — tracked but not gated."
+    },
+    "basicft8/170923_082045.wav": {
+      "category": "skip",
+      "expect": [],
+      "notes": "ft8_lib basicft8 set. Current decoder finds 0 messages — tracked but not gated."
+    },
+    "basicft8/live_now.wav": {
+      "category": "any-decode",
+      "expect": ["any-decode"],
+      "notes": "ft8_lib basicft8 set. Current decoder finds 26 messages."
+    },
+    "generated/ft8_cq.wav": {
+      "category": "exact",
+      "expect": ["CQ K1ABC FN42"],
+      "notes": "Encoded by pancetta-ft8 generator; content is known."
+    },
+    "generated/ft8_report.wav": {
+      "category": "exact",
+      "expect": ["K1DEF W1ABC -12"],
+      "notes": "Generated signal-report fixture."
+    },
+    "generated/ft8_rr73.wav": {
+      "category": "exact",
+      "expect": ["K1DEF W1ABC RR73"],
+      "notes": "Generated RR73 fixture."
+    },
+    "jtdx/000000_000001.wav": {
+      "category": "skip",
+      "expect": [],
+      "notes": "JTDX-recorded off-air. Current decoder finds 0 messages — tracked but not gated."
+    },
+    "jtdx/190227_155815.wav": {
+      "category": "any-decode",
+      "expect": ["any-decode"],
+      "notes": "JTDX-recorded off-air. Current decoder finds 23 messages."
+    },
+    "wsjt/170709_135615.wav": {
+      "category": "skip",
+      "expect": [],
+      "notes": "WSJT-X golden. Current decoder finds 0 messages — tracked but not gated."
+    },
+    "wsjt/181201_180245.wav": {
+      "category": "any-decode",
+      "expect": ["any-decode"],
+      "notes": "WSJT-X golden. Current decoder finds 12 messages."
+    },
+    "wsjt/210703_133430.wav": {
+      "category": "any-decode",
+      "expect": ["any-decode"],
+      "notes": "WSJT-X golden. Current decoder finds 8 messages."
+    }
+  }
+}

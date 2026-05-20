@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "wav_path": "pancetta-ft8/tests/fixtures/wav/jtdx/000000_000001.wav",
+  "wav_sha256": "3ec2101f875aa84886b2d770f2ff8b0e286439695ac282b3d2e8356761c4f679",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "CQ KV4AJ EM87",
+      "freq_hz": 1600.0,
+      "dt_s": 0.2,
+      "snr_db": -20.0
+    },
+    {
+      "message": "CQ KB8CR EM79 a1",
+      "freq_hz": 500.0,
+      "dt_s": 0.2,
+      "snr_db": -22.0
+    },
+    {
+      "message": "CQ HB9EVC JN47 a1",
+      "freq_hz": 2600.0,
+      "dt_s": 0.3,
+      "snr_db": -22.0
+    },
+    {
+      "message": "CQ CO2VE EL83 a1",
+      "freq_hz": 1000.0,
+      "dt_s": 0.3,
+      "snr_db": -21.0
+    },
+    {
+      "message": "CQ W8SWR EN72 a1",
+      "freq_hz": 2399.0,
+      "dt_s": 0.6,
+      "snr_db": -21.0
+    }
+  ],
+  "elapsed_seconds": 3.521314834
+}

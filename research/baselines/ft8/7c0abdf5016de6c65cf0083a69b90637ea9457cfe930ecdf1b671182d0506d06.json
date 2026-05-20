@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "wav_path": "pancetta-ft8/tests/fixtures/wav/generated/ft8_rr73.wav",
+  "wav_sha256": "7c0abdf5016de6c65cf0083a69b90637ea9457cfe930ecdf1b671182d0506d06",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "K1DEF W1ABC RR73",
+      "freq_hz": 800.0,
+      "dt_s": 0.7,
+      "snr_db": 40.0
+    }
+  ],
+  "elapsed_seconds": 2.777902958
+}
