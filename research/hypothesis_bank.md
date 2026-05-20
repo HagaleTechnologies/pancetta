@@ -33,29 +33,45 @@ current_ratio: 0.0
     from 1 to 4 with curated-hard-200 as the primary metric. Instrument new
     decodes-per-pass counts in the scorecard.
 
-### hb-002 — Synth plateau investigation (1-of-6 message type)  [PRIORITY: 0.75]
+### hb-002 — Synth plateau investigation (1-of-6 message type)  [SHELVED 2026-05-20]
+  mode: ft8
+  status: shelved
+  priority_score: 0.75
+  outcome: |
+    Identified the failing message as `K1ABC W9XYZ R-12` — the "Roger +
+    signal report" response form. Fails at every SNR from -28 dB to -10 dB
+    inclusive (not a sensitivity issue; a structural decoder failure
+    specific to R-prefix signal-report responses).
+  learning: |
+    Synth plateau is a real decoder bug, not a sensitivity limit. Until
+    fixed, synth-clean tier composite is capped at 5/6 = 83.3% × full
+    weight. See research/experiments/2026-05-20-synth-plateau-investigation.md
+    for the full per-message-per-SNR table.
+  follow_up: hb-023
+
+### hb-023 — Fix R-signal-report decode failure  [PRIORITY: 7.5]
   mode: ft8
   status: pending
-  priority_score: 0.75
-  estimated_effort: 1 session
-  expected_delta: +0.02 to +0.08 synth-clean composite; potential fixture pass-rate lift
-  defensible_prior: yes
+  priority_score: 7.5
+  estimated_effort: 1-2 sessions
+  expected_delta: synth-clean snr@50% normalized score +0.05 → 1.00 (plateau lifts from 83% to 100%); composite +~0.015
+  defensible_prior: yes (concrete decoder bug identified in hb-002 investigation)
   wild_card: false
   evidence_for:
-    - Plan 2 main.json: SNR@50% recovery = -20.0 dB; at -18 dB only 5/6 messages decoded (83%), same 5/6 pattern at -16, -14, -12, -10 dB — one message type plateaus regardless of SNR
-    - At high SNR (-10 dB) a 5/6 ceiling suggests a structural failure, not a sensitivity issue: the 6th message is just not getting through at any SNR
-    - Six distinct FT8 message types exist in the synth corpus; the failing one is likely a type-1 "non-standard" or grid/suffix variant that exercises a different message parser path
-    - This is a regression-free investigation: read the synth manifest, identify which message always fails, trace the path through MessageParser
+    - Synth `K1ABC W9XYZ R-12` round-trips encode but consistently fails decode at every SNR (-28 to -10 dB)
+    - Other message types (CQ, grid, plain signal report, 73, RR73) all decode successfully at SNR ≥ -18 dB on the same synth corpus
+    - Specific failure surface: R-prefix signal-report responses — distinct FT8 message subtype
   evidence_against:
-    - May be a synth generation issue (wrong ground-truth in manifest) rather than a decoder bug
-    - If only 1 message variant, the absolute decode-rate impact is ~1/N of the corpus
+    - May expose other bugs in the R-message-type bit layout that need fixing in tandem
   notes: |
-    First experiment: run the harness in --quick mode, capture per-message decode
-    results, identify the invariant failure. Compare the failing WAV's encoded
-    message against the ground truth in the synth manifest. If the ground truth
-    is wrong, fix the generator. If the ground truth is right, trace the failure
-    through MessageParser. This is a no-code-change investigation first; code
-    change (if any) follows as hb-002b.
+    Trace why pancetta-ft8 fails to decode the R-signal-report bit layout.
+    Candidates to investigate:
+    (a) Encoder produces bits the decoder can't parse back — i.e. encode/decode
+        mismatch in the R-signal-report bit layout (verify by inspecting the
+        encoded bits vs the decoder's parser).
+    (b) Decoder's message-type detection misclassifies R-prefix responses,
+        dropping them at a parser gate before LDPC even runs.
+    Compare against ft8_lib's reference implementation if needed.
 
 ### hb-003 — Sync candidate count sweep  [PRIORITY: 0.70]
   mode: ft8
