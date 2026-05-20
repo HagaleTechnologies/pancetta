@@ -111,11 +111,11 @@ cmd_preflight() {
 
     if awk -v t="$total" -v p="$PAUSE_GB" 'BEGIN { exit !(t >= p) }'; then
         echo "STOP: ${total} GB >= ${PAUSE_GB} GB pause threshold."
-        echo "Run 'scripts/research-env.sh --cleanup' (available in plan 3) and retry."
+        echo "Run 'scripts/research-env.sh --cleanup --execute' to delete expired artifacts, then retry."
         exit 1
     elif awk -v t="$total" -v w="$WARN_GB" 'BEGIN { exit !(t >= w) }'; then
         echo "WARN: ${total} GB >= ${WARN_GB} GB. Scheduled purges would run here."
-        echo "Plan 1 only reports; --cleanup arrives in plan 3."
+        echo "Run 'scripts/research-env.sh --cleanup' to purge expired artifacts (or '--cleanup --execute' to actually delete)."
     else
         echo "OK: ${total} GB on-disk research footprint."
     fi

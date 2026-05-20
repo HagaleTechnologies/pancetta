@@ -137,7 +137,10 @@ fn score_wav(
     // SNR-diversity proxy: lower mean SNR (more weak decodes) = more interesting.
     let snr_score = mean_snr.map_or(0.0, |m| (-m / 20.0).max(0.0));
     let score = SCORE_W_DECODE_COUNT * (decode_count as f64)
-        + SCORE_W_NOISE_FLOOR * (-noise) // higher noise = bigger negative number = bigger boost
+        // Busier band (noise floor closer to 0 dB) = larger contribution.
+        // noise_floor_db is negative (e.g. -30 dB clean, -20 dB busy);
+        // adding it directly so busier bands (less-negative noise) score higher.
+        + SCORE_W_NOISE_FLOOR * noise
         + SCORE_W_SNR_DIVERSITY * snr_score;
     Ok((
         score,

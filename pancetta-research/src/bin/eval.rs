@@ -1,5 +1,7 @@
 //! eval — runs a DecoderUnderTest against requested corpus tiers and emits a
-//! scorecard. Plan 2 adds synth-clean and truth-validated fixtures tiers.
+//! scorecard. Tiers: fixtures (truth-validated), synth-clean (sensitivity
+//! curve), curated-hard-200 / curated-hard-1000 / wild-50 (real-world WAVs
+//! vs cached jt9 baseline).
 
 use anyhow::Context;
 use chrono::Utc;
@@ -61,7 +63,7 @@ impl Args {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N]"
                     );
-                    eprintln!("  tiers: fixtures, synth-clean (curated-hard-* are plan 3 stubs)");
+                    eprintln!("  tiers: fixtures, synth-clean, curated-hard-200, curated-hard-1000, wild-50");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),

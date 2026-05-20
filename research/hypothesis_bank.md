@@ -9,6 +9,30 @@ current_ratio: 0.0
 
 ## Active (ranked by score)
 
+### hb-023 — Fix R-signal-report decode failure  [PRIORITY: 0.85]
+  mode: ft8
+  status: pending
+  priority_score: 0.85
+  estimated_effort: 1-2 sessions
+  expected_delta: synth-clean snr@50% normalized score +0.05 → 1.00 (plateau lifts from 83% to 100%); composite +~0.015
+  defensible_prior: yes (concrete decoder bug identified in hb-002 investigation)
+  wild_card: false
+  evidence_for:
+    - Synth `K1ABC W9XYZ R-12` round-trips encode but consistently fails decode at every SNR (-28 to -10 dB)
+    - Other message types (CQ, grid, plain signal report, 73, RR73) all decode successfully at SNR ≥ -18 dB on the same synth corpus
+    - Specific failure surface: R-prefix signal-report responses — distinct FT8 message subtype
+  evidence_against:
+    - May expose other bugs in the R-message-type bit layout that need fixing in tandem
+  notes: |
+    Trace why pancetta-ft8 fails to decode the R-signal-report bit layout.
+    Candidates to investigate:
+    (a) Encoder produces bits the decoder can't parse back — i.e. encode/decode
+        mismatch in the R-signal-report bit layout (verify by inspecting the
+        encoded bits vs the decoder's parser).
+    (b) Decoder's message-type detection misclassifies R-prefix responses,
+        dropping them at a parser gate before LDPC even runs.
+    Compare against ft8_lib's reference implementation if needed.
+
 ### hb-001 — Multi-pass subtract-and-redecode  [PRIORITY: 0.82]
   mode: ft8
   status: pending
@@ -32,46 +56,6 @@ current_ratio: 0.0
     in, this hypothesis is directly measurable. Experiment: sweep max_decode_passes
     from 1 to 4 with curated-hard-200 as the primary metric. Instrument new
     decodes-per-pass counts in the scorecard.
-
-### hb-002 — Synth plateau investigation (1-of-6 message type)  [SHELVED 2026-05-20]
-  mode: ft8
-  status: shelved
-  priority_score: 0.75
-  outcome: |
-    Identified the failing message as `K1ABC W9XYZ R-12` — the "Roger +
-    signal report" response form. Fails at every SNR from -28 dB to -10 dB
-    inclusive (not a sensitivity issue; a structural decoder failure
-    specific to R-prefix signal-report responses).
-  learning: |
-    Synth plateau is a real decoder bug, not a sensitivity limit. Until
-    fixed, synth-clean tier composite is capped at 5/6 = 83.3% × full
-    weight. See research/experiments/2026-05-20-synth-plateau-investigation.md
-    for the full per-message-per-SNR table.
-  follow_up: hb-023
-
-### hb-023 — Fix R-signal-report decode failure  [PRIORITY: 7.5]
-  mode: ft8
-  status: pending
-  priority_score: 7.5
-  estimated_effort: 1-2 sessions
-  expected_delta: synth-clean snr@50% normalized score +0.05 → 1.00 (plateau lifts from 83% to 100%); composite +~0.015
-  defensible_prior: yes (concrete decoder bug identified in hb-002 investigation)
-  wild_card: false
-  evidence_for:
-    - Synth `K1ABC W9XYZ R-12` round-trips encode but consistently fails decode at every SNR (-28 to -10 dB)
-    - Other message types (CQ, grid, plain signal report, 73, RR73) all decode successfully at SNR ≥ -18 dB on the same synth corpus
-    - Specific failure surface: R-prefix signal-report responses — distinct FT8 message subtype
-  evidence_against:
-    - May expose other bugs in the R-message-type bit layout that need fixing in tandem
-  notes: |
-    Trace why pancetta-ft8 fails to decode the R-signal-report bit layout.
-    Candidates to investigate:
-    (a) Encoder produces bits the decoder can't parse back — i.e. encode/decode
-        mismatch in the R-signal-report bit layout (verify by inspecting the
-        encoded bits vs the decoder's parser).
-    (b) Decoder's message-type detection misclassifies R-prefix responses,
-        dropping them at a parser gate before LDPC even runs.
-    Compare against ft8_lib's reference implementation if needed.
 
 ### hb-003 — Sync candidate count sweep  [PRIORITY: 0.70]
   mode: ft8
@@ -523,7 +507,21 @@ current_ratio: 0.0
 
 ## Shelved (kept for reference)
 
-(empty)
+### hb-002 — Synth plateau investigation (1-of-6 message type)  [SHELVED 2026-05-20]
+  mode: ft8
+  status: shelved
+  priority_score: 0.75
+  outcome: |
+    Identified the failing message as `K1ABC W9XYZ R-12` — the "Roger +
+    signal report" response form. Fails at every SNR from -28 dB to -10 dB
+    inclusive (not a sensitivity issue; a structural decoder failure
+    specific to R-prefix signal-report responses).
+  learning: |
+    Synth plateau is a real decoder bug, not a sensitivity limit. Until
+    fixed, synth-clean tier composite is capped at 5/6 = 83.3% × full
+    weight. See research/experiments/2026-05-20-synth-plateau-investigation.md
+    for the full per-message-per-SNR table.
+  follow_up: hb-023
 
 ## Graduated (merged to main)
 
