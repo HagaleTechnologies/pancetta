@@ -32,11 +32,7 @@ pub fn load_ft8_fixtures(workspace_root: &Path) -> anyhow::Result<Vec<FixtureEnt
             let entry = entry?;
             let path = entry.path();
             if path.extension().map_or(false, |ext| ext == "wav") {
-                let display = format!(
-                    "{}/{}",
-                    sub,
-                    path.file_name().unwrap().to_string_lossy()
-                );
+                let display = format!("{}/{}", sub, path.file_name().unwrap().to_string_lossy());
                 out.push(FixtureEntry {
                     wav_path: path,
                     display_name: display,

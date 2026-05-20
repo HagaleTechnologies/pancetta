@@ -55,7 +55,9 @@ impl Args {
                     seed = iter.next().context("--seed needs a value")?.parse()?;
                 }
                 "-h" | "--help" => {
-                    eprintln!("usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N]");
+                    eprintln!(
+                        "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N]"
+                    );
                     eprintln!("  plan 1: only --tier fixtures is supported");
                     std::process::exit(0);
                 }
@@ -107,7 +109,11 @@ fn run_fixtures_tier(
         }
     }
     let failed = total - passed;
-    let pass_rate = if total == 0 { 0.0 } else { passed as f64 / total as f64 };
+    let pass_rate = if total == 0 {
+        0.0
+    } else {
+        passed as f64 / total as f64
+    };
     Ok(TierResult {
         wavs_processed: total,
         fixtures_total: Some(total),
