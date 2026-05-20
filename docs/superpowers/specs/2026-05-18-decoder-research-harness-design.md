@@ -229,11 +229,15 @@ Three tiers, distinct ground-truth schemes, partitioned by mode.
 
 ### Tier 2 — Standard fixtures
 
-- **Source:** existing `pancetta-ft8/tests/fixtures/wav/` (82 WAVs:
-  WSJT-X golden + websdr + our generated test signals).
-- **Ground truth:** hand-labeled or recoverable from WSJT-X
-  documentation. Seeded from current decoder regression-test assertions
-  into `research/corpus/fixtures/<mode>/truth.json`.
+- **Source:** existing `pancetta-ft8/tests/fixtures/wav/` — 13 WAVs across
+  four subdirs: `generated/` (3, our encoded test signals), `wsjt/` (3,
+  WSJT-X golden), `basicft8/` (5, ft8_lib reference), `jtdx/` (2,
+  JTDX-recorded off-air).
+- **Ground truth:** hand-labeled in `research/corpus/fixtures/ft8/truth.json`.
+  Each fixture entry lists the expected decoded messages; the fixtures
+  tier passes iff every expected message appears (or, for off-air WAVs
+  where the decoder can't recover full content, the entry uses
+  `expect: "any-decode"` to require ≥1 message).
 - **Role:** regression smoke test. Pass/fail per fixture. A candidate
   that drops fixture decodes is suspicious and must explain itself.
 
