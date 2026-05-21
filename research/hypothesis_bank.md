@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-21T01:00:00Z
+last_updated: 2026-05-21T02:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
-wild_cards_run: 0
+wild_cards_run: 1
 exploitation_run: 2
-current_ratio: 0.0
+current_ratio: 0.333
 
 ## Active (ranked by score)
 
@@ -472,26 +472,32 @@ current_ratio: 0.0
     one new decode appears that was being suppressed, redesign NMS with a smaller
     radius rather than eliminating it.
 
-### hb-020 — Wild-card: aggressive_decoding flag audit  [PRIORITY: wild]
+### hb-032 — Remove or repurpose dead `aggressive_decoding` field  [PRIORITY: 0.40]
   mode: ft8
   status: pending
-  priority_score: 0.0
+  priority_score: 0.40
   estimated_effort: 0.5 sessions
-  expected_delta: unknown; likely +0.01 to +0.03 with unknown FP risk
-  defensible_prior: no
-  wild_card: true
+  expected_delta: cleanup; removes a documentation footgun
+  defensible_prior: yes (hb-020 audit confirmed the field is dead)
+  wild_card: false
   evidence_for:
-    - decoder.rs:100-101: `aggressive_decoding: bool` — "Enable aggressive decoding (more CPU, better weak signal performance)" — but the main.json config shows `aggressive_decoding: false`
-    - The field exists in Ft8Config but the baseline has never been run with it enabled; its actual effect on the decode pipeline is unknown without reading all callsites
-    - If aggressive_decoding unlocks additional code paths that were deemed too risky for production, those paths may be exactly what we want in a research context
+    - hb-020 audit (2026-05-21) confirmed: Ft8Config::aggressive_decoding has 3 references in pancetta-ft8/src/ — field decl, doc comment, default value. Zero reads in the decode pipeline.
+    - Surrounding cargo-cult: integration_tests.rs sets the flag with no behavioral assertion; benches/decoder_benchmark.rs has an "aggressive" benchmark that is bit-identical to "default" (the companion settings it bundles are already defaults); README.md + SPECTRAL_ANALYSIS_ENHANCEMENTS.md + examples/enhanced_spectral_analysis.rs document the flag as a real feature.
+    - Pre-OSS-publish (per memory project_oss_publish_prep.md), so a minor breaking-API change is acceptable.
   evidence_against:
-    - May not be implemented at all (the field exists but callsites may just check it without doing anything different)
-    - "Aggressive" may refer to a parameter we already tuned separately (e.g., candidate count, OSD depth)
+    - Public API change (`pub aggressive_decoding`). Any external consumer that sets it would need to remove the line.
+    - Option (b) repurposing has scope overlap with hb-031 — better to do them together than separately.
   notes: |
-    First step: grep all callsites of aggressive_decoding in pancetta-ft8/src/.
-    If it does nothing, document and shelve. If it unlocks real behavior, run eval
-    with it enabled and measure the actual delta. This is a "what does this flag
-    actually do?" experiment.
+    Three cleanup options:
+    (a) Delete the field + all referencing code (cleanest; minor
+        breaking-API change but acceptable pre-OSS-publish).
+    (b) Repurpose to drive a "fast | balanced | deep" preset (this
+        is the same plumbing hb-031 needs — combining the two would
+        be efficient).
+    (c) Deprecate with `#[deprecated]` + document as a no-op.
+    Recommended: do (b) when hb-031 lands; do (a) if hb-031 doesn't
+    land before OSS publish. The README, example, and benchmark all
+    need updates in any branch.
 
 ### hb-021 — Wild-card: frequency-domain signal subtraction  [PRIORITY: wild]
   mode: ft8
@@ -688,6 +694,33 @@ current_ratio: 0.0
   follow_up: hb-030 (subtraction quality audit), hb-031 (fast-path mode).
   journal: research/experiments/2026-05-21-multi-pass-sweep.md
   scorecards: research/scorecards/sweep/ (hard200-passes-{1..4}.json + synth-passes-{1..4}.json)
+
+### hb-020 — Wild-card: aggressive_decoding flag audit  [SHELVED 2026-05-21]
+  mode: ft8
+  status: shelved
+  priority_score: 0.0
+  wild_card: true
+  outcome: |
+    Audit confirmed `Ft8Config::aggressive_decoding` is dead code:
+    field decl + doc comment + default in decoder.rs:100-127, ZERO
+    reads anywhere in the decode pipeline. Setting it to `true` has
+    no effect.
+  measured_delta: 0 (no code change; audit only)
+  learning: |
+    The flag is a documentation/code-coherence footgun. README.md
+    (lines 135-140 and 256), examples/enhanced_spectral_analysis.rs,
+    SPECTRAL_ANALYSIS_ENHANCEMENTS.md, and the integration test all
+    treat it as a real feature. The "aggressive" benchmark in
+    decoder_benchmark.rs is bit-identical to the "default" benchmark
+    (companion settings it bundles are already defaults). Anyone
+    running `cargo bench` and comparing the two would get matching
+    numbers with no flag indicating something's off.
+
+    "Aggressive" is also the natural name for hb-031's fast-vs-deep
+    toggle — so the cleanup spawns hb-032 with a recommended "repurpose
+    it for hb-031" path rather than just deletion.
+  follow_up: hb-032 (cleanup: remove, repurpose for hb-031, or deprecate).
+  journal: research/experiments/2026-05-21-aggressive-decoding-audit.md
 
 ### hb-002 — Synth plateau investigation (1-of-6 message type)  [SHELVED 2026-05-20]
   mode: ft8
