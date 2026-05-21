@@ -125,13 +125,11 @@ fn test_loopback_full_qso_cq_to_73() {
     );
 
     // Step 4: Station B sends R+report (acknowledges A's report, sends own)
-    // Note: encoder accepts "R-12" but decoder formats as "R -12" (space before report)
-    let r_report_encode = "W1ABC K2DEF R-12";
-    let r_report_decoded = "W1ABC K2DEF R -12";
-    let audio = station_b.encode_and_modulate(r_report_encode, freq);
+    let r_report = "W1ABC K2DEF R-12";
+    let audio = station_b.encode_and_modulate(r_report, freq);
     let decoded = station_a.decode(&audio);
     assert!(
-        find_message(&decoded, r_report_decoded).is_some(),
+        find_message(&decoded, r_report).is_some(),
         "Station A should decode R+report. Got: {:?}",
         decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
     );
@@ -371,7 +369,6 @@ async fn test_loopback_state_machine_driven_qso() {
     assert!(!decoded.is_empty(), "Station A should decode the R+report");
     let decoded_r_report = &decoded[0].text;
 
-    // The parser now handles the decoder's "R -12" format (with space)
     let parsed_r_report = utils::parse_ft8_message(decoded_r_report, "W1ABC").unwrap();
     assert!(
         matches!(parsed_r_report, MessageType::ReportAck { .. }),
@@ -972,15 +969,13 @@ fn test_two_simultaneous_qsos_loopback() {
 
     let decoded_1 = dx_station_1.decode(&combined_audio);
     assert!(
-        find_message(&decoded_1, "K2DEF W1ABC R-12").is_some()
-            || find_message(&decoded_1, "K2DEF W1ABC R -12").is_some(),
+        find_message(&decoded_1, "K2DEF W1ABC R-12").is_some(),
         "DX1 should decode R+report. Got: {:?}",
         decoded_1.iter().map(|m| &m.text).collect::<Vec<_>>()
     );
     let decoded_2 = dx_station_2.decode(&combined_audio);
     assert!(
-        find_message(&decoded_2, "JA1XYZ W1ABC R-08").is_some()
-            || find_message(&decoded_2, "JA1XYZ W1ABC R -08").is_some(),
+        find_message(&decoded_2, "JA1XYZ W1ABC R-08").is_some(),
         "DX2 should decode R+report. Got: {:?}",
         decoded_2.iter().map(|m| &m.text).collect::<Vec<_>>()
     );

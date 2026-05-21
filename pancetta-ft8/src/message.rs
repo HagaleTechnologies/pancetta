@@ -222,9 +222,12 @@ impl fmt::Display for Ft8Message {
                     if let Some(ref from) = self.from_callsign {
                         write!(f, " {}", from)?;
                     }
+                    // WSJT-X / ft8_lib convention: "K1ABC W9XYZ R-12" — the
+                    // sign-prefixed report is appended directly to the `R`
+                    // with no separating space.
                     write!(f, " R")?;
                     if let Some(report) = self.signal_report {
-                        write!(f, " {:+03}", report)?;
+                        write!(f, "{:+03}", report)?;
                     }
                 }
                 Some(StandardMessageType::Rrr) => {
@@ -2194,6 +2197,38 @@ mod tests {
         assert!(display.contains("CQ"));
         assert!(display.contains("W1ABC"));
         assert!(display.contains("FN42"));
+    }
+
+    #[test]
+    fn test_report_with_r_display_no_space_before_report() {
+        // hb-023: WSJT-X / ft8_lib format the Roger+report response as
+        // "K1ABC W9XYZ R-12" — the `R` is immediately followed by the
+        // signed report with no separating space. The decoder must
+        // produce text that matches this convention so that round-tripped
+        // messages compare equal to their source text (and the synth
+        // corpus eval can recognize them).
+        let mut message = Ft8Message::default();
+        message.message_type = MessageType::Standard;
+        message.standard_type = Some(StandardMessageType::ReportWithR);
+        message.to_callsign = Some("K1ABC".to_string());
+        message.from_callsign = Some("W9XYZ".to_string());
+        message.signal_report = Some(-12);
+
+        let display = message.to_string();
+        assert_eq!(display, "K1ABC W9XYZ R-12");
+    }
+
+    #[test]
+    fn test_report_with_r_display_positive_report() {
+        let mut message = Ft8Message::default();
+        message.message_type = MessageType::Standard;
+        message.standard_type = Some(StandardMessageType::ReportWithR);
+        message.to_callsign = Some("K1ABC".to_string());
+        message.from_callsign = Some("W9XYZ".to_string());
+        message.signal_report = Some(5);
+
+        let display = message.to_string();
+        assert_eq!(display, "K1ABC W9XYZ R+05");
     }
 
     #[test]

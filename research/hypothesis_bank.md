@@ -1,37 +1,13 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-20T17:00:00Z
+last_updated: 2026-05-21T00:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 0
-exploitation_run: 0
+exploitation_run: 1
 current_ratio: 0.0
 
 ## Active (ranked by score)
-
-### hb-023 — Fix R-signal-report decode failure  [PRIORITY: 0.85]
-  mode: ft8
-  status: pending
-  priority_score: 0.85
-  estimated_effort: 1-2 sessions
-  expected_delta: synth-clean snr@50% normalized score +0.05 → 1.00 (plateau lifts from 83% to 100%); composite +~0.015
-  defensible_prior: yes (concrete decoder bug identified in hb-002 investigation)
-  wild_card: false
-  evidence_for:
-    - Synth `K1ABC W9XYZ R-12` round-trips encode but consistently fails decode at every SNR (-28 to -10 dB)
-    - Other message types (CQ, grid, plain signal report, 73, RR73) all decode successfully at SNR ≥ -18 dB on the same synth corpus
-    - Specific failure surface: R-prefix signal-report responses — distinct FT8 message subtype
-  evidence_against:
-    - May expose other bugs in the R-message-type bit layout that need fixing in tandem
-  notes: |
-    Trace why pancetta-ft8 fails to decode the R-signal-report bit layout.
-    Candidates to investigate:
-    (a) Encoder produces bits the decoder can't parse back — i.e. encode/decode
-        mismatch in the R-signal-report bit layout (verify by inspecting the
-        encoded bits vs the decoder's parser).
-    (b) Decoder's message-type detection misclassifies R-prefix responses,
-        dropping them at a parser gate before LDPC even runs.
-    Compare against ft8_lib's reference implementation if needed.
 
 ### hb-001 — Multi-pass subtract-and-redecode  [PRIORITY: 0.82]
   mode: ft8
@@ -259,6 +235,33 @@ current_ratio: 0.0
     range (the sensitivity cliff). Track convergence rate (fraction of candidates
     that converge in ≤N iterations) as a separate metric to understand where
     the benefit actually comes from.
+
+### hb-029 — Exact-format Display tests for every message subtype  [PRIORITY: 0.45]
+  mode: ft8
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 1 session
+  expected_delta: diagnostic; surfaces hidden text-format bugs (precedent: hb-023 found ~1900 phantom-novel decodes that were format-mismatched true positives)
+  defensible_prior: yes (concrete bug class identified during hb-023)
+  wild_card: false
+  evidence_for:
+    - hb-023 found that the ReportWithR Display impl produced "R -12" (with space) instead of the canonical "R-12". Until fixed, ~1900 decodes per eval run were silently mis-classified as "novel" on the curated tiers — they were correct decodes that the text-match comparator couldn't see.
+    - No existing test asserts the EXACT formatted text of any standard / i3=0 / contest message subtype — current tests only check `.contains()` on callsign/grid fragments.
+    - The ReplyWithR path (message.rs:195-205) writes `" R"` then `" {grid}"` → `"K1ABC W9XYZ R FN42"`, which is correct per ft8_lib reference, but only happens to be correct — no test guards it.
+    - EU-VHF i3=0 type 0/2 and DXpedition i3=0 type 1 paths each have their own Display formatting code that's never asserted against ft8_lib reference output.
+  evidence_against:
+    - "Exact" format may be over-constrained if WSJT-X output varies (e.g., width/padding differences for boundary cases).
+    - Time spent on tests with no current bug evidence is speculative.
+  notes: |
+    For each StandardMessageType variant (Cq, Reply, ReplyWithR, Report,
+    ReportWithR, Rrr, Final73, RR73) and each i3=0 subtype, add a unit
+    test that builds a synthetic Ft8Message with known fields and
+    asserts `.to_string()` exactly equals the WSJT-X / ft8_lib reference
+    output. Cross-check against `vendor/ft8_lib/ft8/message.c` output
+    for at least one case per subtype.
+    Sub-experiment: add a property-test (proptest) that round-trips
+    `encode(text) → decode → format == text` over a generated message
+    grammar. Would have caught hb-023 automatically.
 
 ### hb-012 — Negative time offset extension (early-arriving DX signals)  [PRIORITY: 0.44]
   mode: ft8
@@ -642,4 +645,45 @@ current_ratio: 0.0
 
 ## Graduated (merged to main)
 
-(empty)
+### hb-023 — Fix R-signal-report decode failure  [GRADUATED 2026-05-21]
+  mode: ft8
+  status: graduated
+  priority_score: 0.85
+  outcome: |
+    Identified the root cause as a Display impl bug, not a decoder bug.
+    `StandardMessageType::ReportWithR` formatted as `"K1ABC W9XYZ R -12"`
+    (with a space between `R` and the signed report) instead of the
+    WSJT-X / ft8_lib canonical `"K1ABC W9XYZ R-12"`. The decoder
+    structurally decoded R-prefix messages correctly all along —
+    only the text representation was wrong, so the synth-eval text
+    matcher (`d.message.contains(truth)`) missed every R-report
+    decode at every SNR.
+
+    Fix: one-line change to drop the leading space from the
+    `write!(f, " {:+03}", report)` in message.rs:225. New unit tests
+    `test_report_with_r_display_no_space_before_report` /
+    `test_report_with_r_display_positive_report` guard the canonical
+    format. Companion cleanup in loopback_qso.rs (removed dual-format
+    fallback assertions and outdated "R -12" comments).
+  measured_delta: |
+    Composite 0.4955 → 0.5234 (+0.0279). Expected was +0.015; the
+    bigger surprise was on the curated tiers:
+    - synth-clean: plateau lifted from 5/6 to 6/6 at SNR ≥ -20 dB (matched prediction).
+    - curated-hard-200: decode_rate 0.3911 → 0.4468 (+0.0557); recovered
+      3354 → 3832 (+478); novel 1154 → 676 (-478) — same fix shifted
+      478 already-correct decodes from "novel" to "matched".
+    - curated-hard-1000: decode_rate 0.3714 → 0.4214 (+0.0500); recovered
+      10437 → 11843 (+1406); novel 3720 → 2314 (-1406).
+    - No regressions; fixtures still 8/8, wild-50 unchanged.
+  learning: |
+    Text-match-based eval can mask correctness wins as completeness
+    misses. Pancetta's true vs_wsjtx_pct on the curated tiers was
+    always ~5 percentage points higher than measured — the bug
+    inflated the "novel decode" count by ~1900 across Hard-200 and
+    Hard-1000 combined. This retroactively recalibrates the
+    "5-10% of WSJT-X decode rate" memory note (which is about the
+    autonomous on-air run, not the harness, but the harness baseline
+    also underrepresented true matches).
+  follow_up: hb-029 (exact-format Display tests for every message subtype).
+  scorecard: research/scorecards/history/2026-05-21-fix-r-signal-report.json
+  journal: research/experiments/2026-05-21-fix-r-signal-report.md
