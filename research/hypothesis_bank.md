@@ -505,6 +505,123 @@ current_ratio: 0.0
     iterations consumed vs decodes gained. If the distribution of convergence
     iterations is already known (add a counter), this could be informed rather than heuristic.
 
+### hb-024 — Cross-validate novel decodes against JTDX + QSO patterns  [PRIORITY: 0.55]
+  mode: ft8
+  status: pending
+  priority_score: 0.55
+  estimated_effort: 1-2 sessions
+  expected_delta: diagnostic; informs whether vs_wsjtx_pct understates or overstates true performance
+  defensible_prior: partial
+  wild_card: false
+  evidence_for:
+    - Plan 3 main.json shows pancetta finds 3720 "novel" decodes on Hard-1000 — messages jt9 didn't recover (~3.7 per WAV)
+    - On Hard-200, 1154 novel decodes against 3354 matched-with-jt9 — novel is 25% of total pancetta decodes
+    - If these are real (not FPs), our 37-39% vs_wsjtx_pct is understated; pancetta's true performance is better
+    - If they're false positives, we have a precision problem masquerading as a recall win
+  evidence_against:
+    - Cross-validation requires JTDX integration (deferred from Plan 3) or QSO-pattern matching infrastructure
+  notes: |
+    Three approaches: (a) install jtdx-cli or use JTDX's GUI in scripted mode to
+    decode the same WAVs; treat the (pancetta ∩ JTDX) − jt9 decodes as
+    high-confidence novel. (b) Within pancetta's own output, treat a novel decode
+    as confirmed if the same callsign appears in adjacent slots (QSO pattern
+    continuity). (c) Filter against a public callsign hash database (HamQTH/QRZ).
+    Run on Hard-200's novel decodes first — smaller sample, faster turnaround.
+
+### hb-025 — Wild-50 zero-overlap investigation  [PRIORITY: 0.50]
+  mode: ft8
+  status: pending
+  priority_score: 0.50
+  estimated_effort: 1 session
+  expected_delta: diagnostic; may surface decoder bug or matching-logic bug
+  defensible_prior: yes (concrete anomaly in Plan 3 main.json)
+  wild_card: false
+  evidence_for:
+    - Plan 3 main.json: wild-50 tier processed 50 WAVs; jt9 found 96 truth decodes (concentrated in 2 outlier WAVs with 49+43 decodes); pancetta matched 0 of them while finding 3 novel decodes of its own
+    - Hard-200 + Hard-1000 don't show this zero-overlap pattern (~37-39% match)
+    - Either (a) those 2 outlier WAVs contain unusual content the decoder mishandles, (b) jt9's message formatting on those specific WAVs differs in a way that breaks our exact-trim-match logic, or (c) timing/sync edge case for those recordings
+  evidence_against:
+    - Random sampling artifact: 2 of 50 WAVs dominate; with more wild samples the effect may average out
+    - Low priority (decode_rate isn't a composite term for wild-50)
+  notes: |
+    Identify the 2 outlier WAVs by hash (per_wav_top_failures in main.json), decode
+    each manually with both pancetta and jt9, compare outputs line-by-line. Look
+    for: format differences (whitespace, casing, callsign hash representation),
+    timing skew (DT offset > 0.5s), unusual modulation. If the issue is matching
+    logic (formatting), fix in eval.rs's run_curated_tier match function — that
+    would lift the Hard-200/1000 numbers too.
+
+### hb-026 — Wild-card: End-to-end neural decoder  [PRIORITY: wild]
+  mode: ft8
+  status: pending
+  priority_score: 0.0
+  estimated_effort: 5+ sessions (heavy)
+  expected_delta: unknown — could be +0.20 (transformative) or -0.30 (regression)
+  defensible_prior: no
+  wild_card: true
+  evidence_for:
+    - Modern speech recognition (Whisper, Wav2Vec2) demonstrates that end-to-end audio-to-text learned models can outperform pipelined DSP+model systems on noisy real-world signals
+    - We have millions of synth samples available (parametric, ground-truth-labeled); training data is not a bottleneck
+    - The neural OSD experiment already shipped in pancetta-ft8 — we know the in-repo ML pipeline pattern works
+  evidence_against:
+    - Abandons decades of FT8-specific signal processing knowledge (sync, LDPC, OSD) for an opaque learned function
+    - Training cost: M-series MPS for small models, cloud GPU for large; cycle time slow
+    - Likely worse on hard cases (deep fade, multipath) until trained on more diverse data
+    - Hard to debug when it fails ("the model just didn't decode it")
+  notes: |
+    Architecture sketch: input is 12 kHz mono samples (~152k samples per 12.64s
+    slot) → STFT → CNN-Transformer hybrid → 91 info bits (sigmoid output).
+    Train on synth corpus generated across SNR / channel / Doppler diversity.
+    Compare against the production decoder on Hard-200. Start with a tiny model
+    (~1M params) just to validate the architecture trains; scale up if signal.
+
+### hb-027 — Wild-card: Joint multi-slot decoding via QSO context  [PRIORITY: wild]
+  mode: ft8
+  status: pending
+  priority_score: 0.0
+  estimated_effort: 2-3 sessions
+  expected_delta: unknown; possibly +0.02 to +0.10 on QSO-pattern corpus; risk of compounding errors
+  defensible_prior: no
+  wild_card: true
+  evidence_for:
+    - QSO content is heavily correlated across slots — once K1ABC and W9XYZ are talking, slot N+1 is very likely to contain those callsigns
+    - Current decoder treats each slot independently, discarding this prior
+    - AP search already supports per-decode callsign injection (Ap1 through Ap4); just needs a rolling-window data source
+  evidence_against:
+    - Temporal coupling means a wrong decode in slot N pollutes slot N+1's prior
+    - Operator-perspective: this is closer to "QSO state machine" than "decoder" — may belong in pancetta-qso, not pancetta-ft8
+    - May not generalize across operating modes (POTA vs contest vs ragchew have different conversation lengths)
+  notes: |
+    Build a rolling table of "recently-decoded callsigns" (last 4-8 slots). Before
+    each new slot's decode, seed AP search with these as high-prior tokens.
+    Measure: per-slot decode count vs without the prior, on Hard-200 (which
+    includes QSO-pattern WAVs because the curate scoring favors busy bands).
+    If positive, productize; if it compounds errors, document and shelve.
+
+### hb-028 — Wild-card: Cross-decoder ensemble at runtime  [PRIORITY: wild]
+  mode: ft8
+  status: pending
+  priority_score: 0.0
+  estimated_effort: 2 sessions
+  expected_delta: +0.10 to +0.20 vs_wsjtx_pct trivially, but morally questionable
+  defensible_prior: no
+  wild_card: true
+  evidence_for:
+    - jt9 + JTDX + pancetta each have non-empty unique-decode sets per Plan 3 data (1154 + 3720 novel decodes on the curated tiers)
+    - Union-of-decoders is a strict superset; would maximize operator's QSO completion rate
+    - Provides a strong "truth" target for training a learned ensemble or for confirming novel decodes (hb-024)
+  evidence_against:
+    - Arguably defeats the purpose: we're not improving "our" decoder, we're delegating
+    - Adds operational complexity: must install + maintain WSJT-X and JTDX as runtime dependencies
+    - Not a path toward "smoking" WSJT-X on the metric — it's the metric becoming irrelevant
+  notes: |
+    Operational mode: at each 15-second slot, run pancetta + jt9 + JTDX in parallel;
+    union the CRC-valid decodes. Could be a separate "pancetta-meta" binary that
+    spawns subprocesses. Useful as the production endpoint while pancetta improves
+    in the background. Also: the (pancetta ∩ jt9) decode set is a strong validation
+    signal — anything pancetta decodes that two other independent decoders agree
+    with is almost certainly real. Use this to train the FP-filter for hb-024.
+
 ## Shelved (kept for reference)
 
 ### hb-002 — Synth plateau investigation (1-of-6 message type)  [SHELVED 2026-05-20]
