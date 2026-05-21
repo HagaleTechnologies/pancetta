@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260424_031113.wav",
+  "wav_sha256": "42a3f5a6d1a4876116c8a318b5bd63715e952f9862a058f93c407f57016904b8",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "IQ4JO N4HFE EM64",
+      "freq_hz": 2538.0,
+      "dt_s": 2.3,
+      "snr_db": 4.0
+    },
+    {
+      "message": "WD6DKW N3YPL RR73",
+      "freq_hz": 531.0,
+      "dt_s": 1.3,
+      "snr_db": -6.0
+    },
+    {
+      "message": "UR4QWW KO4XJ RR73",
+      "freq_hz": 2157.0,
+      "dt_s": 1.4,
+      "snr_db": 2.0
+    },
+    {
+      "message": "UR4QWW KF8DZL -13",
+      "freq_hz": 1939.0,
+      "dt_s": 1.8,
+      "snr_db": -7.0
+    },
+    {
+      "message": "CQ KQ4SCY EL96",
+      "freq_hz": 1404.0,
+      "dt_s": 1.7,
+      "snr_db": -11.0
+    },
+    {
+      "message": "CQ W8ASH",
+      "freq_hz": 2299.0,
+      "dt_s": 1.2,
+      "snr_db": -2.0
+    },
+    {
+      "message": "AD9DU WB6AGE 73",
+      "freq_hz": 2428.0,
+      "dt_s": 1.5,
+      "snr_db": -11.0
+    },
+    {
+      "message": "F5RRS KF0RZX RR73",
+      "freq_hz": 1846.0,
+      "dt_s": 1.9,
+      "snr_db": -19.0
+    },
+    {
+      "message": "CQ NO9D EM54",
+      "freq_hz": 1208.0,
+      "dt_s": 1.8,
+      "snr_db": 6.0
+    },
+    {
+      "message": "OA4DOS K7MC CN85",
+      "freq_hz": 1442.0,
+      "dt_s": 1.6,
+      "snr_db": -14.0
+    },
+    {
+      "message": "F5MOO KF0BAA DM79",
+      "freq_hz": 1042.0,
+      "dt_s": 1.6,
+      "snr_db": -17.0
+    },
+    {
+      "message": "NY4JB RR73; RA9ACA <...> -06",
+      "freq_hz": 2338.0,
+      "dt_s": 1.5,
+      "snr_db": -9.0
+    },
+    {
+      "message": "SQ9MSE NU1T -17",
+      "freq_hz": 1194.0,
+      "dt_s": 1.7,
+      "snr_db": -5.0
+    },
+    {
+      "message": "UT5ZC WA3JAT EN91",
+      "freq_hz": 2200.0,
+      "dt_s": 1.6,
+      "snr_db": -9.0
+    },
+    {
+      "message": "F5NNN SV8DCY +04",
+      "freq_hz": 2452.0,
+      "dt_s": 1.8,
+      "snr_db": -19.0
+    },
+    {
+      "message": "IQ4JO W3RW R-07",
+      "freq_hz": 1022.0,
+      "dt_s": 1.7,
+      "snr_db": -18.0
+    }
+  ],
+  "elapsed_seconds": 8.997072458
+}

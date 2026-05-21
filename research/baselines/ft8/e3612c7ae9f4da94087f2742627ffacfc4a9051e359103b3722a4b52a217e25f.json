@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260426_234128.wav",
+  "wav_sha256": "e3612c7ae9f4da94087f2742627ffacfc4a9051e359103b3722a4b52a217e25f",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "Z62NS K4GHS EM96",
+      "freq_hz": 2626.0,
+      "dt_s": 1.8,
+      "snr_db": -2.0
+    },
+    {
+      "message": "Z62NS N0FW EM79",
+      "freq_hz": 544.0,
+      "dt_s": 1.8,
+      "snr_db": 17.0
+    },
+    {
+      "message": "CQ WB8JUI EN81",
+      "freq_hz": 1696.0,
+      "dt_s": 1.7,
+      "snr_db": -13.0
+    },
+    {
+      "message": "F4FLQ K8LES -04",
+      "freq_hz": 1429.0,
+      "dt_s": 2.0,
+      "snr_db": -21.0
+    },
+    {
+      "message": "IQ4JO KC1WSJ RRR",
+      "freq_hz": 1196.0,
+      "dt_s": 1.8,
+      "snr_db": -25.0
+    },
+    {
+      "message": "TA7OYG K1WAT FM05",
+      "freq_hz": 2460.0,
+      "dt_s": 1.8,
+      "snr_db": 0.0
+    },
+    {
+      "message": "VE6CV K2HT EM49",
+      "freq_hz": 2506.0,
+      "dt_s": 1.8,
+      "snr_db": -11.0
+    },
+    {
+      "message": "KA0QZK EB3JT JN01",
+      "freq_hz": 1042.0,
+      "dt_s": 1.8,
+      "snr_db": -25.0
+    },
+    {
+      "message": "Z62NS KY4SRH EM78",
+      "freq_hz": 2190.0,
+      "dt_s": 1.8,
+      "snr_db": -25.0
+    },
+    {
+      "message": "CQ K2SY EM79",
+      "freq_hz": 2443.0,
+      "dt_s": 1.8,
+      "snr_db": -5.0
+    },
+    {
+      "message": "Z62NS XE1NW EK08",
+      "freq_hz": 2114.0,
+      "dt_s": 2.5,
+      "snr_db": -23.0
+    },
+    {
+      "message": "RO6ON 9A4ZM R-18",
+      "freq_hz": 1360.0,
+      "dt_s": 1.8,
+      "snr_db": -25.0
+    }
+  ],
+  "elapsed_seconds": 7.847917958
+}

@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260419_213210.wav",
+  "wav_sha256": "6669818d7543631d03b685069437b5dae65680322ff8037d87efea5fc028229b",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "VE3EB <...> -19",
+      "freq_hz": 728.0,
+      "dt_s": 2.2,
+      "snr_db": -1.0
+    },
+    {
+      "message": "W3WDK N4ARZ EM84",
+      "freq_hz": 1535.0,
+      "dt_s": 1.6,
+      "snr_db": 3.0
+    },
+    {
+      "message": "PJ4TB KD8ECZ EN73",
+      "freq_hz": 2627.0,
+      "dt_s": 2.3,
+      "snr_db": 5.0
+    },
+    {
+      "message": "W0OVX W9NC -12",
+      "freq_hz": 956.0,
+      "dt_s": 1.6,
+      "snr_db": -11.0
+    },
+    {
+      "message": "W9AV WY7WL RR73",
+      "freq_hz": 2905.0,
+      "dt_s": 2.5,
+      "snr_db": 0.0
+    }
+  ],
+  "elapsed_seconds": 7.394956709
+}

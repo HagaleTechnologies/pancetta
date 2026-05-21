@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260419_221900.wav",
+  "wav_sha256": "080ed45cb95328e82a4ffa0848bd3e06d3baa35fe911d528b688124792bc2f45",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "VA7LWK K2JB EM85",
+      "freq_hz": 1725.0,
+      "dt_s": -2.0,
+      "snr_db": 3.0
+    },
+    {
+      "message": "W3TRO KB4CNQ FM08",
+      "freq_hz": 1792.0,
+      "dt_s": -2.3,
+      "snr_db": -3.0
+    },
+    {
+      "message": "W3TRO W7PK R-06",
+      "freq_hz": 1261.0,
+      "dt_s": -2.6,
+      "snr_db": 3.0
+    }
+  ],
+  "elapsed_seconds": 4.108221584
+}

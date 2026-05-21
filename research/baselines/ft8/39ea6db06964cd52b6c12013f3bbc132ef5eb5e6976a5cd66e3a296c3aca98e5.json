@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260426_233743.wav",
+  "wav_sha256": "39ea6db06964cd52b6c12013f3bbc132ef5eb5e6976a5cd66e3a296c3aca98e5",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "CQ KP4MAQ FK78",
+      "freq_hz": 1492.0,
+      "dt_s": 1.8,
+      "snr_db": -13.0
+    },
+    {
+      "message": "HB9EFK KD4RH R+14",
+      "freq_hz": 1752.0,
+      "dt_s": 1.9,
+      "snr_db": 2.0
+    },
+    {
+      "message": "CQ N3YPL FM19",
+      "freq_hz": 2281.0,
+      "dt_s": 2.0,
+      "snr_db": -12.0
+    },
+    {
+      "message": "SV3AUW KA0QZK EN41",
+      "freq_hz": 1044.0,
+      "dt_s": 1.8,
+      "snr_db": 2.0
+    },
+    {
+      "message": "KC1WSJ KC8VMG EM97",
+      "freq_hz": 2341.0,
+      "dt_s": 2.0,
+      "snr_db": -1.0
+    },
+    {
+      "message": "AA0DW N8JSN -03",
+      "freq_hz": 1659.0,
+      "dt_s": 1.9,
+      "snr_db": -13.0
+    },
+    {
+      "message": "CQ TY5AD JJ16",
+      "freq_hz": 303.0,
+      "dt_s": 1.9,
+      "snr_db": -19.0
+    },
+    {
+      "message": "A61DI KI0EH FN10",
+      "freq_hz": 672.0,
+      "dt_s": 2.1,
+      "snr_db": -18.0
+    },
+    {
+      "message": "K4GHS SV8DCY -08",
+      "freq_hz": 2519.0,
+      "dt_s": 2.1,
+      "snr_db": -22.0
+    },
+    {
+      "message": "WQ8P NN8B EN90",
+      "freq_hz": 1664.0,
+      "dt_s": 1.8,
+      "snr_db": -19.0
+    },
+    {
+      "message": "CQ G8KHF IO92",
+      "freq_hz": 692.0,
+      "dt_s": 1.9,
+      "snr_db": -24.0
+    },
+    {
+      "message": "WQ8P W4UII +01",
+      "freq_hz": 1254.0,
+      "dt_s": 1.9,
+      "snr_db": 5.0
+    },
+    {
+      "message": "BG0BBB K1LDO FM14",
+      "freq_hz": 983.0,
+      "dt_s": 1.9,
+      "snr_db": -1.0
+    },
+    {
+      "message": "KC1WSJ EA5JAH IM99",
+      "freq_hz": 1079.0,
+      "dt_s": 1.9,
+      "snr_db": -24.0
+    },
+    {
+      "message": "VE9ZY N2LCX FN13",
+      "freq_hz": 845.0,
+      "dt_s": 1.9,
+      "snr_db": -25.0
+    },
+    {
+      "message": "OS4K W3TRO R-09",
+      "freq_hz": 1249.0,
+      "dt_s": 1.9,
+      "snr_db": -12.0
+    }
+  ],
+  "elapsed_seconds": 8.061847834
+}

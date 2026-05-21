@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260424_030258.wav",
+  "wav_sha256": "efa741da54d2ec33186d5778c7aaabdda1474baf69fd8dd93b5febe723cec84b",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "LZ1SJ KJ4GNR EL95",
+      "freq_hz": 1153.0,
+      "dt_s": 2.0,
+      "snr_db": -2.0
+    },
+    {
+      "message": "LOOK B4 XMIT",
+      "freq_hz": 426.0,
+      "dt_s": 2.1,
+      "snr_db": -3.0
+    },
+    {
+      "message": "CQ KF9UG EN71",
+      "freq_hz": 1899.0,
+      "dt_s": 1.9,
+      "snr_db": -1.0
+    },
+    {
+      "message": "CQ NP3KW FK78",
+      "freq_hz": 2076.0,
+      "dt_s": 1.9,
+      "snr_db": -4.0
+    },
+    {
+      "message": "KF0BAA F5NNN IN94",
+      "freq_hz": 648.0,
+      "dt_s": 1.7,
+      "snr_db": -12.0
+    },
+    {
+      "message": "CQ KZ7Y EL95",
+      "freq_hz": 2011.0,
+      "dt_s": 1.7,
+      "snr_db": -1.0
+    },
+    {
+      "message": "W4UTZ K6EGG -17",
+      "freq_hz": 1082.0,
+      "dt_s": 2.0,
+      "snr_db": -9.0
+    },
+    {
+      "message": "KA6JHW AD9DU RR73",
+      "freq_hz": 226.0,
+      "dt_s": 2.0,
+      "snr_db": -25.0
+    },
+    {
+      "message": "N6MCW EC3A RR73",
+      "freq_hz": 1644.0,
+      "dt_s": 1.9,
+      "snr_db": -25.0
+    },
+    {
+      "message": "LZ3AI AI5YU EM13",
+      "freq_hz": 842.0,
+      "dt_s": 2.3,
+      "snr_db": -17.0
+    },
+    {
+      "message": "AC5AV E75C -01",
+      "freq_hz": 1823.0,
+      "dt_s": 1.9,
+      "snr_db": -25.0
+    },
+    {
+      "message": "CQ RU3DX KO86",
+      "freq_hz": 2585.0,
+      "dt_s": 2.2,
+      "snr_db": -12.0
+    },
+    {
+      "message": "CQ WW3QB FM28",
+      "freq_hz": 1957.0,
+      "dt_s": 2.4,
+      "snr_db": -23.0
+    },
+    {
+      "message": "<...> K5NBL R-18",
+      "freq_hz": 2123.0,
+      "dt_s": 1.9,
+      "snr_db": -25.0
+    },
+    {
+      "message": "WA3JAT W3LEL EM50",
+      "freq_hz": 1001.0,
+      "dt_s": 1.9,
+      "snr_db": -9.0
+    },
+    {
+      "message": "NO9D UT5ZC 73",
+      "freq_hz": 1709.0,
+      "dt_s": 2.0,
+      "snr_db": -24.0
+    }
+  ],
+  "elapsed_seconds": 8.751383375
+}

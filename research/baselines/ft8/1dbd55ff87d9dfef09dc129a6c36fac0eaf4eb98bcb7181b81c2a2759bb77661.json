@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260424_030643.wav",
+  "wav_sha256": "1dbd55ff87d9dfef09dc129a6c36fac0eaf4eb98bcb7181b81c2a2759bb77661",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "OA4DOS AD9GL EN61",
+      "freq_hz": 1493.0,
+      "dt_s": 1.7,
+      "snr_db": -19.0
+    },
+    {
+      "message": "F5MOO N4HFE EM64",
+      "freq_hz": 2538.0,
+      "dt_s": 2.4,
+      "snr_db": 4.0
+    },
+    {
+      "message": "CQ KF8DZL EN72",
+      "freq_hz": 1939.0,
+      "dt_s": 1.9,
+      "snr_db": -4.0
+    },
+    {
+      "message": "OA4DOS N1PTM 73",
+      "freq_hz": 1017.0,
+      "dt_s": 1.8,
+      "snr_db": -6.0
+    },
+    {
+      "message": "W9CG W8ASH 73",
+      "freq_hz": 2298.0,
+      "dt_s": 1.4,
+      "snr_db": 7.0
+    },
+    {
+      "message": "I1RJP KF0RZX -19",
+      "freq_hz": 1846.0,
+      "dt_s": 2.0,
+      "snr_db": -18.0
+    },
+    {
+      "message": "CQ HA1BF JN86",
+      "freq_hz": 1357.0,
+      "dt_s": 1.8,
+      "snr_db": -25.0
+    },
+    {
+      "message": "HG2DX W4UTZ 73",
+      "freq_hz": 1724.0,
+      "dt_s": 1.8,
+      "snr_db": -25.0
+    },
+    {
+      "message": "UT5ZC AD4C -09",
+      "freq_hz": 2264.0,
+      "dt_s": 1.9,
+      "snr_db": 4.0
+    },
+    {
+      "message": "TI4LAS WB6AGE CN86",
+      "freq_hz": 2607.0,
+      "dt_s": 1.6,
+      "snr_db": -14.0
+    },
+    {
+      "message": "NP3KW OK2ZDL JN79",
+      "freq_hz": 2394.0,
+      "dt_s": 1.8,
+      "snr_db": -18.0
+    },
+    {
+      "message": "CQ NO9D EM54",
+      "freq_hz": 1208.0,
+      "dt_s": 1.9,
+      "snr_db": 0.0
+    },
+    {
+      "message": "F5MOO HI8MSB -18",
+      "freq_hz": 818.0,
+      "dt_s": 1.8,
+      "snr_db": -23.0
+    },
+    {
+      "message": "CQ KN7N DM33",
+      "freq_hz": 1290.0,
+      "dt_s": 1.9,
+      "snr_db": -25.0
+    },
+    {
+      "message": "CQ SV8DCY KM39",
+      "freq_hz": 2451.0,
+      "dt_s": 2.0,
+      "snr_db": -23.0
+    },
+    {
+      "message": "CQ NU1T FN42",
+      "freq_hz": 1193.0,
+      "dt_s": 1.9,
+      "snr_db": -1.0
+    },
+    {
+      "message": "CQ SV2TTC KN10",
+      "freq_hz": 2338.0,
+      "dt_s": 1.8,
+      "snr_db": -14.0
+    },
+    {
+      "message": "CQ SV3AUW KM17",
+      "freq_hz": 1804.0,
+      "dt_s": 1.8,
+      "snr_db": -25.0
+    }
+  ],
+  "elapsed_seconds": 8.506379209
+}

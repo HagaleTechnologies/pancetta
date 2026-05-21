@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260424_033143.wav",
+  "wav_sha256": "1b0d93bd944c25982e21fd2f2da383edae19e6147f9965be7d541e4d5ed12c3d",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "CQ KO4XJ EM57",
+      "freq_hz": 2157.0,
+      "dt_s": 2.0,
+      "snr_db": 10.0
+    },
+    {
+      "message": "OK2ZDL KJ4GNR R-13",
+      "freq_hz": 2718.0,
+      "dt_s": 2.1,
+      "snr_db": 4.0
+    },
+    {
+      "message": "CQ HG2DX JN87",
+      "freq_hz": 2657.0,
+      "dt_s": 2.0,
+      "snr_db": -5.0
+    },
+    {
+      "message": "9A4ZM KM0T -11",
+      "freq_hz": 1715.0,
+      "dt_s": 2.0,
+      "snr_db": -13.0
+    },
+    {
+      "message": "KG2EL KA9FOX EN43",
+      "freq_hz": 2501.0,
+      "dt_s": 2.1,
+      "snr_db": -6.0
+    },
+    {
+      "message": "LX1TI KG7IXX DM45",
+      "freq_hz": 1299.0,
+      "dt_s": 2.1,
+      "snr_db": -18.0
+    },
+    {
+      "message": "CQ HA1BF JN86",
+      "freq_hz": 1357.0,
+      "dt_s": 2.0,
+      "snr_db": -14.0
+    },
+    {
+      "message": "IT9VCE W8ASH RR73",
+      "freq_hz": 2299.0,
+      "dt_s": 1.6,
+      "snr_db": 1.0
+    },
+    {
+      "message": "CE3TMM ES4IN 73",
+      "freq_hz": 645.0,
+      "dt_s": 2.0,
+      "snr_db": -11.0
+    },
+    {
+      "message": "LZ3AI AC5AV EM45",
+      "freq_hz": 920.0,
+      "dt_s": 2.0,
+      "snr_db": -11.0
+    },
+    {
+      "message": "KM7BUM PY7ZZ RR73",
+      "freq_hz": 2443.0,
+      "dt_s": 2.0,
+      "snr_db": -9.0
+    },
+    {
+      "message": "OE4AAC KF0RZX DN81",
+      "freq_hz": 1962.0,
+      "dt_s": 2.2,
+      "snr_db": -19.0
+    },
+    {
+      "message": "CQ SV3AUW KM17",
+      "freq_hz": 1804.0,
+      "dt_s": 2.0,
+      "snr_db": -25.0
+    },
+    {
+      "message": "NP3KW YO8RC KN36",
+      "freq_hz": 1041.0,
+      "dt_s": 2.0,
+      "snr_db": -23.0
+    },
+    {
+      "message": "CQ WD6DKW CM97",
+      "freq_hz": 1104.0,
+      "dt_s": 2.1,
+      "snr_db": -23.0
+    },
+    {
+      "message": "OE4AAC AI6L CM95",
+      "freq_hz": 749.0,
+      "dt_s": 2.0,
+      "snr_db": -18.0
+    },
+    {
+      "message": "CQ SV2TTC KN10",
+      "freq_hz": 2338.0,
+      "dt_s": 1.8,
+      "snr_db": -8.0
+    },
+    {
+      "message": "W6GBM YO8AAZ R-15",
+      "freq_hz": 1765.0,
+      "dt_s": 2.0,
+      "snr_db": -25.0
+    },
+    {
+      "message": "LX1TI W0ONN EM20",
+      "freq_hz": 1288.0,
+      "dt_s": 2.4,
+      "snr_db": -25.0
+    },
+    {
+      "message": "4X1YA TI4LAS EJ79",
+      "freq_hz": 1515.0,
+      "dt_s": 1.9,
+      "snr_db": -18.0
+    },
+    {
+      "message": "CQ SX100PAOK",
+      "freq_hz": 1212.0,
+      "dt_s": 2.0,
+      "snr_db": -16.0
+    },
+    {
+      "message": "CQ LZ1SJ KN32",
+      "freq_hz": 1153.0,
+      "dt_s": 2.3,
+      "snr_db": -24.0
+    },
+    {
+      "message": "K5NBL PA3KUS 73",
+      "freq_hz": 2235.0,
+      "dt_s": 2.4,
+      "snr_db": -25.0
+    },
+    {
+      "message": "AG5PC W6ZU -05",
+      "freq_hz": 2843.0,
+      "dt_s": 1.6,
+      "snr_db": -15.0
+    },
+    {
+      "message": "NA1KW AC7KP -15",
+      "freq_hz": 1551.0,
+      "dt_s": 2.0,
+      "snr_db": -23.0
+    },
+    {
+      "message": "CQ NO9D EM54",
+      "freq_hz": 1207.0,
+      "dt_s": 2.1,
+      "snr_db": -22.0
+    }
+  ],
+  "elapsed_seconds": 9.760619958
+}

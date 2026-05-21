@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260424_034528.wav",
+  "wav_sha256": "5b5f0a1bdf77e001b3f56816ff768fa73bc01295492418da51719d1c6978c913",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "ES4IN VY2FA 73",
+      "freq_hz": 1509.0,
+      "dt_s": 2.3,
+      "snr_db": -25.0
+    },
+    {
+      "message": "KB6B KF9UG R-02",
+      "freq_hz": 1900.0,
+      "dt_s": 1.5,
+      "snr_db": 3.0
+    },
+    {
+      "message": "MM0KPV LX1TI -17",
+      "freq_hz": 784.0,
+      "dt_s": 1.6,
+      "snr_db": 7.0
+    },
+    {
+      "message": "PY7ZZ KD0L EN41",
+      "freq_hz": 1375.0,
+      "dt_s": 1.8,
+      "snr_db": 3.0
+    },
+    {
+      "message": "CQ NP3KW FK78",
+      "freq_hz": 2076.0,
+      "dt_s": 1.6,
+      "snr_db": -7.0
+    },
+    {
+      "message": "CQ F5MOO JN07",
+      "freq_hz": 2390.0,
+      "dt_s": 1.7,
+      "snr_db": -8.0
+    },
+    {
+      "message": "PY7ZZ KG2EL EL87",
+      "freq_hz": 436.0,
+      "dt_s": 1.5,
+      "snr_db": -8.0
+    },
+    {
+      "message": "N6MCW OE4AAC R-09",
+      "freq_hz": 1083.0,
+      "dt_s": 1.6,
+      "snr_db": -6.0
+    },
+    {
+      "message": "LZ3AI AC5AV 73",
+      "freq_hz": 920.0,
+      "dt_s": 1.6,
+      "snr_db": -4.0
+    },
+    {
+      "message": "LZ1SJ AE1G FN42",
+      "freq_hz": 987.0,
+      "dt_s": 1.5,
+      "snr_db": -14.0
+    },
+    {
+      "message": "W7JET EA5D -09",
+      "freq_hz": 1616.0,
+      "dt_s": 1.6,
+      "snr_db": -17.0
+    },
+    {
+      "message": "NT9F SV3ICK RR73",
+      "freq_hz": 1563.0,
+      "dt_s": 1.6,
+      "snr_db": -20.0
+    },
+    {
+      "message": "NT9F EB3JT JN01",
+      "freq_hz": 2126.0,
+      "dt_s": 1.6,
+      "snr_db": -12.0
+    },
+    {
+      "message": "KF6LU NA1KW +01",
+      "freq_hz": 1391.0,
+      "dt_s": 1.6,
+      "snr_db": -2.0
+    },
+    {
+      "message": "CQ EC3A JN00",
+      "freq_hz": 1644.0,
+      "dt_s": 1.6,
+      "snr_db": -20.0
+    },
+    {
+      "message": "CQ EA2CDY IN82",
+      "freq_hz": 2096.0,
+      "dt_s": 1.5,
+      "snr_db": -22.0
+    },
+    {
+      "message": "CQ 2E0PMS IO92",
+      "freq_hz": 1597.0,
+      "dt_s": 1.4,
+      "snr_db": -24.0
+    }
+  ],
+  "elapsed_seconds": 8.638532125
+}

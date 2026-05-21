@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260419_195300.wav",
+  "wav_sha256": "3955a709bff929461098c88cc3c5fb0999455ab3c2e300117d0c7801b6347d43",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "KO3B K1JBP EM67",
+      "freq_hz": 300.0,
+      "dt_s": -1.8,
+      "snr_db": -2.0
+    }
+  ],
+  "elapsed_seconds": 3.602659709
+}
