@@ -25,6 +25,7 @@ struct Args {
     mode: Mode,
     output: PathBuf,
     seed: u64,
+    max_passes: Option<usize>,
 }
 
 impl Args {
@@ -33,6 +34,7 @@ impl Args {
         let mut mode: Option<Mode> = None;
         let mut output: Option<PathBuf> = None;
         let mut seed: u64 = 42;
+        let mut max_passes: Option<usize> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -59,11 +61,15 @@ impl Args {
                 "--seed" => {
                     seed = iter.next().context("--seed needs a value")?.parse()?;
                 }
+                "--max-passes" => {
+                    max_passes = Some(iter.next().context("--max-passes needs a value")?.parse()?);
+                }
                 "-h" | "--help" => {
                     eprintln!(
-                        "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N]"
+                        "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N]"
                     );
                     eprintln!("  tiers: fixtures, synth-clean, curated-hard-200, curated-hard-1000, wild-50");
+                    eprintln!("  --max-passes: override Ft8Config::max_decode_passes (default 3)");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -74,6 +80,7 @@ impl Args {
             mode: mode.context("--mode required")?,
             output: output.context("--output required")?,
             seed,
+            max_passes,
         })
     }
 }
@@ -396,7 +403,13 @@ fn main() -> anyhow::Result<()> {
     let workspace = workspace_root()?;
     let started = Instant::now();
     let decoder: Box<dyn DecoderUnderTest> = match args.mode {
-        Mode::Ft8 => Box::new(Ft8Decoder::with_default_config()),
+        Mode::Ft8 => {
+            let mut d = Ft8Decoder::with_default_config();
+            if let Some(n) = args.max_passes {
+                d = d.with_max_passes(n);
+            }
+            Box::new(d)
+        }
     };
 
     let mut tiers = BTreeMap::new();

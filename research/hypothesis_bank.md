@@ -1,37 +1,13 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-21T00:00:00Z
+last_updated: 2026-05-21T01:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 0
-exploitation_run: 1
+exploitation_run: 2
 current_ratio: 0.0
 
 ## Active (ranked by score)
-
-### hb-001 — Multi-pass subtract-and-redecode  [PRIORITY: 0.82]
-  mode: ft8
-  status: pending
-  priority_score: 0.82
-  estimated_effort: 2 sessions
-  expected_delta: +0.05 to +0.15 real decode rate on hard-200
-  defensible_prior: yes
-  wild_card: false
-  evidence_for:
-    - Memory: "5-10% of WSJT-X decode rate on identical bands" — multi-pass is the documented primary WSJT-X advantage on busy bands
-    - Decoder source (decoder.rs:384): pass 2+ truncates candidate list to 40, but the full spectrogram is rebuilt from scratch each pass; signal subtraction quality is the key lever
-    - subtract_with_sidelobes is called, meaning sidelobe suppression is already in place — the question is whether residual quality is good enough to surface sub-threshold signals
-    - WSJT-X defaults to 3 passes; pancetta's `max_decode_passes` default is also 3 but the curated-hard-200 real decode rate is unknown (not yet in main.json)
-  evidence_against:
-    - Risk of compounding false positives across passes if subtraction is imperfect
-    - Each pass rebuilds the full spectrogram (~O(N) FFT cost per pass)
-  notes: |
-    The core question: does our subtract_with_sidelobes produce a residual clean
-    enough for pass 2 to find new decodes? The plan 2 scorecard only ran synth
-    + fixtures — no real curated data yet. Once the curated-hard-200 baseline is
-    in, this hypothesis is directly measurable. Experiment: sweep max_decode_passes
-    from 1 to 4 with curated-hard-200 as the primary metric. Instrument new
-    decodes-per-pass counts in the scorecard.
 
 ### hb-003 — Sync candidate count sweep  [PRIORITY: 0.70]
   mode: ft8
@@ -235,6 +211,61 @@ current_ratio: 0.0
     range (the sensitivity cliff). Track convergence rate (fraction of candidates
     that converge in ≤N iterations) as a separate metric to understand where
     the benefit actually comes from.
+
+### hb-030 — subtract_with_sidelobes residual quality audit  [PRIORITY: 0.60]
+  mode: ft8
+  status: pending
+  priority_score: 0.60
+  estimated_effort: 1-2 sessions
+  expected_delta: diagnostic; informs whether to redesign subtraction kernel
+  defensible_prior: yes (hb-001 sweep directly motivated this — see 2026-05-21 journal)
+  wild_card: false
+  evidence_for:
+    - hb-001 sweep (2026-05-21) measured pass-2+ multi-pass contribution at +1.2% real decode rate on hard-200, vs the +5-15% hypothesized
+    - Pass 2 contribution: +43 decodes; pass 3 contribution: +3; pass 4 contribution: +1 — sharp diminishing returns after one subtraction
+    - synth-clean shows IDENTICAL decode tables at max_passes ∈ {1,2,3,4} — multi-pass adds zero on clean signals
+    - Either subtraction leaves artifacts that mask weak signals, or weak residual signals fall below sync threshold — current evidence can't distinguish
+  evidence_against:
+    - Diagnostic-only experiment; no guaranteed code change drops out
+    - If the answer is "subtraction is fundamentally limited by FT8's overlapped-symbol structure" no fix is forthcoming
+  notes: |
+    Controlled two-signal synth experiment: generate WAV with strong signal
+    at SNR=-5 dB and weak signal at SNR=-18 dB, offset 25 Hz apart in
+    frequency. Decode the strong, subtract it, then measure:
+    (a) Spectrogram power at the weak signal's TF cell, before and after
+        subtraction — quantifies subtraction quality.
+    (b) Sync score at the weak signal's TF location, before and after —
+        does subtraction surface a sync candidate that pass 1 missed?
+    (c) LDPC convergence rate at the weak candidate, before and after.
+    If (a) shows large residual artifacts at the strong signal's harmonics
+    bleeding into the weak signal's TF cell, the kernel needs sidelobe
+    work. If (a) is clean but (b) doesn't improve, the issue is sync
+    threshold not subtraction quality. If both improve but (c) still
+    fails, the issue is LLR scaling on subtracted residuals.
+
+### hb-031 — Fast-path single-pass mode for autonomous-loop latency  [PRIORITY: 0.40]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 0.5 sessions
+  expected_delta: 9-10× decode latency reduction at cost of ~1.2% real decode rate
+  defensible_prior: yes (hb-001 sweep showed pass 1 = 48ms, pass 2 = 382ms; 98.8% recall at pass 1 alone)
+  wild_card: false
+  evidence_for:
+    - Pass 1 alone recovers 3786 of 3832 multi-pass decodes (98.8%) on hard-200
+    - Pass 1 wall-clock: 48ms/WAV. Pass 2+ adds 335ms/WAV.
+    - Operator's autonomous loop runs every 15s slot; 50-100ms per decode would let multiple decode windows run concurrently on slow CPUs
+    - Already gated by Ft8Config::aggressive_decoding (currently unused — see hb-020)
+  evidence_against:
+    - Losing 1.2% decodes on busy bands matters for the rare-station hunter use case
+    - Adds operating-mode complexity to the coordinator
+  notes: |
+    Pure plumbing: add a "decode_mode: latency | balanced | deep" field to
+    pancetta-config and wire through to the coordinator. Latency mode sets
+    max_decode_passes=1. Balanced (default) stays at 3. Deep can go higher
+    (5+) for offline batch reprocessing.
+    Synergizes with hb-020 (aggressive_decoding audit): if that flag turns
+    out to do nothing, this is what it should do.
 
 ### hb-029 — Exact-format Display tests for every message subtype  [PRIORITY: 0.45]
   mode: ft8
@@ -626,6 +657,37 @@ current_ratio: 0.0
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
 ## Shelved (kept for reference)
+
+### hb-001 — Multi-pass subtract-and-redecode  [SHELVED 2026-05-21]
+  mode: ft8
+  status: shelved
+  priority_score: 0.82
+  outcome: |
+    Sweep at max_decode_passes ∈ {1, 2, 3, 4} on curated-hard-200 and
+    synth-clean. Measured pass-2+ contribution: +1.2% real decode rate
+    on hard-200 (+47 / 3786 from pass 1 alone); 0% on synth-clean
+    (identical decode tables at every setting). Composite delta of
+    raising max_passes from 3 → 4 = +0.0001, well into noise floor.
+    Status quo (max_passes=3) stays.
+  measured_delta: |
+    hard-200 sweep table:
+      passes=1: recovered 3786, rate 0.4415, time 9.6s
+      passes=2: recovered 3829, rate 0.4465, time 76.5s   (+43 vs 1)
+      passes=3: recovered 3832, rate 0.4468, time 92.8s   (+3 vs 2)
+      passes=4: recovered 3833, rate 0.4469, time 99.7s   (+1 vs 3)
+    Pass 2 has an 8× compute multiplier for the 1.1% recall gain.
+    Synth-clean shows zero variation across pass counts.
+  learning: |
+    The "5-10% of WSJT-X" gap isn't in pass count. Pancetta's
+    subtract_with_sidelobes leaves residuals that produce only marginal
+    new decodes — likely a subtraction-quality issue, not a count issue.
+    Two follow-ups: hb-030 (audit subtraction quality on controlled
+    two-signal synth) and hb-031 (fast-path max_passes=1 mode for
+    latency-sensitive autonomous deployment, since pass 1 alone gets
+    98.8% of the multi-pass total at 10% of the wall-clock cost).
+  follow_up: hb-030 (subtraction quality audit), hb-031 (fast-path mode).
+  journal: research/experiments/2026-05-21-multi-pass-sweep.md
+  scorecards: research/scorecards/sweep/ (hard200-passes-{1..4}.json + synth-passes-{1..4}.json)
 
 ### hb-002 — Synth plateau investigation (1-of-6 message type)  [SHELVED 2026-05-20]
   mode: ft8

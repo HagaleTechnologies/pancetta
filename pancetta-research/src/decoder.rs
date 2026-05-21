@@ -58,6 +58,14 @@ impl Ft8Decoder {
             _scratch: Mutex::new(()),
         }
     }
+
+    /// Override `max_decode_passes` on the wrapped config. Used by the
+    /// hb-001 sweep and any future experiments that want to vary this
+    /// without touching the production default.
+    pub fn with_max_passes(mut self, n: usize) -> Self {
+        self.config.max_decode_passes = n;
+        self
+    }
 }
 
 impl DecoderUnderTest for Ft8Decoder {
