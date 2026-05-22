@@ -18,19 +18,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Enhanced FT8 Spectral Analysis Demo");
     println!("====================================\n");
 
-    // Configure decoder for weak signal detection
+    // Configure decoder for weak signal detection. Start from the
+    // default config and override only the fields this demo wants to
+    // tweak — this is forward-compatible with new Ft8Config fields.
     let config = Ft8Config {
-        sample_rate: SAMPLE_RATE,
-        protocol: pancetta_ft8::Protocol::Ft8,
-        enable_multithreading: true,
-        max_candidates: 100,       // Process more candidates for weak signals
-        min_snr_db: -24.0,         // Target -24 dB SNR as per FT8 spec
-        ldpc_iterations: 150,      // More iterations for weak signals
-        aggressive_decoding: true, // Enable aggressive mode
-        frequency_range: 300.0,    // Wider frequency search for Doppler
-        time_range: 3.0,           // Wider time search
-        max_decode_passes: 3,      // Multiple passes for interference cancellation
-        osd_depth: Some(1),        // OSD-1 fallback for weak signals
+        min_snr_db: -24.0,
+        ldpc_iterations: 150,
+        frequency_range: 300.0,
+        time_range: 3.0,
+        osd_depth: Some(1),
+        ..Ft8Config::default()
     };
 
     // Create decoder

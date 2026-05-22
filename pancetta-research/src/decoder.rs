@@ -66,6 +66,21 @@ impl Ft8Decoder {
         self.config.max_decode_passes = n;
         self
     }
+
+    /// Override `max_sync_candidates` on the wrapped config (the
+    /// Costas-search cap before NMS). hb-003 sweep.
+    pub fn with_max_sync_candidates(mut self, n: usize) -> Self {
+        self.config.max_sync_candidates = n;
+        self
+    }
+
+    /// Override `max_candidates` on the wrapped config (the decode-side
+    /// cap, post-NMS). Companion to `with_max_sync_candidates` for
+    /// hb-003 sub-experiment (b).
+    pub fn with_max_candidates(mut self, n: usize) -> Self {
+        self.config.max_candidates = n;
+        self
+    }
 }
 
 impl DecoderUnderTest for Ft8Decoder {

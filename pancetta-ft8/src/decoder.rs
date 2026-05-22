@@ -59,8 +59,10 @@ const LLR_TARGET_VARIANCE: f32 = 24.0;
 /// Minimum Costas sync score to consider a candidate (dB difference, neighbor comparison)
 const MIN_SYNC_SCORE: f64 = 3.0;
 
-/// Maximum candidates from sync search before NMS
-const MAX_SYNC_CANDIDATES: usize = 100;
+/// Maximum candidates from sync search before NMS. Raised from 100 to
+/// 200 on 2026-05-21 (hb-003 sweep): +5.7% real decode rate on hard-200
+/// and +4.5% on hard-1000 with no regressions on fixtures or synth.
+const MAX_SYNC_CANDIDATES: usize = 200;
 
 /// Minimum frequency bin for FT8 search (0 = full passband coverage)
 const MIN_FREQ_BIN: usize = 0;
@@ -113,6 +115,13 @@ pub struct Ft8Config {
     /// Note: OSD-2 (4,187 trials) has a high CRC-14 false positive rate without
     /// additional validation. OSD-1 (92 trials) is the safe default.
     pub osd_depth: Option<u8>,
+
+    /// Maximum candidates retained from Costas sync search before NMS.
+    /// Default matches the historical hard-coded MAX_SYNC_CANDIDATES (100).
+    /// Raising this lets weaker sync candidates survive into NMS + LDPC
+    /// at the cost of CPU per slot; lowering it cuts compute at the risk
+    /// of dropping marginal real signals on busy bands.
+    pub max_sync_candidates: usize,
 }
 
 impl Default for Ft8Config {
@@ -129,6 +138,7 @@ impl Default for Ft8Config {
             time_range: 2.0,
             max_decode_passes: 3,
             osd_depth: Some(2),
+            max_sync_candidates: MAX_SYNC_CANDIDATES,
         }
     }
 }
@@ -1083,7 +1093,7 @@ impl Ft8Decoder {
                 .partial_cmp(&a.sync_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        candidates.truncate(MAX_SYNC_CANDIDATES);
+        candidates.truncate(self.config.max_sync_candidates);
 
         // Non-maximum suppression: remove weaker candidates near stronger ones
         self.nms_candidates(&mut candidates);

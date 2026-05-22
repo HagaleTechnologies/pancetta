@@ -26,6 +26,8 @@ struct Args {
     output: PathBuf,
     seed: u64,
     max_passes: Option<usize>,
+    max_sync_candidates: Option<usize>,
+    max_candidates: Option<usize>,
 }
 
 impl Args {
@@ -35,6 +37,8 @@ impl Args {
         let mut output: Option<PathBuf> = None;
         let mut seed: u64 = 42;
         let mut max_passes: Option<usize> = None;
+        let mut max_sync_candidates: Option<usize> = None;
+        let mut max_candidates: Option<usize> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -64,12 +68,30 @@ impl Args {
                 "--max-passes" => {
                     max_passes = Some(iter.next().context("--max-passes needs a value")?.parse()?);
                 }
+                "--max-sync-candidates" => {
+                    max_sync_candidates = Some(
+                        iter.next()
+                            .context("--max-sync-candidates needs a value")?
+                            .parse()?,
+                    );
+                }
+                "--max-candidates" => {
+                    max_candidates = Some(
+                        iter.next()
+                            .context("--max-candidates needs a value")?
+                            .parse()?,
+                    );
+                }
                 "-h" | "--help" => {
                     eprintln!(
-                        "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N]"
+                        "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N]"
                     );
                     eprintln!("  tiers: fixtures, synth-clean, curated-hard-200, curated-hard-1000, wild-50");
                     eprintln!("  --max-passes: override Ft8Config::max_decode_passes (default 3)");
+                    eprintln!("  --max-sync-candidates: override Ft8Config::max_sync_candidates (default 100)");
+                    eprintln!(
+                        "  --max-candidates: override Ft8Config::max_candidates (default 100)"
+                    );
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -81,6 +103,8 @@ impl Args {
             output: output.context("--output required")?,
             seed,
             max_passes,
+            max_sync_candidates,
+            max_candidates,
         })
     }
 }
@@ -407,6 +431,12 @@ fn main() -> anyhow::Result<()> {
             let mut d = Ft8Decoder::with_default_config();
             if let Some(n) = args.max_passes {
                 d = d.with_max_passes(n);
+            }
+            if let Some(n) = args.max_sync_candidates {
+                d = d.with_max_sync_candidates(n);
+            }
+            if let Some(n) = args.max_candidates {
+                d = d.with_max_candidates(n);
             }
             Box::new(d)
         }

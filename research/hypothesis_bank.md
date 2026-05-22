@@ -1,36 +1,13 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-21T02:00:00Z
+last_updated: 2026-05-22T00:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 1
-exploitation_run: 2
-current_ratio: 0.333
+exploitation_run: 3
+current_ratio: 0.25
 
 ## Active (ranked by score)
-
-### hb-003 — Sync candidate count sweep  [PRIORITY: 0.70]
-  mode: ft8
-  status: pending
-  priority_score: 0.70
-  estimated_effort: 1 session
-  expected_delta: +0.02 to +0.06 real decode rate; potential SNR@50% improvement of 0.5-1.5 dB
-  defensible_prior: yes
-  wild_card: false
-  evidence_for:
-    - decoder.rs:35: MAX_DECODE_CANDIDATES = 100 (hard constant); pass 2+ truncates to 40 (line 385)
-    - decoder.rs:63: MAX_SYNC_CANDIDATES = 100 — same cap on sync search output
-    - If the 101st-ranked candidate is a real signal (possible in a busy FT8 band with 50+ simultaneous QSOs), it's silently dropped before LDPC even runs
-    - WSJT-X processes more candidates on busy bands; JTDX is documented to run more candidate trials
-    - Low-effort sweep: run eval with max_candidates in {50, 100, 150, 200} and record decode rate vs wall-clock time
-  evidence_against:
-    - Increasing candidates raises CPU per 15s slot; at 200 candidates and OSD-2 the budget timer may kick in
-    - The budget tracker (decoder.rs:356) already exists precisely for this; hitting the budget could harm sensitivity on the remaining candidates
-  notes: |
-    Two sub-experiments: (a) raise MAX_SYNC_CANDIDATES to 150-200 without raising
-    MAX_DECODE_CANDIDATES (more candidates enter NMS, best 100 still decoded);
-    (b) raise both. Measure per-pass decode counts and budget-expiry rate.
-    If budget expiry increases, tune the time budget alongside.
 
 ### hb-004 — AP-survival gate retune  [PRIORITY: 0.67]
   mode: ft8
@@ -266,6 +243,32 @@ current_ratio: 0.333
     (5+) for offline batch reprocessing.
     Synergizes with hb-020 (aggressive_decoding audit): if that flag turns
     out to do nothing, this is what it should do.
+
+### hb-033 — Why does sync_cap=300 only beat sync_cap=200 by 21 decodes?  [PRIORITY: 0.45]
+  mode: ft8
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 1 session
+  expected_delta: diagnostic; informs whether NMS or LDPC is the bottleneck past rank-200
+  defensible_prior: yes (hb-003 sweep showed sharp elbow at sync_cap=200)
+  wild_card: false
+  evidence_for:
+    - hb-003 sweep: sync_cap=200 gives +219 decodes vs baseline; sync_cap=300 gives only +240 (+21 more). NMS or LDPC is gating decodes past candidate rank ~200.
+    - Two distinguishable causes: (a) NMS merges candidates 201-300 with stronger neighbors before LDPC sees them; (b) LDPC + OSD fails on candidates that survive NMS but rank low (low sync score → low LLR confidence → harder convergence).
+    - The wall-clock cost of sync_cap=300 vs 200 was +20% per WAV; for 0.5% more decodes that's a poor tradeoff — but the underlying cause matters.
+  evidence_against:
+    - Pure diagnostic; no guaranteed code change drops out
+    - The 0.5% additional headroom may not be worth pursuing even if the cause is identified
+  notes: |
+    Instrument the decoder to emit per-candidate-rank outcomes on a
+    busy-band WAV (one of hard-200's worst — e.g., wav_hash
+    bb445ede300...). For each Costas candidate from rank 1 to 300:
+    - Did NMS suppress it? (record post-NMS survival)
+    - If it survived NMS, did LDPC converge?
+    - If LDPC failed, did OSD fall back?
+    Plot decode-success rate vs candidate rank. If the rate drops
+    cliff-like at rank ~200, NMS is the culprit (sync scores converge);
+    if it drops gradually, LDPC convergence is.
 
 ### hb-029 — Exact-format Display tests for every message subtype  [PRIORITY: 0.45]
   mode: ft8
@@ -739,6 +742,46 @@ current_ratio: 0.333
   follow_up: hb-023
 
 ## Graduated (merged to main)
+
+### hb-003 — Sync candidate count sweep  [GRADUATED 2026-05-22]
+  mode: ft8
+  status: graduated
+  priority_score: 0.70
+  outcome: |
+    Sweep at max_sync_candidates ∈ {50, 100, 150, 200, 250, 300}
+    found a clear elbow at 200. Production default raised from 100 to
+    200 in pancetta-ft8/src/decoder.rs::MAX_SYNC_CANDIDATES.
+
+    Hard-200: 0.4468 → 0.4724 (+0.0255, +5.7%) decode rate; +219
+    recovered, +192 novel.
+    Hard-1000: 0.4214 → 0.4402 (+0.0188, +4.5%) decode rate; +529
+    recovered, +465 novel.
+    Synth-clean + fixtures unchanged; no FPs introduced.
+    Composite 0.5234 → 0.5362 (+0.0128).
+  measured_delta: |
+    +748 real decodes across the two curated tiers; +657 novel.
+    Wall-clock cost: ~+52% per WAV on hard tiers (avg 672 ms/WAV at
+    sync_cap=200, well within the 3000 ms decoder budget).
+  learning: |
+    The "5-10% of WSJT-X" gap was partly a sync-cap issue: the
+    101st-300th-ranked Costas candidates contained ~6% of the real
+    decodes pancetta was missing. hb-003 was right where hb-001 was
+    wrong — same sweep shape, different parameter, decisive result.
+
+    Diminishing returns past 200: sync=300 adds only 21 decodes over
+    sync=200. NMS or LDPC convergence is the bottleneck at that rank
+    range — see hb-033 follow-up.
+
+    Sub-experiment (b) was redundant: max_candidates=100 was never
+    binding. The sync cap was the only meaningful gate.
+
+    enhanced_spectral_analysis.rs example needed the
+    `..Default::default()` update due to exhaustive struct literal
+    syntax — flagged as a pattern that should be cleaned up across
+    other example/test sites (rolled into hb-032).
+  follow_up: hb-033 (audit why sync_cap=300 only adds 21 over 200).
+  scorecard: research/scorecards/history/2026-05-22-sync-candidate-sweep.json
+  journal: research/experiments/2026-05-21-sync-candidate-sweep.md
 
 ### hb-023 — Fix R-signal-report decode failure  [GRADUATED 2026-05-21]
   mode: ft8
