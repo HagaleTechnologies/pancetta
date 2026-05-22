@@ -33,6 +33,7 @@ struct Args {
     /// default."
     osd_depth: Option<Option<u8>>,
     ldpc_iterations: Option<usize>,
+    llr_target_variance: Option<f32>,
 }
 
 impl Args {
@@ -46,6 +47,7 @@ impl Args {
         let mut max_candidates: Option<usize> = None;
         let mut osd_depth: Option<Option<u8>> = None;
         let mut ldpc_iterations: Option<usize> = None;
+        let mut llr_target_variance: Option<f32> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -101,6 +103,13 @@ impl Args {
                     ldpc_iterations =
                         Some(iter.next().context("--ldpc-iters needs a value")?.parse()?);
                 }
+                "--llr-target-variance" => {
+                    llr_target_variance = Some(
+                        iter.next()
+                            .context("--llr-target-variance needs a value")?
+                            .parse()?,
+                    );
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
@@ -112,7 +121,8 @@ impl Args {
                         "  --max-candidates: override Ft8Config::max_candidates (default 100)"
                     );
                     eprintln!("  --osd-depth: override Ft8Config::osd_depth — N is 0..3 or 'none' to disable (default 2)");
-                    eprintln!("  --ldpc-iters: override Ft8Config::ldpc_iterations (default 25)");
+                    eprintln!("  --ldpc-iters: override Ft8Config::ldpc_iterations (default 50)");
+                    eprintln!("  --llr-target-variance: override Ft8Config::llr_target_variance (default 24.0)");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -128,6 +138,7 @@ impl Args {
             max_candidates,
             osd_depth,
             ldpc_iterations,
+            llr_target_variance,
         })
     }
 }
@@ -466,6 +477,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(n) = args.ldpc_iterations {
                 d = d.with_ldpc_iterations(n);
+            }
+            if let Some(v) = args.llr_target_variance {
+                d = d.with_llr_target_variance(v);
             }
             Box::new(d)
         }

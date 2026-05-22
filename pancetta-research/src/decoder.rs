@@ -95,6 +95,12 @@ impl Ft8Decoder {
         self.config.ldpc_iterations = n;
         self
     }
+
+    /// Override `llr_target_variance` on the wrapped config. hb-006 sweep.
+    pub fn with_llr_target_variance(mut self, v: f32) -> Self {
+        self.config.llr_target_variance = v;
+        self
+    }
 }
 
 impl DecoderUnderTest for Ft8Decoder {

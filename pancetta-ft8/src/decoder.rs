@@ -61,7 +61,14 @@ const FREQ_OSR: usize = 2;
 const TIME_OSR: usize = 2;
 
 /// Target LLR variance for normalization (matches ft8_lib's ftx_normalize_logl)
-const LLR_TARGET_VARIANCE: f32 = 24.0;
+/// LLR normalization target variance. Default raised from 24.0 (ft8_lib's
+/// `ftx_normalize_logl` value) to 32.0 on 2026-05-22 (hb-006 sweep): tiny
+/// but monotonic gain on the curated tiers (+5 recovered on hard-200,
+/// +11 on hard-1000, composite +0.0003) with no regressions on fixtures
+/// or synth. Diverges from ft8_lib's reference value but pancetta's
+/// decoder is not bit-exact with ft8_lib anyway (neural OSD, different
+/// candidate ranking, etc.) — operational sensitivity wins.
+const LLR_TARGET_VARIANCE: f32 = 32.0;
 
 /// Minimum Costas sync score to consider a candidate (dB difference, neighbor comparison)
 const MIN_SYNC_SCORE: f64 = 3.0;
@@ -129,6 +136,13 @@ pub struct Ft8Config {
     /// at the cost of CPU per slot; lowering it cuts compute at the risk
     /// of dropping marginal real signals on busy bands.
     pub max_sync_candidates: usize,
+
+    /// Target variance for LLR normalization before LDPC decoding.
+    /// Default 24.0 matches ft8_lib's ftx_normalize_logl(). LDPC
+    /// sum-product propagation is sensitive to LLR scale: over-scaled
+    /// LLRs cause BP to converge too aggressively to wrong codewords;
+    /// under-scaled LLRs slow convergence.
+    pub llr_target_variance: f32,
 }
 
 impl Default for Ft8Config {
@@ -146,6 +160,7 @@ impl Default for Ft8Config {
             max_decode_passes: 3,
             osd_depth: Some(2),
             max_sync_candidates: MAX_SYNC_CANDIDATES,
+            llr_target_variance: LLR_TARGET_VARIANCE,
         }
     }
 }
@@ -471,6 +486,7 @@ impl Ft8Decoder {
                 xor_sequence: self.protocol_params.xor_sequence,
                 ldpc_iterations: self.config.ldpc_iterations,
                 osd_depth: self.config.osd_depth,
+                llr_target_variance: self.config.llr_target_variance,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -1403,7 +1419,7 @@ impl Ft8Decoder {
             }
         }
 
-        normalize_llrs(&mut llrs);
+        normalize_llrs(&mut llrs, self.config.llr_target_variance);
 
         let corrected_bits = match self.ldpc_decoder.decode_soft(&llrs) {
             Ok(bits) => bits,
@@ -1563,7 +1579,7 @@ impl Ft8Decoder {
             let tone_magnitudes =
                 self.extract_symbols_from_spectrogram(spectrogram, &trial_candidate);
             let mut llrs = self.compute_soft_llrs_db(&tone_magnitudes);
-            normalize_llrs(&mut llrs);
+            normalize_llrs(&mut llrs, self.config.llr_target_variance);
 
             if let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) {
                 if self.verify_crc(&corrected_bits) {
@@ -1710,7 +1726,7 @@ impl Ft8Decoder {
                 let mut llrs = self.compute_soft_llrs(&tone_magnitudes);
 
                 // LLR normalization: scale to target variance (ft8_lib's ftx_normalize_logl)
-                normalize_llrs(&mut llrs);
+                normalize_llrs(&mut llrs, self.config.llr_target_variance);
 
                 #[cfg(feature = "debug-decode")]
                 {
@@ -2244,6 +2260,8 @@ struct DecodeContext<'a> {
     /// OSD config for creating per-thread LDPC decoders
     ldpc_iterations: usize,
     osd_depth: Option<u8>,
+    /// LLR normalization target variance (matches Ft8Config field).
+    llr_target_variance: f32,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -2287,7 +2305,7 @@ fn par_decode_candidate(
             &trial_candidate,
         );
         let mut llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes);
-        normalize_llrs(&mut llrs);
+        normalize_llrs(&mut llrs, ctx.llr_target_variance);
 
         if let Ok(corrected_bits) = ldpc.decode_soft(&llrs) {
             if par_verify_crc(&corrected_bits) {
@@ -2381,7 +2399,7 @@ fn par_decode_candidate(
             };
 
             let mut llrs = par_compute_soft_llrs(ctx.protocol_params, &tone_magnitudes);
-            normalize_llrs(&mut llrs);
+            normalize_llrs(&mut llrs, ctx.llr_target_variance);
 
             let corrected_bits = match ldpc.decode_soft(&llrs) {
                 Ok(bits) => bits,
@@ -2587,7 +2605,7 @@ fn par_try_ldpc_with_ap(
         }
     }
 
-    normalize_llrs(&mut llrs);
+    normalize_llrs(&mut llrs, ctx.llr_target_variance);
 
     let corrected_bits = match ldpc.decode_soft(&llrs) {
         Ok(bits) => bits,
@@ -3003,12 +3021,15 @@ fn par_estimate_snr_fft(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES]
 // Helper functions
 // ============================================================================
 
-/// Normalize LLR values to have target variance, matching ft8_lib's ftx_normalize_logl().
+/// Normalize LLR values to have a target variance, matching ft8_lib's
+/// `ftx_normalize_logl()` when called with the default `LLR_TARGET_VARIANCE`.
 ///
 /// LDPC belief propagation is tuned for a specific LLR scale. This function
 /// computes the variance of the 174 LLR values and scales them so the variance
-/// equals LLR_TARGET_VARIANCE (24.0). This is critical for decoding weak signals.
-fn normalize_llrs(llrs: &mut [f32]) {
+/// equals `target_variance`. Default is `LLR_TARGET_VARIANCE` (24.0). This is
+/// critical for decoding weak signals; hb-006 swept this value as a possible
+/// sensitivity knob.
+fn normalize_llrs(llrs: &mut [f32], target_variance: f32) {
     debug_assert_eq!(llrs.len(), 174);
     let n = llrs.len() as f32;
     let inv_n = 1.0 / n;
@@ -3019,7 +3040,7 @@ fn normalize_llrs(llrs: &mut [f32]) {
     let variance = (sum2 - sum * sum * inv_n) * inv_n;
 
     if variance > 0.0 {
-        let norm_factor = (LLR_TARGET_VARIANCE / variance).sqrt();
+        let norm_factor = (target_variance / variance).sqrt();
         for llr in llrs.iter_mut() {
             *llr *= norm_factor;
         }
@@ -3944,7 +3965,7 @@ mod tests {
         );
 
         // Normalize
-        normalize_llrs(&mut llrs);
+        normalize_llrs(&mut llrs, LLR_TARGET_VARIANCE);
 
         // After normalization, variance should be ~24.0
         let norm_var = compute_variance(&llrs);
@@ -3970,7 +3991,7 @@ mod tests {
         }
 
         let signs: Vec<bool> = llrs.iter().map(|&x| x > 0.0).collect();
-        normalize_llrs(&mut llrs);
+        normalize_llrs(&mut llrs, LLR_TARGET_VARIANCE);
         let new_signs: Vec<bool> = llrs.iter().map(|&x| x > 0.0).collect();
         assert_eq!(signs, new_signs, "Normalization should preserve LLR signs");
     }
@@ -3979,7 +4000,7 @@ mod tests {
     fn test_llr_normalization_zero_variance() {
         // All same values: variance = 0, should not crash
         let mut llrs = vec![3.0f32; 174];
-        normalize_llrs(&mut llrs);
+        normalize_llrs(&mut llrs, LLR_TARGET_VARIANCE);
         // Should be unchanged (no scaling possible)
         assert_eq!(llrs[0], 3.0);
     }

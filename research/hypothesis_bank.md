@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-22T02:00:00Z
+last_updated: 2026-05-22T12:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 1
-exploitation_run: 4
-current_ratio: 0.20
+exploitation_run: 5
+current_ratio: 0.167
 
 ## Active (ranked by score)
 
@@ -41,28 +41,6 @@ current_ratio: 0.20
         slot — more representative but more elaborate plumbing).
 
     Either path is hb-004's prerequisite. Then the gate sweep follows.
-
-### hb-006 — LLR normalization target tuning  [PRIORITY: 0.58]
-  mode: ft8
-  status: pending
-  priority_score: 0.58
-  estimated_effort: 1 session
-  expected_delta: +0.01 to +0.04 SNR@50% synth-clean
-  defensible_prior: yes
-  wild_card: false
-  evidence_for:
-    - decoder.rs:57: LLR_TARGET_VARIANCE = 24.0, comment "matches ft8_lib's ftx_normalize_logl". This is correct at initialization, but the normalization target may need tuning for different channel conditions (multipath, Doppler)
-    - LDPC sum-product performance is sensitive to LLR scaling: over-scaled LLRs cause BP to converge too aggressively to wrong codewords; under-scaled LLRs slow convergence
-    - The target variance of 24.0 is empirically matched to AWGN; the Doppler/multipath synth tier may benefit from a different value
-    - WSJT-X has noise floor estimation that feeds back into LLR normalization dynamically
-  evidence_against:
-    - If ft8_lib uses 24.0 and we match it, changing this could diverge from reference behavior
-    - Harder to validate correctness without a clean theoretical derivation
-  notes: |
-    Sweep LLR_TARGET_VARIANCE from 16.0 to 36.0 in steps of 4. Measure synth-clean
-    and synth-doppler SNR@50% separately (the doppler tier benefits most if the
-    hypothesis is correct). Also check whether per-candidate LLR renormalization
-    (after spectrogram-based extraction) could improve the consistency.
 
 ### hb-007 — MIN_SYNC_SCORE threshold sweep  [PRIORITY: 0.56]
   mode: ft8
@@ -258,6 +236,34 @@ current_ratio: 0.20
     Run on the OSD-3 + iters=50 scorecard since that has the most data.
     If <5% are real, document and shelve OSD-3 permanently. If >20%
     are real, fold into hb-018 and push for the stronger FP filter.
+
+### hb-035 — Sweep for max BP convergence rate (reduce OSD fallback)  [PRIORITY: 0.45]
+  mode: ft8
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 1 session
+  expected_delta: speed (wall-clock) + small sensitivity; informs which knobs reduce OSD-fallback rate
+  defensible_prior: yes (hb-005 + hb-006 both produced 3-5% speedups by reducing OSD fallback)
+  wild_card: false
+  evidence_for:
+    - hb-005 (LDPC iters 25 → 50) made the 5-tier eval 3% faster — more BP convergence = fewer expensive OSD calls.
+    - hb-006 (LLR variance 24 → 32) made it 5% faster — same mechanism.
+    - Both speedups were a side-effect; neither was the headline metric. A deliberate target on "BP convergence rate" could unlock more.
+    - The BudgetTracker (decoder.rs:373) limits per-WAV decode time; if BP converges more often, more candidates fit in the budget = more decodes.
+  evidence_against:
+    - Diagnostic-first; no guaranteed code change drops out
+    - Could find that the current setting is already at the BP/OSD tradeoff frontier
+  notes: |
+    Instrument the decoder to emit per-candidate convergence outcomes:
+    (a) BP converged in N iters; (b) BP did not converge, OSD attempted,
+    OSD succeeded; (c) OSD attempted, OSD failed; (d) parity gate
+    blocked OSD. Run on hard-200 with current production settings, then
+    sweep:
+    - LLR_TARGET_VARIANCE ∈ {28, 32, 36, 40, 48} (extend the hb-006 sweep)
+    - LDPC iter cap ∈ {50, 75, 100} (extend the hb-005 sweep)
+    - Combined sweeps for crossing effects.
+    Goal: find a setting that pushes BP convergence rate from current
+    (estimate ~80%?) to ~90%+ while keeping decode rate ≥ current.
 
 ### hb-033 — Why does sync_cap=300 only beat sync_cap=200 by 21 decodes?  [PRIORITY: 0.45]
   mode: ft8
@@ -757,6 +763,43 @@ current_ratio: 0.20
   follow_up: hb-023
 
 ## Graduated (merged to main)
+
+### hb-006 — LLR normalization target tuning  [GRADUATED 2026-05-22, marginal]
+  mode: ft8
+  status: graduated
+  priority_score: 0.58
+  outcome: |
+    Sweep at LLR_TARGET_VARIANCE ∈ {16, 20, 24, 28, 32, 36}. Production
+    raised 24.0 → 32.0 (the peak of a monotonic 16→32→flat shape).
+    Marginal but real WIN: +5 recovered on hard-200, +11 on hard-1000,
+    composite 0.5370 → 0.5373 (+0.0003), no regressions. synth-clean
+    unchanged at every variance value — the predicted sensitivity gain
+    did NOT materialize on AWGN.
+  measured_delta: |
+    Full 5-tier at var=32 vs main:
+      hard-200: rec +5, novel +5, rate +0.0006
+      hard-1000: rec +11, novel +17, rate +0.0004
+      composite: +0.0003
+      5-tier elapsed: -44s (-5% — BP converging more efficiently, fewer
+      OSD fallbacks fire)
+  learning: |
+    Three observations:
+    1. The hypothesis was right about existence of an optimum but
+       wrong about magnitude. Predicted +0.01-0.04 on synth SNR@50%;
+       got 0 on synth + 0.0003 on composite.
+    2. Diminishing returns are real: hb-023 (+0.0279) → hb-003 (+0.0128)
+       → hb-005 (+0.0008) → hb-006 (+0.0003). Each ~3-5× smaller than
+       the prior. Worth considering higher-impact hypothesis classes
+       next: hb-030 (subtraction quality), hb-024 (cross-validation),
+       or hb-015 (Doppler).
+    3. Two consecutive cycles produced 3-5% wall-clock speedups as
+       side effects of changing the BP/OSD interaction. Spawned hb-035
+       to target this metric deliberately — if a knob can push BP
+       convergence rate higher, the OSD-fallback frequency drops and
+       both speed and (within-budget) decode count rise.
+  follow_up: hb-035 (sweep for max BP convergence rate).
+  scorecard: research/scorecards/history/2026-05-22-llr-variance-sweep.json
+  journal: research/experiments/2026-05-22-llr-variance-sweep.md
 
 ### hb-005 — OSD beta + iteration sweep  [GRADUATED 2026-05-22]
   mode: ft8
