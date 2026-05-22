@@ -81,6 +81,20 @@ impl Ft8Decoder {
         self.config.max_candidates = n;
         self
     }
+
+    /// Override `osd_depth` on the wrapped config. `None` disables OSD
+    /// entirely; `Some(0..=3)` selects depth. hb-005 sweep.
+    pub fn with_osd_depth(mut self, depth: Option<u8>) -> Self {
+        self.config.osd_depth = depth;
+        self
+    }
+
+    /// Override `ldpc_iterations` on the wrapped config (BP iteration
+    /// cap before OSD fallback). hb-005 sweep.
+    pub fn with_ldpc_iterations(mut self, n: usize) -> Self {
+        self.config.ldpc_iterations = n;
+        self
+    }
 }
 
 impl DecoderUnderTest for Ft8Decoder {

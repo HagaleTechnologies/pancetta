@@ -1,59 +1,46 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-22T00:00:00Z
+last_updated: 2026-05-22T02:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 1
-exploitation_run: 3
-current_ratio: 0.25
+exploitation_run: 4
+current_ratio: 0.20
 
 ## Active (ranked by score)
 
-### hb-004 — AP-survival gate retune  [PRIORITY: 0.67]
+### hb-004 — AP-survival gate retune  [PRIORITY: 0.50, deferred 2026-05-22]
   mode: ft8
-  status: pending
-  priority_score: 0.67
-  estimated_effort: 1 session
-  expected_delta: +0.01 to +0.04 composite score; lift on QSO-mode scenarios
-  defensible_prior: yes
+  status: deferred
+  priority_score: 0.50
+  estimated_effort: 1 session (gate sweep) + scoping work (eval-AP wiring)
+  expected_delta: 0 from gate sweep alone until AP is exercised in eval
+  defensible_prior: deferred (Phase-1 finding from 2026-05-22 cycle)
   wild_card: false
   evidence_for:
-    - decoder.rs:490-493: AP decode only fires for candidates with sync_score >= 3.0 (MIN_SYNC_SCORE_FOR_AP). Comment says "Sync scores below 4.0 are likely noise" — yet the threshold is 3.0. Inconsistency suggests the threshold was tuned conservatively.
-    - The memory notes (decoder_status.md) record that AP thresholds were set via manual tuning; a systematic sweep against a QSO-pattern corpus hasn't been done
-    - AP levels 1-4 exist (ap.rs:182-194): Ap1 injects own call, Ap2 injects caller, Ap3 injects both, Ap4 adds i3 type. Higher AP levels at very low SNR could recover QSO exchanges missed by AP0
-    - Memory (decoder_sensitivity.md): "AP decoding levels 3-4 (verify which levels are implemented)" — suggests AP3/AP4 activation rate is unknown
+    - decoder.rs MIN_SYNC_SCORE_FOR_AP=3.0 is set conservatively (the comment in the source says "Sync scores below 4.0 are likely noise" but the gate is at 3.0)
+    - Memory notes record AP thresholds were manually tuned; never systematically swept
+    - AP levels 1-4 exist (ap.rs); higher levels at low SNR can recover QSO exchanges missed by AP0
   evidence_against:
-    - Lowering the threshold risks injecting known callsigns into noise, producing false QSO decodes (a security concern per C-1)
-    - Without a curated QSO-pattern corpus, measuring AP recall improvement is indirect
+    - Phase-1 audit during 2026-05-22 cycle: `decode_window` calls `decode_window_with_ap` with `ApContext::default()` → ap_active=false → AP NEVER fires in eval.
+    - Sweeping MIN_SYNC_SCORE_FOR_AP without exercising AP would change nothing measurable.
+    - Lowering the threshold risks security-relevant false-callsign injection (C-1).
   notes: |
-    Sweep MIN_SYNC_SCORE_FOR_AP from 2.0 to 5.0 in 0.5 steps on curated-hard-200.
-    Track: new real decodes found vs false positives introduced. The fixture tier
-    acts as a regression guard. Also audit how often AP3 and AP4 actually fire
-    in normal decoding runs by adding a counter to the metrics struct.
+    DEFERRED. The hb-004 hypothesis assumed eval exercises AP — it
+    doesn't. To make the gate sweep meaningful, the harness needs to
+    inject a my_call into ApContext (or otherwise activate AP) on each
+    decode_wav call. That's a separate scoping question with its own
+    tradeoffs: injecting a specific my_call biases the eval toward
+    that callsign's frequency in the corpus (AP1 helps decodes where
+    a station is calling my_call). Two paths to un-defer:
 
-### hb-005 — OSD beta parameter + iteration sweep  [PRIORITY: 0.63]
-  mode: ft8
-  status: pending
-  priority_score: 0.63
-  estimated_effort: 1 session
-  expected_delta: +0.01 to +0.05 synth sensitivity; potential fixture regression risk
-  defensible_prior: yes
-  wild_card: false
-  evidence_for:
-    - decoder.rs:115: osd_depth: Option<u8>, comment explicitly notes "OSD-2 (4,187 trials) has a high CRC-14 false positive rate without additional validation"
-    - osd.rs default (line 34): max_depth = 1 ("OSD-1 is the safe default") — but main.json config shows osd_depth: 2 in practice
-    - This contradiction: the module default is 1, the decoder's Default impl sets Some(2). The actual OSD depth in production is 2, not 1.
-    - OSD-2 trial count (4,187) vs OSD-1 (92): ~45x more trials for OSD-2. With current parity gate ≤4, false positive rate is claimed high without "additional validation" — but that validation may not be fully implemented
-    - LDPC iterations default 25; WSJT-X uses 50 iterations. More LDPC iterations before falling back to OSD could reduce the workload on OSD.
-  evidence_against:
-    - OSD-3 (125K trials) is mentioned in memory as a future option — but the combinatorial explosion makes it impractical without a stronger FP filter
-    - Changing OSD depth could change the fixture baseline, triggering auto-regression flags
-  notes: |
-    Two sub-experiments: (a) compare OSD-1 vs OSD-2 vs disabled on synth corpus —
-    quantify exactly how many decodes are OSD-only vs LDPC-only; (b) sweep LDPC
-    iterations from 25 to 50 with OSD-1 and check whether more LDPC iterations
-    substitute for OSD-2 on the hard cases. The "additional validation" comment
-    suggests there's an unguarded FP path in OSD-2 worth auditing.
+    (a) Inject the most-common callsign in the curated corpus as my_call
+        (would bias toward that station's traffic).
+    (b) For each WAV, set my_call to the dominant callsign in that
+        WAV's jt9 baseline (biases toward the strongest station per
+        slot — more representative but more elaborate plumbing).
+
+    Either path is hb-004's prerequisite. Then the gate sweep follows.
 
 ### hb-006 — LLR normalization target tuning  [PRIORITY: 0.58]
   mode: ft8
@@ -243,6 +230,34 @@ current_ratio: 0.25
     (5+) for offline batch reprocessing.
     Synergizes with hb-020 (aggressive_decoding audit): if that flag turns
     out to do nothing, this is what it should do.
+
+### hb-034 — Audit OSD-3's +313 unconfirmed novel decodes  [PRIORITY: 0.40]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 1 session
+  expected_delta: diagnostic; determines whether OSD-3 with stronger FP filter is worth pursuing (hb-018)
+  defensible_prior: yes (concrete data from hb-005 sweep)
+  wild_card: false
+  evidence_for:
+    - hb-005 sweep (2026-05-22): at OSD-2→OSD-3 with iters=25, recovered count is identical (4051) but novel count jumps from 868 to 1181 — +313 unconfirmed decodes that aren't in jt9's truth set.
+    - At iters=50: same pattern, +337 novel for +7 recovered going OSD-2 → OSD-3.
+    - If any meaningful fraction (>10%?) of those 313 novel decodes are real (i.e., jt9 missed them too), then OSD-3 with a stronger FP filter (hb-018) would be net-positive for true sensitivity.
+  evidence_against:
+    - Most likely all 313 are CRC-14 collisions (the parity gate ≤4 isn't tight enough at OSD-3's 125K trials per candidate).
+    - Even at 10% real, the per-decode cost of OSD-3 (~20% wall-clock at OSD-2 over none) may not be worth the marginal gain.
+  notes: |
+    Three approaches to validate:
+    (a) Cross-decode the same hard-200 WAVs with JTDX (if installable);
+        treat (pancetta-OSD-3 ∩ JTDX) − jt9 decodes as high-confidence
+        novel. This would also meaningfully scope hb-024.
+    (b) QSO-pattern continuity: if a "novel" decode's callsign appears
+        in adjacent slots' jt9 decodes, the novel is likely real.
+    (c) Plausibility filter on the decoded message: valid callsign
+        format, valid grid, etc. Quick FP cut.
+    Run on the OSD-3 + iters=50 scorecard since that has the most data.
+    If <5% are real, document and shelve OSD-3 permanently. If >20%
+    are real, fold into hb-018 and push for the stronger FP filter.
 
 ### hb-033 — Why does sync_cap=300 only beat sync_cap=200 by 21 decodes?  [PRIORITY: 0.45]
   mode: ft8
@@ -742,6 +757,41 @@ current_ratio: 0.25
   follow_up: hb-023
 
 ## Graduated (merged to main)
+
+### hb-005 — OSD beta + iteration sweep  [GRADUATED 2026-05-22]
+  mode: ft8
+  status: graduated
+  priority_score: 0.63
+  outcome: |
+    2×4 sweep of (osd_depth ∈ {none, 1, 2, 3}) × (ldpc_iters ∈ {25, 50})
+    on hard-200. Production change: raised LDPC_MAX_ITERATIONS from 25
+    to 50. OSD depth stays at Some(2) — OSD-3 explodes novel decodes
+    (+313 vs OSD-2 at iters=25) for zero additional recovered, almost
+    certainly mostly CRC-14 false-positives that the current parity
+    gate ≤4 doesn't catch.
+  measured_delta: |
+    Full 5-tier eval at OSD-2 + iters=50 vs main:
+      hard-200:   rate 0.4724 → 0.4740 (+0.0016); rec +14, novel +2
+      hard-1000:  rate 0.4402 → 0.4425 (+0.0023); rec +64, novel -54
+      fixtures + synth + wild-50: unchanged
+      composite:  0.5362 → 0.5370 (+0.0008)
+      wall-clock: 848s → 828s (-3% — more BP convergence = fewer
+                  expensive OSD fallbacks)
+  learning: |
+    Three insights from this cycle:
+    1. OSD's contribution to confirmed decodes is tiny — 6 decodes
+       across the OSD ∈ {none, 1, 2, 3} range at iters=25 on hard-200.
+       OSD is not where the WSJT-X gap lives.
+    2. LDPC iterations is a quality knob: hard-1000 gained +64 recovered
+       AND lost 54 novel — more BP convergence converts fuzzy "novel"
+       decodes into confirmed truth-matches.
+    3. hb-004 (AP gate retune) needs prerequisite work: eval's
+       decode_window calls decode_window_with_ap with an empty
+       ApContext, so AP never fires in eval. Updated hb-004 status to
+       "deferred" with the scope question documented.
+  follow_up: hb-034 (audit OSD-3's +313 novel decodes — cross-validate or shelve OSD-3).
+  scorecard: research/scorecards/history/2026-05-22-osd-sweep.json
+  journal: research/experiments/2026-05-22-osd-sweep.md
 
 ### hb-003 — Sync candidate count sweep  [GRADUATED 2026-05-22]
   mode: ft8

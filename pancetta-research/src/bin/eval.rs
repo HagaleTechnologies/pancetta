@@ -28,6 +28,11 @@ struct Args {
     max_passes: Option<usize>,
     max_sync_candidates: Option<usize>,
     max_candidates: Option<usize>,
+    /// `Some(None)` means "explicitly disable OSD". `Some(Some(d))` means
+    /// "set depth to d". `None` means "no override; use the production
+    /// default."
+    osd_depth: Option<Option<u8>>,
+    ldpc_iterations: Option<usize>,
 }
 
 impl Args {
@@ -39,6 +44,8 @@ impl Args {
         let mut max_passes: Option<usize> = None;
         let mut max_sync_candidates: Option<usize> = None;
         let mut max_candidates: Option<usize> = None;
+        let mut osd_depth: Option<Option<u8>> = None;
+        let mut ldpc_iterations: Option<usize> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -82,16 +89,30 @@ impl Args {
                             .parse()?,
                     );
                 }
+                "--osd-depth" => {
+                    let s = iter.next().context("--osd-depth needs a value")?;
+                    osd_depth = Some(if s == "none" || s == "off" {
+                        None
+                    } else {
+                        Some(s.parse()?)
+                    });
+                }
+                "--ldpc-iters" => {
+                    ldpc_iterations =
+                        Some(iter.next().context("--ldpc-iters needs a value")?.parse()?);
+                }
                 "-h" | "--help" => {
                     eprintln!(
-                        "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N]"
+                        "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
                     );
                     eprintln!("  tiers: fixtures, synth-clean, curated-hard-200, curated-hard-1000, wild-50");
                     eprintln!("  --max-passes: override Ft8Config::max_decode_passes (default 3)");
-                    eprintln!("  --max-sync-candidates: override Ft8Config::max_sync_candidates (default 100)");
+                    eprintln!("  --max-sync-candidates: override Ft8Config::max_sync_candidates (default 200)");
                     eprintln!(
                         "  --max-candidates: override Ft8Config::max_candidates (default 100)"
                     );
+                    eprintln!("  --osd-depth: override Ft8Config::osd_depth — N is 0..3 or 'none' to disable (default 2)");
+                    eprintln!("  --ldpc-iters: override Ft8Config::ldpc_iterations (default 25)");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -105,6 +126,8 @@ impl Args {
             max_passes,
             max_sync_candidates,
             max_candidates,
+            osd_depth,
+            ldpc_iterations,
         })
     }
 }
@@ -437,6 +460,12 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(n) = args.max_candidates {
                 d = d.with_max_candidates(n);
+            }
+            if let Some(depth) = args.osd_depth {
+                d = d.with_osd_depth(depth);
+            }
+            if let Some(n) = args.ldpc_iterations {
+                d = d.with_ldpc_iterations(n);
             }
             Box::new(d)
         }

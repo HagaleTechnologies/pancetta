@@ -38,7 +38,14 @@ const MAX_DECODE_CANDIDATES: usize = 100;
 const MIN_DECODE_SNR: f32 = -25.0;
 
 /// LDPC decoder iterations
-const LDPC_MAX_ITERATIONS: usize = 25;
+/// LDPC belief-propagation iteration cap before falling back to OSD.
+/// Raised from 25 to 50 on 2026-05-22 (hb-005 sweep): +0.0008 composite
+/// on the curated tiers with no regressions on fixtures or synth.
+/// Notably, hard-1000 saw +64 recovered AND -54 novel — more BP
+/// convergence pulled fuzzy "novel" decodes into confirmed truth-matches.
+/// Wall-clock got slightly FASTER overall (-3%) because BP converging
+/// successfully is cheaper than falling through to OSD.
+const LDPC_MAX_ITERATIONS: usize = 50;
 
 /// FT8 Costas synchronization array
 const COSTAS: [u8; 7] = [3, 1, 4, 0, 6, 5, 2];
