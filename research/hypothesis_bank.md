@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-22T12:00:00Z
+last_updated: 2026-05-22T15:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
-wild_cards_run: 1
+wild_cards_run: 2
 exploitation_run: 5
-current_ratio: 0.167
+current_ratio: 0.286
 
 ## Active (ranked by score)
 
@@ -64,27 +64,32 @@ current_ratio: 0.167
     Budget impact: if at 1.5 we exceed the 2000ms budget, try with a higher max-
     time budget as a separate sub-experiment to separate budget from threshold effects.
 
-### hb-008 — NMS radius parameter sweep  [PRIORITY: 0.52]
+### hb-008 — NMS radius parameter sweep  [PRIORITY: 0.65, bumped 2026-05-22]
   mode: ft8
   status: pending
-  priority_score: 0.52
+  priority_score: 0.65
   estimated_effort: 1 session
-  expected_delta: +0.01 to +0.03 real decode rate on dense-band recordings
-  defensible_prior: yes
+  expected_delta: +0.01 (keep most of hb-019's win) at -30% wall-clock cost vs nms=off
+  defensible_prior: yes (hb-019 graduated showing full NMS-off is +0.0156; tightening should keep most of that)
   wild_card: false
   evidence_for:
-    - decoder.rs:69: NMS_TIME_RADIUS = 4 * TIME_OSR = 8 time steps; NMS_FREQ_RADIUS = 2 bins
-    - Non-maximum suppression with too-large a radius may merge distinct candidates from closely spaced signals (e.g., two QSOs 12.5 Hz apart — 2 bins)
-    - On a busy 40m or 20m FT8 band, signal density can exceed 1 signal per 25 Hz passband
-    - Tightening NMS_FREQ_RADIUS from 2 to 1 could separate candidates that are currently merged into one
+    - hb-019 (2026-05-22) confirmed NMS at the historical radii (time=8, freq=2) was suppressing +1973 real decodes across hard-200/hard-1000. Full disable lands as the production default.
+    - hb-019 wall-clock cost was +58% per 5-tier eval. Most of that comes from redundant candidates of strong signals competing in LDPC. A tighter NMS (e.g., time=2, freq=1) would still deduplicate strong-signal repeats while not merging distinct signals 25 Hz apart.
+    - On a busy 40m or 20m FT8 band, signal density can exceed 1 signal per 25 Hz passband.
   evidence_against:
-    - Too-small NMS radius → duplicate candidates for the same signal → wasted LDPC budget
-    - TIME_OSR=2 means NMS_TIME_RADIUS=8 corresponds to 4 symbols, which is already fairly tight
+    - Even with tighter radii, some real adjacent signals may still get merged. The radius sweep needs to identify the breakpoint between "duplicate-strong-signal merging" and "distinct-adjacent-signal merging."
+    - The right tradeoff (sensitivity vs wall-clock) is context-dependent: on the dev box, +58% is fine; on the operator's MiniPC under autonomous load it may not be.
   notes: |
-    Sweep NMS_FREQ_RADIUS in {1, 2, 3} and NMS_TIME_RADIUS in {4, 6, 8} time steps.
-    Focus on the curated-hard-200 tier which contains real busy-band recordings.
-    Measure candidate count per WAV vs decode count (if candidates spike without
-    decode improvement, NMS is too permissive).
+    With NMS_FREQ_RADIUS and NMS_TIME_RADIUS already promoted to Ft8Config
+    fields (or close to it — currently consts but the gate is now config-
+    driven), sweep:
+      NMS_FREQ_RADIUS ∈ {0 (=disable), 1, 2 (old default)}
+      NMS_TIME_RADIUS ∈ {0 (=disable), 2, 4, 8 (old default)}
+    on curated-hard-200. Production target: pick the (time, freq) pair
+    that recovers ≥90% of hb-019's +267 hard-200 decodes at ≤50% of the
+    +58% wall-clock cost. Verify on hard-1000 + fixtures + synth.
+    Plumb NMS_FREQ_RADIUS / NMS_TIME_RADIUS as Ft8Config fields first
+    (mirror the pattern from MAX_SYNC_CANDIDATES + max_sync_candidates).
 
 ### hb-009 — Block score ranking vs sync-only ranking  [PRIORITY: 0.50]
   mode: ft8
@@ -473,29 +478,6 @@ current_ratio: 0.167
     understand OSD-2's FP rate on the curated corpus. Do hb-005 first, use its
     learnings to decide whether OSD-3 is worth pursuing.
 
-### hb-019 — Wild-card: disable NMS entirely, rely on LDPC dedup  [PRIORITY: wild]
-  mode: ft8
-  status: pending
-  priority_score: 0.0
-  estimated_effort: 0.5 sessions
-  expected_delta: unknown; possibly +0.02 to -0.05 real decode rate
-  defensible_prior: no
-  wild_card: true
-  evidence_for:
-    - NMS is a heuristic for efficiency; LDPC + CRC provides the real validation
-    - If two candidates overlap in time-frequency space, NMS may suppress the weaker one even if it would decode to a different message (adjacent-frequency QSOs)
-    - Removing NMS lets all Costas peaks compete in LDPC — at the cost of more redundant decoding work
-  evidence_against:
-    - Without NMS, the same strong signal would generate O(radius²) redundant candidates — massive CPU waste
-    - Budget timer would almost certainly expire before processing all candidates
-    - Very likely a regression; purely exploratory
-  notes: |
-    Cheap experiment: set NMS_TIME_RADIUS = 0, NMS_FREQ_RADIUS = 0. Measure
-    candidate count explosion and whether any new unique decodes appear. If
-    candidate count triples with zero new decodes, NMS is vindicated. If even
-    one new decode appears that was being suppressed, redesign NMS with a smaller
-    radius rather than eliminating it.
-
 ### hb-032 — Remove or repurpose dead `aggressive_decoding` field  [PRIORITY: 0.40]
   mode: ft8
   status: pending
@@ -763,6 +745,40 @@ current_ratio: 0.167
   follow_up: hb-023
 
 ## Graduated (merged to main)
+
+### hb-019 — Wild-card: disable NMS  [GRADUATED 2026-05-22, biggest win since hb-023]
+  mode: ft8
+  status: graduated
+  priority_score: 0.0 (wild card)
+  wild_card: true
+  outcome: |
+    A/B test of NMS enabled vs disabled on hard-200, then full 5-tier
+    confirmation. The bank entry predicted "very likely a regression";
+    reality: +1973 recovered decodes (+13.7% relative on hard-1000,
+    +6.6% on hard-200). Production `Ft8Config::nms_enabled` flipped
+    `true → false`.
+  measured_delta: |
+    Full 5-tier at nms_enabled=false vs main:
+      hard-200:  rec 4070 → 4337 (+267, +6.6%), novel +162, rate +0.0311
+      hard-1000: rec 12447 → 14153 (+1706, +13.7%), novel +876, rate +0.0607
+      fixtures + synth-clean + wild-50: unchanged (zero FPs in guard tiers)
+      composite: 0.5373 → 0.5529 (+0.0156)
+      5-tier elapsed: 783s → 1237s (+58%, still well within 3s/WAV budget)
+  learning: |
+    Three insights:
+    1. The bank entry's prior was wrong. NMS radii (time=8, freq=2) were
+       too coarse for FT8's signal density — merging real signals 25 Hz
+       apart on busy bands. Conventional wisdom about NMS being a pure
+       efficiency optimization was wrong for this domain.
+    2. Wild-card audits can produce the biggest wins. The diminishing
+       returns trend across parameter-sweep cycles (hb-005/006 marginal)
+       was a sign to step outside the sweep frame, not optimize harder.
+    3. Fixtures + synth-clean as FP guard worked exactly as designed —
+       zero change on those tiers while the busy curated tiers gained
+       +1973 decodes is the cleanest signal the harness has produced.
+  follow_up: hb-008 (NMS radius sweep, priority bumped 0.52 → 0.65 — likely recovers most of the win at ~50% of the wall-clock cost).
+  scorecard: research/scorecards/history/2026-05-22-nms-disable-audit.json
+  journal: research/experiments/2026-05-22-nms-disable-audit.md
 
 ### hb-006 — LLR normalization target tuning  [GRADUATED 2026-05-22, marginal]
   mode: ft8

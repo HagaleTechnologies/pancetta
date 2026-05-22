@@ -143,6 +143,18 @@ pub struct Ft8Config {
     /// LLRs cause BP to converge too aggressively to wrong codewords;
     /// under-scaled LLRs slow convergence.
     pub llr_target_variance: f32,
+
+    /// Enable non-maximum suppression of nearby Costas sync candidates.
+    /// When true, candidates within NMS_TIME_RADIUS time steps and
+    /// NMS_FREQ_RADIUS frequency bins of a stronger candidate are
+    /// dropped before LDPC. Default disabled as of 2026-05-22 (hb-019
+    /// audit): the historical NMS radii (time=8, freq=2) were merging
+    /// real adjacent signals on busy bands at the cost of +1706 decodes
+    /// per hard-1000 corpus (+13.7%). Disabling raises wall-clock per
+    /// WAV by ~58% (still well within the 3000 ms budget). hb-008 (the
+    /// radius sweep) is the natural follow-up to recover wall-clock at
+    /// the cost of the simplicity of having NMS off.
+    pub nms_enabled: bool,
 }
 
 impl Default for Ft8Config {
@@ -161,6 +173,7 @@ impl Default for Ft8Config {
             osd_depth: Some(2),
             max_sync_candidates: MAX_SYNC_CANDIDATES,
             llr_target_variance: LLR_TARGET_VARIANCE,
+            nms_enabled: false,
         }
     }
 }
@@ -1118,8 +1131,11 @@ impl Ft8Decoder {
         });
         candidates.truncate(self.config.max_sync_candidates);
 
-        // Non-maximum suppression: remove weaker candidates near stronger ones
-        self.nms_candidates(&mut candidates);
+        // Non-maximum suppression: remove weaker candidates near stronger ones.
+        // Gated by config so hb-019-style audits can disable it.
+        if self.config.nms_enabled {
+            self.nms_candidates(&mut candidates);
+        }
 
         Ok(candidates)
     }

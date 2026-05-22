@@ -34,6 +34,7 @@ struct Args {
     osd_depth: Option<Option<u8>>,
     ldpc_iterations: Option<usize>,
     llr_target_variance: Option<f32>,
+    nms_enabled: Option<bool>,
 }
 
 impl Args {
@@ -48,6 +49,7 @@ impl Args {
         let mut osd_depth: Option<Option<u8>> = None;
         let mut ldpc_iterations: Option<usize> = None;
         let mut llr_target_variance: Option<f32> = None;
+        let mut nms_enabled: Option<bool> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -110,6 +112,9 @@ impl Args {
                             .parse()?,
                     );
                 }
+                "--no-nms" => {
+                    nms_enabled = Some(false);
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
@@ -122,7 +127,10 @@ impl Args {
                     );
                     eprintln!("  --osd-depth: override Ft8Config::osd_depth — N is 0..3 or 'none' to disable (default 2)");
                     eprintln!("  --ldpc-iters: override Ft8Config::ldpc_iterations (default 50)");
-                    eprintln!("  --llr-target-variance: override Ft8Config::llr_target_variance (default 24.0)");
+                    eprintln!("  --llr-target-variance: override Ft8Config::llr_target_variance (default 32.0)");
+                    eprintln!(
+                        "  --no-nms: disable non-maximum suppression of Costas sync candidates"
+                    );
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -139,6 +147,7 @@ impl Args {
             osd_depth,
             ldpc_iterations,
             llr_target_variance,
+            nms_enabled,
         })
     }
 }
@@ -480,6 +489,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(v) = args.llr_target_variance {
                 d = d.with_llr_target_variance(v);
+            }
+            if let Some(b) = args.nms_enabled {
+                d = d.with_nms_enabled(b);
             }
             Box::new(d)
         }

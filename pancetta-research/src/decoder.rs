@@ -101,6 +101,13 @@ impl Ft8Decoder {
         self.config.llr_target_variance = v;
         self
     }
+
+    /// Override `nms_enabled` on the wrapped config. hb-019 audit —
+    /// disable to let all Costas peaks compete in LDPC.
+    pub fn with_nms_enabled(mut self, enabled: bool) -> Self {
+        self.config.nms_enabled = enabled;
+        self
+    }
 }
 
 impl DecoderUnderTest for Ft8Decoder {
