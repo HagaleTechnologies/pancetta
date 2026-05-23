@@ -36,8 +36,12 @@ pub struct TuiRunner {
     app: Arc<RwLock<App>>,
     /// TUI configuration
     config: Config,
-    /// Terminal instance
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    /// Terminal instance. `None` only in unit tests built via
+    /// `new_for_test`, where constructing a `CrosstermBackend(stdout)`
+    /// on CI hits EAGAIN on the terminal-size ioctl. The render and
+    /// cleanup paths that touch `terminal` aren't exercised by the
+    /// key-event unit tests, so `Option` is the smallest seam.
+    terminal: Option<Terminal<CrosstermBackend<Stdout>>>,
     /// Message receiver from message bus
     message_rx: Receiver<TuiMessage>,
     /// Message sender to message bus
@@ -187,7 +191,7 @@ impl TuiRunner {
         Ok(Self {
             app,
             config,
-            terminal,
+            terminal: Some(terminal),
             message_rx,
             message_tx,
             shutdown,
@@ -197,10 +201,14 @@ impl TuiRunner {
         })
     }
 
-    /// Create a TUI runner for unit tests — bypasses `enable_raw_mode` so tests
-    /// can run headless (CI, tmux, or any environment without a real PTY).
-    /// The terminal is never rendered in key-event unit tests; it's only present
-    /// to satisfy the struct layout.
+    /// Create a TUI runner for unit tests — bypasses `enable_raw_mode`
+    /// AND skips terminal construction entirely. `Terminal::new`
+    /// internally queries the backend for its size, which on a
+    /// `CrosstermBackend(io::stdout())` does a tty ioctl. In a
+    /// headless CI runner that ioctl returns `EAGAIN`/
+    /// `Resource temporarily unavailable` and the constructor panics.
+    /// The key-event unit tests never render, so `terminal = None` is
+    /// fine — render-path callsites are gated by `if let Some(t)`.
     #[cfg(test)]
     fn new_for_test(
         app: Arc<RwLock<App>>,
@@ -209,15 +217,10 @@ impl TuiRunner {
         message_tx: Sender<TuiCommand>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self> {
-        // Skip enable_raw_mode / EnterAlternateScreen — CrosstermBackend and
-        // Terminal::new are safe to construct without a real PTY.
-        let stdout = io::stdout();
-        let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
         Ok(Self {
             app,
             config,
-            terminal,
+            terminal: None,
             message_rx,
             message_tx,
             shutdown,
@@ -618,7 +621,11 @@ impl TuiRunner {
     async fn render_frame(&mut self) -> Result<()> {
         let app = self.app.read().await;
 
-        self.terminal.draw(|f| {
+        let Some(terminal) = self.terminal.as_mut() else {
+            // Headless mode (unit tests) — nothing to render.
+            return Ok(());
+        };
+        terminal.draw(|f| {
             // Use the rich ui::draw for the full frame
             if let Err(e) = crate::ui::draw(f, &app) {
                 // Fallback: render a minimal error message
@@ -918,9 +925,13 @@ impl TuiRunner {
 
     /// Cleanup terminal on exit
     fn cleanup(&mut self) -> Result<()> {
+        let Some(terminal) = self.terminal.as_mut() else {
+            // Headless mode (unit tests) — nothing to clean up.
+            return Ok(());
+        };
         disable_raw_mode()?;
-        execute!(self.terminal.backend_mut(), LeaveAlternateScreen)?;
-        self.terminal.show_cursor()?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+        terminal.show_cursor()?;
 
         info!(
             "TUI metrics - Frames: {}, Messages: {}, Avg render: {:.2}ms, Dropped: {}",

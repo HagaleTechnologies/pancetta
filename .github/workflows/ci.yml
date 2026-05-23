@@ -147,7 +147,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        # windows-latest dropped 2026-05-23: MSVC can't compile the
+        # variable-length arrays in vendor/ft8_lib/ft8/decode.c
+        # (error C2057). The pancetta-ft8 build script invokes cc on
+        # the C sources, and MSVC is stricter than gcc/clang about
+        # VLA support (only allowed with /experimental:c11atomics, and
+        # even then not reliably). Patching upstream ft8_lib is out of
+        # scope; on-rig builds use the MinGW toolchain on the Windows
+        # MiniPC, not MSVC. Re-add windows-latest if the upstream
+        # ft8_lib drops VLAs.
+        os: [macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
