@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-23T20:30:00Z
+last_updated: 2026-05-23T21:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 3
-exploitation_run: 12
-current_ratio: 0.20
+exploitation_run: 13
+current_ratio: 0.188
 
 ## Active (ranked by score)
 
@@ -148,6 +148,35 @@ current_ratio: 0.20
     Prefer (i) first — self-contained, no external deps. (ii) follows
     if (i) is inconclusive. (iii) is a complementary FP-filter idea
     that could become its own production change.
+
+### hb-040 — Plumb (or remove) `Ft8Config::time_range`  [PRIORITY: 0.35]
+  mode: ft8
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 0.5-1 session
+  expected_delta: niche; recovers misaligned recordings (e.g., the 92/96 wild-50 truth decodes at dt < -1.4)
+  defensible_prior: yes (hb-025 audit confirmed time_range is dead code)
+  wild_card: false
+  evidence_for:
+    - hb-025 audit (2026-05-23): `Ft8Config::time_range` exists at decoder.rs:126 with default 2.0 but is unused anywhere in the decode pipeline. Spectrogram time_padding is hardcoded to 0.
+    - Setting time_range=3.0 had zero effect on wild-50 (still 0/96 recovered).
+    - The 92/96 wild-50 truth decodes have dt ∈ [-2.5, -1.4]; current decoder can't search those offsets because the audio buffer's t=0 is the slot's t=0.
+  evidence_against:
+    - Niche benefit: wild-50 outliers are misaligned recordings (corpus quirk, not on-air operational state).
+    - Plumbing requires audio-buffer padding + adjusting Costas search start position — non-trivial code touch.
+    - Alternative: remove the dead field (simpler, drops a misleading API knob).
+  notes: |
+    Two paths:
+    (a) **Plumb:** thread time_range through to Spectrogram::time_padding.
+        Pad audio buffer with leading silence corresponding to time_range
+        seconds. Costas search starts at t=-time_range instead of t=0.
+        Operational benefit: handles recordings that don't start exactly
+        on slot boundary (real on-air capture has jitter).
+    (b) **Remove:** delete the field + default. Smaller, cleaner. Same
+        pattern as hb-020 (`aggressive_decoding` is also dead and
+        spawned hb-032 for removal).
+    Prefer (a) if operational recording-alignment is a concern; (b)
+    otherwise.
 
 ### hb-036 — Score-relative NMS suppression  [PRIORITY: 0.40]
   mode: ft8
@@ -486,29 +515,6 @@ current_ratio: 0.20
     High-effort wild-card; only attempt after profiling confirms the spectrogram
     is a bottleneck.
 
-### hb-025 — Wild-50 zero-overlap investigation  [PRIORITY: 0.50]
-  mode: ft8
-  status: pending
-  priority_score: 0.50
-  estimated_effort: 1 session
-  expected_delta: diagnostic; may surface decoder bug or matching-logic bug
-  defensible_prior: yes (concrete anomaly in Plan 3 main.json)
-  wild_card: false
-  evidence_for:
-    - Plan 3 main.json: wild-50 tier processed 50 WAVs; jt9 found 96 truth decodes (concentrated in 2 outlier WAVs with 49+43 decodes); pancetta matched 0 of them while finding 3 novel decodes of its own
-    - Hard-200 + Hard-1000 don't show this zero-overlap pattern (~37-39% match)
-    - Either (a) those 2 outlier WAVs contain unusual content the decoder mishandles, (b) jt9's message formatting on those specific WAVs differs in a way that breaks our exact-trim-match logic, or (c) timing/sync edge case for those recordings
-  evidence_against:
-    - Random sampling artifact: 2 of 50 WAVs dominate; with more wild samples the effect may average out
-    - Low priority (decode_rate isn't a composite term for wild-50)
-  notes: |
-    Identify the 2 outlier WAVs by hash (per_wav_top_failures in main.json), decode
-    each manually with both pancetta and jt9, compare outputs line-by-line. Look
-    for: format differences (whitespace, casing, callsign hash representation),
-    timing skew (DT offset > 0.5s), unusual modulation. If the issue is matching
-    logic (formatting), fix in eval.rs's run_curated_tier match function — that
-    would lift the Hard-200/1000 numbers too.
-
 ### hb-026 — Wild-card: End-to-end neural decoder  [PRIORITY: wild]
   mode: ft8
   status: pending
@@ -581,6 +587,36 @@ current_ratio: 0.20
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
 ## Shelved (kept for reference)
+
+### hb-025 — Wild-50 zero-overlap investigation  [SHELVED 2026-05-23]
+  mode: ft8
+  status: shelved
+  priority_score: 0.50
+  outcome: |
+    The 2 outlier WAVs (92e31566..., 28f0ce9e...) accounting for 92
+    of the 96 wild-50 truth decodes are slot-misaligned recordings:
+    ALL their jt9 truth decodes are at dt ∈ [-2.5, -1.4]. Pancetta's
+    audio buffer starts at slot t=0; signals before t=0 are outside
+    the search window.
+
+    Secondary finding (more important): `Ft8Config::time_range` is
+    DEAD code. The field exists with default 2.0 but isn't threaded
+    through to the spectrogram's time_padding (hardcoded to 0).
+    Setting time_range=3.0 had zero effect.
+  measured_delta: 0 (production unchanged)
+  learning: |
+    wild-50's 0/96 score is a sampling artifact (2 of 50 WAVs draw
+    misaligned recordings), not a decoder limitation on the operational
+    on-air corpus. Hard-200/1000 don't show this pattern because
+    their curation explicitly filters for pancetta-decodable content.
+
+    The dead `time_range` field is the bigger maintainability finding
+    — same surface-vs-actual gap as hb-020's `aggressive_decoding`.
+    Spawned hb-040 to either plumb it through (so misaligned
+    recordings can be handled) or remove it (cleanup).
+  follow_up: hb-040 (plumb or remove time_range field).
+  scorecards: research/scorecards/sweep/wild50-tr-3.0.json
+  journal: research/experiments/2026-05-23-wild-50-zero-overlap.md
 
 ### hb-009 — Block-score ranking vs sync-only ranking  [SHELVED 2026-05-23]
   mode: ft8

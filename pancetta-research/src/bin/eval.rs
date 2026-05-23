@@ -39,7 +39,7 @@ struct Args {
     nms_freq_radius: Option<usize>,
     min_sync_score: Option<f64>,
     adaptive_ldpc_iters: Option<bool>,
-    block_score_rerank: Option<bool>,
+    time_range: Option<f64>,
 }
 
 impl Args {
@@ -59,7 +59,7 @@ impl Args {
         let mut nms_freq_radius: Option<usize> = None;
         let mut min_sync_score: Option<f64> = None;
         let mut adaptive_ldpc_iters: Option<bool> = None;
-        let mut block_score_rerank: Option<bool> = None;
+        let mut time_range: Option<f64> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -156,8 +156,8 @@ impl Args {
                 "--adaptive-ldpc-iters" => {
                     adaptive_ldpc_iters = Some(true);
                 }
-                "--no-block-score-rerank" => {
-                    block_score_rerank = Some(false);
+                "--time-range" => {
+                    time_range = Some(iter.next().context("--time-range needs a value")?.parse()?);
                 }
                 "-h" | "--help" => {
                     eprintln!(
@@ -203,7 +203,7 @@ impl Args {
             nms_freq_radius,
             min_sync_score,
             adaptive_ldpc_iters,
-            block_score_rerank,
+            time_range,
         })
     }
 }
@@ -561,8 +561,8 @@ fn main() -> anyhow::Result<()> {
             if let Some(on) = args.adaptive_ldpc_iters {
                 d = d.with_adaptive_ldpc_iters(on);
             }
-            if let Some(on) = args.block_score_rerank {
-                d = d.with_block_score_rerank(on);
+            if let Some(v) = args.time_range {
+                d = d.with_time_range(v);
             }
             Box::new(d)
         }

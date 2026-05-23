@@ -133,9 +133,9 @@ impl Ft8Decoder {
         self
     }
 
-    /// Toggle block-score re-ranking after sync search. hb-009.
-    pub fn with_block_score_rerank(mut self, on: bool) -> Self {
-        self.config.block_score_rerank = on;
+    /// Override `time_range` (seconds of ± slot-time search). hb-025 audit.
+    pub fn with_time_range(mut self, v: f64) -> Self {
+        self.config.time_range = v;
         self
     }
 }
