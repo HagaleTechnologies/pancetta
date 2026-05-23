@@ -132,6 +132,12 @@ impl Ft8Decoder {
         self.config.adaptive_ldpc_iters = on;
         self
     }
+
+    /// Toggle block-score re-ranking after sync search. hb-009.
+    pub fn with_block_score_rerank(mut self, on: bool) -> Self {
+        self.config.block_score_rerank = on;
+        self
+    }
 }
 
 impl DecoderUnderTest for Ft8Decoder {

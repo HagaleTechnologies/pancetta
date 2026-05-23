@@ -39,6 +39,7 @@ struct Args {
     nms_freq_radius: Option<usize>,
     min_sync_score: Option<f64>,
     adaptive_ldpc_iters: Option<bool>,
+    block_score_rerank: Option<bool>,
 }
 
 impl Args {
@@ -58,6 +59,7 @@ impl Args {
         let mut nms_freq_radius: Option<usize> = None;
         let mut min_sync_score: Option<f64> = None;
         let mut adaptive_ldpc_iters: Option<bool> = None;
+        let mut block_score_rerank: Option<bool> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -154,6 +156,9 @@ impl Args {
                 "--adaptive-ldpc-iters" => {
                     adaptive_ldpc_iters = Some(true);
                 }
+                "--no-block-score-rerank" => {
+                    block_score_rerank = Some(false);
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
@@ -198,6 +203,7 @@ impl Args {
             nms_freq_radius,
             min_sync_score,
             adaptive_ldpc_iters,
+            block_score_rerank,
         })
     }
 }
@@ -554,6 +560,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(on) = args.adaptive_ldpc_iters {
                 d = d.with_adaptive_ldpc_iters(on);
+            }
+            if let Some(on) = args.block_score_rerank {
+                d = d.with_block_score_rerank(on);
             }
             Box::new(d)
         }

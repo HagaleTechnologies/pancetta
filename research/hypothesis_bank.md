@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-23T20:00:00Z
+last_updated: 2026-05-23T20:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 3
-exploitation_run: 11
-current_ratio: 0.214
+exploitation_run: 12
+current_ratio: 0.20
 
 ## Active (ranked by score)
 
@@ -41,29 +41,6 @@ current_ratio: 0.214
         slot — more representative but more elaborate plumbing).
 
     Either path is hb-004's prerequisite. Then the gate sweep follows.
-
-### hb-009 — Block score ranking vs sync-only ranking  [PRIORITY: 0.50]
-  mode: ft8
-  status: pending
-  priority_score: 0.50
-  estimated_effort: 1 session
-  expected_delta: +0.01 to +0.03 real decode rate; possibly more on doppler tier
-  defensible_prior: partial
-  wild_card: false
-  evidence_for:
-    - decoder.rs:388-398: Re-ranks by block_score after sync search. Block score is likely a combined metric (not just Costas peak). The ranking determines which candidates get LDPC budget first.
-    - If budget expires (budget.expired() check at line 368), lower-ranked candidates are skipped. Better ranking of "most likely to yield a real decode" candidates would maximize decodes-per-budget-dollar.
-    - Alternative ranking strategies: confidence score from AP, correlation energy (already computed in subtract path), estimated SNR from spectrogram power
-  evidence_against:
-    - Block score was deliberately added as an improvement over sync-only; the marginal gain from further refinement may be small
-    - Need to read the full block_score implementation to understand what it already captures
-  notes: |
-    Read block_score implementation fully. Hypothesis: block score doesn't yet
-    incorporate the estimated signal amplitude (correlation_energy function at
-    decoder.rs:619). Adding correlation energy as a weighting factor in candidate
-    ranking could prioritize the strongest signals for LDPC first, improving
-    decodes-per-budget on time-limited runs. Prototype: add a correlation_energy
-    pass over the top-50 candidates, re-rank, measure.
 
 ### hb-010 — Spectrogram window function sweep  [PRIORITY: 0.47]
   mode: ft8
@@ -604,6 +581,32 @@ current_ratio: 0.214
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
 ## Shelved (kept for reference)
+
+### hb-009 — Block-score ranking vs sync-only ranking  [SHELVED 2026-05-23]
+  mode: ft8
+  status: shelved
+  priority_score: 0.50
+  outcome: |
+    Hard-200 A/B with `block_score_rerank ∈ {true, false}`:
+    BIT-IDENTICAL decode counts (rec=4365, novel=1210). Ranking
+    affects only completion order under rayon's parallel iteration,
+    which doesn't affect WHICH decodes succeed because all 300
+    candidates get tried (no biting decode cap at production scale).
+  measured_delta: 0 (production unchanged)
+  learning: |
+    Ranking knobs are pointless when the consumer is parallel +
+    unfiltered. The hb-009 hypothesis pre-dated the parallel decode
+    path; under serial decoding with a hard cap, ranking would
+    matter. Under rayon with no biting cap, it doesn't. Future
+    "ordering matters" hypotheses should first verify a binding
+    consumer cap.
+
+    Block_score computation isn't wasted — it runs but the re-rank
+    is a no-op. Removing the sort would save a tiny amount of CPU
+    per WAV (timing A/B was within 5% noise).
+  follow_up: revisit only if hb-037 restores multi-pass with a biting decode budget.
+  scorecards: research/scorecards/sweep/hard200-blockscore-{on,off}.json
+  journal: research/experiments/2026-05-23-block-score-ranking.md
 
 ### hb-024 — Cross-validate novel decodes  [SHELVED 2026-05-23, strong diagnostic finding]
   mode: ft8

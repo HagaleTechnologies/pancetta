@@ -190,6 +190,14 @@ pub struct Ft8Config {
     /// `ldpc_iterations`, low (<4) → more iters. Default false —
     /// uniform `ldpc_iterations` for all candidates.
     pub adaptive_ldpc_iters: bool,
+
+    /// Re-rank candidates by `block_score` after sync search +
+    /// truncation, before LDPC. Default true (historical behavior).
+    /// hb-009 A/B-tests this — with parallel decoding, candidate
+    /// order shouldn't change which decodes succeed, only the order
+    /// they finish; if A/B is bit-identical, this knob can be
+    /// retired.
+    pub block_score_rerank: bool,
 }
 
 impl Default for Ft8Config {
@@ -213,6 +221,7 @@ impl Default for Ft8Config {
             nms_freq_radius: NMS_FREQ_RADIUS,
             min_sync_score: MIN_SYNC_SCORE,
             adaptive_ldpc_iters: false,
+            block_score_rerank: true,
         }
     }
 }
@@ -469,17 +478,22 @@ impl Ft8Decoder {
                 sync_candidates.truncate(40);
             }
 
-            // Re-rank candidates by block score (better than sync-only ranking)
-            let mut scored: Vec<(f64, CostasCandidate)> = sync_candidates
-                .into_iter()
-                .map(|c| {
-                    let bs = self.block_score(&spectrogram, &c);
-                    (bs, c)
-                })
-                .collect();
-            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-            let sync_candidates: Vec<CostasCandidate> =
-                scored.into_iter().map(|(_, c)| c).collect();
+            // Re-rank candidates by block score (better than sync-only
+            // ranking). hb-009 gates this so the A/B test can compare
+            // sync-only ordering vs block-score ordering.
+            let sync_candidates: Vec<CostasCandidate> = if self.config.block_score_rerank {
+                let mut scored: Vec<(f64, CostasCandidate)> = sync_candidates
+                    .into_iter()
+                    .map(|c| {
+                        let bs = self.block_score(&spectrogram, &c);
+                        (bs, c)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                scored.into_iter().map(|(_, c)| c).collect()
+            } else {
+                sync_candidates
+            };
 
             {
                 let pass_best = sync_candidates.first().map(|c| c.sync_score).unwrap_or(0.0);
