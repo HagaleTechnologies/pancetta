@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-23T22:00:00Z
+last_updated: 2026-05-23T23:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 3
-exploitation_run: 14
-current_ratio: 0.176
+exploitation_run: 15
+current_ratio: 0.167
 
 ## Active (ranked by score)
 
@@ -251,33 +251,6 @@ current_ratio: 0.176
     Plot decode-success rate vs candidate rank. If the rate drops
     cliff-like at rank ~200, NMS is the culprit (sync scores converge);
     if it drops gradually, LDPC convergence is.
-
-### hb-029 — Exact-format Display tests for every message subtype  [PRIORITY: 0.45]
-  mode: ft8
-  status: pending
-  priority_score: 0.45
-  estimated_effort: 1 session
-  expected_delta: diagnostic; surfaces hidden text-format bugs (precedent: hb-023 found ~1900 phantom-novel decodes that were format-mismatched true positives)
-  defensible_prior: yes (concrete bug class identified during hb-023)
-  wild_card: false
-  evidence_for:
-    - hb-023 found that the ReportWithR Display impl produced "R -12" (with space) instead of the canonical "R-12". Until fixed, ~1900 decodes per eval run were silently mis-classified as "novel" on the curated tiers — they were correct decodes that the text-match comparator couldn't see.
-    - No existing test asserts the EXACT formatted text of any standard / i3=0 / contest message subtype — current tests only check `.contains()` on callsign/grid fragments.
-    - The ReplyWithR path (message.rs:195-205) writes `" R"` then `" {grid}"` → `"K1ABC W9XYZ R FN42"`, which is correct per ft8_lib reference, but only happens to be correct — no test guards it.
-    - EU-VHF i3=0 type 0/2 and DXpedition i3=0 type 1 paths each have their own Display formatting code that's never asserted against ft8_lib reference output.
-  evidence_against:
-    - "Exact" format may be over-constrained if WSJT-X output varies (e.g., width/padding differences for boundary cases).
-    - Time spent on tests with no current bug evidence is speculative.
-  notes: |
-    For each StandardMessageType variant (Cq, Reply, ReplyWithR, Report,
-    ReportWithR, Rrr, Final73, RR73) and each i3=0 subtype, add a unit
-    test that builds a synthetic Ft8Message with known fields and
-    asserts `.to_string()` exactly equals the WSJT-X / ft8_lib reference
-    output. Cross-check against `vendor/ft8_lib/ft8/message.c` output
-    for at least one case per subtype.
-    Sub-experiment: add a property-test (proptest) that round-trips
-    `encode(text) → decode → format == text` over a generated message
-    grammar. Would have caught hb-023 automatically.
 
 ### hb-012 — Negative time offset extension (early-arriving DX signals)  [PRIORITY: 0.44]
   mode: ft8
@@ -909,6 +882,27 @@ current_ratio: 0.176
   follow_up: hb-023
 
 ## Graduated (merged to main)
+
+### hb-029 — Exact-format Display tests  [GRADUATED 2026-05-23, regression net]
+  mode: ft8
+  status: graduated
+  priority_score: 0.45
+  outcome: |
+    Added 9 new `assert_eq!`-based unit tests in pancetta-ft8/src/message.rs
+    asserting the exact `to_string()` output for every StandardMessageType
+    variant (Cq, CQ-DX, Reply, ReplyWithR, Report ±, Rrr, Final73, RR73).
+    Plus the 2 ReportWithR tests from hb-023, that's 11 total covering
+    all 8 variants. Lib test count: 180 → 189; all pass.
+  measured_delta: 0 (test-only; no production behavior change)
+  learning: |
+    `.contains()`-based tests catch "is something there" bugs; only
+    `assert_eq!` catches "is it formatted correctly" bugs (the
+    hb-023 class). ReplyWithR's "R EM48" (with space) vs ReportWithR's
+    "R-12" (no space) is exactly the kind of two-conventions-in-one-
+    enum confusion this guards against.
+  follow_up: i3=0 / DXpedition / contest message format tests if those paths become operationally important.
+  scorecard: (n/a — test-only)
+  journal: research/experiments/2026-05-23-exact-format-display-tests.md
 
 ### hb-038 — Re-sweep max_sync_candidates at nms-off  [GRADUATED 2026-05-23]
   mode: ft8

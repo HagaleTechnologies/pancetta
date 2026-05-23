@@ -2199,6 +2199,110 @@ mod tests {
         assert!(display.contains("FN42"));
     }
 
+    // ----- hb-029: exact-format Display assertions for every
+    // StandardMessageType variant. These guard against regressions of the
+    // hb-023 type (where ReportWithR was emitting "R -12" with a stray
+    // space). Each test builds a minimal Ft8Message for the variant and
+    // asserts `to_string()` exactly equals the WSJT-X / ft8_lib reference
+    // format.
+
+    #[test]
+    fn test_cq_exact_format() {
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::Cq);
+        m.from_callsign = Some("W1ABC".to_string());
+        m.grid_square = Some("FN42".to_string());
+        assert_eq!(m.to_string(), "CQ W1ABC FN42");
+    }
+
+    #[test]
+    fn test_cq_with_modifier_exact_format() {
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::Cq);
+        m.special_operation = Some("DX".to_string());
+        m.from_callsign = Some("W1ABC".to_string());
+        m.grid_square = Some("FN42".to_string());
+        assert_eq!(m.to_string(), "CQ DX W1ABC FN42");
+    }
+
+    #[test]
+    fn test_reply_exact_format() {
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::Reply);
+        m.to_callsign = Some("K1ABC".to_string());
+        m.from_callsign = Some("W9XYZ".to_string());
+        m.grid_square = Some("EM48".to_string());
+        assert_eq!(m.to_string(), "K1ABC W9XYZ EM48");
+    }
+
+    #[test]
+    fn test_reply_with_r_exact_format() {
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::ReplyWithR);
+        m.to_callsign = Some("K1ABC".to_string());
+        m.from_callsign = Some("W9XYZ".to_string());
+        m.grid_square = Some("EM48".to_string());
+        // ft8_lib unpackgrid (vendor/ft8_lib/ft8/message.c:1104) writes
+        // "R " (with trailing space) before the grid in the ir=1 case.
+        assert_eq!(m.to_string(), "K1ABC W9XYZ R EM48");
+    }
+
+    #[test]
+    fn test_report_negative_exact_format() {
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::Report);
+        m.to_callsign = Some("K1ABC".to_string());
+        m.from_callsign = Some("W9XYZ".to_string());
+        m.signal_report = Some(-10);
+        assert_eq!(m.to_string(), "K1ABC W9XYZ -10");
+    }
+
+    #[test]
+    fn test_report_positive_exact_format() {
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::Report);
+        m.to_callsign = Some("K1ABC".to_string());
+        m.from_callsign = Some("W9XYZ".to_string());
+        m.signal_report = Some(5);
+        assert_eq!(m.to_string(), "K1ABC W9XYZ +05");
+    }
+
+    #[test]
+    fn test_rrr_exact_format() {
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::Rrr);
+        m.to_callsign = Some("K1ABC".to_string());
+        m.from_callsign = Some("W9XYZ".to_string());
+        assert_eq!(m.to_string(), "K1ABC W9XYZ RRR");
+    }
+
+    #[test]
+    fn test_final73_exact_format() {
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::Final73);
+        m.to_callsign = Some("K1ABC".to_string());
+        m.from_callsign = Some("W9XYZ".to_string());
+        assert_eq!(m.to_string(), "K1ABC W9XYZ 73");
+    }
+
+    #[test]
+    fn test_rr73_exact_format() {
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::Standard;
+        m.standard_type = Some(StandardMessageType::RR73);
+        m.to_callsign = Some("K1ABC".to_string());
+        m.from_callsign = Some("W9XYZ".to_string());
+        assert_eq!(m.to_string(), "K1ABC W9XYZ RR73");
+    }
+
     #[test]
     fn test_report_with_r_display_no_space_before_report() {
         // hb-023: WSJT-X / ft8_lib format the Roger+report response as
