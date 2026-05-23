@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-22T15:00:00Z
+last_updated: 2026-05-22T17:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 2
-exploitation_run: 5
-current_ratio: 0.286
+exploitation_run: 6
+current_ratio: 0.25
 
 ## Active (ranked by score)
 
@@ -63,33 +63,6 @@ current_ratio: 0.286
     found vs new false positives per step, and wall-clock time vs decode count.
     Budget impact: if at 1.5 we exceed the 2000ms budget, try with a higher max-
     time budget as a separate sub-experiment to separate budget from threshold effects.
-
-### hb-008 — NMS radius parameter sweep  [PRIORITY: 0.65, bumped 2026-05-22]
-  mode: ft8
-  status: pending
-  priority_score: 0.65
-  estimated_effort: 1 session
-  expected_delta: +0.01 (keep most of hb-019's win) at -30% wall-clock cost vs nms=off
-  defensible_prior: yes (hb-019 graduated showing full NMS-off is +0.0156; tightening should keep most of that)
-  wild_card: false
-  evidence_for:
-    - hb-019 (2026-05-22) confirmed NMS at the historical radii (time=8, freq=2) was suppressing +1973 real decodes across hard-200/hard-1000. Full disable lands as the production default.
-    - hb-019 wall-clock cost was +58% per 5-tier eval. Most of that comes from redundant candidates of strong signals competing in LDPC. A tighter NMS (e.g., time=2, freq=1) would still deduplicate strong-signal repeats while not merging distinct signals 25 Hz apart.
-    - On a busy 40m or 20m FT8 band, signal density can exceed 1 signal per 25 Hz passband.
-  evidence_against:
-    - Even with tighter radii, some real adjacent signals may still get merged. The radius sweep needs to identify the breakpoint between "duplicate-strong-signal merging" and "distinct-adjacent-signal merging."
-    - The right tradeoff (sensitivity vs wall-clock) is context-dependent: on the dev box, +58% is fine; on the operator's MiniPC under autonomous load it may not be.
-  notes: |
-    With NMS_FREQ_RADIUS and NMS_TIME_RADIUS already promoted to Ft8Config
-    fields (or close to it — currently consts but the gate is now config-
-    driven), sweep:
-      NMS_FREQ_RADIUS ∈ {0 (=disable), 1, 2 (old default)}
-      NMS_TIME_RADIUS ∈ {0 (=disable), 2, 4, 8 (old default)}
-    on curated-hard-200. Production target: pick the (time, freq) pair
-    that recovers ≥90% of hb-019's +267 hard-200 decodes at ≤50% of the
-    +58% wall-clock cost. Verify on hard-1000 + fixtures + synth.
-    Plumb NMS_FREQ_RADIUS / NMS_TIME_RADIUS as Ft8Config fields first
-    (mirror the pattern from MAX_SYNC_CANDIDATES + max_sync_candidates).
 
 ### hb-009 — Block score ranking vs sync-only ranking  [PRIORITY: 0.50]
   mode: ft8
@@ -213,6 +186,28 @@ current_ratio: 0.286
     (5+) for offline batch reprocessing.
     Synergizes with hb-020 (aggressive_decoding audit): if that flag turns
     out to do nothing, this is what it should do.
+
+### hb-036 — Score-relative NMS suppression  [PRIORITY: 0.40]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 1-2 sessions
+  expected_delta: keep hb-019's win at lower wall-clock cost; partial recovery of the +58% NMS-off CPU penalty
+  defensible_prior: yes (hb-008 sweep showed pure TF-distance NMS can't recover the cost; a smarter suppression criterion might)
+  wild_card: false
+  evidence_for:
+    - hb-008 sweep (2026-05-22) confirmed pure TF-distance NMS at any non-trivial radius loses 239+ decodes vs nms-off on hard-200.
+    - The current algorithm conflates "duplicate-of-strong-signal" (same TF cell, near-identical sync_score) with "distinct-weaker-signal" (same TF cell, very different sync_score). The former is what NMS should suppress; the latter is what it should keep.
+    - A score-relative suppression rule (suppress only if within TF radius AND sync_score ≤ stronger_neighbor.sync_score - N dB) would discriminate.
+  evidence_against:
+    - "Score within N dB" needs the right N. Too tight = no suppression (back to nms-off cost); too loose = same problem as TF-distance NMS.
+    - Sync score isn't strictly proportional to SNR — it's a Costas correlation, which has its own noise distribution.
+  notes: |
+    Implement nms_candidates() with a new condition: keep candidate j if
+    (dt > nms_time_radius || df > nms_freq_radius || j.sync_score >
+    i.sync_score - score_delta_db). Sweep score_delta_db ∈ {1.0, 2.0,
+    3.0, 5.0} with reasonable TF radii (t=2, f=1). Goal: composite ≥
+    nms-off's 0.5529 with wall-clock 30-50% better than nms-off.
 
 ### hb-034 — Audit OSD-3's +313 unconfirmed novel decodes  [PRIORITY: 0.40]
   mode: ft8
@@ -669,6 +664,41 @@ current_ratio: 0.286
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
 ## Shelved (kept for reference)
+
+### hb-008 — NMS radius parameter sweep  [SHELVED 2026-05-22]
+  mode: ft8
+  status: shelved
+  priority_score: 0.65
+  outcome: |
+    Sweep of (nms_time_radius, nms_freq_radius) ∈ {(0,0), (1,0),
+    (2,1), (2,2), (4,1), (4,2), (8,2)=historical} on hard-200 with
+    NMS re-enabled. Conclusion: pure TF-distance NMS at ANY non-trivial
+    radius loses 239+ decodes vs nms-off. The hypothesis that tighter
+    radii could recover most of hb-019's gain at lower wall-clock cost
+    was wrong.
+  measured_delta: 0 — production unchanged; nms_enabled=false stays
+  learning: |
+    Three findings:
+    1. NMS based purely on TF-distance is fundamentally too coarse for
+       FT8 signal density. Real distinct stations frequently share TF
+       cells (time-sharing a freq, or close enough that Costas peaks
+       overlap). TF-distance can't distinguish "duplicate of strong"
+       from "distinct weaker."
+    2. t=0 f=0 ≈ nms-off in decode count but is 27% SLOWER (211s vs
+       166s) — O(n²) NMS loop overhead even when its body becomes a
+       no-op. Skipping the function entirely (nms_enabled=false) is the
+       right way to disable.
+    3. The sensitivity-vs-wall-clock tradeoff is decided: nms-off costs
+       +58% wall-clock for +1973 decodes (hb-019). The radius sweep
+       can save ~15-20% wall-clock at the cost of 240+ decodes — a
+       bad trade.
+
+    Infrastructure (`nms_time_radius`, `nms_freq_radius` Ft8Config
+    fields + CLI flags) lands as reusable for hb-036 (score-relative
+    NMS redesign).
+  follow_up: hb-036 (score-relative NMS suppression — discriminate duplicate-of-strong from distinct-weaker via sync_score comparison).
+  scorecards: research/scorecards/sweep/hard200-nms-* (8 sweep settings)
+  journal: research/experiments/2026-05-22-nms-radius-sweep.md
 
 ### hb-001 — Multi-pass subtract-and-redecode  [SHELVED 2026-05-21]
   mode: ft8

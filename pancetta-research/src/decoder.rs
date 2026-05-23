@@ -108,6 +108,18 @@ impl Ft8Decoder {
         self.config.nms_enabled = enabled;
         self
     }
+
+    /// Override `nms_time_radius` on the wrapped config. hb-008 sweep.
+    pub fn with_nms_time_radius(mut self, n: usize) -> Self {
+        self.config.nms_time_radius = n;
+        self
+    }
+
+    /// Override `nms_freq_radius` on the wrapped config. hb-008 sweep.
+    pub fn with_nms_freq_radius(mut self, n: usize) -> Self {
+        self.config.nms_freq_radius = n;
+        self
+    }
 }
 
 impl DecoderUnderTest for Ft8Decoder {

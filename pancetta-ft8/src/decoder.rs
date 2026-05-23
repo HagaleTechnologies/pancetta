@@ -145,16 +145,27 @@ pub struct Ft8Config {
     pub llr_target_variance: f32,
 
     /// Enable non-maximum suppression of nearby Costas sync candidates.
-    /// When true, candidates within NMS_TIME_RADIUS time steps and
-    /// NMS_FREQ_RADIUS frequency bins of a stronger candidate are
+    /// When true, candidates within `nms_time_radius` time steps and
+    /// `nms_freq_radius` frequency bins of a stronger candidate are
     /// dropped before LDPC. Default disabled as of 2026-05-22 (hb-019
     /// audit): the historical NMS radii (time=8, freq=2) were merging
     /// real adjacent signals on busy bands at the cost of +1706 decodes
     /// per hard-1000 corpus (+13.7%). Disabling raises wall-clock per
-    /// WAV by ~58% (still well within the 3000 ms budget). hb-008 (the
-    /// radius sweep) is the natural follow-up to recover wall-clock at
-    /// the cost of the simplicity of having NMS off.
+    /// WAV by ~58% (still well within the 3000 ms budget).
     pub nms_enabled: bool,
+
+    /// Time radius (in spectrogram time steps) for NMS suppression. Only
+    /// used when `nms_enabled = true`. Default value reflects the
+    /// historical `NMS_TIME_RADIUS = 4 * TIME_OSR = 8`. hb-008 sweep
+    /// (TBD) may tune this to recover the hb-019 wall-clock cost.
+    pub nms_time_radius: usize,
+
+    /// Frequency radius (in spectrogram bins) for NMS suppression. Only
+    /// used when `nms_enabled = true`. Default value reflects the
+    /// historical `NMS_FREQ_RADIUS = 2`. Per hb-019 finding, freq=2
+    /// (= 25 Hz at 12.5 Hz/bin) is too coarse for busy FT8 bands —
+    /// merges distinct signals 25 Hz apart. hb-008 sweep candidate.
+    pub nms_freq_radius: usize,
 }
 
 impl Default for Ft8Config {
@@ -174,6 +185,8 @@ impl Default for Ft8Config {
             max_sync_candidates: MAX_SYNC_CANDIDATES,
             llr_target_variance: LLR_TARGET_VARIANCE,
             nms_enabled: false,
+            nms_time_radius: NMS_TIME_RADIUS,
+            nms_freq_radius: NMS_FREQ_RADIUS,
         }
     }
 }
@@ -1252,7 +1265,7 @@ impl Ft8Decoder {
                 let df = (candidates[i].freq_bin as isize - candidates[j].freq_bin as isize)
                     .unsigned_abs();
 
-                if dt <= NMS_TIME_RADIUS && df <= NMS_FREQ_RADIUS {
+                if dt <= self.config.nms_time_radius && df <= self.config.nms_freq_radius {
                     keep[j] = false; // suppress the weaker candidate
                 }
             }

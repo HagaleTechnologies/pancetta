@@ -35,6 +35,8 @@ struct Args {
     ldpc_iterations: Option<usize>,
     llr_target_variance: Option<f32>,
     nms_enabled: Option<bool>,
+    nms_time_radius: Option<usize>,
+    nms_freq_radius: Option<usize>,
 }
 
 impl Args {
@@ -50,6 +52,8 @@ impl Args {
         let mut ldpc_iterations: Option<usize> = None;
         let mut llr_target_variance: Option<f32> = None;
         let mut nms_enabled: Option<bool> = None;
+        let mut nms_time_radius: Option<usize> = None;
+        let mut nms_freq_radius: Option<usize> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -115,6 +119,27 @@ impl Args {
                 "--no-nms" => {
                     nms_enabled = Some(false);
                 }
+                "--nms-on" => {
+                    nms_enabled = Some(true);
+                }
+                "--nms-time-radius" => {
+                    nms_time_radius = Some(
+                        iter.next()
+                            .context("--nms-time-radius needs a value")?
+                            .parse()?,
+                    );
+                    // Setting a radius implicitly opts back into NMS
+                    // unless --no-nms is also passed; respect explicit flag.
+                    nms_enabled.get_or_insert(true);
+                }
+                "--nms-freq-radius" => {
+                    nms_freq_radius = Some(
+                        iter.next()
+                            .context("--nms-freq-radius needs a value")?
+                            .parse()?,
+                    );
+                    nms_enabled.get_or_insert(true);
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
@@ -131,6 +156,9 @@ impl Args {
                     eprintln!(
                         "  --no-nms: disable non-maximum suppression of Costas sync candidates"
                     );
+                    eprintln!("  --nms-on: explicitly re-enable NMS (production default is off)");
+                    eprintln!("  --nms-time-radius N: override Ft8Config::nms_time_radius (default 8); implies --nms-on");
+                    eprintln!("  --nms-freq-radius N: override Ft8Config::nms_freq_radius (default 2); implies --nms-on");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -148,6 +176,8 @@ impl Args {
             ldpc_iterations,
             llr_target_variance,
             nms_enabled,
+            nms_time_radius,
+            nms_freq_radius,
         })
     }
 }
@@ -492,6 +522,12 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(b) = args.nms_enabled {
                 d = d.with_nms_enabled(b);
+            }
+            if let Some(n) = args.nms_time_radius {
+                d = d.with_nms_time_radius(n);
+            }
+            if let Some(n) = args.nms_freq_radius {
+                d = d.with_nms_freq_radius(n);
             }
             Box::new(d)
         }
