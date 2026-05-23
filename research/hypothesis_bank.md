@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-23T17:00:00Z
+last_updated: 2026-05-23T19:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 3
-exploitation_run: 9
-current_ratio: 0.25
+exploitation_run: 10
+current_ratio: 0.231
 
 ## Active (ranked by score)
 
@@ -164,6 +164,36 @@ current_ratio: 0.25
     improvement is wanted. (b) is incremental work on a known-broken
     approach — least appealing.
 
+
+### hb-039 — Resolve the 856 "isolated" novels (hb-024 follow-up)  [PRIORITY: 0.45]
+  mode: ft8
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 1 session
+  expected_delta: precision-side recalibration; tightens the FP-rate bound
+  defensible_prior: yes (hb-024 probe identified the 856 isolated novels as the only ambiguous bucket)
+  wild_card: false
+  evidence_for:
+    - hb-024 (2026-05-23) probe: 1572 / 2433 novels (64.6%) are demonstrably real via callsign continuity. The remaining 856 (35.2%) have callsigns NEVER seen in 1121 jt9 baselines — ambiguous: rare-DX OR FP.
+    - Distinguishing these directly tightens the precision bound. Currently worst-case "100% FPs on isolated" gives ~87% precision; if 30% of isolated are real, precision climbs to ~91%.
+  evidence_against:
+    - Three candidate methods, each with tradeoffs (see notes).
+  notes: |
+    Three approaches:
+    (i) **Self-consistency:** do the same "isolated" callsigns appear
+        in MULTIPLE pancetta-novel decodes? If yes, the callsign is
+        consistent across pancetta runs → likely real but jt9-missed.
+        If each isolated callsign appears exactly once across pancetta,
+        FP-suspicion goes up.
+    (ii) **HamQTH/QRZ external lookup:** if the callsign isn't a
+        registered ham, almost certainly FP. Internet + rate-limited
+        API; doable in batches.
+    (iii) **Decode-SNR + DT plausibility:** real signals have
+        plausible SNR (-22 to +10 dB) and DT (within ±2s of slot).
+        LDPC+CRC FPs often produce weird combos. Filter and see.
+    Prefer (i) first — self-contained, no external deps. (ii) follows
+    if (i) is inconclusive. (iii) is a complementary FP-filter idea
+    that could become its own production change.
 
 ### hb-036 — Score-relative NMS suppression  [PRIORITY: 0.40]
   mode: ft8
@@ -502,29 +532,6 @@ current_ratio: 0.25
     High-effort wild-card; only attempt after profiling confirms the spectrogram
     is a bottleneck.
 
-### hb-024 — Cross-validate novel decodes against JTDX + QSO patterns  [PRIORITY: 0.55]
-  mode: ft8
-  status: pending
-  priority_score: 0.55
-  estimated_effort: 1-2 sessions
-  expected_delta: diagnostic; informs whether vs_wsjtx_pct understates or overstates true performance
-  defensible_prior: partial
-  wild_card: false
-  evidence_for:
-    - Plan 3 main.json shows pancetta finds 3720 "novel" decodes on Hard-1000 — messages jt9 didn't recover (~3.7 per WAV)
-    - On Hard-200, 1154 novel decodes against 3354 matched-with-jt9 — novel is 25% of total pancetta decodes
-    - If these are real (not FPs), our 37-39% vs_wsjtx_pct is understated; pancetta's true performance is better
-    - If they're false positives, we have a precision problem masquerading as a recall win
-  evidence_against:
-    - Cross-validation requires JTDX integration (deferred from Plan 3) or QSO-pattern matching infrastructure
-  notes: |
-    Three approaches: (a) install jtdx-cli or use JTDX's GUI in scripted mode to
-    decode the same WAVs; treat the (pancetta ∩ JTDX) − jt9 decodes as
-    high-confidence novel. (b) Within pancetta's own output, treat a novel decode
-    as confirmed if the same callsign appears in adjacent slots (QSO pattern
-    continuity). (c) Filter against a public callsign hash database (HamQTH/QRZ).
-    Run on Hard-200's novel decodes first — smaller sample, faster turnaround.
-
 ### hb-025 — Wild-50 zero-overlap investigation  [PRIORITY: 0.50]
   mode: ft8
   status: pending
@@ -620,6 +627,46 @@ current_ratio: 0.25
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
 ## Shelved (kept for reference)
+
+### hb-024 — Cross-validate novel decodes  [SHELVED 2026-05-23, strong diagnostic finding]
+  mode: ft8
+  status: shelved
+  priority_score: 0.55
+  outcome: |
+    Callsign-continuity probe on hard_1000 (2433 total novels):
+      continued (callsign seen elsewhere): 1572 (64.6%)
+      isolated (callsign never seen):       856 (35.2%)
+      malformed (no callsign extractable):    5 (0.2%)
+
+    Continuity histogram: the 50+ bucket alone has 863 novels (35.5%)
+    — callsigns seen in 50+ other WAVs' jt9 truth. Overwhelming
+    evidence those are real, active stations. Conservative tally of
+    "almost certainly real" novels (≥4 other appearances): 1493/2433
+    = 61.4%. Likely-real (≥1 other appearance): 1572/2433 = 64.6%.
+  measured_delta: |
+    No production code change. Diagnostic-only.
+
+    Recalibrates the metric interpretation: pancetta's "novel"
+    decodes are mostly REAL — jt9 missed them. Adding 65% of novels
+    as real lifts the operationally-useful decode count on hard_1000
+    from 14126 (current main.json) to ~15700, i.e. ~1500 extra real
+    decodes per 1000 hard WAVs that pancetta finds where jt9 doesn't.
+  learning: |
+    1. Pancetta beats jt9 by a meaningful margin on busy bands —
+       not just "catching up to 50%" but genuinely finding things
+       jt9 misses. ~1500 unique-pancetta-decodes per 1000 WAVs.
+    2. The composite `decode_rate` metric is conservative (jt9-only)
+       and undervalues pancetta's unique-find performance. Future
+       hypothesis evaluation should treat novels as ~65% real.
+    3. The 50+ continuity bucket is rock-solid evidence; the 0
+       (isolated) bucket is the only remaining ambiguity. hb-039
+       spawned to resolve it.
+    4. FP-filter work (hb-014, hb-034) is still motivated but less
+       urgent — worst-case precision is still ~87% even if all
+       isolated novels are FPs.
+  follow_up: hb-039 (resolve the 856 isolated novels via self-consistency, external lookup, or SNR/DT plausibility).
+  scorecards: (n/a — probe output only)
+  journal: research/experiments/2026-05-23-cross-validate-novels.md
 
 ### hb-022 — Wild-card: per-candidate SNR-adaptive LDPC iters  [SHELVED 2026-05-23]
   mode: ft8
