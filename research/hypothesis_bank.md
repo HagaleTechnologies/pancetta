@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-22T19:00:00Z
+last_updated: 2026-05-23T00:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 2
-exploitation_run: 7
-current_ratio: 0.222
+exploitation_run: 8
+current_ratio: 0.20
 
 ## Active (ranked by score)
 
@@ -41,28 +41,6 @@ current_ratio: 0.222
         slot — more representative but more elaborate plumbing).
 
     Either path is hb-004's prerequisite. Then the gate sweep follows.
-
-### hb-007 — MIN_SYNC_SCORE threshold sweep  [PRIORITY: 0.56]
-  mode: ft8
-  status: pending
-  priority_score: 0.56
-  estimated_effort: 1 session
-  expected_delta: +0.01 to +0.04 real decode rate; FP risk if threshold too low
-  defensible_prior: yes
-  wild_card: false
-  evidence_for:
-    - decoder.rs:60: MIN_SYNC_SCORE = 3.0. This is the Costas correlation threshold below which a candidate is silently dropped before LDPC runs.
-    - On the curated hard-200 corpus (busy band conditions), some real signals may have sync scores just below 3.0 due to interference from adjacent signals
-    - ft8_lib uses a similar threshold but the exact value differs; WSJT-X's jt9 binary may accept lower-scoring candidates that it then validates with CRC
-    - Lowering to 2.0 could surface marginal candidates; LDPC + CRC act as the real filter
-  evidence_against:
-    - Lower threshold → more candidates → longer decode time; budget tracker may kick in
-    - More noise candidates → higher LDPC failure rate → wasted CPU without benefit
-  notes: |
-    Sweep MIN_SYNC_SCORE from 1.5 to 4.0 in steps of 0.5. Track: new unique decodes
-    found vs new false positives per step, and wall-clock time vs decode count.
-    Budget impact: if at 1.5 we exceed the 2000ms budget, try with a higher max-
-    time budget as a separate sub-experiment to separate budget from threshold effects.
 
 ### hb-009 — Block score ranking vs sync-only ranking  [PRIORITY: 0.50]
   mode: ft8
@@ -131,6 +109,29 @@ current_ratio: 0.222
     range (the sensitivity cliff). Track convergence rate (fraction of candidates
     that converge in ≤N iterations) as a separate metric to understand where
     the benefit actually comes from.
+
+### hb-038 — Re-sweep max_sync_candidates at nms-off baseline  [PRIORITY: 0.50, spawned 2026-05-23]
+  mode: ft8
+  status: pending
+  priority_score: 0.50
+  estimated_effort: 0.5 sessions
+  expected_delta: +0.001 to +0.005 composite at cap=300; significant FP-bloat risk
+  defensible_prior: yes (hb-007 sweep showed cap=300 yields +39 recovered at nms-off, vs hb-003's +21 at the cap=200 elbow under nms-on)
+  wild_card: false
+  evidence_for:
+    - hb-007 combined sweep (2026-05-23): at threshold=1.5 or 2.0, cap=300 yields rec=4376 (+39 vs current cap=200 production), novel=1228 (+191), composite +0.0022. Cap=500/800 add no more recovered but inflate novel.
+    - The hb-003 sweep that set cap=200 ran at nms-on; the elbow may have shifted with nms-off.
+    - +38% wall-clock cost at cap=300 (288s vs 209s on hard-200) — fits the 3s/WAV budget comfortably.
+  evidence_against:
+    - +191 novel for +39 recovered is a 5:1 ratio of unconfirmed:confirmed. Many novels are likely LDPC+CRC false positives on noise candidates surfacing with the larger cap.
+    - hb-024 (cross-validation) becomes more urgent before promoting; we don't currently know if novels are real.
+    - Marginal composite gain (+0.0022) — same scale as the diminishing-returns-cycle hb-006 win we already accepted.
+  notes: |
+    Run full 5-tier eval at max_sync_candidates=300, all other settings at production
+    defaults (threshold doesn't matter at this cap per hb-007). If guard tiers
+    (fixtures + synth) stay clean and composite goes up by >+0.001, promote.
+    If novel-decode count grows in ways that look like FP-bloat (esp. on synth where
+    we know there should be no novels), shelve.
 
 ### hb-037 — Redesign or remove subtract_with_sidelobes  [PRIORITY: 0.50, spawned 2026-05-22]
   mode: ft8
@@ -670,6 +671,43 @@ current_ratio: 0.222
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
 ## Shelved (kept for reference)
+
+### hb-007 — MIN_SYNC_SCORE threshold sweep  [SHELVED 2026-05-23]
+  mode: ft8
+  status: shelved
+  priority_score: 0.56
+  outcome: |
+    Sweep at MIN_SYNC_SCORE ∈ {1.5, 2.0, 2.5, 3.0, 3.5, 4.0} on
+    hard-200 produced BIT-IDENTICAL decode counts (4337/1037/0.2529)
+    at every value. The threshold knob is fully dead at the current
+    production max_sync_candidates=200 — the truncate-to-200 is the
+    binding gate, not the threshold check (200+ candidates per WAV
+    exceed score=4.0 already).
+
+    Combined sweep at (threshold ∈ {1.5, 2.0}) × (cap ∈ {300, 500, 800})
+    confirmed the threshold is dead at any cap. Caps above 200 do
+    surface +39 recovered (one elbow at cap=300) plus +191-470 novel
+    decodes, but the threshold value within {1.5, 2.0} doesn't matter.
+  measured_delta: 0 (no production change — threshold value irrelevant)
+  learning: |
+    Threshold-first hypotheses are misleading when an upstream
+    truncate exists. The conceptual model "lower the threshold to
+    surface marginal candidates" only works if the threshold is the
+    binding constraint; here the cap is. Future filter-tuning
+    hypotheses should first verify the filter is actually limiting.
+
+    Cap = 300 yields a small (+39 rec, +0.0022 composite) gain on
+    hard-200 over the current cap = 200, but this is hb-003 territory
+    re-evaluated at the new nms-off baseline (hb-003 graduated at
+    cap=200 under nms-on). Spawned as hb-038.
+
+    The novel-count saturation pattern (cap=200 → 800: 1037 → 1507
+    novel for +38 net recovered) is corroborating evidence for hb-024
+    becoming more urgent — many of these novels are likely LDPC+CRC
+    FPs on noise candidates that pass the parity gate.
+  follow_up: hb-038 (re-sweep max_sync_candidates at nms-off baseline).
+  scorecards: research/scorecards/sweep/hard200-msync-*.json + research/scorecards/sweep/hard200-msync*-cap*.json
+  journal: research/experiments/2026-05-23-min-sync-score-sweep.md
 
 ### hb-030 — subtract_with_sidelobes residual quality audit  [SHELVED 2026-05-22 with strong diagnostic finding]
   mode: ft8

@@ -120,6 +120,12 @@ impl Ft8Decoder {
         self.config.nms_freq_radius = n;
         self
     }
+
+    /// Override `min_sync_score` on the wrapped config. hb-007 sweep.
+    pub fn with_min_sync_score(mut self, v: f64) -> Self {
+        self.config.min_sync_score = v;
+        self
+    }
 }
 
 impl DecoderUnderTest for Ft8Decoder {

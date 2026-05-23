@@ -166,6 +166,13 @@ pub struct Ft8Config {
     /// (= 25 Hz at 12.5 Hz/bin) is too coarse for busy FT8 bands —
     /// merges distinct signals 25 Hz apart. hb-008 sweep candidate.
     pub nms_freq_radius: usize,
+
+    /// Minimum Costas sync score (correlation) for a candidate to be
+    /// kept for LDPC decoding. Default 3.0 matches the historical
+    /// `MIN_SYNC_SCORE` constant. Lowering surfaces more candidates
+    /// (potential weak-signal recovery) at the cost of CPU and a
+    /// higher LDPC failure rate. hb-007 sweep candidate.
+    pub min_sync_score: f64,
 }
 
 impl Default for Ft8Config {
@@ -187,6 +194,7 @@ impl Default for Ft8Config {
             nms_enabled: false,
             nms_time_radius: NMS_TIME_RADIUS,
             nms_freq_radius: NMS_FREQ_RADIUS,
+            min_sync_score: MIN_SYNC_SCORE,
         }
     }
 }
@@ -1124,7 +1132,7 @@ impl Ft8Decoder {
                 for f0 in MIN_FREQ_BIN..max_freq_bin {
                     let score = self.compute_costas_score(spectrogram, t0, f0, freq_sub);
 
-                    if score > MIN_SYNC_SCORE {
+                    if score > self.config.min_sync_score {
                         candidates.push(CostasCandidate {
                             time_step: t0,
                             freq_bin: f0,

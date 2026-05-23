@@ -37,6 +37,7 @@ struct Args {
     nms_enabled: Option<bool>,
     nms_time_radius: Option<usize>,
     nms_freq_radius: Option<usize>,
+    min_sync_score: Option<f64>,
 }
 
 impl Args {
@@ -54,6 +55,7 @@ impl Args {
         let mut nms_enabled: Option<bool> = None;
         let mut nms_time_radius: Option<usize> = None;
         let mut nms_freq_radius: Option<usize> = None;
+        let mut min_sync_score: Option<f64> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -140,6 +142,13 @@ impl Args {
                     );
                     nms_enabled.get_or_insert(true);
                 }
+                "--min-sync-score" => {
+                    min_sync_score = Some(
+                        iter.next()
+                            .context("--min-sync-score needs a value")?
+                            .parse()?,
+                    );
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
@@ -159,6 +168,9 @@ impl Args {
                     eprintln!("  --nms-on: explicitly re-enable NMS (production default is off)");
                     eprintln!("  --nms-time-radius N: override Ft8Config::nms_time_radius (default 8); implies --nms-on");
                     eprintln!("  --nms-freq-radius N: override Ft8Config::nms_freq_radius (default 2); implies --nms-on");
+                    eprintln!(
+                        "  --min-sync-score V: override Ft8Config::min_sync_score (default 3.0)"
+                    );
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -178,6 +190,7 @@ impl Args {
             nms_enabled,
             nms_time_radius,
             nms_freq_radius,
+            min_sync_score,
         })
     }
 }
@@ -528,6 +541,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(n) = args.nms_freq_radius {
                 d = d.with_nms_freq_radius(n);
+            }
+            if let Some(v) = args.min_sync_score {
+                d = d.with_min_sync_score(v);
             }
             Box::new(d)
         }
