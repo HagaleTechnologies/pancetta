@@ -180,6 +180,13 @@ pub struct Ft8Config {
     /// (potential weak-signal recovery) at the cost of CPU and a
     /// higher LDPC failure rate. hb-007 sweep candidate.
     pub min_sync_score: f64,
+
+    /// Enable per-candidate adaptive LDPC iteration scheduling
+    /// (hb-022). When true, candidates are bucketed by sync_score:
+    /// high (>8) → fewer iters, medium (4..8) → default
+    /// `ldpc_iterations`, low (<4) → more iters. Default false —
+    /// uniform `ldpc_iterations` for all candidates.
+    pub adaptive_ldpc_iters: bool,
 }
 
 impl Default for Ft8Config {
@@ -202,6 +209,7 @@ impl Default for Ft8Config {
             nms_time_radius: NMS_TIME_RADIUS,
             nms_freq_radius: NMS_FREQ_RADIUS,
             min_sync_score: MIN_SYNC_SCORE,
+            adaptive_ldpc_iters: false,
         }
     }
 }
@@ -528,6 +536,7 @@ impl Ft8Decoder {
                 ldpc_iterations: self.config.ldpc_iterations,
                 osd_depth: self.config.osd_depth,
                 llr_target_variance: self.config.llr_target_variance,
+                adaptive_ldpc_iters: self.config.adaptive_ldpc_iters,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -536,20 +545,53 @@ impl Ft8Decoder {
             let already_decoded = all_decoded_messages.len();
             let sps = self.protocol_params.samples_per_symbol(SAMPLE_RATE);
 
+            // Adaptive LDPC iteration scheduling (hb-022): when
+            // ctx.adaptive_ldpc_iters is true, create three LDPC
+            // decoders per thread at low/mid/high iter counts and
+            // dispatch each candidate by sync_score. When false, the
+            // low/mid/high decoders all use ctx.ldpc_iterations, so
+            // dispatch is a no-op.
+            const ADAPTIVE_HIGH_SCORE: f64 = 8.0;
+            const ADAPTIVE_MID_SCORE: f64 = 4.0;
+            // hb-022 asymmetric variant: don't cut iters on high-SNR
+            // candidates (the first {25,50,100} attempt lost -19 decodes
+            // on hard-200 because score>8 isn't a strong enough
+            // "BP-converges-fast" guarantee). Only add iters on low-SNR.
+            const ADAPTIVE_ITERS_LOW: usize = 50; // = default, no cut on high-SNR
+            const ADAPTIVE_ITERS_HIGH: usize = 100; // for low-SNR (more BP budget)
+
             let pass_decoded: Vec<DecodedMessage> = sync_candidates
                 .par_iter()
                 .map_init(
-                    // Per-thread initialization: create an LDPC decoder and FFT buffer
+                    // Per-thread initialization: create LDPC decoders and FFT buffer
                     || {
-                        let ldpc = LdpcDecoder::new_with_osd(
-                            ctx.ldpc_iterations,
-                            ctx.osd_depth.map(|d| OsdConfig { max_depth: d }),
-                        )
-                        .expect("LDPC decoder init failed");
+                        let osd_cfg = ctx.osd_depth.map(|d| OsdConfig { max_depth: d });
+                        let (iters_low, iters_mid, iters_high) = if ctx.adaptive_ldpc_iters {
+                            (ADAPTIVE_ITERS_LOW, ctx.ldpc_iterations, ADAPTIVE_ITERS_HIGH)
+                        } else {
+                            (
+                                ctx.ldpc_iterations,
+                                ctx.ldpc_iterations,
+                                ctx.ldpc_iterations,
+                            )
+                        };
+                        let ldpc_low = LdpcDecoder::new_with_osd(iters_low, osd_cfg)
+                            .expect("LDPC decoder init failed");
+                        let ldpc_mid = LdpcDecoder::new_with_osd(iters_mid, osd_cfg)
+                            .expect("LDPC decoder init failed");
+                        let ldpc_high = LdpcDecoder::new_with_osd(iters_high, osd_cfg)
+                            .expect("LDPC decoder init failed");
                         let fft_buffer = vec![Complex::new(0.0, 0.0); sps];
-                        (ldpc, fft_buffer)
+                        (ldpc_low, ldpc_mid, ldpc_high, fft_buffer)
                     },
-                    |(ldpc, fft_buffer), candidate| {
+                    |(ldpc_low, ldpc_mid, ldpc_high, fft_buffer), candidate| {
+                        let ldpc = if candidate.sync_score > ADAPTIVE_HIGH_SCORE {
+                            &*ldpc_low
+                        } else if candidate.sync_score > ADAPTIVE_MID_SCORE {
+                            &*ldpc_mid
+                        } else {
+                            &*ldpc_high
+                        };
                         // First try standard AP0 decode
                         if let Some(msg) = par_decode_candidate(&ctx, candidate, ldpc, fft_buffer) {
                             return Some(msg);
@@ -2306,6 +2348,10 @@ struct DecodeContext<'a> {
     osd_depth: Option<u8>,
     /// LLR normalization target variance (matches Ft8Config field).
     llr_target_variance: f32,
+    /// When true, per-thread LDPC decoders are created in 3 buckets
+    /// (low/mid/high iter counts) and dispatched per candidate by
+    /// sync_score. hb-022 wild-card config flag.
+    adaptive_ldpc_iters: bool,
 }
 
 /// Result from parallel candidate decoding (one candidate).

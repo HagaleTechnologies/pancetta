@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-23T15:00:00Z
+last_updated: 2026-05-23T17:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
-wild_cards_run: 2
+wild_cards_run: 3
 exploitation_run: 9
-current_ratio: 0.182
+current_ratio: 0.25
 
 ## Active (ranked by score)
 
@@ -502,28 +502,6 @@ current_ratio: 0.182
     High-effort wild-card; only attempt after profiling confirms the spectrogram
     is a bottleneck.
 
-### hb-022 — Wild-card: per-candidate SNR-adaptive LDPC iteration count  [PRIORITY: wild]
-  mode: ft8
-  status: pending
-  priority_score: 0.0
-  estimated_effort: 1.5 sessions
-  expected_delta: unknown; possibly +0.01 to +0.02 throughput; neutral sensitivity
-  defensible_prior: no
-  wild_card: true
-  evidence_for:
-    - All candidates currently get LDPC_MAX_ITERATIONS = 25 iterations regardless of their sync score or estimated SNR
-    - High-SNR candidates converge in 5-10 iterations; low-SNR candidates may never converge in 50
-    - Adaptive scheduling: give high-SNR candidates fewer iterations (free up budget); give low-SNR candidates more (spend the saved budget productively)
-    - This could improve total decodes-per-budget on mixed-SNR recording
-  evidence_against:
-    - LDPC convergence is not monotonic in SNR — a "high sync score" candidate can still be a hard codeword
-    - Complexity of per-candidate scheduling in the rayon parallel loop
-  notes: |
-    Prototype: use sync_score as a proxy for SNR. High score (>8.0) → 15 iterations.
-    Medium (4.0-8.0) → 25 iterations. Low (<4.0) → 35 iterations. Measure total
-    iterations consumed vs decodes gained. If the distribution of convergence
-    iterations is already known (add a counter), this could be informed rather than heuristic.
-
 ### hb-024 — Cross-validate novel decodes against JTDX + QSO patterns  [PRIORITY: 0.55]
   mode: ft8
   status: pending
@@ -642,6 +620,44 @@ current_ratio: 0.182
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
 ## Shelved (kept for reference)
+
+### hb-022 — Wild-card: per-candidate SNR-adaptive LDPC iters  [SHELVED 2026-05-23]
+  mode: ft8
+  status: shelved
+  priority_score: 0.0 (wild card)
+  wild_card: true
+  outcome: |
+    Two A/B tests on hard-200 with adaptive iter scheduling enabled:
+    - Symmetric {high=25, mid=50, low=100} by sync_score thresholds
+      {>8, 4-8, <4}: -19 recovered, +13 novel, -0.0012 composite,
+      +12% wall-clock. The high-SNR cut hurts.
+    - Asymmetric {high=50, mid=50, low=100}: BIT-IDENTICAL decode
+      counts to baseline, +15% wall-clock. The low-SNR boost finds
+      zero additional truth-matched decodes.
+    Both directions of adaptive scheduling are net-negative or zero.
+  measured_delta: 0 (production unchanged — flag default off)
+  learning: |
+    1. sync_score is not a reliable BP-convergence predictor at the
+       tested thresholds. score > 8 includes many candidates that
+       still need 50+ iters; cutting to 25 loses decodes.
+    2. BP that doesn't converge by iter 50 doesn't converge by 100
+       either. The extra iters just spin without producing new
+       truth-matched decodes — likely Tanner-graph cycles or
+       converged-on-wrong-codeword.
+    3. The hb-005 sweep already captured the LDPC-iters elbow at 50
+       (going 25 → 50 added +14 recovered). Going 50 → 100 adds 0,
+       so the 25→50→100 curve is sharply diminishing.
+    4. OSD-2 (with parity gate ≤ 4) is the real heavy-lifting fallback
+       for hard codewords. Pushing BP iters higher doesn't help
+       because OSD is already catching what it can. Future "go deeper"
+       work should target OSD (hb-014 parity gate, hb-034 OSD-3
+       validation), not BP iters.
+  follow_up: |
+    None. Result is decisive. The infrastructure
+    (`adaptive_ldpc_iters` config flag + per-thread 3-decoder
+    dispatch + CLI flag) lands as reusable but flag-gated to off.
+  scorecards: research/scorecards/sweep/hard200-adaptive-{off,on,asym}.json
+  journal: research/experiments/2026-05-23-adaptive-ldpc-iters.md
 
 ### hb-007 — MIN_SYNC_SCORE threshold sweep  [SHELVED 2026-05-23]
   mode: ft8

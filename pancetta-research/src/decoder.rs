@@ -126,6 +126,12 @@ impl Ft8Decoder {
         self.config.min_sync_score = v;
         self
     }
+
+    /// Enable per-candidate adaptive LDPC iteration scheduling. hb-022 wild card.
+    pub fn with_adaptive_ldpc_iters(mut self, on: bool) -> Self {
+        self.config.adaptive_ldpc_iters = on;
+        self
+    }
 }
 
 impl DecoderUnderTest for Ft8Decoder {

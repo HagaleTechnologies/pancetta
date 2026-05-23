@@ -38,6 +38,7 @@ struct Args {
     nms_time_radius: Option<usize>,
     nms_freq_radius: Option<usize>,
     min_sync_score: Option<f64>,
+    adaptive_ldpc_iters: Option<bool>,
 }
 
 impl Args {
@@ -56,6 +57,7 @@ impl Args {
         let mut nms_time_radius: Option<usize> = None;
         let mut nms_freq_radius: Option<usize> = None;
         let mut min_sync_score: Option<f64> = None;
+        let mut adaptive_ldpc_iters: Option<bool> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -149,6 +151,9 @@ impl Args {
                             .parse()?,
                     );
                 }
+                "--adaptive-ldpc-iters" => {
+                    adaptive_ldpc_iters = Some(true);
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
@@ -171,6 +176,7 @@ impl Args {
                     eprintln!(
                         "  --min-sync-score V: override Ft8Config::min_sync_score (default 3.0)"
                     );
+                    eprintln!("  --adaptive-ldpc-iters: enable hb-022 SNR-adaptive per-candidate LDPC iterations");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -191,6 +197,7 @@ impl Args {
             nms_time_radius,
             nms_freq_radius,
             min_sync_score,
+            adaptive_ldpc_iters,
         })
     }
 }
@@ -544,6 +551,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(v) = args.min_sync_score {
                 d = d.with_min_sync_score(v);
+            }
+            if let Some(on) = args.adaptive_ldpc_iters {
+                d = d.with_adaptive_ldpc_iters(on);
             }
             Box::new(d)
         }
