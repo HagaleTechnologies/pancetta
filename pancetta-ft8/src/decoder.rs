@@ -74,9 +74,12 @@ const LLR_TARGET_VARIANCE: f32 = 32.0;
 const MIN_SYNC_SCORE: f64 = 3.0;
 
 /// Maximum candidates from sync search before NMS. Raised from 100 to
-/// 200 on 2026-05-21 (hb-003 sweep): +5.7% real decode rate on hard-200
-/// and +4.5% on hard-1000 with no regressions on fixtures or synth.
-const MAX_SYNC_CANDIDATES: usize = 200;
+/// 200 on 2026-05-21 (hb-003), then to 300 on 2026-05-23 (hb-038)
+/// after nms-off (hb-019) shifted the elbow. hb-038 5-tier delta vs
+/// 200: composite +0.0023, hard-200 +40 rec, hard-1000 +96 rec, no
+/// regressions; wall-clock +92% per 5-tier (still well within the
+/// 3000 ms per-WAV budget).
+const MAX_SYNC_CANDIDATES: usize = 300;
 
 /// Minimum frequency bin for FT8 search (0 = full passband coverage)
 const MIN_FREQ_BIN: usize = 0;

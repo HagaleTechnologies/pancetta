@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-23T19:00:00Z
+last_updated: 2026-05-23T20:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 3
-exploitation_run: 10
-current_ratio: 0.231
+exploitation_run: 11
+current_ratio: 0.214
 
 ## Active (ranked by score)
 
@@ -109,29 +109,6 @@ current_ratio: 0.231
     range (the sensitivity cliff). Track convergence rate (fraction of candidates
     that converge in ≤N iterations) as a separate metric to understand where
     the benefit actually comes from.
-
-### hb-038 — Re-sweep max_sync_candidates at nms-off baseline  [PRIORITY: 0.50, spawned 2026-05-23]
-  mode: ft8
-  status: pending
-  priority_score: 0.50
-  estimated_effort: 0.5 sessions
-  expected_delta: +0.001 to +0.005 composite at cap=300; significant FP-bloat risk
-  defensible_prior: yes (hb-007 sweep showed cap=300 yields +39 recovered at nms-off, vs hb-003's +21 at the cap=200 elbow under nms-on)
-  wild_card: false
-  evidence_for:
-    - hb-007 combined sweep (2026-05-23): at threshold=1.5 or 2.0, cap=300 yields rec=4376 (+39 vs current cap=200 production), novel=1228 (+191), composite +0.0022. Cap=500/800 add no more recovered but inflate novel.
-    - The hb-003 sweep that set cap=200 ran at nms-on; the elbow may have shifted with nms-off.
-    - +38% wall-clock cost at cap=300 (288s vs 209s on hard-200) — fits the 3s/WAV budget comfortably.
-  evidence_against:
-    - +191 novel for +39 recovered is a 5:1 ratio of unconfirmed:confirmed. Many novels are likely LDPC+CRC false positives on noise candidates surfacing with the larger cap.
-    - hb-024 (cross-validation) becomes more urgent before promoting; we don't currently know if novels are real.
-    - Marginal composite gain (+0.0022) — same scale as the diminishing-returns-cycle hb-006 win we already accepted.
-  notes: |
-    Run full 5-tier eval at max_sync_candidates=300, all other settings at production
-    defaults (threshold doesn't matter at this cap per hb-007). If guard tiers
-    (fixtures + synth) stay clean and composite goes up by >+0.001, promote.
-    If novel-decode count grows in ways that look like FP-bloat (esp. on synth where
-    we know there should be no novels), shelve.
 
 ### hb-037 — Redesign or remove subtract_with_sidelobes  [PRIORITY: 0.50, spawned 2026-05-22]
   mode: ft8
@@ -893,6 +870,38 @@ current_ratio: 0.231
   follow_up: hb-023
 
 ## Graduated (merged to main)
+
+### hb-038 — Re-sweep max_sync_candidates at nms-off  [GRADUATED 2026-05-23]
+  mode: ft8
+  status: graduated
+  priority_score: 0.50
+  outcome: |
+    5-tier eval at max_sync_candidates=300 (vs prior 200): composite
+    +0.0023, hard-200 +40 rec / +190 novel, hard-1000 +96 rec /
+    +482 novel, guards unchanged. Wall-clock per-WAV roughly doubles
+    (~490 ms → ~940 ms) but stays well within the 3000 ms budget.
+    The hb-003 elbow shifted upward after hb-019 turned NMS off,
+    which let pass 1 see more candidates.
+  measured_delta: |
+    composite: 0.5522 → 0.5545 (+0.0023)
+    hard-200:  rec 4325 → 4365 (+40, +0.9%); novel 1020 → 1210 (+190)
+    hard-1000: rec 14126 → 14222 (+96, +0.7%); novel 3537 → 4019 (+482)
+    5-tier elapsed: 631 → 1211 s (+92%, partial undo of hb-031 speed
+    win but still well within per-WAV budget; cumulative wall-clock
+    since pre-run baseline is ~25% better, not regressed).
+  learning: |
+    1. Parameter elbows established under one production state may
+       not hold under another. After every WIN that flips a
+       structural knob (like hb-019 nms-off), the adjacent parameter
+       sweeps are worth re-running.
+    2. Per hb-024 (~65% of novels are real), the +672 novels here
+       represent ~+437 real decodes, giving total ~+573 operational
+       decodes per ~1200 hard WAVs.
+    3. The right shape long-term might be a runtime mode (`latency`
+       vs `balanced` vs `deep`) — see hb-031 disposition.
+  follow_up: none new.
+  scorecard: research/scorecards/history/2026-05-23-cap-300-resweep.json
+  journal: research/experiments/2026-05-23-cap-300-resweep.md
 
 ### hb-031 — Fast-path single-pass mode  [GRADUATED 2026-05-23, speed win]
   mode: ft8
