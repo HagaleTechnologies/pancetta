@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-22T17:00:00Z
+last_updated: 2026-05-22T19:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 2
-exploitation_run: 6
-current_ratio: 0.25
+exploitation_run: 7
+current_ratio: 0.222
 
 ## Active (ranked by score)
 
@@ -132,60 +132,66 @@ current_ratio: 0.25
     that converge in ≤N iterations) as a separate metric to understand where
     the benefit actually comes from.
 
-### hb-030 — subtract_with_sidelobes residual quality audit  [PRIORITY: 0.60]
+### hb-037 — Redesign or remove subtract_with_sidelobes  [PRIORITY: 0.50, spawned 2026-05-22]
   mode: ft8
   status: pending
-  priority_score: 0.60
-  estimated_effort: 1-2 sessions
-  expected_delta: diagnostic; informs whether to redesign subtraction kernel
-  defensible_prior: yes (hb-001 sweep directly motivated this — see 2026-05-21 journal)
+  priority_score: 0.50
+  estimated_effort: 2-3 sessions for kernel redesign; 0.5 for removal
+  expected_delta: speed (current multi-pass is no-op for nearby weak signals); +0 sensitivity from current state but unlocks future multi-pass work
+  defensible_prior: yes (hb-030 probe proved the current kernel masks recoverable signals within ~25 Hz of strong)
   wild_card: false
   evidence_for:
-    - hb-001 sweep (2026-05-21) measured pass-2+ multi-pass contribution at +1.2% real decode rate on hard-200, vs the +5-15% hypothesized
-    - Pass 2 contribution: +43 decodes; pass 3 contribution: +3; pass 4 contribution: +1 — sharp diminishing returns after one subtraction
-    - synth-clean shows IDENTICAL decode tables at max_passes ∈ {1,2,3,4} — multi-pass adds zero on clean signals
-    - Either subtraction leaves artifacts that mask weak signals, or weak residual signals fall below sync threshold — current evidence can't distinguish
+    - hb-030 (2026-05-22) probe: 9 of 16 two-signal cases showed "subtraction masks recoverable weak signal". 0 of 16 showed "subtraction surfaces missed weak signal." The current kernel is net-negative for nearby weak signals.
+    - hb-001 (2026-05-21) macro sweep: pass 2+ contribution is +1.2% on hard-200. Now we know WHY: subtract_with_sidelobes leaves artifacts at the strong signal's TF cell that contaminate the neighborhood.
+    - The hb-019 NMS-off win has a unified explanation: pass 1 sees more signals when NMS doesn't suppress them, and pass 2+ would never have surfaced those signals via subtraction (per this probe).
   evidence_against:
-    - Diagnostic-only experiment; no guaranteed code change drops out
-    - If the answer is "subtraction is fundamentally limited by FT8's overlapped-symbol structure" no fix is forthcoming
+    - Removing multi-pass loses the ability to decode "stacks" of QSOs that overlap in time but not in frequency (where subtraction is actually clean).
+    - Redesigning the kernel is non-trivial (longer window for sidelobe reduction trades against frequency resolution).
   notes: |
-    Controlled two-signal synth experiment: generate WAV with strong signal
-    at SNR=-5 dB and weak signal at SNR=-18 dB, offset 25 Hz apart in
-    frequency. Decode the strong, subtract it, then measure:
-    (a) Spectrogram power at the weak signal's TF cell, before and after
-        subtraction — quantifies subtraction quality.
-    (b) Sync score at the weak signal's TF location, before and after —
-        does subtraction surface a sync candidate that pass 1 missed?
-    (c) LDPC convergence rate at the weak candidate, before and after.
-    If (a) shows large residual artifacts at the strong signal's harmonics
-    bleeding into the weak signal's TF cell, the kernel needs sidelobe
-    work. If (a) is clean but (b) doesn't improve, the issue is sync
-    threshold not subtraction quality. If both improve but (c) still
-    fails, the issue is LLR scaling on subtracted residuals.
+    Three paths:
+    (a) Replace the time-domain reconstruction-and-subtract with a
+        frequency-domain "zero out the strong signal's spectrogram bins"
+        approach (synergizes with hb-021 wild card).
+    (b) Improve the time-domain kernel: longer / better-shaped subtraction
+        window for sidelobe reduction. Trade-off: longer window = wider
+        masked region around the strong signal.
+    (c) Remove multi-pass entirely. Set max_passes=1 as production
+        default (synergizes with hb-031). Reclaim the wall-clock budget
+        for other pass-1 work (more candidates, OSD-3 with stronger FP
+        filter, more LDPC iters).
+    Prefer (c) for fastest implementation; (a) if a deeper structural
+    improvement is wanted. (b) is incremental work on a known-broken
+    approach — least appealing.
 
-### hb-031 — Fast-path single-pass mode for autonomous-loop latency  [PRIORITY: 0.40]
+### hb-031 — Fast-path single-pass mode for autonomous-loop latency  [PRIORITY: 0.55, bumped 2026-05-22]
   mode: ft8
   status: pending
-  priority_score: 0.40
+  priority_score: 0.55
   estimated_effort: 0.5 sessions
-  expected_delta: 9-10× decode latency reduction at cost of ~1.2% real decode rate
-  defensible_prior: yes (hb-001 sweep showed pass 1 = 48ms, pass 2 = 382ms; 98.8% recall at pass 1 alone)
+  expected_delta: ~33% wall-clock reduction per decode at ≤1.2% sensitivity loss (hb-001 estimate, likely lower with hb-019 nms-off baseline)
+  defensible_prior: yes (hb-001 sweep + hb-030 probe BOTH point to pass 2+ being a no-op for nearby weak signals)
   wild_card: false
   evidence_for:
-    - Pass 1 alone recovers 3786 of 3832 multi-pass decodes (98.8%) on hard-200
-    - Pass 1 wall-clock: 48ms/WAV. Pass 2+ adds 335ms/WAV.
-    - Operator's autonomous loop runs every 15s slot; 50-100ms per decode would let multiple decode windows run concurrently on slow CPUs
-    - Already gated by Ft8Config::aggressive_decoding (currently unused — see hb-020)
+    - hb-001 (2026-05-21): pass 1 alone recovers 98.8% of multi-pass total on hard-200 (3786 / 3832). Pass 2+ adds +1.2% at 8× compute per pass.
+    - hb-030 (2026-05-22) probe: subtract_with_sidelobes is BROKEN for adjacent weak signals (0/16 cases surfaced, 9/16 cases masked). Multi-pass is dead infrastructure today.
+    - Pass 1 wall-clock per WAV: ~48 ms; pass 2: ~382 ms; pass 3: ~464 ms; pass 4: ~498 ms. Eliminating passes 2+ would cut current 5-tier eval time from ~1237s to ~800s (-35%).
+    - Cumulative wins already +0.0575 composite; the next big lever isn't more multi-pass.
   evidence_against:
-    - Losing 1.2% decodes on busy bands matters for the rare-station hunter use case
-    - Adds operating-mode complexity to the coordinator
+    - Losing 1.2% decodes matters for the rare-station hunter use case (the user's autonomous-operator goal).
+    - With hb-019 nms-off active, pass 1 already finds more signals than before — the +1.2% pass-2 contribution may shrink further. Need to re-measure under current baseline.
+    - Removing multi-pass closes the door on the kernel-redesign path (hb-037 option a/b). Better done as a config knob than a hard removal.
   notes: |
-    Pure plumbing: add a "decode_mode: latency | balanced | deep" field to
-    pancetta-config and wire through to the coordinator. Latency mode sets
-    max_decode_passes=1. Balanced (default) stays at 3. Deep can go higher
-    (5+) for offline batch reprocessing.
-    Synergizes with hb-020 (aggressive_decoding audit): if that flag turns
-    out to do nothing, this is what it should do.
+    Two implementations:
+    (1) **Just lower the production default to max_passes=1.** Trivial code
+        change. Measures expected: re-run hb-001-style sweep under current
+        (nms-off) production baseline; if pass-2+ contribution is still
+        ≤1.5%, lower the default.
+    (2) **Add a runtime config knob.** decode_mode: latency | balanced |
+        deep. Lets the operator pick per-deployment. Cleaner long-term.
+    Prefer (1) first to validate the measurement; (2) follows if the
+    operator wants the dial.
+
+
 
 ### hb-036 — Score-relative NMS suppression  [PRIORITY: 0.40]
   mode: ft8
@@ -664,6 +670,46 @@ current_ratio: 0.25
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
 ## Shelved (kept for reference)
+
+### hb-030 — subtract_with_sidelobes residual quality audit  [SHELVED 2026-05-22 with strong diagnostic finding]
+  mode: ft8
+  status: shelved
+  priority_score: 0.60
+  outcome: |
+    Two-signal synth probe over (weak_snr ∈ {-15, -18, -20, -22} dB) ×
+    (freq_offset ∈ {12.5, 25, 50, 100} Hz). Result: 9 of 16 cases
+    showed "subtraction MASKS recoverable weak signal" (weak alone
+    decodes; pass 2 after subtracting strong fails). ZERO of 16 cases
+    showed "subtraction surfaces missed weak signal." Multi-pass is
+    currently dead infrastructure — confirmed by direct mechanism, not
+    just macro counts.
+  measured_delta: 0 (diagnostic only, no production change)
+  learning: |
+    The subtract_with_sidelobes kernel leaves artifacts at the strong
+    signal's TF cell that contaminate the spectrogram within ~25 Hz on
+    either side. Any weak signal in that band becomes undecodeable in
+    the residual, even though it would decode if the strong weren't
+    present. Beyond ~50 Hz separation, the two signals don't interfere
+    in the spectrogram and both decode in pass 1 without subtraction.
+
+    This unifies several prior findings:
+    - hb-001 (multi-pass) showed only +1.2% pass-2+ contribution. Now
+      we know why: the kernel is broken.
+    - hb-019 (nms-off) gave +1973 decodes by letting pass 1 see
+      candidates NMS was suppressing. Those candidates would never
+      have been recovered by pass 2 (per this probe).
+    - hb-008 (NMS radius sweep) confirmed pure TF-distance NMS can't
+      recover the cost. The decoder needs to see all candidates in
+      pass 1.
+
+    The right pancetta-ft8 architecture is "pass 1 finds everything;
+    subtract+redecode is overhead." Multi-pass is a dead lever until
+    the subtraction kernel is rewritten OR removed.
+  follow_up: |
+    hb-037 (kernel redesign or removal); hb-031 (bumped priority
+    0.40 → 0.55 — fast-path single-pass is now well motivated).
+  scorecards: (n/a — probe only)
+  journal: research/experiments/2026-05-22-subtract-quality-audit.md
 
 ### hb-008 — NMS radius parameter sweep  [SHELVED 2026-05-22]
   mode: ft8
