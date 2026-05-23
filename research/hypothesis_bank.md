@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-23T00:00:00Z
+last_updated: 2026-05-23T15:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 2
-exploitation_run: 8
-current_ratio: 0.20
+exploitation_run: 9
+current_ratio: 0.182
 
 ## Active (ranked by score)
 
@@ -163,35 +163,6 @@ current_ratio: 0.20
     Prefer (c) for fastest implementation; (a) if a deeper structural
     improvement is wanted. (b) is incremental work on a known-broken
     approach — least appealing.
-
-### hb-031 — Fast-path single-pass mode for autonomous-loop latency  [PRIORITY: 0.55, bumped 2026-05-22]
-  mode: ft8
-  status: pending
-  priority_score: 0.55
-  estimated_effort: 0.5 sessions
-  expected_delta: ~33% wall-clock reduction per decode at ≤1.2% sensitivity loss (hb-001 estimate, likely lower with hb-019 nms-off baseline)
-  defensible_prior: yes (hb-001 sweep + hb-030 probe BOTH point to pass 2+ being a no-op for nearby weak signals)
-  wild_card: false
-  evidence_for:
-    - hb-001 (2026-05-21): pass 1 alone recovers 98.8% of multi-pass total on hard-200 (3786 / 3832). Pass 2+ adds +1.2% at 8× compute per pass.
-    - hb-030 (2026-05-22) probe: subtract_with_sidelobes is BROKEN for adjacent weak signals (0/16 cases surfaced, 9/16 cases masked). Multi-pass is dead infrastructure today.
-    - Pass 1 wall-clock per WAV: ~48 ms; pass 2: ~382 ms; pass 3: ~464 ms; pass 4: ~498 ms. Eliminating passes 2+ would cut current 5-tier eval time from ~1237s to ~800s (-35%).
-    - Cumulative wins already +0.0575 composite; the next big lever isn't more multi-pass.
-  evidence_against:
-    - Losing 1.2% decodes matters for the rare-station hunter use case (the user's autonomous-operator goal).
-    - With hb-019 nms-off active, pass 1 already finds more signals than before — the +1.2% pass-2 contribution may shrink further. Need to re-measure under current baseline.
-    - Removing multi-pass closes the door on the kernel-redesign path (hb-037 option a/b). Better done as a config knob than a hard removal.
-  notes: |
-    Two implementations:
-    (1) **Just lower the production default to max_passes=1.** Trivial code
-        change. Measures expected: re-run hb-001-style sweep under current
-        (nms-off) production baseline; if pass-2+ contribution is still
-        ≤1.5%, lower the default.
-    (2) **Add a runtime config knob.** decode_mode: latency | balanced |
-        deep. Lets the operator pick per-deployment. Cleaner long-term.
-    Prefer (1) first to validate the measurement; (2) follows if the
-    operator wants the dial.
-
 
 
 ### hb-036 — Score-relative NMS suppression  [PRIORITY: 0.40]
@@ -859,6 +830,43 @@ current_ratio: 0.20
   follow_up: hb-023
 
 ## Graduated (merged to main)
+
+### hb-031 — Fast-path single-pass mode  [GRADUATED 2026-05-23, speed win]
+  mode: ft8
+  status: graduated
+  priority_score: 0.55
+  outcome: |
+    Lowered production default `Ft8Config::max_decode_passes` from 3
+    to 1. Direct confirmation via 5-tier eval that multi-pass infra
+    is contributing essentially nothing at the current nms-off
+    baseline. The composite delta is -0.0007 (within noise); the
+    wall-clock delta is -49% (full 5-tier eval drops 1237s → 631s).
+  measured_delta: |
+    Full 5-tier at max_passes=1 vs main (max_passes=3):
+      fixtures + synth-clean + wild-50: identical
+      hard-200:  rec 4337 → 4325 (-12, -0.28%), novel -17
+      hard-1000: rec 14153 → 14126 (-27, -0.19%), novel -81
+      composite: 0.5529 → 0.5522 (-0.0007)
+      5-tier elapsed: 1237s → 631s (-49%, halved)
+  learning: |
+    1. Multi-pass was overhead, not capability. The combined
+       evidence (hb-001 +1.2% under nms-on, hb-030 probe mechanism,
+       this -0.2-0.3% at nms-off baseline) is unambiguous.
+    2. The composite metric undervalues wall-clock improvements. The
+       formula has no wall-clock term; a -0.0007 composite hides a
+       2× decode-time speedup. Treat composite as necessary-but-not-
+       sufficient for production decisions.
+    3. Diagnostic-driven decisions (hb-030 probe) led to a higher-
+       confidence ship than a sweep would have produced.
+    4. The +35% relative jump in hard-1000 decode rate from
+       experiment-run start (0.371 → 0.504) was achieved while ALSO
+       cutting per-WAV decode time by ~35% (from ~430 ms to ~280 ms
+       post-hb-031). Sensitivity and speed wins were not in tension.
+  follow_up: |
+    hb-037 (subtract kernel redesign — if salvageable, re-raise
+    max_decode_passes default). No new spawns.
+  scorecard: research/scorecards/history/2026-05-23-fast-path-single-pass.json
+  journal: research/experiments/2026-05-23-fast-path-single-pass.md
 
 ### hb-019 — Wild-card: disable NMS  [GRADUATED 2026-05-22, biggest win since hb-023]
   mode: ft8

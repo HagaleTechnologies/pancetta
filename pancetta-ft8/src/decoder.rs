@@ -122,7 +122,14 @@ pub struct Ft8Config {
     /// Time search range (seconds)
     pub time_range: f64,
 
-    /// Maximum number of successive decoding passes (1 = no interference cancellation)
+    /// Maximum number of successive decoding passes. Default 1 (no
+    /// subtract-and-redecode). Lowered from 3 to 1 on 2026-05-23
+    /// (hb-031): per hb-030's controlled probe and hb-031's 5-tier
+    /// confirmation, `subtract_with_sidelobes` masks adjacent weak
+    /// signals more than it surfaces new decodes, so passes 2+
+    /// contribute essentially nothing (−0.0007 composite) at huge
+    /// wall-clock cost (~2× decode time). Raise to ≥2 if a future
+    /// fix (hb-037) makes multi-pass productive again.
     pub max_decode_passes: usize,
 
     /// OSD depth (0, 1, or 2). Set to None to disable OSD. Default: Some(1).
@@ -187,7 +194,7 @@ impl Default for Ft8Config {
             aggressive_decoding: false,
             frequency_range: 200.0,
             time_range: 2.0,
-            max_decode_passes: 3,
+            max_decode_passes: 1,
             osd_depth: Some(2),
             max_sync_candidates: MAX_SYNC_CANDIDATES,
             llr_target_variance: LLR_TARGET_VARIANCE,
