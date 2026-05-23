@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-23T21:00:00Z
+last_updated: 2026-05-23T22:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 3
-exploitation_run: 13
-current_ratio: 0.188
+exploitation_run: 14
+current_ratio: 0.176
 
 ## Active (ranked by score)
 
@@ -118,36 +118,6 @@ current_ratio: 0.188
     improvement is wanted. (b) is incremental work on a known-broken
     approach — least appealing.
 
-
-### hb-039 — Resolve the 856 "isolated" novels (hb-024 follow-up)  [PRIORITY: 0.45]
-  mode: ft8
-  status: pending
-  priority_score: 0.45
-  estimated_effort: 1 session
-  expected_delta: precision-side recalibration; tightens the FP-rate bound
-  defensible_prior: yes (hb-024 probe identified the 856 isolated novels as the only ambiguous bucket)
-  wild_card: false
-  evidence_for:
-    - hb-024 (2026-05-23) probe: 1572 / 2433 novels (64.6%) are demonstrably real via callsign continuity. The remaining 856 (35.2%) have callsigns NEVER seen in 1121 jt9 baselines — ambiguous: rare-DX OR FP.
-    - Distinguishing these directly tightens the precision bound. Currently worst-case "100% FPs on isolated" gives ~87% precision; if 30% of isolated are real, precision climbs to ~91%.
-  evidence_against:
-    - Three candidate methods, each with tradeoffs (see notes).
-  notes: |
-    Three approaches:
-    (i) **Self-consistency:** do the same "isolated" callsigns appear
-        in MULTIPLE pancetta-novel decodes? If yes, the callsign is
-        consistent across pancetta runs → likely real but jt9-missed.
-        If each isolated callsign appears exactly once across pancetta,
-        FP-suspicion goes up.
-    (ii) **HamQTH/QRZ external lookup:** if the callsign isn't a
-        registered ham, almost certainly FP. Internet + rate-limited
-        API; doable in batches.
-    (iii) **Decode-SNR + DT plausibility:** real signals have
-        plausible SNR (-22 to +10 dB) and DT (within ±2s of slot).
-        LDPC+CRC FPs often produce weird combos. Filter and see.
-    Prefer (i) first — self-contained, no external deps. (ii) follows
-    if (i) is inconclusive. (iii) is a complementary FP-filter idea
-    that could become its own production change.
 
 ### hb-040 — Plumb (or remove) `Ft8Config::time_range`  [PRIORITY: 0.35]
   mode: ft8
@@ -587,6 +557,36 @@ current_ratio: 0.188
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
 ## Shelved (kept for reference)
+
+### hb-039 — Resolve the 856 isolated novels (hb-024 follow-up)  [SHELVED 2026-05-23]
+  mode: ft8
+  status: shelved
+  priority_score: 0.45
+  outcome: |
+    Self-consistency check on hard_1000 isolated callsigns: 97.1%
+    (2278/2346) are singletons — appear in exactly ONE pancetta WAV.
+    Only 2.9% (68) appear in 2+ distinct pancetta WAVs.
+  measured_delta: 0 (diagnostic only)
+  learning: |
+    Singleton-callsign-in-novels is a strong FP signature: random
+    LDPC+CRC convergences in different noise WAVs almost never
+    produce the same fake callsign. Combined with hb-024:
+
+    Refined precision estimate on hard_1000:
+      - Recovered (jt9-matched):     4326
+      - Continued novels (real):     1572
+      - Multi-isolated novels:        ~26 (likely real rare DX)
+      - Singleton-isolated novels:  ~830 (likely FPs)
+
+    Pancetta precision: ~5924 real / (5924 + 830 FP) ≈ 87.7% —
+    matches hb-024's worst-case bound.
+
+    hb-014 (parity gate sweep) is now better-motivated: tightening
+    the gate from ≤4 to ≤3 might drop the FP rate to ~5% at cost
+    of some real decodes.
+  follow_up: hb-014 (already in active bank) — tighten parity gate to drop FPs.
+  scorecards: (n/a — probe output only)
+  journal: research/experiments/2026-05-23-resolve-isolated-novels.md
 
 ### hb-025 — Wild-50 zero-overlap investigation  [SHELVED 2026-05-23]
   mode: ft8
