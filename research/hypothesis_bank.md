@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T01:30:00Z
+last_updated: 2026-05-24T02:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 19
-current_ratio: 0.174
+exploitation_run: 20
+current_ratio: 0.167
 
 ## Active (ranked by score)
 
@@ -126,30 +126,30 @@ current_ratio: 0.174
     on average across hard-200. Compare against the cap=300 baseline.
     If recall is the same with fewer FPs, graduate.
 
-### hb-041 — Disable OSD fallback entirely (parity gate = 0)  [PRIORITY: 0.50, spawned 2026-05-23 from hb-014]
+### hb-041 — Disable OSD fallback entirely (parity gate = 0)  [SHELVED 2026-05-24]
   mode: ft8
-  status: pending
-  priority_score: 0.50
-  estimated_effort: 0.5 session (parameter change + sweep)
-  expected_delta: -10% additional novels vs gate=2; possible recall loss on synth-clean
-  defensible_prior: partial — hb-014 sweep showed gate=0 has same recall as gate=4 on curated-hard-200
+  status: SHELVED — gate=0 loses 1 fixture-tested real decode (basicft8/170923_082015.wav)
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: REFUTED — fixture corpus catches the 1 decode that OSD provides
+  defensible_prior: partial (turned out wrong on the right tier)
   wild_card: false
-  evidence_for:
-    - hb-014 sweep (2026-05-23): on curated-hard-200, gate=0 had 4365 recovered (identical to gate=2/3/4) and 860 novels (vs 952 at gate=2 = -10% additional FPs).
-    - OSD on hard-200 contributes NO measurable recall vs jt9 truth — all its incremental decodes are "novel" (jt9-missed) and per hb-039 mostly singletons (likely FPs).
-    - Disabling OSD removes a code path entirely, simplifying the decoder.
   evidence_against:
-    - Hard-200 / hard-1000 are derived from jt9; OSD may help on signals jt9 misses too, which we'd want for true on-air sensitivity.
-    - Untested on synth-clean (parametric ground truth). OSD might help on signals near the BP convergence cliff where parity errors are 1-2.
-    - Architectural shift: pancetta would become "BP-only decoder," losing one of its differentiating features (neural OSD).
+    - 2026-05-24 full 5-tier sweep at gate=0 vs current production gate=2:
+      hard-200/1000 recovered unchanged (4365 / 14219 = preserved).
+      synth-clean SNR@50% / @90% preserved (-20 / -18 dB).
+      Novels drop -10% (-92) on hard-200 and -11% (-336) on hard-1000.
+      BUT fixtures pass_rate drops 1.0 → 0.875 (7/8): basicft8/170923_082015.wav
+      decodes 1 message at gate=2 and 0 messages at gate=0. OSD provides the
+      ONLY decode path for that one ground-truth real-world signal.
+    - Composite -0.0188, entirely from the fixture-pass-rate drop (0.15 weight × -0.125 = -0.01875).
+    - The iter-2 "OSD contributes ~0 recall" finding was measured against jt9-derived truth and is incomplete; the fixture corpus catches the marginal OSD recovery that jt9 also misses.
   notes: |
-    Two paths before deciding:
-    (a) Sweep gate=0 on synth-clean with parametric SNR truth. If gate=0
-        loses ≥1 dB in SNR@50%, hold at gate=2. If <0.5 dB, fully disable.
-    (b) Run gate=0 on wild-50 — though wild-50 currently shows 0/96 jt9
-        overlap so it's not super informative.
-    Tie to hb-018 (stronger FP filter): if a reliable FP filter ever
-    lands, we could re-enable a wider gate AND keep precision.
+    SHELVED. Gate=2 confirmed at the elbow.
+    See research/experiments/2026-05-24-osd-disable-audit.md.
+    Future "tighten OSD further" hypotheses are structurally closed —
+    any further OSD reduction must first justify losing the fixture-
+    tested basicft8 decode.
 
 ### hb-040 — Plumb (or remove) `Ft8Config::time_range`  [PRIORITY: 0.35]
   mode: ft8
