@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T00:00:00Z
+last_updated: 2026-05-24T00:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 16
-current_ratio: 0.200
+exploitation_run: 17
+current_ratio: 0.190
 
 ## Active (ranked by score)
 
@@ -105,6 +105,26 @@ current_ratio: 0.200
     a NEW hb-NNN at that point rather than reviving this one — the
     framing has moved on. See research/experiments/2026-05-23-multipass-profile.md.
 
+
+### hb-042 — Score-based cap (replace count cap with min_sync_score)  [PRIORITY: 0.40, spawned 2026-05-24 from hb-033]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 1 session
+  expected_delta: small recall + precision; cleaner principle than count-based cap
+  defensible_prior: yes (saturation sweep showed signal-vs-noise floor at rank 200-300)
+  wild_card: false
+  evidence_for:
+    - hb-033 saturation sweep (2026-05-24): real/FP ratio falls off a cliff past rank ~300. The "right" cap is the boundary where Costas sync score crosses a noise threshold, not a specific count.
+    - hb-007 shelved min_sync_score in an older state (cap=200, NMS on). Picture may be different now (cap=300, NMS off, gate=2).
+  evidence_against:
+    - Score thresholds are corpus-dependent; what works on hard-200 may be wrong on clean bands or DX recordings.
+    - Adding a score floor would clip "barely viable" candidates that hb-038 demonstrated are worth keeping (the 200→300 win).
+  notes: |
+    Implementation: lower max_sync_candidates back to a high cap (e.g.,
+    500) AND set min_sync_score to a value that admits ~300 candidates
+    on average across hard-200. Compare against the cap=300 baseline.
+    If recall is the same with fewer FPs, graduate.
 
 ### hb-041 — Disable OSD fallback entirely (parity gate = 0)  [PRIORITY: 0.50, spawned 2026-05-23 from hb-014]
   mode: ft8
@@ -238,31 +258,23 @@ current_ratio: 0.200
     Goal: find a setting that pushes BP convergence rate from current
     (estimate ~80%?) to ~90%+ while keeping decode rate ≥ current.
 
-### hb-033 — Why does sync_cap=300 only beat sync_cap=200 by 21 decodes?  [PRIORITY: 0.45]
+### hb-033 — sync_cap saturation audit  [SHELVED 2026-05-24]
   mode: ft8
-  status: pending
-  priority_score: 0.45
-  estimated_effort: 1 session
-  expected_delta: diagnostic; informs whether NMS or LDPC is the bottleneck past rank-200
-  defensible_prior: yes (hb-003 sweep showed sharp elbow at sync_cap=200)
+  status: SHELVED — cap=300 is at the elbow; higher caps not worth it
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: REFUTED — +7 decodes at +160% wallclock + degraded precision
+  defensible_prior: yes (saturation sweep data)
   wild_card: false
-  evidence_for:
-    - hb-003 sweep: sync_cap=200 gives +219 decodes vs baseline; sync_cap=300 gives only +240 (+21 more). NMS or LDPC is gating decodes past candidate rank ~200.
-    - Two distinguishable causes: (a) NMS merges candidates 201-300 with stronger neighbors before LDPC sees them; (b) LDPC + OSD fails on candidates that survive NMS but rank low (low sync score → low LLR confidence → harder convergence).
-    - The wall-clock cost of sync_cap=300 vs 200 was +20% per WAV; for 0.5% more decodes that's a poor tradeoff — but the underlying cause matters.
   evidence_against:
-    - Pure diagnostic; no guaranteed code change drops out
-    - The 0.5% additional headroom may not be worth pursuing even if the cause is identified
+    - 2026-05-24 sweep on hard-200 at gate=2: cap=300 → 4365 rec / 952 nov / 255s; cap=400 → 4371 (+6) / 1026 (+74) / 409s; cap=500 → 4372 (+7) / 1076 (+124) / 662s. Marginal real/FP ratio collapses from 1:0.2 (in the top 300) to 1:12 (in 300-400) to 1:18 (in 400-500).
+    - Wallclock blows past the 3000ms/WAV operational budget on individual WAVs at cap=500.
+    - Recall gain is trivially small (+0.08% absolute) and is dwarfed by the FP increase.
   notes: |
-    Instrument the decoder to emit per-candidate-rank outcomes on a
-    busy-band WAV (one of hard-200's worst — e.g., wav_hash
-    bb445ede300...). For each Costas candidate from rank 1 to 300:
-    - Did NMS suppress it? (record post-NMS survival)
-    - If it survived NMS, did LDPC converge?
-    - If LDPC failed, did OSD fall back?
-    Plot decode-success rate vs candidate rank. If the rate drops
-    cliff-like at rank ~200, NMS is the culprit (sync scores converge);
-    if it drops gradually, LDPC convergence is.
+    SHELVED — cap=300 stays as production default. The cap=200→300
+    win that hb-038 found doesn't extrapolate to 300→400→500.
+    See research/experiments/2026-05-24-sync-cap-saturation.md.
+    Successor: hb-042 (try a score-based cap instead of a count-based one).
 
 ### hb-012 — Negative time offset extension (early-arriving DX signals)  [PRIORITY: 0.44]
   mode: ft8
