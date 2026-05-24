@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T04:00:00Z
+last_updated: 2026-05-24T04:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 24
-current_ratio: 0.143
+exploitation_run: 25
+current_ratio: 0.138
 # Note: mr-001 (WSJT-X-Improved audit) added hb-043..hb-048 — six new
 # pending hypotheses sourced from external research. Bank no longer
 # "exhausted" — the meta-research cycle works.
@@ -171,24 +171,25 @@ current_ratio: 0.143
     (likely a faster pass with relaxed sync_cap / OSD off + a thorough pass
     with current production knobs). Then implement and CLI-toggle.
 
-### hb-047 — Auto-tightened passband detection  [PRIORITY: 0.40, spawned 2026-05-24 from mr-001]
+### hb-047 — Auto-tightened passband detection  [SHELVED 2026-05-24 via mr-007 audit]
   mode: ft8
-  status: pending
-  priority_score: 0.40
-  estimated_effort: 1 session
-  expected_delta: +0.005 to +0.02 on Wild-50; near-zero on synth/curated
-  defensible_prior: yes (WSJT-X-Improved v3.1.0)
+  status: SHELVED — architecture audit shows minimal attach-point
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: REFUTED — <1% wallclock + indeterminate precision gain on wild-50
+  defensible_prior: turned out wrong on architecture-fit grounds
   wild_card: false
-  evidence_for:
-    - WSJT-X-Improved v3.1.0: "filter edges are now automatically optimized according to the actual passband...better decoding performance and fewer false decodes when Wide Graph limits are poorly set".
-    - Pancetta's sync_cap=300 limits candidate count but not frequency window; combining auto-passband with the existing cap could narrow more efficiently.
   evidence_against:
-    - Synth + curated corpora are likely already cleanly band-cropped; gain there will be zero or negative.
-    - Edge detection on partly-filtered SDR captures requires hysteresis to avoid flapping.
+    - mr-007 audit (2026-05-24): pancetta's sync_search is only 1.3% of pass time (per hb-021 profile); narrowing the search range maximum saves ~0.5% wallclock.
+    - Precision wall is "candidates that surface ARE noise", not "candidates from outside the passband leak in". The cap (300) is what limits the population; passband narrowing would only matter if it displaced real candidates from the top 300, which it wouldn't given the flat sync_score distribution past rank 300 (hb-033).
+    - Natural target (wild-50) has only 4 total novel decodes — no measurable signal for the technique.
   notes: |
-    Implementation: detect transitions in the per-bin energy histogram
-    that look like filter rolloffs; clamp candidate search to the detected
-    passband. Sweep on wild-50.
+    SHELVED via mr-007's first application. See
+    research/experiments/2026-05-24-passband-architecture-audit.md.
+    First test of architecture-fit audit at iter-pick time saved
+    ~100 LOC + an eval. mr-002 (JTDX audit) is more attractive next
+    external-source target — JTDX is architecturally closer to
+    pancetta than WSJT-X-Improved.
 
 ### hb-048 — AP type 7 (a7) cross-correlation against decoded callsigns  [PRIORITY: 0.45, spawned 2026-05-24 from mr-001]
   mode: ft8
