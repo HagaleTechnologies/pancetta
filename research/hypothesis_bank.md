@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T03:30:00Z
+last_updated: 2026-05-24T04:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 23
-current_ratio: 0.148
+exploitation_run: 24
+current_ratio: 0.143
 # Note: mr-001 (WSJT-X-Improved audit) added hb-043..hb-048 — six new
 # pending hypotheses sourced from external research. Bank no longer
 # "exhausted" — the meta-research cycle works.
@@ -132,27 +132,24 @@ current_ratio: 0.148
     as the candidate's time offset. Add a CLI flag --time-interpolation
     {none|parabolic|gaussian} for sweep.
 
-### hb-045 — Localized baseline / noise-floor estimation  [PRIORITY: 0.50, spawned 2026-05-24 from mr-001]
+### hb-045 — Localized baseline / noise-floor estimation  [SHELVED 2026-05-24]
   mode: ft8
-  status: pending
-  priority_score: 0.50
-  estimated_effort: 1 session
-  expected_delta: +0.005 to +0.02 on Wild-50 + heterogeneous spectra; possibly hard-200 too
-  defensible_prior: yes (WSJT-X-Improved v3.1.0 and original WSJT-X 2019 baseline change)
+  status: SHELVED — technique doesn't apply to pancetta's architecture
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: REFUTED — pancetta already does per-candidate-local SNR estimation
+  defensible_prior: turned out wrong on architecture-fit grounds
   wild_card: false
-  evidence_for:
-    - WSJT-X-Improved v3.1.0: "Optimized baseline calculation, effective for FT4, FT2 and FT8 STD".
-    - WSJT-X mainline `lib/ft8/baseline.f90` saw "Improve FT8 SNR estimates in two ways" change (2019); the technique is to compute noise floor per-window rather than globally so a single strong signal doesn't drag the floor up across the whole band.
-    - Pancetta's wild-50 has 0/96 jt9-overlap recovery — heterogeneous spectra are exactly where a windowed baseline should help.
   evidence_against:
-    - Local baselines on truly empty bands can over-suppress weak candidates; needs a floor on the local estimate.
-    - If pancetta currently uses global baseline (TBD by audit), the change touches the SNR-thresholding path and could shift precision-recall in ways that interact with the parity gate (hb-014).
+    - Audit (2026-05-24): pancetta's `par_estimate_snr_spectrogram` (decoder.rs:3093) and `par_estimate_snr_fft` (decoder.rs:3117) ALREADY compute SNR per-candidate per-symbol (best-tone vs worst-tone within each symbol's 8 tones). No global noise floor is used anywhere in the decode pipeline.
+    - The WSJT-X technique solves a problem that doesn't exist in pancetta (global noise floor + strong signal dragging the floor up).
+    - `Ft8Config::min_snr_db` is dead code (declared, defaulted, never read). Spawned hb-049 to remove it (mirror of hb-032 cleanup pattern).
+    - `estimate_noise_floor` function exists but only in a test, not in the decode pipeline.
   notes: |
-    Source: https://sourceforge.net/p/wsjt/wsjtx/ci/master/tree/lib/ft8/baseline.f90
-    + WSJT-X-Improved v3.1.0 release notes.
-    First step: audit pancetta-ft8 to find where the candidate noise floor /
-    SNR threshold is computed. Then add a CLI flag selecting
-    {global|windowed_50hz|windowed_200hz}. Sweep on hard-200 + wild-50.
+    SHELVED. See research/experiments/2026-05-24-localized-baseline-audit.md.
+    The mr-001 source review didn't catch the architecture mismatch.
+    Spawned mr-007 to add architecture-fit check before promoting
+    harvested hypotheses to active.
 
 ### hb-046 — Two-stage STD-then-MTD pass scheduling  [PRIORITY: 0.50, spawned 2026-05-24 from mr-001]
   mode: ft8
@@ -215,6 +212,23 @@ current_ratio: 0.148
     hb-NNN." First step: design doc outlining template structure, snr7
     threshold (WSJT-X uses snr7 >= 6.0, snr7b >= 1.8), per-callsign cooldown
     integration with pancetta-qso's recently_responded_to.
+
+### hb-049 — Remove dead `Ft8Config::min_snr_db` field  [PRIORITY: 0.40, spawned 2026-05-24 from hb-045]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 0.5 sessions
+  expected_delta: cleanup; removes another documentation footgun
+  defensible_prior: yes (hb-045 audit confirmed the field is dead)
+  wild_card: false
+  evidence_for:
+    - hb-045 audit (2026-05-24): `Ft8Config::min_snr_db` declared at decoder.rs:114, defaulted to MIN_DECODE_SNR=-25.0 at decoder.rs:215. Grep returns zero reads anywhere in the decode pipeline.
+    - Same pattern as hb-032 (aggressive_decoding removal): pub field that's documented but never consumed.
+  evidence_against:
+    - Same as hb-032: minor breaking API change for callers using named-field construction.
+  notes: |
+    Implementation: same as hb-032. Delete the field + Default impl entry +
+    any test references. Tests should still pass.
 
 ### hb-043 — AP my_call-less injection (hb-027 precondition)  [PRIORITY: 0.45, spawned 2026-05-24 from hb-004 wiring]
   mode: ft8
@@ -737,6 +751,30 @@ search to in-repo sources.
     we never followed up on (hb-039's "97% novels are FPs" is one).
   expected_yield: 1-3 reopen-worthy hypotheses + meta-process insights
   defensible_prior: yes — we already have the "precision wall" insight from cross-iter pattern (hb-014 + hb-034 + hb-035 + hb-041 all hit the same wall)
+
+### mr-007 — Architecture-fit audit for harvested hypotheses  [spawned 2026-05-24 from hb-045]
+  status: pending
+  estimated_effort: 0.5 session per harvest batch (added to mr-001/002/003 procedure)
+  source_type: internal — adds a check step to external-source harvests
+  source: hb-045 audit (architecture mismatch caught at iter time, not harvest time)
+  method: |
+    BEFORE promoting a candidate hb-NNN from a meta-research harvest
+    (mr-001, mr-002, mr-003) to active, run an architecture-fit audit:
+    1. What pancetta module/function does the technique correspond to?
+    2. Does pancetta's existing code have the failure mode the technique
+       fixes, or does pancetta's design avoid that failure mode by
+       construction?
+    3. Is the necessary plumbing (e.g., a config flag, a baseline
+       computation, an SNR threshold) ALREADY USED, partly used (dead
+       config flag like aggressive_decoding/min_snr_db), or absent?
+    4. If absent/dead, the hypothesis is either (a) "first install the
+       plumbing, then test the technique" or (b) shelve as
+       architecture-mismatch.
+  rationale: |
+    hb-045 wasted an iter SHELVING a hypothesis whose architecture
+    mismatch was knowable at harvest time. mr-007 catches this class
+    before it consumes an iter slot.
+  expected_yield: prevents 1-3 wasted iters per harvest cycle
 
 ### mr-006 — Real-world FT8 corpus expansion survey
   status: pending
