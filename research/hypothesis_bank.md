@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T00:30:00Z
+last_updated: 2026-05-24T01:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 17
-current_ratio: 0.190
+exploitation_run: 18
+current_ratio: 0.182
 
 ## Active (ranked by score)
 
@@ -202,33 +202,23 @@ current_ratio: 0.190
     3.0, 5.0} with reasonable TF radii (t=2, f=1). Goal: composite ≥
     nms-off's 0.5529 with wall-clock 30-50% better than nms-off.
 
-### hb-034 — Audit OSD-3's +313 unconfirmed novel decodes  [PRIORITY: 0.40]
+### hb-034 — OSD-3 follow-up under gate=2  [SHELVED 2026-05-24]
   mode: ft8
-  status: pending
-  priority_score: 0.40
-  estimated_effort: 1 session
-  expected_delta: diagnostic; determines whether OSD-3 with stronger FP filter is worth pursuing (hb-018)
-  defensible_prior: yes (concrete data from hb-005 sweep)
+  status: SHELVED — OSD-3 LOSES 1 real decode and adds +284 novels
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: REFUTED — negative recall delta, +30% novels
+  defensible_prior: yes (sweep data)
   wild_card: false
-  evidence_for:
-    - hb-005 sweep (2026-05-22): at OSD-2→OSD-3 with iters=25, recovered count is identical (4051) but novel count jumps from 868 to 1181 — +313 unconfirmed decodes that aren't in jt9's truth set.
-    - At iters=50: same pattern, +337 novel for +7 recovered going OSD-2 → OSD-3.
-    - If any meaningful fraction (>10%?) of those 313 novel decodes are real (i.e., jt9 missed them too), then OSD-3 with a stronger FP filter (hb-018) would be net-positive for true sensitivity.
   evidence_against:
-    - Most likely all 313 are CRC-14 collisions (the parity gate ≤4 isn't tight enough at OSD-3's 125K trials per candidate).
-    - Even at 10% real, the per-decode cost of OSD-3 (~20% wall-clock at OSD-2 over none) may not be worth the marginal gain.
+    - 2026-05-24 sweep on hard-200 at current production state (gate=2, cap=300, NMS off): OSD-3 yields 4364 recovered (-1 vs OSD-2's 4365) and 1236 novel (+284 vs OSD-2's 952). Wallclock unchanged.
+    - The +200-ish novels added by OSD-3 are a fixed property of the width-3 trial expansion (~125K trials/candidate, statistically meaningful CRC-14 collision rate), invariant under parity gate width.
+    - Combined with the iter-2 finding that OSD's recall contribution is ~0 on hard-200 vs jt9 truth, OSD-3's "+novels" are nearly all FPs.
   notes: |
-    Three approaches to validate:
-    (a) Cross-decode the same hard-200 WAVs with JTDX (if installable);
-        treat (pancetta-OSD-3 ∩ JTDX) − jt9 decodes as high-confidence
-        novel. This would also meaningfully scope hb-024.
-    (b) QSO-pattern continuity: if a "novel" decode's callsign appears
-        in adjacent slots' jt9 decodes, the novel is likely real.
-    (c) Plausibility filter on the decoded message: valid callsign
-        format, valid grid, etc. Quick FP cut.
-    Run on the OSD-3 + iters=50 scorecard since that has the most data.
-    If <5% are real, document and shelve OSD-3 permanently. If >20%
-    are real, fold into hb-018 and push for the stronger FP filter.
+    SHELVED. See research/experiments/2026-05-24-osd3-followup.md.
+    hb-018 (FP filter for OSD-3) becomes moot — nothing to filter
+    toward without recall benefit. hb-041 (disable OSD fallback)
+    becomes more compelling.
 
 ### hb-035 — Sweep for max BP convergence rate (reduce OSD fallback)  [PRIORITY: 0.45]
   mode: ft8
