@@ -141,10 +141,9 @@ fn benchmark_configuration_variants(c: &mut Criterion) {
         });
     });
 
-    // High-sensitivity configuration (more candidates, wider SNR window)
+    // High-sensitivity configuration (more candidates)
     let mut high_sensitivity_config = Ft8Config::default();
     high_sensitivity_config.max_candidates = 100;
-    high_sensitivity_config.min_snr_db = -25.0;
     let mut high_sensitivity_decoder = Ft8Decoder::new(high_sensitivity_config).unwrap();
 
     group.bench_function("high_sensitivity", |b| {
@@ -160,7 +159,6 @@ fn benchmark_configuration_variants(c: &mut Criterion) {
     // Minimal configuration
     let mut minimal_config = Ft8Config::default();
     minimal_config.max_candidates = 10;
-    minimal_config.min_snr_db = -10.0;
     minimal_config.ldpc_iterations = 25;
     let mut minimal_decoder = Ft8Decoder::new(minimal_config).unwrap();
 

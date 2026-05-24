@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T04:30:00Z
+last_updated: 2026-05-24T05:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 25
-current_ratio: 0.138
+exploitation_run: 26
+current_ratio: 0.133
 # Note: mr-001 (WSJT-X-Improved audit) added hb-043..hb-048 — six new
 # pending hypotheses sourced from external research. Bank no longer
 # "exhausted" — the meta-research cycle works.
@@ -214,22 +214,23 @@ current_ratio: 0.138
     threshold (WSJT-X uses snr7 >= 6.0, snr7b >= 1.8), per-callsign cooldown
     integration with pancetta-qso's recently_responded_to.
 
-### hb-049 — Remove dead `Ft8Config::min_snr_db` field  [PRIORITY: 0.40, spawned 2026-05-24 from hb-045]
+### hb-049 — Remove dead `Ft8Config::min_snr_db` field  [WIN 2026-05-24]
   mode: ft8
-  status: pending
-  priority_score: 0.40
-  estimated_effort: 0.5 sessions
-  expected_delta: cleanup; removes another documentation footgun
-  defensible_prior: yes (hb-045 audit confirmed the field is dead)
+  status: GRADUATED — field + const + all referencing sites removed
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: cleanup (no behavior change)
+  defensible_prior: yes (hb-045 audit + removal verified)
   wild_card: false
   evidence_for:
-    - hb-045 audit (2026-05-24): `Ft8Config::min_snr_db` declared at decoder.rs:114, defaulted to MIN_DECODE_SNR=-25.0 at decoder.rs:215. Grep returns zero reads anywhere in the decode pipeline.
-    - Same pattern as hb-032 (aggressive_decoding removal): pub field that's documented but never consumed.
-  evidence_against:
-    - Same as hb-032: minor breaking API change for callers using named-field construction.
+    - Removed Ft8Config::min_snr_db + MIN_DECODE_SNR const + all 7 referencing sites (decoder.rs decl/Default/const/test_default, integration_tests.rs ×2, decoder_benchmark.rs ×2, README.md ×2, SPECTRAL_ANALYSIS_ENHANCEMENTS.md, examples/enhanced_spectral_analysis.rs).
+    - `grep -rn min_snr_db pancetta-ft8/` returns nothing post-change.
+    - Tests: 189 lib + 7 integration pass; examples build clean.
   notes: |
-    Implementation: same as hb-032. Delete the field + Default impl entry +
-    any test references. Tests should still pass.
+    Mirror of hb-032 (aggressive_decoding removal). See
+    research/experiments/2026-05-24-min-snr-db-removal.md.
+    Recommend running mr-004 (quarterly source-drift audit) to
+    catch remaining dead config flags in one pass.
 
 ### hb-043 — AP my_call-less injection (hb-027 precondition)  [PRIORITY: 0.45, spawned 2026-05-24 from hb-004 wiring]
   mode: ft8

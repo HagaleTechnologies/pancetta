@@ -118,7 +118,6 @@ use pancetta_ft8::{Ft8Decoder, Ft8Config};
 
 // Configure for weak signal detection
 let config = Ft8Config {
-    min_snr_db: -24.0,           // Target weak signals
     frequency_range: 300.0,       // Wide Doppler search
     ldpc_iterations: 150,         // More iterations for weak signals
     ..Default::default()

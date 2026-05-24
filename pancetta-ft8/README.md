@@ -136,7 +136,6 @@ use pancetta_ft8::{Ft8Decoder, Ft8Config};
 let config = Ft8Config {
     enable_multithreading: true,
     max_candidates: 100,
-    min_snr_db: -25.0,
     frequency_range: 300.0,    // ±300 Hz search
     time_range: 2.0,           // ±2 second search
     ..Default::default()
@@ -250,7 +249,6 @@ cargo bench --package pancetta-ft8
 | `sample_rate` | 12000 | Audio sample rate (Hz) |
 | `enable_multithreading` | true | Enable parallel processing |
 | `max_candidates` | 50 | Maximum decode candidates |
-| `min_snr_db` | -25.0 | Minimum SNR threshold |
 | `ldpc_iterations` | 100 | LDPC decoder iterations |
 | `frequency_range` | 200.0 | Frequency search range (±Hz) |
 | `time_range` | 2.0 | Time search range (±seconds) |

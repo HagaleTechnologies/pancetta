@@ -34,9 +34,6 @@ use crate::parallel::BudgetTracker;
 /// Maximum number of decode candidates to process
 const MAX_DECODE_CANDIDATES: usize = 100;
 
-/// Minimum SNR for attempting decode (dB)
-const MIN_DECODE_SNR: f32 = -25.0;
-
 /// LDPC decoder iterations
 /// LDPC belief-propagation iteration cap before falling back to OSD.
 /// Raised from 25 to 50 on 2026-05-22 (hb-005 sweep): +0.0008 composite
@@ -109,9 +106,6 @@ pub struct Ft8Config {
 
     /// Maximum number of candidates to decode
     pub max_candidates: usize,
-
-    /// Minimum SNR threshold for decoding
-    pub min_snr_db: f32,
 
     /// LDPC decoder iterations
     pub ldpc_iterations: usize,
@@ -212,7 +206,6 @@ impl Default for Ft8Config {
             protocol: Protocol::Ft8,
             enable_multithreading: true,
             max_candidates: MAX_DECODE_CANDIDATES,
-            min_snr_db: MIN_DECODE_SNR,
             ldpc_iterations: LDPC_MAX_ITERATIONS,
             frequency_range: 200.0,
             time_range: 2.0,
@@ -3657,7 +3650,6 @@ mod tests {
         let config = Ft8Config::default();
         assert_eq!(config.sample_rate, SAMPLE_RATE);
         assert_eq!(config.max_candidates, MAX_DECODE_CANDIDATES);
-        assert_eq!(config.min_snr_db, MIN_DECODE_SNR);
         assert!(config.enable_multithreading);
     }
 

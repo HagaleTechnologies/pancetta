@@ -190,10 +190,9 @@ fn test_decoder_noise_only() {
 
 #[test]
 fn test_decoder_configuration_variants() {
-    // Test with high-sensitivity configuration (more candidates, wider SNR window)
+    // Test with high-sensitivity configuration (more candidates)
     let mut high_sensitivity_config = Ft8Config::default();
     high_sensitivity_config.max_candidates = 100;
-    high_sensitivity_config.min_snr_db = -25.0;
 
     let mut decoder = Ft8Decoder::new(high_sensitivity_config).unwrap();
     let test_samples = generate_ft8_test_signal("CQ W1ABC FN42", 20.0, 0.0);
@@ -205,7 +204,6 @@ fn test_decoder_configuration_variants() {
     let mut minimal_config = Ft8Config::default();
     minimal_config.enable_multithreading = false;
     minimal_config.max_candidates = 10;
-    minimal_config.min_snr_db = -10.0;
 
     let mut decoder = Ft8Decoder::new(minimal_config).unwrap();
     let result = decoder.decode_window(&test_samples);

@@ -22,7 +22,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // default config and override only the fields this demo wants to
     // tweak — this is forward-compatible with new Ft8Config fields.
     let config = Ft8Config {
-        min_snr_db: -24.0,
         ldpc_iterations: 150,
         frequency_range: 300.0,
         time_range: 3.0,
