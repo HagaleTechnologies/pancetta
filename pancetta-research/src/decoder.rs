@@ -199,9 +199,9 @@ impl DecoderUnderTest for Ft8Decoder {
         let mut decoder = pancetta_ft8::Ft8Decoder::new(self.config.clone())
             .map_err(|e| anyhow::anyhow!("Ft8Decoder::new failed: {e}"))?;
         let raw = match &self.ap_context {
-            Some(ctx) => decoder
-                .decode_window_with_ap(&samples, ctx)
-                .map_err(|e| anyhow::anyhow!("decode_window_with_ap failed for {}: {e}", path.display()))?,
+            Some(ctx) => decoder.decode_window_with_ap(&samples, ctx).map_err(|e| {
+                anyhow::anyhow!("decode_window_with_ap failed for {}: {e}", path.display())
+            })?,
             None => decoder
                 .decode_window(&samples)
                 .map_err(|e| anyhow::anyhow!("decode_window failed for {}: {e}", path.display()))?,

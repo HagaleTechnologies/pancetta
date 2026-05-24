@@ -618,7 +618,9 @@ fn main() -> anyhow::Result<()> {
                             .filter_map(|c| {
                                 let r = RecentCallAp::new(c, 0.0);
                                 if r.is_none() {
-                                    eprintln!("warning: --ap-recent-calls entry {c:?} did not encode");
+                                    eprintln!(
+                                        "warning: --ap-recent-calls entry {c:?} did not encode"
+                                    );
                                 }
                                 r
                             })
