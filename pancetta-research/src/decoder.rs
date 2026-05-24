@@ -138,6 +138,12 @@ impl Ft8Decoder {
         self.config.time_range = v;
         self
     }
+
+    /// Override the OSD parity gate. hb-014 sweep candidate.
+    pub fn with_max_parity_errors_for_osd(mut self, n: usize) -> Self {
+        self.config.max_parity_errors_for_osd = n;
+        self
+    }
 }
 
 impl DecoderUnderTest for Ft8Decoder {

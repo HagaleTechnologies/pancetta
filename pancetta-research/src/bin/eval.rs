@@ -40,6 +40,7 @@ struct Args {
     min_sync_score: Option<f64>,
     adaptive_ldpc_iters: Option<bool>,
     time_range: Option<f64>,
+    max_parity_errors_for_osd: Option<usize>,
 }
 
 impl Args {
@@ -60,6 +61,7 @@ impl Args {
         let mut min_sync_score: Option<f64> = None;
         let mut adaptive_ldpc_iters: Option<bool> = None;
         let mut time_range: Option<f64> = None;
+        let mut max_parity_errors_for_osd: Option<usize> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -159,6 +161,13 @@ impl Args {
                 "--time-range" => {
                     time_range = Some(iter.next().context("--time-range needs a value")?.parse()?);
                 }
+                "--max-parity-errors-for-osd" => {
+                    max_parity_errors_for_osd = Some(
+                        iter.next()
+                            .context("--max-parity-errors-for-osd needs a value")?
+                            .parse()?,
+                    );
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
@@ -204,6 +213,7 @@ impl Args {
             min_sync_score,
             adaptive_ldpc_iters,
             time_range,
+            max_parity_errors_for_osd,
         })
     }
 }
@@ -563,6 +573,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(v) = args.time_range {
                 d = d.with_time_range(v);
+            }
+            if let Some(n) = args.max_parity_errors_for_osd {
+                d = d.with_max_parity_errors_for_osd(n);
             }
             Box::new(d)
         }

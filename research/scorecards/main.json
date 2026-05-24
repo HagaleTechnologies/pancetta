@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-05-23T18:58:25.812207Z",
+  "generated_at": "2026-05-24T04:29:54.819795Z",
   "mode": "ft8",
   "git": {
-    "branch": "experiment/ft8/cap-300-resweep",
-    "head_sha": "77a4444dc2a5f7f5c09308eaf92812c2f5ca4cee",
-    "main_merge_base": "77a4444dc2a5f7f5c09308eaf92812c2f5ca4cee",
-    "dirty": false
+    "branch": "experiment/ft8/multipass-profile",
+    "head_sha": "18910edf6408d023f1cbdc9fa351b452e0faab6a",
+    "main_merge_base": "18910edf6408d023f1cbdc9fa351b452e0faab6a",
+    "dirty": true
   },
   "build": {
     "rustc_version": "rustc 1.94.1 (e408947bf 2026-03-25)",
@@ -19,18 +19,20 @@
     "harness_version": "0.1.0",
     "host": "macos/aarch64",
     "cores_used": 10,
-    "elapsed_seconds": 1211.454948375
+    "elapsed_seconds": 1533.713961833
   },
   "config": {
     "decoder": {
       "adaptive_ldpc_iters": false,
       "aggressive_decoding": false,
+      "block_score_rerank": true,
       "enable_multithreading": true,
       "frequency_range": 200.0,
       "ldpc_iterations": 50,
       "llr_target_variance": 32.0,
       "max_candidates": 100,
       "max_decode_passes": 1,
+      "max_parity_errors_for_osd": 2,
       "max_sync_candidates": 300,
       "min_snr_db": -25.0,
       "min_sync_score": 3.0,
@@ -55,11 +57,11 @@
     "curated-hard-1000": {
       "wavs_processed": 1000,
       "truth_decodes_total": 28104,
-      "truth_decodes_recovered": 14222,
-      "decode_rate": 0.5060489610019926,
-      "novel_decodes": 4019,
+      "truth_decodes_recovered": 14219,
+      "decode_rate": 0.5059422146313692,
+      "novel_decodes": 3172,
       "wsjtx_decoded": 28104,
-      "vs_wsjtx_pct": 50.60489610019926,
+      "vs_wsjtx_pct": 50.59422146313692,
       "per_wav_top_failures": [
         {
           "wav_hash": "bb445ede3009d779c5ce1682c8112082367e355bb9c5943a571324eaa424a3c8",
@@ -208,7 +210,7 @@
       "truth_decodes_total": 8576,
       "truth_decodes_recovered": 4365,
       "decode_rate": 0.5089785447761194,
-      "novel_decodes": 1210,
+      "novel_decodes": 952,
       "wsjtx_decoded": 8576,
       "vs_wsjtx_pct": 50.89785447761194,
       "per_wav_top_failures": [
@@ -434,7 +436,7 @@
       "truth_decodes_total": 96,
       "truth_decodes_recovered": 0,
       "decode_rate": 0.0,
-      "novel_decodes": 4,
+      "novel_decodes": 2,
       "wsjtx_decoded": 96,
       "vs_wsjtx_pct": 0.0,
       "per_wav_top_failures": [

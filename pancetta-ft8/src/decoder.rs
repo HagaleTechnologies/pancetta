@@ -198,6 +198,14 @@ pub struct Ft8Config {
     /// they finish; if A/B is bit-identical, this knob can be
     /// retired.
     pub block_score_rerank: bool,
+
+    /// Maximum unsatisfied parity-check count for a BP-non-converged
+    /// candidate to be eligible for OSD fallback. Default 2 — hb-014
+    /// (2026-05-23) swept {0..6} on curated-hard-200 and curated-hard-1000:
+    /// recall is flat from 0 through 4, but novel-decode count (a proxy
+    /// for false positives) grows monotonically with the gate. Tightening
+    /// 4 → 2 cut FPs ~21% at zero recall cost and was ~26% faster.
+    pub max_parity_errors_for_osd: usize,
 }
 
 impl Default for Ft8Config {
@@ -222,6 +230,7 @@ impl Default for Ft8Config {
             min_sync_score: MIN_SYNC_SCORE,
             adaptive_ldpc_iters: false,
             block_score_rerank: true,
+            max_parity_errors_for_osd: 2,
         }
     }
 }
@@ -346,7 +355,8 @@ impl Ft8Decoder {
         let ldpc_decoder = LdpcDecoder::new_with_osd(
             config.ldpc_iterations,
             config.osd_depth.map(|d| OsdConfig { max_depth: d }),
-        )?;
+        )?
+        .with_max_parity_errors_for_osd(config.max_parity_errors_for_osd);
 
         // Pre-compute FFT plan and Hann window for symbol extraction
         let sps = protocol_params.samples_per_symbol(SAMPLE_RATE);
@@ -554,6 +564,7 @@ impl Ft8Decoder {
                 osd_depth: self.config.osd_depth,
                 llr_target_variance: self.config.llr_target_variance,
                 adaptive_ldpc_iters: self.config.adaptive_ldpc_iters,
+                max_parity_errors_for_osd: self.config.max_parity_errors_for_osd,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -593,11 +604,14 @@ impl Ft8Decoder {
                             )
                         };
                         let ldpc_low = LdpcDecoder::new_with_osd(iters_low, osd_cfg)
-                            .expect("LDPC decoder init failed");
+                            .expect("LDPC decoder init failed")
+                            .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd);
                         let ldpc_mid = LdpcDecoder::new_with_osd(iters_mid, osd_cfg)
-                            .expect("LDPC decoder init failed");
+                            .expect("LDPC decoder init failed")
+                            .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd);
                         let ldpc_high = LdpcDecoder::new_with_osd(iters_high, osd_cfg)
-                            .expect("LDPC decoder init failed");
+                            .expect("LDPC decoder init failed")
+                            .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd);
                         let fft_buffer = vec![Complex::new(0.0, 0.0); sps];
                         (ldpc_low, ldpc_mid, ldpc_high, fft_buffer)
                     },
@@ -2369,6 +2383,8 @@ struct DecodeContext<'a> {
     /// (low/mid/high iter counts) and dispatched per candidate by
     /// sync_score. hb-022 wild-card config flag.
     adaptive_ldpc_iters: bool,
+    /// Max parity errors tolerated before invoking OSD fallback. hb-014.
+    max_parity_errors_for_osd: usize,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -3218,6 +3234,9 @@ struct LdpcDecoder {
     algorithm: LdpcAlgorithm,
     /// Optional OSD fallback decoder
     osd: Option<OsdDecoder>,
+    /// Max unsatisfied parity checks tolerated before invoking OSD.
+    /// 4 = production default; hb-014 sweep candidate.
+    max_parity_errors_for_osd: usize,
 }
 
 impl LdpcDecoder {
@@ -3248,6 +3267,7 @@ impl LdpcDecoder {
             var_positions,
             algorithm: LdpcAlgorithm::SumProduct,
             osd: None,
+            max_parity_errors_for_osd: 4,
         })
     }
 
@@ -3255,6 +3275,11 @@ impl LdpcDecoder {
         let mut decoder = Self::new(max_iterations)?;
         decoder.osd = osd_config.map(OsdDecoder::new);
         Ok(decoder)
+    }
+
+    fn with_max_parity_errors_for_osd(mut self, n: usize) -> Self {
+        self.max_parity_errors_for_osd = n;
+        self
     }
 
     /// Decode using belief propagation with hard-decision input
@@ -3291,13 +3316,11 @@ impl LdpcDecoder {
             let llr_arr: &[f32; 174] = decoded_llrs[..174].try_into().unwrap();
             let parity_errors = self.count_parity_errors(llr_arr);
 
-            // Parity gate for OSD: allow up to 4 parity errors before attempting
-            // OSD. Widening to 5 lets too many noise candidates through, and
-            // CRC-14 collision rate turns those into false positives. Gate of 4
-            // balances false positive reduction with decode sensitivity.
-            const MAX_PARITY_ERRORS_FOR_OSD: usize = 4;
-
-            if parity_errors <= MAX_PARITY_ERRORS_FOR_OSD {
+            // Parity gate for OSD: tunable via Ft8Config::max_parity_errors_for_osd.
+            // Default 4: widening to 5 historically let too many noise candidates
+            // through (CRC-14 collisions become FPs); tightening to 3 lost real
+            // decodes. hb-014 re-sweeps this on the current production state.
+            if parity_errors <= self.max_parity_errors_for_osd {
                 // Compute neural ordering if trajectory is available and the
                 // neural-OSD feature is compiled in. Without the feature,
                 // OSD falls back to |LLR|-based ordering at the cost of

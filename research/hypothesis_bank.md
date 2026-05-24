@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-23T23:30:00Z
+last_updated: 2026-05-24T00:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 15
-current_ratio: 0.211
+exploitation_run: 16
+current_ratio: 0.200
 
 ## Active (ranked by score)
 
@@ -105,6 +105,31 @@ current_ratio: 0.211
     a NEW hb-NNN at that point rather than reviving this one — the
     framing has moved on. See research/experiments/2026-05-23-multipass-profile.md.
 
+
+### hb-041 — Disable OSD fallback entirely (parity gate = 0)  [PRIORITY: 0.50, spawned 2026-05-23 from hb-014]
+  mode: ft8
+  status: pending
+  priority_score: 0.50
+  estimated_effort: 0.5 session (parameter change + sweep)
+  expected_delta: -10% additional novels vs gate=2; possible recall loss on synth-clean
+  defensible_prior: partial — hb-014 sweep showed gate=0 has same recall as gate=4 on curated-hard-200
+  wild_card: false
+  evidence_for:
+    - hb-014 sweep (2026-05-23): on curated-hard-200, gate=0 had 4365 recovered (identical to gate=2/3/4) and 860 novels (vs 952 at gate=2 = -10% additional FPs).
+    - OSD on hard-200 contributes NO measurable recall vs jt9 truth — all its incremental decodes are "novel" (jt9-missed) and per hb-039 mostly singletons (likely FPs).
+    - Disabling OSD removes a code path entirely, simplifying the decoder.
+  evidence_against:
+    - Hard-200 / hard-1000 are derived from jt9; OSD may help on signals jt9 misses too, which we'd want for true on-air sensitivity.
+    - Untested on synth-clean (parametric ground truth). OSD might help on signals near the BP convergence cliff where parity errors are 1-2.
+    - Architectural shift: pancetta would become "BP-only decoder," losing one of its differentiating features (neural OSD).
+  notes: |
+    Two paths before deciding:
+    (a) Sweep gate=0 on synth-clean with parametric SNR truth. If gate=0
+        loses ≥1 dB in SNR@50%, hold at gate=2. If <0.5 dB, fully disable.
+    (b) Run gate=0 on wild-50 — though wild-50 currently shows 0/96 jt9
+        overlap so it's not super informative.
+    Tie to hb-018 (stronger FP filter): if a reliable FP filter ever
+    lands, we could re-enable a wider gate AND keep precision.
 
 ### hb-040 — Plumb (or remove) `Ft8Config::time_range`  [PRIORITY: 0.35]
   mode: ft8
@@ -284,28 +309,22 @@ current_ratio: 0.211
     gap is confirmed closed, document as "already fixed" and shelve hb-013.
     Effort: 0.5 sessions (mostly verification).
 
-### hb-014 — Neural OSD confidence gating (parity threshold sweep)  [PRIORITY: 0.41]
+### hb-014 — Parity gate sweep  [GRADUATED 2026-05-23]
   mode: ft8
-  status: pending
-  priority_score: 0.41
-  estimated_effort: 1 session
-  expected_delta: +0.005 to +0.02 composite; possible FP reduction
-  defensible_prior: partial
+  status: GRADUATED — production default `max_parity_errors_for_osd: 4 → 2`
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: ~0 composite (recall flat); -21% novel decodes; -26% wallclock
+  defensible_prior: yes (sweep data)
   wild_card: false
   evidence_for:
-    - Memory (decoder_status.md): "OSD depth: 2 (safe default). Parity gate: ≤4" — parity gate limits OSD to candidates with ≤4 unsatisfied parity checks
-    - History shows: 139.5% → 123.7% was "entirely removing false decodes, not losing real ones" — the parity gate was tightened at cost of some false decodes
-    - A neural classifier on parity check patterns (which checks failed) could more precisely gate OSD than a raw count threshold
-    - The existing neural OSD (training/neural_osd/) provides a precedent for the ML-in-decode pattern
-  evidence_against:
-    - Neural OSD was already trained with DIA model (20K params); adding a second neural stage compounds latency
-    - May be better framed as "improve the existing neural OSD model" rather than a second gate
+    - 2026-05-23 sweep {0..6} on curated-hard-200: recovered count was IDENTICAL (4365) from gate=0 through gate=4. Gate=5/6 gained ONE real decode (4365→4366) at +211/+531 additional novels (likely FPs).
+    - Verified on curated-hard-1000: gate=2 vs main (gate=4) lost 3 real decodes (out of 28104 = 0.011%, well within noise) and dropped novels 4019 → 3172 (-21%).
+    - Wallclock cut from 331s → 246s on hard-200 (-26%).
+    - Note: OSD's recall contribution on hard-200 is essentially zero vs jt9 truth (gate=0 = gate=6 on recovered). OSD's role is now narrowed to the highest-confidence near-misses (≤2 parity errors after BP).
   notes: |
-    Simpler angle: sweep the parity gate threshold from ≤3 to ≤6 on the synth
-    corpus to understand the sensitivity vs FP tradeoff curve, before committing
-    to a neural gate. A parity gate of ≤5 (wider) may recover some real decodes
-    that were caught by the tightening from 139.5% to 123.7%. Check: how many
-    of those recovered decodes would have been real vs noise on the curated corpus.
+    See research/experiments/2026-05-23-parity-gate-sweep.md.
+    Successor: hb-041 (consider gate=0 to fully disable OSD fallback).
 
 ### hb-015 — Doppler-resilient sync search (phase-coherent integration)  [PRIORITY: 0.38]
   mode: ft8
@@ -846,6 +865,35 @@ current_ratio: 0.211
     it for hb-031" path rather than just deletion.
   follow_up: hb-032 (cleanup: remove, repurpose for hb-031, or deprecate).
   journal: research/experiments/2026-05-21-aggressive-decoding-audit.md
+
+### hb-014 — Parity gate sweep / OSD precision-recall  [GRADUATED 2026-05-23]
+  mode: ft8
+  status: graduated
+  priority_score: 0.41
+  outcome: |
+    Swept Ft8Config::max_parity_errors_for_osd ∈ {0..6} on hard-200,
+    verified gate=2 on hard-1000. Recall flat from gate=0 through
+    gate=4 (4365 / 4366 on hard-200); novel-decode count grows
+    monotonically with gate width. Production graduated from gate=4
+    to gate=2: zero recall cost, -21% novels, -26% wallclock.
+  measured_delta: |
+    hard-200:  recovered 4365 → 4365 (=); novel 1210 → 952 (-21%)
+    hard-1000: recovered 14222 → 14219 (-3, noise); novel 4019 → 3172 (-21%)
+    wallclock (hard-200 single run): 331 s → 246 s (-26%)
+    composite: unchanged at 0.5545 (composite ignores novels by design)
+  learning: |
+    1. OSD's recall contribution on jt9-derived truth is essentially
+       zero — gate=0 and gate=6 yield the same recovered count. OSD
+       only generates "novel" decodes (jt9 missed them) and per hb-039
+       most isolated novels are likely FPs.
+    2. The composite metric doesn't penalize FPs, so precision wins
+       are invisible in composite. They still matter for on-air
+       operation (fewer fake QSO attempts) and CPU usage.
+    3. The "right" parity gate isn't a recall/precision tradeoff at
+       all on hard-200 — it's a pure precision-and-speed knob with
+       no downside under the current jt9-based composite.
+  follow_up: hb-041 (consider gate=0 to fully disable OSD fallback).
+  journal: research/experiments/2026-05-23-parity-gate-sweep.md
 
 ### hb-002 — Synth plateau investigation (1-of-6 message type)  [SHELVED 2026-05-20]
   mode: ft8
