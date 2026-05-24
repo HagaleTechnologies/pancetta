@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T01:00:00Z
+last_updated: 2026-05-24T01:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 18
-current_ratio: 0.182
+exploitation_run: 19
+current_ratio: 0.174
 
 ## Active (ranked by score)
 
@@ -415,32 +415,23 @@ current_ratio: 0.182
     understand OSD-2's FP rate on the curated corpus. Do hb-005 first, use its
     learnings to decide whether OSD-3 is worth pursuing.
 
-### hb-032 — Remove or repurpose dead `aggressive_decoding` field  [PRIORITY: 0.40]
+### hb-032 — Remove or repurpose dead `aggressive_decoding` field  [WIN 2026-05-24]
   mode: ft8
-  status: pending
-  priority_score: 0.40
-  estimated_effort: 0.5 sessions
-  expected_delta: cleanup; removes a documentation footgun
-  defensible_prior: yes (hb-020 audit confirmed the field is dead)
+  status: GRADUATED — field deleted; bench/test names renamed to match actual knobs
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: cleanup (no behavior change)
+  defensible_prior: yes (hb-020 audit)
   wild_card: false
   evidence_for:
-    - hb-020 audit (2026-05-21) confirmed: Ft8Config::aggressive_decoding has 3 references in pancetta-ft8/src/ — field decl, doc comment, default value. Zero reads in the decode pipeline.
-    - Surrounding cargo-cult: integration_tests.rs sets the flag with no behavioral assertion; benches/decoder_benchmark.rs has an "aggressive" benchmark that is bit-identical to "default" (the companion settings it bundles are already defaults); README.md + SPECTRAL_ANALYSIS_ENHANCEMENTS.md + examples/enhanced_spectral_analysis.rs document the flag as a real feature.
-    - Pre-OSS-publish (per memory project_oss_publish_prep.md), so a minor breaking-API change is acceptable.
-  evidence_against:
-    - Public API change (`pub aggressive_decoding`). Any external consumer that sets it would need to remove the line.
-    - Option (b) repurposing has scope overlap with hb-031 — better to do them together than separately.
+    - Removed Ft8Config::aggressive_decoding field + Default impl + all 5 referencing sites (decoder.rs, integration_tests.rs, decoder_benchmark.rs, README.md, SPECTRAL_ANALYSIS_ENHANCEMENTS.md). The "aggressive" benchmark renamed to "high_sensitivity" to describe what the bundled knobs actually do.
+    - Tests: 189 lib + 35 integration pass post-deletion. Build clean.
   notes: |
-    Three cleanup options:
-    (a) Delete the field + all referencing code (cleanest; minor
-        breaking-API change but acceptable pre-OSS-publish).
-    (b) Repurpose to drive a "fast | balanced | deep" preset (this
-        is the same plumbing hb-031 needs — combining the two would
-        be efficient).
-    (c) Deprecate with `#[deprecated]` + document as a no-op.
-    Recommended: do (b) when hb-031 lands; do (a) if hb-031 doesn't
-    land before OSS publish. The README, example, and benchmark all
-    need updates in any branch.
+    Picked option (a) over option (b) (repurpose as preset enum).
+    Repurposing a dead bool would muddy a "remove dead code" commit
+    with new API design. A fresh fast|balanced|deep preset (if ever
+    wanted) is a clean separate hb-NNN.
+    See research/experiments/2026-05-24-aggressive-decoding-removal.md.
 
 ### hb-021 — Wild-card: frequency-domain signal subtraction  [PRIORITY: SHELVED]
   mode: ft8

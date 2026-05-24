@@ -141,17 +141,16 @@ fn benchmark_configuration_variants(c: &mut Criterion) {
         });
     });
 
-    // Aggressive decoding configuration
-    let mut aggressive_config = Ft8Config::default();
-    aggressive_config.aggressive_decoding = true;
-    aggressive_config.max_candidates = 100;
-    aggressive_config.min_snr_db = -25.0;
-    let mut aggressive_decoder = Ft8Decoder::new(aggressive_config).unwrap();
+    // High-sensitivity configuration (more candidates, wider SNR window)
+    let mut high_sensitivity_config = Ft8Config::default();
+    high_sensitivity_config.max_candidates = 100;
+    high_sensitivity_config.min_snr_db = -25.0;
+    let mut high_sensitivity_decoder = Ft8Decoder::new(high_sensitivity_config).unwrap();
 
-    group.bench_function("aggressive", |b| {
+    group.bench_function("high_sensitivity", |b| {
         b.iter(|| {
             black_box(
-                aggressive_decoder
+                high_sensitivity_decoder
                     .decode_window(black_box(&samples))
                     .unwrap(),
             );

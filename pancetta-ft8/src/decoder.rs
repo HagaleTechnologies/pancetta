@@ -116,9 +116,6 @@ pub struct Ft8Config {
     /// LDPC decoder iterations
     pub ldpc_iterations: usize,
 
-    /// Enable aggressive decoding (more CPU, better weak signal performance)
-    pub aggressive_decoding: bool,
-
     /// Frequency search range (Hz)
     pub frequency_range: f64,
 
@@ -217,7 +214,6 @@ impl Default for Ft8Config {
             max_candidates: MAX_DECODE_CANDIDATES,
             min_snr_db: MIN_DECODE_SNR,
             ldpc_iterations: LDPC_MAX_ITERATIONS,
-            aggressive_decoding: false,
             frequency_range: 200.0,
             time_range: 2.0,
             max_decode_passes: 1,
