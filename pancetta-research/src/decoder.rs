@@ -310,14 +310,22 @@ impl DecoderUnderTest for Ft8Decoder {
 ///
 /// Defaults the executable path to the macOS WSJT-X bundle. Override via
 /// `with_executable_path` for Linux installs or non-default locations.
+///
+/// **Slot-length input only.** jt9 expects exactly one 15s FT8 slot per
+/// invocation. For multi-slot WAVs (e.g., hard-200/1000's operator
+/// recordings), enable `with_slot_cut(true)` — the wrapper will chunk
+/// the audio into 15s slices, run jt9 on each tempfile, and aggregate
+/// the decodes with adjusted dt offsets.
 pub struct Jt9Decoder {
     executable: PathBuf,
+    slot_cut: bool,
 }
 
 impl Default for Jt9Decoder {
     fn default() -> Self {
         Self {
             executable: PathBuf::from("/Applications/wsjtx.app/Contents/MacOS/jt9"),
+            slot_cut: false,
         }
     }
 }
@@ -326,6 +334,56 @@ impl Jt9Decoder {
     pub fn with_executable_path(mut self, path: PathBuf) -> Self {
         self.executable = path;
         self
+    }
+
+    /// Enable slot-cutting: chunks the input WAV into 15s slices and runs
+    /// jt9 on each. Required for multi-slot operator recordings. Adds
+    /// tempfile + subprocess overhead per slot.
+    pub fn with_slot_cut(mut self, on: bool) -> Self {
+        self.slot_cut = on;
+        self
+    }
+
+    /// Run jt9 on a single slot-length WAV file and parse the output.
+    fn decode_one_file(&self, path: &Path) -> anyhow::Result<Vec<Decode>> {
+        use std::process::Command;
+        let out = Command::new(&self.executable)
+            .arg("-8")
+            .arg(path)
+            .output()
+            .with_context(|| format!("spawning jt9 at {}", self.executable.display()))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut decodes = Vec::new();
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('<') {
+                continue;
+            }
+            let tilde = match line.find('~') {
+                Some(i) => i,
+                None => continue,
+            };
+            let (prefix, suffix) = line.split_at(tilde);
+            let fields: Vec<&str> = prefix.split_whitespace().collect();
+            if fields.len() < 4 {
+                continue;
+            }
+            let snr_db: f64 = fields[1].parse().unwrap_or(0.0);
+            let dt_s: f64 = fields[2].parse().unwrap_or(0.0);
+            let freq_hz: f64 = fields[3].parse().unwrap_or(0.0);
+            let message = suffix[1..].trim().to_string();
+            if message.is_empty() {
+                continue;
+            }
+            decodes.push(Decode {
+                message,
+                freq_hz,
+                dt_s,
+                snr_db,
+                crc_valid: true,
+            });
+        }
+        Ok(decodes)
     }
 }
 
@@ -339,51 +397,71 @@ impl DecoderUnderTest for Jt9Decoder {
     }
 
     fn decode_wav(&self, path: &Path) -> anyhow::Result<Vec<Decode>> {
-        use std::process::Command;
-        let out = Command::new(&self.executable)
-            .arg("-8") // FT8 mode
-            .arg(path)
-            .output()
-            .with_context(|| format!("spawning jt9 at {}", self.executable.display()))?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        // jt9 output format per line (FT8):
-        //   HHMMSS  snr  dt  freq ~ message
-        // Example:
-        //   000000  -7 -0.5 1500 ~  CQ K1ABC FN42
-        // Lines starting with '<' (e.g., "<DecodeFinished>") are sentinels.
-        let mut decodes = Vec::new();
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('<') {
-                continue;
-            }
-            // Split on whitespace; expect at least 6 fields before the '~'
-            // separator. message is everything after '~'.
-            let tilde = match line.find('~') {
-                Some(i) => i,
-                None => continue,
-            };
-            let (prefix, suffix) = line.split_at(tilde);
-            let fields: Vec<&str> = prefix.split_whitespace().collect();
-            if fields.len() < 4 {
-                continue;
-            }
-            let snr_db: f64 = fields[1].parse().unwrap_or(0.0);
-            let dt_s: f64 = fields[2].parse().unwrap_or(0.0);
-            let freq_hz: f64 = fields[3].parse().unwrap_or(0.0);
-            let message = suffix[1..].trim().to_string(); // drop the '~' itself
-            if message.is_empty() {
-                continue;
-            }
-            decodes.push(Decode {
-                message,
-                freq_hz,
-                dt_s,
-                snr_db,
-                crc_valid: true,
-            });
+        if !self.slot_cut {
+            return self.decode_one_file(path);
         }
-        Ok(decodes)
+        // Slot-cut mode: split the WAV into 15s slices, run jt9 on each
+        // tempfile, aggregate decodes with adjusted dt_s offsets.
+        const SLOT_SECONDS: usize = 15;
+        const SAMPLES_PER_SLOT: usize = 12000 * SLOT_SECONDS;
+        let mut reader = hound::WavReader::open(path)
+            .with_context(|| format!("opening WAV {}", path.display()))?;
+        let spec = reader.spec();
+        anyhow::ensure!(
+            spec.channels == 1 && spec.sample_rate == 12000,
+            "WAV {} not 12kHz mono (got {} ch, {} Hz)",
+            path.display(),
+            spec.channels,
+            spec.sample_rate,
+        );
+        // Read as i16 always — jt9 expects PCM16 input. If the source is
+        // float WAV, convert.
+        let samples: Vec<i16> = match spec.sample_format {
+            hound::SampleFormat::Int => reader.samples::<i16>().collect::<Result<Vec<_>, _>>()?,
+            hound::SampleFormat::Float => reader
+                .samples::<f32>()
+                .map(|s| s.map(|v| (v.clamp(-1.0, 1.0) * 32767.0) as i16))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        let out_spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 12000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut all_decodes = Vec::new();
+        for (slot_idx, chunk) in samples.chunks(SAMPLES_PER_SLOT).enumerate() {
+            // FT8 active duration is 12.64s. Skip chunks too short to contain
+            // a full message (require at least 12.0s of audio).
+            if chunk.len() < 12000 * 12 {
+                continue;
+            }
+            let tmp = tempfile::Builder::new()
+                .prefix("pancetta-jt9-slot-")
+                .suffix(".wav")
+                .tempfile()
+                .with_context(|| "creating tempfile for slot-cut")?;
+            {
+                let mut w = hound::WavWriter::create(tmp.path(), out_spec)
+                    .with_context(|| "creating tempfile WAV writer")?;
+                // Pad to exactly SAMPLES_PER_SLOT with zeros so jt9 sees a
+                // canonical 15-second slot.
+                for &s in chunk {
+                    w.write_sample(s)?;
+                }
+                for _ in chunk.len()..SAMPLES_PER_SLOT {
+                    w.write_sample(0i16)?;
+                }
+                w.finalize()?;
+            }
+            let mut slot_decodes = self.decode_one_file(tmp.path())?;
+            let slot_offset_s = (slot_idx * SLOT_SECONDS) as f64;
+            for d in &mut slot_decodes {
+                d.dt_s += slot_offset_s;
+            }
+            all_decodes.extend(slot_decodes);
+        }
+        Ok(all_decodes)
     }
 
     fn config_snapshot(&self) -> serde_json::Value {

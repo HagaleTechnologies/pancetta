@@ -1,17 +1,22 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T14:00:00Z
+last_updated: 2026-05-25T00:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 32
-current_ratio: 0.111
-# Batch 4 (2026-05-24): 5 iters of structural/unblock work.
-#   hb-051 won (diagnostic, closes AP line on hard-200)
-#   jt9 wrapper, Doppler corpus, hb-050 wiring: infrastructure WIN
-#   FP filter MVP: precision WIN (-21.7% novels at -0.02% recall)
-#   hb-050 + hb-027 SHELVED as consequence of hb-051 ceiling
-#   spawned hb-052 (production FP filter), hb-053 (revisit shelved w/ filter)
+exploitation_run: 33
+current_ratio: 0.108
+# Batch 5 (2026-05-25): plumbing + bank refill.
+#   mr-002 JTDX audit: 5 new clean-attach + plan-sized hypotheses
+#     (hb-054..hb-058). JTDX code frozen 2022, rich harvest, no
+#     future-version risk.
+#   mr-004 source-drift audit: 2 more dead Ft8Config fields surfaced
+#     (hb-060 enable_multithreading, hb-061 frequency_range)
+#   jt9 slot-cut helper: works on slot-aligned; spawned hb-059 for
+#     alignment-detection follow-up
+#   Doppler tier now wired into composite (5% weight)
+#   hb-013 SHELVED (already fixed)
+# Bank state: 8 new active hypotheses queued; bank is REFILLED.
 # Note: mr-001 (WSJT-X-Improved audit) added hb-043..hb-048 — six new
 # pending hypotheses sourced from external research. Bank no longer
 # "exhausted" — the meta-research cycle works.
@@ -260,6 +265,165 @@ current_ratio: 0.111
   notes: |
     Result drives the SHELVE of hb-050 and (by extension) hb-027.
     See research/experiments/2026-05-24-batch-4-unblock.md iter 1.
+
+### hb-054 — Costas 2-of-3 sync rescore (sync8 segment fallback)  [PRIORITY: 0.55, spawned 2026-05-25 from mr-002]
+  mode: ft8
+  status: pending
+  priority_score: 0.55
+  estimated_effort: 1 session
+  expected_delta: small recall gain on signals with corrupted leading Costas (collisions, late start, ionospheric onset)
+  defensible_prior: yes — JTDX 2.2.159 ships this; agent confirmed clean attach to pancetta-ft8/src/sync.rs
+  wild_card: false
+  evidence_for:
+    - JTDX `lib/sync8.f90` aggregates Costas score as `sync2d(i,j) = max(syncf, syncs)` where syncf uses all three 7-symbol Costas blocks and syncs uses only the trailing two (B+C).
+    - On signals where the leading Costas block is corrupted, accepting the trailing-two-block score recovers an otherwise-lost candidate.
+    - pancetta-ft8/src/sync.rs already computes the three-block Costas score — only the aggregation rule changes.
+  evidence_against:
+    - FP pressure bounded by LDPC+CRC downstream — likely low.
+  notes: |
+    Implementation: ~30-line patch in sync.rs. CLI A/B over hard-1000
+    + wild-50. See research/experiments/2026-05-25-batch-5-plumbing.md
+    (mr-002 harvest) and JTDX commit log at
+    https://sourceforge.net/p/jtdx/code/ci/master/log/?path=/lib/sync8.f90
+
+### hb-055 — Adaptive OSD depth based on signal context (ndeep 3→4→5)  [PRIORITY: 0.50, spawned 2026-05-25 from mr-002]
+  mode: ft8
+  status: pending
+  priority_score: 0.50
+  estimated_effort: 1 session
+  expected_delta: small recall + moderate FP pressure at depth 5; depends on parity_gate=2 staying on
+  defensible_prior: yes — JTDX uses this pattern; agent confirmed clean attach
+  wild_card: false
+  evidence_for:
+    - JTDX `lib/ft8b.f90`: ndeep=3 default; ndeep=4 when QSO/MyCall signal detected at proximity; ndeep=5 when reacquisition filter active. Spends OSD effort where prior evidence says a real signal lives.
+    - pancetta-ft8/src/osd.rs exposes depth as a parameter. Hint sources (my_call list, recent_calls) are in ap.rs.
+  evidence_against:
+    - Medium FP pressure at ndeep=5 (deeper OSD → more reorderings → more spurious passes).
+    - Best paired with FP filter (hb-052) so wins survive precision check.
+  notes: |
+    CLI flags --osd-depth-near-qrg and --osd-depth-hinted. Gating logic
+    in decoder.rs around the OSD call site. Eval on wild-50 where FPs
+    matter most.
+
+### hb-056 — Cross-cycle coherent symbol averaging (csold buffer)  [PRIORITY: 0.60 plan-sized, spawned 2026-05-25 from mr-002]
+  mode: ft8
+  status: pending (plan-sized — design doc before iters)
+  priority_score: 0.60
+  estimated_effort: 2-3 sessions (plumbing) + Plan-spec
+  expected_delta: significant — JTDX's headline sensitivity advantage on repeating CQs
+  defensible_prior: yes — JTDX subpasses isubp1={4,7,10} use `s2(i) = |cs|² + |csold|²` averaging
+  wild_card: false
+  evidence_for:
+    - JTDX maintains `complex csold(0:7,79)` populated from evencq/oddcq structs (last cycle's symbol field per CQ candidate by freq+DT).
+    - Subpass branches isubp1=4,7,10 compute `s2(i) = |cs|² + |csold|²` — coherent (amplitude) integration across the 15s slot boundary for stations that repeat their CQ.
+    - This is the headline JTDX sensitivity edge that operators reference when comparing to WSJT-X.
+  evidence_against:
+    - Pancetta has NO cross-slot symbol-buffer cache; decoder is currently stateless across slots.
+    - Plumbing: per-candidate symbol stash in coordinator cycle handoff (~50 LOC), freq+DT proximity matching (~100 LOC), LLR computation extension to accept averaged-symbol mode (~100 LOC). Total ~200-400 LOC.
+    - Needs a new corpus: contiguous slots from same weak repeating station (current corpus is single-slot WAVs).
+    - Risk medium for architecture; once plumbed, low decode-quality risk.
+  notes: |
+    Plan-spec before implementation. Touchpoints:
+    - new module pancetta-ft8/src/csold.rs (cross-cycle buffer)
+    - pancetta-ft8/src/decoder.rs (LLR computation extension)
+    - pancetta/src/coordinator/pipeline.rs (cycle handoff)
+    - new corpus generator: contiguous-slot synth (extend gen-synth)
+    Eval ceiling unknown without the new corpus.
+
+### hb-057 — Median-filter DT averaging for sync/AP  [PRIORITY: 0.35, spawned 2026-05-25 from mr-002]
+  mode: ft8
+  status: pending (needs minor plumbing)
+  priority_score: 0.35
+  estimated_effort: 1-2 sessions
+  expected_delta: latent — multi-pass is disabled (hb-031), so the per-station DT history value is mostly future
+  defensible_prior: partial — JTDX uses this; pancetta currently doesn't track DT per callsign
+  wild_card: false
+  evidence_for:
+    - JTDX commit "use median filter in average DT calculation" (Feb 2022). Median-of-N is robust to fade-dropout outliers.
+    - Could feed back to sync as a prior — narrow the time-window search per known correspondent.
+  evidence_against:
+    - Pancetta tracks DT per-decoded-message but not per-correspondent. Plumbing: track median DT per recently-heard callsign in a small history table.
+    - Value mostly latent — pancetta's multi-pass is disabled per hb-031, so the prior doesn't get to inform a second pass.
+  notes: |
+    Defer until multi-pass returns OR until two-stage scheduling
+    (hb-046) lands and could use this as the second-stage prior.
+
+### hb-058 — `/R` and ARRL Field-Day false-decode filters  [PRIORITY: 0.45, spawned 2026-05-25 from mr-002]
+  mode: ft8
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 1 session
+  expected_delta: precision (-N novels on wild-50 / busy bands); complements hb-052
+  defensible_prior: yes — JTDX commits Feb 2022: "filter out /R false decodes", "better filtering ARRL Field Day messages", "filter out directional CQ false decodes"
+  wild_card: false
+  evidence_for:
+    - Pure post-LDPC-CRC sanity rules: e.g., `/R` suffix only valid in contest contexts; directional CQ "CQ DX" requires DX-side message structure.
+    - Layer onto pancetta-ft8/src/message.rs post-decode, before emission.
+    - Complements existing hb-052 FP filter (callsign continuity) — different signal source.
+  evidence_against:
+    - Risk very low; rules are deterministic and inverse-targeted (FP-only).
+  notes: |
+    Wild-50 is the natural target. CLI flag to disable for ablation.
+    Reference: JTDX commits Feb 2022 on ft8b.f90.
+
+### hb-059 — Slot-alignment detection for jt9 slot-cut on unaligned WAVs  [PRIORITY: 0.35, spawned 2026-05-25 from batch-5 iter 2]
+  mode: ft8
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 1 session
+  expected_delta: unblocks jt9 baseline generation on hard-200/1000 (currently 0 decodes via slot-cut)
+  defensible_prior: yes (problem proven in batch-5 iter 2 smoke test)
+  wild_card: false
+  evidence_for:
+    - The jt9 slot-cut helper produces correctly-sized chunks but they're misaligned with FT8 slot boundaries when the source WAV doesn't start on a slot.
+    - Two approaches:
+      (a) sweep starting offsets 0-14s (~14× jt9 invocations per 15s chunk)
+      (b) detect alignment from spectral energy (Costas-correlation peak in time)
+    - (b) is cheaper but more complex. (a) is brute force but reliable.
+  evidence_against:
+    - Niche: only matters if we want jt9 baselines on hard-200/1000 WAVs that don't already have pre-computed baselines in research/baselines/ft8/.
+    - We already have those baselines so the urgency is low.
+  notes: |
+    Defer until hb-028 (cross-decoder ensemble) actually needs runtime
+    jt9 calls on hard corpora. Currently the FP filter MVP uses
+    pre-baselined truth instead.
+
+### hb-060 — Remove dead `Ft8Config::enable_multithreading` field  [PRIORITY: 0.40, spawned 2026-05-25 from mr-004]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 0.5 sessions
+  expected_delta: cleanup
+  defensible_prior: yes (mr-004 audit)
+  wild_card: false
+  evidence_for:
+    - mr-004 audit (2026-05-25): `Ft8Config::enable_multithreading` declared at decoder.rs:105, defaulted to true at 207, set/asserted in tests and benches, but NEVER READ in the decode pipeline. The parallel decode in par_try_ap_decode uses rayon unconditionally.
+    - Same pattern as hb-032 (aggressive_decoding) + hb-049 (min_snr_db).
+  evidence_against:
+    - Minor breaking API change for named-field Ft8Config callers.
+  notes: |
+    Mirror of hb-032 / hb-049. Delete field + Default + 4-5 referencing
+    sites (integration_tests.rs, decoder_benchmark.rs, asserts in
+    decoder.rs).
+
+### hb-061 — Remove dead `Ft8Config::frequency_range` field  [PRIORITY: 0.40, spawned 2026-05-25 from mr-004]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 0.5 sessions
+  expected_delta: cleanup
+  defensible_prior: yes (mr-004 audit)
+  wild_card: false
+  evidence_for:
+    - mr-004 audit (2026-05-25): `Ft8Config::frequency_range` declared at decoder.rs:114, defaulted to 200.0 at 210, set to 300.0 in examples/enhanced_spectral_analysis.rs:26, but NEVER READ in the decode pipeline. Actual frequency-range bounds (MIN_FREQ_BIN..max_freq_bin) are hardcoded in costas_sync_search.
+    - Same pattern as hb-060 / hb-049 / hb-032.
+  evidence_against:
+    - Minor breaking API change.
+  notes: |
+    Delete field + Default + ~3-4 referencing sites (README.md,
+    SPECTRAL_ANALYSIS_ENHANCEMENTS.md, enhanced_spectral_analysis.rs).
+    Could be combined with hb-060 into a single "remove dead Ft8Config
+    fields" iter.
 
 ### hb-052 — Production FP filter (callsign continuity)  [PRIORITY: 0.55, spawned 2026-05-24 from FP filter MVP]
   mode: ft8
@@ -523,27 +687,18 @@ current_ratio: 0.111
     curated corpus. DX-heavy recordings (jtdx decoded more than jt9) in hard-200
     are the best test set for this.
 
-### hb-013 — MIN_FREQ_BIN floor reduction (below 100 Hz coverage)  [PRIORITY: 0.42]
+### hb-013 — MIN_FREQ_BIN floor reduction  [SHELVED 2026-05-25 — already fixed]
   mode: ft8
-  status: pending
-  priority_score: 0.42
-  estimated_effort: 0.5 sessions
-  expected_delta: +0.005 to +0.02 real decode rate on recordings with low-frequency signals
-  defensible_prior: partial
+  status: SHELVED — confirmed MIN_FREQ_BIN=0 in decoder.rs:82
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: 0 (the fix had landed at some prior point)
+  defensible_prior: confirmed
   wild_card: false
-  evidence_for:
-    - decoder.rs:66: MIN_FREQ_BIN = 0 — currently set to 0, meaning full passband coverage is already enabled
-    - Memory (decoder_sensitivity.md): "A4: MIN_FREQ_BIN still 16 (lower to 0 for on-air coverage below 100 Hz)" — this was a documented gap in Phase A
-    - If MIN_FREQ_BIN is now 0 in the source, the gap may already be closed; but the composite score impact (real decode rate on curated corpus) hasn't been measured
-  evidence_against:
-    - If MIN_FREQ_BIN is already 0, this experiment is a no-op — value is in confirming the fix landed
-    - Very low frequency signals (<100 Hz audio) are rare on typical FT8 operating practice
   notes: |
-    Quick audit: confirm MIN_FREQ_BIN = 0 in current source (it is — decoder.rs:66).
-    Then run eval on curated-hard-200 and confirm no candidates are being missed
-    below 100 Hz (check per-WAV frequency distributions in the scorecard). If the
-    gap is confirmed closed, document as "already fixed" and shelve hb-013.
-    Effort: 0.5 sessions (mostly verification).
+    Batch 5 iter 5 confirmed MIN_FREQ_BIN=0 (line 82 of decoder.rs).
+    The gap referenced in the decoder_sensitivity memory had been
+    closed at some prior point. No further action needed.
 
 ### hb-014 — Parity gate sweep  [GRADUATED 2026-05-23]
   mode: ft8
@@ -788,18 +943,24 @@ search to in-repo sources.
   expected_yield: 2-5 new hypotheses (actual: 6 incl one spawn from the AP wiring work)
   defensible_prior: yes — confirmed by audit results
 
-### mr-002 — JTDX delta vs WSJT-X
-  status: pending
+### mr-002 — JTDX delta vs WSJT-X  [COMPLETED 2026-05-25]
+  status: completed (background Explore agent, ~5 min)
   estimated_effort: 1 session
   source_type: external repo + changelog
-  source: https://sourceforge.net/projects/jtdx/ + CHANGELOG
-  method: |
-    JTDX is the well-known fork of WSJT-X focused on weak-signal
-    performance. Survey JTDX-specific decoder changes that haven't
-    been upstreamed. Particularly Doppler-tolerance, AP variants,
-    and ranking heuristics.
-  expected_yield: 2-4 hypotheses, biased toward weak-signal recall
-  defensible_prior: yes — JTDX is documented to outperform WSJT-X on Doppler/polar paths
+  source: https://sourceforge.net/projects/jtdx/ — code browser, CHANGELOG, forum threads
+  outcome: |
+    Key finding: JTDX public source is FROZEN at 2.2.159 (April 2022).
+    v2.2.160 beta-only; dev team halted public publishing for
+    geopolitical reasons. Rich harvest with no future-version risk.
+    Agent applied mr-007 architecture-fit audit at harvest time —
+    flagged 1 plan-sized item + 1 deferred-plumbing item before they
+    consumed iter slots.
+    Yield: 5 new hypotheses (hb-054, hb-055, hb-056, hb-057, hb-058)
+    — 3 clean-attach + 1 plan-sized + 1 deferred-plumbing.
+    Recommendation: pivot to mr-003 (academic LDPC literature) as
+    next external source. JTDX-Improved is a UI fork only.
+  expected_yield: 2-4 hypotheses (actual: 5)
+  defensible_prior: yes — confirmed by audit results
 
 ### mr-003 — LDPC/OSD academic literature 2020-2026
   status: pending

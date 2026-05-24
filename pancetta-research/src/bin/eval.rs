@@ -202,7 +202,7 @@ impl Args {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
                     );
-                    eprintln!("  tiers: fixtures, synth-clean, curated-hard-200, curated-hard-1000, wild-50");
+                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, curated-hard-200, curated-hard-1000, wild-50");
                     eprintln!("  --max-passes: override Ft8Config::max_decode_passes (default 3)");
                     eprintln!("  --max-sync-candidates: override Ft8Config::max_sync_candidates (default 200)");
                     eprintln!(
@@ -670,6 +670,17 @@ fn main() -> anyhow::Result<()> {
                 );
                 let result = run_synth_tier(decoder.as_ref(), &workspace, &manifest)?;
                 tiers.insert("synth-clean".to_string(), result);
+            }
+            "synth-doppler" => {
+                let manifest =
+                    workspace.join("research/corpus/synth/manifests/doppler.manifest.json");
+                anyhow::ensure!(
+                    manifest.exists(),
+                    "doppler synth manifest missing at {}; run `cargo run --release -p pancetta-research --bin gen-synth -- --config research/corpus/synth/manifests/doppler.config.json --output research/corpus/synth/manifests/doppler.manifest.json`",
+                    manifest.display()
+                );
+                let result = run_synth_tier(decoder.as_ref(), &workspace, &manifest)?;
+                tiers.insert("synth-doppler".to_string(), result);
             }
             "curated-hard-200" | "curated-hard-1000" | "wild-50" => {
                 let label = match tier_name.as_str() {

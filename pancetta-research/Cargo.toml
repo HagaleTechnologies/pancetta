@@ -24,6 +24,7 @@ hound = "3.5"                            # WAV reader (already used in pancetta-
 rand = "0.8"
 rand_distr = "0.4"
 sha2 = "0.10"                            # SHA-256 for WAV cache keying in baseline binary
+tempfile = "3"                           # slot-cutting helper for Jt9Decoder; not in workspace.dependencies
 
 [[bin]]
 name = "gen-synth"
@@ -46,4 +47,4 @@ name = "leaderboard"
 path = "src/bin/leaderboard.rs"
 
 [dev-dependencies]
-tempfile = "3"                           # not in workspace.dependencies; keep inline
+# (tempfile moved to [dependencies] for slot-cutting helper)
