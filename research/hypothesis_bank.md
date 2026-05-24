@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-23T23:00:00Z
+last_updated: 2026-05-23T23:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
-wild_cards_run: 3
+wild_cards_run: 4
 exploitation_run: 15
-current_ratio: 0.167
+current_ratio: 0.211
 
 ## Active (ranked by score)
 
@@ -87,36 +87,23 @@ current_ratio: 0.167
     that converge in ≤N iterations) as a separate metric to understand where
     the benefit actually comes from.
 
-### hb-037 — Redesign or remove subtract_with_sidelobes  [PRIORITY: 0.50, spawned 2026-05-22]
+### hb-037 — Redesign or remove subtract_with_sidelobes  [PRIORITY: SHELVED — superseded by hb-031]
   mode: ft8
-  status: pending
-  priority_score: 0.50
-  estimated_effort: 2-3 sessions for kernel redesign; 0.5 for removal
-  expected_delta: speed (current multi-pass is no-op for nearby weak signals); +0 sensitivity from current state but unlocks future multi-pass work
-  defensible_prior: yes (hb-030 probe proved the current kernel masks recoverable signals within ~25 Hz of strong)
+  status: SHELVED (2026-05-23 — path (c) shipped via hb-031; paths (a)/(b) refuted by profile)
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: n/a
+  defensible_prior: yes (original hb-030 finding stands, but its remedy was already shipped)
   wild_card: false
-  evidence_for:
-    - hb-030 (2026-05-22) probe: 9 of 16 two-signal cases showed "subtraction masks recoverable weak signal". 0 of 16 showed "subtraction surfaces missed weak signal." The current kernel is net-negative for nearby weak signals.
-    - hb-001 (2026-05-21) macro sweep: pass 2+ contribution is +1.2% on hard-200. Now we know WHY: subtract_with_sidelobes leaves artifacts at the strong signal's TF cell that contaminate the neighborhood.
-    - The hb-019 NMS-off win has a unified explanation: pass 1 sees more signals when NMS doesn't suppress them, and pass 2+ would never have surfaced those signals via subtraction (per this probe).
   evidence_against:
-    - Removing multi-pass loses the ability to decode "stacks" of QSOs that overlap in time but not in frequency (where subtraction is actually clean).
-    - Redesigning the kernel is non-trivial (longer window for sidelobe reduction trades against frequency resolution).
+    - Path (c) "set max_passes=1 as production default" already SHIPPED via hb-031 (2026-05-22). Production decoder now runs single-pass; no subtract is invoked.
+    - Path (a) "frequency-domain spectrogram subtraction" rejected by 2026-05-23 multipass-profile: spectrogram is 0.4% of pass time; reusing it saves <1.3% wall-clock. See [[hb-021]] for the profile rejection.
+    - Path (b) "improve the time-domain kernel" is incremental work on a feature (multi-pass) that production no longer uses. The 28 extra decodes pass 2 yields on hard-200 (0.5% recall lift) doesn't justify a kernel redesign even if the redesign were free.
   notes: |
-    Three paths:
-    (a) Replace the time-domain reconstruction-and-subtract with a
-        frequency-domain "zero out the strong signal's spectrogram bins"
-        approach (synergizes with hb-021 wild card).
-    (b) Improve the time-domain kernel: longer / better-shaped subtraction
-        window for sidelobe reduction. Trade-off: longer window = wider
-        masked region around the strong signal.
-    (c) Remove multi-pass entirely. Set max_passes=1 as production
-        default (synergizes with hb-031). Reclaim the wall-clock budget
-        for other pass-1 work (more candidates, OSD-3 with stronger FP
-        filter, more LDPC iters).
-    Prefer (c) for fastest implementation; (a) if a deeper structural
-    improvement is wanted. (b) is incremental work on a known-broken
-    approach — least appealing.
+    SHELVED. The only remaining scenario where this matters: if a future
+    cycle re-enables multi-pass at materially higher recall yield. Open
+    a NEW hb-NNN at that point rather than reviving this one — the
+    framing has moved on. See research/experiments/2026-05-23-multipass-profile.md.
 
 
 ### hb-040 — Plumb (or remove) `Ft8Config::time_range`  [PRIORITY: 0.35]
@@ -434,29 +421,24 @@ current_ratio: 0.167
     land before OSS publish. The README, example, and benchmark all
     need updates in any branch.
 
-### hb-021 — Wild-card: frequency-domain signal subtraction  [PRIORITY: wild]
+### hb-021 — Wild-card: frequency-domain signal subtraction  [PRIORITY: SHELVED]
   mode: ft8
-  status: pending
+  status: SHELVED (2026-05-23 — profile rejected motivation)
   priority_score: 0.0
   estimated_effort: 3 sessions
-  expected_delta: unknown; possibly +0.02 to +0.08 on busy bands
-  defensible_prior: no
+  expected_delta: REFUTED — upper bound ~1.3% wall-clock
+  defensible_prior: no (rejected by 2026-05-23 profile)
   wild_card: true
-  evidence_for:
-    - Current subtract_with_sidelobes operates in the time domain (reconstructs CPFSK and subtracts from audio)
-    - Frequency-domain subtraction (zero out the decoded signal's bins in the spectrogram, reuse the existing spectrogram for pass 2) avoids rebuilding the spectrogram from scratch each pass
-    - JTDX is rumored to use spectrogram-domain subtraction; no public source confirmation
-    - If spectrogram is reused, pass 2+ is much cheaper: no re-FFT, just updated power values
   evidence_against:
-    - Spectrogram-domain subtraction loses phase information that time-domain subtraction preserves — could corrupt adjacent signals
-    - Building a correct frequency-domain subtract that handles the FFT windowing correctly is non-trivial; easy to introduce subtle bugs
-    - Savings only matter if the spectrogram recompute is a significant fraction of pass time (need profiling data first)
+    - 2026-05-23 multipass-profile (hard-200, max_passes=2): spectrogram is 0.4% of pass time, sync_search is 0.9%, combined pre-decode is 1.3%. Even if freq-domain subtract made pass-1 pre-decode entirely free, total speedup is ~1.3%.
+    - The actual multi-pass bottleneck is the time-domain `subtract_with_sidelobes` on pass 0 (547 ms/WAV, 43% of pass-0 wallclock). That cost is paid in time domain regardless of whether subsequent passes reuse the spectrogram.
+    - Pass 2 yields 28 new decodes out of 5575 (0.5% recall lift). Cost/benefit doesn't justify the rewrite even if it were faster.
+    - hb-031 already harvested the multi-pass overhead by setting max_passes=1 in production.
   notes: |
-    Prerequisite: profile where time is actually spent in a multi-pass decode (is
-    it the spectrogram FFT, the LDPC iterations, or the candidate loop?). If
-    spectrogram is <20% of pass time, this experiment's motivation is weak.
-    High-effort wild-card; only attempt after profiling confirms the spectrogram
-    is a bottleneck.
+    SHELVED. See research/experiments/2026-05-23-multipass-profile.md for
+    full per-pass timing breakdown. Revisit only if a future change
+    significantly raises pass-2's recall yield (e.g., NMS-aware subtract
+    or a much better candidate generator on pass 2).
 
 ### hb-026 — Wild-card: End-to-end neural decoder  [PRIORITY: wild]
   mode: ft8
