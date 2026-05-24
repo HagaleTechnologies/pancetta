@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T03:00:00Z
+last_updated: 2026-05-24T03:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 22
-current_ratio: 0.154
+exploitation_run: 23
+current_ratio: 0.148
 # Note: mr-001 (WSJT-X-Improved audit) added hb-043..hb-048 — six new
 # pending hypotheses sourced from external research. Bank no longer
 # "exhausted" — the meta-research cycle works.
@@ -237,25 +237,24 @@ current_ratio: 0.154
     tries the callsign at both address positions (to=callsign and
     from=callsign). Confidence gating per hb-048 to avoid FP explosion.
 
-### hb-042 — Score-based cap (replace count cap with min_sync_score)  [PRIORITY: 0.40, spawned 2026-05-24 from hb-033]
+### hb-042 — Score-based cap  [SHELVED 2026-05-24]
   mode: ft8
-  status: pending
-  priority_score: 0.40
-  estimated_effort: 1 session
-  expected_delta: small recall + precision; cleaner principle than count-based cap
-  defensible_prior: yes (saturation sweep showed signal-vs-noise floor at rank 200-300)
+  status: SHELVED — score-based cap is just count-based cap in disguise
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: REFUTED — same Pareto frontier as hb-033
+  defensible_prior: turned out wrong (score distribution is smooth, no elbow)
   wild_card: false
-  evidence_for:
-    - hb-033 saturation sweep (2026-05-24): real/FP ratio falls off a cliff past rank ~300. The "right" cap is the boundary where Costas sync score crosses a noise threshold, not a specific count.
-    - hb-007 shelved min_sync_score in an older state (cap=200, NMS on). Picture may be different now (cap=300, NMS off, gate=2).
   evidence_against:
-    - Score thresholds are corpus-dependent; what works on hard-200 may be wrong on clean bands or DX recordings.
-    - Adding a score floor would clip "barely viable" candidates that hb-038 demonstrated are worth keeping (the 200→300 win).
+    - 2026-05-24 sweep at cap=500 min_sync ∈ {4.0, 4.5, 5.0} on hard-200:
+      cap=500 min=4.0 ≡ cap=500 min=4.5 BIT-IDENTICAL (no candidates in top-500 have score ∈ [4.0,4.5]).
+      cap=500 min=5.0 trims 11 novels at zero recall change — smooth fade, no elbow.
+      All three configs are equivalent to hb-033's cap=500 finding (4372 rec / 1076 novel), confirming the score floor doesn't bite where the count cap binds.
+    - hb-007's "min_sync_score is dead" finding HOLDS at the new production state (cap=300, NMS off, gate=2). The score-distribution shape didn't change meaningfully.
   notes: |
-    Implementation: lower max_sync_candidates back to a high cap (e.g.,
-    500) AND set min_sync_score to a value that admits ~300 candidates
-    on average across hard-200. Compare against the cap=300 baseline.
-    If recall is the same with fewer FPs, graduate.
+    SHELVED. Score and count caps are dual parameterizations of the
+    same pruning rule; neither addresses the underlying precision
+    wall. See research/experiments/2026-05-24-score-based-cap.md.
 
 ### hb-041 — Disable OSD fallback entirely (parity gate = 0)  [SHELVED 2026-05-24]
   mode: ft8
