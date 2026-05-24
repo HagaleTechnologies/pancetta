@@ -1,7 +1,7 @@
 use crate::Mode;
 use anyhow::Context;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 /// One decoded message from a single WAV. Mode-agnostic.
@@ -47,10 +47,17 @@ pub struct Ft8Decoder {
     /// Optional AP context to pass into `decode_window_with_ap`. When `None`,
     /// the decoder uses `decode_window` (which constructs a default-empty
     /// ApContext internally → ap_active=false → AP code paths short-circuit).
-    /// hb-004 wiring: when set, AP fires in eval.
+    /// hb-004 wiring: when set, AP fires in eval. Mutually exclusive with
+    /// `rolling_window` — if both are set, rolling_window takes precedence.
     ap_context: Option<pancetta_ft8::ap::ApContext>,
-    /// Used only so `config_snapshot` is stable across calls. Empty by
-    /// default; future plans may stash per-experiment overrides here.
+    /// hb-050: when Some(N), maintains a rolling deque of the last N decoded
+    /// callsigns across decode_wav calls. Each call builds an ApContext from
+    /// the current deque contents (no my_call) and uses
+    /// `decode_window_with_ap` so the hb-043 my_call-less AP path fires.
+    /// After decoding, callsigns from new decodes are pushed into the deque.
+    rolling_window: Option<usize>,
+    rolling_calls: Mutex<std::collections::VecDeque<String>>,
+    /// Used only so `config_snapshot` is stable across calls.
     _scratch: Mutex<()>,
 }
 
@@ -61,6 +68,8 @@ impl Ft8Decoder {
         Self {
             config: pancetta_ft8::Ft8Config::default(),
             ap_context: None,
+            rolling_window: None,
+            rolling_calls: Mutex::new(std::collections::VecDeque::new()),
             _scratch: Mutex::new(()),
         }
     }
@@ -161,6 +170,18 @@ impl Ft8Decoder {
         self.ap_context = Some(ctx);
         self
     }
+
+    /// hb-050: enable rolling-callsign-window mode with capacity N. Each
+    /// decode_wav call builds an ApContext.recent_calls from the deque
+    /// contents and uses the my_call-less AP injection path (hb-043).
+    /// After decoding, callsigns from the new decodes are pushed into the
+    /// deque, evicting oldest. N=0 disables the feature.
+    pub fn with_rolling_window(mut self, n: usize) -> Self {
+        if n > 0 {
+            self.rolling_window = Some(n);
+        }
+        self
+    }
 }
 
 impl DecoderUnderTest for Ft8Decoder {
@@ -198,13 +219,61 @@ impl DecoderUnderTest for Ft8Decoder {
         // and we want the outer trait impl to stay `&self`.
         let mut decoder = pancetta_ft8::Ft8Decoder::new(self.config.clone())
             .map_err(|e| anyhow::anyhow!("Ft8Decoder::new failed: {e}"))?;
-        let raw = match &self.ap_context {
-            Some(ctx) => decoder.decode_window_with_ap(&samples, ctx).map_err(|e| {
-                anyhow::anyhow!("decode_window_with_ap failed for {}: {e}", path.display())
-            })?,
-            None => decoder
-                .decode_window(&samples)
-                .map_err(|e| anyhow::anyhow!("decode_window failed for {}: {e}", path.display()))?,
+        let raw = if let Some(window_n) = self.rolling_window {
+            // hb-050: build ApContext from current rolling deque snapshot.
+            let snapshot: Vec<String> = self
+                .rolling_calls
+                .lock()
+                .map(|g| g.iter().cloned().collect())
+                .unwrap_or_default();
+            let recent: Vec<pancetta_ft8::ap::RecentCallAp> = snapshot
+                .iter()
+                .filter_map(|c| pancetta_ft8::ap::RecentCallAp::new(c, 0.0))
+                .collect();
+            let ctx = pancetta_ft8::ap::ApContext {
+                my_call: None,
+                recent_calls: recent,
+                active_qso: None,
+            };
+            let r = decoder.decode_window_with_ap(&samples, &ctx).map_err(|e| {
+                anyhow::anyhow!(
+                    "decode_window_with_ap (rolling) failed for {}: {e}",
+                    path.display()
+                )
+            })?;
+            // Update the deque with callsigns from these decodes.
+            if let Ok(mut deque) = self.rolling_calls.lock() {
+                for msg in &r {
+                    if let Some(call) = msg.message.from_callsign.as_deref() {
+                        let bare = call.split('/').next().unwrap_or(call).to_string();
+                        if !bare.is_empty() && !deque.iter().any(|c| c == &bare) {
+                            deque.push_back(bare);
+                            while deque.len() > window_n {
+                                deque.pop_front();
+                            }
+                        }
+                    }
+                    if let Some(call) = msg.message.to_callsign.as_deref() {
+                        let bare = call.split('/').next().unwrap_or(call).to_string();
+                        if !bare.is_empty() && !deque.iter().any(|c| c == &bare) {
+                            deque.push_back(bare);
+                            while deque.len() > window_n {
+                                deque.pop_front();
+                            }
+                        }
+                    }
+                }
+            }
+            r
+        } else {
+            match &self.ap_context {
+                Some(ctx) => decoder.decode_window_with_ap(&samples, ctx).map_err(|e| {
+                    anyhow::anyhow!("decode_window_with_ap failed for {}: {e}", path.display())
+                })?,
+                None => decoder.decode_window(&samples).map_err(|e| {
+                    anyhow::anyhow!("decode_window failed for {}: {e}", path.display())
+                })?,
+            }
         };
         Ok(raw
             .into_iter()
@@ -227,5 +296,117 @@ impl DecoderUnderTest for Ft8Decoder {
                 "debug_repr": format!("{:?}", self.config),
             }),
         }
+    }
+}
+
+// ============================================================================
+// jt9 (WSJT-X) subprocess wrapper
+// ============================================================================
+
+/// Wraps the WSJT-X `jt9` CLI as a subprocess for FT8 decoding. Used to
+/// generate baseline truth and (with `Ft8Decoder`) to identify
+/// pancetta-only vs pancetta∩jt9 decodes for FP-filter training (hb-024
+/// follow-up) and ensemble (hb-028).
+///
+/// Defaults the executable path to the macOS WSJT-X bundle. Override via
+/// `with_executable_path` for Linux installs or non-default locations.
+pub struct Jt9Decoder {
+    executable: PathBuf,
+}
+
+impl Default for Jt9Decoder {
+    fn default() -> Self {
+        Self {
+            executable: PathBuf::from("/Applications/wsjtx.app/Contents/MacOS/jt9"),
+        }
+    }
+}
+
+impl Jt9Decoder {
+    pub fn with_executable_path(mut self, path: PathBuf) -> Self {
+        self.executable = path;
+        self
+    }
+}
+
+impl DecoderUnderTest for Jt9Decoder {
+    fn mode(&self) -> Mode {
+        Mode::Ft8
+    }
+
+    fn identity(&self) -> String {
+        format!("jt9@subprocess({})", self.executable.display())
+    }
+
+    fn decode_wav(&self, path: &Path) -> anyhow::Result<Vec<Decode>> {
+        use std::process::Command;
+        let out = Command::new(&self.executable)
+            .arg("-8") // FT8 mode
+            .arg(path)
+            .output()
+            .with_context(|| format!("spawning jt9 at {}", self.executable.display()))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // jt9 output format per line (FT8):
+        //   HHMMSS  snr  dt  freq ~ message
+        // Example:
+        //   000000  -7 -0.5 1500 ~  CQ K1ABC FN42
+        // Lines starting with '<' (e.g., "<DecodeFinished>") are sentinels.
+        let mut decodes = Vec::new();
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('<') {
+                continue;
+            }
+            // Split on whitespace; expect at least 6 fields before the '~'
+            // separator. message is everything after '~'.
+            let tilde = match line.find('~') {
+                Some(i) => i,
+                None => continue,
+            };
+            let (prefix, suffix) = line.split_at(tilde);
+            let fields: Vec<&str> = prefix.split_whitespace().collect();
+            if fields.len() < 4 {
+                continue;
+            }
+            let snr_db: f64 = fields[1].parse().unwrap_or(0.0);
+            let dt_s: f64 = fields[2].parse().unwrap_or(0.0);
+            let freq_hz: f64 = fields[3].parse().unwrap_or(0.0);
+            let message = suffix[1..].trim().to_string(); // drop the '~' itself
+            if message.is_empty() {
+                continue;
+            }
+            decodes.push(Decode {
+                message,
+                freq_hz,
+                dt_s,
+                snr_db,
+                crc_valid: true,
+            });
+        }
+        Ok(decodes)
+    }
+
+    fn config_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "decoder": "jt9-subprocess",
+            "executable": self.executable.display().to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod jt9_tests {
+    use super::*;
+
+    #[test]
+    fn jt9_decoder_identity_format() {
+        let d = Jt9Decoder::default();
+        assert!(d.identity().starts_with("jt9@subprocess("));
+    }
+
+    #[test]
+    fn jt9_decoder_with_custom_path() {
+        let d = Jt9Decoder::default().with_executable_path(PathBuf::from("/usr/local/bin/jt9"));
+        assert!(d.identity().contains("/usr/local/bin/jt9"));
     }
 }

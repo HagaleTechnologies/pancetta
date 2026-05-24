@@ -1,0 +1,1764 @@
+{
+  "schema_version": 1,
+  "config": {
+    "schema_version": 1,
+    "label": "doppler",
+    "messages": [
+      "CQ K1ABC FN42",
+      "K1ABC W9XYZ EM48",
+      "W9XYZ K1ABC -10",
+      "K1ABC W9XYZ R-12",
+      "W9XYZ K1ABC RR73",
+      "K1ABC W9XYZ 73"
+    ],
+    "snr_steps_db": [
+      -20.0,
+      -18.0,
+      -16.0,
+      -14.0,
+      -12.0,
+      -10.0
+    ],
+    "channel": "awgn-drift",
+    "drift_steps_hz_per_sec": [
+      -3.0,
+      -1.5,
+      -0.5,
+      0.5,
+      1.5,
+      3.0
+    ],
+    "seed": 142,
+    "output_dir": "research/corpus/synth/wavs/doppler"
+  },
+  "entries": [
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-20.0dB_-3.0Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 131730289242587434
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-20.0dB_-1.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 73183494086770986
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-20.0dB_-0.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18432107375062597930
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-20.0dB_+0.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9208735338207822122
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-20.0dB_+1.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9296555530941546794
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-20.0dB_+3.0Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9355102326097363242
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-18.0dB_-3.0Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 127789639568638250
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-18.0dB_-1.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 69242844412821802
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-18.0dB_-0.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18428166725388648746
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-18.0dB_+0.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9204794688533872938
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-18.0dB_+1.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9292614881267597610
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-18.0dB_+3.0Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9351161676423414058
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-16.0dB_-3.0Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 123848989894689066
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-16.0dB_-1.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 65302194738872618
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-16.0dB_-0.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18424226075714699562
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-16.0dB_+0.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9200854038859923754
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-16.0dB_+1.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9288674231593648426
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-16.0dB_+3.0Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9347221026749464874
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-14.0dB_-3.0Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 115967690546790698
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-14.0dB_-1.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 57420895390974250
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-14.0dB_-0.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18416344776366801194
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-14.0dB_+0.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9192972739512025386
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-14.0dB_+1.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9280792932245750058
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-14.0dB_+3.0Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9339339727401566506
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-12.0dB_-3.0Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 108086391198892330
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-12.0dB_-1.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 49539596043075882
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-12.0dB_-0.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18408463477018902826
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-12.0dB_+0.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9185091440164127018
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-12.0dB_+1.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9272911632897851690
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-12.0dB_+3.0Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9331458428053668138
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-10.0dB_-3.0Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 100205091850993962
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-10.0dB_-1.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 41658296695177514
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-10.0dB_-0.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18400582177671004458
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-10.0dB_+0.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9177210140816228650
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-10.0dB_+1.5Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9265030333549953322
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/CQ_K1ABC_FN42__-10.0dB_+3.0Hzps.wav",
+      "encoded_message": "CQ K1ABC FN42",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9323577128705769770
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-20.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 131730289243587437
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-20.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 73183494087770989
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-20.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18432107375063597933
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-20.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9208735338208822125
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-20.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9296555530942546797
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-20.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9355102326098363245
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-18.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 127789639569638253
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-18.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 69242844413821805
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-18.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18428166725389648749
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-18.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9204794688534872941
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-18.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9292614881268597613
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-18.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9351161676424414061
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-16.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 123848989895689069
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-16.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 65302194739872621
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-16.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18424226075715699565
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-16.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9200854038860923757
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-16.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9288674231594648429
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-16.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9347221026750464877
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-14.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 115967690547790701
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-14.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 57420895391974253
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-14.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18416344776367801197
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-14.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9192972739513025389
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-14.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9280792932246750061
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-14.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9339339727402566509
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-12.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 108086391199892333
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-12.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 49539596044075885
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-12.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18408463477019902829
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-12.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9185091440165127021
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-12.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9272911632898851693
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-12.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9331458428054668141
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-10.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 100205091851993965
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-10.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 41658296696177517
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-10.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18400582177672004461
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-10.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9177210140817228653
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-10.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9265030333550953325
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_EM48__-10.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ EM48",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9323577128706769773
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-20.0dB_-3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 131730289244587440
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-20.0dB_-1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 73183494088770992
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-20.0dB_-0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18432107375064597936
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-20.0dB_+0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9208735338209822128
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-20.0dB_+1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9296555530943546800
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-20.0dB_+3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9355102326099363248
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-18.0dB_-3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 127789639570638256
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-18.0dB_-1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 69242844414821808
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-18.0dB_-0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18428166725390648752
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-18.0dB_+0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9204794688535872944
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-18.0dB_+1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9292614881269597616
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-18.0dB_+3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9351161676425414064
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-16.0dB_-3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 123848989896689072
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-16.0dB_-1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 65302194740872624
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-16.0dB_-0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18424226075716699568
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-16.0dB_+0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9200854038861923760
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-16.0dB_+1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9288674231595648432
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-16.0dB_+3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9347221026751464880
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-14.0dB_-3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 115967690548790704
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-14.0dB_-1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 57420895392974256
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-14.0dB_-0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18416344776368801200
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-14.0dB_+0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9192972739514025392
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-14.0dB_+1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9280792932247750064
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-14.0dB_+3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9339339727403566512
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-12.0dB_-3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 108086391200892336
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-12.0dB_-1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 49539596045075888
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-12.0dB_-0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18408463477020902832
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-12.0dB_+0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9185091440166127024
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-12.0dB_+1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9272911632899851696
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-12.0dB_+3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9331458428055668144
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-10.0dB_-3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 100205091852993968
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-10.0dB_-1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 41658296697177520
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-10.0dB_-0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18400582177673004464
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-10.0dB_+0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9177210140818228656
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-10.0dB_+1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9265030333551953328
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC__10__-10.0dB_+3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC -10",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9323577128707769776
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-20.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 131730289245587443
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-20.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 73183494089770995
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-20.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18432107375065597939
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-20.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9208735338210822131
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-20.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9296555530944546803
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-20.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9355102326100363251
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-18.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 127789639571638259
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-18.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 69242844415821811
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-18.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18428166725391648755
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-18.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9204794688536872947
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-18.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9292614881270597619
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-18.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9351161676426414067
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-16.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 123848989897689075
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-16.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 65302194741872627
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-16.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18424226075717699571
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-16.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9200854038862923763
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-16.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9288674231596648435
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-16.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9347221026752464883
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-14.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 115967690549790707
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-14.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 57420895393974259
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-14.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18416344776369801203
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-14.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9192972739515025395
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-14.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9280792932248750067
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-14.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9339339727404566515
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-12.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 108086391201892339
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-12.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 49539596046075891
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-12.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18408463477021902835
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-12.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9185091440167127027
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-12.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9272911632900851699
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-12.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9331458428056668147
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-10.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 100205091853993971
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-10.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 41658296698177523
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-10.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18400582177674004467
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-10.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9177210140819228659
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-10.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9265030333552953331
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_R_12__-10.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ R-12",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9323577128708769779
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-20.0dB_-3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 131730289246587446
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-20.0dB_-1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 73183494090770998
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-20.0dB_-0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18432107375066597942
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-20.0dB_+0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9208735338211822134
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-20.0dB_+1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9296555530945546806
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-20.0dB_+3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9355102326101363254
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-18.0dB_-3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 127789639572638262
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-18.0dB_-1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 69242844416821814
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-18.0dB_-0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18428166725392648758
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-18.0dB_+0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9204794688537872950
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-18.0dB_+1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9292614881271597622
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-18.0dB_+3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9351161676427414070
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-16.0dB_-3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 123848989898689078
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-16.0dB_-1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 65302194742872630
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-16.0dB_-0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18424226075718699574
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-16.0dB_+0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9200854038863923766
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-16.0dB_+1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9288674231597648438
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-16.0dB_+3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9347221026753464886
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-14.0dB_-3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 115967690550790710
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-14.0dB_-1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 57420895394974262
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-14.0dB_-0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18416344776370801206
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-14.0dB_+0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9192972739516025398
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-14.0dB_+1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9280792932249750070
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-14.0dB_+3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9339339727405566518
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-12.0dB_-3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 108086391202892342
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-12.0dB_-1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 49539596047075894
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-12.0dB_-0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18408463477022902838
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-12.0dB_+0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9185091440168127030
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-12.0dB_+1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9272911632901851702
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-12.0dB_+3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9331458428057668150
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-10.0dB_-3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 100205091854993974
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-10.0dB_-1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 41658296699177526
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-10.0dB_-0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18400582177675004470
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-10.0dB_+0.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9177210140820228662
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-10.0dB_+1.5Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9265030333553953334
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/W9XYZ_K1ABC_RR73__-10.0dB_+3.0Hzps.wav",
+      "encoded_message": "W9XYZ K1ABC RR73",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9323577128709769782
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-20.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 131730289247587449
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-20.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 73183494091771001
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-20.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18432107375067597945
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-20.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9208735338212822137
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-20.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9296555530946546809
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-20.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -20.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9355102326102363257
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-18.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 127789639573638265
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-18.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 69242844417821817
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-18.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18428166725393648761
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-18.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9204794688538872953
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-18.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9292614881272597625
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-18.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -18.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9351161676428414073
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-16.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 123848989899689081
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-16.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 65302194743872633
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-16.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18424226075719699577
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-16.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9200854038864923769
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-16.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9288674231598648441
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-16.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -16.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9347221026754464889
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-14.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 115967690551790713
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-14.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 57420895395974265
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-14.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18416344776371801209
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-14.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9192972739517025401
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-14.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9280792932250750073
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-14.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -14.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9339339727406566521
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-12.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 108086391203892345
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-12.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 49539596048075897
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-12.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18408463477023902841
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-12.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9185091440169127033
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-12.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9272911632902851705
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-12.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -12.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9331458428058668153
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-10.0dB_-3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -3.0,
+      "seed_for_this_wav": 100205091855993977
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-10.0dB_-1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -1.5,
+      "seed_for_this_wav": 41658296700177529
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-10.0dB_-0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": -0.5,
+      "seed_for_this_wav": 18400582177676004473
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-10.0dB_+0.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 0.5,
+      "seed_for_this_wav": 9177210140821228665
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-10.0dB_+1.5Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 1.5,
+      "seed_for_this_wav": 9265030333554953337
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/doppler/K1ABC_W9XYZ_73__-10.0dB_+3.0Hzps.wav",
+      "encoded_message": "K1ABC W9XYZ 73",
+      "snr_db": -10.0,
+      "channel": "awgn-drift",
+      "drift_hz_per_sec": 3.0,
+      "seed_for_this_wav": 9323577128710769785
+    }
+  ]
+}

@@ -76,6 +76,26 @@ fn modulate_message(text: &str) -> anyhow::Result<Vec<f32>> {
     Ok(samples)
 }
 
+/// Apply crude linear frequency drift to a real signal by multiplicative
+/// time-varying cosine. NOT true Doppler — true Doppler requires complex
+/// analytic signal manipulation (Hilbert transform). This multiplicative
+/// model perturbs the spectrogram (introduces AM-like sidebands and shifts
+/// peak energy across bins as time progresses) which is sufficient as a
+/// hb-015 unblock corpus. Rigorous Doppler evaluation needs a Watterson
+/// channel implementation in a future iter.
+fn apply_linear_drift_crude(samples: &mut [f32], drift_hz_per_sec: f64) {
+    if drift_hz_per_sec.abs() < f64::EPSILON {
+        return;
+    }
+    let dt = 1.0 / SAMPLE_RATE as f64;
+    for (i, s) in samples.iter_mut().enumerate() {
+        let t = i as f64 * dt;
+        // Phase ramp: integral of 2π × drift × t dt = π × drift × t²
+        let phase = std::f64::consts::PI * drift_hz_per_sec * t * t;
+        *s = (*s as f64 * phase.cos()) as f32;
+    }
+}
+
 /// Mix AWGN at the target SNR. SNR is measured in dB relative to signal RMS.
 fn add_awgn(samples: &mut [f32], snr_db: f64, rng_seed: u64) {
     let mut rng = rand::rngs::StdRng::seed_from_u64(rng_seed);
@@ -130,10 +150,24 @@ fn main() -> anyhow::Result<()> {
         config.schema_version
     );
     anyhow::ensure!(
-        config.channel == SynthChannel::Awgn,
-        "Plan 2 only supports channel=awgn; got {:?}",
+        matches!(config.channel, SynthChannel::Awgn | SynthChannel::AwgnDrift),
+        "Unsupported channel: {:?}",
         config.channel
     );
+
+    // For Awgn channel, drift_steps is forced to [0.0] (no drift).
+    // For AwgnDrift, use config.drift_steps_hz_per_sec; default to [0.0]
+    // if empty (degenerates to Awgn behavior, useful for sanity).
+    let drift_steps: Vec<f64> = match config.channel {
+        SynthChannel::Awgn => vec![0.0],
+        SynthChannel::AwgnDrift => {
+            if config.drift_steps_hz_per_sec.is_empty() {
+                vec![0.0]
+            } else {
+                config.drift_steps_hz_per_sec.clone()
+            }
+        }
+    };
 
     let output_dir = workspace.join(&config.output_dir);
     let mut entries = Vec::new();
@@ -141,30 +175,39 @@ fn main() -> anyhow::Result<()> {
     for (msg_idx, msg) in config.messages.iter().enumerate() {
         let base_samples = modulate_message(msg)?;
         for snr_db in &config.snr_steps_db {
-            // Per-wav seed is deterministic from (top-level seed, msg index, snr_db).
-            let seed_for_this_wav = config
-                .seed
-                .wrapping_add(msg_idx as u64)
-                .wrapping_mul(1_000_003)
-                .wrapping_add((snr_db.to_bits() as u64).wrapping_mul(7));
-            let mut samples = base_samples.clone();
-            add_awgn(&mut samples, *snr_db, seed_for_this_wav);
-            // Filename: <msg-slug>__<snr>dB.wav (slugify the message text).
-            let slug: String = msg
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-                .collect();
-            let filename = format!("{slug}__{:+.1}dB.wav", snr_db);
-            let wav_path = output_dir.join(&filename);
-            write_wav(&wav_path, &samples)?;
-            entries.push(SynthEntry {
-                wav_path: PathBuf::from(&config.output_dir).join(&filename),
-                encoded_message: msg.clone(),
-                snr_db: *snr_db,
-                channel: config.channel,
-                seed_for_this_wav,
-            });
-            total += 1;
+            for drift in &drift_steps {
+                // Per-wav seed deterministic from (top-level seed, msg index, snr, drift).
+                let seed_for_this_wav = config
+                    .seed
+                    .wrapping_add(msg_idx as u64)
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add((snr_db.to_bits() as u64).wrapping_mul(7))
+                    .wrapping_add((drift.to_bits() as u64).wrapping_mul(13));
+                let mut samples = base_samples.clone();
+                apply_linear_drift_crude(&mut samples, *drift);
+                add_awgn(&mut samples, *snr_db, seed_for_this_wav);
+                // Filename: <msg-slug>__<snr>dB[_<drift>Hzps].wav
+                let slug: String = msg
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect();
+                let filename = if matches!(config.channel, SynthChannel::AwgnDrift) {
+                    format!("{slug}__{:+.1}dB_{:+.1}Hzps.wav", snr_db, drift)
+                } else {
+                    format!("{slug}__{:+.1}dB.wav", snr_db)
+                };
+                let wav_path = output_dir.join(&filename);
+                write_wav(&wav_path, &samples)?;
+                entries.push(SynthEntry {
+                    wav_path: PathBuf::from(&config.output_dir).join(&filename),
+                    encoded_message: msg.clone(),
+                    snr_db: *snr_db,
+                    channel: config.channel,
+                    drift_hz_per_sec: *drift,
+                    seed_for_this_wav,
+                });
+                total += 1;
+            }
         }
     }
 

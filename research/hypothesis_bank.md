@@ -1,11 +1,17 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T05:30:00Z
+last_updated: 2026-05-24T14:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 27
-current_ratio: 0.129
+exploitation_run: 32
+current_ratio: 0.111
+# Batch 4 (2026-05-24): 5 iters of structural/unblock work.
+#   hb-051 won (diagnostic, closes AP line on hard-200)
+#   jt9 wrapper, Doppler corpus, hb-050 wiring: infrastructure WIN
+#   FP filter MVP: precision WIN (-21.7% novels at -0.02% recall)
+#   hb-050 + hb-027 SHELVED as consequence of hb-051 ceiling
+#   spawned hb-052 (production FP filter), hb-053 (revisit shelved w/ filter)
 # Note: mr-001 (WSJT-X-Improved audit) added hb-043..hb-048 — six new
 # pending hypotheses sourced from external research. Bank no longer
 # "exhausted" — the meta-research cycle works.
@@ -214,52 +220,97 @@ current_ratio: 0.129
     threshold (WSJT-X uses snr7 >= 6.0, snr7b >= 1.8), per-callsign cooldown
     integration with pancetta-qso's recently_responded_to.
 
-### hb-050 — Rolling callsign-window tracker (hb-027 data source)  [PRIORITY: 0.50, spawned 2026-05-24 from hb-043]
+### hb-050 — Rolling callsign-window tracker  [SHELVED 2026-05-24 — closed by hb-051 ceiling]
+  mode: ft8
+  status: SHELVED — infrastructure built but adds zero recall (4.7x wallclock penalty)
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: REFUTED — hb-051 ceiling = 1 decode; rolling-window can't beat that
+  defensible_prior: turned out wrong
+  wild_card: false
+  evidence_against:
+    - hb-051 diagnostic (2026-05-24): perfect-information AP hints recover ONE decode out of 8576 truth on hard-200. Rolling-window can only do worse.
+    - hb-050 sweep on hard-200 with --ap-rolling-window 50: Δrec=0, Δnovel=0, 4.7x wallclock penalty (1187s vs ~250s baseline).
+    - The eval-iteration order isn't even chronological (per-corpus shuffle), so the rolling window is essentially "random recent callsigns" — but even if it were perfect, hb-051 caps the upside at 1 decode.
+  notes: |
+    SHELVED. Infrastructure (--ap-rolling-window flag, Mutex<VecDeque>
+    in Ft8Decoder wrapper) is in place and can be reused if a future
+    use case emerges. Possibly still useful for OPERATIONAL on-air
+    decoding where the rolling window pulls from real chronological
+    slots and overlaps with the operator's QSO state — different
+    eval context. Re-evaluate if/when operator-side rolling-window
+    lands. See research/experiments/2026-05-24-batch-4-unblock.md.
+
+### hb-051 — AP-recovery ceiling diagnostic  [WIN (diagnostic) 2026-05-24]
+  mode: ft8
+  status: COMPLETED — ceiling = 1/8576 decodes; closes AP line on hard-200
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: 0; decisive diagnostic
+  defensible_prior: yes
+  wild_card: false
+  outcome: |
+    Per pancetta-research/examples/ap_recovery_ceiling.rs on hard-200
+    (200 WAVs, ~15 min wall): with truth callsigns injected as
+    ApContext.recent_calls (perfect information), pancetta recovers
+    EXACTLY ONE additional decode beyond AP-off baseline (4666 → 4667).
+    WAVs with recovery: 1 / 200.
+    Verdict per the bank-entry interpretation table (<0.5% ceiling):
+    hb-050 / hb-027 lines closed.
+  notes: |
+    Result drives the SHELVE of hb-050 and (by extension) hb-027.
+    See research/experiments/2026-05-24-batch-4-unblock.md iter 1.
+
+### hb-052 — Production FP filter (callsign continuity)  [PRIORITY: 0.55, spawned 2026-05-24 from FP filter MVP]
   mode: ft8
   status: pending
-  priority_score: 0.50
-  estimated_effort: 1-2 sessions
-  expected_delta: prerequisite for hb-027; itself a small infrastructure addition
-  defensible_prior: yes (hb-043 unblocked the algo side; this is the data side)
+  priority_score: 0.55
+  estimated_effort: 2-3 sessions
+  expected_delta: -10 to -25% novel decodes (FPs) on-air at near-zero recall cost
+  defensible_prior: yes — MVP showed -21.7% novels at -0.02% recall on hard-200
   wild_card: false
   evidence_for:
-    - hb-043 (2026-05-24) added the my_call-less AP injection algo. To deliver hb-027's actual value, we need a data source: callsigns observed in the most-recent K slots.
-    - For eval: a rolling-window helper in pancetta-research that tracks per-WAV decoded callsigns and feeds them as ap_recent_calls to subsequent WAVs in the corpus iteration order.
-    - For production: a similar rolling tracker in the coordinator that feeds the per-slot decode_window call.
+    - Batch 4 iter 4 (2026-05-24): callsign-continuity filter using corpus baselines reduced novels by 21.7% (-141 of 651) at 0.02% recall cost (-1 of 4666) on hard-200.
+    - Per hb-039: 97% of isolated-novel callsigns are likely FPs. The filter directly applies this finding.
+    - Production needs a different reference set than corpus baselines: (a) operator's logged callsigns (from ~/.pancetta/qsos.adi), (b) recent rolling-window of decoded callsigns, (c) cqdx.io API for live spots.
   evidence_against:
-    - Corpus iteration order in eval may not reflect real-time slot ordering — the rolling-window prior is only valid if the eval WAVs are processed in chronological order (or at least within-channel batches).
-    - Production rolling window needs interaction with the QSO state machine (callsigns we're actively talking to should be in recent_calls).
+    - Production reference set may be incomplete during cold-start (no operator history yet, no spots cached). Need a fallback mode (lenient filter) for first-N-minutes operation.
+    - cqdx.io API call adds latency to the decode loop. Cache aggressively.
   notes: |
-    Two-stage design:
-    (a) Eval-side: add a `--ap-rolling-window N` flag to pancetta-research/eval
-        that maintains a deque of the last N decoded callsigns across the
-        corpus iteration. Feed as ap_recent_calls on each WAV. Measure on
-        hard-200 + hard-1000.
-    (b) Production-side: hook into the coordinator's decode→decision pipeline
-        to populate ApContext.recent_calls before each slot's decode.
-    Combine with hb-051 (recovery-ceiling diagnostic) to bound expected impact
-    before investing in (b).
+    Design:
+    - Build a `CallsignContinuityFilter` in pancetta-qso or pancetta-core.
+    - Reference set sources (combined, OR-of-membership):
+      (a) Recent ADIF log entries (operator's own logs)
+      (b) Rolling window of last N decoded callsigns this session
+      (c) cqdx.io recent-spots cache (refreshed every N minutes)
+    - Filter applied as post-decode: keep decode iff at least one
+      extracted callsign appears in any of (a)(b)(c).
+    - Cold-start: skip the filter for the first N decodes of a session
+      (no reference set built up yet).
+    - Wire into coordinator's decode pipeline; emit filtered-out
+      decodes to a separate log for review.
 
-### hb-051 — Diagnostic: AP-recovery ceiling on hard-200  [PRIORITY: 0.45, spawned 2026-05-24 from hb-043]
+### hb-053 — Revisit shelved OSD/BP hypotheses under "wider gate + FP filter"  [PRIORITY: 0.45, spawned 2026-05-24]
   mode: ft8
   status: pending
   priority_score: 0.45
-  estimated_effort: 1 session
-  expected_delta: diagnostic — bounds the upper limit of what AP could contribute
-  defensible_prior: yes
+  estimated_effort: 1-2 sessions per re-test
+  expected_delta: variable per hypothesis; potentially salvages shelved items if FP filter cleans up the +novels they generated
+  defensible_prior: yes — hb-052 MVP showed precision tooling exists
   wild_card: false
   evidence_for:
-    - hb-043 sanity sweep produced 0 delta with popular callsigns because AP only fires when AP0 fails, and popular callsigns are AP0-recoverable by definition.
-    - To know whether hb-050 (rolling window data source) is worth building, measure: for each WAV, find the candidates where AP0 fails, then re-decode with AP injection of the TRUTH callsigns (cheat). The decode lift is the upper bound on what hb-050 + hb-027 could ever deliver.
-    - If ceiling is <0.5%, drop the line. If >2%, invest in hb-050 with confidence.
+    - Several hypotheses (hb-018 OSD-3 with CRC filter, hb-034 OSD-3 follow-up, hb-035 BP convergence, hb-014 wider parity gates) were shelved with "loses to precision wall" reasoning.
+    - The precision wall = "more candidates admitted → more FPs". If we add a precision filter post-hoc, the recall-vs-FP tradeoff shifts.
+    - hb-035 iters=100: +12 rec, +21 novel (1.75:1 ratio). If filter kills 21.7% of novels at 0.02% recall cost, net = +12 rec, +16 novel (1.33:1 ratio — better).
   evidence_against:
-    - Diagnostic-only — no production change drops out directly.
+    - Production deployment depends on hb-052 first.
+    - The shelved hypotheses' marginal recall gains are small (10s of decodes) — even with FP filter, the win is modest.
   notes: |
-    Implementation: a new pancetta-research example that takes a WAV +
-    its truth set, runs AP0-only decode, identifies failed candidates,
-    re-decodes those with ApContext populated from the truth callsigns,
-    counts the AP recoveries that survive the confidence/survival gates.
-    Aggregate across hard-200 for a corpus-level ceiling estimate.
+    Two-phase approach:
+    Phase 1 (after hb-052 ships): re-run hb-014 with wider gate (e.g., gate=4)
+    + filter post-process. Measure net recall + novel.
+    Phase 2: similar for hb-034 (OSD-3) and hb-035 (iters=100 + var=40/48).
+    If any re-run shows >0.005 composite gain with filter, graduate.
 
 ### hb-049 — Remove dead `Ft8Config::min_snr_db` field  [WIN 2026-05-24]
   mode: ft8
@@ -659,28 +710,23 @@ current_ratio: 0.129
     Compare against the production decoder on Hard-200. Start with a tiny model
     (~1M params) just to validate the architecture trains; scale up if signal.
 
-### hb-027 — Wild-card: Joint multi-slot decoding via QSO context  [PRIORITY: wild]
+### hb-027 — Wild-card: Joint multi-slot decoding via QSO context  [SHELVED 2026-05-24 via hb-051]
   mode: ft8
-  status: pending
+  status: SHELVED — same architectural premise as hb-050; closed by hb-051 ceiling
   priority_score: 0.0
-  estimated_effort: 2-3 sessions
-  expected_delta: unknown; possibly +0.02 to +0.10 on QSO-pattern corpus; risk of compounding errors
-  defensible_prior: no
+  estimated_effort: n/a
+  expected_delta: REFUTED — hb-051 caps perfect-information AP recovery at 1 decode on hard-200
+  defensible_prior: turned out wrong
   wild_card: true
-  evidence_for:
-    - QSO content is heavily correlated across slots — once K1ABC and W9XYZ are talking, slot N+1 is very likely to contain those callsigns
-    - Current decoder treats each slot independently, discarding this prior
-    - AP search already supports per-decode callsign injection (Ap1 through Ap4); just needs a rolling-window data source
   evidence_against:
-    - Temporal coupling means a wrong decode in slot N pollutes slot N+1's prior
-    - Operator-perspective: this is closer to "QSO state machine" than "decoder" — may belong in pancetta-qso, not pancetta-ft8
-    - May not generalize across operating modes (POTA vs contest vs ragchew have different conversation lengths)
+    - hb-051 diagnostic (2026-05-24): perfect-information AP injection (truth callsigns as hints) recovers 1 decode out of 8576 on hard-200. Any approximation of "callsigns from prior slots" can only do worse.
+    - The architectural premise — that injecting recently-observed callsigns as AP priors will unlock significant recall — is closed for the hard-200 corpus shape.
+    - Pancetta's AP code path only fires when AP0 fails. On hard-200, AP0 already handles candidate callsigns that have any reasonable signal; the failures are weak-signal candidates where the LDPC-with-bias still can't converge.
   notes: |
-    Build a rolling table of "recently-decoded callsigns" (last 4-8 slots). Before
-    each new slot's decode, seed AP search with these as high-prior tokens.
-    Measure: per-slot decode count vs without the prior, on Hard-200 (which
-    includes QSO-pattern WAVs because the curate scoring favors busy bands).
-    If positive, productize; if it compounds errors, document and shelve.
+    SHELVED. May still apply in OPERATIONAL on-air context (different
+    corpus shape; potentially different failure modes). Re-evaluate
+    only with operator-side data once that infrastructure exists.
+    See research/experiments/2026-05-24-batch-4-unblock.md iter 1 + 3.
 
 ### hb-028 — Wild-card: Cross-decoder ensemble at runtime  [PRIORITY: wild]
   mode: ft8

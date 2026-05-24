@@ -15,7 +15,7 @@ pub use scorecard::Scorecard;
 pub mod metrics;
 
 pub mod decoder;
-pub use decoder::{Decode, DecoderUnderTest};
+pub use decoder::{Decode, DecoderUnderTest, Ft8Decoder, Jt9Decoder};
 
 pub mod corpus;
 

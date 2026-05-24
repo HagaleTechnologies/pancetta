@@ -24,10 +24,17 @@ pub struct SynthConfig {
     pub schema_version: u32,
     pub label: String,
     /// Messages to encode. Each will be modulated at every snr_db level
-    /// listed, producing `messages.len() * snr_steps.len()` total WAVs.
+    /// listed, producing `messages.len() * snr_steps.len()` total WAVs
+    /// for AWGN, or `* drift_steps.len()` more for AwgnDrift.
     pub messages: Vec<String>,
     pub snr_steps_db: Vec<f64>,
     pub channel: SynthChannel,
+    /// Drift rates in Hz/s applied to each WAV when channel=AwgnDrift.
+    /// Ignored for Awgn. Empty means [0.0]. Crude model — multiplicative
+    /// cosine on the real signal, not true Doppler frequency translation.
+    /// Sufficient as a hb-015 unblock; rigorous Watterson is future work.
+    #[serde(default)]
+    pub drift_steps_hz_per_sec: Vec<f64>,
     /// Deterministic seed; same seed + same config → byte-identical output.
     pub seed: u64,
     /// Output dir relative to workspace root. WAVs land here.
@@ -41,6 +48,9 @@ pub struct SynthEntry {
     pub encoded_message: String,
     pub snr_db: f64,
     pub channel: SynthChannel,
+    /// Drift rate in Hz/s (only meaningful when channel=AwgnDrift; 0 otherwise).
+    #[serde(default)]
+    pub drift_hz_per_sec: f64,
     pub seed_for_this_wav: u64,
 }
 

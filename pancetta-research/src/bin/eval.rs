@@ -46,6 +46,8 @@ struct Args {
     /// (decode_window with default-empty context → AP never fires).
     ap_my_call: Option<String>,
     ap_recent_calls: Option<Vec<String>>,
+    /// hb-050: enable rolling-callsign-window mode with capacity N.
+    ap_rolling_window: Option<usize>,
 }
 
 impl Args {
@@ -69,6 +71,7 @@ impl Args {
         let mut max_parity_errors_for_osd: Option<usize> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
+        let mut ap_rolling_window: Option<usize> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -188,6 +191,13 @@ impl Args {
                             .collect(),
                     );
                 }
+                "--ap-rolling-window" => {
+                    ap_rolling_window = Some(
+                        iter.next()
+                            .context("--ap-rolling-window needs a value (N)")?
+                            .parse()?,
+                    );
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
@@ -236,6 +246,7 @@ impl Args {
             max_parity_errors_for_osd,
             ap_my_call,
             ap_recent_calls,
+            ap_rolling_window,
         })
     }
 }
@@ -633,6 +644,10 @@ fn main() -> anyhow::Result<()> {
                     active_qso: None,
                 };
                 d = d.with_ap_context(ctx);
+            }
+            // hb-050: rolling-window mode overrides per-call ApContext.
+            if let Some(n) = args.ap_rolling_window {
+                d = d.with_rolling_window(n);
             }
             Box::new(d)
         }
