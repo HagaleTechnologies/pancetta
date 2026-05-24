@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T05:00:00Z
+last_updated: 2026-05-24T05:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 26
-current_ratio: 0.133
+exploitation_run: 27
+current_ratio: 0.129
 # Note: mr-001 (WSJT-X-Improved audit) added hb-043..hb-048 — six new
 # pending hypotheses sourced from external research. Bank no longer
 # "exhausted" — the meta-research cycle works.
@@ -214,6 +214,53 @@ current_ratio: 0.133
     threshold (WSJT-X uses snr7 >= 6.0, snr7b >= 1.8), per-callsign cooldown
     integration with pancetta-qso's recently_responded_to.
 
+### hb-050 — Rolling callsign-window tracker (hb-027 data source)  [PRIORITY: 0.50, spawned 2026-05-24 from hb-043]
+  mode: ft8
+  status: pending
+  priority_score: 0.50
+  estimated_effort: 1-2 sessions
+  expected_delta: prerequisite for hb-027; itself a small infrastructure addition
+  defensible_prior: yes (hb-043 unblocked the algo side; this is the data side)
+  wild_card: false
+  evidence_for:
+    - hb-043 (2026-05-24) added the my_call-less AP injection algo. To deliver hb-027's actual value, we need a data source: callsigns observed in the most-recent K slots.
+    - For eval: a rolling-window helper in pancetta-research that tracks per-WAV decoded callsigns and feeds them as ap_recent_calls to subsequent WAVs in the corpus iteration order.
+    - For production: a similar rolling tracker in the coordinator that feeds the per-slot decode_window call.
+  evidence_against:
+    - Corpus iteration order in eval may not reflect real-time slot ordering — the rolling-window prior is only valid if the eval WAVs are processed in chronological order (or at least within-channel batches).
+    - Production rolling window needs interaction with the QSO state machine (callsigns we're actively talking to should be in recent_calls).
+  notes: |
+    Two-stage design:
+    (a) Eval-side: add a `--ap-rolling-window N` flag to pancetta-research/eval
+        that maintains a deque of the last N decoded callsigns across the
+        corpus iteration. Feed as ap_recent_calls on each WAV. Measure on
+        hard-200 + hard-1000.
+    (b) Production-side: hook into the coordinator's decode→decision pipeline
+        to populate ApContext.recent_calls before each slot's decode.
+    Combine with hb-051 (recovery-ceiling diagnostic) to bound expected impact
+    before investing in (b).
+
+### hb-051 — Diagnostic: AP-recovery ceiling on hard-200  [PRIORITY: 0.45, spawned 2026-05-24 from hb-043]
+  mode: ft8
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 1 session
+  expected_delta: diagnostic — bounds the upper limit of what AP could contribute
+  defensible_prior: yes
+  wild_card: false
+  evidence_for:
+    - hb-043 sanity sweep produced 0 delta with popular callsigns because AP only fires when AP0 fails, and popular callsigns are AP0-recoverable by definition.
+    - To know whether hb-050 (rolling window data source) is worth building, measure: for each WAV, find the candidates where AP0 fails, then re-decode with AP injection of the TRUTH callsigns (cheat). The decode lift is the upper bound on what hb-050 + hb-027 could ever deliver.
+    - If ceiling is <0.5%, drop the line. If >2%, invest in hb-050 with confidence.
+  evidence_against:
+    - Diagnostic-only — no production change drops out directly.
+  notes: |
+    Implementation: a new pancetta-research example that takes a WAV +
+    its truth set, runs AP0-only decode, identifies failed candidates,
+    re-decodes those with ApContext populated from the truth callsigns,
+    counts the AP recoveries that survive the confidence/survival gates.
+    Aggregate across hard-200 for a corpus-level ceiling estimate.
+
 ### hb-049 — Remove dead `Ft8Config::min_snr_db` field  [WIN 2026-05-24]
   mode: ft8
   status: GRADUATED — field + const + all referencing sites removed
@@ -232,26 +279,25 @@ current_ratio: 0.133
     Recommend running mr-004 (quarterly source-drift audit) to
     catch remaining dead config flags in one pass.
 
-### hb-043 — AP my_call-less injection (hb-027 precondition)  [PRIORITY: 0.45, spawned 2026-05-24 from hb-004 wiring]
+### hb-043 — AP my_call-less injection  [WIN 2026-05-24 infrastructure]
   mode: ft8
-  status: pending
-  priority_score: 0.45
-  estimated_effort: 1 session
-  expected_delta: unblocks hb-027 (rolling callsign-prior injection without operator-call dependency)
-  defensible_prior: yes (the AP code structure documents the my_call coupling)
+  status: GRADUATED (infrastructure) — my_call-less AP path plumbed end-to-end
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: 0 composite from this iter; unblocks hb-027
+  defensible_prior: yes
   wild_card: false
   evidence_for:
-    - hb-004 wiring journal (2026-05-24) confirmed that par_try_ap_decode's AP1/AP2/AP3 branches all short-circuit `if ctx.ap_context.my_call.is_none()`. AP2's recent_calls injection requires my_call to also be set.
-    - hb-027's actual use case is "scanning, using observed callsigns as priors regardless of who's addressing whom" — orthogonal to my_call.
-    - The structural fix: add a "calls of interest" injection mode that biases LDPC search toward those callsigns without requiring my_call to be set.
-  evidence_against:
-    - Touches the AP module's API surface — minor breaking change for in-tree callers.
-    - Without my_call's bit-position constraint, the prior is weaker (could be at either address position); needs careful LLR injection.
+    - 2026-05-24 implementation: added `inject_recent_call_at_called` to ap.rs (companion to existing `inject_ap2_caller`); new `RecentInjectPos` enum + `par_try_ldpc_with_recent_only` helper in decoder.rs (~80 LOC); new code path in par_try_ap_decode that runs when my_call.is_none() && !recent_calls.is_empty(); extended ap_active check.
+    - Sanity sweep on hard-200 with 5 + 20 popular callsigns: rec=4365/novel=952 unchanged (the popular callsigns are already AP0-recoverable). Wallclock scales linearly with N (5 calls → 190s, 20 calls → 437s), confirming the AP path activates correctly without bugs.
+    - hb-027 (joint multi-slot via QSO context) is now unblocked. Next step: rolling-window callsign tracker.
   notes: |
-    Implementation: refactor par_try_ap_decode to accept a "callsign hint
-    set" independent of my_call. Each hint becomes an AP variant that
-    tries the callsign at both address positions (to=callsign and
-    from=callsign). Confidence gating per hb-048 to avoid FP explosion.
+    See research/experiments/2026-05-24-ap-mycall-less-injection.md.
+    Note: AP only runs when AP0 FAILS — by construction, AP can only
+    add decodes that AP0 missed. Sanity test with popular callsigns
+    produces 0 delta because AP0 already handles those. Real-value
+    measurement requires hb-050 (rolling-window source) + hb-051
+    (AP-recovery ceiling diagnostic).
 
 ### hb-042 — Score-based cap  [SHELVED 2026-05-24]
   mode: ft8

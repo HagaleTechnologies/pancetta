@@ -363,6 +363,16 @@ pub fn inject_ap2_caller(llrs: &mut [f32], caller: &RecentCallAp) {
     inject_28_bits(llrs, 0, &caller.bits);
 }
 
+/// Inject a specific recent callsign at bits 28-55 (called station).
+///
+/// Companion to `inject_ap2_caller`. Used by hb-043 my_call-less AP
+/// injection — when the operator is scanning rather than transmitting,
+/// observed callsigns are still useful priors but might appear at EITHER
+/// position. This function handles the called-position injection.
+pub fn inject_recent_call_at_called(llrs: &mut [f32], call: &RecentCallAp) {
+    inject_28_bits(llrs, 28, &call.bits);
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================

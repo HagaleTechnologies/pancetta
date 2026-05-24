@@ -441,8 +441,13 @@ impl Ft8Decoder {
 
         let max_passes = self.config.max_decode_passes.max(1);
 
-        // Check whether AP is active (any known information available)
-        let ap_active = ap_context.my_call.is_some() || ap_context.active_qso.is_some();
+        // Check whether AP is active (any known information available).
+        // hb-043: a non-empty `recent_calls` alone activates AP — the
+        // my_call-less injection path tries each recent callsign at
+        // both bits 0-27 (caller) and 28-55 (called).
+        let ap_active = ap_context.my_call.is_some()
+            || ap_context.active_qso.is_some()
+            || !ap_context.recent_calls.is_empty();
 
         // Budget tracker — stops decode passes when wall-clock time is exceeded
         let budget = BudgetTracker::new(self.config.osd_depth.map_or(2000, |d| {
@@ -2641,6 +2646,48 @@ fn par_try_ap_decode(
             }
         }
 
+        // --- AP-recent-only (hb-043, my_call-less): when my_call is
+        // unset, try each recent callsign at BOTH bits 0-27 (caller
+        // position) and bits 28-55 (called position). Enables the
+        // hb-027 "rolling callsign window" use case where the operator
+        // is scanning, not transmitting, so my_call is irrelevant but
+        // observed callsigns are still useful priors.
+        if ctx.ap_context.my_call.is_none() && !ctx.ap_context.recent_calls.is_empty() {
+            for recent in &ctx.ap_context.recent_calls {
+                if decoded_calls.contains(&recent.callsign) {
+                    continue;
+                }
+                // Try as caller (bits 0-27)
+                if let Some(msg) = par_try_ldpc_with_recent_only(
+                    ctx,
+                    ldpc,
+                    &base_llrs,
+                    recent,
+                    RecentInjectPos::Caller,
+                    snr_db,
+                    confidence,
+                    base_frequency,
+                    time_offset_s,
+                ) {
+                    return Some(msg);
+                }
+                // Try as called (bits 28-55)
+                if let Some(msg) = par_try_ldpc_with_recent_only(
+                    ctx,
+                    ldpc,
+                    &base_llrs,
+                    recent,
+                    RecentInjectPos::Called,
+                    snr_db,
+                    confidence,
+                    base_frequency,
+                    time_offset_s,
+                ) {
+                    return Some(msg);
+                }
+            }
+        }
+
         // --- AP3: both callsigns known (active QSO) ---
         if ctx.ap_context.active_qso.is_some() && ctx.ap_context.my_call.is_some() {
             if let Some(msg) = par_try_ldpc_with_ap(
@@ -2781,6 +2828,89 @@ fn par_try_ldpc_with_ap(
     decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
     decoded_message.ap_level = ap_level_num;
 
+    Some(decoded_message)
+}
+
+/// Position to inject a recent callsign in the LLR vector. hb-043 my_call-less AP.
+#[derive(Debug, Clone, Copy)]
+enum RecentInjectPos {
+    /// Inject at bits 0-27 (caller / from-callsign position).
+    Caller,
+    /// Inject at bits 28-55 (called / to-callsign position).
+    Called,
+}
+
+/// hb-043: LDPC decode with a single recent callsign injected at one position,
+/// without the my_call-coupled AP1 injection that AP2 normally prepends.
+/// Mirrors `par_try_ldpc_with_ap` but for the my_call-less use case.
+fn par_try_ldpc_with_recent_only(
+    ctx: &DecodeContext,
+    ldpc: &LdpcDecoder,
+    base_llrs: &[f32],
+    recent: &crate::ap::RecentCallAp,
+    pos: RecentInjectPos,
+    snr_db: f32,
+    confidence: f32,
+    base_frequency: f64,
+    time_offset_s: f64,
+) -> Option<DecodedMessage> {
+    let mut llrs = base_llrs.to_vec();
+    match pos {
+        RecentInjectPos::Caller => crate::ap::inject_ap2_caller(&mut llrs, recent),
+        RecentInjectPos::Called => crate::ap::inject_recent_call_at_called(&mut llrs, recent),
+    }
+
+    normalize_llrs(&mut llrs, ctx.llr_target_variance);
+
+    let corrected_bits = match ldpc.decode_soft(&llrs) {
+        Ok(bits) => bits,
+        Err(_) => return None,
+    };
+    if !par_verify_crc(&corrected_bits) {
+        return None;
+    }
+    let payload_bits = par_apply_xor(ctx.xor_sequence, &corrected_bits);
+    let ft8_message = match ctx.message_parser.parse_payload(&payload_bits) {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+    if !ft8_message.is_plausible() {
+        return None;
+    }
+
+    // Survival check: the decoded message's callsign at the injected position
+    // must match the injected recent callsign. Otherwise the LDPC parity
+    // overruled the bias and produced a CRC-coincidence FP.
+    let target_call = match pos {
+        RecentInjectPos::Caller => ft8_message.from_callsign.as_deref().unwrap_or(""),
+        RecentInjectPos::Called => ft8_message.to_callsign.as_deref().unwrap_or(""),
+    };
+    let target_base = target_call.split('/').next().unwrap_or(target_call);
+    if target_base != recent.callsign {
+        return None;
+    }
+
+    // Same confidence gating as par_try_ldpc_with_ap for AP-level decodes.
+    const MIN_AP_CONFIDENCE: f32 = 0.55;
+    const SCRUTINY_THRESHOLD: f32 = 0.65;
+    if confidence < MIN_AP_CONFIDENCE {
+        return None;
+    }
+    if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
+        return None;
+    }
+
+    let mut decoded_message = DecodedMessage::new(
+        ft8_message,
+        snr_db,
+        confidence,
+        base_frequency,
+        time_offset_s,
+    );
+    decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
+    // Report as AP-level 2 (recent-caller class) for now. Future could
+    // introduce a distinct ap_level number for hb-043 if telemetry needs it.
+    decoded_message.ap_level = 2;
     Some(decoded_message)
 }
 
