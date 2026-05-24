@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T02:00:00Z
+last_updated: 2026-05-24T02:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 20
-current_ratio: 0.167
+exploitation_run: 21
+current_ratio: 0.160
 
 ## Active (ranked by score)
 
@@ -220,33 +220,24 @@ current_ratio: 0.167
     toward without recall benefit. hb-041 (disable OSD fallback)
     becomes more compelling.
 
-### hb-035 — Sweep for max BP convergence rate (reduce OSD fallback)  [PRIORITY: 0.45]
+### hb-035 — Sweep for max BP convergence rate  [SHELVED 2026-05-24]
   mode: ft8
-  status: pending
-  priority_score: 0.45
-  estimated_effort: 1 session
-  expected_delta: speed (wall-clock) + small sensitivity; informs which knobs reduce OSD-fallback rate
-  defensible_prior: yes (hb-005 + hb-006 both produced 3-5% speedups by reducing OSD fallback)
+  status: SHELVED — LLR axis dead (hb-006 elbow holds); iters axis marginal
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: REFUTED — LLR widening regresses; iters extension trades 1.75:1 novel/real (poor)
+  defensible_prior: turned out partial
   wild_card: false
-  evidence_for:
-    - hb-005 (LDPC iters 25 → 50) made the 5-tier eval 3% faster — more BP convergence = fewer expensive OSD calls.
-    - hb-006 (LLR variance 24 → 32) made it 5% faster — same mechanism.
-    - Both speedups were a side-effect; neither was the headline metric. A deliberate target on "BP convergence rate" could unlock more.
-    - The BudgetTracker (decoder.rs:373) limits per-WAV decode time; if BP converges more often, more candidates fit in the budget = more decodes.
   evidence_against:
-    - Diagnostic-first; no guaranteed code change drops out
-    - Could find that the current setting is already at the BP/OSD tradeoff frontier
+    - 2026-05-24 sweep on hard-200 (current prod gate=2 cap=300):
+      LLR ∈ {32, 40, 48} at iters=50: LLR=40 loses -12 rec; LLR=48 loses -14 rec. The hb-006 elbow at variance=32 is intact under the new production state.
+      iters ∈ {50, 75, 100} at LLR=32: iters=100 gains +12 rec at +21 novel (1:1.75 real/novel ratio, vs top-300 5:1). Marginal recall, poor precision.
+      Composite delta in either direction is ±0.0008 — at the limit of what parameter sweeps can move.
   notes: |
-    Instrument the decoder to emit per-candidate convergence outcomes:
-    (a) BP converged in N iters; (b) BP did not converge, OSD attempted,
-    OSD succeeded; (c) OSD attempted, OSD failed; (d) parity gate
-    blocked OSD. Run on hard-200 with current production settings, then
-    sweep:
-    - LLR_TARGET_VARIANCE ∈ {28, 32, 36, 40, 48} (extend the hb-006 sweep)
-    - LDPC iter cap ∈ {50, 75, 100} (extend the hb-005 sweep)
-    - Combined sweeps for crossing effects.
-    Goal: find a setting that pushes BP convergence rate from current
-    (estimate ~80%?) to ~90%+ while keeping decode rate ≥ current.
+    SHELVED. See research/experiments/2026-05-24-bp-convergence-sweep.md.
+    Future parameter tuning hits the precision wall — same as the OSD
+    line. Path forward is structural (NMS-aware subtract, joint multi-
+    slot via QSO context, cross-decoder ensemble), not parametric.
 
 ### hb-033 — sync_cap saturation audit  [SHELVED 2026-05-24]
   mode: ft8
