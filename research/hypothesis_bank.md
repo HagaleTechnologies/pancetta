@@ -1,11 +1,14 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-24T02:30:00Z
+last_updated: 2026-05-24T03:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 21
-current_ratio: 0.160
+exploitation_run: 22
+current_ratio: 0.154
+# Note: mr-001 (WSJT-X-Improved audit) added hb-043..hb-048 — six new
+# pending hypotheses sourced from external research. Bank no longer
+# "exhausted" — the meta-research cycle works.
 
 ## Active (ranked by score)
 
@@ -105,6 +108,134 @@ current_ratio: 0.160
     a NEW hb-NNN at that point rather than reviving this one — the
     framing has moved on. See research/experiments/2026-05-23-multipass-profile.md.
 
+
+### hb-044 — Sub-sample DT refinement (parabolic interpolation of sync peak)  [PRIORITY: 0.55, spawned 2026-05-24 from mr-001]
+  mode: ft8
+  status: pending
+  priority_score: 0.55
+  estimated_effort: 1 session
+  expected_delta: +0.005 to +0.02 SNR@50% on weak/Doppler-shifted signals
+  defensible_prior: yes (WSJT-X-Improved v3.1.0, May 2026)
+  wild_card: false
+  evidence_for:
+    - WSJT-X-Improved v3.1.0 release notes call out "sub-sample DT refinement" as a sensitivity improvement.
+    - Pancetta's Costas search is currently integer-bin in time. Parabolic/Gaussian interpolation of the sync metric peak in the time axis is a small, well-understood signal processing step.
+    - For sync_score peaks that fall between time bins (common at weak SNR or with timing jitter), integer-bin alignment loses fidelity that the LDPC LLR computation could otherwise exploit.
+  evidence_against:
+    - Could shift soft-bit alignment and perturb the LLR distribution; watch precision and the LLR target-variance regime (currently 32, hb-006 elbow).
+    - WSJT-X-Improved's release notes don't quantify the lift — could be small.
+  notes: |
+    Source: WSJT-X-Improved v3.1.0 (https://sourceforge.net/projects/wsjt-x-improved/files/WSJT-X_v3.1.0/)
+    and https://wsjt-x-improved.sourceforge.io/Release_Notes.txt
+    Implementation: after Costas sync scoring, fit a parabola (or Gaussian)
+    to the sync metric at peak ± 1 time bin; use the fitted peak position
+    as the candidate's time offset. Add a CLI flag --time-interpolation
+    {none|parabolic|gaussian} for sweep.
+
+### hb-045 — Localized baseline / noise-floor estimation  [PRIORITY: 0.50, spawned 2026-05-24 from mr-001]
+  mode: ft8
+  status: pending
+  priority_score: 0.50
+  estimated_effort: 1 session
+  expected_delta: +0.005 to +0.02 on Wild-50 + heterogeneous spectra; possibly hard-200 too
+  defensible_prior: yes (WSJT-X-Improved v3.1.0 and original WSJT-X 2019 baseline change)
+  wild_card: false
+  evidence_for:
+    - WSJT-X-Improved v3.1.0: "Optimized baseline calculation, effective for FT4, FT2 and FT8 STD".
+    - WSJT-X mainline `lib/ft8/baseline.f90` saw "Improve FT8 SNR estimates in two ways" change (2019); the technique is to compute noise floor per-window rather than globally so a single strong signal doesn't drag the floor up across the whole band.
+    - Pancetta's wild-50 has 0/96 jt9-overlap recovery — heterogeneous spectra are exactly where a windowed baseline should help.
+  evidence_against:
+    - Local baselines on truly empty bands can over-suppress weak candidates; needs a floor on the local estimate.
+    - If pancetta currently uses global baseline (TBD by audit), the change touches the SNR-thresholding path and could shift precision-recall in ways that interact with the parity gate (hb-014).
+  notes: |
+    Source: https://sourceforge.net/p/wsjt/wsjtx/ci/master/tree/lib/ft8/baseline.f90
+    + WSJT-X-Improved v3.1.0 release notes.
+    First step: audit pancetta-ft8 to find where the candidate noise floor /
+    SNR threshold is computed. Then add a CLI flag selecting
+    {global|windowed_50hz|windowed_200hz}. Sweep on hard-200 + wild-50.
+
+### hb-046 — Two-stage STD-then-MTD pass scheduling  [PRIORITY: 0.50, spawned 2026-05-24 from mr-001]
+  mode: ft8
+  status: pending
+  priority_score: 0.50
+  estimated_effort: 2 sessions (decoder pipeline + scheduler change)
+  expected_delta: precision-preserving recall lift (WSJT-X-Improved reports ~99.5% of 3-stage yield at much lower CPU)
+  defensible_prior: yes (WSJT-X-Improved v3.0 + v3.1 ship this)
+  wild_card: false
+  evidence_for:
+    - WSJT-X-Improved 3.0/3.1: 2-stage and 3-stage decoder modes — early STD pass (e.g., nzhsym=41/46) followed by heavier MTD pass (nzhsym=49/50). Combined results.
+    - Conceptually distinct from pancetta's disabled subtract-and-redecode multi-pass (hb-031/021/037 shelved that): this is *cheap-then-thorough*, not *subtract-then-retry*. The earlier negative result on multi-pass DOESN'T apply.
+    - Reference: https://www.asahi-net.or.jp/~vj5y-tkur/ft8/wsjtx_31improved_article_en.html
+  evidence_against:
+    - Touches the decoder pipeline + coordinator's per-slot scheduler — wider than a CLI sweep.
+    - Duplicate-decode dedup needs to be tightened; could inflate FPs if pre-pass thresholds are too loose.
+  notes: |
+    First step: design doc — clarify what "STD" vs "MTD" map to in pancetta
+    (likely a faster pass with relaxed sync_cap / OSD off + a thorough pass
+    with current production knobs). Then implement and CLI-toggle.
+
+### hb-047 — Auto-tightened passband detection  [PRIORITY: 0.40, spawned 2026-05-24 from mr-001]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 1 session
+  expected_delta: +0.005 to +0.02 on Wild-50; near-zero on synth/curated
+  defensible_prior: yes (WSJT-X-Improved v3.1.0)
+  wild_card: false
+  evidence_for:
+    - WSJT-X-Improved v3.1.0: "filter edges are now automatically optimized according to the actual passband...better decoding performance and fewer false decodes when Wide Graph limits are poorly set".
+    - Pancetta's sync_cap=300 limits candidate count but not frequency window; combining auto-passband with the existing cap could narrow more efficiently.
+  evidence_against:
+    - Synth + curated corpora are likely already cleanly band-cropped; gain there will be zero or negative.
+    - Edge detection on partly-filtered SDR captures requires hysteresis to avoid flapping.
+  notes: |
+    Implementation: detect transitions in the per-bin energy histogram
+    that look like filter rolloffs; clamp candidate search to the detected
+    passband. Sweep on wild-50.
+
+### hb-048 — AP type 7 (a7) cross-correlation against decoded callsigns  [PRIORITY: 0.45, spawned 2026-05-24 from mr-001]
+  mode: ft8
+  status: pending
+  priority_score: 0.45
+  estimated_effort: PLAN-SIZED (~3 sessions, design doc first)
+  expected_delta: step-change recall potential — but high FP risk
+  defensible_prior: yes (Joe Taylor 2021 commit + active uptake in WSJT-X-Improved)
+  wild_card: false
+  evidence_for:
+    - WSJT-X mainline commit f13e31820470291fdd49627287a2dc08f3fa674c (Joe Taylor, 2021) introduces lib/ft8_a7.f90: after decoding callsign C, build ~206 plausible follow-up message templates and cross-correlate against next slot's residual.
+    - Synergizes naturally with pancetta-qso's QSO state machine and the existing `recently_responded_to` callsign tracking.
+    - The mr-001 audit flagged this as "*the* high-leverage idea pancetta's bank doesn't have."
+  evidence_against:
+    - Brings AP-style FP pressure that pancetta currently doesn't have. WSJT-X went through multiple iterations of "better suppression of low-confidence false decodes generated by AP decoding."
+    - Not a CLI sweep — needs new module (~200-400 LOC) for template generation + correlation, plus state in coordinator for cross-slot callsign memory.
+    - Bit-exact decode count will change.
+  notes: |
+    Source: https://www.repo.radio/w4kek/WSJT-X/commit/f13e31820470291fdd49627287a2dc08f3fa674c
+    The mr-001 report calls this "Plan-sized scoping ticket, not a single
+    hb-NNN." First step: design doc outlining template structure, snr7
+    threshold (WSJT-X uses snr7 >= 6.0, snr7b >= 1.8), per-callsign cooldown
+    integration with pancetta-qso's recently_responded_to.
+
+### hb-043 — AP my_call-less injection (hb-027 precondition)  [PRIORITY: 0.45, spawned 2026-05-24 from hb-004 wiring]
+  mode: ft8
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 1 session
+  expected_delta: unblocks hb-027 (rolling callsign-prior injection without operator-call dependency)
+  defensible_prior: yes (the AP code structure documents the my_call coupling)
+  wild_card: false
+  evidence_for:
+    - hb-004 wiring journal (2026-05-24) confirmed that par_try_ap_decode's AP1/AP2/AP3 branches all short-circuit `if ctx.ap_context.my_call.is_none()`. AP2's recent_calls injection requires my_call to also be set.
+    - hb-027's actual use case is "scanning, using observed callsigns as priors regardless of who's addressing whom" — orthogonal to my_call.
+    - The structural fix: add a "calls of interest" injection mode that biases LDPC search toward those callsigns without requiring my_call to be set.
+  evidence_against:
+    - Touches the AP module's API surface — minor breaking change for in-tree callers.
+    - Without my_call's bit-position constraint, the prior is weaker (could be at either address position); needs careful LLR injection.
+  notes: |
+    Implementation: refactor par_try_ap_decode to accept a "callsign hint
+    set" independent of my_call. Each hint becomes an AP variant that
+    tries the callsign at both address positions (to=callsign and
+    from=callsign). Confidence gating per hb-048 to avoid FP explosion.
 
 ### hb-042 — Score-based cap (replace count cap with min_sync_score)  [PRIORITY: 0.40, spawned 2026-05-24 from hb-033]
   mode: ft8
@@ -530,19 +661,25 @@ documented in WSJT-X / JTDX commit history, academic papers on
 LDPC/OSD, and ham radio discussion forums. Don't restrict the
 search to in-repo sources.
 
-### mr-001 — Audit WSJT-X commits in last 12 months
-  status: pending
+### mr-001 — Audit WSJT-X commits in last 12 months  [COMPLETED 2026-05-24]
+  status: completed (executed via Explore-style agent)
   estimated_effort: 1 session (Explore agent + harvesting)
   source_type: external git history
   source: https://sourceforge.net/p/wsjt/wsjtx/ci/main/tree/ + git log
-  method: |
-    Spawn an Explore agent to survey WSJT-X main-branch commits since
-    ~2025-05. Extract any commit that touches FT8 decoder, AP, OSD,
-    multi-pass, or candidate ranking. For each, identify the change
-    in 1-2 sentences and propose whether it's testable as a pancetta
-    hypothesis. Return 3-5 candidate hb-NNN entries.
-  expected_yield: 2-5 new hypotheses
-  defensible_prior: yes — Joe Taylor's team publishes algorithmic details and ships measurable improvements regularly
+  outcome: |
+    Key finding: WSJT-X main is mostly DORMANT on FT8 decoder algorithms
+    since ~2021 (Joe Taylor's a7 commit was the last substantive change).
+    Active development moved to WSJT-X-Improved fork (DG2YCB):
+      - v3.0.0 Dec 2025: 2-stage / 3-stage MTD pass scheduling
+      - v3.1.0 May 2026: sub-sample DT refinement, optimized baseline,
+        auto-tightened passband
+    Yield: 6 new hypotheses (hb-043, hb-044, hb-045, hb-046, hb-047, hb-048)
+    sourced from this audit. The meta-research approach WORKS — external
+    audit pulled in 6 fresh hypotheses where the in-repo bank was thinning.
+    Recommendation: pivot to JTDX (mr-002) when WSJT-X-Improved findings
+    are exhausted.
+  expected_yield: 2-5 new hypotheses (actual: 6 incl one spawn from the AP wiring work)
+  defensible_prior: yes — confirmed by audit results
 
 ### mr-002 — JTDX delta vs WSJT-X
   status: pending

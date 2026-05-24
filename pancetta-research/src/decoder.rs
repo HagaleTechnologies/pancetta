@@ -44,6 +44,11 @@ pub trait DecoderUnderTest: Send + Sync {
 /// so we don't keep the decoder around between calls — construction is cheap.
 pub struct Ft8Decoder {
     config: pancetta_ft8::Ft8Config,
+    /// Optional AP context to pass into `decode_window_with_ap`. When `None`,
+    /// the decoder uses `decode_window` (which constructs a default-empty
+    /// ApContext internally → ap_active=false → AP code paths short-circuit).
+    /// hb-004 wiring: when set, AP fires in eval.
+    ap_context: Option<pancetta_ft8::ap::ApContext>,
     /// Used only so `config_snapshot` is stable across calls. Empty by
     /// default; future plans may stash per-experiment overrides here.
     _scratch: Mutex<()>,
@@ -55,6 +60,7 @@ impl Ft8Decoder {
     pub fn with_default_config() -> Self {
         Self {
             config: pancetta_ft8::Ft8Config::default(),
+            ap_context: None,
             _scratch: Mutex::new(()),
         }
     }
@@ -144,6 +150,17 @@ impl Ft8Decoder {
         self.config.max_parity_errors_for_osd = n;
         self
     }
+
+    /// Attach an AP context. When `Some`, the decoder calls
+    /// `decode_window_with_ap` per WAV — the AP1/AP2/AP3/AP4 code paths
+    /// can fire if `ctx.my_call.is_some() || ctx.active_qso.is_some()`.
+    /// hb-004 wiring (eval-AP infrastructure). Note: with the current
+    /// pancetta-ft8 AP design, recent_calls injection requires my_call
+    /// to also be set. A my_call-less AP path is hb-043 territory.
+    pub fn with_ap_context(mut self, ctx: pancetta_ft8::ap::ApContext) -> Self {
+        self.ap_context = Some(ctx);
+        self
+    }
 }
 
 impl DecoderUnderTest for Ft8Decoder {
@@ -181,9 +198,14 @@ impl DecoderUnderTest for Ft8Decoder {
         // and we want the outer trait impl to stay `&self`.
         let mut decoder = pancetta_ft8::Ft8Decoder::new(self.config.clone())
             .map_err(|e| anyhow::anyhow!("Ft8Decoder::new failed: {e}"))?;
-        let raw = decoder
-            .decode_window(&samples)
-            .map_err(|e| anyhow::anyhow!("decode_window failed for {}: {e}", path.display()))?;
+        let raw = match &self.ap_context {
+            Some(ctx) => decoder
+                .decode_window_with_ap(&samples, ctx)
+                .map_err(|e| anyhow::anyhow!("decode_window_with_ap failed for {}: {e}", path.display()))?,
+            None => decoder
+                .decode_window(&samples)
+                .map_err(|e| anyhow::anyhow!("decode_window failed for {}: {e}", path.display()))?,
+        };
         Ok(raw
             .into_iter()
             .map(|d| Decode {

@@ -41,6 +41,11 @@ struct Args {
     adaptive_ldpc_iters: Option<bool>,
     time_range: Option<f64>,
     max_parity_errors_for_osd: Option<usize>,
+    /// hb-004: when Some, an ApContext is built and passed to
+    /// `decode_window_with_ap`. Empty `None` means default behavior
+    /// (decode_window with default-empty context → AP never fires).
+    ap_my_call: Option<String>,
+    ap_recent_calls: Option<Vec<String>>,
 }
 
 impl Args {
@@ -62,6 +67,8 @@ impl Args {
         let mut adaptive_ldpc_iters: Option<bool> = None;
         let mut time_range: Option<f64> = None;
         let mut max_parity_errors_for_osd: Option<usize> = None;
+        let mut ap_my_call: Option<String> = None;
+        let mut ap_recent_calls: Option<Vec<String>> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -168,6 +175,19 @@ impl Args {
                             .parse()?,
                     );
                 }
+                "--ap-my-call" => {
+                    ap_my_call = Some(iter.next().context("--ap-my-call needs a value")?);
+                }
+                "--ap-recent-calls" => {
+                    ap_recent_calls = Some(
+                        iter.next()
+                            .context("--ap-recent-calls needs a value (comma-separated)")?
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect(),
+                    );
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
@@ -214,6 +234,8 @@ impl Args {
             adaptive_ldpc_iters,
             time_range,
             max_parity_errors_for_osd,
+            ap_my_call,
+            ap_recent_calls,
         })
     }
 }
@@ -576,6 +598,39 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(n) = args.max_parity_errors_for_osd {
                 d = d.with_max_parity_errors_for_osd(n);
+            }
+            // hb-004: build an ApContext from CLI flags if any AP knob set.
+            if args.ap_my_call.is_some() || args.ap_recent_calls.is_some() {
+                use pancetta_ft8::ap::{ApContext, MyCallAp, RecentCallAp};
+                let my_call = args.ap_my_call.as_ref().and_then(|c| {
+                    let r = MyCallAp::new(c);
+                    if r.is_none() {
+                        eprintln!("warning: --ap-my-call {c:?} did not encode (returned None)");
+                    }
+                    r
+                });
+                let recent_calls = args
+                    .ap_recent_calls
+                    .as_ref()
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .filter_map(|c| {
+                                let r = RecentCallAp::new(c, 0.0);
+                                if r.is_none() {
+                                    eprintln!("warning: --ap-recent-calls entry {c:?} did not encode");
+                                }
+                                r
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let ctx = ApContext {
+                    my_call,
+                    recent_calls,
+                    active_qso: None,
+                };
+                d = d.with_ap_context(ctx);
             }
             Box::new(d)
         }
