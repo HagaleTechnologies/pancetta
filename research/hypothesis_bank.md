@@ -514,6 +514,110 @@ current_ratio: 0.160
     signal — anything pancetta decodes that two other independent decoders agree
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
+## Meta-research (idea generators)
+
+These entries are not single hypotheses — they are SOURCES + METHODS
+for generating new hypotheses. When the regular bank thins out (the
+"parameter sweeps exhausted" plateau), run a meta-research cycle:
+pick an `mr-NNN` entry, execute its discovery method, harvest the
+findings into 3-5 new `hb-NNN` entries with proper
+evidence_for/against/notes.
+
+**Internet research is on the table.** WebSearch + WebFetch are
+available and underused. Particularly high-value for FT8 decoder
+work — most algorithmic improvements over the last 5 years are
+documented in WSJT-X / JTDX commit history, academic papers on
+LDPC/OSD, and ham radio discussion forums. Don't restrict the
+search to in-repo sources.
+
+### mr-001 — Audit WSJT-X commits in last 12 months
+  status: pending
+  estimated_effort: 1 session (Explore agent + harvesting)
+  source_type: external git history
+  source: https://sourceforge.net/p/wsjt/wsjtx/ci/main/tree/ + git log
+  method: |
+    Spawn an Explore agent to survey WSJT-X main-branch commits since
+    ~2025-05. Extract any commit that touches FT8 decoder, AP, OSD,
+    multi-pass, or candidate ranking. For each, identify the change
+    in 1-2 sentences and propose whether it's testable as a pancetta
+    hypothesis. Return 3-5 candidate hb-NNN entries.
+  expected_yield: 2-5 new hypotheses
+  defensible_prior: yes — Joe Taylor's team publishes algorithmic details and ships measurable improvements regularly
+
+### mr-002 — JTDX delta vs WSJT-X
+  status: pending
+  estimated_effort: 1 session
+  source_type: external repo + changelog
+  source: https://sourceforge.net/projects/jtdx/ + CHANGELOG
+  method: |
+    JTDX is the well-known fork of WSJT-X focused on weak-signal
+    performance. Survey JTDX-specific decoder changes that haven't
+    been upstreamed. Particularly Doppler-tolerance, AP variants,
+    and ranking heuristics.
+  expected_yield: 2-4 hypotheses, biased toward weak-signal recall
+  defensible_prior: yes — JTDX is documented to outperform WSJT-X on Doppler/polar paths
+
+### mr-003 — LDPC/OSD academic literature 2020-2026
+  status: pending
+  estimated_effort: 1-2 sessions
+  source_type: academic papers via WebSearch
+  source: IEEE, arXiv — search "LDPC belief propagation acceleration", "ordered statistics decoding improvements", "neural-augmented LDPC"
+  method: |
+    Survey papers on (a) BP variants that converge faster (min-sum
+    approximations, layered scheduling, adaptive damping), (b) OSD
+    improvements beyond standard MRB (OSD-MRB, partial-search,
+    learned-ordering), (c) neural-augmented decoders that wrap
+    classical BP. Identify 3-5 that apply to FT8's (174,91) LDPC
+    structure and produce sub-hypotheses for testing.
+  expected_yield: 3-7 hypotheses, mix of speed and sensitivity
+  defensible_prior: yes — academic work continues post-WSJT-X's freeze on the decoder
+
+### mr-004 — Source-code drift audit (quarterly)
+  status: pending
+  estimated_effort: 0.5 session
+  source_type: internal code review
+  source: pancetta-ft8/src + pancetta-research/src
+  method: |
+    Periodic re-grep for: dead config flags (like hb-020 found
+    aggressive_decoding), TODO/FIXME comments, surface-vs-actual
+    drift (config knobs that don't flow into the decode pipeline),
+    obsolete code paths left over from earlier experiments. Run
+    quarterly or after every 5 iters.
+  expected_yield: 1-3 cleanup hypotheses + occasional structural finds
+  defensible_prior: yes — hb-020 (aggressive_decoding) and hb-025 (time_range dead) both came from this technique
+
+### mr-005 — Cross-cutting pattern review of shelved hypotheses
+  status: pending
+  estimated_effort: 1 session
+  source_type: internal journal corpus
+  source: research/experiments/*.md (now 20+ files)
+  method: |
+    Read all shelved journals as a single corpus. Look for
+    cross-cutting patterns we missed iter-by-iter. Specifically:
+    (a) hypotheses that were shelved as "no win" but might unlock
+    each other if combined, (b) common excuses ("the bank entry's
+    motivation was wrong") that hint at meta-process bugs, (c)
+    diagnostic findings that quietly identified structural gaps
+    we never followed up on (hb-039's "97% novels are FPs" is one).
+  expected_yield: 1-3 reopen-worthy hypotheses + meta-process insights
+  defensible_prior: yes — we already have the "precision wall" insight from cross-iter pattern (hb-014 + hb-034 + hb-035 + hb-041 all hit the same wall)
+
+### mr-006 — Real-world FT8 corpus expansion survey
+  status: pending
+  estimated_effort: 1-2 sessions
+  source_type: external recordings + forum discussion
+  source: pskreporter.info, WSJT-X user group, DXpedition recordings on YouTube/QRZ
+  method: |
+    Identify classes of WAVs not in our curated set: (a) DXpedition
+    pile-ups (extreme density), (b) contest weekends (heavy QSB +
+    deliberate fast operating), (c) polar/auroral paths (Doppler
+    spread), (d) high-power local interference, (e) HF mobile-station
+    rapid-flutter. Acquire 10-50 representative WAVs per class. Each
+    class becomes a candidate tier in the eval harness; pancetta's
+    weak spots on that class become hypotheses.
+  expected_yield: 2-3 new tier types + class-specific hypotheses
+  defensible_prior: partial — hard-1000 was curated for one type (busy NA bands); other classes likely expose different decoder weaknesses
+
 ## Shelved (kept for reference)
 
 ### hb-039 — Resolve the 856 isolated novels (hb-024 follow-up)  [SHELVED 2026-05-23]
