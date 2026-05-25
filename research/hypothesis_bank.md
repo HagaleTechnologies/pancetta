@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T19:30:00Z
+last_updated: 2026-05-25T20:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 54
-current_ratio: 0.069
+exploitation_run: 55
+current_ratio: 0.068
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -389,23 +389,58 @@ current_ratio: 0.069
     Defer until multi-pass returns OR until two-stage scheduling
     (hb-046) lands and could use this as the second-stage prior.
 
-### hb-058 — `/R` and ARRL Field-Day false-decode filters  [PRIORITY: 0.45, spawned 2026-05-25 from mr-002]
+### hb-058 — `/R` and ARRL Field-Day false-decode filters  [GRADUATED (focused) 2026-05-25 — batch 10]
   mode: ft8
-  status: pending
-  priority_score: 0.45
+  status: GRADUATED — contest-type rejection shipped in is_plausible; /R + directional-CQ parts spawned as follow-ups
+  priority_score: 0.0
   estimated_effort: 1 session
-  expected_delta: precision (-N novels on wild-50 / busy bands); complements hb-052
-  defensible_prior: yes — JTDX commits Feb 2022: "filter out /R false decodes", "better filtering ARRL Field Day messages", "filter out directional CQ false decodes"
+  expected_delta: CONFIRMED — hard-200 -429 contest-type FP novels at +0 recall (no-filter)
+  defensible_prior: yes (JTDX Feb-2022 commits) + instrumented audit
   wild_card: false
   evidence_for:
-    - Pure post-LDPC-CRC sanity rules: e.g., `/R` suffix only valid in contest contexts; directional CQ "CQ DX" requires DX-side message structure.
-    - Layer onto pancetta-ft8/src/message.rs post-decode, before emission.
-    - Complements existing hb-052 FP filter (callsign continuity) — different signal source.
+    - fp_format_audit.rs on hard-200: RTTYRoundup 335, FieldDay 83, Contest 15 novels — all ZERO recovered. Rejecting them in is_plausible (like the existing Telemetry rejection) removes -429 novels no-filter at +0 recall.
+    - Production value is cold-start defense: the continuity filter (hb-062) runs LENIENT with an empty operator log, so message-type rejection is the primary contest-FP guard then. Also catches contest-format FPs on genuinely-spotted callsigns the continuity filter would pass. Eval-redundant (jt9-baseline filter) ≠ production-redundant.
   evidence_against:
-    - Risk very low; rules are deterministic and inverse-targeted (FP-only).
+    - Composite doesn't measure novels, so no headline-metric movement (like hb-014, hb-052).
+    - DXpedition NOT rejected (88 FPs kept) — real DXpeditions are the highest-value hunt target.
   notes: |
-    Wild-50 is the natural target. CLI flag to disable for ablation.
-    Reference: JTDX commits Feb 2022 on ft8b.f90.
+    See research/experiments/2026-05-25-contest-type-fp-filter.md +
+    pancetta-research/examples/fp_format_audit.rs. /R and directional-CQ
+    were recall-risky in the audit (315 /R = 0-real but rovers exist;
+    directional CQ 77-real/55-FP) → spawned hb-071 + hb-072.
+
+### hb-071 — Single `/R` suffix FP handling  [PRIORITY: 0.30, spawned 2026-05-25 from hb-058]
+  mode: ft8
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 1 session
+  expected_delta: precision (315 hard-200 novels carry a /R suffix, 0 real here) but real-world recall risk
+  defensible_prior: partial — JTDX filters /R FPs, but rovers (K1ABC/R) are legitimate rare traffic
+  wild_card: false
+  evidence_for:
+    - fp_format_audit.rs: 315 single-/R novels on hard-200, ZERO recovered.
+  evidence_against:
+    - Real rovers exist on-air and are valid hunt targets; blanket-rejecting /R costs recall in the field even though hard-200 shows 0.
+  notes: |
+    Don't blanket-reject. Options: reject /R only where structurally
+    invalid for the message context, or only under the continuity
+    filter's cold-start lenient mode. Low priority.
+
+### hb-072 — Directional-CQ modifier whitelist  [PRIORITY: 0.30, spawned 2026-05-25 from hb-058]
+  mode: ft8
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 1 session
+  expected_delta: precision (~55 hard-200 FP) without dropping the 77 real directional CQs
+  defensible_prior: yes (JTDX "filter out directional CQ false decodes")
+  wild_card: false
+  evidence_for:
+    - fp_format_audit.rs: "CQ <modifier>" is 77 recovered / 55 novel on hard-200 — a clean whitelist could split them.
+  evidence_against:
+    - Blanket filtering costs 77 real decodes. Needs a validated modifier set (DX, continents, CQ zones, POTA/SOTA, numeric); risks dropping valid-but-unlisted modifiers.
+  notes: |
+    Reject only CQ whose modifier is outside the whitelist. Pair with
+    fp_format_audit.rs to confirm the split before shipping. Low priority.
 
 ### hb-059 — Slot-alignment detection for jt9 slot-cut on unaligned WAVs  [PRIORITY: 0.35, spawned 2026-05-25 from batch-5 iter 2]
   mode: ft8
