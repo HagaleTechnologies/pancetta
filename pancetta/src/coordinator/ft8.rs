@@ -54,6 +54,10 @@ impl super::ApplicationCoordinator {
         // Shared AP state updated by the QSO component
         let active_qso_ap = self.active_qso_ap.clone();
 
+        // hb-062: shared FP filter (Option<Arc<...>>). When Some, applied
+        // between decode-merge and broadcast loop. None = no filtering.
+        let fp_filter = self.fp_filter.clone();
+
         // Run FT8 decoder on a dedicated thread to avoid tokio starvation
         let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -177,6 +181,20 @@ impl super::ApplicationCoordinator {
 
                         for decoded_msg in decoded_messages.iter_mut() {
                             decoded_msg.slot_parity = Some(window_parity);
+                        }
+
+                        // hb-062: apply FP filter post-decode, pre-broadcast.
+                        // When fp_filter is None (default), all decodes pass
+                        // through unchanged. When Some, decodes whose extracted
+                        // callsigns don't appear in any reference source are
+                        // dropped (logged at debug level).
+                        if let Some(ref filter) = fp_filter {
+                            let pre = decoded_messages.len();
+                            decoded_messages.retain(|m| filter.accept(&m.text));
+                            let dropped = pre - decoded_messages.len();
+                            if dropped > 0 {
+                                debug!("FP filter dropped {} of {} decodes", dropped, pre);
+                            }
                         }
 
                         for decoded_msg in &decoded_messages {

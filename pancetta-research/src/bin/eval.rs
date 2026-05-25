@@ -339,8 +339,15 @@ fn apply_fp_filter(
 fn run_fixtures_tier(
     decoder: &dyn DecoderUnderTest,
     workspace: &std::path::Path,
-    fp_filter: Option<&pancetta_research::FpFilter>,
 ) -> anyhow::Result<TierResult> {
+    // Fixtures tier is a decoder regression test — it does NOT apply the
+    // FP filter. The eval-side FpFilter is strict-membership against jt9
+    // baselines; fixture WAVs (e.g. basicft8/170923_082015.wav from 2017)
+    // contain callsigns absent from those baselines and would be falsely
+    // dropped. Production CallsignContinuityFilter has cold-start lenient
+    // mode that prevents this in a real station. Filter behavior is
+    // validated separately by cross_validate_novels.rs and the hard-corpus
+    // tiers.
     let truth_path = workspace.join("research/corpus/fixtures/ft8/truth.json");
     let truth = FixtureTruth::load(&truth_path)?;
     let fixtures = load_ft8_fixtures(workspace)?;
@@ -350,10 +357,7 @@ fn run_fixtures_tier(
     let mut failures = Vec::new();
     for f in &fixtures {
         let entry = truth.get(&f.display_name);
-        let decodes_result = decoder.decode_wav(&f.wav_path).map(|mut d| {
-            apply_fp_filter(fp_filter, &mut d);
-            d
-        });
+        let decodes_result = decoder.decode_wav(&f.wav_path);
         match (decodes_result, entry) {
             (Ok(decodes), Some(entry)) => match entry.category {
                 FixtureCategory::Exact => {
@@ -797,7 +801,7 @@ fn main() -> anyhow::Result<()> {
     for tier_name in &args.tiers {
         match tier_name.as_str() {
             "fixtures" => {
-                let result = run_fixtures_tier(decoder.as_ref(), &workspace, fp_filter_ref)?;
+                let result = run_fixtures_tier(decoder.as_ref(), &workspace)?;
                 tiers.insert("fixtures".to_string(), result);
             }
             "synth-clean" => {

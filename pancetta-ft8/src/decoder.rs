@@ -42,7 +42,13 @@ const MAX_DECODE_CANDIDATES: usize = 100;
 /// convergence pulled fuzzy "novel" decodes into confirmed truth-matches.
 /// Wall-clock got slightly FASTER overall (-3%) because BP converging
 /// successfully is cheaper than falling through to OSD.
-const LDPC_MAX_ITERATIONS: usize = 50;
+///
+/// 2026-05-25 (hb-053 / batch 9): raised 50 → 100. Per batch-3 hb-035
+/// sweep on hard-200: iters=100 gains +12 real decodes (+0.27%) at +21
+/// novel (-32% net) when filter applied (batch 6 iter 5: rec 4364→4376,
+/// novel 811→818 — Δrec +12, Δnov +7 vs OSD-2 + filter). Production
+/// now ships with FP filter (hb-062), making the extra recall safe.
+const LDPC_MAX_ITERATIONS: usize = 100;
 
 /// FT8 Costas synchronization array
 const COSTAS: [u8; 7] = [3, 1, 4, 0, 6, 5, 2];
@@ -191,11 +197,13 @@ pub struct Ft8Config {
     pub block_score_rerank: bool,
 
     /// Maximum unsatisfied parity-check count for a BP-non-converged
-    /// candidate to be eligible for OSD fallback. Default 2 — hb-014
-    /// (2026-05-23) swept {0..6} on curated-hard-200 and curated-hard-1000:
-    /// recall is flat from 0 through 4, but novel-decode count (a proxy
-    /// for false positives) grows monotonically with the gate. Tightening
-    /// 4 → 2 cut FPs ~21% at zero recall cost and was ~26% faster.
+    /// candidate to be eligible for OSD fallback. Default 6 — hb-014
+    /// (2026-05-23) swept {0..6}: recall is flat from 0 through 4, novels
+    /// grow monotonically with gate. hb-014 initially graduated 4 → 2
+    /// (-21% novels, no recall cost) when no FP filter was available.
+    /// hb-053 + batch 9 raised 2 → 6 because production now ships the
+    /// FP filter (hb-062): gate=6 + filter has same recall as gate=2
+    /// without filter, with -132 fewer novels.
     pub max_parity_errors_for_osd: usize,
 
     /// hb-044: enable parabolic interpolation of the Costas sync peak in
@@ -234,7 +242,10 @@ impl Default for Ft8Config {
             min_sync_score: MIN_SYNC_SCORE,
             adaptive_ldpc_iters: false,
             block_score_rerank: true,
-            max_parity_errors_for_osd: 2,
+            // hb-053 / batch 9: raised 2 → 6. Wider gate is safe with FP
+            // filter shipped (hb-062). Per batch 6 iter 4: gate=6 + filter
+            // gives same recall as production with -132 novels.
+            max_parity_errors_for_osd: 6,
             sync_time_interpolation: false,
             bp_offset_subtract: 0.0,
         }

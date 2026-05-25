@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-05-24T04:29:54.819795Z",
+  "generated_at": "2026-05-25T09:32:47.969506Z",
   "mode": "ft8",
   "git": {
-    "branch": "experiment/ft8/multipass-profile",
-    "head_sha": "18910edf6408d023f1cbdc9fa351b452e0faab6a",
-    "main_merge_base": "18910edf6408d023f1cbdc9fa351b452e0faab6a",
+    "branch": "iter/2026-05-25-batch-9-ship-filter",
+    "head_sha": "1c77d92f5a2bb4a046e911d766f37a7c09621fab",
+    "main_merge_base": "1c77d92f5a2bb4a046e911d766f37a7c09621fab",
     "dirty": true
   },
   "build": {
@@ -19,22 +19,21 @@
     "harness_version": "0.1.0",
     "host": "macos/aarch64",
     "cores_used": 10,
-    "elapsed_seconds": 1533.713961833
+    "elapsed_seconds": 1897.264893583
   },
   "config": {
     "decoder": {
       "adaptive_ldpc_iters": false,
-      "aggressive_decoding": false,
       "block_score_rerank": true,
+      "bp_offset_subtract": 0.0,
       "enable_multithreading": true,
       "frequency_range": 200.0,
-      "ldpc_iterations": 50,
+      "ldpc_iterations": 100,
       "llr_target_variance": 32.0,
       "max_candidates": 100,
       "max_decode_passes": 1,
-      "max_parity_errors_for_osd": 2,
+      "max_parity_errors_for_osd": 6,
       "max_sync_candidates": 300,
-      "min_snr_db": -25.0,
       "min_sync_score": 3.0,
       "nms_enabled": false,
       "nms_freq_radius": 2,
@@ -42,12 +41,14 @@
       "osd_depth": 2,
       "protocol": "Ft8",
       "sample_rate": 12000,
+      "sync_time_interpolation": false,
       "time_range": 2.0
     },
     "seed": 42,
     "tiers_run": [
       "fixtures",
       "synth-clean",
+      "synth-doppler",
       "curated-hard-200",
       "curated-hard-1000",
       "wild-50"
@@ -57,11 +58,11 @@
     "curated-hard-1000": {
       "wavs_processed": 1000,
       "truth_decodes_total": 28104,
-      "truth_decodes_recovered": 14219,
-      "decode_rate": 0.5059422146313692,
-      "novel_decodes": 3172,
+      "truth_decodes_recovered": 14267,
+      "decode_rate": 0.5076501565613436,
+      "novel_decodes": 2808,
       "wsjtx_decoded": 28104,
-      "vs_wsjtx_pct": 50.59422146313692,
+      "vs_wsjtx_pct": 50.76501565613436,
       "per_wav_top_failures": [
         {
           "wav_hash": "bb445ede3009d779c5ce1682c8112082367e355bb9c5943a571324eaa424a3c8",
@@ -87,7 +88,7 @@
         {
           "wav_hash": "97dc7e2b7db097bfa0d69fd9243dcd9c2a90a70f7746b69e92c2a480077b2499",
           "truth": 65,
-          "recovered": 7,
+          "recovered": 6,
           "wsjtx": 65,
           "jtdx": 0
         },
@@ -143,7 +144,7 @@
         {
           "wav_hash": "566cf9fc928d7de3f45929f8f9acf7bd494a626da49f02b3f1a72d2bd7cce0fa",
           "truth": 70,
-          "recovered": 25,
+          "recovered": 26,
           "wsjtx": 70,
           "jtdx": 0
         },
@@ -208,16 +209,16 @@
     "curated-hard-200": {
       "wavs_processed": 200,
       "truth_decodes_total": 8576,
-      "truth_decodes_recovered": 4365,
-      "decode_rate": 0.5089785447761194,
-      "novel_decodes": 952,
+      "truth_decodes_recovered": 4376,
+      "decode_rate": 0.5102611940298507,
+      "novel_decodes": 823,
       "wsjtx_decoded": 8576,
-      "vs_wsjtx_pct": 50.89785447761194,
+      "vs_wsjtx_pct": 51.026119402985074,
       "per_wav_top_failures": [
         {
           "wav_hash": "566cf9fc928d7de3f45929f8f9acf7bd494a626da49f02b3f1a72d2bd7cce0fa",
           "truth": 70,
-          "recovered": 25,
+          "recovered": 26,
           "wsjtx": 70,
           "jtdx": 0
         },
@@ -271,17 +272,17 @@
           "jtdx": 0
         },
         {
-          "wav_hash": "869cff497b9b3a0ab1631329df9f7213cfd222df23db615193ffa71a717c09a5",
-          "truth": 56,
-          "recovered": 19,
-          "wsjtx": 56,
-          "jtdx": 0
-        },
-        {
           "wav_hash": "57b8fa60b691a492ac8c34c1610f157c7d952b22680feded009a5639355673c3",
           "truth": 58,
           "recovered": 21,
           "wsjtx": 58,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "869cff497b9b3a0ab1631329df9f7213cfd222df23db615193ffa71a717c09a5",
+          "truth": 56,
+          "recovered": 20,
+          "wsjtx": 56,
           "jtdx": 0
         },
         {
@@ -334,24 +335,24 @@
           "jtdx": 0
         },
         {
+          "wav_hash": "01a6b67f47ff8fb7555a07d53da73f9e1a8e7e9988732305f9a7191efb507555",
+          "truth": 57,
+          "recovered": 24,
+          "wsjtx": 57,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "0877df98728063bd85f339714e9a7b11d1592c3555b348c563749a401e1c42cc",
+          "truth": 55,
+          "recovered": 22,
+          "wsjtx": 55,
+          "jtdx": 0
+        },
+        {
           "wav_hash": "bdc883cb22b5edce45ee81e1cf25ea6cf7b257f0fcf43e4c4e91b79211789a94",
           "truth": 54,
           "recovered": 21,
           "wsjtx": 54,
-          "jtdx": 0
-        },
-        {
-          "wav_hash": "c08e6126c8a4be368bd2c3c1f6fc722835482c106d0319009b0d2aa1d3947f33",
-          "truth": 54,
-          "recovered": 22,
-          "wsjtx": 54,
-          "jtdx": 0
-        },
-        {
-          "wav_hash": "01a6b67f47ff8fb7555a07d53da73f9e1a8e7e9988732305f9a7191efb507555",
-          "truth": 57,
-          "recovered": 25,
-          "wsjtx": 57,
           "jtdx": 0
         }
       ]
@@ -431,12 +432,53 @@
       "snr_at_50pct_recovery_db": -20.0,
       "snr_at_90pct_recovery_db": -18.0
     },
+    "synth-doppler": {
+      "wavs_processed": 216,
+      "by_snr_db": [
+        {
+          "snr_db": -20.0,
+          "attempts": 36,
+          "decoded": 0,
+          "fp": 0
+        },
+        {
+          "snr_db": -18.0,
+          "attempts": 36,
+          "decoded": 0,
+          "fp": 0
+        },
+        {
+          "snr_db": -16.0,
+          "attempts": 36,
+          "decoded": 0,
+          "fp": 0
+        },
+        {
+          "snr_db": -14.0,
+          "attempts": 36,
+          "decoded": 1,
+          "fp": 0
+        },
+        {
+          "snr_db": -12.0,
+          "attempts": 36,
+          "decoded": 3,
+          "fp": 0
+        },
+        {
+          "snr_db": -10.0,
+          "attempts": 36,
+          "decoded": 3,
+          "fp": 0
+        }
+      ]
+    },
     "wild-50": {
       "wavs_processed": 50,
       "truth_decodes_total": 96,
       "truth_decodes_recovered": 0,
       "decode_rate": 0.0,
-      "novel_decodes": 2,
+      "novel_decodes": 0,
       "wsjtx_decoded": 96,
       "vs_wsjtx_pct": 0.0,
       "per_wav_top_failures": [
@@ -478,7 +520,7 @@
       "snr_50pct_synth_clean": 0.3,
       "snr_50pct_synth_doppler": 0.05
     },
-    "score": 0.5544892723880597
+    "score": 0.5551305970149254
   },
   "regressions": {
     "fixture_regression": false,

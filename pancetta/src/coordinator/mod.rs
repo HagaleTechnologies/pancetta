@@ -114,6 +114,12 @@ pub struct ApplicationCoordinator {
     /// Updated by the QSO component, read by the FT8 decoder thread.
     active_qso_ap: std::sync::Arc<std::sync::RwLock<Option<pancetta_ft8::QsoAp>>>,
 
+    /// hb-062 FP filter: applied between decode merge and broadcast in the
+    /// FT8 thread. None = filter disabled (default). When enabled, drops
+    /// decodes whose extracted callsigns don't appear in operator-ADIF +
+    /// rolling-window + cqdx-spotted sources.
+    fp_filter: Option<std::sync::Arc<pancetta_qso::CallsignContinuityFilter>>,
+
     /// TUI relay OS thread handle (joined on shutdown)
     tui_relay_handle: Option<std::thread::JoinHandle<()>>,
 
@@ -308,6 +314,7 @@ impl ApplicationCoordinator {
             cqdx_bridge: None,
             waterfall_to_auto_tx: None,
             active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            fp_filter: None,
             tui_relay_handle: None,
             // Initialize to 0 — hamlib will read the actual rig frequency on startup.
             // If hamlib isn't available, the TUI default (14.074) takes over.
@@ -387,6 +394,42 @@ impl ApplicationCoordinator {
             } else {
                 drop(config);
                 info!("cqdx.io integration not configured, running in degraded mode");
+            }
+        }
+
+        // hb-062: build production FP filter. Sources:
+        //   1. ~/.pancetta/qsos.adi (operator log)
+        //   2. cqdx-spotted callsigns (refreshed periodically from cqdx_bridge)
+        //   3. rolling window populated by accepted decodes this session
+        // Cold-start lenient: accept all decodes until reference size reaches
+        // 100 callsigns. Avoids dropping legitimate first-of-session decodes
+        // before ADIF + cqdx populate.
+        {
+            let adif_path = dirs::home_dir().map(|h| h.join(".pancetta").join("qsos.adi"));
+            let initial_cqdx_spotted: std::collections::HashSet<String> =
+                if let Some(ref bridge) = self.cqdx_bridge {
+                    let cache = bridge.cache();
+                    let guard = cache.read().await;
+                    guard.spotted_callsigns()
+                } else {
+                    std::collections::HashSet::new()
+                };
+            match pancetta_qso::callsign_continuity::build_filter(
+                adif_path.as_deref(),
+                initial_cqdx_spotted,
+                500, // rolling-window capacity
+                100, // cold-start threshold (lenient until reference ≥ this)
+            ) {
+                Ok(filter) => {
+                    info!(
+                        "FP filter initialized (reference size {}, cold-start lenient until 100)",
+                        filter.reference_size()
+                    );
+                    self.fp_filter = Some(std::sync::Arc::new(filter));
+                }
+                Err(e) => {
+                    warn!("FP filter init failed, decodes will pass unfiltered: {}", e);
+                }
             }
         }
 
