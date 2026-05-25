@@ -202,7 +202,6 @@ fn test_decoder_configuration_variants() {
 
     // Test with minimal configuration
     let mut minimal_config = Ft8Config::default();
-    minimal_config.enable_multithreading = false;
     minimal_config.max_candidates = 10;
 
     let mut decoder = Ft8Decoder::new(minimal_config).unwrap();

@@ -107,17 +107,11 @@ pub struct Ft8Config {
     /// Protocol to decode (FT8, FT4, or FT2)
     pub protocol: Protocol,
 
-    /// Enable multi-threading for parallel decoding
-    pub enable_multithreading: bool,
-
     /// Maximum number of candidates to decode
     pub max_candidates: usize,
 
     /// LDPC decoder iterations
     pub ldpc_iterations: usize,
-
-    /// Frequency search range (Hz)
-    pub frequency_range: f64,
 
     /// Time search range (seconds)
     pub time_range: f64,
@@ -240,10 +234,8 @@ impl Default for Ft8Config {
         Self {
             sample_rate: SAMPLE_RATE,
             protocol: Protocol::Ft8,
-            enable_multithreading: true,
             max_candidates: MAX_DECODE_CANDIDATES,
             ldpc_iterations: LDPC_MAX_ITERATIONS,
-            frequency_range: 200.0,
             time_range: 2.0,
             max_decode_passes: 1,
             osd_depth: Some(2),
@@ -4061,7 +4053,6 @@ mod tests {
         let config = Ft8Config::default();
         assert_eq!(config.sample_rate, SAMPLE_RATE);
         assert_eq!(config.max_candidates, MAX_DECODE_CANDIDATES);
-        assert!(config.enable_multithreading);
     }
 
     #[test]

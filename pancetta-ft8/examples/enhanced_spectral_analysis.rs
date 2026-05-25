@@ -23,7 +23,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // tweak — this is forward-compatible with new Ft8Config fields.
     let config = Ft8Config {
         ldpc_iterations: 150,
-        frequency_range: 300.0,
         time_range: 3.0,
         osd_depth: Some(1),
         ..Ft8Config::default()
