@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T19:00:00Z
+last_updated: 2026-05-25T19:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 53
-current_ratio: 0.070
+exploitation_run: 54
+current_ratio: 0.069
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -326,24 +326,25 @@ current_ratio: 0.070
     leading block is *detectably* depressed; low priority, better
     tested against a slot-misaligned corpus).
 
-### hb-055 — Adaptive OSD depth based on signal context (ndeep 3→4→5)  [PRIORITY: 0.50, spawned 2026-05-25 from mr-002]
+### hb-055 — Adaptive OSD depth based on signal context (ndeep 3→4→5)  [SHELVED 2026-05-25 — batch 10, mr-007]
   mode: ft8
-  status: pending
-  priority_score: 0.50
+  status: SHELVED via mr-007 architecture-fit — no headroom in pancetta; no code/eval
+  priority_score: 0.0
   estimated_effort: 1 session
-  expected_delta: small recall + moderate FP pressure at depth 5; depends on parity_gate=2 staying on
-  defensible_prior: yes — JTDX uses this pattern; agent confirmed clean attach
+  expected_delta: REFUTED before implementation — three independent blockers
+  defensible_prior: was yes (JTDX); closed by pancetta-internal OSD-ladder findings
   wild_card: false
-  evidence_for:
-    - JTDX `lib/ft8b.f90`: ndeep=3 default; ndeep=4 when QSO/MyCall signal detected at proximity; ndeep=5 when reacquisition filter active. Spends OSD effort where prior evidence says a real signal lives.
-    - pancetta-ft8/src/osd.rs exposes depth as a parameter. Hint sources (my_call list, recent_calls) are in ap.rs.
   evidence_against:
-    - Medium FP pressure at ndeep=5 (deeper OSD → more reorderings → more spurious passes).
-    - Best paired with FP filter (hb-052) so wins survive precision check.
+    - pancetta's OSD implements ONLY depths 0-3 (osd.rs::decode). JTDX's ndeep {3,4,5} ladder maps onto pancetta's {0,1,2,3}, already fully swept. No depth 4/5 to climb to.
+    - The deeper end is refuted: hb-034 (OSD-3 loses 1 real, +284 novels), hb-041 (OSD-0 breaks the basicft8 fixture), hb-053 revisit (OSD-3+filter STILL loses 1 real). OSD-2 is the pinned elbow from both directions.
+    - The adaptive TRIGGER needs QSO/MyCall AP hints; eval doesn't populate them and hb-051 measured the AP-recovery ceiling at 1/8576 on hard-200 even with perfect callsign info. ~0 headroom offline and on-air.
+    - hb-014: OSD contributes ~0 recall vs jt9 anyway; its sole value is the one basicft8 fixture. "More OSD effort" can't add recall.
   notes: |
-    CLI flags --osd-depth-near-qrg and --osd-depth-hinted. Gating logic
-    in decoder.rs around the OSD call site. Eval on wild-50 where FPs
-    matter most.
+    See research/experiments/2026-05-25-adaptive-osd-depth.md. mr-007 at
+    pick time closed what harvest-time mr-007 missed (lacked pancetta's
+    hb-034/041/051/053). OSD-depth surface now closed every direction.
+    Orthogonal mr-003 OSD work still open: hb-065 (GE removal, speed),
+    hb-064 (DIA trajectory features — retrain OSD on layered-BP trajs).
 
 ### hb-056 — Cross-cycle coherent symbol averaging (csold buffer)  [PRIORITY: 0.60 plan-sized, spawned 2026-05-25 from mr-002]
   mode: ft8
