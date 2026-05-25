@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T20:00:00Z
+last_updated: 2026-05-25T20:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 55
-current_ratio: 0.068
+exploitation_run: 56
+current_ratio: 0.067
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -464,42 +464,34 @@ current_ratio: 0.068
     jt9 calls on hard corpora. Currently the FP filter MVP uses
     pre-baselined truth instead.
 
-### hb-060 — Remove dead `Ft8Config::enable_multithreading` field  [PRIORITY: 0.40, spawned 2026-05-25 from mr-004]
+### hb-060 — Remove dead `Ft8Config::enable_multithreading` field  [GRADUATED 2026-05-25 — batch 10]
   mode: ft8
-  status: pending
-  priority_score: 0.40
+  status: GRADUATED — field + all sites removed (cleanup, no behavior change)
+  priority_score: 0.0
   estimated_effort: 0.5 sessions
   expected_delta: cleanup
   defensible_prior: yes (mr-004 audit)
   wild_card: false
   evidence_for:
-    - mr-004 audit (2026-05-25): `Ft8Config::enable_multithreading` declared at decoder.rs:105, defaulted to true at 207, set/asserted in tests and benches, but NEVER READ in the decode pipeline. The parallel decode in par_try_ap_decode uses rayon unconditionally.
-    - Same pattern as hb-032 (aggressive_decoding) + hb-049 (min_snr_db).
-  evidence_against:
-    - Minor breaking API change for named-field Ft8Config callers.
+    - Removed field + Default + test assert (decoder.rs), integration_tests.rs line, README table/example. Also removed the misleading `single_thread` benchmark (set the dead flag → bit-identical to `default`). Tests 193 lib + 11 integration pass; all targets build.
   notes: |
-    Mirror of hb-032 / hb-049. Delete field + Default + 4-5 referencing
-    sites (integration_tests.rs, decoder_benchmark.rs, asserts in
-    decoder.rs).
+    See research/experiments/2026-05-25-dead-config-fields.md (combined
+    with hb-061). Fourth dead Ft8Config field retired (after hb-032,
+    hb-049, hb-061).
 
-### hb-061 — Remove dead `Ft8Config::frequency_range` field  [PRIORITY: 0.40, spawned 2026-05-25 from mr-004]
+### hb-061 — Remove dead `Ft8Config::frequency_range` field  [GRADUATED 2026-05-25 — batch 10]
   mode: ft8
-  status: pending
-  priority_score: 0.40
+  status: GRADUATED — field + all sites removed (cleanup, no behavior change)
+  priority_score: 0.0
   estimated_effort: 0.5 sessions
   expected_delta: cleanup
   defensible_prior: yes (mr-004 audit)
   wild_card: false
   evidence_for:
-    - mr-004 audit (2026-05-25): `Ft8Config::frequency_range` declared at decoder.rs:114, defaulted to 200.0 at 210, set to 300.0 in examples/enhanced_spectral_analysis.rs:26, but NEVER READ in the decode pipeline. Actual frequency-range bounds (MIN_FREQ_BIN..max_freq_bin) are hardcoded in costas_sync_search.
-    - Same pattern as hb-060 / hb-049 / hb-032.
-  evidence_against:
-    - Minor breaking API change.
+    - Removed field + Default (decoder.rs), enhanced_spectral_analysis.rs override, README + SPECTRAL_ANALYSIS_ENHANCEMENTS.md references. Actual bounds stay hardcoded (MIN_FREQ_BIN..max_freq_bin in costas_sync_search). Builds clean.
   notes: |
-    Delete field + Default + ~3-4 referencing sites (README.md,
-    SPECTRAL_ANALYSIS_ENHANCEMENTS.md, enhanced_spectral_analysis.rs).
-    Could be combined with hb-060 into a single "remove dead Ft8Config
-    fields" iter.
+    Shipped together with hb-060. See
+    research/experiments/2026-05-25-dead-config-fields.md.
 
 ### hb-052 — Production FP filter (callsign continuity)  [GRADUATED 2026-05-25]
   mode: ft8

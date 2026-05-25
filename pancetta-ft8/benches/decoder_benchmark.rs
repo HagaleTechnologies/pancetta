@@ -130,17 +130,6 @@ fn benchmark_configuration_variants(c: &mut Criterion) {
         });
     });
 
-    // Single-threaded configuration
-    let mut single_thread_config = Ft8Config::default();
-    single_thread_config.enable_multithreading = false;
-    let mut single_decoder = Ft8Decoder::new(single_thread_config).unwrap();
-
-    group.bench_function("single_thread", |b| {
-        b.iter(|| {
-            black_box(single_decoder.decode_window(black_box(&samples)).unwrap());
-        });
-    });
-
     // High-sensitivity configuration (more candidates)
     let mut high_sensitivity_config = Ft8Config::default();
     high_sensitivity_config.max_candidates = 100;
