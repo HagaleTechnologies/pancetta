@@ -41,6 +41,10 @@ struct Args {
     adaptive_ldpc_iters: Option<bool>,
     time_range: Option<f64>,
     max_parity_errors_for_osd: Option<usize>,
+    /// hb-044: enable Costas time-axis parabolic refinement.
+    sync_time_interpolation: Option<bool>,
+    /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
+    two_stage: Option<bool>,
     /// hb-004: when Some, an ApContext is built and passed to
     /// `decode_window_with_ap`. Empty `None` means default behavior
     /// (decode_window with default-empty context → AP never fires).
@@ -82,6 +86,8 @@ impl Args {
         let mut adaptive_ldpc_iters: Option<bool> = None;
         let mut time_range: Option<f64> = None;
         let mut max_parity_errors_for_osd: Option<usize> = None;
+        let mut sync_time_interpolation: Option<bool> = None;
+        let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
         let mut ap_rolling_window: Option<usize> = None;
@@ -194,6 +200,12 @@ impl Args {
                             .parse()?,
                     );
                 }
+                "--sync-time-interpolation" => {
+                    sync_time_interpolation = Some(true);
+                }
+                "--two-stage" => {
+                    two_stage = Some(true);
+                }
                 "--ap-my-call" => {
                     ap_my_call = Some(iter.next().context("--ap-my-call needs a value")?);
                 }
@@ -281,6 +293,8 @@ impl Args {
             adaptive_ldpc_iters,
             time_range,
             max_parity_errors_for_osd,
+            sync_time_interpolation,
+            two_stage,
             ap_my_call,
             ap_recent_calls,
             ap_rolling_window,
@@ -669,6 +683,12 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(n) = args.max_parity_errors_for_osd {
                 d = d.with_max_parity_errors_for_osd(n);
+            }
+            if let Some(on) = args.sync_time_interpolation {
+                d = d.with_sync_time_interpolation(on);
+            }
+            if let Some(on) = args.two_stage {
+                d = d.with_two_stage(on);
             }
             // hb-004: build an ApContext from CLI flags if any AP knob set.
             if args.ap_my_call.is_some() || args.ap_recent_calls.is_some() {

@@ -1,11 +1,17 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T01:00:00Z
+last_updated: 2026-05-25T02:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 38
-current_ratio: 0.095
+exploitation_run: 43
+current_ratio: 0.085
+# Batch 7 (2026-05-25): mr-001 follow-ups + mr-003 LDPC audit.
+#   hb-044 SHELVED for prod (conditional WIN on synth, -116 on hard-200)
+#   hb-046 SHELVED via architecture mismatch (3rd from mr-001)
+#   hb-034 confirmed SHELVED (filter doesn't rescue)
+#   mr-003 harvested 5 candidates (hb-063..hb-067)
+#   hb-068 spawned for hb-044 conditional variants
 # Batch 6 (2026-05-25): FP filter library + revisits.
 #   hb-052 graduated as library (infra); production blocked on hb-062
 #   2 hb-053 revisits show wider gate + iters=100 win with filter
@@ -124,28 +130,32 @@ current_ratio: 0.095
     framing has moved on. See research/experiments/2026-05-23-multipass-profile.md.
 
 
-### hb-044 — Sub-sample DT refinement (parabolic interpolation of sync peak)  [PRIORITY: 0.55, spawned 2026-05-24 from mr-001]
+### hb-044 — Sub-sample DT refinement  [CONDITIONAL WIN 2026-05-25; SHELVED for prod]
   mode: ft8
-  status: pending
-  priority_score: 0.55
-  estimated_effort: 1 session
-  expected_delta: +0.005 to +0.02 SNR@50% on weak/Doppler-shifted signals
-  defensible_prior: yes (WSJT-X-Improved v3.1.0, May 2026)
+  status: SHELVED for production; spawned hb-068 for conditional/scaled variants
+  priority_score: 0.0
+  estimated_effort: implementation complete (parabolic + linear-interp)
+  expected_delta: synth-clean SNR@90% −2dB; hard-200 −116 recovered
+  defensible_prior: validated on synth, refuted on hard-200
   wild_card: false
-  evidence_for:
-    - WSJT-X-Improved v3.1.0 release notes call out "sub-sample DT refinement" as a sensitivity improvement.
-    - Pancetta's Costas search is currently integer-bin in time. Parabolic/Gaussian interpolation of the sync metric peak in the time axis is a small, well-understood signal processing step.
-    - For sync_score peaks that fall between time bins (common at weak SNR or with timing jitter), integer-bin alignment loses fidelity that the LDPC LLR computation could otherwise exploit.
-  evidence_against:
-    - Could shift soft-bit alignment and perturb the LLR distribution; watch precision and the LLR target-variance regime (currently 32, hb-006 elbow).
-    - WSJT-X-Improved's release notes don't quantify the lift — could be small.
+  outcomes: |
+    Implementation (batch 7 iters 1-2):
+    - CostasCandidate gains time_refinement: f64 (parabolic fit of sync peak)
+    - parabolic_peak_refinement helper function + 3 unit tests
+    - lookup_time_interp helper applies fractional shift via linear interpolation
+      in both extract_symbols_from_spectrogram and par_extract_symbols_from_spectrogram
+    - Ft8Config::sync_time_interpolation flag (default false)
+    - CLI --sync-time-interpolation
+    Sweep result (curated-hard-200 + synth-clean):
+      synth-clean SNR@90%: -18.0 → -20.0 dB (1-step improvement, +1 decode at -20dB cell)
+      curated-hard-200: 4365 → 4249 rec (-116, -2.7%); 952 → 925 novel (-27)
+      Composite weight on hard-200 (0.5) dominates synth (0.3) → SHELVE for prod.
   notes: |
-    Source: WSJT-X-Improved v3.1.0 (https://sourceforge.net/projects/wsjt-x-improved/files/WSJT-X_v3.1.0/)
-    and https://wsjt-x-improved.sourceforge.io/Release_Notes.txt
-    Implementation: after Costas sync scoring, fit a parabola (or Gaussian)
-    to the sync metric at peak ± 1 time bin; use the fitted peak position
-    as the candidate's time offset. Add a CLI flag --time-interpolation
-    {none|parabolic|gaussian} for sweep.
+    Real signal in clean conditions. Real regression on noisy multi-slot WAVs
+    — likely candidate displacement under top-300 cap due to score inflation.
+    See research/experiments/2026-05-25-batch-7-mr001-followups.md iters 1-2.
+    Future variants to explore (hb-068): score-gated refinement, scaled delta,
+    rejection of large deltas, "only refine if would-be-dropped" rule.
 
 ### hb-045 — Localized baseline / noise-floor estimation  [SHELVED 2026-05-24]
   mode: ft8
@@ -166,25 +176,30 @@ current_ratio: 0.095
     Spawned mr-007 to add architecture-fit check before promoting
     harvested hypotheses to active.
 
-### hb-046 — Two-stage STD-then-MTD pass scheduling  [PRIORITY: 0.50, spawned 2026-05-24 from mr-001]
+### hb-046 — Two-stage STD-then-MTD pass scheduling  [SHELVED 2026-05-25 — architecture mismatch]
   mode: ft8
-  status: pending
-  priority_score: 0.50
-  estimated_effort: 2 sessions (decoder pipeline + scheduler change)
-  expected_delta: precision-preserving recall lift (WSJT-X-Improved reports ~99.5% of 3-stage yield at much lower CPU)
-  defensible_prior: yes (WSJT-X-Improved v3.0 + v3.1 ship this)
+  status: SHELVED — WSJT-X benefit is latency, not sensitivity; pancetta is offline
+  priority_score: 0.0
+  estimated_effort: implementation complete (two variants tested)
+  expected_delta: REFUTED — both v1 (subset) and v2 (NMS-on different population) give Δrec=0
+  defensible_prior: turned out wrong on architecture-fit grounds
   wild_card: false
-  evidence_for:
-    - WSJT-X-Improved 3.0/3.1: 2-stage and 3-stage decoder modes — early STD pass (e.g., nzhsym=41/46) followed by heavier MTD pass (nzhsym=49/50). Combined results.
-    - Conceptually distinct from pancetta's disabled subtract-and-redecode multi-pass (hb-031/021/037 shelved that): this is *cheap-then-thorough*, not *subtract-then-retry*. The earlier negative result on multi-pass DOESN'T apply.
-    - Reference: https://www.asahi-net.or.jp/~vj5y-tkur/ft8/wsjtx_31improved_article_en.html
-  evidence_against:
-    - Touches the decoder pipeline + coordinator's per-slot scheduler — wider than a CLI sweep.
-    - Duplicate-decode dedup needs to be tightened; could inflate FPs if pre-pass thresholds are too loose.
+  outcomes: |
+    Implementation (batch 7 iters 3-4):
+    - Ft8Decoder.with_two_stage(on); two_stage_first_config field
+    - v1: cheap=sync_cap=100/no-osd/iters=25 + std → Δrec=0 (cheap ⊂ std)
+    - v2: cheap=nms-on/cap=200 + std → Δrec=0 (text-dedup absorbs the
+      different candidate populations into same message strings)
   notes: |
-    First step: design doc — clarify what "STD" vs "MTD" map to in pancetta
-    (likely a faster pass with relaxed sync_cap / OSD off + a thorough pass
-    with current production knobs). Then implement and CLI-toggle.
+    The WSJT-X-Improved "two-stage" benefit is LATENCY (process partial slot
+    data before all 50 symbols received) — pancetta is OFFLINE eval, full
+    slot always available. The cheap-then-thorough pattern doesn't add
+    sensitivity when both passes converge on the same decoded messages.
+    Third architecture-mismatch shelve from mr-001 (after hb-045, hb-047).
+    Note: JTDX "subpass" (mr-002) is conceptually DIFFERENT — that's
+    iteration over different START SAMPLES with cross-cycle averaging
+    (hb-056). Don't conflate the two.
+    See research/experiments/2026-05-25-batch-7-mr001-followups.md iters 3-4.
 
 ### hb-047 — Auto-tightened passband detection  [SHELVED 2026-05-24 via mr-007 audit]
   mode: ft8
@@ -493,6 +508,121 @@ current_ratio: 0.095
     shipping first (hb-052 graduation → hb-062 cqdx integration).
     Future iter slots could revisit hb-034 (OSD-3) and hb-018
     (OSD-3 with CRC filter) under same framing.
+
+### hb-063 — Layered / WR-LBP belief propagation scheduling  [PRIORITY: 0.55, spawned 2026-05-25 from mr-003]
+  mode: ft8
+  status: pending
+  priority_score: 0.55
+  estimated_effort: 1-2 sessions
+  expected_delta: ~2x faster BP convergence per iteration; could enable cutting ldpc_iterations 50→25 with same FER, freeing wall-clock budget
+  defensible_prior: yes (well-established academic technique; arXiv:2410.13131, Hocevar 2004)
+  wild_card: false
+  evidence_for:
+    - Layered BP updates check nodes sequentially with immediate variable-node updates (vs flooding-schedule's all-checks-then-all-variables). Standard ~2x convergence speedup.
+    - WR-LBP (weighted residual layered BP) prioritizes the largest pending message updates per iteration.
+    - Clean attach to pancetta-ft8/src/decoder.rs LDPC BP loop. The (174,91) parity-check matrix has the row-by-row structure layered BP exploits.
+    - mr-003 (2026-05-25) ranked this #1 — lowest risk, biggest potential headroom.
+  evidence_against:
+    - Refactor of BP iteration order is non-trivial — need careful state management for the immediate-update pattern.
+    - At very low SNR (where pancetta lives) the convergence advantage may shrink.
+  notes: |
+    Source: arXiv:2410.13131 (Marquez-Viloria, Lamare et al., Oct 2024) +
+    Hocevar 2004 (foundational). CLI flag --layered-bp for A/B sweep on
+    hard-1000. If layered cuts iters in half at same FER, frees budget
+    for hb-046-style multi-pass or higher OSD depth.
+
+### hb-064 — DIA-augmented OSD with iteration-trajectory features  [PRIORITY: 0.40, spawned 2026-05-25 from mr-003]
+  mode: ft8
+  status: pending (plan-sized — needs training pipeline)
+  priority_score: 0.40
+  estimated_effort: 2-3 sessions (training data + model + integration)
+  expected_delta: significant TEP-enumeration speedup (paper reports 97% reduction at SNR=2dB on CCSDS (128,64))
+  defensible_prior: yes (arXiv:2404.14165; pancetta already has a DIA-style neural_osd)
+  wild_card: false
+  evidence_for:
+    - Paper trains a small neural model (~2 dense layers) on per-BP-iteration LLR trajectories (vs just final LLRs) to refine bit reliabilities; sliding-window classifier decides when to early-terminate TEP enumeration.
+    - pancetta already has neural_osd.rs with DIA-style model (20K params). This refines the existing module — feature extraction changes from final-LLR to per-iteration-LLR-trajectory.
+    - Strong architectural fit per mr-003 audit.
+  evidence_against:
+    - Plan-sized: requires training-data regeneration with per-iteration LLR capture; existing pipeline uses final-iter features only.
+    - Risk of overfit to synth conditions.
+  notes: |
+    Source: arXiv:2404.14165 + companion arXiv:2307.06575.
+    First step: verify pancetta's current DIA feature extraction
+    (probably final-iter only). Then plan trajectory-capture data
+    pipeline.
+
+### hb-065 — Adaptive Gaussian-Elimination removal in OSD  [PRIORITY: 0.45, spawned 2026-05-25 from mr-003]
+  mode: ft8
+  status: pending — needs profile first to confirm GE is OSD bottleneck
+  priority_score: 0.45
+  estimated_effort: 1 session (profile + 1 session impl)
+  expected_delta: OSD CPU cost reduction at unchanged FER (magnitude depends on GE fraction of OSD time)
+  defensible_prior: partial (arXiv:2206.10957; gain depends on whether GE actually dominates pancetta's OSD-2)
+  wild_card: false
+  evidence_for:
+    - OSD complexity dominated by per-call Gaussian elimination on the most-reliable basis (MRB).
+    - Two early-decision conditions allow skipping GE entirely on many OSD calls.
+    - Pancetta runs OSD-2 on every BP failure under parity gate=2; CPU savings would be meaningful if GE dominates.
+  evidence_against:
+    - At OSD-2, TEP enumeration is C(91,2)≈4k patterns per call — might dominate over GE, making the technique a no-op.
+    - Profile required first.
+  notes: |
+    Source: arXiv:2206.10957 (Yue, Wang et al., 2022 IEEE TCom 2023).
+    First step: instrument OSD path to time GE vs TEP enumeration on
+    hard-200. If GE is <20% of OSD time, shelve.
+
+### hb-066 — BP-RNN diversity ensemble for OSD pre-processing  [PRIORITY: 0.30, spawned 2026-05-25 from mr-003]
+  mode: ft8
+  status: pending (plan-sized; deferred)
+  priority_score: 0.30
+  estimated_effort: 3+ sessions
+  expected_delta: speculative
+  defensible_prior: weak (paper arXiv:2206.12150 targets short-block; pancetta-specific gain unknown)
+  wild_card: false
+  notes: |
+    Multiple specialized BP-RNN decoders, each targeting distinct
+    absorbing-set/trapping-set patterns. Plan-sized; defer until
+    hb-063 + hb-065 + hb-067 are exhausted.
+
+### hb-067 — mBP offset parameter for OSD pre-conditioning  [PRIORITY: 0.50, spawned 2026-05-25 from mr-003]
+  mode: ft8
+  status: pending
+  priority_score: 0.50
+  estimated_effort: 1 session
+  expected_delta: claim is order-(m−1) OSD reaches order-m performance with slight BP overhead — could let pancetta drop OSD-2 → OSD-1
+  defensible_prior: yes (arXiv:2306.00443)
+  wild_card: false
+  evidence_for:
+    - Add a fixed offset to BP messages before OSD invocation; tunable per code structure.
+    - Small code surface, no NN, no training data.
+    - Could halve OSD trial count (OSD-1: ~91 patterns vs OSD-2: ~4k).
+  evidence_against:
+    - Offset value likely needs per-code tuning sweep.
+    - May interact with hb-014 parity gate tuning.
+  notes: |
+    Source: arXiv:2306.00443 (Liang, Lau et al., 2023). Implementation
+    in BP→OSD handoff in decoder.rs. CLI flag --bp-offset N for sweep.
+
+### hb-068 — hb-044 conditional/scaled refinement variants  [PRIORITY: 0.45, spawned 2026-05-25 from hb-044 mixed result]
+  mode: ft8
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 1-2 sessions
+  expected_delta: keep hb-044's synth-clean +2dB SNR@90% gain while removing the hard-200 -116 regression
+  defensible_prior: yes (hb-044 batch 7 shows the gain exists; need a way to limit downside)
+  wild_card: false
+  evidence_for:
+    - hb-044 implementation works correctly (parabolic + linear-interp). Synth-clean SNR@90% gained 2 dB. But hard-200 lost 116 decodes.
+    - Likely cause: refinement-inflated scores displace better candidates in the top-300 cap on busy-band WAVs.
+    - Variants worth testing:
+      (a) score-gated refinement (only when sync_score > threshold)
+      (b) scaled delta (0.5× instead of 1.0×)
+      (c) reject large deltas (|delta| > 0.3 → use integer)
+      (d) refinement that NEVER inflates score (use refined position, original score for sorting)
+  notes: |
+    Variant (d) is the most principled — eliminates the displacement
+    mechanism. Try first.
 
 ### hb-062 — cqdx.io production FP-filter source  [PRIORITY: 0.60, spawned 2026-05-25 from hb-052]
   mode: ft8 (production wiring)
@@ -1012,20 +1142,28 @@ search to in-repo sources.
   expected_yield: 2-4 hypotheses (actual: 5)
   defensible_prior: yes — confirmed by audit results
 
-### mr-003 — LDPC/OSD academic literature 2020-2026
-  status: pending
+### mr-003 — LDPC/OSD academic literature 2020-2026  [COMPLETED 2026-05-25]
+  status: completed (background Explore agent, ~2 min)
   estimated_effort: 1-2 sessions
   source_type: academic papers via WebSearch
-  source: IEEE, arXiv — search "LDPC belief propagation acceleration", "ordered statistics decoding improvements", "neural-augmented LDPC"
-  method: |
-    Survey papers on (a) BP variants that converge faster (min-sum
-    approximations, layered scheduling, adaptive damping), (b) OSD
-    improvements beyond standard MRB (OSD-MRB, partial-search,
-    learned-ordering), (c) neural-augmented decoders that wrap
-    classical BP. Identify 3-5 that apply to FT8's (174,91) LDPC
-    structure and produce sub-hypotheses for testing.
-  expected_yield: 3-7 hypotheses, mix of speed and sensitivity
-  defensible_prior: yes — academic work continues post-WSJT-X's freeze on the decoder
+  source: arXiv (cs.IT) — short-block LDPC, layered BP, OSD, neural-augmented
+  outcome: |
+    Field is ACTIVE for short-block LDPC + BP + OSD (driven by 5G NR
+    control channels, CCSDS deep-space, quantum codes). Agent applied
+    mr-007 architecture-fit audit at harvest time.
+    Yield: 5 new hypotheses ranked by attachment fit:
+      hb-063 Layered/WR-LBP BP scheduling (arXiv:2410.13131) — top pick
+      hb-064 DIA-augmented OSD w/ iteration trajectories (arXiv:2404.14165) — plan-sized
+      hb-065 Adaptive GE removal in OSD (arXiv:2206.10957) — needs profile first
+      hb-066 BP-RNN diversity ensemble (arXiv:2206.12150) — plan-sized, deferred
+      hb-067 mBP offset parameter (arXiv:2306.00443) — cheap one-iter sweep
+    Flagged as "not pancetta-relevant": quantum LDPC, long-code 5G NR.
+    Recommendation: hb-063 first (lowest risk, biggest budget headroom).
+    If hb-063/065/067 cycle is exhausted, pivot to signal-processing
+    literature on coherent sync (pancetta's sensitivity gap at very
+    low SNR is increasingly sync-side).
+  expected_yield: 3-7 hypotheses (actual: 5)
+  defensible_prior: yes — confirmed by audit results
 
 ### mr-004 — Source-code drift audit (quarterly)
   status: pending

@@ -197,6 +197,15 @@ pub struct Ft8Config {
     /// for false positives) grows monotonically with the gate. Tightening
     /// 4 → 2 cut FPs ~21% at zero recall cost and was ~26% faster.
     pub max_parity_errors_for_osd: usize,
+
+    /// hb-044: enable parabolic interpolation of the Costas sync peak in
+    /// the time axis. When true, after finding a candidate at integer
+    /// time-step t0, fit a parabola to scores at t0-1/t0/t0+1 and store
+    /// a fractional time offset (in [-0.5, +0.5]) on the candidate.
+    /// Part 1 (this flag) only computes and stores the refinement;
+    /// part 2 applies it in symbol extraction.
+    /// Default false. WSJT-X-Improved v3.1.0 ships this.
+    pub sync_time_interpolation: bool,
 }
 
 impl Default for Ft8Config {
@@ -220,6 +229,7 @@ impl Default for Ft8Config {
             adaptive_ldpc_iters: false,
             block_score_rerank: true,
             max_parity_errors_for_osd: 2,
+            sync_time_interpolation: false,
         }
     }
 }
@@ -245,6 +255,7 @@ struct Spectrogram {
 }
 
 /// Costas sync search candidate
+#[derive(Clone, Copy, Debug)]
 struct CostasCandidate {
     /// Time step in spectrogram (quarter-symbol units with TIME_OSR=2)
     time_step: usize,
@@ -252,8 +263,14 @@ struct CostasCandidate {
     freq_bin: usize,
     /// Frequency sub-bin index (0..freq_osr-1)
     freq_sub: usize,
-    /// Costas sync correlation score
+    /// Costas sync correlation score (refined value when
+    /// `sync_time_interpolation` is enabled).
     sync_score: f64,
+    /// hb-044: fractional time-bin refinement from parabolic interpolation
+    /// of `compute_costas_score` at t0-1 / t0 / t0+1. In [-0.5, +0.5].
+    /// 0.0 = integer-bin alignment (unrefined). Currently unused in
+    /// symbol extraction — that wiring is hb-044 part 2.
+    time_refinement: f64,
 }
 
 /// Waterfall display data for visualization
@@ -1207,11 +1224,28 @@ impl Ft8Decoder {
                     let score = self.compute_costas_score(spectrogram, t0, f0, freq_sub);
 
                     if score > self.config.min_sync_score {
+                        // hb-044: optional parabolic refinement of the
+                        // time-bin peak. Costs 2 extra score evaluations
+                        // per kept candidate.
+                        let (refined_score, time_refinement) =
+                            if self.config.sync_time_interpolation
+                                && t0 > 0
+                                && t0 + 1 <= max_time_step
+                            {
+                                let y_left =
+                                    self.compute_costas_score(spectrogram, t0 - 1, f0, freq_sub);
+                                let y_right =
+                                    self.compute_costas_score(spectrogram, t0 + 1, f0, freq_sub);
+                                parabolic_peak_refinement(y_left, score, y_right)
+                            } else {
+                                (score, 0.0)
+                            };
                         candidates.push(CostasCandidate {
                             time_step: t0,
                             freq_bin: f0,
                             freq_sub,
-                            sync_score: score,
+                            sync_score: refined_score,
+                            time_refinement,
                         });
                     }
                 }
@@ -1396,10 +1430,8 @@ impl Ft8Decoder {
 
         for &trial_freq_sub in &freq_sub_trials {
             let trial_candidate = CostasCandidate {
-                time_step: candidate.time_step,
-                freq_bin: candidate.freq_bin,
                 freq_sub: trial_freq_sub,
-                sync_score: candidate.sync_score,
+                ..*candidate
             };
             let tone_magnitudes =
                 self.extract_symbols_from_spectrogram(spectrogram, &trial_candidate);
@@ -1682,10 +1714,8 @@ impl Ft8Decoder {
         ];
         for &trial_freq_sub in &freq_sub_trials {
             let trial_candidate = CostasCandidate {
-                time_step: candidate.time_step,
-                freq_bin: candidate.freq_bin,
                 freq_sub: trial_freq_sub,
-                sync_score: candidate.sync_score,
+                ..*candidate
             };
             let tone_magnitudes =
                 self.extract_symbols_from_spectrogram(spectrogram, &trial_candidate);
@@ -2058,6 +2088,9 @@ impl Ft8Decoder {
         let t0 = candidate.time_step;
         let f0 = candidate.freq_bin;
         let fs = candidate.freq_sub;
+        // hb-044: optional fractional time-bin shift. dt=0 → identical
+        // to original integer-bin behavior.
+        let dt = candidate.time_refinement;
 
         let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
 
@@ -2079,18 +2112,10 @@ impl Ft8Decoder {
 
                 // Average the first 2 sub-steps within this symbol (the
                 // center of the symbol window at the Costas-aligned offset).
-                // The finer time grid from TIME_OSR provides alignment via t0;
-                // we only need 2 adjacent steps for the actual magnitude.
-                let db_a = if t_base < spectrogram.num_steps {
-                    spectrogram.power[t_base][fs][freq_bin]
-                } else {
-                    -120.0
-                };
-                let db_b = if t_base + 1 < spectrogram.num_steps {
-                    spectrogram.power[t_base + 1][fs][freq_bin]
-                } else {
-                    -120.0
-                };
+                // hb-044: dt applies a fractional time-bin shift via
+                // linear interpolation; dt=0 reproduces original behavior.
+                let db_a = lookup_time_interp(spectrogram, t_base, dt, fs, freq_bin);
+                let db_b = lookup_time_interp(spectrogram, t_base + 1, dt, fs, freq_bin);
                 mags[tone] = (db_a + db_b) / 2.0;
             }
 
@@ -2411,10 +2436,8 @@ fn par_decode_candidate(
     ];
     for &trial_freq_sub in &freq_sub_trials {
         let trial_candidate = CostasCandidate {
-            time_step: candidate.time_step,
-            freq_bin: candidate.freq_bin,
             freq_sub: trial_freq_sub,
-            sync_score: candidate.sync_score,
+            ..*candidate
         };
         let tone_magnitudes = par_extract_symbols_from_spectrogram(
             ctx.protocol_params,
@@ -2586,10 +2609,8 @@ fn par_try_ap_decode(
 
     for &trial_freq_sub in &freq_sub_trials {
         let trial_candidate = CostasCandidate {
-            time_step: candidate.time_step,
-            freq_bin: candidate.freq_bin,
             freq_sub: trial_freq_sub,
-            sync_score: candidate.sync_score,
+            ..*candidate
         };
         let tone_magnitudes = par_extract_symbols_from_spectrogram(
             ctx.protocol_params,
@@ -2988,6 +3009,9 @@ fn par_extract_symbols_from_spectrogram(
     let t0 = candidate.time_step;
     let f0 = candidate.freq_bin;
     let fs = candidate.freq_sub;
+    // hb-044: optional fractional time-bin shift applied to spectrogram
+    // lookups. dt=0 → identical to original integer-bin behavior.
+    let dt = candidate.time_refinement;
 
     let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
     let steps_per_symbol = TIME_OSR;
@@ -3001,16 +3025,8 @@ fn par_extract_symbols_from_spectrogram(
             if freq_bin >= spectrogram.num_bins || fs >= spectrogram.freq_osr {
                 continue;
             }
-            let db_a = if t_base < spectrogram.num_steps {
-                spectrogram.power[t_base][fs][freq_bin]
-            } else {
-                -120.0
-            };
-            let db_b = if t_base + 1 < spectrogram.num_steps {
-                spectrogram.power[t_base + 1][fs][freq_bin]
-            } else {
-                -120.0
-            };
+            let db_a = lookup_time_interp(spectrogram, t_base, dt, fs, freq_bin);
+            let db_b = lookup_time_interp(spectrogram, t_base + 1, dt, fs, freq_bin);
             mags[tone] = (db_a + db_b) / 2.0;
         }
 
@@ -3018,6 +3034,43 @@ fn par_extract_symbols_from_spectrogram(
     }
 
     tone_magnitudes
+}
+
+/// Linear-interpolation lookup into a spectrogram with fractional time
+/// offset. dt=0 returns spectrogram.power[t_base][fs][freq_bin] exactly.
+/// Out-of-range cells contribute -120.0 dB. hb-044 helper.
+#[inline]
+fn lookup_time_interp(
+    spec: &Spectrogram,
+    t_base: usize,
+    dt: f64,
+    fs: usize,
+    freq_bin: usize,
+) -> f64 {
+    if dt.abs() < f64::EPSILON {
+        return if t_base < spec.num_steps {
+            spec.power[t_base][fs][freq_bin]
+        } else {
+            -120.0
+        };
+    }
+    // Continuous time position: t_base + dt
+    let t_cont = t_base as f64 + dt;
+    let t_lo_f = t_cont.floor();
+    let frac = t_cont - t_lo_f;
+    let lo_idx = t_lo_f as isize;
+    let hi_idx = lo_idx + 1;
+    let p_lo = if lo_idx >= 0 && (lo_idx as usize) < spec.num_steps {
+        spec.power[lo_idx as usize][fs][freq_bin]
+    } else {
+        -120.0
+    };
+    let p_hi = if hi_idx >= 0 && (hi_idx as usize) < spec.num_steps {
+        spec.power[hi_idx as usize][fs][freq_bin]
+    } else {
+        -120.0
+    };
+    (1.0 - frac) * p_lo + frac * p_hi
 }
 
 fn par_compute_soft_llrs_db(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<f32> {
@@ -3298,6 +3351,61 @@ fn bits_to_u16(bits: &BitSlice) -> u16 {
         }
     }
     value
+}
+
+/// hb-044: parabolic refinement of a discrete peak. Given three score
+/// samples at integer offsets (-1, 0, +1) around the candidate's peak,
+/// fit a parabola and return (refined_score, fractional_offset). The
+/// fractional offset is in (-0.5, +0.5) relative to the center sample.
+///
+/// If the three points don't form a concave-down parabola (i.e., the
+/// center isn't actually a local max), returns (y_center, 0.0).
+fn parabolic_peak_refinement(y_left: f64, y_center: f64, y_right: f64) -> (f64, f64) {
+    // Parabola: y(x) = a*x^2 + b*x + c
+    //   y(-1) = a - b + c = y_left
+    //   y( 0) =        c = y_center
+    //   y(+1) = a + b + c = y_right
+    //   => a = (y_left + y_right - 2*y_center) / 2
+    //      b = (y_right - y_left) / 2
+    let a = (y_left + y_right - 2.0 * y_center) * 0.5;
+    let b = (y_right - y_left) * 0.5;
+    if a >= 0.0 {
+        // Not concave-down — center is not a local max. No refinement.
+        return (y_center, 0.0);
+    }
+    let delta = -b / (2.0 * a);
+    // Clamp to a sane range — large deltas mean the parabola fit is poor.
+    let delta = delta.clamp(-0.5, 0.5);
+    let refined = y_center + b * delta + a * delta * delta;
+    (refined, delta)
+}
+
+#[cfg(test)]
+mod parabolic_tests {
+    use super::parabolic_peak_refinement;
+
+    #[test]
+    fn symmetric_peak_has_no_offset() {
+        // y_left == y_right, center higher → delta = 0
+        let (refined, delta) = parabolic_peak_refinement(1.0, 2.0, 1.0);
+        assert!(delta.abs() < 1e-9);
+        assert!((refined - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn skewed_right_pushes_delta_right() {
+        let (_, delta) = parabolic_peak_refinement(1.0, 2.0, 1.5);
+        assert!(delta > 0.0, "delta={delta}");
+        assert!(delta < 0.5);
+    }
+
+    #[test]
+    fn non_concave_returns_zero() {
+        // y_center smaller than both neighbors → not a peak
+        let (refined, delta) = parabolic_peak_refinement(2.0, 1.0, 2.0);
+        assert_eq!(delta, 0.0);
+        assert_eq!(refined, 1.0);
+    }
 }
 
 /// Estimate noise floor from power spectral density (median method)
@@ -4165,24 +4273,28 @@ mod tests {
                 freq_bin: 240,
                 freq_sub: 0,
                 sync_score: 20.0,
+                time_refinement: 0.0,
             },
             CostasCandidate {
                 time_step: 1,
                 freq_bin: 240,
                 freq_sub: 0,
                 sync_score: 15.0,
+                time_refinement: 0.0,
             }, // near #0
             CostasCandidate {
                 time_step: 0,
                 freq_bin: 241,
                 freq_sub: 0,
                 sync_score: 12.0,
+                time_refinement: 0.0,
             }, // near #0
             CostasCandidate {
                 time_step: 0,
                 freq_bin: 300,
                 freq_sub: 0,
                 sync_score: 18.0,
+                time_refinement: 0.0,
             }, // far from #0
         ];
 

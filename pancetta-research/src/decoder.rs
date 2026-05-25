@@ -57,6 +57,11 @@ pub struct Ft8Decoder {
     /// After decoding, callsigns from new decodes are pushed into the deque.
     rolling_window: Option<usize>,
     rolling_calls: Mutex<std::collections::VecDeque<String>>,
+    /// hb-046: when Some, run a "cheap" first pass with this config before
+    /// the standard pass; union results dedup'd by message text. NOT the
+    /// same as max_decode_passes (which is subtract-and-retry, shelved).
+    /// Mutually exclusive with rolling_window and ap_context for now.
+    two_stage_first_config: Option<pancetta_ft8::Ft8Config>,
     /// Used only so `config_snapshot` is stable across calls.
     _scratch: Mutex<()>,
 }
@@ -70,6 +75,7 @@ impl Ft8Decoder {
             ap_context: None,
             rolling_window: None,
             rolling_calls: Mutex::new(std::collections::VecDeque::new()),
+            two_stage_first_config: None,
             _scratch: Mutex::new(()),
         }
     }
@@ -160,6 +166,37 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-044: enable parabolic refinement of the Costas time-bin peak.
+    pub fn with_sync_time_interpolation(mut self, on: bool) -> Self {
+        self.config.sync_time_interpolation = on;
+        self
+    }
+
+    /// hb-046: enable two-stage decoding. When `on`, decode_wav runs a
+    /// CHEAP pass first (relaxed sync_cap, no OSD, fewer LDPC iters)
+    /// then the standard PRODUCTION pass on the same audio, unioning
+    /// the decoded messages dedup'd by text. Distinct from
+    /// max_decode_passes (which is subtract-and-retry, shelved).
+    pub fn with_two_stage(mut self, on: bool) -> Self {
+        if on {
+            // Make the first pass MEANINGFULLY DIFFERENT, not just weaker:
+            // - NMS ON (production has it OFF per hb-019); admits a different
+            //   candidate population (merges adjacent peaks that production
+            //   keeps separate).
+            // - Slightly higher min_sync_score to compensate for the merge,
+            //   keeping cost bounded.
+            // This way the cheap pass can catch decodes the standard pass
+            // missed due to candidate displacement.
+            let mut cheap = self.config.clone();
+            cheap.nms_enabled = true;
+            cheap.max_sync_candidates = 200;
+            self.two_stage_first_config = Some(cheap);
+        } else {
+            self.two_stage_first_config = None;
+        }
+        self
+    }
+
     /// Attach an AP context. When `Some`, the decoder calls
     /// `decode_window_with_ap` per WAV — the AP1/AP2/AP3/AP4 code paths
     /// can fire if `ctx.my_call.is_some() || ctx.active_qso.is_some()`.
@@ -214,6 +251,20 @@ impl DecoderUnderTest for Ft8Decoder {
                 .collect::<Result<Vec<_>, _>>()?,
             hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<Vec<_>, _>>()?,
         };
+
+        // hb-046: optional two-stage decoding. Run a cheap first pass,
+        // then merge with the standard pass. Mutually exclusive with
+        // rolling_window and ap_context (those win if also set).
+        let mut prelim: Vec<pancetta_ft8::DecodedMessage> = Vec::new();
+        if self.two_stage_first_config.is_some()
+            && self.rolling_window.is_none()
+            && self.ap_context.is_none()
+        {
+            let cheap_cfg = self.two_stage_first_config.clone().unwrap();
+            let mut cheap_decoder = pancetta_ft8::Ft8Decoder::new(cheap_cfg)
+                .map_err(|e| anyhow::anyhow!("Ft8Decoder::new (cheap pass) failed: {e}"))?;
+            prelim = cheap_decoder.decode_window(&samples).unwrap_or_default();
+        }
 
         // Construct a fresh decoder per WAV. decode_window takes &mut self,
         // and we want the outer trait impl to stay `&self`.
@@ -275,16 +326,29 @@ impl DecoderUnderTest for Ft8Decoder {
                 })?,
             }
         };
-        Ok(raw
-            .into_iter()
-            .map(|d| Decode {
-                message: d.text.clone(),
-                freq_hz: d.frequency_offset,
-                dt_s: d.time_offset,
-                snr_db: d.snr_db as f64,
-                crc_valid: true, // pancetta returns CRC-valid only
-            })
-            .collect())
+        // hb-046: merge prelim (cheap pass) + raw (standard pass) decodes,
+        // dedup'd by message text. Prelim contributes any messages the
+        // standard pass missed.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<Decode> = Vec::new();
+        let mut push = |d: pancetta_ft8::DecodedMessage| {
+            if seen.insert(d.text.clone()) {
+                out.push(Decode {
+                    message: d.text.clone(),
+                    freq_hz: d.frequency_offset,
+                    dt_s: d.time_offset,
+                    snr_db: d.snr_db as f64,
+                    crc_valid: true,
+                });
+            }
+        };
+        for d in raw {
+            push(d);
+        }
+        for d in prelim {
+            push(d);
+        }
+        Ok(out)
     }
 
     fn config_snapshot(&self) -> serde_json::Value {
