@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T18:00:00Z
+last_updated: 2026-05-25T19:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 52
-current_ratio: 0.071
+exploitation_run: 53
+current_ratio: 0.070
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -540,27 +540,26 @@ current_ratio: 0.071
     the filter is live in production. See
     research/experiments/2026-05-25-batch-9-ship-filter.md.
 
-### hb-063 — Layered / WR-LBP belief propagation scheduling  [PRIORITY: 0.55, spawned 2026-05-25 from mr-003]
+### hb-063 — Layered / WR-LBP belief propagation scheduling  [GRADUATED 2026-05-25 — batch 10]
   mode: ft8
-  status: pending
-  priority_score: 0.55
+  status: GRADUATED — layered_bp default true; composite +0.001049 (biggest single-iter move since hb-038)
+  priority_score: 0.0
   estimated_effort: 1-2 sessions
-  expected_delta: ~2x faster BP convergence per iteration; could enable cutting ldpc_iterations 50→25 with same FER, freeing wall-clock budget
-  defensible_prior: yes (well-established academic technique; arXiv:2410.13131, Hocevar 2004)
+  expected_delta: CONFIRMED — hard-200 +18 rec, hard-1000 +88 rec, -16% decode wall-clock, zero guard-tier regression
+  defensible_prior: yes (Hocevar 2004; arXiv:2410.13131)
   wild_card: false
   evidence_for:
-    - Layered BP updates check nodes sequentially with immediate variable-node updates (vs flooding-schedule's all-checks-then-all-variables). Standard ~2x convergence speedup.
-    - WR-LBP (weighted residual layered BP) prioritizes the largest pending message updates per iteration.
-    - Clean attach to pancetta-ft8/src/decoder.rs LDPC BP loop. The (174,91) parity-check matrix has the row-by-row structure layered BP exploits.
-    - mr-003 (2026-05-25) ranked this #1 — lowest risk, biggest potential headroom.
-  evidence_against:
-    - Refactor of BP iteration order is non-trivial — need careful state management for the immediate-update pattern.
-    - At very low SNR (where pancetta lives) the convergence advantage may shrink.
+    - Full 5-tier (with FP filter): composite 0.555131 → 0.556180. fixtures 1.0, synth-clean -20/-18 unchanged. hard-200 rec 4376→4394 / novel 823→836; hard-1000 rec 14267→14355 / novel 2808→2849.
+    - Controlled hard-200 A/B (no filter): flooding@100 4377 rec / 270s; layered@100 4395 rec / 226s (-16%); layered@50 4385 rec / 223s. layered@50 beats flooding@100 at HALF the iters — confirms ~2x convergence.
+    - Layered decodes existing candidates BETTER (more reach syndrome=0 within budget) rather than admitting more candidates — first lever in many batches to add real recall, not just trade FPs. The +194 raw novels collapse to +13 under the production filter; recall is filter-invariant.
   notes: |
-    Source: arXiv:2410.13131 (Marquez-Viloria, Lamare et al., Oct 2024) +
-    Hocevar 2004 (foundational). CLI flag --layered-bp for A/B sweep on
-    hard-1000. If layered cuts iters in half at same FER, frees budget
-    for hb-046-style multi-pass or higher OSD depth.
+    Implemented as a layered branch in belief_propagation_with_trajectory
+    (running posterior + immediate folding of each check's messages).
+    Covers SumProduct + MinSum. Default flipped false→true. Unit test
+    test_ldpc_layered_bp_converges. Lib tests 192→193.
+    See research/experiments/2026-05-25-layered-bp.md. mr-003 #1 delivered.
+    Follow-ups: hb-067 (mBP offset), hb-065 (adaptive GE — profile first),
+    hb-064 (DIA trajectory features — could retrain OSD on layered trajs).
 
 ### hb-064 — DIA-augmented OSD with iteration-trajectory features  [PRIORITY: 0.40, spawned 2026-05-25 from mr-003]
   mode: ft8

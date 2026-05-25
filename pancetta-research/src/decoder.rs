@@ -179,6 +179,13 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-063: use a layered (row-sequential) BP schedule instead of
+    /// the default flooding schedule.
+    pub fn with_layered_bp(mut self, on: bool) -> Self {
+        self.config.layered_bp = on;
+        self
+    }
+
     /// hb-046: enable two-stage decoding. When `on`, decode_wav runs a
     /// CHEAP pass first (relaxed sync_cap, no OSD, fewer LDPC iters)
     /// then the standard PRODUCTION pass on the same audio, unioning
