@@ -1,11 +1,15 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T00:00:00Z
+last_updated: 2026-05-25T01:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 33
-current_ratio: 0.108
+exploitation_run: 38
+current_ratio: 0.095
+# Batch 6 (2026-05-25): FP filter library + revisits.
+#   hb-052 graduated as library (infra); production blocked on hb-062
+#   2 hb-053 revisits show wider gate + iters=100 win with filter
+#   Spawned hb-062 (cqdx.io integration — unblocks production)
 # Batch 5 (2026-05-25): plumbing + bank refill.
 #   mr-002 JTDX audit: 5 new clean-attach + plan-sized hypotheses
 #     (hb-054..hb-058). JTDX code frozen 2022, rich harvest, no
@@ -425,56 +429,102 @@ current_ratio: 0.108
     Could be combined with hb-060 into a single "remove dead Ft8Config
     fields" iter.
 
-### hb-052 — Production FP filter (callsign continuity)  [PRIORITY: 0.55, spawned 2026-05-24 from FP filter MVP]
+### hb-052 — Production FP filter (callsign continuity)  [WIN (infra) 2026-05-25; production blocked on hb-062]
   mode: ft8
-  status: pending
-  priority_score: 0.55
-  estimated_effort: 2-3 sessions
-  expected_delta: -10 to -25% novel decodes (FPs) on-air at near-zero recall cost
-  defensible_prior: yes — MVP showed -21.7% novels at -0.02% recall on hard-200
+  status: GRADUATED (library); production deployment blocked on hb-062 cqdx.io integration
+  priority_score: 0.0
+  estimated_effort: n/a (filter library done; production wiring spawned as hb-062)
+  expected_delta: -10 to -25% novels at -0.02% recall (corpus-baseline reference); production needs cqdx.io to approximate that coverage
+  defensible_prior: yes
   wild_card: false
-  evidence_for:
-    - Batch 4 iter 4 (2026-05-24): callsign-continuity filter using corpus baselines reduced novels by 21.7% (-141 of 651) at 0.02% recall cost (-1 of 4666) on hard-200.
-    - Per hb-039: 97% of isolated-novel callsigns are likely FPs. The filter directly applies this finding.
-    - Production needs a different reference set than corpus baselines: (a) operator's logged callsigns (from ~/.pancetta/qsos.adi), (b) recent rolling-window of decoded callsigns, (c) cqdx.io API for live spots.
-  evidence_against:
-    - Production reference set may be incomplete during cold-start (no operator history yet, no spots cached). Need a fallback mode (lenient filter) for first-N-minutes operation.
-    - cqdx.io API call adds latency to the decode loop. Cache aggressively.
-  notes: |
-    Design:
-    - Build a `CallsignContinuityFilter` in pancetta-qso or pancetta-core.
-    - Reference set sources (combined, OR-of-membership):
-      (a) Recent ADIF log entries (operator's own logs)
-      (b) Rolling window of last N decoded callsigns this session
-      (c) cqdx.io recent-spots cache (refreshed every N minutes)
-    - Filter applied as post-decode: keep decode iff at least one
-      extracted callsign appears in any of (a)(b)(c).
-    - Cold-start: skip the filter for the first N decodes of a session
-      (no reference set built up yet).
-    - Wire into coordinator's decode pipeline; emit filtered-out
-      decodes to a separate log for review.
+  outcome: |
+    Batch 6 (2026-05-25) iters 1-3 implemented the filter as a
+    reusable library in pancetta-research/src/fp_filter.rs:
+    - FpFilter struct with HashSet<String> reference + optional
+      Mutex<VecDeque<String>> rolling window
+    - Sources: extend_from_baselines (corpus), extend_from_adif
+      (operator log), extend_from_iter (test)
+    - 13 unit tests pass
+    - eval CLI flags --fp-filter-baselines, --fp-filter-rolling,
+      --fp-filter-adif; applied post-decode in all three tier handlers
 
-### hb-053 — Revisit shelved OSD/BP hypotheses under "wider gate + FP filter"  [PRIORITY: 0.45, spawned 2026-05-24]
+    Validation: reproduces batch-4 MVP exactly (-141 novels at
+    -1 real decode on hard-200 with corpus-baseline reference).
+
+    Production deployment blocked: operator's ADIF is empty
+    (pre-Phase-5); ADIF top-100 + rolling=200 gives only 65% recall
+    (acceptable production drop is <1%); rolling-only fails
+    cold-start. The missing source is cqdx.io recent-spots cache.
+    Spawned hb-062 to do the production cqdx.io integration; once
+    that lands, the (operator-ADIF + rolling + cqdx) combined source
+    should approximate corpus-baseline coverage.
+  notes: |
+    See research/experiments/2026-05-25-batch-6-fp-filter.md.
+    Two analytical follow-ups (hb-053-014, hb-053-035) showed that
+    once production filter ships, wider parity gate (gate=6) and
+    more BP iters (iters=100) BOTH become attractive — currently
+    blocked on hb-062 / hb-052 production shipping.
+
+### hb-053 — Revisit shelved hypotheses with FP filter  [PARTIALLY EVALUATED 2026-05-25; graduations blocked on hb-052/hb-062]
   mode: ft8
-  status: pending
+  status: 2 evaluations done (hb-014, hb-035); graduations blocked on production filter shipping
   priority_score: 0.45
-  estimated_effort: 1-2 sessions per re-test
-  expected_delta: variable per hypothesis; potentially salvages shelved items if FP filter cleans up the +novels they generated
-  defensible_prior: yes — hb-052 MVP showed precision tooling exists
+  estimated_effort: 1-2 sessions per re-test (3 remaining: hb-034, hb-018, others)
+  expected_delta: per-hypothesis ~+0.001 composite each + meaningful precision
+  defensible_prior: yes (hb-052 MVP + batch 6 revisits)
+  wild_card: false
+  outcomes_so_far: |
+    Batch 6 iter 4 (2026-05-25) — hb-014 with filter applied:
+      gate=2+filter:   4364 rec / 811 novel (-1, -141)
+      gate=4+filter:   4364 rec / 814 novel (-1, -138)
+      gate=6+filter:   4365 rec / 820 novel ( 0, -132)
+      => gate=6+filter MATCHES production recall AND reduces novels
+         by 132 vs production (no filter). Analytical WIN.
+
+    Batch 6 iter 5 (2026-05-25) — hb-035 with filter applied:
+      iters=50  + filter: 4364 rec / 811 novel (-1, -141)
+      iters=100 + filter: 4376 rec / 818 novel (+11, -134)
+      => iters=100+filter gives +11 real decodes AND -134 novels
+         vs production. Stronger analytical WIN than the gate
+         revisit (adds recall, not just removes novels).
+  notes: |
+    Both revisits show wider/bigger knob + filter is strictly
+    better than current production. Both need production filter
+    shipping first (hb-052 graduation → hb-062 cqdx integration).
+    Future iter slots could revisit hb-034 (OSD-3) and hb-018
+    (OSD-3 with CRC filter) under same framing.
+
+### hb-062 — cqdx.io production FP-filter source  [PRIORITY: 0.60, spawned 2026-05-25 from hb-052]
+  mode: ft8 (production wiring)
+  status: pending
+  priority_score: 0.60
+  estimated_effort: 2-3 sessions
+  expected_delta: unblocks hb-052 production deployment; enables hb-053 graduations (gate=6+filter, iters=100+filter)
+  defensible_prior: yes — batch 6 showed operator-ADIF + rolling alone is insufficient (65% recall on hard-200)
   wild_card: false
   evidence_for:
-    - Several hypotheses (hb-018 OSD-3 with CRC filter, hb-034 OSD-3 follow-up, hb-035 BP convergence, hb-014 wider parity gates) were shelved with "loses to precision wall" reasoning.
-    - The precision wall = "more candidates admitted → more FPs". If we add a precision filter post-hoc, the recall-vs-FP tradeoff shifts.
-    - hb-035 iters=100: +12 rec, +21 novel (1.75:1 ratio). If filter kills 21.7% of novels at 0.02% recall cost, net = +12 rec, +16 novel (1.33:1 ratio — better).
+    - hb-052 production blocked: operator-ADIF top-100 + rolling-window=200 = 65% recall on hard-200 (need ~99% for production); the missing source is cqdx.io recent-spots cache.
+    - cqdx.io provides near-real-time global callsign coverage; likely thousands of unique callsigns vs the ~3000 in corpus baselines.
+    - Combined (operator-ADIF + rolling + cqdx) should approximate the corpus-baseline coverage that the MVP showed at 99.98% recall.
+    - Once shipped, two hb-053 revisits become graduatable (gate=6, iters=100) for ~+0.001 composite + meaningful precision.
   evidence_against:
-    - Production deployment depends on hb-052 first.
-    - The shelved hypotheses' marginal recall gains are small (10s of decodes) — even with FP filter, the win is modest.
+    - cqdx.io API adds latency to decode pipeline — must cache aggressively.
+    - Cold-start handling: first N decodes have an empty reference; need a lenient mode (skip filter) until reference is populated.
+    - Requires production code touches across pancetta-cqdx, pancetta-qso, pancetta/coordinator.
   notes: |
-    Two-phase approach:
-    Phase 1 (after hb-052 ships): re-run hb-014 with wider gate (e.g., gate=4)
-    + filter post-process. Measure net recall + novel.
-    Phase 2: similar for hb-034 (OSD-3) and hb-035 (iters=100 + var=40/48).
-    If any re-run shows >0.005 composite gain with filter, graduate.
+    Design touchpoints:
+    1. pancetta-cqdx: add a CallsignSpotsCache that pulls recent
+       spots periodically (every N minutes) and exposes a HashSet<String>.
+    2. pancetta-qso: add a CallsignContinuityFilter that unions
+       (ADIF from disk + rolling window + cqdx cache) into a single
+       reference set.
+    3. pancetta/coordinator/pipeline.rs: apply filter post-decode
+       before emission; emit filtered-out decodes to a separate
+       observability stream for review.
+    4. Cold-start: skip filter for first 60 seconds OR until
+       reference has >100 callsigns.
+    See research/experiments/2026-05-25-batch-6-fp-filter.md for
+    the full MVP-to-production analysis.
 
 ### hb-049 — Remove dead `Ft8Config::min_snr_db` field  [WIN 2026-05-24]
   mode: ft8

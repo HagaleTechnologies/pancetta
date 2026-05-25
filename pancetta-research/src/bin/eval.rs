@@ -48,6 +48,19 @@ struct Args {
     ap_recent_calls: Option<Vec<String>>,
     /// hb-050: enable rolling-callsign-window mode with capacity N.
     ap_rolling_window: Option<usize>,
+    /// hb-052 FP filter: build the reference set from corpus baselines
+    /// at this dir (one .json per WAV). When set, every decode is
+    /// passed through the filter post-decode; rejected decodes don't
+    /// count toward the scorecard.
+    fp_filter_baselines: Option<PathBuf>,
+    /// hb-052: enable a rolling-window callsign source for the FP
+    /// filter (capacity N). Combined with `fp_filter_baselines` via
+    /// OR-of-membership.
+    fp_filter_rolling: Option<usize>,
+    /// hb-052: build the reference set from an ADIF file's CALL
+    /// fields. Used for production-style validation (operator log
+    /// is the natural source). Can combine with baselines via OR.
+    fp_filter_adif: Option<PathBuf>,
 }
 
 impl Args {
@@ -72,6 +85,9 @@ impl Args {
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
         let mut ap_rolling_window: Option<usize> = None;
+        let mut fp_filter_baselines: Option<PathBuf> = None;
+        let mut fp_filter_rolling: Option<usize> = None;
+        let mut fp_filter_adif: Option<PathBuf> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -198,6 +214,27 @@ impl Args {
                             .parse()?,
                     );
                 }
+                "--fp-filter-baselines" => {
+                    fp_filter_baselines = Some(
+                        iter.next()
+                            .context("--fp-filter-baselines needs a directory path")?
+                            .into(),
+                    );
+                }
+                "--fp-filter-rolling" => {
+                    fp_filter_rolling = Some(
+                        iter.next()
+                            .context("--fp-filter-rolling needs a value (N)")?
+                            .parse()?,
+                    );
+                }
+                "--fp-filter-adif" => {
+                    fp_filter_adif = Some(
+                        iter.next()
+                            .context("--fp-filter-adif needs a path to an ADIF file")?
+                            .into(),
+                    );
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
@@ -247,6 +284,9 @@ impl Args {
             ap_my_call,
             ap_recent_calls,
             ap_rolling_window,
+            fp_filter_baselines,
+            fp_filter_rolling,
+            fp_filter_adif,
         })
     }
 }
@@ -259,9 +299,22 @@ fn workspace_root() -> anyhow::Result<PathBuf> {
         .to_path_buf())
 }
 
+/// Apply the FP filter to a decode vector in place, dropping rejected
+/// decodes. Updates the rolling window via the `update_rolling=true`
+/// path so the filter learns within the eval run.
+fn apply_fp_filter(
+    filter: Option<&pancetta_research::FpFilter>,
+    decodes: &mut Vec<pancetta_research::Decode>,
+) {
+    if let Some(f) = filter {
+        decodes.retain(|d| f.accept(&d.message, true));
+    }
+}
+
 fn run_fixtures_tier(
     decoder: &dyn DecoderUnderTest,
     workspace: &std::path::Path,
+    fp_filter: Option<&pancetta_research::FpFilter>,
 ) -> anyhow::Result<TierResult> {
     let truth_path = workspace.join("research/corpus/fixtures/ft8/truth.json");
     let truth = FixtureTruth::load(&truth_path)?;
@@ -272,7 +325,10 @@ fn run_fixtures_tier(
     let mut failures = Vec::new();
     for f in &fixtures {
         let entry = truth.get(&f.display_name);
-        let decodes_result = decoder.decode_wav(&f.wav_path);
+        let decodes_result = decoder.decode_wav(&f.wav_path).map(|mut d| {
+            apply_fp_filter(fp_filter, &mut d);
+            d
+        });
         match (decodes_result, entry) {
             (Ok(decodes), Some(entry)) => match entry.category {
                 FixtureCategory::Exact => {
@@ -349,6 +405,7 @@ fn run_synth_tier(
     decoder: &dyn DecoderUnderTest,
     workspace: &std::path::Path,
     manifest_path: &std::path::Path,
+    fp_filter: Option<&pancetta_research::FpFilter>,
 ) -> anyhow::Result<TierResult> {
     let entries = load_synth_corpus(workspace, manifest_path)?;
     // Group by snr_db bin.
@@ -360,7 +417,8 @@ fn run_synth_tier(
         let bin = bins.entry(bin_key).or_insert((0, 0));
         bin.0 += 1; // attempts
         match decoder.decode_wav(&e.wav_path) {
-            Ok(decodes) => {
+            Ok(mut decodes) => {
+                apply_fp_filter(fp_filter, &mut decodes);
                 if decodes
                     .iter()
                     .any(|d| d.message.contains(&e.encoded_message))
@@ -399,6 +457,7 @@ fn run_curated_tier(
     decoder: &dyn DecoderUnderTest,
     workspace: &std::path::Path,
     manifest_path: &std::path::Path,
+    fp_filter: Option<&pancetta_research::FpFilter>,
 ) -> anyhow::Result<TierResult> {
     let entries: Vec<CuratedEntry> = load_curated_corpus(manifest_path)?;
     let total = entries.len() as u32;
@@ -439,7 +498,8 @@ fn run_curated_tier(
         wsjtx_total += baseline_decodes.len() as u32;
         truth_decodes_total += baseline_decodes.len() as u32;
 
-        let our_decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        let mut our_decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        apply_fp_filter(fp_filter, &mut our_decodes);
         // Match: a baseline decode is "recovered" if we produced a message
         // containing the same callsign tokens. Conservative substring check.
         let mut recovered_here = 0u32;
@@ -653,11 +713,57 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // hb-052: build FP filter from configured sources, if any.
+    let fp_filter: Option<pancetta_research::FpFilter> = if args.fp_filter_baselines.is_some()
+        || args.fp_filter_rolling.is_some()
+        || args.fp_filter_adif.is_some()
+    {
+        let mut f = pancetta_research::FpFilter::new();
+        if let Some(ref dir) = args.fp_filter_baselines {
+            let resolved = if dir.is_absolute() {
+                dir.clone()
+            } else {
+                workspace.join(dir)
+            };
+            let n = f.extend_from_baselines(&resolved).with_context(|| {
+                format!("loading fp-filter baselines from {}", resolved.display())
+            })?;
+            eprintln!(
+                "fp-filter: loaded {n} baselines from {}, {} unique callsigns so far",
+                resolved.display(),
+                f.reference_size()
+            );
+        }
+        if let Some(ref adif) = args.fp_filter_adif {
+            let resolved = if adif.is_absolute() {
+                adif.clone()
+            } else {
+                workspace.join(adif)
+            };
+            let n = f
+                .extend_from_adif(&resolved)
+                .with_context(|| format!("loading fp-filter ADIF from {}", resolved.display()))?;
+            eprintln!(
+                "fp-filter: loaded {n} callsigns from ADIF {}, {} unique total",
+                resolved.display(),
+                f.reference_size()
+            );
+        }
+        if let Some(n) = args.fp_filter_rolling {
+            f = f.with_rolling_window(n);
+            eprintln!("fp-filter: rolling window of {n}");
+        }
+        Some(f)
+    } else {
+        None
+    };
+    let fp_filter_ref = fp_filter.as_ref();
+
     let mut tiers = BTreeMap::new();
     for tier_name in &args.tiers {
         match tier_name.as_str() {
             "fixtures" => {
-                let result = run_fixtures_tier(decoder.as_ref(), &workspace)?;
+                let result = run_fixtures_tier(decoder.as_ref(), &workspace, fp_filter_ref)?;
                 tiers.insert("fixtures".to_string(), result);
             }
             "synth-clean" => {
@@ -668,7 +774,8 @@ fn main() -> anyhow::Result<()> {
                     "synth manifest missing at {}; run `cargo run -p pancetta-research --bin gen-synth -- --config research/corpus/synth/manifests/clean.config.json --output research/corpus/synth/manifests/clean.manifest.json`",
                     manifest.display()
                 );
-                let result = run_synth_tier(decoder.as_ref(), &workspace, &manifest)?;
+                let result =
+                    run_synth_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
                 tiers.insert("synth-clean".to_string(), result);
             }
             "synth-doppler" => {
@@ -679,7 +786,8 @@ fn main() -> anyhow::Result<()> {
                     "doppler synth manifest missing at {}; run `cargo run --release -p pancetta-research --bin gen-synth -- --config research/corpus/synth/manifests/doppler.config.json --output research/corpus/synth/manifests/doppler.manifest.json`",
                     manifest.display()
                 );
-                let result = run_synth_tier(decoder.as_ref(), &workspace, &manifest)?;
+                let result =
+                    run_synth_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
                 tiers.insert("synth-doppler".to_string(), result);
             }
             "curated-hard-200" | "curated-hard-1000" | "wild-50" => {
@@ -697,7 +805,8 @@ fn main() -> anyhow::Result<()> {
                     "curated manifest missing at {}. Run: cargo run --release -p pancetta-research --bin curate -- --source-dir ~/.pancetta/recordings --output-prefix research/corpus/curated/ft8",
                     manifest.display()
                 );
-                let result = run_curated_tier(decoder.as_ref(), &workspace, &manifest)?;
+                let result =
+                    run_curated_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
                 tiers.insert(tier_name.to_string(), result);
             }
             other => anyhow::bail!("unknown tier '{other}'"),

@@ -26,3 +26,6 @@ pub mod synth;
 pub mod noise;
 
 pub mod curated;
+
+pub mod fp_filter;
+pub use fp_filter::FpFilter;
