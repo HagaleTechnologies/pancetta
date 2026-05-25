@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T21:15:00Z
+last_updated: 2026-05-25T21:40:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 58
-current_ratio: 0.065
+exploitation_run: 59
+current_ratio: 0.063
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -589,10 +589,10 @@ current_ratio: 0.065
     Follow-ups: hb-067 (mBP offset), hb-065 (adaptive GE — profile first),
     hb-064 (DIA trajectory features — could retrain OSD on layered trajs).
 
-### hb-064 — DIA-augmented OSD with iteration-trajectory features  [PRIORITY: 0.40, spawned 2026-05-25 from mr-003]
+### hb-064 — DIA-augmented OSD with iteration-trajectory features  [PRIORITY: 0.42, spawned 2026-05-25 from mr-003]
   mode: ft8
-  status: pending (plan-sized — needs training pipeline)
-  priority_score: 0.40
+  status: pending (plan-sized — needs training pipeline). NOW the correct OSD-speed lever: hb-065 profile (batch 11) shows TEP enumeration is 99.6% of OSD time, and this prunes TEP (paper: -97% TEP at SNR=2dB). Doubly motivated — layered BP (batch 10) changed the per-iter LLR trajectories the DIA model consumes, so pair with a retrain on layered trajectories.
+  priority_score: 0.42
   estimated_effort: 2-3 sessions (training data + model + integration)
   expected_delta: significant TEP-enumeration speedup (paper reports 97% reduction at SNR=2dB on CCSDS (128,64))
   defensible_prior: yes (arXiv:2404.14165; pancetta already has a DIA-style neural_osd)
@@ -610,10 +610,10 @@ current_ratio: 0.065
     (probably final-iter only). Then plan trajectory-capture data
     pipeline.
 
-### hb-065 — Adaptive Gaussian-Elimination removal in OSD  [PRIORITY: 0.45, spawned 2026-05-25 from mr-003]
+### hb-065 — Adaptive Gaussian-Elimination removal in OSD  [SHELVED 2026-05-25 — batch 11]
   mode: ft8
-  status: pending — needs profile first to confirm GE is OSD bottleneck
-  priority_score: 0.45
+  status: SHELVED — profiled: GE is 0.4% of OSD time (529ms vs 147s TEP on hard-200). Adaptive-GE removal is a no-op; TEP enumeration dominates → hb-064.
+  priority_score: 0.0
   estimated_effort: 1 session (profile + 1 session impl)
   expected_delta: OSD CPU cost reduction at unchanged FER (magnitude depends on GE fraction of OSD time)
   defensible_prior: partial (arXiv:2206.10957; gain depends on whether GE actually dominates pancetta's OSD-2)
