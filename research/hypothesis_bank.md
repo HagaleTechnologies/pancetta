@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T20:30:00Z
+last_updated: 2026-05-25T21:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 56
-current_ratio: 0.067
+exploitation_run: 57
+current_ratio: 0.066
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -89,10 +89,10 @@ current_ratio: 0.067
 
     Either path is hb-004's prerequisite. Then the gate sweep follows.
 
-### hb-010 — Spectrogram window function sweep  [PRIORITY: 0.47]
+### hb-010 — Spectrogram window function sweep  [SHELVED 2026-05-25 — batch 11]
   mode: ft8
-  status: pending
-  priority_score: 0.47
+  status: SHELVED — Hann (ft8_lib sin² parity) optimal; Blackman/Kaiser8 break a fixture, Kaiser5 ties. Code reverted.
+  priority_score: 0.0
   estimated_effort: 1 session
   expected_delta: +0.005 to +0.02 SNR@50% synth-clean
   defensible_prior: partial
