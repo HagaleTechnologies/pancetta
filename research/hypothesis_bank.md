@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T05:00:00Z
+last_updated: 2026-05-25T18:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 51
-current_ratio: 0.073
+exploitation_run: 52
+current_ratio: 0.071
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -308,25 +308,23 @@ current_ratio: 0.073
     Result drives the SHELVE of hb-050 and (by extension) hb-027.
     See research/experiments/2026-05-24-batch-4-unblock.md iter 1.
 
-### hb-054 — Costas 2-of-3 sync rescore (sync8 segment fallback)  [PRIORITY: 0.55, spawned 2026-05-25 from mr-002]
+### hb-054 — Costas 2-of-3 sync rescore (sync8 segment fallback)  [SHELVED 2026-05-25 — batch 10]
   mode: ft8
-  status: pending
-  priority_score: 0.55
+  status: SHELVED — max(syncf, syncs) adds FPs with zero recall gain on pancetta's busy-band corpus; code reverted
+  priority_score: 0.0
   estimated_effort: 1 session
-  expected_delta: small recall gain on signals with corrupted leading Costas (collisions, late start, ionospheric onset)
-  defensible_prior: yes — JTDX 2.2.159 ships this; agent confirmed clean attach to pancetta-ft8/src/sync.rs
+  expected_delta: REFUTED on hard-200 — -1 rec / +35 novel (both no-filter)
+  defensible_prior: was yes (JTDX 2.2.159 ships this); corpus-mismatch for pancetta
   wild_card: false
-  evidence_for:
-    - JTDX `lib/sync8.f90` aggregates Costas score as `sync2d(i,j) = max(syncf, syncs)` where syncf uses all three 7-symbol Costas blocks and syncs uses only the trailing two (B+C).
-    - On signals where the leading Costas block is corrupted, accepting the trailing-two-block score recovers an otherwise-lost candidate.
-    - pancetta-ft8/src/sync.rs already computes the three-block Costas score — only the aggregation rule changes.
   evidence_against:
-    - FP pressure bounded by LDPC+CRC downstream — likely low.
+    - Implemented faithfully (max(syncf, syncs), syncs = trailing blocks). hard-200 no-filter A/B: recovered 4377 → 4376 (-1, float noise), novel 1787 → 1822 (+35, +2.0% FPs). Zero real-decode recovery.
+    - max(syncf, syncs) only ever RAISES a candidate score → strictly relaxes the min_sync_score gate → surfaces noise candidates whose trailing two blocks align by chance; a fraction clear LDPC+CRC as CRC-14 collision FPs. Precision wall again (batches 2-8).
+    - On pancetta's full-slot busy-band captures the leading Costas block is rarely the limiter, so JTDX's "corrupted-leading-block rescue" finds nothing to rescue. JTDX's edge is weak single-station / slot-misaligned captures.
   notes: |
-    Implementation: ~30-line patch in sync.rs. CLI A/B over hard-1000
-    + wild-50. See research/experiments/2026-05-25-batch-5-plumbing.md
-    (mr-002 harvest) and JTDX commit log at
-    https://sourceforge.net/p/jtdx/code/ci/master/log/?path=/lib/sync8.f90
+    See research/experiments/2026-05-25-costas-two-of-three.md.
+    Spawned hb-070 (gated trailing-block rescue — only relax when the
+    leading block is *detectably* depressed; low priority, better
+    tested against a slot-misaligned corpus).
 
 ### hb-055 — Adaptive OSD depth based on signal context (ndeep 3→4→5)  [PRIORITY: 0.50, spawned 2026-05-25 from mr-002]
   mode: ft8
@@ -735,6 +733,25 @@ current_ratio: 0.073
     Implementation: change lookup_time_interp in pancetta-ft8/src/decoder.rs
     to convert dB→linear, interpolate, convert back. Re-sweep hb-044
     on hard-200 + synth-clean.
+
+### hb-070 — Gated trailing-block Costas rescue  [PRIORITY: 0.30, spawned 2026-05-25 from hb-054]
+  mode: ft8
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 1 session
+  expected_delta: small — bounded by # of hard-corpus signals with a genuinely corrupted leading Costas block (hb-054 says: very few)
+  defensible_prior: partial — fixes hb-054's over-relaxation, but the corpus may simply not need it
+  wild_card: false
+  evidence_for:
+    - hb-054 (batch 10) shelved the ungated max(syncf, syncs): it relaxes the sync gate for ALL candidates, adding +35 novel FPs on hard-200 with zero recall gain.
+    - A gated form would apply syncs ONLY when the leading block is detectably depressed (e.g. syncf < syncs - δ AND block[0] score << block[1..]), so a clean full-slot signal never sees the relaxed gate — eliminating the FP source while keeping the rescue for genuinely leading-corrupted signals.
+  evidence_against:
+    - hb-054 found essentially no real signals on hard-200/-1000 that need the rescue. Upside likely tiny on the curated tiers.
+    - Best motivated against a slot-misaligned / weak-single-station corpus (cf. hb-025: wild-50 captures at dt ∈ [-2.5,-1.4]) which pancetta doesn't yet have as a scored tier.
+  notes: |
+    Defer until a slot-misaligned or weak-single-station corpus exists
+    to score against. On the current curated tiers it will at best be a
+    no-op. See research/experiments/2026-05-25-costas-two-of-three.md.
 
 ### hb-049 — Remove dead `Ft8Config::min_snr_db` field  [WIN 2026-05-24]
   mode: ft8
