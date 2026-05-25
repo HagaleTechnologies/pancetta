@@ -375,10 +375,19 @@ impl Ft8Message {
                 // Reject unconditionally.
                 false
             }
+            // hb-058: contest-only message types pancetta never operates —
+            // ARRL RTTY Roundup (i3=3), ARRL Field Day (i3=0/n3=3,4), and
+            // the EU VHF contest (i3=2). Like Telemetry, they are a
+            // disproportionate CRC-14 false-positive source: on the curated
+            // hard-200 corpus they account for 433 novel (FP-likely) decodes
+            // and ZERO jt9-matched recoveries. pancetta is a general / DX
+            // station, not a contest logger, so rejecting them is pure
+            // precision with no recall cost. DXpedition is deliberately NOT
+            // rejected here — real DXpeditions are pancetta's highest-value
+            // hunt target, so its FPs are left for the callsign-continuity
+            // filter (hb-062) to handle downstream.
+            MessageType::Contest | MessageType::FieldDay | MessageType::RTTYRoundup => false,
             MessageType::Standard
-            | MessageType::Contest
-            | MessageType::FieldDay
-            | MessageType::RTTYRoundup
             | MessageType::NonStdCall
             | MessageType::DXpedition
             | MessageType::Extended => {
@@ -438,11 +447,12 @@ impl Ft8Message {
     /// ack. We accept it; the both-calls-valid gate above already
     /// filters the noise patterns most likely to land here.
     fn has_plausible_payload(&self) -> bool {
-        // Non-Standard contest formats (RTTYRoundup, Contest, FieldDay,
-        // DXpedition, NonStdCall, Extended) carry their own format-
-        // specific fields (contest_exchange, etc.) and don't use
-        // standard_type. Accept them once both calls have already been
-        // validated by the caller.
+        // Non-Standard formats that survive to here (DXpedition,
+        // NonStdCall, Extended) carry their own format-specific fields
+        // (contest_exchange, etc.) and don't use standard_type. Accept
+        // them once both calls have already been validated by the caller.
+        // (The contest types RTTYRoundup / Contest / FieldDay are rejected
+        // outright by is_plausible before reaching this helper — hb-058.)
         if !matches!(self.message_type, MessageType::Standard) {
             return true;
         }
@@ -2714,16 +2724,32 @@ mod tests {
     }
 
     #[test]
-    fn plausible_rttyroundup_passes_without_standard_type() {
-        // RTTYRoundup messages don't use standard_type — they have their
-        // own format-specific fields. Both calls must already be valid
-        // (the outer gate handles that).
-        let mut m = Ft8Message::default();
-        m.message_type = MessageType::RTTYRoundup;
-        m.standard_type = None;
-        m.from_callsign = Some("K1ABC".to_string());
-        m.to_callsign = Some("W1AW".to_string());
-        assert!(m.is_plausible(), "RTTYRoundup with valid calls should pass");
+    fn contest_only_types_rejected() {
+        // hb-058: contest-only message types pancetta never operates
+        // (RTTY Roundup, Field Day, EU VHF contest) are rejected outright,
+        // even with otherwise-valid callsigns — they are a major CRC-14
+        // false-positive source and produce zero real recoveries on the
+        // curated corpus. DXpedition is deliberately NOT rejected.
+        for ty in [
+            MessageType::RTTYRoundup,
+            MessageType::FieldDay,
+            MessageType::Contest,
+        ] {
+            let mut m = Ft8Message::default();
+            m.message_type = ty;
+            m.standard_type = None;
+            m.from_callsign = Some("K1ABC".to_string());
+            m.to_callsign = Some("W1AW".to_string());
+            assert!(!m.is_plausible(), "{ty:?} must be rejected (hb-058)");
+        }
+
+        // DXpedition with valid calls still passes (hunt-target preserved).
+        let mut dx = Ft8Message::default();
+        dx.message_type = MessageType::DXpedition;
+        dx.standard_type = None;
+        dx.from_callsign = Some("K1ABC".to_string());
+        dx.to_callsign = Some("W1AW".to_string());
+        assert!(dx.is_plausible(), "DXpedition with valid calls should pass");
     }
 
     #[test]
