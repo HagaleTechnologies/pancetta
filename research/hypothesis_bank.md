@@ -1,10 +1,10 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T21:40:00Z
+last_updated: 2026-05-25T21:50:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 59
+exploitation_run: 60
 current_ratio: 0.063
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
@@ -112,10 +112,10 @@ current_ratio: 0.063
     synth-clean SNR@50% and curated-hard-200 decode rate. Expect diminishing
     returns vs ft8_lib parity risk; worth a single experiment to close the question.
 
-### hb-011 — LDPC iteration count sweep (25 → 50)  [PRIORITY: 0.46]
+### hb-011 — LDPC iteration count sweep (25 → 50)  [SHELVED 2026-05-25 — batch 11, stale]
   mode: ft8
-  status: pending
-  priority_score: 0.46
+  status: SHELVED — already covered. LDPC_MAX_ITERATIONS is 100 (not 25); hb-005 graduated 50, hb-035 swept 50/75/100, batch 9 shipped 100.
+  priority_score: 0.0
   estimated_effort: 1 session
   expected_delta: +0.005 to +0.02 synth sensitivity at low SNR
   defensible_prior: partial
