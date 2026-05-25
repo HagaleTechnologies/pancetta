@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T21:00:00Z
+last_updated: 2026-05-25T21:15:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 57
-current_ratio: 0.066
+exploitation_run: 58
+current_ratio: 0.065
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -968,10 +968,10 @@ current_ratio: 0.066
     See research/experiments/2026-05-24-sync-cap-saturation.md.
     Successor: hb-042 (try a score-based cap instead of a count-based one).
 
-### hb-012 — Negative time offset extension (early-arriving DX signals)  [PRIORITY: 0.44]
+### hb-012 — Negative time offset extension (early-arriving DX signals)  [SHELVED 2026-05-25 — batch 11]
   mode: ft8
-  status: pending
-  priority_score: 0.44
+  status: SHELVED — premise invalid: corpus is 90s continuous multi-slot recordings; full-buffer Costas scan from t0=0 already covers all interior timing. Operational-only (unmeasurable in harness).
+  priority_score: 0.0
   estimated_effort: 1 session
   expected_delta: +0.01 to +0.03 real decode rate on DX recordings
   defensible_prior: partial
@@ -1021,9 +1021,9 @@ current_ratio: 0.066
     See research/experiments/2026-05-23-parity-gate-sweep.md.
     Successor: hb-041 (consider gate=0 to fully disable OSD fallback).
 
-### hb-015 — Doppler-resilient sync search (phase-coherent integration)  [PRIORITY: 0.38]
+### hb-015 — Doppler-resilient sync search (phase-coherent integration)  [PRIORITY: 0.38 — blocked on hb-073 real-Doppler corpus]
   mode: ft8
-  status: pending
+  status: pending — best validated against a REAL Doppler tier (hb-073); the crude synth-doppler model may understate the gain (lacks true spread). mr-006 (batch 11): bump to ~0.42 once hb-073 lands.
   priority_score: 0.38
   estimated_effort: 2 sessions
   expected_delta: +0.01 to +0.04 synth-doppler SNR@50%
@@ -1343,21 +1343,56 @@ search to in-repo sources.
     before it consumes an iter slot.
   expected_yield: prevents 1-3 wasted iters per harvest cycle
 
-### mr-006 — Real-world FT8 corpus expansion survey
-  status: pending
+### mr-006 — Real-world FT8 corpus expansion survey  [COMPLETED 2026-05-25 — batch 11]
+  status: COMPLETED — background-agent survey; "don't expand corpus for composite now"
   estimated_effort: 1-2 sessions
   source_type: external recordings + forum discussion
   source: pskreporter.info, WSJT-X user group, DXpedition recordings on YouTube/QRZ
-  method: |
-    Identify classes of WAVs not in our curated set: (a) DXpedition
-    pile-ups (extreme density), (b) contest weekends (heavy QSB +
-    deliberate fast operating), (c) polar/auroral paths (Doppler
-    spread), (d) high-power local interference, (e) HF mobile-station
-    rapid-flutter. Acquire 10-50 representative WAVs per class. Each
-    class becomes a candidate tier in the eval harness; pancetta's
-    weak spots on that class become hypotheses.
-  expected_yield: 2-3 new tier types + class-specific hypotheses
-  defensible_prior: partial — hard-1000 was curated for one type (busy NA bands); other classes likely expose different decoder weaknesses
+  outcome: |
+    Skeptical survey (research/experiments/2026-05-25-corpus-expansion-survey.md).
+    Headline: DON'T expand the corpus for composite this batch — the
+    existing tiers aren't the bottleneck (precision wall + no multi-pass/
+    QSO-context are). Findings:
+    - 3 of 5 stress classes DEAD on architecture-fit: (a) DXpedition
+      pileups now use SuperFox (a non-FT8 waveform pancetta CANNOT decode;
+      Hound uplinks are just ordinary FT8 already covered by hard-*);
+      (d) splatter has no decoder lever (FP filter already handles it);
+      (e) HF-mobile flutter is subsumed by Doppler.
+    - 2 task-named sources DISQUALIFIED: PSKReporter stores spots/metadata
+      only (NO audio archive); the arXiv 2512.23160 "Weak Signal" dataset
+      is spectrograms/vectors, NOT WAV.
+    - ONE worthwhile class: (c) real polar/auroral/TEP Doppler — obtainable
+      as native 12 kHz mono WAV via KiwiSDR + kiwirecorder.py (slot-aligned
+      via :12/:27/:42/:57 cron). Spawned hb-073.
+    - Slot-alignment: don't build a preprocessor — capture slot-aligned at
+      source; for already-misaligned audio the dormant time_padding plumb
+      (hb-040/hb-012) is the in-decoder fix, but its corpus payoff is ~0
+      (see hb-012 batch-11 shelve: continuous multi-slot recordings already
+      cover interior timing). The cheap always-do: capture future operator
+      recordings slot-aligned so the next "wild" data is usable.
+  defensible_prior: confirmed — busy-NA hard-* is one class, but most other
+    classes are non-actionable for pancetta's offline/pass-1/no-AP architecture
+
+### hb-073 — Real-Doppler eval tier (KiwiSDR auroral/TEP capture)  [PRIORITY: 0.40, spawned 2026-05-25 from mr-006]
+  mode: ft8
+  status: pending — enabler (acquire corpus), not a direct composite win
+  priority_score: 0.40
+  estimated_effort: 1-2 sessions (capture + manifest + baseline)
+  expected_delta: no direct composite move; replaces the crude synth-doppler model (5% weight) with REAL data and gives hb-015 a real denominator
+  defensible_prior: yes — synth-doppler is documented-crude (multiplicative cosine, not true Doppler); JTDX's known Doppler edge proves the gap is real and decoder-addressable
+  wild_card: false
+  evidence_for:
+    - mr-006: real auroral/TEP/EME paths produce genuine Doppler spread + drift the crude synth model lacks. KiwiSDR native output is 12 kHz mono WAV; kiwirecorder.py cron lands on slot boundaries.
+    - Unblocks hb-015 (frequency-ramp Costas sync) — the structural sync lever that survives the precision wall.
+  evidence_against:
+    - Doppler is only 5% of the composite; an enabler, not a near-term win.
+    - Requires being on-air during the right opening (auroral/TEP) — acquisition latency.
+  notes: |
+    Capture 20-50 slot-aligned 12 kHz WAVs from a high-latitude public
+    KiwiSDR on 6 m/10 m during an auroral or TEP opening; truth via jt9
+    baseline. Schedule only when there's appetite for the multi-session
+    hb-015 structural-sync line. See
+    research/experiments/2026-05-25-corpus-expansion-survey.md.
 
 ## Shelved (kept for reference)
 
