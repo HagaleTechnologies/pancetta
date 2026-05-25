@@ -100,6 +100,18 @@ impl CqdxCache {
     pub fn spot_groups(&self) -> &[SpotGroup] {
         &self.spot_groups
     }
+
+    /// hb-062: return the set of uppercase callsigns currently in the cache
+    /// (from spot_groups + rarity_scores). Used by CallsignContinuityFilter
+    /// as the cqdx source for the production FP filter.
+    pub fn spotted_callsigns(&self) -> std::collections::HashSet<String> {
+        let mut out: std::collections::HashSet<String> =
+            self.rarity_scores.keys().cloned().collect();
+        for g in &self.spot_groups {
+            out.insert(g.dx_call.to_uppercase());
+        }
+        out
+    }
 }
 
 /// Derive ham radio band name from frequency in Hz.
@@ -267,5 +279,19 @@ mod tests {
         assert!(cache.spot_groups().is_empty());
         cache.update_spot_groups(vec![sample_spot_group("3Y0J", Some(1))]);
         assert_eq!(cache.spot_groups().len(), 1);
+    }
+
+    #[test]
+    fn test_spotted_callsigns_returns_uppercase_callsigns() {
+        let mut cache = CqdxCache::new();
+        assert!(cache.spotted_callsigns().is_empty());
+        cache.update_spot_groups(vec![
+            sample_spot_group("3y0j", Some(1)),
+            sample_spot_group("k1abc", Some(500)),
+        ]);
+        let calls = cache.spotted_callsigns();
+        assert!(calls.contains("3Y0J"));
+        assert!(calls.contains("K1ABC"));
+        assert_eq!(calls.len(), 2);
     }
 }

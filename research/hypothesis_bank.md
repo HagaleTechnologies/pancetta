@@ -1,11 +1,18 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T02:00:00Z
+last_updated: 2026-05-25T03:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 43
-current_ratio: 0.085
+exploitation_run: 48
+current_ratio: 0.077
+# Batch 8 (2026-05-25): composite push (Option A).
+#   hb-062 parts 1+2+3 DONE (library + ADIF + cqdx integration; 13 tests)
+#     coordinator hot-path wire DEFERRED to batch 9
+#   hb-067 mBP offset: -48 novels at zero recall (small win, mechanism mismatch);
+#     NOT graduated (decision pending)
+#   hb-068 SHELVED — hb-044 regression is from interpolation itself, not sort
+#   Spawned hb-069 (linear-power interpolation for hb-044 rescue)
 # Batch 7 (2026-05-25): mr-001 follow-ups + mr-003 LDPC audit.
 #   hb-044 SHELVED for prod (conditional WIN on synth, -116 on hard-200)
 #   hb-046 SHELVED via architecture mismatch (3rd from mr-001)
@@ -585,24 +592,53 @@ current_ratio: 0.085
     absorbing-set/trapping-set patterns. Plan-sized; defer until
     hb-063 + hb-065 + hb-067 are exhausted.
 
-### hb-067 — mBP offset parameter for OSD pre-conditioning  [PRIORITY: 0.50, spawned 2026-05-25 from mr-003]
+### hb-067 — mBP offset parameter for OSD pre-conditioning  [SOFT WIN 2026-05-25 — not graduated]
   mode: ft8
-  status: pending
-  priority_score: 0.50
-  estimated_effort: 1 session
-  expected_delta: claim is order-(m−1) OSD reaches order-m performance with slight BP overhead — could let pancetta drop OSD-2 → OSD-1
-  defensible_prior: yes (arXiv:2306.00443)
+  status: tested — small precision finding, mechanism mismatch
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: -3 to -48 novels at zero recall cost (sweep result)
+  defensible_prior: turned out partially right (paper's mechanism doesn't match observed behavior)
   wild_card: false
-  evidence_for:
-    - Add a fixed offset to BP messages before OSD invocation; tunable per code structure.
-    - Small code surface, no NN, no training data.
-    - Could halve OSD trial count (OSD-1: ~91 patterns vs OSD-2: ~4k).
-  evidence_against:
-    - Offset value likely needs per-code tuning sweep.
-    - May interact with hb-014 parity gate tuning.
+  outcomes: |
+    Batch 8 iter 4 (2026-05-25) implemented + swept on hard-200:
+      bp_offset=0.5: 4365 rec / 949 novel (Δ -3)
+      bp_offset=1.0: 4365 rec / 932 novel (Δ -20)
+      bp_offset=2.0: 4365 rec / 920 novel (Δ -32)
+      bp_offset=4.0: 4365 rec / 904 novel (Δ -48)
+    Recall preserved at all values. Novel monotonically decreases.
+    BUT: mechanism is not the paper's "more flip patterns" — the
+    offset interacts with the parity gate (which uses offset-adjusted
+    LLRs), effectively tightening the gate. Not the intended lever.
   notes: |
-    Source: arXiv:2306.00443 (Liang, Lau et al., 2023). Implementation
-    in BP→OSD handoff in decoder.rs. CLI flag --bp-offset N for sweep.
+    Library + CLI in place. Default 0.0 (no behavior change).
+    Decision: don't graduate yet — mechanism mismatch suggests this
+    interacts with hb-014. Spawn hb-067-followup if the parity-gate
+    interaction needs investigating. Could combine with FP filter
+    for additive precision.
+
+### hb-068 — hb-044 variant (no sort-score inflation)  [SHELVED 2026-05-25]
+  mode: ft8
+  status: SHELVED — variant d doesn't fix hb-044 regression
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: REFUTED — hb-068 produces -117 recovered (same as hb-044's -116)
+  defensible_prior: turned out wrong (displacement was not the cause)
+  wild_card: false
+  outcomes: |
+    Batch 8 iter 5 (2026-05-25): variant (d) implemented — keep
+    integer-bin sync_score for sort, use fractional offset for
+    symbol extraction. Result essentially identical to hb-044
+    original: 4248 rec (vs 4249) / 914 novel (vs 925). synth-clean
+    SNR@90% gain still -18 → -20 dB.
+    The hard-200 regression is NOT from sort-displacement. It's
+    from the spectrogram interpolation itself perturbing already-
+    correctly-aligned candidates.
+  notes: |
+    SHELVED. Reverted implementation to original hb-044 (refined
+    score for sort) since neither variant graduates and both have
+    flag default false. Spawn hb-069 for interpolation-in-linear-
+    power-space as a different angle on the problem.
 
 ### hb-068 — hb-044 conditional/scaled refinement variants  [PRIORITY: 0.45, spawned 2026-05-25 from hb-044 mixed result]
   mode: ft8
@@ -624,37 +660,55 @@ current_ratio: 0.085
     Variant (d) is the most principled — eliminates the displacement
     mechanism. Try first.
 
-### hb-062 — cqdx.io production FP-filter source  [PRIORITY: 0.60, spawned 2026-05-25 from hb-052]
+### hb-062 — cqdx.io production FP-filter source  [LIBRARY DONE 2026-05-25; coordinator wire pending]
   mode: ft8 (production wiring)
-  status: pending
+  status: library complete (parts 1+2+3); coordinator hot-path wire deferred to batch 9
   priority_score: 0.60
-  estimated_effort: 2-3 sessions
+  estimated_effort: 1 session remaining (coordinator wire + cold-start config + integration test)
   expected_delta: unblocks hb-052 production deployment; enables hb-053 graduations (gate=6+filter, iters=100+filter)
-  defensible_prior: yes — batch 6 showed operator-ADIF + rolling alone is insufficient (65% recall on hard-200)
+  defensible_prior: yes
+  wild_card: false
+  outcomes_so_far: |
+    Batch 8 iters 1-3:
+    - pancetta-cqdx: CqdxCache.spotted_callsigns() returns
+      HashSet<String> from current spot_groups + rarity_scores
+    - pancetta-qso/src/callsign_continuity.rs: CallsignContinuityFilter
+      struct (static_ref + rolling RwLock<VecDeque> + cqdx RwLock<HashSet>),
+      strict + lenient modes, ADIF + iter + cqdx sources, accept(msg).
+      Thread-safe via RwLock.
+    - build_filter helper combines all sources from optional ADIF path
+      + initial cqdx snapshot + capacity/threshold params
+    - 13 unit tests pass
+  notes: |
+    Remaining work (batch 9 iter 1):
+    1. New pancetta-config field Ft8FilterConfig (enabled, adif_path,
+       rolling_cap, cold_start_threshold)
+    2. Coordinator startup: build_filter() once + Arc<...>
+    3. Hook periodic cqdx-spot refresh to update_cqdx_spotted
+    4. Apply filter in pancetta/src/coordinator/ft8.rs:178 between
+       decoded_messages merge and broadcast loop
+    5. End-to-end integration test on a real WAV recording
+    See research/experiments/2026-05-25-batch-8-composite-push.md.
+
+### hb-069 — hb-044 interpolation in linear power space  [PRIORITY: 0.35, spawned 2026-05-25 from hb-068 finding]
+  mode: ft8
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 1 session
+  expected_delta: rescue hb-044's synth-clean SNR@90% gain at lower hard-200 cost
+  defensible_prior: partial — hb-044 spectrogram interpolation is in dB space; linear-power interpolation may preserve symbol energies better
   wild_card: false
   evidence_for:
-    - hb-052 production blocked: operator-ADIF top-100 + rolling-window=200 = 65% recall on hard-200 (need ~99% for production); the missing source is cqdx.io recent-spots cache.
-    - cqdx.io provides near-real-time global callsign coverage; likely thousands of unique callsigns vs the ~3000 in corpus baselines.
-    - Combined (operator-ADIF + rolling + cqdx) should approximate the corpus-baseline coverage that the MVP showed at 99.98% recall.
-    - Once shipped, two hb-053 revisits become graduatable (gate=6, iters=100) for ~+0.001 composite + meaningful precision.
+    - hb-068 (batch 8 iter 5) confirmed the hard-200 regression is from interpolation perturbing already-correctly-aligned candidates, NOT from sort-displacement.
+    - Linear interpolation in dB space is non-linear in actual power; small fractional shifts can disproportionately affect log values near the noise floor.
+    - Converting to linear (10^(dB/10)) before interpolation, then back to dB, may preserve symbol energy more accurately.
   evidence_against:
-    - cqdx.io API adds latency to decode pipeline — must cache aggressively.
-    - Cold-start handling: first N decodes have an empty reference; need a lenient mode (skip filter) until reference is populated.
-    - Requires production code touches across pancetta-cqdx, pancetta-qso, pancetta/coordinator.
+    - 2x more pow/log operations per interpolated lookup → meaningful CPU cost.
+    - May still regress hard-200 if the issue is more fundamental than just interp space.
   notes: |
-    Design touchpoints:
-    1. pancetta-cqdx: add a CallsignSpotsCache that pulls recent
-       spots periodically (every N minutes) and exposes a HashSet<String>.
-    2. pancetta-qso: add a CallsignContinuityFilter that unions
-       (ADIF from disk + rolling window + cqdx cache) into a single
-       reference set.
-    3. pancetta/coordinator/pipeline.rs: apply filter post-decode
-       before emission; emit filtered-out decodes to a separate
-       observability stream for review.
-    4. Cold-start: skip filter for first 60 seconds OR until
-       reference has >100 callsigns.
-    See research/experiments/2026-05-25-batch-6-fp-filter.md for
-    the full MVP-to-production analysis.
+    Implementation: change lookup_time_interp in pancetta-ft8/src/decoder.rs
+    to convert dB→linear, interpolate, convert back. Re-sweep hb-044
+    on hard-200 + synth-clean.
 
 ### hb-049 — Remove dead `Ft8Config::min_snr_db` field  [WIN 2026-05-24]
   mode: ft8

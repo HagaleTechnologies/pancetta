@@ -43,6 +43,8 @@ struct Args {
     max_parity_errors_for_osd: Option<usize>,
     /// hb-044: enable Costas time-axis parabolic refinement.
     sync_time_interpolation: Option<bool>,
+    /// hb-067: mBP offset value (subtract from |LLR| before OSD).
+    bp_offset_subtract: Option<f32>,
     /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
     two_stage: Option<bool>,
     /// hb-004: when Some, an ApContext is built and passed to
@@ -87,6 +89,7 @@ impl Args {
         let mut time_range: Option<f64> = None;
         let mut max_parity_errors_for_osd: Option<usize> = None;
         let mut sync_time_interpolation: Option<bool> = None;
+        let mut bp_offset_subtract: Option<f32> = None;
         let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
@@ -203,6 +206,13 @@ impl Args {
                 "--sync-time-interpolation" => {
                     sync_time_interpolation = Some(true);
                 }
+                "--bp-offset-subtract" => {
+                    bp_offset_subtract = Some(
+                        iter.next()
+                            .context("--bp-offset-subtract needs a value")?
+                            .parse()?,
+                    );
+                }
                 "--two-stage" => {
                     two_stage = Some(true);
                 }
@@ -294,6 +304,7 @@ impl Args {
             time_range,
             max_parity_errors_for_osd,
             sync_time_interpolation,
+            bp_offset_subtract,
             two_stage,
             ap_my_call,
             ap_recent_calls,
@@ -686,6 +697,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(on) = args.sync_time_interpolation {
                 d = d.with_sync_time_interpolation(on);
+            }
+            if let Some(v) = args.bp_offset_subtract {
+                d = d.with_bp_offset_subtract(v);
             }
             if let Some(on) = args.two_stage {
                 d = d.with_two_stage(on);

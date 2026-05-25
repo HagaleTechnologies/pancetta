@@ -206,6 +206,12 @@ pub struct Ft8Config {
     /// part 2 applies it in symbol extraction.
     /// Default false. WSJT-X-Improved v3.1.0 ships this.
     pub sync_time_interpolation: bool,
+
+    /// hb-067 (arXiv:2306.00443): mBP offset — subtract this magnitude
+    /// from each LLR before invoking OSD. Reduces BP's confidence so
+    /// OSD considers more flip patterns. Default 0.0 (no behavior change).
+    /// Sweep candidate range: 0.5 to 4.0.
+    pub bp_offset_subtract: f32,
 }
 
 impl Default for Ft8Config {
@@ -230,6 +236,7 @@ impl Default for Ft8Config {
             block_score_rerank: true,
             max_parity_errors_for_osd: 2,
             sync_time_interpolation: false,
+            bp_offset_subtract: 0.0,
         }
     }
 }
@@ -362,7 +369,8 @@ impl Ft8Decoder {
             config.ldpc_iterations,
             config.osd_depth.map(|d| OsdConfig { max_depth: d }),
         )?
-        .with_max_parity_errors_for_osd(config.max_parity_errors_for_osd);
+        .with_max_parity_errors_for_osd(config.max_parity_errors_for_osd)
+        .with_bp_offset_subtract(config.bp_offset_subtract);
 
         // Pre-compute FFT plan and Hann window for symbol extraction
         let sps = protocol_params.samples_per_symbol(SAMPLE_RATE);
@@ -576,6 +584,7 @@ impl Ft8Decoder {
                 llr_target_variance: self.config.llr_target_variance,
                 adaptive_ldpc_iters: self.config.adaptive_ldpc_iters,
                 max_parity_errors_for_osd: self.config.max_parity_errors_for_osd,
+                bp_offset_subtract: self.config.bp_offset_subtract,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -616,13 +625,16 @@ impl Ft8Decoder {
                         };
                         let ldpc_low = LdpcDecoder::new_with_osd(iters_low, osd_cfg)
                             .expect("LDPC decoder init failed")
-                            .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd);
+                            .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
+                            .with_bp_offset_subtract(ctx.bp_offset_subtract);
                         let ldpc_mid = LdpcDecoder::new_with_osd(iters_mid, osd_cfg)
                             .expect("LDPC decoder init failed")
-                            .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd);
+                            .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
+                            .with_bp_offset_subtract(ctx.bp_offset_subtract);
                         let ldpc_high = LdpcDecoder::new_with_osd(iters_high, osd_cfg)
                             .expect("LDPC decoder init failed")
-                            .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd);
+                            .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
+                            .with_bp_offset_subtract(ctx.bp_offset_subtract);
                         let fft_buffer = vec![Complex::new(0.0, 0.0); sps];
                         (ldpc_low, ldpc_mid, ldpc_high, fft_buffer)
                     },
@@ -1226,7 +1238,12 @@ impl Ft8Decoder {
                     if score > self.config.min_sync_score {
                         // hb-044: optional parabolic refinement of the
                         // time-bin peak. Costs 2 extra score evaluations
-                        // per kept candidate.
+                        // per kept candidate. Both hb-044 (sort by
+                        // refined score) and hb-068 (sort by integer-bin
+                        // score; only use fractional offset in symbol
+                        // extraction) were tested batch 7-8 and BOTH
+                        // regressed hard-200. Default off; kept for
+                        // research only.
                         let (refined_score, time_refinement) =
                             if self.config.sync_time_interpolation
                                 && t0 > 0
@@ -2404,6 +2421,8 @@ struct DecodeContext<'a> {
     adaptive_ldpc_iters: bool,
     /// Max parity errors tolerated before invoking OSD fallback. hb-014.
     max_parity_errors_for_osd: usize,
+    /// hb-067 mBP offset (subtract from |LLR| before OSD).
+    bp_offset_subtract: f32,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -3464,6 +3483,12 @@ struct LdpcDecoder {
     /// Max unsatisfied parity checks tolerated before invoking OSD.
     /// 4 = production default; hb-014 sweep candidate.
     max_parity_errors_for_osd: usize,
+    /// hb-067 mBP offset: subtract this magnitude from each LLR before
+    /// invoking OSD. Reduces BP's confidence → OSD considers more flip
+    /// patterns. Default 0.0 = no offset (no behavior change).
+    /// Per arXiv:2306.00443 — claim is order-(m-1) OSD reaches order-m
+    /// performance with small offset.
+    bp_offset_subtract: f32,
 }
 
 impl LdpcDecoder {
@@ -3495,6 +3520,7 @@ impl LdpcDecoder {
             algorithm: LdpcAlgorithm::SumProduct,
             osd: None,
             max_parity_errors_for_osd: 4,
+            bp_offset_subtract: 0.0,
         })
     }
 
@@ -3506,6 +3532,11 @@ impl LdpcDecoder {
 
     fn with_max_parity_errors_for_osd(mut self, n: usize) -> Self {
         self.max_parity_errors_for_osd = n;
+        self
+    }
+
+    fn with_bp_offset_subtract(mut self, v: f32) -> Self {
+        self.bp_offset_subtract = v.max(0.0);
         self
     }
 
@@ -3540,7 +3571,18 @@ impl LdpcDecoder {
 
         // BP did not converge — try OSD fallback if available.
         if let Some(ref osd) = self.osd {
-            let llr_arr: &[f32; 174] = decoded_llrs[..174].try_into().unwrap();
+            // hb-067: optional mBP offset — reduce BP-LLR magnitudes
+            // before OSD invocation so OSD considers more flip patterns
+            // (per arXiv:2306.00443). bp_offset_subtract=0 → no change.
+            let llrs_for_osd: Vec<f32> = if self.bp_offset_subtract > 0.0 {
+                decoded_llrs[..174]
+                    .iter()
+                    .map(|&v| v.signum() * (v.abs() - self.bp_offset_subtract).max(0.0))
+                    .collect()
+            } else {
+                decoded_llrs[..174].to_vec()
+            };
+            let llr_arr: &[f32; 174] = llrs_for_osd[..174].try_into().unwrap();
             let parity_errors = self.count_parity_errors(llr_arr);
 
             // Parity gate for OSD: tunable via Ft8Config::max_parity_errors_for_osd.

@@ -170,6 +170,9 @@ pub mod qso_manager;
 pub mod states;
 pub mod statistics;
 
+pub mod callsign_continuity;
+pub use callsign_continuity::{build_filter, CallsignContinuityFilter};
+
 // Common error type for the entire library
 use crate::async_database::AsyncDatabaseError;
 use crate::async_logger::AsyncLoggerError;

@@ -172,6 +172,13 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-067: mBP offset — subtract this magnitude from each LLR
+    /// before invoking OSD. 0.0 = no offset.
+    pub fn with_bp_offset_subtract(mut self, v: f32) -> Self {
+        self.config.bp_offset_subtract = v;
+        self
+    }
+
     /// hb-046: enable two-stage decoding. When `on`, decode_wav runs a
     /// CHEAP pass first (relaxed sync_cap, no OSD, fewer LDPC iters)
     /// then the standard PRODUCTION pass on the same audio, unioning
