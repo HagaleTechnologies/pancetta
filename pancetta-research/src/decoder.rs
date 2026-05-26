@@ -192,6 +192,13 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-074: when paired with cross-cycle averaging, use the coherent
+    /// (complex-spectrogram, phase-aligned) variant instead of non-coherent.
+    pub fn with_cross_cycle_coherent(mut self, on: bool) -> Self {
+        self.config.cross_cycle_coherent = on;
+        self
+    }
+
     /// hb-046: enable two-stage decoding. When `on`, decode_wav runs a
     /// CHEAP pass first (relaxed sync_cap, no OSD, fewer LDPC iters)
     /// then the standard PRODUCTION pass on the same audio, unioning

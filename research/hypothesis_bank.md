@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T22:30:00Z
+last_updated: 2026-05-26T15:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 61
-current_ratio: 0.062
+exploitation_run: 62
+current_ratio: 0.061
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -368,10 +368,10 @@ current_ratio: 0.062
     to JTDX's full headline gain, now defensibly motivated against a
     measured non-coherent baseline.
 
-### hb-074 — Complex-spectrogram coherent cross-cycle averaging  [PRIORITY: 0.50 plan-sized, spawned 2026-05-25 from hb-056]
+### hb-074 — Complex-spectrogram coherent cross-cycle averaging  [SHELVED 2026-05-26 — infrastructure kept flag-gated]
   mode: ft8
-  status: pending — plan-sized (retain-phase spectrogram is the prereq)
-  priority_score: 0.50
+  status: SHELVED — coherent loses 10 hard-200 recovered vs non-coherent. Phase-estimate noise on marginal candidates raises sum variance; inter-slot phase isn't reliably preserved in real-world audio. Math is correct (unit test 3 dB at N=2); the gain doesn't transfer to the operator corpus.
+  priority_score: 0.0
   estimated_effort: 3-5 sessions (large structural change to the spectrogram)
   expected_delta: ~2-3× the non-coherent hb-056 gain (i.e. ~+0.0016-0.0024 composite) if JTDX-class coherent integration carries over; uncertain
   defensible_prior: yes — JTDX's headline sensitivity edge IS the coherent variant; pancetta now has a measured non-coherent baseline (+0.000816) to compare against.
@@ -392,6 +392,70 @@ current_ratio: 0.062
     the complex view. Eval the same way as hb-056 (4-way hard-200 A/B
     + full 5-tier). Schedule only when there's appetite for a multi-
     session structural rework.
+
+    SHELVE outcome 2026-05-26: implemented end-to-end (Spectrogram::complex,
+    par_extract_complex_symbols_from_spectrogram, estimate_candidate_phase_rotor,
+    coherent_sum_complex_to_db, --cross-cycle-coherent flag). Unit test
+    test_coherent_phase_rotor_and_gain confirms 3 dB N=2 gain on aligned
+    synthetics. hard-200 A/B (vs production non-coherent): -10 recovered
+    both no-filter and filtered. Diagnosis: noisy phase estimates on the
+    marginal candidates we're trying to rescue raise sum variance; inter-
+    slot phase not preserved in real-world TX/RX/propagation. See
+    research/experiments/2026-05-26-hb-074-coherent-cross-cycle.md.
+    Infrastructure kept flag-gated (default off). Spawned hb-075/076/077.
+
+### hb-075 — Phase-magnitude-weighted coherent cross-cycle sum  [PRIORITY: 0.30, spawned 2026-05-26 from hb-074]
+  mode: ft8
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 1 session (builds on hb-074 infra)
+  expected_delta: bounded loss vs non-coherent — and possibly a small win if it discounts noisy-rotor members enough; uncertain
+  defensible_prior: yes (paper-standard MRC-style weighting addresses hb-074's exact failure mode)
+  wild_card: false
+  evidence_for:
+    - hb-074 showed that bad phase estimates on marginal members raise variance and drop recall. Weighting each member's contribution by the magnitude of its un-normalised Costas accumulator (`|Σ cs[costas][expected_tone]|` before unit-magnitude division) is the canonical MRC fix: strong rotors count fully, weak rotors count weakly.
+    - The hb-074 infrastructure already computes the un-normalised accumulator; only the sum step changes.
+  evidence_against:
+    - If even the strong-rotor members have unreliable inter-slot phase (hb-074's diagnosis #2), this won't recover the gain — just bounds the loss.
+  notes: |
+    Replace `acc / mag` in estimate_candidate_phase_rotor with returning
+    both the rotor and `mag`; then in coherent_sum_complex_to_db, weight
+    each member by its rotor magnitude. Eval as 4-way A/B vs both
+    non-coherent and the unweighted hb-074 baseline.
+
+### hb-076 — Per-Costas-block phase recovery  [PRIORITY: 0.30, spawned 2026-05-26 from hb-074]
+  mode: ft8
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 1 session (builds on hb-074 infra)
+  expected_delta: targets per-slot phase drift not captured by a single global rotor; bounded
+  defensible_prior: partial — 3 Costas blocks per slot give independent phase estimates that can model drift
+  wild_card: false
+  evidence_for:
+    - hb-074's global rotor averages 21 Costas samples across the whole slot, missing intra-slot phase drift (LO drift, Doppler accumulation across the 12.64 s message).
+    - Three per-block rotors (start/middle/end) let symbols rotate against their nearest block — robust against linear drift.
+  evidence_against:
+    - 7 samples per block estimates noisier than 21-sample global; the noise gain may swamp the drift correction at low SNR. Same per-candidate failure mode hb-074 hit.
+  notes: |
+    Three rotors r_start, r_mid, r_end; per-symbol rotor chosen by
+    proximity to nearest Costas block. Variant: linearly interpolate
+    rotors across symbol positions for smooth drift correction.
+
+### hb-077 — Phase-coherent SDR-IQ eval corpus  [PRIORITY: 0.25, spawned 2026-05-26 from hb-074]
+  mode: ft8
+  status: pending (hardware/operator dependent)
+  priority_score: 0.25
+  estimated_effort: 2-3 sessions (capture + manifest + truth) — operator-pending
+  expected_delta: diagnostic — tests whether the binding constraint is hb-074's algorithm or pancetta's typical corpus's phase-non-coherence
+  defensible_prior: yes — direct SDR-IQ capture (no audio path) guarantees phase coherence end-to-end
+  wild_card: false
+  notes: |
+    Capture a small (10-50 WAV) corpus from a phase-coherent SDR (e.g.,
+    Kiwi IQ, hackrf, RTL-SDR with cohrent reference) of a known stable
+    transmitter calling repeated CQs. Re-run hb-074 (and hb-075, hb-076)
+    against that corpus. If coherent wins there but loses on the operator
+    corpus, the algorithm is sound and the operator corpus is the limit;
+    if coherent loses everywhere, the approach is closed.
 
 ### hb-057 — Median-filter DT averaging for sync/AP  [PRIORITY: 0.35, spawned 2026-05-25 from mr-002]
   mode: ft8

@@ -230,6 +230,17 @@ pub struct Ft8Config {
     /// See docs/superpowers/specs/2026-05-25-cross-cycle-averaging-design.md.
     pub cross_cycle_averaging: bool,
 
+    /// hb-074: when both `cross_cycle_averaging` AND this flag are true,
+    /// the pass becomes coherent — the spectrogram retains complex FFT
+    /// bins, each candidate's phase rotor is estimated from the 21 known
+    /// Costas symbols, the complex symbol amplitudes are rotated to a
+    /// common phase, then summed across cycles; `|sum|²` produces the
+    /// averaged power. Coherent integration of N aligned signals improves
+    /// SNR by N (not √N), so the expected gain is ~2× the non-coherent
+    /// path at N=2. Default false — needs the complex spectrogram which
+    /// costs ~2× memory in the spectrogram pass.
+    pub cross_cycle_coherent: bool,
+
     /// hb-063 (arXiv:2410.13131, Hocevar 2004): use a layered (row-
     /// sequential) belief-propagation schedule instead of the flooding
     /// schedule. Layered BP updates check nodes one at a time and folds
@@ -278,6 +289,9 @@ impl Default for Ft8Config {
             // alone. Synth-clean and fixtures are single-slot so groups
             // never form (no-op).
             cross_cycle_averaging: true,
+            // hb-074: coherent variant opt-in. Off until the A/B shows
+            // coherent integration recovers gain over non-coherent.
+            cross_cycle_coherent: false,
         }
     }
 }
@@ -291,6 +305,12 @@ struct Spectrogram {
     /// Power values [time_step][freq_sub][freq_bin]
     /// With freq_osr=2: freq_sub 0 = even bins (0, 2, 4, ...), freq_sub 1 = odd bins (1, 3, 5, ...)
     power: Vec<Vec<Vec<f64>>>,
+    /// hb-074: optional complex FFT bins, same shape as `power`. Populated
+    /// only when `Ft8Config::cross_cycle_coherent` is true; required for
+    /// coherent cross-cycle averaging (phase recovery from Costas, then
+    /// complex sum across cycles). When `None`, the cross-cycle pass falls
+    /// back to the non-coherent (power-only) path.
+    complex: Option<Vec<Vec<Vec<Complex<f64>>>>>,
     /// Number of time steps
     num_steps: usize,
     /// Number of frequency bins per sub-bin (in 6.25 Hz units)
@@ -1155,6 +1175,14 @@ impl Ft8Decoder {
         let window = &self.spectrogram_window;
 
         let mut power = Vec::with_capacity(num_steps);
+        // hb-074: retain complex bins only when the coherent cross-cycle
+        // path will consume them (doubles the spectrogram's memory).
+        let want_complex = self.config.cross_cycle_coherent;
+        let mut complex: Option<Vec<Vec<Vec<Complex<f64>>>>> = if want_complex {
+            Some(Vec::with_capacity(num_steps))
+        } else {
+            None
+        };
         let mut fft_buffer = vec![Complex::new(0.0, 0.0); nfft];
         // Persistent sliding frame buffer (matches ft8_lib's me->last_frame)
         let mut last_frame = vec![0.0f64; nfft];
@@ -1184,26 +1212,50 @@ impl Ft8Decoder {
 
                 // Organize into freq_osr sub-bins (matches monitor.c lines 164-188)
                 let mut sub_power = Vec::with_capacity(freq_osr);
+                let mut sub_complex: Option<Vec<Vec<Complex<f64>>>> = if want_complex {
+                    Some(Vec::with_capacity(freq_osr))
+                } else {
+                    None
+                };
                 for fs in 0..freq_osr {
                     let mut row = Vec::with_capacity(num_bins);
+                    let mut crow: Option<Vec<Complex<f64>>> = if want_complex {
+                        Some(Vec::with_capacity(num_bins))
+                    } else {
+                        None
+                    };
                     for bin in 0..num_bins {
                         let src_bin = bin * freq_osr + fs;
                         if src_bin < nfft / 2 + 1 {
-                            let mag2 = fft_buffer[src_bin].norm_sqr();
+                            let cval = fft_buffer[src_bin];
+                            let mag2 = cval.norm_sqr();
                             let db = 10.0 * (1e-12f64 + mag2).log10();
                             row.push(db);
+                            if let Some(c) = crow.as_mut() {
+                                c.push(cval);
+                            }
                         } else {
                             row.push(-120.0);
+                            if let Some(c) = crow.as_mut() {
+                                c.push(Complex::new(0.0, 0.0));
+                            }
                         }
                     }
                     sub_power.push(row);
+                    if let (Some(sc), Some(cr)) = (sub_complex.as_mut(), crow) {
+                        sc.push(cr);
+                    }
                 }
                 power.push(sub_power);
+                if let (Some(c), Some(sc)) = (complex.as_mut(), sub_complex) {
+                    c.push(sc);
+                }
             }
         }
 
         Ok(Spectrogram {
             power,
+            complex,
             num_steps,
             num_bins,
             freq_osr,
@@ -1781,15 +1833,57 @@ impl Ft8Decoder {
         let spec_step = sps / TIME_OSR;
         let groups = group_for_cross_cycle(candidates);
 
+        // hb-074: when the coherent flag is on AND the spectrogram retains
+        // complex bins (only when cross_cycle_coherent was set at decode
+        // start), the pass takes a phase-aligned coherent sum path; falls
+        // back to the non-coherent (hb-056) path otherwise.
+        let coherent = self.config.cross_cycle_coherent && spectrogram.complex.is_some();
+
         let mut decoded: Vec<DecodedMessage> = Vec::new();
         for group in groups {
-            // Extract each member's tone magnitudes (dB) from the spectrogram,
-            // then sum across members in LINEAR power and convert back to dB.
-            let members: Vec<Vec<[f64; NUM_TONES]>> = group
-                .iter()
-                .map(|&i| par_extract_symbols_from_spectrogram(pp, spectrogram, &candidates[i]))
-                .collect();
-            let avg_mags = sum_tone_magnitudes_linear(&members, pp.num_symbols);
+            // Combine the group's per-symbol per-tone energies into a single
+            // averaged tone-magnitude table. Coherent path: extract complex
+            // symbols, estimate each candidate's phase rotor from Costas,
+            // align by multiplying with conj(rotor), sum complex, |sum|² →
+            // dB. Non-coherent path: dB → linear power → sum → dB.
+            let avg_mags = if coherent {
+                let mut aligned: Vec<Vec<[Complex<f64>; NUM_TONES]>> =
+                    Vec::with_capacity(group.len());
+                for &i in &group {
+                    let Some(cs) = par_extract_complex_symbols_from_spectrogram(
+                        pp,
+                        spectrogram,
+                        &candidates[i],
+                    ) else {
+                        continue;
+                    };
+                    let Some(rotor) = estimate_candidate_phase_rotor(pp, &cs) else {
+                        continue;
+                    };
+                    let conj_rotor = rotor.conj();
+                    let rotated: Vec<[Complex<f64>; NUM_TONES]> = cs
+                        .into_iter()
+                        .map(|mut row| {
+                            for t in 0..NUM_TONES {
+                                row[t] *= conj_rotor;
+                            }
+                            row
+                        })
+                        .collect();
+                    aligned.push(rotated);
+                }
+                if aligned.len() < 2 {
+                    // Lost too many to bad phase estimates; nothing to coherent-sum.
+                    continue;
+                }
+                coherent_sum_complex_to_db(&aligned, pp.num_symbols)
+            } else {
+                let members: Vec<Vec<[f64; NUM_TONES]>> = group
+                    .iter()
+                    .map(|&i| par_extract_symbols_from_spectrogram(pp, spectrogram, &candidates[i]))
+                    .collect();
+                sum_tone_magnitudes_linear(&members, pp.num_symbols)
+            };
 
             // LLR → LDPC → CRC. Reuses the existing decoder; if BP fails
             // OR CRC fails OR message is implausible, the averaged
@@ -3220,6 +3314,35 @@ fn group_for_cross_cycle(candidates: &[CostasCandidate]) -> Vec<Vec<usize>> {
     groups
 }
 
+/// hb-074: coherent complement of `sum_tone_magnitudes_linear`. Members
+/// are already phase-aligned (each multiplied by `conj(rotor)`), so a
+/// straight complex sum integrates signal amplitudes coherently while
+/// noise (uncorrelated phase) averages down. Returns the resulting
+/// per-symbol per-tone POWER in dB so the existing LLR pipeline can
+/// consume it unchanged. For N aligned signals: signal power scales as
+/// N² while noise scales as N → SNR improves by N (vs √N non-coherent).
+fn coherent_sum_complex_to_db(
+    members: &[Vec<[Complex<f64>; NUM_TONES]>],
+    num_symbols: usize,
+) -> Vec<[f64; NUM_TONES]> {
+    let mut sum = vec![[Complex::new(0.0f64, 0.0); NUM_TONES]; num_symbols];
+    for m in members {
+        for s in 0..num_symbols.min(m.len()) {
+            for t in 0..NUM_TONES {
+                sum[s][t] += m[s][t];
+            }
+        }
+    }
+    let mut result = vec![[0.0f64; NUM_TONES]; num_symbols];
+    for s in 0..num_symbols {
+        for t in 0..NUM_TONES {
+            let p = sum[s][t].norm_sqr();
+            result[s][t] = 10.0 * (p + 1e-30).log10();
+        }
+    }
+    result
+}
+
 /// hb-056: sum tone magnitudes in LINEAR power (10^(dB/10)) across the
 /// group's members, then convert back to dB. This is the non-coherent
 /// analogue of JTDX's `s2(i) = |cs|² + |csold|²`. Linear-domain
@@ -3280,6 +3403,73 @@ fn par_extract_symbols_from_spectrogram(
     }
 
     tone_magnitudes
+}
+
+/// hb-074: complex-valued sibling of `par_extract_symbols_from_spectrogram`.
+/// Returns the complex FFT bin for each (symbol, tone) at the candidate's
+/// time/freq alignment. Returns `None` when the spectrogram wasn't built
+/// with `cross_cycle_coherent` (no `.complex` payload). Uses the FIRST of
+/// the two TIME_OSR substeps per symbol — phase recovery from Costas
+/// already aggregates 21 samples, so the second substep adds little.
+fn par_extract_complex_symbols_from_spectrogram(
+    pp: &ProtocolParams,
+    spectrogram: &Spectrogram,
+    candidate: &CostasCandidate,
+) -> Option<Vec<[Complex<f64>; NUM_TONES]>> {
+    let complex = spectrogram.complex.as_ref()?;
+    let t0 = candidate.time_step;
+    let f0 = candidate.freq_bin;
+    let fs = candidate.freq_sub;
+    let steps_per_symbol = TIME_OSR;
+
+    let mut out: Vec<[Complex<f64>; NUM_TONES]> = Vec::with_capacity(pp.num_symbols);
+    for sym_idx in 0..pp.num_symbols {
+        let mut row = [Complex::new(0.0f64, 0.0); NUM_TONES];
+        let t_base = t0 + sym_idx * steps_per_symbol;
+        if t_base >= spectrogram.num_steps {
+            out.push(row);
+            continue;
+        }
+        for tone in 0..pp.num_tones {
+            let freq_bin = f0 + tone;
+            if freq_bin >= spectrogram.num_bins || fs >= spectrogram.freq_osr {
+                continue;
+            }
+            row[tone] = complex[t_base][fs][freq_bin];
+        }
+        out.push(row);
+    }
+    Some(out)
+}
+
+/// hb-074: estimate a candidate's per-cycle phase rotor from the 21 known
+/// Costas symbols. Each Costas symbol is a known tone; summing the complex
+/// FFT bin at that (symbol, expected_tone) across all 21 positions yields
+/// `Σ A·exp(jφ_cand) = N·A·exp(jφ_cand)` (signal coherent, noise
+/// uncorrelated). Normalising to unit magnitude returns `exp(jφ_cand)` —
+/// the rotor to divide each symbol by to align this candidate's phase
+/// to a common reference. Returns `None` if the sum is too small to give
+/// a stable estimate (silent candidate / clipped buffer).
+fn estimate_candidate_phase_rotor(
+    pp: &ProtocolParams,
+    complex_symbols: &[[Complex<f64>; NUM_TONES]],
+) -> Option<Complex<f64>> {
+    let mut acc = Complex::<f64>::new(0.0, 0.0);
+    for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+        for k in 0..pp.costas_length {
+            let sym_idx = group_start + k;
+            let expected_tone = pp.costas_arrays[m][k] as usize;
+            if sym_idx >= complex_symbols.len() || expected_tone >= NUM_TONES {
+                continue;
+            }
+            acc += complex_symbols[sym_idx][expected_tone];
+        }
+    }
+    let mag = acc.norm();
+    if mag < 1e-30 {
+        return None;
+    }
+    Some(acc / mag)
 }
 
 /// Linear-interpolation lookup into a spectrogram with fractional time
@@ -4388,6 +4578,7 @@ mod tests {
 
         let spec = Spectrogram {
             power,
+            complex: None,
             num_steps,
             num_bins,
             freq_osr,
@@ -4664,6 +4855,71 @@ mod tests {
             (summed[0][0] - expected_db).abs() < 1e-6,
             "expected {expected_db}, got {}",
             summed[0][0]
+        );
+    }
+
+    #[test]
+    fn test_coherent_phase_rotor_and_gain() {
+        // hb-074: build a synthetic "candidate" whose Costas symbols hold
+        // a unit-amplitude tone at the expected positions with phase φ.
+        // estimate_candidate_phase_rotor should recover exp(jφ); multiplying
+        // by conj(rotor) should normalise the phase to 0. The coherent sum
+        // of N=2 phase-aligned signals + uncorrelated noise should beat the
+        // non-coherent (linear-power) sum's SNR by ~3 dB (vs ~1.5 dB).
+        use crate::protocol::ProtocolParams;
+        let pp = ProtocolParams::ft8();
+        // Two synthetic "candidates" with the same signal, different phases.
+        let mk = |phase: f64| -> Vec<[Complex<f64>; NUM_TONES]> {
+            let mut symbols = vec![[Complex::new(0.0, 0.0); NUM_TONES]; pp.num_symbols];
+            for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+                for k in 0..pp.costas_length {
+                    let sym_idx = group_start + k;
+                    let expected_tone = pp.costas_arrays[m][k] as usize;
+                    // Unit amplitude at the expected tone, phase φ; small
+                    // noise on the other tones (won't affect the rotor).
+                    symbols[sym_idx][expected_tone] = Complex::from_polar(1.0, phase);
+                }
+            }
+            symbols
+        };
+        let phase_a = 0.7f64;
+        let phase_b = -1.4f64;
+        let cs_a = mk(phase_a);
+        let cs_b = mk(phase_b);
+
+        let rotor_a = estimate_candidate_phase_rotor(&pp, &cs_a).expect("rotor a");
+        let rotor_b = estimate_candidate_phase_rotor(&pp, &cs_b).expect("rotor b");
+        // Rotor should recover exp(jφ) within float precision.
+        assert!(
+            (rotor_a - Complex::from_polar(1.0, phase_a)).norm() < 1e-6,
+            "rotor_a {rotor_a:?}"
+        );
+        assert!(
+            (rotor_b - Complex::from_polar(1.0, phase_b)).norm() < 1e-6,
+            "rotor_b {rotor_b:?}"
+        );
+
+        // After conj(rotor) rotation, the Costas-symbol amplitudes line up.
+        let conj_rotor_a = rotor_a.conj();
+        let conj_rotor_b = rotor_b.conj();
+        // Pick one Costas position to inspect.
+        let m0 = pp.costas_positions[0];
+        let tone0 = pp.costas_arrays[0][0] as usize;
+        let aligned_a = cs_a[m0][tone0] * conj_rotor_a;
+        let aligned_b = cs_b[m0][tone0] * conj_rotor_b;
+        // Both should be ≈ 1 + 0j (real, positive).
+        assert!(aligned_a.im.abs() < 1e-6 && (aligned_a.re - 1.0).abs() < 1e-6);
+        assert!(aligned_b.im.abs() < 1e-6 && (aligned_b.re - 1.0).abs() < 1e-6);
+
+        // Coherent sum of 2 aligned signals → power = 4 (|1+1|² = 4).
+        // Non-coherent power sum (|1|² + |1|²) = 2. So coherent beats
+        // non-coherent by 3 dB on aligned signals — the canonical claim.
+        let coherent_pwr = (aligned_a + aligned_b).norm_sqr();
+        let noncoherent_pwr = aligned_a.norm_sqr() + aligned_b.norm_sqr();
+        assert!(
+            (coherent_pwr / noncoherent_pwr - 2.0).abs() < 1e-6,
+            "expected 2x (3dB) gain, got {:.3}x",
+            coherent_pwr / noncoherent_pwr
         );
     }
 
