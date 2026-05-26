@@ -215,6 +215,21 @@ pub struct Ft8Config {
     /// Sweep candidate range: 0.5 to 4.0.
     pub bp_offset_subtract: f32,
 
+    /// hb-056 cross-cycle non-coherent averaging: when true, after the
+    /// regular per-candidate decode loop, group repeating-station
+    /// candidates (same `freq_sub`+`freq_bin`±1, `t0` apart by a multiple
+    /// of one FT8 slot ±2 steps, sync-score within band) and decode an
+    /// additional candidate whose per-symbol tone energies are the
+    /// LINEAR-POWER sum of the group's. Additive — never removes a
+    /// per-slot decode; new decodes are unioned + deduped by message
+    /// text. Power-only (pancetta's spectrogram discards phase, so this
+    /// is the non-coherent variant of JTDX's `s2(i) = |cs|² + |csold|²`).
+    /// Default **true** as of 2026-05-25: hard-200 A/B gives +14
+    /// recovered / +8 novel (with FP filter); single-slot tiers
+    /// (fixtures, synth-clean) form no groups and are no-ops.
+    /// See docs/superpowers/specs/2026-05-25-cross-cycle-averaging-design.md.
+    pub cross_cycle_averaging: bool,
+
     /// hb-063 (arXiv:2410.13131, Hocevar 2004): use a layered (row-
     /// sequential) belief-propagation schedule instead of the flooding
     /// schedule. Layered BP updates check nodes one at a time and folds
@@ -257,6 +272,12 @@ impl Default for Ft8Config {
             // +18 hard-200 recovered (composite +0.00105), -16% decode
             // wall-clock, no guard-tier regression.
             layered_bp: true,
+            // hb-056 (2026-05-25): cross-cycle non-coherent averaging is
+            // the production default. hard-200 A/B (with FP filter):
+            // +14 recovered / +8 novel. Composite +~0.000815 from hard-200
+            // alone. Synth-clean and fixtures are single-slot so groups
+            // never form (no-op).
+            cross_cycle_averaging: true,
         }
     }
 }
@@ -630,7 +651,7 @@ impl Ft8Decoder {
             const ADAPTIVE_ITERS_LOW: usize = 50; // = default, no cut on high-SNR
             const ADAPTIVE_ITERS_HIGH: usize = 100; // for low-SNR (more BP budget)
 
-            let pass_decoded: Vec<DecodedMessage> = sync_candidates
+            let mut pass_decoded: Vec<DecodedMessage> = sync_candidates
                 .par_iter()
                 .map_init(
                     // Per-thread initialization: create LDPC decoders and FFT buffer
@@ -691,6 +712,17 @@ impl Ft8Decoder {
                 )
                 .flatten()
                 .collect();
+
+            // hb-056: non-coherent cross-cycle averaging. Groups repeating-
+            // station candidates and decodes a power-summed averaged
+            // candidate alongside the per-slot results. Additive — its
+            // outputs go through the same dedup, and a corrupted average
+            // that fails CRC contributes nothing. Skipped when the flag
+            // is off (default).
+            if self.config.cross_cycle_averaging {
+                let extra = self.cross_cycle_averaging_pass(&spectrogram, &sync_candidates);
+                pass_decoded.extend(extra);
+            }
 
             // Deduplicate the parallel results (multiple candidates may decode to
             // the same message text, and we also need to dedup against prior passes)
@@ -1718,6 +1750,85 @@ impl Ft8Decoder {
         } else {
             -24.0f32
         }
+    }
+
+    /// hb-056: non-coherent cross-cycle symbol averaging.
+    ///
+    /// Groups sync candidates that look like the same repeating station in
+    /// different slots (same `freq_sub`+`freq_bin`±1, `t0` apart by a
+    /// multiple of one FT8 slot ±2 steps, sync-score within band), sums
+    /// each group's per-symbol tone POWERS in linear (10^(dB/10)), and
+    /// runs LLR → LDPC → CRC on the averaged candidate. Returns any
+    /// passing decode for the caller to union + dedup with the per-slot
+    /// results. Additive — never removes a per-slot decode, and a
+    /// corrupted averaged candidate that fails CRC contributes nothing.
+    ///
+    /// Power-only: pancetta's spectrogram discards phase, so this is the
+    /// non-coherent variant of JTDX's `s2(i) = |cs|² + |csold|²` rule.
+    /// Bounds the expected gain below JTDX's coherent edge — see
+    /// docs/superpowers/specs/2026-05-25-cross-cycle-averaging-design.md.
+    fn cross_cycle_averaging_pass(
+        &self,
+        spectrogram: &Spectrogram,
+        candidates: &[CostasCandidate],
+    ) -> Vec<DecodedMessage> {
+        if candidates.len() < 2 {
+            return Vec::new();
+        }
+        let pp = &self.protocol_params;
+        let tone_spacing = pp.tone_spacing;
+        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        let spec_step = sps / TIME_OSR;
+        let groups = group_for_cross_cycle(candidates);
+
+        let mut decoded: Vec<DecodedMessage> = Vec::new();
+        for group in groups {
+            // Extract each member's tone magnitudes (dB) from the spectrogram,
+            // then sum across members in LINEAR power and convert back to dB.
+            let members: Vec<Vec<[f64; NUM_TONES]>> = group
+                .iter()
+                .map(|&i| par_extract_symbols_from_spectrogram(pp, spectrogram, &candidates[i]))
+                .collect();
+            let avg_mags = sum_tone_magnitudes_linear(&members, pp.num_symbols);
+
+            // LLR → LDPC → CRC. Reuses the existing decoder; if BP fails
+            // OR CRC fails OR message is implausible, the averaged
+            // candidate yields nothing (additive, so harmless).
+            let mut llrs = par_compute_soft_llrs_db(pp, &avg_mags);
+            normalize_llrs(&mut llrs, self.config.llr_target_variance);
+            let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
+                continue;
+            };
+            if !par_verify_crc(&corrected_bits) {
+                continue;
+            }
+            let payload_bits = par_apply_xor(pp.xor_sequence, &corrected_bits);
+            let ft8_message = match self.message_parser.parse_payload(&payload_bits) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !ft8_message.is_plausible() {
+                continue;
+            }
+
+            // Build a DecodedMessage anchored on the group's first member
+            // (mirrors par_decode_candidate's pattern).
+            let anchor = &candidates[group[0]];
+            let sub_bin_offset = anchor.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+            let base_frequency = anchor.freq_bin as f64 * tone_spacing + sub_bin_offset;
+            let coarse_offset = (anchor.time_step as isize - spectrogram.time_padding as isize)
+                * spec_step as isize;
+            let snr_db = par_estimate_snr_spectrogram(pp, &avg_mags);
+            let confidence = (anchor.sync_score / 12.0).min(1.0) as f32;
+            decoded.push(DecodedMessage::new(
+                ft8_message,
+                snr_db,
+                confidence,
+                base_frequency,
+                coarse_offset as f64 / SAMPLE_RATE as f64,
+            ));
+        }
+        decoded
     }
 
     // ========================================================================
@@ -3046,6 +3157,95 @@ pub(crate) fn ap_injection_survived(
 }
 
 // ---- Parallel-safe helpers (free functions operating on shared state) ----
+
+// hb-056 cross-cycle averaging tunables. SLOT_TIME_STEPS_FT8 = 15 s of audio
+// expressed in spectrogram steps (subblock_size = 960 samples at 12 kHz =
+// 0.08 s/step → 15/0.08 = 187.5, rounded up to 188). T_TOL/F_TOL/SCORE_BAND
+// gate the grouping conservatively; a corrupted average that gets through
+// is filtered downstream by CRC and the production callsign-continuity filter.
+const SLOT_TIME_STEPS_FT8: usize = 188;
+const CROSS_CYCLE_T_TOL: usize = 2;
+const CROSS_CYCLE_F_TOL: usize = 1;
+const CROSS_CYCLE_SCORE_BAND: f64 = 3.0;
+
+/// hb-056: group candidates that look like the same repeating station in
+/// different slots. Two candidates match when they share `freq_sub`, their
+/// `freq_bin`s are within `F_TOL`, their `t0`s differ by a non-zero
+/// integer multiple of `SLOT_TIME_STEPS_FT8` within `T_TOL`, and their
+/// `sync_score`s are within `SCORE_BAND`. Greedy first-fit: each candidate
+/// joins the first compatible group or starts a new one; only returns
+/// groups of size ≥ 2.
+fn group_for_cross_cycle(candidates: &[CostasCandidate]) -> Vec<Vec<usize>> {
+    let n = candidates.len();
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut grouped = vec![false; n];
+    for i in 0..n {
+        if grouped[i] {
+            continue;
+        }
+        let a = &candidates[i];
+        let mut group = vec![i];
+        grouped[i] = true;
+        for (j, b) in candidates.iter().enumerate().skip(i + 1) {
+            if grouped[j] {
+                continue;
+            }
+            if a.freq_sub != b.freq_sub {
+                continue;
+            }
+            let df = (a.freq_bin as i64 - b.freq_bin as i64).unsigned_abs() as usize;
+            if df > CROSS_CYCLE_F_TOL {
+                continue;
+            }
+            let dt = (a.time_step as i64 - b.time_step as i64).unsigned_abs() as usize;
+            if dt == 0 {
+                continue;
+            }
+            let dt_mod = dt % SLOT_TIME_STEPS_FT8;
+            let aligned =
+                dt_mod <= CROSS_CYCLE_T_TOL || (SLOT_TIME_STEPS_FT8 - dt_mod) <= CROSS_CYCLE_T_TOL;
+            if !aligned {
+                continue;
+            }
+            if (a.sync_score - b.sync_score).abs() > CROSS_CYCLE_SCORE_BAND {
+                continue;
+            }
+            group.push(j);
+            grouped[j] = true;
+        }
+        if group.len() >= 2 {
+            groups.push(group);
+        }
+    }
+    groups
+}
+
+/// hb-056: sum tone magnitudes in LINEAR power (10^(dB/10)) across the
+/// group's members, then convert back to dB. This is the non-coherent
+/// analogue of JTDX's `s2(i) = |cs|² + |csold|²`. Linear-domain
+/// summation is required — averaging in dB is the wrong operation
+/// (the LLR pipeline relies on the dB encoding the power summation,
+/// not the log-power summation).
+fn sum_tone_magnitudes_linear(
+    members: &[Vec<[f64; NUM_TONES]>],
+    num_symbols: usize,
+) -> Vec<[f64; NUM_TONES]> {
+    let mut sum_lin = vec![[0.0f64; NUM_TONES]; num_symbols];
+    for member in members {
+        for s in 0..num_symbols.min(member.len()) {
+            for t in 0..NUM_TONES {
+                sum_lin[s][t] += 10f64.powf(member[s][t] / 10.0);
+            }
+        }
+    }
+    let mut result = vec![[0.0f64; NUM_TONES]; num_symbols];
+    for s in 0..num_symbols {
+        for t in 0..NUM_TONES {
+            result[s][t] = 10.0 * (sum_lin[s][t] + 1e-30).log10();
+        }
+    }
+    result
+}
 
 fn par_extract_symbols_from_spectrogram(
     pp: &ProtocolParams,
@@ -4419,6 +4619,52 @@ mod tests {
         let (noisy_llrs, _) = layered.belief_propagation_with_trajectory(&noisy).unwrap();
         let correct = (0..174).filter(|&i| noisy_llrs[i] > 0.0).count();
         assert!(correct > 170, "layered only corrected {correct}/174 bits");
+    }
+
+    #[test]
+    fn test_cross_cycle_grouping_and_linear_sum() {
+        // hb-056: grouping pairs candidates ~1 slot apart at the same
+        // freq, but only when sync scores are within the band; and the
+        // linear-power sum correctly handles the dB↔linear conversion.
+        let mk = |t0: usize, fb: usize, fs: usize, score: f64| CostasCandidate {
+            time_step: t0,
+            freq_bin: fb,
+            freq_sub: fs,
+            time_refinement: 0.0,
+            sync_score: score,
+        };
+        // Group 1: two candidates exactly one slot apart at the same freq,
+        // matching scores → must group.
+        // Group 2: two candidates two slots apart, score mismatch → must NOT
+        // group (score band guard prevents averaging across distinct
+        // stations that happen to share a frequency).
+        // Singleton: isolated candidate at a unique freq → never grouped.
+        let candidates = vec![
+            mk(50, 100, 0, 7.0),                           // 0  group 1 anchor
+            mk(50 + SLOT_TIME_STEPS_FT8, 100, 0, 6.5),     // 1  group 1 (Δscore 0.5 in band)
+            mk(80, 200, 0, 5.0),                           // 2  group-2 anchor
+            mk(80 + 2 * SLOT_TIME_STEPS_FT8, 200, 0, 1.0), // 3  group 2 reject (Δscore 4 > band)
+            mk(60, 300, 0, 6.0),                           // 4  singleton
+        ];
+        let groups = group_for_cross_cycle(&candidates);
+        assert_eq!(groups.len(), 1, "exactly one valid group expected");
+        let g = &groups[0];
+        assert_eq!(g.len(), 2);
+        assert!(g.contains(&0) && g.contains(&1));
+
+        // Linear-power sum: two members each with a single -10 dB tone in
+        // symbol 0, tone 0; their sum should be +3.01 dB (2x in linear).
+        let mut a = vec![[f64::NEG_INFINITY; NUM_TONES]; 4];
+        let mut b = vec![[f64::NEG_INFINITY; NUM_TONES]; 4];
+        a[0][0] = -10.0;
+        b[0][0] = -10.0;
+        let summed = sum_tone_magnitudes_linear(&[a, b], 4);
+        let expected_db = 10.0 * 2.0f64.log10() - 10.0; // -10 + 3.01 ≈ -6.99
+        assert!(
+            (summed[0][0] - expected_db).abs() < 1e-6,
+            "expected {expected_db}, got {}",
+            summed[0][0]
+        );
     }
 
     #[test]

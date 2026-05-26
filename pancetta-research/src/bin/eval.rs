@@ -47,6 +47,8 @@ struct Args {
     bp_offset_subtract: Option<f32>,
     /// hb-063: enable layered (row-sequential) BP schedule.
     layered_bp: Option<bool>,
+    /// hb-056: enable cross-cycle non-coherent symbol averaging.
+    cross_cycle_averaging: Option<bool>,
     /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
     two_stage: Option<bool>,
     /// hb-004: when Some, an ApContext is built and passed to
@@ -93,6 +95,7 @@ impl Args {
         let mut sync_time_interpolation: Option<bool> = None;
         let mut bp_offset_subtract: Option<f32> = None;
         let mut layered_bp: Option<bool> = None;
+        let mut cross_cycle_averaging: Option<bool> = None;
         let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
@@ -219,6 +222,9 @@ impl Args {
                 "--layered-bp" => {
                     layered_bp = Some(true);
                 }
+                "--cross-cycle-averaging" => {
+                    cross_cycle_averaging = Some(true);
+                }
                 "--two-stage" => {
                     two_stage = Some(true);
                 }
@@ -312,6 +318,7 @@ impl Args {
             sync_time_interpolation,
             bp_offset_subtract,
             layered_bp,
+            cross_cycle_averaging,
             two_stage,
             ap_my_call,
             ap_recent_calls,
@@ -714,6 +721,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(on) = args.layered_bp {
                 d = d.with_layered_bp(on);
+            }
+            if let Some(on) = args.cross_cycle_averaging {
+                d = d.with_cross_cycle_averaging(on);
             }
             if let Some(on) = args.two_stage {
                 d = d.with_two_stage(on);

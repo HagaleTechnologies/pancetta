@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-25T20:30:00Z
+last_updated: 2026-05-25T22:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 56
-current_ratio: 0.067
+exploitation_run: 61
+current_ratio: 0.062
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -346,30 +346,52 @@ current_ratio: 0.067
     Orthogonal mr-003 OSD work still open: hb-065 (GE removal, speed),
     hb-064 (DIA trajectory features — retrain OSD on layered-BP trajs).
 
-### hb-056 — Cross-cycle coherent symbol averaging (csold buffer)  [PRIORITY: 0.60 plan-sized, spawned 2026-05-25 from mr-002]
+### hb-056 — Cross-cycle non-coherent symbol averaging  [GRADUATED 2026-05-25]
   mode: ft8
-  status: pending (plan-sized — design doc before iters)
-  priority_score: 0.60
-  estimated_effort: 2-3 sessions (plumbing) + Plan-spec
-  expected_delta: significant — JTDX's headline sensitivity advantage on repeating CQs
-  defensible_prior: yes — JTDX subpasses isubp1={4,7,10} use `s2(i) = |cs|² + |csold|²` averaging
+  status: GRADUATED — cross_cycle_averaging default true; composite +0.000816 (non-coherent variant)
+  priority_score: 0.0
+  estimated_effort: 2-3 sessions (delivered in 1 — simpler than the bank entry assumed)
+  expected_delta: CONFIRMED non-coherent — hard-200 +14 rec / +8 novel filtered; hard-1000 +82 rec / +48 novel filtered
+  defensible_prior: yes — JTDX (`lib/ft8b.f90`, subpasses isubp1={4,7,10})
   wild_card: false
   evidence_for:
-    - JTDX maintains `complex csold(0:7,79)` populated from evencq/oddcq structs (last cycle's symbol field per CQ candidate by freq+DT).
-    - Subpass branches isubp1=4,7,10 compute `s2(i) = |cs|² + |csold|²` — coherent (amplitude) integration across the 15s slot boundary for stations that repeat their CQ.
-    - This is the headline JTDX sensitivity edge that operators reference when comparing to WSJT-X.
-  evidence_against:
-    - Pancetta has NO cross-slot symbol-buffer cache; decoder is currently stateless across slots.
-    - Plumbing: per-candidate symbol stash in coordinator cycle handoff (~50 LOC), freq+DT proximity matching (~100 LOC), LLR computation extension to accept averaged-symbol mode (~100 LOC). Total ~200-400 LOC.
-    - Needs a new corpus: contiguous slots from same weak repeating station (current corpus is single-slot WAVs).
-    - Risk medium for architecture; once plumbed, low decode-quality risk.
+    - Full 5-tier (FP filter on): composite 0.556180 → 0.556996 (+0.000816). fixtures 1.0 unchanged; synth-clean @50 -20 unchanged; @90 nudged -18→-20 (single-slot, no-op pass, noise). hard-200 rec 4394→4408, hard-1000 rec 14355→14437; novels +8 / +48 filtered (FP filter absorbs ~87% of raw FP cost).
+    - Targeted hard-200 four-way A/B: ctrl-nofilter 4395/1552 vs variant-nofilter 4409/1613 (Δrec +14, Δnovel +61); ctrl-filter 4394/836 vs variant-filter 4408/844 (Δrec +14, Δnovel +8). Recall is filter-invariant; novels addressed.
+  evidence_against (resolved):
+    - "Needs new corpus" — REFUTED. The 90s multi-slot recordings (batch-11 hb-012 finding) already contain repeats; cross-cycle averaging works entirely within one decode_window call.
+    - "200-400 LOC + coordinator state machine" — REVISED. Single-decode-window scope means no coordinator handoff and no new module: ~120 LOC of grouping + linear-power summation + a pass method.
+    - "Pancetta has no complex-spectrogram path" — INTRINSIC. Confirmed pancetta can only do NON-coherent integration; the +0.000816 bounds that ceiling. The coherent variant (retain phase) remains hb-074.
   notes: |
-    Plan-spec before implementation. Touchpoints:
-    - new module pancetta-ft8/src/csold.rs (cross-cycle buffer)
-    - pancetta-ft8/src/decoder.rs (LLR computation extension)
-    - pancetta/src/coordinator/pipeline.rs (cycle handoff)
-    - new corpus generator: contiguous-slot synth (extend gen-synth)
-    Eval ceiling unknown without the new corpus.
+    See research/experiments/2026-05-25-cross-cycle-averaging.md +
+    docs/superpowers/specs/2026-05-25-cross-cycle-averaging-design.md.
+    Spawned hb-074 (coherent / complex-spectrogram rework) as the path
+    to JTDX's full headline gain, now defensibly motivated against a
+    measured non-coherent baseline.
+
+### hb-074 — Complex-spectrogram coherent cross-cycle averaging  [PRIORITY: 0.50 plan-sized, spawned 2026-05-25 from hb-056]
+  mode: ft8
+  status: pending — plan-sized (retain-phase spectrogram is the prereq)
+  priority_score: 0.50
+  estimated_effort: 3-5 sessions (large structural change to the spectrogram)
+  expected_delta: ~2-3× the non-coherent hb-056 gain (i.e. ~+0.0016-0.0024 composite) if JTDX-class coherent integration carries over; uncertain
+  defensible_prior: yes — JTDX's headline sensitivity edge IS the coherent variant; pancetta now has a measured non-coherent baseline (+0.000816) to compare against.
+  wild_card: false
+  evidence_for:
+    - Theoretically: coherent integration improves SNR ~3 dB per doubling vs ~1.5 dB non-coherent, so the gain should be roughly double for N=2 and grow with N.
+    - hb-056 graduation proves the cross-cycle MECHANISM works on pancetta's corpus; the limit is the phase-discarded spectrogram, which is a structural property the rework would fix.
+  evidence_against:
+    - Touches the spectrogram hot path (memory + compute) — careful to not regress wall-clock or break the LLR pipeline.
+    - Higher implementation risk than hb-056; the spectrogram is consumed everywhere.
+  notes: |
+    Approach sketch: extend Spectrogram::power from f64 to Complex<f64>
+    (or add a parallel `phase` array), preserve current dB-power view as
+    a derived projection, and add a coherent variant of
+    sum_tone_magnitudes_linear that sums complex amplitudes (with a
+    phase-rotation correction for the inter-slot phase shift). LLR path
+    can keep using the power projection; only the cross-cycle pass uses
+    the complex view. Eval the same way as hb-056 (4-way hard-200 A/B
+    + full 5-tier). Schedule only when there's appetite for a multi-
+    session structural rework.
 
 ### hb-057 — Median-filter DT averaging for sync/AP  [PRIORITY: 0.35, spawned 2026-05-25 from mr-002]
   mode: ft8
