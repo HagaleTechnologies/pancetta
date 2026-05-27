@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-26T18:00:00Z
+last_updated: 2026-05-26T19:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 63
-current_ratio: 0.060
+exploitation_run: 67
+current_ratio: 0.056
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -512,7 +512,10 @@ current_ratio: 0.060
     invalid for the message context, or only under the continuity
     filter's cold-start lenient mode. Low priority.
 
-### hb-072 — Directional-CQ modifier whitelist  [PRIORITY: 0.30, spawned 2026-05-25 from hb-058]
+### hb-072 — Directional-CQ modifier whitelist  [GRADUATED 2026-05-26 — batch 12]
+  status_2026_05_26: GRADUATED — is_plausible's Cq arm now validates the special_operation modifier against a whitelist (named directionals/programs + ≤3-char numeric + ≤3-char alpha). hard-200 no-filter: -24 novel at +0 recall. Composite unchanged; operational cold-start defense.
+  ---- original priority entry below ----
+  [PRIORITY-WAS: 0.30, spawned 2026-05-25 from hb-058]
   mode: ft8
   status: pending
   priority_score: 0.30
@@ -729,9 +732,9 @@ current_ratio: 0.060
     absorbing-set/trapping-set patterns. Plan-sized; defer until
     hb-063 + hb-065 + hb-067 are exhausted.
 
-### hb-067 — mBP offset parameter for OSD pre-conditioning  [SOFT WIN 2026-05-25 — not graduated]
+### hb-067 — mBP offset parameter for OSD pre-conditioning  [SHELVED 2026-05-26 — definitive close]
   mode: ft8
-  status: tested — small precision finding, mechanism mismatch
+  status: SHELVED definitively. Batch 8 found -32 novels at offset=2.0; batch 12 re-test under post-hb-075 production gave only -11 novels at +1 noise-level recall. The intervening graduations (FP filter, contest-FP rejection, cross-cycle MRC) absorbed most of what mBP offset was filtering. Default stays 0.0; library + CLI remain available for future sweeps.
   priority_score: 0.0
   estimated_effort: n/a
   expected_delta: -3 to -48 novels at zero recall cost (sweep result)
@@ -948,10 +951,10 @@ current_ratio: 0.060
     any further OSD reduction must first justify losing the fixture-
     tested basicft8 decode.
 
-### hb-040 — Plumb (or remove) `Ft8Config::time_range`  [PRIORITY: 0.35]
+### hb-040 — Plumb (or remove) `Ft8Config::time_range`  [SHELVED 2026-05-26 — resolved by hb-012 finding]
   mode: ft8
-  status: pending
-  priority_score: 0.35
+  status: SHELVED — no-op on pancetta's corpus. hb-012 (batch 11) established the curated recordings are 90s continuous multi-slot captures; the Costas search scans t0 from 0 across the whole buffer, so signals at any interior timing are already found. Negative-time search only matters for first-slot pre-recording audio (no data to recover). time_range stays a no-op field; mr-006 corpus survey recommended capturing future audio slot-aligned rather than building a preprocessor. wild-50's 0/96 is corpus-specific (2 outlier WAVs per hb-025) with ~0 composite impact.
+  priority_score: 0.0
   estimated_effort: 0.5-1 session
   expected_delta: niche; recovers misaligned recordings (e.g., the 92/96 wild-50 truth decodes at dt < -1.4)
   defensible_prior: yes (hb-025 audit confirmed time_range is dead code)
@@ -1172,7 +1175,10 @@ current_ratio: 0.060
     AP2 candidate. Measure on a curated recording known to have multiple simultaneous
     callers (identified from the hard-200 manifest's per-WAV truth count).
 
-### hb-018 — OSD-3 with strengthened CRC validation  [PRIORITY: 0.30]
+### hb-018 — OSD-3 with strengthened CRC validation  [SHELVED 2026-05-26 — confirmed under hb-075 production]
+  status_2026_05_26: SHELVED — re-confirmed under post-hb-075 production. OSD-3 + filter: -1 rec / +10 novel vs OSD-2 + filter. Cross-cycle averaging didn't change the OSD candidate population enough to flip hb-053's earlier finding. Direction structurally closed.
+  ---- original entry below ----
+  [PRIORITY-WAS: 0.30]
   mode: ft8
   status: pending
   priority_score: 0.30

@@ -475,12 +475,23 @@ impl Ft8Message {
         };
 
         match stype {
-            // CQ / Token-based exchanges: protocol-defined, no field-level
+            // hb-072: validate the CQ modifier (special_operation) against
+            // a whitelist of known FT8 conventions. The fp_format_audit
+            // (hb-058 instrument) showed 55 hard-200 novels with "CQ
+            // <something>" where the modifier was garbage (CRC-14
+            // collision noise); the corresponding 77 real "CQ <modifier>"
+            // decodes all use modifiers in the whitelist below. None when
+            // bare CQ (no modifier) — accept.
+            StandardMessageType::Cq => match self.special_operation.as_deref() {
+                None => true,
+                Some(m) => Self::is_valid_cq_modifier(m),
+            },
+
+            // Token-based exchanges: protocol-defined, no field-level
             // validation needed beyond what the parser already enforced.
-            StandardMessageType::Cq
-            | StandardMessageType::Rrr
-            | StandardMessageType::RR73
-            | StandardMessageType::Final73 => true,
+            StandardMessageType::Rrr | StandardMessageType::RR73 | StandardMessageType::Final73 => {
+                true
+            }
 
             // Reply / ReplyWithR: grid is optional (the "empty exchange"
             // protocol code lands here with grid = None — a valid bare
@@ -834,6 +845,54 @@ impl Ft8Message {
     /// packs calls as: c0(37) * c1(36) * c2(10) * c3(27) * c4(27) * c5(27).
     /// Position c2 is always a digit (0-9), c3-c5 are letters or space,
     /// c0 is space/digit/letter, c1 is digit/letter. This means the third
+    /// hb-072: validate a CQ message's modifier (`special_operation`)
+    /// against the known FT8 conventions. Real `CQ <modifier>` traffic on
+    /// the hard-200 corpus uses one of: a continent / propagation
+    /// indicator (DX, NA, SA, EU, AS, AF, OC), a power class (QRP), a
+    /// program tag (POTA, SOTA, FD, RU, TEST), an all-digit CQ-zone /
+    /// numeric exchange (≤ 3 digits), or a short alpha prefix /
+    /// state code (≤ 3 letters, e.g. K, W, JA, NY). CRC-14 collision
+    /// noise typically lands on garbage tokens outside this set — the
+    /// fp_format_audit (hb-058) found 55 hard-200 novels here vs 77
+    /// real, and the real ones all match this whitelist.
+    fn is_valid_cq_modifier(modifier: &str) -> bool {
+        if modifier.is_empty() {
+            return true;
+        }
+        let upper: String = modifier.to_ascii_uppercase();
+        // Named modifiers seen in real on-air traffic.
+        if matches!(
+            upper.as_str(),
+            "DX" | "NA"
+                | "SA"
+                | "EU"
+                | "AS"
+                | "AF"
+                | "OC"
+                | "QRP"
+                | "POTA"
+                | "SOTA"
+                | "FD"
+                | "RU"
+                | "TEST"
+        ) {
+            return true;
+        }
+        let len = modifier.chars().count();
+        if !(1..=4).contains(&len) {
+            return false;
+        }
+        // CQ zone / numeric exchange (1-3 digits).
+        if len <= 3 && modifier.chars().all(|c| c.is_ascii_digit()) {
+            return true;
+        }
+        // Short alpha prefix / state code (1-3 letters).
+        if len <= 3 && modifier.chars().all(|c| c.is_ascii_alphabetic()) {
+            return true;
+        }
+        false
+    }
+
     /// character is always a digit, and chars 4-6 are always letters/space.
     ///
     /// Valid examples: W1AW, KA7RLM, R9AA, 4X1RF, 3DA0WW, 9A1A.
@@ -2750,6 +2809,51 @@ mod tests {
         dx.from_callsign = Some("K1ABC".to_string());
         dx.to_callsign = Some("W1AW".to_string());
         assert!(dx.is_plausible(), "DXpedition with valid calls should pass");
+    }
+
+    #[test]
+    fn cq_modifier_whitelist() {
+        // hb-072: validate the CQ modifier whitelist on real and garbage tokens.
+        // Modern-parser CQ messages have to_callsign = None and the calling
+        // station in from_callsign; the legacy "to_callsign = CQ" path is a
+        // separate early-return in has_plausible_payload (doesn't hit the
+        // modifier check).
+        let mk = |modifier: Option<&str>| -> Ft8Message {
+            let mut m = Ft8Message::default();
+            m.message_type = MessageType::Standard;
+            m.standard_type = Some(StandardMessageType::Cq);
+            m.from_callsign = Some("K1ABC".to_string());
+            m.to_callsign = None;
+            m.grid_square = Some("FN42".to_string());
+            m.special_operation = modifier.map(|s| s.to_string());
+            m
+        };
+        // Real-traffic modifiers must pass.
+        for ok in [
+            "DX", "NA", "SA", "EU", "AS", "AF", "OC", "QRP", "POTA", "SOTA", "FD", "RU", "TEST",
+            "K", "W", "JA", "VK", "NY", "MA", "5", "13", "100",
+        ] {
+            assert!(
+                mk(Some(ok)).is_plausible(),
+                "real modifier {ok:?} must pass"
+            );
+        }
+        // Bare CQ (no modifier) must pass.
+        assert!(mk(None).is_plausible(), "bare CQ must pass");
+        // Garbage tokens typical of CRC-14 collisions must fail.
+        for bad in [
+            "ABCD",  // 4 letters — too long for short-prefix path
+            "12345", // 5 digits — too long for zone path
+            "K1ABC", // looks like a callsign, not a modifier
+            "A1",    // alpha+digit — neither pure-digit nor pure-alpha
+            "?!?",   // garbage
+            "VERY",  // 4 letters
+        ] {
+            assert!(
+                !mk(Some(bad)).is_plausible(),
+                "garbage modifier {bad:?} must reject"
+            );
+        }
     }
 
     #[test]
