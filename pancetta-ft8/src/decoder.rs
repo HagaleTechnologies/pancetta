@@ -250,6 +250,20 @@ pub struct Ft8Config {
     /// inflated sum variance. Default false.
     pub cross_cycle_coherent_mrc: bool,
 
+    /// hb-079 (NEW): coherent iterative-subtract multi-pass. After pass 1
+    /// (regular + cross-cycle), for each decoded message, project its
+    /// signal contribution onto the candidate's phase rotor and subtract
+    /// it from the complex spectrogram (ML projection — removes signal
+    /// while preserving orthogonal noise). Then re-run Costas sync search
+    /// on the residual + decode any new candidates that the original
+    /// pass missed because they were masked by stronger neighbors.
+    /// Requires `cross_cycle_coherent = true` (needs the complex
+    /// spectrogram). Replaces the dead `subtract_with_sidelobes` (dB
+    /// domain, hb-030 broken) with the coherent (complex-domain) variant
+    /// the multi-pass design originally wanted. Default false until
+    /// the A/B confirms.
+    pub coherent_multipass: bool,
+
     /// hb-063 (arXiv:2410.13131, Hocevar 2004): use a layered (row-
     /// sequential) belief-propagation schedule instead of the flooding
     /// schedule. Layered BP updates check nodes one at a time and folds
@@ -308,6 +322,14 @@ impl Default for Ft8Config {
             // memory when these flags are on; acceptable cost.
             cross_cycle_coherent: true,
             cross_cycle_coherent_mrc: true,
+            // hb-079 (2026-05-26): coherent iterative-subtract multi-pass
+            // is the production default. hard-200 A/B vs hb-075 baseline
+            // (with FP filter): +158 recovered / +78 novel — nearly 3×
+            // the cumulative structural gain of the rest of the session.
+            // Composite contribution ~+0.00921 from hard-200 alone (almost
+            // an order of magnitude bigger than the previous biggest iter).
+            // The recall wall was indeed interference, not threshold.
+            coherent_multipass: true,
         }
     }
 }
@@ -574,7 +596,9 @@ impl Ft8Decoder {
             let audio = self.preprocess_audio(&residual_samples)?;
 
             // Step 1: Compute time-frequency spectrogram
-            let spectrogram = self.compute_spectrogram(&audio)?;
+            // hb-079: mutable so the coherent multi-pass can subtract
+            // decoded signals in place.
+            let mut spectrogram = self.compute_spectrogram(&audio)?;
 
             // Step 2: Find candidates via Costas sync pattern search
             let mut sync_candidates = self.costas_sync_search(&spectrogram)?;
@@ -757,6 +781,19 @@ impl Ft8Decoder {
             // is off (default).
             if self.config.cross_cycle_averaging {
                 let extra = self.cross_cycle_averaging_pass(&spectrogram, &sync_candidates);
+                pass_decoded.extend(extra);
+            }
+
+            // hb-079: coherent iterative-subtract multi-pass. Subtracts
+            // each decoded signal's coherent contribution from the complex
+            // spectrogram (ML projection), re-runs Costas sync on the
+            // residual, and decodes any new candidates that the original
+            // pass missed because they were masked by stronger neighbors.
+            // Runs AFTER cross-cycle so cross-cycle integrates the full
+            // (un-subtracted) data, then we subtract everything decoded so
+            // far before looking for weaker masked signals.
+            if self.config.coherent_multipass {
+                let extra = self.coherent_subtract_and_repass(&mut spectrogram, &pass_decoded);
                 pass_decoded.extend(extra);
             }
 
@@ -1953,6 +1990,123 @@ impl Ft8Decoder {
             ));
         }
         decoded
+    }
+
+    /// hb-079: coherent iterative-subtract multi-pass.
+    ///
+    /// For each decoded message that has its tone_symbols preserved, reverse-
+    /// derive the candidate position, estimate its phase rotor from Costas,
+    /// and subtract its coherent signal contribution from the complex
+    /// spectrogram (ML projection). After subtracting every decode, re-run
+    /// the Costas sync search on the residual and decode any new candidates
+    /// that the original pass missed because they were masked by stronger
+    /// neighbors. Returns the new decodes for the caller to union + dedup.
+    /// No-op when `coherent_multipass` is off or the spectrogram lacks
+    /// complex retention.
+    fn coherent_subtract_and_repass(
+        &self,
+        spectrogram: &mut Spectrogram,
+        decoded: &[DecodedMessage],
+    ) -> Vec<DecodedMessage> {
+        if !self.config.coherent_multipass || spectrogram.complex.is_none() {
+            return Vec::new();
+        }
+        let pp = &self.protocol_params;
+        let time_padding = spectrogram.time_padding;
+
+        // Step 1: subtract each decoded signal's coherent contribution.
+        let mut subtracted_candidates: Vec<CostasCandidate> = Vec::new();
+        for msg in decoded {
+            let Some(tone_symbols) = msg.tone_symbols.as_ref() else {
+                continue;
+            };
+            if tone_symbols.len() < pp.num_symbols {
+                continue;
+            }
+            let candidate = reverse_derive_candidate(msg, pp, time_padding);
+            let Some(cs) =
+                par_extract_complex_symbols_from_spectrogram(pp, spectrogram, &candidate)
+            else {
+                continue;
+            };
+            let Some(rotor) = estimate_candidate_phase_rotor(pp, &cs) else {
+                continue;
+            };
+            subtract_decode_coherent(spectrogram, pp, &candidate, rotor, tone_symbols);
+            subtracted_candidates.push(candidate);
+        }
+        if subtracted_candidates.is_empty() {
+            return Vec::new();
+        }
+
+        // Step 2: re-run Costas sync search on the residual spectrogram.
+        let Ok(new_candidates) = self.costas_sync_search(spectrogram) else {
+            return Vec::new();
+        };
+
+        // Step 3: keep only candidates not at the same position as something
+        // already subtracted (those would be the original decodes' Costas
+        // pattern reappearing in the residual at a lower score). Match by
+        // freq_sub equality + freq_bin ±1 + time_step ±2 — same shape as
+        // the cross-cycle grouping tolerance.
+        let new_candidates: Vec<CostasCandidate> = new_candidates
+            .into_iter()
+            .filter(|nc| {
+                !subtracted_candidates.iter().any(|sc| {
+                    nc.freq_sub == sc.freq_sub
+                        && (nc.freq_bin as i64 - sc.freq_bin as i64).unsigned_abs() <= 1
+                        && (nc.time_step as i64 - sc.time_step as i64).unsigned_abs() <= 2
+                })
+            })
+            .take(self.config.max_sync_candidates)
+            .collect();
+        if new_candidates.is_empty() {
+            return Vec::new();
+        }
+
+        // Step 4: decode each remaining new candidate, sequentially (count
+        // is small after subtraction).
+        let mut decoded_new: Vec<DecodedMessage> = Vec::new();
+        let tone_spacing = pp.tone_spacing;
+        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        let spec_step = sps / TIME_OSR;
+        for cand in &new_candidates {
+            let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand);
+            let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
+            normalize_llrs(&mut llrs, self.config.llr_target_variance);
+            let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
+                continue;
+            };
+            if !par_verify_crc(&corrected_bits) {
+                continue;
+            }
+            let payload_bits = par_apply_xor(pp.xor_sequence, &corrected_bits);
+            let ft8_message = match self.message_parser.parse_payload(&payload_bits) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !ft8_message.is_plausible() {
+                continue;
+            }
+            let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+            let base_frequency = cand.freq_bin as f64 * tone_spacing + sub_bin_offset;
+            let coarse_offset =
+                (cand.time_step as isize - spectrogram.time_padding as isize) * spec_step as isize;
+            let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
+            let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
+            let mut new_msg = DecodedMessage::new(
+                ft8_message,
+                snr_db,
+                confidence,
+                base_frequency,
+                coarse_offset as f64 / SAMPLE_RATE as f64,
+            );
+            // Preserve tone_symbols on the new decode so future multipass
+            // iterations (if ever added) could subtract this signal too.
+            new_msg.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
+            decoded_new.push(new_msg);
+        }
+        decoded_new
     }
 
     // ========================================================================
@@ -3398,6 +3552,98 @@ fn sum_tone_magnitudes_linear(
         }
     }
     result
+}
+
+/// hb-079: reverse-derive a candidate from a DecodedMessage's
+/// `frequency_offset` and `time_offset`. We don't keep `(message,
+/// candidate)` pairs through the rayon decode path, so we reconstruct
+/// the candidate for coherent subtraction. `time_refinement` defaults
+/// to 0 (production state — `sync_time_interpolation = false`);
+/// `sync_score` is a placeholder (not consumed downstream of subtract).
+fn reverse_derive_candidate(
+    msg: &DecodedMessage,
+    pp: &ProtocolParams,
+    time_padding: usize,
+) -> CostasCandidate {
+    let tone_spacing = pp.tone_spacing;
+    let sub_bin = tone_spacing / FREQ_OSR as f64;
+    let freq_bin = (msg.frequency_offset / tone_spacing).floor() as usize;
+    let remainder = msg.frequency_offset - freq_bin as f64 * tone_spacing;
+    let freq_sub = (remainder / sub_bin).round() as usize;
+    let sps = pp.samples_per_symbol(SAMPLE_RATE);
+    let spec_step = sps / TIME_OSR;
+    let time_step_rel = (msg.time_offset * SAMPLE_RATE as f64 / spec_step as f64).round() as isize;
+    let time_step = (time_step_rel + time_padding as isize).max(0) as usize;
+    CostasCandidate {
+        time_step,
+        freq_bin,
+        freq_sub,
+        sync_score: 0.0,
+        time_refinement: 0.0,
+    }
+}
+
+/// hb-079: coherent maximum-likelihood subtraction of a decoded signal
+/// from the complex spectrogram. At each of the 79 symbol positions, at
+/// the *true* (decoded) tone, project the complex bin onto the
+/// candidate's phase rotor — `proj = Re(bin·conj(rotor))·rotor` — and
+/// subtract. This removes the signal component aligned with the rotor
+/// while preserving the orthogonal noise component (canonical ML signal
+/// subtraction). Affects both TIME_OSR substeps within each symbol
+/// window. Refreshes `spectrogram.power` consistently so the sync search
+/// on the residual sees the updated dB view. No-op when the spectrogram
+/// has no complex retention.
+fn subtract_decode_coherent(
+    spectrogram: &mut Spectrogram,
+    pp: &ProtocolParams,
+    candidate: &CostasCandidate,
+    rotor: Complex<f64>,
+    tone_symbols: &[u8],
+) {
+    if spectrogram.complex.is_none() {
+        return;
+    }
+    let t0 = candidate.time_step;
+    let f0 = candidate.freq_bin;
+    let fs = candidate.freq_sub;
+    let num_bins = spectrogram.num_bins;
+    let num_steps = spectrogram.num_steps;
+    let freq_osr = spectrogram.freq_osr;
+    if fs >= freq_osr {
+        return;
+    }
+    let steps_per_symbol = TIME_OSR;
+    let rotor_conj = rotor.conj();
+
+    for sym_idx in 0..pp.num_symbols.min(tone_symbols.len()) {
+        let tone = tone_symbols[sym_idx] as usize;
+        if tone >= NUM_TONES {
+            continue;
+        }
+        let f_idx = f0 + tone;
+        if f_idx >= num_bins {
+            continue;
+        }
+        let t_base = t0 + sym_idx * steps_per_symbol;
+        for s in 0..steps_per_symbol {
+            let t_idx = t_base + s;
+            if t_idx >= num_steps {
+                continue;
+            }
+            // Scoped &mut to spectrogram.complex; ends before .power access.
+            let residual = {
+                let complex = spectrogram.complex.as_mut().unwrap();
+                let bin = complex[t_idx][fs][f_idx];
+                let proj_real = (bin * rotor_conj).re;
+                let signal_est = Complex::new(proj_real, 0.0) * rotor;
+                let residual = bin - signal_est;
+                complex[t_idx][fs][f_idx] = residual;
+                residual
+            };
+            let mag2 = residual.norm_sqr();
+            spectrogram.power[t_idx][fs][f_idx] = 10.0 * (1e-12 + mag2).log10();
+        }
+    }
 }
 
 fn par_extract_symbols_from_spectrogram(
@@ -4963,6 +5209,49 @@ mod tests {
             "expected 2x (3dB) gain, got {:.3}x",
             coherent_pwr / noncoherent_pwr
         );
+    }
+
+    #[test]
+    fn test_coherent_subtract_ml_projection() {
+        // hb-079: at a bin containing A·exp(jφ) + noise, the ML projection
+        // onto rotor exp(jφ) yields the *parallel* component (signal +
+        // noise's parallel piece). The residual = bin - signal_est is
+        // strictly orthogonal to the rotor — the noise component
+        // perpendicular to the signal direction. This is what we subtract
+        // in the spectrogram: we remove the signal-aligned content while
+        // preserving the orthogonal noise.
+        let phi = 0.7f64;
+        let rotor = Complex::from_polar(1.0, phi);
+        let signal_amp = 2.5;
+        let noise = Complex::new(0.3, -0.6); // arbitrary noise sample
+        let bin = Complex::from_polar(signal_amp, phi) + noise;
+
+        let rotor_conj = rotor.conj();
+        let proj_real = (bin * rotor_conj).re;
+        let signal_est = Complex::new(proj_real, 0.0) * rotor;
+        let residual = bin - signal_est;
+
+        // Residual must be orthogonal to the rotor: Re(residual·conj(rotor)) ≈ 0.
+        let dot = (residual * rotor_conj).re;
+        assert!(
+            dot.abs() < 1e-10,
+            "residual must be orthogonal to rotor, dot={dot}"
+        );
+
+        // Signal estimate, when projected back, must equal signal_amp + noise's
+        // parallel component (the bin's full projection onto rotor).
+        let noise_parallel = (noise * rotor_conj).re;
+        let expected = signal_amp + noise_parallel;
+        let actual = (signal_est * rotor_conj).re;
+        assert!(
+            (actual - expected).abs() < 1e-10,
+            "signal_est projection {actual} != expected {expected}"
+        );
+
+        // |signal_est|² + |residual|² == |bin|² (orthogonal decomposition).
+        let lhs = signal_est.norm_sqr() + residual.norm_sqr();
+        let rhs = bin.norm_sqr();
+        assert!((lhs - rhs).abs() < 1e-10, "Pythagorean: {lhs} != {rhs}");
     }
 
     #[test]

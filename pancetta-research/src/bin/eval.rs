@@ -53,6 +53,8 @@ struct Args {
     cross_cycle_coherent: Option<bool>,
     /// hb-075: MRC-weighted variant of coherent cross-cycle averaging.
     cross_cycle_coherent_mrc: Option<bool>,
+    /// hb-079: coherent iterative-subtract multi-pass.
+    coherent_multipass: Option<bool>,
     /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
     two_stage: Option<bool>,
     /// hb-004: when Some, an ApContext is built and passed to
@@ -102,6 +104,7 @@ impl Args {
         let mut cross_cycle_averaging: Option<bool> = None;
         let mut cross_cycle_coherent: Option<bool> = None;
         let mut cross_cycle_coherent_mrc: Option<bool> = None;
+        let mut coherent_multipass: Option<bool> = None;
         let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
@@ -241,6 +244,12 @@ impl Args {
                     cross_cycle_coherent = Some(true);
                     cross_cycle_coherent_mrc = Some(true);
                 }
+                "--coherent-multipass" => {
+                    coherent_multipass = Some(true);
+                }
+                "--no-coherent-multipass" => {
+                    coherent_multipass = Some(false);
+                }
                 "--two-stage" => {
                     two_stage = Some(true);
                 }
@@ -337,6 +346,7 @@ impl Args {
             cross_cycle_averaging,
             cross_cycle_coherent,
             cross_cycle_coherent_mrc,
+            coherent_multipass,
             two_stage,
             ap_my_call,
             ap_recent_calls,
@@ -748,6 +758,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(on) = args.cross_cycle_coherent_mrc {
                 d = d.with_cross_cycle_coherent_mrc(on);
+            }
+            if let Some(on) = args.coherent_multipass {
+                d = d.with_coherent_multipass(on);
             }
             if let Some(on) = args.two_stage {
                 d = d.with_two_stage(on);

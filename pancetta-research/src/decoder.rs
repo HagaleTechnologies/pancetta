@@ -207,6 +207,16 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-079: enable coherent iterative-subtract multi-pass. Subtracts
+    /// each pass-1 decode's coherent contribution from the complex
+    /// spectrogram, re-runs Costas sync on the residual, and decodes any
+    /// new candidates masked by stronger neighbors. Requires
+    /// cross_cycle_coherent (for the complex spectrogram).
+    pub fn with_coherent_multipass(mut self, on: bool) -> Self {
+        self.config.coherent_multipass = on;
+        self
+    }
+
     /// hb-046: enable two-stage decoding. When `on`, decode_wav runs a
     /// CHEAP pass first (relaxed sync_cap, no OSD, fewer LDPC iters)
     /// then the standard PRODUCTION pass on the same audio, unioning

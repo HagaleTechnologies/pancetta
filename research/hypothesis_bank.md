@@ -1,10 +1,10 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-26T19:00:00Z
+last_updated: 2026-05-26T20:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 67
+exploitation_run: 68
 current_ratio: 0.056
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
@@ -456,6 +456,73 @@ current_ratio: 0.056
     against that corpus. If coherent wins there but loses on the operator
     corpus, the algorithm is sound and the operator corpus is the limit;
     if coherent loses everywhere, the approach is closed.
+
+### hb-079 — Coherent iterative-subtract multi-pass  [GRADUATED 2026-05-26 — biggest single-iter composite win in project history]
+  mode: ft8
+  status: GRADUATED — `coherent_multipass` default true. Composite +0.009212 (0.558279 → 0.567491), ~7× the prior biggest single iter. hard-200 +158 rec / +75 novel; hard-1000 +401 rec / +132 novel. The recall ceiling on hard-* was interference, not threshold; the ML projection in the complex spectrogram is the right kernel for coherent subtraction.
+  priority_score: 0.0
+  estimated_effort: 2-3 sessions (delivered in 1)
+  expected_delta: CONFIRMED massively
+  defensible_prior: built on hb-075's complex spectrogram + ML projection canonical math
+  wild_card: false
+  evidence_for:
+    - Targeted hard-200 A/B (vs hb-075 prod): no-filter +158 rec / +127 novel; with filter +158 rec / +78 novel. Real:novel ratio after filter ~2:1.
+    - Full 5-tier: +401 rec on hard-1000, fixtures + synth preserved exactly, wall-clock +14% (within budget). Composite +0.009212.
+    - hb-030 closed the dB-domain kernel; ML projection in complex domain (residual ⊥ rotor, |signal_est|²+|residual|²=|bin|² by orthogonality) is the canonical fix.
+  notes: |
+    Implementation: reverse_derive_candidate from DecodedMessage (we don't
+    keep candidates paired with msgs); subtract_decode_coherent does ML
+    projection at each (sym, true_tone) × 2 substeps and refreshes the
+    dB power view; coherent_subtract_and_repass orchestrates subtract +
+    residual sync_search + decode of new candidates. Sequential decode
+    of new candidates after subtract (small count). Lib tests 196→197
+    with test_coherent_subtract_ml_projection (orthogonal-decomposition
+    invariant). See
+    research/experiments/2026-05-26-hb-079-coherent-multipass.md.
+    Spawned hb-080 (N>2 passes), hb-081 (MRC-weighted subtract),
+    hb-082 (residual-tier sync threshold).
+
+### hb-080 — Iterative-subtract: N>2 passes  [PRIORITY: 0.45, spawned 2026-05-26 from hb-079]
+  mode: ft8
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 1 session
+  expected_delta: +20-50 hard-200 recovered (additional masked signals revealed in residual-of-residual)
+  defensible_prior: yes — hb-079 confirmed pass-2 finds +158; some signals may be tertiary-masked
+  wild_card: false
+  evidence_for:
+    - hb-079 only does pass 1 + pass 2 (subtract once, redecode once). Multi-stage interference is real on the busy bands (a signal masked by both A and B might surface after subtracting A but stay masked by B until B's pass-2 decode subtracts).
+    - Implementation: wrap the existing coherent_subtract_and_repass in a loop that runs N times or until no new decodes appear. Maybe `coherent_multipass_iterations: usize` (default 2, sweep {2, 3, 4}).
+  evidence_against:
+    - Diminishing returns — each pass finds fewer signals than the previous. Pass 3 might add 0-20.
+    - Cumulative subtract error compounds; bad pass-1 decodes (rare but real) could damage the residual further.
+  notes: |
+    The cleanest implementation: change config to `coherent_multipass_iterations: usize` (default 2 = current behavior), loop subtract_and_repass. Sweep {2, 3, 4} on hard-200 to find the elbow.
+
+### hb-081 — MRC-weighted coherent subtract  [PRIORITY: 0.40, spawned 2026-05-26 from hb-079]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 1 session
+  expected_delta: small bounded improvement — protects adjacent bins from over-subtraction by weak-rotor decodes
+  defensible_prior: yes — direct analogue of hb-075's MRC fix for cross-cycle. The same noisy-rotor problem could over- or under-estimate subtract magnitude.
+  wild_card: false
+  evidence_for:
+    - hb-079 currently subtracts at full ML-projection amplitude regardless of how confident the rotor is. For weak-rotor pass-1 decodes (low-SNR borderline), the projection includes noise variance — subtract amplitude can be wrong by a factor ~|rotor noise| / |signal|.
+    - Weight subtraction magnitude by rotor confidence (|acc|): strong-rotor decodes subtract at ~full amplitude, weak-rotor decodes subtract less. Protects adjacent bins.
+  notes: |
+    Implementation: in subtract_decode_coherent, scale the subtract amount by min(1.0, |acc|/threshold). Adds one parameter (rotor_confidence_threshold).
+
+### hb-082 — Residual-tier sync threshold tuning  [PRIORITY: 0.30, spawned 2026-05-26 from hb-079]
+  mode: ft8
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 1 session
+  expected_delta: small — may surface a few more masked candidates if the residual's noise floor differs from the original
+  defensible_prior: partial — after subtraction the noise statistics change; production min_sync_score might be too strict
+  wild_card: false
+  notes: |
+    Currently coherent_subtract_and_repass uses production min_sync_score for the residual sync_search. After subtracting signal energy, the residual's noise floor drops, so some previously-marginal Costas patterns at the new noise floor become detectable. A separate residual_min_sync_score (or relative offset like -0.5) might surface them. Pair with hb-080.
 
 ### hb-057 — Median-filter DT averaging for sync/AP  [PRIORITY: 0.35, spawned 2026-05-25 from mr-002]
   mode: ft8
