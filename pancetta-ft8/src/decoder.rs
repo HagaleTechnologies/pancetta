@@ -241,6 +241,15 @@ pub struct Ft8Config {
     /// costs ~2× memory in the spectrogram pass.
     pub cross_cycle_coherent: bool,
 
+    /// hb-075: when `cross_cycle_coherent` AND this flag are both true,
+    /// weight each member's contribution by the magnitude of its
+    /// un-normalised Costas accumulator. Equivalent to multiplying each
+    /// member's complex symbols by `conj(acc_i)` instead of `conj(rotor_i)`
+    /// — does alignment AND MRC-style weighting in one op. Addresses
+    /// hb-074's failure mode where noisy rotors on marginal members
+    /// inflated sum variance. Default false.
+    pub cross_cycle_coherent_mrc: bool,
+
     /// hb-063 (arXiv:2410.13131, Hocevar 2004): use a layered (row-
     /// sequential) belief-propagation schedule instead of the flooding
     /// schedule. Layered BP updates check nodes one at a time and folds
@@ -289,9 +298,16 @@ impl Default for Ft8Config {
             // alone. Synth-clean and fixtures are single-slot so groups
             // never form (no-op).
             cross_cycle_averaging: true,
-            // hb-074: coherent variant opt-in. Off until the A/B shows
-            // coherent integration recovers gain over non-coherent.
-            cross_cycle_coherent: false,
+            // hb-074 + hb-075 (2026-05-26): coherent cross-cycle averaging
+            // with MRC magnitude-weighting is the production default. The
+            // unweighted variant (hb-074, default off here was the right
+            // call — it lost 10 hard-200 recovered). MRC fixes the
+            // marginal-rotor variance problem; hard-200 A/B vs non-coherent
+            // (with FP filter): +22 recovered / +1 novel. Composite ~+0.00128
+            // from hard-200 alone (almost 2× hb-056). Spectrogram pays ~2x
+            // memory when these flags are on; acceptable cost.
+            cross_cycle_coherent: true,
+            cross_cycle_coherent_mrc: true,
         }
     }
 }
@@ -1847,6 +1863,12 @@ impl Ft8Decoder {
             // align by multiplying with conj(rotor), sum complex, |sum|² →
             // dB. Non-coherent path: dB → linear power → sum → dB.
             let avg_mags = if coherent {
+                // hb-075: when MRC is on, multiply each member by conj(acc)
+                // directly — does alignment + magnitude weighting in one
+                // op so strong rotors dominate, noisy weak rotors contribute
+                // weakly. Falls back to hb-074's unweighted alignment
+                // (conj(rotor)) when MRC is off.
+                let mrc = self.config.cross_cycle_coherent_mrc;
                 let mut aligned: Vec<Vec<[Complex<f64>; NUM_TONES]>> =
                     Vec::with_capacity(group.len());
                 for &i in &group {
@@ -1857,15 +1879,23 @@ impl Ft8Decoder {
                     ) else {
                         continue;
                     };
-                    let Some(rotor) = estimate_candidate_phase_rotor(pp, &cs) else {
-                        continue;
+                    let multiplier = if mrc {
+                        let acc = compute_costas_complex_accumulator(pp, &cs);
+                        if acc.norm_sqr() < 1e-60 {
+                            continue;
+                        }
+                        acc.conj()
+                    } else {
+                        let Some(rotor) = estimate_candidate_phase_rotor(pp, &cs) else {
+                            continue;
+                        };
+                        rotor.conj()
                     };
-                    let conj_rotor = rotor.conj();
                     let rotated: Vec<[Complex<f64>; NUM_TONES]> = cs
                         .into_iter()
                         .map(|mut row| {
                             for t in 0..NUM_TONES {
-                                row[t] *= conj_rotor;
+                                row[t] *= multiplier;
                             }
                             row
                         })
@@ -3442,18 +3472,17 @@ fn par_extract_complex_symbols_from_spectrogram(
     Some(out)
 }
 
-/// hb-074: estimate a candidate's per-cycle phase rotor from the 21 known
-/// Costas symbols. Each Costas symbol is a known tone; summing the complex
-/// FFT bin at that (symbol, expected_tone) across all 21 positions yields
-/// `Σ A·exp(jφ_cand) = N·A·exp(jφ_cand)` (signal coherent, noise
-/// uncorrelated). Normalising to unit magnitude returns `exp(jφ_cand)` —
-/// the rotor to divide each symbol by to align this candidate's phase
-/// to a common reference. Returns `None` if the sum is too small to give
-/// a stable estimate (silent candidate / clipped buffer).
-fn estimate_candidate_phase_rotor(
+/// hb-074: sum the candidate's complex FFT bins at all 21 Costas positions
+/// (each at its expected tone). `Σ cs[costas_sym][expected_tone] =
+/// N·A·exp(jφ_cand)` (signal coherent, noise uncorrelated). The result's
+/// phase is the candidate's reference phase; the result's magnitude is
+/// proportional to the candidate's signal strength × √N_costas — the MRC
+/// weight for hb-075. Returned un-normalised so callers can pick
+/// rotor-only (hb-074) or rotor+magnitude (hb-075).
+fn compute_costas_complex_accumulator(
     pp: &ProtocolParams,
     complex_symbols: &[[Complex<f64>; NUM_TONES]],
-) -> Option<Complex<f64>> {
+) -> Complex<f64> {
     let mut acc = Complex::<f64>::new(0.0, 0.0);
     for (m, &group_start) in pp.costas_positions.iter().enumerate() {
         for k in 0..pp.costas_length {
@@ -3465,6 +3494,19 @@ fn estimate_candidate_phase_rotor(
             acc += complex_symbols[sym_idx][expected_tone];
         }
     }
+    acc
+}
+
+/// hb-074: estimate a candidate's per-cycle phase rotor — the
+/// unit-magnitude `exp(jφ_cand)` to divide each symbol by to align the
+/// candidate's phase to a common reference. Returns `None` if the
+/// accumulator magnitude is too small to give a stable estimate
+/// (silent candidate / clipped buffer).
+fn estimate_candidate_phase_rotor(
+    pp: &ProtocolParams,
+    complex_symbols: &[[Complex<f64>; NUM_TONES]],
+) -> Option<Complex<f64>> {
+    let acc = compute_costas_complex_accumulator(pp, complex_symbols);
     let mag = acc.norm();
     if mag < 1e-30 {
         return None;

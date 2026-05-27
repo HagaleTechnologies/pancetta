@@ -199,6 +199,14 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-075: when paired with coherent cross-cycle, use MRC-style
+    /// magnitude-weighting (multiply by conj(acc) directly) instead of
+    /// unweighted unit-rotor alignment.
+    pub fn with_cross_cycle_coherent_mrc(mut self, on: bool) -> Self {
+        self.config.cross_cycle_coherent_mrc = on;
+        self
+    }
+
     /// hb-046: enable two-stage decoding. When `on`, decode_wav runs a
     /// CHEAP pass first (relaxed sync_cap, no OSD, fewer LDPC iters)
     /// then the standard PRODUCTION pass on the same audio, unioning

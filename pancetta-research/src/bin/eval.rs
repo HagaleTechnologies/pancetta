@@ -51,6 +51,8 @@ struct Args {
     cross_cycle_averaging: Option<bool>,
     /// hb-074: coherent (phase-aligned complex sum) variant of cross-cycle averaging.
     cross_cycle_coherent: Option<bool>,
+    /// hb-075: MRC-weighted variant of coherent cross-cycle averaging.
+    cross_cycle_coherent_mrc: Option<bool>,
     /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
     two_stage: Option<bool>,
     /// hb-004: when Some, an ApContext is built and passed to
@@ -99,6 +101,7 @@ impl Args {
         let mut layered_bp: Option<bool> = None;
         let mut cross_cycle_averaging: Option<bool> = None;
         let mut cross_cycle_coherent: Option<bool> = None;
+        let mut cross_cycle_coherent_mrc: Option<bool> = None;
         let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
@@ -234,6 +237,10 @@ impl Args {
                 "--cross-cycle-coherent" => {
                     cross_cycle_coherent = Some(true);
                 }
+                "--cross-cycle-coherent-mrc" => {
+                    cross_cycle_coherent = Some(true);
+                    cross_cycle_coherent_mrc = Some(true);
+                }
                 "--two-stage" => {
                     two_stage = Some(true);
                 }
@@ -329,6 +336,7 @@ impl Args {
             layered_bp,
             cross_cycle_averaging,
             cross_cycle_coherent,
+            cross_cycle_coherent_mrc,
             two_stage,
             ap_my_call,
             ap_recent_calls,
@@ -737,6 +745,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(on) = args.cross_cycle_coherent {
                 d = d.with_cross_cycle_coherent(on);
+            }
+            if let Some(on) = args.cross_cycle_coherent_mrc {
+                d = d.with_cross_cycle_coherent_mrc(on);
             }
             if let Some(on) = args.two_stage {
                 d = d.with_two_stage(on);

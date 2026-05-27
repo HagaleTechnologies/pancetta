@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-26T15:00:00Z
+last_updated: 2026-05-26T18:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 62
-current_ratio: 0.061
+exploitation_run: 63
+current_ratio: 0.060
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -404,10 +404,10 @@ current_ratio: 0.061
     research/experiments/2026-05-26-hb-074-coherent-cross-cycle.md.
     Infrastructure kept flag-gated (default off). Spawned hb-075/076/077.
 
-### hb-075 — Phase-magnitude-weighted coherent cross-cycle sum  [PRIORITY: 0.30, spawned 2026-05-26 from hb-074]
+### hb-075 — Phase-magnitude-weighted coherent cross-cycle sum  [GRADUATED 2026-05-26 — biggest single-iter win of the session]
   mode: ft8
-  status: pending
-  priority_score: 0.30
+  status: GRADUATED — cross_cycle_coherent_mrc default true; composite +0.001283; hard-200 +22 rec / +1 novel; hard-1000 +78 rec / -7 novel. MRC weighting flips the hb-074 sign exactly as the failure-mode diagnosis predicted.
+  priority_score: 0.0
   estimated_effort: 1 session (builds on hb-074 infra)
   expected_delta: bounded loss vs non-coherent — and possibly a small win if it discounts noisy-rotor members enough; uncertain
   defensible_prior: yes (paper-standard MRC-style weighting addresses hb-074's exact failure mode)
@@ -423,10 +423,10 @@ current_ratio: 0.061
     each member by its rotor magnitude. Eval as 4-way A/B vs both
     non-coherent and the unweighted hb-074 baseline.
 
-### hb-076 — Per-Costas-block phase recovery  [PRIORITY: 0.30, spawned 2026-05-26 from hb-074]
+### hb-076 — Per-Costas-block phase recovery  [PRIORITY: 0.20, spawned 2026-05-26 from hb-074]
   mode: ft8
-  status: pending
-  priority_score: 0.30
+  status: pending — DOWNGRADED post-hb-075. The global rotor + MRC weighting (hb-075) handles the marginal-rotor variance issue without per-block phase modeling. hb-076 still might rescue an additional sliver for genuinely drift-dominated cases, but the headroom is small.
+  priority_score: 0.20
   estimated_effort: 1 session (builds on hb-074 infra)
   expected_delta: targets per-slot phase drift not captured by a single global rotor; bounded
   defensible_prior: partial — 3 Costas blocks per slot give independent phase estimates that can model drift
@@ -441,10 +441,10 @@ current_ratio: 0.061
     proximity to nearest Costas block. Variant: linearly interpolate
     rotors across symbol positions for smooth drift correction.
 
-### hb-077 — Phase-coherent SDR-IQ eval corpus  [PRIORITY: 0.25, spawned 2026-05-26 from hb-074]
+### hb-077 — Phase-coherent SDR-IQ eval corpus  [PRIORITY: 0.20, spawned 2026-05-26 from hb-074]
   mode: ft8
-  status: pending (hardware/operator dependent)
-  priority_score: 0.25
+  status: pending (hardware/operator dependent) — DOWNGRADED post-hb-075. Real operator audio supports coherent gain after MRC weighting; the SDR-IQ corpus would mainly check whether an upper bound exists beyond MRC.
+  priority_score: 0.20
   estimated_effort: 2-3 sessions (capture + manifest + truth) — operator-pending
   expected_delta: diagnostic — tests whether the binding constraint is hb-074's algorithm or pancetta's typical corpus's phase-non-coherence
   defensible_prior: yes — direct SDR-IQ capture (no audio path) guarantees phase coherence end-to-end
