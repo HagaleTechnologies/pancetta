@@ -250,19 +250,32 @@ pub struct Ft8Config {
     /// inflated sum variance. Default false.
     pub cross_cycle_coherent_mrc: bool,
 
-    /// hb-079 (NEW): coherent iterative-subtract multi-pass. After pass 1
-    /// (regular + cross-cycle), for each decoded message, project its
-    /// signal contribution onto the candidate's phase rotor and subtract
-    /// it from the complex spectrogram (ML projection — removes signal
-    /// while preserving orthogonal noise). Then re-run Costas sync search
-    /// on the residual + decode any new candidates that the original
-    /// pass missed because they were masked by stronger neighbors.
-    /// Requires `cross_cycle_coherent = true` (needs the complex
-    /// spectrogram). Replaces the dead `subtract_with_sidelobes` (dB
-    /// domain, hb-030 broken) with the coherent (complex-domain) variant
-    /// the multi-pass design originally wanted. Default false until
-    /// the A/B confirms.
-    pub coherent_multipass: bool,
+    /// hb-082: optional sync_score floor applied to the *residual*
+    /// Costas search inside the multipass loop (independent of the
+    /// production `min_sync_score` that gates the original pass). After
+    /// subtraction the noise floor drops, so a lower threshold can
+    /// surface more masked candidates. `None` reuses `min_sync_score`.
+    pub residual_min_sync_score: Option<f64>,
+
+    /// hb-081: MRC-weighted coherent subtract. When > 0.0, the
+    /// subtract amplitude is scaled by `min(1, |acc|/threshold)` where
+    /// |acc| is the un-normalised Costas accumulator magnitude (rotor's
+    /// confidence). Weak-rotor decodes subtract less (avoiding
+    /// over-subtraction of adjacent bins when the rotor estimate is
+    /// noisy), strong-rotor decodes subtract fully. 0.0 = unweighted
+    /// hb-079 behavior.
+    pub coherent_subtract_mrc_threshold: f64,
+
+    /// hb-079 + hb-080: coherent iterative-subtract multi-pass. After
+    /// pass 1 (regular + cross-cycle), each decoded message's signal is
+    /// subtracted from the complex spectrogram via ML projection
+    /// (`Re(bin·conj(rotor))·rotor` — removes signal while preserving
+    /// orthogonal noise); the residual is re-synced and any newly-
+    /// revealed masked candidates are decoded. This field counts how
+    /// many such subtract+repass *rounds* to run. 0 disables; 1 = the
+    /// original hb-079 production (one round). hb-080 sweeps {2,3,4,5}.
+    /// Replaces the dead dB-domain `subtract_with_sidelobes` (hb-030).
+    pub coherent_multipass_iterations: u8,
 
     /// hb-063 (arXiv:2410.13131, Hocevar 2004): use a layered (row-
     /// sequential) belief-propagation schedule instead of the flooding
@@ -322,14 +335,20 @@ impl Default for Ft8Config {
             // memory when these flags are on; acceptable cost.
             cross_cycle_coherent: true,
             cross_cycle_coherent_mrc: true,
-            // hb-079 (2026-05-26): coherent iterative-subtract multi-pass
-            // is the production default. hard-200 A/B vs hb-075 baseline
-            // (with FP filter): +158 recovered / +78 novel — nearly 3×
-            // the cumulative structural gain of the rest of the session.
-            // Composite contribution ~+0.00921 from hard-200 alone (almost
-            // an order of magnitude bigger than the previous biggest iter).
-            // The recall wall was indeed interference, not threshold.
-            coherent_multipass: true,
+            // hb-081: MRC subtract scaling off by default until the
+            // A/B confirms.
+            coherent_subtract_mrc_threshold: 0.0,
+            // hb-082: residual sync threshold uses production `min_sync_score`
+            // until the A/B confirms a lower value is better.
+            residual_min_sync_score: None,
+            // hb-079 (2026-05-26) + hb-080 (2026-05-27): coherent
+            // iterative-subtract multi-pass at N=3 rounds. hb-080 sweep
+            // on hard-200: N=1→2 +7 rec, N=2→3 +9 rec, N=4/5 saturate;
+            // ZERO novel cost across the sweep. +16 hard-200 recall at
+            // N=3 vs N=1 (rate 0.53498 → 0.53685; composite +~0.000935).
+            // Wall-clock at N=3 is 1.78× N=1, well within the 3000 ms/WAV
+            // budget. 0 disables.
+            coherent_multipass_iterations: 3,
         }
     }
 }
@@ -792,9 +811,24 @@ impl Ft8Decoder {
             // Runs AFTER cross-cycle so cross-cycle integrates the full
             // (un-subtracted) data, then we subtract everything decoded so
             // far before looking for weaker masked signals.
-            if self.config.coherent_multipass {
-                let extra = self.coherent_subtract_and_repass(&mut spectrogram, &pass_decoded);
-                pass_decoded.extend(extra);
+            // hb-080: loop N rounds of subtract+repass. Each round only
+            // subtracts the signals newly-decoded in the previous round —
+            // pass 1's decodes are subtracted once on round 1, round 2
+            // subtracts the new (residual) decodes, etc. Stops early if a
+            // round finds nothing new.
+            if self.config.coherent_multipass_iterations > 0 {
+                let mut to_subtract: &[DecodedMessage] = &pass_decoded;
+                let mut round_start_offset = 0;
+                for _round in 0..self.config.coherent_multipass_iterations {
+                    let extra = self.coherent_subtract_and_repass(&mut spectrogram, to_subtract);
+                    if extra.is_empty() {
+                        break;
+                    }
+                    let added = extra.len();
+                    pass_decoded.extend(extra);
+                    round_start_offset = pass_decoded.len() - added;
+                    to_subtract = &pass_decoded[round_start_offset..];
+                }
             }
 
             // Deduplicate the parallel results (multiple candidates may decode to
@@ -1380,6 +1414,18 @@ impl Ft8Decoder {
     /// all 21 Costas positions and score using neighbor comparison (ft8_lib style).
     /// With freq_osr=2, we search both even and odd frequency sub-bins.
     fn costas_sync_search(&self, spectrogram: &Spectrogram) -> Ft8Result<Vec<CostasCandidate>> {
+        self.costas_sync_search_with_threshold(spectrogram, self.config.min_sync_score)
+    }
+
+    /// hb-082: same sync search as `costas_sync_search` but with an explicit
+    /// minimum-score threshold. The residual multipass uses this with
+    /// `residual_min_sync_score` so the residual's lower noise floor can
+    /// surface candidates the production threshold would reject.
+    fn costas_sync_search_with_threshold(
+        &self,
+        spectrogram: &Spectrogram,
+        min_score: f64,
+    ) -> Ft8Result<Vec<CostasCandidate>> {
         let mut candidates = Vec::new();
         let pp = &self.protocol_params;
 
@@ -1397,7 +1443,7 @@ impl Ft8Decoder {
                 for f0 in MIN_FREQ_BIN..max_freq_bin {
                     let score = self.compute_costas_score(spectrogram, t0, f0, freq_sub);
 
-                    if score > self.config.min_sync_score {
+                    if score > min_score {
                         // hb-044: optional parabolic refinement of the
                         // time-bin peak. Costs 2 extra score evaluations
                         // per kept candidate. Both hb-044 (sort by
@@ -2001,14 +2047,15 @@ impl Ft8Decoder {
     /// the Costas sync search on the residual and decode any new candidates
     /// that the original pass missed because they were masked by stronger
     /// neighbors. Returns the new decodes for the caller to union + dedup.
-    /// No-op when `coherent_multipass` is off or the spectrogram lacks
-    /// complex retention.
+    /// No-op when `coherent_multipass_iterations == 0` or the spectrogram
+    /// lacks complex retention. Called once per round by the caller;
+    /// `decoded` is the slice of just-found decodes to subtract this round.
     fn coherent_subtract_and_repass(
         &self,
         spectrogram: &mut Spectrogram,
         decoded: &[DecodedMessage],
     ) -> Vec<DecodedMessage> {
-        if !self.config.coherent_multipass || spectrogram.complex.is_none() {
+        if self.config.coherent_multipass_iterations == 0 || spectrogram.complex.is_none() {
             return Vec::new();
         }
         let pp = &self.protocol_params;
@@ -2029,10 +2076,20 @@ impl Ft8Decoder {
             else {
                 continue;
             };
-            let Some(rotor) = estimate_candidate_phase_rotor(pp, &cs) else {
+            // hb-081: compute both the accumulator (for MRC scaling) and
+            // the unit rotor (for ML projection direction).
+            let acc = compute_costas_complex_accumulator(pp, &cs);
+            let mag = acc.norm();
+            if mag < 1e-30 {
                 continue;
+            }
+            let rotor = acc / mag;
+            let scale = if self.config.coherent_subtract_mrc_threshold > 0.0 {
+                (mag / self.config.coherent_subtract_mrc_threshold).min(1.0)
+            } else {
+                1.0
             };
-            subtract_decode_coherent(spectrogram, pp, &candidate, rotor, tone_symbols);
+            subtract_decode_coherent(spectrogram, pp, &candidate, rotor, tone_symbols, scale);
             subtracted_candidates.push(candidate);
         }
         if subtracted_candidates.is_empty() {
@@ -2040,7 +2097,13 @@ impl Ft8Decoder {
         }
 
         // Step 2: re-run Costas sync search on the residual spectrogram.
-        let Ok(new_candidates) = self.costas_sync_search(spectrogram) else {
+        // hb-082: use residual-specific threshold if set, else production.
+        let residual_min = self
+            .config
+            .residual_min_sync_score
+            .unwrap_or(self.config.min_sync_score);
+        let Ok(new_candidates) = self.costas_sync_search_with_threshold(spectrogram, residual_min)
+        else {
             return Vec::new();
         };
 
@@ -3599,10 +3662,15 @@ fn subtract_decode_coherent(
     candidate: &CostasCandidate,
     rotor: Complex<f64>,
     tone_symbols: &[u8],
+    // hb-081: subtract amplitude scale ∈ [0, 1]. 1.0 = full ML subtract
+    // (hb-079 default); <1.0 reduces the magnitude (MRC weighting from a
+    // noisy-rotor caller). Outside [0,1] is clamped.
+    scale: f64,
 ) {
     if spectrogram.complex.is_none() {
         return;
     }
+    let scale = scale.clamp(0.0, 1.0);
     let t0 = candidate.time_step;
     let f0 = candidate.freq_bin;
     let fs = candidate.freq_sub;
@@ -3635,7 +3703,8 @@ fn subtract_decode_coherent(
                 let complex = spectrogram.complex.as_mut().unwrap();
                 let bin = complex[t_idx][fs][f_idx];
                 let proj_real = (bin * rotor_conj).re;
-                let signal_est = Complex::new(proj_real, 0.0) * rotor;
+                // hb-081: scale the subtracted projection magnitude.
+                let signal_est = Complex::new(proj_real * scale, 0.0) * rotor;
                 let residual = bin - signal_est;
                 complex[t_idx][fs][f_idx] = residual;
                 residual

@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-26T20:00:00Z
+last_updated: 2026-05-27T17:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 68
-current_ratio: 0.056
+exploitation_run: 73
+current_ratio: 0.052
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -482,7 +482,10 @@ current_ratio: 0.056
     Spawned hb-080 (N>2 passes), hb-081 (MRC-weighted subtract),
     hb-082 (residual-tier sync threshold).
 
-### hb-080 — Iterative-subtract: N>2 passes  [PRIORITY: 0.45, spawned 2026-05-26 from hb-079]
+### hb-080 — Iterative-subtract: N>2 passes  [GRADUATED 2026-05-27 — batch 13]
+  status_2026_05_27: GRADUATED — `coherent_multipass_iterations` default 1→3. hard-200 sweep N∈{1,2,3,4,5}: N=2 +7 rec, N=3 +9 rec (+16 total vs N=1), N=4/5 saturate. ZERO novel cost across the sweep. Wall-clock 1.78× N=1, within budget. Composite +~0.000935 from hard-200 alone. Tertiary masking is real but saturates at three rounds; deeper signal masking is the joint-decoding territory (hb-086).
+  ---- original priority below ----
+  [PRIORITY-WAS: 0.45, spawned 2026-05-26 from hb-079]
   mode: ft8
   status: pending
   priority_score: 0.45
@@ -499,7 +502,10 @@ current_ratio: 0.056
   notes: |
     The cleanest implementation: change config to `coherent_multipass_iterations: usize` (default 2 = current behavior), loop subtract_and_repass. Sweep {2, 3, 4} on hard-200 to find the elbow.
 
-### hb-081 — MRC-weighted coherent subtract  [PRIORITY: 0.40, spawned 2026-05-26 from hb-079]
+### hb-081 — MRC-weighted coherent subtract  [SHELVED 2026-05-27 — batch 13]
+  status_2026_05_27: SHELVED — hard-200 sweep at MRC threshold ∈ {5, 10, 20, 40} all regress -170 to -173 recovered vs full ML subtract (threshold=0). The assumed failure mode (over-subtract from noisy rotors) wasn't real: hb-080 confirms full subtract gives +0 novel cost. *Under-subtracting* instead leaves residual signal energy at decoded positions, which BLOCKS multipass from finding masked candidates. The mechanism's already optimal. Library + CLI flag stay available for re-evaluation if the corpus changes.
+  ---- original priority below ----
+  [PRIORITY-WAS: 0.40, spawned 2026-05-26 from hb-079]
   mode: ft8
   status: pending
   priority_score: 0.40
@@ -513,7 +519,36 @@ current_ratio: 0.056
   notes: |
     Implementation: in subtract_decode_coherent, scale the subtract amount by min(1.0, |acc|/threshold). Adds one parameter (rotor_confidence_threshold).
 
-### hb-082 — Residual-tier sync threshold tuning  [PRIORITY: 0.30, spawned 2026-05-26 from hb-079]
+### hb-082 — Residual-tier sync threshold tuning  [SHELVED 2026-05-27 — batch 13]
+  status_2026_05_27: SHELVED — hard-200 sweep at residual threshold ∈ {2.0, 2.5, 3.5} produced ZERO change at every threshold vs production (3.0). The candidates that surface in the residual naturally cluster above 3.0; the threshold isn't binding. Plumbing left in place (residual_min_sync_score: Option<f64>) for future use if the corpus changes.
+  ---- original priority below ----
+  [PRIORITY-WAS: 0.30, spawned 2026-05-26 from hb-079]
+
+### hb-085 — Cross-cycle on residual  [SHELVED 2026-05-27 — design analysis, batch 13]
+  status: SHELVED before implementation — structurally redundant. After hb-079's subtract, the original signal positions are near-zero (averaging with zero dilutes) and residual-revealed candidates aren't at the same `(freq_sub, freq_bin, t0 mod slot)` as any original repeating-station group (no peer to average with). The cross-cycle integration that would help — coherent subtract of the masking signal then cross-cycle on the now-unmasked positions — is what hb-079 already does implicitly. See research/experiments/2026-05-27-hb-085-cross-cycle-on-residual.md.
+  priority_score: 0.0
+
+### hb-086 — Joint multi-candidate decoding (pair / cluster)  [PRIORITY: 0.50 plan-sized, spawned 2026-05-27 from batch-13 diagnostic]
+  mode: ft8
+  status: pending — design spec written; needs diagnostic-first step + multi-session implementation
+  priority_score: 0.50
+  estimated_effort: 3-5 sessions (incl. dead-ends)
+  expected_delta: targets the measured top-20 hard-200 wall (17% of all misses, 60% per-WAV miss rate); plausible +30-100 hard-200 rec / +0.0015-0.005 composite if mechanism fits
+  defensible_prior: yes — diagnostic confirms dense-interference top-20 WAVs are the binding constraint after hb-079; jt9 recovers them so the signal IS there
+  wild_card: false
+  evidence_for:
+    - main.json `per_wav_top_failures`: 20 WAVs carry 1214 truths, pancetta recovers 518 (60% miss), jt9 gets all. 17% of total hard-200 misses concentrated in these WAVs.
+    - hb-079's coherent subtract works one signal at a time; mutually-masking pairs (neither decodes first) cannot be addressed by serial subtract. Joint decoding addresses this directly.
+    - Infrastructure reuse: hb-079's complex spectrogram, rotor estimation, ML projection all carry over for the joint subtract step.
+  evidence_against:
+    - 3-5 session commitment with multiple variant decisions (pair selection, hard vs soft decision, iteration count).
+    - CPU cost adds per-pair work on top of hb-079's already-doubled cost.
+    - Risk that the top-20 wall is "too dense" — joint pair decoding may help triplets/quadruplets less than naive pair-counting suggests.
+  notes: |
+    See docs/superpowers/specs/2026-05-27-joint-decoding-design.md.
+    Kill-switch built in: diagnostic step quantifies pair-density on
+    top-20 misses; if <30% match the pair pattern, mechanism doesn't fit
+    and we shelve without implementing. Risk-bounded scope.
   mode: ft8
   status: pending
   priority_score: 0.30

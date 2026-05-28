@@ -53,8 +53,12 @@ struct Args {
     cross_cycle_coherent: Option<bool>,
     /// hb-075: MRC-weighted variant of coherent cross-cycle averaging.
     cross_cycle_coherent_mrc: Option<bool>,
-    /// hb-079: coherent iterative-subtract multi-pass.
-    coherent_multipass: Option<bool>,
+    /// hb-079 + hb-080: number of coherent subtract+repass rounds.
+    coherent_multipass_iterations: Option<u8>,
+    /// hb-081: MRC subtract scaling threshold (0 disables).
+    coherent_subtract_mrc_threshold: Option<f64>,
+    /// hb-082: residual sync_score threshold (None reuses production).
+    residual_min_sync_score: Option<f64>,
     /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
     two_stage: Option<bool>,
     /// hb-004: when Some, an ApContext is built and passed to
@@ -104,7 +108,9 @@ impl Args {
         let mut cross_cycle_averaging: Option<bool> = None;
         let mut cross_cycle_coherent: Option<bool> = None;
         let mut cross_cycle_coherent_mrc: Option<bool> = None;
-        let mut coherent_multipass: Option<bool> = None;
+        let mut coherent_multipass_iterations: Option<u8> = None;
+        let mut coherent_subtract_mrc_threshold: Option<f64> = None;
+        let mut residual_min_sync_score: Option<f64> = None;
         let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
@@ -245,10 +251,31 @@ impl Args {
                     cross_cycle_coherent_mrc = Some(true);
                 }
                 "--coherent-multipass" => {
-                    coherent_multipass = Some(true);
+                    coherent_multipass_iterations = Some(1);
                 }
                 "--no-coherent-multipass" => {
-                    coherent_multipass = Some(false);
+                    coherent_multipass_iterations = Some(0);
+                }
+                "--coherent-multipass-iters" => {
+                    coherent_multipass_iterations = Some(
+                        iter.next()
+                            .context("--coherent-multipass-iters needs a value")?
+                            .parse()?,
+                    );
+                }
+                "--coherent-mrc-threshold" => {
+                    coherent_subtract_mrc_threshold = Some(
+                        iter.next()
+                            .context("--coherent-mrc-threshold needs a value")?
+                            .parse()?,
+                    );
+                }
+                "--residual-min-sync-score" => {
+                    residual_min_sync_score = Some(
+                        iter.next()
+                            .context("--residual-min-sync-score needs a value")?
+                            .parse()?,
+                    );
                 }
                 "--two-stage" => {
                     two_stage = Some(true);
@@ -346,7 +373,9 @@ impl Args {
             cross_cycle_averaging,
             cross_cycle_coherent,
             cross_cycle_coherent_mrc,
-            coherent_multipass,
+            coherent_multipass_iterations,
+            coherent_subtract_mrc_threshold,
+            residual_min_sync_score,
             two_stage,
             ap_my_call,
             ap_recent_calls,
@@ -759,8 +788,14 @@ fn main() -> anyhow::Result<()> {
             if let Some(on) = args.cross_cycle_coherent_mrc {
                 d = d.with_cross_cycle_coherent_mrc(on);
             }
-            if let Some(on) = args.coherent_multipass {
-                d = d.with_coherent_multipass(on);
+            if let Some(n) = args.coherent_multipass_iterations {
+                d = d.with_coherent_multipass_iterations(n);
+            }
+            if let Some(t) = args.coherent_subtract_mrc_threshold {
+                d = d.with_coherent_subtract_mrc_threshold(t);
+            }
+            if args.residual_min_sync_score.is_some() {
+                d = d.with_residual_min_sync_score(args.residual_min_sync_score);
             }
             if let Some(on) = args.two_stage {
                 d = d.with_two_stage(on);

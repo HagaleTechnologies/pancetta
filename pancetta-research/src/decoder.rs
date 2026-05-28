@@ -207,13 +207,23 @@ impl Ft8Decoder {
         self
     }
 
-    /// hb-079: enable coherent iterative-subtract multi-pass. Subtracts
-    /// each pass-1 decode's coherent contribution from the complex
-    /// spectrogram, re-runs Costas sync on the residual, and decodes any
-    /// new candidates masked by stronger neighbors. Requires
-    /// cross_cycle_coherent (for the complex spectrogram).
-    pub fn with_coherent_multipass(mut self, on: bool) -> Self {
-        self.config.coherent_multipass = on;
+    /// hb-079 + hb-080: set the number of coherent subtract+repass rounds.
+    /// 0 disables; 1 = original hb-079 (one round). hb-080 sweeps {2..5}.
+    pub fn with_coherent_multipass_iterations(mut self, n: u8) -> Self {
+        self.config.coherent_multipass_iterations = n;
+        self
+    }
+
+    /// hb-081: MRC-weighted coherent subtract threshold (0 disables).
+    pub fn with_coherent_subtract_mrc_threshold(mut self, t: f64) -> Self {
+        self.config.coherent_subtract_mrc_threshold = t;
+        self
+    }
+
+    /// hb-082: minimum Costas sync_score for the residual pass (None reuses
+    /// production min_sync_score).
+    pub fn with_residual_min_sync_score(mut self, t: Option<f64>) -> Self {
+        self.config.residual_min_sync_score = t;
         self
     }
 
