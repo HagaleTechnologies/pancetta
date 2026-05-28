@@ -227,6 +227,16 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-086 V1: after the multipass subtract loop, force-retry every
+    /// ORIGINAL sync candidate not at an already-subtracted position
+    /// against the residual spectrogram. Targets interference-pair
+    /// recovery where B's residual sync_score falls below the threshold
+    /// even though its post-A-subtract LLRs are decodable.
+    pub fn with_joint_pair_retry(mut self, on: bool) -> Self {
+        self.config.joint_pair_retry = on;
+        self
+    }
+
     /// hb-046: enable two-stage decoding. When `on`, decode_wav runs a
     /// CHEAP pass first (relaxed sync_cap, no OSD, fewer LDPC iters)
     /// then the standard PRODUCTION pass on the same audio, unioning

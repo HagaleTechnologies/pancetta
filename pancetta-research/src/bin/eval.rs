@@ -59,6 +59,8 @@ struct Args {
     coherent_subtract_mrc_threshold: Option<f64>,
     /// hb-082: residual sync_score threshold (None reuses production).
     residual_min_sync_score: Option<f64>,
+    /// hb-086 V1: force-retry failed original candidates on residual.
+    joint_pair_retry: Option<bool>,
     /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
     two_stage: Option<bool>,
     /// hb-004: when Some, an ApContext is built and passed to
@@ -111,6 +113,7 @@ impl Args {
         let mut coherent_multipass_iterations: Option<u8> = None;
         let mut coherent_subtract_mrc_threshold: Option<f64> = None;
         let mut residual_min_sync_score: Option<f64> = None;
+        let mut joint_pair_retry: Option<bool> = None;
         let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
@@ -277,6 +280,12 @@ impl Args {
                             .parse()?,
                     );
                 }
+                "--joint-pair-retry" => {
+                    joint_pair_retry = Some(true);
+                }
+                "--no-joint-pair-retry" => {
+                    joint_pair_retry = Some(false);
+                }
                 "--two-stage" => {
                     two_stage = Some(true);
                 }
@@ -376,6 +385,7 @@ impl Args {
             coherent_multipass_iterations,
             coherent_subtract_mrc_threshold,
             residual_min_sync_score,
+            joint_pair_retry,
             two_stage,
             ap_my_call,
             ap_recent_calls,
@@ -796,6 +806,9 @@ fn main() -> anyhow::Result<()> {
             }
             if args.residual_min_sync_score.is_some() {
                 d = d.with_residual_min_sync_score(args.residual_min_sync_score);
+            }
+            if let Some(on) = args.joint_pair_retry {
+                d = d.with_joint_pair_retry(on);
             }
             if let Some(on) = args.two_stage {
                 d = d.with_two_stage(on);

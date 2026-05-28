@@ -250,6 +250,16 @@ pub struct Ft8Config {
     /// inflated sum variance. Default false.
     pub cross_cycle_coherent_mrc: bool,
 
+    /// hb-086 V1: after the multipass loop, force-retry every original
+    /// sync candidate (not at an already-subtracted position) against the
+    /// residual spectrogram. Catches pairs where pass-1 LDPC failed at B's
+    /// position because of A's interference but B's residual sync score
+    /// (post-A-subtract) is below threshold — so hb-079's residual
+    /// sync_search wouldn't re-surface B. Diagnostic on top-20 hard-200
+    /// WAVs (`joint_decoding_pair_density.rs`) found 78% of missed truths
+    /// are within 50 Hz of a recovered decode — the structural fit.
+    pub joint_pair_retry: bool,
+
     /// hb-082: optional sync_score floor applied to the *residual*
     /// Costas search inside the multipass loop (independent of the
     /// production `min_sync_score` that gates the original pass). After
@@ -341,6 +351,13 @@ impl Default for Ft8Config {
             // hb-082: residual sync threshold uses production `min_sync_score`
             // until the A/B confirms a lower value is better.
             residual_min_sync_score: None,
+            // hb-086 V1 (GRADUATED 2026-05-28): force-retry failed original
+            // candidates against the residual spectrogram. hard-200 +12 rec
+            // / +1 novel, hard-1000 +17 rec / +9 novel, composite +0.000700,
+            // elapsed +2.2%. Targets interference pairs where pass-1 LDPC
+            // failed because of mutual masking but the residual LLRs are
+            // decodable and the residual sync_score is below threshold.
+            joint_pair_retry: true,
             // hb-079 (2026-05-26) + hb-080 (2026-05-27): coherent
             // iterative-subtract multi-pass at N=3 rounds. hb-080 sweep
             // on hard-200: N=1→2 +7 rec, N=2→3 +9 rec, N=4/5 saturate;
@@ -829,6 +846,20 @@ impl Ft8Decoder {
                     round_start_offset = pass_decoded.len() - added;
                     to_subtract = &pass_decoded[round_start_offset..];
                 }
+            }
+
+            // hb-086 V1: after the multipass loop, try every ORIGINAL sync
+            // candidate not at an already-subtracted position by re-extracting
+            // symbols from the residual spectrogram and re-decoding. Catches
+            // pairs where pass-1 LDPC failed because of interference and
+            // the residual sync threshold rejected B even though its LLRs
+            // at the (now-cleaned) overlap bins are decodable. Diagnostic
+            // confirmed 78% of missed truths on top-20 hard-200 WAVs are
+            // within 50 Hz of a recovered decode.
+            if self.config.joint_pair_retry {
+                let extra =
+                    self.joint_pair_retry_pass(&spectrogram, &sync_candidates, &pass_decoded);
+                pass_decoded.extend(extra);
             }
 
             // Deduplicate the parallel results (multiple candidates may decode to
@@ -2166,6 +2197,104 @@ impl Ft8Decoder {
             );
             // Preserve tone_symbols on the new decode so future multipass
             // iterations (if ever added) could subtract this signal too.
+            new_msg.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
+            decoded_new.push(new_msg);
+        }
+        decoded_new
+    }
+
+    /// hb-086 V1: after the multipass subtract+repass loop saturates, take
+    /// every ORIGINAL sync candidate that didn't already become a decoded
+    /// (and therefore subtracted) signal, and try decoding it against the
+    /// residual spectrogram. Catches signal pairs where pass-1 failed at
+    /// position B because A's interference corrupted B's LLRs, but B's
+    /// residual sync_score (post-A-subtract) sits below `min_sync_score`,
+    /// so the residual `costas_sync_search` in `coherent_subtract_and_repass`
+    /// never re-surfaces B. We bypass that filter by reusing the ORIGINAL
+    /// candidate positions (which had a real Costas signature in the raw
+    /// data) and just retrying the LDPC against the cleaner LLRs.
+    ///
+    /// The kill-switch diagnostic
+    /// (`examples/joint_decoding_pair_density.rs`) found 78% of missed
+    /// truths on top-20 hard-200 WAVs are within 50 Hz of a recovered
+    /// decode — a strong "pair structure exists" signal.
+    fn joint_pair_retry_pass(
+        &self,
+        spectrogram: &Spectrogram,
+        sync_candidates: &[CostasCandidate],
+        pass_decoded: &[DecodedMessage],
+    ) -> Vec<DecodedMessage> {
+        let pp = &self.protocol_params;
+        let time_padding = spectrogram.time_padding;
+
+        // Build the set of positions whose coherent contribution was
+        // subtracted by `coherent_subtract_and_repass` (every decode with
+        // tone_symbols, across all multipass rounds).
+        let subtracted_positions: Vec<CostasCandidate> = pass_decoded
+            .iter()
+            .filter_map(|m| {
+                m.tone_symbols
+                    .as_ref()
+                    .map(|_| reverse_derive_candidate(m, pp, time_padding))
+            })
+            .collect();
+
+        // Filter sync_candidates to those NOT at an already-subtracted
+        // position. Same ±1 freq_bin / ±2 time_step tolerance as the
+        // residual sync_search filter in `coherent_subtract_and_repass`.
+        let pending: Vec<&CostasCandidate> = sync_candidates
+            .iter()
+            .filter(|sc| {
+                !subtracted_positions.iter().any(|sp| {
+                    sc.freq_sub == sp.freq_sub
+                        && (sc.freq_bin as i64 - sp.freq_bin as i64).unsigned_abs() <= 1
+                        && (sc.time_step as i64 - sp.time_step as i64).unsigned_abs() <= 2
+                })
+            })
+            .collect();
+        if pending.is_empty() {
+            return Vec::new();
+        }
+
+        // Decode each pending candidate against the residual spectrogram.
+        // Same per-candidate path as `coherent_subtract_and_repass` step 4
+        // (sequential — count is bounded by the candidate ceiling, and the
+        // expensive work is the LDPC inside).
+        let mut decoded_new: Vec<DecodedMessage> = Vec::new();
+        let tone_spacing = pp.tone_spacing;
+        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        let spec_step = sps / TIME_OSR;
+        for cand in &pending {
+            let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand);
+            let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
+            normalize_llrs(&mut llrs, self.config.llr_target_variance);
+            let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
+                continue;
+            };
+            if !par_verify_crc(&corrected_bits) {
+                continue;
+            }
+            let payload_bits = par_apply_xor(pp.xor_sequence, &corrected_bits);
+            let ft8_message = match self.message_parser.parse_payload(&payload_bits) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !ft8_message.is_plausible() {
+                continue;
+            }
+            let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+            let base_frequency = cand.freq_bin as f64 * tone_spacing + sub_bin_offset;
+            let coarse_offset =
+                (cand.time_step as isize - spectrogram.time_padding as isize) * spec_step as isize;
+            let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
+            let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
+            let mut new_msg = DecodedMessage::new(
+                ft8_message,
+                snr_db,
+                confidence,
+                base_frequency,
+                coarse_offset as f64 / SAMPLE_RATE as f64,
+            );
             new_msg.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
             decoded_new.push(new_msg);
         }

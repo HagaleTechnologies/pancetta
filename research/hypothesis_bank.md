@@ -1,11 +1,11 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-27T17:30:00Z
+last_updated: 2026-05-28T01:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
-exploitation_run: 73
-current_ratio: 0.052
+exploitation_run: 74
+current_ratio: 0.051
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -528,27 +528,34 @@ current_ratio: 0.052
   status: SHELVED before implementation — structurally redundant. After hb-079's subtract, the original signal positions are near-zero (averaging with zero dilutes) and residual-revealed candidates aren't at the same `(freq_sub, freq_bin, t0 mod slot)` as any original repeating-station group (no peer to average with). The cross-cycle integration that would help — coherent subtract of the masking signal then cross-cycle on the now-unmasked positions — is what hb-079 already does implicitly. See research/experiments/2026-05-27-hb-085-cross-cycle-on-residual.md.
   priority_score: 0.0
 
-### hb-086 — Joint multi-candidate decoding (pair / cluster)  [PRIORITY: 0.50 plan-sized, spawned 2026-05-27 from batch-13 diagnostic]
+### hb-086 — Joint multi-candidate decoding V1 (force-retry on residual)  [GRADUATED 2026-05-28]
   mode: ft8
-  status: pending — design spec written; needs diagnostic-first step + multi-session implementation
-  priority_score: 0.50
-  estimated_effort: 3-5 sessions (incl. dead-ends)
-  expected_delta: targets the measured top-20 hard-200 wall (17% of all misses, 60% per-WAV miss rate); plausible +30-100 hard-200 rec / +0.0015-0.005 composite if mechanism fits
-  defensible_prior: yes — diagnostic confirms dense-interference top-20 WAVs are the binding constraint after hb-079; jt9 recovers them so the signal IS there
+  status_2026_05_28: V1 GRADUATED — `joint_pair_retry` default false→true. Diagnostic confirmed 78.3% pair-likely vs 30% threshold on top-20 worst hard-200 WAVs; PROCEED earned. V1 = force-retry original sync candidates against the (post-multipass) residual spectrogram, bypassing the residual sync_score threshold. hard-200 +12 rec / +1 novel; hard-1000 +17 rec / +9 novel; composite +0.000700 (0.568424 → 0.569123); fixtures + synth preserved; elapsed +2.2%. See research/experiments/2026-05-28-hb-086-joint-pair-retry-v1.md.
+  priority_score: 0.0
+
+### hb-086 V2 — Joint LLR with iterative interference cancellation  [PRIORITY: 0.40 plan-sized, spawned 2026-05-28 from hb-086 V1 graduation]
+  mode: ft8
+  status: pending — V1 captured the easy wins (+12 hard-200); V2 attacks the deeper structure
+  priority_score: 0.40
+  estimated_effort: 2-3 sessions
+  expected_delta: targets the gap between "78% pair-likely" diagnostic and V1's +12 hard-200; plausible additional +20-40 hard-200 rec / +0.001-0.002 composite if soft-decision joint decode works
+  defensible_prior: partial — diagnostic confirms pair structure exists; V1 took the candidates already in sync_candidates and the V2 mechanism (soft conditioning on decoded neighbors) addresses a different leak (residual LLRs corrupted by other neighbors past the subtracted one)
   wild_card: false
   evidence_for:
-    - main.json `per_wav_top_failures`: 20 WAVs carry 1214 truths, pancetta recovers 518 (60% miss), jt9 gets all. 17% of total hard-200 misses concentrated in these WAVs.
-    - hb-079's coherent subtract works one signal at a time; mutually-masking pairs (neither decodes first) cannot be addressed by serial subtract. Joint decoding addresses this directly.
-    - Infrastructure reuse: hb-079's complex spectrogram, rotor estimation, ML projection all carry over for the joint subtract step.
+    - V1's narrow window (candidate already in sync_candidates AND residual LLRs decodable AND residual sync_score below threshold) captured ~1.5% of the diagnostic's ~500+ pair-likely missed truths. The gap is the V2 opportunity.
+    - Soft cancellation is well-studied in turbo/iterative decoding; conditioning on decoded-neighbors' tone uncertainty is a known LLR refinement.
   evidence_against:
-    - 3-5 session commitment with multiple variant decisions (pair selection, hard vs soft decision, iteration count).
-    - CPU cost adds per-pair work on top of hb-079's already-doubled cost.
-    - Risk that the top-20 wall is "too dense" — joint pair decoding may help triplets/quadruplets less than naive pair-counting suggests.
+    - V1's +12 already takes the diagnostic's easiest catches; deeper structure may not be addressable without sync_search changes (V3 territory).
+    - Soft-decision joint LLR adds per-candidate BP iteration cost; budget pressure.
   notes: |
-    See docs/superpowers/specs/2026-05-27-joint-decoding-design.md.
-    Kill-switch built in: diagnostic step quantifies pair-density on
-    top-20 misses; if <30% match the pair pattern, mechanism doesn't fit
-    and we shelve without implementing. Risk-bounded scope.
+    V1 mechanism: candidate in sync_candidates → extract symbols from
+    residual → LDPC → CRC. Failure mode caught: residual sync threshold
+    too high. NOT caught: residual LLRs still corrupted by neighbors
+    other than the one subtracted. V2 attacks that: condition each
+    pending candidate's LLRs on the soft tone posteriors of nearby
+    decoded signals (probability-weighted subtract, not hard projection),
+    iterate BP. See docs/superpowers/specs/2026-05-27-joint-decoding-design.md
+    for the original V2 sketch.
   mode: ft8
   status: pending
   priority_score: 0.30
