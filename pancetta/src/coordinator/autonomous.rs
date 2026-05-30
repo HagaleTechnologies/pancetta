@@ -25,10 +25,35 @@ impl super::ApplicationCoordinator {
         if !auto_config_enabled {
             info!("Autonomous operator disabled in configuration");
             drop(config);
-            let _ = self
+            // The decoder fans every decoded message out to Autonomous via the
+            // message bus unconditionally. If we created the channel without a
+            // reader, it would fill within a few cycles and emit a continuous
+            // "Channel full" warning flood (10k+ warnings/session observed in
+            // the 2026-05-30 live capture). Spawn a noop drain task so the
+            // channel stays open but messages are silently discarded.
+            let (_drain_tx, drain_rx) = self
                 .message_bus
                 .create_channel(ComponentId::Autonomous)
                 .await?;
+            let shutdown = self.shutdown_signal.clone();
+            let drain_handle = tokio::spawn(async move {
+                while !shutdown.load(Ordering::Acquire) {
+                    loop {
+                        match drain_rx.try_recv() {
+                            Ok(_) => {}
+                            Err(crossbeam_channel::TryRecvError::Empty) => break,
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                                debug!("Autonomous drain channel disconnected");
+                                return Ok(());
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Ok(())
+            });
+            self.named_task_handles
+                .push((ComponentId::Autonomous, drain_handle));
             return Ok(());
         }
 
