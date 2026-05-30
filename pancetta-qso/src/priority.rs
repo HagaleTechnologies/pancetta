@@ -109,15 +109,32 @@ impl WorkedStationLookup for NullLookup {
 
 /// Detect POTA/SOTA activators from callsign patterns.
 ///
-/// POTA (Parks on the Air) stations use the `/P` portable suffix.
-/// SOTA (Summits on the Air) stations use the `/S` portable suffix.
+/// Recognized suffixes (case-insensitive):
+/// - `/P`   — generic portable, commonly used by POTA activators
+/// - `/POTA` — explicit POTA activation suffix
+/// - `/S`   — generic portable suffix used by SOTA activators
+/// - `/SOTA` — explicit SOTA activation suffix
+/// - `/PORT` — portable (less common, but seen on POTA spots)
+///
 /// `/QRP` indicates low-power operation only — not a portable activation.
 ///
 /// Only suffix-style indicators count; operating-area prefixes like
 /// `VE3/W1ABC` are not POTA/SOTA activations.
+///
+/// Limitation: cannot detect POTA/SOTA from message text alone without
+/// external metadata. Many real activators just send their bare call + grid
+/// from the activated park/summit. A future `pota_flag: Option<bool>` field
+/// sourced from cqdx.io spot enrichment (see `docs/cqdx-api-requirements.md`)
+/// would close this gap; until then suffix detection is the only signal.
+// TODO: thread pota_flag from cqdx spot enrichment through DecodedMessageInfo
+// so genuine activators without a /P or /POTA suffix are detected.
 pub fn is_pota_sota_candidate(callsign: &str) -> bool {
     let upper = callsign.to_uppercase();
-    upper.ends_with("/P") || upper.ends_with("/S")
+    upper.ends_with("/P")
+        || upper.ends_with("/POTA")
+        || upper.ends_with("/S")
+        || upper.ends_with("/SOTA")
+        || upper.ends_with("/PORT")
 }
 
 /// Normalize SNR from typical FT8 range (-24 to +10) to 0.0–1.0.
@@ -285,9 +302,21 @@ mod tests {
         assert!(is_pota_sota_candidate("K1ABC/P"));
         assert!(is_pota_sota_candidate("w1abc/p")); // case insensitive
 
+        // Explicit /POTA suffix — should match (real activators sometimes use this)
+        assert!(is_pota_sota_candidate("KK4MTC/POTA"));
+        assert!(is_pota_sota_candidate("K1ABC/POTA"));
+        assert!(is_pota_sota_candidate("w1abc/pota")); // case insensitive
+
         // SOTA portable suffix — should match
         assert!(is_pota_sota_candidate("W1ABC/S"));
         assert!(is_pota_sota_candidate("K1ABC/S"));
+
+        // Explicit /SOTA suffix — should match
+        assert!(is_pota_sota_candidate("W1ABC/SOTA"));
+        assert!(is_pota_sota_candidate("k1abc/sota")); // case insensitive
+
+        // /PORT suffix — should match (less common portable indicator)
+        assert!(is_pota_sota_candidate("W1ABC/PORT"));
 
         // /QRP is low-power only — NOT a POTA/SOTA indicator
         assert!(!is_pota_sota_candidate("K1ABC/QRP"));
