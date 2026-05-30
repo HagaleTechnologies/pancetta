@@ -43,6 +43,12 @@ struct Args {
     max_parity_errors_for_osd: Option<usize>,
     /// hb-044: enable Costas time-axis parabolic refinement.
     sync_time_interpolation: Option<bool>,
+    /// hb-068 variant (a) — score gate; only refine when score > gate.
+    sync_time_interp_score_gate: Option<f64>,
+    /// hb-068 variant (b) — scale parabolic delta by this factor.
+    sync_time_interp_delta_scale: Option<f64>,
+    /// hb-068 variant (c) — reject |delta| > threshold (fall back to integer).
+    sync_time_interp_max_delta_abs: Option<f64>,
     /// hb-067: mBP offset value (subtract from |LLR| before OSD).
     bp_offset_subtract: Option<f32>,
     /// hb-063: enable layered (row-sequential) BP schedule.
@@ -107,6 +113,9 @@ impl Args {
         let mut time_range: Option<f64> = None;
         let mut max_parity_errors_for_osd: Option<usize> = None;
         let mut sync_time_interpolation: Option<bool> = None;
+        let mut sync_time_interp_score_gate: Option<f64> = None;
+        let mut sync_time_interp_delta_scale: Option<f64> = None;
+        let mut sync_time_interp_max_delta_abs: Option<f64> = None;
         let mut bp_offset_subtract: Option<f32> = None;
         let mut layered_bp: Option<bool> = None;
         let mut cross_cycle_averaging: Option<bool> = None;
@@ -232,6 +241,31 @@ impl Args {
                 }
                 "--sync-time-interpolation" => {
                     sync_time_interpolation = Some(true);
+                }
+                "--sync-time-interp-score-gate" => {
+                    sync_time_interp_score_gate = Some(
+                        iter.next()
+                            .context("--sync-time-interp-score-gate needs a value")?
+                            .parse()?,
+                    );
+                    // Setting a variant knob implicitly enables refinement.
+                    sync_time_interpolation.get_or_insert(true);
+                }
+                "--sync-time-interp-delta-scale" => {
+                    sync_time_interp_delta_scale = Some(
+                        iter.next()
+                            .context("--sync-time-interp-delta-scale needs a value")?
+                            .parse()?,
+                    );
+                    sync_time_interpolation.get_or_insert(true);
+                }
+                "--sync-time-interp-max-delta-abs" => {
+                    sync_time_interp_max_delta_abs = Some(
+                        iter.next()
+                            .context("--sync-time-interp-max-delta-abs needs a value")?
+                            .parse()?,
+                    );
+                    sync_time_interpolation.get_or_insert(true);
                 }
                 "--bp-offset-subtract" => {
                     bp_offset_subtract = Some(
@@ -387,6 +421,9 @@ impl Args {
             time_range,
             max_parity_errors_for_osd,
             sync_time_interpolation,
+            sync_time_interp_score_gate,
+            sync_time_interp_delta_scale,
+            sync_time_interp_max_delta_abs,
             bp_offset_subtract,
             layered_bp,
             cross_cycle_averaging,
@@ -793,6 +830,15 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(on) = args.sync_time_interpolation {
                 d = d.with_sync_time_interpolation(on);
+            }
+            if let Some(v) = args.sync_time_interp_score_gate {
+                d = d.with_sync_time_interp_score_gate(v);
+            }
+            if let Some(v) = args.sync_time_interp_delta_scale {
+                d = d.with_sync_time_interp_delta_scale(v);
+            }
+            if args.sync_time_interp_max_delta_abs.is_some() {
+                d = d.with_sync_time_interp_max_delta_abs(args.sync_time_interp_max_delta_abs);
             }
             if let Some(v) = args.bp_offset_subtract {
                 d = d.with_bp_offset_subtract(v);

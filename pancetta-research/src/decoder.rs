@@ -172,6 +172,29 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-068 variant (a): only apply the parabolic refinement when the
+    /// integer-bin sync score exceeds this threshold. 0.0 = no gate.
+    pub fn with_sync_time_interp_score_gate(mut self, v: f64) -> Self {
+        self.config.sync_time_interp_score_gate = v;
+        self
+    }
+
+    /// hb-068 variant (b): multiply the parabolic delta by this factor
+    /// before applying it. Score is recomputed from the parabola at the
+    /// scaled offset. 1.0 = no scaling.
+    pub fn with_sync_time_interp_delta_scale(mut self, v: f64) -> Self {
+        self.config.sync_time_interp_delta_scale = v;
+        self
+    }
+
+    /// hb-068 variant (c): reject parabolic refinements whose magnitude
+    /// exceeds this threshold (fall back to integer-bin + original score).
+    /// `None` disables rejection.
+    pub fn with_sync_time_interp_max_delta_abs(mut self, v: Option<f64>) -> Self {
+        self.config.sync_time_interp_max_delta_abs = v;
+        self
+    }
+
     /// hb-067: mBP offset — subtract this magnitude from each LLR
     /// before invoking OSD. 0.0 = no offset.
     pub fn with_bp_offset_subtract(mut self, v: f32) -> Self {

@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-30T15:44:48.640529Z",
+  "mode": "ft8",
+  "git": {
+    "branch": "worktree-agent-a902a7d6a73c64b89",
+    "head_sha": "03516b8b5fa2d4a3b0720210037f9a8f1ad01d3b",
+    "main_merge_base": "03516b8b5fa2d4a3b0720210037f9a8f1ad01d3b",
+    "dirty": true
+  },
+  "build": {
+    "rustc_version": "rustc 1.94.1 (e408947bf 2026-03-25)",
+    "release": true,
+    "features": [
+      "research-eval"
+    ]
+  },
+  "harness": {
+    "harness_version": "0.1.0",
+    "host": "macos/aarch64",
+    "cores_used": 10,
+    "elapsed_seconds": 49.823169834
+  },
+  "config": {
+    "decoder": {
+      "adaptive_ldpc_iters": false,
+      "block_score_rerank": true,
+      "bp_offset_subtract": 0.0,
+      "coherent_multipass_iterations": 3,
+      "coherent_subtract_mrc_threshold": 0.0,
+      "cross_cycle_averaging": true,
+      "cross_cycle_coherent": true,
+      "cross_cycle_coherent_mrc": true,
+      "joint_pair_retry": true,
+      "layered_bp": true,
+      "ldpc_iterations": 100,
+      "llr_target_variance": 32.0,
+      "max_candidates": 100,
+      "max_decode_passes": 1,
+      "max_parity_errors_for_osd": 6,
+      "max_sync_candidates": 300,
+      "min_sync_score": 3.0,
+      "nms_enabled": false,
+      "nms_freq_radius": 2,
+      "nms_time_radius": 8,
+      "osd_depth": 2,
+      "protocol": "Ft8",
+      "residual_min_sync_score": null,
+      "sample_rate": 12000,
+      "sync_time_interp_delta_scale": 1.0,
+      "sync_time_interp_max_delta_abs": null,
+      "sync_time_interp_score_gate": 0.0,
+      "sync_time_interpolation": true,
+      "time_range": 2.0
+    },
+    "seed": 42,
+    "tiers_run": [
+      "synth-clean"
+    ]
+  },
+  "tiers": {
+    "synth-clean": {
+      "wavs_processed": 60,
+      "by_snr_db": [
+        {
+          "snr_db": -28.0,
+          "attempts": 6,
+          "decoded": 0,
+          "fp": 0
+        },
+        {
+          "snr_db": -26.0,
+          "attempts": 6,
+          "decoded": 0,
+          "fp": 0
+        },
+        {
+          "snr_db": -24.0,
+          "attempts": 6,
+          "decoded": 0,
+          "fp": 0
+        },
+        {
+          "snr_db": -22.0,
+          "attempts": 6,
+          "decoded": 0,
+          "fp": 0
+        },
+        {
+          "snr_db": -20.0,
+          "attempts": 6,
+          "decoded": 6,
+          "fp": 0
+        },
+        {
+          "snr_db": -18.0,
+          "attempts": 6,
+          "decoded": 6,
+          "fp": 0
+        },
+        {
+          "snr_db": -16.0,
+          "attempts": 6,
+          "decoded": 6,
+          "fp": 0
+        },
+        {
+          "snr_db": -14.0,
+          "attempts": 6,
+          "decoded": 6,
+          "fp": 0
+        },
+        {
+          "snr_db": -12.0,
+          "attempts": 6,
+          "decoded": 6,
+          "fp": 0
+        },
+        {
+          "snr_db": -10.0,
+          "attempts": 6,
+          "decoded": 6,
+          "fp": 0
+        }
+      ],
+      "snr_at_50pct_recovery_db": -20.0,
+      "snr_at_90pct_recovery_db": -20.0
+    }
+  },
+  "composite": {
+    "weights": {
+      "fixtures_pass_rate": 0.15,
+      "real_decode_rate_hard_200": 0.5,
+      "snr_50pct_synth_clean": 0.3,
+      "snr_50pct_synth_doppler": 0.05
+    },
+    "score": 0.15
+  },
+  "regressions": {
+    "fixture_regression": false,
+    "false_positive_introduced": false,
+    "snr_curve_regression_db": 0.0
+  },
+  "notes": "Decoder under test: pancetta-ft8@0.1.0"
+}

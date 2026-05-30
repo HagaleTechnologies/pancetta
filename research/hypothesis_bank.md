@@ -886,25 +886,53 @@ current_ratio: 0.051
     flag default false. Spawn hb-069 for interpolation-in-linear-
     power-space as a different angle on the problem.
 
-### hb-068 — hb-044 conditional/scaled refinement variants  [PRIORITY: 0.45, spawned 2026-05-25 from hb-044 mixed result]
+### hb-068 — hb-044 scaled-delta refinement (variant b @ 0.3×)  [GRADUATED 2026-05-30]
   mode: ft8
-  status: pending
-  priority_score: 0.45
-  estimated_effort: 1-2 sessions
-  expected_delta: keep hb-044's synth-clean +2dB SNR@90% gain while removing the hard-200 -116 regression
-  defensible_prior: yes (hb-044 batch 7 shows the gain exists; need a way to limit downside)
+  status: GRADUATED — `sync_time_interpolation = true` + `sync_time_interp_delta_scale = 0.3`
+  priority_score: 0.0
+  estimated_effort: n/a
+  expected_delta: confirmed +5 hard-200 rec / -7 novel; +17 hard-1000 rec / +2 novel; synth-clean snr@90% -18 → -20 dB (+2 dB); fixtures + wild-50 preserved; composite +0.000292 (0.569123 → 0.569415); elapsed +10.8%
+  defensible_prior: yes (hb-044 gain was real; needed gentler application)
   wild_card: false
-  evidence_for:
-    - hb-044 implementation works correctly (parabolic + linear-interp). Synth-clean SNR@90% gained 2 dB. But hard-200 lost 116 decodes.
-    - Likely cause: refinement-inflated scores displace better candidates in the top-300 cap on busy-band WAVs.
-    - Variants worth testing:
-      (a) score-gated refinement (only when sync_score > threshold)
-      (b) scaled delta (0.5× instead of 1.0×)
-      (c) reject large deltas (|delta| > 0.3 → use integer)
-      (d) refinement that NEVER inflates score (use refined position, original score for sorting)
+  outcomes: |
+    Iter 2026-05-30 tested three conditional variants on hard-200 (with
+    FP filter) and synth-clean:
+
+    Variant (a) score gate — REFUTED
+      gate=4.0: rec=4507 / novel=856 (-109 hard-200 — full hb-044 regression)
+      gate=5.0: rec=4508 / novel=857 (-108 hard-200)
+      Higher gates barely move the needle; bad refinements happen at all scores.
+
+    Variant (b) scaled delta — WINNER
+      scale=0.3: rec=4621 / novel=914 / synth snr90=-20  → +5 rec / -7 novel
+      scale=0.5: rec=4616 / novel=878 / synth snr90=-20  → 0 rec / -43 novel
+      scale=0.7: rec=4577 / novel=876 / synth snr90=-20  → -39 rec / -45 novel
+      Monotonic in scale: smaller offset = less perturbation of correctly-
+      aligned candidates while still capturing the synth-clean gain.
+
+    Variant (c) reject large deltas — REFUTED
+      max_delta=0.3: rec=4616 / novel=921 / synth snr90=-18  → no-op (rejection too aggressive)
+      max_delta=0.4: rec=4616 / novel=921 / synth snr90=-18  → no-op
+      Real-audio parabolic deltas are mostly > 0.4 (hitting the clamp's
+      [-0.5,+0.5] edge — itself a signature of unreliable fits). Rejection
+      kills the gain along with the regression.
+
+    Decision: GRADUATE variant (b) at delta_scale=0.3 — keeps the +2 dB
+    synth gain AND modestly improves hard-200 (+5 rec). Defaults flipped
+    in `Ft8Config`.
   notes: |
-    Variant (d) is the most principled — eliminates the displacement
-    mechanism. Try first.
+    See research/experiments/2026-05-30-hb-068-conditional-refinement.md.
+    Variant (d) was tested in batch 8 (2026-05-25) and refuted — confirmed
+    failure was not sort displacement but per-candidate perturbation,
+    motivating this variant scan.
+    Parallel-agent run (research/scorecards/sweep/hb068-b-scale-0.25.json)
+    saw scale=0.25 reach rec=4623 / novel=914 on hard-200 — +2 over our
+    chosen 0.3 default. Did not validate synth at 0.25; if synth gain
+    holds, a follow-up could safely tune the default down. Within
+    experimental noise; 0.3 ships as the conservative choice.
+    Spawned follow-ups: hb-068 finer-scale sweep ({0.2, 0.25, 0.35});
+    hb-069 reconfirm (linear-power interp) may stack with this; hb-086 V2
+    should be re-evaluated under scale=0.3.
 
 ### hb-062 — cqdx.io production FP-filter source  [GRADUATED 2026-05-25]
   mode: ft8 (production wiring)

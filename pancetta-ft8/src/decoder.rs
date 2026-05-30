@@ -206,8 +206,39 @@ pub struct Ft8Config {
     /// a fractional time offset (in [-0.5, +0.5]) on the candidate.
     /// Part 1 (this flag) only computes and stores the refinement;
     /// part 2 applies it in symbol extraction.
-    /// Default false. WSJT-X-Improved v3.1.0 ships this.
+    /// **Default `true`** as of hb-068 graduation (2026-05-30), paired
+    /// with `sync_time_interp_delta_scale = 0.3` — see that field's docs
+    /// for the recall/sensitivity trade-off measurements.
     pub sync_time_interpolation: bool,
+
+    /// hb-068 variant (a) — score gate: when `sync_time_interpolation` is
+    /// on, only apply the parabolic refinement if the integer-bin sync
+    /// score exceeds this threshold. Candidates with score ≤ gate keep
+    /// the original (un-inflated) integer-bin score and `time_refinement=0`.
+    /// Default 0.0 (no gate — refine all qualifying candidates).
+    pub sync_time_interp_score_gate: f64,
+
+    /// hb-068 variant (b) — delta scale: when `sync_time_interpolation` is
+    /// on, multiply the parabolic delta by this factor before applying it
+    /// to symbol extraction. The refined score is also recomputed from
+    /// the scaled delta (parabola is `y_center + b·δ + a·δ²`), so the
+    /// score consistently reflects the position used downstream.
+    /// **Default 0.3** as of hb-068 graduation (2026-05-30). The
+    /// unscaled (1.0) parabolic delta over-corrects on noisy real-corpus
+    /// audio and regresses hard-200 by -116 recall. Scaling to 0.3
+    /// captures the +2 dB synth-clean SNR@90% gain (clean single-peak
+    /// fits) while only mildly perturbing correctly-aligned hard-corpus
+    /// candidates (net +5 hard-200 recall, -7 novels).
+    pub sync_time_interp_delta_scale: f64,
+
+    /// hb-068 variant (c) — reject large deltas: when
+    /// `sync_time_interpolation` is on AND `|delta| > threshold`, treat
+    /// the refinement as unreliable and fall back to integer-bin
+    /// behavior (delta=0, original score). Applied AFTER the
+    /// parabolic clamp to [-0.5, 0.5]. `None` disables (no rejection
+    /// — original hb-044 behavior).
+    /// Default `None`.
+    pub sync_time_interp_max_delta_abs: Option<f64>,
 
     /// hb-067 (arXiv:2306.00443): mBP offset — subtract this magnitude
     /// from each LLR before invoking OSD. Reduces BP's confidence so
@@ -337,7 +368,20 @@ impl Default for Ft8Config {
             // filter shipped (hb-062). Per batch 6 iter 4: gate=6 + filter
             // gives same recall as production with -132 novels.
             max_parity_errors_for_osd: 6,
-            sync_time_interpolation: false,
+            // hb-068 (GRADUATED 2026-05-30): sync_time_interpolation is the
+            // production default ON, paired with delta_scale = 0.3 (variant b).
+            // Hard-200: +5 recovered / -7 novels vs prior main (4616 → 4621).
+            // Synth-clean snr@90% recovery: -18 → -20 dB (+2 dB sensitivity).
+            // Plain hb-044 (scale = 1.0) regressed hard-200 by -116 recall;
+            // scaling the parabolic delta to 0.3 captures the gain on clean
+            // single-peak Costas patterns while only mildly perturbing
+            // correctly-aligned candidates on noisy real-corpus audio (where
+            // the unscaled delta over-corrects). See
+            // research/experiments/2026-05-30-hb-068-conditional-refinement.md.
+            sync_time_interpolation: true,
+            sync_time_interp_score_gate: 0.0,
+            sync_time_interp_delta_scale: 0.3,
+            sync_time_interp_max_delta_abs: None,
             bp_offset_subtract: 0.0,
             // hb-063 (batch 10): layered BP is the production default —
             // +18 hard-200 recovered (composite +0.00105), -16% decode
@@ -1510,21 +1554,54 @@ impl Ft8Decoder {
                         // hb-044: optional parabolic refinement of the
                         // time-bin peak. Costs 2 extra score evaluations
                         // per kept candidate. Both hb-044 (sort by
-                        // refined score) and hb-068 (sort by integer-bin
-                        // score; only use fractional offset in symbol
-                        // extraction) were tested batch 7-8 and BOTH
-                        // regressed hard-200. Default off; kept for
-                        // research only.
+                        // refined score) and hb-068 batch-8 variant (d,
+                        // sort by integer-bin score; only use fractional
+                        // offset in symbol extraction) were tested batch
+                        // 7-8 and BOTH regressed hard-200. Default off;
+                        // kept for research only.
+                        //
+                        // hb-068 batch-14 variants (when interpolation is
+                        // on AND a knob is set):
+                        // - (a) score gate: skip refinement entirely if
+                        //   `score ≤ sync_time_interp_score_gate`.
+                        // - (b) delta scale: multiply parabolic delta by
+                        //   `sync_time_interp_delta_scale` (and recompute
+                        //   refined score consistently).
+                        // - (c) reject large delta: if `|delta| >
+                        //   sync_time_interp_max_delta_abs`, fall back to
+                        //   integer-bin (delta=0, original score).
                         let (refined_score, time_refinement) =
                             if self.config.sync_time_interpolation
                                 && t0 > 0
                                 && t0 + 1 <= max_time_step
+                                && score > self.config.sync_time_interp_score_gate
                             {
                                 let y_left =
                                     self.compute_costas_score(spectrogram, t0 - 1, f0, freq_sub);
                                 let y_right =
                                     self.compute_costas_score(spectrogram, t0 + 1, f0, freq_sub);
-                                parabolic_peak_refinement(y_left, score, y_right)
+                                let (mut r_score, mut r_delta) =
+                                    parabolic_peak_refinement(y_left, score, y_right);
+                                // (b) delta scale: rescale the offset and
+                                // recompute the score from the parabola
+                                // so the score reflects the position used.
+                                let scale = self.config.sync_time_interp_delta_scale;
+                                if (scale - 1.0).abs() > f64::EPSILON && r_delta.abs() > 0.0 {
+                                    let a = (y_left + y_right - 2.0 * score) * 0.5;
+                                    let b = (y_right - y_left) * 0.5;
+                                    r_delta *= scale;
+                                    r_score = score + b * r_delta + a * r_delta * r_delta;
+                                }
+                                // (c) reject large delta: post-clamp/scale,
+                                // if magnitude exceeds threshold, fall back
+                                // to integer-bin position + original score.
+                                if let Some(max_abs) = self.config.sync_time_interp_max_delta_abs {
+                                    if r_delta.abs() > max_abs {
+                                        r_score = score;
+                                        r_delta = 0.0;
+                                    }
+                                }
+                                (r_score, r_delta)
                             } else {
                                 (score, 0.0)
                             };
