@@ -533,38 +533,35 @@ current_ratio: 0.051
   status_2026_05_28: V1 GRADUATED — `joint_pair_retry` default false→true. Diagnostic confirmed 78.3% pair-likely vs 30% threshold on top-20 worst hard-200 WAVs; PROCEED earned. V1 = force-retry original sync candidates against the (post-multipass) residual spectrogram, bypassing the residual sync_score threshold. hard-200 +12 rec / +1 novel; hard-1000 +17 rec / +9 novel; composite +0.000700 (0.568424 → 0.569123); fixtures + synth preserved; elapsed +2.2%. See research/experiments/2026-05-28-hb-086-joint-pair-retry-v1.md.
   priority_score: 0.0
 
-### hb-086 V2 — Joint LLR with iterative interference cancellation  [PRIORITY: 0.40 plan-sized, spawned 2026-05-28 from hb-086 V1 graduation]
+### hb-086 V2 — Joint LLR with iterative interference cancellation  [SHELVED 2026-05-30 — batch 15]
   mode: ft8
-  status: pending — V1 captured the easy wins (+12 hard-200); V2 attacks the deeper structure
-  priority_score: 0.40
-  estimated_effort: 2-3 sessions
-  expected_delta: targets the gap between "78% pair-likely" diagnostic and V1's +12 hard-200; plausible additional +20-40 hard-200 rec / +0.001-0.002 composite if soft-decision joint decode works
-  defensible_prior: partial — diagnostic confirms pair structure exists; V1 took the candidates already in sync_candidates and the V2 mechanism (soft conditioning on decoded neighbors) addresses a different leak (residual LLRs corrupted by other neighbors past the subtracted one)
+  status_2026_05_30: SHELVED at the diagnostic gate. `examples/hb086_v2_soft_posterior_potential.rs` on top-20 hard-200 WAVs found 0% of V1-failed candidates have a marginal-SNR neighbor (median neighbor SNR -1.5 dB; p10 -5.7 dB; nothing below -15 dB). Multi-neighbor count: 14.8% strict (±25 Hz), 34.8% relaxed (±50 Hz). Secondary count threshold passes at the relaxed window, but the primary criterion (soft posterior meaningfully differs from hard) fails: neighbors of missed truths are uniformly strong, so their LDPC-corrected codewords yield delta-function tone posteriors and soft cancellation collapses to hard. Reinforces hb-081 (per-decode subtract scaling SHELVED −170 hard-200): under-subtracting strong neighbors hurts. See research/experiments/2026-05-30-hb-086-v2-soft-cancellation.md.
+  priority_score: 0.0
+
+### hb-086 V3 — Subtract-aware sync threshold relaxation  [PRIORITY: 0.30, spawned 2026-05-30 from hb-086 V2 shelve]
+  mode: ft8
+  status: pending — attacks the OTHER V1 leak (the V1 journal's leak (a): sync_search misses the candidate); V2 closed the soft-cancellation family.
+  priority_score: 0.30
+  estimated_effort: 1-2 sessions
+  expected_delta: targets the 47.6% of missed truths on top-20 hard-200 with ZERO nearby decode in the ±25 Hz window (sync_search blind spot); plausible additional +5-15 hard-200 rec if the bin-targeted relaxation surfaces them without FP novel pressure
+  defensible_prior: partial — hb-082 (global residual sync threshold relaxation) found candidates surface naturally above 3.0 (no-op), but V3 differs: relax only at bins newly cleaned by subtraction, where the noise floor genuinely dropped
   wild_card: false
   evidence_for:
-    - V1's narrow window (candidate already in sync_candidates AND residual LLRs decodable AND residual sync_score below threshold) captured ~1.5% of the diagnostic's ~500+ pair-likely missed truths. The gap is the V2 opportunity.
-    - Soft cancellation is well-studied in turbo/iterative decoding; conditioning on decoded-neighbors' tone uncertainty is a known LLR refinement.
+    - V2 diagnostic confirmed the dominant V1 leak is candidates with ZERO nearby decode (47.6% strict, 21.9% relaxed) — sync_search itself never surfaced them. V1 only retries what sync_search flagged.
+    - hb-079's coherent subtract demonstrably reduces tone energy at subtracted bins; a targeted residual threshold relaxation at those specific bins is a structurally different bet from hb-082's global relaxation (which did nothing).
   evidence_against:
-    - V1's +12 already takes the diagnostic's easiest catches; deeper structure may not be addressable without sync_search changes (V3 territory).
-    - Soft-decision joint LLR adds per-candidate BP iteration cost; budget pressure.
+    - hb-082 already failed on global relaxation. V3 is bin-targeted, but the targeting infrastructure (track which bins were subtracted in this round) adds plumbing.
+    - The candidates V1 misses may be ones whose Costas pattern was never strong enough in the raw data — a relaxed threshold may surface noise, not signal.
   notes: |
-    V1 mechanism: candidate in sync_candidates → extract symbols from
-    residual → LDPC → CRC. Failure mode caught: residual sync threshold
-    too high. NOT caught: residual LLRs still corrupted by neighbors
-    other than the one subtracted. V2 attacks that: condition each
-    pending candidate's LLRs on the soft tone posteriors of nearby
-    decoded signals (probability-weighted subtract, not hard projection),
-    iterate BP. See docs/superpowers/specs/2026-05-27-joint-decoding-design.md
-    for the original V2 sketch.
-  mode: ft8
-  status: pending
-  priority_score: 0.30
-  estimated_effort: 1 session
-  expected_delta: small — may surface a few more masked candidates if the residual's noise floor differs from the original
-  defensible_prior: partial — after subtraction the noise statistics change; production min_sync_score might be too strict
-  wild_card: false
-  notes: |
-    Currently coherent_subtract_and_repass uses production min_sync_score for the residual sync_search. After subtracting signal energy, the residual's noise floor drops, so some previously-marginal Costas patterns at the new noise floor become detectable. A separate residual_min_sync_score (or relative offset like -0.5) might surface them. Pair with hb-080.
+    Mechanism: after coherent_subtract_and_repass + joint_pair_retry,
+    run ONE MORE pass of costas_sync_search restricted to a
+    relaxation_zone = freq_bins within ±N bins of any subtracted
+    position, with min_sync_score reduced by some delta (e.g. 0.5).
+    Candidates that surface get the standard LDPC + CRC + plausibility
+    treatment. The targeting (only bins where subtraction actually
+    cleaned the residual) is the difference vs hb-082 (which relaxed
+    globally and found nothing — the candidates that surface naturally
+    cluster above 3.0).
 
 ### hb-057 — Median-filter DT averaging for sync/AP  [PRIORITY: 0.35, spawned 2026-05-25 from mr-002]
   mode: ft8
