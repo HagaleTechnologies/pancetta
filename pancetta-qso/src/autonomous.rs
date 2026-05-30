@@ -737,6 +737,13 @@ pub struct AutonomousOperator {
     /// FAKECALL FN42` every cycle to flood pancetta's QSO slots and
     /// log. (Security review 2026-04-29 I-1.)
     recently_responded_to: HashMap<String, std::time::Instant>,
+    /// Phase-5 hardening #1: optional callsign-continuity FP filter
+    /// consulted before responding to any CQ. Defends against OSD
+    /// fabrications (`R44XYB`, `OR1QRD`, ...) reaching the TX path.
+    /// When `None` (default; constructed via `new`), all CQs are
+    /// allowed through — the decode-side filter still runs in the
+    /// coordinator, this is a second-layer TX gate.
+    fp_filter: Option<std::sync::Arc<crate::callsign_continuity::CallsignContinuityFilter>>,
 }
 
 impl AutonomousOperator {
@@ -768,7 +775,21 @@ impl AutonomousOperator {
             paused: false,
             live_spot_frequencies: Vec::new(),
             recently_responded_to: HashMap::new(),
+            fp_filter: None,
         }
+    }
+
+    /// Phase-5 hardening #1: install the callsign-continuity FP filter
+    /// so the TX decision path can reject CQs from callsigns absent
+    /// from the trust set (ADIF + cqdx + seed + accepted-decode rolling
+    /// window). Called once by the coordinator after constructing the
+    /// filter. Passing `None` (or never calling this) leaves CQ
+    /// responses unfiltered — the decode-side filter still runs.
+    pub fn set_fp_filter(
+        &mut self,
+        filter: Option<std::sync::Arc<crate::callsign_continuity::CallsignContinuityFilter>>,
+    ) {
+        self.fp_filter = filter;
     }
 
     // -- external inputs ----------------------------------------------------
@@ -1078,11 +1099,33 @@ impl AutonomousOperator {
                     };
 
                     let now = std::time::Instant::now();
+                    // Phase-5 hardening #1: TX-side FP gate. If a
+                    // callsign-continuity filter is installed, reject
+                    // any CQ whose sender doesn't appear in the trust
+                    // set (ADIF + cqdx + seed + rolling window).
+                    // Mirrors the decode-side filter; catches CQs from
+                    // OSD fabrications that slipped through (e.g. the
+                    // first one before the rolling window populated).
+                    let fp = self.fp_filter.clone();
                     let best_cq = self
                         .pending_cqs
                         .iter()
                         .filter(|cq| cq.dx_score >= threshold)
                         .filter(|cq| !self.is_recently_responded_to(&cq.callsign, now))
+                        .filter(|cq| match fp.as_ref() {
+                            None => true,
+                            Some(f) => {
+                                let ok = f.would_accept_callsign(&cq.callsign);
+                                if !ok {
+                                    debug!(
+                                        target: "qso.security",
+                                        "rejecting CQ response: callsign continuity (callsign={}, score={:.2})",
+                                        cq.callsign, cq.dx_score
+                                    );
+                                }
+                                ok
+                            }
+                        })
                         .find(|cq| self.frequency_allocator.is_clear_of_own(cq.frequency_hz))
                         .cloned();
 
@@ -1441,6 +1484,92 @@ mod tests {
             }
         });
         assert!(has_response, "Expected response to CQ");
+    }
+
+    #[test]
+    fn test_decision_engine_skips_cq_blocked_by_fp_filter() {
+        // Phase-5 hardening #1: with an FP filter installed and the CQ
+        // sender absent from the trust set, the responder must NOT
+        // transmit. Mirrors the 2026-05-30 audit scenario where
+        // OSD-fabricated calls (`R44XYB`, `OR1QRD`) flowed through to
+        // the autonomous TX path.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.min_dx_score = 0.3;
+        config.listen_cycle.initial_interval = 100;
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+
+        // Build a strict-mode filter that knows only "K1KNOWN".
+        let mut filter = crate::callsign_continuity::CallsignContinuityFilter::new(100);
+        filter.extend_from_iter(["K1KNOWN"]);
+        op.set_fp_filter(Some(std::sync::Arc::new(filter)));
+
+        // Feed an unknown-callsign CQ with a passing score.
+        let messages = vec![DecodedMessageInfo {
+            callsign: Some("R44XYB".into()),
+            frequency_hz: 1500.0,
+            snr: -5,
+            message_text: "CQ R44XYB FN42".into(),
+            slot_parity: None,
+        }];
+        op.feed_decoded_messages(&messages, &NullDxEvaluator);
+
+        let even_ts: i64 = 0;
+        let actions = op.decide_at(even_ts);
+        let has_response = actions.iter().any(|a| {
+            if let OperatorAction::Transmit { message_text, .. } = a {
+                message_text.contains("R44XYB")
+            } else {
+                false
+            }
+        });
+        assert!(
+            !has_response,
+            "Expected FP filter to block response to OSD-fabricated callsign"
+        );
+    }
+
+    #[test]
+    fn test_decision_engine_responds_when_fp_filter_accepts() {
+        // Phase-5 hardening #1: with an FP filter installed and the CQ
+        // sender present in the trust set, the responder behaves as
+        // before — proves the gate isn't broken for legitimate decodes.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.min_dx_score = 0.3;
+        config.listen_cycle.initial_interval = 100;
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+
+        let mut filter = crate::callsign_continuity::CallsignContinuityFilter::new(100);
+        filter.extend_from_iter(["K9ZZ"]);
+        op.set_fp_filter(Some(std::sync::Arc::new(filter)));
+
+        let messages = vec![DecodedMessageInfo {
+            callsign: Some("K9ZZ".into()),
+            frequency_hz: 1500.0,
+            snr: -5,
+            message_text: "CQ K9ZZ EM48".into(),
+            slot_parity: None,
+        }];
+        op.feed_decoded_messages(&messages, &NullDxEvaluator);
+
+        let even_ts: i64 = 0;
+        let actions = op.decide_at(even_ts);
+        let has_response = actions.iter().any(|a| {
+            if let OperatorAction::Transmit { message_text, .. } = a {
+                message_text.contains("K9ZZ")
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_response,
+            "Expected responder to TX when CQ sender passes FP filter"
+        );
     }
 
     #[test]

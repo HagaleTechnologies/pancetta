@@ -137,6 +137,25 @@ impl super::ApplicationCoordinator {
             pancetta_qso::AutonomousOperator::new(qso_auto_config, our_callsign, our_grid),
         ));
 
+        // Phase-5 hardening #1: install the same callsign-continuity FP
+        // filter the decoder uses, so the TX decision path can reject
+        // CQs from callsigns absent from the trust set (defense in
+        // depth — the decode-side filter still runs in
+        // coordinator/ft8.rs).
+        if let Some(ref filter) = self.fp_filter {
+            let filter = filter.clone();
+            let op = operator.clone();
+            let mut guard = op.lock().await;
+            guard.set_fp_filter(Some(filter));
+            drop(guard);
+            info!("Autonomous operator: FP filter installed for TX-side gating");
+        } else {
+            warn!(
+                "Autonomous operator: no FP filter available; CQ responses are NOT \
+                 gated by callsign continuity"
+            );
+        }
+
         let (waterfall_to_auto_tx, waterfall_to_auto_rx) =
             crossbeam_channel::bounded::<Vec<Vec<f32>>>(2);
         self.waterfall_to_auto_tx = Some(waterfall_to_auto_tx);

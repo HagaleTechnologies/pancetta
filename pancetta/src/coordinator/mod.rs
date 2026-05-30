@@ -397,15 +397,41 @@ impl ApplicationCoordinator {
             }
         }
 
-        // hb-062: build production FP filter. Sources:
+        // hb-062 + Phase-5 hardening #1: build production FP filter.
+        // Sources:
         //   1. ~/.pancetta/qsos.adi (operator log)
-        //   2. cqdx-spotted callsigns (refreshed periodically from cqdx_bridge)
-        //   3. rolling window populated by accepted decodes this session
-        // Cold-start lenient: accept all decodes until reference size reaches
-        // 100 callsigns. Avoids dropping legitimate first-of-session decodes
-        // before ADIF + cqdx populate.
+        //   2. ~/.pancetta/callsign_seed.txt (operator-curated seed list)
+        //   3. cqdx-spotted callsigns (refreshed periodically from cqdx_bridge)
+        //   4. rolling window populated by accepted decodes this session
+        // Cold-start lenient: accept all decodes until reference size
+        // reaches `COLD_START_THRESHOLD` (5). The 2026-05-30 live capture
+        // showed the previous threshold of 100 left the filter dormant
+        // the entire session — empty ADIF + no cqdx config meant
+        // reference_size stayed at 0 for 149 minutes and ~3.4k
+        // OSD-fabricated decodes leaked through. A small seed file is
+        // now enough to flip into strict mode immediately.
+        const COLD_START_THRESHOLD: usize = 5;
         {
             let adif_path = dirs::home_dir().map(|h| h.join(".pancetta").join("qsos.adi"));
+            let seed_path = dirs::home_dir().map(|h| h.join(".pancetta").join("callsign_seed.txt"));
+            let adif_count = adif_path
+                .as_ref()
+                .filter(|p| p.exists())
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|t| pancetta_qso::callsign_continuity::parse_adif_calls(&t).len())
+                .unwrap_or(0);
+            let seed: Vec<String> = seed_path
+                .as_ref()
+                .and_then(|p| {
+                    pancetta_qso::callsign_continuity::parse_seed_file(p)
+                        .map_err(|e| {
+                            warn!("FP filter: failed to read seed file {:?}: {}", p, e);
+                            e
+                        })
+                        .ok()
+                })
+                .unwrap_or_default();
+            let seed_count = seed.len();
             let initial_cqdx_spotted: std::collections::HashSet<String> =
                 if let Some(ref bridge) = self.cqdx_bridge {
                     let cache = bridge.cache();
@@ -414,17 +440,35 @@ impl ApplicationCoordinator {
                 } else {
                     std::collections::HashSet::new()
                 };
-            match pancetta_qso::callsign_continuity::build_filter(
+            let cqdx_count = initial_cqdx_spotted.len();
+            match pancetta_qso::callsign_continuity::build_filter_with_seed(
                 adif_path.as_deref(),
                 initial_cqdx_spotted,
+                seed,
                 500, // rolling-window capacity
-                100, // cold-start threshold (lenient until reference ≥ this)
+                COLD_START_THRESHOLD,
             ) {
                 Ok(filter) => {
+                    let total_unique = filter.reference_size();
                     info!(
-                        "FP filter initialized (reference size {}, cold-start lenient until 100)",
-                        filter.reference_size()
+                        target: "fp_filter",
+                        "FP filter sources: adif={} cqdx={} seed={} total_unique={} cold_start_threshold={}",
+                        adif_count, cqdx_count, seed_count, total_unique, COLD_START_THRESHOLD
                     );
+                    if total_unique < COLD_START_THRESHOLD {
+                        warn!(
+                            target: "fp_filter",
+                            "FP filter reference set is small ({}/{}); decodes will pass unfiltered \
+                             until rolling window populates. Populate {} or configure cqdx for \
+                             better coverage.",
+                            total_unique,
+                            COLD_START_THRESHOLD,
+                            seed_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "~/.pancetta/callsign_seed.txt".to_string())
+                        );
+                    }
                     self.fp_filter = Some(std::sync::Arc::new(filter));
                 }
                 Err(e) => {

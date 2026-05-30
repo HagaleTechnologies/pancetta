@@ -238,6 +238,36 @@ impl CallsignContinuityFilter {
         true
     }
 
+    /// Non-mutating membership check: would `accept(message)` return true
+    /// right now? Same source-of-truth as `accept` but does NOT push the
+    /// message's callsigns into the rolling window. Use this from a TX
+    /// decision path where you only want to consult the filter, not let
+    /// the consultation expand the trust set.
+    ///
+    /// Single-callsign overload: pass an already-extracted uppercase
+    /// callsign string. Matches the same union (static + cqdx + rolling)
+    /// but skips message parsing.
+    pub fn would_accept_callsign(&self, callsign: &str) -> bool {
+        if self.cold_start_threshold > 0 && self.reference_size() < self.cold_start_threshold {
+            return true;
+        }
+        let upper = callsign.to_uppercase();
+        if self.static_ref.contains(&upper) {
+            return true;
+        }
+        if let Ok(g) = self.cqdx_spotted.read() {
+            if g.contains(&upper) {
+                return true;
+            }
+        }
+        if let Ok(g) = self.rolling.read() {
+            if g.iter().any(|q| q == &upper) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn push_rolling(&self, calls: &[String]) {
         if let Ok(mut g) = self.rolling.write() {
             for c in calls {
@@ -253,16 +283,45 @@ impl CallsignContinuityFilter {
 }
 
 /// hb-062: convenience builder. Construct a production filter from an
-/// optional ADIF path + initial cqdx-spotted snapshot + rolling-window
-/// capacity + cold-start threshold. The cqdx snapshot can be empty at
-/// construction; the coordinator calls `update_cqdx_spotted` periodically
-/// via the cqdx bridge.
+/// optional ADIF path + initial cqdx-spotted snapshot + optional seed
+/// list + rolling-window capacity + cold-start threshold. The cqdx
+/// snapshot can be empty at construction; the coordinator calls
+/// `update_cqdx_spotted` periodically via the cqdx bridge.
 ///
 /// `cold_start_threshold = 0` → strict from first decode.
 /// `cold_start_threshold > 0` → lenient until reference_size() ≥ threshold.
+///
+/// Phase-5 hardening: the `seed` parameter supplies operator-curated
+/// callsigns (typically loaded from `~/.pancetta/callsign_seed.txt`).
+/// Combined with a small `cold_start_threshold` (e.g. 5), a few seed
+/// entries are enough to flip the filter into strict mode immediately,
+/// preventing OSD-fabricated calls (`R44XYB`, `OR1QRD`, ...) from
+/// flooding the pipeline before ADIF / cqdx populate.
 pub fn build_filter(
     adif_path: Option<&Path>,
     initial_cqdx_spotted: HashSet<String>,
+    rolling_cap: usize,
+    cold_start_threshold: usize,
+) -> std::io::Result<CallsignContinuityFilter> {
+    build_filter_with_seed(
+        adif_path,
+        initial_cqdx_spotted,
+        Vec::new(),
+        rolling_cap,
+        cold_start_threshold,
+    )
+}
+
+/// Phase-5 convenience builder accepting an explicit `seed` list of
+/// operator-curated callsigns alongside ADIF + cqdx sources. Seed entries
+/// are uppercased and inserted into `static_ref`, contributing to
+/// `reference_size()` so a small file can flip the filter out of
+/// cold-start lenient mode immediately. See [`build_filter`] for the
+/// non-seed shorthand.
+pub fn build_filter_with_seed(
+    adif_path: Option<&Path>,
+    initial_cqdx_spotted: HashSet<String>,
+    seed: Vec<String>,
     rolling_cap: usize,
     cold_start_threshold: usize,
 ) -> std::io::Result<CallsignContinuityFilter> {
@@ -276,8 +335,42 @@ pub fn build_filter(
             f.extend_from_adif(p)?;
         }
     }
+    if !seed.is_empty() {
+        f.extend_from_iter(seed);
+    }
     f.update_cqdx_spotted(initial_cqdx_spotted);
     Ok(f)
+}
+
+/// Parse a seed file: one uppercase callsign per line, ignoring blank
+/// lines and lines starting with `#`. Returns the deduplicated set of
+/// uppercase callsigns. Returns an empty vec if the path doesn't exist.
+pub fn parse_seed_file(path: &Path) -> std::io::Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path)?;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        // Tolerate inline comments after the callsign.
+        let token = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_uppercase();
+        if token.is_empty() {
+            continue;
+        }
+        if seen.insert(token.clone()) {
+            out.push(token);
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -370,6 +463,75 @@ mod tests {
         let f = build_filter(Some(&nonexistent), HashSet::new(), 100, 0).unwrap();
         // Strict + empty reference → reject
         assert!(!f.accept("CQ K1ABC FN42"));
+    }
+
+    #[test]
+    fn seed_flips_filter_out_of_cold_start() {
+        // Phase-5 hardening: with a small threshold (5) and a 3-entry
+        // seed, an unknown callsign like the OSD-fabricated `R44XYB`
+        // observed in the 2026-05-30 live capture must be REJECTED.
+        // Threshold met case: bump the seed to 5 so the filter is strict.
+        let f = build_filter_with_seed(
+            None,
+            HashSet::new(),
+            vec![
+                "K5ARH".to_string(),
+                "W1ABC".to_string(),
+                "WB9KMW".to_string(),
+                "JA1XYZ".to_string(),
+                "DL5XYZ".to_string(),
+            ],
+            100,
+            5,
+        )
+        .unwrap();
+        assert_eq!(f.reference_size(), 5);
+        // The 5 seed entries hit the threshold → strict mode active.
+        assert!(!f.accept("CQ R44XYB FN42"));
+        assert!(f.accept("CQ K5ARH EM12"));
+    }
+
+    #[test]
+    fn would_accept_callsign_does_not_mutate_rolling() {
+        let mut f = CallsignContinuityFilter::new(100);
+        f.extend_from_iter(["K1ABC"]);
+        // Check an unknown callsign: must NOT add it to rolling.
+        assert!(!f.would_accept_callsign("ZZ0ZZZ"));
+        // Subsequent accept of a message containing ZZ0ZZZ — still
+        // rejected, proving the prior would_accept call didn't taint
+        // the rolling window.
+        assert!(!f.accept("ZZ0ZZZ AA00 -10"));
+    }
+
+    #[test]
+    fn would_accept_callsign_matches_accept_for_known() {
+        let mut f = CallsignContinuityFilter::new(100);
+        f.extend_from_iter(["K1ABC", "W9XYZ"]);
+        assert!(f.would_accept_callsign("K1ABC"));
+        assert!(f.would_accept_callsign("k1abc")); // case-insensitive
+        assert!(!f.would_accept_callsign("UNKNOWN"));
+    }
+
+    #[test]
+    fn parse_seed_file_handles_comments_and_blanks() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            tmp,
+            "# operator seed list\nK5ARH\n\n  W1ABC  # nearby\nwb9kmw\n# trailing comment"
+        )
+        .unwrap();
+        let calls = parse_seed_file(tmp.path()).unwrap();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.contains(&"K5ARH".to_string()));
+        assert!(calls.contains(&"W1ABC".to_string()));
+        assert!(calls.contains(&"WB9KMW".to_string()));
+    }
+
+    #[test]
+    fn parse_seed_file_missing_returns_empty() {
+        let nonexistent = std::path::PathBuf::from("/tmp/seed-does-not-exist-zzz.txt");
+        let calls = parse_seed_file(&nonexistent).unwrap();
+        assert!(calls.is_empty());
     }
 
     #[test]
