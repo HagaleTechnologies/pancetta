@@ -6,7 +6,84 @@
 use pancetta_qso::priority::WorkedStationLookup;
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
+
+/// Derive the operator's home DXCC prefix from a callsign by stripping
+/// at the first digit. Examples:
+///   K5ARH  -> "K"
+///   JA1ABC -> "JA"
+///   WB9KMW -> "WB"
+///   DL5XYZ -> "DL"
+/// Returns the uppercase prefix, or `None` if the callsign has no
+/// digit (unparseable). Note: this is a heuristic — for the operator's
+/// own callsign it's accurate enough. The result is intended for the
+/// "all-except-home" exclusion set, not for general DXCC lookup.
+pub fn derive_prefix_from_callsign(callsign: &str) -> Option<String> {
+    let upper = callsign.to_uppercase();
+    let mut prefix = String::new();
+    let mut found_digit = false;
+    for c in upper.chars() {
+        if c.is_ascii_digit() {
+            found_digit = true;
+            break;
+        }
+        if c.is_ascii_alphabetic() {
+            prefix.push(c);
+        } else {
+            // Non-alpha, non-digit (e.g. '/') — stop, callsign
+            // structure is unusual and we should bail.
+            break;
+        }
+    }
+    if !found_digit || prefix.is_empty() {
+        None
+    } else {
+        Some(prefix)
+    }
+}
+
+/// Phase-5 hardening #2: compute the default "excluded DXCC prefixes"
+/// set used when cqdx hasn't supplied a needed-set. The set covers:
+///
+///   - the operator's home DXCC, derived from their configured callsign
+///     (e.g. K5ARH → K). When `dxcc_entity` is 291 (United States), the
+///     full US prefix family is added: K, W, N, AA-AK.
+///   - prefixes derived from each CALL field in the operator's ADIF
+///     (already-worked stations' home DXCCs). Same callsign-prefix
+///     heuristic.
+///
+/// If `adif_path` doesn't exist or isn't readable, ADIF prefixes are
+/// silently skipped. Returns an upper-case `HashSet<String>`.
+pub fn default_excluded_dxcc_prefixes(
+    operator_callsign: &str,
+    dxcc_entity: u16,
+    adif_path: Option<&Path>,
+) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    if let Some(p) = derive_prefix_from_callsign(operator_callsign) {
+        out.insert(p);
+    }
+    if dxcc_entity == 291 {
+        // United States: ITU has allocated K, W, N, AA-AK to the US.
+        for p in [
+            "K", "W", "N", "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK",
+        ] {
+            out.insert(p.to_string());
+        }
+    }
+    if let Some(path) = adif_path {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let calls = pancetta_qso::callsign_continuity::parse_adif_calls(&text);
+            for call in calls {
+                if let Some(p) = derive_prefix_from_callsign(&call) {
+                    out.insert(p);
+                }
+            }
+        }
+    }
+    out
+}
 
 /// Cached station lookup that holds a snapshot of worked stations.
 ///
@@ -31,6 +108,20 @@ pub struct CachedStationLookup {
     network_snr: Arc<RwLock<HashMap<String, (u32, i32)>>>,
     /// Network last-seen timestamps: callsign -> unix timestamp.
     network_last_seen: Arc<RwLock<HashMap<String, i64>>>,
+    /// Phase-5 hardening #2: callsign-prefix exclusions used when
+    /// `needed_dxcc` is empty (cqdx unavailable). Populated from:
+    ///
+    /// - operator's own callsign (home DXCC)
+    /// - ADIF CALL field of prior QSOs (already-worked DXCCs)
+    ///
+    /// When empty, behavior matches the pre-hardening "all needed"
+    /// default; when populated, `is_needed_dxcc` returns true for
+    /// every callsign whose uppercase prefix does NOT match any entry
+    /// (i.e. "all entities except home + already-worked"). This avoids
+    /// shipping a full DXCC entity list while still giving the
+    /// autonomous operator a defensible signal: non-home calls are
+    /// candidates, home calls aren't.
+    excluded_dxcc_prefixes: Arc<RwLock<HashSet<String>>>,
 }
 
 impl CachedStationLookup {
@@ -44,7 +135,26 @@ impl CachedStationLookup {
             notable_callsigns: Arc::new(RwLock::new(HashSet::new())),
             network_snr: Arc::new(RwLock::new(HashMap::new())),
             network_last_seen: Arc::new(RwLock::new(HashMap::new())),
+            excluded_dxcc_prefixes: Arc::new(RwLock::new(HashSet::new())),
         }
+    }
+
+    /// Phase-5 hardening #2: install the set of callsign-prefix
+    /// exclusions used when `needed_dxcc` is empty (cqdx unavailable
+    /// or hasn't populated). Operator typically seeds this with:
+    ///
+    ///   - their own home DXCC prefixes (e.g. K, W, N, AA-AK for US)
+    ///   - prefixes derived from worked QSOs in their ADIF
+    ///
+    /// Subsequent calls fully replace the set. Uppercase enforced.
+    pub fn set_excluded_dxcc_prefixes(&self, prefixes: HashSet<String>) {
+        let upper: HashSet<String> = prefixes.into_iter().map(|p| p.to_uppercase()).collect();
+        *self.excluded_dxcc_prefixes.write() = upper;
+    }
+
+    /// Returns the current count of excluded prefixes (for logging).
+    pub fn excluded_dxcc_prefix_count(&self) -> usize {
+        self.excluded_dxcc_prefixes.read().len()
     }
 
     /// Seed `worked_on_band` for `band` from a list of callsigns loaded out-of-band
@@ -129,14 +239,28 @@ impl WorkedStationLookup for CachedStationLookup {
 
     fn is_needed_dxcc(&self, callsign: &str) -> bool {
         let needed = self.needed_dxcc.read();
-        // Conservative policy: when no DXCC filter is configured (empty set),
-        // treat every entity as needed.
-        if needed.is_empty() {
-            return true;
-        }
-        // The set contains DXCC prefixes (e.g., "3Y/B"), not full callsigns.
-        // Use prefix matching: callsign "3Y/B1234" matches prefix "3Y/B".
         let upper = callsign.to_uppercase();
+        if needed.is_empty() {
+            // Phase-5 hardening #2: when cqdx hasn't supplied a needed
+            // set, fall back to the "all-except-excluded" default.
+            // Excluded = operator's home DXCC + already-worked DXCCs
+            // (set by the coordinator at startup). This stops the
+            // autonomous operator from scoring every CQ at ~needed
+            // (which inflates every callsign to >threshold), while
+            // still letting non-home / new-DXCC calls through.
+            let excluded = self.excluded_dxcc_prefixes.read();
+            if excluded.is_empty() {
+                // No exclusions configured either — preserve the
+                // historical "everything is needed" behavior so
+                // existing tests / dev setups don't regress.
+                return true;
+            }
+            // "Needed" = NOT in excluded prefix set.
+            return !excluded
+                .iter()
+                .any(|prefix| upper.starts_with(prefix.as_str()));
+        }
+        // cqdx-populated `needed` set: prefix-match as before.
         needed
             .iter()
             .any(|prefix| upper.starts_with(prefix.as_str()))
@@ -229,5 +353,131 @@ mod tests {
         assert!(lookup.is_duplicate("W1ABC", 14_074_000.0));
         assert!(lookup.is_duplicate("K2DEF", 14_074_000.0));
         assert!(!lookup.is_duplicate("W1ABC", 7_074_000.0)); // not on 40m
+    }
+
+    #[test]
+    fn test_empty_needed_no_exclusions_keeps_all_needed_default() {
+        // Phase-5 hardening #2: with neither cqdx data nor exclusions,
+        // preserve historical "everything is needed" behavior (no
+        // regression for dev / tests that depended on this).
+        let lookup = CachedStationLookup::new();
+        assert!(lookup.is_needed_dxcc("K1ABC"));
+        assert!(lookup.is_needed_dxcc("JA1XYZ"));
+        assert!(lookup.is_needed_dxcc("3Y/B1234"));
+    }
+
+    #[test]
+    fn test_empty_needed_with_exclusions_all_except_home() {
+        // Phase-5 hardening #2: with US prefixes excluded and no
+        // cqdx-populated needed set, "needed" becomes "anything
+        // outside US". Mirrors the operator's typical configuration.
+        let lookup = CachedStationLookup::new();
+        let mut excluded = HashSet::new();
+        for p in [
+            "K", "W", "N", "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK",
+        ] {
+            excluded.insert(p.to_string());
+        }
+        lookup.set_excluded_dxcc_prefixes(excluded);
+
+        // US calls — NOT needed
+        assert!(!lookup.is_needed_dxcc("K5ARH"));
+        assert!(!lookup.is_needed_dxcc("W1ABC"));
+        assert!(!lookup.is_needed_dxcc("N9ZZ"));
+        assert!(!lookup.is_needed_dxcc("AA1XX"));
+
+        // Non-US calls — needed
+        assert!(lookup.is_needed_dxcc("JA1ABC"));
+        assert!(lookup.is_needed_dxcc("DL5XYZ"));
+        assert!(lookup.is_needed_dxcc("VK2DEF"));
+        assert!(lookup.is_needed_dxcc("3Y/B1234"));
+    }
+
+    #[test]
+    fn test_cqdx_needed_set_wins_over_exclusions() {
+        // When cqdx populates needed_dxcc, the exclusion fallback is
+        // bypassed entirely — needed-set semantics rule.
+        let lookup = CachedStationLookup::new();
+        // Configure exclusions (would normally apply)
+        let mut excluded = HashSet::new();
+        excluded.insert("K".to_string());
+        lookup.set_excluded_dxcc_prefixes(excluded);
+        // But cqdx says only Bouvet is needed
+        let mut needed = HashSet::new();
+        needed.insert("3Y/B".to_string());
+        lookup.update_needed_dxcc(needed);
+
+        // K5ARH should NOT be needed (not in cqdx-needed set)
+        assert!(!lookup.is_needed_dxcc("K5ARH"));
+        // JA1ABC — also not in cqdx-needed
+        assert!(!lookup.is_needed_dxcc("JA1ABC"));
+        // 3Y/B1234 — is in cqdx-needed
+        assert!(lookup.is_needed_dxcc("3Y/B1234"));
+    }
+
+    #[test]
+    fn test_priority_score_non_us_high_with_default_exclusions() {
+        // Phase-5 hardening #2 success criteria: a Japanese CQ
+        // (DXCC 339) must score ≥ 0.35 when default exclusions are
+        // US-only, and a US CQ must score < 0.30 (won't respond).
+        use pancetta_qso::priority::{PriorityScorer, PriorityWeights};
+        use pancetta_qso::DxEvaluator;
+        let lookup = CachedStationLookup::new();
+        let mut excluded = HashSet::new();
+        for p in [
+            "K", "W", "N", "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK",
+        ] {
+            excluded.insert(p.to_string());
+        }
+        lookup.set_excluded_dxcc_prefixes(excluded);
+
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let ja_score = scorer.evaluate_cq("JA1ABC", Some("PM95"), -10, 14_074_000.0);
+        let us_score = scorer.evaluate_cq("K5ARH", Some("EM12"), -10, 14_074_000.0);
+
+        assert!(
+            ja_score >= 0.35,
+            "non-home (JA) call should score >= 0.35; got {}",
+            ja_score
+        );
+        assert!(
+            us_score < 0.30,
+            "home (US) call should score < 0.30; got {}",
+            us_score
+        );
+    }
+
+    #[test]
+    fn test_derive_prefix_from_callsign() {
+        assert_eq!(derive_prefix_from_callsign("K5ARH"), Some("K".into()));
+        assert_eq!(derive_prefix_from_callsign("JA1ABC"), Some("JA".into()));
+        assert_eq!(derive_prefix_from_callsign("WB9KMW"), Some("WB".into()));
+        assert_eq!(derive_prefix_from_callsign("DL5XYZ"), Some("DL".into()));
+        assert_eq!(derive_prefix_from_callsign("k5arh"), Some("K".into())); // case-insensitive
+        assert_eq!(derive_prefix_from_callsign("NODIGITS"), None);
+    }
+
+    #[test]
+    fn test_default_exclusions_us() {
+        // Operator K5ARH, US (291), no ADIF
+        let excluded = default_excluded_dxcc_prefixes("K5ARH", 291, None);
+        for p in [
+            "K", "W", "N", "AA", "AB", "AC", "AD", "AE", "AF", "AG", "AH", "AI", "AJ", "AK",
+        ] {
+            assert!(excluded.contains(p), "US prefix '{}' missing", p);
+        }
+        // Non-US prefix shouldn't be present
+        assert!(!excluded.contains("JA"));
+        assert!(!excluded.contains("DL"));
+    }
+
+    #[test]
+    fn test_default_exclusions_non_us_operator() {
+        // German operator: DL5XYZ, DXCC 230, no ADIF — only "DL"
+        // gets added (no special-case prefix family).
+        let excluded = default_excluded_dxcc_prefixes("DL5XYZ", 230, None);
+        assert!(excluded.contains("DL"));
+        assert!(!excluded.contains("K"));
+        assert!(!excluded.contains("JA"));
     }
 }

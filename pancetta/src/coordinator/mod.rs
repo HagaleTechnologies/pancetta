@@ -477,6 +477,37 @@ impl ApplicationCoordinator {
             }
         }
 
+        // Phase-5 hardening #2: seed the priority engine's
+        // "excluded DXCC prefixes" set from operator config + ADIF.
+        // Used by `CachedStationLookup::is_needed_dxcc` when cqdx
+        // hasn't populated a needed-set. Without this, the empty-set
+        // fallback returns true for every callsign — inflating CQ
+        // scores so the operator would consider every station "needed"
+        // (or, under different weighting, treat none as needed). This
+        // gives the autonomous operator a defensible signal: anything
+        // outside the operator's home DXCC + already-worked DXCCs
+        // counts as needed.
+        {
+            let config = self.config.read().await;
+            let operator_callsign = config.station.callsign.clone();
+            let dxcc_entity = config.station.dxcc_entity;
+            drop(config);
+            let adif_path = dirs::home_dir().map(|h| h.join(".pancetta").join("qsos.adi"));
+            let excluded = crate::priority_evaluator::default_excluded_dxcc_prefixes(
+                &operator_callsign,
+                dxcc_entity,
+                adif_path.as_deref(),
+            );
+            let n = excluded.len();
+            self.cached_lookup.set_excluded_dxcc_prefixes(excluded);
+            info!(
+                target: "priority",
+                "needed_dxcc default: excluded {} prefixes (home={} entity={}); \
+                 cqdx-populated needed-set will override when available",
+                n, operator_callsign, dxcc_entity
+            );
+        }
+
         self.start_transmitter_component().await?;
 
         // If --test-tx was passed, inject a single TransmitRequest after a
