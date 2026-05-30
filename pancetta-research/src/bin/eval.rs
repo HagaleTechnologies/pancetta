@@ -61,6 +61,8 @@ struct Args {
     residual_min_sync_score: Option<f64>,
     /// hb-086 V1: force-retry failed original candidates on residual.
     joint_pair_retry: Option<bool>,
+    /// hb-016: residual energy early-stop margin in dB (None disables).
+    residual_energy_stop_db: Option<f64>,
     /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
     two_stage: Option<bool>,
     /// hb-004: when Some, an ApContext is built and passed to
@@ -114,6 +116,7 @@ impl Args {
         let mut coherent_subtract_mrc_threshold: Option<f64> = None;
         let mut residual_min_sync_score: Option<f64> = None;
         let mut joint_pair_retry: Option<bool> = None;
+        let mut residual_energy_stop_db: Option<f64> = None;
         let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
@@ -286,6 +289,13 @@ impl Args {
                 "--no-joint-pair-retry" => {
                     joint_pair_retry = Some(false);
                 }
+                "--hb016-residual-energy-stop-db" => {
+                    residual_energy_stop_db = Some(
+                        iter.next()
+                            .context("--hb016-residual-energy-stop-db needs a value (dB margin)")?
+                            .parse()?,
+                    );
+                }
                 "--two-stage" => {
                     two_stage = Some(true);
                 }
@@ -386,6 +396,7 @@ impl Args {
             coherent_subtract_mrc_threshold,
             residual_min_sync_score,
             joint_pair_retry,
+            residual_energy_stop_db,
             two_stage,
             ap_my_call,
             ap_recent_calls,
@@ -809,6 +820,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(on) = args.joint_pair_retry {
                 d = d.with_joint_pair_retry(on);
+            }
+            if args.residual_energy_stop_db.is_some() {
+                d = d.with_residual_energy_stop_db(args.residual_energy_stop_db);
             }
             if let Some(on) = args.two_stage {
                 d = d.with_two_stage(on);

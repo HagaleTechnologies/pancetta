@@ -287,6 +287,20 @@ pub struct Ft8Config {
     /// Replaces the dead dB-domain `subtract_with_sidelobes` (hb-030).
     pub coherent_multipass_iterations: u8,
 
+    /// hb-016: residual energy early-stop for the coherent multipass
+    /// loop. After step 1 (subtract) of each `coherent_subtract_and_repass`
+    /// round, compute the mean per-bin "excess above noise" of the
+    /// residual spectrogram — `mean(max(0, db - noise_floor_db))` where
+    /// `noise_floor_db` is the median dB of the ORIGINAL spectrogram.
+    /// When this drops BELOW the configured threshold (in dB), the
+    /// residual is signal-poor; the expensive sync_search + LDPC for the
+    /// rest of the round is skipped and the multipass loop breaks early.
+    /// Saves CPU on WAVs where pass 1 already recovered most signal
+    /// energy. `None` disables the probe (production default until an
+    /// A/B confirms a threshold that saves wall-clock without regressing
+    /// recall).
+    pub residual_energy_stop_db: Option<f64>,
+
     /// hb-063 (arXiv:2410.13131, Hocevar 2004): use a layered (row-
     /// sequential) belief-propagation schedule instead of the flooding
     /// schedule. Layered BP updates check nodes one at a time and folds
@@ -366,6 +380,11 @@ impl Default for Ft8Config {
             // Wall-clock at N=3 is 1.78× N=1, well within the 3000 ms/WAV
             // budget. 0 disables.
             coherent_multipass_iterations: 3,
+            // hb-016: residual energy early-stop disabled by default until
+            // an A/B sweep finds a threshold that saves wall-clock without
+            // regressing composite. `Some(x_db)` enables the probe with
+            // margin `x_db` above noise floor (median of original power).
+            residual_energy_stop_db: None,
         }
     }
 }
@@ -834,10 +853,23 @@ impl Ft8Decoder {
             // subtracts the new (residual) decodes, etc. Stops early if a
             // round finds nothing new.
             if self.config.coherent_multipass_iterations > 0 {
+                // hb-016: when enabled, compute the spectrogram's noise-floor
+                // proxy ONCE up front. Each round will compare its residual
+                // mean dB against this reference to decide whether to keep
+                // looking. Skipped (`None`) when the flag is off — keeps the
+                // historical fast-path overhead at zero.
+                let energy_stop = self
+                    .config
+                    .residual_energy_stop_db
+                    .map(|margin| (noise_floor_db_median(&spectrogram.power), margin));
                 let mut to_subtract: &[DecodedMessage] = &pass_decoded;
                 let mut round_start_offset = 0;
                 for _round in 0..self.config.coherent_multipass_iterations {
-                    let extra = self.coherent_subtract_and_repass(&mut spectrogram, to_subtract);
+                    let extra = self.coherent_subtract_and_repass(
+                        &mut spectrogram,
+                        to_subtract,
+                        energy_stop,
+                    );
                     if extra.is_empty() {
                         break;
                     }
@@ -2085,6 +2117,15 @@ impl Ft8Decoder {
         &self,
         spectrogram: &mut Spectrogram,
         decoded: &[DecodedMessage],
+        // hb-016: optional residual energy early-stop. When
+        // `Some((floor_db, threshold_db))`, after step 1 (subtract)
+        // compute the mean per-bin excess above `floor_db` of the
+        // residual spectrogram and bail (returning empty) if it falls
+        // below `threshold_db`. `None` disables the probe (matches the
+        // historical hb-079/hb-080 behavior). `floor_db` is the
+        // noise-floor proxy computed once on the ORIGINAL spectrogram
+        // by the caller (so the reference is stable across rounds).
+        energy_stop: Option<(f64, f64)>,
     ) -> Vec<DecodedMessage> {
         if self.config.coherent_multipass_iterations == 0 || spectrogram.complex.is_none() {
             return Vec::new();
@@ -2125,6 +2166,20 @@ impl Ft8Decoder {
         }
         if subtracted_candidates.is_empty() {
             return Vec::new();
+        }
+
+        // hb-016: residual energy early-stop. After subtraction, compute
+        // the average per-bin excess above the original noise floor. If
+        // it drops below `threshold_db`, the residual is dominated by
+        // noise (signals subtracted away) and the sync_search + LDPC
+        // work this round would be wasted — bail. The probe is O(N) over
+        // the power tensor; cheap relative to the Costas sweep it
+        // short-circuits.
+        if let Some((noise_floor_db, threshold_db)) = energy_stop {
+            let residual_excess_db = mean_excess_above_noise_db(&spectrogram.power, noise_floor_db);
+            if residual_excess_db < threshold_db {
+                return Vec::new();
+            }
         }
 
         // Step 2: re-run Costas sync search on the residual spectrogram.
@@ -4336,6 +4391,63 @@ fn estimate_noise_floor(psd: &[f64]) -> f64 {
     sorted_psd.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median_idx = sorted_psd.len() / 2;
     sorted_psd[median_idx]
+}
+
+/// hb-016: average excess-above-noise (in dB) across a spectrogram's
+/// power tensor. For each bin, take `max(0, db - noise_floor_db)` and
+/// average. Result is monotone in signal energy: 0 when every bin sits
+/// at or below the noise-floor reference, grows as bright signal bins
+/// are added. O(N) over all (time, freq_sub, freq_bin) entries. The
+/// earlier `mean(linear power)` variant was dominated by surviving
+/// strong bins and failed to drop into the early-stop regime even
+/// after most signals had been subtracted; this metric goes to zero
+/// when subtraction zeroes the per-bin excess above the original
+/// floor.
+fn mean_excess_above_noise_db(power: &[Vec<Vec<f64>>], noise_floor_db: f64) -> f64 {
+    let mut sum = 0.0_f64;
+    let mut count = 0_usize;
+    for ts in power {
+        for sub in ts {
+            for &db in sub {
+                let excess = db - noise_floor_db;
+                if excess > 0.0 {
+                    sum += excess;
+                }
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        return 0.0;
+    }
+    sum / count as f64
+}
+
+/// hb-016: noise-floor proxy across a spectrogram — median dB of all
+/// bins. Most bins in an FT8 slot are noise (signals occupy a small
+/// fraction of (time, freq) cells), so the median of dB is a robust
+/// floor estimator. Computed once on the ORIGINAL spectrogram and
+/// reused as a stable reference across multipass rounds. O(N log N) one
+/// time; small relative to the rest of the decode budget.
+fn noise_floor_db_median(power: &[Vec<Vec<f64>>]) -> f64 {
+    let mut all: Vec<f64> = Vec::with_capacity(
+        power
+            .iter()
+            .map(|t| t.iter().map(|s| s.len()).sum::<usize>())
+            .sum::<usize>(),
+    );
+    for ts in power {
+        for sub in ts {
+            for &db in sub {
+                all.push(db);
+            }
+        }
+    }
+    if all.is_empty() {
+        return -120.0;
+    }
+    all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    all[all.len() / 2]
 }
 
 // ============================================================================

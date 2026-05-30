@@ -1238,7 +1238,26 @@ current_ratio: 0.051
     improvement specifically on synth-doppler tier. May interact positively with hb-001
     (multi-pass) since Doppler-distorted signals are harder to subtract cleanly.
 
-### hb-016 — Residual energy early-stop for multi-pass  [PRIORITY: 0.36]
+### hb-016 — Residual energy early-stop for multi-pass  [SHELVED 2026-05-30]
+  status_2026_05_30: SHELVED — implemented as `residual_energy_stop_db` with the
+    `mean_excess_above_noise_db` probe (after a V1 mean-linear-power variant
+    proved insensitive — bright bins dominated the linear mean and the metric
+    never converged toward floor). hard-200 sweep at thresholds {1.0, 2.0,
+    3.0, 5.0} dB: recall identical to baseline at every threshold (4616 rec /
+    921 nov / rate 0.53825). Elapsed: probe-off baselines 350-361 s; probe-on
+    variants 381-397 s at th ≥ 2.0 — ~5-12 % SLOWER, not faster. The probe is
+    paid per round (O(N) mean over the power tensor) but the rebate it was
+    designed to harvest is already absorbed by the existing empty-pass-break
+    in `decode_window_with_ap`, which short-circuits the multipass loop
+    whenever `coherent_subtract_and_repass` returns an empty Vec (the case
+    where the residual is signal-poor). hb-016 was a useful hypothesis when
+    multipass wasn't shipping (the bank entry predates hb-079); under N=3
+    multipass + hb-086 V1's joint-pair-retry that the residual feeds, the
+    early-exit window is too narrow to recover its overhead. Code preserved
+    on the branch with the flag defaulted off (zero production impact).
+    Journal: research/experiments/2026-05-30-hb-016-residual-energy-stop.md.
+  ---- original entry below ----
+  [PRIORITY-WAS: 0.36]
   mode: ft8
   status: pending
   priority_score: 0.36

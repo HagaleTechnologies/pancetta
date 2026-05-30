@@ -237,6 +237,15 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-016: residual-energy early-stop margin (in dB above noise
+    /// floor) for the coherent multipass loop. `None` disables; `Some(x)`
+    /// makes each round bail when post-subtract residual mean dB is
+    /// within `x` dB of the original spectrogram's median dB.
+    pub fn with_residual_energy_stop_db(mut self, t: Option<f64>) -> Self {
+        self.config.residual_energy_stop_db = t;
+        self
+    }
+
     /// hb-046: enable two-stage decoding. When `on`, decode_wav runs a
     /// CHEAP pass first (relaxed sync_cap, no OSD, fewer LDPC iters)
     /// then the standard PRODUCTION pass on the same audio, unioning
