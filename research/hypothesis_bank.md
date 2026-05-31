@@ -1716,6 +1716,24 @@ search to in-repo sources.
     baseline. Schedule only when there's appetite for the multi-session
     hb-015 structural-sync line. See
     research/experiments/2026-05-25-corpus-expansion-survey.md.
+  status_2026_05_31_session1: |
+    SCOPED. Capture procedure + eval-tier stub landed (no production
+    decoder change). Operator-physical work remaining.
+    - Procedure doc: docs/operations/2026-05-31-hb-073-kiwisdr-capture-procedure.md
+      (conditions, KiwiSDR site selection, slot-aligned kiwirecorder.py
+      command, ingestion pipeline, operator action-item checklist).
+    - Eval-tier stub: `wild-doppler-50` added to
+      pancetta-research/src/bin/eval.rs tier dispatch. Missing manifest
+      treated as SKIP (logs to stderr, returns 0-WAV TierResult); does
+      not break existing eval runs. Smoke-test verified.
+    - Manifest expected at
+      research/corpus/curated/ft8/wild_doppler_50.manifest.json once
+      operator captures + curates 30-60 Doppler-rich WAVs (target ~50
+      after filtering for jt9-recovery ≤ 0.70).
+    - Unblocks: hb-015 (bump 0.38 → ~0.42 once manifest lands),
+      hb-077 (partial — KiwiSDR audio captures cover the same propagation
+      regime; phase-coherent IQ via HackRF/GPSDO still operator-pending).
+    - Scoping journal: research/experiments/2026-05-31-hb-073-scoping.md.
 
 ## Shelved (kept for reference)
 
