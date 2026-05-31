@@ -1458,10 +1458,11 @@ current_ratio: 0.051
     signal — anything pancetta decodes that two other independent decoders agree
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
-### hb-087 — Callsign-priors-on-residual (AP-constrained, bypass Costas pre-gate)  [PRIORITY: 0.45, spawned 2026-05-31 from hb-086 V3 shelve]
+### hb-087 — Callsign-priors-on-residual (AP-constrained, bypass Costas pre-gate)  [PRIORITY: 0.0, SHELVED 2026-05-31 at Session 2 — 0/10 AP-decode rescue]
+  status_2026_05_31_session2: SHELVED — Session 2 per-truth AP-decode micro-test returned 0 of 10 rescued on diverse top-20 hard-200 picks (need ≥3 for PROCEED). The production AP path with singleton recent_calls=[truth_callsign] could not surface any of the 10 prior-covered missed truths from positions sync_search did find. Conclusion: AP injection alone doesn't rescue noise-dominated residuals. The bypass-Costas extension (Session 3, deferred forever) would inherit this null result because it uses the same LDPC+AP machinery against weaker (sub-Costas) residual LLRs. Sibling hb-088 (OSD-without-Costas) SHELVED structurally at the same wall. Priority 0.45 → 0.0. See `research/experiments/2026-05-31-hb-087-session2.md` for the per-truth table, mechanism inference, and revisit conditions.
   mode: ft8
-  status: scoped (diagnostic PROCEED; design spec written; awaiting implementation session)
-  priority_score: 0.45
+  status: shelved (Session 2 kill-switch failed; Session 3 not started)
+  priority_score: 0.0
   estimated_effort: 3 sessions (session 1 = scoping/diagnostic, DONE; session 2 = prior-set aggregation in research crate; session 3 = AP-constrained residual decode pass + eval)
   expected_delta: +5 to +30 hard-200 rec (diagnostic upper bound 153 of 647 = 23.6% coverage; mechanism efficiency assumed 5-20% of that); composite +0.0005 to +0.0015
   defensible_prior: yes — AP-without-sync is the canonical weak-signal recovery lever (JT9/JT65 "apsym"/"napwid"; pancetta's own AP1/AP2 already work on the sync-passing path). The residual at sub-Costas positions HAS energy at masked-but-real signal locations (hb-079's coherent subtract proves the locality); the missing ingredient is a constraint strong enough to prevent LDPC from converging on noise (V3's failure mode).
@@ -1482,11 +1483,15 @@ current_ratio: 0.051
     Spec: docs/superpowers/specs/2026-05-31-hb-087-callsign-priors-design.md
     Diagnostic: pancetta-research/examples/hb087_callsign_priors_feasibility.rs
     Scoping journal: research/experiments/2026-05-31-hb-087-scoping.md
+    Session 2 journal (SHELVE): research/experiments/2026-05-31-hb-087-session2.md
+    Session 2 micro-test: pancetta-research/examples/hb087_session2_ap_decode_microtest.rs
+    Session 2 aggregator: pancetta-research/src/callsign_priors.rs
 
-    Sibling hypothesis (being scoped separately): OSD-without-Costas-pre-gate.
-    The two bypass-Costas mechanisms attack the same V3-identified wall via
-    different constraints (callsign-AP vs ordered-statistics). Whichever
-    graduates first informs whether the other adds incremental value.
+    Sibling hypothesis (also SHELVED 2026-05-31): hb-088 OSD-without-Costas.
+    Both bypass-Costas mechanisms attack the same V3-identified wall via
+    different constraints (callsign-AP vs ordered-statistics). Both
+    SHELVED — the structural failure (sub-Costas residuals are
+    noise-dominated; no AP-style constraint rescues them) is shared.
 
     Doctrine note inherited from V3: gate session 2 → session 3 on a
     per-truth decodability micro-test (10 truths from top-3 worst WAVs whose
@@ -1494,6 +1499,17 @@ current_ratio: 0.051
     known truth coordinates). This is the V3 SHELVE doctrine refinement
     ("geometric proximity is not decodability") applied to hb-087's
     feasibility step. Cheap insurance (~30 min of session 2 wall-clock).
+    DOCTRINE VINDICATED: the kill-switch caught what the 23.6% coverage
+    diagnostic missed. 1-2 days of Session 3 implementation effort saved.
+
+    Revisit conditions: a downstream mechanism that improves residual
+    quality at sub-Costas positions (coherent-subtract refinements
+    beyond hb-079's wins, multi-cycle accumulation across adjacent
+    slots, per-position residual SNR estimation pre-decode) could
+    change the AP-rescue probability for these specific truths. The
+    Session 2 micro-test + aggregator stay in place and are reusable.
+    Until such a mechanism graduates, hb-087's structural shelf-reason
+    holds.
 
 ## Meta-research (idea generators)
 
@@ -2079,11 +2095,13 @@ search to in-repo sources.
   notes: |
     Diagnostic: pancetta-research/examples/hb088_osd_without_costas_feasibility.rs
     Scoping journal: research/experiments/2026-05-31-hb-088-scoping.md
-    Sibling: hb-087 (callsign-priors-on-residual, PROCEEDING). hb-088's
-    SHELVE strengthens hb-087's case: hb-087 doesn't rely on LLR signs
-    being correct, it pins 28 bits via AP1/AP2 injection at ±15.0 LLR
-    magnitude, collapsing the codeword space independently of the channel
-    LLR sign pattern.
+    Sibling: hb-087 (callsign-priors-on-residual, ALSO SHELVED 2026-05-31
+    at Session 2 — 0/10 AP-decode rescue). hb-087's null result confirms
+    that even the AP-pinned-28-bits constraint can't pull BP across the
+    gap when the other 146 LLRs are noise-dominated. The two
+    bypass-Costas mechanisms close together; the family wall is
+    "noise-dominated residuals at sub-Costas positions", structurally
+    inaccessible to per-position AP or OSD techniques.
 
     Re-visit conditions:
     - Sparser corpus (rural VHF, low-activity HF) MIGHT show higher
