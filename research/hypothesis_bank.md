@@ -1138,9 +1138,10 @@ current_ratio: 0.051
     Prefer (a) if operational recording-alignment is a concern; (b)
     otherwise.
 
-### hb-036 — Score-relative NMS suppression  [PRIORITY: 0.40]
+### hb-036 — Score-relative NMS suppression  [SHELVED 2026-05-31]
   mode: ft8
-  status: pending
+  status_2026_05_31: SHELVED — sweep at delta_db ∈ {1.0, 2.0, 3.0, 5.0} all regress hard-200 by -748 to -1034 rec vs nms-off baseline. Mechanism interpolates between pure-NMS and nms-off; no sweet spot. Costas sync_score variance dominates the duplicate-vs-distinct gap. **NMS suppression family closed on this corpus's signal distribution.** Future work would need a fundamentally different discriminator (e.g., LDPC-codeword-based dedup). Config knob `nms_score_delta_db` preserved at default 0.0 for research re-evaluation.
+  status: shelved
   priority_score: 0.40
   estimated_effort: 1-2 sessions
   expected_delta: keep hb-019's win at lower wall-clock cost; partial recovery of the +58% NMS-off CPU penalty

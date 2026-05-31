@@ -1,0 +1,233 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-05-31T20:55:52.098830Z",
+  "mode": "ft8",
+  "git": {
+    "branch": "iter/2026-05-31-hb-064-session2",
+    "head_sha": "21b69b19e5b2ab61bad230f94e2356586adad66e",
+    "main_merge_base": "e6a1594e158e1db5d201b980d211cf18efa0fa37",
+    "dirty": true
+  },
+  "build": {
+    "rustc_version": "rustc 1.94.1 (e408947bf 2026-03-25)",
+    "release": true,
+    "features": [
+      "research-eval"
+    ]
+  },
+  "harness": {
+    "harness_version": "0.1.0",
+    "host": "macos/aarch64",
+    "cores_used": 10,
+    "elapsed_seconds": 156.299375125
+  },
+  "config": {
+    "decoder": {
+      "adaptive_ldpc_iters": false,
+      "block_score_rerank": true,
+      "bp_offset_subtract": 0.0,
+      "coherent_multipass_iterations": 3,
+      "coherent_subtract_mrc_threshold": 0.0,
+      "cross_cycle_averaging": true,
+      "cross_cycle_coherent": true,
+      "cross_cycle_coherent_mrc": true,
+      "joint_pair_retry": true,
+      "joint_residual_sync_relax_db": 0.0,
+      "joint_residual_sync_window_bins": 8,
+      "layered_bp": true,
+      "ldpc_iterations": 100,
+      "llr_target_variance": 32.0,
+      "max_candidates": 100,
+      "max_decode_passes": 1,
+      "max_parity_errors_for_osd": 6,
+      "max_sync_candidates": 300,
+      "min_sync_score": 3.0,
+      "nms_enabled": true,
+      "nms_freq_radius": 1,
+      "nms_score_delta_db": 3.0,
+      "nms_time_radius": 2,
+      "osd_depth": 2,
+      "protocol": "Ft8",
+      "residual_energy_stop_db": null,
+      "residual_min_sync_score": null,
+      "sample_rate": 12000,
+      "sync_time_interp_delta_scale": 0.3,
+      "sync_time_interp_max_delta_abs": null,
+      "sync_time_interp_score_gate": 0.0,
+      "sync_time_interpolation": true,
+      "time_range": 2.0
+    },
+    "seed": 42,
+    "tiers_run": [
+      "curated-hard-200"
+    ]
+  },
+  "tiers": {
+    "curated-hard-200": {
+      "wavs_processed": 200,
+      "truth_decodes_total": 8853,
+      "truth_decodes_recovered": 3990,
+      "decode_rate": 0.4506946797695696,
+      "novel_decodes": 801,
+      "wsjtx_decoded": 8853,
+      "vs_wsjtx_pct": 45.069467976956965,
+      "per_wav_top_failures": [
+        {
+          "wav_hash": "566cf9fc928d7de3f45929f8f9acf7bd494a626da49f02b3f1a72d2bd7cce0fa",
+          "truth": 70,
+          "recovered": 23,
+          "wsjtx": 70,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "eb762156b2316ab5cb707b9480242e0d9e82d06f0e9a48dadf24a4d0aa4de90a",
+          "truth": 66,
+          "recovered": 20,
+          "wsjtx": 66,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "06fec54c745c787ce8231d2a200c7b2821540492a057d09ef272eb200fca1780",
+          "truth": 66,
+          "recovered": 23,
+          "wsjtx": 66,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "f342610a94861413862c390bee0918813cb3af9440ca3e37eefc1f71c74e66b0",
+          "truth": 57,
+          "recovered": 15,
+          "wsjtx": 57,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "9e5b9243b432ca7660a68b78dc4fa293cf4bea3fcb3792bca1da4bd7b3374aba",
+          "truth": 65,
+          "recovered": 23,
+          "wsjtx": 65,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "c328dfb5289d9cad4e0280f5ddac3a7c2f82427ccfb708aa4667044fa9a2ec5a",
+          "truth": 65,
+          "recovered": 24,
+          "wsjtx": 65,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "773b009bbe928612f117e90d547fc9d9fce42282b9cd6d41ebc9c966b1359e4b",
+          "truth": 67,
+          "recovered": 28,
+          "wsjtx": 67,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "869cff497b9b3a0ab1631329df9f7213cfd222df23db615193ffa71a717c09a5",
+          "truth": 56,
+          "recovered": 17,
+          "wsjtx": 56,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "fbeddac8fb4266a65ed88a2bcea3ee0a204d53c639e49b8ffa5e72c229ef3ac6",
+          "truth": 61,
+          "recovered": 22,
+          "wsjtx": 61,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "24acc7134e34192230a9fd0220996b3a243e34315af0a20eb3cf817de4aaebae",
+          "truth": 62,
+          "recovered": 23,
+          "wsjtx": 62,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "1fee43bccf376f9e715b43a44476bad16d11913be48088fbac3a9986347e2407",
+          "truth": 55,
+          "recovered": 18,
+          "wsjtx": 55,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "bb7ea7909fd8069f03e38de5c69f68dced4d68e8df119345618ce22af5d58d9d",
+          "truth": 51,
+          "recovered": 14,
+          "wsjtx": 51,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "78454594f5651b0bc30a0bba387be9e93d227e2859111b8498e6ad1333768145",
+          "truth": 56,
+          "recovered": 19,
+          "wsjtx": 56,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "33d0c2603427c4793ab52ee8108a3d68feac3a488a78ce4ac0dc88fa7c55dadd",
+          "truth": 56,
+          "recovered": 20,
+          "wsjtx": 56,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "e7ed9e478f2bf4cd552f9c3210438459047dd5974c7d8f5b2cc5f256e9d25070",
+          "truth": 52,
+          "recovered": 16,
+          "wsjtx": 52,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "166fe3b7673c1b89db388479dbe203cd3873a57f1e14b4517bd5b866bafed1dc",
+          "truth": 62,
+          "recovered": 26,
+          "wsjtx": 62,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "ac07db234020b115ad584033b553c8d15fd2047c7313ff2f0816da4e3e40768e",
+          "truth": 56,
+          "recovered": 20,
+          "wsjtx": 56,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "1bd3e87f3f4394d3324a445391b9f00a3e7212ba1923a5de74455f5eca97bcb6",
+          "truth": 53,
+          "recovered": 17,
+          "wsjtx": 53,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "997a0ec57485bca52a1d39af5f4d162b210b1d9d02353bd7837e31165b98b928",
+          "truth": 51,
+          "recovered": 16,
+          "wsjtx": 51,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "74e840bbc4510219fc01c282adc2c7af265e825966dba607d050e1f7ade759f1",
+          "truth": 53,
+          "recovered": 18,
+          "wsjtx": 53,
+          "jtdx": 0
+        }
+      ]
+    }
+  },
+  "composite": {
+    "weights": {
+      "fixtures_pass_rate": 0.15,
+      "real_decode_rate_hard_200": 0.5,
+      "snr_50pct_synth_clean": 0.3,
+      "snr_50pct_synth_doppler": 0.05
+    },
+    "score": 0.2253473398847848
+  },
+  "regressions": {
+    "fixture_regression": false,
+    "false_positive_introduced": false,
+    "snr_curve_regression_db": 0.0
+  },
+  "notes": "Decoder under test: pancetta-ft8@0.1.0"
+}
