@@ -266,6 +266,28 @@ current_ratio: 0.051
     hb-NNN." First step: design doc outlining template structure, snr7
     threshold (WSJT-X uses snr7 >= 6.0, snr7b >= 1.8), per-callsign cooldown
     integration with pancetta-qso's recently_responded_to.
+  status_2026_05_31_session1: |
+    Session 1 (design-only) COMPLETE. Spec at
+    docs/superpowers/specs/2026-05-31-hb-048-a7-design.md.
+    Key decisions:
+      * Cross-slot state (prev_slot_calls) lives in Ft8Decoder, not
+        coordinator — local feedback loops already live there.
+      * Mechanism is structurally different from existing AP1-AP6:
+        template cross-correlation REPLACES Costas pre-gate; existing
+        AP only re-decodes Costas-admitted candidates. hb-051's
+        AP-recovery ceiling does NOT bound a7.
+      * Thresholds start at WSJT-X reference (snr7 ≥ 6.0, snr7b ≥ 1.8)
+        but will need a wide Session-3 sweep — pancetta's FFT scaling
+        may differ from WSJT-X's correlation power normalization.
+      * Per-decode template cap of 32 (down from WSJT-X's 206) is the
+        first-cut CPU mitigation; source-decode cap of 8 (top-K by SNR).
+      * Eval-harness limitation: shuffled-WAV corpus undercounts the
+        cross-WAV (production-only) yield. Session 3 will measure
+        within-WAV effect only; document the gap.
+    Session 2 = template generator + cross-corr primitive + 10 unit
+    tests, gated, no production hook. Session 3 = production wiring +
+    threshold sweep + A/B eval. Priority stays at 0.45 (active).
+    Branch: iter/2026-05-31-hb-048-session1, 1 commit (docs only).
 
 ### hb-050 — Rolling callsign-window tracker  [SHELVED 2026-05-24 — closed by hb-051 ceiling]
   mode: ft8
