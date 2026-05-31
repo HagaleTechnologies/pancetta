@@ -254,6 +254,17 @@ pub struct Ft8Config {
     /// Default `None`.
     pub sync_time_interp_max_delta_abs: Option<f64>,
 
+    /// hb-069: interpolate spectrogram lookups in linear power instead
+    /// of dB. When true and the candidate has a non-zero
+    /// `time_refinement`, `lookup_time_interp` converts each endpoint
+    /// dB→linear (10^(db/10)), linearly interpolates in power, and
+    /// converts back to dB. dB-space interpolation is non-linear in
+    /// real power and can introduce non-physical values near the noise
+    /// floor; linear-power interpolation preserves symbol energy more
+    /// accurately at the cost of two pow/log per lookup.
+    /// Default `false` until A/B confirms a net gain.
+    pub sync_time_interp_linear_power: bool,
+
     /// hb-067 (arXiv:2306.00443): mBP offset — subtract this magnitude
     /// from each LLR before invoking OSD. Reduces BP's confidence so
     /// OSD considers more flip patterns. Default 0.0 (no behavior change).
@@ -424,6 +435,10 @@ impl Default for Ft8Config {
             sync_time_interp_score_gate: 0.0,
             sync_time_interp_delta_scale: 0.3,
             sync_time_interp_max_delta_abs: None,
+            // hb-069: linear-power interpolation default off; CLI
+            // sweep gates a possible flip to true if it rescues
+            // hard-200 residual cost without regressing other tiers.
+            sync_time_interp_linear_power: false,
             bp_offset_subtract: 0.0,
             // hb-063 (batch 10): layered BP is the production default —
             // +18 hard-200 recovered (composite +0.00105), -16% decode
@@ -835,6 +850,7 @@ impl Ft8Decoder {
                 max_parity_errors_for_osd: self.config.max_parity_errors_for_osd,
                 bp_offset_subtract: self.config.bp_offset_subtract,
                 layered_bp: self.config.layered_bp,
+                sync_time_interp_linear_power: self.config.sync_time_interp_linear_power,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -2213,9 +2229,12 @@ impl Ft8Decoder {
                 }
                 coherent_sum_complex_to_db(&aligned, pp.num_symbols)
             } else {
+                let lin = self.config.sync_time_interp_linear_power;
                 let members: Vec<Vec<[f64; NUM_TONES]>> = group
                     .iter()
-                    .map(|&i| par_extract_symbols_from_spectrogram(pp, spectrogram, &candidates[i]))
+                    .map(|&i| {
+                        par_extract_symbols_from_spectrogram(pp, spectrogram, &candidates[i], lin)
+                    })
                     .collect();
                 sum_tone_magnitudes_linear(&members, pp.num_symbols)
             };
@@ -2378,8 +2397,9 @@ impl Ft8Decoder {
         let tone_spacing = pp.tone_spacing;
         let sps = pp.samples_per_symbol(SAMPLE_RATE);
         let spec_step = sps / TIME_OSR;
+        let lin = self.config.sync_time_interp_linear_power;
         for cand in &new_candidates {
-            let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand);
+            let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
@@ -2478,8 +2498,9 @@ impl Ft8Decoder {
         let tone_spacing = pp.tone_spacing;
         let sps = pp.samples_per_symbol(SAMPLE_RATE);
         let spec_step = sps / TIME_OSR;
+        let lin = self.config.sync_time_interp_linear_power;
         for cand in &pending {
-            let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand);
+            let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
@@ -2627,8 +2648,9 @@ impl Ft8Decoder {
         let tone_spacing = pp.tone_spacing;
         let sps = pp.samples_per_symbol(SAMPLE_RATE);
         let spec_step = sps / TIME_OSR;
+        let lin = self.config.sync_time_interp_linear_power;
         for cand in &new_candidates {
-            let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand);
+            let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
@@ -3161,6 +3183,8 @@ impl Ft8Decoder {
         // hb-044: optional fractional time-bin shift. dt=0 → identical
         // to original integer-bin behavior.
         let dt = candidate.time_refinement;
+        // hb-069: linear-power interpolation gate.
+        let lin = self.config.sync_time_interp_linear_power;
 
         let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
 
@@ -3184,8 +3208,8 @@ impl Ft8Decoder {
                 // center of the symbol window at the Costas-aligned offset).
                 // hb-044: dt applies a fractional time-bin shift via
                 // linear interpolation; dt=0 reproduces original behavior.
-                let db_a = lookup_time_interp(spectrogram, t_base, dt, fs, freq_bin);
-                let db_b = lookup_time_interp(spectrogram, t_base + 1, dt, fs, freq_bin);
+                let db_a = lookup_time_interp(spectrogram, t_base, dt, fs, freq_bin, lin);
+                let db_b = lookup_time_interp(spectrogram, t_base + 1, dt, fs, freq_bin, lin);
                 mags[tone] = (db_a + db_b) / 2.0;
             }
 
@@ -3478,6 +3502,8 @@ struct DecodeContext<'a> {
     bp_offset_subtract: f32,
     /// hb-063 layered (row-sequential) BP schedule.
     layered_bp: bool,
+    /// hb-069 linear-power spectrogram interpolation gate.
+    sync_time_interp_linear_power: bool,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -3517,6 +3543,7 @@ fn par_decode_candidate(
             ctx.protocol_params,
             ctx.spectrogram,
             &trial_candidate,
+            ctx.sync_time_interp_linear_power,
         );
         let mut llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes);
         normalize_llrs(&mut llrs, ctx.llr_target_variance);
@@ -3690,6 +3717,7 @@ fn par_try_ap_decode(
             ctx.protocol_params,
             ctx.spectrogram,
             &trial_candidate,
+            ctx.sync_time_interp_linear_power,
         );
         let base_llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes);
 
@@ -4295,6 +4323,7 @@ fn par_extract_symbols_from_spectrogram(
     pp: &ProtocolParams,
     spectrogram: &Spectrogram,
     candidate: &CostasCandidate,
+    linear_power: bool,
 ) -> Vec<[f64; NUM_TONES]> {
     let t0 = candidate.time_step;
     let f0 = candidate.freq_bin;
@@ -4315,8 +4344,8 @@ fn par_extract_symbols_from_spectrogram(
             if freq_bin >= spectrogram.num_bins || fs >= spectrogram.freq_osr {
                 continue;
             }
-            let db_a = lookup_time_interp(spectrogram, t_base, dt, fs, freq_bin);
-            let db_b = lookup_time_interp(spectrogram, t_base + 1, dt, fs, freq_bin);
+            let db_a = lookup_time_interp(spectrogram, t_base, dt, fs, freq_bin, linear_power);
+            let db_b = lookup_time_interp(spectrogram, t_base + 1, dt, fs, freq_bin, linear_power);
             mags[tone] = (db_a + db_b) / 2.0;
         }
 
@@ -4408,6 +4437,14 @@ fn estimate_candidate_phase_rotor(
 /// Linear-interpolation lookup into a spectrogram with fractional time
 /// offset. dt=0 returns spectrogram.power[t_base][fs][freq_bin] exactly.
 /// Out-of-range cells contribute -120.0 dB. hb-044 helper.
+///
+/// hb-069: when `linear_power` is true and `dt != 0`, the two endpoint
+/// dB values are converted to linear power (10^(db/10)), interpolated
+/// linearly, then converted back to dB. dB-space interpolation is
+/// non-linear in real power; linear-power interpolation preserves
+/// symbol energy more accurately near the noise floor at the cost of
+/// two pow/log per call. `linear_power=false` (legacy path) keeps the
+/// straight dB interpolation.
 #[inline]
 fn lookup_time_interp(
     spec: &Spectrogram,
@@ -4415,6 +4452,7 @@ fn lookup_time_interp(
     dt: f64,
     fs: usize,
     freq_bin: usize,
+    linear_power: bool,
 ) -> f64 {
     if dt.abs() < f64::EPSILON {
         return if t_base < spec.num_steps {
@@ -4439,7 +4477,20 @@ fn lookup_time_interp(
     } else {
         -120.0
     };
-    (1.0 - frac) * p_lo + frac * p_hi
+    if linear_power {
+        // hb-069: interpolate in linear power, return dB.
+        let lin_lo = 10f64.powf(p_lo / 10.0);
+        let lin_hi = 10f64.powf(p_hi / 10.0);
+        let lin_mid = (1.0 - frac) * lin_lo + frac * lin_hi;
+        // Floor matches the -120 dB sentinel; 10^(-120/10) = 1e-12.
+        if lin_mid <= 1e-12 {
+            -120.0
+        } else {
+            10.0 * lin_mid.log10()
+        }
+    } else {
+        (1.0 - frac) * p_lo + frac * p_hi
+    }
 }
 
 fn par_compute_soft_llrs_db(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<f32> {

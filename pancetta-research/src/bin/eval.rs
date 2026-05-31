@@ -50,6 +50,8 @@ struct Args {
     sync_time_interp_delta_scale: Option<f64>,
     /// hb-068 variant (c) — reject |delta| > threshold (fall back to integer).
     sync_time_interp_max_delta_abs: Option<f64>,
+    /// hb-069: interpolate spectrogram lookups in linear power instead of dB.
+    sync_time_interp_linear_power: Option<bool>,
     /// hb-067: mBP offset value (subtract from |LLR| before OSD).
     bp_offset_subtract: Option<f32>,
     /// hb-063: enable layered (row-sequential) BP schedule.
@@ -125,6 +127,7 @@ impl Args {
         let mut sync_time_interp_score_gate: Option<f64> = None;
         let mut sync_time_interp_delta_scale: Option<f64> = None;
         let mut sync_time_interp_max_delta_abs: Option<f64> = None;
+        let mut sync_time_interp_linear_power: Option<bool> = None;
         let mut bp_offset_subtract: Option<f32> = None;
         let mut layered_bp: Option<bool> = None;
         let mut cross_cycle_averaging: Option<bool> = None;
@@ -286,6 +289,13 @@ impl Args {
                             .context("--sync-time-interp-max-delta-abs needs a value")?
                             .parse()?,
                     );
+                    sync_time_interpolation.get_or_insert(true);
+                }
+                "--sync-time-interp-linear-power" => {
+                    // hb-069: turn on linear-power interpolation. Implies
+                    // sync_time_interpolation is also on (the flag is a no-op
+                    // when the parabolic refinement isn't running).
+                    sync_time_interp_linear_power = Some(true);
                     sync_time_interpolation.get_or_insert(true);
                 }
                 "--bp-offset-subtract" => {
@@ -461,6 +471,7 @@ impl Args {
             sync_time_interp_score_gate,
             sync_time_interp_delta_scale,
             sync_time_interp_max_delta_abs,
+            sync_time_interp_linear_power,
             bp_offset_subtract,
             layered_bp,
             cross_cycle_averaging,
@@ -881,6 +892,9 @@ fn main() -> anyhow::Result<()> {
             }
             if args.sync_time_interp_max_delta_abs.is_some() {
                 d = d.with_sync_time_interp_max_delta_abs(args.sync_time_interp_max_delta_abs);
+            }
+            if let Some(on) = args.sync_time_interp_linear_power {
+                d = d.with_sync_time_interp_linear_power(on);
             }
             if let Some(v) = args.bp_offset_subtract {
                 d = d.with_bp_offset_subtract(v);

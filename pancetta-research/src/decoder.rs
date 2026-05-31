@@ -205,6 +205,16 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-069: interpolate spectrogram lookups in linear power instead of
+    /// dB. When true, `lookup_time_interp` converts each endpoint dB→
+    /// linear, interpolates, then converts back to dB. Preserves symbol
+    /// energy more accurately near the noise floor at the cost of two
+    /// pow/log per call.
+    pub fn with_sync_time_interp_linear_power(mut self, on: bool) -> Self {
+        self.config.sync_time_interp_linear_power = on;
+        self
+    }
+
     /// hb-067: mBP offset — subtract this magnitude from each LLR
     /// before invoking OSD. 0.0 = no offset.
     pub fn with_bp_offset_subtract(mut self, v: f32) -> Self {
