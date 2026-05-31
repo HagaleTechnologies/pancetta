@@ -1070,6 +1070,7 @@ fn main() -> anyhow::Result<()> {
             decoder: decoder.config_snapshot(),
             seed: args.seed,
             tiers_run: args.tiers.clone(),
+            fp_filter_active: fp_filter.is_some(),
         },
         tiers,
         composite: pancetta_research::scorecard::CompositeInfo {

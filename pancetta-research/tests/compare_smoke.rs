@@ -60,6 +60,7 @@ fn make_scorecard(score: f64, pass_rate: f64, snr50: f64) -> Scorecard {
             decoder: json!({"placeholder": "config"}),
             seed: 42,
             tiers_run: vec!["fixtures".into(), "synth-clean".into()],
+            fp_filter_active: false,
         },
         tiers,
         composite: CompositeInfo {

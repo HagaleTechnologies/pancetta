@@ -47,6 +47,7 @@ fn sample_scorecard() -> Scorecard {
             decoder: json!({"placeholder": "decoder config snapshot"}),
             seed: 42,
             tiers_run: vec!["fixtures".to_string()],
+            fp_filter_active: false,
         },
         tiers,
         composite: CompositeInfo {

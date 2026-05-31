@@ -51,6 +51,13 @@ pub struct ConfigInfo {
     pub decoder: Value, // opaque snapshot of the decoder config
     pub seed: u64,
     pub tiers_run: Vec<String>,
+    /// Whether the eval invocation enabled the harness-side FP filter
+    /// (`--fp-filter-baselines`, `--fp-filter-adif`, or `--fp-filter-rolling`).
+    /// Recorded so cross-scorecard comparisons can detect methodology
+    /// shifts (the filter is invisible to recall but moves `novel_decodes`).
+    /// See `research/experiments/2026-05-31-hard-1000-novel-investigation.md`.
+    #[serde(default)]
+    pub fp_filter_active: bool,
 }
 
 /// Per-tier results. Sparse: only fields relevant to the tier are populated.
