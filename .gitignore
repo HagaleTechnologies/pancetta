@@ -75,6 +75,9 @@ __pycache__/
 training/neural_osd/data/
 training/neural_osd/data_test/
 training/neural_osd/model.pt
+training/neural_osd/session2_best.pt
+training/neural_osd/session2_best.metrics.json
+training/neural_osd/session2_train.log
 *.npy
 
 # Database backups
