@@ -1,11 +1,11 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-05-31T05:14:51.401760Z",
+  "generated_at": "2026-05-31T20:23:33.283993Z",
   "mode": "ft8",
   "git": {
-    "branch": "iter/2026-05-31-corpus-refresh-ingestion",
-    "head_sha": "0f8299ec22ebf8d1b283bfbc86585ea6cde8216e",
-    "main_merge_base": "0f8299ec22ebf8d1b283bfbc86585ea6cde8216e",
+    "branch": "iter/2026-05-31-hb-064-session2",
+    "head_sha": "e6a1594e158e1db5d201b980d211cf18efa0fa37",
+    "main_merge_base": "e6a1594e158e1db5d201b980d211cf18efa0fa37",
     "dirty": true
   },
   "build": {
@@ -19,7 +19,7 @@
     "harness_version": "0.1.0",
     "host": "macos/aarch64",
     "cores_used": 10,
-    "elapsed_seconds": 1338.169299334
+    "elapsed_seconds": 1416.96047125
   },
   "config": {
     "decoder": {
@@ -32,6 +32,8 @@
       "cross_cycle_coherent": true,
       "cross_cycle_coherent_mrc": true,
       "joint_pair_retry": true,
+      "joint_residual_sync_relax_db": 0.0,
+      "joint_residual_sync_window_bins": 8,
       "layered_bp": true,
       "ldpc_iterations": 100,
       "llr_target_variance": 32.0,
@@ -63,17 +65,18 @@
       "curated-hard-1000",
       "wild-50",
       "wild-100"
-    ]
+    ],
+    "fp_filter_active": true
   },
   "tiers": {
     "curated-hard-1000": {
       "wavs_processed": 1000,
       "truth_decodes_total": 28104,
-      "truth_decodes_recovered": 14993,
-      "decode_rate": 0.5334827782522061,
-      "novel_decodes": 6320,
+      "truth_decodes_recovered": 14987,
+      "decode_rate": 0.5332692855109593,
+      "novel_decodes": 3053,
       "wsjtx_decoded": 28104,
-      "vs_wsjtx_pct": 53.348277825220606,
+      "vs_wsjtx_pct": 53.32692855109593,
       "per_wav_top_failures": [
         {
           "wav_hash": "bb445ede3009d779c5ce1682c8112082367e355bb9c5943a571324eaa424a3c8",
@@ -222,7 +225,7 @@
       "truth_decodes_total": 8853,
       "truth_decodes_recovered": 4942,
       "decode_rate": 0.5582288489777476,
-      "novel_decodes": 1970,
+      "novel_decodes": 1024,
       "wsjtx_decoded": 8853,
       "vs_wsjtx_pct": 55.82288489777476,
       "per_wav_top_failures": [
@@ -487,11 +490,11 @@
     "wild-100": {
       "wavs_processed": 100,
       "truth_decodes_total": 3526,
-      "truth_decodes_recovered": 1880,
-      "decode_rate": 0.5331820760068066,
-      "novel_decodes": 650,
+      "truth_decodes_recovered": 1879,
+      "decode_rate": 0.5328984685195689,
+      "novel_decodes": 391,
       "wsjtx_decoded": 3526,
-      "vs_wsjtx_pct": 53.31820760068066,
+      "vs_wsjtx_pct": 53.289846851956895,
       "per_wav_top_failures": [
         {
           "wav_hash": "8f51d5fee6d5aac0fe591e32cf07e4a393511c16c38d173a04ff2ab0c19b2696",
@@ -640,7 +643,7 @@
       "truth_decodes_total": 96,
       "truth_decodes_recovered": 0,
       "decode_rate": 0.0,
-      "novel_decodes": 64,
+      "novel_decodes": 0,
       "wsjtx_decoded": 96,
       "vs_wsjtx_pct": 0.0,
       "per_wav_top_failures": [
