@@ -1,11 +1,20 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-28T01:30:00Z
+last_updated: 2026-05-31T23:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
 exploitation_run: 74
 current_ratio: 0.051
+# mr-008 ideation pass (2026-05-31): 12 new candidates spawned
+#   (hb-089..hb-100) after the 5-shelve session closed five mechanism
+#   families (soft cancellation, sync relaxation, OSD-without-Costas,
+#   AP-on-residual, score-NMS, neural-OSD-small-corpus). 3 rejected at
+#   generation by mr-007 (documented in ideation journal as anti-pattern).
+#   Top-5 attackable post-ideation: hb-093, hb-048 a7, hb-089, hb-064 S3,
+#   hb-091. Bank shape diversified across 5 open territories (residual
+#   quality, precision/throughput, signal class, ML/learned bounded,
+#   operational). See research/experiments/2026-05-31-mr-008-ideation.md.
 # Batch 9 (2026-05-25): SHIPPED FP filter + composite WIN (+0.000641).
 #   First main.json composite movement since hb-038 (April 2026):
 #     0.554489 → 0.555131.
@@ -1537,6 +1546,382 @@ current_ratio: 0.051
     Until such a mechanism graduates, hb-087's structural shelf-reason
     holds.
 
+### hb-089 — Multi-cycle coherent residual accumulation  [PRIORITY: 0.48, spawned 2026-05-31 from mr-008 ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.48
+  estimated_effort: 1-2 sessions (Session 1 = diagnostic, Session 2 = implement + sweep)
+  expected_delta: +5-30 hard-200 rec (mechanism analogous to hb-079's interference cleanup but applied across same-slot sub-windows after multipass saturation)
+  defensible_prior: yes — Q65 averages over receive windows; hb-079's mechanism cleared the per-slot interferers but didn't combine cleaned residuals across sub-windows; structurally different from hb-085 (which attacked decode-positions, not residual bins)
+  wild_card: false
+  evidence_for:
+    - mr-008 source: Q65 weak-signal mode in WSJT-X uses multi-window averaging; FT8's 90s curated WAVs naturally contain 5 same-slot sub-windows.
+    - hb-079 graduated +158 hard-200 rec by coherently cleaning interference; the post-multipass residual is the cleanest representation of remaining weak signals. Accumulating that residual coherently across 5 sub-windows is the standard noise-floor-reduction step Q65 uses.
+    - Different from hb-074/075 (which average the RAW spectrogram pre-subtract) and from hb-085 (which attacked decode positions, not bins). New shape: average the CLEANED RESIDUAL.
+  evidence_against:
+    - Inter-slot phase coherence: hb-074 found that real-world audio doesn't preserve phase across slot boundaries (hb-075's MRC was the workaround). The residual at sub-Costas positions has even more uncertain phase than the raw signal. May require MRC-weighting analogous to hb-075.
+    - Adds another full residual-decode pass; wall-clock budget pressure.
+    - The 5 sub-windows in a 90s WAV aren't all decodable for the same truth signal — fade dropouts mean the per-sub-window residual at the truth's freq_bin may be all-noise on 3 of 5 windows.
+  notes: |
+    mr-007 audit: pancetta-ft8 has cross_cycle_averaging (hb-056) and
+    coherent_multipass (hb-079) infra already. The new piece sits
+    BETWEEN them: after multipass saturates per sub-window, accumulate
+    the complex residual across sub-windows with MRC-weighting (per
+    hb-075's pattern), then run one final decode pass on the
+    accumulated residual.
+
+    Kill-switch (V3 doctrine: paired decodability test):
+    Diagnostic on top-20 hard-200 worst WAVs — for missed truths whose
+    callsign appears in 2+ same-slot sub-windows, measure per-position
+    residual SNR before and after 5-window coherent accumulation.
+    PROCEED if median SNR improvement ≥ 2 dB AND the LLR sign-agreement
+    with truth codeword at those positions improves to ≥ 70% (vs
+    hb-088's 50.6% baseline).
+
+    Source: mr-008 ideation,
+    research/experiments/2026-05-31-mr-008-ideation.md (territory A).
+
+### hb-090 — Phase-coherent matched filter at truth coordinates  [PRIORITY: 0.38, spawned 2026-05-31 from mr-008 ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.38
+  estimated_effort: 2-3 sessions (Session 1 = matched-filter primitive + diagnostic, Session 2-3 = production wiring + sweep)
+  expected_delta: targets the interferer-leakage wall hb-088 closed; bounded — IF matched filter beats max-log on sign-agreement, +10-40 hard-200 rec is possible
+  defensible_prior: partial — explicitly cited in hb-088 shelve journal as the structurally-different mechanism family not tested ("rejects energy at adjacent freq_bins via phase-coherent matched filtering at the truth's exact freq + dt"); standard radar/sonar weak-signal technique
+  wild_card: false
+  evidence_for:
+    - hb-088 shelve journal Section 4 "What WOULD work" calls out IQ matched filter at truth coords as orthogonal to single-position spectrogram mining.
+    - hb-075 + hb-079 established complex-spectrogram infrastructure; the matched-filter primitive operates on the same complex domain.
+    - Matched filter is the optimal linear detector for known-shape signals in additive Gaussian noise (FT8 tone patterns ARE known by symbol index); the result rejects adjacent-bin energy by filter selectivity.
+  evidence_against:
+    - "Known shape" is only true once the Costas alignment + freq/dt are fixed — fine for AP-known positions but not for sub-Costas discovery. Most useful as a precision step at SYNC-PASSING positions, less so at sub-Costas.
+    - Doesn't help with the "what callsign to assume" problem; need to enumerate plausible tone sequences which collapses to OSD on matched-filter LLRs. Bounds upside.
+    - Implementation cost: per-candidate IQ extraction + 79-symbol matched filter for each enumerated tone sequence. CPU/cache risk.
+  notes: |
+    mr-007 audit: pancetta-ft8 has complex spectrogram (hb-075). NEW work:
+    per-candidate IQ window extraction (time-domain audio buffer slice)
+    + matched-filter correlation against 79-symbol templates at the
+    Costas-aligned tone sequence positions. Plumbing borrows from
+    extract_symbols_via_fft.
+
+    Kill-switch (hb-088 doctrine: LLR sign-agreement):
+    Replace pancetta-research/examples/hb088_osd_without_costas_feasibility.rs's
+    max-log demod with a matched-filter demod at the truth's known
+    coordinates; measure sign-agreement with the truth codeword on the
+    same top-20 hard-200. PROCEED if median ≥ 70% (vs hb-088's 50.6%).
+
+    Source: mr-008 ideation (territory A).
+
+### hb-091 — a8-style early-decode latency reduction  [PRIORITY: 0.42, spawned 2026-05-31 from mr-008 ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.42
+  estimated_effort: 2-3 sessions (Session 1 = design, Session 2 = partial-buffer decode primitive, Session 3 = coordinator wiring)
+  expected_delta: operational — +5-15% QSO/hr in autonomous Phase 5 under variable propagation; recall on hard-200 unchanged (different axis)
+  defensible_prior: yes — WSJT-X-Improved v3.x ships "a8" decoding technology that decodes the in-QSO station's message 0.5-1s earlier; documented in DG2YCB release notes for v3.0.0 250924
+  wild_card: false
+  evidence_for:
+    - WSJT-X-Improved 3.0/3.1 changelog (2025-2026): "MTD 3-Stage now (partially) supports the new 'a8' decoding technology, which allows messages from the station in QSO to be displayed 0.5 to 1 second earlier."
+    - For an autonomous station, 0.5-1s earlier turnaround per QSO leg increases QSOs/hour under fast-fade or QSB conditions (the partner's TX may end early; faster decode = faster RR73 = faster log).
+    - pancetta's coordinator already tracks the in-QSO partner's callsign + frequency (`activeQso` state in QSO state machine). The known position makes partial-buffer decoding viable (sync isn't the limit; signal length is).
+  evidence_against:
+    - Operational target, not composite. The eval harness doesn't measure QSO/hr; need loopback simulation infrastructure to validate.
+    - Partial-buffer decoding reduces LLR integration time (~13s vs ~15s) → ~0.5 dB sensitivity hit on the in-QSO partner's message. Only viable when the partner is strong (which is expected for in-QSO).
+    - Requires coordinator-side plumbing (partial-buffer hook) plus decoder-side gating logic. Cross-crate change.
+  notes: |
+    mr-007 audit: pancetta-qso has the active_qso state; pancetta-coordinator
+    streams audio buffers in 15s chunks. NEW work: coordinator emits a
+    partial buffer at t=13s tagged with the in-QSO partner's expected
+    freq_bin. Decoder runs a SCOPED decode_window restricted to the
+    partner's freq_bin ±10 Hz. Returns early if the partner's expected
+    message type (R+report, RRR, RR73, 73) is decoded.
+
+    Kill-switch (operational):
+    Existing pancetta loopback infrastructure can simulate QSO sequences;
+    extend to vary partner fade timing. Measure mean turnaround time +
+    QSO/hr with vs without a8. PROCEED if QSO/hr improves by ≥ 10% in
+    the simulation.
+
+    Source: mr-008 ideation (territory B);
+    WSJT-X-Improved v3.0.0 250924 release notes.
+
+### hb-092 — Codeword-based NMS dedup (post-decode)  [PRIORITY: 0.40, spawned 2026-05-31 from mr-008 ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 1 session
+  expected_delta: precision (-5-15% of remaining novel duplicates on hard-200); recall preserved by construction; bounded but clean
+  defensible_prior: yes — explicitly cited in hb-036 shelve journal as "the brute-force answer" to duplicate-vs-distinct discrimination ("just decode both, dedup by codeword")
+  wild_card: false
+  evidence_for:
+    - hb-036 SHELVE journal (2026-05-31): "Future attempts would need a fundamentally different discriminator — e.g., LDPC-result-based 'did this candidate decode to the same codeword as the stronger one?' (which is the brute-force answer: just decode both, dedup by codeword)."
+    - pancetta's current dedup is at the `unique_decoded` HashSet level by text representation. Two decodes of the SAME codeword can have different displayed (freq, dt) due to fractional-bin sync refinements (hb-068 graduated scaled-delta refinement, which itself produces small DT perturbations).
+    - Codeword-binary dedup is recall-preserving by construction (no decode is dropped that doesn't have a binary-identical companion).
+  evidence_against:
+    - Bounded upside: if pancetta's text-level dedup already catches most duplicates, codeword-binary catches only edge cases.
+    - Costs a per-decode 174-bit comparison + hash set lookup; trivial CPU.
+  notes: |
+    mr-007 audit: pancetta-ft8's DecodedMessage already retains the
+    `codeword` field for hb-079's subtraction needs. Plumbing: change
+    the dedup HashSet from String to (String, [u8; 174]) or just
+    [u8; 174] keyed on codeword; same-codeword duplicates collapse.
+
+    Kill-switch (precision):
+    Diagnostic on top-20 hard-200 — count fraction of unique_decoded
+    outputs that have a codeword-binary match with another output in
+    the same WAV but differ in (freq, dt) by ≥ 5 Hz / 50 ms. PROCEED
+    if ≥ 5% of novels are codeword-duplicates.
+
+    Source: mr-008 ideation (territory B); hb-036 shelve journal.
+
+### hb-093 — Per-position residual SNR pre-decode gate  [PRIORITY: 0.52, spawned 2026-05-31 from mr-008 ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.52
+  estimated_effort: 2 sessions (Session 1 = diagnostic + threshold sweep, Session 2 = production wire + A/B)
+  expected_delta: efficiency: -5-15% elapsed on hard-200 (skip noise-only positions in joint_pair_retry); recall preserved; precision lift via novel reduction
+  defensible_prior: yes — V3 SHELVE + hb-088 SHELVE both showed sub-Costas residual positions are dominated by noise/interferer leakage; a cheap per-position SNR estimator can gate which residual positions are worth the LDPC+CRC work
+  wild_card: false
+  evidence_for:
+    - V3 mechanism trace (top-3 hard-200 WAVs): 300+ candidates surfaced in the targeted residual window per WAV; LDPC processes all of them; only 1-4 pass CRC, plausibility catches the rest. The other ~99% are noise-position waste.
+    - hb-088 diagnostic: sub-Costas |LLR| at truth positions is 82% of control — energy IS there. The problem is signs are random (50.6%). A pre-LDPC residual SNR estimator wouldn't directly fix sign agreement, but it could filter the LOW-energy positions where the residual hasn't even cleared the local noise floor (those are pure noise, not interferer leakage; the latter has high energy but wrong direction).
+    - pancetta-ft8's `par_estimate_snr_spectrogram` already computes per-candidate per-symbol SNR on the original spectrogram; applying the same primitive to the residual spectrogram is a small plumbing change.
+  evidence_against:
+    - The gate must be conservative; a too-tight threshold loses joint-pair-retry's +12 hard-200 graduated win.
+    - The savings target is wall-clock (precision/efficiency), not recall — composite doesn't move directly. Operational value (more decode budget per slot) but not headline composite.
+    - V3 doctrine warning: per-position SNR on the residual is itself a geometric/energy proxy, not a decodability test. The TWO-PART kill-switch addresses this.
+  notes: |
+    mr-007 audit: par_estimate_snr_spectrogram exists; the new call applies
+    it to the post-multipass residual_spectrogram. Plumbing: add
+    `residual_snr_gate_db: Option<f64>` to Ft8Config (default None =
+    disabled); when set, V3-style candidates with residual_snr_db <
+    threshold are skipped from LDPC. The gate also applies to
+    joint_pair_retry candidates.
+
+    Kill-switch (V3 doctrine: TWO-PART decodability-validated):
+    Part 1 (efficiency): measure wall-clock saved by gating low-residual-
+    SNR positions out of joint_pair_retry on top-20 hard-200; PROCEED if
+    ≥ 5% elapsed savings at the chosen threshold.
+    Part 2 (decodability): for the gated-OUT positions in Part 1,
+    count how many had a truth that joint_pair_retry would have
+    recovered (cross-reference to truth manifest). PROCEED only if
+    ≤ 1 truth-lost per WAV across top-20 (≤ 20 total).
+
+    Source: mr-008 ideation (territory A).
+
+### hb-094 — Residual denoising autoencoder pre-LDPC  [PRIORITY: wild, spawned 2026-05-31 from mr-008 ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.0
+  estimated_effort: PLAN-SIZED (3-5 sessions: training-data gen + tiny model + diagnostic + integration)
+  expected_delta: speculative — could rescue 20-60 hard-200 rec IF the denoiser successfully removes interferer-leakage from sub-Costas residuals; could regress like hb-064 Session 2 (-135 novels) on out-of-distribution drift
+  defensible_prior: partial — self-supervised audio denoising literature 2025 (DCUNET, ONT-model variants) shows narrowband signal denoising via small (~1-2M param) deep models. Targeted at the interferer-leakage residual structure that hb-088 identified as the closed-family wall.
+  wild_card: true
+  evidence_for:
+    - hb-088 doctrine: sub-Costas residual energy is INTERFERER LEAKAGE, not white noise. A learned denoiser trained on (clean_truth_tile, residual_with_known_neighbor_leakage_tile) pairs has structured signal to remove (leakage pattern depends on neighbor's tone sequence, which is encoded in the spectrogram).
+    - Training data IS available: multipass produces matched (decoded_msg, post-subtract residual) pairs for every hard-200 WAV. The pair (cleaned_residual_tile, truth_codeword_signal_tile) is the supervision signal.
+    - Bounded scope: the denoiser sits BEFORE LDPC on the spectrogram tile at the candidate's freq/time window. The LDPC+CRC+plausibility funnel is unchanged. Failure mode is clean: low recall preserved, high recall gates on the denoiser confidence.
+  evidence_against:
+    - hb-064 Session 2's out-of-distribution drift cost -135 novels at a much smaller intervention (just OSD ranker). A denoiser operating on the spectrogram itself has FAR more drift risk.
+    - The "right" architecture is unknown — small UNet, small transformer, dense MLP? Each is its own multi-session pipeline.
+    - Training data quality is bounded by hb-079's subtraction quality; the denoiser is learning to clean what subtraction already failed to clean, which by definition is the residual that BP can't decode.
+  notes: |
+    mr-007 audit: pancetta-ft8 has neural_osd.rs (DIA-OSD style) precedent.
+    NEW work: separate inference module for spectrogram-tile denoising,
+    pre-LDPC integration in decode_window_with_ap. Production wiring is
+    a feature-gated config flag (`residual_denoiser: bool`).
+
+    Kill-switch (hb-088 doctrine: LLR sign-agreement):
+    Train tiny denoiser on paired (clean_synth_tile, synth_with_neighbor_
+    leakage_tile) from pancetta-research's synth generator. Measure LLR
+    sign-agreement on the truth codeword AFTER denoiser vs hb-088's
+    50.6% baseline on top-20 hard-200. PROCEED to plan-sized work if
+    ≥ 70%.
+
+    Source: mr-008 ideation (territory D); self-supervised audio
+    denoising literature 2025.
+
+### hb-095 — Neural soft-demod replacement for max-log LLR  [PRIORITY: wild, spawned 2026-05-31 from mr-008 ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.0
+  estimated_effort: PLAN-SIZED (3-4 sessions: training-data gen + small NN + integration + retune LDPC)
+  expected_delta: speculative; could lift LLR sign-agreement from max-log's baseline; uncertain LDPC interaction; potentially +0.01 composite IF the LDPC retune absorbs the LLR distribution shift
+  defensible_prior: partial — arXiv:2502.16371 "Software defined demodulation of multiple frequency shift keying with dense neural network for weak signal communications" reports gains for 8-FSK demod in low-SNR regimes; FT8 is 8-GFSK so structurally similar
+  wild_card: true
+  evidence_for:
+    - Paper claim: a small dense NN trained on synthetic 8-FSK tone-magnitude vectors outputs better-than-max-log LLRs in low-SNR + ionospheric regimes. Architecturally aligned with FT8.
+    - pancetta's max-log demod (par_compute_soft_llrs_db) is a deterministic max-of-8-tones rule per symbol; it ignores the joint distribution of the 7 non-winning tone magnitudes which carries soft information.
+    - Trainable with paired (clean_synth_tone_magnitudes, ground_truth_bit) data from pancetta-research's synth generator. No external data required.
+  evidence_against:
+    - Changes LDPC INPUT distribution → existing LDPC tunings (parity_gate=2, max_iters=100, llr_variance_target=32) may need re-sweep. Multiple closed shelves to potentially re-open.
+    - Plan-sized; multi-session investment with no shipped neural infra precedent at this site.
+    - Risk of synth-overfit (production hard-200 is dense band, not synth-clean).
+  notes: |
+    mr-007 audit: pancetta-ft8 has the LLR computation primitive
+    (par_compute_soft_llrs_db). NEW work: replace with a small NN
+    (~50k params) that consumes the 8-tone-magnitude vector for 79
+    symbols and outputs 174 LLRs. Risk: LDPC retune may be needed.
+
+    Kill-switch (hb-088 doctrine: LLR sign-agreement):
+    Train tiny model on synth-clean. Measure (a) per-bit sign-agreement
+    on the truth codeword at SYNC-PASSING positions on hard-200
+    (control: max-log = 84% at sync-passing — same as hb-088's
+    control distribution baseline), (b) LDPC+CRC pass rate. PROCEED
+    if (a) ≥ 88% AND (b) doesn't drop.
+
+    Source: mr-008 ideation (territory D); arXiv:2502.16371.
+
+### hb-096 — Adaptive multipass termination by decode-count delta  [PRIORITY: 0.32, spawned 2026-05-31 from mr-008 ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 1 session
+  expected_delta: efficiency — -5-15% elapsed on hard-200 (early-terminate multipass when pass N adds < K decodes); recall preserved at the chosen floor
+  defensible_prior: partial — hb-080 graduated N=3 multipass with no per-WAV adaptation; pass N's marginal contribution varies wildly across WAVs
+  wild_card: false
+  evidence_for:
+    - hb-080 sweep showed N=3 adds +9 hard-200 rec over N=1 (cumulative +16). The marginal value of pass 3 is small. On most WAVs pass 3 adds zero; pass 3's wall-clock is paid uniformly.
+    - hb-016 (residual ENERGY axis) was SHELVED tonight because the energy probe paid per-round cost that exceeded its savings AND the empty-pass-break already short-circuits perfect-clean cases. The DECODE-COUNT axis is different: the count is already computed (it's the result of the just-finished pass), so the gate is free.
+    - Adaptive termination is a long-standing standard pattern in iterative numerical methods.
+  evidence_against:
+    - Bounded upside: hb-080's sweep showed N=2 → N=3 added +9 rec at +25% wall-clock; gating on "N=2 added < K" might preserve only ~half of N=3's contribution.
+    - hb-016's SHELVE narrative warned that the existing empty-pass-break already covers the cheap case.
+  notes: |
+    mr-007 audit: hb-080's multipass loop has `pass_unique.is_empty() {
+    break }` already. Plumbing: add `if pass_unique.len() <
+    multipass_decode_floor && current_pass_idx >= 1 { break }`.
+    Trivial code touch.
+
+    Kill-switch (efficiency-with-recall-preservation):
+    Sweep `multipass_decode_floor ∈ {1, 2, 3}` on hard-200; PROCEED at
+    the highest floor where elapsed drops ≥ 5% AND hard-200 recall is
+    preserved (within ±2 of baseline).
+
+    Source: mr-008 ideation (territory B).
+
+### hb-097 — Subtract amplitude calibration via residual-energy minimization  [PRIORITY: 0.40, spawned 2026-05-31 from mr-008 ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 1-2 sessions
+  expected_delta: +3-10 hard-200 rec (slightly better residual quality → multipass finds slightly more masked candidates); structurally similar to hb-081 but with data-driven optimum rather than fixed threshold
+  defensible_prior: partial — hb-079 subtracts at full ML projection assuming exact rotor; rotor noise systematically biases the projection magnitude. A per-decode amplitude calibration step finding α ∈ [0.8, 1.2] minimizing local residual energy could improve precision WITHOUT under-subtracting (data-driven optimum)
+  wild_card: false
+  evidence_for:
+    - hb-079's ML projection: residual = bin - α·rotor·Re(bin·conj(rotor)); pancetta uses α=1 always. Rotor noise → projection magnitude bias. α=1 is correct only if rotor is exact.
+    - hb-081 SHELVED at fixed under-subtract thresholds (α < 1.0 always); the journal explicitly diagnosed "under-subtracting blocks multipass." hb-097's α can be > 1.0 when the rotor under-estimates the signal — the data-driven optimum CAN over-subtract too, which the fixed-threshold approach couldn't.
+    - Cheap to implement: 1D line search over α ∈ [0.8, 1.2] in ~10 evaluations per decode minimizing residual energy in a ±3 freq_bin × ±2 time_step window around the subtracted position.
+  evidence_against:
+    - hb-081's failure mode: under-subtract leaves signal energy that BLOCKS multipass. Over-subtract carries DIFFERENT risk: removes too much, including adjacent weak signal energy in the optimization window. Need careful tuning of the optimization window.
+    - The optimum α may cluster near 1.0 → no-op; hb-081 sweep was at fixed [5,10,20,40] thresholds and recall dropped uniformly. Need to verify the rotor-noise hypothesis is correct.
+  notes: |
+    mr-007 audit: pancetta-ft8's subtract_decode_coherent uses fixed ML
+    projection. NEW work: replace fixed α with a 1D line search over
+    a local residual-energy objective in a ±3×±2 window. Per-decode
+    cost ~10 mul-add evaluations; negligible.
+
+    Kill-switch (precision/recall-net):
+    Top-20 hard-200 diagnostic — measure per-decode α optimum
+    distribution. PROCEED if median(|α - 1|) ≥ 0.05 AND follow-up
+    multipass on the α-optimized subtract finds ≥ 1 additional decode
+    per WAV vs full ML.
+
+    Source: mr-008 ideation (territory A).
+
+### hb-098 — Autonomous strategy switching (CQ/hunt/hybrid auto-toggle)  [PRIORITY: 0.35, spawned 2026-05-31 from mr-008 ideation]
+  mode: ft8 (operational, not decoder)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 1-2 sessions
+  expected_delta: operational — +5-15% QSOs/hr across variable band conditions; recall on hard-200 unchanged (different axis)
+  defensible_prior: yes — AutoFT8 / FT8Commander 2025 ops data (~7.4 QSO/hr mean) shows mixed strategies switching between CQ and S/P give the best rate vs static modes
+  wild_card: false
+  evidence_for:
+    - pancetta-qso/src/autonomous.rs already has the three modes (hunt, cq, hybrid). The gap is the switching logic — mode is currently set at startup and stays.
+    - Decision signal: rolling callers-per-CQ rate + observed-callsign-count-per-slot. If callers-per-CQ < 0.5 over 10 CQs → switch to hunt mode; if observed-callsign-count > N → switch to CQ to capture answers.
+    - Operational FT8 community has 5+ years of evidence that auto-strategy outperforms static modes during contests / DX openings.
+  evidence_against:
+    - Eval harness can't measure operational QSO/hr directly; need a loopback simulation framework. Existing loopback infrastructure (pancetta/tests/loopback_qso.rs) supports single-QSO test but not variable-band simulation.
+    - "Best mode" depends on operator goals (DXCC chase vs contest vs ragchew); a one-size-fits-all auto-toggle may be wrong for some users. Config flag should let operator pin a mode.
+  notes: |
+    mr-007 audit: pancetta-qso has all three modes; pancetta-coordinator
+    runs the mode-driven decision per slot. NEW work: a callers/CQ +
+    callsign-density rolling window in autonomous.rs + ~50 LOC mode-
+    transition rule. No decoder change.
+
+    Kill-switch (operational):
+    Extend the loopback simulation to inject varying-density callsign
+    streams (low, medium, high). Measure mean QSO/hr in static CQ vs
+    static hunt vs auto-switching over 1000 simulated slots per
+    density level. PROCEED if auto-switching is ≥ 5% better than the
+    best static mode on at least 2 of 3 density levels.
+
+    Source: mr-008 ideation (territory E); AutoFT8 ops data 2025.
+
+### hb-099 — QSO-completion-rate-optimized priority scoring  [PRIORITY: 0.28, spawned 2026-05-31 from mr-008 ideation]
+  mode: ft8 (operational, not decoder)
+  status: pending
+  priority_score: 0.28
+  estimated_effort: 1-2 sessions
+  expected_delta: operational — +3-10% QSOs/hr via Bayesian completion-probability prior on station selection
+  defensible_prior: partial — pancetta's priority scoring weights needed-DXCC + needed-grid + POTA/SOTA + rarity but has no completion-probability feedback. Completed QSOs are logged to ADIF; a Bayesian update per (callsign | band-condition cluster) is straightforward
+  wild_card: false
+  evidence_for:
+    - pancetta-qso/src/priority.rs computes priority scores from static features. Real-world completion success varies by callsign (some stations are unreliable QSO partners) and by band condition (some clusters of conditions produce high completion rates).
+    - pancetta logs every QSO outcome to ~/.pancetta/qsos.adi + sqlite index. The completion-probability per (callsign, band-condition cluster) is computable on startup + per-completion update.
+    - Multiplicative integration: priority = static_priority × completion_prob_smoothed (with Laplace smoothing for new stations to keep them explorable).
+  evidence_against:
+    - Cold-start: new stations have no completion-rate prior. Need lenient smoothing to avoid biasing toward only known-completing stations.
+    - The benefit is bounded by the completion-rate variance in the population. If most stations complete at ~70%, the prior barely moves anyone.
+    - Operational, not composite. Eval harness doesn't measure.
+  notes: |
+    mr-007 audit: pancetta-qso already has the ADIF + sqlite QSO log
+    infrastructure. NEW work: a startup-time completion-rate computation
+    + per-completion update + multiplicative integration into
+    priority.rs.
+
+    Kill-switch (operational):
+    Simulation — measure mean QSOs/hr with vs without completion-rate
+    prior over 1000 simulated slots with varying station-completion
+    distributions. PROCEED if ≥ 5% improvement at realistic distributions
+    (completion ranges 40-90% mixed).
+
+    Source: mr-008 ideation (territory E).
+
+### hb-100 — Synthetic interferer-pair corpus generator  [PRIORITY: 0.25, spawned 2026-05-31 from mr-008 ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.25
+  estimated_effort: 1-2 sessions (Session 1 = generator + manifest, Session 2 = baseline + tier wiring)
+  expected_delta: 0 direct composite; enables future joint-decoding hypotheses to ground-truth their decodability micro-tests (V3-doctrine closure)
+  defensible_prior: yes — hb-088 shelve journal explicitly notes "the actual sub-Costas energy distribution in dense bands is dominated by neighbor leakage and interference, not by weak versions of the truth's own tone pattern." We lack a CORPUS that ground-truths this regime
+  wild_card: false
+  evidence_for:
+    - mr-006 corpus survey 2026-05-25 graded SuperFox / splatter / HF-mobile flutter as dead/marginal/Doppler-subsumed; the missing class for pancetta's research is ground-truthed two-signal scenes.
+    - pancetta-ft8's synthetic_audio_generator already supports single-signal synth tones; extending to two-signal scenes is mechanically straightforward (sum two GFSK waveforms with controlled freq/time/SNR offsets).
+    - Closes the V3-doctrine loop: future "find more candidates" mechanisms can validate decodability micro-tests against ground truth, not just against jt9 baselines.
+  evidence_against:
+    - Doesn't move composite directly; it's enabler infrastructure (similar to hb-073's role for hb-015).
+    - If no future joint-decoding hypothesis spawns, the corpus may sit unused.
+  notes: |
+    mr-007 audit: pancetta-ft8's synthetic_audio_generator exists;
+    pancetta-research has the fixture/synth tier framework. NEW work:
+    extend generator to two-signal scenes parameterized by (freq_offset
+    ∈ {12.5, 25, 50, 100} Hz × time_offset ∈ {0, 50, 100, 200} ms ×
+    SNR_pair ∈ {(0, -12), (-6, -18), (-12, -24)} dB). Create
+    synth_interferer_pair_50 manifest with deterministic seeds. Add to
+    composite or as untimed reference tier.
+
+    Kill-switch (corpus quality):
+    Generated WAVs pass through pancetta + jt9 + JTDX; all three must
+    produce non-empty decodes for the stronger signal at minimum SNR
+    pairs, and the weaker signal must be detectable (jt9 alone is
+    fine) at favorable separations. Manifest commits when these gates
+    pass.
+
+    Source: mr-008 ideation (territory C; complements hb-073/077).
+
 ## Meta-research (idea generators)
 
 These entries are not single hypotheses — they are SOURCES + METHODS
@@ -1668,6 +2053,46 @@ search to in-repo sources.
     mismatch was knowable at harvest time. mr-007 catches this class
     before it consumes an iter slot.
   expected_yield: prevents 1-3 wasted iters per harvest cycle
+
+### mr-008 — Post-V2/V3/088/087/036/064 closures ideation pass  [COMPLETED 2026-05-31]
+  status: completed (this session)
+  estimated_effort: 1 session (reading + WebSearch + bank refill)
+  source_type: mixed — external (WebSearch) + internal (tonight's 5 shelve journals) + cross-discipline
+  source: |
+    arXiv 2502.16371 (dense NN MFSK demod), arXiv 2404.14165 (sliding-
+    window OSD, updated 2025), WSJT-X-Improved v3.x release notes
+    (a8 decoding tech), Q65 multi-window averaging, AutoFT8 /
+    FT8Commander ops data, self-supervised audio denoising literature
+    2025, plus internal closure journals for hb-086 V2/V3, hb-087, hb-088,
+    hb-036, hb-064.
+  outcome: |
+    Tonight closed five hypothesis families:
+      - Soft cancellation (hb-086 V2 across 2 corpora)
+      - Sync threshold relaxation (hb-086 V3)
+      - OSD-without-Costas single-position LLR mining (hb-088)
+      - Callsign-priors-on-residual (hb-087 Session 2)
+      - Neural OSD retrain at small corpus (hb-064 Session 2)
+      - Score-relative NMS (hb-036)
+    The structural picture afterward: sub-Costas residuals on dense
+    hard-200 are interferer-dominated, not weak-truth-dominated.
+    Future progress is in 4 open territories: (A) better residual
+    quality, (B) different decode targets (precision/throughput/latency),
+    (C) different signal class, (D) ML/learned augmentation bounded
+    scope, (E) operational/autonomous loop.
+    Yield: 12 new hypotheses (hb-089..hb-100) distributed across
+    territories. 3 candidates explicitly rejected at generation by
+    mr-007 (anti-pattern documentation in the ideation journal).
+    Top-5 active hypotheses post-ideation (priority order):
+      hb-093 (residual SNR pre-decode gate, 0.52)
+      hb-048 a7 (template cross-correlation, 0.45)
+      hb-089 (multi-cycle coherent residual accumulation, 0.48)
+      hb-064 Session 3 (DIA-OSD bigger corpus, 0.42)
+      hb-091 (a8 early-decode latency, 0.42)
+    The bank is REFILLED with diverse-territory candidates respecting
+    the structural picture from tonight's 5-shelve session.
+  expected_yield: 8-15 new hypotheses (actual: 12 spawned + 3 rejected at generation)
+  defensible_prior: yes — direct response to bank shrinkage from tonight's closures; structural picture from journals is solid
+  journal: research/experiments/2026-05-31-mr-008-ideation.md
 
 ### mr-006 — Real-world FT8 corpus expansion survey  [COMPLETED 2026-05-25 — batch 11]
   status: COMPLETED — background-agent survey; "don't expand corpus for composite now"
