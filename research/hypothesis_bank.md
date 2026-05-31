@@ -923,6 +923,19 @@ current_ratio: 0.051
     hb-069 reconfirm (linear-power interp) may stack with this; hb-086 V2
     should be re-evaluated under scale=0.3.
 
+    **b-0.25 refreshed-corpus retest (2026-05-31, KEEP-b-0.3):**
+    Full 5-tier eval at scale=0.25 against refreshed main.json
+    (research/scorecards/sweep/hb068-b-0.25-refreshed-5tier.json):
+    composite 0.578776 vs main 0.579114 (Δ −0.000339); hard-200
+    4936 rec / 1834 novel vs 4942 / 1970 (Δ −6 rec / −136 novel);
+    hard-1000 +4 rec / +63 novel; wild-100 +4 rec / −11 novel;
+    synth-clean @90 preserved at −20 dB. The corpus refresh
+    (100 K5ARH 20m WAVs into hard-200) flipped the optimum back to
+    0.3 — the OLD-corpus +2 was a corpus-specific artifact, not a
+    fundamental b-scale property. Finer-scale sweep CLOSED: 0.3 is
+    the production setting on the refreshed corpus too. Journal:
+    research/experiments/2026-05-31-hb-068-b-0.25-refreshed-corpus.md.
+
 ### hb-062 — cqdx.io production FP-filter source  [GRADUATED 2026-05-25]
   mode: ft8 (production wiring)
   status: GRADUATED — full production pipeline (cqdx + ADIF + rolling) wired into coordinator
