@@ -260,6 +260,22 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-086 V3: dB relaxation for the bin-targeted residual sync
+    /// pass. 0.0 disables; negative values lower `min_sync_score` by
+    /// that magnitude only at freq_bins within
+    /// `joint_residual_sync_window_bins` of subtracted decodes.
+    pub fn with_joint_residual_sync_relax_db(mut self, db: f64) -> Self {
+        self.config.joint_residual_sync_relax_db = db;
+        self
+    }
+
+    /// hb-086 V3: half-width (in freq_bins) of the bin-targeting window
+    /// for the V3 localized residual sync pass.
+    pub fn with_joint_residual_sync_window_bins(mut self, n: usize) -> Self {
+        self.config.joint_residual_sync_window_bins = n;
+        self
+    }
+
     /// hb-016: residual-energy early-stop margin (in dB above noise
     /// floor) for the coherent multipass loop. `None` disables; `Some(x)`
     /// makes each round bail when post-subtract residual mean dB is

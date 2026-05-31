@@ -67,6 +67,13 @@ struct Args {
     residual_min_sync_score: Option<f64>,
     /// hb-086 V1: force-retry failed original candidates on residual.
     joint_pair_retry: Option<bool>,
+    /// hb-086 V3: dB relaxation on the bin-targeted residual sync pass
+    /// (0.0 = disabled, negative = lower min_sync_score by that much
+    /// only at freq_bins within ±window of subtracted positions).
+    joint_residual_sync_relax_db: Option<f64>,
+    /// hb-086 V3: half-width in freq_bins of the bin-targeting window
+    /// for the V3 localized residual sync pass.
+    joint_residual_sync_window_bins: Option<usize>,
     /// hb-016: residual energy early-stop margin in dB (None disables).
     residual_energy_stop_db: Option<f64>,
     /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
@@ -125,6 +132,8 @@ impl Args {
         let mut coherent_subtract_mrc_threshold: Option<f64> = None;
         let mut residual_min_sync_score: Option<f64> = None;
         let mut joint_pair_retry: Option<bool> = None;
+        let mut joint_residual_sync_relax_db: Option<f64> = None;
+        let mut joint_residual_sync_window_bins: Option<usize> = None;
         let mut residual_energy_stop_db: Option<f64> = None;
         let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
@@ -323,6 +332,20 @@ impl Args {
                 "--no-joint-pair-retry" => {
                     joint_pair_retry = Some(false);
                 }
+                "--joint-residual-sync-relax-db" => {
+                    joint_residual_sync_relax_db = Some(
+                        iter.next()
+                            .context("--joint-residual-sync-relax-db needs a value (negative dB; 0 disables)")?
+                            .parse()?,
+                    );
+                }
+                "--joint-residual-sync-window-bins" => {
+                    joint_residual_sync_window_bins = Some(
+                        iter.next()
+                            .context("--joint-residual-sync-window-bins needs a value (half-width in freq_bins)")?
+                            .parse()?,
+                    );
+                }
                 "--hb016-residual-energy-stop-db" => {
                     residual_energy_stop_db = Some(
                         iter.next()
@@ -433,6 +456,8 @@ impl Args {
             coherent_subtract_mrc_threshold,
             residual_min_sync_score,
             joint_pair_retry,
+            joint_residual_sync_relax_db,
+            joint_residual_sync_window_bins,
             residual_energy_stop_db,
             two_stage,
             ap_my_call,
@@ -866,6 +891,12 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(on) = args.joint_pair_retry {
                 d = d.with_joint_pair_retry(on);
+            }
+            if let Some(db) = args.joint_residual_sync_relax_db {
+                d = d.with_joint_residual_sync_relax_db(db);
+            }
+            if let Some(n) = args.joint_residual_sync_window_bins {
+                d = d.with_joint_residual_sync_window_bins(n);
             }
             if args.residual_energy_stop_db.is_some() {
                 d = d.with_residual_energy_stop_db(args.residual_energy_stop_db);

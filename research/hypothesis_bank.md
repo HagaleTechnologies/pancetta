@@ -540,30 +540,17 @@ current_ratio: 0.051
   **Structural insight (now confirmed across corpora):** pancetta's *decoded* neighbors are uniformly high-confidence, even when the *band* has marginal-SNR truths. When pancetta decodes a neighbor it's because the decode passed CRC, which selects for sharp LLRs → delta-function tone posteriors → soft cancellation collapses to hard subtraction. This is a property of pancetta's decoder architecture (hard-decision pipeline through LDPC + CRC), not the corpus. The soft-cancellation family (hb-086 V2, hb-081 per-decode subtract scaling) is structurally closed against pancetta's *decoded* neighborhood. Hypotheses targeting *missed* truths via different mechanisms (V3 sync-relaxation, hb-064 OSD pruning) are unaffected by this insight.
   priority_score: 0.0  # permanently shelved
 
-### hb-086 V3 — Subtract-aware sync threshold relaxation  [PRIORITY: 0.30, spawned 2026-05-30 from hb-086 V2 shelve]
+### hb-086 V3 — Subtract-aware sync threshold relaxation  [SHELVED 2026-05-31]
   mode: ft8
-  status: pending — attacks the OTHER V1 leak (the V1 journal's leak (a): sync_search misses the candidate); V2 closed the soft-cancellation family.
-  priority_score: 0.30
-  estimated_effort: 1-2 sessions
-  expected_delta: targets the 47.6% of missed truths on top-20 hard-200 with ZERO nearby decode in the ±25 Hz window (sync_search blind spot); plausible additional +5-15 hard-200 rec if the bin-targeted relaxation surfaces them without FP novel pressure
-  defensible_prior: partial — hb-082 (global residual sync threshold relaxation) found candidates surface naturally above 3.0 (no-op), but V3 differs: relax only at bins newly cleaned by subtraction, where the noise floor genuinely dropped
-  wild_card: false
-  evidence_for:
-    - V2 diagnostic confirmed the dominant V1 leak is candidates with ZERO nearby decode (47.6% strict, 21.9% relaxed) — sync_search itself never surfaced them. V1 only retries what sync_search flagged.
-    - hb-079's coherent subtract demonstrably reduces tone energy at subtracted bins; a targeted residual threshold relaxation at those specific bins is a structurally different bet from hb-082's global relaxation (which did nothing).
-  evidence_against:
-    - hb-082 already failed on global relaxation. V3 is bin-targeted, but the targeting infrastructure (track which bins were subtracted in this round) adds plumbing.
-    - The candidates V1 misses may be ones whose Costas pattern was never strong enough in the raw data — a relaxed threshold may surface noise, not signal.
-  notes: |
-    Mechanism: after coherent_subtract_and_repass + joint_pair_retry,
-    run ONE MORE pass of costas_sync_search restricted to a
-    relaxation_zone = freq_bins within ±N bins of any subtracted
-    position, with min_sync_score reduced by some delta (e.g. 0.5).
-    Candidates that surface get the standard LDPC + CRC + plausibility
-    treatment. The targeting (only bins where subtraction actually
-    cleaned the residual) is the difference vs hb-082 (which relaxed
-    globally and found nothing — the candidates that surface naturally
-    cluster above 3.0).
+  status_2026_05_31: SHELVED. Geometric kill-switch (`hb086_v3_subtract_window_potential.rs`) PROCEED'd at 56.8% of V1-uncoverable truths sitting within ±8 bins of a subtracted decode (top-20 hard-200), well above the 20% gate. Implementation landed cleanly (`Ft8Config::joint_residual_sync_relax_db` + `joint_residual_sync_window_bins`; `joint_residual_localized_sync_pass`; `localized_costas_sync_search`). **Sweep at {-0.5, -1.0, -1.5, -2.0} on hard-200 produced 0 additional decoded messages at every threshold.** Mechanism trace (`hb086_v3_trace.rs`) on top-3 worst-WAVs: V3 surfaces 100-131 truly-new (non-collision) candidates per WAV in the targeted window — but they are noise. LDPC "decodes" all of them (BP always converges at production iteration count), CRC catches ~98% as false positives, plausibility rejects the remaining 1-4 per WAV. The residual at sub-3.0 sync_score in the targeted window is *noise*, not weak signal. Plumbing kept at default-off; the hook in `decode_window_with_ap` is one `if relax_db < 0.0` check. See `research/experiments/2026-05-31-hb-086-v3-subtract-aware-sync.md`.
+
+  **Structural insight (the keep)**: geometric proximity diagnostics need a paired *decodability* sub-test before earning PROCEED. The V3 diagnostic measured "where truths exist relative to subtracted bins" (geometric); the V2 diagnostic measured "are neighbors decodable in a soft-relevant way" (decodability proxy via SNR). V2's pre-impl SHELVE was the right call; V3's PROCEED on geometry-only led to a wasted implementation pass. For any future mechanism whose value depends on decoding new candidates surfaced from a perturbation of the production pipeline, the kill-switch needs to extract LLRs at the truth's coordinates from the residual and confirm LDPC+CRC pass — not just check geometric proximity.
+
+  **The hb-086 family is now closed.** V1 GRADUATED (+12 hard-200), V2 DEFINITIVELY SHELVED (soft cancellation closed by pancetta's hard-decision pipeline across two corpora), V3 SHELVED (Costas relaxation surfaces noise, not signal). The joint-decoding design space documented in `docs/superpowers/specs/2026-05-27-joint-decoding-design.md` is exhausted. The remaining hard-200 wall is for a different family of mechanism: sub-Costas-threshold weak signals (would need AP without sync, callsign-priors-on-residual, or OSD-without-Costas-pre-gate to crack).
+
+  priority_score: 0.0  # shelved
+  ---- original priority below ----
+  [PRIORITY-WAS: 0.30, spawned 2026-05-30 from hb-086 V2 shelve]
 
 ### hb-057 — Median-filter DT averaging for sync/AP  [PRIORITY: 0.35, spawned 2026-05-25 from mr-002]
   mode: ft8

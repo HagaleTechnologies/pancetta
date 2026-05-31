@@ -298,6 +298,30 @@ pub struct Ft8Config {
     /// surface more masked candidates. `None` reuses `min_sync_score`.
     pub residual_min_sync_score: Option<f64>,
 
+    /// hb-086 V3 (SHELVED 2026-05-31): dB relaxation applied to
+    /// `min_sync_score` for a post-V1 localized sync_search pass on
+    /// the residual spectrogram. The pass scans ONLY frequency bins
+    /// within `joint_residual_sync_window_bins` of a subtracted-
+    /// eligible decode. 0.0 disables (production default); negative
+    /// values would lower the threshold.
+    ///
+    /// SHELVED: production sweep at {-0.5, -1.0, -1.5, -2.0} on
+    /// hard-200 produced 0 additional decoded messages at every
+    /// threshold. Mechanism surfaces ~100+ truly-new candidates per
+    /// WAV in the targeted window, but they are noise — CRC catches
+    /// ~98% as FPs, plausibility rejects the rest. The residual at
+    /// sub-3.0 sync_score in the targeted window is not decodable
+    /// signal. Plumbing kept at default-off for future revisit.
+    /// See `research/experiments/2026-05-31-hb-086-v3-subtract-aware-sync.md`.
+    pub joint_residual_sync_relax_db: f64,
+
+    /// hb-086 V3 (SHELVED 2026-05-31): half-width (in freq_bins) of
+    /// the bin-targeting window around each subtracted-eligible
+    /// decode for the V3 localized sync_search pass. Ignored when
+    /// `joint_residual_sync_relax_db == 0.0`. Default 8 (≈ ±50 Hz at
+    /// 6.25 Hz/bin) per the V3 subtract-window-potential diagnostic.
+    pub joint_residual_sync_window_bins: usize,
+
     /// hb-081: MRC-weighted coherent subtract. When > 0.0, the
     /// subtract amplitude is scaled by `min(1, |acc|/threshold)` where
     /// |acc| is the un-normalised Costas accumulator magnitude (rotor's
@@ -409,6 +433,12 @@ impl Default for Ft8Config {
             // hb-082: residual sync threshold uses production `min_sync_score`
             // until the A/B confirms a lower value is better.
             residual_min_sync_score: None,
+            // hb-086 V3 (SHELVED 2026-05-31): disabled by default.
+            // Sweep at {-0.5, -1.0, -1.5, -2.0} produced 0 additional
+            // decoded messages — V3 surfaces noise, not signal, at the
+            // relaxed threshold. Plumbing kept for future revisit.
+            joint_residual_sync_relax_db: 0.0,
+            joint_residual_sync_window_bins: 8,
             // hb-086 V1 (GRADUATED 2026-05-28): force-retry failed original
             // candidates against the residual spectrogram. hard-200 +12 rec
             // / +1 novel, hard-1000 +17 rec / +9 novel, composite +0.000700,
@@ -935,6 +965,22 @@ impl Ft8Decoder {
             if self.config.joint_pair_retry {
                 let extra =
                     self.joint_pair_retry_pass(&spectrogram, &sync_candidates, &pass_decoded);
+                pass_decoded.extend(extra);
+            }
+
+            // hb-086 V3 (SHELVED 2026-05-31): see
+            // `joint_residual_localized_sync_pass` docstring. Production
+            // sweep showed the mechanism surfaces noise (not signal) at
+            // every relaxation level; default is 0.0 (disabled). The
+            // hook stays here so a follow-up that fixes the LDPC-on-noise
+            // problem (different LLR scaling, OSD-only path, callsign
+            // priors) can land without re-plumbing.
+            if self.config.joint_residual_sync_relax_db < 0.0 {
+                let extra = self.joint_residual_localized_sync_pass(
+                    &spectrogram,
+                    &sync_candidates,
+                    &pass_decoded,
+                );
                 pass_decoded.extend(extra);
             }
 
@@ -2431,6 +2477,239 @@ impl Ft8Decoder {
             decoded_new.push(new_msg);
         }
         decoded_new
+    }
+
+    /// hb-086 V3 (SHELVED 2026-05-31): subtract-aware localized sync
+    /// threshold relaxation. After multipass subtract+V1 saturate, run
+    /// one more Costas sync_search on the residual at threshold
+    /// `min_sync_score + joint_residual_sync_relax_db` (relax_db is
+    /// negative), confined to freq_bins within
+    /// `±joint_residual_sync_window_bins` of any subtracted-eligible
+    /// decode position. Then decode each surfaced candidate against
+    /// the residual via the same per-candidate path as V1.
+    ///
+    /// **Status: SHELVED.** The structural hypothesis (subtraction
+    /// localizes its noise-floor drop to specific bins, so a bin-
+    /// targeted relaxation surfaces decodable weak signals at those
+    /// bins) is **wrong on this corpus**. Production hard-200 sweep
+    /// (relax_db ∈ {-0.5, -1.0, -1.5, -2.0}) at the diagnostic-default
+    /// window of 8 bins produced 0 additional decoded messages at
+    /// every threshold. Mechanism trace
+    /// (`examples/hb086_v3_trace.rs`) on top-3 worst hard-200 WAVs
+    /// shows V3 surfaces ~100-131 truly-new (non-collision) candidates
+    /// per WAV at all thresholds — but LDPC "decodes" all of them
+    /// (random noise → BP converges on garbage), CRC catches ~98% as
+    /// false positives, and plausibility rejects the remaining 1-4
+    /// per WAV (all are CRC FPs that happen to form structured-but-
+    /// invalid FT8 messages). The residual at sub-3.0 sync_score in
+    /// the targeted window is *noise*, not weak signal.
+    ///
+    /// Why this differs from hb-082 (SHELVED — global residual
+    /// relaxation, no-op): hb-082 found ZERO localized candidates
+    /// because the global noise floor in the residual is unchanged.
+    /// V3 *does* find candidates in the bin-targeted window (the
+    /// noise floor IS lower at subtracted bins, enough to cross the
+    /// relaxed score threshold), but they don't decode. The
+    /// pre-graduation diagnostic
+    /// (`examples/hb086_v3_subtract_window_potential.rs`) found 56.8%
+    /// of V1-uncoverable truths sit within ±8 bins of a subtracted
+    /// decode — geometric PROCEED — but the geometric proximity
+    /// doesn't imply decodability. Plumbing kept at default-off for
+    /// future revisit if the corpus or pipeline changes.
+    fn joint_residual_localized_sync_pass(
+        &self,
+        spectrogram: &Spectrogram,
+        sync_candidates: &[CostasCandidate],
+        pass_decoded: &[DecodedMessage],
+    ) -> Vec<DecodedMessage> {
+        let pp = &self.protocol_params;
+        let time_padding = spectrogram.time_padding;
+
+        // Build the set of bin-centers from subtracted-eligible decodes
+        // (every successful pancetta decode populates tone_symbols and
+        // is subtract-eligible — pass-1 decodes are subtracted on
+        // multipass round 1, multipass decodes are subtracted on
+        // subsequent rounds, and V1 decodes are subtract-eligible too).
+        let subtracted_positions: Vec<CostasCandidate> = pass_decoded
+            .iter()
+            .filter_map(|m| {
+                m.tone_symbols
+                    .as_ref()
+                    .map(|_| reverse_derive_candidate(m, pp, time_padding))
+            })
+            .collect();
+        if subtracted_positions.is_empty() {
+            return Vec::new();
+        }
+
+        // Localized sync_search at the relaxed threshold. Restrict the
+        // (t0, f0, freq_sub) sweep to f0 values within ±N freq_bins of
+        // any subtracted_position. Time is unrestricted (the truth's t0
+        // is arbitrary; sync_search must scan the time axis).
+        let n_bins = self.config.joint_residual_sync_window_bins as i64;
+        let relaxed_threshold =
+            self.config.min_sync_score + self.config.joint_residual_sync_relax_db;
+        let Ok(localized_candidates) = self.localized_costas_sync_search(
+            spectrogram,
+            &subtracted_positions,
+            n_bins,
+            relaxed_threshold,
+        ) else {
+            return Vec::new();
+        };
+
+        // Filter out candidates already covered by the existing
+        // pipeline:
+        //   - any subtracted-eligible position (those are decoded
+        //     already; same ±1 freq_bin/±2 time_step tolerance the
+        //     multipass uses);
+        //   - any ORIGINAL sync_candidate position (V1 already retried
+        //     those against the residual — V3 must surface only NEW
+        //     positions sync_search missed in pass 1).
+        let new_candidates: Vec<CostasCandidate> = localized_candidates
+            .into_iter()
+            .filter(|nc| {
+                !subtracted_positions.iter().any(|sp| {
+                    nc.freq_sub == sp.freq_sub
+                        && (nc.freq_bin as i64 - sp.freq_bin as i64).unsigned_abs() <= 1
+                        && (nc.time_step as i64 - sp.time_step as i64).unsigned_abs() <= 2
+                }) && !sync_candidates.iter().any(|sc| {
+                    nc.freq_sub == sc.freq_sub
+                        && (nc.freq_bin as i64 - sc.freq_bin as i64).unsigned_abs() <= 1
+                        && (nc.time_step as i64 - sc.time_step as i64).unsigned_abs() <= 2
+                })
+            })
+            .take(self.config.max_sync_candidates)
+            .collect();
+        if new_candidates.is_empty() {
+            return Vec::new();
+        }
+
+        // Decode each new candidate against the residual via the same
+        // per-candidate path as V1 (sequential — count is bounded).
+        let mut decoded_new: Vec<DecodedMessage> = Vec::new();
+        let tone_spacing = pp.tone_spacing;
+        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        let spec_step = sps / TIME_OSR;
+        for cand in &new_candidates {
+            let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand);
+            let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
+            normalize_llrs(&mut llrs, self.config.llr_target_variance);
+            let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
+                continue;
+            };
+            if !par_verify_crc(&corrected_bits) {
+                continue;
+            }
+            let payload_bits = par_apply_xor(pp.xor_sequence, &corrected_bits);
+            let ft8_message = match self.message_parser.parse_payload(&payload_bits) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if !ft8_message.is_plausible() {
+                continue;
+            }
+            let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+            let base_frequency = cand.freq_bin as f64 * tone_spacing + sub_bin_offset;
+            let coarse_offset =
+                (cand.time_step as isize - spectrogram.time_padding as isize) * spec_step as isize;
+            let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
+            let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
+            let mut new_msg = DecodedMessage::new(
+                ft8_message,
+                snr_db,
+                confidence,
+                base_frequency,
+                coarse_offset as f64 / SAMPLE_RATE as f64,
+            );
+            new_msg.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
+            decoded_new.push(new_msg);
+        }
+        decoded_new
+    }
+
+    /// hb-086 V3 helper: like `costas_sync_search_with_threshold` but
+    /// restricts the f0 sweep to bins within ±`n_bins` of any
+    /// `target_position.freq_bin` (matching `freq_sub`). NMS+truncate
+    /// still apply.
+    fn localized_costas_sync_search(
+        &self,
+        spectrogram: &Spectrogram,
+        target_positions: &[CostasCandidate],
+        n_bins: i64,
+        min_score: f64,
+    ) -> Ft8Result<Vec<CostasCandidate>> {
+        let mut candidates = Vec::new();
+        let pp = &self.protocol_params;
+
+        let steps_per_symbol = TIME_OSR;
+        let msg_span = pp.num_symbols * steps_per_symbol;
+        let max_time_step = spectrogram.num_steps.saturating_sub(msg_span + 1);
+        let max_freq_bin = spectrogram.num_bins.saturating_sub(pp.num_tones);
+        let max_freq_bin = max_freq_bin.min((4000.0 / pp.tone_spacing) as usize);
+
+        // Build per-freq_sub set of allowed f0 values (sparse, so a
+        // boolean mask is the cheapest representation).
+        let mut allowed_per_sub: Vec<Vec<bool>> = (0..spectrogram.freq_osr)
+            .map(|_| vec![false; max_freq_bin])
+            .collect();
+        for tp in target_positions {
+            if tp.freq_sub >= spectrogram.freq_osr {
+                continue;
+            }
+            let center = tp.freq_bin as i64;
+            let lo = (center - n_bins).max(MIN_FREQ_BIN as i64) as usize;
+            let hi = (center + n_bins + 1).min(max_freq_bin as i64) as usize;
+            if lo >= hi {
+                continue;
+            }
+            for cell in allowed_per_sub[tp.freq_sub][lo..hi].iter_mut() {
+                *cell = true;
+            }
+        }
+
+        for (freq_sub, allowed) in allowed_per_sub.iter().enumerate() {
+            for t0 in 0..=max_time_step {
+                for (f0, &is_allowed) in allowed
+                    .iter()
+                    .enumerate()
+                    .take(max_freq_bin)
+                    .skip(MIN_FREQ_BIN)
+                {
+                    if !is_allowed {
+                        continue;
+                    }
+                    let score = self.compute_costas_score(spectrogram, t0, f0, freq_sub);
+                    if score > min_score {
+                        // V3 deliberately skips the parabolic time-refinement
+                        // path used in the production sync_search. We're
+                        // already in a relaxed-threshold corner; adding
+                        // refinement complexity here would conflate two
+                        // axes of variability. If a position decodes from
+                        // its integer t0, it's a real signal; if not,
+                        // refinement isn't going to rescue it.
+                        candidates.push(CostasCandidate {
+                            time_step: t0,
+                            freq_bin: f0,
+                            freq_sub,
+                            sync_score: score,
+                            time_refinement: 0.0,
+                        });
+                    }
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| {
+            b.sync_score
+                .partial_cmp(&a.sync_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        candidates.truncate(self.config.max_sync_candidates);
+        if self.config.nms_enabled {
+            self.nms_candidates(&mut candidates);
+        }
+        Ok(candidates)
     }
 
     // ========================================================================
