@@ -186,7 +186,7 @@ fn median(xs: &[f64]) -> f64 {
 
 struct WavData {
     sha: String,
-    truths: Vec<(f64, f64, String)>,     // (freq, dt, message)
+    truths: Vec<(f64, f64, String)>,           // (freq, dt, message)
     pancetta_decodes: Vec<(f64, f64, String)>, // (freq, dt, message)
 }
 
@@ -301,13 +301,10 @@ fn main() -> anyhow::Result<()> {
     for wav in &wav_data {
         for (_freq, dt, msg) in &wav.truths {
             if let Some(sender) = sender_callsign(msg) {
-                sightings
-                    .entry(sender)
-                    .or_default()
-                    .push(Sighting {
-                        wav_sha: wav.sha.clone(),
-                        dt_s: *dt,
-                    });
+                sightings.entry(sender).or_default().push(Sighting {
+                    wav_sha: wav.sha.clone(),
+                    dt_s: *dt,
+                });
             }
         }
     }
@@ -317,8 +314,7 @@ fn main() -> anyhow::Result<()> {
     let multi_wav_callsigns: HashSet<String> = sightings
         .iter()
         .filter_map(|(c, sl)| {
-            let distinct_wavs: HashSet<&str> =
-                sl.iter().map(|s| s.wav_sha.as_str()).collect();
+            let distinct_wavs: HashSet<&str> = sl.iter().map(|s| s.wav_sha.as_str()).collect();
             if distinct_wavs.len() >= 2 {
                 Some(c.clone())
             } else {
@@ -513,10 +509,14 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    println!(
-        "\nAggregate (denominators in parens = % of total missed truths):"
-    );
-    let pct = |n: usize, d: usize| if d == 0 { 0.0 } else { 100.0 * n as f64 / d as f64 };
+    println!("\nAggregate (denominators in parens = % of total missed truths):");
+    let pct = |n: usize, d: usize| {
+        if d == 0 {
+            0.0
+        } else {
+            100.0 * n as f64 / d as f64
+        }
+    };
     println!(
         "  missed total                                    : {} (100.0%)",
         missed_total
