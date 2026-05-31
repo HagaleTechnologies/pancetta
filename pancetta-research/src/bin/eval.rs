@@ -37,6 +37,7 @@ struct Args {
     nms_enabled: Option<bool>,
     nms_time_radius: Option<usize>,
     nms_freq_radius: Option<usize>,
+    nms_score_delta_db: Option<f64>,
     min_sync_score: Option<f64>,
     adaptive_ldpc_iters: Option<bool>,
     time_range: Option<f64>,
@@ -115,6 +116,7 @@ impl Args {
         let mut nms_enabled: Option<bool> = None;
         let mut nms_time_radius: Option<usize> = None;
         let mut nms_freq_radius: Option<usize> = None;
+        let mut nms_score_delta_db: Option<f64> = None;
         let mut min_sync_score: Option<f64> = None;
         let mut adaptive_ldpc_iters: Option<bool> = None;
         let mut time_range: Option<f64> = None;
@@ -226,6 +228,16 @@ impl Args {
                             .context("--nms-freq-radius needs a value")?
                             .parse()?,
                     );
+                    nms_enabled.get_or_insert(true);
+                }
+                "--nms-score-delta-db" => {
+                    nms_score_delta_db = Some(
+                        iter.next()
+                            .context("--nms-score-delta-db needs a value")?
+                            .parse()?,
+                    );
+                    // hb-036: a non-zero score-delta implies NMS is active
+                    // (the gate only fires when nms_enabled = true).
                     nms_enabled.get_or_insert(true);
                 }
                 "--min-sync-score" => {
@@ -416,6 +428,7 @@ impl Args {
                     eprintln!("  --nms-on: explicitly re-enable NMS (production default is off)");
                     eprintln!("  --nms-time-radius N: override Ft8Config::nms_time_radius (default 8); implies --nms-on");
                     eprintln!("  --nms-freq-radius N: override Ft8Config::nms_freq_radius (default 2); implies --nms-on");
+                    eprintln!("  --nms-score-delta-db V: hb-036 score-relative NMS suppression delta (default 0.0 = pure TF-distance); implies --nms-on");
                     eprintln!(
                         "  --min-sync-score V: override Ft8Config::min_sync_score (default 3.0)"
                     );
@@ -439,6 +452,7 @@ impl Args {
             nms_enabled,
             nms_time_radius,
             nms_freq_radius,
+            nms_score_delta_db,
             min_sync_score,
             adaptive_ldpc_iters,
             time_range,
@@ -840,6 +854,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(n) = args.nms_freq_radius {
                 d = d.with_nms_freq_radius(n);
+            }
+            if let Some(v) = args.nms_score_delta_db {
+                d = d.with_nms_score_delta_db(v);
             }
             if let Some(v) = args.min_sync_score {
                 d = d.with_min_sync_score(v);

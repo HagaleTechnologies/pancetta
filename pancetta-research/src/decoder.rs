@@ -142,6 +142,16 @@ impl Ft8Decoder {
         self
     }
 
+    /// Override `nms_score_delta_db` on the wrapped config. hb-036:
+    /// score-relative NMS suppression. Setting a non-zero value enables
+    /// the score-relative gate that keeps "distinct weaker" signals while
+    /// still suppressing near-duplicates of a strong signal. 0.0 is the
+    /// legacy pure TF-distance NMS behavior.
+    pub fn with_nms_score_delta_db(mut self, v: f64) -> Self {
+        self.config.nms_score_delta_db = v;
+        self
+    }
+
     /// Override `min_sync_score` on the wrapped config. hb-007 sweep.
     pub fn with_min_sync_score(mut self, v: f64) -> Self {
         self.config.min_sync_score = v;

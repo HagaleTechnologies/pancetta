@@ -168,6 +168,20 @@ pub struct Ft8Config {
     /// merges distinct signals 25 Hz apart. hb-008 sweep candidate.
     pub nms_freq_radius: usize,
 
+    /// hb-036: score-relative NMS suppression delta. When `> 0.0` and
+    /// `nms_enabled = true`, a weaker candidate `j` is suppressed only
+    /// if it lies within the TF radius AND its `sync_score` is within
+    /// `nms_score_delta_db` of the stronger candidate `i`'s sync_score
+    /// (i.e. `j.sync_score > i.sync_score - nms_score_delta_db`).
+    /// Meaningfully-weaker candidates (`j.sync_score <= i.sync_score -
+    /// nms_score_delta_db`) are treated as distinct signals and kept.
+    /// This discriminates "duplicate of a strong signal" (low Δscore,
+    /// suppressed) from "distinct weaker signal" (high Δscore, kept).
+    /// Default 0.0 — legacy pure TF-distance NMS behavior preserved.
+    /// Note: sync_score is a Costas correlation, not a strict dB
+    /// quantity; the `_db` suffix reflects the conceptual framing.
+    pub nms_score_delta_db: f64,
+
     /// Minimum Costas sync score (correlation) for a candidate to be
     /// kept for LDPC decoding. Default 3.0 matches the historical
     /// `MIN_SYNC_SCORE` constant. Lowering surfaces more candidates
@@ -385,6 +399,10 @@ impl Default for Ft8Config {
             nms_enabled: false,
             nms_time_radius: NMS_TIME_RADIUS,
             nms_freq_radius: NMS_FREQ_RADIUS,
+            // hb-036: 0.0 = legacy pure TF-distance NMS behavior. Production
+            // NMS is currently off (hb-019), so this knob is a no-op unless
+            // `nms_enabled` is also turned on by the eval harness.
+            nms_score_delta_db: 0.0,
             min_sync_score: MIN_SYNC_SCORE,
             adaptive_ldpc_iters: false,
             block_score_rerank: true,
@@ -1774,10 +1792,19 @@ impl Ft8Decoder {
         best_score
     }
 
-    /// Non-maximum suppression: remove weaker candidates near stronger ones
+    /// Non-maximum suppression: remove weaker candidates near stronger ones.
+    ///
+    /// hb-036: when `nms_score_delta_db > 0.0`, a weaker candidate `j` is
+    /// suppressed only if it lies within the TF radius AND its sync_score
+    /// is within `nms_score_delta_db` of the stronger candidate `i`'s
+    /// sync_score. Meaningfully-weaker candidates are treated as distinct
+    /// signals and kept. With `nms_score_delta_db == 0.0` (the default),
+    /// the legacy pure TF-distance behavior is preserved bit-exactly.
     fn nms_candidates(&self, candidates: &mut Vec<CostasCandidate>) {
         // candidates are already sorted by score (best first)
         let mut keep = vec![true; candidates.len()];
+        let score_delta = self.config.nms_score_delta_db;
+        let score_relative = score_delta > 0.0;
 
         for i in 0..candidates.len() {
             if !keep[i] {
@@ -1793,6 +1820,15 @@ impl Ft8Decoder {
                     .unsigned_abs();
 
                 if dt <= self.config.nms_time_radius && df <= self.config.nms_freq_radius {
+                    // hb-036: score-relative gate. j is "within delta of i"
+                    // when j.sync_score > i.sync_score - score_delta. If
+                    // j is meaningfully weaker (j.score <= i.score - delta),
+                    // treat as a distinct signal and KEEP it.
+                    if score_relative
+                        && candidates[j].sync_score <= candidates[i].sync_score - score_delta
+                    {
+                        continue;
+                    }
                     keep[j] = false; // suppress the weaker candidate
                 }
             }
@@ -6066,6 +6102,168 @@ mod tests {
         assert_eq!(candidates[0].freq_bin, 240);
         assert_eq!(candidates[0].sync_score, 20.0);
         assert_eq!(candidates[1].freq_bin, 300);
+    }
+
+    // hb-036: score-relative NMS suppression.
+    //
+    // Legacy guard: with `nms_score_delta_db = 0.0` (the production default),
+    // the score-relative branch is bypassed and behavior is bit-exactly the
+    // same as pre-hb-036 pure TF-distance NMS.
+    #[test]
+    fn test_nms_score_delta_zero_matches_legacy_tf_distance() {
+        // Build the same fixture as the legacy `test_nms_suppression`, but
+        // run it with NMS explicitly enabled and `nms_score_delta_db = 0.0`.
+        // The result must match the legacy suppression pattern exactly.
+        let mut config = Ft8Config::default();
+        config.nms_enabled = true;
+        config.nms_score_delta_db = 0.0;
+        let decoder = Ft8Decoder::new(config).unwrap();
+
+        let mut candidates = vec![
+            CostasCandidate {
+                time_step: 0,
+                freq_bin: 240,
+                freq_sub: 0,
+                sync_score: 20.0,
+                time_refinement: 0.0,
+            },
+            CostasCandidate {
+                time_step: 1,
+                freq_bin: 240,
+                freq_sub: 0,
+                sync_score: 5.0, // very weak — would survive the score gate
+                time_refinement: 0.0,
+            },
+            CostasCandidate {
+                time_step: 0,
+                freq_bin: 300,
+                freq_sub: 0,
+                sync_score: 18.0,
+                time_refinement: 0.0,
+            },
+        ];
+
+        decoder.nms_candidates(&mut candidates);
+
+        // delta=0 ⇒ pure TF-distance: weak neighbor #1 still suppressed.
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].freq_bin, 240);
+        assert_eq!(candidates[1].freq_bin, 300);
+    }
+
+    // hb-036: with `nms_score_delta_db = 3.0` and NMS on, a strong-and-weak
+    // pair inside the same TF cell must KEEP both: the weak candidate
+    // (score < strong.score - 3.0) is treated as a distinct signal. Contrast
+    // with legacy NMS, which would have suppressed the weak one.
+    #[test]
+    fn test_nms_score_delta_keeps_distinct_weaker_signal() {
+        let mut config = Ft8Config::default();
+        config.nms_enabled = true;
+        config.nms_time_radius = 2;
+        config.nms_freq_radius = 1;
+        config.nms_score_delta_db = 3.0;
+        let decoder = Ft8Decoder::new(config).unwrap();
+
+        // Two candidates sharing a TF cell (within t=2, f=1) but with a
+        // 5.0 sync_score gap — much larger than the 3.0 delta. Under
+        // hb-036 the weaker is a distinct signal, KEEP it.
+        let mut candidates = vec![
+            CostasCandidate {
+                time_step: 10,
+                freq_bin: 240,
+                freq_sub: 0,
+                sync_score: 12.0, // strong
+                time_refinement: 0.0,
+            },
+            CostasCandidate {
+                time_step: 11,
+                freq_bin: 240,
+                freq_sub: 0,
+                sync_score: 6.0, // weak (12 - 6 = 6 > delta=3 ⇒ KEEP)
+                time_refinement: 0.0,
+            },
+        ];
+
+        decoder.nms_candidates(&mut candidates);
+
+        // hb-036: distinct weaker signal preserved.
+        assert_eq!(
+            candidates.len(),
+            2,
+            "score-relative NMS should KEEP a meaningfully weaker neighbor"
+        );
+        assert_eq!(candidates[0].sync_score, 12.0);
+        assert_eq!(candidates[1].sync_score, 6.0);
+
+        // Confirm that legacy (delta=0) would have suppressed it, proving
+        // the new condition is the discriminator.
+        let mut legacy_config = Ft8Config::default();
+        legacy_config.nms_enabled = true;
+        legacy_config.nms_time_radius = 2;
+        legacy_config.nms_freq_radius = 1;
+        legacy_config.nms_score_delta_db = 0.0;
+        let legacy_decoder = Ft8Decoder::new(legacy_config).unwrap();
+        let mut legacy_candidates = vec![
+            CostasCandidate {
+                time_step: 10,
+                freq_bin: 240,
+                freq_sub: 0,
+                sync_score: 12.0,
+                time_refinement: 0.0,
+            },
+            CostasCandidate {
+                time_step: 11,
+                freq_bin: 240,
+                freq_sub: 0,
+                sync_score: 6.0,
+                time_refinement: 0.0,
+            },
+        ];
+        legacy_decoder.nms_candidates(&mut legacy_candidates);
+        assert_eq!(
+            legacy_candidates.len(),
+            1,
+            "legacy TF-distance NMS suppresses the weaker neighbor"
+        );
+    }
+
+    // hb-036: a near-duplicate within the score delta should STILL be
+    // suppressed — that's exactly what NMS is supposed to catch
+    // (duplicate of a strong signal).
+    #[test]
+    fn test_nms_score_delta_suppresses_near_duplicate() {
+        let mut config = Ft8Config::default();
+        config.nms_enabled = true;
+        config.nms_time_radius = 2;
+        config.nms_freq_radius = 1;
+        config.nms_score_delta_db = 3.0;
+        let decoder = Ft8Decoder::new(config).unwrap();
+
+        let mut candidates = vec![
+            CostasCandidate {
+                time_step: 10,
+                freq_bin: 240,
+                freq_sub: 0,
+                sync_score: 12.0,
+                time_refinement: 0.0,
+            },
+            CostasCandidate {
+                time_step: 11,
+                freq_bin: 240,
+                freq_sub: 0,
+                sync_score: 10.5, // within delta=3 of 12 ⇒ suppress
+                time_refinement: 0.0,
+            },
+        ];
+
+        decoder.nms_candidates(&mut candidates);
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "near-duplicate within delta is still suppressed"
+        );
+        assert_eq!(candidates[0].sync_score, 12.0);
     }
 
     #[test]
