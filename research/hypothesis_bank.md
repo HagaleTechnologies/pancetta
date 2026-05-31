@@ -1458,6 +1458,43 @@ current_ratio: 0.051
     signal — anything pancetta decodes that two other independent decoders agree
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
+### hb-087 — Callsign-priors-on-residual (AP-constrained, bypass Costas pre-gate)  [PRIORITY: 0.45, spawned 2026-05-31 from hb-086 V3 shelve]
+  mode: ft8
+  status: scoped (diagnostic PROCEED; design spec written; awaiting implementation session)
+  priority_score: 0.45
+  estimated_effort: 3 sessions (session 1 = scoping/diagnostic, DONE; session 2 = prior-set aggregation in research crate; session 3 = AP-constrained residual decode pass + eval)
+  expected_delta: +5 to +30 hard-200 rec (diagnostic upper bound 153 of 647 = 23.6% coverage; mechanism efficiency assumed 5-20% of that); composite +0.0005 to +0.0015
+  defensible_prior: yes — AP-without-sync is the canonical weak-signal recovery lever (JT9/JT65 "apsym"/"napwid"; pancetta's own AP1/AP2 already work on the sync-passing path). The residual at sub-Costas positions HAS energy at masked-but-real signal locations (hb-079's coherent subtract proves the locality); the missing ingredient is a constraint strong enough to prevent LDPC from converging on noise (V3's failure mode).
+  wild_card: false
+  evidence_for:
+    - Diagnostic (hb087_callsign_priors_feasibility.rs): 23.6% of missed truths in top-20 worst hard-200 have a callsign already in {operator, recent-window, bundled-common}. Above 20% PROCEED gate.
+    - Recent-window prior dominates (23.2% of 23.6%); is the same source pancetta-qso::callsign_continuity already maintains in production for FP filtering. Production cqdx-spotted prior is broader than the diagnostic's bundled-100 stand-in, so 23.6% is a conservative lower bound.
+    - V3 SHELVE confirmed the geometry: 56.8% of V1-uncoverable missed truths sit within ±8 freq_bins of a subtracted decode. The positions ARE there; what V3 lacked was a constraint preventing BP from converging on noise.
+    - AP injection at ±15.0 LLR magnitude structurally pins 28 bits per callsign-position attempt; with continuity-filter + plausibility + CRC, FP rate is bounded multiplicatively below 1%.
+    - Reuses existing primitives: `inject_ap_llrs`, `inject_ap2_caller`, `inject_recent_call_at_called` in pancetta-ft8/src/ap.rs; `joint_pair_retry_pass` is the residual-decode template; `callsign_continuity::CallsignContinuityFilter` is the prior-source aggregator.
+  evidence_against:
+    - CPU cost is the dominant risk. Lattice density × prior-set size × per-position-LDPC could blow past +25% wall-clock budget if naive. Mitigation plan: cheap LLR-energy pre-screen per position; cap prior-set at 64 most-recent + 32 highest-rarity cqdx; tight lattice ±4 bins × ±1 time_step. Even so, session 3 must measure wall-clock carefully and stop early on overrun.
+    - Operator-call prior contributes 0% on this corpus (the hard-200 WAVs aren't from K5ARH's logs). Production value would be larger but field-eval only.
+    - Bundled-common prior contributes only 0.8% on the diagnostic (the bundled list is small; the specific WAVs don't carry DXpedition activity). Field cqdx-spots would contribute more but the diagnostic understates this.
+    - V3-style risk: per-truth decodability micro-test (extract residual LLRs at the truth's known coordinates and run AP-decode) might shelve the mechanism even after 23.6% coverage. Gated at session 2 → 3 boundary.
+    - Coverage doesn't equal recovery: a truth's callsign being in the prior set is necessary but not sufficient. The mechanism efficiency (fraction of covered truths that actually decode) is unknown without session 3 measurement.
+  notes: |
+    Spec: docs/superpowers/specs/2026-05-31-hb-087-callsign-priors-design.md
+    Diagnostic: pancetta-research/examples/hb087_callsign_priors_feasibility.rs
+    Scoping journal: research/experiments/2026-05-31-hb-087-scoping.md
+
+    Sibling hypothesis (being scoped separately): OSD-without-Costas-pre-gate.
+    The two bypass-Costas mechanisms attack the same V3-identified wall via
+    different constraints (callsign-AP vs ordered-statistics). Whichever
+    graduates first informs whether the other adds incremental value.
+
+    Doctrine note inherited from V3: gate session 2 → session 3 on a
+    per-truth decodability micro-test (10 truths from top-3 worst WAVs whose
+    callsign IS in the prior set; ≥3 must AP-decode against residual at
+    known truth coordinates). This is the V3 SHELVE doctrine refinement
+    ("geometric proximity is not decodability") applied to hb-087's
+    feasibility step. Cheap insurance (~30 min of session 2 wall-clock).
+
 ## Meta-research (idea generators)
 
 These entries are not single hypotheses — they are SOURCES + METHODS
