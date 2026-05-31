@@ -80,7 +80,7 @@ impl Args {
                 }
                 "--force" => force = true,
                 "-h" | "--help" => {
-                    eprintln!("usage: baseline --tier <fixtures|synth|curated-hard-200|curated-hard-1000|wild-50> --mode ft8 [--jt9-path PATH] [--synth-manifest PATH] [--manifest PATH] [--force]");
+                    eprintln!("usage: baseline --tier <fixtures|synth|curated-hard-200|curated-hard-1000|wild-50|wild-100> --mode ft8 [--jt9-path PATH] [--synth-manifest PATH] [--manifest PATH] [--force]");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -249,11 +249,12 @@ fn main() -> anyhow::Result<()> {
                 .map(|e| e.wav_path)
                 .collect()
         }
-        "curated-hard-200" | "curated-hard-1000" | "wild-50" => {
+        "curated-hard-200" | "curated-hard-1000" | "wild-50" | "wild-100" => {
             let label = match args.tier.as_str() {
                 "curated-hard-200" => "hard_200",
                 "curated-hard-1000" => "hard_1000",
                 "wild-50" => "wild_50",
+                "wild-100" => "wild_100",
                 _ => unreachable!(),
             };
             let manifest = args.manifest.clone().unwrap_or_else(|| {

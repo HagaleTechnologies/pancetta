@@ -378,7 +378,7 @@ impl Args {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
                     );
-                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, curated-hard-200, curated-hard-1000, wild-50");
+                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, curated-hard-200, curated-hard-1000, wild-50, wild-100");
                     eprintln!("  --max-passes: override Ft8Config::max_decode_passes (default 3)");
                     eprintln!("  --max-sync-candidates: override Ft8Config::max_sync_candidates (default 200)");
                     eprintln!(
@@ -993,11 +993,12 @@ fn main() -> anyhow::Result<()> {
                     run_synth_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
                 tiers.insert("synth-doppler".to_string(), result);
             }
-            "curated-hard-200" | "curated-hard-1000" | "wild-50" => {
+            "curated-hard-200" | "curated-hard-1000" | "wild-50" | "wild-100" => {
                 let label = match tier_name.as_str() {
                     "curated-hard-200" => "hard_200",
                     "curated-hard-1000" => "hard_1000",
                     "wild-50" => "wild_50",
+                    "wild-100" => "wild_100",
                     _ => unreachable!(),
                 };
                 let manifest = workspace
