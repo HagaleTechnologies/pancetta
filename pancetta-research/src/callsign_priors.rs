@@ -174,7 +174,11 @@ impl CallsignPriorSet {
         if self.cqdx_spotted.iter().any(|c| c.to_uppercase() == up) {
             return true;
         }
-        if self.bundled_common.iter().any(|c| c.eq_ignore_ascii_case(&up)) {
+        if self
+            .bundled_common
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&up))
+        {
             return true;
         }
         false
@@ -198,7 +202,11 @@ impl CallsignPriorSet {
         if self.cqdx_spotted.iter().any(|c| c.to_uppercase() == up) {
             mask.cqdx = true;
         }
-        if self.bundled_common.iter().any(|c| c.eq_ignore_ascii_case(&up)) {
+        if self
+            .bundled_common
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case(&up))
+        {
             mask.bundled = true;
         }
         mask
@@ -278,8 +286,10 @@ mod tests {
         let s = CallsignPriorSet::from_session1_pool(Some("K5ARH"), vec!["W1AW".to_string()]);
         let v = s.iter_unique(100);
         assert_eq!(v[0], "K5ARH");
-        assert!(v.iter().position(|c| c == "K5ARH").unwrap()
-            < v.iter().position(|c| c == "W1AW").unwrap());
+        assert!(
+            v.iter().position(|c| c == "K5ARH").unwrap()
+                < v.iter().position(|c| c == "W1AW").unwrap()
+        );
     }
 
     #[test]
@@ -297,10 +307,7 @@ mod tests {
 
     #[test]
     fn source_of_reports_correct_origin() {
-        let s = CallsignPriorSet::from_session1_pool(
-            Some("K5ARH"),
-            vec!["W1AW".to_string()],
-        );
+        let s = CallsignPriorSet::from_session1_pool(Some("K5ARH"), vec!["W1AW".to_string()]);
         assert_eq!(s.source_of("K5ARH").label(), "operator");
         // W1AW is in BOTH recent_this_wav AND bundled; recent wins by priority
         // because operator beats recent which beats bundled, and W1AW isn't operator.
