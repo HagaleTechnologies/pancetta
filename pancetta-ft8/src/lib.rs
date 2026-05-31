@@ -85,6 +85,7 @@ pub mod parallel;
 pub use parallel::{BudgetTracker, DecodeConfig, Parallelism};
 
 // Core FT8 decoding modules
+pub mod bp_trajectory_capture;
 pub mod decoder;
 pub mod ldpc;
 pub mod message;

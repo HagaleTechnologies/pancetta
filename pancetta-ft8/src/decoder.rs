@@ -4949,6 +4949,27 @@ impl LdpcDecoder {
             return self.llrs_to_bits(&decoded_llrs);
         }
 
+        // hb-064: BP did not converge — note channel LLRs + trajectory
+        // before potentially handing off to OSD, so the research
+        // capture path can correlate input/trajectory/outcome. Cheap
+        // unconditional thread-local read; the borrow only happens
+        // when capture is enabled.
+        let capture_enabled = crate::bp_trajectory_capture::is_enabled();
+        let captured_channel_llrs: Option<[f32; 174]> = if capture_enabled {
+            let mut arr = [0.0f32; 174];
+            arr.copy_from_slice(&llrs[..174]);
+            Some(arr)
+        } else {
+            None
+        };
+        let captured_final_llrs: Option<[f32; 174]> = if capture_enabled {
+            let mut arr = [0.0f32; 174];
+            arr.copy_from_slice(&decoded_llrs[..174]);
+            Some(arr)
+        } else {
+            None
+        };
+
         // BP did not converge — try OSD fallback if available.
         if let Some(ref osd) = self.osd {
             // hb-067: optional mBP offset — reduce BP-LLR magnitudes
@@ -4980,13 +5001,60 @@ impl LdpcDecoder {
                     .map(|traj| crate::neural_osd::predict_error_bits(traj));
                 #[cfg(not(feature = "neural_osd"))]
                 let neural_ordering: Option<[f32; 91]> = {
-                    let _ = trajectory;
+                    let _ = trajectory.as_ref();
                     None
                 };
 
-                if let Some(codeword) = osd.decode(llr_arr, neural_ordering.as_ref()) {
+                let osd_result = osd.decode(llr_arr, neural_ordering.as_ref());
+
+                // hb-064: record (trajectory, OSD outcome) for the
+                // research dataset. Only fires when capture is enabled
+                // AND OSD was actually attempted (i.e. parity-gate
+                // passed) — those are the cases the future model will
+                // see in production.
+                if capture_enabled {
+                    let (osd_recovered, osd_codeword) = match &osd_result {
+                        Some(bv) => {
+                            let mut arr = [0u8; 174];
+                            for (i, slot) in arr.iter_mut().enumerate() {
+                                *slot = u8::from(bv.get(i).map(|b| *b).unwrap_or(false));
+                            }
+                            (true, Some(arr))
+                        }
+                        None => (false, None),
+                    };
+                    let traj = trajectory.unwrap_or([[0.0; 174]; 25]);
+                    crate::bp_trajectory_capture::record(
+                        crate::bp_trajectory_capture::CapturedTrajectory {
+                            channel_llrs: captured_channel_llrs.unwrap_or([0.0; 174]),
+                            trajectory: traj,
+                            final_llrs: captured_final_llrs.unwrap_or([0.0; 174]),
+                            osd_recovered,
+                            osd_codeword,
+                            bp_iters_run: self.max_iterations.min(25) as u16,
+                        },
+                    );
+                }
+
+                if let Some(codeword) = osd_result {
                     return Ok(codeword);
                 }
+            } else if capture_enabled {
+                // Parity-gate rejected. Record with `osd_recovered = false`
+                // and `osd_codeword = None` so the dataset can also study
+                // whether the trajectory signature predicts the gate
+                // outcome (a useful auxiliary signal for the diagnostic).
+                let traj = trajectory.unwrap_or([[0.0; 174]; 25]);
+                crate::bp_trajectory_capture::record(
+                    crate::bp_trajectory_capture::CapturedTrajectory {
+                        channel_llrs: captured_channel_llrs.unwrap_or([0.0; 174]),
+                        trajectory: traj,
+                        final_llrs: captured_final_llrs.unwrap_or([0.0; 174]),
+                        osd_recovered: false,
+                        osd_codeword: None,
+                        bp_iters_run: self.max_iterations.min(25) as u16,
+                    },
+                );
             }
         }
 
