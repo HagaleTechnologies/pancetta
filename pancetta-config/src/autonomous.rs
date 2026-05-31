@@ -204,6 +204,14 @@ pub struct AutonomousConfig {
     pub band_hopping: BandHoppingConfig,
     /// Priority scoring weights for autonomous operator decisions.
     pub priorities: PriorityWeightsConfig,
+    /// Dry-run mode: when true, the coordinator logs autonomous-issued
+    /// TransmitRequest / MultiTransmitRequest at INFO level but does NOT
+    /// forward them to the transmitter component. Manual TX paths
+    /// (TUI Space-press, --test-tx) are unaffected. Use during Phase 5
+    /// validation to observe the autonomous operator's TX decisions
+    /// without keying the rig.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 impl Default for AutonomousConfig {
@@ -221,6 +229,7 @@ impl Default for AutonomousConfig {
             listen_cycle: ListenCycleConfig::default(),
             band_hopping: BandHoppingConfig::default(),
             priorities: PriorityWeightsConfig::default(),
+            dry_run: false,
         }
     }
 }
@@ -274,6 +283,7 @@ impl ConfigSection for AutonomousConfig {
         self.listen_cycle = other.listen_cycle;
         self.band_hopping = other.band_hopping;
         self.priorities = other.priorities;
+        self.dry_run = other.dry_run;
     }
 }
 
@@ -337,6 +347,110 @@ mod tests {
 
         config.min_multi_slot_score = 1.5;
         assert!(config.validate_section().is_err());
+    }
+
+    #[test]
+    fn test_dry_run_defaults_false() {
+        let config = AutonomousConfig::default();
+        assert!(
+            !config.dry_run,
+            "dry_run must default to false to preserve existing TX behavior"
+        );
+    }
+
+    #[test]
+    fn test_dry_run_toml_roundtrip_true() {
+        let toml_input = r#"
+enabled = true
+slot_parity = "auto"
+cq_after_idle_cycles = 10
+max_concurrent_qsos = 1
+tx_offset_hz = 1500.0
+min_dx_score = 0.3
+min_multi_slot_score = 0.7
+cq_direction = ""
+dry_run = true
+
+[frequency]
+decode_history_cycles = 4
+center_bias_hz = 1500.0
+dx_proximity_min_hz = 50.0
+dx_proximity_max_hz = 200.0
+min_separation_hz = 75.0
+neighbor_guard_hz = 100.0
+
+[listen_cycle]
+initial_interval = 3
+backoff_interval = 5
+collision_interval = 2
+backoff_threshold = 5
+
+[band_hopping]
+enabled = false
+hop_threshold = 20
+bands = []
+
+[priorities]
+needed_dxcc = 0.35
+needed_grid = 0.20
+pota_sota = 0.15
+rarity = 0.10
+signal_strength = 0.05
+duplicate_penalty = -0.40
+recent_failure_penalty = -0.15
+"#;
+        let parsed: AutonomousConfig = toml::from_str(toml_input).unwrap();
+        assert!(parsed.dry_run, "dry_run = true must parse from TOML");
+
+        // Round-trip
+        let serialized = toml::to_string(&parsed).unwrap();
+        let reparsed: AutonomousConfig = toml::from_str(&serialized).unwrap();
+        assert!(reparsed.dry_run);
+    }
+
+    #[test]
+    fn test_dry_run_omitted_defaults_false() {
+        // When the field is absent from TOML, serde(default) yields false.
+        let toml_input = r#"
+enabled = false
+slot_parity = "auto"
+cq_after_idle_cycles = 10
+max_concurrent_qsos = 1
+tx_offset_hz = 1500.0
+min_dx_score = 0.3
+min_multi_slot_score = 0.7
+cq_direction = ""
+
+[frequency]
+decode_history_cycles = 4
+center_bias_hz = 1500.0
+dx_proximity_min_hz = 50.0
+dx_proximity_max_hz = 200.0
+min_separation_hz = 75.0
+neighbor_guard_hz = 100.0
+
+[listen_cycle]
+initial_interval = 3
+backoff_interval = 5
+collision_interval = 2
+backoff_threshold = 5
+
+[band_hopping]
+enabled = false
+hop_threshold = 20
+bands = []
+
+[priorities]
+needed_dxcc = 0.35
+needed_grid = 0.20
+pota_sota = 0.15
+rarity = 0.10
+signal_strength = 0.05
+duplicate_penalty = -0.40
+recent_failure_penalty = -0.15
+"#;
+        let parsed: AutonomousConfig = toml::from_str(toml_input).unwrap();
+        assert!(!parsed.dry_run);
     }
 
     #[test]

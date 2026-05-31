@@ -110,6 +110,16 @@ impl super::ApplicationCoordinator {
             },
         };
 
+        let dry_run = config.autonomous.dry_run;
+        if dry_run {
+            warn!(
+                target: "autonomous.dry_run",
+                "Autonomous DRY RUN mode ENABLED: TransmitRequest / MultiTransmitRequest \
+                 from the autonomous operator will be logged but NOT forwarded to the \
+                 transmitter. Manual TX (Space-press, --test-tx) is unaffected."
+            );
+        }
+
         let our_callsign = config.station.callsign.clone();
         let our_grid = if config.station.grid_square.is_empty() {
             None
@@ -346,19 +356,30 @@ impl super::ApplicationCoordinator {
                             // Bundle collected TX items into a single message.
                             if tx_items.len() == 1 {
                                 let (item, tx_parity) = tx_items.remove(0);
-                                let msg = ComponentMessage::new(
-                                    ComponentId::Autonomous,
-                                    ComponentId::Ft8Transmitter,
-                                    MessageType::TransmitRequest {
-                                        message_text: item.message_text,
-                                        frequency_offset: item.frequency_offset,
-                                        qso_id: item.qso_id,
-                                        tx_parity,
-                                    },
-                                    Instant::now(),
-                                );
-                                if let Err(e) = message_bus.send_message(msg).await {
-                                    warn!("Failed to send TransmitRequest: {}", e);
+                                if dry_run {
+                                    info!(
+                                        target: "autonomous.dry_run",
+                                        "DRY RUN: would have transmitted '{}' at offset {:.0} Hz (qso_id={:?}, parity={:?})",
+                                        item.message_text,
+                                        item.frequency_offset,
+                                        item.qso_id,
+                                        tx_parity
+                                    );
+                                } else {
+                                    let msg = ComponentMessage::new(
+                                        ComponentId::Autonomous,
+                                        ComponentId::Ft8Transmitter,
+                                        MessageType::TransmitRequest {
+                                            message_text: item.message_text,
+                                            frequency_offset: item.frequency_offset,
+                                            qso_id: item.qso_id,
+                                            tx_parity,
+                                        },
+                                        Instant::now(),
+                                    );
+                                    if let Err(e) = message_bus.send_message(msg).await {
+                                        warn!("Failed to send TransmitRequest: {}", e);
+                                    }
                                 }
                             } else if tx_items.len() > 1 {
                                 let bundle_parity = tx_items[0].1;
@@ -372,18 +393,36 @@ impl super::ApplicationCoordinator {
                                     }
                                 }
                                 let items: Vec<_> = tx_items.into_iter().map(|(it, _)| it).collect();
-                                info!("Bundling {} TX items into MultiTransmitRequest", items.len());
-                                let msg = ComponentMessage::new(
-                                    ComponentId::Autonomous,
-                                    ComponentId::Ft8Transmitter,
-                                    MessageType::MultiTransmitRequest {
-                                        items,
-                                        tx_parity: bundle_parity,
-                                    },
-                                    Instant::now(),
-                                );
-                                if let Err(e) = message_bus.send_message(msg).await {
-                                    warn!("Failed to send MultiTransmitRequest: {}", e);
+                                if dry_run {
+                                    info!(
+                                        target: "autonomous.dry_run",
+                                        "DRY RUN: would have bundled {} TX items (parity={:?})",
+                                        items.len(),
+                                        bundle_parity
+                                    );
+                                    for item in &items {
+                                        info!(
+                                            target: "autonomous.dry_run",
+                                            "DRY RUN:   - '{}' at offset {:.0} Hz (qso_id={:?})",
+                                            item.message_text,
+                                            item.frequency_offset,
+                                            item.qso_id
+                                        );
+                                    }
+                                } else {
+                                    info!("Bundling {} TX items into MultiTransmitRequest", items.len());
+                                    let msg = ComponentMessage::new(
+                                        ComponentId::Autonomous,
+                                        ComponentId::Ft8Transmitter,
+                                        MessageType::MultiTransmitRequest {
+                                            items,
+                                            tx_parity: bundle_parity,
+                                        },
+                                        Instant::now(),
+                                    );
+                                    if let Err(e) = message_bus.send_message(msg).await {
+                                        warn!("Failed to send MultiTransmitRequest: {}", e);
+                                    }
                                 }
                             }
                         }
