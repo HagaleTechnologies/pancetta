@@ -413,7 +413,7 @@ impl Args {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
                     );
-                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, curated-hard-200, curated-hard-1000, wild-50, wild-100");
+                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50");
                     eprintln!("  --max-passes: override Ft8Config::max_decode_passes (default 3)");
                     eprintln!("  --max-sync-candidates: override Ft8Config::max_sync_candidates (default 200)");
                     eprintln!(
@@ -1060,6 +1060,33 @@ fn main() -> anyhow::Result<()> {
                 let result =
                     run_curated_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
                 tiers.insert(tier_name.to_string(), result);
+            }
+            // hb-073 — real-Doppler eval tier sourced from KiwiSDR auroral/TEP
+            // captures. Manifest is curated by the operator after capturing
+            // 30-60 slot-aligned 12 kHz WAVs per
+            // docs/operations/2026-05-31-hb-073-kiwisdr-capture-procedure.md.
+            // Until then, treat a missing manifest as a SKIP so existing eval
+            // runs that include this tier do not break.
+            "wild-doppler-50" => {
+                let manifest =
+                    workspace.join("research/corpus/curated/ft8/wild_doppler_50.manifest.json");
+                if !manifest.exists() {
+                    eprintln!(
+                        "tier wild-doppler-50: manifest missing at {} — SKIPPING (operator capture pending; see docs/operations/2026-05-31-hb-073-kiwisdr-capture-procedure.md)",
+                        manifest.display()
+                    );
+                    tiers.insert(
+                        "wild-doppler-50".to_string(),
+                        TierResult {
+                            wavs_processed: 0,
+                            ..Default::default()
+                        },
+                    );
+                } else {
+                    let result =
+                        run_curated_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
+                    tiers.insert("wild-doppler-50".to_string(), result);
+                }
             }
             other => anyhow::bail!("unknown tier '{other}'"),
         }
