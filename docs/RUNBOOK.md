@@ -352,8 +352,21 @@ for tier in fixtures synth curated-hard-200 curated-hard-1000 wild-50; do
 done
 
 # Compute the main.json baseline.
+#
+# Canonical convention (as of 2026-05-31): main.json is generated with
+# the harness-side FP filter ON (`--fp-filter-baselines`). The filter
+# drops decodes whose callsigns are absent from the jt9-baselines union
+# reference set — invisible to recall (truth matches are by definition
+# already in the reference set) but it strips the marginal/likely-FP
+# tail from `novel_decodes`. Every graduation sweep in this project's
+# history was measured FP-filter-on, so main.json must match for
+# apples-to-apples comparisons. The scorecard's
+# `config.fp_filter_active` field records whether the filter ran;
+# compare-tool/diffs assume it matches between sides.
+# See: research/experiments/2026-05-31-hard-1000-novel-investigation.md
 cargo run --release -p pancetta-research --bin eval -- \
     --tier fixtures,synth-clean,curated-hard-200,curated-hard-1000,wild-50 \
+    --fp-filter-baselines research/baselines/ft8 \
     --mode ft8 --output research/scorecards/main.json
 ```
 
