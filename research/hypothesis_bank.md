@@ -2059,6 +2059,60 @@ search to in-repo sources.
     for the full per-message-per-SNR table.
   follow_up: hb-023
 
+### hb-088 — OSD-without-Costas-pre-gate (residual LLRs → OSD flip enumeration, BYPASS Costas threshold)  [SHELVED 2026-05-31 pre-implementation, strong diagnostic finding]
+  mode: ft8
+  status: shelved
+  priority_score: 0.10  (intended at scoping = 0.35; downgraded by diagnostic SHELVE)
+  estimated_effort: (not implemented; 3 sessions if PROCEED — Session 1 diagnostic DONE, Sessions 2/3 not justified)
+  expected_delta: 0 (diagnostic SHELVED; no production change warranted)
+  defensible_prior: structurally plausible at hypothesis stage — OSD's flip enumeration is independent of BP convergence, and at sub-Costas-but-not-noise-only positions the LLR sign pattern COULD encode a weak truth signal. The diagnostic disproves the empirical premise on busy-band hard-200.
+  wild_card: false
+  evidence_for:
+    - Hypothesis premise: OSD-2 enumerates C(91,2)=4095 flip patterns over most-reliable basis; CRC-14 gates per pattern. At positions where channel LLRs have ~80% sign agreement with the truth codeword, OSD-2 can find the truth in ≤14 flips. This was the structural argument.
+    - Sub-Costas |LLR| at truth positions IS ~82% of control's |LLR| — there IS energy at these positions (kill-switch a passes handsomely). The premise "sub-Costas = noise-only" was wrong.
+  evidence_against:
+    - Diagnostic (hb088_osd_without_costas_feasibility.rs, top-20 hard-200): median LLR-sign-agreement with truth codeword at sub-Costas positions = 50.6% (essentially coin-flip). p10 = 45.4%, p90 = 55.7%. Compare control = 92.0% median.
+    - 50.6% agreement means ~85 of 174 bits are sign-wrong. OSD-2 budgets 2 flips, OSD-3 budgets 3, OSD-4 budgets 4. None can correct 85 bits.
+    - Structural explanation: sub-Costas energy at the truth's freq_bin window comes from NEIGHBOR LEAKAGE and interferer tones, not from the truth's own (weakly) tone-aligned energy. max-log demod picks the LOUDER tone (the interferer), not the truth's tone.
+    - FP-control argument was structurally weak even pre-diagnostic: CRC-14 catches 1/16384 by chance; OSD-2 enumerates 4095 patterns × 300+ sub-Costas positions per WAV ⇒ ~75 CRC-FPs per WAV expected. With high-energy garbage LLRs (not noise-only), these FPs would have non-trivial bit patterns and beat shallow plausibility checks at non-negligible rates.
+    - Closes single-position spectrogram-mining family on hard-200. V3, hb-082, hb-088 all confirm: dense busy-band sub-Costas energy is interferer-dominated, not weak-truth-dominated. Any mechanism in this family that operates on per-position LLRs cannot work on this corpus.
+  notes: |
+    Diagnostic: pancetta-research/examples/hb088_osd_without_costas_feasibility.rs
+    Scoping journal: research/experiments/2026-05-31-hb-088-scoping.md
+    Sibling: hb-087 (callsign-priors-on-residual, PROCEEDING). hb-088's
+    SHELVE strengthens hb-087's case: hb-087 doesn't rely on LLR signs
+    being correct, it pins 28 bits via AP1/AP2 injection at ±15.0 LLR
+    magnitude, collapsing the codeword space independently of the channel
+    LLR sign pattern.
+
+    Re-visit conditions:
+    - Sparser corpus (rural VHF, low-activity HF) MIGHT show higher
+      sub-Costas sign-agreement (truths on noise floor, not on interferer
+      floor). Re-run the diagnostic on any new sparse-band curated tier
+      before re-considering.
+    - The "coherent IQ matched-filter at truth coordinates" mechanism
+      family is structurally different (rejects neighbor-bin energy via
+      phase-coherent matched filtering at the truth's exact freq + dt).
+      Could be spawned independently if hb-087 graduates and the wall
+      warrants further attacks.
+
+    Methodology contribution: LLR sign-agreement with encoded truth
+    codeword is the right kill-switch for any per-position-LLR-mining
+    mechanism. Cheap (~10s on top-20 hard-200), definitive
+    (decodability proxy, not geometric/coverage proxy). Bake into
+    the spec template for "find more candidates from existing
+    spectrogram" mechanisms — companion to V3's "geometric proximity
+    is not decodability" doctrine.
+  learning: |
+    Two facts collapsed the hypothesis space here. (1) Sub-Costas LLR
+    energy is real (not noise-only) — this surprises if the priors
+    were "missing decodes = below noise floor". (2) Sub-Costas LLR
+    SIGNS at the truth's known position are random — this is the
+    interferer-leakage signature. The decoder's max-log demodulator
+    at a sub-Costas freq_bin in a busy band is reading the dominant
+    LOCAL signal's tones, not a weak buried truth's tones. The wall
+    is structural to single-position spectrogram mining.
+
 ## Graduated (merged to main)
 
 ### hb-029 — Exact-format Display tests  [GRADUATED 2026-05-23, regression net]

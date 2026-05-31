@@ -23,6 +23,10 @@ hound = "3.5"                            # WAV reader (already used in pancetta-
 # Used by gen-synth binary for AWGN noise (Box-Muller via rand_distr).
 rand = "0.8"
 rand_distr = "0.4"
+# hb-088 OSD-without-Costas scoping diagnostic replicates pancetta-ft8's
+# spectrogram + Costas score + LLR pipeline inline.
+rustfft = "6.4"
+num-complex = "0.4"
 sha2 = "0.10"                            # SHA-256 for WAV cache keying in baseline binary
 tempfile = "3"                           # slot-cutting helper for Jt9Decoder; not in workspace.dependencies
 
