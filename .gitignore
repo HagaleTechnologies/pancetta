@@ -98,6 +98,13 @@ training/*/data_test/*
 # inside the repo by mistake, ignore them)
 research/corpus/curated/ft8/staged/
 
+# hb-064 trajectory datasets — generated locally, regenerated per
+# Session-2 retrain; sizes in the hundreds of MB. summary.json /
+# README.txt / *.md inside the same experiment dir DO get tracked.
+research/experiments/**/trajectories.jsonl
+research/experiments/**/trajectories.npz
+research/experiments/**/trajectories.parquet
+
 # jt9 (WSJT-X CLI) side-effect files dropped into the working dir when
 # the baseline binary runs from the workspace root
 /decoded.txt
