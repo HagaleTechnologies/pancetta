@@ -129,6 +129,14 @@ pub struct ApplicationCoordinator {
     /// rolling-window + cqdx-spotted sources.
     fp_filter: Option<std::sync::Arc<pancetta_qso::CallsignContinuityFilter>>,
 
+    /// Shared cross-slot state (hb-048 a7 / hb-057 DT history / hb-173
+    /// within-QSO context substrate). Populated by the FT8 decoder thread
+    /// after each successful, FP-filter-accepted decode; consumed by
+    /// downstream hypotheses (none yet — SHIPPED-INFRA module). Cloning
+    /// the `Arc` is cheap; the container's three inner tables hold their
+    /// own `RwLock`s so locks never cross tables.
+    cross_time_state: std::sync::Arc<pancetta_qso::CrossTimeState>,
+
     /// TUI relay OS thread handle (joined on shutdown)
     tui_relay_handle: Option<std::thread::JoinHandle<()>>,
 
@@ -329,6 +337,7 @@ impl ApplicationCoordinator {
             waterfall_to_auto_tx: None,
             active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(None)),
             fp_filter: None,
+            cross_time_state: std::sync::Arc::new(pancetta_qso::CrossTimeState::empty()),
             tui_relay_handle: None,
             // Initialize to 0 — hamlib will read the actual rig frequency on startup.
             // If hamlib isn't available, the TUI default (14.074) takes over.

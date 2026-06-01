@@ -58,6 +58,11 @@ impl super::ApplicationCoordinator {
         // between decode-merge and broadcast loop. None = no filtering.
         let fp_filter = self.fp_filter.clone();
 
+        // Shared cross-slot state substrate (hb-048 / hb-057 / hb-173).
+        // Populated post-FP-filter so the three downstream tables never
+        // ingest decodes the continuity filter judged false.
+        let cross_time_state = self.cross_time_state.clone();
+
         // Run FT8 decoder on a dedicated thread to avoid tokio starvation
         let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -195,6 +200,28 @@ impl super::ApplicationCoordinator {
                             if dropped > 0 {
                                 debug!("FP filter dropped {} of {} decodes", dropped, pre);
                             }
+                        }
+
+                        // Update shared cross-slot state (hb-048 / hb-057 /
+                        // hb-173 substrate). Runs post-FP-filter so the three
+                        // downstream tables never ingest decodes the continuity
+                        // filter judged false. The container is SHIPPED-INFRA
+                        // — no consumer reads from it yet; downstream
+                        // hypotheses will hook in here in future sessions.
+                        for decoded_msg in &decoded_messages {
+                            let parity_u8 = decoded_msg.slot_parity.map(|p| match p {
+                                pancetta_core::slot::SlotParity::Even => 0u8,
+                                pancetta_core::slot::SlotParity::Odd => 1u8,
+                            });
+                            cross_time_state.record_decode(&pancetta_qso::DecodeRecord {
+                                from_callsign: decoded_msg.message.from_callsign.clone(),
+                                to_callsign: decoded_msg.message.to_callsign.clone(),
+                                text: decoded_msg.text.clone(),
+                                frequency_hz: decoded_msg.frequency_offset,
+                                time_offset_s: decoded_msg.time_offset,
+                                slot_parity: parity_u8,
+                                at: decoded_msg.timestamp,
+                            });
                         }
 
                         for decoded_msg in &decoded_messages {
