@@ -185,7 +185,10 @@ fn main() -> anyhow::Result<()> {
         .with_heard_with("W1AW")
         .with_my_call("W1AW");
     let templates = generate_templates(&expected_call);
-    println!("Generated {} templates for K1ABC (cap = 32)", templates.len());
+    println!(
+        "Generated {} templates for K1ABC (cap = 32)",
+        templates.len()
+    );
     println!("Template kinds:");
     for (i, t) in templates.iter().enumerate() {
         println!("  [{:02}] {:?}: {}", i, t.kind, t.message_text);
@@ -276,8 +279,14 @@ fn main() -> anyhow::Result<()> {
         .or_else(|| results.iter().find(|r| r.noise_std == 2.0))
         .expect("results not empty");
     println!("Headline (signal=5.0, noise={:.1}):", headline.noise_std);
-    println!("  snr7 = {:.2}  (threshold {:.1})", headline.snr7, A7_SNR7_THRESHOLD_DEFAULT);
-    println!("  snr7b = {:.2}  (threshold {:.1})", headline.snr7b, A7_SNR7B_THRESHOLD_DEFAULT);
+    println!(
+        "  snr7 = {:.2}  (threshold {:.1})",
+        headline.snr7, A7_SNR7_THRESHOLD_DEFAULT
+    );
+    println!(
+        "  snr7b = {:.2}  (threshold {:.1})",
+        headline.snr7b, A7_SNR7B_THRESHOLD_DEFAULT
+    );
     println!(
         "  best-template correctly identified: {}",
         headline.match_idx_correct
