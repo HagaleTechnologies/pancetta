@@ -339,6 +339,32 @@ current_ratio: 0.051
     tests, gated, no production hook. Session 3 = production wiring +
     threshold sweep + A/B eval. Priority stays at 0.45 (active).
     Branch: iter/2026-05-31-hb-048-session1, 1 commit (docs only).
+  status_2026_06_01_session2: |
+    Session 2 GRADUATES. Both deliverables landed:
+      * pancetta-ft8/src/a7.rs (~640 LOC + 15 tests) — A7ExpectedCall,
+        A7Template, A7TemplateKind, generate_templates (up to 32 per
+        call), cross_correlate (snr7 in LLR domain), best_template_score
+        (snr7 + snr7b), dedup_against_previous (the f0=-98 analog).
+      * pancetta-research/examples/hb048_a7_synthetic_injection.rs —
+        encodes truth `K1ABC W1AW RR73`, generates 22 templates for
+        K1ABC, runs noise sweep against the matching template.
+    Test count: 15/15 a7 unit tests pass; full pancetta-ft8 --lib
+    suite still 219/219 (zero regression).
+    Synthetic-injection result (signal_mag=5.0 LLR units, mid-band
+    noise_std=3.0, lin SNR +4.4 dB):
+      * snr7 = 65.38  (WSJT-X threshold 6.0)
+      * snr7b = 1.83  (WSJT-X threshold 1.8)
+      * best-template correctly identified in 5/5 trials
+      * Match-correct holds across the full sweep (noise_std up to 12,
+        lin SNR -7.6 dB).
+    Observation for Session 3: snr7b is the tight metric — sits at 1.85
+    even with clean LLRs because the bank has structurally-similar
+    templates (RRR/RR73/73 share callsign-pair bits). Session 3's
+    threshold sweep should map snr7b ∈ {1.5, 1.8, 2.2} carefully.
+    Branch: iter/2026-06-01-hb-048-session2, 3 commits.
+    Next: Session 3 = wire a7_cross_correlation_pass into
+    decode_window_with_ap after V1 joint-pair-retry; threshold sweep on
+    hard-200 + synth + fixtures; A/B vs main.
 
 ### hb-050 — Rolling callsign-window tracker  [SHELVED 2026-05-24 — closed by hb-051 ceiling]
   mode: ft8
