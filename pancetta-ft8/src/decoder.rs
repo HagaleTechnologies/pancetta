@@ -381,6 +381,32 @@ pub struct Ft8Config {
     /// recall).
     pub residual_energy_stop_db: Option<f64>,
 
+    /// hb-093: per-position residual SNR pre-decode gate. When `Some(db)`,
+    /// the `joint_pair_retry_pass` (and `coherent_subtract_and_repass`'s
+    /// post-sync decode loop) computes a per-position residual SNR estimate
+    /// (same primitive as `par_estimate_snr_spectrogram`) BEFORE running
+    /// the expensive LDPC+CRC pipeline. Candidates with SNR below the
+    /// threshold are skipped — they sit at noise-only positions and the
+    /// LDPC work is wasted (BP converges on garbage, CRC catches ~98%
+    /// as FPs, plausibility rejects the rest).
+    ///
+    /// The threshold is the WAV-relative SNR (dB, after the 2500/6.25
+    /// bandwidth correction) — typical FT8 decodable signals sit at
+    /// −20 dB to +10 dB. Setting around −18..−24 dB filters the
+    /// noise-only floor without losing weak real signals.
+    ///
+    /// `None` disables the gate (production default until a diagnostic
+    /// confirms it filters ≥30% of candidates without losing decodes).
+    pub residual_snr_gate_db: Option<f64>,
+
+    /// hb-093 diagnostic: when true, the decoder records per-position
+    /// SNR + decode-success for every candidate the gate would evaluate
+    /// (joint_pair_retry path). The data is reset per `decode_window`
+    /// call and read out via `Ft8Decoder::take_residual_snr_diagnostic`.
+    /// The gate behavior is NOT affected — measurement only.
+    /// Default false.
+    pub residual_snr_diagnostic: bool,
+
     /// hb-063 (arXiv:2410.13131, Hocevar 2004): use a layered (row-
     /// sequential) belief-propagation schedule instead of the flooding
     /// schedule. Layered BP updates check nodes one at a time and folds
@@ -492,6 +518,13 @@ impl Default for Ft8Config {
             // regressing composite. `Some(x_db)` enables the probe with
             // margin `x_db` above noise floor (median of original power).
             residual_energy_stop_db: None,
+            // hb-093: per-position residual SNR pre-decode gate disabled
+            // until a diagnostic confirms it filters ≥30% of candidates
+            // and the gated-out positions are ≤2% decodable.
+            residual_snr_gate_db: None,
+            // hb-093: diagnostic instrumentation off by default. Enabled
+            // by the hb093 diagnostic example.
+            residual_snr_diagnostic: false,
         }
     }
 }
@@ -597,6 +630,12 @@ pub struct Ft8Decoder {
 
     /// Performance metrics
     last_metrics: DecodingMetrics,
+
+    /// hb-093 diagnostic accumulator. Populated only when
+    /// `config.residual_snr_diagnostic` is true. Per joint_pair_retry
+    /// candidate position: (sync_score, residual_snr_db, decoded_ok).
+    /// Read out (and reset) by `take_residual_snr_diagnostic`.
+    residual_snr_records: Vec<(f64, f32, bool)>,
 }
 
 impl Ft8Decoder {
@@ -672,7 +711,17 @@ impl Ft8Decoder {
             spectrogram_window,
             message_handler,
             last_metrics: DecodingMetrics::default(),
+            residual_snr_records: Vec::new(),
         })
+    }
+
+    /// hb-093: drain the diagnostic accumulator. Returns the per-candidate
+    /// `(sync_score, residual_snr_db, decoded_ok)` records captured during
+    /// the most recent `decode_window` call (joint_pair_retry path). Resets
+    /// the internal buffer. Only populated when
+    /// `config.residual_snr_diagnostic` is true.
+    pub fn take_residual_snr_diagnostic(&mut self) -> Vec<(f64, f32, bool)> {
+        std::mem::take(&mut self.residual_snr_records)
     }
 
     /// Get the current protocol parameters
@@ -717,6 +766,8 @@ impl Ft8Decoder {
     ) -> Ft8Result<Vec<DecodedMessage>> {
         let start_time = Instant::now();
         self.message_handler.on_window_start(SystemTime::now());
+        // hb-093: reset diagnostic buffer at the start of each window.
+        self.residual_snr_records.clear();
 
         let min_samples = self.protocol_params.total_samples(SAMPLE_RATE);
         if samples.len() < min_samples {
@@ -851,6 +902,7 @@ impl Ft8Decoder {
                 bp_offset_subtract: self.config.bp_offset_subtract,
                 layered_bp: self.config.layered_bp,
                 sync_time_interp_linear_power: self.config.sync_time_interp_linear_power,
+                window_start: start_time,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -936,6 +988,19 @@ impl Ft8Decoder {
                 .flatten()
                 .collect();
 
+            // hb-129: safety net — stamp any par_iter outputs that
+            // weren't tagged at their CRC-pass site (par_decode_candidate /
+            // par_try_ap_decode / par_try_ldpc_with_recent_only stamp
+            // themselves for fine-grained timing).
+            {
+                let now_elapsed = start_time.elapsed();
+                for m in pass_decoded.iter_mut() {
+                    if m.decode_time_into_window.is_none() {
+                        m.decode_time_into_window = Some(now_elapsed);
+                    }
+                }
+            }
+
             // hb-056: non-coherent cross-cycle averaging. Groups repeating-
             // station candidates and decodes a power-summed averaged
             // candidate alongside the per-slot results. Additive — its
@@ -943,7 +1008,13 @@ impl Ft8Decoder {
             // that fails CRC contributes nothing. Skipped when the flag
             // is off (default).
             if self.config.cross_cycle_averaging {
-                let extra = self.cross_cycle_averaging_pass(&spectrogram, &sync_candidates);
+                let mut extra = self.cross_cycle_averaging_pass(&spectrogram, &sync_candidates);
+                let now_elapsed = start_time.elapsed();
+                for m in extra.iter_mut() {
+                    if m.decode_time_into_window.is_none() {
+                        m.decode_time_into_window = Some(now_elapsed);
+                    }
+                }
                 pass_decoded.extend(extra);
             }
 
@@ -973,13 +1044,22 @@ impl Ft8Decoder {
                 let mut to_subtract: &[DecodedMessage] = &pass_decoded;
                 let mut round_start_offset = 0;
                 for _round in 0..self.config.coherent_multipass_iterations {
-                    let extra = self.coherent_subtract_and_repass(
+                    let mut extra = self.coherent_subtract_and_repass(
                         &mut spectrogram,
                         to_subtract,
                         energy_stop,
                     );
                     if extra.is_empty() {
                         break;
+                    }
+                    // hb-129: stamp multipass decodes — these arrive
+                    // LATER in the slot than pass-1 outputs, so TTFD
+                    // distinguishes them.
+                    let now_elapsed = start_time.elapsed();
+                    for m in extra.iter_mut() {
+                        if m.decode_time_into_window.is_none() {
+                            m.decode_time_into_window = Some(now_elapsed);
+                        }
                     }
                     let added = extra.len();
                     pass_decoded.extend(extra);
@@ -997,8 +1077,15 @@ impl Ft8Decoder {
             // confirmed 78% of missed truths on top-20 hard-200 WAVs are
             // within 50 Hz of a recovered decode.
             if self.config.joint_pair_retry {
-                let extra =
+                let mut extra =
                     self.joint_pair_retry_pass(&spectrogram, &sync_candidates, &pass_decoded);
+                // hb-129: stamp joint-pair-retry decodes at pass completion.
+                let now_elapsed = start_time.elapsed();
+                for m in extra.iter_mut() {
+                    if m.decode_time_into_window.is_none() {
+                        m.decode_time_into_window = Some(now_elapsed);
+                    }
+                }
                 pass_decoded.extend(extra);
             }
 
@@ -1010,11 +1097,18 @@ impl Ft8Decoder {
             // problem (different LLR scaling, OSD-only path, callsign
             // priors) can land without re-plumbing.
             if self.config.joint_residual_sync_relax_db < 0.0 {
-                let extra = self.joint_residual_localized_sync_pass(
+                let mut extra = self.joint_residual_localized_sync_pass(
                     &spectrogram,
                     &sync_candidates,
                     &pass_decoded,
                 );
+                // hb-129: stamp joint-residual decodes at pass completion.
+                let now_elapsed = start_time.elapsed();
+                for m in extra.iter_mut() {
+                    if m.decode_time_into_window.is_none() {
+                        m.decode_time_into_window = Some(now_elapsed);
+                    }
+                }
                 pass_decoded.extend(extra);
             }
 
@@ -2453,7 +2547,7 @@ impl Ft8Decoder {
     /// truths on top-20 hard-200 WAVs are within 50 Hz of a recovered
     /// decode — a strong "pair structure exists" signal.
     fn joint_pair_retry_pass(
-        &self,
+        &mut self,
         spectrogram: &Spectrogram,
         sync_candidates: &[CostasCandidate],
         pass_decoded: &[DecodedMessage],
@@ -2499,22 +2593,55 @@ impl Ft8Decoder {
         let sps = pp.samples_per_symbol(SAMPLE_RATE);
         let spec_step = sps / TIME_OSR;
         let lin = self.config.sync_time_interp_linear_power;
+        // hb-093: optional pre-decode residual SNR gate + diagnostic capture.
+        let snr_gate_db = self.config.residual_snr_gate_db;
+        let diagnostic_on = self.config.residual_snr_diagnostic;
         for cand in &pending {
             let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
+            // hb-093: pre-decode residual SNR estimate. Cheap — just
+            // iterates the already-extracted tone magnitudes.
+            let pre_snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
+            if let Some(threshold) = snr_gate_db {
+                if (pre_snr_db as f64) < threshold {
+                    if diagnostic_on {
+                        self.residual_snr_records
+                            .push((cand.sync_score, pre_snr_db, false));
+                    }
+                    continue;
+                }
+            }
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
+                if diagnostic_on {
+                    self.residual_snr_records
+                        .push((cand.sync_score, pre_snr_db, false));
+                }
                 continue;
             };
             if !par_verify_crc(&corrected_bits) {
+                if diagnostic_on {
+                    self.residual_snr_records
+                        .push((cand.sync_score, pre_snr_db, false));
+                }
                 continue;
             }
             let payload_bits = par_apply_xor(pp.xor_sequence, &corrected_bits);
             let ft8_message = match self.message_parser.parse_payload(&payload_bits) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(_) => {
+                    if diagnostic_on {
+                        self.residual_snr_records
+                            .push((cand.sync_score, pre_snr_db, false));
+                    }
+                    continue;
+                }
             };
             if !ft8_message.is_plausible() {
+                if diagnostic_on {
+                    self.residual_snr_records
+                        .push((cand.sync_score, pre_snr_db, false));
+                }
                 continue;
             }
             let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
@@ -2531,6 +2658,10 @@ impl Ft8Decoder {
                 coarse_offset as f64 / SAMPLE_RATE as f64,
             );
             new_msg.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
+            if diagnostic_on {
+                self.residual_snr_records
+                    .push((cand.sync_score, pre_snr_db, true));
+            }
             decoded_new.push(new_msg);
         }
         decoded_new
@@ -3504,6 +3635,9 @@ struct DecodeContext<'a> {
     layered_bp: bool,
     /// hb-069 linear-power spectrogram interpolation gate.
     sync_time_interp_linear_power: bool,
+    /// hb-129: window-start instant. Used to stamp each successful decode
+    /// with its presentation-time-into-window for the TTFD metric.
+    window_start: Instant,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -3587,6 +3721,7 @@ fn par_decode_candidate(
                 );
                 decoded_message.tone_symbols =
                     Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
+                decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
 
                 return Some(decoded_message);
             }
@@ -3681,6 +3816,7 @@ fn par_decode_candidate(
                 time_offset_samples as f64 / SAMPLE_RATE as f64,
             );
             decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
+            decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
 
             return Some(decoded_message);
         }
@@ -3950,6 +4086,7 @@ fn par_try_ldpc_with_ap(
     );
     decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
     decoded_message.ap_level = ap_level_num;
+    decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
 
     Some(decoded_message)
 }
@@ -4034,6 +4171,7 @@ fn par_try_ldpc_with_recent_only(
     // Report as AP-level 2 (recent-caller class) for now. Future could
     // introduce a distinct ap_level number for hb-043 if telemetry needs it.
     decoded_message.ap_level = 2;
+    decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
     Some(decoded_message)
 }
 
@@ -6088,6 +6226,47 @@ mod tests {
         assert!(metrics.processing_time.as_millis() > 0);
     }
 
+    /// hb-129: every decode that survives CRC must carry a presentation-time
+    /// `decode_time_into_window` stamp. Exercises the full pipeline with a
+    /// synthetic FT8 transmission, then verifies every emitted message has a
+    /// non-zero stamp that does not exceed the wall-clock processing time.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn test_ttfd_stamping_on_synth_signal() {
+        let mut encoder = crate::Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+
+        let mut modulator = crate::Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let config = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(config).unwrap();
+        let start = std::time::Instant::now();
+        let decoded = decoder.decode_window(&tx).expect("decode");
+        let elapsed = start.elapsed();
+
+        assert!(
+            !decoded.is_empty(),
+            "synth FT8 signal should produce at least one decode"
+        );
+        for msg in &decoded {
+            let ttfd = msg
+                .decode_time_into_window
+                .expect("every decode produced by the pipeline must carry a TTFD stamp");
+            // Stamp must be non-zero and not exceed wall-clock elapsed.
+            assert!(ttfd.as_micros() > 0, "TTFD must be > 0, got {:?}", ttfd);
+            assert!(
+                ttfd <= elapsed + std::time::Duration::from_millis(50),
+                "TTFD {:?} cannot exceed wall-clock elapsed {:?}",
+                ttfd,
+                elapsed
+            );
+        }
+    }
+
     #[test]
     fn test_waterfall_data_generation() {
         let config = Ft8Config::default();
@@ -6508,6 +6687,7 @@ mod tests {
             tone_symbols: Some(symbols),
             ap_level: 0,
             slot_parity: None,
+            decode_time_into_window: None,
         };
 
         decoder.subtract_signal(&mut audio, &msg);

@@ -11,7 +11,7 @@ use crate::{Ft8Error, Ft8Result};
 use bitvec::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Number of bits in FT8 information payload
 pub const PAYLOAD_BITS: usize = 77;
@@ -988,6 +988,13 @@ pub struct DecodedMessage {
     /// message routed to TUI / QSO / autonomous). Constructors leave it
     /// unset because they don't have access to the slot timing.
     pub slot_parity: Option<pancetta_core::slot::SlotParity>,
+    /// hb-129: Time elapsed from window-start until this decode passed CRC
+    /// and became available (presentation-time, not arrival-time).
+    /// `None` for decodes produced by external paths (ft8_lib FFI) or
+    /// for unit-test scaffolding where the decode pipeline doesn't run.
+    /// Used by the research harness to compute Time-To-First-Decode (TTFD)
+    /// per WAV — see `research/ideation/2026-06-01-metric.md` M1.
+    pub decode_time_into_window: Option<Duration>,
 }
 
 impl DecodedMessage {
@@ -1012,6 +1019,7 @@ impl DecodedMessage {
             tone_symbols: None,
             ap_level: 0,
             slot_parity: None,
+            decode_time_into_window: None,
         }
     }
 
@@ -1035,6 +1043,7 @@ impl DecodedMessage {
             tone_symbols: None,
             ap_level: 0,
             slot_parity: None,
+            decode_time_into_window: None,
         }
     }
 }
