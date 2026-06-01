@@ -78,6 +78,12 @@ training/neural_osd/model.pt
 training/neural_osd/session2_best.pt
 training/neural_osd/session2_best.metrics.json
 training/neural_osd/session2_train.log
+# hb-194 ensemble training artifacts
+training/neural_osd/ensemble_seed_*.pt
+training/neural_osd/ensemble_seed_*.metrics.json
+training/neural_osd/ensemble_train_summary.json
+training/neural_osd/train_ensemble.log
+training/neural_osd/ensemble_eval.json
 *.npy
 
 # Database backups
