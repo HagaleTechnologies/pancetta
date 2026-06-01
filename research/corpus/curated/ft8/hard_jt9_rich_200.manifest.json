@@ -1,0 +1,2007 @@
+{
+  "schema_version": 1,
+  "label": "hard_jt9_rich_200",
+  "generated_at": "2026-06-01T16:06:54.128257+00:00",
+  "scoring_decoder": "pancetta-ft8@default (jt9-novel-density curation, hb-150)",
+  "entries": [
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003200.wav",
+      "wav_sha256": "bb445ede3009d779c5ce1682c8112082367e355bb9c5943a571324eaa424a3c8",
+      "interest_score": 66.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 7,
+        "noise_floor_db": -38.24611124679071,
+        "mean_decoded_snr_db": -2.872687416417258
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003130.wav",
+      "wav_sha256": "09dfaa1a4db3bd00b47e0ddeae5477a5e8f325b7b1332e0fe1ac390ede73ba32",
+      "interest_score": 63.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 5,
+        "noise_floor_db": -38.117110514689955,
+        "mean_decoded_snr_db": -1.3671461701393128
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260419_213158.wav",
+      "wav_sha256": "a18968282b2f8216ec16dc558ad874b0e12e8761025144059a99f8636919156a",
+      "interest_score": 58.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 11,
+        "noise_floor_db": -38.117110514689955,
+        "mean_decoded_snr_db": -1.430733190341429
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003030.wav",
+      "wav_sha256": "97dc7e2b7db097bfa0d69fd9243dcd9c2a90a70f7746b69e92c2a480077b2499",
+      "interest_score": 56.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 9,
+        "noise_floor_db": -38.421147691685825,
+        "mean_decoded_snr_db": -2.2776729928122625
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003100.wav",
+      "wav_sha256": "686b3888a30defe8f0c4cb6d915a548f29e1a113c370d067c9458587882aa562",
+      "interest_score": 55.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 6,
+        "noise_floor_db": -38.13847802765048,
+        "mean_decoded_snr_db": -1.554329350590706
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003300.wav",
+      "wav_sha256": "eb05058c29608f4d43c2ff42f256910cfd5fe676754d6dc02f99a0240f6c73ae",
+      "interest_score": 54.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 5,
+        "noise_floor_db": -38.18137139698226,
+        "mean_decoded_snr_db": -1.0012053847312927
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003000.wav",
+      "wav_sha256": "a2c274899c8196ede2bd56b500de1b125367cd87e13c6784aa28a86ea8d6a4d3",
+      "interest_score": 54.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 8,
+        "noise_floor_db": -38.510006672680205,
+        "mean_decoded_snr_db": -1.2946205846965313
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003245.wav",
+      "wav_sha256": "2d190461a24bea9685ae5c62b5c50714c3a2cc8ece0f8b9c690f0f33202c8d61",
+      "interest_score": 51.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 6,
+        "noise_floor_db": -37.98999766606634,
+        "mean_decoded_snr_db": 0.8985114693641663
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002000.wav",
+      "wav_sha256": "92e3156682cbe2412a571420001ce0c854a8924759f6b1245469ace950b3be52",
+      "interest_score": 49.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 0,
+        "noise_floor_db": 0.0
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003215.wav",
+      "wav_sha256": "f1fefb6f163d8443c516648ea94dff18fc39ccac95dbdacd00cb1e0559e91e77",
+      "interest_score": 49.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 7,
+        "noise_floor_db": -37.61945329597973,
+        "mean_decoded_snr_db": -0.907322381223951
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003530.wav",
+      "wav_sha256": "566cf9fc928d7de3f45929f8f9acf7bd494a626da49f02b3f1a72d2bd7cce0fa",
+      "interest_score": 48.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 22,
+        "noise_floor_db": -38.55477939881613,
+        "mean_decoded_snr_db": 0.4212890653447671
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003900.wav",
+      "wav_sha256": "59bf66376bf1ac3f6c21e7dc6ba82c62dccd1d87803677ceb9084d83d88d15d3",
+      "interest_score": 47.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -38.20289777637217,
+        "mean_decoded_snr_db": 1.1946014262441742
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003230.wav",
+      "wav_sha256": "318ff3fc9e478a38ed687299ed7c04facc2b635c34b55849663ff930f5713ff2",
+      "interest_score": 46.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 8,
+        "noise_floor_db": -38.13847802765048,
+        "mean_decoded_snr_db": -1.8910012617707253
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003316.wav",
+      "wav_sha256": "2c2e82a6ffd599dc60e7b5b676418b212adbc07c3b3dbe7423d5db714ab31fea",
+      "interest_score": 46.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 5,
+        "noise_floor_db": -37.65985285549987,
+        "mean_decoded_snr_db": -2.115799975395203
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003045.wav",
+      "wav_sha256": "ddfe4c7af178491169edc8901e84541c887b7685227d6a192ceb82b048dab2a0",
+      "interest_score": 44.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 5,
+        "noise_floor_db": -37.20623000296672,
+        "mean_decoded_snr_db": 0.4635507382452488
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003015.wav",
+      "wav_sha256": "e600a3b88ea575e8249cc08b1d196f29bf5a4a08aaac88d62de1bfea7d4eab6c",
+      "interest_score": 44.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 6,
+        "noise_floor_db": -37.57924077212705,
+        "mean_decoded_snr_db": -0.2599998116493225
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003930.wav",
+      "wav_sha256": "c328dfb5289d9cad4e0280f5ddac3a7c2f82427ccfb708aa4667044fa9a2ec5a",
+      "interest_score": 42.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -38.053321564799646,
+        "mean_decoded_snr_db": 0.5002739834396736
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003600.wav",
+      "wav_sha256": "eb762156b2316ab5cb707b9480242e0d9e82d06f0e9a48dadf24a4d0aa4de90a",
+      "interest_score": 42.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 24,
+        "noise_floor_db": -37.72080671713998,
+        "mean_decoded_snr_db": 1.0447538681328297
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260419_185700.wav",
+      "wav_sha256": "28f0ce9e4fef72764e21ed295edc22b91e003b513d4567e11fac403a391cdb3b",
+      "interest_score": 42.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 1,
+        "noise_floor_db": 0.0,
+        "mean_decoded_snr_db": -1.4311573505401611
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002600.wav",
+      "wav_sha256": "9e5b9243b432ca7660a68b78dc4fa293cf4bea3fcb3792bca1da4bd7b3374aba",
+      "interest_score": 42.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -37.98999766606634,
+        "mean_decoded_snr_db": -0.638170441855555
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003500.wav",
+      "wav_sha256": "8e83c6826a718a48441228884e3ad893e7991b9fe0258b7f53884a16c453d3cf",
+      "interest_score": 40.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 20,
+        "noise_floor_db": -38.33318856393206,
+        "mean_decoded_snr_db": 0.23354044407606123
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003730.wav",
+      "wav_sha256": "24acc7134e34192230a9fd0220996b3a243e34315af0a20eb3cf817de4aaebae",
+      "interest_score": 39.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -38.289540785459394,
+        "mean_decoded_snr_db": 0.11356871413147968
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002700.wav",
+      "wav_sha256": "06fec54c745c787ce8231d2a200c7b2821540492a057d09ef272eb200fca1780",
+      "interest_score": 39.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 27,
+        "noise_floor_db": -38.01105437853167,
+        "mean_decoded_snr_db": 0.07912063709011784
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002830.wav",
+      "wav_sha256": "eedc8f12cda07cf24aba3ff7bc531f238262e80ca6bbc86d1d63125ebe369f42",
+      "interest_score": 38.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 17,
+        "noise_floor_db": -37.459708294351934,
+        "mean_decoded_snr_db": 1.90512998928042
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003800.wav",
+      "wav_sha256": "57b8fa60b691a492ac8c34c1610f157c7d952b22680feded009a5639355673c3",
+      "interest_score": 38.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 20,
+        "noise_floor_db": -38.117110514689955,
+        "mean_decoded_snr_db": 0.9767947509884836
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003330.wav",
+      "wav_sha256": "773b009bbe928612f117e90d547fc9d9fce42282b9cd6d41ebc9c966b1359e4b",
+      "interest_score": 37.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 30,
+        "noise_floor_db": -37.9062775997192,
+        "mean_decoded_snr_db": -0.33630918376147745
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003400.wav",
+      "wav_sha256": "42a73dca34731d1c9efd4f23131cda5b2cae9a7668e1b50d7e9b12c018f8dfde",
+      "interest_score": 37.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 22,
+        "noise_floor_db": -37.68012331893092,
+        "mean_decoded_snr_db": 0.6579669029875235
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003830.wav",
+      "wav_sha256": "fbeddac8fb4266a65ed88a2bcea3ee0a204d53c639e49b8ffa5e72c229ef3ac6",
+      "interest_score": 37.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 24,
+        "noise_floor_db": -37.927132086659505,
+        "mean_decoded_snr_db": 0.5552840853730837
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005228.wav",
+      "wav_sha256": "0dc4be386fb5ede87f56bb249fa95c1095acb5450bf1082645ace1272d2e8931",
+      "interest_score": 37.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -35.75817355862323,
+        "mean_decoded_snr_db": 1.409081157710817
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003630.wav",
+      "wav_sha256": "c6c0684db3207ea0dce1a21df74a9342880b4e2e9fa38abe00ea8d0c784cabc2",
+      "interest_score": 35.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 27,
+        "noise_floor_db": -37.68012331893092,
+        "mean_decoded_snr_db": 0.7498401658678496
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003145.wav",
+      "wav_sha256": "143adeeb6f6648a3e28afab279556ce8fab1d4c9801440ada10c0b9df9c4d4be",
+      "interest_score": 34.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 8,
+        "noise_floor_db": -37.40055331221252,
+        "mean_decoded_snr_db": -1.180550403892994
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004030.wav",
+      "wav_sha256": "26c38282bc636090db5478e09f6d4caded9c661a8dda060c7d3aaf5b02642224",
+      "interest_score": 34.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 24,
+        "noise_floor_db": -38.117110514689955,
+        "mean_decoded_snr_db": 1.010516461295386
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005558.wav",
+      "wav_sha256": "01a6b67f47ff8fb7555a07d53da73f9e1a8e7e9988732305f9a7191efb507555",
+      "interest_score": 34.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -38.62237421184374,
+        "mean_decoded_snr_db": 0.23016243719536325
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004758.wav",
+      "wav_sha256": "8b6c84a26a59275d8ee533c553fa7790de591ee42ab33e74a98065222cfdf35a",
+      "interest_score": 34.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 17,
+        "noise_floor_db": -38.355094980684115,
+        "mean_decoded_snr_db": 2.5646929793498097
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005658.wav",
+      "wav_sha256": "7aa3cdbf969ba23fb4b6b1a94f29b70fac6fbe23bc1bef857894ab49150f3206",
+      "interest_score": 34.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 20,
+        "noise_floor_db": -38.18137139698226,
+        "mean_decoded_snr_db": -0.22939696675166488
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025328.wav",
+      "wav_sha256": "cfe6e5c555e3d3c99e78a1a08cc3d24b3a2c21590cb255ce5acffce42e4a8d6b",
+      "interest_score": 34.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 13,
+        "noise_floor_db": -38.3113372577206,
+        "mean_decoded_snr_db": -0.08682051988748404
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002630.wav",
+      "wav_sha256": "166fe3b7673c1b89db388479dbe203cd3873a57f1e14b4517bd5b866bafed1dc",
+      "interest_score": 34.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 28,
+        "noise_floor_db": -37.78219135169351,
+        "mean_decoded_snr_db": -1.0053325109183788
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002800.wav",
+      "wav_sha256": "bdc883cb22b5edce45ee81e1cf25ea6cf7b257f0fcf43e4c4e91b79211789a94",
+      "interest_score": 33.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -37.96899187677638,
+        "mean_decoded_snr_db": -0.6781671542142119
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005358.wav",
+      "wav_sha256": "0877df98728063bd85f339714e9a7b11d1592c3555b348c563749a401e1c42cc",
+      "interest_score": 33.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 22,
+        "noise_floor_db": -36.45206031364976,
+        "mean_decoded_snr_db": 1.5330339839512652
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003115.wav",
+      "wav_sha256": "42107b0cccb3ced2ef24deabd2be12378d4038890474abe034e735750dab07ce",
+      "interest_score": 33.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 8,
+        "noise_floor_db": -37.47951648911237,
+        "mean_decoded_snr_db": -0.9579423181712629
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003700.wav",
+      "wav_sha256": "5522efcba53e0738b6db2689dfdcb7f04c15aaafb77bd38ae5b48050ab85c7c7",
+      "interest_score": 33.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -38.48770655866438,
+        "mean_decoded_snr_db": 1.1286526804878598
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260419_202926.wav",
+      "wav_sha256": "92cc7853e33ab3dcc33ebc100fda5a58382cfad31ab1b899f98b635fd3e809e2",
+      "interest_score": 33.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -38.355094980684115,
+        "mean_decoded_snr_db": -3.630104887816641
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004000.wav",
+      "wav_sha256": "7882622fa7102f38fadd3c7d7e29cbda422afd5ac5d4636887eb9f51361a4518",
+      "interest_score": 33.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 25,
+        "noise_floor_db": -37.65985285549987,
+        "mean_decoded_snr_db": 0.1662896817177534
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025313.wav",
+      "wav_sha256": "34be112ff543c9f6c990d2c6ab746f6f60e954a1a2c8713ed5478a4cbb2dc958",
+      "interest_score": 33.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 16,
+        "noise_floor_db": -37.927132086659505,
+        "mean_decoded_snr_db": -1.5661077369150007
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002730.wav",
+      "wav_sha256": "dce2ea002c6bbef9a64ea216f258ed648042aeb85275d26ab382b5ef4f38baf1",
+      "interest_score": 33.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -37.68012331893092,
+        "mean_decoded_snr_db": -0.28172815623490705
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005628.wav",
+      "wav_sha256": "7eae9ecd4b32b8cb4e5cdb82a3520fcd794b39fd2a0a639519c11aa55e8a1ee6",
+      "interest_score": 32.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 24,
+        "noise_floor_db": -35.645053397062966,
+        "mean_decoded_snr_db": 0.8766729356721044
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002915.wav",
+      "wav_sha256": "ac07db234020b115ad584033b553c8d15fd2047c7313ff2f0816da4e3e40768e",
+      "interest_score": 32.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 24,
+        "noise_floor_db": -37.61945329597973,
+        "mean_decoded_snr_db": -0.6751473744710287
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002715.wav",
+      "wav_sha256": "869cff497b9b3a0ab1631329df9f7213cfd222df23db615193ffa71a717c09a5",
+      "interest_score": 32.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 24,
+        "noise_floor_db": -38.55477939881613,
+        "mean_decoded_snr_db": -1.3557524991532166
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025843.wav",
+      "wav_sha256": "9c2ba9e06dbfa8693b9a1b30650343e447d06582799a96401497210b1f34c424",
+      "interest_score": 31.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 13,
+        "noise_floor_db": -37.9062775997192,
+        "mean_decoded_snr_db": 0.30027632071421695
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002900.wav",
+      "wav_sha256": "2dd06e9841aa7dbc8154f9d1abbaf7eabb287899b44b169b6db93733e7b595f3",
+      "interest_score": 31.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 26,
+        "noise_floor_db": -38.73621449983291,
+        "mean_decoded_snr_db": -0.07803899049758911
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260517_232213.wav",
+      "wav_sha256": "4aa4620d4e043d4d61f7c37606b49b4dea0ff4105c9862ed03bf543c43d4de50",
+      "interest_score": 31.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 17,
+        "noise_floor_db": -38.03216226167297,
+        "mean_decoded_snr_db": 2.0135118111091503
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003745.wav",
+      "wav_sha256": "fa4acd929d51642e7309f4d3429e65fd2daf90c3a3e824929202f8d937a5fbd6",
+      "interest_score": 31.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -38.73621449983291,
+        "mean_decoded_snr_db": 1.4869857287925223
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004628.wav",
+      "wav_sha256": "277dd2e6445eaba8f221afe1a28a2ec3794b428e66b76d7f3b9b9822f5b1ba4b",
+      "interest_score": 31.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -38.07453253904752,
+        "mean_decoded_snr_db": 1.7591719180345535
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002645.wav",
+      "wav_sha256": "1bd3e87f3f4394d3324a445391b9f00a3e7212ba1923a5de74455f5eca97bcb6",
+      "interest_score": 30.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -38.07453253904752,
+        "mean_decoded_snr_db": 0.12187748629113902
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_010628.wav",
+      "wav_sha256": "be1d42577f75dd96014ab0bd416dc8df511b7f8db70e3a055d34709ef4c01219",
+      "interest_score": 30.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 16,
+        "noise_floor_db": -38.510006672680205,
+        "mean_decoded_snr_db": 1.4412725269794464
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_024258.wav",
+      "wav_sha256": "4fe8ec8796ff40fbd12def2bd4dc35959da98073bff4f867e5339c7b978c7d07",
+      "interest_score": 30.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 20,
+        "noise_floor_db": -38.48770655866438,
+        "mean_decoded_snr_db": -0.2787225402891636
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005243.wav",
+      "wav_sha256": "168e3d02c72ee866c211bdd92155fe8bf2e6e5f458be6cbb36deccb6273d14c4",
+      "interest_score": 30.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -36.41689472052298,
+        "mean_decoded_snr_db": 1.7392350264957972
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005958.wav",
+      "wav_sha256": "08cb3e2e486cbff4bb9851ecbdabeaf7154ef9130c739767e86f76d3a41cc702",
+      "interest_score": 29.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -35.95558863914911,
+        "mean_decoded_snr_db": 2.892089655524806
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002815.wav",
+      "wav_sha256": "19820265c0b08989858129b079f430b6b30a834766717577f1e78c93312a7731",
+      "interest_score": 29.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -37.40055331221252,
+        "mean_decoded_snr_db": 0.6597178874780303
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003645.wav",
+      "wav_sha256": "baa9a81c41b5b4784ba43d28c7e8a43a4193a139132c27e98dfd966e5785771a",
+      "interest_score": 29.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -37.42022690983759,
+        "mean_decoded_snr_db": 1.259957809811053
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260517_231943.wav",
+      "wav_sha256": "3632aed89c4eb678135aff44e48f9b3bac2d403c84501ec8d77ae71fa96c7a6b",
+      "interest_score": 29.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 14,
+        "noise_floor_db": -37.2640718791279,
+        "mean_decoded_snr_db": 1.7965169394654887
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_024358.wav",
+      "wav_sha256": "a68a4a0c7bf062d938e6e67ede2ca699d3fc5f45828711a7e3c7549831fcdc9a",
+      "interest_score": 29.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 22,
+        "noise_floor_db": -38.532364187310215,
+        "mean_decoded_snr_db": 0.4171958491206169
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003345.wav",
+      "wav_sha256": "c08e6126c8a4be368bd2c3c1f6fc722835482c106d0319009b0d2aa1d3947f33",
+      "interest_score": 29.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 25,
+        "noise_floor_db": -37.14877076605211,
+        "mean_decoded_snr_db": 0.24379348635673523
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003415.wav",
+      "wav_sha256": "b07d43832193e2480018032aef3c20f7ba5775d3220392c6a4ceed81990b926a",
+      "interest_score": 29.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -36.95993964139528,
+        "mean_decoded_snr_db": 1.960416561081296
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005258.wav",
+      "wav_sha256": "70514b090407406b4bbd29f55079b8c429a69a8ce491fae3b81beedb26b9e071",
+      "interest_score": 29.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -36.48736885673499,
+        "mean_decoded_snr_db": 2.3758492712911807
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003615.wav",
+      "wav_sha256": "53783baa59d7404dd2e44649adfb1f4391c552beda7248ebd4b3d71c91c59833",
+      "interest_score": 28.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 26,
+        "noise_floor_db": -37.51926891382264,
+        "mean_decoded_snr_db": -0.7182703198721776
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_010013.wav",
+      "wav_sha256": "9016d1a76f67d1e2f7a9ac93bdf37a527f9542fc55b4de0a435ba04e8d0713ee",
+      "interest_score": 28.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -37.47951648911237,
+        "mean_decoded_snr_db": 1.0365079272361029
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005458.wav",
+      "wav_sha256": "f975236cc4580bf6582f3c1e56ecaba5dc7c9fd4b2dbaa0ea7fb6a30c3741d40",
+      "interest_score": 28.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 25,
+        "noise_floor_db": -34.267213541559705,
+        "mean_decoded_snr_db": 1.369464453458786
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025228.wav",
+      "wav_sha256": "a9564e2638ae99aed504d4c372c13b30eb528b48758bf8afcb67a95d0c65fef6",
+      "interest_score": 28.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 13,
+        "noise_floor_db": -38.01105437853167,
+        "mean_decoded_snr_db": -0.4101928793467008
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003915.wav",
+      "wav_sha256": "b6af328573410377636e732f1d823f3dd73918302150f2f423eda8b07a5aefbf",
+      "interest_score": 28.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 20,
+        "noise_floor_db": -37.844012891236346,
+        "mean_decoded_snr_db": 2.083935187757015
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005528.wav",
+      "wav_sha256": "17c4b25a92a1f13cbcee1722334a7048870a09431905445901390457b402a4cf",
+      "interest_score": 28.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 27,
+        "noise_floor_db": -35.39189479571978,
+        "mean_decoded_snr_db": 2.0860470503016755
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260517_232243.wav",
+      "wav_sha256": "ee0e744dd0d96ddc8cdf8434562fd716bb21d4f5d3e51a43e23ebfb96c809ce8",
+      "interest_score": 28.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 16,
+        "noise_floor_db": -37.72080671713998,
+        "mean_decoded_snr_db": 2.3731602877378464
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_032658.wav",
+      "wav_sha256": "bcdb78383c34f0726cce5858fa95ec1d462cf69409334bb01e8a2babc291ff2f",
+      "interest_score": 28.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -38.96847137601315,
+        "mean_decoded_snr_db": -2.6223089579078884
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_032213.wav",
+      "wav_sha256": "0900b55a4f18229b0bb7688e4d92464e2a6112122bb878f485091a7d5f4f5fec",
+      "interest_score": 28.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 7,
+        "noise_floor_db": -38.828373344639985,
+        "mean_decoded_snr_db": 0.5594403573444912
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004858.wav",
+      "wav_sha256": "13369209839a3b5851118123f16ea3bd8d55a8e60dabbbe9aac7701f5f16b17e",
+      "interest_score": 28.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 16,
+        "noise_floor_db": -37.9062775997192,
+        "mean_decoded_snr_db": 2.299805405549705
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025728.wav",
+      "wav_sha256": "d1d004c26d810174c59e4cac47fe8b78035f46ee40c97df570c0b594122ddbf2",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 15,
+        "noise_floor_db": -37.30284823655563,
+        "mean_decoded_snr_db": 1.1701695223649342
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003545.wav",
+      "wav_sha256": "ac22a4dddb421257004186c7c6e3a1ad89c9491291845e1389738e8b519d6cc8",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -38.24611124679071,
+        "mean_decoded_snr_db": 0.3644393796012515
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002745.wav",
+      "wav_sha256": "91121b336c2c0e657454b9d24b7a8b4dd8ad3d2c6cf0a92e58240b3dd7f439da",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 30,
+        "noise_floor_db": -37.28343841923148,
+        "mean_decoded_snr_db": 0.31898349821567534
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004658.wav",
+      "wav_sha256": "871d6f82ce2df8c0a4757de0ac70f073456374b342bf320a3335c51d809b43ca",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 22,
+        "noise_floor_db": -38.13847802765048,
+        "mean_decoded_snr_db": 1.419703250581568
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_021858.wav",
+      "wav_sha256": "c8484eb8d1827d037d6407948f705eb305018ef76762f5fe65686ccd6b4cf3f5",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -39.679420358349255,
+        "mean_decoded_snr_db": -0.0034555809365378488
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025428.wav",
+      "wav_sha256": "899201607af0ef6b5b57c527267aa58243538bedb58d37cb02b7769a79236a73",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 13,
+        "noise_floor_db": -38.64502321982191,
+        "mean_decoded_snr_db": 1.1449762078431935
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_030928.wav",
+      "wav_sha256": "b87cbb7bdb0dd07dfb0f98fc087058078fe8b559cd23b1b761bf0952d692a494",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 9,
+        "noise_floor_db": -38.805241800641134,
+        "mean_decoded_snr_db": 3.2615831361876593
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004943.wav",
+      "wav_sha256": "c48a3db4e15e1a64258812f3d6ee522768f2cb3c8f2beb644bcf917996539e28",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 20,
+        "noise_floor_db": -37.12970184590566,
+        "mean_decoded_snr_db": -0.08428555931895972
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_024943.wav",
+      "wav_sha256": "e68fa64aed66ca2bdcb6e318c06b2201e6d0c5a45f738950fdca729bb0f3a492",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 16,
+        "noise_floor_db": -37.82335678248099,
+        "mean_decoded_snr_db": 0.8402002342045307
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_033043.wav",
+      "wav_sha256": "7c9911dd8d80ac140c456d6d7373e2d5ec255cf8804fe812bb7d51d40b3f6cf6",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 11,
+        "noise_floor_db": -38.20289777637217,
+        "mean_decoded_snr_db": -0.4392747526819056
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_032113.wav",
+      "wav_sha256": "1ed7f2801bf5bac512dc77dd126bc855e5586cd135fabddf88d95267df2859f3",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 14,
+        "noise_floor_db": -38.64502321982191,
+        "mean_decoded_snr_db": -1.7677887848445348
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_010158.wav",
+      "wav_sha256": "580d95acd450a5a64fef82e4d05b41bcdc4686b630ba00ce6766bc7d93bd05f5",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 12,
+        "noise_floor_db": -38.69049918568197,
+        "mean_decoded_snr_db": 1.758442673832178
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_232528.wav",
+      "wav_sha256": "8f51d5fee6d5aac0fe591e32cf07e4a393511c16c38d173a04ff2ab0c19b2696",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 27,
+        "noise_floor_db": -37.76168156733971,
+        "mean_decoded_snr_db": -0.13613217103260536
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_024058.wav",
+      "wav_sha256": "08dac709ec366a0ee42416cd678b91b4d786170689af362b5306ce2a1d794338",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 15,
+        "noise_floor_db": -38.71332676685816,
+        "mean_decoded_snr_db": -0.4846323873847723
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003715.wav",
+      "wav_sha256": "f60da148fe16a6a8aee0ffc0897b71585345138081f070f7b3f4f2e2e1a3167d",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 24,
+        "noise_floor_db": -38.01105437853167,
+        "mean_decoded_snr_db": 0.20284167428811392
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_010328.wav",
+      "wav_sha256": "2d4795593313cf93fb68d9900776acabcfff6810b609f3023dfa607379bf1c32",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -37.225467861635146,
+        "mean_decoded_snr_db": 0.0443460104011354
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005313.wav",
+      "wav_sha256": "30211ff1796fdc6f1b9ef1ba8a64f93058339edfcbd7c98392bd048bd1fe54e8",
+      "interest_score": 27.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -36.45206031364976,
+        "mean_decoded_snr_db": 1.341504334693863
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004613.wav",
+      "wav_sha256": "3fccb5863ea7adbb00bdde156e7cbe809d4017bd0d5659025ad0d7e59e26b11c",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -36.86704154048001,
+        "mean_decoded_snr_db": 1.6572315316451225
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_010458.wav",
+      "wav_sha256": "a44c44d38f924d5d948ee690a603b1c6fd0341c4d2fa1050b205c406eddb2560",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -36.9973788788353,
+        "mean_decoded_snr_db": 1.5007359967567029
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_031743.wav",
+      "wav_sha256": "6293606e4a667e3546d4a93bc850a39d7cae75c416bf68d26ef319298c0ef695",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 13,
+        "noise_floor_db": -36.922661087872115,
+        "mean_decoded_snr_db": -0.17520054945578942
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_031943.wav",
+      "wav_sha256": "5832543aab6278676fa8674d1b29d26bdaf3e7e563e0d681c97590cabd352093",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 15,
+        "noise_floor_db": -38.69049918568197,
+        "mean_decoded_snr_db": -1.109254320462545
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025458.wav",
+      "wav_sha256": "e4797731793b636abc50a6ca0196ae3824576f9f748117ef4847bff5fd202efc",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 14,
+        "noise_floor_db": -37.40055331221252,
+        "mean_decoded_snr_db": 0.4754738030689103
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_010558.wav",
+      "wav_sha256": "4abbfc7156651c57d05353587415f0f3dec16efb974d0a443bc9ad2995d7211e",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 17,
+        "noise_floor_db": -37.9062775997192,
+        "mean_decoded_snr_db": 1.102905519580578
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_010758.wav",
+      "wav_sha256": "cc39fd8d43399cd91f8976d3851ecfb912be508ba56d235a97b4d48eedf4ae3b",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -38.289540785459394,
+        "mean_decoded_snr_db": 0.2750051220258077
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002545.wav",
+      "wav_sha256": "0a37a501a153bf071404c6e48d7929e4ae7c5dbcc4d2edbffabbb8eb21d84454",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 25,
+        "noise_floor_db": -36.84858055661643,
+        "mean_decoded_snr_db": 0.184992949962616
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025158.wav",
+      "wav_sha256": "5911a9d92078284baf6352af60573c411f8bd831a420ddc8b6a379cc1a1b4f4d",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -37.38092417473297,
+        "mean_decoded_snr_db": 0.045449202259381614
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002615.wav",
+      "wav_sha256": "3c0f167c0477aee31ca709e411a0dfe2594c62ce98c42cef9df999a2a136c9d6",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 25,
+        "noise_floor_db": -38.26779887263511,
+        "mean_decoded_snr_db": -1.4114446191489696
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_030958.wav",
+      "wav_sha256": "101bbf775ed586b27d3d5852d865552cbf6bbf2c1471854a1cc88182ce217a26",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 10,
+        "noise_floor_db": -36.97863908809674,
+        "mean_decoded_snr_db": 1.3256118983030318
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004558.wav",
+      "wav_sha256": "cb36bfc430af5ed5242ad3e53cd7abbcabbdf4604ef54da36dda9ed2b4fc49a7",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -38.355094980684115,
+        "mean_decoded_snr_db": 2.2809646026757746
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004928.wav",
+      "wav_sha256": "cad26712204b63e61f1263ac5b6c29d041cd8012f0dace5f28b667d1b64b3681",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -38.09579543739676,
+        "mean_decoded_snr_db": 0.8482075074444646
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_033628.wav",
+      "wav_sha256": "1bf94c1db45826e0f638c0fc35d33acca8aff00b64df2273d4bbe26e3cc4ae54",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 12,
+        "noise_floor_db": -37.459708294351934,
+        "mean_decoded_snr_db": -0.1065229040880998
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_024758.wav",
+      "wav_sha256": "d7eff3c4716e0f025b3c4c9e6cd9b51fb5d4be162f3b4123bb707aa1dd7a30c5",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 16,
+        "noise_floor_db": -37.68012331893092,
+        "mean_decoded_snr_db": 1.516126834321767
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_030343.wav",
+      "wav_sha256": "e4924431c89dbe4d230814140b4c91c55d4d27bbaa6ed521c6480bb6536463dd",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 14,
+        "noise_floor_db": -38.355094980684115,
+        "mean_decoded_snr_db": -0.4764265843800136
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_031428.wav",
+      "wav_sha256": "63b1d1e234eb82a076bbd7fee844ce098fc31cfd14b668c34c01e78abdf90496",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 11,
+        "noise_floor_db": -36.46969664384715,
+        "mean_decoded_snr_db": 2.791583299636841
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_024458.wav",
+      "wav_sha256": "1c252a3e3d1490f9c29b6c65ff89463fdd19fe07a8b5e5f029e5f6737f9c9e1f",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -37.88547306369365,
+        "mean_decoded_snr_db": 1.0190982007318072
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_010428.wav",
+      "wav_sha256": "c75021ec745bdf88feeab37c8da46447b6f777029afcd02b359701b89e027fbd",
+      "interest_score": 26.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 20,
+        "noise_floor_db": -37.70044119869388,
+        "mean_decoded_snr_db": 0.6999586788471788
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_032328.wav",
+      "wav_sha256": "847a89b338b17aace7106fdfb59a6fd9c206d5d71d117e05252a56f134ab359e",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 16,
+        "noise_floor_db": -37.61945329597973,
+        "mean_decoded_snr_db": -1.5938984267413616
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_033028.wav",
+      "wav_sha256": "57c48355ee95e6b6f652d25e8b2c6bf14323f0e04363e0b8934892bb45cf0eb5",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 12,
+        "noise_floor_db": -38.87482206302061,
+        "mean_decoded_snr_db": -0.6818769484137496
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_021828.wav",
+      "wav_sha256": "10486f2aa5ab509125f996da7e596960e074915e462ffee67b8c4aeae0bf861b",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 13,
+        "noise_floor_db": -39.628476578071655,
+        "mean_decoded_snr_db": -0.28164108899923473
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_232028.wav",
+      "wav_sha256": "54a8dc4446aac74d54ee7a8653b7c59c38de925a9de7185ca90ece39814c8d4e",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -37.76168156733971,
+        "mean_decoded_snr_db": -0.31504018345604773
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004643.wav",
+      "wav_sha256": "764accede86b4930707d11c629392a886e3a7f4461694768104f1000d2a7f4ba",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -37.539213560101615,
+        "mean_decoded_snr_db": 1.4659159114318234
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025343.wav",
+      "wav_sha256": "b32bfa10d08233ad1f5500ccbf766f420826ba459cf3a1f804b6e3c1873058f1",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -37.74122009818812,
+        "mean_decoded_snr_db": -0.07123244948604185
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004015.wav",
+      "wav_sha256": "6100352384b62eaeaddb7bea0c51e3d3e7d95ddc5551dcc474f608da8c438936",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 25,
+        "noise_floor_db": -37.42022690983759,
+        "mean_decoded_snr_db": 1.5321653786301612
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_024728.wav",
+      "wav_sha256": "22285312c72b3931c5610f5758dd5fe9593ae75754093c353ce883db6c9ac1fc",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 10,
+        "noise_floor_db": -36.55841947490168,
+        "mean_decoded_snr_db": 1.054989266395569
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025613.wav",
+      "wav_sha256": "fbc5fe5f8730394efbfef806aca1f666fd1c3305e6d127def40f1bdda1295625",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -37.88547306369365,
+        "mean_decoded_snr_db": 0.4353466488813099
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_024828.wav",
+      "wav_sha256": "b95744a526d60270453adeac654c66e02ee60c17e446c10c145fe6d1db634460",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -38.532364187310215,
+        "mean_decoded_snr_db": 0.6043622238295419
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_033958.wav",
+      "wav_sha256": "bd4cf1045f0bd182590e593f9b94e88b89736548dd847a1bd99ee7f2fba9a8dd",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 8,
+        "noise_floor_db": -37.844012891236346,
+        "mean_decoded_snr_db": -1.6687778532505035
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_024958.wav",
+      "wav_sha256": "3caab14589238e4884421d64ba63433e5430b2e4b3cf65011a78cd420f35cecc",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -37.74122009818812,
+        "mean_decoded_snr_db": -0.20862807830174765
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_020458.wav",
+      "wav_sha256": "f278af5fd43993a420562bd1a619dee56b26ab10b1d80d5acc0071a703e7d353",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 14,
+        "noise_floor_db": -37.76168156733971,
+        "mean_decoded_snr_db": 1.2535192146897316
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005858.wav",
+      "wav_sha256": "2fd20708cf934b58021c5f77111a5c277bbf21059a07bcf7c502451f2a360bf4",
+      "interest_score": 25.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 25,
+        "noise_floor_db": -38.24611124679071,
+        "mean_decoded_snr_db": 1.2298936999961734
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025858.wav",
+      "wav_sha256": "9ea4782342cd674861b362e9fbe3cd410a5fbeaf28579c759260fb4f65cbce9c",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 13,
+        "noise_floor_db": -37.844012891236346,
+        "mean_decoded_snr_db": 0.9857750374537247
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_020343.wav",
+      "wav_sha256": "28f4a553c3fe9d9dff024d1a4f74db5568ed609a9afd5ed9cd40f35f0fdaf238",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 16,
+        "noise_floor_db": -38.94496421785446,
+        "mean_decoded_snr_db": 1.6744495779275894
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_024243.wav",
+      "wav_sha256": "b17ebe17caf7b74ca327063f308dc5a12a9f026759753ea3b70ae8fb78cd9470",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 14,
+        "noise_floor_db": -37.57924077212705,
+        "mean_decoded_snr_db": -1.568732729979924
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_022028.wav",
+      "wav_sha256": "969aa58e726cd80861b92b84048fd9d9d54e015fdc24d5132f3ab842b326fddf",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 16,
+        "noise_floor_db": -38.94496421785446,
+        "mean_decoded_snr_db": 2.196616720408201
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025358.wav",
+      "wav_sha256": "0777e56a2c564e1fee24cb437e498a658e24be980ceda77eddf19ea31384ce69",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 11,
+        "noise_floor_db": -36.9973788788353,
+        "mean_decoded_snr_db": 0.9247040235522118
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005513.wav",
+      "wav_sha256": "832181c8a4004c14a26efa0b554a7e4f2e2b31201c11753e2ef29c6e63f36845",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 22,
+        "noise_floor_db": -33.23503446367087,
+        "mean_decoded_snr_db": 0.3329236480322751
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025258.wav",
+      "wav_sha256": "31a3bc9d9812afd94168ffcb4facb0bfacd8ca1d547ce556fad66ff1b8b373db",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -37.57924077212705,
+        "mean_decoded_snr_db": 0.588685719590438
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005328.wav",
+      "wav_sha256": "34ba45d0f7b21e6e7841403e6d866eaad273af57f96434fd2efde603b483047e",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -36.540602259140144,
+        "mean_decoded_snr_db": 1.707474912915911
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005758.wav",
+      "wav_sha256": "8e17abbbcc95017a3c510f40b5832d42daff52da7092b45a6f73a018dda8fef4",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -34.010735073692885,
+        "mean_decoded_snr_db": 1.8058894924495532
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003945.wav",
+      "wav_sha256": "8aa8d889091b8ef792603c61980da00f2a3dd9fe58dcd6fd12572238b11ce211",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -37.47951648911237,
+        "mean_decoded_snr_db": 1.2300224962987398
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_021658.wav",
+      "wav_sha256": "335abfc352fb4394fc3237da6c991820f687fda5c4fc9921299b40b51fdd9eb9",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -39.3289334586786,
+        "mean_decoded_snr_db": 0.3246803631385167
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005543.wav",
+      "wav_sha256": "bc92642b768e85333d63cc64d0a461928b6ae290174431405f3bc7dc6da31247",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 22,
+        "noise_floor_db": -36.86704154048001,
+        "mean_decoded_snr_db": 1.123884659937837
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_002845.wav",
+      "wav_sha256": "75e84f8e3b18cabd0e8d18fa0f34bc928201b9d8a5cad3b3ceae476d97ee9b69",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 22,
+        "noise_floor_db": -38.07453253904752,
+        "mean_decoded_snr_db": -0.22870661301369016
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004514.wav",
+      "wav_sha256": "5b04dd2c9c3f4b5f201b78b9c30590f1cb3c155c5e11ce36e282461cd3c2f1c9",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 26,
+        "noise_floor_db": -36.8301587265126,
+        "mean_decoded_snr_db": 1.0461094637329762
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005928.wav",
+      "wav_sha256": "7079eca01d47a42dac723f4e6142fa6ac4742f60f21b254e8ae609291fed5d37",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 24,
+        "noise_floor_db": -39.52747672333883,
+        "mean_decoded_snr_db": 1.902634672820568
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025513.wav",
+      "wav_sha256": "a194b448dbcca94f2ac9393f42074d08567e1d0d88dc3a749035229a774bcb95",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 15,
+        "noise_floor_db": -39.182948683848615,
+        "mean_decoded_snr_db": 1.3095480938752493
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_031228.wav",
+      "wav_sha256": "f3a8fa194815c2536ab62e40a9fbc9e1ee7f4bc0cc80e90c56bacd851d76bddb",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 14,
+        "noise_floor_db": -37.559204108944144,
+        "mean_decoded_snr_db": 1.266953753573554
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_232958.wav",
+      "wav_sha256": "f342610a94861413862c390bee0918813cb3af9440ca3e37eefc1f71c74e66b0",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 33,
+        "noise_floor_db": 0.0,
+        "mean_decoded_snr_db": -0.1764166508660172
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_032628.wav",
+      "wav_sha256": "19f53ad760bc00df052dc809dff26c6d648f887277242444a3839efb233e5789",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 20,
+        "noise_floor_db": -39.279998739736854,
+        "mean_decoded_snr_db": -1.0380486249923706
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005343.wav",
+      "wav_sha256": "36cdfce9030b217e211764b4c436472944d8daafaabffa4d85c5f9c19444f9bd",
+      "interest_score": 24.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 22,
+        "noise_floor_db": -36.73863111839208,
+        "mean_decoded_snr_db": 1.631921158934181
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003815.wav",
+      "wav_sha256": "a76f751eb0181e93801cc7208cf600c71cba4e250e5eb8aa961feb73774d0c9a",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 24,
+        "noise_floor_db": -38.64502321982191,
+        "mean_decoded_snr_db": 1.0835649486010273
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025128.wav",
+      "wav_sha256": "3fa6faa49657c7ae49584a3f1a26ccd55482b3343013bd23b90f210feae28013",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 17,
+        "noise_floor_db": -37.74122009818812,
+        "mean_decoded_snr_db": -0.49092668185339255
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_032043.wav",
+      "wav_sha256": "a488c9b041f8a9dd65a267c119caccc281af1eb817b0da83e69ceece5b13cb1d",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -38.44327735878522,
+        "mean_decoded_snr_db": -1.3985517524544977
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_033528.wav",
+      "wav_sha256": "b5359463779bd645987c9c2373bc82a44889d5e854d39e0d21f3774c3f828e45",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 16,
+        "noise_floor_db": -37.98999766606634,
+        "mean_decoded_snr_db": -2.0214471286162734
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_032243.wav",
+      "wav_sha256": "54991618e717f7b7e8ed9340103521219e4021852e015163c89e1f113c2abfc4",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 12,
+        "noise_floor_db": -38.75916270244985,
+        "mean_decoded_snr_db": 0.06204529975851377
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_020513.wav",
+      "wav_sha256": "d5cc9cd884ae7fd6eea09d1e26c1b5b55ab08b56fbbfeebeea44aea8dee154f2",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 20,
+        "noise_floor_db": -38.421147691685825,
+        "mean_decoded_snr_db": 1.1729631841182708
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_034013.wav",
+      "wav_sha256": "22ab499937a0d8c37269a2284eeeef2cc9d498d99323f3e493a6c0453debc67a",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 17,
+        "noise_floor_db": -37.96899187677638,
+        "mean_decoded_snr_db": -0.6302814263412181
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_232858.wav",
+      "wav_sha256": "78454594f5651b0bc30a0bba387be9e93d227e2859111b8498e6ad1333768145",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 33,
+        "noise_floor_db": 0.0,
+        "mean_decoded_snr_db": 0.8356685277187463
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_020413.wav",
+      "wav_sha256": "b1e87266dcbf8d95caa0604586b40a6c1c6f139e40a715656837a71ba5adbd3c",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -38.33318856393206,
+        "mean_decoded_snr_db": 1.792525893284215
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_022458.wav",
+      "wav_sha256": "0a11ff3ccc72a744decd38df8d5735cdec4e21882e56e539bc6eb7415253ee20",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 15,
+        "noise_floor_db": -38.92152050689344,
+        "mean_decoded_snr_db": 1.7167080521583558
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005213.wav",
+      "wav_sha256": "2b2fd1a80a61e1c0e1049faffb69549b92d8c7620d92ff322f2a0a0218bbd707",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 25,
+        "noise_floor_db": -36.86704154048001,
+        "mean_decoded_snr_db": 2.275438054203987
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_032558.wav",
+      "wav_sha256": "0c15d4a2d5674ed0be1389c5f975b565e6e2612fbce9b1e4bad650f048b4f3b8",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 14,
+        "noise_floor_db": -38.33318856393206,
+        "mean_decoded_snr_db": -0.7592197837574142
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_032528.wav",
+      "wav_sha256": "c5ec0a544b8cb384e9101eb555c924bfcf36c84f3fbf008d50dd07293e5b3efb",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 17,
+        "noise_floor_db": -38.07453253904752,
+        "mean_decoded_snr_db": 1.156799489960951
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_033143.wav",
+      "wav_sha256": "9b6b5710faa618fb1f1e0eff14f3bd707f9bde573dcb69af1044ba4d534f84c3",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 16,
+        "noise_floor_db": -37.72080671713998,
+        "mean_decoded_snr_db": -0.9082662221044302
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_030458.wav",
+      "wav_sha256": "a2b109cc79ac342692d86c1f7e8b849304b1b95d519037273df9d14451a2f724",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 14,
+        "noise_floor_db": -38.18137139698226,
+        "mean_decoded_snr_db": 1.5571814945765905
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025043.wav",
+      "wav_sha256": "0b09b0a79f486b29a3fd7389fce28a39c20175fc598a5f69be89f0a15f4b7cdb",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -38.03216226167297,
+        "mean_decoded_snr_db": -0.08512190690166072
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005428.wav",
+      "wav_sha256": "4feabe92785f9128493607fa2a5854e051a10cbac3ecd87bcce546cd3ce5444b",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 26,
+        "noise_floor_db": -36.17464305245918,
+        "mean_decoded_snr_db": 1.0682089059398725
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_033213.wav",
+      "wav_sha256": "4c45d793fda0a97f49bc00ce17356f7d771d691320284582ec7a169083c527c8",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 12,
+        "noise_floor_db": -37.57924077212705,
+        "mean_decoded_snr_db": -0.5422304718134304
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004713.wav",
+      "wav_sha256": "96d2432d49d70fbf110e5cdd808ee9f50d905aca79561388e65eaebe5369d705",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -37.61945329597973,
+        "mean_decoded_snr_db": 1.4988157404096505
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_030528.wav",
+      "wav_sha256": "c3e2e5d6f1bb804511bc95387ab695fc5bd4f149ffc81dc90086aa78f4b2558a",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -38.39907426268287,
+        "mean_decoded_snr_db": 1.747052694621839
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_031128.wav",
+      "wav_sha256": "995a6e8678e3a3c0170dab61ab90dc13aacaa591bab5f008b54b1a427b855f75",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 15,
+        "noise_floor_db": -33.60787666479204,
+        "mean_decoded_snr_db": 0.8059109965960185
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_020443.wav",
+      "wav_sha256": "196fac23c6b5b1c0c34712fbe73b5944aeaee2875df30f7ced1f2d3c4bc0a0c3",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -38.532364187310215,
+        "mean_decoded_snr_db": 1.724397534798635
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004543.wav",
+      "wav_sha256": "c3175142e7c133f7c49ad861c1e9e414df2cc735a725a64c14b2fe0653e44a87",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -37.36133929690196,
+        "mean_decoded_snr_db": 1.83101709101997
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004743.wav",
+      "wav_sha256": "3d300c345a0fa3f562cb962d9675394d85de070a4608e4651cee4d34990b5b76",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 17,
+        "noise_floor_db": -37.42022690983759,
+        "mean_decoded_snr_db": 0.22540678522166083
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_011058.wav",
+      "wav_sha256": "8396309c25afaffe8a7099c8f1a1f9caffd8f5c88dab893e6f08da714ccaca26",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 25,
+        "noise_floor_db": -37.74122009818812,
+        "mean_decoded_snr_db": 1.4935796320438386
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_032458.wav",
+      "wav_sha256": "64b5f090ccc101eba918edf237c35d84346c63620b32e77a357a9f350e1ba5cb",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 16,
+        "noise_floor_db": -37.49936995978592,
+        "mean_decoded_snr_db": -0.4842157366219908
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005643.wav",
+      "wav_sha256": "50a53397557ab4518f9c3838d69e07f7a0918ff603013250a5cf0fafb6f0a129",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 23,
+        "noise_floor_db": -37.30284823655563,
+        "mean_decoded_snr_db": 1.8281472203848157
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_024628.wav",
+      "wav_sha256": "ef5f9d8967f9c81f784e8caafa722afd42841f31dbb173fb92052c7ddfae4cbc",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 22,
+        "noise_floor_db": -37.96899187677638,
+        "mean_decoded_snr_db": 0.9039908119223334
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_005443.wav",
+      "wav_sha256": "21c891e87e211cb3917e90ac1e2b5bf67263e0a84d7eef5e2dade00cddbd6df8",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -36.612091466306104,
+        "mean_decoded_snr_db": 1.4995156469799222
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_024228.wav",
+      "wav_sha256": "86f8448aaf0fc4caa49b90b3fac98cb164054eacfd69597e144bb453b4a35266",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -38.465463551277026,
+        "mean_decoded_snr_db": 0.6805267749648345
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_030213.wav",
+      "wav_sha256": "5c3fea6669ad870230b037442e29534a825c51b637f1fd95162b31220d60c3df",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 11,
+        "noise_floor_db": -37.98999766606634,
+        "mean_decoded_snr_db": 1.077268191020597
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_024928.wav",
+      "wav_sha256": "608f65b6215f1d89ffb66fff3050ad78a4f8ed39151f09f9aae36f85623bf531",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 15,
+        "noise_floor_db": -37.12970184590566,
+        "mean_decoded_snr_db": -0.6021463096141815
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_030613.wav",
+      "wav_sha256": "4dc2c37807f57d5cdb6adb8cfaed58d137d052741da8109a15bf73d5de4235fe",
+      "interest_score": 23.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 15,
+        "noise_floor_db": -35.92237295951983,
+        "mean_decoded_snr_db": -0.6331860701243083
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_033228.wav",
+      "wav_sha256": "35875cb182d82a55013db3685e113fb5a2ea96ab9420f4ebc181f3f4b487d2de",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 11,
+        "noise_floor_db": -38.71332676685816,
+        "mean_decoded_snr_db": 0.9926578917286611
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_023128.wav",
+      "wav_sha256": "6a992692b14b74651fe28b0b102bd4cecc836fb7482e2697591da4154491245b",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 11,
+        "noise_floor_db": -38.224477637504954,
+        "mean_decoded_snr_db": 2.352902951226993
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_003515.wav",
+      "wav_sha256": "6dac30ab28da96b1605c8778b3331187c3b902fb01e1ce95f85d38a6946dcb8e",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 24,
+        "noise_floor_db": -38.20289777637217,
+        "mean_decoded_snr_db": 0.7731701278438171
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_022528.wav",
+      "wav_sha256": "8fba5d092021366612fe32dad9507de64f3a6c22eb2847ab9f75cb5276263ede",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 14,
+        "noise_floor_db": -39.08697102621324,
+        "mean_decoded_snr_db": 1.7209617240088326
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_024758.wav",
+      "wav_sha256": "a578885f93ef0024529187de211895cf140c90b43e534411d9c26416c5336af5",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 20,
+        "noise_floor_db": -38.94496421785446,
+        "mean_decoded_snr_db": 0.9699501425027848
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025443.wav",
+      "wav_sha256": "5b973c99dfbec2048e5a1e2b41a3fe10967c73e0cf518534fb06938c74031ca6",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -38.59978410902435,
+        "mean_decoded_snr_db": 0.5279196082570013
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025543.wav",
+      "wav_sha256": "b1b72ca070d53a9af47f20995e1fc6224e4609bc0afb3eb3c752a2a263b675fe",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -38.33318856393206,
+        "mean_decoded_snr_db": 0.07661672433217366
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_033458.wav",
+      "wav_sha256": "d2743b19337983f90d92c85eea5c24f03b24acfe7980bf76ed4b5adc13783760",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -37.927132086659505,
+        "mean_decoded_snr_db": -1.0775471445586946
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_031843.wav",
+      "wav_sha256": "0030b4ecbe9f7c8033aa3751851da91131f424458aafbe2e5996fe64bf952d13",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 15,
+        "noise_floor_db": -37.61945329597973,
+        "mean_decoded_snr_db": -0.808954581618309
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025943.wav",
+      "wav_sha256": "73e9a5764e97df0831eb7d82b055e95f635ff368e9b842351b11c6345dabca46",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 14,
+        "noise_floor_db": -38.24611124679071,
+        "mean_decoded_snr_db": 0.8893407455512455
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_233628.wav",
+      "wav_sha256": "c080f07dacb25e1cf7ebf4841d9a48c10d100ad9f01e096a06682ff55fb530b8",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 26,
+        "noise_floor_db": -37.98999766606634,
+        "mean_decoded_snr_db": -1.017203341309841
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004528.wav",
+      "wav_sha256": "0e4939de0fe011a66e29e765322020ca7a777b7159cad1088b7e8fea00bb2148",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -38.20289777637217,
+        "mean_decoded_snr_db": 1.7829803495357437
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_033358.wav",
+      "wav_sha256": "b273fd9d680a49c88f820565c05592ef308f90bd3e698c4724ab4137334ff706",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 12,
+        "noise_floor_db": -38.39907426268287,
+        "mean_decoded_snr_db": -0.28257850309213
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025758.wav",
+      "wav_sha256": "52f672df7943e4fadda72e83b45404a24f73c04b956b3915da63df886f46b123",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 19,
+        "noise_floor_db": -37.86471823986845,
+        "mean_decoded_snr_db": 0.07550671147672754
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_032343.wav",
+      "wav_sha256": "c7c00e86958232bc2f0fe364e9b448789aa1a5af1b7158d04749786beb2c1d73",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 13,
+        "noise_floor_db": -35.66112350273499,
+        "mean_decoded_snr_db": -1.4555901564084566
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_010543.wav",
+      "wav_sha256": "72dec25f30af21771d1446af77a41e5643c173a8fa55868889515e8574a4e2d1",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 26,
+        "noise_floor_db": -36.157595177235635,
+        "mean_decoded_snr_db": 1.7774255608136835
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_021628.wav",
+      "wav_sha256": "34f83118eadce7d03b889d7d5ff60d0253df76f38fa4fb277d59215ead5a892b",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -39.628476578071655,
+        "mean_decoded_snr_db": 1.3230766590152467
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_031028.wav",
+      "wav_sha256": "79ab9dd3443fdfaa7a2dcf120f0f6dfff2dce1cd66dafd64d263466b18635787",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 11,
+        "noise_floor_db": -36.540602259140144,
+        "mean_decoded_snr_db": 1.2811635299162432
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_031628.wav",
+      "wav_sha256": "5ddc292cf0b4622e7da71dd756ca331d0bfd114a47a13fca440af86f3ce61586",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 14,
+        "noise_floor_db": -37.18703465893772,
+        "mean_decoded_snr_db": 2.213016771844455
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260420_004828.wav",
+      "wav_sha256": "820ea8c0294255edf51bc0c8bf1f3f4899a6cb1a22576393d1ad27ee658e061c",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 21,
+        "noise_floor_db": -37.82335678248099,
+        "mean_decoded_snr_db": 2.313737890727463
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_025558.wav",
+      "wav_sha256": "8c27ae2e1ff1d9504092a70b9fe870c27fe6661aeb9c2565b2397a81e5544171",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 18,
+        "noise_floor_db": -36.73863111839208,
+        "mean_decoded_snr_db": 0.3604308168093363
+      }
+    },
+    {
+      "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260428_033243.wav",
+      "wav_sha256": "412a91ecd188c6d1f381c810abae23834f3cfb36eb0cb899cfa494d14c873f20",
+      "interest_score": 22.0,
+      "score_breakdown": {
+        "pancetta_decode_count": 15,
+        "noise_floor_db": -37.86471823986845,
+        "mean_decoded_snr_db": -1.9729462054868536
+      }
+    }
+  ]
+}

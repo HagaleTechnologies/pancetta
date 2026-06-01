@@ -47,6 +47,10 @@ name = "curate"
 path = "src/bin/curate.rs"
 
 [[bin]]
+name = "curate-jt9-rich"
+path = "src/bin/curate_jt9_rich.rs"
+
+[[bin]]
 name = "leaderboard"
 path = "src/bin/leaderboard.rs"
 
