@@ -3187,9 +3187,12 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-human-loop.md (entry H3).
 
-### hb-161 — `Q` key: operator STOP mid-QSO when pancetta is wrong  [PRIORITY: 0.50, spawned 2026-06-01 from human-loop ideation]
+### hb-161 — `Q` key: operator STOP mid-QSO when pancetta is wrong  [SHIPPED 2026-06-01 — Phase 5 safety driver]
   mode: ft8 (operator-HITL / safety)
-  status: pending
+  status: SHIPPED — code lands as `feat(tui): hb-161 — Q STOP key
+    emergency operator override + TUI banner`. Phase 5 meatspace
+    verification (actually pressing Q at the rig) deferred to
+    project-meatspace-pending.
   priority_score: 0.50
   estimated_effort: 1 session
   expected_delta: immediate TX stop + diagnostic snapshot + ADIF flag operator-aborted (NOT failure for recent-failure penalty); every Q-press is gold-standard training data
@@ -3205,6 +3208,25 @@ current_ratio: 0.051
     already has terminal states.
 
     See research/ideation/2026-06-01-human-loop.md (entry H4).
+
+    Implementation summary (2026-06-01):
+    - Shift+Q in the TUI emits `TuiCommand::OperatorEmergencyStop`.
+    - Coordinator handler aborts in-flight TX, flips a new
+      `autonomous_enabled_runtime: Arc<AtomicBool>` to false, stops
+      the repeating-CQ loop and any active tune, and logs at WARN
+      with target=operator.override.
+    - Autonomous decision loop reads the runtime gate every slot
+      before dispatching TX items; dropped items are logged once.
+    - TUI renders a red "STOPPED BY OPERATOR" banner (non-modal —
+      other keys keep working). Esc clears the banner. Re-enabling
+      autonomous is explicit (`a` key) — the gate does not auto-restore.
+    - 4 new unit tests in pancetta-tui::tui_runner::key_tests.
+    - 61 pancetta-tui tests pass, 49 pancetta tests pass.
+
+    Diagnostic-snapshot (last-3-RX + decoder-conf + audio-RMS) and
+    ADIF "operator-aborted" flag from the original ideation are NOT
+    in this drop — the safety-driver kill switch is. Those are
+    follow-ons; the spec called for the kill-switch first.
 
 ### hb-162 — Post-session review CSV: operator labels each decode  [PRIORITY: 0.30, spawned 2026-06-01 from human-loop ideation]
   mode: ft8 (operator-HITL)
