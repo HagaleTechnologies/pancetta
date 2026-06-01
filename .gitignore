@@ -91,6 +91,10 @@ training/neural_osd/train_ensemble.stdout.log
 training/neural_osd/train_ensemble_nb.stdout.log
 training/neural_osd/ensemble_inference.stdout.log
 training/neural_osd/ensemble_nb_inference.stdout.log
+# hb-194 Session 2 — N=8 ensemble checkpoints used to produce the
+# weight-space averaged (Wortsman 2022 model-soup) blob. The averaged
+# blob is reproducible from these via average_ensemble_weights.py.
+training/neural_osd/session2/
 *.npy
 
 # Database backups
