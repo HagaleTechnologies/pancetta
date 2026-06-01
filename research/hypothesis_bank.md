@@ -303,10 +303,10 @@ current_ratio: 0.051
     external-source target — JTDX is architecturally closer to
     pancetta than WSJT-X-Improved.
 
-### hb-048 — AP type 7 (a7) cross-correlation against decoded callsigns  [PRIORITY: 0.45, spawned 2026-05-24 from mr-001]
+### hb-048 — AP type 7 (a7) cross-correlation against decoded callsigns  [SHELVED 2026-06-02 — within-WAV mechanism does not surface truths]
   mode: ft8
-  status: pending
-  priority_score: 0.45
+  status: SHELVED — within-WAV path. Cross-slot path deferred (needs chronological corpus or live trace).
+  priority_score: 0.0
   estimated_effort: PLAN-SIZED (~3 sessions, design doc first)
   expected_delta: step-change recall potential — but high FP risk
   defensible_prior: yes (Joe Taylor 2021 commit + active uptake in WSJT-X-Improved)
@@ -378,6 +378,47 @@ current_ratio: 0.051
     Next: Session 3 = wire a7_cross_correlation_pass into
     decode_window_with_ap after V1 joint-pair-retry; threshold sweep on
     hard-200 + synth + fixtures; A/B vs main.
+  status_2026_06_02_session3: |
+    Session 3 COMPLETE — SHELVED (within-WAV path).
+    Production wiring landed: `a7_cross_correlation_pass` invoked in
+    `decode_window_with_ap` after V1 joint-pair-retry. 4 new
+    `Ft8Config` fields (`a7_enabled` default false; thresholds default
+    to WSJT-X 6.0 / 1.8 / 6.25 Hz). 4 new eval CLI flags
+    (`--a7-enabled`, `--a7-snr7-threshold`, etc.).
+    Sweep on hard-200 (FP-filter on, 6 settings + baseline):
+      * snr7=6.0  snr7b=1.8 (WSJT-X ref):   rec Δ=+0   novel Δ=+382
+      * snr7=5.0  snr7b=1.5 (most loose):   rec Δ=+1   novel Δ=+727
+      * snr7=5.5  snr7b=1.8:                rec Δ=+0   novel Δ=+390
+      * snr7=6.0  snr7b=2.2:                rec Δ=+0   novel Δ=+214
+      * snr7=6.5  snr7b=2.2:                rec Δ=+0   novel Δ=+212
+      * snr7=7.0  snr7b=1.8:                rec Δ=+0   novel Δ=+369
+    Bootstrap CI (n=1000, seed=0xb007):
+      * smoke: rec CI [+0.0, +0.0] — NOT significant; novel CI
+        [+342, +421] — significant FP.
+      * most permissive: rec CI [+0.0, +3.0] — NOT significant;
+        novel CI [+664, +783] — significant FP.
+    SHELVE-definitive (per design spec): hard-200 rec < +5 across the
+    full sweep AND no plausible parameter set survives.
+    Why the within-WAV path failed where Session 2's synthetic-injection
+    micro-test passed: Session 2 verified primitive correctness against
+    a known-injected truth; Session 3 measures the production case
+    where a7's template bank is rooted at callsigns decoded IN THE
+    CURRENT WAV — but the residual at nearby `sync_candidate`s holds
+    OTHER stations' transmissions, not the rooted callsign's
+    follow-up. WSJT-X's a7 only works cross-slot (slot N's decode
+    seeds slot N+1's templates), which the offline eval-harness
+    cannot simulate (each WAV is independent).
+    `a7_enabled` stays default-false in production. The within-WAV
+    path is SHELVED.
+    DEFERRED (cross-slot follow-up): the CrossTimeState bridge that
+    would seed `prev_slot_calls` from a previous slot's decodes
+    remains buildable; testing requires either a chronological-slot
+    synthetic corpus or a live production trace. NOT a separate
+    hypothesis — shares all Session 2 plumbing. To revisit when:
+    (a) chronological-slot corpus exists, (b) production needs to be
+    measured live on an FT8 station with a real cross-slot QSO. Until
+    then, `a7_enabled = false` is correct.
+    Branch: iter/2026-06-02-hb-048-session3, 3 commits.
 
 ### hb-050 — Rolling callsign-window tracker  [SHELVED 2026-05-24 — closed by hb-051 ceiling]
   mode: ft8
