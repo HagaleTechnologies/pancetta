@@ -19,6 +19,11 @@ pub struct Decode {
     /// today, so this is `true` for our impl; the field exists for parity
     /// with baseline tools that may report uncertain decodes.
     pub crc_valid: bool,
+    /// hb-129: presentation-time-into-window (seconds elapsed from window
+    /// start until this decode passed CRC). `None` for decoders that don't
+    /// emit timing (jt9 subprocess, ft8_lib FFI). Used by the TTFD metric.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode_time_into_window_s: Option<f64>,
 }
 
 /// Generic interface for any decoder we want to evaluate. Implementors wrap
@@ -472,6 +477,9 @@ impl DecoderUnderTest for Ft8Decoder {
                     dt_s: d.time_offset,
                     snr_db: d.snr_db as f64,
                     crc_valid: true,
+                    // hb-129: presentation-time elapsed from window start
+                    // when this decode passed CRC. Used by TTFD metric.
+                    decode_time_into_window_s: d.decode_time_into_window.map(|t| t.as_secs_f64()),
                 });
             }
         };
@@ -578,6 +586,8 @@ impl Jt9Decoder {
                 dt_s,
                 snr_db,
                 crc_valid: true,
+                // hb-129: jt9 doesn't expose per-decode timing.
+                decode_time_into_window_s: None,
             });
         }
         Ok(decodes)

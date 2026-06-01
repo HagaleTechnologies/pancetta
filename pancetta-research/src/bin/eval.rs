@@ -13,7 +13,7 @@ use pancetta_research::metrics::{
 };
 use pancetta_research::scorecard::{
     BuildInfo, ConfigInfo, GitInfo, HarnessInfo, PerWavFailure, RegressionFlags, Scorecard, SnrBin,
-    TierResult,
+    TierResult, TtfdDistribution,
 };
 use pancetta_research::truth::{FixtureCategory, FixtureTruth};
 use pancetta_research::Mode;
@@ -621,6 +621,8 @@ fn run_synth_tier(
     // Group by snr_db bin.
     let mut bins: BTreeMap<i64, (u32, u32)> = BTreeMap::new(); // key = snr*10 to avoid float keys
     let mut wavs_processed = 0u32;
+    // hb-129: per-WAV TTFD collection for the synth-clean tier.
+    let mut per_wav_ttfd_s: Vec<f64> = Vec::new();
     for e in &entries {
         wavs_processed += 1;
         let bin_key = (e.snr_db * 10.0).round() as i64;
@@ -629,6 +631,16 @@ fn run_synth_tier(
         match decoder.decode_wav(&e.wav_path) {
             Ok(mut decodes) => {
                 apply_fp_filter(fp_filter, &mut decodes);
+                if let Some(min_ttfd) = decodes
+                    .iter()
+                    .filter_map(|d| d.decode_time_into_window_s)
+                    .fold(None::<f64>, |acc, t| match acc {
+                        None => Some(t),
+                        Some(cur) => Some(cur.min(t)),
+                    })
+                {
+                    per_wav_ttfd_s.push(min_ttfd);
+                }
                 if decodes
                     .iter()
                     .any(|d| d.message.contains(&e.encoded_message))
@@ -654,11 +666,13 @@ fn run_synth_tier(
     // Find SNR @ 50% and 90% recovery (first bin where decoded/attempts >= threshold).
     let snr_at_50 = first_threshold_db(&by_snr, 0.50);
     let snr_at_90 = first_threshold_db(&by_snr, 0.90);
+    let ttfd_distribution = TtfdDistribution::from_per_wav(per_wav_ttfd_s);
     Ok(TierResult {
         wavs_processed,
         by_snr_db: by_snr,
         snr_at_50pct_recovery_db: snr_at_50,
         snr_at_90pct_recovery_db: snr_at_90,
+        ttfd_distribution,
         ..Default::default()
     })
 }
@@ -682,6 +696,8 @@ fn run_curated_tier(
     let mut novel_decodes = 0u32;
     let mut wsjtx_total = 0u32;
     let mut per_wav_failures: Vec<PerWavFailure> = Vec::new();
+    // hb-129: per-WAV TTFD collection.
+    let mut per_wav_ttfd_s: Vec<f64> = Vec::new();
 
     for entry in &entries {
         // Look up the jt9 baseline cache for this WAV's SHA.
@@ -710,6 +726,18 @@ fn run_curated_tier(
 
         let mut our_decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
         apply_fp_filter(fp_filter, &mut our_decodes);
+        // hb-129: per-WAV TTFD — min decode_time_into_window_s over decodes.
+        // WAVs with zero stamped decodes don't contribute to the distribution.
+        if let Some(min_ttfd) = our_decodes
+            .iter()
+            .filter_map(|d| d.decode_time_into_window_s)
+            .fold(None::<f64>, |acc, t| match acc {
+                None => Some(t),
+                Some(cur) => Some(cur.min(t)),
+            })
+        {
+            per_wav_ttfd_s.push(min_ttfd);
+        }
         // Match: a baseline decode is "recovered" if we produced a message
         // containing the same callsign tokens. Conservative substring check.
         let mut recovered_here = 0u32;
@@ -761,6 +789,14 @@ fn run_curated_tier(
         100.0 * truth_recovered as f64 / wsjtx_total as f64
     };
 
+    let ttfd_distribution = TtfdDistribution::from_per_wav(per_wav_ttfd_s);
+    if let Some(ttfd) = &ttfd_distribution {
+        eprintln!(
+            "curated tier TTFD: n={} wavs, p50={:.3}s p90={:.3}s mean={:.3}s",
+            ttfd.wavs_with_decode, ttfd.p50_seconds, ttfd.p90_seconds, ttfd.mean_seconds,
+        );
+    }
+
     Ok(TierResult {
         wavs_processed: total,
         truth_decodes_total: Some(truth_decodes_total),
@@ -770,6 +806,7 @@ fn run_curated_tier(
         wsjtx_decoded: Some(wsjtx_total),
         vs_wsjtx_pct: Some(vs_wsjtx_pct),
         per_wav_top_failures: per_wav_failures,
+        ttfd_distribution,
         ..Default::default()
     })
 }
