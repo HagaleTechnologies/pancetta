@@ -10,7 +10,7 @@ prior_session: research/experiments/2026-05-31-hb-064-dia-osd-session2.md
 wild_card: true
 scorecard: n/a (offline ensemble eval on Session 1 trajectory test split — same split as Session 2 for direct comparability)
 delta_vs_main: zero (no Rust changes; trainer + inference scripts only)
-disposition: GRADUATE — ensemble mean +55% over single-model on test sample_recovery_rate, variance is well-calibrated (Spearman +0.46), proceed to Session 2 (wire into production decoder)
+disposition: SESSION-1-COMPLETE-A/B-PENDING — ensemble mean +55% over single-model on offline test sample_recovery_rate (N=55, ±13 pp CI), variance is INFORMATIVE (Pearson +0.48, Spearman +0.46 — NOT calibration in the Guo 2017 ECE sense; ECE not measured). Phase A 2026-06-02 re-labeled from "GRADUATE". Session 2 = wire into production decoder + binding A/B with bootstrap CI vs production composite.
 ---
 
 ## Headline
@@ -20,8 +20,20 @@ single-model baseline by +55% on the Session 1 trajectory test split.**
 Ensemble mean sample_recovery_rate = **0.564** vs single-model mean
 **0.364** (std 0.054, range 0.291–0.473). The ensemble even beats the
 best individual member (seed=42 at 0.473). The variance signal is
-**strongly calibrated**: Spearman(variance, error) = **+0.46**, low-
+**strongly informative**: Spearman(variance, error) = **+0.46**, low-
 variance half accuracy **0.74** vs high-variance half accuracy **0.39**.
+
+> **Terminology note (Phase C 2026-06-02):** the original journal text
+> called the Pearson(variance, error) signal "well-calibrated." That's
+> imprecise. Calibration in the Guo et al. 2017 (ICML) sense is
+> measured by **Expected Calibration Error (ECE)** — confidence-vs-
+> accuracy bin agreement — and was NOT computed here. Pearson(var,
+> error) measures **informativeness**: whether high-variance samples
+> have higher error rates. Both are useful but distinct. ECE was not
+> measured in Session 1; if a Session 2 lands, an ECE column is one
+> extra row in the metrics table. See
+> `docs/engineering/2026-06-02-engineering-substance-audit.md`
+> (claim 27).
 
 **Decision: GRADUATE.** Both decision conditions in the brief are
 satisfied — the ensemble mean clears the 5% improvement gate by 11×,
@@ -145,7 +157,11 @@ No-bootstrap variance is ~2.5× larger across all percentiles — the
 non-bootstrap ensemble has MORE between-member disagreement, which is
 the desired signal for "model doesn't know."
 
-### Variance-vs-correctness calibration (the brief's secondary gate)
+### Variance-vs-correctness informativeness (the brief's secondary gate)
+
+> Phase C 2026-06-02: renamed from "calibration" to "informativeness".
+> Pearson/Spearman(var, error) measures whether high-variance samples
+> have higher error rates — informativeness, not ECE-style calibration.
 
 | metric | bootstrap | no-bootstrap |
 |---|---:|---:|
@@ -155,11 +171,12 @@ the desired signal for "model doesn't know."
 | Pearson(variance, error)   | −0.41 | **+0.48** |
 | Spearman(variance, error)  | −0.16 | **+0.46** |
 
-**No-bootstrap variance is strongly calibrated.** Low-variance samples
-are correct 74% of the time; high-variance samples drop to 39%. The
-sign of the correlation is correct (high variance → high error), and
-the magnitude (Spearman +0.46) is far above the brief's |r| ≥ 0.2
-threshold. The bootstrap ensemble has miscalibrated variance (negative
+**No-bootstrap variance is strongly informative** (Phase C 2026-06-02
+rename: was "calibrated"). Low-variance samples are correct 74% of
+the time; high-variance samples drop to 39%. The sign of the
+correlation is correct (high variance → high error), and the magnitude
+(Spearman +0.46) is far above the brief's |r| ≥ 0.2 threshold. The
+bootstrap ensemble has anti-informative variance (negative
 correlation) — another sign that bootstrap is sabotaging the underlying
 diversity structure on this small dataset.
 
@@ -169,8 +186,9 @@ Per the brief:
 
 1. **Ensemble mean beats single-model by >5% (relative) → GRADUATE.**
    No-bootstrap: +55.0% — clears the gate by 11×. **PASS**.
-2. **OR** variance is calibrated (high-var samples have higher error
+2. **OR** variance is informative (high-var samples have higher error
    rate, |r| ≥ 0.2) → PROCEED to Session 2 (wire variance as a flag).
+   (Phase C 2026-06-02 rename: was "calibrated".)
    No-bootstrap: Spearman +0.46, low-var acc 0.74 > high-var 0.39 by
    +0.35. **ALSO PASS**.
 
@@ -278,12 +296,17 @@ inference (dominated by the JSONL load).
 
 ## Bank update
 
-hb-194 → **GRADUATED**. Bank entry:
-`status_2026_06_01_session1: GRADUATED — N=8 ensemble (no-bootstrap)
-on Session 1 trajectories beats single-model mean by +55% sample_rec
-(0.564 vs 0.364) and beats best single (0.473) on N=55 test fold;
-variance is calibrated (Spearman +0.46) so the disagreement signal is
-also useful as an OSD-time gate. Both GRADUATE and PROCEED-to-Session-2
-gates from the brief are satisfied. Session 2: A/B ensemble-mean
-weights and/or variance-gated OSD against production on hard-200 +
-hard-1000.`
+hb-194 → **SESSION-1-COMPLETE-A/B-PENDING** (Phase A 2026-06-02
+re-label: was "GRADUATED". The Session 1 result is an OFFLINE
+sample_recovery_rate on a 55-sample test fold (95% CI ±13 pp); the
+binding production A/B against hard-200 / hard-1000 composite is
+Session 2 and was NOT run.) Bank entry:
+`status_2026_06_01_session1: SESSION-1-COMPLETE-A/B-PENDING — N=8
+ensemble (no-bootstrap) on Session 1 trajectories beats single-model
+mean by +55% sample_rec (0.564 vs 0.364) and beats best single (0.473)
+on N=55 test fold; variance is INFORMATIVE (Pearson +0.48,
+Spearman +0.46) — note this is informativeness, NOT calibration in
+the Guo 2017 ECE sense (Phase C 2026-06-02 terminology fix). Both the
+offline +55% gate AND the informativeness gate from the brief are
+satisfied. Session 2: A/B ensemble-mean weights and/or variance-gated
+OSD against production on hard-200 + hard-1000 with bootstrap CIs.`

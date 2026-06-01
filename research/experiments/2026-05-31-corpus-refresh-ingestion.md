@@ -14,6 +14,16 @@ disposition: SHIPPED — new hard_200 (today top-100 + existing top-100) + new w
 
 ## What changed
 
+> **Naming note (Phase C 2026-06-02):** The "saturation-aware composite"
+> machinery that downstream entries (hb-133) lean on is pancetta-internal
+> shorthand for "composite-with-corpus-offset" or
+> "corpus-shift-corrected composite". "Saturation" here is the *operator
+> story* — corpora rotate when the decoder saturates the previous
+> corpus — not a statistical saturation correction. The math is just
+> a fixed additive offset. See
+> `docs/engineering/2026-06-02-engineering-substance-audit.md` (claim 31)
+> and `pancetta-research/src/metrics.rs` for the naming clarification.
+
 The hard-200 corpus was a fixed 200-WAV set since 2026-05-20 (manifest
 generated_at=2026-05-20T22:23:04Z). Six days of decoder graduations
 (hb-052/053/058/060/061/063/072/075/079/080/086 V1/068) were measured

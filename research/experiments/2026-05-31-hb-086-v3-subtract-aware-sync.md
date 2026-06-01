@@ -17,9 +17,10 @@ disposition: SHELVE — diagnostic geometry passed (56.8% of V1-uncoverable trut
 V1 (`joint_pair_retry`, GRADUATED 2026-05-28) closed the "candidate is in
 sync list but failed pass-1 LDPC due to interference" leak by retrying
 original sync_candidates against the post-multipass residual. V2 (soft
-cancellation, DEFINITIVELY SHELVED 2026-05-31) was closed by pancetta's
+cancellation, SHELVED across two corpora 2026-05-31; Phase A honesty
+pass 2026-06-02 replaced "DEFINITIVELY SHELVED") was closed by pancetta's
 hard-decision pipeline (CRC-validated neighbors yield delta-function
-posteriors → soft ≡ hard).
+posteriors → soft ≡ hard). Re-test gate: hb-146 synth-pair-200.
 
 V3 attacks the OTHER V1 leak documented in the V1 journal:
 
@@ -179,7 +180,7 @@ aren't recoverable via Costas-relaxation.
 | variant | leak attacked | structural test | result |
 |---|---|---|---|
 | V1 hard-decision retry | (b) pass-1 LDPC failed on interfered candidate present in sync list | 78% pair-likely → PROCEED | **GRADUATED** (+12 hard-200, +17 hard-1000) |
-| V2 soft cancellation | (b) deeper: multi-neighbor LLR conditioning | 0% marginal-SNR neighbors → SHELVE pre-impl | **DEFINITIVELY SHELVED** (corpus has no marginal-SNR neighbors; pancetta's CRC selects for sharp posteriors) |
+| V2 soft cancellation | (b) deeper: multi-neighbor LLR conditioning | 0% marginal-SNR neighbors → SHELVE pre-impl | **SHELVED across two real-audio corpora** (hard-200 May + refreshed; pancetta's CRC selects for sharp posteriors). Re-test gate: hb-146 synth-pair-200. (Phase A honesty pass replaced "DEFINITIVELY SHELVED".) |
 | V3 relaxed sync at subtracted bins | (a) candidate not in sync list | 56.8% geometric proximity → PROCEED | **SHELVED post-impl** (V3-surfaced candidates are noise; CRC catches 98%, plausibility catches the rest) |
 
 The V2 spec's primary kill-switch (SNR-quality of neighbors) was a
@@ -240,11 +241,18 @@ main.json unchanged. No graduations from this iter.
   refinement on residual, callsign-priors-on-residual) would be
   needed to crack them.
 
-- **The hb-086 family is now closed.** V1 GRADUATED, V2 DEFINITIVELY
-  SHELVED, V3 SHELVED. The joint-decoding design space documented in
+- **The hb-086 family is closed on current corpora + implementations
+  tested.** V1 GRADUATED, V2 SHELVED across two real-audio corpora
+  (hb-146 synth-pair is the re-test gate), V3 SHELVED on hard-200
+  (hb-146 synth-pair is also a candidate re-test gate). The
+  joint-decoding implementations tested to date show closure on this
+  signal class; the design space documented in
   `docs/superpowers/specs/2026-05-27-joint-decoding-design.md` is
-  exhausted. The remaining hard-200 wall is for a different family of
-  mechanism.
+  exhausted on organic corpora with the implementations tried — the
+  synth_pair_revisit_candidate flag preserves V2/V3 unshelve paths.
+  (Phase A honesty pass 2026-06-02 replaced "joint-decoding design
+  space exhausted" with this scoped phrasing.) The remaining hard-200
+  wall is for a different family of mechanism.
 
 - **Plumbing-kept-at-default-off is the right pattern for shelved
   mechanisms with non-trivial hooks.** V3's `joint_residual_*` config

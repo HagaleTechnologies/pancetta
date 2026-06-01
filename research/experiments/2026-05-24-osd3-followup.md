@@ -18,7 +18,9 @@ hb-034 (originally from 2026-05-22): hb-005 sweep at gate=4 / iters=25
 showed OSD-3 added +313 novel decodes at zero recall gain. The
 follow-up question: how many of those 313 are real (jt9-missed) vs
 FPs? If >20% real, fold into hb-018 (stronger FP filter for OSD-3).
-If <5%, shelve OSD-3 permanently.
+If <5%, shelve OSD-3 on this corpus + current implementation. (Phase A
+honesty pass 2026-06-02 replaced "permanently" — a new corpus or
+different OSD reordering scheme could legitimately revisit.)
 
 iter 2 (hb-014) just graduated parity gate 4 → 2, which restricts
 OSD invocation. The hb-005 baseline is stale. Re-test OSD-3 against

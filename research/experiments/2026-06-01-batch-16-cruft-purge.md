@@ -4,6 +4,19 @@ date: 2026-06-01
 branch: iter/2026-06-01-batch-16-cruft-purge
 mode: bank hygiene only (no production code touched, no eval run)
 
+## Phase A honesty caveat (added 2026-06-02)
+
+The wider Batch 16 narrative celebrates "8/8 valuable iterations." That's
+fair as substrate work, but: **0 of 8 produced a measurable composite
+delta this batch.** All were infra / corpus / instrumentation / scoping.
+The batch advances the *substrate*, not the headline metric. The hb-194
+(N=8 ensemble +55% on N=55 test fold) is an offline number with ±13 pp
+CI; the binding production A/B is Session 2 and was NOT run.
+
+See `docs/engineering/2026-06-02-engineering-substance-audit.md` and
+`research/experiments/2026-06-01-phase-b-bootstrap-ci.md` for the
+honesty-pass policy that motivated this caveat.
+
 ## What this batch did
 
 Pre-batch hygiene before batch 16 (first semi-autonomous batch). The

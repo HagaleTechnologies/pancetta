@@ -15,13 +15,15 @@ disposition: SHIPPED — pair-synth generator + tier wired; baseline measured; c
 ## Motivation
 
 hb-086 V2 (joint LLR with iterative soft cancellation) and V3
-(subtract-aware sync threshold relaxation) were DEFINITIVELY SHELVED in
-batch 14 (2026-05-31) because the available real-audio corpus
-(hard-200) had no marginal-SNR pair structure: every decoded neighbor
-on hard-200 was already a strong, high-confidence decode. Soft
-cancellation collapses to hard subtraction when LLRs are sharp;
-sync-threshold relaxation surfaces sub-Costas noise rather than weak
-signals.
+(subtract-aware sync threshold relaxation) were SHELVED across the two
+real-audio corpora available in batch 14 (2026-05-31; Phase A honesty
+pass 2026-06-02 replaced "DEFINITIVELY SHELVED") because the available
+real-audio corpus (hard-200) had no marginal-SNR pair structure: every
+decoded neighbor on hard-200 was already a strong, high-confidence
+decode. Soft cancellation collapses to hard subtraction when LLRs are
+sharp; sync-threshold relaxation surfaces sub-Costas noise rather than
+weak signals. This experiment was designed precisely to be the re-test
+gate that could unshelve them.
 
 Corpus ideation (`research/ideation/2026-06-01-corpus.md`, entry C3 →
 hb-146) proposed the missing complement: an adversarial synthetic

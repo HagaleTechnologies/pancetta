@@ -9,7 +9,7 @@ parent_hypothesis: hb-089 (spawned from mr-008 ideation, territory A)
 wild_card: false
 scorecard: (n/a — diagnostic-only; kill switch fired before implementation)
 delta_vs_main: 0 (no production change)
-disposition: SHELVE — bank-stated kill switch unsatisfiable on the actual corpus (no callsign repeats in 15 s WAVs); task-stated SNR-delta fallback measured mean Δ +0.013 dB across 28 missed truths (median +0.007 dB, p75 +0.042 dB), two orders of magnitude below the 2 dB PROCEED gate.
+disposition: SHELVE — bank-stated kill switch unsatisfiable on the actual corpus (no callsign repeats in 15 s WAVs); task-stated SNR-delta fallback (overlap-averaged magnitude across sub-windows — Phase C 2026-06-02 rename from "Welch averaging"; see claim 7 in docs/engineering/2026-06-02-engineering-substance-audit.md) measured mean Δ +0.013 dB across 28 missed truths (median +0.007 dB, p75 +0.042 dB), two orders of magnitude below the 2 dB PROCEED gate.
 ---
 
 ## Hypothesis
@@ -67,6 +67,15 @@ Examples binary `hb089_residual_accumulation_diagnostic` measures:
          length 156 000 samples (= 13.0 s), offsets {0, 0.25, 0.50}s
 4. Report Δ = (b) − (a).
 
+> **Naming note (Phase C 2026-06-02):** the column labeled `snr_welch`
+> below is the overlap-averaged magnitude across the 3 sub-windows at
+> the bin coordinate. The "Welch" label is loose — Welch (1967) is a
+> PSD estimator via averaged-windowed periodograms; what was actually
+> measured is per-bin magnitude averaging at fixed coordinates. The
+> diagnostic + conclusion are correct; only the column label is loose.
+> See docs/engineering/2026-06-02-engineering-substance-audit.md
+> (claim 7).
+
 ### Per-WAV results (top-5 hard-200)
 
 ```
@@ -98,14 +107,17 @@ Examples binary `hb089_residual_accumulation_diagnostic` measures:
 
 ## Why the mechanism doesn't work (theoretical)
 
-Welch's method reduces spectral estimate variance by a factor up to
-~T_total / T_window when sub-windows are non-overlapping. With
-SUBWINDOW_LENGTH = 13.0 s and total audio = 15.0 s, the sub-windows
-overlap by ≥85%, so the noise samples are highly correlated across
-sub-windows. Averaging correlated noise samples does not reduce noise
-power. The theoretical best-case SNR improvement is
-10·log10(15.0 / 13.0) ≈ 0.6 dB — and that requires fully decorrelated
-sub-windows, which the actual 85% overlap prevents.
+Overlap-averaged-magnitude across sub-windows (the mechanism this
+experiment evaluated; Phase C 2026-06-02 rename from "Welch's method"
+— Welch is the PSD estimator from which this borrows the
+windowing/overlap idea but is *not* what we implemented) reduces
+spectral estimate variance by a factor up to ~T_total / T_window when
+sub-windows are non-overlapping. With SUBWINDOW_LENGTH = 13.0 s and
+total audio = 15.0 s, the sub-windows overlap by ≥85%, so the noise
+samples are highly correlated across sub-windows. Averaging correlated
+noise samples does not reduce noise power. The theoretical best-case
+SNR improvement is 10·log10(15.0 / 13.0) ≈ 0.6 dB — and that requires
+fully decorrelated sub-windows, which the actual 85% overlap prevents.
 
 For a TRUE multi-window coherent gain, the sub-windows must be either:
 (a) drawn from independent slots of the same callsign (= existing

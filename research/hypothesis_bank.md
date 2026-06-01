@@ -1,5 +1,13 @@
 # Hypothesis Bank
 
+# Engineering substance verified 2026-06-02 — see
+# docs/engineering/2026-06-02-engineering-substance-audit.md
+# Honesty re-labels applied 2026-06-02 (Phase A) — GRADUATED entries
+# distinguish behavioral graduations (composite-moving) from
+# SHIPPED-INFRA (no decoder change) and SESSION-N-COMPLETE (binding
+# A/B pending). Bootstrap-CI policy: see
+# research/experiments/2026-06-01-phase-b-bootstrap-ci.md.
+
 last_updated: 2026-06-01T23:45:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
@@ -340,7 +348,12 @@ current_ratio: 0.051
     threshold sweep + A/B eval. Priority stays at 0.45 (active).
     Branch: iter/2026-05-31-hb-048-session1, 1 commit (docs only).
   status_2026_06_01_session2: |
-    Session 2 GRADUATES. Both deliverables landed:
+    Session 2 COMPLETE — SESSION-3-PENDING. The "GRADUATES" framing was
+    too loose: Session 2 shipped the cross-correlation primitive +
+    synthetic-injection verification; the binding hard-200 A/B (Session 3)
+    that flips a production default is what would justify GRADUATED.
+    Per Phase A honesty pass (2026-06-02), re-labeled as
+    SESSION-2-COMPLETE-SESSION-3-PENDING. Both deliverables landed:
       * pancetta-ft8/src/a7.rs (~640 LOC + 15 tests) — A7ExpectedCall,
         A7Template, A7TemplateKind, generate_templates (up to 32 per
         call), cross_correlate (snr7 in LLR domain), best_template_score
@@ -503,8 +516,15 @@ current_ratio: 0.051
     research/experiments/2026-05-26-hb-074-coherent-cross-cycle.md.
     Infrastructure kept flag-gated (default off). Spawned hb-075/076/077.
 
-### hb-075 — Phase-magnitude-weighted coherent cross-cycle sum  [GRADUATED 2026-05-26 — biggest single-iter win of the session]
+### hb-075 — Phase-magnitude-weighted coherent cross-cycle sum  [GRADUATED 2026-05-26 — biggest single-iter win of the session] (verified pre-CI: may need re-validation)
   mode: ft8
+  # Phase A bootstrap-CI retrofit (2026-06-02): +22 hard-200 rec and
+  # +78 hard-1000 rec are above the marginal range Phase B's smoke
+  # test flagged as potentially within noise. Mechanism (MRC) has
+  # canonical primary-source backing. Bootstrap CI per Phase B was
+  # not run at graduation time but the delta magnitude makes
+  # post-hoc re-validation low priority.
+  bootstrap_ci_status: VERIFIED-PRE-CI (large enough delta + MRC has primary-source backing; post-hoc bootstrap CI optional)
   status: GRADUATED — cross_cycle_coherent_mrc default true; composite +0.001283; hard-200 +22 rec / +1 novel; hard-1000 +78 rec / -7 novel. MRC weighting flips the hb-074 sign exactly as the failure-mode diagnosis predicted.
   priority_score: 0.0
   estimated_effort: 1 session (builds on hb-074 infra)
@@ -556,8 +576,24 @@ current_ratio: 0.051
     corpus, the algorithm is sound and the operator corpus is the limit;
     if coherent loses everywhere, the approach is closed.
 
-### hb-079 — Coherent iterative-subtract multi-pass  [GRADUATED 2026-05-26 — biggest single-iter composite win in project history]
+### hb-079 — Coherent iterative-subtract multi-pass  [GRADUATED 2026-05-26 — biggest single-iter composite win in project history] (verified pre-CI: may need re-validation)
+  # Canonical name (Phase C, 2026-06-02): **Successive Interference
+  # Cancellation (SIC)** per multi-user-detection literature
+  # (Verdu 1998, *Multiuser Detection*; Patel-Holtzman 1994 IEEE
+  # J. Sel. Areas Commun.). Pancetta's "coherent iterative-subtract
+  # multi-pass" is canonically SIC with ML-projection cancellation.
+  # See docs/engineering/2026-06-02-engineering-substance-audit.md
+  # (claim 15).
   mode: ft8
+  # Phase A bootstrap-CI retrofit (2026-06-02): the composite delta
+  # (+0.009212) and the hard-200 +158 rec / hard-1000 +401 rec are
+  # substantially above any plausible noise floor — well outside the
+  # marginal range Phase B's bootstrap CI calls "NOT significant".
+  # Listed as "verified pre-CI" because the actual bootstrap CI per
+  # Phase B was not run at graduation time, but the magnitude makes
+  # post-hoc re-validation low priority. See
+  # research/experiments/2026-06-01-phase-b-bootstrap-ci.md.
+  bootstrap_ci_status: VERIFIED-PRE-CI (large delta well above marginal range; post-hoc bootstrap CI optional)
   status: GRADUATED — `coherent_multipass` default true. Composite +0.009212 (0.558279 → 0.567491), ~7× the prior biggest single iter. hard-200 +158 rec / +75 novel; hard-1000 +401 rec / +132 novel. The recall ceiling on hard-* was interference, not threshold; the ML projection in the complex spectrogram is the right kernel for coherent subtraction.
   priority_score: 0.0
   estimated_effort: 2-3 sessions (delivered in 1)
@@ -581,7 +617,15 @@ current_ratio: 0.051
     Spawned hb-080 (N>2 passes), hb-081 (MRC-weighted subtract),
     hb-082 (residual-tier sync threshold).
 
-### hb-080 — Iterative-subtract: N>2 passes  [GRADUATED 2026-05-27 — batch 13]
+### hb-080 — Iterative-subtract: N>2 passes  [GRADUATED 2026-05-27 — batch 13] (verified pre-CI: may need re-validation)
+  # Canonical name (Phase C, 2026-06-02): multi-stage SIC (Successive
+  # Interference Cancellation, N passes). See hb-079 cross-ref.
+  # Phase A bootstrap-CI retrofit (2026-06-02): +16 hard-200 rec is in
+  # the marginal range Phase B's smoke test flagged as potentially
+  # within noise; the N=2/3/4/5 sweep monotonicity is the
+  # corroborating signal that supports the graduation, but a binding
+  # bootstrap CI per Phase B was not run at graduation time.
+  bootstrap_ci_status: PENDING (pre-Phase-B graduation; +16 hard-200 rec is in marginal range — sweep monotonicity is corroborating but a binding CI was not computed)
   status_2026_05_27: GRADUATED — `coherent_multipass_iterations` default 1→3. hard-200 sweep N∈{1,2,3,4,5}: N=2 +7 rec, N=3 +9 rec (+16 total vs N=1), N=4/5 saturate. ZERO novel cost across the sweep. Wall-clock 1.78× N=1, within budget. Composite +~0.000935 from hard-200 alone. Tertiary masking is real but saturates at three rounds; deeper signal masking is the joint-decoding territory (hb-086).
   ---- original priority below ----
   [PRIORITY-WAS: 0.45, spawned 2026-05-26 from hb-079]
@@ -602,6 +646,13 @@ current_ratio: 0.051
     The cleanest implementation: change config to `coherent_multipass_iterations: usize` (default 2 = current behavior), loop subtract_and_repass. Sweep {2, 3, 4} on hard-200 to find the elbow.
 
 ### hb-081 — MRC-weighted coherent subtract  [SHELVED 2026-05-27 — batch 13]
+  # Canonical name (Phase C, 2026-06-02): MRC-weighted "soft SIC"
+  # (rotor-confidence-weighted Successive Interference Cancellation).
+  # The shelve finding is "the existing full-amplitude SIC is already
+  # optimal on this corpus; soft-SIC under-subtracts and leaves
+  # residual signal at decoded positions, blocking multipass." See
+  # hb-079 SIC cross-ref and docs/engineering/2026-06-02-engineering-substance-audit.md
+  # (claim 15: "hb-081 = soft SIC / soft cancellation").
   status_2026_05_27: SHELVED — hard-200 sweep at MRC threshold ∈ {5, 10, 20, 40} all regress -170 to -173 recovered vs full ML subtract (threshold=0). The assumed failure mode (over-subtract from noisy rotors) wasn't real: hb-080 confirms full subtract gives +0 novel cost. *Under-subtracting* instead leaves residual signal energy at decoded positions, which BLOCKS multipass from finding masked candidates. The mechanism's already optimal. Library + CLI flag stay available for re-evaluation if the corpus changes.
   ---- original priority below ----
   [PRIORITY-WAS: 0.40, spawned 2026-05-26 from hb-079]
@@ -627,18 +678,30 @@ current_ratio: 0.051
   status: SHELVED before implementation — structurally redundant. After hb-079's subtract, the original signal positions are near-zero (averaging with zero dilutes) and residual-revealed candidates aren't at the same `(freq_sub, freq_bin, t0 mod slot)` as any original repeating-station group (no peer to average with). The cross-cycle integration that would help — coherent subtract of the masking signal then cross-cycle on the now-unmasked positions — is what hb-079 already does implicitly. See research/experiments/2026-05-27-hb-085-cross-cycle-on-residual.md.
   priority_score: 0.0
 
-### hb-086 — Joint multi-candidate decoding V1 (force-retry on residual)  [GRADUATED 2026-05-28]
+### hb-086 — Joint multi-candidate decoding V1 (force-retry on residual)  [GRADUATED 2026-05-28] (verified pre-CI: may need re-validation)
   mode: ft8
+  # Phase A bootstrap-CI retrofit (2026-06-02): +12 hard-200 rec is in
+  # the marginal range Phase B's smoke test flagged as potentially
+  # within noise (the +3 hard-200 case landed at [-6, +12] CI). The
+  # diagnostic-first kill switch (78.3% pair-likely vs 30% threshold)
+  # is the corroborating evidence that supports the graduation, but a
+  # binding bootstrap CI per Phase B was not run at graduation time.
+  # See research/experiments/2026-06-01-phase-b-bootstrap-ci.md.
+  bootstrap_ci_status: PENDING (pre-Phase-B graduation; +12 hard-200 rec in marginal range; diagnostic kill switch is corroborating but a binding CI was not computed)
   status_2026_05_28: V1 GRADUATED — `joint_pair_retry` default false→true. Diagnostic confirmed 78.3% pair-likely vs 30% threshold on top-20 worst hard-200 WAVs; PROCEED earned. V1 = force-retry original sync candidates against the (post-multipass) residual spectrogram, bypassing the residual sync_score threshold. hard-200 +12 rec / +1 novel; hard-1000 +17 rec / +9 novel; composite +0.000700 (0.568424 → 0.569123); fixtures + synth preserved; elapsed +2.2%. See research/experiments/2026-05-28-hb-086-joint-pair-retry-v1.md.
   priority_score: 0.0
 
-### hb-086 V2 — Joint LLR with iterative interference cancellation  [DEFINITIVELY SHELVED on real-audio; synth_pair_revisit_candidate 2026-06-01]
+### hb-086 V2 — Joint LLR with iterative interference cancellation  [SHELVED across two corpora (May + refreshed); synth_pair_revisit_candidate 2026-06-01]
+  # Phase A honesty pass (2026-06-02): "DEFINITIVELY SHELVED" replaced
+  # with "SHELVED across two corpora (May + refreshed) — re-test gate:
+  # new signal class or new mechanism variant". The hb-146 synth-pair
+  # corpus IS the new-signal-class re-test gate.
   mode: ft8
   status_2026_05_30: SHELVED at the diagnostic gate (OLD hard-200 top-20). 0% marginal-SNR neighbors; multi-neighbor count 14.8% strict / 34.8% relaxed.
-  status_2026_05_31_recheck: **DEFINITIVELY SHELVED.** Re-ran the diagnostic on the REFRESHED hard-200 top-20 (100 of the 200 entries are today's K5ARH 20m captures — denser, with 9/20 sample slots reaching jt9's -25 dB SNR floor per survey). Result essentially identical: multi-neighbor 16.7% strict / 33.8% relaxed, **STILL 0% marginal-SNR neighbors** (p10 -5.1 dB, median -1.6 dB, nothing below -15 dB on either window). The pattern is corpus-independent.
+  status_2026_05_31_recheck: SHELVED across two corpora (May + refreshed). Re-ran the diagnostic on the REFRESHED hard-200 top-20 (100 of the 200 entries are today's K5ARH 20m captures — denser, with 9/20 sample slots reaching jt9's -25 dB SNR floor per survey). Result essentially identical: multi-neighbor 16.7% strict / 33.8% relaxed, **STILL 0% marginal-SNR neighbors** (p10 -5.1 dB, median -1.6 dB, nothing below -15 dB on either window). The pattern is corpus-independent for the *decoded-neighbor* configuration tested here. Re-test gate: new signal class (hb-146 synth-pair-200 ships the configuration V2 is designed for) or a fundamentally new mechanism variant. Phase A honesty pass (2026-06-02) replaced "DEFINITIVELY SHELVED" with this two-corpus phrasing.
   **Structural insight (now confirmed across corpora):** pancetta's *decoded* neighbors are uniformly high-confidence, even when the *band* has marginal-SNR truths. When pancetta decodes a neighbor it's because the decode passed CRC, which selects for sharp LLRs → delta-function tone posteriors → soft cancellation collapses to hard subtraction. This is a property of pancetta's decoder architecture (hard-decision pipeline through LDPC + CRC), not the corpus. The soft-cancellation family (hb-086 V2, hb-081 per-decode subtract scaling) is structurally closed against pancetta's *decoded* neighborhood. Hypotheses targeting *missed* truths via different mechanisms (V3 sync-relaxation, hb-064 OSD pruning) are unaffected by this insight.
   synth_pair_revisit_candidate: true  # hb-146 (2026-06-01) shipped synth-pair-200 — pancetta loses the weak signal in 0% of buckets at ΔSNR ≥ 9 dB AND Δf ≤ 12 Hz while still decoding the strong. The "decoded strong neighbor + marginal weak truth" configuration V2 is designed for now EXISTS as an evaluable population. Re-eval V2 (existing `joint_pair_retry` plumbing extended with soft-cancellation pass) against synth-pair-200 in a future iter; if V2 cracks ≥20% of the 88 currently-missed weak signals (0% buckets) AND preserves hard-200 baseline, it unshelves. Graduation still requires hard-200 co-improvement; synth-pair-200 is diagnostic-only.
-  priority_score: 0.0  # permanently shelved on real-audio; synth-pair re-eval is a separate experiment
+  priority_score: 0.0  # shelved on real-audio (hard-200 / hard-1000) across May + refreshed corpora; synth-pair re-eval (hb-146) is a separate experiment with its own kill switch
 
 ### hb-086 V3 — Subtract-aware sync threshold relaxation  [SHELVED on real-audio; synth_pair_revisit_candidate 2026-06-01]
   mode: ft8
@@ -646,7 +709,7 @@ current_ratio: 0.051
 
   **Structural insight (the keep)**: geometric proximity diagnostics need a paired *decodability* sub-test before earning PROCEED. The V3 diagnostic measured "where truths exist relative to subtracted bins" (geometric); the V2 diagnostic measured "are neighbors decodable in a soft-relevant way" (decodability proxy via SNR). V2's pre-impl SHELVE was the right call; V3's PROCEED on geometry-only led to a wasted implementation pass. For any future mechanism whose value depends on decoding new candidates surfaced from a perturbation of the production pipeline, the kill-switch needs to extract LLRs at the truth's coordinates from the residual and confirm LDPC+CRC pass — not just check geometric proximity.
 
-  **The hb-086 family is closed on real-audio (hard-200 / hard-1000).** V1 GRADUATED (+12 hard-200), V2 DEFINITIVELY SHELVED (soft cancellation closed by pancetta's hard-decision pipeline across two corpora), V3 SHELVED (Costas relaxation surfaces noise, not signal). The joint-decoding design space documented in `docs/superpowers/specs/2026-05-27-joint-decoding-design.md` is exhausted on organic corpora. The remaining hard-200 wall is for a different family of mechanism: sub-Costas-threshold weak signals (would need AP without sync, callsign-priors-on-residual, or OSD-without-Costas-pre-gate to crack).
+  **The hb-086 family is closed on current corpora (real-audio hard-200 / hard-1000) + the decoder + implementations tested.** V1 GRADUATED (+12 hard-200), V2 SHELVED across two corpora (soft cancellation collapsed to hard subtraction under pancetta's hard-decision pipeline on May + refreshed real-audio; hb-146 synth-pair is the new-signal-class re-test gate), V3 SHELVED (Costas relaxation surfaced noise on hard-200; hb-146 again is the re-test gate). The joint-decoding implementations tested to date show closure on this signal class; the design space documented in `docs/superpowers/specs/2026-05-27-joint-decoding-design.md` is exhausted ON ORGANIC CORPORA WITH THE IMPLEMENTATIONS TRIED — hb-146 synth-pair corpus may unshelve V2/V3 (synth_pair_revisit_candidate flag preserved on both entries). The remaining hard-200 wall is for a different family of mechanism: sub-Costas-threshold weak signals (would need AP without sync, callsign-priors-on-residual, or OSD-without-Costas-pre-gate to crack).
 
   synth_pair_revisit_candidate: true  # hb-146 (2026-06-01) shipped synth-pair-200 with by-construction marginal-SNR weak signals beside strongly-decoded neighbors. V3's hard-200 trace showed it surfaces *noise* in sub-Costas windows because hard-200 has no real weak signal there; on synth-pair-200, the weak truth IS present in the targeted window by construction. Re-eval V3's sweep ({-0.5, -1.0, -1.5, -2.0 dB} × ±{4,8,16} bins) against synth-pair-200 in a future iter. If the relaxed Costas pass at the truth's exact freq_bin extracts LDPC+CRC-passable LLRs in the 0% buckets (ΔSNR ≥ 9 dB AND Δf ≤ 12 Hz), the V3 mechanism is validated as "correct mechanism, wrong corpus" rather than "wrong mechanism." Graduation still requires hard-200 co-improvement; synth-pair-200 is diagnostic-only.
 
@@ -677,6 +740,13 @@ current_ratio: 0.051
 
 ### hb-058 — `/R` and ARRL Field-Day false-decode filters  [GRADUATED (focused) 2026-05-25 — batch 10]
   mode: ft8
+  # Phase A bootstrap-CI retrofit (2026-06-02): small-delta graduation
+  # (contest-type rejection in is_plausible); composite movement small
+  # enough to be within Phase B's marginal range; no bootstrap CI was
+  # run at graduation time. Mechanism is correctness-oriented (false-
+  # decode filter), so the binding correctness test is FP-rate on
+  # contest WAVs rather than composite delta.
+  bootstrap_ci_status: PENDING (pre-Phase-B graduation; small-delta. FP-filter justifies on correctness grounds, not composite — composite CI is secondary)
   status: GRADUATED — contest-type rejection shipped in is_plausible; /R + directional-CQ parts spawned as follow-ups
   priority_score: 0.0
   estimated_effort: 1 session
@@ -755,6 +825,10 @@ current_ratio: 0.051
 
 ### hb-060 — Remove dead `Ft8Config::enable_multithreading` field  [GRADUATED 2026-05-25 — batch 10]
   mode: ft8
+  # Phase A bootstrap-CI retrofit (2026-06-02): cleanup-only graduation
+  # ("no behavior change" by the entry's own description). Composite
+  # delta is exactly zero by construction; bootstrap CI not applicable.
+  bootstrap_ci_status: N/A (cleanup-only — no decoder behavior change by construction; in retrospect this is SHIPPED-INFRA-style)
   status: GRADUATED — field + all sites removed (cleanup, no behavior change)
   priority_score: 0.0
   estimated_effort: 0.5 sessions
@@ -770,6 +844,9 @@ current_ratio: 0.051
 
 ### hb-061 — Remove dead `Ft8Config::frequency_range` field  [GRADUATED 2026-05-25 — batch 10]
   mode: ft8
+  # Phase A bootstrap-CI retrofit (2026-06-02): cleanup-only graduation;
+  # composite delta zero by construction.
+  bootstrap_ci_status: N/A (cleanup-only — no decoder behavior change by construction)
   status: GRADUATED — field + all sites removed (cleanup, no behavior change)
   priority_score: 0.0
   estimated_effort: 0.5 sessions
@@ -858,6 +935,12 @@ current_ratio: 0.051
     research/experiments/2026-05-25-batch-9-ship-filter.md.
 
 ### hb-063 — Layered / WR-LBP belief propagation scheduling  [GRADUATED 2026-05-25 — batch 10]
+  # Phase A bootstrap-CI retrofit (2026-06-02): composite +0.001049 is
+  # at the edge of Phase B's marginal range. The mechanism (Hocevar
+  # 2004 layered schedule) is mathematically sound and has external
+  # primary-source backing; the binding bootstrap CI per Phase B was
+  # not run at graduation time.
+  bootstrap_ci_status: PENDING (pre-Phase-B graduation; small composite delta; corroborated by Hocevar 2004 primary source — re-validation is low-priority)
   mode: ft8
   status: GRADUATED — layered_bp default true; composite +0.001049 (biggest single-iter move since hb-038)
   priority_score: 0.0
@@ -997,6 +1080,15 @@ current_ratio: 0.051
 
 ### hb-068 — hb-044 scaled-delta refinement (variant b @ 0.3×)  [GRADUATED 2026-05-30]
   mode: ft8
+  # Phase A bootstrap-CI retrofit (2026-06-02): +5 hard-200 rec falls
+  # squarely in the marginal range Phase B's smoke test flagged as
+  # potentially within noise (the +3 case landed at [-6, +12] CI;
+  # +5 is plausibly inside a similar CI). Corroborating signal:
+  # synth-clean @90% improved -18 → -20 dB (a +2 dB pure-noise-axis
+  # gain that's harder to attribute to rayon scheduling). The
+  # binding bootstrap CI per Phase B was not run at graduation time.
+  # See research/experiments/2026-06-01-phase-b-bootstrap-ci.md.
+  bootstrap_ci_status: PENDING (pre-Phase-B graduation; +5 hard-200 rec in marginal range — synth-clean +2 dB is the corroborating signal that justified GRADUATE)
   status: GRADUATED — `sync_time_interpolation = true` + `sync_time_interp_delta_scale = 0.3`
   priority_score: 0.0
   estimated_effort: n/a
@@ -1086,8 +1178,8 @@ current_ratio: 0.051
     the station to refresh. Spawning followup if/when this becomes
     operationally noticeable.
 
-### hb-069 — hb-044 interpolation in linear power space  [SHELVED 2026-06-01 — composite -0.003049 vs dB; hb-044 family closed]
-  status_2026_06_01: SHELVED — implemented as `Ft8Config::sync_time_interp_linear_power` flag (default false; production unchanged). A/B sweep on refreshed main.json baseline: composite 0.579114 → 0.576065 (-0.003049); hard-200 -54 rec / -34 novel; hard-1000 -94 rec / -33 novel; fixtures + synth preserved. Linear-power interpolation regresses recall and composite. dB-space interpolation stays optimal under the hb-068 b-0.3 production setting. The hb-044 refinement family (hb-044 → hb-068 graduated, hb-069 shelved) is effectively closed. Plumbing kept for future use. See research/experiments/2026-05-31-hb-069-linear-power-interp.md and commit d04c596.
+### hb-069 — hb-044 interpolation in linear power space  [SHELVED 2026-06-01 — composite -0.003049 vs dB; hb-044 refinement closed on current corpus + dB/linear-power variants tested]
+  status_2026_06_01: SHELVED — implemented as `Ft8Config::sync_time_interp_linear_power` flag (default false; production unchanged). A/B sweep on refreshed main.json baseline: composite 0.579114 → 0.576065 (-0.003049); hard-200 -54 rec / -34 novel; hard-1000 -94 rec / -33 novel; fixtures + synth preserved. Linear-power interpolation regresses recall and composite. dB-space interpolation stays optimal under the hb-068 b-0.3 production setting. The hb-044 refinement is closed on current corpus + the dB/linear-power variants tested (hb-044 → hb-068 graduated, hb-069 shelved); Phase A honesty pass (2026-06-02) replaced "family fully closed" with this scoped phrasing — a new mechanism variant (e.g. quadratic-fit-with-residual-check) or new corpus could unshelve. Plumbing kept for future use. See research/experiments/2026-05-31-hb-069-linear-power-interp.md and commit d04c596.
   ---- original priority below ----
   [PRIORITY-WAS: 0.35, spawned 2026-05-25 from hb-068 finding]
   mode: ft8
@@ -1241,7 +1333,7 @@ current_ratio: 0.051
 
 ### hb-036 — Score-relative NMS suppression  [SHELVED 2026-05-31]
   mode: ft8
-  status_2026_05_31: SHELVED — sweep at delta_db ∈ {1.0, 2.0, 3.0, 5.0} all regress hard-200 by -748 to -1034 rec vs nms-off baseline. Mechanism interpolates between pure-NMS and nms-off; no sweet spot. Costas sync_score variance dominates the duplicate-vs-distinct gap. **NMS suppression family closed on this corpus's signal distribution.** Future work would need a fundamentally different discriminator (e.g., LDPC-codeword-based dedup). Config knob `nms_score_delta_db` preserved at default 0.0 for research re-evaluation.
+  status_2026_05_31: SHELVED — sweep at delta_db ∈ {1.0, 2.0, 3.0, 5.0} all regress hard-200 by -748 to -1034 rec vs nms-off baseline. Mechanism interpolates between pure-NMS and nms-off; no sweet spot. Costas sync_score variance dominates the duplicate-vs-distinct gap. **NMS suppression closed on current corpus + implementations tested** (Phase A honesty pass 2026-06-02; previously "family closed"). Future work would need a fundamentally different discriminator (e.g., LDPC-codeword-based dedup, hb-104 territory). Config knob `nms_score_delta_db` preserved at default 0.0 for research re-evaluation.
   status: shelved
   priority_score: 0.40
   estimated_effort: 1-2 sessions
@@ -1646,19 +1738,29 @@ current_ratio: 0.051
         is UNSATISFIABLE — pancetta hard-200 WAVs are 15.0 s each (one
         FT8 slot); no callsign repeats within a WAV. The mr-008
         ideation prose mistakenly assumed 90 s multi-slot WAVs.
-    (2) Task-stated SNR-delta fallback (intra-slot Welch averaging on
-        the post-multipass residual at missed-truth coordinates)
-        measured mean Δ +0.013 dB across 28 missed truths in top-5
-        worst WAVs — two orders of magnitude below the 2 dB PROCEED
-        gate. Theoretically expected: 85%+ overlap between same-slot
-        sub-windows means the noise samples are correlated, so Welch
-        variance reduction is bounded by ~10·log10(15/13) ≈ 0.6 dB
-        even in the best case.
+    (2) Task-stated SNR-delta fallback ("intra-slot overlap-averaged
+        magnitude across sub-windows" on the post-multipass residual
+        at missed-truth coordinates) measured mean Δ +0.013 dB across
+        28 missed truths in top-5 worst WAVs — two orders of magnitude
+        below the 2 dB PROCEED gate. Theoretically expected: 85%+
+        overlap between same-slot sub-windows means the noise samples
+        are correlated, so variance reduction is bounded by
+        ~10·log10(15/13) ≈ 0.6 dB even in the best case.
     The structural geometry of single-slot FT8 makes same-slot
     sub-window averaging inapplicable; the mechanism only has real
     coherent gain across SEPARATE slots, which the existing
     hb-074/075/079 cross-cycle infrastructure already covers on
     multi-slot WAVs.
+
+    **Naming note (Phase C 2026-06-02):** the original bank/journal
+    called this "Welch averaging." Welch (1967) is a PSD estimator
+    via averaged-windowed periodograms; what was actually measured is
+    **overlap-averaged magnitude across sub-windows** at a fixed
+    time-frequency coordinate (per-bin magnitude averaging, not PSD
+    estimation). The diagnostic + conclusion are correct; only the
+    term was loose. See
+    docs/engineering/2026-06-02-engineering-substance-audit.md
+    (claim 7).
   estimated_effort: 1-2 sessions (Session 1 = diagnostic, Session 2 = implement + sweep)
   expected_delta: +5-30 hard-200 rec (mechanism analogous to hb-079's interference cleanup but applied across same-slot sub-windows after multipass saturation)
   defensible_prior: yes — Q65 averages over receive windows; hb-079's mechanism cleared the per-slot interferers but didn't combine cleaned residuals across sub-windows; structurally different from hb-085 (which attacked decode-positions, not residual bins)
@@ -2618,10 +2720,16 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-diversity.md (entry D14).
 
-### hb-129 — Time-to-first-decode (TTFD) per-slot metric  [GRADUATED 2026-06-01]
+### hb-129 — Time-to-first-decode (TTFD) per-slot metric  [SHIPPED-INFRA 2026-06-01 — sidecar scorecard field; no decoder behavior change]
+  # Phase A re-label (2026-06-01): originally tagged GRADUATED. The TTFD
+  # metric is a sidecar scorecard field — instrumentation only, no production
+  # default flipped, composite unchanged by construction. Per the
+  # Phase A honesty-pass definition, INFRA-only changes are SHIPPED-INFRA,
+  # not GRADUATED. See docs/engineering/2026-06-02-engineering-substance-audit.md
+  # and research/experiments/2026-06-01-phase-b-bootstrap-ci.md.
   mode: ft8 (metric/instrumentation)
-  status: graduated
-  priority_score: 0.45
+  status: SHIPPED-INFRA — sidecar metric live; no decoder change, composite unchanged.
+  priority_score: 0.0  # was 0.45; instrumentation has shipped
   estimated_effort: 1 session (actual: ~50 min)
   expected_delta: median TTFD ttfd_score = clamp((15.0 - median_ttfd_s) / 15.0, 0, 1); re-ranks hb-091 (a8 early-decode) up, hb-079 (multipass) down; surfaces hb-093 (residual SNR gate) as operationally attractive
   defensible_prior: yes — WSJT-X-Improved a8 mode markets "0.5-1s early decode" as headline feature; TTFD is what they're optimizing
@@ -2632,7 +2740,7 @@ current_ratio: 0.051
   evidence_against:
     - Gameable by early FP emissions; must combine with precision gate
   notes: |
-    GRADUATED — TTFD metric live. `DecodedMessage` carries
+    SHIPPED-INFRA — TTFD metric live. `DecodedMessage` carries
     `decode_time_into_window: Option<Duration>`; stamped at CRC-pass site
     in par_decode_candidate / par_try_ap_decode /
     par_try_ldpc_with_recent_only, plus caller-side stamping for cross-
@@ -2981,9 +3089,12 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-corpus.md (entry C2).
 
-### hb-146 — Synthetic adversarial corpus targeting measured walls  [SHIPPED 2026-06-01 — mutual-masking pair sub-family; sub-Costas + 3+ stacks deferred]
+### hb-146 — Synthetic adversarial corpus targeting measured walls  [SHIPPED-INFRA 2026-06-01 — mutual-masking pair sub-family; sub-Costas + 3+ stacks deferred]
+  # Phase A re-label (2026-06-01): new corpus tier — decoder unchanged.
+  # SHIPPED-INFRA, not GRADUATED. V2/V3 re-eval on this corpus is the
+  # binding decoder-change test (flagged synth_pair_revisit_candidate).
   mode: ft8 (corpus/eval infrastructure)
-  status: SHIPPED 2026-06-01 — synth-pair-200 corpus + generator + tier wired; baseline measured; V2 + V3 flagged synth_pair_revisit_candidate.
+  status: SHIPPED-INFRA 2026-06-01 — synth-pair-200 corpus + generator + tier wired; baseline measured; V2 + V3 flagged synth_pair_revisit_candidate.
   priority_score: 0.0  # tier infra landed; V2/V3 re-eval are separate hypotheses
   estimated_effort: ~1 day curation + ~6 hours integration; collection synthetic (free)
   expected_delta: 3 sub-families (mutual-masking pairs, sub-Costas signals, 3+ collision stacks); directly resurrects shelved V2/V3 if win on adversarial tier
@@ -3080,9 +3191,12 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-corpus.md (entry C6).
 
-### hb-150 — High-jt9-novel-density tier (jt9-beats-pancetta inverse)  [PRIORITY: 0.50, spawned 2026-06-01 from corpus ideation]
+### hb-150 — High-jt9-novel-density tier (jt9-beats-pancetta inverse)  [SHIPPED-INFRA 2026-06-01 — new corpus tier, no decoder change]
+  # Phase A re-label (2026-06-01): tier infrastructure only — no decoder
+  # change, no production default flipped, composite unchanged by
+  # construction. SHIPPED-INFRA per the Phase A honesty pass.
   mode: ft8 (corpus/eval infrastructure)
-  status: SHIPPED 2026-06-01 — 200 WAVs curated, baseline recall 44.23%
+  status: SHIPPED-INFRA 2026-06-01 — 200 WAVs curated, baseline recall 44.23%
   priority_score: 0.50
   estimated_effort: ~3h curation + 2h integration; zero new audio
   expected_delta: 200 slots where jt9_count - pancetta_count >= 5; truth = jt9 decodes; recall on bigger find list; directly measures the pancetta-vs-jt9 gap
@@ -3306,9 +3420,13 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-human-loop.md (entry H3).
 
-### hb-161 — `Q` key: operator STOP mid-QSO when pancetta is wrong  [SHIPPED 2026-06-01 — Phase 5 safety driver]
+### hb-161 — `Q` key: operator STOP mid-QSO when pancetta is wrong  [SHIPPED-INFRA 2026-06-01 — Phase 5 safety driver; meatspace verification pending]
+  # Phase A re-label (2026-06-01): operator UI / safety driver — no decoder
+  # change, no composite impact. SHIPPED-INFRA. Real-world Q-press at the rig
+  # by the operator is the binding test and remains pending; see memory
+  # project_ssh_tmux_pending.md.
   mode: ft8 (operator-HITL / safety)
-  status: SHIPPED — code lands as `feat(tui): hb-161 — Q STOP key
+  status: SHIPPED-INFRA — code lands as `feat(tui): hb-161 — Q STOP key
     emergency operator override + TUI banner`. Phase 5 meatspace
     verification (actually pressing Q at the rig) deferred to
     project-meatspace-pending.
@@ -3974,9 +4092,19 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-foundation-models.md (entry F7).
 
-### hb-194 — Bayesian neural OSD via deep ensembles + entropic gating  [PRIORITY: 0.35 (wild), spawned 2026-06-01 from foundation-models ideation]
+### hb-194 — Bayesian neural OSD via deep ensembles + entropic gating  [SESSION-1-COMPLETE-A/B-PENDING 2026-06-01 — offline ensemble metric only; production composite A/B is Session 2]
+  # Phase A re-label (2026-06-01): the Session 1 journal called this
+  # GRADUATED based on an OFFLINE sample_recovery_rate on a 55-sample test
+  # fold (95% CI ±13 pp). No production decoder A/B was run; no composite
+  # delta measured against the production loop. Per the Phase A honesty
+  # pass + Phase B bootstrap-CI policy, this is SESSION-1-COMPLETE rather
+  # than GRADUATED. Session 2 = wire ensemble-mean weights and/or
+  # variance-gated OSD into the production decoder; A/B on hard-200 +
+  # hard-1000 with bootstrap CIs.
+  # See: research/experiments/2026-06-01-hb-194-bayesian-ensembles.md
+  # and  research/experiments/2026-06-01-phase-b-bootstrap-ci.md.
   mode: ft8 (ML / OSD)
-  status: pending
+  status: SESSION-1-COMPLETE-A/B-PENDING — N=8 no-bootstrap ensemble beats single-model mean by +55% sample_recovery_rate on Session 1 test split (N=55, ±13 pp CI); variance Pearson(var, error)=+0.48 (informativeness, NOT calibration in the Guo-2017 ECE sense). Session 2 binding A/B not run.
   priority_score: 0.35
   estimated_effort: 2 sessions; 8 GPU-hours (~$10) — cheapest deploy of any foundation-model idea
   expected_delta: K=8 independent copies of existing 20K OSD CNN with different seeds/bootstraps; ensemble disagreement = "should we run longer OSD?" gate; addresses hb-064 S2 overconfident-wrong directly
@@ -5036,7 +5164,7 @@ search to in-repo sources.
     - 50.6% agreement means ~85 of 174 bits are sign-wrong. OSD-2 budgets 2 flips, OSD-3 budgets 3, OSD-4 budgets 4. None can correct 85 bits.
     - Structural explanation: sub-Costas energy at the truth's freq_bin window comes from NEIGHBOR LEAKAGE and interferer tones, not from the truth's own (weakly) tone-aligned energy. max-log demod picks the LOUDER tone (the interferer), not the truth's tone.
     - FP-control argument was structurally weak even pre-diagnostic: CRC-14 catches 1/16384 by chance; OSD-2 enumerates 4095 patterns × 300+ sub-Costas positions per WAV ⇒ ~75 CRC-FPs per WAV expected. With high-energy garbage LLRs (not noise-only), these FPs would have non-trivial bit patterns and beat shallow plausibility checks at non-negligible rates.
-    - Closes single-position spectrogram-mining family on hard-200. V3, hb-082, hb-088 all confirm: dense busy-band sub-Costas energy is interferer-dominated, not weak-truth-dominated. Any mechanism in this family that operates on per-position LLRs cannot work on this corpus.
+    - Closes single-position spectrogram-mining family on current hard-200 corpus + implementations tested. V3, hb-082, hb-088 all confirm: dense busy-band sub-Costas energy is interferer-dominated, not weak-truth-dominated. The per-position-LLR mechanism family is closed on busy-band real-audio; sparser corpora and structurally-different mechanisms (e.g. phase-coherent IQ matched filter at truth coords, hb-090) remain unrefuted. Phase A honesty pass (2026-06-02) replaced "family closed" with this scoped phrasing.
   notes: |
     Diagnostic: pancetta-research/examples/hb088_osd_without_costas_feasibility.rs
     Scoping journal: research/experiments/2026-05-31-hb-088-scoping.md
