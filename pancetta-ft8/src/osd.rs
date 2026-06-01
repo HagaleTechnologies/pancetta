@@ -391,7 +391,10 @@ impl OsdDecoder {
             return None;
         }
 
-        // 8. OSD-3: flip all triples — C(91, 3) = 125,580 trials.
+        // 8. OSD-3: flip all triples — C(91, 3) = 121,485 trials
+        //    (= 91 · 90 · 89 / 6). Comment corrected 2026-06-02 (Phase C)
+        //    per docs/engineering/2026-06-02-engineering-substance-audit.md
+        //    (claim 17); loop math was already correct.
         // Each trial XORs 3 rows of the reduced generator matrix, then checks CRC-14.
         for i in 0..LDPC_INFO_BITS {
             for j in (i + 1)..LDPC_INFO_BITS {

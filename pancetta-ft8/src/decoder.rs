@@ -5068,7 +5068,13 @@ enum LdpcAlgorithm {
 /// Implements the LDPC decoder for FT8's (174,91) code:
 /// - 91 information bits (77 payload + 14 CRC)
 /// - 83 parity bits
-/// - Sum-product or min-sum belief propagation algorithm
+/// - **Sum-product** belief propagation algorithm (tanh check-message:
+///   `2·atanh(∏ tanh(v/2))`). The `LdpcAlgorithm::MinSum` enum variant
+///   is implemented but the production constructor hardcodes
+///   `SumProduct` — min-sum is library-only and unreachable from the
+///   production decoder path. Phase D 2026-06-02 audit (claim 18)
+///   tightened this docstring from "sum-product or min-sum" — see
+///   `docs/engineering/2026-06-02-engineering-substance-audit.md`.
 struct LdpcDecoder {
     max_iterations: usize,
     /// Parity check matrix (83x174) - sparse representation

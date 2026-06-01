@@ -79,6 +79,18 @@ pub fn populate_composite(card: &mut Scorecard, weights: BTreeMap<String, f64>) 
 // hb-133 — Saturation-aware composite (corpus-shift-robust)
 // ---------------------------------------------------------------------------
 //
+// **Naming note (Phase C 2026-06-02):** the name "saturation-aware" is
+// pancetta-internal shorthand. It does NOT mean a statistical-saturation
+// correction (i.e. nonlinear ceiling behavior); it is a corpus-refresh
+// offset accumulator that corrects for known corpus-shift jumps so the
+// cumulative graduation log stays comparable across refresh events.
+// A clearer (longer) name would be **composite-with-corpus-offset** or
+// **corpus-shift-corrected composite**. The "saturation" framing comes
+// from the operational story: corpora rotate when the decoder
+// *saturates* the previous corpus. The math is just an additive offset.
+// See `docs/engineering/2026-06-02-engineering-substance-audit.md`
+// (claim 31).
+//
 // When the evaluation corpus is rotated (e.g. hard-200 mix refresh on
 // 2026-05-30), the raw composite jumps by an amount that reflects corpus
 // shift, NOT decoder improvement. To keep multi-week graduation tracking

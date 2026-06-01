@@ -30,9 +30,19 @@ impl std::fmt::Display for Protocol {
 /// Modulation type used by a protocol
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ModulationType {
-    /// Pure continuous-phase FSK (FT8 standard)
+    /// Pure continuous-phase FSK (no Gaussian smoothing).
+    ///
+    /// NOTE (Phase D audit 2026-06-02): formerly used as the FT8 tag.
+    /// FT8 is canonically **8-GFSK with BT=2.0** per Franke-Taylor QEX
+    /// 2020; pancetta's modulator (`modulator.rs`) already produces
+    /// GFSK output, so the tag was the only thing wrong. FT8 now
+    /// correctly uses `Gfsk { bt: 2.0 }`. This variant is retained
+    /// for completeness; no current production protocol references it.
+    /// See `docs/engineering/2026-06-02-engineering-substance-audit.md`
+    /// (claim 4).
     Cpfsk,
-    /// Gaussian FSK with specified bandwidth-time product
+    /// Gaussian FSK with specified bandwidth-time product.
+    /// FT8 uses `Gfsk { bt: 2.0 }`; FT4 uses `Gfsk { bt: 1.0 }`.
     Gfsk { bt: f64 },
 }
 
@@ -153,7 +163,12 @@ impl ProtocolParams {
             data_symbol_ranges: &FT8_DATA_RANGES,
             num_data_symbols: 58, // 29 + 29
             cycle_duration: 15.0,
-            modulation: ModulationType::Cpfsk,
+            // FT8 is 8-GFSK BT=2.0 per Franke-Taylor QEX 2020. The
+            // modulator (modulator.rs) already produces GFSK output with
+            // BT=2.0; only the enum tag was previously wrong (Cpfsk).
+            // Fix landed 2026-06-02 (Phase C) per
+            // docs/engineering/2026-06-02-engineering-substance-audit.md.
+            modulation: ModulationType::Gfsk { bt: 2.0 },
             xor_sequence: None,
         }
     }
