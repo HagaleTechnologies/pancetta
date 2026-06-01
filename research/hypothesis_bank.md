@@ -1,11 +1,27 @@
 # Hypothesis Bank
 
-last_updated: 2026-06-01T18:00:00Z
+last_updated: 2026-06-01T23:30:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
 exploitation_run: 74
 current_ratio: 0.051
+# Batch 16 cruft-purge (2026-06-01): bank counters as of this commit.
+#   total_entries: 216
+#   pending (active, title PRIORITY): 141
+#   deferred:                            1   (hb-004)
+#   shelved (title SHELVED/DEFINITIVELY): 45
+#   graduated/win (title GRADUATED/WIN/CONDITIONAL/PARTIALLY): 29
+#   wild_cards (wild_card: true): 33
+#   closure_reminders flagged 2026-06-01: 2   (hb-108, hb-121)
+#   Status drift reconciled this batch: 10 entries (hb-016, hb-018,
+#     hb-021, hb-037, hb-064, hb-069, hb-072, hb-080, hb-081, hb-087)
+#     — hb-064 and hb-069 had unmerged SHELVE/Session-2 commits on
+#     iter branches that never landed on main; this batch ported the
+#     bank-side updates from those journals into main.
+#   Priorities assigned to title-PRIORITY-wild entries: 28
+#   (numeric priority_score was already populated by mr-009 aggregator;
+#    cruft purge propagated it into the title tag for visibility.)
 # mr-009 deep ideation pass (2026-06-01): 115 new candidates spawned
 #   (hb-101..hb-215) across 8 parallel sub-passes attacking different
 #   assumption axes:
@@ -167,7 +183,7 @@ current_ratio: 0.051
     that converge in ≤N iterations) as a separate metric to understand where
     the benefit actually comes from.
 
-### hb-037 — Redesign or remove subtract_with_sidelobes  [PRIORITY: SHELVED — superseded by hb-031]
+### hb-037 — Redesign or remove subtract_with_sidelobes  [SHELVED 2026-05-23 — superseded by hb-031]
   mode: ft8
   status: SHELVED (2026-05-23 — path (c) shipped via hb-031; paths (a)/(b) refuted by profile)
   priority_score: 0.0
@@ -542,8 +558,8 @@ current_ratio: 0.051
   ---- original priority below ----
   [PRIORITY-WAS: 0.45, spawned 2026-05-26 from hb-079]
   mode: ft8
-  status: pending
-  priority_score: 0.45
+  status: GRADUATED 2026-05-27
+  priority_score: 0.0
   estimated_effort: 1 session
   expected_delta: +20-50 hard-200 recovered (additional masked signals revealed in residual-of-residual)
   defensible_prior: yes — hb-079 confirmed pass-2 finds +158; some signals may be tertiary-masked
@@ -562,8 +578,8 @@ current_ratio: 0.051
   ---- original priority below ----
   [PRIORITY-WAS: 0.40, spawned 2026-05-26 from hb-079]
   mode: ft8
-  status: pending
-  priority_score: 0.40
+  status: SHELVED 2026-05-27
+  priority_score: 0.0
   estimated_effort: 1 session
   expected_delta: small bounded improvement — protects adjacent bins from over-subtraction by weak-rotor decodes
   defensible_prior: yes — direct analogue of hb-075's MRC fix for cross-cycle. The same noisy-rotor problem could over- or under-estimate subtract magnitude.
@@ -670,8 +686,8 @@ current_ratio: 0.051
   ---- original priority entry below ----
   [PRIORITY-WAS: 0.30, spawned 2026-05-25 from hb-058]
   mode: ft8
-  status: pending
-  priority_score: 0.30
+  status: GRADUATED 2026-05-26
+  priority_score: 0.0
   estimated_effort: 1 session
   expected_delta: precision (~55 hard-200 FP) without dropping the 77 real directional CQs
   defensible_prior: yes (JTDX "filter out directional CQ false decodes")
@@ -831,26 +847,41 @@ current_ratio: 0.051
     Follow-ups: hb-067 (mBP offset), hb-065 (adaptive GE — profile first),
     hb-064 (DIA trajectory features — could retrain OSD on layered trajs).
 
-### hb-064 — DIA-augmented OSD with iteration-trajectory features  [PRIORITY: 0.42, spawned 2026-05-25 from mr-003]
+### hb-064 — DIA-augmented OSD with iteration-trajectory features  [PRIORITY: 0.42, Session 2 SHELVED 2026-05-31; Session 3 deferred]
   mode: ft8
-  status: pending (plan-sized — needs training pipeline). NOW the correct OSD-speed lever: hb-065 profile (batch 11) shows TEP enumeration is 99.6% of OSD time, and this prunes TEP (paper: -97% TEP at SNR=2dB). Doubly motivated — layered BP (batch 10) changed the per-iter LLR trajectories the DIA model consumes, so pair with a retrain on layered trajectories.
+  status_2026_05_31_session2: SHELVED — Session 2 retrained the existing DIA CNN (20K params) on the Session 1 production-config trajectory JSONL (545 OSD-recovered samples, focal loss γ=2, MPS, 60-epoch cosine schedule). Offline: model beats |LLR|-ordering baseline 5.3× on sample-level top-T recovery (0.291 vs 0.055). A/B on hard-200: composite −0.00022 (4942→4938 rec, 1970→1835 novel), elapsed −7.4% (183.0s→169.5s). Composite regression is the binding SHELVE condition; the −135 novels indicates mild OOD drift (training pool was 33 WAVs incl. only 25 hard-200 head). Defer to Session 3 (bigger corpus and/or different architecture). See commit afd5921 (iter/2026-05-31-hb-064-session2 branch, not merged) + research/experiments/2026-05-31-hb-064-dia-osd-session2.md.
+  status: pending Session 3 — plan-sized (priority preserved at 0.42 since Session 2 produced a real but insufficient signal; Session 3 has clear levers).
   priority_score: 0.42
-  estimated_effort: 2-3 sessions (training data + model + integration)
-  expected_delta: significant TEP-enumeration speedup (paper reports 97% reduction at SNR=2dB on CCSDS (128,64))
+  estimated_effort: 2-3 sessions remaining (bigger training corpus, possibly new architecture)
+  expected_delta: paper reports 97% TEP-enumeration reduction at SNR=2dB on CCSDS (128,64); Session 2 hit −7.4% wall-clock elapsed with a composite regression
   defensible_prior: yes (arXiv:2404.14165; pancetta already has a DIA-style neural_osd)
   wild_card: false
   evidence_for:
     - Paper trains a small neural model (~2 dense layers) on per-BP-iteration LLR trajectories (vs just final LLRs) to refine bit reliabilities; sliding-window classifier decides when to early-terminate TEP enumeration.
     - pancetta already has neural_osd.rs with DIA-style model (20K params). This refines the existing module — feature extraction changes from final-LLR to per-iteration-LLR-trajectory.
     - Strong architectural fit per mr-003 audit.
+    - Session 2 (2026-05-31) confirmed the model offline beats |LLR| 5.3× on sample-level top-T recovery (0.291 vs 0.055). The paper's mechanism is real on pancetta's BP-failure population.
   evidence_against:
-    - Plan-sized: requires training-data regeneration with per-iteration LLR capture; existing pipeline uses final-iter features only.
-    - Risk of overfit to synth conditions.
+    - Plan-sized: requires training-data regeneration with per-iteration LLR capture; existing pipeline uses final-iter features only. [Resolved Session 1 — capture API in place.]
+    - Risk of overfit to synth conditions. [Resolved Session 2 partially — trained on production-config; but 33-WAV pool is small and shows OOD on full hard-200.]
+    - Session 2: composite regression −0.00022 (−135 novels) outweighs the −7.4% elapsed gain. Offline metric improvements don't transfer 1:1 to production wins.
   notes: |
     Source: arXiv:2404.14165 + companion arXiv:2307.06575.
-    First step: verify pancetta's current DIA feature extraction
-    (probably final-iter only). Then plan trajectory-capture data
-    pipeline.
+    Session 1: BP trajectory capture API + diagnostic — see
+      research/experiments/2026-05-31-hb-064-dia-osd-session1.md.
+    Session 2: retrain + A/B — see
+      research/experiments/2026-05-31-hb-064-dia-osd-session2.md.
+    Session 3 levers (NOT YET STARTED):
+      a) Scale the training corpus from 33 WAVs (25 hard-200 head) to full
+         hard-200 + hard-1000. Expect ~5-10× more recovered positives, less
+         OOD drift, possibly enough to flip the composite to +.
+      b) Try a wider model: transformer-style bit-attention over the
+         trajectory, or hand-add the 7 scalar features as a wide path
+         alongside the convolutions.
+      c) Train + evaluate against a different OSD operating point (e.g.
+         disable parity gate, allow OSD on more BP failures) — Session 2's
+         metric was confined to gate-pass samples, missing the bulk of the
+         BP-failure population.
 
 ### hb-065 — Adaptive Gaussian-Elimination removal in OSD  [SHELVED 2026-05-25 — batch 11]
   mode: ft8
@@ -1024,10 +1055,13 @@ current_ratio: 0.051
     the station to refresh. Spawning followup if/when this becomes
     operationally noticeable.
 
-### hb-069 — hb-044 interpolation in linear power space  [PRIORITY: 0.35, spawned 2026-05-25 from hb-068 finding]
+### hb-069 — hb-044 interpolation in linear power space  [SHELVED 2026-06-01 — composite -0.003049 vs dB; hb-044 family closed]
+  status_2026_06_01: SHELVED — implemented as `Ft8Config::sync_time_interp_linear_power` flag (default false; production unchanged). A/B sweep on refreshed main.json baseline: composite 0.579114 → 0.576065 (-0.003049); hard-200 -54 rec / -34 novel; hard-1000 -94 rec / -33 novel; fixtures + synth preserved. Linear-power interpolation regresses recall and composite. dB-space interpolation stays optimal under the hb-068 b-0.3 production setting. The hb-044 refinement family (hb-044 → hb-068 graduated, hb-069 shelved) is effectively closed. Plumbing kept for future use. See research/experiments/2026-05-31-hb-069-linear-power-interp.md and commit d04c596.
+  ---- original priority below ----
+  [PRIORITY-WAS: 0.35, spawned 2026-05-25 from hb-068 finding]
   mode: ft8
-  status: pending
-  priority_score: 0.35
+  status: SHELVED 2026-06-01
+  priority_score: 0.0
   estimated_effort: 1 session
   expected_delta: rescue hb-044's synth-clean SNR@90% gain at lower hard-200 cost
   defensible_prior: partial — hb-044 spectrogram interpolation is in dB space; linear-power interpolation may preserve symbol energies better
@@ -1348,8 +1382,8 @@ current_ratio: 0.051
   ---- original entry below ----
   [PRIORITY-WAS: 0.36]
   mode: ft8
-  status: pending
-  priority_score: 0.36
+  status: SHELVED 2026-05-30
+  priority_score: 0.0
   estimated_effort: 0.5 sessions
   expected_delta: +0.01 to +0.02 throughput (CPU saved); neutral real decode rate
   defensible_prior: partial
@@ -1394,8 +1428,8 @@ current_ratio: 0.051
   ---- original entry below ----
   [PRIORITY-WAS: 0.30]
   mode: ft8
-  status: pending
-  priority_score: 0.30
+  status: SHELVED 2026-05-26
+  priority_score: 0.0
   estimated_effort: 3 sessions
   expected_delta: +0.005 to +0.03 synth sensitivity below -22 dB; high FP risk without mitigation
   defensible_prior: partial
@@ -1432,7 +1466,7 @@ current_ratio: 0.051
     wanted) is a clean separate hb-NNN.
     See research/experiments/2026-05-24-aggressive-decoding-removal.md.
 
-### hb-021 — Wild-card: frequency-domain signal subtraction  [PRIORITY: SHELVED]
+### hb-021 — Wild-card: frequency-domain signal subtraction  [SHELVED 2026-05-23]
   mode: ft8
   status: SHELVED (2026-05-23 — profile rejected motivation)
   priority_score: 0.0
@@ -1451,10 +1485,10 @@ current_ratio: 0.051
     significantly raises pass-2's recall yield (e.g., NMS-aware subtract
     or a much better candidate generator on pass 2).
 
-### hb-026 — Wild-card: End-to-end neural decoder  [PRIORITY: wild]
+### hb-026 — Wild-card: End-to-end neural decoder  [PRIORITY: 0.15 (wild)]
   mode: ft8
   status: pending
-  priority_score: 0.0
+  priority_score: 0.15
   estimated_effort: 5+ sessions (heavy)
   expected_delta: unknown — could be +0.20 (transformative) or -0.30 (regression)
   defensible_prior: no
@@ -1493,10 +1527,10 @@ current_ratio: 0.051
     only with operator-side data once that infrastructure exists.
     See research/experiments/2026-05-24-batch-4-unblock.md iter 1 + 3.
 
-### hb-028 — Wild-card: Cross-decoder ensemble at runtime  [PRIORITY: wild]
+### hb-028 — Wild-card: Cross-decoder ensemble at runtime  [PRIORITY: 0.25 (wild)]
   mode: ft8
   status: pending
-  priority_score: 0.0
+  priority_score: 0.25
   estimated_effort: 2 sessions
   expected_delta: +0.10 to +0.20 vs_wsjtx_pct trivially, but morally questionable
   defensible_prior: no
@@ -1517,10 +1551,11 @@ current_ratio: 0.051
     signal — anything pancetta decodes that two other independent decoders agree
     with is almost certainly real. Use this to train the FP-filter for hb-024.
 
-### hb-087 — Callsign-priors-on-residual (AP-constrained, bypass Costas pre-gate)  [PRIORITY: 0.0, SHELVED 2026-05-31 at Session 2 — 0/10 AP-decode rescue]
+### hb-087 — Callsign-priors-on-residual (AP-constrained, bypass Costas pre-gate)  [SHELVED 2026-05-31 at Session 2 — 0/10 AP-decode rescue]
   status_2026_05_31_session2: SHELVED — Session 2 per-truth AP-decode micro-test returned 0 of 10 rescued on diverse top-20 hard-200 picks (need ≥3 for PROCEED). The production AP path with singleton recent_calls=[truth_callsign] could not surface any of the 10 prior-covered missed truths from positions sync_search did find. Conclusion: AP injection alone doesn't rescue noise-dominated residuals. The bypass-Costas extension (Session 3, deferred forever) would inherit this null result because it uses the same LDPC+AP machinery against weaker (sub-Costas) residual LLRs. Sibling hb-088 (OSD-without-Costas) SHELVED structurally at the same wall. Priority 0.45 → 0.0. See `research/experiments/2026-05-31-hb-087-session2.md` for the per-truth table, mechanism inference, and revisit conditions.
+  ---- original priority: 0.45 ----
   mode: ft8
-  status: shelved (Session 2 kill-switch failed; Session 3 not started)
+  status: SHELVED 2026-05-31
   priority_score: 0.0
   estimated_effort: 3 sessions (session 1 = scoping/diagnostic, DONE; session 2 = prior-set aggregation in research crate; session 3 = AP-constrained residual decode pass + eval)
   expected_delta: +5 to +30 hard-200 rec (diagnostic upper bound 153 of 647 = 23.6% coverage; mechanism efficiency assumed 5-20% of that); composite +0.0005 to +0.0015
@@ -1733,10 +1768,10 @@ current_ratio: 0.051
 
     Source: mr-008 ideation (territory A).
 
-### hb-094 — Residual denoising autoencoder pre-LDPC  [PRIORITY: wild, spawned 2026-05-31 from mr-008 ideation]
+### hb-094 — Residual denoising autoencoder pre-LDPC  [PRIORITY: 0.20 (wild), spawned 2026-05-31 from mr-008 ideation]
   mode: ft8
   status: pending
-  priority_score: 0.0
+  priority_score: 0.20
   estimated_effort: PLAN-SIZED (3-5 sessions: training-data gen + tiny model + diagnostic + integration)
   expected_delta: speculative — could rescue 20-60 hard-200 rec IF the denoiser successfully removes interferer-leakage from sub-Costas residuals; could regress like hb-064 Session 2 (-135 novels) on out-of-distribution drift
   defensible_prior: partial — self-supervised audio denoising literature 2025 (DCUNET, ONT-model variants) shows narrowband signal denoising via small (~1-2M param) deep models. Targeted at the interferer-leakage residual structure that hb-088 identified as the closed-family wall.
@@ -1765,10 +1800,10 @@ current_ratio: 0.051
     Source: mr-008 ideation (territory D); self-supervised audio
     denoising literature 2025.
 
-### hb-095 — Neural soft-demod replacement for max-log LLR  [PRIORITY: wild, spawned 2026-05-31 from mr-008 ideation]
+### hb-095 — Neural soft-demod replacement for max-log LLR  [PRIORITY: 0.25 (wild), spawned 2026-05-31 from mr-008 ideation]
   mode: ft8
   status: pending
-  priority_score: 0.0
+  priority_score: 0.25
   estimated_effort: PLAN-SIZED (3-4 sessions: training-data gen + small NN + integration + retune LDPC)
   expected_delta: speculative; could lift LLR sign-agreement from max-log's baseline; uncertain LDPC interaction; potentially +0.01 composite IF the LDPC retune absorbs the LLR distribution shift
   defensible_prior: partial — arXiv:2502.16371 "Software defined demodulation of multiple frequency shift keying with dense neural network for weak signal communications" reports gains for 8-FSK demod in low-SNR regimes; FT8 is 8-GFSK so structurally similar
@@ -2054,7 +2089,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-architectural.md (entry A5).
 
-### hb-106 — Variational message-set inference (Bayesian decoder)  [PRIORITY: wild, spawned 2026-06-01 from architectural ideation]
+### hb-106 — Variational message-set inference (Bayesian decoder)  [PRIORITY: 0.20 (wild), spawned 2026-06-01 from architectural ideation]
   mode: ft8
   status: pending
   priority_score: 0.20
@@ -2097,6 +2132,7 @@ current_ratio: 0.051
     See research/ideation/2026-06-01-architectural.md (entry A7).
 
 ### hb-108 — Time-frequency uncertainty distribution at sync  [PRIORITY: 0.40, spawned 2026-06-01 from architectural ideation]
+  closure_reminder_2026_06_01: ADJACENT to hb-086 V3 closure (subtract-aware sync threshold relaxation). V3 surfaced 100-131 "truly new" candidates per WAV in a relaxed-Costas window — all noise. hb-108's grid-search ±2 bins × 5 sub-bin around the Costas point on the SAME residual is a similar relaxation mechanism. The V3 trace showed LDPC always converges on noise at sub-Costas LLRs, CRC catches ~98% as FPs. Differentiator: hb-108 evaluates BEFORE subtract (pass-1 candidate population, not residual) and the grid is around POINT-detected Costas peaks, not relaxation across a continuous threshold band. The kill-switch (≥8% of missed truths decode at some grid point) is the right diagnostic — if it clears against the same population V3 was killed on, the differentiator is real.
   mode: ft8
   status: pending
   priority_score: 0.40
@@ -2138,7 +2174,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-architectural.md (entry A9).
 
-### hb-110 — Learned soft decoder (replace LDPC+OSD with a neural codec)  [PRIORITY: wild, spawned 2026-06-01 from architectural ideation]
+### hb-110 — Learned soft decoder (replace LDPC+OSD with a neural codec)  [PRIORITY: 0.15 (wild), spawned 2026-06-01 from architectural ideation]
   mode: ft8
   status: pending
   priority_score: 0.15
@@ -2222,7 +2258,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-architectural.md (entry A13).
 
-### hb-114 — Generative-prior decoder (FT8 messages as samples from learned model)  [PRIORITY: wild, spawned 2026-06-01 from architectural ideation]
+### hb-114 — Generative-prior decoder (FT8 messages as samples from learned model)  [PRIORITY: 0.18 (wild), spawned 2026-06-01 from architectural ideation]
   mode: ft8
   status: pending
   priority_score: 0.18
@@ -2300,7 +2336,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-diversity.md (entry D3).
 
-### hb-118 — IQ-pair-diversity from one KiwiSDR: USB + LSB simultaneous  [PRIORITY: wild, spawned 2026-06-01 from diversity ideation]
+### hb-118 — IQ-pair-diversity from one KiwiSDR: USB + LSB simultaneous  [PRIORITY: 0.20 (wild), spawned 2026-06-01 from diversity ideation]
   mode: ft8
   status: pending
   priority_score: 0.20
@@ -2319,7 +2355,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-diversity.md (entry D4).
 
-### hb-119 — Cross-band conditional prior (20m+40m same QSO)  [PRIORITY: wild, spawned 2026-06-01 from diversity ideation]
+### hb-119 — Cross-band conditional prior (20m+40m same QSO)  [PRIORITY: 0.22 (wild), spawned 2026-06-01 from diversity ideation]
   mode: ft8
   status: pending
   priority_score: 0.22
@@ -2361,6 +2397,7 @@ current_ratio: 0.051
     See research/ideation/2026-06-01-diversity.md (entry D6).
 
 ### hb-121 — Time-diversity by long-window IF acquisition (Q65-style)  [PRIORITY: 0.38, spawned 2026-06-01 from diversity ideation]
+  closure_reminder_2026_06_01: ADJACENT to hb-074 closure (complex-spectrogram coherent cross-cycle averaging). hb-074 SHELVED because phase estimates on marginal candidates raised sum variance, AND inter-slot phase wasn't reliably preserved in real-world audio. hb-075 (MRC-weighted) was the rescue, GRADUATED non-coherent-style. hb-121's "coherently average IF-level spectrograms" relies on the same coherence assumption that failed for hb-074 on the operator-corpus. The kill-switch noted ("phase-tracker" requirement) confirms the diagnosis. Either: (a) implement non-coherent magnitude averaging gated by codeword match (closer to graduated hb-056/hb-075 territory, may have small upside), or (b) restrict scope to a phase-coherent SDR-IQ corpus (hb-077 territory) to test if the coherence-limit lifts off-corpus.
   mode: ft8
   status: pending
   priority_score: 0.38
@@ -2399,7 +2436,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-diversity.md (entry D8).
 
-### hb-123 — Polarization-diversity emulator via two physical antennas  [PRIORITY: wild, spawned 2026-06-01 from diversity ideation]
+### hb-123 — Polarization-diversity emulator via two physical antennas  [PRIORITY: 0.15 (wild), spawned 2026-06-01 from diversity ideation]
   mode: ft8
   status: pending
   priority_score: 0.15
@@ -2458,7 +2495,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-diversity.md (entry D11).
 
-### hb-126 — Adversarial-noise injection diversity (test-time augmentation confidence)  [PRIORITY: wild, spawned 2026-06-01 from diversity ideation]
+### hb-126 — Adversarial-noise injection diversity (test-time augmentation confidence)  [PRIORITY: 0.20 (wild), spawned 2026-06-01 from diversity ideation]
   mode: ft8
   status: pending
   priority_score: 0.20
@@ -2478,7 +2515,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-diversity.md (entry D12).
 
-### hb-127 — Public-KiwiSDR scavenging fleet (Phase-5 QSO reliability)  [PRIORITY: wild, spawned 2026-06-01 from diversity ideation]
+### hb-127 — Public-KiwiSDR scavenging fleet (Phase-5 QSO reliability)  [PRIORITY: 0.18 (wild), spawned 2026-06-01 from diversity ideation]
   mode: ft8
   status: pending
   priority_score: 0.18
@@ -2686,7 +2723,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-metric.md (entry M9).
 
-### hb-138 — DXCC-coverage rate (unique entities per hour)  [PRIORITY: wild, spawned 2026-06-01 from metric ideation]
+### hb-138 — DXCC-coverage rate (unique entities per hour)  [PRIORITY: 0.25 (wild), spawned 2026-06-01 from metric ideation]
   mode: ft8 (metric/instrumentation)
   status: pending
   priority_score: 0.25
@@ -2705,7 +2742,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-metric.md (entry M10).
 
-### hb-139 — Information-theoretic recall (Shannon-weighted bits/slot)  [PRIORITY: wild, spawned 2026-06-01 from metric ideation]
+### hb-139 — Information-theoretic recall (Shannon-weighted bits/slot)  [PRIORITY: 0.20 (wild), spawned 2026-06-01 from metric ideation]
   mode: ft8 (metric/instrumentation)
   status: pending
   priority_score: 0.20
@@ -2724,7 +2761,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-metric.md (entry M11).
 
-### hb-140 — Counterfactual QSO-completion impact (causal A/B replay)  [PRIORITY: wild, spawned 2026-06-01 from metric ideation]
+### hb-140 — Counterfactual QSO-completion impact (causal A/B replay)  [PRIORITY: 0.22 (wild), spawned 2026-06-01 from metric ideation]
   mode: ft8 (metric/instrumentation)
   status: pending
   priority_score: 0.22
@@ -2760,7 +2797,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-metric.md (entry M13).
 
-### hb-142 — Listen-only Pareto: (recall, latency, CPU%) frontier  [PRIORITY: wild, spawned 2026-06-01 from metric ideation]
+### hb-142 — Listen-only Pareto: (recall, latency, CPU%) frontier  [PRIORITY: 0.20 (wild), spawned 2026-06-01 from metric ideation]
   mode: ft8 (metric/instrumentation)
   status: pending
   priority_score: 0.20
@@ -2778,7 +2815,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-metric.md (entry M14).
 
-### hb-143 — Operator-day-replay composite (8h K5ARH session, end-to-end QSO)  [PRIORITY: wild, spawned 2026-06-01 from metric ideation]
+### hb-143 — Operator-day-replay composite (8h K5ARH session, end-to-end QSO)  [PRIORITY: 0.25 (wild, FLAGSHIP), spawned 2026-06-01 from metric ideation]
   mode: ft8 (metric/instrumentation)
   status: pending
   priority_score: 0.25
@@ -3150,7 +3187,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-human-loop.md (entry H5).
 
-### hb-163 — Voice/foot-pedal shortcut: "answer that one"  [PRIORITY: wild, spawned 2026-06-01 from human-loop ideation]
+### hb-163 — Voice/foot-pedal shortcut: "answer that one"  [PRIORITY: 0.15 (wild), spawned 2026-06-01 from human-loop ideation]
   mode: ft8 (operator-HITL)
   status: pending
   priority_score: 0.15
@@ -3448,7 +3485,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-cross-time.md (entry T6).
 
-### hb-179 — Per-operator (sender) personality fingerprint  [PRIORITY: wild, spawned 2026-06-01 from cross-time ideation]
+### hb-179 — Per-operator (sender) personality fingerprint  [PRIORITY: 0.22 (wild), spawned 2026-06-01 from cross-time ideation]
   mode: ft8 (cross-time / behavioral)
   status: pending
   priority_score: 0.22
@@ -3503,7 +3540,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-cross-time.md (entry T9).
 
-### hb-182 — Time-aware decode-confidence calibration (retroactive boost)  [PRIORITY: wild, spawned 2026-06-01 from cross-time ideation]
+### hb-182 — Time-aware decode-confidence calibration (retroactive boost)  [PRIORITY: 0.20 (wild), spawned 2026-06-01 from cross-time ideation]
   mode: ft8 (cross-time / calibration)
   status: pending
   priority_score: 0.20
@@ -3521,7 +3558,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-cross-time.md (entry T10).
 
-### hb-183 — Federated cross-operator priors (pancetta-network)  [PRIORITY: wild, spawned 2026-06-01 from cross-time ideation]
+### hb-183 — Federated cross-operator priors (pancetta-network)  [PRIORITY: 0.22 (wild), spawned 2026-06-01 from cross-time ideation]
   mode: ft8 (cross-time / network)
   status: pending
   priority_score: 0.22
@@ -3540,7 +3577,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-cross-time.md (entry T11).
 
-### hb-184 — Time-reversed multipass (forward-backward smoothing on residual)  [PRIORITY: wild, spawned 2026-06-01 from cross-time ideation]
+### hb-184 — Time-reversed multipass (forward-backward smoothing on residual)  [PRIORITY: 0.22 (wild), spawned 2026-06-01 from cross-time ideation]
   mode: ft8 (cross-time / DSP)
   status: pending
   priority_score: 0.22
@@ -3559,7 +3596,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-cross-time.md (entry T12).
 
-### hb-185 — Meta-decode QSO-state HMM (decode the OPERATOR not the slot)  [PRIORITY: wild, spawned 2026-06-01 from cross-time ideation]
+### hb-185 — Meta-decode QSO-state HMM (decode the OPERATOR not the slot)  [PRIORITY: 0.20 (wild), spawned 2026-06-01 from cross-time ideation]
   mode: ft8 (cross-time / operator-state)
   status: pending
   priority_score: 0.20
@@ -3657,7 +3694,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-foundation-models.md (entry F3).
 
-### hb-190 — End-to-end Transformer audio → 91-bit message  [PRIORITY: wild, spawned 2026-06-01 from foundation-models ideation]
+### hb-190 — End-to-end Transformer audio → 91-bit message  [PRIORITY: 0.25 (wild), spawned 2026-06-01 from foundation-models ideation]
   mode: ft8 (ML / foundation-model)
   status: pending
   priority_score: 0.25
@@ -3736,7 +3773,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-foundation-models.md (entry F7).
 
-### hb-194 — Bayesian neural OSD via deep ensembles + entropic gating  [PRIORITY: wild, spawned 2026-06-01 from foundation-models ideation]
+### hb-194 — Bayesian neural OSD via deep ensembles + entropic gating  [PRIORITY: 0.35 (wild), spawned 2026-06-01 from foundation-models ideation]
   mode: ft8 (ML / OSD)
   status: pending
   priority_score: 0.35
@@ -3793,7 +3830,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-foundation-models.md (entry F10).
 
-### hb-197 — Latent-diffusion over LDPC codeword space  [PRIORITY: wild, spawned 2026-06-01 from foundation-models ideation]
+### hb-197 — Latent-diffusion over LDPC codeword space  [PRIORITY: 0.18 (wild), spawned 2026-06-01 from foundation-models ideation]
   mode: ft8 (ML / generative)
   status: pending
   priority_score: 0.18
@@ -3851,7 +3888,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-foundation-models.md (entry F13).
 
-### hb-200 — RF-foundation-model (SigMF-trained) transfer learning  [PRIORITY: wild, spawned 2026-06-01 from foundation-models ideation]
+### hb-200 — RF-foundation-model (SigMF-trained) transfer learning  [PRIORITY: 0.25 (wild), spawned 2026-06-01 from foundation-models ideation]
   mode: ft8 (ML / RF-foundation)
   status: pending
   priority_score: 0.25
@@ -3870,7 +3907,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-foundation-models.md (entry F14).
 
-### hb-201 — Neural sync / Costas-array detector (DETR-style)  [PRIORITY: wild, spawned 2026-06-01 from foundation-models ideation]
+### hb-201 — Neural sync / Costas-array detector (DETR-style)  [PRIORITY: 0.28 (wild), spawned 2026-06-01 from foundation-models ideation]
   mode: ft8 (ML / sync)
   status: pending
   priority_score: 0.28
