@@ -453,6 +453,34 @@ pub struct Ft8Config {
     /// cross-correlation. Default 6.25 Hz (one freq_bin). WSJT-X uses 2 Hz
     /// — pancetta's bin step is 3.125 Hz so 6.25 captures ±1 bin.
     pub a7_freq_window_hz: f64,
+
+    /// hb-057 V1 (Session 2): master switch for per-callsign median-DT
+    /// prior narrowing of the residual Costas sync search. When `false`
+    /// (default), the prior lookup is never consulted and the residual
+    /// sync sweep is unrestricted. When `true` AND a prior is registered
+    /// for at least one callsign decoded in the prior pass, residual
+    /// sync candidates are filtered to those whose t0 (converted to
+    /// slot-relative seconds) lies within at least one prior's window
+    /// (`max(dt_history_window_floor_s, prior.iqr * dt_history_window_iqr_scale)`
+    /// around `prior.median_dt`). Candidates outside every prior window
+    /// AND callsigns with no prior remain searchable via the AP/joint
+    /// retry path — the filter NEVER rejects candidates when no prior
+    /// is available (cold-start safe). Diagnostic: 38.6% of missed
+    /// truths on top-20 hard-200 WAVs sit in the prior-recoverable
+    /// population (kill switch cleared 3.86×). See
+    /// `docs/superpowers/specs/2026-05-31-hb-057-median-dt-design.md`.
+    pub dt_history_enabled: bool,
+
+    /// hb-057 V1: minimum prior-gate radius (seconds). The gate width is
+    /// `max(this, prior.iqr * dt_history_window_iqr_scale)`. Default 0.2
+    /// matches the diagnostic's ±0.2s window. Floor prevents IQR=0
+    /// callsigns (stable bucket) from collapsing to a sub-step window.
+    pub dt_history_window_floor_s: f64,
+
+    /// hb-057 V1: IQR scaling factor for the prior gate. Default 3.0 —
+    /// for the moderate-variance bucket (IQR ≤ 0.3s) this gives a
+    /// ±0.9s window, well within the diagnostic's recoverable bound.
+    pub dt_history_window_iqr_scale: f64,
 }
 
 impl Default for Ft8Config {
@@ -567,6 +595,12 @@ impl Default for Ft8Config {
             a7_snr7_threshold: crate::a7::A7_SNR7_THRESHOLD_DEFAULT,
             a7_snr7b_threshold: crate::a7::A7_SNR7B_THRESHOLD_DEFAULT,
             a7_freq_window_hz: 6.25,
+            // hb-057 V1 (Session 2): master switch off by default.
+            // Eval harness flips this on to A/B-test the mechanism. See
+            // `dt_history_window_floor_s` / `dt_history_window_iqr_scale`.
+            dt_history_enabled: false,
+            dt_history_window_floor_s: 0.2,
+            dt_history_window_iqr_scale: 3.0,
         }
     }
 }
@@ -678,6 +712,13 @@ pub struct Ft8Decoder {
     /// candidate position: (sync_score, residual_snr_db, decoded_ok).
     /// Read out (and reset) by `take_residual_snr_diagnostic`.
     residual_snr_records: Vec<(f64, f32, bool)>,
+
+    /// hb-057 V1 (Session 2): optional per-callsign DT prior lookup. When
+    /// `Some(...)` AND `config.dt_history_enabled` is true, the residual
+    /// `coherent_subtract_and_repass` step narrows its candidate set by
+    /// the union of prior-windows for callsigns decoded in the prior
+    /// pass. `None` (default) restores the historical full-axis sweep.
+    dt_priors: Option<std::sync::Arc<dyn crate::dt_history::DtPriorLookup>>,
 }
 
 impl Ft8Decoder {
@@ -754,7 +795,20 @@ impl Ft8Decoder {
             message_handler,
             last_metrics: DecodingMetrics::default(),
             residual_snr_records: Vec::new(),
+            dt_priors: None,
         })
+    }
+
+    /// hb-057 V1: attach a per-callsign DT prior lookup. Combined with
+    /// `Ft8Config::dt_history_enabled = true`, the residual
+    /// `coherent_subtract_and_repass` narrows its candidate t0 axis by
+    /// the union of per-callsign prior windows.
+    pub fn with_dt_priors(
+        mut self,
+        priors: std::sync::Arc<dyn crate::dt_history::DtPriorLookup>,
+    ) -> Self {
+        self.dt_priors = Some(priors);
+        self
     }
 
     /// hb-093: drain the diagnostic accumulator. Returns the per-candidate
@@ -2557,6 +2611,61 @@ impl Ft8Decoder {
             })
             .take(self.config.max_sync_candidates)
             .collect();
+        if new_candidates.is_empty() {
+            return Vec::new();
+        }
+
+        // hb-057 V1 (Session 2): per-callsign median-DT prior narrowing.
+        // When `dt_history_enabled` AND a lookup is attached, build the
+        // union of t0-windows from priors for each callsign decoded in
+        // the prior pass (`decoded`). Filter new_candidates to those
+        // whose t0 (slot-relative seconds) lies within at least one
+        // prior window. NO-OP when no priors fire (cold-start safe);
+        // pass-1 sync is NEVER touched (this is the residual pass only).
+        // Spec: docs/superpowers/specs/2026-05-31-hb-057-median-dt-design.md.
+        let new_candidates: Vec<CostasCandidate> =
+            if self.config.dt_history_enabled && self.dt_priors.is_some() {
+                let lookup = self.dt_priors.as_ref().expect("checked above");
+                let sps_local = pp.samples_per_symbol(SAMPLE_RATE);
+                let spec_step_local = sps_local / TIME_OSR;
+                let floor = self.config.dt_history_window_floor_s;
+                let scale = self.config.dt_history_window_iqr_scale;
+                // Collect prior windows from each decoded callsign with a prior.
+                let prior_windows: Vec<(f64, f64)> = decoded
+                    .iter()
+                    .filter_map(|m| m.message.from_callsign.as_deref())
+                    .filter_map(|call| {
+                        // Bare callsign (no /SUFFIX) — the diagnostic strips
+                        // suffixes when building cross-WAV history.
+                        let bare = call.split('/').next().unwrap_or(call);
+                        lookup.prior(bare)
+                    })
+                    .map(|p| {
+                        let radius = floor.max(p.iqr * scale);
+                        (p.median_dt - radius, p.median_dt + radius)
+                    })
+                    .collect();
+                if prior_windows.is_empty() {
+                    // Cold-start: no priors available. Preserve historical
+                    // behavior — pass everything through.
+                    new_candidates
+                } else {
+                    new_candidates
+                        .into_iter()
+                        .filter(|nc| {
+                            let coarse_offset = (nc.time_step as isize
+                                - spectrogram.time_padding as isize)
+                                * spec_step_local as isize;
+                            let t_s = coarse_offset as f64 / SAMPLE_RATE as f64;
+                            prior_windows
+                                .iter()
+                                .any(|(lo, hi)| t_s >= *lo && t_s <= *hi)
+                        })
+                        .collect()
+                }
+            } else {
+                new_candidates
+            };
         if new_candidates.is_empty() {
             return Vec::new();
         }

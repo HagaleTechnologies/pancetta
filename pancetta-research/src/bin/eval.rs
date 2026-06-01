@@ -93,6 +93,16 @@ struct Args {
     a7_snr7b_threshold: Option<f64>,
     /// hb-048: freq-window in Hz around each expected call (default 6.25).
     a7_freq_window_hz: Option<f64>,
+    /// hb-057 V1: enable per-callsign median-DT prior on the residual
+    /// sync pass. When set, the eval harness threads a shared
+    /// `InMemoryDtHistory` across all WAVs in a tier so the prior
+    /// reflects cross-WAV (cross-session-proxy) history. Defaults to
+    /// (floor_s=0.2, iqr_scale=3.0) per the spec.
+    hb057_dt_history_enabled: Option<bool>,
+    /// hb-057 V1: override the minimum prior-gate radius (seconds).
+    hb057_dt_history_window_floor_s: Option<f64>,
+    /// hb-057 V1: override the IQR scaling factor for the prior gate.
+    hb057_dt_history_window_iqr_scale: Option<f64>,
     /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
     two_stage: Option<bool>,
     /// hb-004: when Some, an ApContext is built and passed to
@@ -159,6 +169,9 @@ impl Args {
         let mut a7_snr7_threshold: Option<f64> = None;
         let mut a7_snr7b_threshold: Option<f64> = None;
         let mut a7_freq_window_hz: Option<f64> = None;
+        let mut hb057_dt_history_enabled: Option<bool> = None;
+        let mut hb057_dt_history_window_floor_s: Option<f64> = None;
+        let mut hb057_dt_history_window_iqr_scale: Option<f64> = None;
         let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
@@ -431,6 +444,25 @@ impl Args {
                     );
                     a7_enabled.get_or_insert(true);
                 }
+                "--hb057-dt-history-enabled" => {
+                    hb057_dt_history_enabled = Some(true);
+                }
+                "--hb057-dt-history-window-floor-s" => {
+                    hb057_dt_history_window_floor_s = Some(
+                        iter.next()
+                            .context("--hb057-dt-history-window-floor-s needs a value (seconds, e.g. 0.2)")?
+                            .parse()?,
+                    );
+                }
+                "--hb057-dt-history-window-iqr-scale" => {
+                    hb057_dt_history_window_iqr_scale = Some(
+                        iter.next()
+                            .context(
+                                "--hb057-dt-history-window-iqr-scale needs a value (e.g. 3.0)",
+                            )?
+                            .parse()?,
+                    );
+                }
                 "--two-stage" => {
                     two_stage = Some(true);
                 }
@@ -545,6 +577,9 @@ impl Args {
             a7_snr7_threshold,
             a7_snr7b_threshold,
             a7_freq_window_hz,
+            hb057_dt_history_enabled,
+            hb057_dt_history_window_floor_s,
+            hb057_dt_history_window_iqr_scale,
             two_stage,
             ap_my_call,
             ap_recent_calls,
@@ -1167,6 +1202,11 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(hz) = args.a7_freq_window_hz {
                 d = d.with_a7_freq_window_hz(hz);
+            }
+            if matches!(args.hb057_dt_history_enabled, Some(true)) {
+                let floor = args.hb057_dt_history_window_floor_s.unwrap_or(0.2);
+                let scale = args.hb057_dt_history_window_iqr_scale.unwrap_or(3.0);
+                d = d.with_dt_history(floor, scale);
             }
             if let Some(on) = args.two_stage {
                 d = d.with_two_stage(on);

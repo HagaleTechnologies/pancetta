@@ -67,6 +67,14 @@ pub struct Ft8Decoder {
     /// same as max_decode_passes (which is subtract-and-retry, shelved).
     /// Mutually exclusive with rolling_window and ap_context for now.
     two_stage_first_config: Option<pancetta_ft8::Ft8Config>,
+    /// hb-057 V1 (Session 2): shared per-callsign DT history persisting
+    /// across `decode_wav` calls. The eval harness creates one decoder
+    /// wrapper and reuses it across all WAVs in a tier, so this is the
+    /// natural place to hold the cross-WAV history (mirroring how
+    /// pancetta-coordinator-scoped `CrossTimeState` would behave in
+    /// production). `None` disables — `Ft8Config::dt_history_enabled`
+    /// also gates the decoder-side narrowing.
+    dt_history: Option<std::sync::Arc<pancetta_ft8::InMemoryDtHistory>>,
     /// Used only so `config_snapshot` is stable across calls.
     _scratch: Mutex<()>,
 }
@@ -81,8 +89,29 @@ impl Ft8Decoder {
             rolling_window: None,
             rolling_calls: Mutex::new(std::collections::VecDeque::new()),
             two_stage_first_config: None,
+            dt_history: None,
             _scratch: Mutex::new(()),
         }
+    }
+
+    /// hb-057 V1 (Session 2): enable the median-DT-per-callsign prior on
+    /// the residual sync pass. Creates a shared `InMemoryDtHistory`
+    /// persisting across `decode_wav` calls (the eval harness reuses one
+    /// `Ft8Decoder` wrapper across all WAVs in a tier; the history
+    /// mirrors what a coordinator-scoped `CrossTimeState` would carry in
+    /// production).
+    ///
+    /// `floor_s` is the minimum prior-gate radius (default 0.2 per
+    /// diagnostic); `iqr_scale` widens the gate proportional to IQR
+    /// (default 3.0). Both forwarded to `Ft8Config`.
+    pub fn with_dt_history(mut self, floor_s: f64, iqr_scale: f64) -> Self {
+        self.config.dt_history_enabled = true;
+        self.config.dt_history_window_floor_s = floor_s;
+        self.config.dt_history_window_iqr_scale = iqr_scale;
+        self.dt_history = Some(std::sync::Arc::new(
+            pancetta_ft8::InMemoryDtHistory::default(),
+        ));
+        self
     }
 
     /// Override `max_decode_passes` on the wrapped config. Used by the
@@ -458,6 +487,13 @@ impl DecoderUnderTest for Ft8Decoder {
         // and we want the outer trait impl to stay `&self`.
         let mut decoder = pancetta_ft8::Ft8Decoder::new(self.config.clone())
             .map_err(|e| anyhow::anyhow!("Ft8Decoder::new failed: {e}"))?;
+        // hb-057 V1: attach the shared DT history (Arc cloned per-WAV;
+        // the Arc<dyn DtPriorLookup> erases the concrete type so the
+        // decoder doesn't need to know about `InMemoryDtHistory`).
+        if let Some(ref h) = self.dt_history {
+            decoder = decoder
+                .with_dt_priors(h.clone() as std::sync::Arc<dyn pancetta_ft8::DtPriorLookup>);
+        }
         let raw = if let Some(window_n) = self.rolling_window {
             // hb-050: build ApContext from current rolling deque snapshot.
             let snapshot: Vec<String> = self
@@ -514,6 +550,21 @@ impl DecoderUnderTest for Ft8Decoder {
                 })?,
             }
         };
+        // hb-057 V1: record each decoded (callsign, DT) into the shared
+        // history BEFORE consuming `raw`/`prelim`. The next `decode_wav`
+        // call (next WAV in this tier) will see the accumulated history.
+        if let Some(ref h) = self.dt_history {
+            let now = std::time::SystemTime::now();
+            for d in raw.iter().chain(prelim.iter()) {
+                if let Some(ref call) = d.message.from_callsign {
+                    let bare = call.split('/').next().unwrap_or(call);
+                    if !bare.is_empty() {
+                        h.record(bare, d.time_offset, now);
+                    }
+                }
+            }
+        }
+
         // hb-046: merge prelim (cheap pass) + raw (standard pass) decodes,
         // dedup'd by message text. Prelim contributes any messages the
         // standard pass missed.

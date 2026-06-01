@@ -84,6 +84,10 @@ pub use ap::{ApContext, ApLevel, MyCallAp, QsoAp, QsoApProgress, RecentCallAp};
 // Session 2 of hb-048; no production hook in this session.
 pub mod a7;
 
+// hb-057 V1: median-DT-per-callsign prior + lookup trait (Session 2).
+pub mod dt_history;
+pub use dt_history::{DtPrior, DtPriorLookup, InMemoryDtHistory};
+
 // Parallel decode configuration
 pub mod parallel;
 pub use parallel::{BudgetTracker, DecodeConfig, Parallelism};
