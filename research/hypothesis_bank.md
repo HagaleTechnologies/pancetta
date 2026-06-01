@@ -4137,7 +4137,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-foundation-models.md (entry F7).
 
-### hb-194 — Bayesian neural OSD via deep ensembles + entropic gating  [SESSION-1-COMPLETE-A/B-PENDING 2026-06-01 — offline ensemble metric only; production composite A/B is Session 2]
+### hb-194 — Bayesian neural OSD via deep ensembles + entropic gating  [SESSION-2-COMPLETE-SHELVED 2026-06-02 — weight-space averaging didn't translate]
   # Phase A re-label (2026-06-01): the Session 1 journal called this
   # GRADUATED based on an OFFLINE sample_recovery_rate on a 55-sample test
   # fold (95% CI ±13 pp). No production decoder A/B was run; no composite
@@ -4146,10 +4146,19 @@ current_ratio: 0.051
   # than GRADUATED. Session 2 = wire ensemble-mean weights and/or
   # variance-gated OSD into the production decoder; A/B on hard-200 +
   # hard-1000 with bootstrap CIs.
+  #
+  # Session 2 result (2026-06-02): SHELVED on the weight-space averaging
+  # (Wortsman 2022 "model soup") variant. Production A/B on
+  # hard-200 + hard-1000 produced hard-200 recall Δ=−7 (95% CI [−15, +1],
+  # NOT significant), composite Δ=−0.000395, elapsed +82%. The from-
+  # scratch seed-diverse ensemble violates Wortsman's shared-basin
+  # assumption. Future ensemble work on this CNN requires either (a) a
+  # shared pre-trained backbone or (b) paying the 8× inference cost for
+  # output-space averaging. Production weights restored.
   # See: research/experiments/2026-06-01-hb-194-bayesian-ensembles.md
-  # and  research/experiments/2026-06-01-phase-b-bootstrap-ci.md.
+  # and  research/experiments/2026-06-02-hb-194-session2.md.
   mode: ft8 (ML / OSD)
-  status: SESSION-1-COMPLETE-A/B-PENDING — N=8 no-bootstrap ensemble beats single-model mean by +55% sample_recovery_rate on Session 1 test split (N=55, ±13 pp CI); variance Pearson(var, error)=+0.48 (informativeness, NOT calibration in the Guo-2017 ECE sense). Session 2 binding A/B not run.
+  status: SESSION-2-COMPLETE-SHELVED (weight-space averaging variant) — production A/B on hard-200 + hard-1000 with bootstrap CI shows hard-200 recall Δ=−7 (95% CI [−15, +1], NOT significant), composite Δ=−0.000395, elapsed +82%; Wortsman 2022 "model soup" shared-basin assumption violated by from-scratch seed-diverse training; Session 1's +55% offline OUTPUT-space gain does NOT translate via uniform-soup weight averaging.
   priority_score: 0.35
   estimated_effort: 2 sessions; 8 GPU-hours (~$10) — cheapest deploy of any foundation-model idea
   expected_delta: K=8 independent copies of existing 20K OSD CNN with different seeds/bootstraps; ensemble disagreement = "should we run longer OSD?" gate; addresses hb-064 S2 overconfident-wrong directly
