@@ -3769,8 +3769,9 @@ current_ratio: 0.051
 
 ### hb-187 — Wav2Vec2 / HuBERT frozen-encoder front-end (foundation-model adapter)  [PRIORITY: 0.40, spawned 2026-06-01 from foundation-models ideation]
   mode: ft8 (ML / foundation-model)
-  status: pending
+  status: session-1-complete (PROCEED; feasibility passed 2026-06-01)
   priority_score: 0.40
+  session_1_outcome: PROCEED — Wav2Vec2-base loads on MPS in <1s, pooled embeddings on 10 real FT8 WAVs show non-degenerate structure (cos mean 0.698, PC1=45%, eff-rank 4.7), per-WAV latency 145ms warm. Session 2 spec at docs/superpowers/specs/2026-06-01-hb-187-wav2vec2-design.md. Journal: research/experiments/2026-06-01-hb-187-session1.md.
   estimated_effort: 3-4 sessions to first A/B; 8 GPU-hours rented (~$10)
   expected_delta: pretrained 95M-param SSL encoder (Wav2Vec2/HuBERT/WavLM) + thin Linear(768→174) adapter; LLRs into existing BP; OOD risk bounded (frozen encoder, tiny adapter)
   defensible_prior: yes — ICASSP 2025 "Self-Supervised Speech Models as Universal Narrowband-Audio Feature Extractors" (Chen et al.) reports Wav2Vec2 improves PER on narrowband incl. FT4/FT8 even without fine-tuning
