@@ -2389,6 +2389,22 @@ impl Ft8Decoder {
     /// No-op when `coherent_multipass_iterations == 0` or the spectrogram
     /// lacks complex retention. Called once per round by the caller;
     /// `decoded` is the slice of just-found decodes to subtract this round.
+    ///
+    /// **Prior art**: this is a spectrogram-domain implementation of the
+    /// coherent iterative subtract-and-redecode technique published by
+    /// Franke, Taylor & Somerville in QEX July/August 2020 ("The FT4 and
+    /// FT8 Communication Protocols", <https://wsjt.sourceforge.io/FT4_FT8_QEX.pdf>)
+    /// and shipping in WSJT-X mainline as `lib/ft8/subtractft8.f90` since
+    /// 2020. The formula `proj = Re(bin·conj(rotor))·rotor` is canonical
+    /// ML single-user projection. The mechanism family is **Successive
+    /// Interference Cancellation (SIC)** per Verdú 1998 "Multiuser
+    /// Detection". Pancetta's variant differs from WSJT-X in implementation
+    /// domain (spectrogram bins vs time-domain waveform) and rotor
+    /// reference set (21 Costas symbols vs all 79), not in algorithm.
+    /// hb-079 closed a gap vs our underlying ft8_lib dependency (which has
+    /// no multi-pass), not vs WSJT-X. See
+    /// `docs/engineering/2026-06-02-sic-novelty-verification.md` for the
+    /// full novelty review.
     fn coherent_subtract_and_repass(
         &self,
         spectrogram: &mut Spectrogram,
