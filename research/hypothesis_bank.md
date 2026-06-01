@@ -1,6 +1,6 @@
 # Hypothesis Bank
 
-last_updated: 2026-06-01T23:30:00Z
+last_updated: 2026-06-01T23:45:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
@@ -8,10 +8,12 @@ exploitation_run: 74
 current_ratio: 0.051
 # Batch 16 cruft-purge (2026-06-01): bank counters as of this commit.
 #   total_entries: 216
-#   pending (active, title PRIORITY): 141
+#   pending (active, title PRIORITY): 140
 #   deferred:                            1   (hb-004)
 #   shelved (title SHELVED/DEFINITIVELY): 45
-#   graduated/win (title GRADUATED/WIN/CONDITIONAL/PARTIALLY): 29
+#   graduated/win (title GRADUATED/WIN/CONDITIONAL/PARTIALLY): 30
+#   (hb-133 GRADUATED 2026-06-01: saturation-aware composite + refresh-offset
+#    registry; instrumentation only, no decoder change.)
 #   wild_cards (wild_card: true): 33
 #   closure_reminders flagged 2026-06-01: 2   (hb-108, hb-121)
 #   Status drift reconciled this batch: 10 entries (hb-016, hb-018,
@@ -2631,9 +2633,9 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-metric.md (entry M4).
 
-### hb-133 — Saturation-aware composite (corpus-shift-robust)  [PRIORITY: 0.52, spawned 2026-06-01 from metric ideation]
+### hb-133 — Saturation-aware composite (corpus-shift-robust)  [GRADUATED 2026-06-01]
   mode: ft8 (metric/instrumentation)
-  status: pending
+  status: GRADUATED — RefreshOffsetRegistry + saturation_aware_composite() in pancetta-research/src/metrics.rs; sidecar at research/scorecards/refresh_offsets.json. eval binary prints both raw + saturation-aware composite. Seeded with the 2026-05-30 hard-200 refresh: offset +0.009699 (raw 0.579114 → saturation-aware 0.569415, exactly reconstructing the pre-refresh baseline within 1e-6 rounding).
   priority_score: 0.52
   estimated_effort: 1 session — pure aggregation change, no decoder change
   expected_delta: score' = score(current_decoder, current_corpus) - score(prev_main, current_corpus) + score(prev_main, prev_corpus); corpus refresh becomes automatic; cumulative graduations survive
@@ -2642,11 +2644,24 @@ current_ratio: 0.051
   evidence_for:
     - Removes pressure to delay corpus refresh; unblocks corpus survey recommendation
     - Highest work-to-impact ratio of the 15 metric ideas (per ideation summary)
+    - Saturation-aware value 0.569415 vs pre-refresh main.json's 0.569415 → cross-refresh comparability restored
   evidence_against:
     - Hides real recall growth: 5% better decoder + 5% harder corpus = 0% change
   notes: |
     "Definitely worth shipping" per metric ideation summary. Stable
     virtual baseline across corpus rotations.
+
+    Implementation: `RefreshOffset` + `RefreshOffsetRegistry` in
+    pancetta-research/src/metrics.rs; sidecar JSON registry at
+    research/scorecards/refresh_offsets.json (append-only, never edit
+    historical entries). Scorecards on disk are unmodified — offsets are
+    applied at read-time only via `saturation_aware_composite(raw, reg)`.
+
+    Future refresh procedure: when the corpus rotates, run the previous
+    main decoder against both the old and new corpus (or rely on the
+    archived pre/post main scorecards if same decoder), compute
+    `offset = score(prev_main, new_corpus) - score(prev_main, old_corpus)`,
+    and append a new entry to `refresh_offsets.json`.
 
     See research/ideation/2026-06-01-metric.md (entry M5).
 
