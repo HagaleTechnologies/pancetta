@@ -5,7 +5,7 @@
 
 use anyhow::Context;
 use chrono::Utc;
-use pancetta_research::corpus::{load_ft8_fixtures, load_synth_corpus};
+use pancetta_research::corpus::{load_ft8_fixtures, load_synth_corpus, load_synth_pair_corpus};
 use pancetta_research::curated::{load_curated_corpus, CuratedEntry};
 use pancetta_research::decoder::{DecoderUnderTest, Ft8Decoder};
 use pancetta_research::metrics::{
@@ -437,7 +437,7 @@ impl Args {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
                     );
-                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50, hard-jt9-rich-200");
+                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, synth-pair-200, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50, hard-jt9-rich-200");
                     eprintln!("  --max-passes: override Ft8Config::max_decode_passes (default 3)");
                     eprintln!("  --max-sync-candidates: override Ft8Config::max_sync_candidates (default 200)");
                     eprintln!(
@@ -686,6 +686,113 @@ fn run_synth_tier(
         snr_at_50pct_recovery_db: snr_at_50,
         snr_at_90pct_recovery_db: snr_at_90,
         ttfd_distribution,
+        ..Default::default()
+    })
+}
+
+/// hb-146 — synth-pair adversarial mutual-masking pair tier. Each WAV
+/// contains two FT8 signals at controlled (ΔSNR, Δf, Δt). Reports
+/// per-bucket recovery (strong vs weak) so the regime where pancetta
+/// drops the weak signal is visible and V2/V3 hypotheses can target it.
+fn run_synth_pair_tier(
+    decoder: &dyn DecoderUnderTest,
+    workspace: &std::path::Path,
+    manifest_path: &std::path::Path,
+    fp_filter: Option<&pancetta_research::FpFilter>,
+) -> anyhow::Result<TierResult> {
+    let entries = load_synth_pair_corpus(workspace, manifest_path)?;
+    let total = entries.len() as u32;
+    if total == 0 {
+        return Ok(TierResult {
+            wavs_processed: 0,
+            ..Default::default()
+        });
+    }
+
+    // Per-bucket counters keyed by (delta_snr*10, delta_freq*10, delta_time*100)
+    // — integer keys avoid float-ordering ambiguity. Each bucket tracks
+    // (strong_recovered, weak_recovered, attempts).
+    type Bucket = (u32, u32, u32);
+    let mut buckets: BTreeMap<(i64, i64, i64), Bucket> = BTreeMap::new();
+    let mut strong_total = 0u32;
+    let mut weak_total = 0u32;
+
+    for entry in &entries {
+        let key = (
+            (entry.delta_snr_db * 10.0).round() as i64,
+            (entry.delta_freq_hz * 10.0).round() as i64,
+            (entry.delta_time_s * 100.0).round() as i64,
+        );
+        let bucket = buckets.entry(key).or_insert((0, 0, 0));
+        bucket.2 += 1;
+
+        let mut decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        apply_fp_filter(fp_filter, &mut decodes);
+
+        let got_strong = decodes
+            .iter()
+            .any(|d| d.message.contains(&entry.message_strong));
+        let got_weak = decodes
+            .iter()
+            .any(|d| d.message.contains(&entry.message_weak));
+        if got_strong {
+            bucket.0 += 1;
+            strong_total += 1;
+        }
+        if got_weak {
+            bucket.1 += 1;
+            weak_total += 1;
+        }
+    }
+
+    // Print per-bucket regime map to stderr. The scorecard JSON keeps the
+    // aggregate (decode_rate over 2*total truths); the regime breakdown
+    // is operator-readable.
+    eprintln!(
+        "synth-pair-200 regime map ({} WAVs, 2 truths per WAV):",
+        total
+    );
+    eprintln!(
+        "  {:>8} {:>8} {:>8} {:>6} {:>6} {:>6} {:>8} {:>8}",
+        "dSNR", "dF_Hz", "dT_s", "n", "strong", "weak", "rec_s%", "rec_w%"
+    );
+    for ((dsnr_k, df_k, dt_k), (strong, weak, n)) in &buckets {
+        let dsnr = (*dsnr_k as f64) / 10.0;
+        let df = (*df_k as f64) / 10.0;
+        let dt = (*dt_k as f64) / 100.0;
+        let rec_s = if *n > 0 {
+            100.0 * *strong as f64 / *n as f64
+        } else {
+            0.0
+        };
+        let rec_w = if *n > 0 {
+            100.0 * *weak as f64 / *n as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  {:>8.1} {:>8.1} {:>8.2} {:>6} {:>6} {:>6} {:>7.1}% {:>7.1}%",
+            dsnr, df, dt, n, strong, weak, rec_s, rec_w,
+        );
+    }
+    eprintln!(
+        "synth-pair-200 totals: strong_recovered={}/{} ({:.1}%), weak_recovered={}/{} ({:.1}%)",
+        strong_total,
+        total,
+        100.0 * strong_total as f64 / total as f64,
+        weak_total,
+        total,
+        100.0 * weak_total as f64 / total as f64,
+    );
+
+    let truth_total = total * 2; // strong + weak per WAV
+    let recovered = strong_total + weak_total;
+    let decode_rate = recovered as f64 / truth_total as f64;
+    Ok(TierResult {
+        wavs_processed: total,
+        truth_decodes_total: Some(truth_total),
+        truth_decodes_recovered: Some(recovered),
+        decode_rate: Some(decode_rate),
         ..Default::default()
     })
 }
@@ -1109,6 +1216,24 @@ fn main() -> anyhow::Result<()> {
                 let result =
                     run_synth_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
                 tiers.insert("synth-doppler".to_string(), result);
+            }
+            // hb-146 — synthetic adversarial mutual-masking pair tier.
+            // Each WAV contains two FT8 signals at controlled (ΔSNR, Δf,
+            // Δt). Diagnostic tier (NEVER primary): targets shelved
+            // hb-086 V2 (soft cancellation) + V3 (subtract-aware sync
+            // relaxation) by building the marginal-SNR pair regime they
+            // were designed for on demand.
+            "synth-pair-200" => {
+                let manifest =
+                    workspace.join("research/corpus/synth/manifests/synth_pair_200.manifest.json");
+                anyhow::ensure!(
+                    manifest.exists(),
+                    "synth-pair-200 manifest missing at {}; run `cargo run --release -p pancetta-research --bin gen-synth-pair -- --config research/corpus/synth/manifests/synth_pair_200.config.json --output research/corpus/synth/manifests/synth_pair_200.manifest.json`",
+                    manifest.display()
+                );
+                let result =
+                    run_synth_pair_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
+                tiers.insert("synth-pair-200".to_string(), result);
             }
             "curated-hard-200" | "curated-hard-1000" | "wild-50" | "wild-100" => {
                 let label = match tier_name.as_str() {

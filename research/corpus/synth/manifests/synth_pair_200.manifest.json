@@ -1,0 +1,1840 @@
+{
+  "schema_version": 1,
+  "config": {
+    "schema_version": 1,
+    "label": "synth_pair_200",
+    "message_templates": [
+      "CQ K1ABC FN42",
+      "K1ABC W9XYZ EM48",
+      "W9XYZ K1ABC -10",
+      "K1ABC W9XYZ R-12",
+      "W9XYZ K1ABC RR73",
+      "K1ABC W9XYZ 73"
+    ],
+    "strong_snr_db": -8.0,
+    "delta_snr_db_steps": [
+      0.0,
+      3.0,
+      6.0,
+      9.0,
+      12.0
+    ],
+    "delta_freq_hz_steps": [
+      6.0,
+      12.0,
+      25.0,
+      50.0
+    ],
+    "delta_time_s_steps": [
+      0.0,
+      0.1,
+      0.25
+    ],
+    "slot_lead_in_s": 1.0,
+    "max_wavs": 200,
+    "seed": 6146,
+    "output_dir": "research/corpus/synth/wavs/pair_200"
+  },
+  "entries": [
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+0.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 4699506217307131014
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+0.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 18277859093829176454
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+0.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 18216610138896937716
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+0.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 4820258982316002438
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+0.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 18398611858838047878
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+0.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 18337362903905809140
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+3.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 103582797575539846
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+3.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13681935674097585286
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+3.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13620686719165346548
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+3.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 224335562584411270
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+3.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13802688439106456710
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+3.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13741439484174217972
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+6.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 135107994967133318
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+6.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13713460871489178758
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+6.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13652211916556940020
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+6.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 255860759976004742
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+6.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13834213636498050182
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+6.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13772964681565811444
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+9.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 154811243336879238
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+9.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13733164119858924678
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+9.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13671915164926685940
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+9.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 275564008345750662
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+9.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13853916884867796102
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+9.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13792667929935557364
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+12.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 166633192358726790
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+12.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13744986068880772230
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+12.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13683737113948533492
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+12.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 287385957367598214
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+12.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13865738833889643654
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p00_CQ_K1ABC_FN42__dSNR+12.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "CQ K1ABC FN42",
+      "message_weak": "K1ABC W9XYZ EM48",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13804489878957404916
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+0.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 4699506217308131017
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+0.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 18277859093830176457
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+0.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 18216610138897937719
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+0.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 4820258982317002441
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+0.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 18398611858839047881
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+0.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 18337362903906809143
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+3.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 103582797576539849
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+3.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13681935674098585289
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+3.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13620686719166346551
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+3.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 224335562585411273
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+3.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13802688439107456713
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+3.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13741439484175217975
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+6.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 135107994968133321
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+6.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13713460871490178761
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+6.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13652211916557940023
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+6.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 255860759977004745
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+6.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13834213636499050185
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+6.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13772964681566811447
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+9.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 154811243337879241
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+9.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13733164119859924681
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+9.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13671915164927685943
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+9.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 275564008346750665
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+9.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13853916884868796105
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+9.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13792667929936557367
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+12.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 166633192359726793
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+12.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13744986068881772233
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+12.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13683737113949533495
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+12.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 287385957368598217
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+12.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13865738833890643657
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p01_K1ABC_W9XYZ_EM48__dSNR+12.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ EM48",
+      "message_weak": "W9XYZ K1ABC -10",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13804489878958404919
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+0.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 4699506217309131020
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+0.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 18277859093831176460
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+0.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 18216610138898937722
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+0.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 4820258982318002444
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+0.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 18398611858840047884
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+0.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 18337362903907809146
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+3.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 103582797577539852
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+3.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13681935674099585292
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+3.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13620686719167346554
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+3.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 224335562586411276
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+3.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13802688439108456716
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+3.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13741439484176217978
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+6.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 135107994969133324
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+6.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13713460871491178764
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+6.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13652211916558940026
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+6.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 255860759978004748
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+6.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13834213636500050188
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+6.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13772964681567811450
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+9.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 154811243338879244
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+9.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13733164119860924684
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+9.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13671915164928685946
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+9.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 275564008347750668
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+9.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13853916884869796108
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+9.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13792667929937557370
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+12.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 166633192360726796
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+12.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13744986068882772236
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+12.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13683737113950533498
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+12.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 287385957369598220
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+12.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13865738833891643660
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p02_W9XYZ_K1ABC__10__dSNR+12.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC -10",
+      "message_weak": "K1ABC W9XYZ R-12",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13804489878959404922
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+0.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 4699506217310131023
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+0.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 18277859093832176463
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+0.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 18216610138899937725
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+0.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 4820258982319002447
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+0.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 18398611858841047887
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+0.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 18337362903908809149
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+3.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 103582797578539855
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+3.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13681935674100585295
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+3.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13620686719168346557
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+3.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 224335562587411279
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+3.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13802688439109456719
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+3.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13741439484177217981
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+6.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 135107994970133327
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+6.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13713460871492178767
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+6.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13652211916559940029
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+6.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 255860759979004751
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+6.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13834213636501050191
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+6.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13772964681568811453
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+9.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 154811243339879247
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+9.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13733164119861924687
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+9.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13671915164929685949
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+9.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 275564008348750671
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+9.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13853916884870796111
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+9.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13792667929938557373
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+12.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 166633192361726799
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+12.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13744986068883772239
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+12.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13683737113951533501
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+12.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 287385957370598223
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+12.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13865738833892643663
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p03_K1ABC_W9XYZ_R_12__dSNR+12.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ R-12",
+      "message_weak": "W9XYZ K1ABC RR73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13804489878960404925
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+0.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 4699506217311131026
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+0.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 18277859093833176466
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+0.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 18216610138900937728
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+0.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 4820258982320002450
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+0.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 18398611858842047890
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+0.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 18337362903909809152
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+3.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 103582797579539858
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+3.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13681935674101585298
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+3.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13620686719169346560
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+3.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 224335562588411282
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+3.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13802688439110456722
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+3.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13741439484178217984
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+6.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 135107994971133330
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+6.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13713460871493178770
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+6.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13652211916560940032
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+6.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 255860759980004754
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+6.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13834213636502050194
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+6.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13772964681569811456
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+9.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 154811243340879250
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+9.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13733164119862924690
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+9.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13671915164930685952
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+9.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 275564008349750674
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+9.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13853916884871796114
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+9.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13792667929939557376
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+12.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 166633192362726802
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+12.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13744986068884772242
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+12.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13683737113952533504
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+12.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 287385957371598226
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+12.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13865738833893643666
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p04_W9XYZ_K1ABC_RR73__dSNR+12.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "W9XYZ K1ABC RR73",
+      "message_weak": "K1ABC W9XYZ 73",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13804489878961404928
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+0.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 4699506217312131029
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+0.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 18277859093834176469
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+0.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 18216610138901937731
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+0.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 4820258982321002453
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+0.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 18398611858843047893
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+0.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 0.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 18337362903910809155
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+3.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 103582797580539861
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+3.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13681935674102585301
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+3.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13620686719170346563
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+3.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 224335562589411285
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+3.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13802688439111456725
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+3.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 3.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13741439484179217987
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+6.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 135107994972133333
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+6.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13713460871494178773
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+6.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13652211916561940035
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+6.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 255860759981004757
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+6.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13834213636503050197
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+6.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 6.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13772964681570811459
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+9.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 154811243341879253
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+9.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13733164119863924693
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+9.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13671915164931685955
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+9.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 275564008350750677
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+9.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13853916884872796117
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+9.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 9.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13792667929940557379
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+12.0_dF+6.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 166633192363726805
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+12.0_dF+6.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 6.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13744986068885772245
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+12.0_dF+12.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 12.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13683737113953533507
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+12.0_dF+25.0_dT+0.00.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.0,
+      "seed_for_this_wav": 287385957372598229
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+12.0_dF+25.0_dT+0.25.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 25.0,
+      "delta_time_s": 0.25,
+      "seed_for_this_wav": 13865738833894643669
+    },
+    {
+      "wav_path": "research/corpus/synth/wavs/pair_200/p05_K1ABC_W9XYZ_73__dSNR+12.0_dF+50.0_dT+0.10.wav",
+      "message_strong": "K1ABC W9XYZ 73",
+      "message_weak": "CQ K1ABC FN42",
+      "strong_snr_db": -8.0,
+      "delta_snr_db": 12.0,
+      "delta_freq_hz": 50.0,
+      "delta_time_s": 0.1,
+      "seed_for_this_wav": 13804489878962404931
+    }
+  ]
+}
