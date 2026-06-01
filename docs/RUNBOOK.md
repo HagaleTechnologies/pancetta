@@ -384,6 +384,17 @@ Claude will:
 4. Implement the change on the branch.
 5. Run eval: `cargo run --bin eval -- --tier ... --output research/scorecards/<branch>.json`.
 6. Run compare: `cargo run --bin compare -- research/scorecards/main.json research/scorecards/<branch>.json`.
+   The compare output includes a `BOOTSTRAP CI` section with 95 % nonparametric
+   confidence intervals on per-tier recall and novel deltas (Phase B, 2026-06-01;
+   see `research/experiments/2026-06-01-phase-b-bootstrap-ci.md`). If the
+   headline tier reports `NOT significant`, the win is statistically
+   indistinguishable from same-config rayon/OSD noise — default to SHELVE
+   unless a corroborating tier (hard-1000, wild-50, or synth-clean SNR-at-50%)
+   also moves significantly. The CI requires `per_wav_records` on both
+   scorecards (always present on eval runs from 2026-06-01 onwards;
+   older scorecards in `history/` will trigger an explicit skip banner).
+   Override knobs: `--no-bootstrap`, `--bootstrap-n N` (default 1000),
+   `--bootstrap-seed S` (default 0xb007).
 7. Decide merge/shelve/defer based on composite delta + regression flags.
 8. If WIN: PR to main, scorecard moves to `history/`, journal updated, hypothesis-bank entry marked graduated.
 9. If LOSS: journal documents learnings, follow-ups added to bank, branch deleted, artifacts marked for 14-day purge.
