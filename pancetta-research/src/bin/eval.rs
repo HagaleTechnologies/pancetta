@@ -423,7 +423,7 @@ impl Args {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
                     );
-                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50");
+                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50, hard-jt9-rich-200");
                     eprintln!("  --max-passes: override Ft8Config::max_decode_passes (default 3)");
                     eprintln!("  --max-sync-candidates: override Ft8Config::max_sync_candidates (default 200)");
                     eprintln!(
@@ -1102,6 +1102,34 @@ fn main() -> anyhow::Result<()> {
                     tiers.insert("wild-doppler-50".to_string(), result);
                 }
             }
+            // hb-150 — high-jt9-novel-density tier curated from existing
+            // baselines: WAVs where jt9 finds meaningfully more decodes
+            // than pancetta. Stresses recall gaps vs jt9 and unblocks
+            // sync-related hypotheses (hb-015 family) + bias-detection
+            // work. Manifest is produced by the `curate-jt9-rich` binary;
+            // treat missing manifest as a SKIP (matches wild-doppler-50
+            // pattern).
+            "hard-jt9-rich-200" => {
+                let manifest =
+                    workspace.join("research/corpus/curated/ft8/hard_jt9_rich_200.manifest.json");
+                if !manifest.exists() {
+                    eprintln!(
+                        "tier hard-jt9-rich-200: manifest missing at {} — SKIPPING (run `cargo run --release -p pancetta-research --bin curate-jt9-rich` to generate)",
+                        manifest.display()
+                    );
+                    tiers.insert(
+                        "hard-jt9-rich-200".to_string(),
+                        TierResult {
+                            wavs_processed: 0,
+                            ..Default::default()
+                        },
+                    );
+                } else {
+                    let result =
+                        run_curated_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
+                    tiers.insert("hard-jt9-rich-200".to_string(), result);
+                }
+            }
             other => anyhow::bail!("unknown tier '{other}'"),
         }
     }
@@ -1147,10 +1175,33 @@ fn main() -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     card.save(&args.output)?;
+
+    // hb-133: load corpus-refresh offsets (if any) and report both raw
+    // and saturation-aware composite. The saturation-aware number is
+    // comparable across corpus rotations (e.g. 2026-05-30 hard-200 mix
+    // update). The raw scorecard on disk is unmodified — offsets are
+    // applied at read-time only.
+    let offsets_path = workspace.join("research/scorecards/refresh_offsets.json");
+    let registry = match RefreshOffsetRegistry::load_or_default(&offsets_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "warn: failed to load corpus-refresh offsets from {} ({e}); reporting raw composite only",
+                offsets_path.display(),
+            );
+            RefreshOffsetRegistry::default()
+        }
+    };
+    let raw = card.composite.score;
+    let sat = saturation_aware_composite(raw, &registry);
+    let n_offsets = registry.offsets.len();
     println!(
-        "wrote scorecard: {} (composite {:.4}, {} tier(s), {:.1}s)",
+        "wrote scorecard: {} (composite raw {:.4}, saturation-aware {:.4} [{} refresh-offset(s) totaling {:+.4}], {} tier(s), {:.1}s)",
         args.output.display(),
-        card.composite.score,
+        raw,
+        sat,
+        n_offsets,
+        registry.total_offset(),
         args.tiers.len(),
         card.harness.elapsed_seconds,
     );
