@@ -359,6 +359,16 @@ pub struct App {
     /// dismisses. Modal blocks all other keys while visible.
     pub quit_confirm_visible: bool,
 
+    /// hb-161 — Phase 5 emergency-stop banner state. Flipped to `true`
+    /// the moment the operator presses Shift+Q; the UI renders a red
+    /// "STOPPED BY OPERATOR" banner over the main view. Cleared by Esc.
+    /// The actual side effects (TX abort, autonomous-off, CQ-stop) are
+    /// driven by the `TuiCommand::OperatorEmergencyStop` event the
+    /// coordinator handles — this field is just the visual signal so
+    /// the operator sees the keypress was received even if the
+    /// command-forwarding loop is briefly stalled.
+    pub stopped_by_operator: bool,
+
     // TX input
     pub tx_input_buffer: String,
     pub tx_input_cursor: usize,
@@ -444,6 +454,7 @@ impl App {
             device_selection: DeviceSelectionState::new(),
             help_visible: false,
             quit_confirm_visible: false,
+            stopped_by_operator: false,
             tx_input_buffer: String::new(),
             tx_input_cursor: 0,
             is_transmitting: false,

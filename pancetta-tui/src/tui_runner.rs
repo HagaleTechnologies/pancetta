@@ -160,6 +160,19 @@ pub enum TuiCommand {
     },
     /// User requested quit
     Quit,
+    /// Operator pressed the emergency-stop key (`Q` / `q` with Shift).
+    /// hb-161: Phase 5 safety driver. One keypress halts everything the
+    /// station is doing without exiting pancetta. The coordinator's
+    /// command-forwarding task aborts any in-flight TX, disables
+    /// autonomous mode at runtime, stops the repeating-CQ loop and any
+    /// active tune tone, and logs the event at WARN with
+    /// `target: "operator.override"`.
+    ///
+    /// Distinct from:
+    /// - `Quit` (whole-app shutdown via the `q` confirm modal)
+    /// - `StopTx` (halt current TX only; autonomous keeps running)
+    /// - `StopCq` (turn off repeating CQ only)
+    OperatorEmergencyStop,
 }
 
 /// TUI performance metrics
@@ -453,6 +466,15 @@ impl TuiRunner {
         }
 
         match key.code {
+            // hb-161: Esc clears the operator-stop banner without re-enabling
+            // anything. Re-enabling autonomous still requires `a`. Bound here
+            // (not in a modal-style early-return block) so other keys keep
+            // working — the banner is informational, not blocking.
+            KeyCode::Esc if app.stopped_by_operator => {
+                app.stopped_by_operator = false;
+                app.status_message = "Operator-stop banner cleared".to_string();
+            }
+
             // Panel navigation
             KeyCode::Tab => {
                 app.next_panel();
@@ -509,6 +531,26 @@ impl TuiRunner {
                 app.quit_confirm_visible = true;
                 app.status_message =
                     "Quit pancetta? Press y/Enter to confirm, n/Esc/q to cancel".to_string();
+            }
+
+            // === Emergency stop (hb-161: Phase 5 safety driver) ===
+            // Shift+Q halts the station without exiting. Distinct from
+            // lowercase `q` (quit-confirm). The coordinator handles the
+            // event: aborts in-flight TX, disables autonomous at runtime,
+            // stops the repeating CQ + active tune, and logs at WARN.
+            // The TUI also flips `stopped_by_operator` locally so the
+            // banner appears immediately — no round-trip needed for the
+            // visual signal.
+            KeyCode::Char('Q') => {
+                app.stopped_by_operator = true;
+                app.status_message =
+                    "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"
+                        .to_string();
+                warn!(
+                    target: "operator.override",
+                    "Operator pressed Q emergency stop key — halting station"
+                );
+                self.message_tx.send(TuiCommand::OperatorEmergencyStop)?;
             }
 
             // === Modal shortcuts ===
@@ -642,6 +684,13 @@ impl TuiRunner {
             // Render help overlay if visible
             if app.help_visible {
                 TuiRunner::render_help_overlay(f, f.area());
+            }
+
+            // Render operator-stop banner if active. Drawn before the
+            // quit-confirm overlay so the latter sits on top — Q-press
+            // then q-press should still let the operator quit.
+            if app.stopped_by_operator {
+                TuiRunner::render_stopped_by_operator_banner(f, f.area());
             }
 
             // Render quit-confirm overlay if visible (drawn last so it sits on top)
@@ -801,7 +850,8 @@ impl TuiRunner {
             ("d", "Device picker"),
             ("x", "Clear decoded messages"),
             ("q", "Quit (with confirm)"),
-            ("Esc", "Dismiss overlay / cancel modal"),
+            ("Shift+Q", "EMERGENCY STOP (halt TX, autonomous off)"),
+            ("Esc", "Dismiss overlay / cancel modal / clear stop banner"),
         ];
 
         // Modal sizing: wide enough for content, tall enough for all lines
@@ -858,6 +908,51 @@ impl TuiRunner {
             .wrap(Wrap { trim: false });
 
         f.render_widget(paragraph, inner);
+    }
+
+    /// hb-161: render the "STOPPED BY OPERATOR" banner across the top of
+    /// the frame. Non-modal — the operator can still interact with the
+    /// rest of the TUI, but the red banner makes it impossible to miss
+    /// that the emergency-stop is in effect. Cleared by Esc.
+    fn render_stopped_by_operator_banner(f: &mut Frame, area: Rect) {
+        use ratatui::text::{Line, Span};
+
+        // Two-row banner pinned to the top of the screen. Tall enough to
+        // be unmistakable, short enough not to obliterate the main view.
+        let banner_height: u16 = 3;
+        let banner_height = banner_height.min(area.height);
+        let banner_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: banner_height,
+        };
+
+        f.render_widget(ratatui::widgets::Clear, banner_area);
+
+        let lines = vec![
+            Line::from(Span::styled(
+                "  STOPPED BY OPERATOR — autonomous off, TX aborted",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "  Press Esc to clear banner. Press `a` to re-enable autonomous.",
+                Style::default().fg(Color::White).bg(Color::Red),
+            )),
+        ];
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .style(Style::default().bg(Color::Red).fg(Color::White));
+
+        let para = Paragraph::new(lines)
+            .block(block)
+            .style(Style::default().bg(Color::Red).fg(Color::White));
+        f.render_widget(para, banner_area);
     }
 
     /// Render quit-confirm overlay as a centered modal
@@ -1152,6 +1247,81 @@ mod key_tests {
         let (mut r, cmd_rx, _app) = make_runner().await;
         r.handle_key_event(key('+')).await.unwrap();
         assert!(cmd_rx.try_recv().is_err());
+    }
+
+    // === hb-161: Q STOP key emergency operator override ===
+
+    /// Shift+Q emits OperatorEmergencyStop AND flips the
+    /// `stopped_by_operator` banner flag immediately so the operator
+    /// sees the keypress register without waiting for the coordinator
+    /// round trip.
+    #[tokio::test]
+    async fn key_shift_q_emits_emergency_stop_and_sets_banner() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key_shift('Q')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::OperatorEmergencyStop)),
+            "Shift+Q must emit OperatorEmergencyStop"
+        );
+        assert!(
+            app.read().await.stopped_by_operator,
+            "Shift+Q must flip the banner state"
+        );
+    }
+
+    /// Lowercase q must NOT emit OperatorEmergencyStop — it's reserved
+    /// for the quit-confirm modal. Regression guard against accidentally
+    /// re-binding lowercase q while shipping the safety driver.
+    #[tokio::test]
+    async fn key_lowercase_q_does_not_emit_emergency_stop() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('q')).await.unwrap();
+        // The quit-confirm modal should be visible, NOT the operator-stop banner.
+        assert!(
+            app.read().await.quit_confirm_visible,
+            "lowercase q must open quit-confirm modal"
+        );
+        assert!(
+            !app.read().await.stopped_by_operator,
+            "lowercase q must not flip the operator-stop banner"
+        );
+        let cmd = cmd_rx.try_recv();
+        assert!(
+            !matches!(cmd, Ok(TuiCommand::OperatorEmergencyStop)),
+            "lowercase q must not emit OperatorEmergencyStop (got {:?})",
+            cmd
+        );
+    }
+
+    /// Esc clears the operator-stop banner. The banner is informational,
+    /// not modal, so other keys keep working even while it's visible —
+    /// but Esc is the documented dismissal.
+    #[tokio::test]
+    async fn key_esc_clears_operator_stop_banner() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        app.write().await.stopped_by_operator = true;
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(
+            !app.read().await.stopped_by_operator,
+            "Esc must clear the banner"
+        );
+    }
+
+    /// While the operator-stop banner is up, regular keys still work.
+    /// The banner is a warning, not a modal — other interactions (e.g.
+    /// switching panels) keep functioning so the operator can inspect
+    /// the state of the system.
+    #[tokio::test]
+    async fn banner_visible_does_not_block_other_keys() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.stopped_by_operator = true;
+        r.handle_key_event(key('c')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq)),
+            "c key must still emit StartCq even with banner visible"
+        );
     }
 }
 

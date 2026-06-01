@@ -22,6 +22,16 @@ impl super::ApplicationCoordinator {
         let config = self.config.read().await;
         let auto_config_enabled = config.autonomous.enabled;
 
+        // hb-161: seed the runtime gate from the configured value. The
+        // TUI's OperatorEmergencyStop handler flips this to `false` on
+        // Shift+Q; the autonomous loop checks it before submitting any
+        // TX. Doing the seed here means: if the operator launched with
+        // autonomous=false in config, the gate is already `false` and
+        // any Q-press is a no-op (idempotent — that's the desired
+        // safety-driver property).
+        self.autonomous_enabled_runtime
+            .store(auto_config_enabled, Ordering::Release);
+
         if !auto_config_enabled {
             info!("Autonomous operator disabled in configuration");
             drop(config);
@@ -182,6 +192,7 @@ impl super::ApplicationCoordinator {
 
         let cqdx_bridge_for_auto = self.cqdx_bridge.clone();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
+        let autonomous_runtime_gate = self.autonomous_enabled_runtime.clone();
         let auto_handle = {
             let shutdown = self.shutdown_signal.clone();
             let operator = operator.clone();
@@ -351,6 +362,28 @@ impl super::ApplicationCoordinator {
                                         info!("Autonomous: TX offset shifted to {:.0} Hz", new_offset_hz);
                                     }
                                 }
+                            }
+
+                            // hb-161: gate TX dispatch on the runtime
+                            // operator-override flag. If the operator
+                            // pressed Shift+Q, drop any TX items the
+                            // decision engine produced this cycle and
+                            // log once at WARN so the disengagement is
+                            // visible in journals. Listen/Status/Band
+                            // actions are still forwarded — only
+                            // outgoing TX is suppressed. The autonomous
+                            // operator retains its internal state so
+                            // re-enabling later picks up cleanly.
+                            if !autonomous_runtime_gate.load(Ordering::Acquire)
+                                && !tx_items.is_empty()
+                            {
+                                warn!(
+                                    target: "operator.override",
+                                    "Autonomous runtime gate is OFF; dropping {} TX items \
+                                     produced this cycle (operator pressed Shift+Q)",
+                                    tx_items.len()
+                                );
+                                tx_items.clear();
                             }
 
                             // Bundle collected TX items into a single message.

@@ -334,6 +334,7 @@ impl super::ApplicationCoordinator {
         let cmd_ptt_state = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_cq_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_abort_current_tx = self.abort_current_tx.clone();
+        let cmd_autonomous_enabled = self.autonomous_enabled_runtime.clone();
         // F4 toggle state: Some(t) when a tune is in flight and expected
         // to auto-stop at instant t. None when no tune is queued. The
         // coordinator owns this — TUI just emits ToggleTune events.
@@ -443,6 +444,32 @@ impl super::ApplicationCoordinator {
                         pancetta_tui::tui_runner::TuiCommand::StopCq => {
                             info!("TUI StopCq: stopping repeating CQ");
                             cmd_cq_active.store(false, Ordering::Relaxed);
+                            next_cq_time = None;
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::OperatorEmergencyStop => {
+                            // hb-161: Phase 5 emergency stop. Operator
+                            // pressed Shift+Q. Halt every TX path the
+                            // station can drive:
+                            //   1. Abort the in-flight TX (PTT-off in
+                            //      ~50ms via the existing F8 path).
+                            //   2. Disable autonomous mode at runtime
+                            //      (the autonomous loop reads this flag
+                            //      every slot before submitting TX).
+                            //   3. Stop the repeating-CQ loop.
+                            //   4. Cancel any active tune tone.
+                            // Logged at WARN with target=operator.override
+                            // so it stands out in the journal. The
+                            // operator re-enables autonomous explicitly
+                            // (TUI `a` key); we don't auto-restore.
+                            warn!(
+                                target: "operator.override",
+                                "Operator emergency stop (Shift+Q): aborting TX, disabling \
+                                 autonomous, stopping CQ + tune"
+                            );
+                            cmd_abort_current_tx.store(true, Ordering::Release);
+                            cmd_autonomous_enabled.store(false, Ordering::Release);
+                            cmd_cq_active.store(false, Ordering::Relaxed);
+                            *cmd_tune_until.write().await = None;
                             next_cq_time = None;
                         }
                         pancetta_tui::tui_runner::TuiCommand::StopTx => {

@@ -83,6 +83,15 @@ pub struct ApplicationCoordinator {
     /// the flag at the start of the next message, and continues.
     /// Distinct from `shutdown_signal` (which means "stop the whole app").
     abort_current_tx: Arc<AtomicBool>,
+    /// hb-161 — Phase 5 emergency-stop runtime gate. Set to `true` at
+    /// startup based on `config.autonomous.enabled`. Cleared (set to
+    /// `false`) when the operator presses Shift+Q in the TUI; the
+    /// autonomous decision loop reads this every cycle and skips
+    /// `TransmitRequest` dispatch when it's false. Toggled back on by
+    /// the autonomous TUI command (`a`) or by re-pressing Shift+Q (the
+    /// latter is reserved for future use; today it's one-shot off).
+    /// Separate from `shutdown_signal` and `abort_current_tx`.
+    autonomous_enabled_runtime: Arc<AtomicBool>,
     startup_time: Instant,
 
     /// Configuration
@@ -299,6 +308,11 @@ impl ApplicationCoordinator {
             is_running: Arc::new(AtomicBool::new(false)),
             shutdown_signal,
             abort_current_tx: Arc::new(AtomicBool::new(false)),
+            // Initial value is overwritten in start_autonomous_component
+            // once config.autonomous.enabled is read. Start `true` so a
+            // Q-press before component start still records the operator's
+            // intent (the autonomous start path also respects this gate).
+            autonomous_enabled_runtime: Arc::new(AtomicBool::new(true)),
             startup_time,
             audio_device,
             no_audio,
