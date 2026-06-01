@@ -85,6 +85,14 @@ struct Args {
     /// None disables; Some(db) skips LDPC at residual joint_pair_retry
     /// candidates with SNR < db.
     residual_snr_gate_db: Option<f64>,
+    /// hb-048 Session 3: enable a7 template cross-correlation pass.
+    a7_enabled: Option<bool>,
+    /// hb-048: snr7 acceptance threshold (default 6.0 per WSJT-X).
+    a7_snr7_threshold: Option<f64>,
+    /// hb-048: snr7b acceptance threshold (default 1.8 per WSJT-X).
+    a7_snr7b_threshold: Option<f64>,
+    /// hb-048: freq-window in Hz around each expected call (default 6.25).
+    a7_freq_window_hz: Option<f64>,
     /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
     two_stage: Option<bool>,
     /// hb-004: when Some, an ApContext is built and passed to
@@ -147,6 +155,10 @@ impl Args {
         let mut joint_residual_sync_window_bins: Option<usize> = None;
         let mut residual_energy_stop_db: Option<f64> = None;
         let mut residual_snr_gate_db: Option<f64> = None;
+        let mut a7_enabled: Option<bool> = None;
+        let mut a7_snr7_threshold: Option<f64> = None;
+        let mut a7_snr7b_threshold: Option<f64> = None;
+        let mut a7_freq_window_hz: Option<f64> = None;
         let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
@@ -389,6 +401,36 @@ impl Args {
                             .parse()?,
                     );
                 }
+                "--a7-enabled" => {
+                    a7_enabled = Some(true);
+                }
+                "--no-a7" => {
+                    a7_enabled = Some(false);
+                }
+                "--a7-snr7-threshold" => {
+                    a7_snr7_threshold = Some(
+                        iter.next()
+                            .context("--a7-snr7-threshold needs a value (default 6.0 per WSJT-X)")?
+                            .parse()?,
+                    );
+                    a7_enabled.get_or_insert(true);
+                }
+                "--a7-snr7b-threshold" => {
+                    a7_snr7b_threshold = Some(
+                        iter.next()
+                            .context("--a7-snr7b-threshold needs a value (default 1.8 per WSJT-X)")?
+                            .parse()?,
+                    );
+                    a7_enabled.get_or_insert(true);
+                }
+                "--a7-freq-window-hz" => {
+                    a7_freq_window_hz = Some(
+                        iter.next()
+                            .context("--a7-freq-window-hz needs a value (default 6.25)")?
+                            .parse()?,
+                    );
+                    a7_enabled.get_or_insert(true);
+                }
                 "--two-stage" => {
                     two_stage = Some(true);
                 }
@@ -499,6 +541,10 @@ impl Args {
             joint_residual_sync_window_bins,
             residual_energy_stop_db,
             residual_snr_gate_db,
+            a7_enabled,
+            a7_snr7_threshold,
+            a7_snr7b_threshold,
+            a7_freq_window_hz,
             two_stage,
             ap_my_call,
             ap_recent_calls,
@@ -1109,6 +1155,18 @@ fn main() -> anyhow::Result<()> {
             }
             if args.residual_snr_gate_db.is_some() {
                 d = d.with_residual_snr_gate_db(args.residual_snr_gate_db);
+            }
+            if let Some(on) = args.a7_enabled {
+                d = d.with_a7_enabled(on);
+            }
+            if let Some(t) = args.a7_snr7_threshold {
+                d = d.with_a7_snr7_threshold(t);
+            }
+            if let Some(t) = args.a7_snr7b_threshold {
+                d = d.with_a7_snr7b_threshold(t);
+            }
+            if let Some(hz) = args.a7_freq_window_hz {
+                d = d.with_a7_freq_window_hz(hz);
             }
             if let Some(on) = args.two_stage {
                 d = d.with_two_stage(on);

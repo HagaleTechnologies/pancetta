@@ -328,6 +328,38 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-048 Session 3: enable the a7 template cross-correlation pass.
+    /// Default false (off in production until graduation).
+    pub fn with_a7_enabled(mut self, on: bool) -> Self {
+        self.config.a7_enabled = on;
+        self
+    }
+
+    /// hb-048: override the a7 snr7 acceptance threshold (default 6.0 per
+    /// WSJT-X reference).
+    pub fn with_a7_snr7_threshold(mut self, t: f64) -> Self {
+        self.config.a7_snr7_threshold = t;
+        self.config.a7_enabled = true;
+        self
+    }
+
+    /// hb-048: override the a7 snr7b acceptance threshold (default 1.8 per
+    /// WSJT-X reference).
+    pub fn with_a7_snr7b_threshold(mut self, t: f64) -> Self {
+        self.config.a7_snr7b_threshold = t;
+        self.config.a7_enabled = true;
+        self
+    }
+
+    /// hb-048: override the a7 freq-window (Hz) used to select
+    /// sync_candidates around each expected call. Default 6.25 Hz (one
+    /// pancetta freq_bin).
+    pub fn with_a7_freq_window_hz(mut self, hz: f64) -> Self {
+        self.config.a7_freq_window_hz = hz;
+        self.config.a7_enabled = true;
+        self
+    }
+
     /// hb-046: enable two-stage decoding. When `on`, decode_wav runs a
     /// CHEAP pass first (relaxed sync_cap, no OSD, fewer LDPC iters)
     /// then the standard PRODUCTION pass on the same audio, unioning
