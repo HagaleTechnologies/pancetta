@@ -1610,10 +1610,29 @@ current_ratio: 0.051
     Until such a mechanism graduates, hb-087's structural shelf-reason
     holds.
 
-### hb-089 — Multi-cycle coherent residual accumulation  [PRIORITY: 0.48, spawned 2026-05-31 from mr-008 ideation]
+### hb-089 — Multi-cycle coherent residual accumulation  [SHELVED 2026-06-01 — see research/experiments/2026-06-01-hb-089-residual-accumulation.md]
   mode: ft8
-  status: pending
+  status: shelved
   priority_score: 0.48
+  shelve_reason: |
+    Diagnostic-first kill switch FIRED on two independent paths.
+    (1) Bank-stated kill switch ("callsign in 2+ same-slot sub-windows")
+        is UNSATISFIABLE — pancetta hard-200 WAVs are 15.0 s each (one
+        FT8 slot); no callsign repeats within a WAV. The mr-008
+        ideation prose mistakenly assumed 90 s multi-slot WAVs.
+    (2) Task-stated SNR-delta fallback (intra-slot Welch averaging on
+        the post-multipass residual at missed-truth coordinates)
+        measured mean Δ +0.013 dB across 28 missed truths in top-5
+        worst WAVs — two orders of magnitude below the 2 dB PROCEED
+        gate. Theoretically expected: 85%+ overlap between same-slot
+        sub-windows means the noise samples are correlated, so Welch
+        variance reduction is bounded by ~10·log10(15/13) ≈ 0.6 dB
+        even in the best case.
+    The structural geometry of single-slot FT8 makes same-slot
+    sub-window averaging inapplicable; the mechanism only has real
+    coherent gain across SEPARATE slots, which the existing
+    hb-074/075/079 cross-cycle infrastructure already covers on
+    multi-slot WAVs.
   estimated_effort: 1-2 sessions (Session 1 = diagnostic, Session 2 = implement + sweep)
   expected_delta: +5-30 hard-200 rec (mechanism analogous to hb-079's interference cleanup but applied across same-slot sub-windows after multipass saturation)
   defensible_prior: yes — Q65 averages over receive windows; hb-079's mechanism cleared the per-slot interferers but didn't combine cleaned residuals across sub-windows; structurally different from hb-085 (which attacked decode-positions, not residual bins)
