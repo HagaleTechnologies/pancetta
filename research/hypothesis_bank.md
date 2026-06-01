@@ -3549,7 +3549,29 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-human-loop.md (entry H15).
 
-### hb-173 — Within-QSO context graph (decode-time pair-conditional AP templates)  [PRIORITY: 0.50, spawned 2026-06-01 from cross-time ideation]
+### hb-173 — Within-QSO context graph (decode-time pair-conditional AP templates)  [PRIORITY: 0.50, scoped 2026-06-01]
+  status_2026_06_01_session1: |
+    Session 1 (design + diagnostic) COMPLETE → PROCEED.
+    Diagnostic `hb173_within_qso_diagnostic.rs` on hard-200: 18.48% of
+    8626 jt9-truth decodes (1594) are downstream turns of an
+    identifiable QSO whose upstream turn is in the same chronological
+    session — 1.85× the 10% PROCEED threshold. Hard-1000: 46.53%
+    (12775/27458). Depth distribution shows turn-2 = 55% (a7's target
+    population) but turn-3+ = 45% (exclusive to pair-conditional
+    templates; a7 cannot capture these because the responder swaps
+    roles). Slot-gap bimodal at 1+2 slots (89% of continuations) —
+    matches FT8 slot-parity QSO pattern. 80% of hard-200 sessions are
+    single-slot due to curation; production coverage is UNDERESTIMATED.
+    Design spec at docs/superpowers/specs/2026-06-01-hb-173-within-qso-design.md.
+    Session 2 builds WithinQsoContext + pair_conditional_templates +
+    classify_phase + 12 unit tests; Session 3 wires into decoder
+    post-V1, A/B evals on hard-200/1000 with target ≥5/≥20 recall
+    lift and composite ≥+0.0005. Recommends shared-infra crate
+    `CrossTimeState` co-housing hb-057, hb-048 a7, hb-173 tables.
+    Recommends separate chronological-replay eval-tier hypothesis
+    after Session 2 (corpus curation suppresses cross-slot effect).
+  ---- original priority entry below ----
+  [PRIORITY-WAS: 0.50, spawned 2026-06-01 from cross-time ideation]
   mode: ft8 (cross-time / AP)
   status: pending
   priority_score: 0.50
