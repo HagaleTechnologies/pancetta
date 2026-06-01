@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "label": "synth_pair_200",
+  "message_templates": [
+    "CQ K1ABC FN42",
+    "K1ABC W9XYZ EM48",
+    "W9XYZ K1ABC -10",
+    "K1ABC W9XYZ R-12",
+    "W9XYZ K1ABC RR73",
+    "K1ABC W9XYZ 73"
+  ],
+  "strong_snr_db": -8.0,
+  "delta_snr_db_steps": [0.0, 3.0, 6.0, 9.0, 12.0],
+  "delta_freq_hz_steps": [6.0, 12.0, 25.0, 50.0],
+  "delta_time_s_steps": [0.0, 0.1, 0.25],
+  "slot_lead_in_s": 1.0,
+  "max_wavs": 200,
+  "seed": 6146,
+  "output_dir": "research/corpus/synth/wavs/pair_200"
+}

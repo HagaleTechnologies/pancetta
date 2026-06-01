@@ -35,6 +35,10 @@ name = "gen-synth"
 path = "src/bin/gen_synth.rs"
 
 [[bin]]
+name = "gen-synth-pair"
+path = "src/bin/gen_synth_pair.rs"
+
+[[bin]]
 name = "baseline"
 path = "src/bin/baseline.rs"
 

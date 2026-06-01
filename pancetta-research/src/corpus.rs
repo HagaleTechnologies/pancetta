@@ -46,7 +46,7 @@ pub fn load_ft8_fixtures(workspace_root: &Path) -> anyhow::Result<Vec<FixtureEnt
     Ok(out)
 }
 
-use crate::synth::SynthManifest;
+use crate::synth::{SynthManifest, SynthPairManifest};
 
 /// One synth corpus entry, denormalized for the eval binary's convenience.
 #[derive(Clone, Debug)]
@@ -70,6 +70,42 @@ pub fn load_synth_corpus(
             wav_path: workspace_root.join(&e.wav_path),
             encoded_message: e.encoded_message.clone(),
             snr_db: e.snr_db,
+        })
+        .collect();
+    Ok(entries)
+}
+
+/// hb-146 — one pair-synth corpus entry. Each WAV contains two FT8
+/// signals at controlled (ΔSNR, Δf, Δt). Two truths per WAV; recall is
+/// per-message.
+#[derive(Clone, Debug)]
+pub struct SynthPairCorpusEntry {
+    pub wav_path: PathBuf,
+    pub message_strong: String,
+    pub message_weak: String,
+    pub strong_snr_db: f64,
+    pub delta_snr_db: f64,
+    pub delta_freq_hz: f64,
+    pub delta_time_s: f64,
+}
+
+/// hb-146 — load a pair-synth manifest from disk and resolve wav paths.
+pub fn load_synth_pair_corpus(
+    workspace_root: &Path,
+    manifest_path: &Path,
+) -> anyhow::Result<Vec<SynthPairCorpusEntry>> {
+    let manifest = SynthPairManifest::load(manifest_path)?;
+    let entries = manifest
+        .entries
+        .iter()
+        .map(|e| SynthPairCorpusEntry {
+            wav_path: workspace_root.join(&e.wav_path),
+            message_strong: e.message_strong.clone(),
+            message_weak: e.message_weak.clone(),
+            strong_snr_db: e.strong_snr_db,
+            delta_snr_db: e.delta_snr_db,
+            delta_freq_hz: e.delta_freq_hz,
+            delta_time_s: e.delta_time_s,
         })
         .collect();
     Ok(entries)
