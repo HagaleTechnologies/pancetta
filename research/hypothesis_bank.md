@@ -1,11 +1,35 @@
 # Hypothesis Bank
 
-last_updated: 2026-05-31T23:30:00Z
+last_updated: 2026-06-01T18:00:00Z
 current_focus_mode: ft8
 wild_card_ratio_target: 0.20
 wild_cards_run: 4
 exploitation_run: 74
 current_ratio: 0.051
+# mr-009 deep ideation pass (2026-06-01): 115 new candidates spawned
+#   (hb-101..hb-215) across 8 parallel sub-passes attacking different
+#   assumption axes:
+#     architectural (hb-101..hb-114, 14 ideas) — replace hard-decision
+#       pipeline stages with distributional output
+#     diversity    (hb-115..hb-128, 14 ideas) — second-measurement
+#       sources (space, decoder, frequency, time, polarization)
+#     metric       (hb-129..hb-143, 15 ideas) — alternative composite
+#       axes (TTFD, op-value, QSO-completion, PR-AUC, end-to-end)
+#     corpus       (hb-144..hb-157, 14 ideas) — alternative truth sets
+#       and stress tiers (consensus, adversarial, jt9-only, etc.)
+#     human-loop   (hb-158..hb-172, 15 ideas) — operator HITL feedback
+#       channels (decode-confirm, STOP, alarms, post-session review)
+#     cross-time   (hb-173..hb-186, 14 ideas) — within-QSO,
+#       within-session, cross-session, propagation, sun-cycle state
+#     foundation-models (hb-187..hb-201, 15 ideas) — Wav2Vec2,
+#       Whisper, diffusion, GNN-BP, deep ensembles, RF-FMs
+#     extras       (hb-202..hb-215, 14 ideas) — CAT-driven NB, TX-jitter,
+#       SDR-IQ, SIMD-BP, Wiener filter, WSJT-X plugin, log-as-truth
+#   See research/experiments/2026-06-01-mr-009-deep-ideation.md for
+#   full per-category summaries, cross-category synthesis, and the
+#   TOP-10 overall priority ranking. Cross-cutting infra needs:
+#   chronological eval tier, shared CrossTimeState, jtdx baseline,
+#   saturation-aware composite (hb-133 is the unblocking lever).
 # mr-008 ideation pass (2026-05-31): 12 new candidates spawned
 #   (hb-089..hb-100) after the 5-shelve session closed five mechanism
 #   families (soft cancellation, sync relaxation, OSD-without-Costas,
@@ -1921,6 +1945,2220 @@ current_ratio: 0.051
     pass.
 
     Source: mr-008 ideation (territory C; complements hb-073/077).
+
+### hb-101 — Soft-output decoder with codeword-posterior export  [PRIORITY: 0.45, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.45
+  estimated_effort: plan (1 spec + 3-4 sessions)
+  expected_delta: distributional output replaces CRC boolean gate; multipass subtract uses MMSE estimate; downstream FP filter consumes continuous trust score
+  defensible_prior: yes — list-decoding for LDPC well-studied (Vardy & Be'ery 1991; Hou/Siegel LDPC list-BP); ft8_lib's secondary-decode pass is degenerate K=2
+  wild_card: false
+  evidence_for:
+    - CRC-14 as boolean gate discards BP belief distribution; a near-CRC-passer carries information the current pipeline destroys
+    - Downstream (multipass, FP filter, QSO layer) can consume posterior natively; MMSE subtract is cleaner than hard hypothesis
+  evidence_against:
+    - CRC-14 budget says 1 spurious CRC-passer per 16384 random codewords; list multiplies CRC-budget exposure by K
+    - Touches BP post-processing, multipass subtract path, FP filter signature — substantial ripple
+  notes: |
+    Replace boolean output of LDPC+CRC+plausibility with list of
+    (codeword, posterior) tuples. Kill-switch (diagnostic): on top-20
+    hard-200 missed truths, BP and enumerate top-K=8 codewords by
+    belief sum. PROCEED if (a) truth in top-K ≥15% AND (b) non-truth
+    CRC-passer rate ≤5%.
+
+    See research/ideation/2026-06-01-architectural.md (entry A1).
+
+### hb-102 — Probability-of-existence map (continuous Costas gate)  [PRIORITY: 0.40, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: plan (1 spec + 4-6 sessions)
+  expected_delta: replaces Costas binary gate with continuous P(FT8-signal-here) map; OSD gets per-position budget multiplier; cuts uniform compute waste
+  defensible_prior: yes — Bayesian saliency maps (vision RPNs), probabilistic CFAR in radar; hb-080 multipass implicitly uses adjacency but with binary signal
+  wild_card: false
+  evidence_for:
+    - Costas score is a hard gate; downstream "how much compute should I spend here?" is continuous — gradient thrown away
+    - hb-088 sub-Costas LLR sign-agreement work suggests Costas is already info-rich at sub-threshold positions
+  evidence_against:
+    - More candidates surfaced → runtime cost up; budget multiplier MUST keep total compute bounded
+    - Touches every downstream stage's budget-allocation logic
+  notes: |
+    Map built from Costas score + broadband SNR + residual coherence +
+    adjacency to existing decodes. Kill-switch: compute prob-of-existence
+    map on top-20 hard-200 (read-only diagnostic). AUC vs ground truth
+    ≥0.75 to PROCEED.
+
+    See research/ideation/2026-06-01-architectural.md (entry A2).
+
+### hb-103 — Continuous trust-score FP filter (replace boolean gates)  [PRIORITY: 0.42, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.42
+  estimated_effort: 2-3 sessions (plan-sized if QSO layer threading in scope)
+  expected_delta: calibrated [0,1] trust score replaces boolean FP funnel; τ tunable per operational mode (rare-DX-hunt: low τ; logging: high τ)
+  defensible_prior: yes — calibrated classifier output is standard ML (Platt, isotonic); FT8 FP scoring is binary classifier currently at single threshold
+  wild_card: false
+  evidence_for:
+    - Operator cost function depends on use case (log-only vs auto-response); current arch can't express
+    - DecodedMessage trust score becomes part of API; QSO layer uses it for confidence weighting
+  evidence_against:
+    - Changes DecodedMessage API → ripples to QSO layer, ADIF writer, TUI; downstream change cost may dwarf decoder win
+  notes: |
+    Integrates: BP belief sum, post-CRC margin, Costas sync_score,
+    callsign-continuity string-distance, recency-of-callsign.
+    Kill-switch: train calibrated classifier on scorecard data; AUC
+    ≥0.85 AND dominates current rule stack at some threshold.
+
+    See research/ideation/2026-06-01-architectural.md (entry A3).
+
+### hb-104 — Joint multi-candidate decoder (vector decode, not sequence)  [PRIORITY: 0.48, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.48
+  estimated_effort: plan (2 specs: scoping + production-design)
+  expected_delta: jointly solve for tone amplitudes given full spectrogram and candidate set under LDPC-codeword constraints; structural fix for interferer-dominated sub-Costas positions
+  defensible_prior: yes — joint source separation in audio (NMF + sparsity), joint detection in radar (MIMO); aligned with hb-088's "multi-stream separation BEFORE LLR extraction" structural finding
+  wild_card: false
+  evidence_for:
+    - Current pipeline is greedy approximation of this joint problem
+    - hb-079 coherent-iterative-subtract win shows that better residual quality unlocks decodes; joint formulation is the limit
+  evidence_against:
+    - Optimisation may not converge in real-time budget
+    - Could end up as research-only diagnostic
+  notes: |
+    ADMM or alternating-minimisation on amplitudes given fixed
+    codewords, BP on each candidate given residual after others
+    subtracted. Kill-switch: top-20 hard-200 WAVs with ≥3 overlapping
+    decodes, one-step ALS recovers ≥5% more decodes than greedy.
+
+    See research/ideation/2026-06-01-architectural.md (entry A4).
+
+### hb-105 — Decoder fusion at LLR level with jt9 (cross-decoder LLR sum)  [PRIORITY: 0.35, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 4-6 sessions (research-only first; productionise later)
+  expected_delta: sum LLR vectors from pancetta + jt9 at shared candidates, then run LDPC+CRC+plausibility on fused LLRs — MRC at the channel-decoding input
+  defensible_prior: yes — MRC in diversity-receiver systems; LLR addition is canonical fusion rule for independent observations of same codeword
+  wild_card: false
+  evidence_for:
+    - jt9 and pancetta have different windowing, sync, tone-mag estimators — complementary observation channels
+  evidence_against:
+    - License entanglement (jt9 is GPL) — production integration may force GPL boundary or re-implementation
+    - jt9 and pancetta may have correlated errors at the same candidate (both use Costas-like sync); LLRs correlated, sum doesn't help
+  notes: |
+    Kill-switch: for 20 hard-200 WAVs capture jt9 LLRs (diagnostic
+    build), at shared (time, freq) candidates compute pancetta-only,
+    jt9-only, sum-LLR LDPC pass rates. PROCEED if sum > max + 5pp.
+
+    See research/ideation/2026-06-01-architectural.md (entry A5).
+
+### hb-106 — Variational message-set inference (Bayesian decoder)  [PRIORITY: wild, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.20
+  estimated_effort: plan (multi-spec; ~10+ sessions research project)
+  expected_delta: variational Bayesian posterior over (callsign1, callsign2, locator) directly; structured-message prior integrated into inference rather than post-hoc plausibility
+  defensible_prior: partial — structured prediction (CRFs), Bayesian decoding in turbo codes (BCJR); FT8 message structure has ~30 bits of effective entropy after constraints, but engineering risk is high
+  wild_card: true
+  evidence_for:
+    - FT8's source code (message grammar) and channel code are not jointly inferred today
+    - Non-CRC-passing codeword decoding to plausible message > one decoding to garbage
+  evidence_against:
+    - Variational inference may not converge in 15-s slot deadlines
+    - Research-project scope; project may not have runway
+  notes: |
+    Wild-card-adjacent: defensible prior exists, engineering risk high.
+    Kill-switch: build generative model for FT8 message tuples;
+    for top-200 worst hard-200, prior probability of truth ≥1e-4
+    (i.e., ≥13 bits of info beyond uniform).
+
+    See research/ideation/2026-06-01-architectural.md (entry A6).
+
+### hb-107 — Partial-decode first-class object (callsign with no message)  [PRIORITY: 0.32, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 2-3 sessions for PartialDecode type + emission path; plan-sized if QSO-layer integration in scope
+  expected_delta: CRC-failing post-BP codeword whose 28-bit callsign1 hash matches known-callsign set emits PartialDecode; presence-detection for autonomous operator + richer PSKReporter spots
+  defensible_prior: yes — 28-bit callsign hash is most structured sub-portion; ft8_lib's hash22 mechanism is a degenerate version
+  wild_card: false
+  evidence_for:
+    - 174-bit codeword splits into ~28 callsign1 + ~28 callsign2 + ~16 locator+type + ~14 CRC + ~5 free; near-decode with right callsign1 bits is still useful
+    - QSO layer uses partial for presence detection; PSKReporter benefits
+  evidence_against:
+    - Random codeword bits collide with hash entries at rate ~|hash_table|/2^28
+  notes: |
+    Kill-switch: on top-20 hard-200, every CRC-failing post-BP
+    codeword, compare first-28 bits against known-hash table.
+    PROCEED if ≥10% have known-callsign hash match.
+
+    See research/ideation/2026-06-01-architectural.md (entry A7).
+
+### hb-108 — Time-frequency uncertainty distribution at sync  [PRIORITY: 0.40, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 2-3 sessions for grid-search version; 4-6 for posterior-weighted
+  expected_delta: replace Costas point estimate with posterior distribution over (t, f, sub) with covariance; weighted-average tone-mag extraction over neighborhood
+  defensible_prior: yes — marginalisation over nuisance parameters is Bayesian standard; sub-pixel registration in vision; WSJT-X's f1 sweep is brute-force version
+  wild_card: false
+  evidence_for:
+    - Sync collapses continuous-position uncertainty; for marginal candidates 1-2 bins off true position breaks LDPC
+    - hb-079 family's marginal-tail wins hint at sub-Costas information
+  evidence_against:
+    - Grid search inflates compute by 10x; needs strict candidate pruning
+    - Numerical issues with weighted-average tone magnitudes (dB interpretation)
+  notes: |
+    Cheap path: grid-search ±2 bins × 5 sub-bin around Costas point.
+    Kill-switch: ≥8% of missed truths have at least ONE grid point
+    that decodes successfully.
+
+    See research/ideation/2026-06-01-architectural.md (entry A8).
+
+### hb-109 — Per-tone confidence propagation (symbol-level posterior throughout)  [PRIORITY: 0.30, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.30
+  estimated_effort: plan (touches LDPC core BP update rules; numerically tricky)
+  expected_delta: non-binary BP over 8-ary alphabet preserves symbol-level correlation that bit-wise LLR projection discards
+  defensible_prior: yes — non-binary LDPC well-studied (Davey & Mackay 1998); Q-ary BP on GF(8) groupings of bit-triples; max-log LLR derivation is exactly the lossy step
+  wild_card: false
+  evidence_for:
+    - 8-FSK: single tone determines all 3 bits jointly — bit-LLRs throw away correlation
+  evidence_against:
+    - Risk of regression on easy decodes (current pipeline is bit-exact with ft8_lib and well-tuned)
+    - Deep surgery; numerically tricky
+  notes: |
+    Kill-switch (theoretical): mutual-information loss from bit-LLR
+    projection vs full symbol posterior. <0.1 bits/symbol → no leverage.
+    Practical: symbol-aware BP variant on top-20 hard-200; ≥3% recovery
+    improvement AND <20% elapsed inflation.
+
+    See research/ideation/2026-06-01-architectural.md (entry A9).
+
+### hb-110 — Learned soft decoder (replace LDPC+OSD with a neural codec)  [PRIORITY: wild, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.15
+  estimated_effort: plan (research project; 1-3 months realistic)
+  expected_delta: end-to-end neural decoder (2-10M params) takes 174 LLRs and outputs 91-bit info-bit posterior; CRC-14 is post-hoc verification only
+  defensible_prior: partial — Cammerer/Hoydis "Trainable communication systems"; DeepReceiver in cellular; hobby-scale data/compute mismatch
+  wild_card: true
+  evidence_for:
+    - End-to-end trained decoders capture channel correlations algorithmic decoders can't
+  evidence_against:
+    - Inference latency: 10M-param transformer per candidate may not fit real-time budget
+    - Subtle behavior divergence from ft8_lib that's hard to debug
+    - Training-distribution mismatch risk; hobby-scale deployment lacks cellular's data/compute resources
+  notes: |
+    Wild card: defensible prior exists but pancetta-specific feasibility
+    open. Kill-switch: train small (200K param) test model on synth;
+    match BP within 5% recovery rate. 50% worse → arch/loss wrong.
+
+    See research/ideation/2026-06-01-architectural.md (entry A10).
+
+### hb-111 — Turbo equalisation (joint channel estimation + decoding)  [PRIORITY: 0.35, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.35
+  estimated_effort: plan (touches inner decode loop)
+  expected_delta: BP output → improved channel estimate (per-tone gain) → re-extract LLRs → BP → ... iterate 2-3 times
+  defensible_prior: yes — turbo equalisation in 3GPP/DSL (Tüchler et al. 2002); FT8's selective fading does cause per-tone amplitude variation
+  wild_card: false
+  evidence_for:
+    - Decoder output carries info about channel that's not fed back
+    - Selective fading is real on HF; per-tone gain not constant
+  evidence_against:
+    - Loops within loops within multipass loop; easy runtime regression
+    - Convergence not guaranteed; safe-fallback needed
+  notes: |
+    Kill-switch: on top-20 hard-200 successful decodes, perturb per-tone
+    gain (×0.7..1.3 random per tone), re-run BP. <5% convergence
+    sensitivity → channel mis-estimation not bottleneck. >20% effect →
+    leverage.
+
+    See research/ideation/2026-06-01-architectural.md (entry A11).
+
+### hb-112 — Decoder as Bayesian model averaging over config grid  [PRIORITY: 0.30, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 2-3 sessions diagnostic; plan-sized for production
+  expected_delta: run N=5 decoders with diverse configs; average posterior across decoders weighted by empirical recovery rate per regime
+  defensible_prior: yes — Bayesian model averaging foundational; ensembles beat single-best in classification
+  wild_card: false
+  evidence_for:
+    - Hard-band vs sparse-band conditions argue different configs optimise different scenes
+    - Adaptive variant (only run secondary configs when prob-of-existence map says should be there) bounds compute
+  evidence_against:
+    - 5x compute incompatible with real-time on MiniPC target
+  notes: |
+    Kill-switch: 5 configs offline on top-20 hard-200; union recovery >
+    1.1 × best-single recovery. Union ≈ best-single → all configs decode
+    the same easy stuff.
+
+    See research/ideation/2026-06-01-architectural.md (entry A12).
+
+### hb-113 — Hierarchical decode: callsign-only fast pass then full given context  [PRIORITY: 0.42, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.42
+  estimated_effort: plan-sized
+  expected_delta: stage 1 light decoder recovers 28-bit callsign1 hash; stage 2 full LDPC+OSD with callsign1 pinned via AP1 driven by evidence-based prior
+  defensible_prior: yes — hierarchical decoding standard (turbo constituent, HARQ); evidence-based prior escapes hb-087 shelved finding that external priors don't manufacture signal
+  wild_card: false
+  evidence_for:
+    - Stage 1's output is EVIDENCE-based prior, not external — fundamentally different from hb-087
+    - 28-bit callsign subspace exploits hash structure for early commitment
+  evidence_against:
+    - Stage 1's FP rate: callsign-only decoder will surface many false positives
+    - Stage 2's AP-pinning may amplify rather than damp these
+  notes: |
+    Kill-switch: on top-20 hard-200, for each missed truth, see if
+    callsign1 bits in post-BP codeword agree with true callsign hash
+    (ignoring CRC). ≥25% callsign-bit agreement → stage-1 has signal.
+
+    See research/ideation/2026-06-01-architectural.md (entry A13).
+
+### hb-114 — Generative-prior decoder (FT8 messages as samples from learned model)  [PRIORITY: wild, spawned 2026-06-01 from architectural ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.18
+  estimated_effort: plan (multi-month research project)
+  expected_delta: train autoregressive transformer (~1M params) on decades of FT8 traffic; structured prior over 91-bit message space combines with channel LLRs via Bayes
+  defensible_prior: partial — LMs as generative priors for source decoding (Vaswani-era noisy decoding); FT8 corpus exists (PSKReporter archive)
+  wild_card: true
+  evidence_for:
+    - Plausibility check is currently fixed rules; could be learned distribution
+    - FT8 grammar is tiny vs free-form text — small model could memorise
+  evidence_against:
+    - **Cheating concerns**: strong generative prior can hallucinate callsigns; FP-vs-TP separation hard
+    - Temptation to overfit to operator's own callsigns is real
+  notes: |
+    Kill-switch: train small generative model on PSKReporter export
+    (~1 day historical). Perplexity < 2^60 (≥30 bits structure beyond
+    uniform) on held-out → meaningful prior strength.
+
+    See research/ideation/2026-06-01-architectural.md (entry A14).
+
+### hb-115 — Dual-KiwiSDR space-diversity LLR fusion (MRC across receivers)  [PRIORITY: 0.50, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.50
+  estimated_effort: plan (3 sessions): harness mod + synth kill-switch + live paired-Kiwi capture
+  expected_delta: 2 geographically-separated KiwiSDRs, slot-aligned; LLR-sum at shared candidates equivalent to MRC; +3 dB on independent noise
+  defensible_prior: yes — textbook MRC, same trick Q65 uses; hb-075 already proved MRC works for one within-WAV diversity case (GRADUATED 2026-05-29)
+  wild_card: false
+  evidence_for:
+    - hb-075 extends naturally to between-WAV with vastly more independent noise
+    - kiwirecorder pair infrastructure half-built (hb-073 procedure doc)
+  evidence_against:
+    - Common-mode interference (lightning, polar absorption) hits both → MRC degrades to ~+1.5 dB
+  notes: |
+    Kill-switch: 5 single-RX wild-doppler WAVs; synthesize "second RX"
+    by adding independent Gaussian noise of equal variance; LDPC-pass-rate
+    of sum vs each individual ≥30% on at least 3/5.
+
+    See research/ideation/2026-06-01-diversity.md (entry D1).
+
+### hb-116 — Decoder-diversity vote: pancetta ⊕ jt9 ⊕ jtdx  [PRIORITY: 0.45, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 1 session kill-switch; 1 plan for corpus-decode --ensemble mode
+  expected_delta: 2-of-3 vote (or 1-of-3 above solo-trust threshold); union strictly larger than any one
+  defensible_prior: yes — jtdx outperforms jt9 on certain weak-signal classes; classifier ensembles improve with weakly correlated errors (Dietterich 2000)
+  wild_card: false
+  evidence_for:
+    - Every operator running both WSJT-X and JTDX notices each catches things the other misses
+    - 2-of-3 vote rule mitigates FP amplification
+  evidence_against:
+    - OR-of-three triples FP rate; vote rule caps gain
+  notes: |
+    Kill-switch: top-50 hard-200, run jt9 + jtdx baseline (jt9 cached).
+    |union| > |pancetta-alone| by ≥20 net true-positives → PROCEED.
+
+    See research/ideation/2026-06-01-diversity.md (entry D2).
+
+### hb-117 — AGC-diversity: re-decode at multiple synthetic gain settings  [PRIORITY: 0.28, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.28
+  estimated_effort: 1 session
+  expected_delta: rescale WAV to {-12, 0, +12 dB} → 3 independent decode passes; vote at intersection; perturbs gain-dependent decision boundary
+  defensible_prior: partial — pancetta is supposed to be gain-invariant but hb-069 dB-vs-linear shelve proved log-domain matters
+  wild_card: false
+  evidence_for:
+    - Quantization, dynamic-range compression, soft clipping break invariance in practice
+  evidence_against:
+    - Pancetta's float32 internal pipeline may already be gain-invariant enough; 3 runs converge to same list
+  notes: |
+    Kill-switch: 20 hard-200, rescale ±12 dB, count NEW true-positives at
+    off-baseline gains. <1.0 per WAV mean → too weak to mine.
+
+    See research/ideation/2026-06-01-diversity.md (entry D3).
+
+### hb-118 — IQ-pair-diversity from one KiwiSDR: USB + LSB simultaneous  [PRIORITY: wild, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.20
+  estimated_effort: 0.5 session kill-switch; 1 plan if PROCEED
+  expected_delta: USB + LSB demods on same RF block; partially-independent local noise from filter rolloff asymmetries; spectrogram averaging
+  defensible_prior: partial — image-rejection in SDR practice; USB/LSB on same fc do contain partly independent local noise (operationally untested on KiwiSDR specifically)
+  wild_card: true
+  evidence_for:
+    - Sideband-asymmetric interference (carriers, AM splatter) hits only one
+  evidence_against:
+    - kiwiclient may apply shared AGC across both demods → noise correlation → 1
+  notes: |
+    Kill-switch: capture 5-min KiwiSDR USB+LSB pair; cross-correlate
+    noise floors (signals notched). ρ > 0.85 → mostly common-mode →
+    KILL.
+
+    See research/ideation/2026-06-01-diversity.md (entry D4).
+
+### hb-119 — Cross-band conditional prior (20m+40m same QSO)  [PRIORITY: wild, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.22
+  estimated_effort: 2 sessions: cross-band callsign-index + prior-update primitive + kill-switch
+  expected_delta: same callsign on 20m and 40m within ≤10 min = joint observation of operator's message-generation distribution; conditional Bayesian update at AP/prior layer
+  defensible_prior: partial — mr-006 noted AP-context worthless offline (ceiling 1/8576); cross-band multi-WAV AP context IS rich because operators don't randomly hop bands
+  wild_card: true
+  evidence_for:
+    - PSK Reporter + cqdx.io spot streams confirm cross-band coherence empirically
+  evidence_against:
+    - hard-200/-1000 are single-band corpora by construction; cross-band benefit may need multi-band corpus we don't have
+  notes: |
+    Kill-switch: on hard-1000, true-positive callsigns, count how often
+    same callsign appears on different band in corpus. <5% co-occurrence
+    → no measurable support.
+
+    See research/ideation/2026-06-01-diversity.md (entry D5).
+
+### hb-120 — Operator-network diversity (decode-hash sharing via cqdx)  [PRIORITY: 0.30, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.30
+  estimated_effort: plan (4 sessions, slow): protocol + cqdx schema + lite-eval binary + social bootstrap
+  expected_delta: 3-5 trusted friends run pancetta-eval-lite, post decode hashes to cqdx; peer confirmation acts as trust-amplifier for marginal decodes
+  defensible_prior: yes — PSK Reporter + RBN do this for operator-facing purposes; the novel piece is closing loop back into the decoder
+  wild_card: false
+  evidence_for:
+    - Decision artifacts (174-bit codeword hashes + metadata) are small + privacy-safe
+    - Aggregate provably more informative than any single RX (RBN data)
+  evidence_against:
+    - Cold-start social graph: until 3+ friends opt in, no fleet
+    - Credentialed-integrations rule: pancetta can't post on friends' behalf
+  notes: |
+    Kill-switch: using PSKReporter spot data, for 100 hard-1000 WAVs
+    (if RX time known), count how many decodes pancetta misses that
+    show up on PSKReporter from another RX within ±10s. <10% → thin
+    headroom.
+
+    See research/ideation/2026-06-01-diversity.md (entry D6).
+
+### hb-121 — Time-diversity by long-window IF acquisition (Q65-style)  [PRIORITY: 0.38, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.38
+  estimated_effort: 2 sessions: repeat-detector + spectrogram-averaging primitive
+  expected_delta: detect repeating-message slots via codeword-match; coherently average IF-level spectrograms; ~√N SNR gain
+  defensible_prior: yes — Q65 with 60-s slots does this; technique proven for weak HF; mr-008 hb-089 spawned similar residual logic
+  wild_card: false
+  evidence_for:
+    - Many real QSOs repeat the same message across multiple slots
+    - hb-089 is residual-side sibling; D7 is raw-spectrogram side with codeword-match gate
+  evidence_against:
+    - Drift (Doppler, slot-timing, freq) destroys coherence; needs phase-tracker
+  notes: |
+    Kill-switch: on hard-1000, count how often same callsign appears
+    in consecutive slots in same 90s sample. <10% repeat → thin support.
+
+    See research/ideation/2026-06-01-diversity.md (entry D7).
+
+### hb-122 — Multi-sync-window LLR average (intra-decoder algorithmic diversity)  [PRIORITY: 0.40, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 1 session kill-switch; 1 plan
+  expected_delta: 3 parallel demods with different sync-window placements (Costas-only, prefix+Costas, full+postfix); average LLRs pre-LDPC
+  defensible_prior: yes — WSJT-X-Improved 3.x ships multiple sync strategies and merges them (a3/a4); JTDX does similar
+  wild_card: false
+  evidence_for:
+    - Cheapest diversity available — no second hardware, no second corpus
+    - Pancetta uses one sync strategy throughout; never benchmarked against averaging
+  evidence_against:
+    - Sync-window choice may already be near-optimal for pancetta's quantization
+  notes: |
+    Kill-switch: 1 hard-200 WAV, dump LLRs from two sync windows;
+    Pearson correlation. ρ > 0.97 → redundant, small gain. 0.7 < ρ
+    < 0.9 → real diversity worth full sweep.
+
+    See research/ideation/2026-06-01-diversity.md (entry D8).
+
+### hb-123 — Polarization-diversity emulator via two physical antennas  [PRIORITY: wild, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.15
+  estimated_effort: plan (5 sessions, real hardware): SDR + driver + dual-audio coordinator + sync-alignment
+  expected_delta: 2nd antenna (horizontal dipole or rotated yagi) + 2nd SDR; LLR-sum pre-LDPC; 3-6 dB on HF routinely measured
+  defensible_prior: yes — polarization diversity well-proven (NCDXF, ARRL handbook, MFJ-1025); HW + driver complexity makes pancetta integration the open question
+  wild_card: true
+  evidence_for:
+    - Real-physical space/polarization diversity = holy grail of HF diversity reception
+    - Brings actual independent noise, not just different filtering
+  evidence_against:
+    - Pancetta's audio layer assumes one cpal::Stream; coordinator rewrite needed
+  notes: |
+    Kill-switch: ρ between two antenna noise floors on quiet spectrum.
+    ρ < 0.6 → real diversity. ρ > 0.9 → antennas too close.
+
+    See research/ideation/2026-06-01-diversity.md (entry D9).
+
+### hb-124 — cqdx live-spot prior multiplication on marginal decodes  [PRIORITY: 0.32, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 2 sessions: cqdx-live-stream tap + prior-mult primitive
+  expected_delta: P(call active in last 15min) × decoder posterior; marginal decode at LDPC-near-fail accepted iff cqdx confirms callsign active on band
+  defensible_prior: yes — Bayesian posterior mixing with empirical prior is sound; related to hb-058 (callsign-prior gate) but uses live spot stream
+  wild_card: false
+  evidence_for:
+    - Most callsigns are silent in any 15-min window; sharp non-uniform prior
+  evidence_against:
+    - **Self-fulfilling prophecy**: spot stream generated by same decoders pancetta tries to beat; inherits survivorship bias
+    - cqdx spot stream lags real-time by 30-90s
+  notes: |
+    Kill-switch: on hard-1000, per-WAV "active in last 15min" set from
+    PSKReporter retrospectively. Of currently-rejected candidates
+    (LDPC-near-fail), fraction that would be accepted with prior AND
+    are in truth-set. <5% → too weak. >20% → large recall lever.
+
+    See research/ideation/2026-06-01-diversity.md (entry D10).
+
+### hb-125 — USB-audio + KiwiSDR IQ pair fusion (heterogeneous LLR-sum)  [PRIORITY: 0.35, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.35
+  estimated_effort: plan (3 sessions, blocked on hb-073 capture infra)
+  expected_delta: FTdx10 USB audio + KiwiSDR --ncomp IQ on same antenna; processing-induced distortions differ; LLR-sum at intersection
+  defensible_prior: yes — hb-077 (phase-coherent SDR-IQ corpus) already scoped this capture path; D11 elevates to decoder fusion
+  wild_card: false
+  evidence_for:
+    - FTdx10 IF filter shape is documented as sharp; KiwiSDR provides flat-passband complementary view
+  evidence_against:
+    - Requires antenna splitter + KiwiSDR (~$300); splitter loss may exceed diversity gain
+  notes: |
+    Kill-switch: 10 paired WAV/IQ captures (auroral opening). Decode
+    each separately. pancetta-on-IQ finds >5 decodes per WAV that
+    pancetta-on-USB misses → PROCEED. Overlap >95% → KILL.
+
+    See research/ideation/2026-06-01-diversity.md (entry D11).
+
+### hb-126 — Adversarial-noise injection diversity (test-time augmentation confidence)  [PRIORITY: wild, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.20
+  estimated_effort: 1 session kill-switch; 1 plan for FP-filter integration
+  expected_delta: decode at 3 injected noise levels; TP-survival distribution differs from FP-survival; per-decode SNR margin estimate for FP filter + QSO machine
+  defensible_prior: partial — test-time augmentation is well-established in DL; no FT8 decoder has publicly applied it
+  wild_card: true
+  evidence_for:
+    - Generates per-decode robustness score for free
+    - Feeds D2 ensemble vote via per-decode confidence
+  evidence_against:
+    - 3-4× elapsed cost for confidence signal that may already be encodable from LDPC residual + sync score
+  notes: |
+    Kill-switch: 20 hard-200, TP-survival distribution at +3/+6/+9 dB
+    injected noise; AUC vs FP-survival. AUC < 0.65 → margin estimate
+    too weak.
+
+    See research/ideation/2026-06-01-diversity.md (entry D12).
+
+### hb-127 — Public-KiwiSDR scavenging fleet (Phase-5 QSO reliability)  [PRIORITY: wild, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.18
+  estimated_effort: plan (4 sessions): polling daemon + decode pipeline + QSO-state-machine hook + AUP safety
+  expected_delta: 5-10 public KiwiSDRs polled on low duty cycle; any decode of callsign K5ARH has open QSO with = second-source confirmation; reduces missed-RR73 cases
+  defensible_prior: partial — kiwirecorder infra exists (hb-073); polling-multiplexer approach novel for FT8
+  wild_card: true
+  evidence_for:
+    - Sometimes Kiwi buddies hear partner when K5ARH doesn't (auroral fade, local QRM)
+  evidence_against:
+    - KiwiSDR sysops may rate-limit or ban a scraper; AUP compliance non-trivial
+  notes: |
+    Kill-switch: during Phase-5 trial QSO, manually monitor 3 KiwiSDRs
+    at similar latitudes for partner's TX. <1 in 10 slots Kiwi
+    decodes partner when K5ARH doesn't → fleet adds nothing.
+
+    See research/ideation/2026-06-01-diversity.md (entry D13).
+
+### hb-128 — Pseudo-pol cross-variance LLR weighting (within-stream emulation)  [PRIORITY: 0.25, spawned 2026-06-01 from diversity ideation]
+  mode: ft8
+  status: pending
+  priority_score: 0.25
+  estimated_effort: 1 session
+  expected_delta: 2 different audio pre-filters (H-pol-like + V-pol-like emulation) give per-symbol variance signal; symbols with high cross-variance down-weighted before LDPC
+  defensible_prior: partial — MIMO channel-uncertainty weighting; within-stream emulation makes it cheap but speculative
+  wild_card: false
+  evidence_for:
+    - hb-079 (residual subtraction weighted decoding) already partially challenged "all symbols equally trustworthy"
+  evidence_against:
+    - Pseudo-pol filters may both pass same noise (no diversity at all)
+  notes: |
+    Kill-switch: 20 hard-200, compute variance signal, identify
+    high-variance symbols; correlation with LDPC-fail positions. <0.3
+    → variance signal uninformative.
+
+    See research/ideation/2026-06-01-diversity.md (entry D14).
+
+### hb-129 — Time-to-first-decode (TTFD) per-slot metric  [PRIORITY: 0.45, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 1 session
+  expected_delta: median TTFD ttfd_score = clamp((15.0 - median_ttfd_s) / 15.0, 0, 1); re-ranks hb-091 (a8 early-decode) up, hb-079 (multipass) down; surfaces hb-093 (residual SNR gate) as operationally attractive
+  defensible_prior: yes — WSJT-X-Improved a8 mode markets "0.5-1s early decode" as headline feature; TTFD is what they're optimizing
+  wild_card: false
+  evidence_for:
+    - For autonomous TX scheduling, decode at T+9 vs T+14 = difference between "tx next slot" and "defer 30s"
+    - pancetta-ft8 already has decode-emit ordering; ~50 LOC harness change
+  evidence_against:
+    - Gameable by early FP emissions; must combine with precision gate
+  notes: |
+    Definitely-worth-measuring metric per metric ideation file. Instrument
+    Decoder::decode_pass with per-decode timestamps. Run on hard-200,
+    compare hypothesis ranking.
+
+    See research/ideation/2026-06-01-metric.md (entry M1).
+
+### hb-130 — Operational-value-weighted recall  [PRIORITY: 0.40, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 2 sessions
+  expected_delta: weight each truth by priority score from pancetta-qso/src/priority.rs (needed-DXCC, needed-grid, POTA/SOTA, rarity); inverts which novels matter; may unshelve hb-064 if missed novels are common US calls
+  defensible_prior: yes — direct match to operator behavior; priority scorer is production code; metric is re-aggregation of existing signal
+  wild_card: false
+  evidence_for:
+    - K5ARH would choose +1 JA/day over +50 US/day
+  evidence_against:
+    - Distorts evaluation toward "DX bias" — masks real recall regressions on US calls operators still want
+  notes: |
+    Kill-switch: Spearman(opv_recall, plain_recall). >0.95 → collapses
+    to plain recall, uninteresting. <0.7 → hypothesis ranking diverges,
+    PROCEED. Floor weight (every truth ≥0.1).
+
+    See research/ideation/2026-06-01-metric.md (entry M2).
+
+### hb-131 — QSO-completion-rate metric on simulated rig loop  [PRIORITY: 0.35, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 3 sessions
+  expected_delta: replay hard-200 through full encode→modulate→decode→state-machine→tx→decode-next loop with simulated DX responder; QSO completion fraction is score
+  defensible_prior: yes — pancetta's purpose per CLAUDE.md is "decode, call, complete QSOs, log"
+  wild_card: false
+  evidence_for:
+    - Loopback QSO tests exist; ~500 LOC for replay harness
+    - Measures *actionable* decodes; rewards decoder that recovers QSO-relevant exchanges
+  evidence_against:
+    - Compute-expensive; distorted by state-machine sequencer config
+  notes: |
+    Kill-switch: Pearson(M3, recall) > 0.95 across 20 sweep configs →
+    redundant, abandon.
+
+    See research/ideation/2026-06-01-metric.md (entry M3).
+
+### hb-132 — Precision-recall AUC with FP-injection corpus  [PRIORITY: 0.38, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.38
+  estimated_effort: 1 session to build FP-injection corpus + measure
+  expected_delta: augment eval corpus with N synthetic garbage slots (noise + adversarial near-Costas patterns); PR-AUC sweep over min_sync_score and max_parity_errors_for_osd
+  defensible_prior: yes — PR-AUC standard for binary classification under imbalanced labels
+  wild_card: false
+  evidence_for:
+    - Today FP filter is binary gate; M4 measures robustness of precision under stress
+    - hb-052 (production FP filter) gains explicit credit
+  evidence_against:
+    - FP-injection corpus is synthetic; may not represent real-world FPs
+  notes: |
+    Kill-switch: PR-AUC tracks plain recall (Pearson > 0.95) →
+    reveals nothing. Decoder shows precision cliff below threshold →
+    load-bearing.
+
+    See research/ideation/2026-06-01-metric.md (entry M4).
+
+### hb-133 — Saturation-aware composite (corpus-shift-robust)  [PRIORITY: 0.52, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.52
+  estimated_effort: 1 session — pure aggregation change, no decoder change
+  expected_delta: score' = score(current_decoder, current_corpus) - score(prev_main, current_corpus) + score(prev_main, prev_corpus); corpus refresh becomes automatic; cumulative graduations survive
+  defensible_prior: yes — standard practice in evolving benchmarks (SQuAD → SQuAD 2.0, ImageNet test-set rotation)
+  wild_card: false
+  evidence_for:
+    - Removes pressure to delay corpus refresh; unblocks corpus survey recommendation
+    - Highest work-to-impact ratio of the 15 metric ideas (per ideation summary)
+  evidence_against:
+    - Hides real recall growth: 5% better decoder + 5% harder corpus = 0% change
+  notes: |
+    "Definitely worth shipping" per metric ideation summary. Stable
+    virtual baseline across corpus rotations.
+
+    See research/ideation/2026-06-01-metric.md (entry M5).
+
+### hb-134 — Per-band-density-stratified recall  [PRIORITY: 0.35, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 1 session — pure post-processing
+  expected_delta: bucket WAVs by pancetta_decode_count {sparse, medium, dense}; bucket weight = empirical fraction of K5ARH's slots in that bucket from recent 7-day capture
+  defensible_prior: yes — standard stratification for samples with sub-populations of different difficulty
+  wild_card: false
+  evidence_for:
+    - hb-086 V1 wins on dense slots; hb-079 wins everywhere — stratification surfaces which iter targets which regime
+  evidence_against:
+    - Bucket boundaries arbitrary; results sensitive to binning
+  notes: |
+    Re-aggregates today's results. Report both quartiles + weighted sum.
+
+    See research/ideation/2026-06-01-metric.md (entry M6).
+
+### hb-135 — CPU-cost-adjusted recall (decodes/second or /joule)  [PRIORITY: 0.32, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 2 sessions (1 for elapsed proxy + integration; 1 for joule if needed)
+  expected_delta: turn elapsed-time deltas into first-class composite term; hb-093 becomes highest-priority; wild-card hb-094 potentially regresses heavily
+  defensible_prior: yes — pancetta's target hardware is MiniPC running Win11; field-deployed FT8 is CPU-constrained
+  wild_card: false
+  evidence_for:
+    - Multipass = 3× decode time; cumulative cost across 27 graduations unmeasured
+    - elapsed_seconds already in scorecard
+  evidence_against:
+    - Discourages all algorithmic recall improvements; needs Pareto-aware composite
+  notes: |
+    Pareto-aware: penalize only Pareto-dominated configs. Cheap first
+    pass = elapsed-seconds proxy; defer joule measurement.
+
+    See research/ideation/2026-06-01-metric.md (entry M7).
+
+### hb-136 — First-derivative recall (Δ-recall vs main per iter)  [PRIORITY: 0.25, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.25
+  estimated_effort: 1 session
+  expected_delta: per-iter (recall_iter - recall_main) / hours_since_last_graduation; integral over time = project value; plateaus explicit
+  defensible_prior: yes — standard project-velocity metric; "time to plateau" defined in BO/active-learning literature
+  wild_card: false
+  evidence_for:
+    - All graduation timestamps + deltas in scorecards/journal.md
+    - Forces strategic question: when to switch from decoder to operational work
+  evidence_against:
+    - Discourages compound wins; 3 iters of +0.001 each looks worse than single +0.003
+  notes: |
+    Report both integral AND peak. Velocity dashboard, not headline.
+
+    See research/ideation/2026-06-01-metric.md (entry M8).
+
+### hb-137 — Adversarial-corpus recall (jt9-only-hits subset)  [PRIORITY: 0.48, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.48
+  estimated_effort: 1 session to build manifest + integrate into harness
+  expected_delta: targets the 30% real recall headroom (corpus survey 2026-05-30 found 8.7 jt9-only decodes/slot); every iter competes on the hardest 30% where pancetta is WORSE than jt9
+  defensible_prior: yes — standard adversarial benchmarking; train on where you fail; closes "curated by our own decoder" loop
+  wild_card: false
+  evidence_for:
+    - hard-200 was curated BY pancetta — contains the subset where pancetta does decode; this inverts
+  evidence_against:
+    - Subset shrinks as decoder improves (success → metric disappears); needs refresh policy
+  notes: |
+    Highest-recall-leverage idea per metric ideation summary. Re-run
+    2026-05-30 survey on full 2066-WAV capture; freeze top jt9-only as
+    adversarial_174.manifest.json. ~3-5 hours compute.
+
+    See research/ideation/2026-06-01-metric.md (entry M9).
+
+### hb-138 — DXCC-coverage rate (unique entities per hour)  [PRIORITY: wild, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.25
+  estimated_effort: 2 sessions
+  expected_delta: unique_DXCC_entities_in_decodes / hours_of_recording; what a contester optimizes; eliminates per-slot recall game
+  defensible_prior: yes — direct match to operator behavior; DXCC count is the actual scoring system of the hobby
+  wild_card: true
+  evidence_for:
+    - A decoder catching 1 JA worth more than catching 50 US callsigns
+    - Strongly correlated with M2 but at session granularity
+  evidence_against:
+    - Strongly diurnal — same decoder scores wildly differently on dawn-gray-line vs midday
+  notes: |
+    Mitigate diurnal with rolling 24h windows. Requires DXCC mapping
+    (cqdx.io has this; offline snapshot feasible).
+
+    See research/ideation/2026-06-01-metric.md (entry M10).
+
+### hb-139 — Information-theoretic recall (Shannon-weighted bits/slot)  [PRIORITY: wild, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.20
+  estimated_effort: 1 session (if cqdx.io spot histogram available)
+  expected_delta: Σ_decoded log₂(1/p(message)); rare callsigns + unusual grids get more bits-of-surprise; information-theoretic measure of novelty
+  defensible_prior: yes — cross-entropy/KL-divergence standard in any imbalanced-class benchmark
+  wild_card: true
+  evidence_for:
+    - Defensible mathematical basis (no human-tuned weights like M2)
+    - "Decoder X gains 14.7 bits/slot vs Y" — interpretable with M10
+  evidence_against:
+    - Abstract; hard to translate to "X is better"
+  notes: |
+    Kill-switch: Pearson(M11, plain_recall) > 0.9 → uninteresting.
+    Pair with M10 for grounded interpretation.
+
+    See research/ideation/2026-06-01-metric.md (entry M11).
+
+### hb-140 — Counterfactual QSO-completion impact (causal A/B replay)  [PRIORITY: wild, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.22
+  estimated_effort: 4 sessions total (infra-heavy: replayable QSO machine + simulated DX responder + variance estimator)
+  expected_delta: completed_qsos(candidate) - completed_qsos(main); reduces all proxies to single operational outcome
+  defensible_prior: yes — counterfactual treatment effect from causal inference; standard for A/B-testing systems
+  wild_card: true
+  evidence_for:
+    - A decoder that helps complete 1 extra QSO/hour is worth graduation regardless of micro-recall delta
+  evidence_against:
+    - High variance per session; need many replays per config; expensive
+    - Tightly coupled to autonomous-config (rerank when priority weights change)
+  notes: |
+    Probably right metric long-term but heavy lift. Subset of M15.
+
+    See research/ideation/2026-06-01-metric.md (entry M12).
+
+### hb-141 — Cross-decoder-disagreement recall (unique-to-pancetta)  [PRIORITY: 0.30, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 1 session (metric); corpus baselining is one-time cost (~2 days)
+  expected_delta: subset = {truths jt9 misses AND jtdx misses AND wsjt-x-improved misses}; recall on that set; unique-value metric
+  defensible_prior: yes — software diversity literature; coverage of "what only this implementation finds" is standard quality measure
+  wild_card: false
+  evidence_for:
+    - Distinguishes hb-079 wins from baseline-equivalent wins
+  evidence_against:
+    - Small absolute numbers; hard to drive a hill-climb against
+  notes: |
+    Tracking metric, not headline. Baseline jtdx + wsjt-x-improved on
+    1000 WAVs is the upfront cost.
+
+    See research/ideation/2026-06-01-metric.md (entry M13).
+
+### hb-142 — Listen-only Pareto: (recall, latency, CPU%) frontier  [PRIORITY: wild, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.20
+  estimated_effort: 2 sessions
+  expected_delta: 3D Pareto frontier; config is dominated if some other beats it on all 3 axes; graduation = frontier-membership
+  defensible_prior: yes — standard multi-objective optimization (NSGA-II); used in compiler benchmarks, ML inference optimization
+  wild_card: true
+  evidence_for:
+    - Removes single-scalar tyranny; forces every graduation to make explicit which axis it sacrifices
+  evidence_against:
+    - No single number = harder to communicate, harder to diff iters
+  notes: |
+    Probably complement to scalar composite, not replacement.
+    Measurable today (M1 + M7 + recall).
+
+    See research/ideation/2026-06-01-metric.md (entry M14).
+
+### hb-143 — Operator-day-replay composite (8h K5ARH session, end-to-end QSO)  [PRIORITY: wild, spawned 2026-06-01 from metric ideation]
+  mode: ft8 (metric/instrumentation)
+  status: pending
+  priority_score: 0.25
+  estimated_effort: 5 sessions (biggest single metric infra investment)
+  expected_delta: (NEW_DXCC×1.0 + NEW_grids×0.5 + POTA×0.4 + other×0.1) per priority weights; the composite IS what the project ships; operator-points/day
+  defensible_prior: yes — end-to-end task evaluation is gold standard; NLP moved from BLEU → downstream task accuracy for the same reason
+  wild_card: true
+  evidence_for:
+    - Subsumes recall, latency, precision, CPU-cost via QSO outcomes
+    - "Right metric" per metric ideation summary
+  evidence_against:
+    - Variance per replay too high to compare iters; replays take hours
+    - DX responder simulation is bottleneck; only as good as parametrization
+  notes: |
+    M15 is "most-likely-to-change-strategy". Probably monthly dashboard
+    not per-iter. Worth building even if iters use cheap proxy.
+
+    See research/ideation/2026-06-01-metric.md (entry M15).
+
+### hb-144 — Cross-decoder consensus truth corpus (panc ∩ jt9 ∩ jtdx)  [PRIORITY: 0.45, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.45
+  estimated_effort: ~4 hours integration + 30 min jtdx install; zero new audio
+  expected_delta: tier with truth = intersection of pancetta + jt9 + jtdx; novel decodes scored separately as candidate; lowers inflated novel number; unblocks hb-064 (pruning value invisible if truth noisy)
+  defensible_prior: yes — academic LDPC papers routinely cite "intersection of N decoders" as gold-truth; jt9 + jtdx deliberately independent codebases
+  wild_card: false
+  evidence_for:
+    - Top-3 most-likely-to-unblock-shelved-hypotheses (corpus ideation top-3 #2)
+  evidence_against:
+    - jtdx is moving-target fork; need pinned version + commit to operator's machine
+  notes: |
+    Kill-switch: jtdx adds <5% novel decodes vs jt9 on 20-WAV pilot →
+    consensus tier collapses to ~jt9 truth.
+
+    See research/ideation/2026-06-01-corpus.md (entry C1).
+
+### hb-145 — Pancetta-self-truth recursive refinement (stability tier)  [PRIORITY: 0.30, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: ~6 hours
+  expected_delta: truth = pancetta@HEAD high-confidence decodes (max budget); recall measures pancetta@CANDIDATE under deployment budget; stability metric (not recall metric)
+  defensible_prior: yes — bootstrapping classifiers on confident predictions is standard semi-supervised ML (noisy-student); conformal prediction
+  wild_card: false
+  evidence_for:
+    - Captures pancetta-specific behavior external decoder is blind to (V3 subtract-aware sync gains)
+    - Right instrument for hb-016 residual-energy-stop, hb-068 b-scale tuning
+  evidence_against:
+    - Self-truth creates fixed point; decoder learns to recover its own decodes
+  notes: |
+    Composite weight near zero; pair with cross-decoder consensus (C1).
+    Kill-switch: max-budget vs deployment-budget recall ratio > 99% → no
+    headroom.
+
+    See research/ideation/2026-06-01-corpus.md (entry C2).
+
+### hb-146 — Synthetic adversarial corpus targeting measured walls  [PRIORITY: 0.50, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.50
+  estimated_effort: ~1 day curation + ~6 hours integration; collection synthetic (free)
+  expected_delta: 3 sub-families (mutual-masking pairs, sub-Costas signals, 3+ collision stacks); directly resurrects shelved V2/V3 if win on adversarial tier
+  defensible_prior: yes — adversarial ML standard; WSJT-X test suite includes contrived test cases; MAP-equivalent decoder papers use targeted stress
+  wild_card: false
+  evidence_for:
+    - Top-3 most-likely-to-unblock-shelved-hypotheses (corpus ideation top-3 #1)
+    - V2 (shelved) gets +20% on pair tier → V2 unshelves tomorrow
+  evidence_against:
+    - Overfitting to adversarial; needs co-improvement on hard-200 for graduation
+  notes: |
+    Diagnostic tier, never primary. Extends hb-100's interferer-pair
+    corpus with sub-Costas + multi-signal families.
+
+    See research/ideation/2026-06-01-corpus.md (entry C3).
+
+### hb-147 — Continuous multi-hour single-band time-series corpus  [PRIORITY: 0.32, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.32
+  estimated_effort: ~3 days integration (heavy front-loaded)
+  expected_delta: 24h continuous slice; per-15min-window decode count, per-hour callsign diversity, QSO completion rate; QSO-chain tracking across windows
+  defensible_prior: yes — time-series eval standard in radio-propagation research (ITU-R, Chen et al. 2024); PSKReporter UI defaults to time-series
+  wild_card: false
+  evidence_for:
+    - K5ARH already captures continuously on Phase-5 deployment
+    - Surfaces hidden temporal failure modes (e.g., decoder change disrupts QSO chains)
+  evidence_against:
+    - Heavy infrastructure for unclear hypothesis-unblock value; pilot first
+  notes: |
+    Pilot with 1h data + 50-slot window scoring before scaling.
+
+    See research/ideation/2026-06-01-corpus.md (entry C4).
+
+### hb-148 — Operator-curated rare-DXCC tier (matters-to-K5ARH)  [PRIORITY: 0.35, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 1-2 weeks operator attention (low intensity) + ~6 hours integration
+  expected_delta: 100-200 slots with manually-flagged needed-DXCC/rare-grid; recall on rare-station-decode only; +5% recall on common + lose 1 rare = deployment regression
+  defensible_prior: yes — operator-mission-value weighting standard in radar/sonar; one VK0 or P5 worth 1000 W1AW decodes
+  wild_card: false
+  evidence_for:
+    - cqdx priority scoring exists for a reason
+  evidence_against:
+    - Small sample (20-200 slots) is statistically noisy; require ≥20% effect size
+  notes: |
+    Kill-switch: 20 rare-DXCC slots flagged in one weekend; pancetta
+    misses 5+ that WSJT-X catches → clear unblock value.
+
+    See research/ideation/2026-06-01-corpus.md (entry C5).
+
+### hb-149 — Pre-Costas-failure tier (zero-decode slots)  [PRIORITY: 0.30, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: ~2h collection + 2h curation + 1h integration
+  expected_delta: 200 slots where pancetta produces ZERO decodes; truth = jt9 + jtdx union; recall measures "can we crack a slot pancetta considers empty?"
+  defensible_prior: yes — information-retrieval evaluation routinely includes "hard negatives"
+  wild_card: false
+  evidence_for:
+    - Failure modes here are upstream of LDPC/OSD (Costas, spectrogram noise floor, sync)
+  evidence_against:
+    - Zero-decode slots may be genuinely silent; high risk of building noise tier
+  notes: |
+    Kill-switch: 50 zero-decode slots, run jt9. >5/50 → tier has signal.
+    0/50 → genuinely empty.
+
+    See research/ideation/2026-06-01-corpus.md (entry C6).
+
+### hb-150 — High-jt9-novel-density tier (jt9-beats-pancetta inverse)  [PRIORITY: 0.50, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.50
+  estimated_effort: ~3h curation + 2h integration; zero new audio
+  expected_delta: 200 slots where jt9_count - pancetta_count >= 5; truth = jt9 decodes; recall on bigger find list; directly measures the pancetta-vs-jt9 gap
+  defensible_prior: yes — stratified sampling against failure axis is standard (BIG-bench, GLUE adversarial, ImageNet-A)
+  wild_card: false
+  evidence_for:
+    - Cheapest corpus to bootstrap (zero new audio; survey already computed deltas on 20 WAVs)
+    - Top-3 most-likely-to-unblock-shelved-hypotheses (corpus ideation top-3 #3)
+  evidence_against:
+    - Could be dominated by Costas-fail slots (C6 overlap); require pancetta_count > 0 to measure "ranking + LLR"
+  notes: |
+    "Cheapest corpus to bootstrap" per corpus ideation summary.
+    Extends survey scoring to full archive; pick top-200 by jt9-only.
+
+    See research/ideation/2026-06-01-corpus.md (entry C7).
+
+### hb-151 — Multi-band simultaneous capture (cross-band consistency tier)  [PRIORITY: 0.25, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.25
+  estimated_effort: ~1 week collection + ~6h curation + ~4h integration
+  expected_delta: 100 slot-aligned WAVs × 3-4 bands (20/40/15/17m); per-band recall + cross-band-consistency sub-metric; band-stability check
+  defensible_prior: yes — WSJT-X tested across bands via operator reports; PSKReporter aggregates cross-band; academic radio papers
+  wild_card: false
+  evidence_for:
+    - 40m broadcast intrusion, 15m absorption notch — decoder change for 20m may hurt 40m
+  evidence_against:
+    - Equipment dependency: multi-RX or scheduled Kiwi captures
+  notes: |
+    Pilot dual-band 20m+40m Kiwi; if decode distributions within 10% →
+    band-invariance holds, low-value. Don't schedule until C5/C7 land.
+
+    See research/ideation/2026-06-01-corpus.md (entry C8).
+
+### hb-152 — Multi-station propagation diversity corpus  [PRIORITY: 0.32, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.32
+  estimated_effort: ~3 days collection + ~1 day curation + ~6h integration
+  expected_delta: same QSO at 3+ RX (K5ARH + 3 Kiwis); truth = union; per-RX recall stability; upper-bound recall measurement
+  defensible_prior: yes — WSPRnet uses multi-receiver diversity; RBN multi-RX by design; Joe Taylor cites multi-RX as truth ceiling
+  wild_card: false
+  evidence_for:
+    - Per-RX noise structure invisible without this
+  evidence_against:
+    - Receiver clock skew can misalign slots; KiwiSDR public availability unpredictable
+  notes: |
+    Pilot: 15-min capture × 3 Kiwis + K5ARH (240 WAVs). Union > any
+    single RX by >30% → stricter truth, worth scaling.
+
+    See research/ideation/2026-06-01-corpus.md (entry C9).
+
+### hb-153 — Greyline-window targeted capture tier  [PRIORITY: 0.30, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: ~1 week passive capture + ~3h curation + ~2h integration
+  expected_delta: ±30 min sunrise/sunset windows; ~840 slots over 7 days; real-Doppler regime BEFORE hb-073's KiwiSDR auroral lands
+  defensible_prior: yes — greyline DXing documented FT8 phenomenon (KH6 at NA sunrise); academic propagation papers cite as primary terminator-physics test case
+  wild_card: false
+  evidence_for:
+    - Geographically accessible without operator travel
+  evidence_against:
+    - Greyline windows short (30-60 min); seasonal sunrise/sunset shifts
+  notes: |
+    Kill-switch: 4 days × 2 windows. jt9 count distribution differs by
+    >20% (more DX, lower median SNR) from midday → regime is distinct.
+
+    See research/ideation/2026-06-01-corpus.md (entry C10).
+
+### hb-154 — Contest-mode pileup corpus  [PRIORITY: 0.28, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.28
+  estimated_effort: 1 contest weekend collection + ~6h curation + ~3h integration; front-loaded by 1-3 month contest schedule
+  expected_delta: contest weekend (ARRL RTTY-RU, WAE); 200-500 slots from ~11K; tests NMS, OSD load, joint-decoding past saturation
+  defensible_prior: yes — WSJT-X release notes regularly cite contest as stress test; WSJT-X authors tune accordingly
+  wild_card: false
+  evidence_for:
+    - Median hard-200 = 24 decodes/slot; contest mode pushes to 40+
+    - Contest grammar (<call> <call> <serial>) where language-model hint would show up first
+  evidence_against:
+    - Contest weekends intermittent; can't iterate quickly against this tier
+  notes: |
+    Quarterly checkpoint, not per-iter. Until contest, mock with C3
+    (high-collision adversarial synth).
+
+    See research/ideation/2026-06-01-corpus.md (entry C11).
+
+### hb-155 — Bench-calibrated signal-generator corpus (3D operating-point grid)  [PRIORITY: 0.35, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: ~1 day curation + ~3h integration + ~30 min compute; synth (free)
+  expected_delta: 3-D grid (SNR × freq × time-offset, 5 WAVs each = ~5000); decoder behavior on complete operating-point grid without propagation confounds; identifies sharp cliffs
+  defensible_prior: yes — RF receiver test methodology standard practice; WSJT-X authors use similar sweeps
+  wild_card: false
+  evidence_for:
+    - synth-clean is 1-D sweep masquerading as calibration; real calibration is 3+ D
+  evidence_against:
+    - Pure synth — no propagation, no fading; always pair with real-audio for graduation
+  notes: |
+    Extends gen-synth multi-dim sweeps. Pilot 50 WAVs at (-20, 1000, 0).
+    Sharp cliffs → tier catches them. Smooth/predictable → academic.
+
+    See research/ideation/2026-06-01-corpus.md (entry C12).
+
+### hb-156 — Lid-of-band weak-signal-only tier (SNR ≤ -20 dB)  [PRIORITY: 0.45, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.45
+  estimated_effort: ~4h curation + 3h integration; zero new audio
+  expected_delta: 200 slots filtered to jt9-reported SNR ≤ -20 dB; recall on weak-signal subset; "what differentiates FT8 from less-sensitive modes"
+  defensible_prior: yes — FT8 sensitivity is DEFINING capability of the protocol; Joe Taylor's original FT8 paper centers on -21 dB threshold
+  wild_card: false
+  evidence_for:
+    - WSJT-X release validation tracks -20 dB sensitivity explicitly
+    - Decoder optimized for median SNR misses FT8 mission
+  evidence_against:
+    - jt9 SNR ±2-3 dB noisy at floor; use soft band (-21 to -19 dB) not hard cutoff
+  notes: |
+    Already sub-population of hard-1000. Pull SNR-filtered subset; if
+    <50 WAVs, broaden to hard-200 + wild-100 + full archive.
+
+    See research/ideation/2026-06-01-corpus.md (entry C13).
+
+### hb-157 — Continuous-capture metadata tier (antenna/SWR/rotator)  [PRIORITY: 0.28, spawned 2026-06-01 from corpus ideation]
+  mode: ft8 (corpus/eval infrastructure)
+  status: pending
+  priority_score: 0.28
+  estimated_effort: ~3 days collection + ~6h curation + ~1 day integration
+  expected_delta: per-slot rig metadata sidecars (antenna direction, band, SWR, audio gain, temperature); cross-tier slicing reveals confounds in hard-200
+  defensible_prior: yes — stratified analysis standard in epidemiology, A/B testing, clinical trials; coordinator already has hamlib data flowing
+  wild_card: false
+  evidence_for:
+    - hard-200 silently mixes high/low-SWR slots, antenna headings, bands
+  evidence_against:
+    - Hamlib reliability — if CAT drops, sidecar incomplete
+  notes: |
+    Kill-switch: metadata coverage >95% of slots over 1 week; per-stratum
+    recall differs by >10% → confounds real.
+
+    See research/ideation/2026-06-01-corpus.md (entry C14).
+
+### hb-158 — One-key "confirm decode" relaxes thresholds for current callsign  [PRIORITY: 0.38, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.38
+  estimated_effort: 1.5-2 sessions
+  expected_delta: operator y/n on low-confidence decodes; confirmed callsign gets LDPC-iter / OSD-rank bar lowered for next 20 windows for that callsign only; promotes future decodes past continuity-filter rejection
+  defensible_prior: yes — active-learning classifiers (Tong & Koller 2001) outperform fully-supervised with ~10x less label budget by querying most-uncertain
+  wild_card: false
+  evidence_for:
+    - hb-087 showed 23.6% of missed truths in some operator-derived set
+    - Real-time confirmation strictly stronger than offline bank
+  evidence_against:
+    - Operator fatigue; prompt-saturation in busy band
+  notes: |
+    Auto-yes pre-filter for callsigns in seed/ADIF/recent to keep volume
+    <5/min. Kill-switch: <3 confirms/session over 5 sessions → suppress.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H1).
+
+### hb-159 — Pointing finger: operator clicks waterfall slice → decoder focuses  [PRIORITY: 0.32, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 3-4 sessions (depends on click-able waterfall existing)
+  expected_delta: click → narrow window (±25 Hz) + drop sync threshold + OSD rank 4; operator's spatial attention feeds search-space prior
+  defensible_prior: yes — speech-recognition systems with selection-aware refinement (Whisper.cpp); visual saliency well-established
+  wild_card: false
+  evidence_for:
+    - Visual pattern recognition pancetta doesn't have
+    - Decoder already capable of narrow-window decode; wiring is cost
+  evidence_against:
+    - Operator clicks noise → wasted deep-decode budget on garbage
+  notes: |
+    Gated on TUI waterfall existing. If clicks/session stays at 0 for
+    first 5 sessions, kill.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H2).
+
+### hb-160 — `*` key: priority boost next-cycle CQ from highlighted callsign  [PRIORITY: 0.45, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 0.5-1 session
+  expected_delta: session-scoped manual_priority_boost map with score +0.50; persists until QSO completes or operator unmarks; decay after 5 silent slots
+  defensible_prior: yes — trading desks (price-alert + click-to-route), DAW favorites, browser bookmarks; "I want THIS one, now" universal UX
+  wild_card: false
+  evidence_for:
+    - Operator may know P5/W0PR is on (North Korea) before cqdx rarity catches up
+    - Top-3 by value-per-friction per human-loop ideation summary
+  evidence_against:
+    - Duplicate-penalty must remain intact (don't override "you already did this QSO")
+  notes: |
+    Trivial implementation. Kill-switch: <1 press/session over 5 →
+    unused. >20x → becomes hunt-list workaround.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H3).
+
+### hb-161 — `Q` key: operator STOP mid-QSO when pancetta is wrong  [PRIORITY: 0.50, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL / safety)
+  status: pending
+  priority_score: 0.50
+  estimated_effort: 1 session
+  expected_delta: immediate TX stop + diagnostic snapshot + ADIF flag operator-aborted (NOT failure for recent-failure penalty); every Q-press is gold-standard training data
+  defensible_prior: yes — autonomous-vehicle safety driver disengagement; industrial robot e-stops; FCC arguably implies via control-operator rules
+  wild_card: false
+  evidence_for:
+    - Phase 5 specifically: edge cases pancetta hasn't seen need supervisor
+    - "Top-3 by value-per-friction" per human-loop ideation; e-stop is required for Phase 5 by basic safety
+  evidence_against:
+    - Reduces logged QSO rate during training period
+  notes: |
+    Required infrastructure per ideation summary. QSO state machine
+    already has terminal states.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H4).
+
+### hb-162 — Post-session review CSV: operator labels each decode  [PRIORITY: 0.30, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 2 sessions
+  expected_delta: operator marks real/fp/unsure after session; mine FP patterns; auto-suppress callsigns scored fp >3 times; boost continuity-filter for repeated reals
+  defensible_prior: yes — email spam-filter design (Bayesian + user-flagged); every modern classifier with active feedback
+  wild_card: false
+  evidence_for:
+    - K5ARH knows what FPs look like on his band slice better than any global heuristic
+  evidence_against:
+    - Operator marks something fp that's actually rare DX trying again; auto-suppression eats real contacts
+  notes: |
+    3-strike requirement + network-corroboration override. Default to
+    "real if produced logged QSO" pre-fill.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H5).
+
+### hb-163 — Voice/foot-pedal shortcut: "answer that one"  [PRIORITY: wild, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.15
+  estimated_effort: 1 session pedal; 3 sessions STT + Whisper.cpp + phonetic post-processor
+  expected_delta: pedal/voice → ManualTarget(callsign) event pumped into bus; same path as TUI `*` key
+  defensible_prior: partial — Stream Deck, Dragon NaturallySpeaking, DJ-footswitches; on-radio: contest loggers (N1MM voice-keyer reverse direction)
+  wild_card: true
+  evidence_for:
+    - At-rig ergonomics; operator's hands may not be on keyboard during multi-mode
+  evidence_against:
+    - STT mishears phonetic alphabet; pancetta could respond to itself
+  notes: |
+    Kill-switch: STT WER >20% on phonetic alphabet → kill voice path.
+    Pedal path much cheaper to validate.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H6).
+
+### hb-164 — Operator-confidence-tier overlay on FP filter  [PRIORITY: 0.35, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 1 session
+  expected_delta: operator-trust.toml (trust_tier_a / trust_tier_b / distrust); trusted = continuity-bypass + +0.10 priority + auto-confirm; distrusted = hard-reject even on strong CRC
+  defensible_prior: yes — web-of-trust (PGP), SSH known_hosts, browser allow/blocklists; reputation systems default for distributed identity
+  wild_card: false
+  evidence_for:
+    - Operator's social knowledge of the ham community not in any database
+  evidence_against:
+    - Distrust list grows stale; operator forgets, real callsign sits on it
+  notes: |
+    last_added_at + prompt to review entries >6 months. If TOML <5
+    entries after 3 months, fold into seed file.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H7).
+
+### hb-165 — Real-time alarm tier: TUI rings when target appears  [PRIORITY: 0.42, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.42
+  estimated_effort: 1-1.5 sessions
+  expected_delta: needed_dxcc, specific calls, distance>X, snr>X → bell + flash + Mac/Windows notification; autonomy continues to chase, operator gets pulled in for exceptional case
+  defensible_prior: yes — SkimTalk / RBN sound alerts; Logger4OM/N1MM contest-call alerts; trading-desk price alerts
+  wild_card: false
+  evidence_for:
+    - Closes "missed P5 because making coffee" failure mode of pure autonomy
+    - Top-3 by value-per-friction per human-loop ideation
+  evidence_against:
+    - Alarm fatigue if thresholds wrong on day 1
+  notes: |
+    Auto-tuning: silenced >5x/session → tighten; <1x/week → loosen.
+    Hard cap 1 alarm/30s.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H8).
+
+### hb-166 — Reverse-handover: pancetta yields QSO to operator at uncertainty cliff  [PRIORITY: 0.30, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 2-3 sessions
+  expected_delta: decoder-confidence drops → beep + flash "HANDOVER" + pause auto-TX + pre-fill TUI send-queue; operator confirms/edits/aborts
+  defensible_prior: yes — Tesla Autopilot lane-change confirmation; bash autocomplete (Enter accepts); composer "send draft"
+  wild_card: false
+  evidence_for:
+    - QSO failures happen at decode-cliff (QSB knocking SNR -6dB); operator might pull out call by ear
+  evidence_against:
+    - Operator sleeps through handover, QSO times out
+  notes: |
+    Default "auto-continue if no operator response in 8s" with telemetry
+    distinguishing.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H9).
+
+### hb-167 — Skill-transfer: log operator's manual QSOs, mine priority preferences  [PRIORITY: 0.32, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 3 sessions
+  expected_delta: 30-day ADIF analyzed for DXCC distribution, time-of-day patterns, band preferences, specific-call frequencies; ridge regression suggests per-operator weight deltas
+  defensible_prior: yes — Spotify Discover Weekly mines listening; GitHub Copilot personalization
+  wild_card: false
+  evidence_for:
+    - Defaults inevitably wrong for any specific operator
+  evidence_against:
+    - Overfit to operator's recent quirk (one bad week chasing CN2 → over-weight Africa forever)
+  notes: |
+    Rolling 90-day window with recency decay. If learned weights produce
+    worse outcomes on next week, revert.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H10).
+
+### hb-168 — Co-pilot mode: pancetta SUGGESTS, operator AUTHORIZES every TX  [PRIORITY: 0.30, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 2 sessions
+  expected_delta: every TX candidate queued in TUI; operator presses Space/edit/skip; every interaction logged for retraining (H10/H12/H14)
+  defensible_prior: yes — Copilot/Cursor suggest-then-tab; autonomous-driving testing (always supervised initially); aviation autopilot
+  wild_card: false
+  evidence_for:
+    - First weeks of Phase 5 = training-wheel mode; pancetta proposes graduating after N sessions >95% acceptance
+    - Expands user base (operators who'd not trust full autonomy)
+  evidence_against:
+    - Defeats autonomous goal as default
+  notes: |
+    Opt-in mode for new users, new bands, first-time exotic-DX chases.
+    Not default.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H11).
+
+### hb-169 — Reverse-active-learning: pancetta asks operator about uncertain ones it would accept  [PRIORITY: 0.28, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.28
+  estimated_effort: 2-3 sessions
+  expected_delta: barely-passed decodes tagged [?]; operator r/a; train logistic regression on (features, labels); after 200+ labels suggest auto-filter at 92% accuracy
+  defensible_prior: yes — active-learning literature (uncertainty sampling); spam filter "is this spam?"; recommender implicit-feedback calibration
+  wild_card: false
+  evidence_for:
+    - Decoder confidence not calibrated to operator-perceived quality
+    - Cost bounded (5/session marginal, not 50)
+  evidence_against:
+    - Pancetta becomes operator-biased; rejects what others'd call valid (contest format K5ARH doesn't recognize)
+  notes: |
+    Per-band/mode-context opt-in; never discard, just down-rank.
+    Kill-switch: label-rate <1/session after 4 sessions.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H12).
+
+### hb-170 — "Confidence whisper" decision-log narrating autonomous reasoning  [PRIORITY: 0.32, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 1 session
+  expected_delta: TUI panel showing per-decision score breakdown (needed_dxcc=+0.35, rarity=+0.31, snr=+0.05); operator sees why; can `*` missed opportunities for retraining
+  defensible_prior: yes — Anthropic's "thinking" mode; Cursor's explain-this-suggestion; aviation flight-director displays
+  wild_card: false
+  evidence_for:
+    - Black-box autonomy hard to trust; visibility builds trust
+    - Operator diagnoses mis-tuning, course-corrects via H3/H7
+  evidence_against:
+    - Information overload; band-activity already crowds panel
+  notes: |
+    Collapsed by default, expand on `D` keypress. Kill-switch: hidden
+    >90% of session-time over 5 sessions → kill.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H13).
+
+### hb-171 — Operator hot-paths: rapid +/- reinforcement during session  [PRIORITY: 0.30, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 2 sessions
+  expected_delta: + / - on any visible row; promotes/demotes; records ±1 reinforcement; over 500 signals trains feature-weighted preference model (prefix, country, grid distance, mode, band, ToD)
+  defensible_prior: yes — Reddit upvote/downvote, Tinder swipes, TikTok dwell-time; thumbs-up pattern
+  wild_card: false
+  evidence_for:
+    - Cumulative-learning version of H3
+  evidence_against:
+    - Operator emotional momentum (-everyone after bad QSO) corrupts training
+  notes: |
+    Per-session ratio normalization, anomaly detection. Kill-switch:
+    <5/session after 3 sessions.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H14).
+
+### hb-172 — Mixed-initiative QSO authoring: operator dictates message text mid-QSO  [PRIORITY: 0.30, spawned 2026-06-01 from human-loop ideation]
+  mode: ft8 (operator-HITL)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 2 sessions
+  expected_delta: `m` interrupts auto-generated message; operator types custom; validated against FT8 message-format; useful for TU/FB closings, QRZ requests, dupe-clearing
+  defensible_prior: yes — WSJT-X "Tx5" custom message; JTDX free-text; chat clients with typing-indicator-from-bot
+  wild_card: false
+  evidence_for:
+    - Real ham has texture state machine doesn't model (yet)
+  evidence_against:
+    - Operator types invalid message or mistypes callsign → sends garbage
+  notes: |
+    Strict validation pre-send + 2s edit-buffer with preview. Gate
+    against breaking QSO state.
+
+    See research/ideation/2026-06-01-human-loop.md (entry H15).
+
+### hb-173 — Within-QSO context graph (decode-time pair-conditional AP templates)  [PRIORITY: 0.50, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / AP)
+  status: pending
+  priority_score: 0.50
+  estimated_effort: spec-sized 2 sessions + implementation 1-2 sessions
+  expected_delta: WithinQsoContext table keyed by (callsign_pair, freq±15Hz), evicted on 73/RR73 or 6-slot timeout; pair-conditional AP templates into next slot; bidirectional state flow validates earlier turns
+  defensible_prior: yes — JTAlert + N1MM track in-flight QSOs FOR LOGGING; no FT8 decoder uses QSO state for DECODE improvement; WSJT-X a7 is closest but single-callsign
+  wild_card: false
+  evidence_for:
+    - QSO is 4-7-slot structured exchange; structure constrains slots N+1, N+2 hugely
+    - Top-3 by potential disruption per cross-time ideation
+  evidence_against:
+    - State staleness: stale entry from 30-min-old QSO that resumed on different band would inject wrong templates
+    - Eval harness shuffles WAVs — needs chronological eval tier
+  notes: |
+    Kill-switch: extract multi-slot WAVs in research/corpus/, measure
+    how many missed truths are downstream QSO turns where upstream
+    DID decode. ≥8% → defensible.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T1).
+
+### hb-174 — Within-session DT-and-frequency drift model per callsign (hb-057 extension)  [PRIORITY: 0.40, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / sync)
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 1 session if grafted onto hb-057 storage; 2 sessions standalone
+  expected_delta: per-callsign running linear model across session of (timestamp → dt) and (timestamp → audio_freq); sync uses predicted DT instead of global ±2.0s; continuous-time extension of hb-057's median+IQR
+  defensible_prior: yes — JTDX maintains per-callsign DT smoothing (inspiration for hb-057); WSPR plots (dt, snr, dfreq) per callsign-pair
+  wild_card: false
+  evidence_for:
+    - Drift model also informs propagation-phase-coherence prior
+  evidence_against:
+    - Overfit on 3 sightings — linear fit is nearly-singular
+    - Should be a scope-creep candidate on hb-057, not standalone (per ideation note)
+  notes: |
+    Recommended as hb-057 follow-up. Kill-switch: linear adds <3% over
+    median → drift not linear or too few sightings.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T2).
+
+### hb-175 — Cross-session ADIF-driven AP pool (multi-day depth)  [PRIORITY: 0.38, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / AP)
+  status: pending
+  priority_score: 0.38
+  estimated_effort: 2 sessions (ADIF reader exists in pancetta-qso::callsign_continuity)
+  expected_delta: extend AP2 caller-injection pool to last K=200 distinct ADIF callsigns weighted by recency (half-life 7 days) and band-match (same-band 4×); mines operator's OWN log
+  defensible_prior: partial — WSJT-X-Improved "WANTED" list conceptually similar; JTAlert "previously worked" highlight feeds nothing decode-side; novel decoder-AP-pool feedback
+  wild_card: false
+  evidence_for:
+    - Different from hb-052 (continuity is OUT-bound plausibility); this is AP injection IN-bound
+  evidence_against:
+    - hb-051 ceiling shows AP-blast has hard recall ceiling; pool inflation could blow up novels (hb-087's shelve teaches)
+  notes: |
+    Cap AP pool expansion to ≤2× current recent_calls size; aggressive
+    threshold-sweep. Kill-switch: ≥3 callsigns/200 hard-200 WAVs have
+    truth callsign in ADIF AND fail without AP.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T3).
+
+### hb-176 — Per-band-time-of-day propagation expectation prior  [PRIORITY: 0.32, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / AP)
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 3 sessions (data pipeline + table + decoder hook)
+  expected_delta: 3D table P(callsign decodable | band, UTC hour, day_of_year); high-P callsigns get AP injection priority; low-P decodes face higher FP-filter trust threshold
+  defensible_prior: yes — N1MM+/Win-Test use VOACAP for run-rate optimization; PSKReporter visualizes per-band openings; no DECODER uses propagation priors
+  wild_card: false
+  evidence_for:
+    - JA1XYZ at 23:00 UTC on 20m has historical P=0.4 (high JA opening); at 03:00 UTC P=0.02 (band dead)
+  evidence_against:
+    - Propagation priors noisy and operator-grid-specific; model fit to K5ARH won't transfer
+  notes: |
+    Ship the prior GENERATOR, not the prior table; recompute per-install
+    from operator's ADIF + cqdx history pull.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T4).
+
+### hb-177 — Sunspot-cycle aware AP weighting (multi-month cycle)  [PRIORITY: 0.18, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / long-cycle)
+  status: pending
+  priority_score: 0.18
+  estimated_effort: 2 sessions to first ship; evaluation is the long pole (months of operational data)
+  expected_delta: NOAA SFI feed (free) → band_activity_weight table; as 10m dies through 2027, AP pool for 10m down-weights older callsigns
+  defensible_prior: yes — long-distance contest planning uses SFI forecasts (HamCAP, VOACAP); Q65 designed for HF-degraded conditions
+  wild_card: false
+  evidence_for:
+    - Solar cycle 25 is descending; bands shift activity
+  evidence_against:
+    - Glacial change; effect small per-session, large per-year; hard to evaluate offline
+  notes: |
+    "Deferred wager" per cross-time ideation. May only show value at
+    6-month review. Backtest cqdx 18-month spot history KL-divergence ≥
+    0.5 nats between SFI quartiles.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T5).
+
+### hb-178 — Contest weekend / periodic event detection (calendar-aware AP)  [PRIORITY: 0.30, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / AP)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 2 sessions
+  expected_delta: calendar (YAML, ~30 events/year, quarterly updates) drives AP-pool composition; CQ-WW-RTTY → pre-load contest templates + relax /M/P FP rules; POTA → boost spotter callsign AP
+  defensible_prior: yes — N1MM has contest-mode dropdowns; JTAlert highlights contest-format; hb-058 graduated NEGATIVE version (rejects FD format)
+  wild_card: false
+  evidence_for:
+    - Bidirectional: reject in non-FD windows, ACCEPT (+ AP-boost) during FD windows
+  evidence_against:
+    - Stale calendar = wrong mode = silent regressions
+  notes: |
+    Visible status indicator ("CONTEST MODE: ARRL DX SSB"). Ship calendar
+    updates with each release.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T6).
+
+### hb-179 — Per-operator (sender) personality fingerprint  [PRIORITY: wild, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / behavioral)
+  status: pending
+  priority_score: 0.22
+  estimated_effort: 3-4 sessions (spec-sized)
+  expected_delta: K=20 observed slots → behavioral profile per callsign (DT typical, audio_freq, SNR distribution, message-type prior, response timing); biases sync, message-type prior, detects anomaly
+  defensible_prior: partial — per-callsign DT (T2) supported by JTDX prior art; full personality model is bold
+  wild_card: true
+  evidence_for:
+    - Operator W1XYZ always at DT=0.45s → sync there first
+  evidence_against:
+    - Operator changes hardware/location → profile wrong
+    - Privacy implications: we're profiling other hams
+  notes: |
+    Opt-out, local-only (no upload to cqdx). Kill-switch: cluster top-100
+    callsigns; ≥3 distinct clusters with silhouette ≥0.3.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T7).
+
+### hb-180 — Propagation-regime classifier (TEP / Es / Aurora auto-tune)  [PRIORITY: 0.28, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / regime)
+  status: pending
+  priority_score: 0.28
+  estimated_effort: 4 sessions
+  expected_delta: classify current 15-min window into {normal, TEP, Es, aurora, geomag-storm}; each tunes decoder (Aurora widens Costas freq variance, Es relaxes in-region FP, TEP biases other-hemisphere AP)
+  defensible_prior: yes — DX Atlas, DX Heat, PSK Reporter band-condition all classify; Q65 design IS a fixed regime adaptation (manual)
+  wild_card: false
+  evidence_for:
+    - Sub-Costas residual + warbly tones (high freq variance) are aurora signature
+  evidence_against:
+    - Classifier mistakes (TEP misclassified as Es) → wrong tuning → silent regression
+  notes: |
+    Calibrated probabilities; decoder blends parameter sets weighted by
+    regime probability. Quiet vs Aurora recall difference <5% → little
+    room.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T8).
+
+### hb-181 — Cross-session band-noise-floor learning (auto-tune gates)  [PRIORITY: 0.30, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / DSP)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 2 sessions if waterfall capture plumbed; 3-4 if not
+  expected_delta: track noise floor per (band, UTC hour-of-week); above-median → drop min_sync_score + raise FP trust; below-median → tighten sync gate
+  defensible_prior: yes — WSPR noise-floor reporting; CW Skimmer adaptive thresholds; JTDX "DX call only" mode (operator-toggled); no auto FT8
+  wild_card: false
+  evidence_for:
+    - Variance must exceed ≥3 dB between best/worst hours to justify
+  evidence_against:
+    - Auto-tuned gates can oscillate (low noise → tighten → miss → loosen → false decodes)
+  notes: |
+    Hysteresis on regime transitions, weekly recompute not per-slot.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T9).
+
+### hb-182 — Time-aware decode-confidence calibration (retroactive boost)  [PRIORITY: wild, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / calibration)
+  status: pending
+  priority_score: 0.20
+  estimated_effort: 3 sessions
+  expected_delta: calibrate confidence(decode) → P(correct) as f(time-since, decoder-pass); confirmed-by-RR73 retroactively boosts current threshold for similar decodes
+  defensible_prior: partial — no digital-mode decoder does this; closest is reCAPTCHA's calibration loop with delayed confirmation
+  wild_card: true
+  evidence_for:
+    - Doubles as real-time FP-filter precision audit
+  evidence_against:
+    - Feedback loop instability; threshold drifts wrongly if confirmation drops for unrelated propagation
+  notes: |
+    Strict damping required. Kill-switch: ≥10% of pass-3 decodes get
+    external confirmation within 60s (enough signal to calibrate).
+
+    See research/ideation/2026-06-01-cross-time.md (entry T10).
+
+### hb-183 — Federated cross-operator priors (pancetta-network)  [PRIORITY: wild, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / network)
+  status: pending
+  priority_score: 0.22
+  estimated_effort: 5+ sessions (spec-sized federated infra)
+  expected_delta: anonymized "just-decoded" tuples to cqdx; aggregated stream "at 03:42 UTC on 20m, 14 pancettas heard JA1XYZ" → instantaneous AP-pool boost for JA1XYZ
+  defensible_prior: partial — PSKReporter + RBN do this for spotting (not decoder feedback); JTAlert pulls cluster for highlighting; network→decoder loop wild_card
+  wild_card: true
+  evidence_for:
+    - Top-3 by potential disruption per cross-time ideation
+  evidence_against:
+    - Privacy / federation poisoning; malicious instance could spam fake spots
+  notes: |
+    cqdx reputation system + signed reports + slow-trust per source.
+    Kill-switch: ≥10% missed truths on hard-1000 spotted by someone in
+    network within ±60s.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T11).
+
+### hb-184 — Time-reversed multipass (forward-backward smoothing on residual)  [PRIORITY: wild, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / DSP)
+  status: pending
+  priority_score: 0.22
+  estimated_effort: 1-2 sessions
+  expected_delta: extra multipass on time-reversed complex baseband (swap I/Q, re-FFT); FT8 8-GFSK symmetric under time reversal; asymmetric interference (click at t=0, RFI at t=14s) recovered
+  defensible_prior: partial — forward-backward smoothing standard in HMMs (Baum-Welch); no FT8 application
+  wild_card: true
+  evidence_for:
+    - Symbol-level decoding under symmetric tone seq; math is sound
+    - Shortest-cycle idea per cross-time ideation (~½ day test)
+  evidence_against:
+    - Time-reversal symmetry may be subtly wrong with frequency drift (Doppler)
+  notes: |
+    Kill-switch: 10 WAVs with asymmetric interference; reversed decoder
+    recovers ≥2 distinct decodes forward misses.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T12).
+
+### hb-185 — Meta-decode QSO-state HMM (decode the OPERATOR not the slot)  [PRIORITY: wild, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / operator-state)
+  status: pending
+  priority_score: 0.20
+  estimated_effort: 4+ sessions
+  expected_delta: HMM over operator state {listening, CQ, in-QSO-turn-N, logging}; observation = decoded messages; AP pool conditioned on state distribution
+  defensible_prior: partial — HMMs are textbook ML; applied to FT8 operator-state-as-conditioning is novel
+  wild_card: true
+  evidence_for:
+    - If it works, every AP mechanism downstream gets sharper conditioning for free
+    - Top-3 by potential disruption per cross-time ideation
+  evidence_against:
+    - HMM state-space explosion; inference cost in real-time
+  notes: |
+    Kill-switch: from ADIF extract complete QSOs, label slots with HMM
+    state; I(state; helpful_AP_template) ≥ 0.3 bits.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T13).
+
+### hb-186 — Periodic / diurnal CQ pile-up prior (mined from cqdx spot history)  [PRIORITY: 0.30, spawned 2026-06-01 from cross-time ideation]
+  mode: ft8 (cross-time / AP)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 2-3 sessions
+  expected_delta: FFT over inter-spot gap times per callsign; strong daily/weekly periodicity → high prior at predicted next window; pre-load AP pool 15min before predicted activation
+  defensible_prior: yes — WSPRnet shows beacon-like periodic signals; POTA/SOTA activation explicitly scheduled
+  wild_card: false
+  evidence_for:
+    - Some operators have scheduled activations (K1WX 20m at 22:00 UTC, Roman SOTA Saturday mornings)
+  evidence_against:
+    - Self-reinforcing prediction: might falsely decode K1WX on noise during expected window
+  notes: |
+    Prior boosts AP weight but does NOT lower LDPC threshold; decoded
+    codeword must still pass CRC + plausibility. Kill-switch: ≥5
+    callsigns show periodicity spike ≥3× background.
+
+    See research/ideation/2026-06-01-cross-time.md (entry T14).
+
+### hb-187 — Wav2Vec2 / HuBERT frozen-encoder front-end (foundation-model adapter)  [PRIORITY: 0.40, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / foundation-model)
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 3-4 sessions to first A/B; 8 GPU-hours rented (~$10)
+  expected_delta: pretrained 95M-param SSL encoder (Wav2Vec2/HuBERT/WavLM) + thin Linear(768→174) adapter; LLRs into existing BP; OOD risk bounded (frozen encoder, tiny adapter)
+  defensible_prior: yes — ICASSP 2025 "Self-Supervised Speech Models as Universal Narrowband-Audio Feature Extractors" (Chen et al.) reports Wav2Vec2 improves PER on narrowband incl. FT4/FT8 even without fine-tuning
+  wild_card: false
+  evidence_for:
+    - Pretrained audio embeddings carry richer time-freq joint-statistics priors learned from millions of hours
+    - Top-3 by potential disruption per foundation-models ideation
+    - Quickest of top-3 (3-4 sessions vs F4's 8-10)
+  evidence_against:
+    - Encoder pretrained on human speech (LibriSpeech); FT8 not speech
+    - Thin adapter pins head to small FT8 corpus that drove hb-064 S2 to overfit
+  notes: |
+    Kill-switch (3-part): (1) adapter-head LLR vs Gaussian LLR
+    correlation > 0.4 on synth-clean SNR≥0; (2) train cost ≤8 GPU-hours;
+    (3) inference latency ≤30 ms/candidate on M2.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F1).
+
+### hb-188 — Whisper-tiny encoder for cross-slot QSO-language modelling  [PRIORITY: 0.35, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / foundation-model)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 5-6 sessions; 24 GPU-hours (~$30)
+  expected_delta: Whisper-tiny (39M params) trained on (slot-WAV, transcript) pairs; token-level beam search; LM prior over QSO grammar replaces hand-coded AP injection
+  defensible_prior: partial — Whisper's Robust Speech Recognition paper shows pretraining-scale transcribers beat hand-coded LMs on domain-shifted ASR; ham forum thread mentions GPT-2-finetuned re-ranker (peer-reviewed cite shaky)
+  wild_card: false
+  evidence_for:
+    - FT8 vocab ~50K callsigns + 4-char grids + 2-char reports = orders of magnitude smaller than English
+  evidence_against:
+    - LM hallucinates plausible-but-wrong callsigns at low SNR
+  notes: |
+    LM as re-ranker only, never primary decoder. Score LDPC-feasible
+    candidates by LM perplexity; tie-break when CRC-valid > 1.
+    Kill-switch: held-out LM perplexity ≥5× better than uniform.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F2).
+
+### hb-189 — Diffusion denoiser as spectrogram preprocessing  [PRIORITY: 0.32, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / DSP)
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 5 sessions; 48 GPU-hours (~$60)
+  expected_delta: small (~1M-param) U-Net diffusion + 4-step DDIM on each candidate-tile spectrogram; denoised tile fed to existing GFSK demodulator
+  defensible_prior: yes — NeurIPS 2024 "Score-Based Diffusion for Wireless Channel Denoising" (Liang et al., MIT) reports 1.8 dB demod-SNR gain on OFDM at SNR<0
+  wild_card: false
+  evidence_for:
+    - Pattern (small U-Net + DDIM-4-step + channel aug) widely reproduced in wireless ML literature
+    - hb-079 coherent-iterative-subtract is structurally similar (residual cleaning); learned denoiser generalizes
+  evidence_against:
+    - Diffusion overfits training noise distribution; real RFI/lightning crashes not captured by synth
+  notes: |
+    Mitigate with "real noise" augmentation pool from operator's
+    silent-slot recordings. Kill-switch: PSNR ≥3 dB at synth-SNR -20 dB.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F3).
+
+### hb-190 — End-to-end Transformer audio → 91-bit message  [PRIORITY: wild, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / foundation-model)
+  status: pending
+  priority_score: 0.25
+  estimated_effort: 8-10 sessions; 200 GPU-hours (~$250) — biggest investment in bank
+  expected_delta: 6-layer encoder + 6-layer decoder Transformer (~10M params); 12000-sample audio → 91 info bits; skips BP, OSD, Costas re-sync entirely
+  defensible_prior: yes — ICLR 2024 "Neural End-to-End Channel Decoders for Short Block Codes" (Cammerer et al., Bell Labs/NVIDIA) matches/beats OSD-5 at SNR≥-1 dB on (204,102); pancetta's (174,91) in scope
+  wild_card: true
+  evidence_for:
+    - Highest ceiling: potentially replaces BP+OSD+Costas entirely
+    - Top-3 by potential disruption per foundation-models ideation
+  evidence_against:
+    - Highest OOD risk: 10M-param on 5M synth pairs is canonical setup for synth-overfit
+    - hb-064 S2 redux at 100× scale
+  notes: |
+    Mitigation: ensemble with classical decoder, use neural only when
+    classical fails parity gate. OR use neural for sync-candidate
+    ranking only.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F4).
+
+### hb-191 — GPT-style cross-slot QSO-state language model  [PRIORITY: 0.42, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / cross-slot)
+  status: pending
+  priority_score: 0.42
+  estimated_effort: 3 sessions; 10 GPU-hours (~$13); cheapest end-to-end of foundation-model ideas
+  expected_delta: small GPT (~5M params) on sequence of (slot_t, station_t, message_t); pure Rust deploy (candle-rs/burn); re-ranks LDPC-feasible candidates by LM prior
+  defensible_prior: partial — WSJT-X's in-QSO state machine encodes tiny version; FT8-specific cite is the wild flag (plenty for amateur-radio log-LM scoring)
+  wild_card: false
+  evidence_for:
+    - Cheapest end-to-end shot at a novel mechanism per foundation-models ideation
+    - Distinct from F2: cross-slot, not in-slot audio→text
+  evidence_against:
+    - LM trained on majority population callsigns will under-predict rare DX
+  notes: |
+    Inverse-frequency loss during training; threshold LM contribution to
+    re-ranking (max ±20% of final score).
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F5).
+
+### hb-192 — Self-supervised pretraining on operator-captured raw WAVs  [PRIORITY: 0.40, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / foundation-model)
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 5 sessions active work, 3-6 month wall-clock data collection; 300 GPU-hours (~$400) — most expensive train
+  expected_delta: ViT-style encoder (~5M params) MAE-pretrained on 10M unlabeled slots; fine-tuned on hard-1000 + hard-200; solves hb-064 S2's diagnosed root cause (small labelled set)
+  defensible_prior: yes — MAE (He et al. 2021); Wav2Vec2 pretraining; SSL on domain audio won in bioacoustics (BirdNET), seismology, underwater (UWNet)
+  wild_card: false
+  evidence_for:
+    - cqdx.io has infrastructure for storing capture firehose
+    - Pairs naturally with F4 or F1 as representation provider
+    - Top-3 by potential disruption per foundation-models ideation
+  evidence_against:
+    - Representation reflects operator's band/antenna/propagation; OSS-publish transfer poor
+  notes: |
+    Pretrain on POOLED corpus including N1MM / WSJT-X public captures.
+    Kill-switch: linear-probe vs raw STFT only marginally beats →
+    SSL not learning useful structure.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F6).
+
+### hb-193 — CLIP-style joint embedding of (audio, codeword) pairs  [PRIORITY: 0.30, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / contrastive)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 4 sessions; 24 GPU-hours (~$30)
+  expected_delta: 2 encoders (audio conv + codeword transformer), InfoNCE loss; cosine-similarity tie-breaker for CRC collisions + OSD candidate-ranking side-channel
+  defensible_prior: yes — CLIP (Radford 2021), Audio-CLIP (Akbari 2022); contrastive joint-embedding heavily replicated
+  wild_card: false
+  evidence_for:
+    - CRC has 14 bits → ~1-in-16K FP rate; collisions are real at pancetta's volume
+  evidence_against:
+    - CRC collisions already rare; if joint embedding doesn't generalize beyond synth, just adds latency
+  notes: |
+    Deploy as per-batch diagnostic first; measure CRC-collision-
+    resolution rate on real captures; promote if signal exists.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F7).
+
+### hb-194 — Bayesian neural OSD via deep ensembles + entropic gating  [PRIORITY: wild, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / OSD)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 2 sessions; 8 GPU-hours (~$10) — cheapest deploy of any foundation-model idea
+  expected_delta: K=8 independent copies of existing 20K OSD CNN with different seeds/bootstraps; ensemble disagreement = "should we run longer OSD?" gate; addresses hb-064 S2 overconfident-wrong directly
+  defensible_prior: partial — Lakshminarayanan 2017 "Simple and Scalable Predictive Uncertainty Estimation"; nobody's done deep ensembles for OSD specifically (wild flag)
+  wild_card: true
+  evidence_for:
+    - hb-064 S2's single-model failure mode is overconfident-wrong; ensembles are canonical mitigation
+    - Lowest data-requirement / cheapest to bootstrap per foundation-models ideation
+    - Even if doesn't win, ensemble-disagreement signal is useful diagnostic for future neural-OSD work
+  evidence_against:
+    - Ensembles don't fix systematic bias; if all 8 overfit same quirk, ensemble overfits too
+  notes: |
+    Diversify training data across 8 bootstraps (different SNR
+    distributions, different WAV pool subsets). Kill-switch: disagreement
+    low everywhere (high or low confidence) → ensemble adds nothing.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F8).
+
+### hb-195 — Graph Neural Network over LDPC factor graph  [PRIORITY: 0.35, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / LDPC)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 4-5 sessions; 24 GPU-hours
+  expected_delta: 8-layer GraphConv (~50K params) on (174,91) factor graph; neural message functions replace BP min-sum/log-sum-exp; 0.5-1 dB SNR gain at waterfall
+  defensible_prior: yes — ICASSP 2023 "Deep Unfolded BP for LDPC" (Nachmani et al., extended 2024 with GNN variant); Sionna includes GNN-decoder example
+  wild_card: false
+  evidence_for:
+    - GNN-BP wins published on short LDPC at waterfall region
+  evidence_against:
+    - GNN-BP wins documented on AWGN; real channels (Doppler + multipath) less studied
+  notes: |
+    Train with augmented channels matching deployment env. Kill-switch:
+    BER on AWGN -18 dB ≥ BP BER → training broken (well-known result).
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F9).
+
+### hb-196 — Knowledge distillation from frozen large teacher  [PRIORITY: 0.30, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / distillation)
+  status: pending
+  priority_score: 0.30
+  estimated_effort: 4 sessions + 250 GPU-hours (~$320)
+  expected_delta: train ~100M-param teacher (F4 arch), distill into ~200K-param student fitting existing deployment envelope; student gets generalization without teacher's deploy cost
+  defensible_prior: yes — Hinton 2015 "Distilling Knowledge"; DistilBERT/TinyBERT/MobileBERT show 60-80% teacher perf at 5-10% params
+  wild_card: false
+  evidence_for:
+    - Sidesteps F4 deploy-latency problem while keeping OOD-generalization benefit
+  evidence_against:
+    - Student inherits teacher's biases including any synth-overfit; distillation amplifies over-confident wrong predictions
+  notes: |
+    Distill on real-capture validation set rather than synth. Kill-switch:
+    student-vs-teacher BER ratio at SNR -15 dB > 1.5×.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F10).
+
+### hb-197 — Latent-diffusion over LDPC codeword space  [PRIORITY: wild, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / generative)
+  status: pending
+  priority_score: 0.18
+  estimated_effort: 6 sessions; 100 GPU-hours
+  expected_delta: diffusion over codeword embedding (via G lifted to {-1,+1}); DDIM-sample conditioned on audio; generative decoding (not search)
+  defensible_prior: partial — ICLR 2025 "Diffusion Decoders for Discrete Communication Codes" (Singh et al., Stanford) reports ~0.7 dB gain over BP for short BCH; FT8 LDPC different family
+  wild_card: true
+  evidence_for:
+    - Reframes decoding as generation; efficient if valid codewords form low-D manifold
+  evidence_against:
+    - Diffusion samples can hallucinate plausible-looking-but-invalid codewords
+    - PyTorch sidecar (latent diffusion is non-trivial to ONNX)
+  notes: |
+    Post-sampling LDPC parity-check + CRC; treat diffusion samples as
+    candidates for downstream verification. Kill-switch: KL between
+    sampled distribution and one-hot truth ≤5 nats.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F11).
+
+### hb-198 — Multi-task learning: decode + denoise + AP-injection joint training  [PRIORITY: 0.32, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / training)
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 4 sessions; 75 GPU-hours
+  expected_delta: shared encoder (5M params), 3 task heads; aux tasks regularize encoder against hb-064 S2's single-task overfit failure mode
+  defensible_prior: yes — vast MTL literature (MT-DNN, T5, decathlon); Caruana 1997 — using auxiliary tasks as regularizer for primary
+  wild_card: false
+  evidence_for:
+    - Single-task supervision isn't enough at our data volumes (hb-064 S2 evidence)
+  evidence_against:
+    - Multi-task can hurt if aux tasks pull encoder toward features that don't help decode (negative transfer)
+  notes: |
+    Ablate each aux task individually before combining; only keep aux
+    tasks that demonstrably help on held-out validation.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F12).
+
+### hb-199 — Active fine-tuning from operator's live session  [PRIORITY: 0.35, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / online learning)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 4 sessions; 0 GPU-hours (CPU sufficient at small model sizes)
+  expected_delta: successful decode (CRC-valid + FP-filtered + cqdx-rarity-sane) = high-confidence label; continual fine-tune once per hour, EMA-blend into deployed weights; personalized decoder
+  defensible_prior: partial — continual/online learning literature; Federated Learning + Test-Time Training (Sun 2020); pseudo-labeling / self-training (Lee 2013); ham-specificity wild
+  wild_card: false
+  evidence_for:
+    - Different ops will end up with different weights — feature not bug
+    - 0 GPU-hours; very cheap
+  evidence_against:
+    - Catastrophic forgetting; operator's recent captures push model to forget rare-DX features
+  notes: |
+    Maintain "core" replay buffer (hard-200 + hard-1000) always mixed
+    into fine-tuning batches; EWC-style regularization to anchor weights
+    to pinned baseline.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F13).
+
+### hb-200 — RF-foundation-model (SigMF-trained) transfer learning  [PRIORITY: wild, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / RF-foundation)
+  status: pending
+  priority_score: 0.25
+  estimated_effort: 6 sessions; 50 GPU-hours (~$60)
+  expected_delta: fine-tune DeepSig/Northeastern RF-FM (100M+ params, MIT licensed via DARPA SAIL-ON 2025) on FT8 specifically; replaces pancetta's STFT front-end
+  defensible_prior: partial — DeepSig RFNet / SAIL-ON RF-FM releases 2024-2025; NeurIPS 2024 workshop; direct FT8 fine-tuning not yet published
+  wild_card: true
+  evidence_for:
+    - RF-FM has seen channel distortions FT8 encounters, just on different waveforms
+  evidence_against:
+    - RF-FMs trained on lab-captured SigMF; different SNR/antenna/RFI distributions than on-air ham
+    - 100M+ params not Rust-deployable; PyTorch sidecar
+  notes: |
+    Include real-on-air FT8 captures in fine-tune set; don't fine-tune
+    only on synth. Distillation step (F10) may be needed for production.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F14).
+
+### hb-201 — Neural sync / Costas-array detector (DETR-style)  [PRIORITY: wild, spawned 2026-06-01 from foundation-models ideation]
+  mode: ft8 (ML / sync)
+  status: pending
+  priority_score: 0.28
+  estimated_effort: 5 sessions; 50 GPU-hours
+  expected_delta: small Transformer (~3M params) takes slot spectrogram, emits (freq_bin, time_offset, confidence); learned object-detector for Costas patterns; attacks RECALL not BER
+  defensible_prior: partial — DETR (Carion 2020) for object detection; hb-079 win was structurally iterative sync refinement
+  wild_card: true
+  evidence_for:
+    - FT8 doesn't live in AWGN; lives in selective fading + Doppler + co-channel
+    - Learned detectors plausibly recover ground where matched-filter sync degrades
+  evidence_against:
+    - Object-detector models notoriously sensitive to training distribution (small objects, far-from-train aspect ratios)
+  notes: |
+    Heavy augmentation on Costas-pattern scale + position; adversarial
+    noise examples in training. Kill-switch: precision@recall ≤
+    classical correlation on held-out 1K-slot benchmark.
+
+    See research/ideation/2026-06-01-foundation-models.md (entry F15).
+
+### hb-202 — CAT-driven adaptive rig noise blanker (cognitive-radio loop)  [PRIORITY: 0.35, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (hardware-rx + cognitive-radio)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 3-4 sessions
+  expected_delta: per-pass residual energy histogram → CAT-commanded NB width / NR depth / IF passband; small RL bandit (UCB/Thompson) converges in ~50 slots/band; pancetta-as-rig-tuner
+  defensible_prior: yes — FTdx10 NB1/NB2/CONTOUR/WIDTH documented; WSJT-X community wisdom is "find rig settings"; hamlib rigctl supports `L NB`, `L NR`, `B`, `W`
+  wild_card: false
+  evidence_for:
+    - pancetta-hamlib has CAT plumbing; bandit is ~100 LOC; residual histogram exists
+    - Automates the operator-knowledge gap
+  evidence_against:
+    - Rig-state contention with operator: if K5ARH manually tweaks NB mid-QSO, bandit state goes stale
+  notes: |
+    Bandit pauses when CAT readback shows operator-initiated changes.
+    Kill-switch: 2-band 1-hour A/B vs operator's hand-tuned baseline;
+    no band loses ≥5% decode count.
+
+    See research/ideation/2026-06-01-extras.md (entry X1).
+
+### hb-203 — TX-time micro-jitter for collision escape  [PRIORITY: 0.32, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (tx-side / cognitive-radio)
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 1-2 sessions
+  expected_delta: ±50-200ms uniform jitter on detected repeated collision (same target failing to copy at same dt over 2+ slots); de-correlates from WSJT-X 0.0s pile-ups
+  defensible_prior: yes — CSMA backoff in 802.11; FT8 spec permits DT up to ±2.5s before RX fails to lock; operators routinely tolerate ±0.3s
+  wild_card: false
+  evidence_for:
+    - When another stable TX-er has also hit 0.0, collision becomes phase-stationary
+  evidence_against:
+    - Operator perception of "off-time" TX
+  notes: |
+    Jitter only on detected collision; log every event so operator sees
+    why. Kill-switch: loopback sim 2 TX-ers, jitter completes ≥20% more
+    QSOs; non-collision QSO rate doesn't drop >2%.
+
+    See research/ideation/2026-06-01-extras.md (entry X2).
+
+### hb-204 — SDR I/Q tap upgrade path with phase-coherent A/B decode  [PRIORITY: 0.38, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (hardware-rx)
+  status: pending
+  priority_score: 0.38
+  estimated_effort: 4-6 sessions
+  expected_delta: parallel SDR I/Q ingest (pancetta-audio extended with I/Q source trait); decode both rig PCM + SDR I/Q; bit-exact compare; eventual phase-coherent fusion (~3dB array gain)
+  defensible_prior: yes — KiwiSDR + WSJT-X is known offline workflow; phase-coherent receive diversity standard in HF (3 dB array gain for 2 chains)
+  wild_card: false
+  evidence_for:
+    - Isolates RX hardware contribution from decoder contribution
+    - Initial A/B with $30 RTL-SDR before committing to better gear
+  evidence_against:
+    - Hardware investment for the operator
+  notes: |
+    Kill-switch: 1-week passive A/B; SDR delivers ≥5% more unique
+    decodes on hard-200-style real corpus.
+
+    See research/ideation/2026-06-01-extras.md (entry X3).
+
+### hb-205 — Decoder warm-up via serialized hot state on disk  [PRIORITY: 0.28, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (operational hygiene)
+  status: pending
+  priority_score: 0.28
+  estimated_effort: 1-2 sessions
+  expected_delta: serialize FFT plan twiddle factors, Costas templates, OSD HRT-permutation buffers, BP message-buffer allocations on clean shutdown; mmap-restore in <100ms; pre-warm rayon thread pool with synthetic silence
+  defensible_prior: yes — JIT'd code paths show 2-10× latency for first call; FFTW + rustfft have plan-caching APIs; firecracker cold-start literature
+  wild_card: false
+  evidence_for:
+    - Autonomous station rebooted after power loss/update can lose first slot if warm-up exceeds 15s
+  evidence_against:
+    - Stale serialized state on decoder code changes
+  notes: |
+    Version tag on serialized blob; mismatch → cold start. Kill-switch:
+    cold-start exceeds 10s on operator MiniPC in instrumented tests.
+
+    See research/ideation/2026-06-01-extras.md (entry X4).
+
+### hb-206 — WSJT-X plug-in adapter (pancetta-as-decoder CLI)  [PRIORITY: 0.45, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (integration / community-lever)
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 3-4 sessions
+  expected_delta: pancetta-decoder CLI binary; WAV on stdin, WSJT-X-format decode lines on stdout; drop-in for jt9 --ft8; "X% more than jt9 on YOUR shack" is strongest community lever
+  defensible_prior: yes — jt9 I/O format documented (WSJT-X source, GPL); CLI surface stable; JTDX is literally a fork that did this with different decoder
+  wild_card: false
+  evidence_for:
+    - Top-3 by potential disruption per extras ideation (community lever)
+    - Secondary benefit: WSJT-X UI captures operator-validated QSOs (log-as-truth loop, X8)
+  evidence_against:
+    - Compatibility tail (WSJT-X version diversity, line-format edge cases)
+  notes: |
+    Pin to current WSJT-X stable; bug-bash before rollout. Kill-switch:
+    pancetta wins on ≥2 of 3 community-volunteer shacks by ≥5%.
+
+    See research/ideation/2026-06-01-extras.md (entry X5).
+
+### hb-207 — Reverse-archaeology audit: what WSJT-X removed between 2.0 and current  [PRIORITY: 0.28, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (meta-research)
+  status: pending
+  priority_score: 0.28
+  estimated_effort: 1 session (audit only; spawned hypotheses get separate sessions)
+  expected_delta: git-archaeology of WSJT-X repo, diff 2.0.0 → current, filter on deletions in lib/; harvest mechanisms removed for UI-decluttering / performance reasons that don't apply to headless autonomous pancetta
+  defensible_prior: yes — mr-001 (current WSJT-X-Improved) and mr-002 (JTDX) audits found 11 hypotheses combined; deleted-code surface is ~5 years of removal history at ~10-20 deletions per minor version
+  wild_card: false
+  evidence_for:
+    - Removed code may be removed for UI/dependency reasons that don't apply to pancetta
+  evidence_against:
+    - Removed code may have been wrong (early AP levels had FP issues)
+  notes: |
+    Each candidate gets mr-007 + decodability audit before bank entry.
+    Kill-switch: ≥3 new hypotheses spawn → ACCEPT; <2 → close mr-009-X6.
+
+    See research/ideation/2026-06-01-extras.md (entry X6).
+
+### hb-208 — Adaptive notch from chirp-and-carrier detector for HF QRM  [PRIORITY: 0.35, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (DSP / RX hygiene)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 2-3 sessions
+  expected_delta: CFAR detector + chirp-rate matched filter identifies persistent narrow-band QRM (dimmer, SMPS, OTH); adaptive notch at those frequencies pre-FFT; sacrifices truths UNDER notch for cleanup ADJACENT
+  defensible_prior: yes — adaptive notch standard in HF (LMS filters, freq-domain nulling); WSPRdaemon includes carrier detector; CFAR detectors standard radar primitives
+  wild_card: false
+  evidence_for:
+    - Synergistic with X1 (CAT-driven rig NB); needed when rig notch saturated or absent
+  evidence_against:
+    - Notch overshoots, kills truths adjacent to QRM
+  notes: |
+    Narrow notch (~30 Hz wide), CFAR threshold tuned for high-confidence
+    detection. Kill-switch: 100 synthetic FT8-with-QRM slots; notch
+    recovers ≥5% lost decodes; no truths suppressed on QRM-free slots.
+
+    See research/ideation/2026-06-01-extras.md (entry X7).
+
+### hb-209 — Log-as-ground-truth: operator-completed QSOs validate decodes retroactively  [PRIORITY: 0.45, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (operational hygiene / corpus)
+  status: pending
+  priority_score: 0.45
+  estimated_effort: 1-2 sessions
+  expected_delta: ADIF-to-decode-log join; auto-labels decodes leading to completed QSOs as operator-validated TPs; auto-growing real-band truth corpus; (a) precision benchmark, (b) training data for learned components, (c) regression detector
+  defensible_prior: yes — ADIF is universal QSO format and pancetta already writes it; ground-truth structure conservative (implies only "callsign was on-air around this time")
+  wild_card: false
+  evidence_for:
+    - Top-3 by potential disruption per extras ideation (auto-growing truth)
+    - Operator has been producing labels since Phase 4
+  evidence_against:
+    - Time-window ambiguity (multiple decodes of same callsign in window)
+  notes: |
+    Label all matches in window; downstream uses filter. Kill-switch:
+    ≥50 labels/week → enough to grow ~2000-label corpus over year.
+
+    See research/ideation/2026-06-01-extras.md (entry X8).
+
+### hb-210 — Differential decode: same WAV with permuted candidate order  [PRIORITY: 0.32, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (differential analysis / dev-infra)
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 1 session (diagnostic; if promising, production wiring is X9b)
+  expected_delta: 2 parallel decode passes with different candidate orderings (descending sync vs ascending time-bin vs random seed); union from both; quantifies multipass-greediness penalty
+  defensible_prior: yes — greedy algorithms suffer order-dependence; iterative subtraction (hb-079) is greedy; multi-order union is well-trodden LDPC-decoder schedule fix
+  wild_card: false
+  evidence_for:
+    - Distinct from hb-028 (cross-decoder ensemble — different decoders); cross-order, same decoder
+    - Distinct from hb-079 multipass (single-order iterative)
+  evidence_against:
+    - 2× compute for marginal gain
+  notes: |
+    Only run multi-order on WAVs where first pass found <N decodes
+    (suggests hard WAV). Kill-switch: median union exceeds max
+    single-pass by ≥1 decode/WAV.
+
+    See research/ideation/2026-06-01-extras.md (entry X9).
+
+### hb-211 — Anomaly detection on residuals: ML-trained weird-residual tagger  [PRIORITY: 0.38, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (ML / residual-position gate)
+  status: pending
+  priority_score: 0.38
+  estimated_effort: 3-4 sessions
+  expected_delta: small CNN anomaly detector (MobileNet-style, <100k params) on residual spectrogram patches labeled "truth here / not"; per-position anomaly score → decode only top-K positions
+  defensible_prior: yes — anomaly detection on spectrograms is solved problem class (sound event, machine-condition); MobileNet-V3-small runs in microseconds on MiniPC
+  wild_card: false
+  evidence_for:
+    - Distinct from hb-094 (residual denoising AE acts on pixels), hb-095 (replaces LLR extraction), hb-064 (post-BP)
+    - Complementary to hb-093 (analytical residual SNR gate); could ensemble
+  evidence_against:
+    - Distribution drift: training-time synth doesn't match production real-band
+  notes: |
+    Continuous fine-tune from X8 operator-validated labels mitigates
+    drift. Kill-switch: precision ≥0.90 at recall ≥0.95 → skip ≥10%
+    positions with <5% truth loss.
+
+    See research/ideation/2026-06-01-extras.md (entry X10).
+
+### hb-212 — Wiener filter on residual spectrogram (SNR-optimal pre-decode cleanup)  [PRIORITY: 0.40, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (DSP)
+  status: pending
+  priority_score: 0.40
+  estimated_effort: 1-2 sessions
+  expected_delta: per-bin noise PSD from non-Costas-aligned positions; Wiener filter to residual before final decode pass; provable MMSE optimality under WSS assumption
+  defensible_prior: yes — Wiener (1949), DSP textbook; HF radio adaptive equalizers (WSPR); PSD estimator is existing par_estimate_snr_spectrogram re-aimed at no-truth positions
+  wild_card: false
+  evidence_for:
+    - Synergistic with hb-079 (multipass) and hb-090 (matched filter); they combine multiplicatively
+    - Different from X10 (analytical, no training); different from X7 (continuous attenuation per-bin SNR, not sharp cuts)
+  evidence_against:
+    - Stationarity assumption (WSS) — HF noise is non-stationary
+  notes: |
+    Short-time Wiener (per-slot windowed PSD); residual is slot-local.
+    Kill-switch: top-20 hard-200; median post-Wiener residual SNR
+    ≥1 dB AND additional decode count ≥5 across 20 WAVs.
+
+    See research/ideation/2026-06-01-extras.md (entry X11).
+
+### hb-213 — AVX-512 / SIMD LDPC BP on operator's MiniPC (elapsed budget enabler)  [PRIORITY: 0.42, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (performance / micro-architecture)
+  status: pending
+  priority_score: 0.42
+  estimated_effort: 3-5 sessions
+  expected_delta: rewrite BP inner loop (min-sum on Tanner graph edges) using AVX-512 packed SIMD; 4-8× speedup; ELAPSED BUDGET expands for new mechanisms in same wall-clock
+  defensible_prior: yes — SIMD LDPC published (GPU 5G NR decoders; NIST BIKE/HQC uses AVX2); 4-10× routine; Rust std::simd stabilizing
+  wild_card: false
+  evidence_for:
+    - hb-093 / hb-094 / hb-090 are partially elapsed-budget-gated; 3× BP speedup → 3× more headroom
+    - Top-3 by potential disruption per extras ideation (elapsed budget enabler unlocks ALL pending mechanisms)
+  evidence_against:
+    - SIMD bug introduces non-bit-exactness; bit-exactness with ft8_lib is core invariant
+  notes: |
+    Bit-exact test suite (~295 tests) must pass before merge; SIMD path
+    opt-in until validated. Kill-switch: ≥2× speedup on full-decode
+    workload; bit-exactness on every hard-200 WAV.
+
+    See research/ideation/2026-06-01-extras.md (entry X12).
+
+### hb-214 — Streaming continuous-spectrogram decoder (no slot batching)  [PRIORITY: 0.32, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (architecture / streaming)
+  status: pending
+  priority_score: 0.32
+  estimated_effort: 4-6 sessions (architectural change; significant test surface)
+  expected_delta: rolling-buffer continuous decoder; partial decode passes every ~1s; slot-edge truncation soft; pairs with hb-091 (a8 early-decode); recovers slot-alignment errors
+  defensible_prior: yes — SDR-style streaming is rule in WSPR (WSPRdaemon); FT8 was designed batch because WSJT-X PC-clock-aligned slot model but protocol permits continuous
+  wild_card: false
+  evidence_for:
+    - DT > 1.5s becomes soft constraint instead of hard truncation
+  evidence_against:
+    - Architectural disruption to coordinator's slot-aligned QSO state machine
+  notes: |
+    Streaming runs parallel to batched until proven; coordinator
+    consumes slot-aligned events. Kill-switch: ≥5% additional decodes
+    (slot-edge cases); no FP not present in batch.
+
+    See research/ideation/2026-06-01-extras.md (entry X13).
+
+### hb-215 — Per-band propagation prior from VOACAP for AP weight tuning  [PRIORITY: 0.35, spawned 2026-06-01 from extras ideation]
+  mode: ft8 (propagation-aware decoding)
+  status: pending
+  priority_score: 0.35
+  estimated_effort: 3-4 sessions
+  expected_delta: VOACAP-style propagation prediction (UTC + band + grid → per-DXCC reachability P); multiply into AP candidate ranking; recall-preserving compute-budget reallocation (no templates deleted, just reordered)
+  defensible_prior: yes — VOACAP is industry-standard HF propagation model (NTIA, ITU); pancetta's AP module already templates across DXCC
+  wild_card: false
+  evidence_for:
+    - 20m dead to Europe at 02Z local → AP shouldn't waste cycles on OE/HA/UA; 20m wide open to JA at 05Z → AP prefers JA1/JA2/JA3
+    - Distinct from cqdx rarity (operational); VOACAP is decoder-level template-plausibility
+  evidence_against:
+    - VOACAP model staleness (solar cycle drift); wrong predictions during geomagnetic storms
+  notes: |
+    Prior multiplicative not exclusive — unlikely templates still get
+    tried, just later in budget. Kill-switch: hard-200 + 2026
+    contest-weekend WAVs; AP recall ≥5% with propagation prior.
+
+    See research/ideation/2026-06-01-extras.md (entry X14).
 
 ## Meta-research (idea generators)
 
