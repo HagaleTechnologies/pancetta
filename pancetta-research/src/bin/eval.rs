@@ -8,7 +8,9 @@ use chrono::Utc;
 use pancetta_research::corpus::{load_ft8_fixtures, load_synth_corpus};
 use pancetta_research::curated::{load_curated_corpus, CuratedEntry};
 use pancetta_research::decoder::{DecoderUnderTest, Ft8Decoder};
-use pancetta_research::metrics::{default_weights, populate_composite};
+use pancetta_research::metrics::{
+    default_weights, populate_composite, saturation_aware_composite, RefreshOffsetRegistry,
+};
 use pancetta_research::scorecard::{
     BuildInfo, ConfigInfo, GitInfo, HarnessInfo, PerWavFailure, RegressionFlags, Scorecard, SnrBin,
     TierResult,
