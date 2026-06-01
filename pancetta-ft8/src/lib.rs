@@ -80,6 +80,10 @@ pub mod protocol;
 pub mod ap;
 pub use ap::{ApContext, ApLevel, MyCallAp, QsoAp, QsoApProgress, RecentCallAp};
 
+// AP type 7 (a7) — template cross-correlation against decoded callsigns.
+// Session 2 of hb-048; no production hook in this session.
+pub mod a7;
+
 // Parallel decode configuration
 pub mod parallel;
 pub use parallel::{BudgetTracker, DecodeConfig, Parallelism};
