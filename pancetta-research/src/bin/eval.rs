@@ -12,8 +12,8 @@ use pancetta_research::metrics::{
     default_weights, populate_composite, saturation_aware_composite, RefreshOffsetRegistry,
 };
 use pancetta_research::scorecard::{
-    BuildInfo, ConfigInfo, GitInfo, HarnessInfo, PerWavFailure, RegressionFlags, Scorecard, SnrBin,
-    TierResult, TtfdDistribution,
+    BuildInfo, ConfigInfo, GitInfo, HarnessInfo, PerWavFailure, PerWavRecord, RegressionFlags,
+    Scorecard, SnrBin, TierResult, TtfdDistribution,
 };
 use pancetta_research::truth::{FixtureCategory, FixtureTruth};
 use pancetta_research::Mode;
@@ -816,6 +816,10 @@ fn run_curated_tier(
     let mut novel_decodes = 0u32;
     let mut wsjtx_total = 0u32;
     let mut per_wav_failures: Vec<PerWavFailure> = Vec::new();
+    // Phase B (2026-06-01): full per-WAV (truth, recovered, novel) records
+    // for bootstrap-CI input. Unlike per_wav_failures (truncated to top-20),
+    // this is one entry per WAV in the tier.
+    let mut per_wav_records: Vec<PerWavRecord> = Vec::new();
     // hb-129: per-WAV TTFD collection.
     let mut per_wav_ttfd_s: Vec<f64> = Vec::new();
 
@@ -872,12 +876,14 @@ fn run_curated_tier(
         truth_recovered += recovered_here;
 
         // "Novel" decodes: ones in our output that aren't in baseline.
+        let mut novel_here = 0u32;
         for ours in &our_decodes {
             if !baseline_decodes
                 .iter()
                 .any(|t| t.trim() == ours.message.trim())
             {
                 novel_decodes += 1;
+                novel_here += 1;
             }
         }
 
@@ -892,6 +898,15 @@ fn run_curated_tier(
                 jtdx: 0, // Plan 3 doesn't wire JTDX; field stays 0.
             });
         }
+
+        // Phase B: full per-WAV record for unbiased bootstrap-CI input.
+        // Recorded for every WAV in the tier (not just failures).
+        per_wav_records.push(PerWavRecord {
+            wav_hash: entry.wav_sha256.clone(),
+            truth: baseline_decodes.len() as u32,
+            recovered: recovered_here,
+            novel: novel_here,
+        });
     }
 
     // Keep top-20 worst gaps for the per_wav_top_failures field.
@@ -926,6 +941,7 @@ fn run_curated_tier(
         wsjtx_decoded: Some(wsjtx_total),
         vs_wsjtx_pct: Some(vs_wsjtx_pct),
         per_wav_top_failures: per_wav_failures,
+        per_wav_records,
         ttfd_distribution,
         ..Default::default()
     })

@@ -14,6 +14,9 @@ pub use scorecard::Scorecard;
 
 pub mod metrics;
 
+pub mod bootstrap_ci;
+pub use bootstrap_ci::{bootstrap_novel_delta, bootstrap_recall_delta, DeltaCi};
+
 pub mod decoder;
 pub use decoder::{Decode, DecoderUnderTest, Ft8Decoder, Jt9Decoder};
 

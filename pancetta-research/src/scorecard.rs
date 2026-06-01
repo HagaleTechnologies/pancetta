@@ -102,6 +102,14 @@ pub struct TierResult {
     pub vs_jtdx_pct: Option<f64>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub per_wav_top_failures: Vec<PerWavFailure>,
+    /// Phase B (2026-06-01): full per-WAV `(wav_hash, truth, recovered, novel)`
+    /// records for EVERY WAV in the tier, not just the top-20 worst gaps.
+    /// Needed for unbiased nonparametric bootstrap CIs on per-tier deltas
+    /// (see `crate::bootstrap_ci`). Empty for older scorecards and for
+    /// tiers that don't track per-WAV (synth, fixtures); the compare
+    /// binary falls back to top-20 in that case with a noted caveat.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub per_wav_records: Vec<PerWavRecord>,
     /// hb-129: Time-To-First-Decode (TTFD) distribution for this tier.
     /// `None` when the tier doesn't run the decoder (e.g., fixture-only
     /// tiers) or when no decode produced a stamped result.
@@ -183,6 +191,23 @@ pub struct PerWavFailure {
     pub recovered: u32,
     pub wsjtx: u32,
     pub jtdx: u32,
+}
+
+/// Phase B: per-WAV record for the full set of WAVs in a tier — the
+/// unbiased input to nonparametric bootstrap CIs on per-tier deltas.
+/// Emitted by the eval binary alongside (not in place of) the truncated
+/// top-20 `per_wav_top_failures` list.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PerWavRecord {
+    /// SHA-256 of the WAV. Used to join records across scorecards.
+    pub wav_hash: String,
+    /// Baseline (truth) decode count for this WAV.
+    pub truth: u32,
+    /// Decodes the system-under-test matched against truth.
+    pub recovered: u32,
+    /// Decodes the system-under-test produced that aren't in truth (after
+    /// the FP filter, if active).
+    pub novel: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
