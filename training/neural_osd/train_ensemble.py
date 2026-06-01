@@ -67,9 +67,15 @@ def train_one_seed(seed, splits, args, device, log_fh):
     test_X, test_Y, test_p = splits["test"]
 
     n_train = len(train_X)
-    boot_idx = rng.integers(low=0, high=n_train, size=n_train)
-    boot_X = train_X[boot_idx]
-    boot_Y = train_Y[boot_idx]
+    if getattr(args, "no_bootstrap", False):
+        # Lakshminarayanan-style: same data, different init only
+        boot_idx = np.arange(n_train)
+        boot_X = train_X
+        boot_Y = train_Y
+    else:
+        boot_idx = rng.integers(low=0, high=n_train, size=n_train)
+        boot_X = train_X[boot_idx]
+        boot_Y = train_Y[boot_idx]
 
     train_ds = TensorDataset(torch.from_numpy(boot_X), torch.from_numpy(boot_Y))
     val_ds = TensorDataset(torch.from_numpy(val_X), torch.from_numpy(val_Y))
@@ -152,7 +158,8 @@ def train_one_seed(seed, splits, args, device, log_fh):
                 )
                 break
 
-    ckpt_path = Path(args.outdir) / f"ensemble_seed_{seed}.pt"
+    prefix = getattr(args, "ckpt_prefix", None) or "ensemble"
+    ckpt_path = Path(args.outdir) / f"{prefix}_seed_{seed}.pt"
     torch.save(best_state, ckpt_path)
 
     # Test-eval the best checkpoint for this member
@@ -177,7 +184,7 @@ def train_one_seed(seed, splits, args, device, log_fh):
     test_metrics["n_bootstrap_unique"] = int(np.unique(boot_idx).size)
     test_metrics["bootstrap_size"] = int(n_train)
 
-    metrics_path = Path(args.outdir) / f"ensemble_seed_{seed}.metrics.json"
+    metrics_path = Path(args.outdir) / f"{prefix}_seed_{seed}.metrics.json"
     with open(metrics_path, "w") as f:
         json.dump(test_metrics, f, indent=2)
 
@@ -207,6 +214,18 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--focal-gamma", type=float, default=2.0)
+    parser.add_argument(
+        "--no-bootstrap",
+        action="store_true",
+        help="Disable bootstrap sampling — each member trains on the FULL "
+        "train fold (diversity from init seed only). Lakshminarayanan 2017's "
+        "original deep-ensembles formulation. Use when the train fold is "
+        "small enough that bootstrap drops critical samples.",
+    )
+    parser.add_argument(
+        "--ckpt-prefix", type=str, default="ensemble",
+        help="Prefix for output checkpoint files (default 'ensemble').",
+    )
     parser.add_argument(
         "--split-seed",
         type=int,

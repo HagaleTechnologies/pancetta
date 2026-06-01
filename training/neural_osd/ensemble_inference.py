@@ -88,6 +88,10 @@ def main():
     parser.add_argument(
         "--output-json", type=str, default="ensemble_eval.json",
     )
+    parser.add_argument(
+        "--ckpt-prefix", type=str, default="ensemble",
+        help="Prefix for input checkpoint files (default 'ensemble').",
+    )
     args = parser.parse_args()
 
     seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
@@ -117,7 +121,7 @@ def main():
     all_preds = []
     member_metrics = []
     for seed in seeds:
-        ckpt_path = Path(args.outdir) / f"ensemble_seed_{seed}.pt"
+        ckpt_path = Path(args.outdir) / f"{args.ckpt_prefix}_seed_{seed}.pt"
         if not ckpt_path.exists():
             print(f"ERROR: missing checkpoint {ckpt_path}", file=sys.stderr)
             sys.exit(1)

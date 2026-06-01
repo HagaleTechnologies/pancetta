@@ -81,9 +81,16 @@ training/neural_osd/session2_train.log
 # hb-194 ensemble training artifacts
 training/neural_osd/ensemble_seed_*.pt
 training/neural_osd/ensemble_seed_*.metrics.json
+training/neural_osd/ensemble_nb_seed_*.pt
+training/neural_osd/ensemble_nb_seed_*.metrics.json
 training/neural_osd/ensemble_train_summary.json
 training/neural_osd/train_ensemble.log
 training/neural_osd/ensemble_eval.json
+training/neural_osd/ensemble_nb_eval.json
+training/neural_osd/train_ensemble.stdout.log
+training/neural_osd/train_ensemble_nb.stdout.log
+training/neural_osd/ensemble_inference.stdout.log
+training/neural_osd/ensemble_nb_inference.stdout.log
 *.npy
 
 # Database backups
