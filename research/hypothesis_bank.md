@@ -2555,11 +2555,11 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-diversity.md (entry D14).
 
-### hb-129 — Time-to-first-decode (TTFD) per-slot metric  [PRIORITY: 0.45, spawned 2026-06-01 from metric ideation]
+### hb-129 — Time-to-first-decode (TTFD) per-slot metric  [GRADUATED 2026-06-01]
   mode: ft8 (metric/instrumentation)
-  status: pending
+  status: graduated
   priority_score: 0.45
-  estimated_effort: 1 session
+  estimated_effort: 1 session (actual: ~50 min)
   expected_delta: median TTFD ttfd_score = clamp((15.0 - median_ttfd_s) / 15.0, 0, 1); re-ranks hb-091 (a8 early-decode) up, hb-079 (multipass) down; surfaces hb-093 (residual SNR gate) as operationally attractive
   defensible_prior: yes — WSJT-X-Improved a8 mode markets "0.5-1s early decode" as headline feature; TTFD is what they're optimizing
   wild_card: false
@@ -2569,9 +2569,39 @@ current_ratio: 0.051
   evidence_against:
     - Gameable by early FP emissions; must combine with precision gate
   notes: |
-    Definitely-worth-measuring metric per metric ideation file. Instrument
-    Decoder::decode_pass with per-decode timestamps. Run on hard-200,
-    compare hypothesis ranking.
+    GRADUATED — TTFD metric live. `DecodedMessage` carries
+    `decode_time_into_window: Option<Duration>`; stamped at CRC-pass site
+    in par_decode_candidate / par_try_ap_decode /
+    par_try_ldpc_with_recent_only, plus caller-side stamping for cross-
+    cycle, coherent multipass, joint-pair-retry, and joint-residual passes.
+    Scorecard `TierResult` gains `ttfd_distribution:
+    Option<TtfdDistribution>` (wavs_with_decode + p50/p90/mean +
+    per_wav_seconds). Eval prints summary line for the curated tier.
+
+    Hard-200 numbers (single run, default config): n=200/200 WAVs
+    produced stamped decodes, p50=22.4 ms, p90=47.5 ms, mean=32.5 ms,
+    min=13.4 ms, max=373.0 ms. The metric measures CPU wall-clock to
+    first CRC pass, NOT slot-arrival time — pancetta processes the
+    whole 12.64s window offline, so the first decode lands within tens
+    of milliseconds of pipeline start. Variance (13-373 ms range)
+    reflects per-WAV candidate density (more candidates → more
+    parallel work → later first-decode).
+
+    Caveat for hypothesis ranking: the original M1 framing
+    (`clamp((15.0 - median_ttfd_s) / 15.0)`) was designed for a
+    REAL-TIME streaming decoder where the first decode emerges at
+    T+8-T+14s into a 15s slot. Pancetta's offline pipeline collapses
+    everything into <50 ms wall-clock. To make TTFD useful for
+    re-ranking hb-079 (multipass) vs hb-091 (a8 early-decode), a
+    follow-up needs to either (a) measure WHICH PASS produced the
+    decode (pass-1 vs pass-2 vs multipass vs joint-pair-retry —
+    pass identity is recoverable from the stamping order), or (b)
+    instrument the streaming decoder path (when one exists) to give
+    audio-arrival-relative timing.
+
+    Tests: 4 new unit tests for TtfdDistribution aggregation;
+    test_ttfd_stamping_on_synth_signal in pancetta-ft8 verifies every
+    pipeline decode carries a non-zero stamp.
 
     See research/ideation/2026-06-01-metric.md (entry M1).
 
