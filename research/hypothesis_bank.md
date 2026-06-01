@@ -606,22 +606,25 @@ current_ratio: 0.051
   status_2026_05_28: V1 GRADUATED — `joint_pair_retry` default false→true. Diagnostic confirmed 78.3% pair-likely vs 30% threshold on top-20 worst hard-200 WAVs; PROCEED earned. V1 = force-retry original sync candidates against the (post-multipass) residual spectrogram, bypassing the residual sync_score threshold. hard-200 +12 rec / +1 novel; hard-1000 +17 rec / +9 novel; composite +0.000700 (0.568424 → 0.569123); fixtures + synth preserved; elapsed +2.2%. See research/experiments/2026-05-28-hb-086-joint-pair-retry-v1.md.
   priority_score: 0.0
 
-### hb-086 V2 — Joint LLR with iterative interference cancellation  [DEFINITIVELY SHELVED — confirmed on TWO corpora, 2026-05-31]
+### hb-086 V2 — Joint LLR with iterative interference cancellation  [DEFINITIVELY SHELVED on real-audio; synth_pair_revisit_candidate 2026-06-01]
   mode: ft8
   status_2026_05_30: SHELVED at the diagnostic gate (OLD hard-200 top-20). 0% marginal-SNR neighbors; multi-neighbor count 14.8% strict / 34.8% relaxed.
   status_2026_05_31_recheck: **DEFINITIVELY SHELVED.** Re-ran the diagnostic on the REFRESHED hard-200 top-20 (100 of the 200 entries are today's K5ARH 20m captures — denser, with 9/20 sample slots reaching jt9's -25 dB SNR floor per survey). Result essentially identical: multi-neighbor 16.7% strict / 33.8% relaxed, **STILL 0% marginal-SNR neighbors** (p10 -5.1 dB, median -1.6 dB, nothing below -15 dB on either window). The pattern is corpus-independent.
   **Structural insight (now confirmed across corpora):** pancetta's *decoded* neighbors are uniformly high-confidence, even when the *band* has marginal-SNR truths. When pancetta decodes a neighbor it's because the decode passed CRC, which selects for sharp LLRs → delta-function tone posteriors → soft cancellation collapses to hard subtraction. This is a property of pancetta's decoder architecture (hard-decision pipeline through LDPC + CRC), not the corpus. The soft-cancellation family (hb-086 V2, hb-081 per-decode subtract scaling) is structurally closed against pancetta's *decoded* neighborhood. Hypotheses targeting *missed* truths via different mechanisms (V3 sync-relaxation, hb-064 OSD pruning) are unaffected by this insight.
-  priority_score: 0.0  # permanently shelved
+  synth_pair_revisit_candidate: true  # hb-146 (2026-06-01) shipped synth-pair-200 — pancetta loses the weak signal in 0% of buckets at ΔSNR ≥ 9 dB AND Δf ≤ 12 Hz while still decoding the strong. The "decoded strong neighbor + marginal weak truth" configuration V2 is designed for now EXISTS as an evaluable population. Re-eval V2 (existing `joint_pair_retry` plumbing extended with soft-cancellation pass) against synth-pair-200 in a future iter; if V2 cracks ≥20% of the 88 currently-missed weak signals (0% buckets) AND preserves hard-200 baseline, it unshelves. Graduation still requires hard-200 co-improvement; synth-pair-200 is diagnostic-only.
+  priority_score: 0.0  # permanently shelved on real-audio; synth-pair re-eval is a separate experiment
 
-### hb-086 V3 — Subtract-aware sync threshold relaxation  [SHELVED 2026-05-31]
+### hb-086 V3 — Subtract-aware sync threshold relaxation  [SHELVED on real-audio; synth_pair_revisit_candidate 2026-06-01]
   mode: ft8
   status_2026_05_31: SHELVED. Geometric kill-switch (`hb086_v3_subtract_window_potential.rs`) PROCEED'd at 56.8% of V1-uncoverable truths sitting within ±8 bins of a subtracted decode (top-20 hard-200), well above the 20% gate. Implementation landed cleanly (`Ft8Config::joint_residual_sync_relax_db` + `joint_residual_sync_window_bins`; `joint_residual_localized_sync_pass`; `localized_costas_sync_search`). **Sweep at {-0.5, -1.0, -1.5, -2.0} on hard-200 produced 0 additional decoded messages at every threshold.** Mechanism trace (`hb086_v3_trace.rs`) on top-3 worst-WAVs: V3 surfaces 100-131 truly-new (non-collision) candidates per WAV in the targeted window — but they are noise. LDPC "decodes" all of them (BP always converges at production iteration count), CRC catches ~98% as false positives, plausibility rejects the remaining 1-4 per WAV. The residual at sub-3.0 sync_score in the targeted window is *noise*, not weak signal. Plumbing kept at default-off; the hook in `decode_window_with_ap` is one `if relax_db < 0.0` check. See `research/experiments/2026-05-31-hb-086-v3-subtract-aware-sync.md`.
 
   **Structural insight (the keep)**: geometric proximity diagnostics need a paired *decodability* sub-test before earning PROCEED. The V3 diagnostic measured "where truths exist relative to subtracted bins" (geometric); the V2 diagnostic measured "are neighbors decodable in a soft-relevant way" (decodability proxy via SNR). V2's pre-impl SHELVE was the right call; V3's PROCEED on geometry-only led to a wasted implementation pass. For any future mechanism whose value depends on decoding new candidates surfaced from a perturbation of the production pipeline, the kill-switch needs to extract LLRs at the truth's coordinates from the residual and confirm LDPC+CRC pass — not just check geometric proximity.
 
-  **The hb-086 family is now closed.** V1 GRADUATED (+12 hard-200), V2 DEFINITIVELY SHELVED (soft cancellation closed by pancetta's hard-decision pipeline across two corpora), V3 SHELVED (Costas relaxation surfaces noise, not signal). The joint-decoding design space documented in `docs/superpowers/specs/2026-05-27-joint-decoding-design.md` is exhausted. The remaining hard-200 wall is for a different family of mechanism: sub-Costas-threshold weak signals (would need AP without sync, callsign-priors-on-residual, or OSD-without-Costas-pre-gate to crack).
+  **The hb-086 family is closed on real-audio (hard-200 / hard-1000).** V1 GRADUATED (+12 hard-200), V2 DEFINITIVELY SHELVED (soft cancellation closed by pancetta's hard-decision pipeline across two corpora), V3 SHELVED (Costas relaxation surfaces noise, not signal). The joint-decoding design space documented in `docs/superpowers/specs/2026-05-27-joint-decoding-design.md` is exhausted on organic corpora. The remaining hard-200 wall is for a different family of mechanism: sub-Costas-threshold weak signals (would need AP without sync, callsign-priors-on-residual, or OSD-without-Costas-pre-gate to crack).
 
-  priority_score: 0.0  # shelved
+  synth_pair_revisit_candidate: true  # hb-146 (2026-06-01) shipped synth-pair-200 with by-construction marginal-SNR weak signals beside strongly-decoded neighbors. V3's hard-200 trace showed it surfaces *noise* in sub-Costas windows because hard-200 has no real weak signal there; on synth-pair-200, the weak truth IS present in the targeted window by construction. Re-eval V3's sweep ({-0.5, -1.0, -1.5, -2.0 dB} × ±{4,8,16} bins) against synth-pair-200 in a future iter. If the relaxed Costas pass at the truth's exact freq_bin extracts LDPC+CRC-passable LLRs in the 0% buckets (ΔSNR ≥ 9 dB AND Δf ≤ 12 Hz), the V3 mechanism is validated as "correct mechanism, wrong corpus" rather than "wrong mechanism." Graduation still requires hard-200 co-improvement; synth-pair-200 is diagnostic-only.
+
+  priority_score: 0.0  # shelved on real-audio; synth-pair re-eval is a separate experiment
   ---- original priority below ----
   [PRIORITY-WAS: 0.30, spawned 2026-05-30 from hb-086 V2 shelve]
 
@@ -2933,10 +2936,10 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-corpus.md (entry C2).
 
-### hb-146 — Synthetic adversarial corpus targeting measured walls  [PRIORITY: 0.50, spawned 2026-06-01 from corpus ideation]
+### hb-146 — Synthetic adversarial corpus targeting measured walls  [SHIPPED 2026-06-01 — mutual-masking pair sub-family; sub-Costas + 3+ stacks deferred]
   mode: ft8 (corpus/eval infrastructure)
-  status: pending
-  priority_score: 0.50
+  status: SHIPPED 2026-06-01 — synth-pair-200 corpus + generator + tier wired; baseline measured; V2 + V3 flagged synth_pair_revisit_candidate.
+  priority_score: 0.0  # tier infra landed; V2/V3 re-eval are separate hypotheses
   estimated_effort: ~1 day curation + ~6 hours integration; collection synthetic (free)
   expected_delta: 3 sub-families (mutual-masking pairs, sub-Costas signals, 3+ collision stacks); directly resurrects shelved V2/V3 if win on adversarial tier
   defensible_prior: yes — adversarial ML standard; WSJT-X test suite includes contrived test cases; MAP-equivalent decoder papers use targeted stress
@@ -2951,6 +2954,32 @@ current_ratio: 0.051
     corpus with sub-Costas + multi-signal families.
 
     See research/ideation/2026-06-01-corpus.md (entry C3).
+
+  status_2026_06_01: |
+    SHIPPED. Mutual-masking pair sub-family landed; sub-Costas + 3+
+    collision stack sub-families deferred to follow-up iters (separate
+    generator configs, same infrastructure).
+
+    - generator: pancetta-research/src/bin/gen_synth_pair.rs
+      (registered in pancetta-research/Cargo.toml as gen-synth-pair).
+    - config:   research/corpus/synth/manifests/synth_pair_200.config.json
+      (180 WAVs after stride-2 subsample of 360-point grid:
+      6 templates × 5 ΔSNR × 4 Δf × 3 Δt; strong_snr_db -8 dB).
+    - manifest: research/corpus/synth/manifests/synth_pair_200.manifest.json
+      (deterministic seeds; regeneration is byte-identical).
+    - eval tier: `synth-pair-200` (matches existing missing-manifest
+      pattern). Reports per-(ΔSNR, Δf, Δt) regime map to stderr;
+      truth_decodes_total/recovered/decode_rate to scorecard.
+    - baseline scorecard:
+      research/scorecards/sweep/synth-pair-200-baseline.json
+      • Strong recovered: 177/180 (98.3%)
+      • Weak recovered:    92/180 (51.1%)
+      • Regime: weak recovery 0% in ΔSNR ≥ 9 dB AND Δf ≤ 12 Hz; weak
+        recovery 100% at Δf=50 Hz across all ΔSNR. The marginal-SNR
+        neighbor structure V2 needs is present by construction.
+    - journal: research/experiments/2026-06-01-hb-146-synth-pair-corpus.md
+    - V2 + V3 flagged with `synth_pair_revisit_candidate: true`
+      (hb-086 V2 / V3 entries above).
 
 ### hb-147 — Continuous multi-hour single-band time-series corpus  [PRIORITY: 0.32, spawned 2026-06-01 from corpus ideation]
   mode: ft8 (corpus/eval infrastructure)
