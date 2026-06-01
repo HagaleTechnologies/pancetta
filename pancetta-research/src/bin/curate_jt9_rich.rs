@@ -121,7 +121,7 @@ fn load_baselines(dir: &Path) -> anyhow::Result<Vec<WavInfo>> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let p = entry.path();
-        if p.extension().map_or(true, |e| e != "json") {
+        if p.extension().is_none_or(|e| e != "json") {
             continue;
         }
         match std::fs::read_to_string(&p) {
@@ -275,7 +275,7 @@ fn main() -> anyhow::Result<()> {
         schema_version: CuratedManifest::CURRENT_SCHEMA_VERSION,
         label: "hard_jt9_rich_200".to_string(),
         generated_at: Utc::now().to_rfc3339(),
-        scoring_decoder: format!("pancetta-ft8@default (jt9-novel-density curation, hb-150)"),
+        scoring_decoder: "pancetta-ft8@default (jt9-novel-density curation, hb-150)".to_string(),
         entries,
     };
     manifest.save(&args.output)?;
