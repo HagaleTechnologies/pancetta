@@ -2963,7 +2963,7 @@ current_ratio: 0.051
 
 ### hb-150 — High-jt9-novel-density tier (jt9-beats-pancetta inverse)  [PRIORITY: 0.50, spawned 2026-06-01 from corpus ideation]
   mode: ft8 (corpus/eval infrastructure)
-  status: pending
+  status: SHIPPED 2026-06-01 — 200 WAVs curated, baseline recall 44.23%
   priority_score: 0.50
   estimated_effort: ~3h curation + 2h integration; zero new audio
   expected_delta: 200 slots where jt9_count - pancetta_count >= 5; truth = jt9 decodes; recall on bigger find list; directly measures the pancetta-vs-jt9 gap
@@ -2979,6 +2979,28 @@ current_ratio: 0.051
     Extends survey scoring to full archive; pick top-200 by jt9-only.
 
     See research/ideation/2026-06-01-corpus.md (entry C7).
+
+  status_2026_06_01: |
+    SHIPPED. Tier curated, eval-dispatch arm wired, baseline measured.
+
+    - manifest: research/corpus/curated/ft8/hard_jt9_rich_200.manifest.json
+    - eval tier name: `hard-jt9-rich-200` (matches wild-doppler-50
+      missing-manifest SKIP pattern; not a composite term)
+    - curation pass: 1317 baselines, 1100 pancetta_decode_count from
+      snapshot, 217 WAVs freshly decoded with current default config,
+      top-200 by jt9_novel_density (gap = jt9_count - pancetta_count).
+      Gap range 22..66, mean 28.93.
+    - baseline scorecard: research/scorecards/sweep/hard-jt9-rich-200-baseline.json
+      • 200 WAVs, 9385 jt9 truth decodes, 4151 recovered → **44.23%**
+        decode_rate (vs 55.82% on curated-hard-200, a ~11.6 pp gap).
+      • Missed-truth headroom: 5234 (≈ 5× larger than the 3911 on
+        curated-hard-200) — gives sync / LLR / ranking experiments a
+        clean denominator.
+    - journal: research/experiments/2026-06-01-hb-150-jt9-rich-tier.md
+    - INFRA only. No decoder change. composite unchanged.
+    - Unblocks hb-015 family (sync-resilience experiments now have a
+      tier that directly measures the pancetta-vs-jt9 recall gap) and
+      future bias-detection / callsign-prior FP-audit work.
 
 ### hb-151 — Multi-band simultaneous capture (cross-band consistency tier)  [PRIORITY: 0.25, spawned 2026-06-01 from corpus ideation]
   mode: ft8 (corpus/eval infrastructure)
