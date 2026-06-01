@@ -173,6 +173,15 @@ pub mod statistics;
 pub mod callsign_continuity;
 pub use callsign_continuity::{build_filter, CallsignContinuityFilter};
 
+pub mod cross_time_state;
+// Note: `QsoState`/`QsoPhase` live inside the `cross_time_state` module
+// rather than being re-exported, to avoid clashing with the existing
+// `states::QsoState` (the QSO-lifecycle state machine).
+pub use cross_time_state::{
+    A7ExpectedCall, A7RecentCallTable, CallsignDtHistory, CrossTimeState, DecodeRecord, DtPrior,
+    DtSighting, QsoKey, WithinQsoContext,
+};
+
 // Common error type for the entire library
 use crate::async_database::AsyncDatabaseError;
 use crate::async_logger::AsyncLoggerError;
