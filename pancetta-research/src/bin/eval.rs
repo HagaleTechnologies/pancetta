@@ -81,6 +81,10 @@ struct Args {
     joint_residual_sync_window_bins: Option<usize>,
     /// hb-016: residual energy early-stop margin in dB (None disables).
     residual_energy_stop_db: Option<f64>,
+    /// hb-093: per-position residual SNR pre-decode gate (dB, WAV-relative).
+    /// None disables; Some(db) skips LDPC at residual joint_pair_retry
+    /// candidates with SNR < db.
+    residual_snr_gate_db: Option<f64>,
     /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
     two_stage: Option<bool>,
     /// hb-004: when Some, an ApContext is built and passed to
@@ -142,6 +146,7 @@ impl Args {
         let mut joint_residual_sync_relax_db: Option<f64> = None;
         let mut joint_residual_sync_window_bins: Option<usize> = None;
         let mut residual_energy_stop_db: Option<f64> = None;
+        let mut residual_snr_gate_db: Option<f64> = None;
         let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
@@ -377,6 +382,13 @@ impl Args {
                             .parse()?,
                     );
                 }
+                "--residual-snr-gate-db" => {
+                    residual_snr_gate_db = Some(
+                        iter.next()
+                            .context("--residual-snr-gate-db needs a value (dB, WAV-relative; e.g. -5.0)")?
+                            .parse()?,
+                    );
+                }
                 "--two-stage" => {
                     two_stage = Some(true);
                 }
@@ -486,6 +498,7 @@ impl Args {
             joint_residual_sync_relax_db,
             joint_residual_sync_window_bins,
             residual_energy_stop_db,
+            residual_snr_gate_db,
             two_stage,
             ap_my_call,
             ap_recent_calls,
@@ -970,6 +983,9 @@ fn main() -> anyhow::Result<()> {
             }
             if args.residual_energy_stop_db.is_some() {
                 d = d.with_residual_energy_stop_db(args.residual_energy_stop_db);
+            }
+            if args.residual_snr_gate_db.is_some() {
+                d = d.with_residual_snr_gate_db(args.residual_snr_gate_db);
             }
             if let Some(on) = args.two_stage {
                 d = d.with_two_stage(on);

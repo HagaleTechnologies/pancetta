@@ -310,6 +310,24 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-093: per-position residual SNR pre-decode gate (dB, WAV-relative).
+    /// `None` disables; `Some(db)` skips LDPC in the joint_pair_retry path
+    /// at any candidate whose residual SNR is below `db`.
+    pub fn with_residual_snr_gate_db(mut self, t: Option<f64>) -> Self {
+        self.config.residual_snr_gate_db = t;
+        self
+    }
+
+    /// hb-093: enable diagnostic capture of per-candidate
+    /// (sync_score, residual_snr_db, decoded_ok) records in the
+    /// joint_pair_retry pass. Read out via
+    /// `Ft8Decoder::take_residual_snr_diagnostic` on the underlying
+    /// pancetta_ft8 decoder. Default false.
+    pub fn with_residual_snr_diagnostic(mut self, on: bool) -> Self {
+        self.config.residual_snr_diagnostic = on;
+        self
+    }
+
     /// hb-046: enable two-stage decoding. When `on`, decode_wav runs a
     /// CHEAP pass first (relaxed sync_cap, no OSD, fewer LDPC iters)
     /// then the standard PRODUCTION pass on the same audio, unioning

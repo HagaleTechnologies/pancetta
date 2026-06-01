@@ -382,18 +382,22 @@ pub struct Ft8Config {
     pub residual_energy_stop_db: Option<f64>,
 
     /// hb-093: per-position residual SNR pre-decode gate. When `Some(db)`,
-    /// the `joint_pair_retry_pass` (and `coherent_subtract_and_repass`'s
-    /// post-sync decode loop) computes a per-position residual SNR estimate
-    /// (same primitive as `par_estimate_snr_spectrogram`) BEFORE running
-    /// the expensive LDPC+CRC pipeline. Candidates with SNR below the
-    /// threshold are skipped — they sit at noise-only positions and the
-    /// LDPC work is wasted (BP converges on garbage, CRC catches ~98%
-    /// as FPs, plausibility rejects the rest).
+    /// the `joint_pair_retry_pass` (and future extension to
+    /// `coherent_subtract_and_repass`'s post-sync decode loop) computes
+    /// a per-position residual SNR estimate (same primitive as
+    /// `par_estimate_snr_spectrogram`) BEFORE running the expensive
+    /// LDPC+CRC pipeline. Candidates with SNR below the threshold are
+    /// skipped — they sit at noise-only positions and the LDPC work is
+    /// wasted (BP converges on garbage, CRC catches ~98% as FPs,
+    /// plausibility rejects the rest).
     ///
     /// The threshold is the WAV-relative SNR (dB, after the 2500/6.25
-    /// bandwidth correction) — typical FT8 decodable signals sit at
-    /// −20 dB to +10 dB. Setting around −18..−24 dB filters the
-    /// noise-only floor without losing weak real signals.
+    /// bandwidth correction) — typical FT8 decodable signals sit in
+    /// the −20..+10 dB range; the diagnostic recommends ~−5 dB as the
+    /// sweet spot (filters ~37% of pair-retry candidates with 0% decode
+    /// loss on top-5 hard-200). Production sweep maxed at ~3% elapsed
+    /// savings (joint_pair_retry's slice is small) — SHELVED at default
+    /// None pending extension to coherent_subtract_and_repass step 4.
     ///
     /// `None` disables the gate (production default until a diagnostic
     /// confirms it filters ≥30% of candidates without losing decodes).
