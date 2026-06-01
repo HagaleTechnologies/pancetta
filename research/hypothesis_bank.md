@@ -1735,9 +1735,9 @@ current_ratio: 0.051
 
     Source: mr-008 ideation (territory B); hb-036 shelve journal.
 
-### hb-093 — Per-position residual SNR pre-decode gate  [PRIORITY: 0.52, spawned 2026-05-31 from mr-008 ideation]
+### hb-093 — Per-position residual SNR pre-decode gate  [SHELVED 2026-06-01]
   mode: ft8
-  status: pending
+  status: shelved
   priority_score: 0.52
   estimated_effort: 2 sessions (Session 1 = diagnostic + threshold sweep, Session 2 = production wire + A/B)
   expected_delta: efficiency: -5-15% elapsed on hard-200 (skip noise-only positions in joint_pair_retry); recall preserved; precision lift via novel reduction
@@ -1769,6 +1769,21 @@ current_ratio: 0.051
     ≤ 1 truth-lost per WAV across top-20 (≤ 20 total).
 
     Source: mr-008 ideation (territory A).
+
+    SHELVED 2026-06-01 (iter/2026-06-01-hb-093): kill-switch PROCEEDED
+    at thr=-5.0 dB on the top-5 diagnostic (filter 36.5%, decode loss
+    0.00%), but the production hard-200 sweep with FP filter shows
+    elapsed savings cap at ~2-3% (best: gate=-10 dB gives -2.08%
+    elapsed with ZERO recall loss). The iter-spec graduation bar
+    (10% elapsed reduction) is unreachable on this corpus because
+    joint_pair_retry is only a small slice of total slot work — the
+    pass-1 par_iter LDPC dominates. Plumbing kept at default-off in
+    `Ft8Config::residual_snr_gate_db` for future revisits (the
+    obvious next mechanism is extending the gate to
+    `coherent_subtract_and_repass` step 4, where the candidate set is
+    `max_sync_candidates` (200) per round — a much larger surface area
+    to filter). Journal:
+    research/experiments/2026-06-01-hb-093-snr-gate.md.
 
 ### hb-094 — Residual denoising autoencoder pre-LDPC  [PRIORITY: 0.20 (wild), spawned 2026-05-31 from mr-008 ideation]
   mode: ft8
