@@ -1,0 +1,485 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-06-02T03:02:49.544737Z",
+  "mode": "ft8",
+  "git": {
+    "branch": "iter/2026-06-02-hb-048-s3-chrono",
+    "head_sha": "4989fd0632354ae73f06c9a9a4dc910a34f55e0f",
+    "main_merge_base": "77f38010de5222343dd44911a0619f6456dd6336",
+    "dirty": true
+  },
+  "build": {
+    "rustc_version": "rustc 1.94.1 (e408947bf 2026-03-25)",
+    "release": true,
+    "features": [
+      "research-eval"
+    ]
+  },
+  "harness": {
+    "harness_version": "0.1.0",
+    "host": "macos/aarch64",
+    "cores_used": 10,
+    "elapsed_seconds": 4611.363407209
+  },
+  "config": {
+    "decoder": {
+      "a7_enabled": true,
+      "a7_freq_window_hz": 6.25,
+      "a7_snr7_threshold": 6.0,
+      "a7_snr7b_threshold": 1.8,
+      "adaptive_ldpc_iters": false,
+      "block_score_rerank": true,
+      "bp_offset_subtract": 0.0,
+      "coherent_multipass_iterations": 3,
+      "coherent_subtract_mrc_threshold": 0.0,
+      "cross_cycle_averaging": true,
+      "cross_cycle_coherent": true,
+      "cross_cycle_coherent_mrc": true,
+      "dt_history_enabled": false,
+      "dt_history_window_floor_s": 0.2,
+      "dt_history_window_iqr_scale": 3.0,
+      "joint_pair_retry": true,
+      "joint_residual_sync_relax_db": 0.0,
+      "joint_residual_sync_window_bins": 8,
+      "layered_bp": true,
+      "ldpc_iterations": 100,
+      "llr_target_variance": 32.0,
+      "max_candidates": 100,
+      "max_decode_passes": 1,
+      "max_parity_errors_for_osd": 6,
+      "max_sync_candidates": 300,
+      "min_sync_score": 3.0,
+      "nms_enabled": false,
+      "nms_freq_radius": 2,
+      "nms_score_delta_db": 0.0,
+      "nms_time_radius": 8,
+      "osd_depth": 2,
+      "protocol": "Ft8",
+      "residual_energy_stop_db": null,
+      "residual_min_sync_score": null,
+      "residual_snr_diagnostic": false,
+      "residual_snr_gate_db": null,
+      "sample_rate": 12000,
+      "sync_time_interp_delta_scale": 0.3,
+      "sync_time_interp_linear_power": false,
+      "sync_time_interp_max_delta_abs": null,
+      "sync_time_interp_score_gate": 0.0,
+      "sync_time_interpolation": true,
+      "time_range": 2.0
+    },
+    "seed": 42,
+    "tiers_run": [
+      "chrono-replay"
+    ],
+    "fp_filter_active": true
+  },
+  "tiers": {
+    "chrono-replay": {
+      "wavs_processed": 33,
+      "truth_decodes_total": 1167,
+      "truth_decodes_recovered": 640,
+      "decode_rate": 0.5484147386461011,
+      "novel_decodes": 2501,
+      "wsjtx_decoded": 1167,
+      "vs_wsjtx_pct": 54.84147386461011,
+      "per_wav_top_failures": [
+        {
+          "wav_hash": "7fc0c623d95096c72969fa8b2927a84b5fcb01d3a5c8b4f34bcaf7678098b833",
+          "truth": 49,
+          "recovered": 25,
+          "wsjtx": 49,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "e9a229ecbd5db988f31b601ae3c3d509cb22472339251941d1773d86fc25fc8f",
+          "truth": 46,
+          "recovered": 23,
+          "wsjtx": 46,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "2bb2f150d3b8915a578239f53f32a0731cd0ea8d696f2fc46c9bf6ddcd7d1978",
+          "truth": 46,
+          "recovered": 24,
+          "wsjtx": 46,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "2f79557eb3f900312be4cd588d3c0779cf16c21b9e9a61c4531b095ed35a0eed",
+          "truth": 42,
+          "recovered": 21,
+          "wsjtx": 42,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "5d00c34137b690c3cb96f9ce6bd0c48c486b0bf71b6658840b9fef91e9ca5f4f",
+          "truth": 36,
+          "recovered": 16,
+          "wsjtx": 36,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "aebcd8950b2b75dbcbe3b763f90dc635c50068f8fc59527d82b9d9513348daba",
+          "truth": 40,
+          "recovered": 20,
+          "wsjtx": 40,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "2c59450374037eb0cfc59e7a71c8f81298a4710f0cbcbd73a5eeed85b0e8da08",
+          "truth": 34,
+          "recovered": 15,
+          "wsjtx": 34,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "12d59017718f9dd3472e12ec142dc2f4b90cefe97d503454697a1ce9058aadf0",
+          "truth": 45,
+          "recovered": 26,
+          "wsjtx": 45,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "2b54f071f788d415a2d832b1a603988cfd074d672b4372d6de4609311c5907c1",
+          "truth": 40,
+          "recovered": 21,
+          "wsjtx": 40,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "a21d50a6f2315178f7351801a9602a41008765dec368f8ba9891de7c7e88107d",
+          "truth": 42,
+          "recovered": 24,
+          "wsjtx": 42,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "3d43d1bd9647abbb68b1ad894de834fbec402dbca3ff67a00b102c9f8c62569d",
+          "truth": 40,
+          "recovered": 22,
+          "wsjtx": 40,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "6b9ee33977a67a96fda3f6ce4af95e8a22d48f873449ea4cee947b3bdb7bc56d",
+          "truth": 30,
+          "recovered": 13,
+          "wsjtx": 30,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "d01f4560cdd7350c849b195d0728aa53022b3c7f9b77702672dfb1a0d70ce754",
+          "truth": 39,
+          "recovered": 22,
+          "wsjtx": 39,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "80033b3004c5000aee3eb82813c8697d11c5b031382cef3f526afdad63cf1c11",
+          "truth": 36,
+          "recovered": 19,
+          "wsjtx": 36,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "8b49b8b53128e3807e69d9ec0f2bc5c5abc46d1569e5e0e0e87b2e115e68e059",
+          "truth": 31,
+          "recovered": 14,
+          "wsjtx": 31,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "ce652a8ead4cbd112bf3087443d0b7f51ff8429b02dc9f85571a9ba43d8d960d",
+          "truth": 38,
+          "recovered": 22,
+          "wsjtx": 38,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "3a16df8c815ca8d8b2bcca4b7c88b27da925da2c8fb15e6b5c4b02058e76e7db",
+          "truth": 32,
+          "recovered": 16,
+          "wsjtx": 32,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "3d9cb28ee49842fd9933efd0406196ec6d6ccb783285dc2cd4f8f5a1656bc4bf",
+          "truth": 30,
+          "recovered": 14,
+          "wsjtx": 30,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "b999ed7f03d6bd2e2db1504fe747eea8575ceaae26027b713080434d6c32fdb9",
+          "truth": 35,
+          "recovered": 19,
+          "wsjtx": 35,
+          "jtdx": 0
+        },
+        {
+          "wav_hash": "e5ad5a3f26a26eb20ac991289b6bb60e79b155349bc49200288b110720f51dbe",
+          "truth": 40,
+          "recovered": 25,
+          "wsjtx": 40,
+          "jtdx": 0
+        }
+      ],
+      "per_wav_records": [
+        {
+          "wav_hash": "d35d87b728aa502ae57c8937f86e92e050ec781b415f7bdf32de0d4eb0c77729",
+          "truth": 30,
+          "recovered": 17,
+          "novel": 6
+        },
+        {
+          "wav_hash": "dc0d3abd9870f4c8142ba66a36fc336997e9ce4e035d84ac96baa5d3bea2a225",
+          "truth": 27,
+          "recovered": 17,
+          "novel": 83
+        },
+        {
+          "wav_hash": "74e64b38e91fa4872dcd77d1e562dcdd7d358b82ad4e9eae841483621938d15c",
+          "truth": 30,
+          "recovered": 19,
+          "novel": 78
+        },
+        {
+          "wav_hash": "5a72c9ecfdbe49b0da82f837d83243656ff8de198a4c0506fa4f4eb3c5b2fe83",
+          "truth": 30,
+          "recovered": 19,
+          "novel": 80
+        },
+        {
+          "wav_hash": "d50dccc09d856229800fc7da4107e02bdf5a5b93bee38d1a50dc07e92b382f83",
+          "truth": 34,
+          "recovered": 20,
+          "novel": 79
+        },
+        {
+          "wav_hash": "da316c7b2393e731dbf17d5ec9fc6fed92bb958ac259c00c74054c7d4aec29ae",
+          "truth": 28,
+          "recovered": 17,
+          "novel": 80
+        },
+        {
+          "wav_hash": "ce652a8ead4cbd112bf3087443d0b7f51ff8429b02dc9f85571a9ba43d8d960d",
+          "truth": 38,
+          "recovered": 22,
+          "novel": 77
+        },
+        {
+          "wav_hash": "6b1008f9c93ba2bff21dfb858c16be15d5a702fe6459b51489770367881dfc04",
+          "truth": 33,
+          "recovered": 19,
+          "novel": 79
+        },
+        {
+          "wav_hash": "6f24644d8b2f68b6ef11776e091e55e4a48190f91478333e2e88a7c4d93d8d83",
+          "truth": 31,
+          "recovered": 21,
+          "novel": 79
+        },
+        {
+          "wav_hash": "8b3917157acda76492059a1d5a24689216adc6eb93b4a102b46036ac5024e768",
+          "truth": 28,
+          "recovered": 17,
+          "novel": 78
+        },
+        {
+          "wav_hash": "a21d50a6f2315178f7351801a9602a41008765dec368f8ba9891de7c7e88107d",
+          "truth": 42,
+          "recovered": 24,
+          "novel": 72
+        },
+        {
+          "wav_hash": "2c59450374037eb0cfc59e7a71c8f81298a4710f0cbcbd73a5eeed85b0e8da08",
+          "truth": 34,
+          "recovered": 15,
+          "novel": 80
+        },
+        {
+          "wav_hash": "e5ad5a3f26a26eb20ac991289b6bb60e79b155349bc49200288b110720f51dbe",
+          "truth": 40,
+          "recovered": 25,
+          "novel": 71
+        },
+        {
+          "wav_hash": "9a094c0ed98ca4b04e3563b0e303b6ee1188233628c0619a15832a6ddf85648b",
+          "truth": 29,
+          "recovered": 17,
+          "novel": 83
+        },
+        {
+          "wav_hash": "3d43d1bd9647abbb68b1ad894de834fbec402dbca3ff67a00b102c9f8c62569d",
+          "truth": 40,
+          "recovered": 22,
+          "novel": 77
+        },
+        {
+          "wav_hash": "3a16df8c815ca8d8b2bcca4b7c88b27da925da2c8fb15e6b5c4b02058e76e7db",
+          "truth": 32,
+          "recovered": 16,
+          "novel": 83
+        },
+        {
+          "wav_hash": "e9a229ecbd5db988f31b601ae3c3d509cb22472339251941d1773d86fc25fc8f",
+          "truth": 46,
+          "recovered": 23,
+          "novel": 75
+        },
+        {
+          "wav_hash": "6b9ee33977a67a96fda3f6ce4af95e8a22d48f873449ea4cee947b3bdb7bc56d",
+          "truth": 30,
+          "recovered": 13,
+          "novel": 84
+        },
+        {
+          "wav_hash": "7fc0c623d95096c72969fa8b2927a84b5fcb01d3a5c8b4f34bcaf7678098b833",
+          "truth": 49,
+          "recovered": 25,
+          "novel": 67
+        },
+        {
+          "wav_hash": "6f548a626747a0c538c816dc1547fd0c0a60b84cd743af5b589d06e6c6e1d954",
+          "truth": 28,
+          "recovered": 13,
+          "novel": 83
+        },
+        {
+          "wav_hash": "12d59017718f9dd3472e12ec142dc2f4b90cefe97d503454697a1ce9058aadf0",
+          "truth": 45,
+          "recovered": 26,
+          "novel": 70
+        },
+        {
+          "wav_hash": "3d9cb28ee49842fd9933efd0406196ec6d6ccb783285dc2cd4f8f5a1656bc4bf",
+          "truth": 30,
+          "recovered": 14,
+          "novel": 83
+        },
+        {
+          "wav_hash": "2bb2f150d3b8915a578239f53f32a0731cd0ea8d696f2fc46c9bf6ddcd7d1978",
+          "truth": 46,
+          "recovered": 24,
+          "novel": 73
+        },
+        {
+          "wav_hash": "b999ed7f03d6bd2e2db1504fe747eea8575ceaae26027b713080434d6c32fdb9",
+          "truth": 35,
+          "recovered": 19,
+          "novel": 79
+        },
+        {
+          "wav_hash": "d01f4560cdd7350c849b195d0728aa53022b3c7f9b77702672dfb1a0d70ce754",
+          "truth": 39,
+          "recovered": 22,
+          "novel": 75
+        },
+        {
+          "wav_hash": "80033b3004c5000aee3eb82813c8697d11c5b031382cef3f526afdad63cf1c11",
+          "truth": 36,
+          "recovered": 19,
+          "novel": 80
+        },
+        {
+          "wav_hash": "2b54f071f788d415a2d832b1a603988cfd074d672b4372d6de4609311c5907c1",
+          "truth": 40,
+          "recovered": 21,
+          "novel": 78
+        },
+        {
+          "wav_hash": "09caecf06c32db93fc0f07a96b158138eb9fd76a05dfb5432292d7e0f74878f4",
+          "truth": 33,
+          "recovered": 21,
+          "novel": 75
+        },
+        {
+          "wav_hash": "c9b033c1deaa26ed780826c37729963048c57c4b201761089964b86ff5485ec5",
+          "truth": 35,
+          "recovered": 22,
+          "novel": 75
+        },
+        {
+          "wav_hash": "8b49b8b53128e3807e69d9ec0f2bc5c5abc46d1569e5e0e0e87b2e115e68e059",
+          "truth": 31,
+          "recovered": 14,
+          "novel": 84
+        },
+        {
+          "wav_hash": "2f79557eb3f900312be4cd588d3c0779cf16c21b9e9a61c4531b095ed35a0eed",
+          "truth": 42,
+          "recovered": 21,
+          "novel": 79
+        },
+        {
+          "wav_hash": "5d00c34137b690c3cb96f9ce6bd0c48c486b0bf71b6658840b9fef91e9ca5f4f",
+          "truth": 36,
+          "recovered": 16,
+          "novel": 78
+        },
+        {
+          "wav_hash": "aebcd8950b2b75dbcbe3b763f90dc635c50068f8fc59527d82b9d9513348daba",
+          "truth": 40,
+          "recovered": 20,
+          "novel": 78
+        }
+      ],
+      "ttfd_distribution": {
+        "wavs_with_decode": 33,
+        "p50_seconds": 0.186811292,
+        "p90_seconds": 0.326135667,
+        "mean_seconds": 0.47253747609090907,
+        "per_wav_seconds": [
+          0.0200665,
+          0.099160709,
+          0.11351625,
+          0.124925333,
+          0.132173459,
+          0.133349792,
+          0.141589542,
+          0.155011583,
+          0.157760542,
+          0.159802167,
+          0.161351959,
+          0.16791675,
+          0.169447542,
+          0.175286208,
+          0.1754225,
+          0.186517833,
+          0.186811292,
+          0.18785375,
+          0.190426375,
+          0.202786666,
+          0.209454583,
+          0.213295792,
+          0.2151325,
+          0.217523125,
+          0.221791291,
+          0.226333667,
+          0.279169875,
+          0.2896235,
+          0.292463917,
+          0.326135667,
+          0.360607667,
+          0.371726875,
+          9.3293015
+        ]
+      }
+    }
+  },
+  "composite": {
+    "weights": {
+      "fixtures_pass_rate": 0.15,
+      "real_decode_rate_hard_200": 0.5,
+      "snr_50pct_synth_clean": 0.3,
+      "snr_50pct_synth_doppler": 0.05
+    },
+    "score": 0.0
+  },
+  "regressions": {
+    "fixture_regression": false,
+    "false_positive_introduced": false,
+    "snr_curve_regression_db": 0.0
+  },
+  "notes": "Decoder under test: pancetta-ft8@0.1.0"
+}
