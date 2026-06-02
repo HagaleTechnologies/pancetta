@@ -382,32 +382,32 @@ pub struct Ft8Config {
     pub residual_energy_stop_db: Option<f64>,
 
     /// hb-093: per-position residual SNR pre-decode gate. When `Some(db)`,
-    /// the `joint_pair_retry_pass` (and future extension to
-    /// `coherent_subtract_and_repass`'s post-sync decode loop) computes
-    /// a per-position residual SNR estimate (same primitive as
-    /// `par_estimate_snr_spectrogram`) BEFORE running the expensive
-    /// LDPC+CRC pipeline. Candidates with SNR below the threshold are
-    /// skipped — they sit at noise-only positions and the LDPC work is
-    /// wasted (BP converges on garbage, CRC catches ~98% as FPs,
-    /// plausibility rejects the rest).
+    /// both `joint_pair_retry_pass` AND `coherent_subtract_and_repass`'s
+    /// step-4 post-sync decode loop compute a per-position residual SNR
+    /// estimate (same primitive as `par_estimate_snr_spectrogram`) BEFORE
+    /// running the expensive LDPC+CRC pipeline. Candidates with SNR below
+    /// the threshold are skipped — they sit at noise-only positions and
+    /// the LDPC work is wasted (BP converges on garbage, CRC catches
+    /// ~98% as FPs, plausibility rejects the rest).
     ///
     /// The threshold is the WAV-relative SNR (dB, after the 2500/6.25
     /// bandwidth correction) — typical FT8 decodable signals sit in
-    /// the −20..+10 dB range; the diagnostic recommends ~−5 dB as the
+    /// the −20..+10 dB range; the diagnostic recommended ~−5 dB as the
     /// sweet spot (filters ~37% of pair-retry candidates with 0% decode
-    /// loss on top-5 hard-200). Production sweep maxed at ~3% elapsed
-    /// savings (joint_pair_retry's slice is small) — SHELVED at default
-    /// None pending extension to coherent_subtract_and_repass step 4.
+    /// loss on top-5 hard-200). hb-093 step-4 extension (2026-06-01)
+    /// applies the same gate to the much larger `coherent_subtract_and_repass`
+    /// step-4 candidate set (~200/round vs ~130 for joint_pair_retry).
     ///
-    /// `None` disables the gate (production default until a diagnostic
-    /// confirms it filters ≥30% of candidates without losing decodes).
+    /// `None` disables the gate (production default until a sweep
+    /// confirms ≥10% elapsed reduction with zero recall loss).
     pub residual_snr_gate_db: Option<f64>,
 
     /// hb-093 diagnostic: when true, the decoder records per-position
     /// SNR + decode-success for every candidate the gate would evaluate
-    /// (joint_pair_retry path). The data is reset per `decode_window`
-    /// call and read out via `Ft8Decoder::take_residual_snr_diagnostic`.
-    /// The gate behavior is NOT affected — measurement only.
+    /// (both `joint_pair_retry_pass` AND `coherent_subtract_and_repass`
+    /// step-4 paths). The data is reset per `decode_window` call and
+    /// read out via `Ft8Decoder::take_residual_snr_diagnostic`. The
+    /// gate behavior is NOT affected — measurement only.
     /// Default false.
     pub residual_snr_diagnostic: bool,
 
@@ -2516,7 +2516,7 @@ impl Ft8Decoder {
     /// `docs/engineering/2026-06-02-sic-novelty-verification.md` for the
     /// full novelty review.
     fn coherent_subtract_and_repass(
-        &self,
+        &mut self,
         spectrogram: &mut Spectrogram,
         decoded: &[DecodedMessage],
         // hb-016: optional residual energy early-stop. When
@@ -2677,22 +2677,60 @@ impl Ft8Decoder {
         let sps = pp.samples_per_symbol(SAMPLE_RATE);
         let spec_step = sps / TIME_OSR;
         let lin = self.config.sync_time_interp_linear_power;
+        // hb-093 step-4 extension: optional pre-decode residual SNR gate +
+        // diagnostic capture. Mirrors `joint_pair_retry_pass` — the per-WAV
+        // candidate count at this site (post-sync-search, bounded by
+        // `max_sync_candidates`) is typically ~10× larger than
+        // joint_pair_retry's surface, so the same gate yields ~10× the
+        // elapsed savings here.
+        let snr_gate_db = self.config.residual_snr_gate_db;
+        let diagnostic_on = self.config.residual_snr_diagnostic;
         for cand in &new_candidates {
             let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
+            // hb-093 step-4: pre-decode residual SNR estimate. Cheap — just
+            // iterates the already-extracted tone magnitudes.
+            let pre_snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
+            if let Some(threshold) = snr_gate_db {
+                if (pre_snr_db as f64) < threshold {
+                    if diagnostic_on {
+                        self.residual_snr_records
+                            .push((cand.sync_score, pre_snr_db, false));
+                    }
+                    continue;
+                }
+            }
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
+                if diagnostic_on {
+                    self.residual_snr_records
+                        .push((cand.sync_score, pre_snr_db, false));
+                }
                 continue;
             };
             if !par_verify_crc(&corrected_bits) {
+                if diagnostic_on {
+                    self.residual_snr_records
+                        .push((cand.sync_score, pre_snr_db, false));
+                }
                 continue;
             }
             let payload_bits = par_apply_xor(pp.xor_sequence, &corrected_bits);
             let ft8_message = match self.message_parser.parse_payload(&payload_bits) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(_) => {
+                    if diagnostic_on {
+                        self.residual_snr_records
+                            .push((cand.sync_score, pre_snr_db, false));
+                    }
+                    continue;
+                }
             };
             if !ft8_message.is_plausible() {
+                if diagnostic_on {
+                    self.residual_snr_records
+                        .push((cand.sync_score, pre_snr_db, false));
+                }
                 continue;
             }
             let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
@@ -2711,6 +2749,10 @@ impl Ft8Decoder {
             // Preserve tone_symbols on the new decode so future multipass
             // iterations (if ever added) could subtract this signal too.
             new_msg.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
+            if diagnostic_on {
+                self.residual_snr_records
+                    .push((cand.sync_score, pre_snr_db, true));
+            }
             decoded_new.push(new_msg);
         }
         decoded_new
