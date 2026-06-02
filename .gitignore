@@ -95,6 +95,9 @@ training/neural_osd/ensemble_nb_inference.stdout.log
 # weight-space averaged (Wortsman 2022 model-soup) blob. The averaged
 # blob is reproducible from these via average_ensemble_weights.py.
 training/neural_osd/session2/
+# hb-064 Session 3 — Wortsman-compliant shared-init ensemble
+# checkpoints. Same reproducibility story as Session 2.
+training/neural_osd/session3/
 *.npy
 
 # Database backups
