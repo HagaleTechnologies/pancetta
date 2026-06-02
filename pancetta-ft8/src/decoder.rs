@@ -1203,10 +1203,22 @@ impl Ft8Decoder {
             // this window, generate next-utterance templates and
             // cross-correlate against residual LLRs at sync_candidate
             // positions within ±a7_freq_window_hz of the expected call.
+            // hb-048 S3-chrono (2026-06-01): additionally seed templates
+            // from `ap_context.recent_calls` — when populated by a
+            // chronological-replay tier from `ChronoReplayState`, this is
+            // the cross-slot path WSJT-X's a7 actually exercises (slot N+1
+            // templates rooted at callsigns heard in slot N). Cross-slot
+            // calls have no known audio frequency, so they probe ALL
+            // sync_candidates (the within-WAV ±freq-window gate only
+            // applies to in-WAV expected calls).
             // WSJT-X prior art: mainline commit f13e3182 (Joe Taylor 2021).
             if self.config.a7_enabled {
-                let mut extra =
-                    self.a7_cross_correlation_pass(&spectrogram, &sync_candidates, &pass_decoded);
+                let mut extra = self.a7_cross_correlation_pass(
+                    &spectrogram,
+                    &sync_candidates,
+                    &pass_decoded,
+                    &ap_context.recent_calls,
+                );
                 let now_elapsed = start_time.elapsed();
                 for m in extra.iter_mut() {
                     if m.decode_time_into_window.is_none() {
@@ -2968,11 +2980,16 @@ impl Ft8Decoder {
     /// filter catch what slips through.
     ///
     /// **Within-WAV vs cross-WAV**: this pass uses callsigns decoded in
-    /// THIS window as the expected-call source. In production, the
-    /// coordinator additionally seeds across slots via the CrossTimeState
-    /// recent-call table (substrate landed 2026-06-01). Eval runs decode
-    /// one WAV at a time so cross-slot is moot for the offline scorecard
-    /// — the within-WAV path is what gets measured here.
+    /// THIS window as the expected-call source. The
+    /// `cross_slot_recent_calls` arg additionally seeds templates from
+    /// cross-slot context (e.g. `ApContext.recent_calls` populated by a
+    /// chronological-replay tier from `ChronoReplayState`, or by the
+    /// production coordinator from `CrossTimeState`). Cross-slot calls
+    /// have no known audio frequency, so they probe ALL sync_candidates
+    /// (the within-WAV `±a7_freq_window_hz` gate only applies to in-WAV
+    /// expected calls). Without cross-slot context the function still
+    /// runs the within-WAV path — the design preserves the Session 3
+    /// behavior at default config.
     ///
     /// Prior art: WSJT-X mainline commit
     /// `f13e31820470291fdd49627287a2dc08f3fa674c` (`lib/ft8_a7.f90`,
@@ -2982,9 +2999,11 @@ impl Ft8Decoder {
         spectrogram: &Spectrogram,
         sync_candidates: &[CostasCandidate],
         pass_decoded: &[DecodedMessage],
+        cross_slot_recent_calls: &[crate::ap::RecentCallAp],
     ) -> Vec<DecodedMessage> {
-        // Guard: nothing to template against if no decodes yet.
-        if pass_decoded.is_empty() {
+        // Guard: nothing to template against if no decodes yet AND no
+        // cross-slot calls — the pass is a no-op.
+        if pass_decoded.is_empty() && cross_slot_recent_calls.is_empty() {
             return Vec::new();
         }
 
@@ -3005,15 +3024,41 @@ impl Ft8Decoder {
             let spec_step = sps / TIME_OSR;
             let lin = self.config.sync_time_interp_linear_power;
 
-            // Build the set of (callsign, freq_hz) tuples for already-decoded
-            // messages — these seed the template generator. Skip messages
-            // without a parseable sender.
-            let mut expected_calls: Vec<crate::a7::A7ExpectedCall> = Vec::new();
+            // Build the set of (callsign, freq_hz, source) tuples for the
+            // template generator. Sources:
+            //   1. Within-WAV decodes from `pass_decoded` — these carry a
+            //      known audio frequency (probe within ±freq_window_hz).
+            //   2. Cross-slot recent calls from `cross_slot_recent_calls`
+            //      — no known audio frequency (probe ALL sync_candidates).
+            //
+            // We track the freq-known-ness alongside each expected call so
+            // the probe loop below can skip the freq filter when no
+            // frequency is associated.
+            //
+            // Dedup by bare callsign (case-insensitive) so a callsign that
+            // appears both in the snapshot AND in this window doesn't get
+            // double-templated. Within-WAV entries (with known freq) win
+            // on collision — they have the tighter probe window.
+            struct A7ProbeEntry {
+                ec: crate::a7::A7ExpectedCall,
+                has_known_freq: bool,
+            }
+            let mut expected_calls: Vec<A7ProbeEntry> = Vec::new();
+            let mut seen_calls: HashSet<String> = HashSet::new();
+
             for msg in pass_decoded {
                 let Some(ref from_call) = msg.message.from_callsign else {
                     continue;
                 };
                 if from_call.is_empty() {
+                    continue;
+                }
+                let bare = from_call
+                    .split('/')
+                    .next()
+                    .unwrap_or(from_call)
+                    .to_uppercase();
+                if !seen_calls.insert(bare) {
                     continue;
                 }
                 let heard_with = msg.message.to_callsign.clone();
@@ -3030,8 +3075,42 @@ impl Ft8Decoder {
                         ec = ec.with_heard_with(other);
                     }
                 }
-                expected_calls.push(ec);
+                expected_calls.push(A7ProbeEntry {
+                    ec,
+                    has_known_freq: true,
+                });
             }
+
+            // hb-048 S3-chrono: cross-slot recent calls (no known freq).
+            // These probe every sync_candidate in the window — the
+            // mechanism is "we heard this station before; look for any
+            // follow-up here, freq unknown". This is the WSJT-X-canonical
+            // a7 path when fed from slot N's heard-list into slot N+1.
+            for rc in cross_slot_recent_calls {
+                if rc.callsign.is_empty() {
+                    continue;
+                }
+                let bare = rc
+                    .callsign
+                    .split('/')
+                    .next()
+                    .unwrap_or(&rc.callsign)
+                    .to_uppercase();
+                if !seen_calls.insert(bare) {
+                    continue;
+                }
+                // freq_hz placeholder (unused when has_known_freq=false).
+                let ec = crate::a7::A7ExpectedCall::new(
+                    rc.callsign.clone(),
+                    0.0,
+                    crate::a7::A7SlotParity::Even,
+                );
+                expected_calls.push(A7ProbeEntry {
+                    ec,
+                    has_known_freq: false,
+                });
+            }
+
             if expected_calls.is_empty() {
                 return Vec::new();
             }
@@ -3066,7 +3145,14 @@ impl Ft8Decoder {
             // sync_candidates. Each (expected_call, candidate) pair is one
             // cross-correlation evaluation; the bank's `best_template_score`
             // picks the winner.
-            for ec in &expected_calls {
+            //
+            // Within-WAV entries (has_known_freq=true) probe only candidates
+            // within ±freq_window_hz of the expected call. Cross-slot
+            // entries (has_known_freq=false) probe ALL candidates — the
+            // canonical WSJT-X a7 path searches the whole window for a
+            // follow-up to any callsign heard in a previous slot.
+            for entry in &expected_calls {
+                let ec = &entry.ec;
                 let templates = crate::a7::generate_templates(ec);
                 if templates.is_empty() {
                     continue;
@@ -3081,7 +3167,7 @@ impl Ft8Decoder {
                     // Compute candidate audio frequency.
                     let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
                     let cand_freq = cand.freq_bin as f64 * tone_spacing + sub_bin_offset;
-                    if (cand_freq - ec_freq).abs() > freq_window_hz {
+                    if entry.has_known_freq && (cand_freq - ec_freq).abs() > freq_window_hz {
                         continue;
                     }
                     // Skip positions whose codeword has been subtracted —
