@@ -39,6 +39,16 @@ pub trait DecoderUnderTest: Send + Sync {
     /// Opaque JSON snapshot of effective config — serialized into the
     /// scorecard for reproducibility.
     fn config_snapshot(&self) -> serde_json::Value;
+    /// Chronological-replay diagnostic (2026-06-01): when stateful mode
+    /// is active, returns the count of accumulated callsigns in the
+    /// cross-WAV snapshot. The default returns `None` for stateless or
+    /// unsupported decoders (jt9, default-config Ft8Decoder); the
+    /// chrono-replay tier uses the per-slot delta to confirm
+    /// statefulness ("snapshot grows monotonically across consecutive
+    /// WAVs").
+    fn chrono_replay_snapshot_len(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Wraps the production pancetta-ft8 decoder for use by the harness.
@@ -75,8 +85,32 @@ pub struct Ft8Decoder {
     /// production). `None` disables — `Ft8Config::dt_history_enabled`
     /// also gates the decoder-side narrowing.
     dt_history: Option<std::sync::Arc<pancetta_ft8::InMemoryDtHistory>>,
+    /// Chronological-replay tier substrate (2026-06-01). When `Some`, this
+    /// decoder is operating in stateful mode: each successful `decode_wav`
+    /// pushes its decoded callsigns into the shared deque, and the NEXT
+    /// `decode_wav` builds an `ApContext.recent_calls` from the current
+    /// deque contents (no my_call — hb-043 my_call-less injection path).
+    ///
+    /// Distinct from `rolling_window` only in INTENT and labeling — both
+    /// implement the same accumulator semantics on top of the AP
+    /// `recent_calls` channel. The split exists so a future iter that
+    /// wires `pancetta_qso::CrossTimeState` into pancetta-ft8 can replace
+    /// THIS field with a `CrossTimeState` handle WITHOUT touching the
+    /// rolling-window paths used by hb-050.
+    chrono_replay_state: Option<ChronoReplayState>,
     /// Used only so `config_snapshot` is stable across calls.
     _scratch: Mutex<()>,
+}
+
+/// Per-decoder accumulated state for chronological replay. Cloned on
+/// builder calls; the inner `Arc<Mutex<…>>` is shared so all clones see
+/// the same growing snapshot.
+#[derive(Clone, Default)]
+pub struct ChronoReplayState {
+    /// Capacity cap on the rolling deque. `0` = unbounded.
+    pub capacity: usize,
+    /// FIFO of bare callsigns seen across decode_wav calls.
+    pub calls: std::sync::Arc<Mutex<std::collections::VecDeque<String>>>,
 }
 
 impl Ft8Decoder {
@@ -90,7 +124,41 @@ impl Ft8Decoder {
             rolling_calls: Mutex::new(std::collections::VecDeque::new()),
             two_stage_first_config: None,
             dt_history: None,
+            chrono_replay_state: None,
             _scratch: Mutex::new(()),
+        }
+    }
+
+    /// Chronological-replay tier (2026-06-01): enable stateful mode where
+    /// callsigns decoded from one WAV are carried into the next WAV's
+    /// `ApContext.recent_calls`. `capacity` caps the deque (use 0 for
+    /// unbounded — the chrono-replay tier defaults to 0 since session
+    /// length is what bounds growth in practice).
+    ///
+    /// Returns a NEW handle to `ChronoReplayState` for the caller to
+    /// inspect mid-tier (e.g. smoke-test assertions that the snapshot
+    /// grows monotonically). The decoder owns its own clone of the same
+    /// `Arc`.
+    pub fn with_chrono_replay(mut self, capacity: usize) -> (Self, ChronoReplayState) {
+        let state = ChronoReplayState {
+            capacity,
+            calls: std::sync::Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        };
+        self.chrono_replay_state = Some(state.clone());
+        (self, state)
+    }
+
+    /// Read the current accumulated callsign snapshot. Returns an empty
+    /// `Vec` when chrono-replay is disabled. Used by the eval harness for
+    /// per-WAV diagnostics ("snapshot.len() = N going into slot K").
+    pub fn chrono_replay_snapshot(&self) -> Vec<String> {
+        match &self.chrono_replay_state {
+            Some(s) => s
+                .calls
+                .lock()
+                .map(|g| g.iter().cloned().collect())
+                .unwrap_or_default(),
+            None => Vec::new(),
         }
     }
 
@@ -471,11 +539,13 @@ impl DecoderUnderTest for Ft8Decoder {
 
         // hb-046: optional two-stage decoding. Run a cheap first pass,
         // then merge with the standard pass. Mutually exclusive with
-        // rolling_window and ap_context (those win if also set).
+        // rolling_window, chrono_replay, and ap_context (those win if
+        // also set — they take the AP path).
         let mut prelim: Vec<pancetta_ft8::DecodedMessage> = Vec::new();
         if self.two_stage_first_config.is_some()
             && self.rolling_window.is_none()
             && self.ap_context.is_none()
+            && self.chrono_replay_state.is_none()
         {
             let cheap_cfg = self.two_stage_first_config.clone().unwrap();
             let mut cheap_decoder = pancetta_ft8::Ft8Decoder::new(cheap_cfg)
@@ -494,7 +564,59 @@ impl DecoderUnderTest for Ft8Decoder {
             decoder = decoder
                 .with_dt_priors(h.clone() as std::sync::Arc<dyn pancetta_ft8::DtPriorLookup>);
         }
-        let raw = if let Some(window_n) = self.rolling_window {
+        let raw = if let Some(state) = self.chrono_replay_state.clone() {
+            // Chronological-replay tier (2026-06-01): build ApContext.recent_calls
+            // from the persistent cross-WAV snapshot. The snapshot grows
+            // monotonically across consecutive `decode_wav` calls — that is
+            // the central statefulness guarantee of this tier.
+            let snapshot: Vec<String> = state
+                .calls
+                .lock()
+                .map(|g| g.iter().cloned().collect())
+                .unwrap_or_default();
+            let recent: Vec<pancetta_ft8::ap::RecentCallAp> = snapshot
+                .iter()
+                .filter_map(|c| pancetta_ft8::ap::RecentCallAp::new(c, 0.0))
+                .collect();
+            let ctx = pancetta_ft8::ap::ApContext {
+                my_call: None,
+                recent_calls: recent,
+                active_qso: None,
+            };
+            let r = decoder.decode_window_with_ap(&samples, &ctx).map_err(|e| {
+                anyhow::anyhow!(
+                    "decode_window_with_ap (chrono-replay) failed for {}: {e}",
+                    path.display()
+                )
+            })?;
+            // Push every from/to callsign into the persistent deque. We
+            // dedup against current contents so the snapshot doesn't grow
+            // with re-sightings (the SET semantics here are what a future
+            // `pancetta_qso::CrossTimeState`-backed implementation will
+            // mirror, with TTL-based eviction replacing the capacity cap).
+            if let Ok(mut deque) = state.calls.lock() {
+                for msg in &r {
+                    for cs in [
+                        msg.message.from_callsign.as_deref(),
+                        msg.message.to_callsign.as_deref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        let bare = cs.split('/').next().unwrap_or(cs).to_string();
+                        if !bare.is_empty() && !deque.iter().any(|c| c == &bare) {
+                            deque.push_back(bare);
+                            if state.capacity > 0 {
+                                while deque.len() > state.capacity {
+                                    deque.pop_front();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            r
+        } else if let Some(window_n) = self.rolling_window {
             // hb-050: build ApContext from current rolling deque snapshot.
             let snapshot: Vec<String> = self
                 .rolling_calls
@@ -602,6 +724,12 @@ impl DecoderUnderTest for Ft8Decoder {
                 "debug_repr": format!("{:?}", self.config),
             }),
         }
+    }
+
+    fn chrono_replay_snapshot_len(&self) -> Option<usize> {
+        self.chrono_replay_state
+            .as_ref()
+            .map(|s| s.calls.lock().map(|g| g.len()).unwrap_or(0))
     }
 }
 

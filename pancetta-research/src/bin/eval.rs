@@ -125,6 +125,19 @@ struct Args {
     /// fields. Used for production-style validation (operator log
     /// is the natural source). Can combine with baselines via OR.
     fp_filter_adif: Option<PathBuf>,
+    /// Chronological-replay tier (2026-06-01): explicit opt-in to
+    /// stateful cross-WAV semantics. Auto-set when the `chrono-replay`
+    /// tier is in `tiers`. Exposing this as a flag lets ad-hoc dispatch
+    /// (e.g. running hard-200 with a stateful decoder for diagnostic
+    /// purposes) opt in without renaming the tier.
+    chrono_replay_enabled: Option<bool>,
+    /// Chronological-replay tier (2026-06-01): cap on the persistent
+    /// callsign deque. `None` → unbounded (default for chrono-replay,
+    /// where session length naturally bounds growth).
+    chrono_replay_capacity: Option<usize>,
+    /// Chronological-replay tier (2026-06-01): override the default
+    /// manifest path (`research/corpus/curated/ft8/chrono_replay.manifest.json`).
+    chrono_replay_manifest: Option<PathBuf>,
 }
 
 impl Args {
@@ -179,6 +192,9 @@ impl Args {
         let mut fp_filter_baselines: Option<PathBuf> = None;
         let mut fp_filter_rolling: Option<usize> = None;
         let mut fp_filter_adif: Option<PathBuf> = None;
+        let mut chrono_replay_enabled: Option<bool> = None;
+        let mut chrono_replay_capacity: Option<usize> = None;
+        let mut chrono_replay_manifest: Option<PathBuf> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -507,11 +523,31 @@ impl Args {
                             .into(),
                     );
                 }
+                "--chrono-replay-enabled" => {
+                    chrono_replay_enabled = Some(true);
+                }
+                "--no-chrono-replay" => {
+                    chrono_replay_enabled = Some(false);
+                }
+                "--chrono-replay-capacity" => {
+                    chrono_replay_capacity = Some(
+                        iter.next()
+                            .context("--chrono-replay-capacity needs a value (N; 0 = unbounded)")?
+                            .parse()?,
+                    );
+                }
+                "--chrono-replay-manifest" => {
+                    chrono_replay_manifest = Some(
+                        iter.next()
+                            .context("--chrono-replay-manifest needs a path to a manifest JSON")?
+                            .into(),
+                    );
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
                     );
-                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, synth-pair-200, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50, hard-jt9-rich-200");
+                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, synth-pair-200, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50, hard-jt9-rich-200, chrono-replay");
                     eprintln!("  --max-passes: override Ft8Config::max_decode_passes (default 3)");
                     eprintln!("  --max-sync-candidates: override Ft8Config::max_sync_candidates (default 200)");
                     eprintln!(
@@ -587,6 +623,9 @@ impl Args {
             fp_filter_baselines,
             fp_filter_rolling,
             fp_filter_adif,
+            chrono_replay_enabled,
+            chrono_replay_capacity,
+            chrono_replay_manifest,
         })
     }
 }
@@ -874,6 +913,211 @@ fn run_synth_pair_tier(
         truth_decodes_total: Some(truth_total),
         truth_decodes_recovered: Some(recovered),
         decode_rate: Some(decode_rate),
+        ..Default::default()
+    })
+}
+
+/// Chronological-replay tier (2026-06-01) — processes WAVs in
+/// `slot_index` order from a [`pancetta_research::chrono_replay::ChronoReplayManifest`].
+///
+/// Stateful semantics: unlike `run_curated_tier`, the decoder's persistent
+/// state (chrono_replay deque, dt_history, etc.) IS NOT reset between
+/// WAVs. The caller MUST construct the `decoder` with stateful mode
+/// enabled (auto-enabled when `--tier chrono-replay` is requested; see
+/// the dispatch in `main`).
+///
+/// Per-WAV scoring is identical to the curated tier (recovered vs jt9
+/// baseline + novels). The differences are:
+/// - manifest ordering is the ground truth (we do NOT sort or reshuffle);
+/// - between-WAV decoder state is preserved (rolling deque grows);
+/// - a per-tier snapshot-growth diagnostic is logged.
+fn run_chrono_replay_tier(
+    decoder: &dyn DecoderUnderTest,
+    workspace: &std::path::Path,
+    manifest_path: &std::path::Path,
+    fp_filter: Option<&pancetta_research::FpFilter>,
+) -> anyhow::Result<TierResult> {
+    use pancetta_research::chrono_replay::load_chrono_replay_corpus;
+    let entries = load_chrono_replay_corpus(manifest_path)?;
+    let total = entries.len() as u32;
+    if total == 0 {
+        return Ok(TierResult {
+            wavs_processed: 0,
+            ..Default::default()
+        });
+    }
+    let mut truth_decodes_total = 0u32;
+    let mut truth_recovered = 0u32;
+    let mut novel_decodes = 0u32;
+    let mut wsjtx_total = 0u32;
+    let mut per_wav_failures: Vec<PerWavFailure> = Vec::new();
+    let mut per_wav_records: Vec<PerWavRecord> = Vec::new();
+    let mut per_wav_ttfd_s: Vec<f64> = Vec::new();
+
+    // Snapshot-growth diagnostic: read the decoder's chrono-replay
+    // snapshot length before/after each WAV. Confirms statefulness —
+    // a stateless tier returns the same length (0 or None) at every
+    // observation; a stateful tier shows monotonic growth.
+    let snapshot_at_start = decoder.chrono_replay_snapshot_len();
+    let mut snapshot_growth_log: Vec<(usize, usize)> = Vec::new();
+    eprintln!(
+        "chrono-replay: snapshot at tier start = {:?}",
+        snapshot_at_start
+    );
+    for (i, entry) in entries.iter().enumerate() {
+        let baseline_path = workspace
+            .join("research/baselines/ft8")
+            .join(format!("{}.json", entry.wav_sha256));
+        let baseline_decodes: Vec<String> = if baseline_path.exists() {
+            let s = std::fs::read_to_string(&baseline_path)?;
+            let cache: serde_json::Value = serde_json::from_str(&s)?;
+            cache
+                .get("decodes")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|d| d.get("message").and_then(|m| m.as_str()))
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        wsjtx_total += baseline_decodes.len() as u32;
+        truth_decodes_total += baseline_decodes.len() as u32;
+
+        let mut our_decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        apply_fp_filter(fp_filter, &mut our_decodes);
+
+        if let Some(min_ttfd) = our_decodes
+            .iter()
+            .filter_map(|d| d.decode_time_into_window_s)
+            .fold(None::<f64>, |acc, t| match acc {
+                None => Some(t),
+                Some(cur) => Some(cur.min(t)),
+            })
+        {
+            per_wav_ttfd_s.push(min_ttfd);
+        }
+
+        let mut recovered_here = 0u32;
+        for truth_msg in &baseline_decodes {
+            if our_decodes
+                .iter()
+                .any(|d| d.message.trim() == truth_msg.trim())
+            {
+                recovered_here += 1;
+            }
+        }
+        truth_recovered += recovered_here;
+
+        let mut novel_here = 0u32;
+        for ours in &our_decodes {
+            if !baseline_decodes
+                .iter()
+                .any(|t| t.trim() == ours.message.trim())
+            {
+                novel_decodes += 1;
+                novel_here += 1;
+            }
+        }
+
+        let gap = baseline_decodes.len() as i64 - recovered_here as i64;
+        if gap > 0 {
+            per_wav_failures.push(PerWavFailure {
+                wav_hash: entry.wav_sha256.clone(),
+                truth: baseline_decodes.len() as u32,
+                recovered: recovered_here,
+                wsjtx: baseline_decodes.len() as u32,
+                jtdx: 0,
+            });
+        }
+
+        per_wav_records.push(PerWavRecord {
+            wav_hash: entry.wav_sha256.clone(),
+            truth: baseline_decodes.len() as u32,
+            recovered: recovered_here,
+            novel: novel_here,
+        });
+
+        // Statefulness probe: record snapshot length after this WAV.
+        if let Some(len) = decoder.chrono_replay_snapshot_len() {
+            snapshot_growth_log.push((i, len));
+        }
+
+        if i < 5 || (i + 1) % 50 == 0 || i + 1 == entries.len() {
+            let snap_info = decoder
+                .chrono_replay_snapshot_len()
+                .map(|n| format!(" snapshot={n}"))
+                .unwrap_or_default();
+            eprintln!(
+                "chrono-replay: slot {}/{} ({}): {} truth, {} recovered, {} novel{}",
+                i + 1,
+                entries.len(),
+                entry
+                    .wav_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?"),
+                baseline_decodes.len(),
+                recovered_here,
+                novel_here,
+                snap_info,
+            );
+        }
+    }
+
+    // Statefulness summary: report snapshot growth across the tier.
+    if !snapshot_growth_log.is_empty() {
+        let (_, final_len) = snapshot_growth_log.last().copied().unwrap_or((0, 0));
+        let monotonic = snapshot_growth_log.windows(2).all(|w| w[1].1 >= w[0].1);
+        eprintln!(
+            "chrono-replay: STATEFULNESS final snapshot={} callsigns, monotonic-growth={}, samples={}",
+            final_len,
+            monotonic,
+            snapshot_growth_log.len(),
+        );
+    } else {
+        eprintln!(
+            "chrono-replay: STATEFULNESS no chrono_replay_snapshot_len reported by decoder \
+             (stateless mode — verify --chrono-replay-enabled or chrono-replay tier is in --tiers)"
+        );
+    }
+
+    per_wav_failures.sort_by(|a, b| (b.truth - b.recovered).cmp(&(a.truth - a.recovered)));
+    per_wav_failures.truncate(20);
+
+    let decode_rate = if truth_decodes_total == 0 {
+        0.0
+    } else {
+        truth_recovered as f64 / truth_decodes_total as f64
+    };
+    let vs_wsjtx_pct = if wsjtx_total == 0 {
+        0.0
+    } else {
+        100.0 * truth_recovered as f64 / wsjtx_total as f64
+    };
+
+    let ttfd_distribution = TtfdDistribution::from_per_wav(per_wav_ttfd_s);
+    if let Some(ttfd) = &ttfd_distribution {
+        eprintln!(
+            "chrono-replay tier TTFD: n={} wavs, p50={:.3}s p90={:.3}s mean={:.3}s",
+            ttfd.wavs_with_decode, ttfd.p50_seconds, ttfd.p90_seconds, ttfd.mean_seconds,
+        );
+    }
+
+    Ok(TierResult {
+        wavs_processed: total,
+        truth_decodes_total: Some(truth_decodes_total),
+        truth_decodes_recovered: Some(truth_recovered),
+        decode_rate: Some(decode_rate),
+        novel_decodes: Some(novel_decodes),
+        wsjtx_decoded: Some(wsjtx_total),
+        vs_wsjtx_pct: Some(vs_wsjtx_pct),
+        per_wav_top_failures: per_wav_failures,
+        per_wav_records,
+        ttfd_distribution,
         ..Default::default()
     })
 }
@@ -1250,6 +1494,19 @@ fn main() -> anyhow::Result<()> {
             if let Some(n) = args.ap_rolling_window {
                 d = d.with_rolling_window(n);
             }
+            // Chronological-replay tier (2026-06-01): when the user
+            // requests the `chrono-replay` tier, stateful mode is
+            // mandatory (the tier's whole point). Auto-enable here so the
+            // operator doesn't have to remember a redundant flag — but
+            // also expose `--chrono-replay-enabled` for explicit
+            // hard-200/hard-1000 dispatch where the tier name doesn't
+            // imply statefulness (e.g. ad-hoc combinations).
+            let chrono_tier_requested = args.tiers.iter().any(|t| t == "chrono-replay");
+            if chrono_tier_requested || args.chrono_replay_enabled.unwrap_or(false) {
+                let cap = args.chrono_replay_capacity.unwrap_or(0);
+                let (d2, _state) = d.with_chrono_replay(cap);
+                d = d2;
+            }
             Box::new(d)
         }
     };
@@ -1422,6 +1679,44 @@ fn main() -> anyhow::Result<()> {
                     let result =
                         run_curated_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
                     tiers.insert("hard-jt9-rich-200".to_string(), result);
+                }
+            }
+            // Chronological-replay tier (2026-06-01): stateful cross-WAV
+            // semantics — the decoder's `chrono_replay_state` persists
+            // across consecutive WAVs, so callsigns decoded in slot N
+            // are available to slot N+1's AP path. Unblocks future
+            // re-tests of hb-048 a7, hb-057 median-DT, and hb-173
+            // within-QSO (all SHELVED on the per-WAV-isolated curated
+            // tiers; root cause was empty cross-slot snapshot).
+            "chrono-replay" => {
+                let manifest = args.chrono_replay_manifest.clone().unwrap_or_else(|| {
+                    workspace.join("research/corpus/curated/ft8/chrono_replay.manifest.json")
+                });
+                let manifest = if manifest.is_absolute() {
+                    manifest
+                } else {
+                    workspace.join(&manifest)
+                };
+                if !manifest.exists() {
+                    eprintln!(
+                        "tier chrono-replay: manifest missing at {} — SKIPPING (run `cargo run --release -p pancetta-research --bin curate-chrono-replay` to generate)",
+                        manifest.display()
+                    );
+                    tiers.insert(
+                        "chrono-replay".to_string(),
+                        TierResult {
+                            wavs_processed: 0,
+                            ..Default::default()
+                        },
+                    );
+                } else {
+                    let result = run_chrono_replay_tier(
+                        decoder.as_ref(),
+                        &workspace,
+                        &manifest,
+                        fp_filter_ref,
+                    )?;
+                    tiers.insert("chrono-replay".to_string(), result);
                 }
             }
             other => anyhow::bail!("unknown tier '{other}'"),
