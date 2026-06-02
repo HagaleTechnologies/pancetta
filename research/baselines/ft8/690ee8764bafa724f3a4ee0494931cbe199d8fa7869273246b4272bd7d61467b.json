@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_154243.wav",
+  "wav_sha256": "690ee8764bafa724f3a4ee0494931cbe199d8fa7869273246b4272bd7d61467b",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "K4XP KB9RP EN43",
+      "freq_hz": 525.0,
+      "dt_s": -0.3,
+      "snr_db": 16.0
+    },
+    {
+      "message": "K3FNB N4FLB EM62",
+      "freq_hz": 1097.0,
+      "dt_s": 2.0,
+      "snr_db": 22.0
+    },
+    {
+      "message": "LA1PHA W1CCO FN43",
+      "freq_hz": 2574.0,
+      "dt_s": 2.3,
+      "snr_db": -8.0
+    },
+    {
+      "message": "WW3QB NG7E RR73",
+      "freq_hz": 1368.0,
+      "dt_s": 2.2,
+      "snr_db": -6.0
+    },
+    {
+      "message": "M1DDD/P KE2ET EM75",
+      "freq_hz": 862.0,
+      "dt_s": 2.3,
+      "snr_db": 12.0
+    },
+    {
+      "message": "KA1MXL KI5JTR EM54",
+      "freq_hz": 684.0,
+      "dt_s": 1.1,
+      "snr_db": -6.0
+    },
+    {
+      "message": "K4XP W9AV EN43",
+      "freq_hz": 1727.0,
+      "dt_s": 2.1,
+      "snr_db": -4.0
+    },
+    {
+      "message": "AC0QG N4FJB R-01",
+      "freq_hz": 1162.0,
+      "dt_s": 1.4,
+      "snr_db": 6.0
+    },
+    {
+      "message": "K6ELE KK7O DM43",
+      "freq_hz": 409.0,
+      "dt_s": 2.2,
+      "snr_db": -21.0
+    },
+    {
+      "message": "VE6CV N0BTN EM28",
+      "freq_hz": 2298.0,
+      "dt_s": 2.0,
+      "snr_db": -15.0
+    },
+    {
+      "message": "KQ4ZIP NJ6K DM12",
+      "freq_hz": 1641.0,
+      "dt_s": 2.1,
+      "snr_db": -21.0
+    },
+    {
+      "message": "WH6S KE8ESJ EM79",
+      "freq_hz": 565.0,
+      "dt_s": 2.1,
+      "snr_db": -15.0
+    },
+    {
+      "message": "WZ8DX <...> +02",
+      "freq_hz": 1048.0,
+      "dt_s": 2.1,
+      "snr_db": 5.0
+    },
+    {
+      "message": "CQ NM3B FN01",
+      "freq_hz": 1908.0,
+      "dt_s": 2.0,
+      "snr_db": -25.0
+    },
+    {
+      "message": "N7GKE N4DWD EM86",
+      "freq_hz": 1473.0,
+      "dt_s": 2.0,
+      "snr_db": -23.0
+    },
+    {
+      "message": "KE7BNR W2JOY -09",
+      "freq_hz": 704.0,
+      "dt_s": 2.0,
+      "snr_db": -25.0
+    },
+    {
+      "message": "M1QMS N6CFC DM04",
+      "freq_hz": 1825.0,
+      "dt_s": 2.0,
+      "snr_db": -25.0
+    },
+    {
+      "message": "KG4IMO K7NWF 73",
+      "freq_hz": 634.0,
+      "dt_s": 2.1,
+      "snr_db": -25.0
+    },
+    {
+      "message": "CQ KC9YTT EN40",
+      "freq_hz": 1288.0,
+      "dt_s": 2.1,
+      "snr_db": -17.0
+    },
+    {
+      "message": "NY3H KB8KHW EN91",
+      "freq_hz": 1598.0,
+      "dt_s": 2.1,
+      "snr_db": -25.0
+    },
+    {
+      "message": "CQ VE3OZW EN94",
+      "freq_hz": 1341.0,
+      "dt_s": 1.7,
+      "snr_db": -25.0
+    },
+    {
+      "message": "CQ AB8PS EN83",
+      "freq_hz": 1253.0,
+      "dt_s": 2.1,
+      "snr_db": -25.0
+    },
+    {
+      "message": "KE7MRA K2HT R-15",
+      "freq_hz": 2410.0,
+      "dt_s": 2.1,
+      "snr_db": -6.0
+    },
+    {
+      "message": "AC0QG KF8EFV -08",
+      "freq_hz": 2469.0,
+      "dt_s": 2.2,
+      "snr_db": -20.0
+    },
+    {
+      "message": "AA7RS KO6MFA CM94",
+      "freq_hz": 2660.0,
+      "dt_s": 2.1,
+      "snr_db": -23.0
+    },
+    {
+      "message": "CQ W2MWS FN20 ? a1",
+      "freq_hz": 2130.0,
+      "dt_s": 2.1,
+      "snr_db": -25.0
+    },
+    {
+      "message": "N4TZR KQ4CER EM92",
+      "freq_hz": 2762.0,
+      "dt_s": 2.2,
+      "snr_db": -25.0
+    },
+    {
+      "message": "M1DDD/P KE0QEQ EN04",
+      "freq_hz": 2415.0,
+      "dt_s": 2.1,
+      "snr_db": -9.0
+    },
+    {
+      "message": "9M2ALT WL7E CM98",
+      "freq_hz": 2489.0,
+      "dt_s": 2.1,
+      "snr_db": -24.0
+    },
+    {
+      "message": "KE5NUB KE8UOH RR73",
+      "freq_hz": 2377.0,
+      "dt_s": 2.3,
+      "snr_db": -20.0
+    },
+    {
+      "message": "KE8WAV KD9PML -05",
+      "freq_hz": 2536.0,
+      "dt_s": 2.1,
+      "snr_db": -25.0
+    }
+  ],
+  "elapsed_seconds": 84.070428292
+}

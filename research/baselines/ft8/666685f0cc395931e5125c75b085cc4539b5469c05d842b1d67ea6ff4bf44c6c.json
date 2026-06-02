@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_153558.wav",
+  "wav_sha256": "666685f0cc395931e5125c75b085cc4539b5469c05d842b1d67ea6ff4bf44c6c",
+  "decoder_identity": "jt9 (/Applications/wsjtx.app/Contents/MacOS/jt9)",
+  "decodes": [
+    {
+      "message": "K7NGS KK7O DM43",
+      "freq_hz": 2160.0,
+      "dt_s": 2.1,
+      "snr_db": 0.0
+    },
+    {
+      "message": "NA7KR WZ8DX RR73",
+      "freq_hz": 1321.0,
+      "dt_s": 2.0,
+      "snr_db": -10.0
+    },
+    {
+      "message": "KQ4CER K2AK RR73",
+      "freq_hz": 1694.0,
+      "dt_s": 2.2,
+      "snr_db": 5.0
+    },
+    {
+      "message": "CQ POTA K9DY EM69",
+      "freq_hz": 2418.0,
+      "dt_s": 1.6,
+      "snr_db": -9.0
+    },
+    {
+      "message": "KD9PML AC0QG RR73",
+      "freq_hz": 1476.0,
+      "dt_s": 0.8,
+      "snr_db": -2.0
+    },
+    {
+      "message": "WA8KQF VE3GLN FN25",
+      "freq_hz": 2621.0,
+      "dt_s": 1.8,
+      "snr_db": -1.0
+    },
+    {
+      "message": "CQ POTA KE8EOQ EM79",
+      "freq_hz": 876.0,
+      "dt_s": 2.4,
+      "snr_db": -19.0
+    },
+    {
+      "message": "KC8ZKS KN4RNO R+05",
+      "freq_hz": 1789.0,
+      "dt_s": 2.1,
+      "snr_db": -2.0
+    },
+    {
+      "message": "K3LUE K8VSY R-10",
+      "freq_hz": 1089.0,
+      "dt_s": 2.1,
+      "snr_db": -14.0
+    },
+    {
+      "message": "CQ WA4TED EM75",
+      "freq_hz": 1199.0,
+      "dt_s": 2.0,
+      "snr_db": -7.0
+    },
+    {
+      "message": "W8WH KG4OJT RR73",
+      "freq_hz": 502.0,
+      "dt_s": 2.2,
+      "snr_db": -5.0
+    },
+    {
+      "message": "K3LUE V31DL EK57",
+      "freq_hz": 1973.0,
+      "dt_s": 2.2,
+      "snr_db": -21.0
+    },
+    {
+      "message": "W0JLR W4UTZ EM95",
+      "freq_hz": 2066.0,
+      "dt_s": 2.1,
+      "snr_db": -21.0
+    },
+    {
+      "message": "<...> WB8TLI EN70",
+      "freq_hz": 1531.0,
+      "dt_s": 2.1,
+      "snr_db": -1.0
+    },
+    {
+      "message": "KK7OEA KB3DQI FM18",
+      "freq_hz": 620.0,
+      "dt_s": 2.1,
+      "snr_db": -22.0
+    },
+    {
+      "message": "KD7YOX WA5RIP EM66",
+      "freq_hz": 1455.0,
+      "dt_s": 2.0,
+      "snr_db": -12.0
+    },
+    {
+      "message": "R6OJ AA0MZ EM29",
+      "freq_hz": 2754.0,
+      "dt_s": 2.1,
+      "snr_db": -16.0
+    },
+    {
+      "message": "NG7E KO4KYM EM85",
+      "freq_hz": 2857.0,
+      "dt_s": 2.5,
+      "snr_db": -7.0
+    },
+    {
+      "message": "KC5UZI KE8IFR EM79",
+      "freq_hz": 1434.0,
+      "dt_s": 2.1,
+      "snr_db": -17.0
+    },
+    {
+      "message": "KF0FBK AA7RS -05",
+      "freq_hz": 2493.0,
+      "dt_s": 2.0,
+      "snr_db": -25.0
+    },
+    {
+      "message": "N0DOW K0LMB 73",
+      "freq_hz": 1140.0,
+      "dt_s": 2.4,
+      "snr_db": -25.0
+    },
+    {
+      "message": "KA5RBZ W9IKE EM68",
+      "freq_hz": 2315.0,
+      "dt_s": 2.0,
+      "snr_db": -7.0
+    },
+    {
+      "message": "K6HTD W4PHC EM84",
+      "freq_hz": 1879.0,
+      "dt_s": 2.2,
+      "snr_db": -21.0
+    },
+    {
+      "message": "CQ W3BJ FM27 ? a1",
+      "freq_hz": 959.0,
+      "dt_s": 1.5,
+      "snr_db": -6.0
+    },
+    {
+      "message": "VP2MAA N2UD R+16",
+      "freq_hz": 1206.0,
+      "dt_s": 1.9,
+      "snr_db": -17.0
+    },
+    {
+      "message": "K4TLJ VE9NM -12",
+      "freq_hz": 927.0,
+      "dt_s": 2.1,
+      "snr_db": -11.0
+    },
+    {
+      "message": "KB9RP AC6F +00",
+      "freq_hz": 1828.0,
+      "dt_s": 2.0,
+      "snr_db": -25.0
+    },
+    {
+      "message": "KP4TR K3FNB +11",
+      "freq_hz": 1097.0,
+      "dt_s": 2.1,
+      "snr_db": -25.0
+    },
+    {
+      "message": "CQ K7IOC CN88",
+      "freq_hz": 955.0,
+      "dt_s": 2.4,
+      "snr_db": -13.0
+    },
+    {
+      "message": "DG7SJK KD2YCK -20",
+      "freq_hz": 2348.0,
+      "dt_s": 2.0,
+      "snr_db": -22.0
+    },
+    {
+      "message": "CQ NY3H FN30",
+      "freq_hz": 1598.0,
+      "dt_s": 2.4,
+      "snr_db": -25.0
+    }
+  ],
+  "elapsed_seconds": 89.324152792
+}
