@@ -1980,6 +1980,22 @@ current_ratio: 0.051
     to filter). Journal:
     research/experiments/2026-06-01-hb-093-snr-gate.md.
 
+    SHELVED 2026-06-02 step-4 extension (iter/2026-06-02-hb-093-step4):
+    the gate was extended to `coherent_subtract_and_repass` step 4 as
+    the prior journal recommended. Sweep on hard-200 (with FP filter):
+    -3 dB → -115 rec / -39.7% elapsed; -5 dB → -45 rec / -13.6% elapsed;
+    -7 dB → -10 rec; -10 dB → 0 rec (CI [0,0]). Mechanism finding:
+    step-4 candidates have already passed the residual costas_sync_search,
+    so their per-position SNR distribution is shifted high enough that
+    the decoded-SNR floor sits between -10 and -7 dB (vs -3.7 dB at
+    joint_pair_retry). The "safe" threshold (-10 dB) fires too rarely
+    to give meaningful elapsed savings; any threshold that skips
+    meaningful work fails the [-1, +1] recall bracket badly. The gate
+    plumbing now applies at BOTH sites when set; default still None.
+    Two SHELVEs suggest the "skip LDPC at noise-only positions" play
+    has been mined out at the FT8 decoder's current shape. Journal:
+    research/experiments/2026-06-02-hb-093-step4.md.
+
 ### hb-094 — Residual denoising autoencoder pre-LDPC  [PRIORITY: 0.20 (wild), spawned 2026-05-31 from mr-008 ideation]
   mode: ft8
   status: pending
