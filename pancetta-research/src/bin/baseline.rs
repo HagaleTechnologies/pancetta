@@ -80,7 +80,7 @@ impl Args {
                 }
                 "--force" => force = true,
                 "-h" | "--help" => {
-                    eprintln!("usage: baseline --tier <fixtures|synth|curated-hard-200|curated-hard-1000|wild-50|wild-100> --mode ft8 [--jt9-path PATH] [--synth-manifest PATH] [--manifest PATH] [--force]");
+                    eprintln!("usage: baseline --tier <fixtures|synth|curated-hard-200|curated-hard-1000|wild-50|wild-100|chrono-replay> --mode ft8 [--jt9-path PATH] [--synth-manifest PATH] [--manifest PATH] [--force]");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -249,6 +249,16 @@ fn main() -> anyhow::Result<()> {
                 .map(|e| e.wav_path)
                 .collect()
         }
+        "chrono-replay" => {
+            let manifest = args.manifest.clone().unwrap_or_else(|| {
+                workspace
+                    .join("research/corpus/curated/ft8/chrono_replay.manifest.json")
+            });
+            pancetta_research::chrono_replay::load_chrono_replay_corpus(&manifest)?
+                .into_iter()
+                .map(|e| e.wav_path)
+                .collect()
+        }
         "curated-hard-200" | "curated-hard-1000" | "wild-50" | "wild-100" => {
             let label = match args.tier.as_str() {
                 "curated-hard-200" => "hard_200",
@@ -268,7 +278,7 @@ fn main() -> anyhow::Result<()> {
                 .collect()
         }
         other => anyhow::bail!(
-            "unknown tier '{other}'. Use 'fixtures', 'synth', 'curated-hard-200', 'curated-hard-1000', or 'wild-50'."
+            "unknown tier '{other}'. Use 'fixtures', 'synth', 'curated-hard-200', 'curated-hard-1000', 'wild-50', or 'chrono-replay'."
         ),
     };
     println!(
