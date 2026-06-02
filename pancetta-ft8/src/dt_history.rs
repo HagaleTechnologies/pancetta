@@ -1,4 +1,4 @@
-//! hb-057 V1: median-DT-per-callsign history + lookup trait.
+//! hb-057 V1/V2: median-DT-per-callsign history + lookup trait.
 //!
 //! See `docs/superpowers/specs/2026-05-31-hb-057-median-dt-design.md`.
 //!
@@ -19,8 +19,22 @@
 //! If no priors are available, the narrowing is a no-op (full t0 sweep
 //! preserved).
 //!
+//! # Mechanism (V2 — per-candidate callsign-keyed sync)
+//!
+//! V1 (Session 2 SHELVED) keyed the prior lookup by "callsigns decoded in
+//! THIS WAV's pass 1" — the WRONG key. The right key is "callsigns whose
+//! prior sightings predict THIS candidate's frequency." V2 (Session 3)
+//! also records the per-decode frequency_offset and exposes
+//! `priors_near_freq(freq_hz, window_hz)` so the decoder can look up
+//! candidate-specific priors at residual-sync time: for each candidate
+//! at (cand_freq, time_step), the union of nearby-callsigns' DT windows
+//! is the gate. Cold-start (no priors near the candidate) preserves
+//! the candidate.
+//!
 //! See the spec for the kill-switch diagnostic (38.6% coverage on top-20
-//! hard-200) and Phase A graduation criteria.
+//! hard-200) and Phase A graduation criteria. Prior art for the
+//! per-callsign median-DT statistic: JTDX commit "use median filter in
+//! average DT calculation" (Feb 2022).
 
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -61,6 +75,20 @@ pub trait DtPriorLookup: Send + Sync {
     /// Return the DT prior for `callsign`, or `None` if no prior is
     /// available (insufficient sightings, expired, unknown callsign).
     fn prior(&self, callsign: &str) -> Option<DtPrior>;
+
+    /// V2 (Session 3): return the union of DT priors for all callsigns
+    /// whose recent sightings were within `freq_window_hz` of
+    /// `target_freq_hz`. The decoder uses this at residual-sync time to
+    /// narrow each candidate's t0 axis by the priors of callsigns
+    /// "plausibly at this frequency" — implementing the per-candidate
+    /// callsign-keyed narrowing the V1 hook missed.
+    ///
+    /// Default impl returns an empty `Vec` (preserves backward
+    /// compatibility for impls that pre-date V2; the decoder treats
+    /// "empty" as "no narrowing" by construction).
+    fn priors_near_freq(&self, _target_freq_hz: f64, _freq_window_hz: f64) -> Vec<DtPrior> {
+        Vec::new()
+    }
 }
 
 /// In-memory reference implementation of `DtPriorLookup`.
@@ -84,6 +112,12 @@ struct DtHistoryInner {
 struct DtSighting {
     at: SystemTime,
     dt_s: f64,
+    /// V2 (Session 3): per-sighting frequency in Hz. Used by
+    /// `priors_near_freq` to gate which callsigns participate in the
+    /// per-candidate narrowing. `f64::NAN` for legacy sightings recorded
+    /// via `record(...)` (without freq), which excludes them from
+    /// `priors_near_freq` queries (they remain returned by `prior(...)`).
+    freq_hz: f64,
 }
 
 impl Default for InMemoryDtHistory {
@@ -109,9 +143,17 @@ impl InMemoryDtHistory {
         }
     }
 
-    /// Record a sighting. Evicts expired sightings for this callsign
-    /// before inserting.
+    /// Record a sighting (legacy, V1). Evicts expired sightings for this
+    /// callsign before inserting. The recorded sighting's freq is set to
+    /// NaN, which excludes it from `priors_near_freq` queries.
     pub fn record(&self, callsign: &str, dt_s: f64, at: SystemTime) {
+        self.record_with_freq(callsign, dt_s, f64::NAN, at);
+    }
+
+    /// V2 (Session 3): Record a sighting with frequency. Used by the
+    /// per-candidate callsign-keyed narrowing hook — sightings recorded
+    /// here participate in `priors_near_freq` queries.
+    pub fn record_with_freq(&self, callsign: &str, dt_s: f64, freq_hz: f64, at: SystemTime) {
         let Ok(mut g) = self.inner.lock() else {
             return;
         };
@@ -130,7 +172,7 @@ impl InMemoryDtHistory {
         if entry.len() == capacity {
             entry.pop_front();
         }
-        entry.push_back(DtSighting { at, dt_s });
+        entry.push_back(DtSighting { at, dt_s, freq_hz });
     }
 
     /// Number of callsigns currently tracked. Test/diagnostic helper.
@@ -147,6 +189,25 @@ impl InMemoryDtHistory {
     }
 }
 
+fn compute_prior_from_dts(dts: &mut [f64]) -> DtPrior {
+    dts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = dts.len();
+    let median_dt = if n % 2 == 1 {
+        dts[n / 2]
+    } else {
+        (dts[n / 2 - 1] + dts[n / 2]) / 2.0
+    };
+    // Nearest-rank quartile (fine for n ≤ 10).
+    let q1 = dts[n / 4];
+    let q3 = dts[(3 * n) / 4];
+    let iqr = (q3 - q1).abs();
+    DtPrior {
+        median_dt,
+        iqr,
+        sighting_count: n,
+    }
+}
+
 impl DtPriorLookup for InMemoryDtHistory {
     fn prior(&self, callsign: &str) -> Option<DtPrior> {
         let g = self.inner.lock().ok()?;
@@ -155,22 +216,35 @@ impl DtPriorLookup for InMemoryDtHistory {
             return None;
         }
         let mut dts: Vec<f64> = entries.iter().map(|s| s.dt_s).collect();
-        dts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let n = dts.len();
-        let median_dt = if n % 2 == 1 {
-            dts[n / 2]
-        } else {
-            (dts[n / 2 - 1] + dts[n / 2]) / 2.0
+        Some(compute_prior_from_dts(&mut dts))
+    }
+
+    /// V2: walk every tracked callsign; for each, check if ANY of its
+    /// (non-NaN) sightings is within `freq_window_hz` of
+    /// `target_freq_hz`. If yes AND that callsign meets `min_sightings`,
+    /// compute its DtPrior and add it to the result. O(N*K) where
+    /// N = tracked callsigns, K = avg sightings/callsign (≤ capacity).
+    /// On a chrono-replay session with ~50 callsigns and capacity 10,
+    /// this is ≤ 500 floats per residual candidate — negligible.
+    fn priors_near_freq(&self, target_freq_hz: f64, freq_window_hz: f64) -> Vec<DtPrior> {
+        let Ok(g) = self.inner.lock() else {
+            return Vec::new();
         };
-        // Nearest-rank quartile (fine for n ≤ 10).
-        let q1 = dts[n / 4];
-        let q3 = dts[(3 * n) / 4];
-        let iqr = (q3 - q1).abs();
-        Some(DtPrior {
-            median_dt,
-            iqr,
-            sighting_count: n,
-        })
+        let mut out = Vec::new();
+        for entries in g.entries.values() {
+            if entries.len() < g.min_sightings {
+                continue;
+            }
+            let near = entries.iter().any(|s| {
+                s.freq_hz.is_finite() && (s.freq_hz - target_freq_hz).abs() <= freq_window_hz
+            });
+            if !near {
+                continue;
+            }
+            let mut dts: Vec<f64> = entries.iter().map(|s| s.dt_s).collect();
+            out.push(compute_prior_from_dts(&mut dts));
+        }
+        out
     }
 }
 
@@ -232,5 +306,50 @@ mod tests {
         let p = h.prior("K1ABC");
         // Only the third sighting survives → below min_sightings gate
         assert!(p.is_none());
+    }
+
+    #[test]
+    fn priors_near_freq_returns_only_nearby_callsigns() {
+        // V2 (Session 3): per-candidate callsign-keyed sync test. Three
+        // callsigns recorded at distinct frequencies; query at one and
+        // verify only the matching callsign's prior comes back.
+        let h = InMemoryDtHistory::default();
+        let t = t0();
+        // K1ABC near 1000 Hz, two sightings → prior should fire.
+        h.record_with_freq("K1ABC", 0.2, 1000.0, t);
+        h.record_with_freq("K1ABC", 0.4, 1002.0, t + Duration::from_secs(15));
+        // K2XYZ near 1500 Hz, two sightings → prior fires too, but far away.
+        h.record_with_freq("K2XYZ", -0.3, 1500.0, t);
+        h.record_with_freq("K2XYZ", -0.5, 1498.0, t + Duration::from_secs(15));
+        // K3LMN near 1003 Hz, only one sighting → below gate, not returned.
+        h.record_with_freq("K3LMN", 1.2, 1003.0, t);
+
+        let near = h.priors_near_freq(1001.0, 25.0);
+        assert_eq!(near.len(), 1, "only K1ABC should fire");
+        assert!((near[0].median_dt - 0.3).abs() < 1e-9);
+
+        let none = h.priors_near_freq(2000.0, 25.0);
+        assert!(none.is_empty(), "no callsign near 2000 Hz");
+
+        let both = h.priors_near_freq(1250.0, 260.0);
+        assert_eq!(both.len(), 2, "wide window catches both K1ABC and K2XYZ");
+    }
+
+    #[test]
+    fn legacy_record_excluded_from_freq_lookup() {
+        // Sightings recorded without freq (via `record`) carry NaN and
+        // are excluded from priors_near_freq queries — this preserves
+        // backward-compat for callers that only use the V1 prior() path.
+        let h = InMemoryDtHistory::default();
+        let t = t0();
+        h.record("K1ABC", 0.2, t);
+        h.record("K1ABC", 0.4, t + Duration::from_secs(15));
+
+        // priors_near_freq returns empty (no finite-freq sightings).
+        let near = h.priors_near_freq(1000.0, 25.0);
+        assert!(near.is_empty(), "legacy-recorded sightings excluded");
+
+        // But the V1 prior() path still finds the callsign.
+        assert!(h.prior("K1ABC").is_some());
     }
 }

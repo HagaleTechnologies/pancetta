@@ -481,6 +481,16 @@ pub struct Ft8Config {
     /// for the moderate-variance bucket (IQR ≤ 0.3s) this gives a
     /// ±0.9s window, well within the diagnostic's recoverable bound.
     pub dt_history_window_iqr_scale: f64,
+
+    /// hb-057 V2 (Session 3): frequency window (Hz) for per-candidate
+    /// callsign-keyed sync narrowing. For each residual candidate at
+    /// `cand_freq`, the union of DT priors from callsigns whose recent
+    /// sightings were within ±`dt_history_freq_window_hz` of `cand_freq`
+    /// forms the t0 gate. Set to 25.0 (≈ 4 freq_bins at 6.25 Hz/bin) to
+    /// match the typical operator-frequency stability window across a
+    /// chrono-replay session. 0.0 disables V2 (falls back to V1 union-of-
+    /// prior-pass behavior, kept for back-compat).
+    pub dt_history_freq_window_hz: f64,
 }
 
 impl Default for Ft8Config {
@@ -601,6 +611,9 @@ impl Default for Ft8Config {
             dt_history_enabled: false,
             dt_history_window_floor_s: 0.2,
             dt_history_window_iqr_scale: 3.0,
+            // V2 default: 25 Hz = ~4 freq_bins. Set to 0.0 to fall back
+            // to V1 behavior (union-of-prior-pass-callsigns within-WAV).
+            dt_history_freq_window_hz: 25.0,
         }
     }
 }
@@ -2615,14 +2628,29 @@ impl Ft8Decoder {
             return Vec::new();
         }
 
-        // hb-057 V1 (Session 2): per-callsign median-DT prior narrowing.
-        // When `dt_history_enabled` AND a lookup is attached, build the
-        // union of t0-windows from priors for each callsign decoded in
-        // the prior pass (`decoded`). Filter new_candidates to those
-        // whose t0 (slot-relative seconds) lies within at least one
-        // prior window. NO-OP when no priors fire (cold-start safe);
-        // pass-1 sync is NEVER touched (this is the residual pass only).
+        // hb-057 V2 (Session 3): per-candidate callsign-keyed DT prior
+        // narrowing. When `dt_history_enabled` AND a lookup is attached
+        // AND `dt_history_freq_window_hz > 0`, for EACH residual
+        // candidate at (cand_freq_hz, time_step) query the lookup for
+        // the union of DT priors from callsigns whose recent sightings
+        // were within `freq_window_hz` of `cand_freq`. Filter the
+        // candidate's t0 against that union; keep candidates with no
+        // nearby priors (cold-start safe).
+        //
+        // This is structurally different from V1 (SHELVED 2026-06-02):
+        // V1 took the UNION over callsigns in THIS WAV's pass 1 and
+        // applied the same gate to every candidate — the wrong key, as
+        // the V1 SHELVE note diagnosed. V2 keys the lookup per candidate
+        // by frequency proximity, which is the predictable proxy for
+        // "which callsign would this candidate decode to."
+        //
+        // The V1 path (union of pass-1 callsigns) is retained when
+        // `dt_history_freq_window_hz == 0.0` for back-compat.
+        //
+        // Pass 1 is NEVER touched — this is the residual pass only.
         // Spec: docs/superpowers/specs/2026-05-31-hb-057-median-dt-design.md.
+        // Prior art: JTDX commit "use median filter in average DT
+        // calculation" (Feb 2022).
         let new_candidates: Vec<CostasCandidate> =
             if self.config.dt_history_enabled && self.dt_priors.is_some() {
                 let lookup = self.dt_priors.as_ref().expect("checked above");
@@ -2630,38 +2658,64 @@ impl Ft8Decoder {
                 let spec_step_local = sps_local / TIME_OSR;
                 let floor = self.config.dt_history_window_floor_s;
                 let scale = self.config.dt_history_window_iqr_scale;
-                // Collect prior windows from each decoded callsign with a prior.
-                let prior_windows: Vec<(f64, f64)> = decoded
-                    .iter()
-                    .filter_map(|m| m.message.from_callsign.as_deref())
-                    .filter_map(|call| {
-                        // Bare callsign (no /SUFFIX) — the diagnostic strips
-                        // suffixes when building cross-WAV history.
-                        let bare = call.split('/').next().unwrap_or(call);
-                        lookup.prior(bare)
-                    })
-                    .map(|p| {
-                        let radius = floor.max(p.iqr * scale);
-                        (p.median_dt - radius, p.median_dt + radius)
-                    })
-                    .collect();
-                if prior_windows.is_empty() {
-                    // Cold-start: no priors available. Preserve historical
-                    // behavior — pass everything through.
-                    new_candidates
-                } else {
+                let freq_window = self.config.dt_history_freq_window_hz;
+                let tone_spacing = pp.tone_spacing;
+
+                if freq_window > 0.0 {
+                    // V2: per-candidate callsign-keyed sync.
                     new_candidates
                         .into_iter()
                         .filter(|nc| {
+                            let sub_off = nc.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+                            let cand_freq = nc.freq_bin as f64 * tone_spacing + sub_off;
+                            let priors = lookup.priors_near_freq(cand_freq, freq_window);
+                            if priors.is_empty() {
+                                // Cold-start for THIS candidate's freq — keep.
+                                return true;
+                            }
                             let coarse_offset = (nc.time_step as isize
                                 - spectrogram.time_padding as isize)
                                 * spec_step_local as isize;
                             let t_s = coarse_offset as f64 / SAMPLE_RATE as f64;
-                            prior_windows
-                                .iter()
-                                .any(|(lo, hi)| t_s >= *lo && t_s <= *hi)
+                            priors.iter().any(|p| {
+                                let radius = floor.max(p.iqr * scale);
+                                let lo = p.median_dt - radius;
+                                let hi = p.median_dt + radius;
+                                t_s >= lo && t_s <= hi
+                            })
                         })
                         .collect()
+                } else {
+                    // V1 legacy path (SHELVED — retained behind
+                    // freq_window=0 for back-compat).
+                    let prior_windows: Vec<(f64, f64)> = decoded
+                        .iter()
+                        .filter_map(|m| m.message.from_callsign.as_deref())
+                        .filter_map(|call| {
+                            let bare = call.split('/').next().unwrap_or(call);
+                            lookup.prior(bare)
+                        })
+                        .map(|p| {
+                            let radius = floor.max(p.iqr * scale);
+                            (p.median_dt - radius, p.median_dt + radius)
+                        })
+                        .collect();
+                    if prior_windows.is_empty() {
+                        new_candidates
+                    } else {
+                        new_candidates
+                            .into_iter()
+                            .filter(|nc| {
+                                let coarse_offset = (nc.time_step as isize
+                                    - spectrogram.time_padding as isize)
+                                    * spec_step_local as isize;
+                                let t_s = coarse_offset as f64 / SAMPLE_RATE as f64;
+                                prior_windows
+                                    .iter()
+                                    .any(|(lo, hi)| t_s >= *lo && t_s <= *hi)
+                            })
+                            .collect()
+                    }
                 }
             } else {
                 new_candidates

@@ -182,6 +182,14 @@ impl Ft8Decoder {
         self
     }
 
+    /// hb-057 V2 (Session 3): override the frequency window (Hz) for
+    /// per-candidate callsign-keyed sync narrowing. Default 25.0. Set
+    /// to 0.0 to fall back to V1 (union-of-pass-1-callsigns) behavior.
+    pub fn with_dt_history_freq_window_hz(mut self, hz: f64) -> Self {
+        self.config.dt_history_freq_window_hz = hz;
+        self
+    }
+
     /// Override `max_decode_passes` on the wrapped config. Used by the
     /// hb-001 sweep and any future experiments that want to vary this
     /// without touching the production default.
@@ -672,16 +680,19 @@ impl DecoderUnderTest for Ft8Decoder {
                 })?,
             }
         };
-        // hb-057 V1: record each decoded (callsign, DT) into the shared
-        // history BEFORE consuming `raw`/`prelim`. The next `decode_wav`
-        // call (next WAV in this tier) will see the accumulated history.
+        // hb-057 V2 (Session 3): record each decoded (callsign, DT, freq)
+        // into the shared history BEFORE consuming `raw`/`prelim`. The
+        // next `decode_wav` call (next WAV in this tier) sees the
+        // accumulated history; the freq channel feeds the per-candidate
+        // callsign-keyed sync narrowing in
+        // `coherent_subtract_and_repass`.
         if let Some(ref h) = self.dt_history {
             let now = std::time::SystemTime::now();
             for d in raw.iter().chain(prelim.iter()) {
                 if let Some(ref call) = d.message.from_callsign {
                     let bare = call.split('/').next().unwrap_or(call);
                     if !bare.is_empty() {
-                        h.record(bare, d.time_offset, now);
+                        h.record_with_freq(bare, d.time_offset, d.frequency_offset, now);
                     }
                 }
             }

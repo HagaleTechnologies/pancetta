@@ -103,6 +103,11 @@ struct Args {
     hb057_dt_history_window_floor_s: Option<f64>,
     /// hb-057 V1: override the IQR scaling factor for the prior gate.
     hb057_dt_history_window_iqr_scale: Option<f64>,
+    /// hb-057 V2 (Session 3): frequency window (Hz) for per-candidate
+    /// callsign-keyed sync narrowing. Default 25.0 (≈ 4 freq_bins at
+    /// 6.25 Hz/bin). Set to 0.0 to fall back to V1 union-of-pass-1
+    /// callsigns behavior.
+    hb057_dt_history_freq_window_hz: Option<f64>,
     /// hb-046: enable two-stage decoding (cheap pass + standard pass, unioned).
     two_stage: Option<bool>,
     /// hb-004: when Some, an ApContext is built and passed to
@@ -185,6 +190,7 @@ impl Args {
         let mut hb057_dt_history_enabled: Option<bool> = None;
         let mut hb057_dt_history_window_floor_s: Option<f64> = None;
         let mut hb057_dt_history_window_iqr_scale: Option<f64> = None;
+        let mut hb057_dt_history_freq_window_hz: Option<f64> = None;
         let mut two_stage: Option<bool> = None;
         let mut ap_my_call: Option<String> = None;
         let mut ap_recent_calls: Option<Vec<String>> = None;
@@ -479,6 +485,15 @@ impl Args {
                             .parse()?,
                     );
                 }
+                "--hb057-dt-history-freq-window-hz" => {
+                    hb057_dt_history_freq_window_hz = Some(
+                        iter.next()
+                            .context(
+                                "--hb057-dt-history-freq-window-hz needs a value (Hz, e.g. 25.0; 0.0 disables V2)",
+                            )?
+                            .parse()?,
+                    );
+                }
                 "--two-stage" => {
                     two_stage = Some(true);
                 }
@@ -616,6 +631,7 @@ impl Args {
             hb057_dt_history_enabled,
             hb057_dt_history_window_floor_s,
             hb057_dt_history_window_iqr_scale,
+            hb057_dt_history_freq_window_hz,
             two_stage,
             ap_my_call,
             ap_recent_calls,
@@ -1451,6 +1467,9 @@ fn main() -> anyhow::Result<()> {
                 let floor = args.hb057_dt_history_window_floor_s.unwrap_or(0.2);
                 let scale = args.hb057_dt_history_window_iqr_scale.unwrap_or(3.0);
                 d = d.with_dt_history(floor, scale);
+                if let Some(hz) = args.hb057_dt_history_freq_window_hz {
+                    d = d.with_dt_history_freq_window_hz(hz);
+                }
             }
             if let Some(on) = args.two_stage {
                 d = d.with_two_stage(on);
