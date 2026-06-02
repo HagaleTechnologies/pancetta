@@ -125,6 +125,7 @@ research/corpus/curated/ft8/staged/
 # Session-2 retrain; sizes in the hundreds of MB. summary.json /
 # README.txt / *.md inside the same experiment dir DO get tracked.
 research/experiments/**/trajectories.jsonl
+research/experiments/**/trajectories_recovered.jsonl
 research/experiments/**/trajectories.npz
 research/experiments/**/trajectories.parquet
 
