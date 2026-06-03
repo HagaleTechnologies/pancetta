@@ -1868,22 +1868,54 @@ current_ratio: 0.051
 
     Source: mr-008 ideation (territory A).
 
-### hb-091 — a8-style early-decode latency reduction  [PRIORITY: 0.42, spawned 2026-05-31 from mr-008 ideation]
+### hb-091 — a8-style early-decode latency reduction  [SESSION-1-COMPLETE-SESSION-2-PENDING 2026-06-02 — PROCEED, retention(14.0s) = 97.73% on hard-200]
   mode: ft8
-  status: pending
+  status: SESSION-1-COMPLETE-SESSION-2-PENDING (truncation-feasibility kill-switch PASSED on hard-200; production wiring not yet built)
+  status_2026_06_02: |
+    Session 1 (this iter) ran the truncation-feasibility kill-switch on
+    real hard-200 WAVs. At 14.0s cutoff (= 1.0s early, the a8 sweet
+    spot per WSJT-X-Improved release notes): retention = 97.73% of full
+    recall (4830 / 4942 vs baseline), Δ = −112 (95% bootstrap CI
+    [−141, −80], significant but well under the 5% catastrophic-loss
+    floor of −247). At 0.5s early (14.5s): retention 99.29%, Δ = −35.
+    At 2.0s early (13.0s): retention 91.12% — below the 95% bar.
+
+    The recall curve has a 1s knee that matches the release-notes claim
+    ("0.5-1s earlier") exactly. Session 2 should target 1.0s early
+    (t=14.0s scoped decode); 2.0s early is past the cliff and would
+    regress recall.
+
+    PROCEED gate (≥95% retention at 14.0s + CI excludes >5% loss):
+    PASSED on both clauses.
+
+    Session 2 scope (production wiring):
+      1. add `decode_window_scoped(samples, freq_bin_range)` primitive
+         to pancetta-ft8 (restrict Costas sync to ±10 Hz around partner)
+      2. coordinator emits partial buffer at t=13.0s tagged with the
+         partner's last freq_bin; standard t=15s pass still runs after
+         (additive — no recall risk to hard-200/hard-1000)
+      3. extend loopback_qso to vary partner fade timing; measure
+         QSOs/hour with vs without a8. PROCEED to production-default-on
+         if QSOs/hr +≥10% under any fade scenario; otherwise SHELVE the
+         feature but preserve the primitive gated default-off.
+
+    Journal: research/experiments/2026-06-02-hb-091-a8-early-decode.md
+    Diagnostic: pancetta-research/examples/hb091_early_decode_diagnostic.rs
   priority_score: 0.42
-  estimated_effort: 2-3 sessions (Session 1 = design, Session 2 = partial-buffer decode primitive, Session 3 = coordinator wiring)
-  expected_delta: operational — +5-15% QSO/hr in autonomous Phase 5 under variable propagation; recall on hard-200 unchanged (different axis)
+  estimated_effort: 2-3 sessions (Session 1 = feasibility — DONE 2026-06-02; Session 2 = decoder primitive + coordinator wiring + loopback A/B)
+  expected_delta: operational — +5-15% QSO/hr in autonomous Phase 5 under variable propagation; recall on hard-200 −0 (additive design, no regression to composite)
   defensible_prior: yes — WSJT-X-Improved v3.x ships "a8" decoding technology that decodes the in-QSO station's message 0.5-1s earlier; documented in DG2YCB release notes for v3.0.0 250924
   wild_card: false
   evidence_for:
     - WSJT-X-Improved 3.0/3.1 changelog (2025-2026): "MTD 3-Stage now (partially) supports the new 'a8' decoding technology, which allows messages from the station in QSO to be displayed 0.5 to 1 second earlier."
     - For an autonomous station, 0.5-1s earlier turnaround per QSO leg increases QSOs/hour under fast-fade or QSB conditions (the partner's TX may end early; faster decode = faster RR73 = faster log).
     - pancetta's coordinator already tracks the in-QSO partner's callsign + frequency (`activeQso` state in QSO state machine). The known position makes partial-buffer decoding viable (sync isn't the limit; signal length is).
+    - **Session 1 measurement (2026-06-02)**: 14.0s truncation on hard-200 retains 97.73% of full-slot recall (Δ=−112 of 4942, 95% CI [−141, −80]). The release-notes "1s earlier" claim is mechanistically grounded — FT8 LDPC has ~1s of tail-redundancy budget at the hard-200 SNR distribution.
   evidence_against:
     - Operational target, not composite. The eval harness doesn't measure QSO/hr; need loopback simulation infrastructure to validate.
     - Partial-buffer decoding reduces LLR integration time (~13s vs ~15s) → ~0.5 dB sensitivity hit on the in-QSO partner's message. Only viable when the partner is strong (which is expected for in-QSO).
     - Requires coordinator-side plumbing (partial-buffer hook) plus decoder-side gating logic. Cross-crate change.
+    - **Session 1 measurement (2026-06-02)**: 13.0s truncation (2s early) drops retention to 91.12%, below the 95% bar. Session 2 must target 14.0s (1s early), not 13.0s.
   notes: |
     mr-007 audit: pancetta-qso has the active_qso state; pancetta-coordinator
     streams audio buffers in 15s chunks. NEW work: coordinator emits a
