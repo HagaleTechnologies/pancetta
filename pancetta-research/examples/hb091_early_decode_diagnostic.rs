@@ -125,7 +125,11 @@ fn load_baseline_messages(ws: &Path, wav_sha256: &str) -> Result<Vec<String>> {
 }
 
 /// Decode a truncated buffer and return the set of recovered jt9 truths.
-fn recovered_from_truncation(samples_full: &[f32], cutoff_samples: usize, truths: &[String]) -> u32 {
+fn recovered_from_truncation(
+    samples_full: &[f32],
+    cutoff_samples: usize,
+    truths: &[String],
+) -> u32 {
     let cut = cutoff_samples.min(samples_full.len());
     let buf = &samples_full[..cut];
     let cfg = Ft8Config::default();
@@ -282,7 +286,10 @@ fn main() -> Result<()> {
     println!("{:-<60}", "");
 
     let baseline_key = 150_i64; // 15.0s key
-    let baseline_recovered = totals.get(&baseline_key).map(|c| c.recovered_sum).unwrap_or(0);
+    let baseline_recovered = totals
+        .get(&baseline_key)
+        .map(|c| c.recovered_sum)
+        .unwrap_or(0);
 
     for &cutoff_s in TRUNCATIONS_S {
         let key = (cutoff_s * 10.0).round() as i64;
@@ -367,7 +374,10 @@ fn main() -> Result<()> {
 
     println!("== Decision rule (a8 Session-1 PROCEED gate) ==");
     println!("  PROCEED if retention(14.0s) >= 95% AND bootstrap CI excludes >5% loss");
-    println!("  i.e. CI_low > -0.05 * baseline_recovered = {:.1}", -0.05 * baseline_recovered as f64);
+    println!(
+        "  i.e. CI_low > -0.05 * baseline_recovered = {:.1}",
+        -0.05 * baseline_recovered as f64
+    );
     println!();
 
     let ci_floor = -0.05 * baseline_recovered as f64;
