@@ -143,6 +143,18 @@ struct Args {
     /// Chronological-replay tier (2026-06-01): override the default
     /// manifest path (`research/corpus/curated/ft8/chrono_replay.manifest.json`).
     chrono_replay_manifest: Option<PathBuf>,
+    /// Batch 19 (2026-06-02): cap on the number of *heavy* tier runs
+    /// that may execute concurrently across all `eval` invocations on
+    /// this host. None = unbounded (default; behaviour is unchanged).
+    /// When `Some(n)`, each heavy tier acquires one of `n` slots in a
+    /// shared file-lock pool (`/tmp/pancetta-eval-tier-slots/`, or
+    /// `--max-concurrent-tiers-pool-dir`) before running. Releases on
+    /// tier completion. Light tiers (fixtures, synth-*) run
+    /// unconditionally — see `pancetta_research::tier_slots::is_heavy_tier`.
+    max_concurrent_tiers: Option<usize>,
+    /// Override the pool directory for `--max-concurrent-tiers`. Default
+    /// is `pancetta_research::tier_slots::DEFAULT_POOL_DIR`.
+    max_concurrent_tiers_pool_dir: Option<PathBuf>,
 }
 
 impl Args {
@@ -201,6 +213,8 @@ impl Args {
         let mut chrono_replay_enabled: Option<bool> = None;
         let mut chrono_replay_capacity: Option<usize> = None;
         let mut chrono_replay_manifest: Option<PathBuf> = None;
+        let mut max_concurrent_tiers: Option<usize> = None;
+        let mut max_concurrent_tiers_pool_dir: Option<PathBuf> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -558,6 +572,26 @@ impl Args {
                             .into(),
                     );
                 }
+                "--max-concurrent-tiers" => {
+                    let raw = iter
+                        .next()
+                        .context("--max-concurrent-tiers needs a value (positive integer)")?;
+                    let n: usize = raw.parse().with_context(|| {
+                        format!("--max-concurrent-tiers value {raw:?} is not a positive integer")
+                    })?;
+                    anyhow::ensure!(
+                        n >= 1,
+                        "--max-concurrent-tiers must be >= 1 (got {n}); omit the flag to disable the guard entirely"
+                    );
+                    max_concurrent_tiers = Some(n);
+                }
+                "--max-concurrent-tiers-pool-dir" => {
+                    max_concurrent_tiers_pool_dir = Some(
+                        iter.next()
+                            .context("--max-concurrent-tiers-pool-dir needs a path")?
+                            .into(),
+                    );
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
@@ -582,6 +616,8 @@ impl Args {
                         "  --min-sync-score V: override Ft8Config::min_sync_score (default 3.0)"
                     );
                     eprintln!("  --adaptive-ldpc-iters: enable hb-022 SNR-adaptive per-candidate LDPC iterations");
+                    eprintln!("  --max-concurrent-tiers N: opt-in CPU-contention guard. Heavy tiers (hard-200/1000, chrono-replay, wild-*, hard-jt9-rich-200) acquire one of N file-lock slots in /tmp/pancetta-eval-tier-slots/ before running. Default unbounded (no guard).");
+                    eprintln!("  --max-concurrent-tiers-pool-dir PATH: override the slot-pool directory (default /tmp/pancetta-eval-tier-slots).");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -642,6 +678,8 @@ impl Args {
             chrono_replay_enabled,
             chrono_replay_capacity,
             chrono_replay_manifest,
+            max_concurrent_tiers,
+            max_concurrent_tiers_pool_dir,
         })
     }
 }
@@ -1576,8 +1614,44 @@ fn main() -> anyhow::Result<()> {
     };
     let fp_filter_ref = fp_filter.as_ref();
 
+    // Batch 19 (2026-06-02): build a tier-slot pool when --max-concurrent-tiers
+    // is set so heavy tier runs across N parallel `eval` invocations don't
+    // co-saturate CPU. The pool is a no-op for light tiers (fixtures,
+    // synth-*); see pancetta_research::tier_slots::is_heavy_tier.
+    let tier_slot_pool: Option<pancetta_research::TierSlotPool> = if let Some(n) =
+        args.max_concurrent_tiers
+    {
+        let dir = args
+            .max_concurrent_tiers_pool_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(pancetta_research::DEFAULT_POOL_DIR));
+        let pool = pancetta_research::TierSlotPool::new(&dir, n)
+            .with_context(|| format!("creating tier-slot pool (size={n}) at {}", dir.display()))?;
+        eprintln!(
+            "tier-slot: pool active (size={}, dir={}); heavy tiers will acquire one slot before running",
+            pool.size(),
+            pool.dir().display(),
+        );
+        Some(pool)
+    } else {
+        None
+    };
+
     let mut tiers = BTreeMap::new();
     for tier_name in &args.tiers {
+        // Acquire a slot before any heavy tier dispatches. Light tiers
+        // (fixtures, synth-*) skip the gate. The guard releases on drop
+        // at the end of this loop iteration (after `tiers.insert`).
+        let _tier_slot = match (
+            tier_slot_pool.as_ref(),
+            pancetta_research::is_heavy_tier(tier_name),
+        ) {
+            (Some(pool), true) => Some(
+                pool.acquire(tier_name)
+                    .with_context(|| format!("acquiring tier slot for heavy tier {tier_name}"))?,
+            ),
+            _ => None,
+        };
         match tier_name.as_str() {
             "fixtures" => {
                 let result = run_fixtures_tier(decoder.as_ref(), &workspace)?;

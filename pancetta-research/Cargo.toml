@@ -29,6 +29,10 @@ rustfft = "6.4"
 num-complex = "0.4"
 sha2 = "0.10"                            # SHA-256 for WAV cache keying in baseline binary
 tempfile = "3"                           # slot-cutting helper for Jt9Decoder; not in workspace.dependencies
+# Raw flock(2) for cross-process tier-slot semaphore (see tier_slots.rs).
+# Already transitively present in the workspace via other crates; we pin
+# it directly here so the call sites compile cleanly.
+libc = "0.2"
 
 [[bin]]
 name = "gen-synth"

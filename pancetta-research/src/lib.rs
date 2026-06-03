@@ -37,3 +37,6 @@ pub use fp_filter::FpFilter;
 
 pub mod callsign_priors;
 pub use callsign_priors::{CallsignPriorSet, PriorSourceMask, BUNDLED_COMMON_ACTIVE};
+
+pub mod tier_slots;
+pub use tier_slots::{is_heavy_tier, SlotGuard, TierSlotPool, DEFAULT_POOL_DIR};
