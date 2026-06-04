@@ -2740,9 +2740,9 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-diversity.md (entry D2).
 
-### hb-117 — AGC-diversity: re-decode at multiple synthetic gain settings  [PRIORITY: 0.28, spawned 2026-06-01 from diversity ideation]
+### hb-117 — AGC-diversity: re-decode at multiple synthetic gain settings  [SHELVED 2026-06-04 — 0/861 truth novel TPs at ±12 dB on top-20 hard-200]
   mode: ft8
-  status: pending
+  status: SHELVED — mean novel TP/WAV at ±12 dB off-baseline = 0.000 (threshold ≥ 1.0). Pancetta's dB-domain spectrogram + max-vs-max LLR + Costas-differential sync is structurally invariant to constant scaling of input audio. Total decode counts wobble slightly (gain perturbs absolute-dB FP/plausibility gates downstream of decode) but TP subset is byte-identical across -12/0/+12 dB. The hb-069 "log-domain matters" effect cited as evidence-for operates at ~0.1 dB scale (fractional bin interpolation), not at ±12 dB. Strengthens hb-092's pattern: bank entry's premise about gain non-invariance doesn't *exist* in pancetta, not just "doesn't pay off." Journal: research/experiments/2026-06-04-hb-117-agc-diversity.md.
   priority_score: 0.28
   estimated_effort: 1 session
   expected_delta: rescale WAV to {-12, 0, +12 dB} → 3 independent decode passes; vote at intersection; perturbs gain-dependent decision boundary
