@@ -22,6 +22,7 @@ use num_complex::Complex;
 use rayon::prelude::*;
 use rustfft::FftPlanner;
 use std::collections::HashSet;
+use std::ops::RangeInclusive;
 use std::time::{Instant, SystemTime};
 use tracing::{debug, info};
 
@@ -873,6 +874,36 @@ impl Ft8Decoder {
         samples: &[f32],
         ap_context: &crate::ap::ApContext,
     ) -> Ft8Result<Vec<DecodedMessage>> {
+        self.decode_window_with_ap_scoped(samples, ap_context, None)
+    }
+
+    /// Decode with default AP context but restrict the Costas sync search to
+    /// `freq_bin_range`. Used by the coordinator's t=13s partial-buffer path
+    /// (hb-091 Session 2) to scope decoding to the in-QSO partner's known
+    /// frequency.
+    pub fn decode_window_scoped(
+        &mut self,
+        samples: &[f32],
+        freq_bin_range: RangeInclusive<usize>,
+    ) -> Ft8Result<Vec<DecodedMessage>> {
+        self.decode_window_with_ap_scoped(
+            samples,
+            &crate::ap::ApContext::default(),
+            Some(freq_bin_range),
+        )
+    }
+
+    /// Decode with AP context, optionally restricting Costas sync to
+    /// `freq_bin_range`. `None` matches `decode_window_with_ap`. The scope
+    /// is applied to **all** sync passes within this call (initial sweep +
+    /// residual multipass), so latency-bounded scoped decodes never silently
+    /// spend budget searching outside the requested range.
+    pub fn decode_window_with_ap_scoped(
+        &mut self,
+        samples: &[f32],
+        ap_context: &crate::ap::ApContext,
+        freq_bin_range: Option<RangeInclusive<usize>>,
+    ) -> Ft8Result<Vec<DecodedMessage>> {
         let start_time = Instant::now();
         self.message_handler.on_window_start(SystemTime::now());
         // hb-093: reset diagnostic buffer at the start of each window.
@@ -922,8 +953,11 @@ impl Ft8Decoder {
             // decoded signals in place.
             let mut spectrogram = self.compute_spectrogram(&audio)?;
 
-            // Step 2: Find candidates via Costas sync pattern search
-            let mut sync_candidates = self.costas_sync_search(&spectrogram)?;
+            // Step 2: Find candidates via Costas sync pattern search.
+            // hb-091 Session 2: when `freq_bin_range` is Some, the Costas
+            // sweep is restricted to that bin range (additive scoped path).
+            let mut sync_candidates =
+                self.costas_sync_search(&spectrogram, freq_bin_range.as_ref())?;
 
             // On passes 2+, reduce candidate count — strong signals are already
             // decoded and subtracted, so fewer candidates need evaluation.
@@ -1157,6 +1191,7 @@ impl Ft8Decoder {
                         &mut spectrogram,
                         to_subtract,
                         energy_stop,
+                        freq_bin_range.as_ref(),
                     );
                     if extra.is_empty() {
                         break;
@@ -1833,18 +1868,31 @@ impl Ft8Decoder {
     /// 36-42, and 72-78. For each candidate (t0, f0, freq_sub), we check
     /// all 21 Costas positions and score using neighbor comparison (ft8_lib style).
     /// With freq_osr=2, we search both even and odd frequency sub-bins.
-    fn costas_sync_search(&self, spectrogram: &Spectrogram) -> Ft8Result<Vec<CostasCandidate>> {
-        self.costas_sync_search_with_threshold(spectrogram, self.config.min_sync_score)
+    fn costas_sync_search(
+        &self,
+        spectrogram: &Spectrogram,
+        freq_bin_scope: Option<&RangeInclusive<usize>>,
+    ) -> Ft8Result<Vec<CostasCandidate>> {
+        self.costas_sync_search_with_threshold(
+            spectrogram,
+            self.config.min_sync_score,
+            freq_bin_scope,
+        )
     }
 
     /// hb-082: same sync search as `costas_sync_search` but with an explicit
     /// minimum-score threshold. The residual multipass uses this with
     /// `residual_min_sync_score` so the residual's lower noise floor can
     /// surface candidates the production threshold would reject.
+    ///
+    /// hb-091 Session 2: when `freq_bin_scope` is `Some`, the Costas sweep
+    /// is clamped to the intersection of the supplied range and the natural
+    /// `MIN_FREQ_BIN..max_freq_bin` envelope. `None` preserves the full sweep.
     fn costas_sync_search_with_threshold(
         &self,
         spectrogram: &Spectrogram,
         min_score: f64,
+        freq_bin_scope: Option<&RangeInclusive<usize>>,
     ) -> Ft8Result<Vec<CostasCandidate>> {
         let mut candidates = Vec::new();
         let pp = &self.protocol_params;
@@ -1858,9 +1906,20 @@ impl Ft8Decoder {
         let max_freq_bin = spectrogram.num_bins.saturating_sub(pp.num_tones);
         let max_freq_bin = max_freq_bin.min((4000.0 / pp.tone_spacing) as usize);
 
+        // hb-091 Session 2: intersect natural envelope with the optional
+        // user-supplied scope. Empty intersection → zero iterations → zero
+        // candidates (matches the "scoped out of range" contract).
+        let (lo, hi) = match freq_bin_scope {
+            Some(range) => (
+                MIN_FREQ_BIN.max(*range.start()),
+                max_freq_bin.min(range.end().saturating_add(1)),
+            ),
+            None => (MIN_FREQ_BIN, max_freq_bin),
+        };
+
         for freq_sub in 0..spectrogram.freq_osr {
             for t0 in 0..=max_time_step {
-                for f0 in MIN_FREQ_BIN..max_freq_bin {
+                for f0 in lo..hi {
                     let score = self.compute_costas_score(spectrogram, t0, f0, freq_sub);
 
                     if score > min_score {
@@ -2553,6 +2612,11 @@ impl Ft8Decoder {
         // noise-floor proxy computed once on the ORIGINAL spectrogram
         // by the caller (so the reference is stable across rounds).
         energy_stop: Option<(f64, f64)>,
+        // hb-091 Session 2: scope to apply on the residual sync sweep.
+        // Threaded through from the top-level scoped decode call so the
+        // residual pass never silently re-searches outside the requested
+        // bin range.
+        freq_bin_scope: Option<&RangeInclusive<usize>>,
     ) -> Vec<DecodedMessage> {
         if self.config.coherent_multipass_iterations == 0 || spectrogram.complex.is_none() {
             return Vec::new();
@@ -2615,7 +2679,8 @@ impl Ft8Decoder {
             .config
             .residual_min_sync_score
             .unwrap_or(self.config.min_sync_score);
-        let Ok(new_candidates) = self.costas_sync_search_with_threshold(spectrogram, residual_min)
+        let Ok(new_candidates) =
+            self.costas_sync_search_with_threshold(spectrogram, residual_min, freq_bin_scope)
         else {
             return Vec::new();
         };
@@ -7290,6 +7355,66 @@ mod tests {
             reduction > 0.7,
             "Signal subtraction only removed {:.1}% of energy (expected >70%)",
             reduction * 100.0
+        );
+    }
+
+    // hb-091 Session 2: scoped decode primitive — restrict Costas sync to a
+    // user-supplied freq_bin range. Lets the coordinator scope the t=13s
+    // partial-buffer decode to the in-QSO partner's known frequency.
+    //
+    // Frequency model: `Ft8Modulator::new_default()` has base_frequency =
+    // BASE_FREQUENCY (1500 Hz). `modulate_symbols(symbols, freq_offset)`
+    // emits at `1500 + freq_offset` Hz. Costas freq_bins are spaced at
+    // tone_spacing = 6.25 Hz, so freq_bin = total_hz / 6.25.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn test_scoped_decode_within_range_recovers_message() {
+        // Signal at 1500 + 500 = 2000 Hz → freq_bin 320. Scope 318..=322
+        // brackets the truth with a few bins of slack.
+        let mut encoder = crate::Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = crate::Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let mut decoder = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let decoded = decoder
+            .decode_window_scoped(&tx, 318..=322)
+            .expect("decode");
+
+        assert!(
+            decoded.iter().any(|m| m.text == "CQ K5ARH EM10"),
+            "scoped decode covering the truth bin should recover CQ K5ARH EM10, got: {:?}",
+            decoded.iter().map(|m| m.text.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn test_scoped_decode_excludes_out_of_range_message() {
+        // Same signal at 2000 Hz (freq_bin 320). Scope 78..=82 covers
+        // ~500 Hz — far from the truth. Sync sweep should never reach it.
+        let mut encoder = crate::Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = crate::Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let mut decoder = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let decoded = decoder.decode_window_scoped(&tx, 78..=82).expect("decode");
+
+        assert!(
+            !decoded.iter().any(|m| m.text == "CQ K5ARH EM10"),
+            "scoped decode at ~500 Hz must NOT recover the 2000 Hz transmission, got: {:?}",
+            decoded.iter().map(|m| m.text.as_str()).collect::<Vec<_>>()
         );
     }
 }

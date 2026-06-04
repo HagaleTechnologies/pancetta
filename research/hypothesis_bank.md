@@ -1868,9 +1868,66 @@ current_ratio: 0.051
 
     Source: mr-008 ideation (territory A).
 
-### hb-091 — a8-style early-decode latency reduction  [SESSION-1-COMPLETE-SESSION-2-PENDING 2026-06-02 — PROCEED, retention(14.0s) = 97.73% on hard-200]
+### hb-091 — a8-style early-decode latency reduction  [SESSION-2-COMPLETE-SESSION-3-PENDING 2026-06-03 — PROCEED at HW=±5 bins, retention(scoped@14.0s) = 96.03% on hard-200]
   mode: ft8
-  status: SESSION-1-COMPLETE-SESSION-2-PENDING (truncation-feasibility kill-switch PASSED on hard-200; production wiring not yet built)
+  status: SESSION-2-COMPLETE-SESSION-3-PENDING (decoder primitive shipped + scoped-recall PROCEED at HW=±5 on hard-200; production coordinator wiring not yet built)
+  status_2026_06_03: |
+    Session 2 (this iter) shipped the `decode_window_scoped` /
+    `decode_window_with_ap_scoped` primitive in pancetta-ft8 (threaded
+    `Option<&RangeInclusive<usize>>` through `costas_sync_search*` and
+    `coherent_subtract_and_repass`; both passes get scoped coherently).
+    Two unit tests verify in-range recovery and out-of-range skip.
+    Pancetta-ft8 suite stays green (350+ tests).
+
+    Session 2 measurement: scoped-recall diagnostic on hard-200 with
+    jt9-truth-anchored scope centers, comparing recall(scoped @ 14.0s)
+    vs recall(full @ 15.0s).
+
+    Width-sweep results:
+      HW=±2 bins (±12.5 Hz, journal's "±10 Hz" default):
+        recall = 0.5250 / 0.5582 = 94.05% retention
+        Δ = −294, CI [−331, −261], floor = −247
+        → SHELVE (gate fails on both clauses).
+        Marginal scoping cost: −182 decodes beyond truncation alone.
+
+      HW=±5 bins (±31 Hz):
+        recall = 0.5361 / 0.5582 = 96.03% retention
+        Δ = −196, CI [−226, −167], floor = −247
+        → PROCEED (gate passes on both clauses, CI floor clears by 21).
+        Marginal scoping cost: −84 decodes beyond truncation alone.
+
+    Widening cuts marginal scoping cost by >50%, mechanistically
+    consistent with sub-bin jitter + freq_osr=2 sub-bin resolution +
+    jt9-vs-pancetta convention slack needing ≥3 bins of slack each side
+    (not a fundamental decoder cost).
+
+    Production scope width: **±5 bins (±31 Hz)** — gives ~58x compute
+    reduction vs full Costas sweep (11 of ~640 bins) at acceptable
+    recall.
+
+    Session 3 scope (production wiring):
+      3a. DSP-side partial-buffer emit at t=13s into the slot.
+      3b. Coordinator scoped-decode dispatch when activeQso is set;
+          anchor scope on partner's last frequency_offset ± 5 bins.
+          Standard t=15s pass still runs after (additive — no recall
+          risk to hard-200/hard-1000).
+      3c. Extend loopback_qso with a slot-timing model; measure
+          QSO/hr with vs without a8 under variable partner fade.
+          PROCEED to default-on if QSOs/hr +≥10% under any scenario.
+
+    Caveats:
+    - Session 2 used TRUTH-anchored scope centers (upper bound).
+      Production anchors on partner's previous decode (±2-3 Hz
+      additional jitter). Production retention is likely 95.0-95.5%
+      — still passes gate but close. Session 3c should measure
+      partner-anchored retention as part of the QSO/hr A/B.
+    - QSO/hr is the actual deployment gate. Session 2 only settled
+      RECALL feasibility.
+
+    Journal: research/experiments/2026-06-03-hb-091-session2.md
+    Diagnostic: pancetta-research/examples/hb091_session2_scoped_recall.rs
+    Primitive: pancetta-ft8::Ft8Decoder::{decode_window_scoped, decode_window_with_ap_scoped}
+
   status_2026_06_02: |
     Session 1 (this iter) ran the truncation-feasibility kill-switch on
     real hard-200 WAVs. At 14.0s cutoff (= 1.0s early, the a8 sweet
@@ -1902,7 +1959,7 @@ current_ratio: 0.051
     Journal: research/experiments/2026-06-02-hb-091-a8-early-decode.md
     Diagnostic: pancetta-research/examples/hb091_early_decode_diagnostic.rs
   priority_score: 0.42
-  estimated_effort: 2-3 sessions (Session 1 = feasibility — DONE 2026-06-02; Session 2 = decoder primitive + coordinator wiring + loopback A/B)
+  estimated_effort: 4-5 sessions total (S1 truncation-feasibility DONE 2026-06-02; S2 decoder primitive + scoped-recall PROCEED at HW=5 DONE 2026-06-03; S3 = production wiring split into 3a DSP partial-buffer + 3b coordinator dispatch + 3c loopback QSO/hr A/B)
   expected_delta: operational — +5-15% QSO/hr in autonomous Phase 5 under variable propagation; recall on hard-200 −0 (additive design, no regression to composite)
   defensible_prior: yes — WSJT-X-Improved v3.x ships "a8" decoding technology that decodes the in-QSO station's message 0.5-1s earlier; documented in DG2YCB release notes for v3.0.0 250924
   wild_card: false
