@@ -2701,9 +2701,9 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-architectural.md (entry A14).
 
-### hb-115 — Dual-KiwiSDR space-diversity LLR fusion (MRC across receivers)  [PRIORITY: 0.50, spawned 2026-06-01 from diversity ideation]
+### hb-115 — Dual-KiwiSDR space-diversity LLR fusion (MRC across receivers)  [MECHANISM-PROCEED 2026-06-04 — synthetic-noise control 4/5 ≥+30% at σ=0.16; live-paired-Kiwi capture is next plan-sized step]
   mode: ft8
-  status: pending
+  status: MECHANISM-PROCEED — synthetic kill-switch confirmed +3 dB MRC gain in marginal-decoder regime. Sample-domain MRC of two synthetic-independent-noise copies clears the ≥30%-on-3/5 bar at σ=0.16 (4/5 WAVs: +50/+0/+40/+100/+60%). The mechanism manifests only when individual decode counts are at 15-25% of baseline (cliff regime); above that range +3 dB SNR gain isn't visible because most decodes were already easy. Live-paired-Kiwi capture + sample-domain MRC wire is the plan-sized next session. Substance-check: synthetic +3 dB is an upper bound; live noise has common-mode (lightning/polar) so real gain ≤ +1.5 dB. Journal: research/experiments/2026-06-04-hb-115-mrc-killswitch.md.
   priority_score: 0.50
   estimated_effort: plan (3 sessions): harness mod + synth kill-switch + live paired-Kiwi capture
   expected_delta: 2 geographically-separated KiwiSDRs, slot-aligned; LLR-sum at shared candidates equivalent to MRC; +3 dB on independent noise
