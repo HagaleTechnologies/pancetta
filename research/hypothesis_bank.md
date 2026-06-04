@@ -783,7 +783,7 @@ current_ratio: 0.051
     Defer until multi-pass returns OR until two-stage scheduling
     (hb-046) lands and could use this as the second-stage prior.
 
-### hb-058 — `/R` and ARRL Field-Day false-decode filters  [GRADUATED (focused) 2026-05-25 — batch 10]
+### hb-058 — `/R` and ARRL Field-Day false-decode filters  [GRADUATED-PARTIAL — batch 10 shipped Contest-type rejection; /R + Field-Day deferred. Batch 29 reconfirmed 62/62 /R = FP on top-20 hard-200, 0/0 truths; /R follow-up implementation justified.]
   mode: ft8
   # Phase A bootstrap-CI retrofit (2026-06-02): small-delta graduation
   # (contest-type rejection in is_plausible); composite movement small
@@ -2281,7 +2281,7 @@ current_ratio: 0.051
 
     Source: mr-008 ideation (territory B).
 
-### hb-097 — Subtract amplitude calibration via residual-energy minimization  [PRIORITY: 0.40, spawned 2026-05-31 from mr-008 ideation]
+### hb-097 — Subtract amplitude calibration via residual-energy minimization  [MECHANISM-VALIDATED 2026-06-04 — Batch 29 I: synthetic baseline α* = 1.0 confirms line-search math; production-mechanism test deferred (needs internal subtract_decode_coherent instrumentation to measure α-drift from rotor noise)]
   mode: ft8
   status: pending
   priority_score: 0.40
@@ -2370,7 +2370,7 @@ current_ratio: 0.051
 
     Source: mr-008 ideation (territory E).
 
-### hb-100 — Synthetic interferer-pair corpus generator  [PRIORITY: 0.25, spawned 2026-05-31 from mr-008 ideation]
+### hb-100 — Synthetic interferer-pair corpus generator  [PROCEED-INFO 2026-06-04 — Batch 29 J: capture-effect threshold ~25 Hz for equal amplitude pairs; ≥25 Hz both decode; 6 dB asymmetric pairs always recover stronger A, B blocked only at Δfreq=6.25 Hz]
   mode: ft8 (corpus/eval infrastructure)
   status: pending
   priority_score: 0.25
@@ -3069,7 +3069,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-metric.md (entry M3).
 
-### hb-132 — Precision-recall AUC with FP-injection corpus  [PROCEED 2026-06-04 — Batch 28 baseline: 71% of pure-noise windows emit ≥1 CRC-passing decode; FP-AUC corpus has clear surface area] [PRIORITY: 0.38, spawned 2026-06-01 from metric ideation]
+### hb-132 — Precision-recall AUC with FP-injection corpus  [PROCEED-WITH-CAVEAT 2026-06-04 — Batch 28 baseline 71% noise FP rate; Batch 29 follow-on found 0/502 noise-FP callsigns appear in hard-200 truth → existing hb-062 callsign-continuity filter catches 100% of noise FPs. Production FP problem already solved at callsign-continuity layer; FP-AUC corpus would characterize internal decoder behavior but operational gain is bounded.] [PRIORITY: 0.38, spawned 2026-06-01 from metric ideation]
   mode: ft8 (metric/instrumentation)
   status: pending
   priority_score: 0.38
@@ -3581,7 +3581,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-corpus.md (entry C12).
 
-### hb-156 — Lid-of-band weak-signal-only tier (SNR ≤ -20 dB)  [SHIP-DEFERRED 2026-06-04 — Batch 28 — wrong-granularity filter on manifest.json mean_decoded_snr_db; needs per-truth-decode jt9 SNR aggregation]
+### hb-156 — Lid-of-band weak-signal-only tier (SNR ≤ -20 dB)  [SHIPPED 2026-06-04 — Batch 29 — lid_of_band.manifest.json with 294/300 WAVs and 2498/12291 weak truths (20.3%); ready for eval.rs tier-dispatch integration]
   mode: ft8 (corpus/eval infrastructure)
   status: pending
   priority_score: 0.45
