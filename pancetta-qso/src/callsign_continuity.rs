@@ -27,6 +27,25 @@ use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::RwLock;
 
+/// True if the message contains a token ending in `/R`, `/R1`, or `/R2`.
+/// Used by `accept()` as a pre-callsign-lookup reject: hb-058 follow-on
+/// finding (Batch 29) showed 62/62 such emissions on pure-noise + top-20
+/// hard-200 are FPs, 0 are legitimate truths on this corpus. Contest
+/// rovers exist but the operator's autonomous-personal-station profile
+/// does not run contests; reject these patterns unconditionally to keep
+/// the FP filter sharp.
+///
+/// Returns true when the message should be rejected. Matches uppercase.
+pub fn has_high_risk_fp_pattern(message: &str) -> bool {
+    let upper = message.to_uppercase();
+    for t in upper.split_whitespace() {
+        if t.ends_with("/R") || t.ends_with("/R1") || t.ends_with("/R2") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Extract bare callsign tokens from an FT8 decoded message.
 /// Returns the first 2 callsign-shaped tokens after stripping
 /// `CQ`/CQ-modifier prefixes and `/R`,`/P`,`/QRP` suffixes.
@@ -208,6 +227,14 @@ impl CallsignContinuityFilter {
     /// Always pushes the decode's callsigns into the rolling window on
     /// acceptance (or in lenient cold-start), so the window keeps growing.
     pub fn accept(&self, message: &str) -> bool {
+        // hb-058 follow-on (Batch 29): reject high-risk FP patterns (/R*)
+        // BEFORE the cold-start lenient gate. These are 100% FP on the audit
+        // corpus regardless of trust-set state, so even cold-start operators
+        // shouldn't accept them. Rover ops in contests would need a separate
+        // toggle (out of scope for this iter).
+        if has_high_risk_fp_pattern(message) {
+            return false;
+        }
         let calls = callsigns_in(message);
         // Cold-start lenient mode: accept everything until reference is big enough.
         if self.cold_start_threshold > 0 && self.reference_size() < self.cold_start_threshold {
@@ -382,6 +409,48 @@ mod tests {
     fn strict_filter_rejects_unknown_callsigns() {
         let f = CallsignContinuityFilter::new(100);
         assert!(!f.accept("CQ K1ABC FN42"));
+    }
+
+    #[test]
+    fn high_risk_fp_pattern_detects_slash_r_variants() {
+        assert!(has_high_risk_fp_pattern("K1ABC/R W9XYZ FN42"));
+        assert!(has_high_risk_fp_pattern("K1ABC/R1 W9XYZ FN42"));
+        assert!(has_high_risk_fp_pattern("K1ABC/R2 W9XYZ FN42"));
+        assert!(has_high_risk_fp_pattern("CQ K1ABC/R FN42"));
+        // Lowercase tolerated
+        assert!(has_high_risk_fp_pattern("k1abc/r w9xyz fn42"));
+        // Not /R - other suffixes pass through
+        assert!(!has_high_risk_fp_pattern("K1ABC/P W9XYZ FN42"));
+        assert!(!has_high_risk_fp_pattern("K1ABC/QRP W9XYZ FN42"));
+        assert!(!has_high_risk_fp_pattern("CQ K1ABC FN42"));
+        // Adjacent characters that aren't /R
+        assert!(!has_high_risk_fp_pattern("K1ABC R-12"));
+        assert!(!has_high_risk_fp_pattern("RR73"));
+    }
+
+    #[test]
+    fn slash_r_rejected_even_when_base_callsign_trusted() {
+        // hb-058 Batch 29 finding: /R-suffix decodes are 100% FP on the audit
+        // corpus regardless of whether the base callsign is in the trust set.
+        // Pre-callsign-lookup rejection prevents the /R FP from passing via
+        // trust-set inclusion of the base callsign.
+        let mut f = CallsignContinuityFilter::new(100);
+        f.extend_from_iter(["K1ABC", "W9XYZ"]);
+        // Base callsigns are in trust set, but the /R-suffix form is rejected.
+        assert!(!f.accept("K1ABC/R W9XYZ FN42"));
+        // Same message without /R passes (trust-set match on the base).
+        assert!(f.accept("K1ABC W9XYZ FN42"));
+    }
+
+    #[test]
+    fn slash_r_rejected_even_in_cold_start() {
+        // The /R reject runs BEFORE the cold-start lenient gate; even a
+        // brand-new operator log doesn't open the floodgates to /R FPs.
+        let f = CallsignContinuityFilter::new_lenient(100, 50);
+        // In cold-start, normal messages are accepted.
+        assert!(f.accept("CQ K1ABC FN42"));
+        // But /R is rejected even pre-threshold.
+        assert!(!f.accept("CQ K1ABC/R FN42"));
     }
 
     #[test]

@@ -783,7 +783,7 @@ current_ratio: 0.051
     Defer until multi-pass returns OR until two-stage scheduling
     (hb-046) lands and could use this as the second-stage prior.
 
-### hb-058 — `/R` and ARRL Field-Day false-decode filters  [GRADUATED-PARTIAL — batch 10 shipped Contest-type rejection; /R + Field-Day deferred. Batch 29 reconfirmed 62/62 /R = FP on top-20 hard-200, 0/0 truths; /R follow-up implementation justified.]
+### hb-058 — `/R` and ARRL Field-Day false-decode filters  [GRADUATED — Batch 30 SHIPPED /R-suffix pre-gate in pancetta-qso/src/callsign_continuity.rs::accept(); Diagnostic L validated 436 FPs eliminated / 0 TPs lost on full hard-200 (22.08% of all FPs). Field-Day blanket remains shelved (3/3 FD emissions on top-20 are TPs).]
   mode: ft8
   # Phase A bootstrap-CI retrofit (2026-06-02): small-delta graduation
   # (contest-type rejection in is_plausible); composite movement small
@@ -2448,7 +2448,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-architectural.md (entry A2).
 
-### hb-103 — Continuous trust-score FP filter (replace boolean gates)  [PRIORITY: 0.42, spawned 2026-06-01 from architectural ideation]
+### hb-103 — Continuous trust-score FP filter (replace boolean gates)  [CHARACTERIZED 2026-06-04 — Batch 30 M AUC: at 100% trust hb-062 caps at 67.3% FP reduction; remaining 33% are trusted-callsign-attached to wrong messages (message-level discrimination required). hb-103's headroom = ~90 surviving FPs on hard-200 top-20 slice, precision-only.] [PRIORITY: 0.42
   mode: ft8
   status: pending
   priority_score: 0.42
@@ -3581,7 +3581,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-corpus.md (entry C12).
 
-### hb-156 — Lid-of-band weak-signal-only tier (SNR ≤ -20 dB)  [SHIPPED 2026-06-04 — Batch 29 — lid_of_band.manifest.json with 294/300 WAVs and 2498/12291 weak truths (20.3%); ready for eval.rs tier-dispatch integration]
+### hb-156 — Lid-of-band weak-signal-only tier (SNR ≤ -20 dB)  [SHIPPED+WIRED 2026-06-04 — Batch 29 SHIPPED manifest (294/300 WAVs, 2498 weak truths); Batch 30 wired into eval.rs tier dispatch + tier_slots heavy classification; next eval run produces lid-of-band entry in main.json]
   mode: ft8 (corpus/eval infrastructure)
   status: pending
   priority_score: 0.45

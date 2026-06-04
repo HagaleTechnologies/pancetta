@@ -596,7 +596,7 @@ impl Args {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
                     );
-                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, synth-pair-200, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50, hard-jt9-rich-200, chrono-replay");
+                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, synth-pair-200, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50, hard-jt9-rich-200, lid-of-band, chrono-replay");
                     eprintln!("  --max-passes: override Ft8Config::max_decode_passes (default 3)");
                     eprintln!("  --max-sync-candidates: override Ft8Config::max_sync_candidates (default 200)");
                     eprintln!(
@@ -1699,12 +1699,18 @@ fn main() -> anyhow::Result<()> {
                     run_synth_pair_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
                 tiers.insert("synth-pair-200".to_string(), result);
             }
-            "curated-hard-200" | "curated-hard-1000" | "wild-50" | "wild-100" => {
+            "curated-hard-200" | "curated-hard-1000" | "wild-50" | "wild-100" | "lid-of-band" => {
                 let label = match tier_name.as_str() {
                     "curated-hard-200" => "hard_200",
                     "curated-hard-1000" => "hard_1000",
                     "wild-50" => "wild_50",
                     "wild-100" => "wild_100",
+                    // hb-156 (Batch 29): weak-signal-only subset filtered from
+                    // hard_200 + wild_100 by per-truth jt9 SNR ≤ -19 dB. Each
+                    // entry annotated with `min_truth_snr_db` and
+                    // `n_truths_at_or_below_threshold`; tier evaluates pancetta
+                    // on the operationally hardest slice of FT8 decoding.
+                    "lid-of-band" => "lid_of_band",
                     _ => unreachable!(),
                 };
                 let manifest = workspace

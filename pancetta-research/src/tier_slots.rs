@@ -253,6 +253,9 @@ pub fn is_heavy_tier(tier_name: &str) -> bool {
             | "wild-doppler-50"
             | "hard-jt9-rich-200"
             | "chrono-replay"
+            // hb-156 (Batch 29): weak-signal subset of hard-200 + wild-100;
+            // same curated-tier runtime profile so classified heavy.
+            | "lid-of-band"
     )
 }
 
@@ -354,6 +357,7 @@ mod tests {
         assert!(is_heavy_tier("wild-50"));
         assert!(is_heavy_tier("wild-100"));
         assert!(is_heavy_tier("wild-doppler-50"));
+        assert!(is_heavy_tier("lid-of-band"));
 
         // Light tiers: regression/synthetic, NOT gated.
         assert!(!is_heavy_tier("fixtures"));
