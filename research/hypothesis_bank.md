@@ -1868,9 +1868,61 @@ current_ratio: 0.051
 
     Source: mr-008 ideation (territory A).
 
-### hb-091 — a8-style early-decode latency reduction  [SESSION-2-COMPLETE-SESSION-3-PENDING 2026-06-03 — PROCEED at HW=±5 bins, retention(scoped@14.0s) = 96.03% on hard-200]
+### hb-091 — a8-style early-decode latency reduction  [SESSION-3-MECHANISM-CONFIRMED 2026-06-04 — scoped reliably saves wall-clock at p95/p99 (M4: -1.4s); PROCEED to S3 production wiring]
   mode: ft8
-  status: SESSION-2-COMPLETE-SESSION-3-PENDING (decoder primitive shipped + scoped-recall PROCEED at HW=±5 on hard-200; production coordinator wiring not yet built)
+  status: SESSION-3-MECHANISM-CONFIRMED (S2 recall feasibility PROCEED + S3 latency-mechanism diagnostic PROCEED; coordinator wiring + loopback QSO/hr A/B remaining)
+  status_2026_06_04: |
+    Session 3 mechanism diagnostic — built generic
+    `decode_latency_profile` (pancetta-research/examples/) to measure
+    decoder wall-clock distribution; reports hardware context and is
+    reusable for future hardware-tier baseline work.
+
+    LOAD-BEARING ARCHITECTURAL FACT (missed by S1/S2 journal): pancetta's
+    DSP already fires decode at t=13.0s into the slot
+    (pancetta/src/coordinator/dsp.rs:217-220, 363-365), not at slot-end.
+    The 15s window includes slot N-1's last 2s + slot N's first 13s, full
+    FT8 message contained. WSJT-X-Improved a8's "1s earlier" framing
+    doesn't translate to "fire earlier" for pancetta — already there.
+
+    What DOES translate: scoped decode is ~3× faster per call, and full
+    decode's wall-clock TAIL on hard-200 reliably busts the slot deadline
+    on M4 Mac Mini (10-core Apple Silicon, the reference machine):
+
+      full   p50=862ms  p90=1980ms  p95=2132ms  p99=2332ms  max=2446ms
+      scoped p50=329ms  p90=605ms   p95=712ms   p99=866ms   max=917ms
+
+    Pancetta fires at t=13.0; next-slot TX boundary is t=15.0 (2000ms
+    slack). Full p95=2132ms completes at t=15.13 (130ms LATE); full
+    p99=2332ms is 330ms late. Scoped p99=866ms completes at t=13.87
+    with 1130ms slack — comfortably inside the budget.
+
+    Operational mechanism is NOT "decode 1s earlier" but "reliably
+    decode within slot budget." TX scheduler's tx_late_max_ms=8s
+    skip-ahead-cursoring recovers late-firings but truncates leading
+    symbols (degrades receiving-end decode rate). Scoped fast-path
+    eliminates this risk class.
+
+    PROCEED to Session 3 production wiring:
+      3b. Coordinator scoped fast-path on activeQso (anchor at partner's
+          last frequency_offset ± 5 bins), runs FIRST. Standard ft8_lib
+          + native full decode runs SECOND as authoritative. Gate behind
+          coordinator.scoped_fast_path config flag (default off).
+      3c. Loopback A/B with slot-timing model + variable fade scenarios.
+          Default-on requires QSOs/hr +≥10% in some scenario.
+
+    Session 3a (DSP partial-buffer emit) is NOT needed — pancetta's DSP
+    already does this. The journal's S3 scope simplifies.
+
+    BROADER VALUE: the latency-profile diagnostic establishes the M4
+    Mac Mini baseline. Suggested follow-ups:
+      - Run on operator's Windows 11 MiniPC (Phase 5 target hardware).
+      - Build a tier classifier (startup-time wall-clock measurement →
+        decoder config presets keyed to measured p95).
+      - Extend to vary decoder config + plot Pareto (recall, p95 ms).
+
+    Journal: research/experiments/2026-06-04-hb-091-session3-mechanism.md
+    Diagnostic: pancetta-research/examples/decode_latency_profile.rs
+
   status_2026_06_03: |
     Session 2 (this iter) shipped the `decode_window_scoped` /
     `decode_window_with_ap_scoped` primitive in pancetta-ft8 (threaded
