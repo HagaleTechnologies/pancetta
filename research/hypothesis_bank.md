@@ -2253,7 +2253,7 @@ current_ratio: 0.051
 
     Source: mr-008 ideation (territory D); arXiv:2502.16371.
 
-### hb-096 — Adaptive multipass termination by decode-count delta  [PRIORITY: 0.32, spawned 2026-05-31 from mr-008 ideation]
+### hb-096 — Adaptive multipass termination by decode-count delta  [SHELVED 2026-06-04 — Batch 28 — multipass=2 adds raw +1.30 decodes/WAV but truth-matched +0.00 TPs/WAV; confirms hb-031]
   mode: ft8
   status: pending
   priority_score: 0.32
@@ -2758,7 +2758,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-diversity.md (entry D3).
 
-### hb-118 — IQ-pair-diversity from one KiwiSDR: USB + LSB simultaneous  [PRIORITY: 0.20 (wild), spawned 2026-06-01 from diversity ideation]
+### hb-118 — IQ-pair-diversity from one KiwiSDR: USB + LSB simultaneous  [SHELVED 2026-06-04 — Batch 28 spectral-mirror proxy: 0 novel TPs on 20 hard-200 WAVs; decoder internal filtering rejects mirror cleanly]
   mode: ft8
   status: pending
   priority_score: 0.20
@@ -2838,9 +2838,9 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-diversity.md (entry D7).
 
-### hb-122 — Multi-sync-window LLR average (intra-decoder algorithmic diversity)  [PRIORITY: 0.40, spawned 2026-06-01 from diversity ideation]
+### hb-122 — Multi-sync-window LLR average (intra-decoder algorithmic diversity)  [SHELVED 2026-06-04 — Batch 28 — config-diversity proxy shows union-vs-max lift +16.7% RAW but +0.0% TRUTH-MATCHED on top-20 hard-200]
   mode: ft8
-  status: pending
+  status: SHELVED — 9-config sweep (max_sync_candidates ∈ {200,300,400} × ldpc_iterations ∈ {50,100,200}) showed +16.7% raw decode-union lift over best individual config (19/20 WAVs). Truth-intersected: identical TP sets across all configs (0/20 WAVs with ≥+5% lift). The raw lift is 100% FP variation — configs find the same TPs but different FPs. LLR-averaging across configs at this granularity cannot surface new TPs. Multi-sync-window diversity would need a structurally different signal-extraction primitive, not a config sweep. Journal: research/experiments/2026-06-04-batch-28.md (Diagnostic A).
   priority_score: 0.40
   estimated_effort: 1 session kill-switch; 1 plan
   expected_delta: 3 parallel demods with different sync-window placements (Costas-only, prefix+Costas, full+postfix); average LLRs pre-LDPC
@@ -3031,7 +3031,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-metric.md (entry M1).
 
-### hb-130 — Operational-value-weighted recall  [PRIORITY: 0.40, spawned 2026-06-01 from metric ideation]
+### hb-130 — Operational-value-weighted recall  [WEAK-SHELVE-ON-HARD-200 2026-06-04 — Batch 28 — 92.1% NA+EU truths; 8% DX mass insufficient to reorder hypothesis rankings on this corpus]
   mode: ft8 (metric/instrumentation)
   status: pending
   priority_score: 0.40
@@ -3069,7 +3069,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-metric.md (entry M3).
 
-### hb-132 — Precision-recall AUC with FP-injection corpus  [PRIORITY: 0.38, spawned 2026-06-01 from metric ideation]
+### hb-132 — Precision-recall AUC with FP-injection corpus  [PROCEED 2026-06-04 — Batch 28 baseline: 71% of pure-noise windows emit ≥1 CRC-passing decode; FP-AUC corpus has clear surface area] [PRIORITY: 0.38, spawned 2026-06-01 from metric ideation]
   mode: ft8 (metric/instrumentation)
   status: pending
   priority_score: 0.38
@@ -3581,7 +3581,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-corpus.md (entry C12).
 
-### hb-156 — Lid-of-band weak-signal-only tier (SNR ≤ -20 dB)  [PRIORITY: 0.45, spawned 2026-06-01 from corpus ideation]
+### hb-156 — Lid-of-band weak-signal-only tier (SNR ≤ -20 dB)  [SHIP-DEFERRED 2026-06-04 — Batch 28 — wrong-granularity filter on manifest.json mean_decoded_snr_db; needs per-truth-decode jt9 SNR aggregation]
   mode: ft8 (corpus/eval infrastructure)
   status: pending
   priority_score: 0.45
@@ -3965,7 +3965,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-cross-time.md (entry T1).
 
-### hb-174 — Within-session DT-and-frequency drift model per callsign (hb-057 extension)  [PRIORITY: 0.40, spawned 2026-06-01 from cross-time ideation]
+### hb-174 — Within-session DT-and-frequency drift model per callsign (hb-057 extension)  [SHELVED-ON-HARD-200 2026-06-04 — Batch 28 — median Δfreq=1269 Hz Δdt=0.500 s on 767 callsigns; corpus is non-contiguous; re-test on within-session contiguous capture] [PRIORITY: 0.40, spawned 2026-06-01 from cross-time ideation]
   mode: ft8 (cross-time / sync)
   status: pending
   priority_score: 0.40
