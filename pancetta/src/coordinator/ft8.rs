@@ -54,6 +54,16 @@ impl super::ApplicationCoordinator {
         // Shared AP state updated by the QSO component
         let active_qso_ap = self.active_qso_ap.clone();
 
+        // hb-091 scoped fast-path: shared partner-freq state. When Some,
+        // and `PANCETTA_SCOPED_FAST_PATH=1` is set, the FT8 thread runs
+        // a scoped Costas search at the partner's freq_bin BEFORE the
+        // standard ft8_lib + native decode. Scoped completes in
+        // ~329ms p50 / ~866ms p99 on M4 reference hardware (vs full
+        // p50=862ms / p99=2332ms), reliably finishing inside the slot
+        // budget. Standard pipeline still runs after as the
+        // authoritative result; the QSO state machine deduplicates.
+        let active_qso_freq_hz = self.active_qso_freq_hz.clone();
+
         // hb-062: shared FP filter (Option<Arc<...>>). When Some, applied
         // between decode-merge and broadcast loop. None = no filtering.
         let fp_filter = self.fp_filter.clone();
@@ -130,6 +140,76 @@ impl super::ApplicationCoordinator {
                             }
                             Err(e) => {
                                 warn!("Waterfall generation error: {}", e);
+                            }
+                        }
+
+                        // hb-091 scoped fast-path: when activeQso is set
+                        // and PANCETTA_SCOPED_FAST_PATH=1, run a scoped
+                        // Costas search at the partner's freq_bin BEFORE
+                        // the standard pipeline. ~3× faster wall-clock
+                        // (p99 866ms vs 2332ms on M4 reference); reliably
+                        // completes inside the 2s slot budget so the QSO
+                        // state machine advances before the next slot's
+                        // TX boundary. Standard pipeline still runs after
+                        // as the authoritative result; the QSO state
+                        // machine deduplicates by verifying
+                        // from_station == expected DX callsign per
+                        // is_message_relevant.
+                        const SCOPED_HALF_WIDTH: usize = 5;
+                        let scoped_fast_path_enabled =
+                            std::env::var("PANCETTA_SCOPED_FAST_PATH").as_deref() == Ok("1");
+                        let scoped_decodes: Vec<pancetta_ft8::DecodedMessage> =
+                            if scoped_fast_path_enabled {
+                                let partner_freq_hz =
+                                    active_qso_freq_hz.read().ok().and_then(|g| *g);
+                                if let Some(freq_hz) = partner_freq_hz {
+                                    let center = (freq_hz / 6.25).round() as usize;
+                                    let lo = center.saturating_sub(SCOPED_HALF_WIDTH);
+                                    let hi = center.saturating_add(SCOPED_HALF_WIDTH);
+                                    decoder
+                                        .decode_window_scoped(&window, lo..=hi)
+                                        .unwrap_or_default()
+                                } else {
+                                    Vec::new()
+                                }
+                            } else {
+                                Vec::new()
+                            };
+
+                        // Tag scoped decodes with slot parity (same
+                        // derivation as the standard pipeline below) and
+                        // fire them at the QSO state machine immediately.
+                        // The QSO state machine handles duplicates of
+                        // already-consumed messages by rejecting them at
+                        // is_message_relevant (state has already advanced).
+                        if !scoped_decodes.is_empty() {
+                            let scoped_slot_start =
+                                window_received_utc - chrono::Duration::seconds(13);
+                            let scoped_parity =
+                                pancetta_core::slot::SlotParity::of(scoped_slot_start);
+                            for mut decoded_msg in scoped_decodes {
+                                decoded_msg.slot_parity = Some(scoped_parity);
+                                info!(
+                                    "FT8 scoped fast-path: {} (SNR: {:.0}, freq: {:.1})",
+                                    decoded_msg.text,
+                                    decoded_msg.snr_db,
+                                    decoded_msg.frequency_offset
+                                );
+                                let qso_msg = ComponentMessage::new(
+                                    ComponentId::Ft8Decoder,
+                                    ComponentId::Qso,
+                                    MessageType::DecodedMessage(decoded_msg),
+                                    Instant::now(),
+                                );
+                                let bus = message_bus.clone();
+                                rt.spawn(async move {
+                                    if let Err(e) = bus.send_message(qso_msg).await {
+                                        debug!(
+                                            "Failed to forward scoped fast-path decode to QSO: {}",
+                                            e
+                                        );
+                                    }
+                                });
                             }
                         }
 

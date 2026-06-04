@@ -1868,9 +1868,62 @@ current_ratio: 0.051
 
     Source: mr-008 ideation (territory A).
 
-### hb-091 — a8-style early-decode latency reduction  [SESSION-3-MECHANISM-CONFIRMED 2026-06-04 — scoped reliably saves wall-clock at p95/p99 (M4: -1.4s); PROCEED to S3 production wiring]
+### hb-091 — a8-style early-decode latency reduction  [SESSION-3-COMPLETE 2026-06-04 — SHELVE-default-on on M4 (best ratio 1.05x < +10% gate); gated infrastructure shipped, ready for MiniPC tier]
   mode: ft8
-  status: SESSION-3-MECHANISM-CONFIRMED (S2 recall feasibility PROCEED + S3 latency-mechanism diagnostic PROCEED; coordinator wiring + loopback QSO/hr A/B remaining)
+  status: SESSION-3-COMPLETE-SHELVE-DEFAULT-ON (gated production infrastructure shipped behind PANCETTA_SCOPED_FAST_PATH=1 env var; default-on awaiting MiniPC tier characterization)
+  status_2026_06_04_s3bc: |
+    Session 3 completed: shipped gated coordinator scoped fast-path +
+    QSO/hr A/B simulation. Result: SHELVE default-on on M4 reference;
+    KEEP env-var-gated infrastructure for hardware tiers that need it.
+
+    S3b coordinator wiring (all gated default-off):
+      - `active_qso_freq_hz: Arc<RwLock<Option<f64>>>` shared state
+        (pancetta/src/coordinator/mod.rs).
+      - QSO state-change handler in coordinator/qso.rs writes the
+        partner's audio freq from `QsoState::frequency()` on in-QSO
+        states; clears on QsoCompleted.
+      - FT8 component (coordinator/ft8.rs) checks PANCETTA_SCOPED_FAST_PATH=1
+        env var. When enabled AND active_qso_freq_hz is Some, runs
+        `decode_window_scoped` with center=round(freq_hz/6.25),
+        range ±5 bins BEFORE standard ft8_lib + native pipeline.
+        Forwards hits to QSO bus immediately; standard pipeline runs
+        unchanged after. QSO state machine deduplicates via
+        is_message_relevant.
+      - HALF_WIDTH=5 per Session 2's width-sweep (96.03% retention).
+
+    S3c QSO/hr A/B (pancetta-research/examples/hb091_qso_per_hour_ab.rs):
+    Monte Carlo using the S3 latency-profile distribution. Per QSO:
+    4 legs; per leg: sample decode_ms from arm's distribution;
+    tx_late = max(0, decode_ms - 2000ms); fade scenario maps tx_late
+    → partner decode-fail probability; up to 3 retries per leg.
+    2000 trials per (arm, scenario).
+
+    M4 Mac Mini results (best ratio observed: 1.05x):
+      | scenario | full QSO/hr | scoped QSO/hr | ratio |
+      |---|---|---|---|
+      | no-fade  | 30.00 | 30.00 | 1.00x |
+      | moderate | 29.44 | 30.00 | 1.02x |
+      | heavy    | 28.68 | 30.00 | 1.05x |
+
+    No scenario clears the +10% gate on M4. AUTO-DECISION: SHELVE
+    default-on. Honest framing: M4's full distribution is fast enough
+    that even p99 busts (446ms over budget) drive only ~5% QSO/hr
+    cost under heavy fade.
+
+    BROADER VALUE / next step: the user's framing — "people may run
+    on minimal hardware" — is now the load-bearing question. On lower-
+    tier hardware (operator's Windows 11 MiniPC, Phase 5 target) the
+    full distribution shifts right; bust rate compounds; scoped's
+    relative win grows. Concrete next step: run decode_latency_profile
+    on MiniPC, plug new percentiles into qso_per_hour_ab constants,
+    re-run. If MiniPC clears +10%, flip env-var per-tier (via runbook
+    recommendation or hardware-detection startup check).
+
+    Journal: research/experiments/2026-06-04-hb-091-session3-production.md
+    Coordinator wiring: pancetta/src/coordinator/{mod,qso,ft8}.rs
+    A/B sim: pancetta-research/examples/hb091_qso_per_hour_ab.rs
+
+  status_2026_06_04: |
   status_2026_06_04: |
     Session 3 mechanism diagnostic — built generic
     `decode_latency_profile` (pancetta-research/examples/) to measure

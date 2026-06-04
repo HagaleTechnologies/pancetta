@@ -62,6 +62,7 @@ impl super::ApplicationCoordinator {
         let qso_lookup = self.cached_lookup.clone();
         let cqdx_bridge = self.cqdx_bridge.clone();
         let active_qso_ap = self.active_qso_ap.clone();
+        let active_qso_freq_hz = self.active_qso_freq_hz.clone();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
@@ -277,6 +278,7 @@ impl super::ApplicationCoordinator {
                 let tx_shutdown = shutdown.clone();
                 let tx_callsign = our_callsign.clone();
                 let ap_state = active_qso_ap;
+                let qso_freq_state = active_qso_freq_hz;
                 let snapshot_qso_manager = qso_manager.clone();
                 let snapshot_bus = tx_bus.clone();
                 tokio::spawn(async move {
@@ -316,6 +318,19 @@ impl super::ApplicationCoordinator {
                                 };
                                 if let Ok(mut guard) = ap_state.write() {
                                     *guard = new_ap;
+                                }
+
+                                // hb-091 scoped fast-path: mirror the AP
+                                // update with the partner's audio freq.
+                                // `QsoState::frequency()` returns Some for
+                                // the in-QSO states and None for Idle /
+                                // Failed / Completed.
+                                if let Ok(mut guard) = qso_freq_state.write() {
+                                    *guard = if new_state.is_active() {
+                                        new_state.frequency()
+                                    } else {
+                                        None
+                                    };
                                 }
 
                                 // Push an updated snapshot of in-progress
@@ -380,6 +395,10 @@ impl super::ApplicationCoordinator {
                             Ok(pancetta_qso::QsoEvent::QsoCompleted { metadata, .. }) => {
                                 // Clear AP state on QSO completion
                                 if let Ok(mut guard) = ap_state.write() {
+                                    *guard = None;
+                                }
+                                // hb-091: also clear the partner freq.
+                                if let Ok(mut guard) = qso_freq_state.write() {
                                     *guard = None;
                                 }
                                 // Push fresh snapshot so the banner drops

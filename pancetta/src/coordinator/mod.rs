@@ -123,6 +123,13 @@ pub struct ApplicationCoordinator {
     /// Updated by the QSO component, read by the FT8 decoder thread.
     active_qso_ap: std::sync::Arc<std::sync::RwLock<Option<pancetta_ft8::QsoAp>>>,
 
+    /// hb-091 scoped fast-path: most recent active QSO partner's audio
+    /// frequency in Hz. Updated by the QSO component alongside
+    /// `active_qso_ap`; read by the FT8 decoder thread to scope an
+    /// early scoped decode pass at the partner's known location.
+    /// `None` when no QSO is active.
+    active_qso_freq_hz: std::sync::Arc<std::sync::RwLock<Option<f64>>>,
+
     /// hb-062 FP filter: applied between decode merge and broadcast in the
     /// FT8 thread. None = filter disabled (default). When enabled, drops
     /// decodes whose extracted callsigns don't appear in operator-ADIF +
@@ -336,6 +343,7 @@ impl ApplicationCoordinator {
             cqdx_bridge: None,
             waterfall_to_auto_tx: None,
             active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            active_qso_freq_hz: std::sync::Arc::new(std::sync::RwLock::new(None)),
             fp_filter: None,
             cross_time_state: std::sync::Arc::new(pancetta_qso::CrossTimeState::empty()),
             tui_relay_handle: None,
