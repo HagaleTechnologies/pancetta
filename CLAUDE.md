@@ -67,6 +67,17 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
   Plans 1-3 complete; the loop is operational. Run `./scripts/research-env.sh --status`
   to see active experiments; read `research/hypothesis_bank.md` for the
   current backlog.
+- **Hardware-tier auto-classification** (`pancetta/src/coordinator/tier.rs`,
+  hb-216 S2): on coordinator startup, the host is classified into
+  Fast / Moderate / Slow via a background `probe_hardware_tier(10)` call
+  (or a cache hit from `~/.pancetta/tier_cache.json` keyed on
+  `(cpu_model, core_count, pancetta_version)`). Moderate/Slow tiers
+  flip the `scoped_fast_path: Arc<AtomicBool>` (replaces the old
+  env-var read in the FT8 hot loop); Slow tier additionally rewrites
+  the shared `Ft8Config` to `max_decode_passes = 1`,
+  `osd_depth = Some(1)`. Operator override: `PANCETTA_SCOPED_FAST_PATH=1`
+  forces on, `=0` forces off, both skip the tier-driven preset. Spec:
+  `docs/superpowers/specs/2026-06-04-hb-216-s2-tier-wiring-design.md`.
 - **QSO sender verification**: The QSO state machine (`pancetta-qso/src/qso_manager.rs::determine_state_transition` and `is_message_relevant`) verifies `from_station == expected DX callsign` on every state-advance. Mismatches are logged at `warn!` level (`target: "qso.security"`) and discarded. Frequency tolerance is 15 Hz. The autonomous responder (`autonomous.rs`) tracks per-callsign response timestamps in `recently_responded_to` and skips CQs from callsigns it responded to within the last 60s. Both defenses landed 2026-04-29 in response to Security Review C-1 and I-1; see `docs/security-review-2026-04-29.md`.
 
 ## Development Phases (End-to-End QSO Initiative)

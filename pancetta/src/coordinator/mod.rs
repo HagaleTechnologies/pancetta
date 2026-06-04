@@ -27,6 +27,7 @@ mod pipeline;
 mod psk_reporter;
 mod qso;
 mod shutdown;
+mod tier;
 mod tui_relay;
 mod tx;
 mod util;
@@ -36,7 +37,7 @@ pub use tx::{schedule_tx, TxSchedule};
 
 use anyhow::Result;
 use pancetta_config::Config;
-use pancetta_ft8::Ft8Decoder;
+use pancetta_ft8::{Ft8Config, Ft8Decoder};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -156,6 +157,20 @@ pub struct ApplicationCoordinator {
     message_count: Arc<std::sync::atomic::AtomicU64>,
     last_audio_timestamp: Arc<RwLock<Option<Instant>>>,
     last_decode_timestamp: Arc<RwLock<Option<Instant>>>,
+
+    /// hb-216 S2 — scoped-fast-path activation flag. Seeded from
+    /// `PANCETTA_SCOPED_FAST_PATH` env var at startup; rewritten by the
+    /// hardware-tier probe (background) when it lands. The FT8 hot loop
+    /// reads this with a relaxed load each window iteration in lieu of
+    /// the prior env-var probe.
+    pub(crate) scoped_fast_path: Arc<AtomicBool>,
+
+    /// hb-216 S2 — shared decoder config the FT8 thread reads on each
+    /// window iteration. The tier probe may rewrite Slow-tier presets
+    /// (`max_decode_passes=1`, `osd_depth=Some(1)`) once it classifies
+    /// the host; the FT8 thread rebuilds its decoder when the
+    /// `(max_decode_passes, osd_depth)` tuple changes.
+    pub(crate) ft8_config: Arc<RwLock<Ft8Config>>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -313,6 +328,14 @@ impl ApplicationCoordinator {
         // Wrap config in Arc<RwLock> for hot-reloading
         let config = Arc::new(RwLock::new(config));
 
+        // hb-216 S2: shared FT8 decoder config + scoped-fast-path atomic.
+        // `tier::initialize` seeds the atomic from env, reads the on-disk
+        // cache if present, and spawns a background probe on cache miss.
+        // The FT8 hot loop reads both fields without blocking on probe
+        // completion.
+        let ft8_config = Arc::new(RwLock::new(Ft8Config::default()));
+        let scoped_fast_path = tier::initialize(ft8_config.clone()).await;
+
         let coordinator = Self {
             id,
             config,
@@ -355,6 +378,8 @@ impl ApplicationCoordinator {
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(RwLock::new(None)),
             last_decode_timestamp: Arc::new(RwLock::new(None)),
+            scoped_fast_path,
+            ft8_config,
         };
 
         info!("Application Coordinator initialized with ID: {}", id);

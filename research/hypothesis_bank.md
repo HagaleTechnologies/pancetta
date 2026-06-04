@@ -5749,9 +5749,9 @@ search to in-repo sources.
   scorecard: research/scorecards/history/2026-05-21-fix-r-signal-report.json
   journal: research/experiments/2026-05-21-fix-r-signal-report.md
 
-### hb-216 — Hardware-tier classifier (runtime decoder-budget probe → adaptive config presets)  [PRIORITY: 0.50, spawned 2026-06-04 from hb-091 S3 follow-on]
+### hb-216 — Hardware-tier classifier (runtime decoder-budget probe → adaptive config presets)  [SESSION-2-COMPLETE 2026-06-04 — coordinator wiring shipped: background probe + cache + atomic + Slow-tier Ft8Config rewrite, M4 verified Fast → defaults unchanged]
   mode: ft8 / infrastructure
-  status: pending (this iter ships the probe + classifier; per-tier config plumbing is next)
+  status: SESSION-2-COMPLETE — production wiring shipped. S1 = probe + classifier module (1c40954). S2 = coordinator initialize + on-disk cache + scoped_fast_path AtomicBool + Slow-tier Ft8Config rewrite + FT8 hot loop decoder rebuild on config change. Threshold tuning (cross-hardware data) is the next data-driven follow-on.
   priority_score: 0.50
   estimated_effort: 1-2 sessions (S1 probe + classifier shipped; S2 = wire into coordinator startup + per-tier config selection)
   expected_delta: operational — enables adaptive decoder behavior on lower-tier hardware (MiniPCs, ARMv7) so users with constrained CPU budget still complete QSOs reliably without manually setting env vars
@@ -5792,4 +5792,6 @@ search to in-repo sources.
     Tier-threshold tuning is data-driven: as we collect latency profiles on
     diverse hardware (MiniPC, ARMv7, etc.), refine the Fast/Moderate/Slow
     boundaries to match empirical bust-rate-vs-QSO/hr A/B results from each tier.
-  journal: research/experiments/2026-06-04-hb-216-tier-classifier.md (to follow)
+  journal:
+    - research/experiments/2026-06-04-hb-216-tier-classifier.md (S1 — probe + classifier)
+    - research/experiments/2026-06-04-hb-216-session2.md (S2 — coordinator wiring)

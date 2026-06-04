@@ -15,7 +15,7 @@
 //! allocator.
 
 use anyhow::Result;
-use pancetta_ft8::{Ft8Config, Ft8Decoder};
+use pancetta_ft8::Ft8Decoder;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,8 +37,18 @@ impl super::ApplicationCoordinator {
 
         info!("Starting FT8 component");
 
-        let ft8_config = Ft8Config::default();
-        let mut decoder = Ft8Decoder::new(ft8_config)?;
+        // hb-216 S2: read the shared Ft8Config. The tier probe (background
+        // task spawned by coordinator::tier::initialize) may rewrite this
+        // with the Slow-tier preset after measurement; the hot loop
+        // re-reads it each iteration and rebuilds the decoder if
+        // (max_decode_passes, osd_depth) changed.
+        let initial_ft8_config = self.ft8_config.read().await.clone();
+        let mut decoder = Ft8Decoder::new(initial_ft8_config.clone())?;
+        let ft8_config_shared = self.ft8_config.clone();
+
+        // hb-216 S2: scoped fast-path activation flag. Seeded from env at
+        // startup; rewritten by the tier probe (Moderate/Slow → true).
+        let scoped_fast_path = self.scoped_fast_path.clone();
 
         let shutdown = self.shutdown_signal.clone();
         let last_decode_timestamp = self.last_decode_timestamp.clone();
@@ -78,6 +88,12 @@ impl super::ApplicationCoordinator {
             let rt = tokio::runtime::Handle::current();
             info!("FT8 decoder thread started");
 
+            // hb-216 S2: track the config tuple the current decoder was
+            // built with. When the shared config changes (tier probe
+            // landing a Slow preset), rebuild before the next decode.
+            let mut last_max_passes = initial_ft8_config.max_decode_passes;
+            let mut last_osd_depth = initial_ft8_config.osd_depth;
+
             // Create persistent AP state for enhanced decoding
             let my_call_ap = pancetta_ft8::MyCallAp::new(&station_callsign);
             if my_call_ap.is_none() {
@@ -103,6 +119,35 @@ impl super::ApplicationCoordinator {
                         // and produce the wrong parity, causing the autonomous
                         // operator to TX in the same slot as the DX.)
                         let window_received_utc = chrono::Utc::now();
+
+                        // hb-216 S2: re-check the shared Ft8Config. If the
+                        // tier probe landed a Slow preset since the last
+                        // window, rebuild the decoder. `try_read` keeps the
+                        // hot loop non-blocking; on contention, we skip the
+                        // check this iteration and pick it up on the next.
+                        if let Ok(cfg_guard) = ft8_config_shared.try_read() {
+                            let cur_max = cfg_guard.max_decode_passes;
+                            let cur_osd = cfg_guard.osd_depth;
+                            if cur_max != last_max_passes || cur_osd != last_osd_depth {
+                                let new_cfg = cfg_guard.clone();
+                                drop(cfg_guard);
+                                match Ft8Decoder::new(new_cfg) {
+                                    Ok(d) => {
+                                        info!(
+                                            "FT8 decoder rebuilt for tier preset: max_decode_passes={}, osd_depth={:?}",
+                                            cur_max, cur_osd
+                                        );
+                                        decoder = d;
+                                        last_max_passes = cur_max;
+                                        last_osd_depth = cur_osd;
+                                    }
+                                    Err(e) => warn!(
+                                        "FT8 decoder rebuild failed (keeping previous): {}",
+                                        e
+                                    ),
+                                }
+                            }
+                        }
 
                         info!("FT8 decoder: received window ({} samples)", window.len());
 
@@ -144,20 +189,21 @@ impl super::ApplicationCoordinator {
                         }
 
                         // hb-091 scoped fast-path: when activeQso is set
-                        // and PANCETTA_SCOPED_FAST_PATH=1, run a scoped
-                        // Costas search at the partner's freq_bin BEFORE
-                        // the standard pipeline. ~3× faster wall-clock
-                        // (p99 866ms vs 2332ms on M4 reference); reliably
-                        // completes inside the 2s slot budget so the QSO
-                        // state machine advances before the next slot's
-                        // TX boundary. Standard pipeline still runs after
-                        // as the authoritative result; the QSO state
-                        // machine deduplicates by verifying
-                        // from_station == expected DX callsign per
-                        // is_message_relevant.
+                        // and scoped_fast_path is enabled (hb-216 S2: set
+                        // by the tier probe on Moderate/Slow hardware, or
+                        // by env var PANCETTA_SCOPED_FAST_PATH=1 as
+                        // operator override), run a scoped Costas search
+                        // at the partner's freq_bin BEFORE the standard
+                        // pipeline. ~3× faster wall-clock (p99 866ms vs
+                        // 2332ms on M4 reference); reliably completes
+                        // inside the 2s slot budget so the QSO state
+                        // machine advances before the next slot's TX
+                        // boundary. Standard pipeline still runs after as
+                        // the authoritative result; the QSO state machine
+                        // deduplicates by verifying from_station ==
+                        // expected DX callsign per is_message_relevant.
                         const SCOPED_HALF_WIDTH: usize = 5;
-                        let scoped_fast_path_enabled =
-                            std::env::var("PANCETTA_SCOPED_FAST_PATH").as_deref() == Ok("1");
+                        let scoped_fast_path_enabled = scoped_fast_path.load(Ordering::Relaxed);
                         let scoped_decodes: Vec<pancetta_ft8::DecodedMessage> =
                             if scoped_fast_path_enabled {
                                 let partner_freq_hz =
