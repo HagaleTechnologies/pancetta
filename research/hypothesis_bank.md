@@ -5748,3 +5748,48 @@ search to in-repo sources.
   follow_up: hb-029 (exact-format Display tests for every message subtype).
   scorecard: research/scorecards/history/2026-05-21-fix-r-signal-report.json
   journal: research/experiments/2026-05-21-fix-r-signal-report.md
+
+### hb-216 — Hardware-tier classifier (runtime decoder-budget probe → adaptive config presets)  [PRIORITY: 0.50, spawned 2026-06-04 from hb-091 S3 follow-on]
+  mode: ft8 / infrastructure
+  status: pending (this iter ships the probe + classifier; per-tier config plumbing is next)
+  priority_score: 0.50
+  estimated_effort: 1-2 sessions (S1 probe + classifier shipped; S2 = wire into coordinator startup + per-tier config selection)
+  expected_delta: operational — enables adaptive decoder behavior on lower-tier hardware (MiniPCs, ARMv7) so users with constrained CPU budget still complete QSOs reliably without manually setting env vars
+  defensible_prior: yes — hb-091 Session 3 latency profile shows full-decode wall-clock distribution is hardware-bound; M4 reference p99=2332ms already busts 2000ms slot budget. User explicitly flagged: "people may run this code on very minimal hardware, and we'll need to know what's possible and potentially (in the future) support more and less aggressive decoding based on hardware capability."
+  wild_card: false
+  evidence_for:
+    - hb-091 S3 latency profile (decode_latency_profile.rs) measured M4 baseline: full p99=2332ms / scoped p99=866ms. Distribution is hardware-bound.
+    - hb-091 S3 A/B sim showed M4 doesn't clear +10% QSO/hr gate (best 1.05x); lower-tier hardware would need scoped fast-path to maintain on-air operation.
+    - The infrastructure (`decode_window_scoped`, `PANCETTA_SCOPED_FAST_PATH` env var) is ALREADY shipped — what's missing is automatic per-tier selection.
+    - Other ham radio software (e.g., WSJT-X) ships static defaults; a runtime probe + tier classification is a meaningful differentiator for diverse-hardware deployment.
+  evidence_against:
+    - Startup probe adds 5-10s of one-time latency on every cold start. Mitigation: cache classification result on disk; re-probe only on hardware-change detection or stale cache.
+    - Per-tier config presets risk surprising users who expect deterministic behavior. Mitigation: log the classification + chosen preset prominently at startup; allow operator override via config.
+    - Synthetic probe signal might not match real-world decode wall-clock distribution. Acceptable: the probe is a rough classifier (3-4 tiers), not a precise wall-clock predictor.
+  notes: |
+    Session 1 deliverables (this iter):
+      1. `pancetta-ft8::tier_probe` module:
+         - `HardwareTier` enum: Fast | Moderate | Slow (3-tier minimum).
+         - `TierProbeResult { p50, p95, p99, max_ms, tier, recommendations }`.
+         - `probe_hardware_tier(n_iterations) -> TierProbeResult`: encode +
+           modulate a synthetic FT8 message, decode N times, sort, compute
+           percentiles, classify by p95 threshold, emit per-tier recommendations.
+      2. CLI demo (`pancetta-research/examples/tier_probe.rs`) for ad-hoc runs.
+      3. Unit tests on classifier boundaries + probe smoke.
+
+    Tier thresholds (initial; tunable as MiniPC data lands):
+      Fast:     p95 < 800ms     → no recommendations (current defaults are fine)
+      Moderate: 800 ≤ p95 < 1800ms → recommend PANCETTA_SCOPED_FAST_PATH=1
+      Slow:     p95 ≥ 1800ms     → require PANCETTA_SCOPED_FAST_PATH=1;
+                                    consider reducing multipass passes / OSD depth
+
+    Session 2 (deferred, separate batch):
+      - Wire `probe_hardware_tier` into coordinator startup
+      - Per-tier config preset selection
+      - On-disk classification cache with hardware-change detection (e.g., hash of CPU model + core count)
+      - Operator override via pancetta-config
+
+    Tier-threshold tuning is data-driven: as we collect latency profiles on
+    diverse hardware (MiniPC, ARMv7, etc.), refine the Fast/Moderate/Slow
+    boundaries to match empirical bust-rate-vs-QSO/hr A/B results from each tier.
+  journal: research/experiments/2026-06-04-hb-216-tier-classifier.md (to follow)

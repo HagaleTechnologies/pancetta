@@ -121,6 +121,9 @@ pub mod modulator;
 #[cfg(feature = "transmit")]
 pub mod transmit;
 
+// hb-216: runtime hardware-tier classifier.
+pub mod tier_probe;
+
 // Protocol exports
 pub use protocol::{ModulationType, Protocol, ProtocolParams};
 
