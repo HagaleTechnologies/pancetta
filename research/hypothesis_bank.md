@@ -2095,9 +2095,9 @@ current_ratio: 0.051
     Source: mr-008 ideation (territory B);
     WSJT-X-Improved v3.0.0 250924 release notes.
 
-### hb-092 — Codeword-based NMS dedup (post-decode)  [PRIORITY: 0.40, spawned 2026-05-31 from mr-008 ideation]
+### hb-092 — Codeword-based NMS dedup (post-decode)  [SHELVED 2026-06-04 — premise wrong, 0/6912 codeword-dups on hard-200]
   mode: ft8
-  status: pending
+  status: SHELVED — text-level dedup is already functionally equivalent to codeword-binary dedup on this corpus. Diagnostic on top-20 and full hard-200 both report 0 codeword-duplicates with TF separation. Mechanism: `Ft8Message::to_string()` is deterministic from `payload_bits`, so same payload → same text → existing `unique_decoded: HashSet<String>` collapses what hb-092 proposed to collapse with a binary key. Closes the "brute-force codeword dedup" line from hb-036 SHELVE. Journal: research/experiments/2026-06-04-hb-092-codeword-dedup.md.
   priority_score: 0.40
   estimated_effort: 1 session
   expected_delta: precision (-5-15% of remaining novel duplicates on hard-200); recall preserved by construction; bounded but clean
