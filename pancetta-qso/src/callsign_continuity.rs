@@ -27,20 +27,88 @@ use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::RwLock;
 
-/// True if the message contains a token ending in `/R`, `/R1`, or `/R2`.
-/// Used by `accept()` as a pre-callsign-lookup reject: hb-058 follow-on
-/// finding (Batch 29) showed 62/62 such emissions on pure-noise + top-20
-/// hard-200 are FPs, 0 are legitimate truths on this corpus. Contest
-/// rovers exist but the operator's autonomous-personal-station profile
-/// does not run contests; reject these patterns unconditionally to keep
-/// the FP filter sharp.
+/// True if the message contains a high-risk false-positive pattern.
+///
+/// Used by `accept()` as a pre-callsign-lookup reject. These patterns
+/// are FT8-protocol-legal but operationally implausible in the
+/// autonomous-personal-station operator profile, and they happen to be
+/// attractor patterns for random LDPC convergence on noise.
+///
+/// Currently checks:
+/// * **/R suffix** (Batch 29 hb-058: 436 FPs eliminated on full
+///   hard-200 at 0% recall cost; contest rovers are out-of-profile)
+/// * **degenerate Maidenhead grid** (Batch 31 Q: 12 emissions, all FP;
+///   field letters outside A-R or AA/ZZ extremes are LDPC-random,
+///   never real)
+/// * **callsign with ≥3 consecutive digits** (Batch 31 Q: 1 emission
+///   on hard-200, FP; real callsigns max out at 2 consecutive digits)
 ///
 /// Returns true when the message should be rejected. Matches uppercase.
 pub fn has_high_risk_fp_pattern(message: &str) -> bool {
     let upper = message.to_uppercase();
+
+    // 1. /R suffix variants (hb-058 Batch 29).
     for t in upper.split_whitespace() {
         if t.ends_with("/R") || t.ends_with("/R1") || t.ends_with("/R2") {
             return true;
+        }
+    }
+
+    // 2. Degenerate Maidenhead grid (Batch 31).
+    for t in upper.split_whitespace() {
+        if t.len() == 4 && is_grid_shape(t) {
+            let chars: Vec<char> = t.chars().collect();
+            let f0 = chars[0];
+            let f1 = chars[1];
+            // Field letters outside A-R are not a legal Maidenhead grid.
+            if !('A'..='R').contains(&f0) || !('A'..='R').contains(&f1) {
+                return true;
+            }
+            // Same letter twice at the A or Z extreme (e.g., AA00, ZZ99).
+            if f0 == f1 && (f0 == 'A' || f0 == 'Z') {
+                return true;
+            }
+        }
+    }
+
+    // 3. Callsign with 3+ consecutive digits (Batch 31).
+    for t in upper.split_whitespace() {
+        // Skip grids and SNR/report tokens.
+        if t.len() == 4 && is_grid_shape(t) {
+            continue;
+        }
+        if t.starts_with('-') || t.starts_with('+') || t == "73" || t == "RR73" {
+            continue;
+        }
+        // Strip suffix for the consecutive-digit check.
+        let base = t.split('/').next().unwrap_or(t);
+        if has_consecutive_digit_run(base, 3) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_grid_shape(t: &str) -> bool {
+    let chars: Vec<char> = t.chars().collect();
+    chars.len() == 4
+        && chars[0].is_ascii_alphabetic()
+        && chars[1].is_ascii_alphabetic()
+        && chars[2].is_ascii_digit()
+        && chars[3].is_ascii_digit()
+}
+
+fn has_consecutive_digit_run(s: &str, min_run: usize) -> bool {
+    let mut run = 0usize;
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            run += 1;
+            if run >= min_run {
+                return true;
+            }
+        } else {
+            run = 0;
         }
     }
     false
@@ -443,6 +511,36 @@ mod tests {
     }
 
     #[test]
+    fn degenerate_grid_detected() {
+        // Field letters outside A-R are not legal Maidenhead grids.
+        assert!(has_high_risk_fp_pattern("K1ABC W9XYZ ZZ12"));
+        assert!(has_high_risk_fp_pattern("K1ABC W9XYZ TT99"));
+        assert!(has_high_risk_fp_pattern("k1abc w9xyz xz45"));
+        // Same letter twice at extremes.
+        assert!(has_high_risk_fp_pattern("K1ABC W9XYZ AA00"));
+        assert!(has_high_risk_fp_pattern("K1ABC W9XYZ ZZ99"));
+        // Legal grids pass through (we reject the message at the trust-set
+        // layer if the callsigns don't match).
+        assert!(!has_high_risk_fp_pattern("CQ K1ABC FN42"));
+        assert!(!has_high_risk_fp_pattern("CQ K1ABC EM10"));
+        assert!(!has_high_risk_fp_pattern("CQ K1ABC PM85")); // Japan
+        assert!(!has_high_risk_fp_pattern("CQ K1ABC RR73")); // RR73 is exchange, not grid
+    }
+
+    #[test]
+    fn digit_run_callsign_detected() {
+        // 3+ consecutive digits in a callsign-shaped token is not real.
+        assert!(has_high_risk_fp_pattern("K123 W9XYZ FN42"));
+        assert!(has_high_risk_fp_pattern("K1ABC AB9876 FN42"));
+        // 2 consecutive digits is fine (KA1AB, W9XYZ patterns).
+        assert!(!has_high_risk_fp_pattern("KA12B W9XYZ FN42"));
+        assert!(!has_high_risk_fp_pattern("CQ K1ABC FN42"));
+        // SNR/grid tokens with digits are not callsigns.
+        assert!(!has_high_risk_fp_pattern("K1ABC W9XYZ -12"));
+        assert!(!has_high_risk_fp_pattern("K1ABC W9XYZ FN42"));
+    }
+
+    #[test]
     fn slash_r_rejected_even_in_cold_start() {
         // The /R reject runs BEFORE the cold-start lenient gate; even a
         // brand-new operator log doesn't open the floodgates to /R FPs.
@@ -478,28 +576,32 @@ mod tests {
         assert!(f.accept("CQ K1ABC FN42"));
         // W9XYZ not in static, but K1ABC is → accept; W9XYZ now in rolling.
         assert!(f.accept("K1ABC W9XYZ EM48"));
-        // ZZ0ZZZ has no anchor → reject.
-        assert!(!f.accept("ZZ0ZZZ AA0AA AA00"));
+        // Real-looking but untrusted → reject (no anchor in static or rolling yet).
+        assert!(!f.accept("K7ZZX KC4XYZ EM10"));
     }
 
     #[test]
     fn lenient_cold_start_passes_until_threshold() {
         let f = CallsignContinuityFilter::new_lenient(100, 5);
-        // No static, no cqdx → reference_size()=0 < 5 → lenient → accept all.
-        assert!(f.accept("CQ ZZ0ZZZ AA00"));
+        // No static, no cqdx → reference_size()=0 < 5 → lenient → accept
+        // real-looking-but-untrusted messages. (Note: degenerate-grid /
+        // /R-suffix / digit-run patterns are rejected EVEN in lenient
+        // cold-start because they're definitionally noise-emergent FPs.)
+        assert!(f.accept("CQ K7ZZX EM10"));
         assert!(f.accept("ANY GARBAGE WITH NO CALLSIGN"));
     }
 
     #[test]
     fn lenient_activates_when_reference_grows() {
         let mut f = CallsignContinuityFilter::new_lenient(100, 3);
-        // Lenient mode initially.
-        assert!(f.accept("ZZ0ZZZ AA00"));
+        // Lenient mode initially (real-looking-but-untrusted goes through).
+        assert!(f.accept("K7ZZX W9XYZ EM10"));
         // Add 3 static callsigns → threshold met → strict mode.
         f.extend_from_iter(["K1ABC", "W9XYZ", "DL5XYZ"]);
         assert_eq!(f.reference_size(), 3);
         assert!(f.accept("CQ K1ABC FN42"));
-        assert!(!f.accept("CQ AA0AA BB11"));
+        // Use a fresh callsign not in static/cqdx/rolling → reject in strict.
+        assert!(!f.accept("CQ KC4QQQ EM10"));
     }
 
     #[test]
@@ -515,14 +617,14 @@ mod tests {
         // cqdx-spotted
         assert!(f.accept("CQ DL5XYZ FN42"));
         // Unknown
-        assert!(!f.accept("CQ ZZ0ZZZ AA00"));
+        assert!(!f.accept("CQ K7ZZX EM10"));
     }
 
     #[test]
     fn build_filter_lenient_mode() {
         let f = build_filter(None, HashSet::new(), 100, 5).unwrap();
-        // Lenient: reference empty → accept all
-        assert!(f.accept("CQ ZZ0ZZZ AA00"));
+        // Lenient: reference empty → accept real-looking unknown
+        assert!(f.accept("CQ K7ZZX EM10"));
     }
 
     #[test]

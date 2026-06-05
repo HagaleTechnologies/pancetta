@@ -783,7 +783,7 @@ current_ratio: 0.051
     Defer until multi-pass returns OR until two-stage scheduling
     (hb-046) lands and could use this as the second-stage prior.
 
-### hb-058 — `/R` and ARRL Field-Day false-decode filters  [GRADUATED — Batch 30 SHIPPED /R-suffix pre-gate in pancetta-qso/src/callsign_continuity.rs::accept(); Diagnostic L validated 436 FPs eliminated / 0 TPs lost on full hard-200 (22.08% of all FPs). Field-Day blanket remains shelved (3/3 FD emissions on top-20 are TPs).]
+### hb-058 — `/R` and ARRL Field-Day false-decode filters  [GRADUATED-EXTENDED 2026-06-04 — Batch 30 SHIPPED /R; Batch 31 extended `has_high_risk_fp_pattern()` with degenerate_grid (12 FPs on hard-200, AA00/ZZ99/non-A-R-fields) and digit_run_callsign (≥3 consecutive digits). All zero recall cost. Combined pattern reject + hb-062 + hb-103 stack characterized in Batch 31 Diagnostic U.]
   mode: ft8
   # Phase A bootstrap-CI retrofit (2026-06-02): small-delta graduation
   # (contest-type rejection in is_plausible); composite movement small
@@ -2448,7 +2448,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-architectural.md (entry A2).
 
-### hb-103 — Continuous trust-score FP filter (replace boolean gates)  [CHARACTERIZED 2026-06-04 — Batch 30 M AUC: at 100% trust hb-062 caps at 67.3% FP reduction; remaining 33% are trusted-callsign-attached to wrong messages (message-level discrimination required). hb-103's headroom = ~90 surviving FPs on hard-200 top-20 slice, precision-only.] [PRIORITY: 0.42
+### hb-103 — Continuous trust-score FP filter (replace boolean gates)  [SHIPPED-V1 2026-06-04 — Batch 31: pancetta-qso::content_score module with `MessageContentScore` + 3 threshold constants + 6 tests. Fused-score AUC 0.886 on full hard-200 + 50 noise. At SHIP_PRECISE (+2.977): 98% recall, 74.2% FP reduction (vs hb-062 alone 55.3%). NOT in default accept(); sibling API for autonomous TX / TUI display ordering / opt-in higher-precision use cases.] [PRIORITY: 0.42
   mode: ft8
   status: pending
   priority_score: 0.42
