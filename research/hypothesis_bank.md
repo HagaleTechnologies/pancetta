@@ -5795,3 +5795,61 @@ search to in-repo sources.
   journal:
     - research/experiments/2026-06-04-hb-216-tier-classifier.md (S1 — probe + classifier)
     - research/experiments/2026-06-04-hb-216-session2.md (S2 — coordinator wiring)
+
+### hb-217 — RR73 decoder pipeline bug (99.6% miss rate on hard-200)  [PRIORITY: 0.65, spawned 2026-06-04 from Batch 33]
+  mode: ft8
+  status: BUG-IDENTIFIED — mechanism unknown but isolated; needs focused next-batch debug
+  priority_score: 0.65
+  estimated_effort: 1-2 sessions for instrumented debug; potentially small fix once mechanism known
+  expected_delta: recovery of ~501 missing RR73 truths on hard-200 (≈ +10% of all truths). Bigger if same mechanism affects related QSO-completion types (RRR, 73).
+  defensible_prior: YES — Batch 33 audit found 503 RR73 truths / 5 emissions across hard-200. Round-trip test (clean encode→modulate→decode of "K1DEF W1ABC RR73") passes, so parser + encoder work. is_plausible accepts RR73. Bug is in the decoder pipeline between sync and parser.
+  wild_card: false
+  evidence_for:
+    - Batch 33 DD: 0.4% recall, 99.6% no-emission at truth position
+    - All misses at strong SNR (≥-10 dB; sample up to +21 dB) — not a sensitivity issue
+    - 99.2% sync-vs-payload split: misses have no nearby pancetta emission at all
+    - Synthetic round-trip test for RR73 passes — parser path proven
+    - Other message types (grid, report, etc.) at 55-65% recall — comparable to overall; not a "common pipeline" issue
+  evidence_against:
+    - Mechanism unknown; risk of misdiagnosing the root cause
+    - Some legitimate operator practice variations not yet ruled out
+  notes: |
+    Debug plan:
+    1. Take one missed RR73 truth with high SNR (e.g., "VA7HZ KJ4IHN RR73"
+       at +14 dB on sha=d572fe73). Run pancetta with verbose tracing
+       through the full decode pipeline, looking for where it rejects
+       the RR73 codeword.
+    2. Compare against a successful RR73 (sha=KJ5CHK N8PFK RR73 — one of
+       the 2 hits). What's different in the spectrogram?
+    3. Check if there's a duplicate-suppression step that's dropping
+       RR73 patterns based on some token-collision (igrid4=32373 vs
+       32403 collision noted in message.rs:1407).
+    4. Consider if pancetta-ft8 has a fast-reject pattern that
+       incidentally hits RR73-bit-patterns.
+
+    Journal: research/experiments/2026-06-04-batch-33.md (Diagnostic DD)
+
+### hb-218 — Capture-effect joint-decoding (corpus-scale headroom)  [PRIORITY: 0.55, spawned 2026-06-04 from Batch 33 AA]
+  mode: ft8
+  status: QUANTIFIED-HEADROOM — re-motivates hb-079/080/086 family with corpus-scale data
+  priority_score: 0.55
+  estimated_effort: plan-sized (multiple sessions); previous joint-pair-retry work shipped infra without major production-recall gain
+  expected_delta: recovery of up to 1058 strong-signal misses currently capture-locked (Batch 33 AA). Plus the corresponding weaker-SNR captures (not yet measured).
+  defensible_prior: YES — Batch 29 J quantified the capture-effect boundary at ~25 Hz (equal amplitudes block both signals). Batch 33 AA measured at corpus scale: 67.1% of strong misses have a companion truth within ±25 Hz. The structural mechanism is the dominant production-recall blocker.
+  wild_card: false
+  evidence_for:
+    - Batch 29 J: 0/20 decode at Δfreq=6.25 Hz, 0/20 at 12.5 Hz equal-amp; clean separation at ≥25 Hz
+    - Batch 33 AA: 1058/1576 (67.1%) strong-signal misses are capture-locked
+    - hb-079 (coherent multipass) and hb-080 (multipass N=3) graduated with composite-positive results — joint decoding works in principle
+  evidence_against:
+    - hb-079/080 graduations didn't translate to large production-recall gains
+    - Joint decoding adds substantial computational cost
+    - Some capture-locked pairs may be FP-FP rather than FP-blocking-TP
+  notes: |
+    Strategic context: this is the LARGEST single recall mechanism
+    surfaced by Batch 33's corpus-scale measurement. Worth a plan-sized
+    revisit. But first, ship hb-217 (RR73 fix) — it's a bounded debug
+    with high-probability win, and its mechanism is independent of
+    joint decoding.
+
+    Journal: research/experiments/2026-06-04-batch-33.md (Diagnostic AA)
