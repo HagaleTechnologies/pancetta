@@ -340,33 +340,15 @@ impl Ft8Message {
             MessageType::Unknown => false,
             MessageType::FreeText => {
                 // Free text messages are rare on-air and are a common source
-                // of CRC false positives. Require: multi-word, all printable,
-                // and at least one word must be ≥2 alphabetic characters
-                // (rejects noise like "2 8E 1VL8S59B").
-                match &self.text {
-                    Some(t) => {
-                        let trimmed = t.trim();
-                        if trimmed.is_empty() {
-                            return false;
-                        }
-                        let all_printable = trimmed
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '/' || c == '.');
-                        if !all_printable {
-                            return false;
-                        }
-                        let words: Vec<&str> = trimmed.split_whitespace().collect();
-                        if words.len() < 2 {
-                            return false;
-                        }
-                        // At least one word must be ≥2 chars and all-alphabetic
-                        // (a callsign fragment, "CQ", "TNX", etc.)
-                        words
-                            .iter()
-                            .any(|w| w.len() >= 2 && w.chars().all(|c| c.is_ascii_alphabetic()))
-                    }
-                    None => false,
-                }
+                // of CRC false positives. The previous structural filter
+                // (multi-word with one alphabetic word ≥2 chars) was too
+                // lenient: Batch 32 Diagnostic Y found 16 FreeText emissions
+                // per hard-200 cleared the structural gate but were 100% FP
+                // by jt9 baseline (zero TPs). The autonomous-station profile
+                // doesn't generate or expect free-text traffic; reject
+                // unconditionally. (Future: an opt-in `accept_freetext`
+                // config field could re-enable when needed.)
+                false
             }
             MessageType::Telemetry => {
                 // Telemetry is not used by pancetta and is the #1 source of
@@ -382,15 +364,28 @@ impl Ft8Message {
             // hard-200 corpus they account for 433 novel (FP-likely) decodes
             // and ZERO jt9-matched recoveries. pancetta is a general / DX
             // station, not a contest logger, so rejecting them is pure
-            // precision with no recall cost. DXpedition is deliberately NOT
-            // rejected here — real DXpeditions are pancetta's highest-value
-            // hunt target, so its FPs are left for the callsign-continuity
-            // filter (hb-062) to handle downstream.
-            MessageType::Contest | MessageType::FieldDay | MessageType::RTTYRoundup => false,
-            MessageType::Standard
-            | MessageType::NonStdCall
-            | MessageType::DXpedition
-            | MessageType::Extended => {
+            // precision with no recall cost.
+            //
+            // Batch 32 Diagnostic Y revisited the original "DXpedition is
+            // deliberately not rejected" stance: on K5ARH's full hard-200
+            // corpus, 69 DXpedition-typed emissions are 100% FP with 0 jt9
+            // truths matching. The original rationale (real DXpeditions are
+            // a high-value target) holds in principle, but K5ARH's eval
+            // corpus contains no active DXpedition windows. Reject by
+            // default; reintroduce as an opt-in mode when an operator is
+            // explicitly hunting active DXpeditions. (Future: a
+            // `Ft8Config::accept_dxpedition: bool` field could re-enable.)
+            //
+            // Same applies to FreeText: even after the structural multi-
+            // word/alphabetic-word check above (which already rejects most
+            // garbage), 16 emissions per hard-200 cleared the structural
+            // gate but were FPs. Reject unconditionally for the autonomous-
+            // station profile.
+            MessageType::Contest
+            | MessageType::FieldDay
+            | MessageType::RTTYRoundup
+            | MessageType::DXpedition => false,
+            MessageType::Standard | MessageType::NonStdCall | MessageType::Extended => {
                 // ALL present callsigns must look valid.
                 let calls: Vec<&str> = [&self.from_callsign, &self.to_callsign]
                     .iter()
@@ -2793,31 +2788,50 @@ mod tests {
 
     #[test]
     fn contest_only_types_rejected() {
-        // hb-058: contest-only message types pancetta never operates
-        // (RTTY Roundup, Field Day, EU VHF contest) are rejected outright,
-        // even with otherwise-valid callsigns — they are a major CRC-14
-        // false-positive source and produce zero real recoveries on the
-        // curated corpus. DXpedition is deliberately NOT rejected.
+        // hb-058 (Batch 31 + 32): contest-only and DXpedition message
+        // types are rejected outright. Batch 32 Diagnostic Y revisited
+        // the original "DXpedition is highest-value hunt target" stance
+        // — on K5ARH's hard-200 corpus 69/69 DXpedition emissions were
+        // FP at 0% truth. Reject all four types unconditionally. A
+        // future opt-in `accept_dxpedition` config can re-enable when
+        // the operator is explicitly hunting an active DXpedition.
         for ty in [
             MessageType::RTTYRoundup,
             MessageType::FieldDay,
             MessageType::Contest,
+            MessageType::DXpedition,
         ] {
             let mut m = Ft8Message::default();
             m.message_type = ty;
             m.standard_type = None;
             m.from_callsign = Some("K1ABC".to_string());
             m.to_callsign = Some("W1AW".to_string());
-            assert!(!m.is_plausible(), "{ty:?} must be rejected (hb-058)");
+            assert!(
+                !m.is_plausible(),
+                "{ty:?} must be rejected (hb-058 Batch 32)"
+            );
         }
+    }
 
-        // DXpedition with valid calls still passes (hunt-target preserved).
-        let mut dx = Ft8Message::default();
-        dx.message_type = MessageType::DXpedition;
-        dx.standard_type = None;
-        dx.from_callsign = Some("K1ABC".to_string());
-        dx.to_callsign = Some("W1AW".to_string());
-        assert!(dx.is_plausible(), "DXpedition with valid calls should pass");
+    #[test]
+    fn freetext_rejected_unconditionally_batch_32() {
+        // Batch 32: FreeText is now rejected by is_plausible. Previously
+        // we passed FreeText messages that cleared a structural multi-
+        // word/alphabetic-word check, but those messages were 16/16 FP
+        // on hard-200. The autonomous-station profile doesn't generate
+        // or expect free-text.
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::FreeText;
+        m.text = Some("CQ DE K1ABC".to_string());
+        assert!(!m.is_plausible(), "FreeText must be rejected (Batch 32)");
+
+        let mut m2 = Ft8Message::default();
+        m2.message_type = MessageType::FreeText;
+        m2.text = Some("TNX 73 K1ABC".to_string());
+        assert!(
+            !m2.is_plausible(),
+            "FreeText must be rejected even with sensible words"
+        );
     }
 
     #[test]

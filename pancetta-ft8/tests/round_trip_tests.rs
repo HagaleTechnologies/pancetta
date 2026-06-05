@@ -327,7 +327,13 @@ fn test_round_trip_snr_sweep() {
     }
 }
 
-/// Full round-trip for all standard FT8 message types
+/// Full round-trip for all standard FT8 message types.
+///
+/// FreeText ("HELLO WORLD") is intentionally excluded as of Batch 32:
+/// `is_plausible` now rejects FreeText unconditionally for the
+/// autonomous-station profile (16/16 emissions were FP on hard-200).
+/// See `test_freetext_round_trip_rejected_post_batch_32` for the
+/// inverse assertion.
 #[test]
 fn test_round_trip_all_message_types() {
     let messages = [
@@ -339,7 +345,6 @@ fn test_round_trip_all_message_types() {
         "K1DEF W1ABC RRR",
         "K1DEF W1ABC 73",
         "K1DEF W1ABC RR73",
-        "HELLO WORLD",
     ];
 
     for msg in &messages {
@@ -354,6 +359,23 @@ fn test_round_trip_all_message_types() {
             decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
         );
     }
+}
+
+/// Batch 32: FreeText round-trips through encoder + modulator + decoder
+/// at the SIGNAL level, but `is_plausible` rejects it at the message-
+/// level filter. Decoded output should NOT contain "HELLO WORLD".
+#[test]
+fn test_freetext_round_trip_rejected_post_batch_32() {
+    let symbols = encode_message("HELLO WORLD");
+    let audio = modulate_symbols(&symbols, 0.0);
+    let decoded = decode_audio(&audio);
+    // The FreeText filter is now unconditional; decoded must not include
+    // the original FreeText message.
+    assert!(
+        !decoded.iter().any(|m| m.text == "HELLO WORLD"),
+        "FreeText must be rejected post-Batch-32: decoded = {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
 }
 
 // =========================================================================
@@ -454,6 +476,8 @@ fn test_ft4_round_trip_cq() {
 
 #[test]
 fn test_ft4_round_trip_all_message_types() {
+    // FreeText ("HELLO WORLD") excluded — see Batch 32 `is_plausible`
+    // unconditional reject.
     let messages = [
         "CQ W1ABC FN42",
         "K1DEF W1ABC FN42",
@@ -461,7 +485,6 @@ fn test_ft4_round_trip_all_message_types() {
         "K1DEF W1ABC RRR",
         "K1DEF W1ABC 73",
         "K1DEF W1ABC RR73",
-        "HELLO WORLD",
     ];
 
     for msg in &messages {

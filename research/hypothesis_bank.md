@@ -783,7 +783,7 @@ current_ratio: 0.051
     Defer until multi-pass returns OR until two-stage scheduling
     (hb-046) lands and could use this as the second-stage prior.
 
-### hb-058 — `/R` and ARRL Field-Day false-decode filters  [GRADUATED-EXTENDED 2026-06-04 — Batch 30 SHIPPED /R; Batch 31 extended `has_high_risk_fp_pattern()` with degenerate_grid (12 FPs on hard-200, AA00/ZZ99/non-A-R-fields) and digit_run_callsign (≥3 consecutive digits). All zero recall cost. Combined pattern reject + hb-062 + hb-103 stack characterized in Batch 31 Diagnostic U.]
+### hb-058 — `/R` and ARRL Field-Day false-decode filters  [GRADUATED-EXTENDED-3X 2026-06-04 — Batch 30 SHIPPED /R; Batch 31 extended `has_high_risk_fp_pattern()` with degenerate_grid + digit_run; Batch 32 extended is_plausible to also reject DXpedition (69/69 FP on hard-200) + FreeText (16/16 FP, previously lenient). All zero-recall-cost (1 TP lost net = noise). Diagnostic Y also found pancetta MISSES 16 legitimate /P portable truths — recall gap, not filter target. msg_type bucketing reveals NonStdCall is mixed (7 TP / 11 FP = 39%); careful handling needed.]
   mode: ft8
   # Phase A bootstrap-CI retrofit (2026-06-02): small-delta graduation
   # (contest-type rejection in is_plausible); composite movement small
@@ -2448,7 +2448,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-architectural.md (entry A2).
 
-### hb-103 — Continuous trust-score FP filter (replace boolean gates)  [SHIPPED-V1 2026-06-04 — Batch 31: pancetta-qso::content_score module with `MessageContentScore` + 3 threshold constants + 6 tests. Fused-score AUC 0.886 on full hard-200 + 50 noise. At SHIP_PRECISE (+2.977): 98% recall, 74.2% FP reduction (vs hb-062 alone 55.3%). NOT in default accept(); sibling API for autonomous TX / TUI display ordering / opt-in higher-precision use cases.] [PRIORITY: 0.42
+### hb-103 — Continuous trust-score FP filter (replace boolean gates)  [SHIPPED-V1-AUTONOMOUS-WIRED 2026-06-04 — Batch 31 shipped sibling API; Batch 32 wired into pancetta-qso::autonomous.rs::decide() at SHIP_CONSERVATIVE (+0.35, not SHIP_PRECISE which is structurally unreachable by single-callsign CQs). Plumbed confidence+time_offset_s through DecodedMessageInfo + CqCandidate. 2 new autonomous tests + 17 fixture updates. Diagnostic X showed 31% surviving FPs at SHIP_PRECISE are TP-shaped (jt9-baseline gaps, not noise FPs); next-attack-surface is corpus quality not filtering. Diagnostic V identified decode_time_into_window as hb-103 v2 feature (AUC 0.695 inverted, LR weight -0.80).] [PRIORITY: 0.42
   mode: ft8
   status: pending
   priority_score: 0.42

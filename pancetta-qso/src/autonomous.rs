@@ -236,6 +236,15 @@ pub struct DecodedMessageInfo {
     /// The parity of the slot in which this message was decoded.
     /// `None` if the slot parity was not tracked at decode time.
     pub slot_parity: Option<pancetta_core::slot::SlotParity>,
+    /// hb-103 (Batch 32): decoder self-reported confidence in `[0, 1]`.
+    /// `None` for messages from test scaffolding or pre-hb-103 code paths.
+    /// Used together with `time_offset_s` and the filter trust set to
+    /// compute a content score for autonomous TX gating.
+    pub confidence: Option<f32>,
+    /// hb-103 (Batch 32): time offset of the decode within its slot, in
+    /// seconds. `None` for messages from test scaffolding or pre-hb-103
+    /// code paths. Used as a content-score input.
+    pub time_offset_s: Option<f64>,
 }
 
 /// Result of a collision check on a listen slot.
@@ -316,6 +325,15 @@ pub struct CqCandidate {
     /// The parity of the slot in which this CQ was heard.
     /// Used to derive `tx_parity = slot_parity.opposite()` for our response.
     pub slot_parity: Option<pancetta_core::slot::SlotParity>,
+    /// hb-103 (Batch 32): original message text the CQ was parsed from.
+    /// Used as input to the content-score TX gate.
+    pub message_text: String,
+    /// hb-103 (Batch 32): decoder confidence in `[0, 1]`. `None` for
+    /// pre-hb-103 code paths.
+    pub confidence: Option<f32>,
+    /// hb-103 (Batch 32): time offset of the decode within its slot.
+    /// `None` for pre-hb-103 code paths.
+    pub time_offset_s: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -848,6 +866,9 @@ impl AutonomousOperator {
                         frequency_hz: msg.frequency_hz,
                         dx_score: score,
                         slot_parity: msg.slot_parity,
+                        message_text: msg.message_text.clone(),
+                        confidence: msg.confidence,
+                        time_offset_s: msg.time_offset_s,
                     });
                 }
             }
@@ -1126,6 +1147,51 @@ impl AutonomousOperator {
                                 ok
                             }
                         })
+                        // hb-103 (Batch 32): content-score gate.
+                        //
+                        // CQs are single-callsign messages, so the
+                        // in_trust_set_both bonus (+2) cannot fire — the
+                        // achievable score range for legitimate CQs sits
+                        // below SHIP_PRECISE (+2.977, calibrated on the full
+                        // hard-200 message mix that includes 2-callsign
+                        // exchanges). For autonomous CQ gating we use
+                        // **SHIP_CONSERVATIVE (+0.35)** which preserves
+                        // 100% recall on the corpus while eliminating 34% of
+                        // FPs (Diagnostic T). Reply / report messages with
+                        // two trusted callsigns would warrant SHIP_PRECISE.
+                        //
+                        // When the FP filter is installed AND the decode
+                        // carries confidence + time_offset_s, compute the
+                        // fused score and require it to clear the threshold.
+                        // Decodes missing confidence/dt (test fixtures,
+                        // pre-hb-103 paths) pass through.
+                        .filter(|cq| match (fp.as_ref(), cq.confidence, cq.time_offset_s) {
+                            (Some(f), Some(conf), Some(dt)) => {
+                                use crate::content_score::{content_score_from_features, ContentFeatures, MessageContentScore};
+                                let score = content_score_from_features(
+                                    ContentFeatures {
+                                        text: &cq.message_text,
+                                        confidence: conf,
+                                        snr_db: cq.snr as f32,
+                                        time_offset: dt,
+                                    },
+                                    f,
+                                );
+                                let pass = score >= MessageContentScore::SHIP_CONSERVATIVE;
+                                if !pass {
+                                    debug!(
+                                        target: "qso.security",
+                                        "rejecting CQ response: hb-103 content score (callsign={}, dx_score={:.2}, content_score={:.3}, threshold={:.3})",
+                                        cq.callsign,
+                                        cq.dx_score,
+                                        score,
+                                        MessageContentScore::SHIP_CONSERVATIVE,
+                                    );
+                                }
+                                pass
+                            }
+                            _ => true,
+                        })
                         .find(|cq| self.frequency_allocator.is_clear_of_own(cq.frequency_hz))
                         .cloned();
 
@@ -1360,6 +1426,8 @@ mod tests {
             snr: -10,
             message_text: "CQ K1DEF FN31".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         }];
 
         let result = detector.check_for_collision(&messages);
@@ -1375,6 +1443,8 @@ mod tests {
             snr: -10,
             message_text: "CQ K1DEF FN31".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         }];
 
         let result = detector.check_for_collision(&messages);
@@ -1469,6 +1539,8 @@ mod tests {
             snr: -5,
             message_text: "CQ K9ZZ EM48".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         }];
         let evaluator = NullDxEvaluator; // returns 0.5, above our 0.3 threshold
         op.feed_decoded_messages(&messages, &evaluator);
@@ -1513,6 +1585,8 @@ mod tests {
             snr: -5,
             message_text: "CQ R44XYB FN42".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         }];
         op.feed_decoded_messages(&messages, &NullDxEvaluator);
 
@@ -1554,6 +1628,8 @@ mod tests {
             snr: -5,
             message_text: "CQ K9ZZ EM48".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         }];
         op.feed_decoded_messages(&messages, &NullDxEvaluator);
 
@@ -1569,6 +1645,99 @@ mod tests {
         assert!(
             has_response,
             "Expected responder to TX when CQ sender passes FP filter"
+        );
+    }
+
+    #[test]
+    fn test_content_score_blocks_low_score_cq_at_autonomous_tx() {
+        // hb-103 (Batch 32): even when the FP filter accepts the callsign,
+        // a sufficiently low content score blocks autonomous TX.
+        // SHIP_CONSERVATIVE = +0.35; very-low confidence + late dt + bad
+        // SNR + no trust-bonus → score well below threshold.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.min_dx_score = 0.3;
+        config.listen_cycle.initial_interval = 100;
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+
+        let mut filter = crate::callsign_continuity::CallsignContinuityFilter::new(100);
+        // Trust K9ZZ so hb-062 accepts; the content score still gates.
+        filter.extend_from_iter(["K9ZZ"]);
+        op.set_fp_filter(Some(std::sync::Arc::new(filter)));
+
+        // confidence=0.1 + dt=12s + snr=-15 + 1 (any) - 0.1*12 - 0.05*15
+        // = 1 + 0.1 - 1.2 - 0.75 = -0.85, below SHIP_CONSERVATIVE +0.35.
+        let messages = vec![DecodedMessageInfo {
+            callsign: Some("K9ZZ".into()),
+            frequency_hz: 1500.0,
+            snr: -15,
+            message_text: "CQ K9ZZ EM48".into(),
+            slot_parity: None,
+            confidence: Some(0.1),
+            time_offset_s: Some(12.0),
+        }];
+        op.feed_decoded_messages(&messages, &NullDxEvaluator);
+
+        let even_ts: i64 = 0;
+        let actions = op.decide_at(even_ts);
+        let has_response = actions.iter().any(|a| {
+            if let OperatorAction::Transmit { message_text, .. } = a {
+                message_text.contains("K9ZZ")
+            } else {
+                false
+            }
+        });
+        assert!(
+            !has_response,
+            "Expected hb-103 content-score gate to block low-score CQ even when callsign is trusted"
+        );
+    }
+
+    #[test]
+    fn test_content_score_permits_high_score_cq_at_autonomous_tx() {
+        // hb-103 (Batch 32): when the content score clears SHIP_CONSERVATIVE
+        // (+0.35), the responder TX's. Single-callsign CQ with high
+        // confidence + low dt + trusted callsign + decent SNR comfortably
+        // clears the conservative threshold.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.min_dx_score = 0.3;
+        config.listen_cycle.initial_interval = 100;
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+
+        let mut filter = crate::callsign_continuity::CallsignContinuityFilter::new(100);
+        filter.extend_from_iter(["K9ZZ"]);
+        op.set_fp_filter(Some(std::sync::Arc::new(filter)));
+
+        // 1 (any) + 0.95 (conf) - 0.1*1 (dt) + 0.05*-5 (snr)
+        // = 1 + 0.95 - 0.1 - 0.25 = 1.60, well above SHIP_CONSERVATIVE +0.35.
+        let messages = vec![DecodedMessageInfo {
+            callsign: Some("K9ZZ".into()),
+            frequency_hz: 1500.0,
+            snr: -5,
+            message_text: "CQ K9ZZ EM48".into(),
+            slot_parity: None,
+            confidence: Some(0.95),
+            time_offset_s: Some(1.0),
+        }];
+        op.feed_decoded_messages(&messages, &NullDxEvaluator);
+
+        let even_ts: i64 = 0;
+        let actions = op.decide_at(even_ts);
+        let has_response = actions.iter().any(|a| {
+            if let OperatorAction::Transmit { message_text, .. } = a {
+                message_text.contains("K9ZZ")
+            } else {
+                false
+            }
+        });
+        assert!(
+            has_response,
+            "Expected responder to TX when content score clears SHIP_CONSERVATIVE"
         );
     }
 
@@ -1717,6 +1886,8 @@ mod tests {
             snr: -5,
             message_text: "CQ JA1ABC PM95".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         }];
         let evaluator = NullDxEvaluator;
         op.feed_decoded_messages(&messages, &evaluator);
@@ -1761,6 +1932,8 @@ mod tests {
             snr: -5,
             message_text: "CQ JA1ABC PM95".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         }];
         let evaluator = NullDxEvaluator;
         op.feed_decoded_messages(&messages, &evaluator);
@@ -1820,6 +1993,8 @@ mod tests {
                 snr: -5,
                 message_text: "CQ 3Y0J JD15".to_string(),
                 slot_parity: None,
+                confidence: None,
+                time_offset_s: None,
             }],
             &evaluator,
         );
@@ -1870,6 +2045,8 @@ mod tests {
                 snr: -10,
                 message_text: "CQ VE3XYZ FN03".to_string(),
                 slot_parity: None,
+                confidence: None,
+                time_offset_s: None,
             }],
             &evaluator,
         );
@@ -1923,6 +2100,8 @@ mod tests {
                 snr: -5,
                 message_text: "CQ 3Y0J JD15".to_string(),
                 slot_parity: None,
+                confidence: None,
+                time_offset_s: None,
             }],
             &evaluator,
         );

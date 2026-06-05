@@ -2967,6 +2967,7 @@ name = "pancetta-research"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bitvec",
  "chrono",
  "hound",
  "libc",

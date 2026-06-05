@@ -473,6 +473,8 @@ fn test_hunt_mode_picks_best_cq() {
             snr: -5,
             message_text: "CQ K9ZZ EM48".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         },
         DecodedMessageInfo {
             callsign: Some("JA1ABC".into()),
@@ -480,6 +482,8 @@ fn test_hunt_mode_picks_best_cq() {
             snr: -10,
             message_text: "CQ JA1ABC PM95".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         },
     ];
 
@@ -537,6 +541,8 @@ fn test_hunt_mode_response_survives_audio_roundtrip() {
             snr: m.snr_db as i32,
             message_text: m.text.clone(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         })
         .collect();
     op.feed_decoded_messages(&decoded_infos, &evaluator);
@@ -710,6 +716,8 @@ fn test_priority_scorer_skips_duplicate() {
             snr: 0,
             message_text: "CQ K9ZZ EM48".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         },
         DecodedMessageInfo {
             callsign: Some("JA1ABC".into()),
@@ -717,6 +725,8 @@ fn test_priority_scorer_skips_duplicate() {
             snr: -15,
             message_text: "CQ JA1ABC PM95".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         },
     ];
 
@@ -773,6 +783,8 @@ fn test_priority_scorer_prefers_pota() {
             snr: 0,
             message_text: "CQ K9ZZ EM48".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         },
         DecodedMessageInfo {
             callsign: Some("W5ABC/P".into()),
@@ -780,6 +792,8 @@ fn test_priority_scorer_prefers_pota() {
             snr: -15,
             message_text: "CQ W5ABC/P EM12".into(),
             slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
         },
     ];
 

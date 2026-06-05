@@ -471,6 +471,10 @@ impl super::ApplicationCoordinator {
                                                 snr: decoded_msg.snr_db as i32,
                                                 message_text: decoded_msg.text.clone(),
                                                 slot_parity: decoded_msg.slot_parity,
+                                                // hb-103 (Batch 32): plumb through for the
+                                                // content-score TX gate in autonomous.decide().
+                                                confidence: Some(decoded_msg.confidence),
+                                                time_offset_s: Some(decoded_msg.time_offset),
                                             });
                                         }
                                     }
