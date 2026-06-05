@@ -1403,10 +1403,26 @@ impl MessageParser {
         let call_a_str = apply_suffix(call_a.to_callsign(), ipa);
         let call_b_str = apply_suffix(call_b.to_callsign(), ipb);
 
-        // Filter "RR73" from grids — it's a QSO-completion token, not a
-        // Maidenhead locator (igrid4=32373 collides with the RR73 token at
-        // igrid4=32403). Allow grids on both CQ and reply messages.
-        let filtered_grid = grid.as_ref().filter(|g| g.as_str() != "RR73").cloned();
+        // RR73 collision (hb-217, Batch 34): the Maidenhead grid at
+        // igrid4=32373 unpacks to the visual string "RR73" — colliding
+        // with the QSO-completion TOKEN at igrid4=32403. Real FT8 traffic
+        // uses igrid4=32373 to encode RR73 (Batch 33 audit: 99.6% of jt9-
+        // truth RR73 messages on hard-200 land at this igrid4). The
+        // previous code filtered the "RR73"-shaped grid out and never
+        // promoted it to a token, producing blank-exchange Reply decodes
+        // missing the trailing "RR73". Treat both igrid4=32373 and
+        // igrid4=32403 as the RR73 token.
+        let (filtered_grid, rr73_from_grid) = match grid.as_ref() {
+            Some(g) if g.as_str() == "RR73" => (None, true),
+            _ => (grid.clone(), false),
+        };
+        // Promote: if the grid was RR73-shaped, synthesize the token so
+        // the downstream branch picks it up correctly.
+        let token = if rr73_from_grid && token.is_none() {
+            Some("RR73".to_string())
+        } else {
+            token
+        };
 
         if is_cq {
             message.standard_type = Some(StandardMessageType::Cq);
@@ -2546,6 +2562,101 @@ mod tests {
         assert_eq!(msg.message_type, MessageType::NonStdCall);
         assert_eq!(msg.to_callsign, Some("CQ".to_string()));
         assert_eq!(msg.from_callsign, Some("PJ4/KA1ABC".to_string()));
+    }
+
+    #[test]
+    fn test_rr73_via_igrid4_32373_collision() {
+        // hb-217 (Batch 34): the i3=1 Standard message with igrid4=32373
+        // unpacks as visual grid "RR73" — colliding with the RR73 token at
+        // igrid4=32403. Real FT8 traffic uses igrid4=32373 to encode RR73
+        // on hard-200 (Batch 33 audit: 99.6% of jt9-truth RR73 land at
+        // this value). The parser must promote the RR73-shaped grid to a
+        // token, producing a properly-displayed "K1ABC W9XYZ RR73" message.
+        //
+        // Build the 77-bit payload for "K1ABC W9XYZ RR73" via igrid4=32373:
+        //   n29a(29) + n29b(29) + ir(1) + igrid4(15) + i3(3) = 77
+        // (Callsign packing not used here — we set call_a/call_b to junk
+        //  hashes and only verify that the post-parse standard_type and
+        //  to_string output include RR73.)
+        // Use the encoder's pack28 to get valid non-CQ callsign codes.
+        // Use n28 values in the "standard callsign" range (≥ NTOKENS+MAX22
+        // = 6_257_896) so they're not interpreted as CQ-special.
+        let n28a: u32 = 7_000_000;
+        let n28b: u32 = 7_500_000;
+        let n29a = n28a << 1;
+        let n29b = n28b << 1;
+        let ir: u8 = 0;
+        let igrid4: u16 = 32373; // the RR73-collision grid
+        let i3: u8 = 1;
+
+        let mut payload = BitVec::with_capacity(77);
+        for i in (0..29).rev() {
+            payload.push((n29a >> i) & 1 != 0);
+        }
+        for i in (0..29).rev() {
+            payload.push((n29b >> i) & 1 != 0);
+        }
+        payload.push(ir != 0);
+        for i in (0..15).rev() {
+            payload.push((igrid4 >> i) & 1 != 0);
+        }
+        for i in (0..3).rev() {
+            payload.push((i3 >> i) & 1 != 0);
+        }
+        assert_eq!(payload.len(), 77);
+
+        let parser = MessageParser::new();
+        let msg = parser.parse_payload(&payload).unwrap();
+        assert_eq!(msg.message_type, MessageType::Standard);
+        assert_eq!(
+            msg.standard_type,
+            Some(StandardMessageType::RR73),
+            "igrid4=32373 must parse as RR73 token (hb-217)"
+        );
+        assert!(
+            msg.to_string().ends_with(" RR73"),
+            "rendered message must end in RR73 — got: {}",
+            msg.to_string()
+        );
+        assert!(
+            msg.grid_square.is_none(),
+            "RR73 must not leak as a grid_square"
+        );
+    }
+
+    #[test]
+    fn test_rr73_via_igrid4_32403_canonical_still_works() {
+        // hb-217: also verify the canonical RR73 path (igrid4=32403) still
+        // works after the 32373 promotion. Don't regress the original
+        // token-decoding flow.
+        // Use n28 values in the "standard callsign" range (≥ NTOKENS+MAX22
+        // = 6_257_896) so they're not interpreted as CQ-special.
+        let n28a: u32 = 7_000_000;
+        let n28b: u32 = 7_500_000;
+        let n29a = n28a << 1;
+        let n29b = n28b << 1;
+        let ir: u8 = 0;
+        let igrid4: u16 = 32403; // canonical RR73 token
+        let i3: u8 = 1;
+
+        let mut payload = BitVec::with_capacity(77);
+        for i in (0..29).rev() {
+            payload.push((n29a >> i) & 1 != 0);
+        }
+        for i in (0..29).rev() {
+            payload.push((n29b >> i) & 1 != 0);
+        }
+        payload.push(ir != 0);
+        for i in (0..15).rev() {
+            payload.push((igrid4 >> i) & 1 != 0);
+        }
+        for i in (0..3).rev() {
+            payload.push((i3 >> i) & 1 != 0);
+        }
+
+        let parser = MessageParser::new();
+        let msg = parser.parse_payload(&payload).unwrap();
+        assert_eq!(msg.standard_type, Some(StandardMessageType::RR73));
     }
 
     #[test]

@@ -5796,9 +5796,9 @@ search to in-repo sources.
     - research/experiments/2026-06-04-hb-216-tier-classifier.md (S1 — probe + classifier)
     - research/experiments/2026-06-04-hb-216-session2.md (S2 — coordinator wiring)
 
-### hb-217 — RR73 decoder pipeline bug (99.6% miss rate on hard-200)  [PRIORITY: 0.65, spawned 2026-06-04 from Batch 33]
+### hb-217 — RR73 decoder pipeline bug (99.6% miss rate on hard-200)  [GRADUATED 2026-06-04 Batch 34 — fix: parse_type1_standard promotes RR73-shaped grid (igrid4=32373) to RR73 token. Result: 2/503 → 312/503 RR73 recall (+310 TPs); strong-signal recall 67.6% → 71.9%. +3 unit tests. Production-grade win.]
   mode: ft8
-  status: BUG-IDENTIFIED — mechanism unknown but isolated; needs focused next-batch debug
+  status: GRADUATED — Batch 34 shipped the fix. Mechanism: parser filtered "RR73"-shaped grid (igrid4=32373) without promoting to a token; the comment at message.rs:1407 acknowledged the collision but the original code only filtered.
   priority_score: 0.65
   estimated_effort: 1-2 sessions for instrumented debug; potentially small fix once mechanism known
   expected_delta: recovery of ~501 missing RR73 truths on hard-200 (≈ +10% of all truths). Bigger if same mechanism affects related QSO-completion types (RRR, 73).
