@@ -325,16 +325,23 @@ fn test_suffix_messages_use_i3_1() {
 
 #[test]
 fn test_suffix_round_trip() {
-    // /R round-trip should decode exactly
-    let decoded = encode_and_decode("K1DEF W1ABC/R FN42");
-    assert_eq!(decoded, "K1DEF W1ABC/R FN42");
-
-    // /P round-trip: ip=1 is protocol-identical to /R, so decoder shows /R
-    // This is a known FT8 protocol limitation (both suffixes encode the same way)
+    // Batch 35 (hb-219): both /R and /P encode with ip=1 (protocol-
+    // identical). The renderer now defaults to /P (matching jt9 and
+    // recovering 16 /P truths on hard-200). /R-only operators (contest
+    // rovers, rare in the autonomous-personal-station profile) are
+    // displayed as /P.
+    //
+    // /P round-trip: input → ip=1 → render as /P → exact match.
     let decoded = encode_and_decode("K1DEF W1ABC/P FN42");
+    assert_eq!(decoded, "K1DEF W1ABC/P FN42");
+
+    // /R round-trip: input → ip=1 → render as /P (protocol limitation).
+    // Contest /R operators decode as /P; pancetta's autonomous-station
+    // profile does not run contests, so this is an acceptable loss.
+    let decoded = encode_and_decode("K1DEF W1ABC/R FN42");
     assert_eq!(
-        decoded, "K1DEF W1ABC/R FN42",
-        "/P decodes as /R (protocol limitation)"
+        decoded, "K1DEF W1ABC/P FN42",
+        "/R decodes as /P (Batch 35 renderer change)"
     );
 }
 

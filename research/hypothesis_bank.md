@@ -5853,3 +5853,30 @@ search to in-repo sources.
     joint decoding.
 
     Journal: research/experiments/2026-06-04-batch-33.md (Diagnostic AA)
+
+### hb-219 — /R → /P renderer (compound-callsign coverage)  [GRADUATED 2026-06-05 Batch 35 — 1-line fix in parse_type1_standard renders ip=1 as /P (matching jt9 convention) instead of /R. Pancetta now emits 434 /P (was 0); +7 /P TPs recovered on hard-200. Noise FPs that previously matched the /R-pattern filter now flow through callsign-continuity which Batch 31 F showed catches 100%. Net +7 TPs at ~0 FP leak. 1 new test + 1 round-trip test updated. Companion to hb-217 — same "audit reveals display bug → 1-line fix" pattern.]
+  mode: ft8
+  status: GRADUATED — Batch 35 shipped the renderer change.
+  priority_score: 0.0
+  estimated_effort: complete
+  expected_delta: CONFIRMED — +7 TPs on hard-200 (16 /P truths existed; 7 decoded via other paths that previously rendered as /R now match /P)
+  defensible_prior: YES — Batch 33 Y audit found 16 /P truths / 0 /P emissions. Batch 35 B confirmed pancetta emits exactly the same encoded bits as jt9 but renders as /R while jt9 renders as /P. The protocol's ip=1 flag is /R-or-/P-ambiguous.
+  wild_card: false
+  evidence_for:
+    - Batch 33 Y: 16 /P truths in hard-200 baseline, 0 /P emissions from pancetta
+    - Batch 35 B: 434 /R emissions in pancetta (all noise FPs per Batch 30)
+    - jt9's convention is /P; /R contest rovers are out-of-profile
+    - Batch 31 F: 0/502 noise-FP callsigns appear in trust set → callsign-continuity catches the noise patterns regardless of suffix
+  notes: |
+    Fix: pancetta-ft8/src/message.rs::parse_type1_standard
+    `Some(format!("{}/R", c))` → `Some(format!("{}/P", c))`
+
+    Round-trip semantics: encoding /R-input or /P-input both produce
+    ip=1 (protocol-equivalent). Decoder now always renders as /P. The
+    test `test_suffix_round_trip` was updated to reflect this.
+
+    Operational impact: /P portable ops decoded correctly. /R contest
+    rovers (rare in the K5ARH autonomous-personal-station profile) get
+    rendered as /P — acceptable loss.
+
+    Journal: research/experiments/2026-06-05-batch-35.md

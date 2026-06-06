@@ -1377,17 +1377,26 @@ impl MessageParser {
         let n28b = n29b >> 1;
         let ipb = (n29b & 1) as u8;
 
-        // Decode callsigns, appending /R suffix when ip=1
+        // Decode callsigns, appending /P suffix when ip=1
         let call_a = self.unpack28(n28a);
         let call_b = self.unpack28(n28b);
 
-        // Helper to apply suffix: ip=1 means /R (or /P — indistinguishable in protocol)
+        // Helper to apply suffix: ip=1 means /R or /P — indistinguishable
+        // in protocol bits. Batch 35 (hb-219): default to /P. jt9's
+        // convention is /P; pancetta previously hardcoded /R, mismatching
+        // jt9 on 16 hard-200 /P truths (Diagnostic B). Real /R contest
+        // rovers are rare in the autonomous-personal-station profile;
+        // /P portable ops are common. Render as /P so the displayed text
+        // matches jt9's truth format and so the noise-emergent ip=1 FPs
+        // get caught by the callsign-continuity filter (the Batch 30 /R
+        // pattern reject becomes a no-op for these decodes but remains in
+        // place as defense-in-depth against any actual /R emissions).
         let apply_suffix = |call: Option<String>, ip: u8| -> Option<String> {
             match (call, ip) {
                 (Some(c), 1)
                     if !c.starts_with("CQ") && !c.starts_with("DE") && !c.starts_with("QRZ") =>
                 {
-                    Some(format!("{}/R", c))
+                    Some(format!("{}/P", c))
                 }
                 (c, _) => c,
             }
@@ -2657,6 +2666,57 @@ mod tests {
         let parser = MessageParser::new();
         let msg = parser.parse_payload(&payload).unwrap();
         assert_eq!(msg.standard_type, Some(StandardMessageType::RR73));
+    }
+
+    #[test]
+    fn test_ip_flag_renders_as_slash_p_not_slash_r() {
+        // Batch 35 (hb-219): a Standard message with ip=1 must render
+        // its callsign with "/P" suffix (not "/R"). The protocol uses
+        // ip=1 for both /P portable and /R contest rover; jt9's
+        // convention is /P, and Diagnostic B (Batch 35) found pancetta
+        // previously rendered every ip=1 as /R, missing 16 /P truths
+        // on hard-200.
+        //
+        // Build a Standard message with ip-flag set on the first
+        // callsign; verify the rendered text ends in "/P".
+        let (n28a, _) = crate::encoder::pack28("K1ABC").expect("pack K1ABC");
+        let (n28b, _) = crate::encoder::pack28("W9XYZ").expect("pack W9XYZ");
+        let n29a = (n28a << 1) | 1; // ip=1 on call_a
+        let n29b = n28b << 1;
+        let ir: u8 = 0;
+        // Use a real grid (FN42 → some valid igrid4) so the message
+        // parses as ReplyWithGrid not blank.
+        // FN42: F=5, N=13, 4, 2 → igrid4 = 5*1800 + 13*100 + 4*10 + 2 = 10342
+        let igrid4: u16 = 10342;
+        let i3: u8 = 1;
+
+        let mut payload = BitVec::with_capacity(77);
+        for i in (0..29).rev() {
+            payload.push((n29a >> i) & 1 != 0);
+        }
+        for i in (0..29).rev() {
+            payload.push((n29b >> i) & 1 != 0);
+        }
+        payload.push(ir != 0);
+        for i in (0..15).rev() {
+            payload.push((igrid4 >> i) & 1 != 0);
+        }
+        for i in (0..3).rev() {
+            payload.push((i3 >> i) & 1 != 0);
+        }
+
+        let parser = MessageParser::new();
+        let msg = parser.parse_payload(&payload).unwrap();
+        let rendered = msg.to_string();
+        // The ip=1 callsign must end in /P, not /R.
+        assert!(
+            rendered.contains("/P"),
+            "rendered message must contain /P (hb-219); got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("/R"),
+            "rendered message must NOT contain /R (hb-219); got: {rendered}"
+        );
     }
 
     #[test]
