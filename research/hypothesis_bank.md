@@ -5829,30 +5829,99 @@ search to in-repo sources.
 
     Journal: research/experiments/2026-06-04-batch-33.md (Diagnostic DD)
 
-### hb-218 — Capture-effect joint-decoding (corpus-scale headroom)  [PRIORITY: 0.55, spawned 2026-06-04 from Batch 33 AA]
+### hb-218 — Capture-effect joint-decoding (corpus-scale headroom)  [SPLIT 2026-06-06 by Batch 37 — see hb-218a/b/c]
   mode: ft8
-  status: QUANTIFIED-HEADROOM — re-motivates hb-079/080/086 family with corpus-scale data
-  priority_score: 0.55
-  estimated_effort: plan-sized (multiple sessions); previous joint-pair-retry work shipped infra without major production-recall gain
-  expected_delta: recovery of up to 1058 strong-signal misses currently capture-locked (Batch 33 AA). Plus the corresponding weaker-SNR captures (not yet measured).
-  defensible_prior: YES — Batch 29 J quantified the capture-effect boundary at ~25 Hz (equal amplitudes block both signals). Batch 33 AA measured at corpus scale: 67.1% of strong misses have a companion truth within ±25 Hz. The structural mechanism is the dominant production-recall blocker.
+  status: SPLIT — Batch 37 characterized the post-mp=2 974-truth frontier in detail; the umbrella hypothesis is now split into three sub-hypotheses with distinct mechanisms.
+  priority_score: 0.0 (umbrella retired; sub-hypotheses tracked separately)
+  estimated_effort: see sub-hypotheses
+  expected_delta: ALL three together would close the 974-truth post-mp=2 capture-locked frontier (Batch 37 AA)
+  defensible_prior: YES — Batch 29 J quantified capture-effect at ~25 Hz. Batch 33 AA corpus-scale 67.1%. Batch 36 B1 mp=2 ship recovered ~84 capture-locked truths via brute-force SIC. Batch 37 AA: 974 remaining frontier; Batch 37 CC1 split it 51/49 between SIC-failure and dual-miss.
+  notes: |
+    Batch 37 findings that drove the split:
+    - AA1: 974 capture-locked truths remain post-mp=2 (was 1058 pre-mp=2)
+    - AA2: Δfreq distribution uniform 0-25 Hz (not at-the-boundary)
+    - AA3: 24% have MISSED truth LOUDER than neighbor (anomaly → hb-218c)
+    - BB1: 68% within Δdt 0.3s (time-domain separation has limited potential)
+    - BB2: 174 WAVs hold the 974 (5.6 mean/WAV; 26 WAVs have 11+)
+    - **CC1: 51% SIC failure / 49% dual miss** (the central split)
+
+    See research/experiments/2026-06-06-batch-37.md.
+
+    Journal: research/experiments/2026-06-04-batch-33.md (original AA)
+
+### hb-218a — SIC residual quality improvement  [PRIORITY: 0.50, spawned 2026-06-06 from Batch 37 CC1]
+  mode: ft8
+  status: QUANTIFIED-HEADROOM — Batch 37 CC1 showed 486 frontier truths have neighbor decoded by pancetta (SIC fired) but truth still missed
+  priority_score: 0.50
+  estimated_effort: 2-3 sessions; revisits subtract_with_sidelobes
+  expected_delta: up to 486 strong-SNR TPs (if SIC residual quality fix recovers them all). Realistic 30-50% recovery → 145-243 TPs.
+  defensible_prior: YES — these truths failed AFTER pancetta successfully decoded their neighbor. The blocker is residual quality, not sync or LDPC.
   wild_card: false
   evidence_for:
-    - Batch 29 J: 0/20 decode at Δfreq=6.25 Hz, 0/20 at 12.5 Hz equal-amp; clean separation at ≥25 Hz
-    - Batch 33 AA: 1058/1576 (67.1%) strong-signal misses are capture-locked
-    - hb-079 (coherent multipass) and hb-080 (multipass N=3) graduated with composite-positive results — joint decoding works in principle
+    - Batch 37 CC1: 497/974 frontier truths had pancetta-decoded neighbor (51%)
+    - 486 of those had truth quieter than neighbor (textbook SIC victim)
+    - hb-097 mechanism-validated (α*=1.0 confirms math) — same family
   evidence_against:
-    - hb-079/080 graduations didn't translate to large production-recall gains
-    - Joint decoding adds substantial computational cost
-    - Some capture-locked pairs may be FP-FP rather than FP-blocking-TP
+    - hb-086 V2 (soft cancellation) SHELVED across 3 corpora — pancetta's LLRs are sharp so soft → hard collapses
+    - hb-097 production wire still pending
   notes: |
-    Strategic context: this is the LARGEST single recall mechanism
-    surfaced by Batch 33's corpus-scale measurement. Worth a plan-sized
-    revisit. But first, ship hb-217 (RR73 fix) — it's a bounded debug
-    with high-probability win, and its mechanism is independent of
+    Mechanism: improve the per-decode subtract such that the post-SIC
+    residual is cleaner. Possible attacks:
+    1. Per-decode amplitude scaling (refit α in residual = signal - α·model)
+    2. Per-decode phase refinement before subtraction
+    3. Iterative subtract-and-refit (multi-pass per signal)
+    Journal: research/experiments/2026-06-06-batch-37.md
+
+### hb-218b — Joint LDPC for dual-miss capture pairs  [PRIORITY: 0.45, spawned 2026-06-06 from Batch 37 CC1]
+  mode: ft8
+  status: QUANTIFIED-HEADROOM — Batch 37 CC1 showed 477 frontier truths where BOTH signals are missed by pancetta
+  priority_score: 0.45
+  estimated_effort: plan-sized (3-5 sessions); requires joint sync candidate generation + joint LDPC decoder
+  expected_delta: up to 477 truth recoveries + corresponding 477 neighbor recoveries → ~950 TPs total IF mechanism works. hb-079/080/086 V1 family hit single-pair joint-pair-retry; this needs full joint sync + LDPC.
+  defensible_prior: PARTIAL — joint decoding is theoretically sound. hb-086 V1 graduated showing pair-retry works. But the dual-miss population is by definition the hardest cases — no individual signal is even sync-passing.
+  wild_card: false
+  evidence_for:
+    - Batch 37 CC1: 477/974 frontier truths are dual-miss (49%)
+    - hb-086 V1 graduated (+12 hard-200 recall) on joint pair-retry
+  evidence_against:
+    - hb-086 V2 (soft cancellation) SHELVED — soft cancellation collapses
+    - dual-miss truths failed sync even before LDPC; the sync candidate generation step itself is what's missing
+    - Computational cost of joint LDPC is substantial
+  notes: |
+    The dual-miss regime is fundamentally different from hb-218a:
+    there is no decoded neighbor to subtract. Need to detect that a
+    capture-effect pair *exists* (e.g., by looking at the sync
+    spectrum for two clustered peaks within ±25 Hz) and then attempt
     joint decoding.
 
-    Journal: research/experiments/2026-06-04-batch-33.md (Diagnostic AA)
+    Plan-sized — defer to a dedicated multi-batch initiative once
+    hb-218a is shipped or shelved.
+
+### hb-218c — Louder-truth-missed anomaly  [PRIORITY: 0.40, spawned 2026-06-06 from Batch 37 AA3 + CC1]
+  mode: ft8
+  status: QUANTIFIED — Batch 37 AA3 found 238 frontier truths (24%) with Δsnr<-3 dB (truth LOUDER); CC1: 11 had decoded neighbor + truth louder, 227 had both missed + truth louder
+  priority_score: 0.40
+  estimated_effort: 1-2 sessions diagnostic; mechanism unknown
+  expected_delta: up to 238 truth recoveries IF mechanism is identifiable and fixable. Unknown.
+  defensible_prior: PARTIAL — anomaly is real (238 frontier truths). Mechanism is unknown — louder signals shouldn't be capture-victims under classical capture-effect.
+  wild_card: true
+  evidence_for:
+    - Batch 37 AA3: 238 frontier truths have truth louder than neighbor
+    - Batch 37 CC1: 227 of those have BOTH missed (so it's not "SIC subtracted the wrong one")
+  evidence_against:
+    - Could be artifacts of jt9-baseline SNR estimate (jt9 approximate)
+    - Selection bias: louder signals in low-truth-density areas may have
+      other neighbors not in the ±25 Hz window
+  notes: |
+    Investigation candidate. Likely mechanisms:
+    1. Sync candidate priority bug — pancetta picks the wrong (weaker)
+       neighbor first, SIC subtraction damages the louder one
+    2. jt9 SNR estimate noise — louder isn't really louder
+    3. Spectrogram normalization (per-window AGC) where the louder is
+       in a noisier bin so its effective SNR is lower
+    Diagnostic-first: dump the sync candidate list for these 238 cases
+    and check if the louder appears in the top-K candidates.
+    Journal: research/experiments/2026-06-06-batch-37.md
 
 ### hb-219 — /R → /P renderer (compound-callsign coverage)  [GRADUATED 2026-06-05 Batch 35 — 1-line fix in parse_type1_standard renders ip=1 as /P (matching jt9 convention) instead of /R. Pancetta now emits 434 /P (was 0); +7 /P TPs recovered on hard-200. Noise FPs that previously matched the /R-pattern filter now flow through callsign-continuity which Batch 31 F showed catches 100%. Net +7 TPs at ~0 FP leak. 1 new test + 1 round-trip test updated. Companion to hb-217 — same "audit reveals display bug → 1-line fix" pattern.]
   mode: ft8
