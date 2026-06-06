@@ -5849,28 +5849,42 @@ search to in-repo sources.
 
     Journal: research/experiments/2026-06-04-batch-33.md (original AA)
 
-### hb-218a — SIC residual quality improvement  [PRIORITY: 0.50, spawned 2026-06-06 from Batch 37 CC1]
+### hb-218a — SIC residual quality improvement  [SHELVED 2026-06-06 Batch 38 by hb-086 V3 inheritance]
   mode: ft8
-  status: QUANTIFIED-HEADROOM — Batch 37 CC1 showed 486 frontier truths have neighbor decoded by pancetta (SIC fired) but truth still missed
-  priority_score: 0.50
-  estimated_effort: 2-3 sessions; revisits subtract_with_sidelobes
-  expected_delta: up to 486 strong-SNR TPs (if SIC residual quality fix recovers them all). Realistic 30-50% recovery → 145-243 TPs.
-  defensible_prior: YES — these truths failed AFTER pancetta successfully decoded their neighbor. The blocker is residual quality, not sync or LDPC.
+  status: SHELVED — Batch 38 V3-inheritance probe: 0/479 SIC-victim truths surfaced under joint_residual_sync_relax_db=-2.0 (most-aggressive setting). Pancetta's INTERNAL residual at the 479 textbook SIC-victim truth coords does not contain decodable signal. The naive perfect-SIC subtraction attempt (encode neighbor + subtract from WAV) was also 0/43, but technique was broken (jt9's 1 Hz freq resolution × 12.64s = ~6 cycles of phase drift). The V3-inheritance test bypasses the synthesis problem by using pancetta's coherent ML-projection subtract directly.
+  priority_score: 0.0 (shelved)
+  estimated_effort: complete
+  expected_delta: REFUTED — 0 truths recoverable via residual quality improvement at this corpus regime
+  defensible_prior: refuted by direct measurement
   wild_card: false
   evidence_for:
-    - Batch 37 CC1: 497/974 frontier truths had pancetta-decoded neighbor (51%)
-    - 486 of those had truth quieter than neighbor (textbook SIC victim)
-    - hb-097 mechanism-validated (α*=1.0 confirms math) — same family
+    - Batch 37 CC1: 497/974 frontier truths had pancetta-decoded neighbor
   evidence_against:
+    - **Batch 38 V3-inheritance: 0/479 SIC-victim truths surfaced under V3 relax_db=-2.0 (the previously most-aggressive setting tested at hard-200 wide and shelved with 0 additional TPs)**
     - hb-086 V2 (soft cancellation) SHELVED across 3 corpora — pancetta's LLRs are sharp so soft → hard collapses
-    - hb-097 production wire still pending
+    - hb-086 V3 SHELVED on hard-200 wide; Batch 38 confirmed at SIC-victim targeted subset
   notes: |
-    Mechanism: improve the per-decode subtract such that the post-SIC
-    residual is cleaner. Possible attacks:
-    1. Per-decode amplitude scaling (refit α in residual = signal - α·model)
-    2. Per-decode phase refinement before subtraction
-    3. Iterative subtract-and-refit (multi-pass per signal)
-    Journal: research/experiments/2026-06-06-batch-37.md
+    The original premise — that residual quality at the truth's
+    expected coords is improvable — is refuted at this corpus
+    regime. The residual is genuinely noise, not weak signal.
+
+    Why isn't there signal? Likely the SIC subtraction is doing what
+    it's supposed to: removing the strong neighbor's energy. The weak
+    truth's signal energy is small (∼6-15 dB below neighbor) AND
+    spatially co-located (±25 Hz, same dt). When the strong
+    is subtracted, the weak's energy was already overlapping the
+    strong's tone pattern; what remains has weak-truth tones embedded
+    in residual decimation noise at sub-decodable amplitude.
+
+    Re-test gate: a fundamentally new mechanism (e.g., joint sync
+    candidate generation that detects BOTH signals before either is
+    decoded — hb-218b territory) or a new corpus class that contains
+    the specific signal regime where residual would have decodable
+    headroom.
+
+    Journals:
+    - research/experiments/2026-06-06-batch-37.md (frontier characterization)
+    - research/experiments/2026-06-06-batch-38.md (this shelve)
 
 ### hb-218b — Joint LDPC for dual-miss capture pairs  [PRIORITY: 0.45, spawned 2026-06-06 from Batch 37 CC1]
   mode: ft8
