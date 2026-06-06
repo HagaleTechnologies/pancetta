@@ -5880,3 +5880,28 @@ search to in-repo sources.
     rendered as /P — acceptable loss.
 
     Journal: research/experiments/2026-06-05-batch-35.md
+
+### hb-216 — Fast-tier multipass=2 preset (Batch 36 B1)  [SHIPPED-V2 2026-06-06]
+
+  status: SHIPPED-V2 — Batch 36 B1 extended the tier-driven `Ft8Config` rewrite to also bump `max_decode_passes=2` on Fast tier; was already shipped at coordinator wiring in Session 2.
+  mode: ft8
+  priority_score: 0.0
+  evidence_for:
+    - Batch 35 C probe: mp=2 = +32 TPs / 0 lost on hard-200; +296 raw FPs
+    - Batch 36 B2 validation: identical +32 / 0 (replicates)
+    - Batch 36 B3 sweep: mp=3 +6 (diminishing); mp=4 +0 (plateau) — mp=2 is the Pareto choice
+    - Batch 36 B4: 50% of mp=2 gain at strong SNR (≥-5 dB) — capture-effect recovery, not sensitivity
+    - Batch 31 F: noise-FP callsigns caught 100% by hb-062 — added FPs flow through cleanly
+  measured:
+    expected_delta: +32 TPs per hard-200 cycle on Fast-tier hosts
+    cost: ~2.0× wall-clock per decode window (acceptable on Fast tier)
+  notes: |
+    Slow tier remains at mp=1 + osd_depth=Some(1); Moderate stays at default mp=1.
+    Operator override `PANCETTA_SCOPED_FAST_PATH=0` or `=1` skips the preset entirely.
+
+    The 50%-of-gain-at-strong-SNR finding from Batch 36 B4 is methodologically
+    important: it confirms mp=2 is operating as a partial substitute for the
+    plan-sized hb-218 capture-effect joint decoder. hb-218 still has ~1042
+    truths of headroom beyond what mp=2 brute-forces.
+
+    Journal: research/experiments/2026-06-06-batch-36.md

@@ -18,13 +18,18 @@
 //!
 //! ## Override matrix
 //!
-//! | env var | probe result | atomic final | Slow preset applied? |
-//! |---------|--------------|--------------|----------------------|
-//! | unset   | Fast         | false        | no                   |
-//! | unset   | Moderate     | true         | no                   |
-//! | unset   | Slow         | true         | yes                  |
-//! | `"1"`   | (any)        | true         | no (operator chose)  |
-//! | `"0"`   | (any)        | false        | no (operator chose)  |
+//! | env var | probe result | atomic final | Ft8Config preset                       |
+//! |---------|--------------|--------------|----------------------------------------|
+//! | unset   | Fast         | false        | Fast preset (max_decode_passes=2)      |
+//! | unset   | Moderate     | true         | none (defaults)                        |
+//! | unset   | Slow         | true         | Slow preset (mp=1, osd_depth=Some(1))  |
+//! | `"1"`   | (any)        | true         | none (operator chose)                  |
+//! | `"0"`   | (any)        | false        | none (operator chose)                  |
+//!
+//! The Fast preset (Batch 36 B1) trades wall-clock for sensitivity:
+//! `max_decode_passes=2` recovers ~+32 TPs on hard-200 over the
+//! default mp=1, at ~+50% per-window wall-clock cost. Hosts with the
+//! compute budget pay it; Moderate/Slow stay at the default.
 //!
 //! See `docs/superpowers/specs/2026-06-04-hb-216-s2-tier-wiring-design.md`.
 
@@ -262,12 +267,23 @@ pub(crate) async fn apply_tier(
     };
     scoped_fast_path.store(atomic_value, Ordering::Release);
 
-    // Slow-preset rewrite, skipped on any operator override.
-    let config_change = if override_ == Override::None && tier == HardwareTier::Slow {
-        let mut cfg = ft8_config.write().await;
-        cfg.max_decode_passes = 1;
-        cfg.osd_depth = Some(1);
-        " + Ft8Config slow preset (max_decode_passes=1, osd_depth=Some(1))"
+    // Tier-driven Ft8Config preset. Skipped on any operator override
+    // — the operator's env var settings always win.
+    let config_change = if override_ == Override::None {
+        match tier {
+            HardwareTier::Fast => {
+                let mut cfg = ft8_config.write().await;
+                cfg.max_decode_passes = 2;
+                " + Ft8Config fast preset (max_decode_passes=2)"
+            }
+            HardwareTier::Moderate => "",
+            HardwareTier::Slow => {
+                let mut cfg = ft8_config.write().await;
+                cfg.max_decode_passes = 1;
+                cfg.osd_depth = Some(1);
+                " + Ft8Config slow preset (max_decode_passes=1, osd_depth=Some(1))"
+            }
+        }
     } else {
         ""
     };
@@ -496,13 +512,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_tier_fast_no_override_leaves_config_alone() {
-        let atomic = AtomicBool::new(false);
+    async fn apply_tier_fast_no_override_writes_fast_preset() {
+        // Batch 36 B1: Fast tier bumps max_decode_passes to 2 to spend
+        // available compute budget on the ~+32-TP multipass=2 lift
+        // measured in Batch 35.
+        let atomic = AtomicBool::new(true); // pre-set to verify it gets cleared
         let cfg = RwLock::new(Ft8Config::default());
-        let before = cfg.read().await.osd_depth;
+        let before_osd = cfg.read().await.osd_depth;
         apply_tier(HardwareTier::Fast, Override::None, &atomic, &cfg).await;
         assert!(!atomic.load(Ordering::Acquire));
-        assert_eq!(cfg.read().await.osd_depth, before);
+        let c = cfg.read().await;
+        assert_eq!(c.max_decode_passes, 2);
+        // osd_depth left alone on Fast tier (only Slow rewrites it).
+        assert_eq!(c.osd_depth, before_osd);
+    }
+
+    #[tokio::test]
+    async fn apply_tier_fast_with_force_off_does_not_change_config() {
+        // Operator override always wins over tier-driven preset.
+        let atomic = AtomicBool::new(false);
+        let cfg = RwLock::new(Ft8Config::default());
+        let before_mp = cfg.read().await.max_decode_passes;
+        apply_tier(HardwareTier::Fast, Override::ForceOff, &atomic, &cfg).await;
+        assert!(!atomic.load(Ordering::Acquire));
+        assert_eq!(cfg.read().await.max_decode_passes, before_mp);
     }
 
     #[tokio::test]
@@ -541,8 +574,11 @@ mod tests {
         let atomic = AtomicBool::new(false);
         let cfg = RwLock::new(Ft8Config::default());
         let before_osd = cfg.read().await.osd_depth;
+        let before_mp = cfg.read().await.max_decode_passes;
         apply_tier(HardwareTier::Fast, Override::ForceOn, &atomic, &cfg).await;
         assert!(atomic.load(Ordering::Acquire));
+        // Operator override skips the Fast preset.
+        assert_eq!(cfg.read().await.max_decode_passes, before_mp);
         assert_eq!(cfg.read().await.osd_depth, before_osd);
     }
 
