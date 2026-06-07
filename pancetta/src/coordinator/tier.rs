@@ -20,16 +20,17 @@
 //!
 //! | env var | probe result | atomic final | Ft8Config preset                       |
 //! |---------|--------------|--------------|----------------------------------------|
-//! | unset   | Fast         | false        | Fast preset (max_decode_passes=2)      |
+//! | unset   | Fast         | false        | Fast preset (mp=2, ldpc_iters=200)     |
 //! | unset   | Moderate     | true         | none (defaults)                        |
 //! | unset   | Slow         | true         | Slow preset (mp=1, osd_depth=Some(1))  |
 //! | `"1"`   | (any)        | true         | none (operator chose)                  |
 //! | `"0"`   | (any)        | false        | none (operator chose)                  |
 //!
-//! The Fast preset (Batch 36 B1) trades wall-clock for sensitivity:
-//! `max_decode_passes=2` recovers ~+32 TPs on hard-200 over the
-//! default mp=1, at ~+50% per-window wall-clock cost. Hosts with the
-//! compute budget pay it; Moderate/Slow stay at the default.
+//! The Fast preset trades wall-clock for sensitivity:
+//! - Batch 36 B1: `max_decode_passes=2` (+32 TPs / hard-200, 2.0× WC)
+//! - Batch 41:    `ldpc_iterations=200` (+16 TPs / hard-200; early-
+//!                termination means avg iter count rises modestly)
+//! Hosts with the compute budget pay it; Moderate/Slow stay at the default.
 //!
 //! See `docs/superpowers/specs/2026-06-04-hb-216-s2-tier-wiring-design.md`.
 
@@ -274,7 +275,8 @@ pub(crate) async fn apply_tier(
             HardwareTier::Fast => {
                 let mut cfg = ft8_config.write().await;
                 cfg.max_decode_passes = 2;
-                " + Ft8Config fast preset (max_decode_passes=2)"
+                cfg.ldpc_iterations = 200;
+                " + Ft8Config fast preset (max_decode_passes=2, ldpc_iterations=200)"
             }
             HardwareTier::Moderate => "",
             HardwareTier::Slow => {
@@ -514,8 +516,9 @@ mod tests {
     #[tokio::test]
     async fn apply_tier_fast_no_override_writes_fast_preset() {
         // Batch 36 B1: Fast tier bumps max_decode_passes to 2 to spend
-        // available compute budget on the ~+32-TP multipass=2 lift
-        // measured in Batch 35.
+        // available compute budget on the ~+32-TP multipass=2 lift.
+        // Batch 41: also bumps ldpc_iterations to 200 for the ~+16 TP
+        // LDPC-iter lift on hard-200.
         let atomic = AtomicBool::new(true); // pre-set to verify it gets cleared
         let cfg = RwLock::new(Ft8Config::default());
         let before_osd = cfg.read().await.osd_depth;
@@ -523,6 +526,7 @@ mod tests {
         assert!(!atomic.load(Ordering::Acquire));
         let c = cfg.read().await;
         assert_eq!(c.max_decode_passes, 2);
+        assert_eq!(c.ldpc_iterations, 200);
         // osd_depth left alone on Fast tier (only Slow rewrites it).
         assert_eq!(c.osd_depth, before_osd);
     }

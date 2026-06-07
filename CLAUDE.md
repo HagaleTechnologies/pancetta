@@ -74,10 +74,10 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
   `(cpu_model, core_count, pancetta_version)`). Moderate/Slow tiers
   flip the `scoped_fast_path: Arc<AtomicBool>` (replaces the old
   env-var read in the FT8 hot loop). Tier-driven `Ft8Config` rewrites
-  (Batch 36 B1): Fast tier bumps `max_decode_passes = 2` for the
-  ~+32-TP multipass lift on hard-200; Slow tier rewrites to
-  `max_decode_passes = 1` + `osd_depth = Some(1)`; Moderate stays at
-  defaults. Operator override: `PANCETTA_SCOPED_FAST_PATH=1` forces
+  (Batch 36 B1, Batch 41): Fast tier bumps `max_decode_passes = 2`
+  (+32 TPs/hard-200) AND `ldpc_iterations = 200` (+16 TPs); Slow tier
+  rewrites to `max_decode_passes = 1` + `osd_depth = Some(1)`;
+  Moderate stays at defaults. Operator override: `PANCETTA_SCOPED_FAST_PATH=1` forces
   on, `=0` forces off, both skip the tier-driven preset. Spec:
   `docs/superpowers/specs/2026-06-04-hb-216-s2-tier-wiring-design.md`.
 - **QSO sender verification**: The QSO state machine (`pancetta-qso/src/qso_manager.rs::determine_state_transition` and `is_message_relevant`) verifies `from_station == expected DX callsign` on every state-advance. Mismatches are logged at `warn!` level (`target: "qso.security"`) and discarded. Frequency tolerance is 15 Hz. The autonomous responder (`autonomous.rs`) tracks per-callsign response timestamps in `recently_responded_to` and skips CQs from callsigns it responded to within the last 60s. Both defenses landed 2026-04-29 in response to Security Review C-1 and I-1; see `docs/security-review-2026-04-29.md`.
