@@ -5994,3 +5994,40 @@ search to in-repo sources.
     truths of headroom beyond what mp=2 brute-forces.
 
     Journal: research/experiments/2026-06-06-batch-36.md
+
+### hb-220 — Slot-edge sync expansion  [PRIORITY: 0.50, spawned 2026-06-06 Batch 40]
+  mode: ft8
+  status: QUANTIFIED-HEADROOM — Batch 40 characterized 357 isolated strong-misses; 227 (64%) are at slot-edge (94 at dt<0, 133 at dt≥2.0)
+  priority_score: 0.50
+  estimated_effort: plan-sized (3-4 sessions): coordinator audio buffering + decoder Costas range extension + integration
+  expected_delta: realistic 150-200 TPs from isolated strong-misses (if both early and late slot-edge are addressed). Plus capture-locked slot-edge subset (Batch 36 C2 found ~66 truths at dt<-0.5 with 0% recall).
+  defensible_prior: YES — Batch 36 C1 code-read showed `for t0 in 0..=max_time_step` in decoder.rs:1921 (structurally non-negative). Batch 36 C2 showed dt<-0.5 cliff (83 truths at 0-20% recall). Batch 40 AA5 corpus-scale confirmation: 26% of isolated strong-misses at dt<0, 37% at dt≥2.0.
+  wild_card: false
+  evidence_for:
+    - Batch 40 AA5: 94/357 (26%) at dt<0 + 133/357 (37%) at dt≥2.0 = 64% slot-edge
+    - Batch 40 BB1/BB2/BB3: sync-relaxation probes recover ≤1.4% — the issue is NOT sync threshold but structural sync range
+    - Batch 36 C1: Costas `for t0 in 0..=max_time_step` (decoder.rs:1921) excludes negative t0
+    - Batch 36 C2: 64 truths at dt-1..-0.5 = 20.3% recall; 19 truths at dt<-1 = 0% recall
+  evidence_against:
+    - Coordinator architecture change required (audio buffer of prior/next slot)
+    - Late-edge truncation (dt≥2.0) may have lower headroom than negative-dt
+    - Plan-sized; risk of session 2 implementation hitting unforeseen complexity
+  notes: |
+    Mechanism:
+    1. Coordinator buffers ~2s of audio from PREVIOUS slot (for early-edge)
+       and ~2s from NEXT slot (for late-edge truncation).
+    2. Decoder builds a wider spectrogram from concatenated audio.
+    3. Costas sync iterates t0 from `-pad_steps` to `max_time_step + pad_steps`.
+    4. Decode pipeline unchanged; sync expansion alone surfaces the truths.
+
+    Risk: coordinator-side buffering implies stateful decoding, which
+    complicates the rolling-window AP context (hb-050) and the
+    chrono-replay tier. Likely needs careful architectural design.
+
+    Subset breakdowns from Batch 40:
+    - Early-edge dt<0: 94 isolated strong-misses
+    - Late-edge dt≥2.0: 133 isolated strong-misses
+    - Middle (0-2s, isolated): 130 (other mechanisms — possibly LDPC
+      convergence or AGC. Worth separate diagnostic.)
+
+    Journal: research/experiments/2026-06-06-batch-40.md
