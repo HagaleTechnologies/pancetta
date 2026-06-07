@@ -5911,31 +5911,37 @@ search to in-repo sources.
     Plan-sized — defer to a dedicated multi-batch initiative once
     hb-218a is shipped or shelved.
 
-### hb-218c — Louder-truth-missed anomaly  [PRIORITY: 0.40, spawned 2026-06-06 from Batch 37 AA3 + CC1]
+### hb-218c — Louder-truth-missed anomaly  [SHELVED 2026-06-06 Batch 39 — jt9 SNR estimation artifact + null mechanism probes]
   mode: ft8
-  status: QUANTIFIED — Batch 37 AA3 found 238 frontier truths (24%) with Δsnr<-3 dB (truth LOUDER); CC1: 11 had decoded neighbor + truth louder, 227 had both missed + truth louder
-  priority_score: 0.40
-  estimated_effort: 1-2 sessions diagnostic; mechanism unknown
-  expected_delta: up to 238 truth recoveries IF mechanism is identifiable and fixable. Unknown.
-  defensible_prior: PARTIAL — anomaly is real (238 frontier truths). Mechanism is unknown — louder signals shouldn't be capture-victims under classical capture-effect.
-  wild_card: true
-  evidence_for:
-    - Batch 37 AA3: 238 frontier truths have truth louder than neighbor
-    - Batch 37 CC1: 227 of those have BOTH missed (so it's not "SIC subtracted the wrong one")
+  status: SHELVED — Batch 39 found three independent kill-signals: (1) 94% of 238 "louder-missed" truths are NOT measurably louder by FFT-energy at their freq band — the "louder" claim was jt9 SNR estimation noise; (2) V3 force-decode at relax=-3.0 + window=12 yields 0/238 recovery; (3) neighbor-mask probe (notch ±60 Hz around neighbor.freq) yields 0/20 recovery; (4) CC1 synth control: pancetta correctly decodes BOTH signals at Δfreq=15 Hz / 6 dB asymmetric in clean conditions, ruling out a sync priority bug.
+  priority_score: 0.0 (shelved)
+  estimated_effort: complete
+  expected_delta: REFUTED — anomaly is largely measurement artifact in the jt9 baseline, not a real pancetta mechanism
+  defensible_prior: refuted by direct measurement
+  wild_card: false
   evidence_against:
-    - Could be artifacts of jt9-baseline SNR estimate (jt9 approximate)
-    - Selection bias: louder signals in low-truth-density areas may have
-      other neighbors not in the ±25 Hz window
+    - Batch 39 AA2: 47/50 (94%) of louder-missed truths have FFT-energy(truth.freq) ≤ +1 dB above FFT-energy(neighbor.freq). The truths are NOT actually louder in pancetta's spectrum view; jt9's SNR is noisy at this regime.
+    - Batch 39 BB1: V3 at relax=-3.0 + window=12 → 0/238 louder-missed recovered
+    - Batch 39 BB2: neighbor-mask (notch ±60 Hz around neighbor.freq) → 0/20 recovered. Removing the "occluding" neighbor doesn't surface truth signal.
+    - Batch 39 CC1: synth 2-signal control — pancetta correctly decodes BOTH at Δfreq=15 Hz / 6 dB asymmetric. No priority bug.
+    - Batch 39 DD1: V3 adds 75 decodes / +8 TPs across 122 louder-missed WAVs (11% precision on additions); confirms hb-086 V3's earlier SHELVE rationale.
   notes: |
-    Investigation candidate. Likely mechanisms:
-    1. Sync candidate priority bug — pancetta picks the wrong (weaker)
-       neighbor first, SIC subtraction damages the louder one
-    2. jt9 SNR estimate noise — louder isn't really louder
-    3. Spectrogram normalization (per-window AGC) where the louder is
-       in a noisier bin so its effective SNR is lower
-    Diagnostic-first: dump the sync candidate list for these 238 cases
-    and check if the louder appears in the top-K candidates.
-    Journal: research/experiments/2026-06-06-batch-37.md
+    The mechanism investigation was diagnostic-first as planned. AA2's
+    FFT-energy probe established the anomaly's premise is unreliable
+    (jt9 baseline SNR estimate noise). BB1/BB2 confirmed no mechanism
+    surfaces the truths. CC1 rules out the most plausible mechanism
+    (sync priority bug). All three angles converge on SHELVE.
+
+    The remaining hb-218 attack surface is hb-218b (joint LDPC for
+    dual-miss, plan-sized). Of the original 974 capture-locked
+    frontier from Batch 37, hb-218a SHELVED 486, hb-218c SHELVED
+    238 (with ~227 overlap into dual-miss). Realistic hb-218b
+    headroom is now ~250 truly weak-pair dual-miss truths
+    (down from 477 nominal).
+
+    Journals:
+    - research/experiments/2026-06-06-batch-37.md (frontier characterization)
+    - research/experiments/2026-06-06-batch-39.md (this shelve)
 
 ### hb-219 — /R → /P renderer (compound-callsign coverage)  [GRADUATED 2026-06-05 Batch 35 — 1-line fix in parse_type1_standard renders ip=1 as /P (matching jt9 convention) instead of /R. Pancetta now emits 434 /P (was 0); +7 /P TPs recovered on hard-200. Noise FPs that previously matched the /R-pattern filter now flow through callsign-continuity which Batch 31 F showed catches 100%. Net +7 TPs at ~0 FP leak. 1 new test + 1 round-trip test updated. Companion to hb-217 — same "audit reveals display bug → 1-line fix" pattern.]
   mode: ft8
