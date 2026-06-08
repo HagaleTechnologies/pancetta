@@ -6032,12 +6032,12 @@ search to in-repo sources.
 
     Journal: research/experiments/2026-06-06-batch-40.md
 
-### hb-221 — Multi-interval sliding decode window (WSJT-X 2.2 inspired)  [PRIORITY: 0.55, spawned 2026-06-07 Batch 42]
+### hb-221 — Multi-interval sliding decode window (WSJT-X 2.2 inspired)  [PRIORITY: 0.40, spawned 2026-06-07 Batch 42, RE-MEASURED Batch 43]
   mode: ft8
-  status: QUANTIFIED-HEADROOM — Batch 42 measured +118 TPs over production baseline via 5-window union (sliding offsets 0, 0.5, 1.0, 1.5, 2.0s)
-  priority_score: 0.55
-  estimated_effort: 1-2 sessions for 2-window variant; 3-4 sessions for full N-window coordinator integration
-  expected_delta: +118 TPs measured @5-window union (full hard-200, mp=2 + ldpc=200 baseline 5285 → 5403). Realistic 2-window variant: ~+60-80 TPs at 2x decode cost.
+  status: QUANTIFIED-HEADROOM (revised down) — Batch 43 re-measurement against TRUE production baseline (15s WAV passed in single call, 5301 TPs). Batch 42's +118 was vs wrong baseline (12.64s-truncated single decode = 4724 TPs). True deltas: 3-window {0, 1.0, 2.0} +29 TPs; 5-window {0, 0.5, 1.0, 1.5, 2.0} +102 TPs; **2-window variants ALL NET-NEGATIVE** ({0,1.0}=-179; {0,1.5}=-89; {0,2.0}=-67). Production's 28 internal Costas t0 positions beat 2 single-position windows.
+  priority_score: 0.40
+  estimated_effort: 3-5 sessions for 3-window coordinator integration; 5+ for 5-window
+  expected_delta: 3-window: +29 TPs at 3x decode cost. 5-window: +102 TPs at 5x decode cost + precision drop 74.6% → 62.5% (relies on downstream FP filters to catch added noise).
   defensible_prior: YES — WSJT-X 2.2+ ships multi-interval decoding (11.8/13.5/14.7s) with documented +10% on crowded bands (ARRL release notes). Pancetta single-window at slot end; missing late-dt and slot-edge truths covered by additional windows.
   wild_card: false
   evidence_for:
@@ -6219,3 +6219,76 @@ search to in-repo sources.
     4. Plug into pre-BP soft decoder
 
     Reference: ft8mon ft8.cc:386-407
+
+### hb-224 — `max_parity_errors_for_osd` widening (ft8mon osd_ldpc_thresh=70 port)  [SHELVED 2026-06-07 Batch 43 — pancetta gate=6 already optimal]
+  mode: ft8
+  status: SHELVED — Batch 43 sweep {6, 9, 13, 20} measured: gate=6 baseline; gate=9 +4 TPs at +32% wall-clock; gate=13 (ft8mon equivalent) -34 TPs; gate=20 -82 TPs. Pancetta's downstream FP filters (hb-062 callsign-continuity, hb-103, is_plausible) are tuned for gate=6 and don't compose well with looser OSD gating.
+  priority_score: 0.0
+  notes: |
+    ft8mon's gate=70 (parity errors ≤ 13) is well-tuned for ft8mon's
+    different downstream pipeline. Pancetta's gate=6 is well-tuned for
+    its hb-062/hb-103 stack. Different ecosystems; can't lift the
+    knob in isolation.
+
+    Journal: research/experiments/2026-06-07-batch-43.md
+
+### hb-228 — JTDX 3-method spectral sweep (sqrt/power/L1 magnitudes)  [PRIORITY: 0.60, spawned 2026-06-07 Batch 43, HIGHEST-PRIORITY NEW]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — JTDX runs Costas sync on 3 different magnitude maps from the SAME FFT (sqrt(re²+im²), re²+im², |re|+|im|), each with different syncmin threshold. Different signals pop under different metrics. Truly orthogonal to pancetta's residual-subtract mp=2.
+  priority_score: 0.60
+  estimated_effort: ~1 day (~150 LOC); FFT cost amortized across 3 magnitude maps
+  expected_delta: largest expected recall lift among new findings per agent assessment; not numerically published but JTDX users report sensitivity gain (the ">i7/>3GHz" CPU req is mostly this)
+  defensible_prior: YES — JTDX ships this as "subpass" (despite name, NOT residual-based). Mechanism is orthogonal to all pancetta-shipped multipass/SIC mechanisms.
+  wild_card: false
+  evidence_for:
+    - JTDX lib/sync8.f90 sweep: ipass 1,4,7=sqrt; 2,5,8=power; 3,6,9=L1
+    - Different metrics have different sensitivity profiles: sqrt favors fading recovery; power-squared boosts strong-SNR; L1 robust to impulse noise
+    - syncmin per metric: 1.225 / 1.5 / 1.1 (relaxed for L1)
+    - Pancetta currently uses ONE magnitude (dB-power per spectrogram path)
+  conflict_analysis:
+    - vs hb-079/080 mp=2: ZERO — multipass is residual-based; sweep is spectrum-based
+    - vs hb-086 V1 joint_pair_retry: ZERO — independent stages
+    - vs hb-044 Costas parabolic: NO conflict — parabolic refines after sync; sweep generates more candidates pre-refinement
+  notes: |
+    Implementation: in compute_spectrogram, build 3 magnitude maps from
+    the same complex FFT. Run costas_sync_search on each independently
+    with appropriate syncmin. Union candidate lists with dedup.
+
+    Insertion point: pancetta-ft8/src/decoder.rs near compute_spectrogram
+    + costas_sync_search (~line 950).
+
+    Recommendation: HIGHEST-PRIORITY ship candidate for Batch 44.
+
+    Reference: JTDX lib/sync8.f90 (https://github.com/jtdx-project/jtdx)
+
+### hb-229 — JTDX QSO partner band-collapse (autonomous narrow filter)  [PRIORITY: 0.35, spawned 2026-06-07 Batch 43]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — JTDX collapses search band to ±60 Hz around active QSO partner freq (±290 Hz in Hound mode). Plumbing already exists in pancetta via hb-091 `freq_bin_range`. Just need autonomous side to set it.
+  priority_score: 0.35
+  estimated_effort: ~hours (mostly plumbing)
+  expected_delta: ~0 TPs recall (same recall in target band) but CPU savings + reduced FP exposure outside the band
+  defensible_prior: YES — JTDX standard feature. Pure operational win.
+  wild_card: false
+  notes: |
+    Wire in pancetta-qso/src/qso_manager.rs: when QSO in-flight, pass
+    `Some(±60 Hz around partner freq)` to decoder. Enables parallel
+    multi-stream-per-QSO architecture.
+
+    NOT a TP win — operational win only. Defer to autonomous-mode work.
+
+    Reference: JTDX lib/decoder.f90
+
+### hb-230 — JTDX relaxed sync threshold within ±3 Hz of partner freq  [PRIORITY: 0.30, spawned 2026-06-07 Batch 43]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — JTDX uses syncmin=1.1 for candidates within ±3 Hz of nfqso, vs per-pass syncmin elsewhere
+  priority_score: 0.30
+  estimated_effort: ~1-2 hours (scalar tweak in Costas filter)
+  expected_delta: small modest +TPs for weak partner messages near QSO partner freq
+  defensible_prior: YES — JTDX standard; complements hb-217 by giving weak partner messages a second chance
+  wild_card: false
+  notes: |
+    Pancetta doesn't currently have a "preferred frequency" notion in
+    Costas. Needs plumbing of partner freq + tiny scalar relaxation.
+    Pairs naturally with hb-229.
+
+    Reference: JTDX lib/sync8.f90

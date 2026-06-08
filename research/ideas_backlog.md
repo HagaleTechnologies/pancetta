@@ -325,3 +325,208 @@ literature, neural LDPC papers, GPU-OSD discussions, and more.
 - `DC offset removal pre-decode` — flipped to -4 TPs after Batch 41
   ldpc_iters=200 ship (was +4 vs ldpc=100). Effect captured by ldpc bump.
 - `combo (residual_min=1.5 + dc_remove)` — same as dc_remove alone
+
+---
+
+## Unified pancetta + ft8mon roadmap (added Batch 43)
+
+After Batch 42's ft8mon research agent, the strategic landscape is
+the clearest it has been across all 42 batches. The 7 new hb-NNN
+entries from ft8mon stack into 3 natural mechanism families:
+
+### Family A — Multipass amplifiers (boost mp=2's yield)
+- **hb-222** post-decode `search_both_known` subtraction refinement
+- **hb-226** inter-symbol phase-bridged subtraction reconstruction
+- Together: ~450 LOC, ~3-4 sessions; cleaner residual → more decodes
+  from residual without changing the candidate population.
+
+### Family B — Sync improvements (find more candidates)
+- **hb-221** multi-interval sliding decode window (MEASURED +118 TPs)
+- **hb-225** 2-D coarse sub-bin Costas grid (band-middle scalloping)
+- **hb-220** slot-edge sync expansion (negative-dt + late-dt coverage)
+- Together: ~750 LOC, ~5-6 sessions; recover signals currently missed
+  by sync coverage. hb-221 is measured and the cheapest.
+
+### Family C — LDPC/OSD improvements (rescue near-converging cases)
+- **hb-223** `soft_decode_pairs` independent LLR producer
+- **hb-224** wider parity-gate via max_parity_errors_for_osd
+- **hb-227** apriori174 empirical bit prior
+- Together: ~210 LOC + 1-2 sessions corpus extraction; squeeze more
+  decodes out of marginal candidates that current LDPC almost rescues.
+
+### Family D — Plan-sized initiatives (not in ft8mon)
+- **hb-218b** joint LDPC for dual-miss capture pairs (~250 truths)
+- **CrossMPT transformer decoder** (academic, multi-plan)
+- **Neural NMS LDPC** (academic, plan-sized)
+- These are high-risk longer-term R&D, not next-batch material.
+
+### Recommended ship order (next 3-4 batches)
+
+**Batch 43 (current)**: hb-221 multi-interval 2-window ship
++ hb-224 parity-gate probe + Tier 1 measurement
++ 2 research agents (JTDX, MAP65) for new ideas
+
+**Batch 44**: hb-223 `soft_decode_pairs` implementation
++ hb-225 2-D coarse sub-bin Costas (if synergy with hb-221)
++ measure stacking effect (Family B + C)
+
+**Batch 45**: hb-222 + hb-226 as a pair (Family A multipass amplifiers)
++ measure mp=2 yield boost
++ if hb-220 slot-edge can fit, ship Session 1
+
+**Batch 46**: hb-227 apriori174 corpus extraction + impl
++ characterize remaining frontier
++ decide on hb-218b plan kickoff vs new direction
+
+### Ideation: areas where pancetta could LEAD ft8mon/WSJT-X
+
+ft8mon and WSJT-X are well-tuned reference implementations. To get
+beyond their performance ceiling, pancetta could explore:
+
+- **GPU-accelerated OSD order 4-6** (Metal/wgpu) — May 2026 wsjt-devel
+  thread documents Radeon RX 6900 XT giving meaningful FER curve
+  improvement; M4 Metal is comparable hardware
+- **Neural OSD / neural BP** — academic 2024-2026 literature shows
+  0.4-0.5 dB Eb/N0 gain; could ship as Fast-tier optional
+- **Cross-slot temporal coherence** — pancetta has QSO state machine;
+  could feed prior-slot decoded callsigns as AP context (extends hb-050)
+- **Live-paired dual-Kiwi MRC** (hb-115) — pancetta's autonomous mode
+  could ingest 2 Kiwi streams for +1-3 dB sensitivity (meatspace-pending)
+- **Operator-tailored AP context** — autonomous operator knows what
+  it's transmitting → feeds expected callsigns as a-priori; ground-truth
+  context that WSJT-X doesn't have access to in the same way
+
+These are MEDIUM-term R&D bets. Worth keeping in the backlog but not
+next-3-batch material.
+
+### Process: when to look outward vs inward
+
+Batches 33-40 (inward focus): rich mechanism characterization,
+shelved many candidates, narrowed the frontier. Necessary but
+diminishing returns.
+
+Batches 41-42 (outward focus): web research surfaced 7+ new bank
+entries from ft8mon alone. Continue investing 1-2 research agents
+per batch on different sources (JTDX, WSJT-X dev, academic literature,
+adjacent projects).
+
+Suggested ratio for next 5 batches: **70% implementation/probe,
+30% external research**. Adjust as research yield drops.
+
+---
+
+## MAP65 research finding (added Batch 43)
+
+**MAP65 is NOT a source of new ideas for FT8 capture-effect.**
+Per research agent's read of K1JT EME 2012 paper, MAP65 (despite its
+"multi-decode" reputation) does:
+1. Wideband (90 kHz) panoramic search
+2. Polarization-matched MRC over dual-pol antenna inputs
+3. **Per-candidate independent decode** (no joint MUD)
+
+The "MUD reputation" is sociological — in 2007 wideband JT65 decoding
+was revolutionary vs WSJT's 2.5 kHz window. None of MAP65's components
+translate to FT8 capture-effect:
+- Wideband: pancetta already enumerates all candidates per pass
+- Pol-MRC: requires dual-pol antennas (HF stations are single-pol; only
+  hb-115 dual-Kiwi MRC is in scope, which is meatspace-pending +1.5 dB)
+- Per-candidate decode: WSJT-X + pancetta both do this
+
+WSJT-X's iterative-subtract SIC (FT4_FT8_QEX.pdf) is the closest thing
+to MUD in K1JT's codebase, and pancetta implements it equivalently
+(hb-079/080 + hb-086 V1).
+
+### Implication for hb-218b
+
+The MAP65 research closes "is there a published reference for FT8
+multi-user detection?" with: **no**. hb-218b joint LDPC remains the
+only viable attack on dual-miss capture pairs. Plan-sized; high-risk.
+
+### Preparatory baseline (NEW PROBE)
+
+- `jt9 on pancetta's dual-miss subset` (PROBE/RESEARCH) — run
+  WSJT-X reference decoder on the same ~250 dual-miss truths.
+  If jt9 also fails on them, hb-218b is the only frontier left.
+  If jt9 succeeds on some, pancetta has a parameter-tuning gap
+  with WSJT-X.
+
+Source: [MAP65 EME 2012 paper](https://wsjt.sourceforge.io/K1JT_EME2012.pdf),
+[FT4 FT8 QEX paper](https://wsjt.sourceforge.io/FT4_FT8_QEX.pdf),
+[Pfister 2008 joint LDPC academic ref](http://pfister.ee.duke.edu/papers/Pfister-jsac08.pdf)
+
+---
+
+## JTDX research findings (added Batch 43 — high-priority concrete ports)
+
+Agent surveyed JTDX (jtdx-project/jtdx) source code (Fortran). Found
+3 mechanisms genuinely orthogonal to pancetta's existing pipeline:
+
+### hb-228 candidate — JTDX 3-method spectral sweep (PROBE/PROD WIRE — HIGHEST PRIORITY)
+
+JTDX's "subpass" is NOT residual subtraction — it's 3 different
+magnitude metrics fed to Costas sync from the SAME FFT:
+
+```fortran
+! ipass 1,4,7 — sqrt(re² + im²)        amplitude (favors fading recovery)
+! ipass 2,5,8 — re² + im²               power-squared (boosts strong SNR)
+! ipass 3,6,9 — |re| + |im|              L1 norm (robust to outliers/impulse)
+```
+
+Each gets a different `syncmin` (1.225 / 1.5 / 1.1). Different signals
+in the same WAV pop under different metrics. Source: lib/sync8.f90.
+
+- Effort: **~1 day** in Rust
+- Conflict: ZERO with mp=2 or hb-086 (FFT cost amortized; just compute
+  3 spectrograms from same FFT, run sync on each, union+dedup)
+- Mechanism is **truly orthogonal** to pancetta's residual-subtract
+  approach — not a re-discovery
+- Pancetta currently uses ONE magnitude (dB-power per spectrogram path)
+- Insertion point: pancetta-ft8/src/decoder.rs near `compute_spectrogram`
+  + `costas_sync_search` (~line 950)
+
+### hb-229 candidate — QSO partner band-collapse (PROD WIRE — autonomous-only)
+
+JTDX's `nfilter` collapses search band to ±60 Hz around active partner
+frequency (±290 Hz in Hound mode). Pure CPU win — same recall, less
+work. Source: lib/decoder.f90.
+
+- Effort: **~hours** (plumbing already exists via hb-091 `freq_bin_range`)
+- Conflict: none
+- Wire in `pancetta-qso/src/qso_manager.rs`: when QSO in-flight, pass
+  `Some(±60 Hz around partner freq)` to decoder
+- Enables parallel multi-stream-per-QSO architecture
+
+### hb-230 candidate — ±3 Hz relaxed sync threshold near partner freq (TINY PROBE)
+
+Independent of band-collapse: even in full-band sweep, candidates
+within ±3 Hz of `nfqso` get relaxed `syncmin=1.1` vs per-pass threshold.
+Source: lib/sync8.f90.
+
+- Effort: **1-2 hours** scalar tweak in Costas filter
+- Conflict: none
+- Risk: pancetta doesn't currently have a "preferred frequency" notion;
+  needs to plumb partner-freq through to Costas. Could complement hb-217
+  for weak partner messages.
+
+### Anti-recommendations (JTDX features NOT worth porting)
+
+- **DT-distance thinning** (`ncandthin`, lib/sync8.f90 sort key
+  `sync / |dt - dtcenter|`): would WORSEN pancetta's slot-edge recall
+  hole (Batch 40 finding: 64% of isolated strong-misses at slot-edges).
+  Confirmed anti-recommend.
+- **napwid AP gating** (`abs(f1 - nfqso) > napwid`): pancetta's AP
+  injection already gated by trust-set match; not in top FP buckets.
+
+### Notable null finding
+
+JTDX does NOT do residual subtraction between its "subpasses". The
+WSJT-X-derived doc wording ("audio spectrum is searched a second time")
+describes the 3-method spectral sweep. Pancetta's mp=2 (residual
+subtract + re-sync) and JTDX's 3-method (multiple magnitudes, no
+subtract) are **mechanistically different and orthogonal**. Stacking
+both is the natural next ship.
+
+Sources:
+- [JTDX repo](https://github.com/jtdx-project/jtdx)
+- [DB6LL optimal settings PDF](https://www.asahi-net.or.jp/~vj5y-tkur/ft8/optimal-decoding-settings.pdf)
+- lib/sync8.f90, lib/ft8b.f90, lib/decoder.f90
