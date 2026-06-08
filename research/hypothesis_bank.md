@@ -6156,9 +6156,9 @@ search to in-repo sources.
 
     Reference: ft8mon ft8.cc:2186-2225
 
-### hb-225 — ft8mon 2-D coarse sub-bin Costas search grid  [PRIORITY: 0.45, spawned 2026-06-07 Batch 42]
+### hb-225 — ft8mon 2-D coarse sub-bin Costas search grid  [PRIORITY: 0.55, spawned 2026-06-07 Batch 42, RAISED by Batch 45 freq-dither corroboration]
   mode: ft8
-  status: PROPOSED-FROM-RESEARCH
+  status: PROPOSED-FROM-RESEARCH (corroborated: Batch 45 sub-Hz freq dither measured +33 TPs on hard-200 N=200, demonstrating sub-bin offset surfaces sync candidates pancetta currently misses)
   priority_score: 0.45
   estimated_effort: 1 session (~250 LOC including cached-FFT-with-bin-shift optimization)
   expected_delta: targets pancetta's band-middle 1000-2000 Hz recall hole (Batch 34 finding); potentially +30-50 TPs
@@ -6380,13 +6380,13 @@ search to in-repo sources.
 
     Reference: [wsjtr cross_sequence_decoding.md](https://github.com/bodiya/wsjtr/blob/main/docs/cross_sequence_decoding.md)
 
-### hb-238 — OSD dmin initialization audit (FP reduction)  [PRIORITY: 0.55, spawned 2026-06-08 Batch 44 — HIGHEST LEVERAGE FP REDUCTION]
+### hb-238 — OSD dmin initialization audit (FP reduction)  [CLOSED 2026-06-08 Batch 45 — NOT APPLICABLE to pancetta]
   mode: ft8
-  status: PROPOSED-FROM-RESEARCH (Bodiya wsjtr docs/osd-depth-enhancement.md)
-  priority_score: 0.55
-  estimated_effort: ~hours to audit + fix (LOW)
-  expected_delta: potentially HIGH FP reduction; unknown until audit completes
-  defensible_prior: YES — Bodiya's wsjtr found that initializing dmin to INFINITY (vs WSJT-X's "seed from order-0's distance regardless of CRC") gave 4.1% noise FP rate per OSD call (40 FPs / 10-window run)
+  status: CLOSED-NOT-APPLICABLE — Batch 45 audit (research/notes/2026-06-08-hb238-audit.md) found pancetta's OSD has NO dmin tracking at all. Pancetta uses "lexicographically first CRC-pass wins" design (return on first try_solution() success at OSD-0, OSD-1, OSD-2, OSD-3 in order). Bodiya's INFINITY-init bug doesn't apply because pancetta doesn't track distance. Downstream filters (hb-062, hb-103, is_plausible) handle FP cases that "first wins" would accept.
+  priority_score: 0.0 (closed)
+  estimated_effort: complete
+  expected_delta: REFUTED — Bodiya bug doesn't apply
+  defensible_prior: original prior was based on assuming pancetta matched WSJT-X's design; audit shows it doesn't
   wild_card: false
   evidence_for:
     - Bodiya's documented bug: ~40 FPs / 10 windows from wrong dmin init
@@ -6404,3 +6404,61 @@ search to in-repo sources.
     it before assuming there's a fix.
 
     Reference: [wsjtr osd-depth-enhancement.md](https://github.com/bodiya/wsjtr/blob/main/docs/osd-depth-enhancement.md)
+
+### hb-242 — wsjtr `sync_bc` partial Costas metric for slot-edge recovery  [PRIORITY: 0.65, spawned 2026-06-08 Batch 45 — HIGHEST NEW PRIORITY]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — wsjtr (Bodiya KC1WIH) uses 3-position Costas correlation with `sync_bc` partial metric (uses only Costas positions 2 + 3 when position 1 falls outside recorded window). Directly addresses pancetta's slot-edge negative-dt 48.3% recall miss bucket (Batch 40 finding).
+  priority_score: 0.65
+  estimated_effort: 1-2 sessions (algorithm publicly documented; pancetta writes implementation from docs, not GPL code — license-clean)
+  expected_delta: +50-150 RR73-class slot-edge truths on hard-1000 per agent estimate
+  defensible_prior: YES — wsjtr ships this; targets a documented pancetta miss bucket; license-clean port path
+  wild_card: false
+  evidence_for:
+    - Bodiya wsjtr docs/jt9r.md §Sync Detection — implementation reference
+    - Pancetta Batch 40 finding: slot-edge negative-dt 48.3% recall
+    - Pancetta Batch 36 C2: 1376 truths at slot-edge (broader bucket)
+  conflict_analysis:
+    - vs hb-220 (slot-edge sync expansion): COMPLEMENTARY — hb-220 is
+      coordinator-side audio buffering; hb-242 is decoder-side sync
+      partial metric. Could stack.
+    - vs hb-044 (Costas parabolic): NO conflict. hb-044 refines time
+      axis; hb-242 generates more candidates pre-refinement.
+    - vs hb-228 (3-method spectral sweep): COMPLEMENTARY — different
+      mechanism (magnitude variation vs sync partial)
+  notes: |
+    Mechanism: standard Costas correlation requires all 3 sync arrays
+    (positions 0-6, 36-42, 72-78) to be present. When signal starts
+    before WAV begins (negative dt), position 0 (first array) falls
+    outside the recording. WSJT-X's `sync_bc` uses ONLY positions 2 + 3
+    (arrays 36-42 and 72-78) to generate a partial sync candidate.
+    Higher false-positive rate but catches slot-edge cases otherwise
+    lost.
+
+    Implementation:
+    1. Add a second Costas correlation path that scores using only
+       arrays 2 + 3
+    2. Apply higher sync threshold to compensate for fewer arrays
+       (Bodiya's tuning: TBD, read docs)
+    3. Mark candidates as "partial-sync" and apply stricter downstream
+       filters
+
+    Source: [wsjtr docs/jt9r.md](https://github.com/bodiya/wsjtr/blob/main/docs/jt9r.md)
+
+### hb-243 — wsjtr-style cached-bandpass downsampler + fine-sync  [PRIORITY: 0.55, spawned 2026-06-08 Batch 45]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — wsjtr ports WSJT-X's ft8_downsample.f90 directly: cached 192k-point forward FFT + per-candidate band extraction + 3200-point IFFT → 200 Hz complex baseband at 32 samples/symbol. Single biggest documented sensitivity gap between pancetta and WSJT-X.
+  priority_score: 0.55
+  estimated_effort: 3-4 sessions (significant decoder restructure; license-clean port from public docs)
+  expected_delta: closes 1-2 dB of the documented 5-10% pancetta-vs-WSJT-X sensitivity gap
+  defensible_prior: YES — wsjtr ships this; ft8_downsample.f90 is original WSJT-X mechanism
+  wild_card: false
+  notes: |
+    Pancetta currently operates on spectrogram power bins throughout
+    decode. Cached-bandpass downsampler gives complex baseband samples
+    that can be refined via ±10-sample time × ±2.5-Hz frequency search
+    using complex frequency-shift vectors.
+
+    Refinement: 5×5 grid (dt, freq) via time-domain Goertzel per
+    candidate. Currently pancetta uses NMS only.
+
+    Source: [wsjtr docs/jt9r.md §Downsampling](https://github.com/bodiya/wsjtr/blob/main/docs/jt9r.md)
