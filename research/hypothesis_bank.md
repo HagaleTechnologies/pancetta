@@ -6292,3 +6292,115 @@ search to in-repo sources.
     Pairs naturally with hb-229.
 
     Reference: JTDX lib/sync8.f90
+
+### hb-231 — RS-ORBGRAND (Reshuffling ORBGRAND for short-block LDPC)  [PRIORITY: 0.40, spawned 2026-06-08 Batch 44 arXiv]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — arXiv:2401.15946 (Liu/Duffy/Médard). Reshuffles ORBGRAND query order, "0.1 dB from ML at BLER 1e-6". FT8 (174,87) high-rate code is ORBGRAND's sweet spot.
+  priority_score: 0.40
+  estimated_effort: plan-sized — need ORBGRAND baseline first (also new to pancetta), then RS-ORBGRAND is a query-ordering change
+  expected_delta: literature claim "0.1 dB from ML"; pancetta-corpus impact unknown
+  notes: |
+    Source: [arXiv:2401.15946](https://arxiv.org/abs/2401.15946)
+    Build ORBGRAND first, then RS-ORBGRAND as variant.
+
+### hb-232 — ORDEPT (Ordered Reliability Direct Error-Pattern Testing)  [PRIORITY: 0.35, spawned 2026-06-08]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — arXiv:2310.12039 + 2506.20079. Universal soft-decision decoder for binary block codes; faster than Chase-II, ORBGRAND, GCD per 2025 follow-on.
+  priority_score: 0.35
+  notes: |
+    Demonstrated on BCH(256,239), BCH(32,21), polar(128,116). FT8 (174,87) in range. Effort: medium.
+    Source: [arXiv:2310.12039](https://arxiv.org/abs/2310.12039), [arXiv:2506.20079](https://arxiv.org/abs/2506.20079)
+
+### hb-233 — MP-WSD (Multipoint Code-Weight Sphere Decoding)  [PRIORITY: 0.35, spawned 2026-06-08]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — arXiv:2602.08501. Precomputes low-weight codeword list; two-stage decoder, near-ML on misses.
+  priority_score: 0.35
+  notes: |
+    Could compose with mp=2 as "round 3" post-pass.
+    Offline: enumerate low-weight codewords of (174,87) ft8_lib LDPC.
+    Source: [arXiv:2602.08501](https://arxiv.org/abs/2602.08501)
+
+### hb-234 — Soft-Output GRAND for calibrated bit posteriors  [PRIORITY: 0.45, spawned 2026-06-08]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — arXiv:2310.10737. Calibrated per-bit posteriors improve hb-103 content scoring and any joint-message reasoning (hb-218 family).
+  priority_score: 0.45
+  notes: |
+    Even pre-GRAND-decoder, the SO machinery is useful. Composable.
+    Source: [arXiv:2310.10737](https://arxiv.org/abs/2310.10737)
+
+### hb-235 — IBA-LDPC iterative phase-tracking ↔ LDPC loop  [PRIORITY: 0.50, spawned 2026-06-08 HIGH POTENTIAL]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — arXiv:2604.07004. Models bursty differential phase noise as Wiener process; iterates between channel estimator and LDPC decoder. **HF ionospheric phase noise on FT8 = exactly the regime they model.** 1.4 dB BER@4e-3, 3 dB PER@1e-2 vs conventional.
+  priority_score: 0.50
+  estimated_effort: HIGH (plan-sized) — requires phase-tracking instrumentation inside symbol-demap loop + feedback from LDPC posteriors
+  defensible_prior: YES — only finding that addresses FT8's *channel*, not its *code*. Pancetta has no closed-loop between phase tracking and LDPC.
+  notes: |
+    Source: [arXiv:2604.07004](https://arxiv.org/abs/2604.07004)
+    Theoretically grounded. Potential 1.4-3 dB sensitivity gain.
+
+### hb-236 — Policy-Guided MCTS / RL-OSD  [PRIORITY: 0.30, spawned 2026-06-08]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — arXiv:2511.09054. RL policy replaces OSD's Gaussian elimination. 95% search reduction vs non-GE OSD.
+  priority_score: 0.30
+  notes: |
+    Complexity-reduction angle — if OSD eats budget after hb-222/223 ship, this is the cleanup tool.
+    Source: [arXiv:2511.09054](https://arxiv.org/abs/2511.09054)
+
+### hb-237 — Cross-sequence A7 (callsign-from-prior-window AP correlation)  [PRIORITY: 0.60, spawned 2026-06-08 Batch 44 — HIGHEST NEW]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH (Bodiya's wsjtr docs/cross_sequence_decoding.md; WSJT-X mainline since v2.6.0 Jun 2022)
+  priority_score: 0.60
+  estimated_effort: 1-2 sessions — pancetta-qso already has QSO state; need cross-sequence decode table + correlation
+  expected_delta: estimated ~30% of pancetta's response-shaped misses recoverable (per agent assessment)
+  defensible_prior: YES — WSJT-X has had this for 4 years; pancetta has callsign trust set (hb-062, hb-103) but NOT AP-driven candidate-message correlation in decoder
+  wild_card: false
+  evidence_for:
+    - Bodiya wsjtr (https://github.com/bodiya/wsjtr) — Rust implementation reference, 200+ LOC docs
+    - WSJT-X v2.6.0+ has shipped this as production
+    - Conceptually orthogonal to pancetta's existing AP wiring (hb-050)
+  notes: |
+    Mechanism: maintain `prev[Even][N]` and `prev[Odd][N]` decode tables
+    indexed by sequence. At each window, take previous opposite-sequence
+    decodes, downsample current window at each (DT, freq), do fine sync
+    + 4 LLR metric variants, generate up to 206 candidate messages from
+    the two callsigns and exchange-stage variants ("CALL1 CALL2", "+
+    RRR/RR73/73", reports −50 to +49, hashed `<call>` variants for
+    non-standard), correlate, accept if dmin ≤ 100 AND dmin2/dmin ≥ 1.3.
+
+    Implementation surface: pancetta-qso has QSO state machine that
+    knows partner callsign + expected exchange. Wire that into a new
+    candidate-message generator that feeds into a7 module.
+
+    Insertion point: pancetta-ft8/src/a7.rs already has template
+    cross-correlation. Extend to generate the 206-message template set
+    from QSO context.
+
+    Risk: cross-sequence is a new data-flow direction (pancetta-qso →
+    pancetta-ft8). May require coordinator-level callsign forwarding.
+
+    Reference: [wsjtr cross_sequence_decoding.md](https://github.com/bodiya/wsjtr/blob/main/docs/cross_sequence_decoding.md)
+
+### hb-238 — OSD dmin initialization audit (FP reduction)  [PRIORITY: 0.55, spawned 2026-06-08 Batch 44 — HIGHEST LEVERAGE FP REDUCTION]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH (Bodiya wsjtr docs/osd-depth-enhancement.md)
+  priority_score: 0.55
+  estimated_effort: ~hours to audit + fix (LOW)
+  expected_delta: potentially HIGH FP reduction; unknown until audit completes
+  defensible_prior: YES — Bodiya's wsjtr found that initializing dmin to INFINITY (vs WSJT-X's "seed from order-0's distance regardless of CRC") gave 4.1% noise FP rate per OSD call (40 FPs / 10-window run)
+  wild_card: false
+  evidence_for:
+    - Bodiya's documented bug: ~40 FPs / 10 windows from wrong dmin init
+    - WSJT-X's seeding is the proven-correct reference behavior
+    - Pancetta's OSD implementation may have the same bug
+  notes: |
+    Action: read pancetta-ft8 OSD implementation. Find dmin initialization.
+    Verify it's seeded from order-0's distance (the no-bit-flips solve),
+    NOT from INFINITY. If wrong, fix is 1-line.
+
+    Insertion point: pancetta-ft8/src/decoder.rs — search for "osd"
+    code paths.
+
+    Risk: pancetta's OSD might already be correct. Audit is cheap; do
+    it before assuming there's a fix.
+
+    Reference: [wsjtr osd-depth-enhancement.md](https://github.com/bodiya/wsjtr/blob/main/docs/osd-depth-enhancement.md)

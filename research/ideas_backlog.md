@@ -530,3 +530,289 @@ Sources:
 - [JTDX repo](https://github.com/jtdx-project/jtdx)
 - [DB6LL optimal settings PDF](https://www.asahi-net.or.jp/~vj5y-tkur/ft8/optimal-decoding-settings.pdf)
 - lib/sync8.f90, lib/ft8b.f90, lib/decoder.f90
+
+---
+
+## Brainstorm: 15 cross-domain wild ideas (added Batch 44)
+
+Drawing from adjacent fields: GPS signal acquisition, OFDM receivers,
+voice codecs, sonar processing, biometric recognition, dispersive-channel
+estimation.
+
+### WILD (each speculative; bank entry only if probe motivates)
+
+1. **GPS-style code-aided acquisition** — use Costas pattern as a
+   pseudo-code and do massively-parallel correlation across
+   doppler/time bins (already what pancetta does, but the GPS literature
+   has specific delay-lock-loop tracking variants worth borrowing).
+2. **OFDM Schmidl-Cox correlation for FT8 sync** — adjacent symbols of
+   a known sequence have a known phase relationship; cross-correlate
+   sliding pairs. Could improve sync at low SNR.
+3. **Voice-codec-style harmonic enhancement** — voice codecs use
+   harmonic predictive filtering to clean speech. FT8 tones have no
+   harmonic structure but the per-symbol tone IS periodic at the
+   carrier — could exploit harmonic averaging.
+4. **Sonar-style adaptive matched filter** — sonar receivers track
+   slowly-varying channel impulse response and update the matched
+   filter. HF ionosphere is similar slow-varying.
+5. **Biometric-style template matching** — treat each FT8 callsign as
+   a "fingerprint" and use ML similarity matching across slots. Could
+   surface callsigns that pancetta misses individually but recurs over
+   slots.
+6. **Sparse linear-algebra solve** — model 79 received symbols as a
+   sparse linear combination of N-tone codebook entries; use OMP
+   or LASSO. Lower-bound on sparsity = LDPC codeword bound.
+7. **Phase-coherent inter-symbol correlation** — compute phase
+   difference between adjacent same-tone symbols. Should be constant
+   for a true signal; random for noise. Could be a sync verifier.
+8. **Adaptive bandpass at expected freq** — dynamic LPF around each
+   sync candidate's expected freq before extracting symbols. Removes
+   neighbor energy contamination.
+9. **Multi-rate dyadic decomposition** — analyze signal at 6, 12, 24
+   kHz sample rates simultaneously. Different artifacts at each rate
+   may surface different signals.
+10. **Cumulant-based detection** — 4th-order cumulants are signal-
+    sensitive but noise-insensitive. Could replace |·|² in sync.
+11. **Reservoir computing for sync** — train a tiny ESN to map
+    spectrogram patches to sync_score. Cheap inference, learns
+    band-specific noise patterns.
+12. **Reinforcement learning for OSD bit-flip selection** — learn
+    which bits to flip based on LLR pattern.
+13. **HMM for symbol decoding** — Viterbi on a hidden-Markov model
+    of FT8 symbol transitions (GFSK has memory).
+14. **Karhunen-Loève transform for spectrogram denoising** — project
+    onto signal-subspace eigenvectors, discard noise subspace.
+15. **Empirical mode decomposition (EMD)** — separate signal modes
+    via Hilbert-Huang transform. Adaptive to non-stationary HF noise.
+
+### Lower-priority ideation (no specific mechanism)
+
+- **Cross-band "leakage" correlation** — strong signals on adjacent
+  freqs sometimes leak into target band; could be subtracted
+- **Self-similar codeword detection** — FT8 has 79 symbols; certain
+  positions in standard messages have predictable patterns
+- **Operator-fingerprint** — same operator's signal has consistent
+  carrier drift, audio levels; train per-station calibration
+
+Most of these are PROBE-able with research examples. None are
+production-ready without significant work. The list is intentionally
+broad to surface cross-domain inspiration; promotion to hb-NNN
+requires a concrete mechanism + probe.
+
+---
+
+## arXiv research findings (added Batch 44 — academic candidates)
+
+Agent scanned arXiv 2024-2026 for FT8-adjacent decoder improvements.
+Excellent finds beyond ORBGRAND/neural-LDPC already in bank:
+
+### High-priority new academic candidates
+
+- `hb-231 candidate — RS-ORBGRAND` (RESEARCH→PLAN)
+  Reshuffling ORBGRAND minimizes expected query count. "0.1 dB from
+  ML at BLER 1e-6". Query-ordering change to plain ORBGRAND — pancetta
+  needs ORBGRAND baseline first. Effort: medium-low if ORBGRAND lands.
+  Source: [arXiv:2401.15946](https://arxiv.org/abs/2401.15946)
+
+- `hb-232 candidate — ORDEPT (Ordered Reliability Direct Error-Pattern Testing)`
+  (RESEARCH→PLAN)
+  Universal soft-decision decoder; faster than Chase-II, ORBGRAND, GCD
+  per 2025 follow-on. Demonstrated on BCH(256,239), BCH(32,21),
+  polar(128,116) — FT8 (174,87) in range. Effort: medium.
+  Source: [arXiv:2310.12039](https://arxiv.org/abs/2310.12039),
+  [arXiv:2506.20079 (2025 follow-on)](https://arxiv.org/abs/2506.20079)
+
+- `hb-233 candidate — MP-WSD (Multipoint Code-Weight Sphere Decoding)`
+  (RESEARCH→PLAN)
+  Precomputes low-weight codeword list; perturb first-stage estimate
+  with selected combinations, retest in Euclidean ball. Two-stage:
+  fast common-case, near-ML on misses. Could compose with mp=2 as
+  "round 3". Offline: enumerate low-weight (174,87) codewords. Effort: medium.
+  Source: [arXiv:2602.08501](https://arxiv.org/abs/2602.08501)
+
+- `hb-234 candidate — Soft-Output GRAND + iterative coupling`
+  (RESEARCH→IMPL)
+  Turns soft-input GRAND into soft-output. **Even without GRAND
+  decoder shipped, the SO machinery improves hb-103 content scoring
+  and any joint-message reasoning (hb-218 family)**. Low-medium effort.
+  Source: [arXiv:2310.10737](https://arxiv.org/abs/2310.10737)
+
+- `hb-235 candidate — IBA-LDPC iterative phase-tracking ↔ LDPC loop`
+  (RESEARCH→PLAN — HIGH POTENTIAL)
+  Models bursty differential phase noise as Wiener process with
+  time-varying innovation variance; iterates between channel estimator
+  and LDPC decoder. 1.4 dB BER@4e-3, 3 dB PER@1e-2 vs conventional.
+  **HF ionospheric phase noise on FT8 = exactly the regime they
+  model.** Pancetta has no closed-loop between phase tracking and
+  LDPC. Effort: HIGH but theoretically grounded.
+  Source: [arXiv:2604.07004](https://arxiv.org/abs/2604.07004)
+
+- `hb-236 candidate — Policy-Guided MCTS for OSD bit-flip selection`
+  (RESEARCH→PLAN)
+  RL policy replaces OSD's Gaussian elimination. 95% search reduction
+  vs non-GE OSD. Complexity-reduction angle is the value-add — if
+  OSD eats budget after hb-222/223 ship, this is the cleanup tool.
+  Tiny network. Effort: medium-high (RL training pipeline).
+  Source: [arXiv:2511.09054](https://arxiv.org/abs/2511.09054)
+
+### Lower-priority / wild-card academic candidates
+
+- CrossMPT / FCrossMPT / CrossED (arXiv:2507.01038) — transformer
+  decoder ensemble; cross-validates with hb-225+ family but
+  high-effort training pipeline.
+- TransCoder (arXiv:2511.22539) — paper explicitly says it's
+  "particularly effective for longer codes" — FT8 short+high-rate
+  may be exactly NOT the regime. Note-but-don't-prioritize.
+- Mamba-Transformer hybrid (arXiv:2505.17834) — evolution not
+  step-change; bank as wild-card peer.
+- EQML via saturation (arXiv:1810.13111) — older paper but
+  short-code-friendly idea worth keeping.
+- BP-RNN diversity + OSD (arXiv:2206.12150) — re-cited as SOTA for
+  short LDPC; overlap with bank's neural-LDPC line.
+
+### Honest negatives (agent searched, found nothing genuinely new)
+
+- **No FT8-specific MUD / capture-effect papers**: recent literature
+  (2509.25074, 2412.01511) is asymptotic massive-MTC, not pancetta's
+  corpus-scale problem
+- **No new Doppler/HF-ionosphere coherent receiver work** beyond
+  IBA-LDPC (hb-235 above)
+- **No new GFSK soft demod** — area dominated by 1990s-2000s patents
+- **No WSJT-X academic publications** — WSJT-X research is in the
+  K1JT/G3WDG/G4WJS code base, not arXiv
+
+### Recommended bank insertion priority
+
+Per arXiv agent:
+1. hb-235 (IBA-LDPC phase loop) — addresses FT8 *channel*, not code
+2. hb-234 (Soft-Output GRAND) — useful pre-GRAND-decoder
+3. hb-231 (RS-ORBGRAND) + ORBGRAND baseline
+4. hb-232 (ORDEPT) — universal short-block decoder
+5. hb-233 (MP-WSD) — composes with mp=2
+6. hb-236 (P-MCTS) — OSD complexity reduction after hb-222/223
+
+---
+
+## WSJT-X dev agent research (added Batch 44 — wsjtr discovery + bombshells)
+
+Agent surveyed wsjt-devel mailing list + WSJT-X Improved + Bodiya's
+NEW Rust peer `wsjtr` (created Mar 2026). Headline finding:
+**mainline WSJT-X has had ZERO meaningful FT8 decoder algorithm
+commits in 12+ months. Active R&D is in (1) WSJT-X Improved fork,
+(2) Brian Bodiya KC1WIH's `wsjtr` Rust decoder, (3) experiments on
+the mailing list.**
+
+### MAJOR: Brian Bodiya's `wsjtr` is a direct Rust peer to pancetta
+
+- Repo: https://github.com/bodiya/wsjtr (GPLv3, Mar 2026, very recent)
+- crates: ft8core, jt9r, wsjtr, wsjtr-supplement, ft8coder, ft8-engine
+- crate listing: https://lib.rs/crates/ft8core
+- Architecture: downsample → fine sync → soft metrics → BP/OSD hybrid → between-pass subtraction
+- Has cross-sequence (A7) decoding, multi-WAV chaining for A7 context,
+  configurable per-pass depth, DT refinement during subtraction
+
+**Action**: read wsjtr source as additional reference alongside ft8mon.
+Direct Rust port may be easier to extract idioms from than Fortran.
+
+### High-priority new bank candidates
+
+- `hb-237 candidate — Cross-sequence A7 (callsign-from-prior-window AP)`
+  (PROBE/PROD — HIGHEST PRIORITY from this agent)
+  Bodiya's wsjtr docs/cross_sequence_decoding.md is a 200+ line
+  Rust implementation reference. Maintains `prev[Even][N]` /
+  `prev[Odd][N]` decode tables; at each window, takes prior
+  opposite-sequence decodes, generates 206 candidate messages
+  (CALL1 CALL2 + RRR/RR73/73, reports −50 to +49), correlates.
+  Acceptance criteria: dmin ≤ 100 AND dmin2/dmin ≥ 1.3.
+  - WSJT-X has had this since v2.6.0 (Jun 2022)
+  - Pancetta has callsign trust set (hb-062, hb-103) but NOT
+    AP-driven candidate-message correlation in decoder
+  - Estimated headroom: ~30% of pancetta's response-shaped misses
+  - Conflict: orthogonal to FP-filter line and spectral-sweep line
+  - Effort: ~1-2 sessions for cross-sequence table + correlation;
+    pancetta-qso already has QSO state for related context
+  Source: [wsjtr cross_sequence_decoding.md](https://github.com/bodiya/wsjtr/blob/main/docs/cross_sequence_decoding.md)
+
+- `hb-238 candidate — OSD dmin initialization audit` (PROBE/PROD —
+  HIGH PRIORITY for FP reduction)
+  Bodiya found wsjtx seeds dmin to order-0's distance regardless of
+  CRC; he was initializing to INFINITY and accepting any CRC-passing
+  codeword → ~4.1% noise FP rate per OSD call (40 FPs / 10 windows).
+  **Pancetta should audit its OSD's `dmin` init.** Single highest-
+  leverage finding for FP reduction.
+  - Action: read pancetta-ft8/src/ldpc.rs or wherever OSD lives;
+    verify dmin is seeded from order-0's distance, not INFINITY
+  - Effort: ~hours to audit + fix
+  Source: [wsjtr osd-depth-enhancement.md](https://github.com/bodiya/wsjtr/blob/main/docs/osd-depth-enhancement.md)
+
+- `hb-239 candidate — WSJT-X Improved "a8" mechanism investigation`
+  (RESEARCH)
+  WSJT-X Improved 3.1.0 added "a8 decoding technology" with NO public
+  mechanism documentation. Likely sequenced-QSO-state AP. Requires
+  direct source-read of Risse's fork.
+  Effort: 1 session research-only
+  Source: [WSJT-X Improved release notes](https://wsjt-x-improved.sourceforge.io/)
+
+- `hb-240 candidate — Multi-point sub-sample DT refinement during
+  subtraction` (PROBE/PROD)
+  21-point at 5-sample spacing (range=50, steps=10). Bodiya measured
+  net +80 decodes / 4314 = ~1.8% on crowded bands.
+  Effort: ~1 session; pancetta has hb-044 parabolic but only at sync
+  candidate level, not during subtraction.
+  Source: [wsjtr internal_pass_enhancement.md](https://github.com/bodiya/wsjtr/blob/main/docs/internal_pass_enhancement.md)
+
+- `hb-241 candidate — Per-pass parameter variation + skip-on-zero`
+  (PROBE/PROD)
+  WSJT-X varies `imetric` across passes (pass 1 = amplitude, pass 2-3
+  = power) AND syncmin (1.3 ndepth>2; 2.1 ndepth≤2). Also skips pass 3
+  if ndecodes==0 on prior — cheap CPU save. **Confirms pancetta's
+  hb-228 3-method sweep is on the right path** — Bodiya independently
+  identified "carbon-copy passes" as the limit.
+  Effort: ~1 session for the skip-on-zero; the variation overlaps
+  with hb-228.
+
+### Other meaningful findings
+
+- **Polar codes for FT8 (Logan N5RLD)** — replaced LDPC(174,91) with
+  Polar(174,91), shortened from 256-bit. "~1 dB gain in certain
+  conditions." K1JT's response: "requires heavy AP usage, underperforms
+  in cold decoding." Not actionable for pancetta (over-the-air format
+  break).
+  Source: [wsjt-devel msg28544](http://www.mail-archive.com/wsjt-devel@lists.sourceforge.net/msg28544.html)
+
+- **GPU/OpenCL OSD** (Logan N5RLD May 2026) — brute-force OSD search
+  on GPU. "Modest increase in successful decodes" + "smooth-outs FER
+  curve, especially near lower end." Pancetta is CPU-bound by M4
+  design; not chasing unless concrete patch lands.
+
+- **`a7-subtract.patch` + `pass4.patch`** (Bodiya, Feb 2026) — inside
+  A7 decode loop, subtract each freshly decoded A7 signal from
+  residual. Measured: ~0.5% additional decodes on crowded bands at
+  negligible CPU. Cross-confirms pancetta's ft8mon-extracted hb-222.
+
+- **WSJT-X Improved FDR (False Decode Reduction)** — per-message-type
+  ship gate. Convergent with pancetta's Batch 32 is_plausible
+  extensions (DXpedition + FreeText rejected). Confirms approach.
+
+- **Mainline WSJT-X 3.0/3.0.1** — parallelism (up to 12 threads), NOT
+  sensitivity. K1JT/K9AN are NOT pursuing structural decoder rewrites.
+  Pancetta's gains will come from passes/sync/AP work.
+
+### Strategic readout
+
+1. **Pancetta + Bodiya's wsjtr are pursuing decoder R&D mainline
+   isn't.** Competitive frontier is Improved fork + 2 Rust experiments.
+2. **Pancetta's hb-218 capture-effect line is net-new in FT8
+   ecosystem.** No public competitor is pursuing it.
+3. **Pancetta's mp=2 + ldpc=200 ship matches DG2YCB's 99.5%-yield-at-
+   2-stage claim.** On the right side of the cost/yield Pareto.
+4. **The 3-method spectral sweep (pancetta's hb-228) is corroborated**
+   — Bodiya independently found "carbon-copy passes" are the limit.
+
+### Recommended bank actions
+
+1. **Add hb-237** (cross-sequence A7) at priority 0.60 — top new
+2. **Add hb-238** (OSD dmin audit) at priority 0.50 — high-leverage FP
+3. **Add hb-239** (a8 investigation) at priority 0.35 — research
+4. **Add hb-240** (multi-point DT refinement) at priority 0.30
+5. **Add hb-241** (per-pass variation + skip-on-zero) at priority 0.25
