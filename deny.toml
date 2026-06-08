@@ -26,6 +26,11 @@ ignore = [
     # compile time. No runtime code, no security surface from being
     # unmaintained.
     { id = "RUSTSEC-2024-0436", reason = "proc-macro only — runs at build time, no runtime exposure" },
+
+    # `proc-macro-error2` was a maintained fork of proc-macro-error; both
+    # the original and the fork are now unmaintained. Proc-macro only
+    # (compile time), no runtime surface.
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro only — runs at build time, no runtime exposure (also tracked as RUSTSEC-2024-0370)" },
 ]
 
 [licenses]

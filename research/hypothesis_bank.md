@@ -6031,3 +6031,191 @@ search to in-repo sources.
       convergence or AGC. Worth separate diagnostic.)
 
     Journal: research/experiments/2026-06-06-batch-40.md
+
+### hb-221 — Multi-interval sliding decode window (WSJT-X 2.2 inspired)  [PRIORITY: 0.55, spawned 2026-06-07 Batch 42]
+  mode: ft8
+  status: QUANTIFIED-HEADROOM — Batch 42 measured +118 TPs over production baseline via 5-window union (sliding offsets 0, 0.5, 1.0, 1.5, 2.0s)
+  priority_score: 0.55
+  estimated_effort: 1-2 sessions for 2-window variant; 3-4 sessions for full N-window coordinator integration
+  expected_delta: +118 TPs measured @5-window union (full hard-200, mp=2 + ldpc=200 baseline 5285 → 5403). Realistic 2-window variant: ~+60-80 TPs at 2x decode cost.
+  defensible_prior: YES — WSJT-X 2.2+ ships multi-interval decoding (11.8/13.5/14.7s) with documented +10% on crowded bands (ARRL release notes). Pancetta single-window at slot end; missing late-dt and slot-edge truths covered by additional windows.
+  wild_card: false
+  evidence_for:
+    - Batch 42 multi-interval probe: 5-window union 5403 TPs vs 5285 baseline (+118)
+    - Per-offset TPs at 12.64s window: 4724 / 4421 / 4235 / 4266 / 3714 (each individually lower than full-15s baseline but union exceeds it)
+    - Mechanism: different audio start positions surface different Costas time-search candidates, especially late-dt (>2.16s)
+    - WSJT-X reports +10% on crowded bands
+  evidence_against:
+    - 5x decode cost for +118 TPs is steep
+    - Production mp=2 already exploits the wider 15s audio (Costas scans 28 time positions)
+    - May overlap with hb-220 (slot-edge sync expansion)
+  notes: |
+    Mechanism: run `decode_window` at multiple offsets within the 15s WAV:
+    - offset 0:  samples[0..151680]      (current production behavior)
+    - offset 0.5: samples[6000..157680]
+    - offset 1.0: samples[12000..163680]
+    - offset 1.5: samples[18000..169680]
+    - offset 2.0: samples[24000..175680] (latest possible — needs full 15s)
+    Each window covers a different range of dt values for the Costas
+    sync iteration (t0 from 0 to ~2.24s). Union of decoded text strings
+    across windows exceeds single-window count.
+
+    For Fast tier: try 2-window (offset 0 + offset 2.0) first — captures
+    late-dt benefit at 2x cost. If +60-80 TPs delivered, ship as Fast
+    preset extension.
+
+    For coordinator integration: pancetta currently calls decode_window
+    once per slot. Multi-window would either:
+    (a) call decode_window N times sequentially, union results (simple,
+        2-5x latency)
+    (b) extend decode_window internal API to accept multiple offsets and
+        share spectrogram across windows (efficient but invasive)
+
+    Likely overlaps with hb-220 (slot-edge sync expansion) — both attack
+    the dt-edge population. Consider whether shipping hb-221 makes hb-220
+    redundant (hb-220 covers negative-dt; hb-221 covers late-dt at edge).
+
+    Journal: research/experiments/2026-06-07-batch-42.md
+
+### hb-222 — ft8mon post-decode `search_both_known` refinement for subtraction  [PRIORITY: 0.55, spawned 2026-06-07 Batch 42]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — extracted from ft8mon source by Batch 42 research agent
+  priority_score: 0.55
+  estimated_effort: 2 sessions (~250 LOC in coherent_subtract_and_repass path)
+  expected_delta: UNKNOWN; "biggest expected win for multipass (mp=2)" per ft8mon author. Mechanism amplifies pancetta's mp=2 by tightening subtraction.
+  defensible_prior: YES — ft8mon ships this; the `known_strength_how=7` score (negative-of-sum-of-magnitudes-of-symbol-FFT-bin-differences using known tone sequence) is the secret sauce. Coherence/derivative score rewards inter-symbol phase continuity. After successful LDPC+CRC decode, re-optimize (Hz, time-offset) to where the known 79-symbol pattern best matches, then subtract.
+  wild_card: false
+  evidence_for:
+    - ft8mon ft8.cc:2948-2967 + 1160-1214 (search_both_known); ft8.cc:1005-1012 (one_strength_known with how=7)
+    - Multipass-amplifier mechanism: cleaner subtraction → cleaner residual → more decodes from residual
+    - Default `do_third=1` in ft8mon — author considers it stable
+  evidence_against:
+    - hb-086 V2 (soft cancellation) SHELVED across 3 corpora; post-decode coherent refit is a DIFFERENT mechanism but adjacent
+    - hb-218a SHELVED — residual at SIC-victim coords is noise per V3 inheritance probe; refining subtraction position may not surface signal that isn't there
+  notes: |
+    Mechanism: after a successful LDPC+CRC decode, take the known
+    79-symbol tone sequence and find the (Hz, time-offset) that best
+    matches via a coherence score using the inter-symbol bin-difference
+    magnitudes. Then subtract using that refined position. The known
+    pattern allows sub-bin and sub-sample precision because we know
+    exactly what the signal should look like.
+
+    The `known_strength_how=7` score is novel — rewards inter-symbol
+    phase continuity at the known tones. Inverse correlation of "the
+    signal would look like this" vs the spectrogram.
+
+    Implementation locus: pancetta-ft8 multipass subtract path (currently
+    coherent_subtract_and_repass). After step 1 (decode), add a
+    refinement step before step 2 (subtract).
+
+    Risk: hb-086 V2/V3 + hb-218a shelves suggest the residual at the
+    weak-truth coords is noise. This proposal would NOT recover those
+    cases — but it may help OTHER cases where mp=2 currently barely
+    converges by giving a cleaner residual signal-to-residual ratio.
+
+    Reference: ft8mon (rtmrtmrtmrtm/ft8mon) ft8.cc
+
+### hb-223 — ft8mon `soft_decode_pairs` independent soft-LLR producer  [PRIORITY: 0.50, spawned 2026-06-07 Batch 42]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH
+  priority_score: 0.50
+  estimated_effort: 1 session (~150 LOC)
+  expected_delta: literature claims 1-3 dB on flat-fading channels; corpus impact unknown but plausible mid-tier (+50-150 TPs?)
+  defensible_prior: YES — ft8mon uses three independent soft-LLR producers (single-symbol, pairs, triples) and runs LDPC+OSD on each independently; whichever decodes first wins. Pairs/triples exploit coherent phase across adjacent symbols.
+  wild_card: false
+  evidence_for:
+    - ft8mon ft8.cc:1949-2053 (soft_decode_pairs); 2055-2180 (soft_decode_triples)
+    - Theoretical: coherent integration over N symbols recovers √N improvement on stable channels
+    - Stacks with shipped pancetta mechanisms (hb-086 V1, hb-079 SIC, hb-048 a7)
+  evidence_against:
+    - HF ionospheric channel may not have phase stability across adjacent symbols (Doppler spread)
+    - LDPC + OSD already integrates information across the codeword
+  notes: |
+    Mechanism: for each pair of adjacent FT8 symbols, evaluate |csum| =
+    |m79[si][s1] + m79[si+1][s2]| for all 64 (s1, s2) pairs. Use the
+    max-correlation pair to fix bit probabilities via Bayes. Produces a
+    different ll174 LLR array than single-symbol soft decoding. Feed
+    both into LDPC+OSD independently; whichever decodes first wins.
+
+    Reference: ft8mon ft8.cc:1949-2053
+
+### hb-224 — ft8mon `osd_ldpc_thresh=70` conditional OSD gate  [PRIORITY: 0.30, spawned 2026-06-07 Batch 42]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH (CPU efficiency win, not TP win)
+  priority_score: 0.30
+  estimated_effort: 1 session (~30 LOC)
+  expected_delta: ~0 TPs but ~5-20% CPU savings on multipass paths. Could enable higher osd_depth (currently 2) at acceptable cost.
+  defensible_prior: YES — ft8mon gates OSD invocation on `parity_checks_passing >= 70 / 83`. Skips OSD when BP is hopeless OR already won. Pure CPU savings.
+  wild_card: false
+  notes: |
+    Pancetta currently invokes OSD whenever BP fails parity. Gating on
+    ≥70/83 parity checks correct skips the hopeless cases. Doesn't
+    surface new TPs alone — but the CPU savings could fund higher
+    osd_depth (currently capped at 2 — Batch 41 showed osd=3 adds 4000
+    FPs with -10 TPs, but maybe at higher gate threshold the FPs drop).
+
+    Reference: ft8mon ft8.cc:2186-2225
+
+### hb-225 — ft8mon 2-D coarse sub-bin Costas search grid  [PRIORITY: 0.45, spawned 2026-06-07 Batch 42]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH
+  priority_score: 0.45
+  estimated_effort: 1 session (~250 LOC including cached-FFT-with-bin-shift optimization)
+  expected_delta: targets pancetta's band-middle 1000-2000 Hz recall hole (Batch 34 finding); potentially +30-50 TPs
+  defensible_prior: PARTIAL — pancetta already has hb-044 parabolic time-axis refinement, but ft8mon's grid is finer (4×4 sub-bin per FFT bin via cached global FFT + bin-shift). Sub-bin frequency search not currently done.
+  wild_card: false
+  notes: |
+    Mechanism: 4×4 = 16 sub-bin offsets per FFT bin during coarse Costas
+    search. The optimization: one global FFT cached, sub-bin frequency
+    shifts done via bin-rotation + IFFT (cheap), per-symbol FFT array
+    recomputed per offset variant. Targets scalloping loss specifically.
+
+    Conflicts with hb-044 only at refinement stage — operates at coarser
+    granularity (replaces bin-aligned coarse with sub-bin grid).
+
+    Reference: ft8mon ft8.cc:480-628
+
+### hb-226 — ft8mon inter-symbol phase-bridged subtraction reconstruction  [PRIORITY: 0.40, spawned 2026-06-07 Batch 42]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH (multipass amplifier, do AFTER hb-222)
+  priority_score: 0.40
+  estimated_effort: 2 sessions (~200 LOC)
+  expected_delta: amplifies mp=2 yield by improving subtraction signal-to-residual ratio
+  defensible_prior: YES — ft8mon uses Gaussian-ramp inter-symbol transitions (11% of symbol = ~3.5ms ramp) when reconstructing the subtracted signal, bridging adjacent symbols' measured phases. Pancetta's current subtraction likely uses constant-tone-within-symbol hard-switching.
+  notes: |
+    Mechanism: reconstruct decoded signal for subtraction with phase-
+    smooth inter-symbol transitions matching GFSK modulator behavior.
+    Read next symbol's measured phase, compute correction to bridge
+    actual→target, spread linearly across ramp samples.
+
+    Multipass amplifier: better subtraction = cleaner residual = more
+    decodes from residual.
+
+    Reference: ft8mon ft8.cc:2770-2912
+
+### hb-227 — ft8mon `apriori174[]` empirical bit-frequency prior  [PRIORITY: 0.35, spawned 2026-06-07 Batch 42]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH (requires corpus extraction)
+  priority_score: 0.35
+  estimated_effort: 1 session corpus extraction + 1 session implementation
+  expected_delta: small modest +TPs on common message types; near-deterministic message-type-flag bits get clean priors
+  defensible_prior: PARTIAL — ft8mon's table was derived from a different decode corpus and a different bit ordering. Pancetta would need its own corpus extraction. Mechanism is sound (Bayesian prior on LLR input).
+  notes: |
+    Mechanism: 174-element array of empirical P(bit=1) frequencies from
+    statistical analysis of correct codewords. Applied as Bayesian prior
+    to initial LLR computation (multiplied with empirical tone-strength
+    probabilities). Doesn't modify BP messages mid-iteration.
+
+    ft8mon's table shows interesting structure:
+    - First 28 bits (i3.n3 header / call1) skewed (0.29 - 0.59 range)
+    - Bits 28 / 57 / 74 / 75 are near-deterministic (0.01-0.03)
+    - Bit 76 is 0.98
+    - 83 parity bits cluster at 0.46-0.55 (near-random as expected)
+
+    Pancetta would need:
+    1. Decode hard-200 + hard-1000 + adversarial corpora
+    2. Extract 174-bit codewords from confirmed-correct decodes
+    3. Compute P(bit=1) per position over corpus
+    4. Plug into pre-BP soft decoder
+
+    Reference: ft8mon ft8.cc:386-407

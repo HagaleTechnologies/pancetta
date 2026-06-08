@@ -297,8 +297,31 @@ literature, neural LDPC papers, GPU-OSD discussions, and more.
 
 ## Promoted (moved to `hypothesis_bank.md` as `hb-NNN`)
 
-(none yet from this backlog)
+### Promoted Batch 42
+
+- `WSJT-X multi-interval decoding` → **hb-221** (measured +118 TPs on hard-200)
+- `ft8mon search_both_known post-decode subtraction refinement` → **hb-222**
+- `ft8mon soft_decode_pairs` → **hb-223**
+- `ft8mon osd_ldpc_thresh=70 gate` → **hb-224**
+- `ft8mon 2-D coarse sub-bin Costas grid` → **hb-225**
+- `ft8mon inter-symbol phase-bridged subtraction reconstruction` → **hb-226**
+- `ft8mon apriori174[] empirical bit prior` → **hb-227**
 
 ## Killed (during brainstorm; not worth a probe)
 
-(none yet)
+### Killed by Batch 42 sweep (all null or negative vs mp=2+ldpc=200 baseline)
+
+- `residual_min_sync_score = Some(1.0/1.5/2.0/2.5)` — **all +0 TPs**.
+  WSJT-X's 2.1→1.3 cascade does NOT help pancetta. Confirms hb-086 V3's
+  shelve at the global level. Sole highest-priority Tier 1 prediction
+  refuted by direct measurement.
+- `min_sync_score = 2.0 / 2.5` — null
+- `time_range = 1.5 / 2.5 / 3.0` — null
+- `max_sync_candidates = 450 / 500 / 700` — NEGATIVE -8, -8, -28 TPs.
+  Added candidates are all noise. Current 300 is well-tuned.
+- `NMS enable` — CATASTROPHIC -1198 TPs. Suppresses too aggressively.
+- `adaptive_ldpc_iters = true` — -8 TPs
+- `HPF 300 Hz pre-decode` — -25 TPs
+- `DC offset removal pre-decode` — flipped to -4 TPs after Batch 41
+  ldpc_iters=200 ship (was +4 vs ldpc=100). Effect captured by ldpc bump.
+- `combo (residual_min=1.5 + dc_remove)` — same as dc_remove alone
