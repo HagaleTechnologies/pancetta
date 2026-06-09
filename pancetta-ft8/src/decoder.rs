@@ -492,6 +492,59 @@ pub struct Ft8Config {
     /// chrono-replay session. 0.0 disables V2 (falls back to V1 union-of-
     /// prior-pass behavior, kept for back-compat).
     pub dt_history_freq_window_hz: f64,
+
+    /// hb-242: sync_bc partial-Costas metric. When enabled, the Costas
+    /// search computes a parallel score using ONLY the second and third
+    /// Costas blocks (symbols 36–42 and 72–78), skipping block A (0–6),
+    /// and takes `max(full_abc, partial_bc)` as the candidate's sync
+    /// score. This rescues slot-edge negative-dt signals where block A
+    /// falls outside the recorded window — the full metric collapses
+    /// (block A is noise/garbage) while the partial metric is still
+    /// meaningful. Non-destructive: when block A contains real signal,
+    /// the full metric dominates and nothing changes. Inspired by
+    /// wsjtr `sync_bc` / WSJT-X mainline `sync8`. Targets the documented
+    /// slot-edge bucket at 48.3% recall in pancetta's hard-200 corpus
+    /// (1376 truths). Default **true** as a non-destructive backstop;
+    /// flip to false to A/B-test the mechanism.
+    pub costas_partial_metric_enabled: bool,
+
+    /// hb-242 + wide-lag baseline (red2): two-pathway sync candidate
+    /// emission. When enabled, candidates are filtered through two
+    /// parallel 40th-percentile-normalized rankings — a "tight" window
+    /// near the nominal slot start (t0 ≤ `costas_two_baseline_tight_steps`)
+    /// and a "wide" window covering the full lag sweep. A candidate
+    /// passes if EITHER normalized score clears
+    /// `costas_two_baseline_norm_threshold`. When the per-bin tight and
+    /// wide peaks land at different time-steps, BOTH are kept (the
+    /// mainline `sync8` "second candidate per bin" rule).
+    ///
+    /// Inspired by WSJT-X mainline `sync8.f90` — the wide-lag baseline
+    /// (`red2`) is the mechanism that catches slot-edge negative-dt
+    /// signals at the candidate-generation stage, distinct from the
+    /// per-candidate `sync_bc` partial-Costas metric. Default **false**
+    /// until corpus measurement confirms the FP profile.
+    pub costas_two_baseline_enabled: bool,
+
+    /// hb-242 wide-lag baseline: half-width (in spectrogram time-steps)
+    /// of the tight-lag window centred on the nominal slot start. Only
+    /// consulted when `costas_two_baseline_enabled = true`. Default 20
+    /// (≈ ±0.8 s at TIME_OSR=2 → 40 ms/step). The WSJT-X mainline
+    /// `mlag = 10` references a 4-steps-per-symbol grid; pancetta's
+    /// `TIME_OSR = 2` halves the resolution, so 20 steps ≈ 10 mainline
+    /// steps in absolute time.
+    pub costas_two_baseline_tight_steps: usize,
+
+    /// hb-242 wide-lag baseline: percentile used as the per-bin
+    /// normalization base. Default 0.40 matches WSJT-X mainline
+    /// `npctile = nint(0.40 * iz)`. Only consulted when
+    /// `costas_two_baseline_enabled = true`.
+    pub costas_two_baseline_percentile: f64,
+
+    /// hb-242 wide-lag baseline: minimum normalized sync score for a
+    /// candidate to be kept. Default 1.2 matches the wsjtr / WSJT-X
+    /// mainline `syncmin` constant. Only consulted when
+    /// `costas_two_baseline_enabled = true`.
+    pub costas_two_baseline_norm_threshold: f64,
 }
 
 impl Default for Ft8Config {
@@ -615,6 +668,22 @@ impl Default for Ft8Config {
             // V2 default: 25 Hz = ~4 freq_bins. Set to 0.0 to fall back
             // to V1 behavior (union-of-prior-pass-callsigns within-WAV).
             dt_history_freq_window_hz: 25.0,
+            // hb-242: sync_bc partial-Costas metric. Default ON — the
+            // max(full, partial) selection is non-destructive (partial
+            // only wins when block A is degraded; otherwise full wins).
+            // Targets the slot-edge negative-dt bucket (48.3% recall,
+            // 1376 truths in hard-200).
+            costas_partial_metric_enabled: true,
+            // Wide-lag two-baseline pathway: default OFF until corpus
+            // measurement confirms the FP profile. The mechanism doubles
+            // the candidate count on some bins (per-bin double-emission
+            // when wide and tight peaks disagree), and the percentile
+            // normalization shifts the threshold semantics — both need
+            // hard-200 sweep before flipping on.
+            costas_two_baseline_enabled: false,
+            costas_two_baseline_tight_steps: 20,
+            costas_two_baseline_percentile: 0.40,
+            costas_two_baseline_norm_threshold: 1.2,
         }
     }
 }
@@ -1917,10 +1986,73 @@ impl Ft8Decoder {
             None => (MIN_FREQ_BIN, max_freq_bin),
         };
 
+        // hb-242: when enabled, also compute the partial-Costas
+        // (`sync_bc`) metric and use `max(full, partial)`. The partial
+        // metric drops block A from both the numerator and denominator,
+        // so it stays meaningful for slot-edge negative-dt signals
+        // where the leading edge fell outside the recorded window.
+        let partial_enabled = self.config.costas_partial_metric_enabled;
+
+        // hb-242 wide-lag baseline: when enabled, also record (per
+        // freq_sub, freq_bin) the peak score and time-step within a
+        // tight window near the nominal slot start AND within the full
+        // ("wide") window. After the sweep, each per-bin peak array is
+        // sorted and 40th-percentile-normalised; the normalisation base
+        // becomes the `red` / `red2` reference. Candidates clearing the
+        // normalised threshold in EITHER pathway are kept; when the
+        // tight and wide peaks land at distinct time-steps, BOTH are
+        // emitted (mainline `sync8` per-bin double-emission rule).
+        let two_baseline_enabled = self.config.costas_two_baseline_enabled;
+        let tight_steps = self.config.costas_two_baseline_tight_steps;
+
+        // Per-bin peak buffers, indexed by [freq_sub][freq_bin - lo].
+        // Only populated when two_baseline_enabled. Stores the (best
+        // sync_score, time_step) pair for the tight and wide pathways.
+        let bin_count = hi.saturating_sub(lo);
+        let mut tight_peaks: Vec<Vec<(f64, usize)>> = if two_baseline_enabled {
+            vec![vec![(0.0_f64, 0_usize); bin_count]; spectrogram.freq_osr]
+        } else {
+            Vec::new()
+        };
+        let mut wide_peaks: Vec<Vec<(f64, usize)>> = if two_baseline_enabled {
+            vec![vec![(0.0_f64, 0_usize); bin_count]; spectrogram.freq_osr]
+        } else {
+            Vec::new()
+        };
+
+        // Local closure that applies the hb-242 max(full, partial)
+        // rule when enabled, otherwise returns the full metric. Used
+        // both for the main score and for parabolic-refinement
+        // neighbour scores so the refined-score scale stays consistent.
+        let scored = |t0: usize, f0: usize, freq_sub: usize| -> f64 {
+            let full = self.compute_costas_score(spectrogram, t0, f0, freq_sub);
+            if partial_enabled {
+                let partial = self.compute_costas_score_partial_bc(spectrogram, t0, f0, freq_sub);
+                full.max(partial)
+            } else {
+                full
+            }
+        };
+
         for freq_sub in 0..spectrogram.freq_osr {
             for t0 in 0..=max_time_step {
                 for f0 in lo..hi {
-                    let score = self.compute_costas_score(spectrogram, t0, f0, freq_sub);
+                    let score = scored(t0, f0, freq_sub);
+
+                    if two_baseline_enabled {
+                        let bin_idx = f0 - lo;
+                        // Wide pathway: any t0 contributes.
+                        if score > wide_peaks[freq_sub][bin_idx].0 {
+                            wide_peaks[freq_sub][bin_idx] = (score, t0);
+                        }
+                        // Tight pathway: only t0 ≤ tight_steps from the
+                        // nominal slot start. With `time_padding = 0`
+                        // and the t0 sweep starting at 0, "tight"
+                        // means low t0 values.
+                        if t0 <= tight_steps && score > tight_peaks[freq_sub][bin_idx].0 {
+                            tight_peaks[freq_sub][bin_idx] = (score, t0);
+                        }
+                    }
 
                     if score > min_score {
                         // hb-044: optional parabolic refinement of the
@@ -1948,10 +2080,18 @@ impl Ft8Decoder {
                                 && t0 + 1 <= max_time_step
                                 && score > self.config.sync_time_interp_score_gate
                             {
-                                let y_left =
-                                    self.compute_costas_score(spectrogram, t0 - 1, f0, freq_sub);
-                                let y_right =
-                                    self.compute_costas_score(spectrogram, t0 + 1, f0, freq_sub);
+                                // hb-245: parabolic peak interpolation
+                                // (sub-sample DT refinement). Use the same
+                                // `scored` closure so the y_left / y_right
+                                // values match the y_center scoring rule
+                                // (hb-242 max(full, partial) when enabled).
+                                // The math is the textbook Smith parabola
+                                // through three equally-spaced points,
+                                // already proven correct by
+                                // `parabolic_peak_refinement` and its
+                                // unit tests.
+                                let y_left = scored(t0 - 1, f0, freq_sub);
+                                let y_right = scored(t0 + 1, f0, freq_sub);
                                 let (mut r_score, mut r_delta) =
                                     parabolic_peak_refinement(y_left, score, y_right);
                                 // (b) delta scale: rescale the offset and
@@ -1989,6 +2129,77 @@ impl Ft8Decoder {
             }
         }
 
+        // hb-242 wide-lag baseline (red2): emit additional candidates
+        // from the tight and wide per-bin peak buffers if their 40th-
+        // percentile-normalised score clears the `norm_threshold`. The
+        // wide pathway is what specifically catches slot-edge negative-dt
+        // signals — the absolute min_score gate above filters them out
+        // because the dB-difference metric is biased low on those bins,
+        // but the percentile baseline accounts for the per-band noise
+        // floor. When the tight and wide peaks land at different
+        // time-steps, BOTH are emitted (the mainline `sync8` per-bin
+        // double-emission rule).
+        if two_baseline_enabled && bin_count > 0 {
+            let pct = self.config.costas_two_baseline_percentile;
+            let norm_min = self.config.costas_two_baseline_norm_threshold;
+
+            for freq_sub in 0..spectrogram.freq_osr {
+                let tight_base = percentile_baseline(&tight_peaks[freq_sub], pct);
+                let wide_base = percentile_baseline(&wide_peaks[freq_sub], pct);
+
+                for bin_idx in 0..bin_count {
+                    let f0 = lo + bin_idx;
+                    let (tight_score, tight_t0) = tight_peaks[freq_sub][bin_idx];
+                    let (wide_score, wide_t0) = wide_peaks[freq_sub][bin_idx];
+
+                    let tight_norm = if tight_base > 0.0 && tight_base.is_finite() {
+                        tight_score / tight_base
+                    } else {
+                        0.0
+                    };
+                    let wide_norm = if wide_base > 0.0 && wide_base.is_finite() {
+                        wide_score / wide_base
+                    } else {
+                        0.0
+                    };
+
+                    let tight_pass = tight_norm >= norm_min && tight_score > 0.0;
+                    let wide_pass = wide_norm >= norm_min && wide_score > 0.0;
+
+                    // Emit the tight-pathway candidate if it cleared
+                    // the normalised threshold but was below `min_score`
+                    // absolute. (If it cleared absolute already, the
+                    // main loop pushed it.) The duplicate is removed
+                    // downstream by NMS / dedup; the worst case is a
+                    // single redundant entry per bin.
+                    if tight_pass && tight_score <= min_score {
+                        candidates.push(CostasCandidate {
+                            time_step: tight_t0,
+                            freq_bin: f0,
+                            freq_sub,
+                            sync_score: tight_score,
+                            time_refinement: 0.0,
+                        });
+                    }
+                    // Emit the wide-pathway candidate when:
+                    //   (a) it cleared the normalised threshold, AND
+                    //   (b) either it's below the absolute gate OR the
+                    //       wide peak landed at a different time-step
+                    //       than the tight peak (per-bin double
+                    //       emission rule from mainline sync8).
+                    if wide_pass && (wide_score <= min_score || wide_t0 != tight_t0) {
+                        candidates.push(CostasCandidate {
+                            time_step: wide_t0,
+                            freq_bin: f0,
+                            freq_sub,
+                            sync_score: wide_score,
+                            time_refinement: 0.0,
+                        });
+                    }
+                }
+            }
+        }
+
         // Sort by score (best first)
         candidates.sort_by(|a, b| {
             b.sync_score
@@ -2020,6 +2231,49 @@ impl Ft8Decoder {
         f0: usize,
         freq_sub: usize,
     ) -> f64 {
+        // Full-Costas metric: all three sync groups (block A + B + C).
+        self.compute_costas_score_groups(spec, t0, f0, freq_sub, |_| true)
+    }
+
+    /// hb-242: Partial-Costas metric (`sync_bc`). Computes the sync score
+    /// using ONLY the second and third Costas blocks (symbols 36–42 and
+    /// 72–78), skipping block A. This is the slot-edge rescue metric:
+    /// when the leading edge of the audio is missing or corrupted and
+    /// block A contains noise/garbage, the full metric collapses while
+    /// the partial metric remains meaningful. Per spec-wsjtr-sync-bc.md
+    /// and spec-wsjtx-mainline-sync8.md, this is intended to be
+    /// combined with the full metric via `max(full, partial)` at the
+    /// candidate-emission site — never as a replacement for the full
+    /// metric on healthy signals.
+    fn compute_costas_score_partial_bc(
+        &self,
+        spec: &Spectrogram,
+        t0: usize,
+        f0: usize,
+        freq_sub: usize,
+    ) -> f64 {
+        // Partial: skip group 0 (block A); only blocks B (m=1) and C (m=2).
+        self.compute_costas_score_groups(spec, t0, f0, freq_sub, |m| m != 0)
+    }
+
+    /// Inner Costas-score kernel parameterised by which sync groups to
+    /// include. `keep_group(m)` is consulted once per group; pass
+    /// `|_| true` for the full ABC metric or `|m| m != 0` for the
+    /// hb-242 partial BC metric.
+    ///
+    /// Because the score is an *average* (sum of per-comparison
+    /// differences divided by the comparison count, not a sum), the
+    /// full and partial metrics live on the same scale — `max(full,
+    /// partial)` is a meaningful selection rule without any
+    /// per-pathway threshold adjustment.
+    fn compute_costas_score_groups<F: Fn(usize) -> bool>(
+        &self,
+        spec: &Spectrogram,
+        t0: usize,
+        f0: usize,
+        freq_sub: usize,
+        keep_group: F,
+    ) -> f64 {
         let pp = &self.protocol_params;
 
         // With TIME_OSR>1, the outer t0 loop already iterates at sub-symbol
@@ -2033,6 +2287,9 @@ impl Ft8Decoder {
             let mut num_average = 0usize;
 
             for (m, &group_start) in pp.costas_positions.iter().enumerate() {
+                if !keep_group(m) {
+                    continue;
+                }
                 for k in 0..pp.costas_length {
                     let symbol_idx = group_start + k;
                     let time_idx = t0 + symbol_idx * steps_per_symbol + half;
@@ -5552,13 +5809,50 @@ fn bits_to_u16(bits: &BitSlice) -> u16 {
     value
 }
 
-/// hb-044: parabolic refinement of a discrete peak. Given three score
-/// samples at integer offsets (-1, 0, +1) around the candidate's peak,
-/// fit a parabola and return (refined_score, fractional_offset). The
-/// fractional offset is in (-0.5, +0.5) relative to the center sample.
+/// hb-242 wide-lag baseline: compute the nth-percentile reference of
+/// a per-bin sync-peak array. Each entry is a `(score, time_step)`
+/// pair; only the score participates in the percentile. NaN / non-
+/// finite scores sort to the front (treated as zero). The percentile
+/// index follows the wsjtr convention:
+/// `idx = round(pct * len).max(1) - 1`.
+///
+/// Returns the score value at the selected sorted index, or 0.0 if
+/// the input is empty.
+fn percentile_baseline(peaks: &[(f64, usize)], pct: f64) -> f64 {
+    if peaks.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<f64> = peaks
+        .iter()
+        .map(|&(s, _)| if s.is_finite() { s } else { 0.0 })
+        .collect();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let len = sorted.len();
+    // `round` is "round half away from zero" — within-one-bin of any
+    // other rounding mode, well below the sensitivity of the
+    // percentile baseline.
+    let raw = (pct * len as f64).round() as usize;
+    let idx = raw.max(1) - 1;
+    let idx = idx.min(len - 1);
+    sorted[idx]
+}
+
+/// hb-044 / hb-245: parabolic refinement of a discrete peak. Given
+/// three score samples at integer offsets (-1, 0, +1) around the
+/// candidate's peak, fit a parabola and return (refined_score,
+/// fractional_offset). The fractional offset is in (-0.5, +0.5)
+/// relative to the center sample.
 ///
 /// If the three points don't form a concave-down parabola (i.e., the
 /// center isn't actually a local max), returns (y_center, 0.0).
+///
+/// Per spec-wsjtx-improved-subsample-dt-refinement.md (hb-245), this
+/// is the textbook three-point parabolic peak interpolator (Smith,
+/// "Spectral Audio Signal Processing"). Pancetta's `a < 0` concave
+/// check is equivalent to the spec's "denominator strictly positive"
+/// check (the spec uses `c[-1] - 2*c[0] + c[+1] > 0`, which is the
+/// same condition as `-2*a > 0` ⇔ `a < 0`). The clamp to [-0.5,
+/// +0.5] matches the spec's edge-case handling.
 fn parabolic_peak_refinement(y_left: f64, y_center: f64, y_right: f64) -> (f64, f64) {
     // Parabola: y(x) = a*x^2 + b*x + c
     //   y(-1) = a - b + c = y_left
@@ -5581,7 +5875,7 @@ fn parabolic_peak_refinement(y_left: f64, y_center: f64, y_right: f64) -> (f64, 
 
 #[cfg(test)]
 mod parabolic_tests {
-    use super::parabolic_peak_refinement;
+    use super::{parabolic_peak_refinement, percentile_baseline};
 
     #[test]
     fn symmetric_peak_has_no_offset() {
@@ -5604,6 +5898,65 @@ mod parabolic_tests {
         let (refined, delta) = parabolic_peak_refinement(2.0, 1.0, 2.0);
         assert_eq!(delta, 0.0);
         assert_eq!(refined, 1.0);
+    }
+
+    /// hb-245: recover a Gaussian peak centred at a sub-sample offset.
+    /// Pancetta's `parabolic_peak_refinement` implements the same
+    /// closed-form formula as the hb-245 spec (Smith textbook).
+    #[test]
+    fn hb245_synthetic_offset_peak_recovered() {
+        let true_offset = 0.37_f64;
+        let g = |k: f64| (-((k - true_offset).powi(2) / 2.0)).exp();
+        let (refined, delta) = parabolic_peak_refinement(g(-1.0), g(0.0), g(1.0));
+        assert!(
+            (delta - true_offset).abs() < 0.05,
+            "delta={delta} should be near {true_offset}"
+        );
+        assert!(refined >= g(0.0) - 1e-9);
+    }
+
+    /// hb-245 edge: flat three-point window (all values equal) is
+    /// not a peak — non-concave branch returns delta = 0.
+    #[test]
+    fn hb245_flat_window_returns_zero_delta() {
+        let (refined, delta) = parabolic_peak_refinement(2.0, 2.0, 2.0);
+        assert_eq!(delta, 0.0);
+        assert!((refined - 2.0).abs() < 1e-9);
+    }
+
+    /// hb-245 edge: result always falls in [-0.5, +0.5].
+    #[test]
+    fn hb245_result_clamped_to_half_sample() {
+        let (_refined, delta) = parabolic_peak_refinement(10.0, 11.0, 0.0);
+        assert!((-0.5..=0.5).contains(&delta), "delta={delta} out of range");
+    }
+
+    /// hb-242 percentile baseline: uniform distribution → the 40th-
+    /// percentile entry equals the 40th-percentile value.
+    #[test]
+    fn percentile_baseline_uniform_distribution() {
+        let peaks: Vec<(f64, usize)> = (0..100).map(|i| (i as f64 / 100.0, i)).collect();
+        let base = percentile_baseline(&peaks, 0.40);
+        // round(0.40 * 100) = 40, idx = 39, sorted[39] = 0.39.
+        assert!((base - 0.39).abs() < 1e-9, "base={base}");
+    }
+
+    /// hb-242 percentile baseline: empty input → 0.0 gracefully
+    /// disables normalisation downstream.
+    #[test]
+    fn percentile_baseline_empty_input() {
+        assert_eq!(percentile_baseline(&[], 0.40), 0.0);
+    }
+
+    /// hb-242 percentile baseline: NaN scores are treated as zero
+    /// and sort to the front. The result must remain finite.
+    #[test]
+    fn percentile_baseline_nan_safe() {
+        let peaks = vec![(f64::NAN, 0), (1.0, 1), (2.0, 2), (3.0, 3), (4.0, 4)];
+        let base = percentile_baseline(&peaks, 0.40);
+        assert!(base.is_finite());
+        // round(0.40 * 5) = 2, idx = 1, sorted (NaN→0): [0, 1, 2, 3, 4]. → 1.0.
+        assert!((base - 1.0).abs() < 1e-9, "base={base}");
     }
 }
 
@@ -7415,6 +7768,221 @@ mod tests {
             !decoded.iter().any(|m| m.text == "CQ K5ARH EM10"),
             "scoped decode at ~500 Hz must NOT recover the 2000 Hz transmission, got: {:?}",
             decoded.iter().map(|m| m.text.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    // ========================================================================
+    // hb-242 sync_bc partial-Costas + wide-lag baseline (red2) + hb-245
+    // subsample DT refinement.
+    // ========================================================================
+
+    /// Synthetic helper: build a Costas spectrogram where the caller
+    /// picks which sync groups (A=0, B=1, C=2) are present.
+    fn synthetic_costas_spec(
+        present_groups: &[usize],
+        signal_db: f64,
+        noise_db: f64,
+        f0: usize,
+    ) -> Spectrogram {
+        let steps_per_symbol = TIME_OSR;
+        let num_steps = 79 * steps_per_symbol;
+        let num_bins = SAMPLES_PER_SYMBOL / 2 + 1;
+        let freq_osr = FREQ_OSR;
+
+        let mut power = vec![vec![vec![noise_db; num_bins]; freq_osr]; num_steps];
+
+        for &m in present_groups {
+            let group_start = [0usize, 36, 72][m];
+            for j in 0..7 {
+                let sym = group_start + j;
+                let tone = crate::protocol::FT8_COSTAS[j] as usize;
+                for sub in 0..steps_per_symbol {
+                    let time_idx = sym * steps_per_symbol + sub;
+                    if time_idx < num_steps && f0 + tone < num_bins {
+                        power[time_idx][0][f0 + tone] = signal_db;
+                    }
+                }
+            }
+        }
+
+        Spectrogram {
+            power,
+            complex: None,
+            num_steps,
+            num_bins,
+            freq_osr,
+            time_padding: 0,
+        }
+    }
+
+    /// hb-242: on a fully-clean signal (all three Costas blocks
+    /// present), the full ABC metric and partial BC metric agree
+    /// within a small tolerance.
+    #[test]
+    fn hb242_full_and_partial_agree_on_clean_signal() {
+        let config = Ft8Config::default();
+        let decoder = Ft8Decoder::new(config).unwrap();
+        let f0 = 240usize;
+        let spec = synthetic_costas_spec(&[0, 1, 2], -10.0, -40.0, f0);
+
+        let full = decoder.compute_costas_score(&spec, 0, f0, 0);
+        let partial = decoder.compute_costas_score_partial_bc(&spec, 0, f0, 0);
+
+        assert!(full > MIN_SYNC_SCORE, "full={full} below gate");
+        assert!(partial > MIN_SYNC_SCORE, "partial={partial} below gate");
+        let ratio = (full - partial).abs() / full;
+        assert!(
+            ratio < 0.05,
+            "clean full {full} and partial {partial} should agree within 5%"
+        );
+    }
+
+    /// hb-242 core: when block A is zeroed out (slot-edge negative-dt
+    /// scenario), the full ABC metric collapses while the partial BC
+    /// metric stays meaningful.
+    #[test]
+    fn hb242_partial_rescues_when_block_a_missing() {
+        let config = Ft8Config::default();
+        let decoder = Ft8Decoder::new(config).unwrap();
+        let f0 = 240usize;
+        let spec = synthetic_costas_spec(&[1, 2], -10.0, -40.0, f0);
+
+        let full = decoder.compute_costas_score(&spec, 0, f0, 0);
+        let partial = decoder.compute_costas_score_partial_bc(&spec, 0, f0, 0);
+
+        assert!(
+            partial > MIN_SYNC_SCORE,
+            "partial={partial} should exceed gate without block A"
+        );
+        assert!(
+            partial > full * 1.3,
+            "partial {partial} should be >=1.3x full {full} with block A missing"
+        );
+    }
+
+    /// hb-242: costas_sync_search_with_threshold recovers the (t0=0,
+    /// f0) candidate when only blocks B+C are present.
+    #[test]
+    fn hb242_sync_search_recovers_block_a_missing_candidate() {
+        let mut config = Ft8Config::default();
+        config.nms_enabled = false;
+        config.sync_time_interpolation = false;
+        config.costas_partial_metric_enabled = true;
+        config.costas_two_baseline_enabled = false;
+
+        let decoder = Ft8Decoder::new(config).unwrap();
+        let f0 = 240usize;
+        let spec = synthetic_costas_spec(&[1, 2], -10.0, -40.0, f0);
+
+        let candidates = decoder
+            .costas_sync_search_with_threshold(&spec, MIN_SYNC_SCORE, None)
+            .expect("sync search");
+
+        let found = candidates
+            .iter()
+            .any(|c| c.freq_bin == f0 && c.freq_sub == 0 && c.time_step == 0);
+        assert!(
+            found,
+            "hb-242: block-A-missing candidate should be recovered; got {} candidates",
+            candidates.len()
+        );
+    }
+
+    /// hb-242 negative control: turning the partial-Costas metric off
+    /// should lower the (t0=0, f0) sync_score on the block-A-missing
+    /// spec. The candidate may still survive the absolute gate on
+    /// synthetic-clean noise (block A's per-symbol signal_dB -
+    /// neighbor_dB ≈ 0 averages harmlessly into the ABC metric); the
+    /// production payoff is measured on hard-200 separately.
+    #[test]
+    fn hb242_disabled_lowers_block_a_missing_score() {
+        let f0 = 240usize;
+        let spec = synthetic_costas_spec(&[1, 2], -10.0, -40.0, f0);
+
+        let candidate_score = |partial_enabled: bool| -> f64 {
+            let mut config = Ft8Config::default();
+            config.nms_enabled = false;
+            config.sync_time_interpolation = false;
+            config.costas_partial_metric_enabled = partial_enabled;
+            config.costas_two_baseline_enabled = false;
+            let decoder = Ft8Decoder::new(config).unwrap();
+            let candidates = decoder
+                .costas_sync_search_with_threshold(&spec, MIN_SYNC_SCORE, None)
+                .expect("sync search");
+            candidates
+                .iter()
+                .find(|c| c.freq_bin == f0 && c.freq_sub == 0 && c.time_step == 0)
+                .map(|c| c.sync_score)
+                .unwrap_or(0.0)
+        };
+
+        let with_partial = candidate_score(true);
+        let without_partial = candidate_score(false);
+
+        assert!(
+            with_partial > without_partial * 1.2,
+            "partial-on score {with_partial} should be >1.2x partial-off score {without_partial}"
+        );
+    }
+
+    /// hb-242 wide-lag baseline: when enabled, a clean signal still
+    /// keeps its main candidate. The mechanism is additive.
+    #[test]
+    fn hb242_two_baseline_preserves_clean_candidate() {
+        let mut config = Ft8Config::default();
+        config.nms_enabled = false;
+        config.sync_time_interpolation = false;
+        config.costas_partial_metric_enabled = true;
+        config.costas_two_baseline_enabled = true;
+
+        let decoder = Ft8Decoder::new(config).unwrap();
+        let f0 = 240usize;
+        let spec = synthetic_costas_spec(&[0, 1, 2], -10.0, -40.0, f0);
+
+        let candidates = decoder
+            .costas_sync_search_with_threshold(&spec, MIN_SYNC_SCORE, None)
+            .expect("sync search");
+
+        let found = candidates
+            .iter()
+            .any(|c| c.freq_bin == f0 && c.freq_sub == 0 && c.time_step == 0);
+        assert!(
+            found,
+            "two-baseline must keep the clean (0, {f0}) candidate; got {} candidates",
+            candidates.len()
+        );
+    }
+
+    /// hb-245 subsample DT refinement: an aligned synthetic signal
+    /// produces a `time_refinement` in [-0.5, +0.5]. Verifies
+    /// pancetta's hb-044 implementation satisfies the hb-245 spec.
+    #[test]
+    fn hb245_aligned_signal_has_bounded_time_refinement() {
+        let mut config = Ft8Config::default();
+        config.nms_enabled = false;
+        config.sync_time_interpolation = true;
+        config.sync_time_interp_delta_scale = 1.0;
+        config.sync_time_interp_score_gate = 0.0;
+        config.costas_partial_metric_enabled = false;
+        config.costas_two_baseline_enabled = false;
+
+        let decoder = Ft8Decoder::new(config).unwrap();
+        let f0 = 240usize;
+        let spec = synthetic_costas_spec(&[0, 1, 2], -10.0, -40.0, f0);
+
+        let candidates = decoder
+            .costas_sync_search_with_threshold(&spec, MIN_SYNC_SCORE, None)
+            .expect("sync search");
+
+        let cand = candidates
+            .iter()
+            .find(|c| c.freq_bin == f0 && c.freq_sub == 0 && c.time_step == 0)
+            .expect("aligned candidate must survive");
+
+        assert!(
+            cand.time_refinement.abs() <= 0.5,
+            "time_refinement {} out of [-0.5, +0.5]",
+            cand.time_refinement
         );
     }
 }
