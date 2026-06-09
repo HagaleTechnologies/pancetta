@@ -26,6 +26,7 @@ mod health;
 mod pipeline;
 mod psk_reporter;
 mod qso;
+mod qso_filter;
 mod shutdown;
 mod tier;
 mod tui_relay;

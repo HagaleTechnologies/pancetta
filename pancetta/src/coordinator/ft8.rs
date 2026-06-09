@@ -72,7 +72,25 @@ impl super::ApplicationCoordinator {
         // p50=862ms / p99=2332ms), reliably finishing inside the slot
         // budget. Standard pipeline still runs after as the
         // authoritative result; the QSO state machine deduplicates.
+        //
+        // hb-229 — QSO partner band-collapse: the same shared state is
+        // ALSO consumed by the main native decode below. When a QSO is
+        // in flight (and `PANCETTA_QSO_FILTER_OFF` is not set), the
+        // main decode is narrowed to ±60 Hz around the partner. Pure
+        // operational CPU win; same recall in the target band.
         let active_qso_freq_hz = self.active_qso_freq_hz.clone();
+
+        // hb-229: cache the operator override once at thread start so
+        // the hot loop doesn't pay a syscall on every window. The
+        // env var is documented as set-at-startup; live re-reads would
+        // race the QSO state machine anyway.
+        let qso_filter_override_off = super::qso_filter::filter_disabled_by_env();
+        if qso_filter_override_off {
+            info!(
+                "hb-229: QSO partner band-collapse disabled by {}=1",
+                super::qso_filter::QSO_FILTER_OFF_ENV
+            );
+        }
 
         // hb-062: shared FP filter (Option<Arc<...>>). When Some, applied
         // between decode-merge and broadcast loop. None = no filtering.
@@ -272,8 +290,31 @@ impl super::ApplicationCoordinator {
                             recent_calls: recent_pool.clone(),
                             active_qso: current_qso_ap,
                         };
+
+                        // hb-229: QSO partner band-collapse. When a QSO is
+                        // active and the operator hasn't overridden via env
+                        // var, narrow the Costas sweep to ±60 Hz around the
+                        // partner's audio freq. The pure observer in
+                        // `qso_filter` maps Option<freq_hz> → Option<range>;
+                        // the FT8 layer's `decode_window_with_ap_scoped`
+                        // is the existing hb-091 hook that clamps the
+                        // sync sweep to the supplied bin range.
+                        let partner_freq_for_main = active_qso_freq_hz.read().ok().and_then(|g| *g);
+                        let narrow_filter_bins =
+                            super::qso_filter::compute_narrow_filter_bins_default(
+                                partner_freq_for_main,
+                                qso_filter_override_off,
+                            );
+                        if let Some(ref range) = narrow_filter_bins {
+                            debug!(
+                                "hb-229: narrowing main decode to freq_bins {}..={} (partner {:.1} Hz)",
+                                range.start(),
+                                range.end(),
+                                partner_freq_for_main.unwrap_or(0.0),
+                            );
+                        }
                         let native_messages = decoder
-                            .decode_window_with_ap(&window, &ap_context)
+                            .decode_window_with_ap_scoped(&window, &ap_context, narrow_filter_bins)
                             .unwrap_or_default();
 
                         // Merge: start with ft8_lib results, add any native-only
