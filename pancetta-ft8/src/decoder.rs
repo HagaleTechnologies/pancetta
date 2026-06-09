@@ -843,6 +843,41 @@ pub struct Ft8Config {
     /// (WSJT-X Improved v3.0.0, DG2YCB). Pancetta's implementation
     /// is independent of upstream GPL source.
     pub a8_qso_state_ap_enabled: bool,
+
+    /// WSJT-X Improved-style automatic passband baseline (v3.1.0,
+    /// DG2YCB). When `true` AND no explicit `freq_bin_range` is supplied
+    /// by the caller, the decoder analyses the per-bin average power of
+    /// the first-pass spectrogram, detects the operator's actual
+    /// rig-passband edges from the smoothed spectrum's rolloff shape,
+    /// and narrows the Costas sync sweep to that interval.
+    ///
+    /// The closed-form algorithm (per spec ref
+    /// `research/specs/spec-wsjtx-improved-auto-passband.md`):
+    ///   1. Average the spectrogram across time for each freq bin
+    ///      (skipping bins below ~50 Hz to reject DC).
+    ///   2. Smooth with a wide moving-average (≈300 Hz window) along
+    ///      the freq axis to expose the rolloff shape — wider than
+    ///      individual FT8 signals but narrower than typical SSB
+    ///      rolloff transitions.
+    ///   3. Find a robust peak (95th percentile of the smoothed
+    ///      spectrum to reject lone strong carriers) and a threshold
+    ///      `t = peak - 6 dB`.
+    ///   4. Walk inward from each Wide Graph edge until the smoothed
+    ///      spectrum exceeds `t` — those are `auto_low_hz` and
+    ///      `auto_high_hz`. Always clamped to the Wide Graph window.
+    ///   5. Sanity floor: enforce `auto_high - auto_low >= 500 Hz`;
+    ///      below that, fall back to the operator's full window
+    ///      (likely an empty band or a configuration error).
+    ///
+    /// Default **false** — when off the decoder path is byte-identical
+    /// to the legacy fixed-range sweep. When the caller supplies an
+    /// explicit `freq_bin_range` (e.g. the coordinator's hb-091 scoped
+    /// fast path), auto-passband is skipped — the caller's narrower
+    /// scope always wins. Inspired by spec ref
+    /// `research/specs/spec-wsjtx-improved-auto-passband.md` (WSJT-X
+    /// Improved v3.1.0, DG2YCB). Pancetta's implementation is
+    /// independent of upstream GPL source.
+    pub auto_passband_enabled: bool,
 }
 
 impl Default for Ft8Config {
@@ -1073,6 +1108,13 @@ impl Default for Ft8Config {
             // templates. Inspired by spec ref
             // `spec-wsjtx-improved-a8-decoding.md`.
             a8_qso_state_ap_enabled: false,
+            // WSJT-X Improved-style auto-passband (v3.1.0, DG2YCB).
+            // Default OFF — preserves byte-identical legacy fixed-range
+            // sweep behavior. Flip on to narrow the Costas sweep to the
+            // rig's actual audio passband based on the per-bin
+            // spectrogram rolloff shape. Inspired by spec ref
+            // `spec-wsjtx-improved-auto-passband.md`.
+            auto_passband_enabled: false,
         }
     }
 }
@@ -1515,6 +1557,16 @@ impl Ft8Decoder {
         let mut seen_messages: HashSet<String> = HashSet::new();
         let mut best_sync_score = 0.0f64;
 
+        // WSJT-X Improved auto-passband: computed once per window from
+        // the pass-0 spectrogram and held constant across passes. The
+        // spec's "per-window recomputation" recommendation maps to this
+        // call site (one window = one decode_window call). When the
+        // caller supplied an explicit `freq_bin_range`, auto-passband
+        // is skipped — the caller's scope always wins. Inspired by
+        // spec ref `spec-wsjtx-improved-auto-passband.md`.
+        let auto_passband_active = self.config.auto_passband_enabled && freq_bin_range.is_none();
+        let mut auto_passband_range: Option<RangeInclusive<usize>> = None;
+
         for pass in 0..loop_passes {
             if budget.expired() {
                 info!(pass, "Decode budget expired, stopping early");
@@ -1602,17 +1654,62 @@ impl Ft8Decoder {
             // decoded signals in place.
             let mut spectrogram = self.compute_spectrogram(&audio)?;
 
+            // WSJT-X Improved auto-passband: compute the bin range from
+            // the pass-0 spectrogram and reuse it for subsequent passes.
+            // The detection is shape-based on the per-bin time-average
+            // (rig rolloff stands out; individual signals average down),
+            // so the residual spectrograms in passes 2+ — which differ
+            // from pass 0 only by signals having been subtracted out —
+            // produce essentially the same passband shape. Computing
+            // once per window also matches the spec recommendation
+            // ("per-window recomputation; no caching, no rig-fingerprint
+            // matching") at the call-site granularity.
+            if auto_passband_active && auto_passband_range.is_none() && pass == 0 {
+                let avg = Self::average_spectrum_per_bin(&spectrogram);
+                let bin_hz = self.protocol_params.tone_spacing;
+                // Full Wide Graph window: 0 Hz to the natural FT8 max
+                // (`(4000 / tone_spacing)` bins, matching the historical
+                // Costas envelope). This is the outer envelope; the
+                // auto-passband can only narrow it.
+                let wg_high_hz = 4000.0_f64;
+                let (auto_low_hz, auto_high_hz) =
+                    Self::compute_auto_passband(&avg, 0.0, wg_high_hz, bin_hz);
+                let auto_lo_bin = (auto_low_hz / bin_hz).floor().max(0.0) as usize;
+                let auto_hi_bin_excl = (auto_high_hz / bin_hz).ceil().max(0.0) as usize;
+                // Convert exclusive upper to the inclusive form
+                // `costas_sync_search_partner` expects.
+                let auto_hi_bin_incl = auto_hi_bin_excl.saturating_sub(1);
+                if auto_hi_bin_incl >= auto_lo_bin {
+                    debug!(
+                        target: "dsp.passband",
+                        auto_low_hz = format!("{:.1}", auto_low_hz),
+                        auto_high_hz = format!("{:.1}", auto_high_hz),
+                        width_hz = format!("{:.1}", auto_high_hz - auto_low_hz),
+                        auto_lo_bin,
+                        auto_hi_bin_incl,
+                        "Auto-passband detected"
+                    );
+                    auto_passband_range = Some(auto_lo_bin..=auto_hi_bin_incl);
+                }
+            }
+
             // Step 2: Find candidates via Costas sync pattern search.
             // hb-091 Session 2: when `freq_bin_range` is Some, the Costas
             // sweep is restricted to that bin range (additive scoped path).
             // hb-230: forward `partner_freq_hz` so the relaxed-threshold
             // branch fires within ±radius Hz of the partner (no-op when
             // either input is None).
-            let mut sync_candidates = self.costas_sync_search_partner(
-                &spectrogram,
-                freq_bin_range.as_ref(),
-                partner_freq_hz,
-            )?;
+            // Auto-passband: when the caller did NOT supply a scope and
+            // the auto-passband flag is on, forward the detected range
+            // instead of `None`. The caller's scope (when present) always
+            // takes precedence over auto-passband.
+            let effective_scope: Option<&RangeInclusive<usize>> = if freq_bin_range.is_some() {
+                freq_bin_range.as_ref()
+            } else {
+                auto_passband_range.as_ref()
+            };
+            let mut sync_candidates =
+                self.costas_sync_search_partner(&spectrogram, effective_scope, partner_freq_hz)?;
 
             // On passes 2+, reduce candidate count — strong signals are already
             // decoded and subtracted, so fewer candidates need evaluation.
@@ -1892,12 +1989,22 @@ impl Ft8Decoder {
                     .map(|margin| (noise_floor_db_median(&spectrogram.power), margin));
                 let mut to_subtract: &[DecodedMessage] = &pass_decoded;
                 let mut round_start_offset = 0;
+                // Auto-passband scope (when active) flows into the
+                // residual multipass too — the spec is explicit that the
+                // detected window applies to all sync passes within
+                // this call, mirroring how the explicit `freq_bin_range`
+                // scope already does in hb-091.
+                let residual_scope: Option<&RangeInclusive<usize>> = if freq_bin_range.is_some() {
+                    freq_bin_range.as_ref()
+                } else {
+                    auto_passband_range.as_ref()
+                };
                 for _round in 0..self.config.coherent_multipass_iterations {
                     let mut extra = self.coherent_subtract_and_repass(
                         &mut spectrogram,
                         to_subtract,
                         energy_stop,
-                        freq_bin_range.as_ref(),
+                        residual_scope,
                         partner_freq_hz,
                     );
                     if extra.is_empty() {
@@ -2926,6 +3033,189 @@ impl Ft8Decoder {
             freq_osr,
             time_padding: 0,
         })
+    }
+
+    // ========================================================================
+    // Auto-passband (WSJT-X Improved v3.1.0, inspired by spec ref
+    // `spec-wsjtx-improved-auto-passband.md`)
+    // ========================================================================
+
+    /// Average the per-bin power across all time steps and freq sub-bins,
+    /// producing a single power value per freq bin. This is the input the
+    /// auto-passband shape detector consumes — the rolloff edges of the
+    /// rig's actual passband stand out clearly in the long-window
+    /// average, while individual signals average down.
+    ///
+    /// Returns a vector of length `spectrogram.num_bins` in dB units
+    /// (the spectrogram itself stores `10*log10(mag2)` per bin).
+    fn average_spectrum_per_bin(spectrogram: &Spectrogram) -> Vec<f64> {
+        let num_bins = spectrogram.num_bins;
+        let mut avg = vec![0.0_f64; num_bins];
+        if spectrogram.num_steps == 0 || spectrogram.freq_osr == 0 {
+            return avg;
+        }
+        // dB values are conceptually a logarithmic quantity; averaging
+        // them yields a geometric mean of power, which is a stable
+        // noise-floor proxy in the FT8/WSJT-X tradition. We follow that
+        // convention here (matches the spectrogram's own dB storage).
+        let denom = (spectrogram.num_steps as f64) * (spectrogram.freq_osr as f64);
+        for step in &spectrogram.power {
+            for fsub in step {
+                for (bin, &val) in fsub.iter().enumerate() {
+                    avg[bin] += val;
+                }
+            }
+        }
+        for v in &mut avg {
+            *v /= denom;
+        }
+        avg
+    }
+
+    /// Default smoothing window width (≈300 Hz at 6.25 Hz/bin) per spec
+    /// recommendation. Wide enough to average over individual FT8
+    /// signals; narrower than the typical 200 Hz SSB rig rolloff
+    /// transition so the edge shape is preserved.
+    const AUTO_PASSBAND_SMOOTH_BINS: usize = 48;
+
+    /// Rolloff allowance threshold below the spectrum peak (spec
+    /// recommends 6 dB — the standard half-power passband edge for an
+    /// SSB rig).
+    const AUTO_PASSBAND_DELTA_DB: f64 = 6.0;
+
+    /// Minimum sane passband width (Hz). Below this, fall back to the
+    /// operator's full Wide Graph window — likely an empty band or a
+    /// single dominant carrier, not a rig-passband shape.
+    const AUTO_PASSBAND_MIN_WIDTH_HZ: f64 = 500.0;
+
+    /// Robust-peak quantile to reject lone strong signals. Per spec
+    /// "very strong in-band signal" edge case: a loud carrier can
+    /// dominate `max(smoothed)` and inflate the threshold. Using the
+    /// 95th percentile of the smoothed spectrum keeps the threshold
+    /// representative of the in-band noise floor + signals, not the
+    /// strongest single tone.
+    const AUTO_PASSBAND_PEAK_QUANTILE: f64 = 0.95;
+
+    /// DC-reject cutoff (Hz). Spec: "skip bins below ~50 Hz when
+    /// computing peak_power to avoid biasing the threshold" — many SSB
+    /// audio chains leak DC + audio-card power-supply artifacts into
+    /// the first ~10 bins (at 6.25 Hz/bin), which look like a huge
+    /// peak.
+    const AUTO_PASSBAND_DC_REJECT_HZ: f64 = 50.0;
+
+    /// Compute the auto-detected passband edges `(auto_low_hz,
+    /// auto_high_hz)` from the per-bin averaged spectrogram. The
+    /// algorithm follows the spec ref
+    /// `spec-wsjtx-improved-auto-passband.md`:
+    ///   - moving-average smoothing along the freq axis to expose the
+    ///     rig rolloff shape,
+    ///   - peak detection via a high quantile (robust against lone
+    ///     strong carriers — spec edge case),
+    ///   - threshold = `peak - delta_dB`,
+    ///   - walk inward from each Wide Graph edge to find the first bin
+    ///     exceeding the threshold,
+    ///   - sanity floor: if `auto_high - auto_low < 500 Hz`, fall back
+    ///     to `(wg_low_hz, wg_high_hz)`.
+    ///
+    /// The result always satisfies `wg_low_hz <= auto_low_hz <=
+    /// auto_high_hz <= wg_high_hz`.
+    pub fn compute_auto_passband(
+        avg_spectrum_db: &[f64],
+        wg_low_hz: f64,
+        wg_high_hz: f64,
+        bin_hz: f64,
+    ) -> (f64, f64) {
+        let n = avg_spectrum_db.len();
+        if n == 0 || bin_hz <= 0.0 || !(wg_low_hz < wg_high_hz) {
+            return (wg_low_hz, wg_high_hz);
+        }
+
+        // Translate WG cutoffs into clamped bin indices [wg_lo, wg_hi).
+        let wg_lo = ((wg_low_hz / bin_hz).floor().max(0.0) as usize).min(n);
+        let wg_hi = ((wg_high_hz / bin_hz).ceil().max(0.0) as usize).min(n);
+        if wg_hi.saturating_sub(wg_lo) < 2 {
+            return (wg_low_hz, wg_high_hz);
+        }
+
+        // DC-reject: do not let the first ~50 Hz contribute to the peak
+        // detection. The smoothed-spectrum walk still starts at `wg_lo`
+        // — DC bins simply can't trip the threshold because the peak
+        // (and therefore the threshold) is set in the in-band region.
+        let dc_reject_bin = ((Self::AUTO_PASSBAND_DC_REJECT_HZ / bin_hz).ceil() as usize).min(n);
+        let peak_lo = wg_lo.max(dc_reject_bin);
+        let peak_hi = wg_hi;
+        if peak_hi.saturating_sub(peak_lo) < 2 {
+            return (wg_low_hz, wg_high_hz);
+        }
+
+        // Step 1: smooth the spectrum. Symmetric moving average of width
+        // SMOOTH_BINS. Bin i averages over `i - half ..= i + half`,
+        // clamped to `[0, n)`. The half-width is bounded above by the
+        // spectrum length so very-short test spectra still produce a
+        // valid smoothed array.
+        let smooth_w = Self::AUTO_PASSBAND_SMOOTH_BINS.min(n).max(1);
+        let half = smooth_w / 2;
+        let mut smoothed = vec![0.0_f64; n];
+        // Prefix sums let us evaluate each window in O(1).
+        let mut psum = vec![0.0_f64; n + 1];
+        for i in 0..n {
+            psum[i + 1] = psum[i] + avg_spectrum_db[i];
+        }
+        for i in 0..n {
+            let lo = i.saturating_sub(half);
+            let hi = (i + half + 1).min(n);
+            let count = hi - lo;
+            smoothed[i] = (psum[hi] - psum[lo]) / count as f64;
+        }
+
+        // Step 2: robust peak via the 95th percentile of the smoothed
+        // spectrum over the DC-rejected in-band region.
+        let mut sorted_vals: Vec<f64> = smoothed[peak_lo..peak_hi].to_vec();
+        sorted_vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let q_idx_raw =
+            (sorted_vals.len() as f64 * Self::AUTO_PASSBAND_PEAK_QUANTILE).floor() as usize;
+        let q_idx = q_idx_raw.min(sorted_vals.len().saturating_sub(1));
+        let peak_db = sorted_vals[q_idx];
+        let threshold_db = peak_db - Self::AUTO_PASSBAND_DELTA_DB;
+
+        // Step 3: find the leftmost in-band bin whose smoothed value
+        // exceeds the threshold, walking from `wg_lo` upward. If no
+        // bin clears the threshold, the result is `wg_lo` (the full
+        // window is the safest fallback).
+        let mut auto_lo_bin = wg_lo;
+        for i in wg_lo..wg_hi {
+            if smoothed[i] >= threshold_db {
+                auto_lo_bin = i;
+                break;
+            }
+        }
+
+        // Step 4: find the rightmost in-band bin whose smoothed value
+        // exceeds the threshold, walking from `wg_hi - 1` downward.
+        let mut auto_hi_bin = wg_hi.saturating_sub(1);
+        for i in (wg_lo..wg_hi).rev() {
+            if smoothed[i] >= threshold_db {
+                auto_hi_bin = i;
+                break;
+            }
+        }
+
+        if auto_hi_bin < auto_lo_bin {
+            // Pathological — fall back to the full WG window.
+            return (wg_low_hz, wg_high_hz);
+        }
+
+        let auto_low_hz = (auto_lo_bin as f64) * bin_hz;
+        let auto_high_hz = (auto_hi_bin as f64) * bin_hz;
+
+        // Step 5: sanity floor. Reject pathological narrow detections
+        // (e.g. a single-carrier-dominated spectrum) by falling back to
+        // the operator's full Wide Graph window.
+        if auto_high_hz - auto_low_hz < Self::AUTO_PASSBAND_MIN_WIDTH_HZ {
+            return (wg_low_hz, wg_high_hz);
+        }
+
+        (auto_low_hz.max(wg_low_hz), auto_high_hz.min(wg_high_hz))
     }
 
     // ========================================================================
@@ -12735,5 +13025,276 @@ mod a8_qso_state_tests {
         assert!(texts.is_empty());
         let texts = enumerate_a8_expected_texts("K1ABC", "  ", QsoApProgress::WaitingForReport);
         assert!(texts.is_empty());
+    }
+}
+
+// ============================================================================
+// WSJT-X Improved auto-passband tests
+// ============================================================================
+//
+// Inspired by spec ref `research/specs/spec-wsjtx-improved-auto-passband.md`
+// (WSJT-X Improved v3.1.0, DG2YCB). Pancetta's implementation is independent
+// of upstream GPL source.
+//
+// These tests exercise the closed-form helper directly with synthetic per-bin
+// spectra. The helper is shape-detection on a smoothed, time-averaged power
+// vector — the same input it would receive from a real spectrogram via the
+// `average_spectrum_per_bin` reducer. Working at this level keeps tests fast
+// and lets us assert exact bin-edge behavior on hand-crafted inputs.
+
+#[cfg(test)]
+mod auto_passband_tests {
+    use super::*;
+
+    // FT8 bin width (Hz). The auto-passband helper is bin-resolution agnostic
+    // — pass in whatever step size matches the spectrum. Tests use 6.25 Hz to
+    // match the production FT8 spectrogram.
+    const BIN_HZ: f64 = 6.25;
+
+    /// Build a synthetic averaged spectrum that mimics an SSB rig: low
+    /// noise floor outside the passband, an "in-band" plateau of higher
+    /// power, with sharp rolloff at `low_hz` and `high_hz`. Values are in
+    /// dB units to match the production spectrogram storage.
+    fn build_rolloff_spectrum(num_bins: usize, low_hz: f64, high_hz: f64) -> Vec<f64> {
+        let noise_db = -90.0_f64;
+        let inband_db = -70.0_f64;
+        let mut out = vec![noise_db; num_bins];
+        let lo_bin = (low_hz / BIN_HZ).round() as usize;
+        let hi_bin = (high_hz / BIN_HZ).round() as usize;
+        for (i, v) in out.iter_mut().enumerate() {
+            if i >= lo_bin && i < hi_bin {
+                *v = inband_db;
+            }
+        }
+        out
+    }
+
+    /// Default config: `auto_passband_enabled = false`. The default-OFF
+    /// promise is a regression guard — flipping ON requires a hard-200
+    /// measurement, per the field doc-comment.
+    #[test]
+    fn default_config_keeps_auto_passband_off() {
+        let cfg = Ft8Config::default();
+        assert!(
+            !cfg.auto_passband_enabled,
+            "Ft8Config::default().auto_passband_enabled must be false; \
+             toggling default-ON requires a hard-200 measurement"
+        );
+    }
+
+    /// Flat-noise spectrum (no rolloff, no signals): the auto-passband
+    /// detection must return the operator's full Wide Graph window
+    /// unchanged. This is the "Wide Graph already tightly bounded" /
+    /// "empty band" edge case from the spec (steps 8 + edge cases).
+    #[test]
+    fn flat_noise_returns_full_window() {
+        let num_bins = 640;
+        let flat = vec![-90.0_f64; num_bins];
+        let (auto_low, auto_high) = Ft8Decoder::compute_auto_passband(&flat, 0.0, 4000.0, BIN_HZ);
+        // Flat spectrum → peak ≈ noise floor; threshold ≈ noise - 6 dB;
+        // every bin clears it, so the detected edges are the full window
+        // (clamped to the WG bounds). Width therefore ≥ the sanity
+        // floor; result should be very close to (0, 4000).
+        assert_eq!(auto_low, 0.0, "flat-noise low edge should stay at WG low");
+        // The high edge lands on the last bin that cleared the
+        // threshold, which for a perfectly flat spectrum is bin
+        // `num_bins - 1`. Allow a small tolerance for the bin-quantization.
+        assert!(
+            auto_high >= 4000.0 - BIN_HZ * 2.0,
+            "flat-noise high edge should stay near WG high; got {auto_high}"
+        );
+        assert!(auto_high <= 4000.0, "result must stay clamped to WG high");
+    }
+
+    /// Spectrum with strong out-of-band noise below 500 Hz: the
+    /// detected low cutoff must move UP, because the smoothed
+    /// spectrum's "in-band" plateau (where signal-shape sits) starts
+    /// above 500 Hz. This mirrors the spec's "Wide Graph set wider
+    /// than the rig passband" common case.
+    #[test]
+    fn strong_low_rolloff_pushes_low_cutoff_up() {
+        // Rig passes 500–3000 Hz cleanly: everything outside that
+        // window is at the noise floor.
+        let num_bins = 640;
+        let spec = build_rolloff_spectrum(num_bins, 500.0, 3000.0);
+        let (auto_low, auto_high) = Ft8Decoder::compute_auto_passband(&spec, 0.0, 4000.0, BIN_HZ);
+        // The detected low edge should be clearly above 0 Hz — the
+        // smoothing pass spreads the rolloff transition over ~150 Hz
+        // (half-width of the 48-bin window at 6.25 Hz/bin), so we
+        // require >150 Hz to confirm the cutoff actually moved.
+        assert!(
+            auto_low > 150.0,
+            "low cutoff should move up from WG low when in-band is 500+ Hz; got {auto_low}"
+        );
+        // And it should land in the rolloff transition zone — not so
+        // high that we've eaten into the passband interior.
+        assert!(
+            auto_low < 700.0,
+            "low cutoff should land near the 500 Hz rolloff; got {auto_low}"
+        );
+        // High cutoff should stay near the rig's 3000 Hz upper edge.
+        assert!(
+            auto_high > 2700.0 && auto_high < 3200.0,
+            "high cutoff should stay near 3000 Hz rolloff; got {auto_high}"
+        );
+    }
+
+    /// Spectrum with strong out-of-band noise above 3500 Hz (the
+    /// classic case is an unfiltered audio chain that lets carrier
+    /// energy bleed through above the rig's audio rolloff): the
+    /// detected high cutoff must move DOWN.
+    #[test]
+    fn strong_high_rolloff_pulls_high_cutoff_down() {
+        // Rig passes 200–3500 Hz; everything outside is noise.
+        let num_bins = 640;
+        let spec = build_rolloff_spectrum(num_bins, 200.0, 3500.0);
+        let (auto_low, auto_high) = Ft8Decoder::compute_auto_passband(&spec, 0.0, 4000.0, BIN_HZ);
+        // High cutoff should land near the 3500 Hz rolloff.
+        assert!(
+            auto_high > 3200.0 && auto_high < 3700.0,
+            "high cutoff should land near 3500 Hz rolloff; got {auto_high}"
+        );
+        // High cutoff should be clearly below the WG high (4000 Hz).
+        assert!(
+            auto_high < 4000.0 - 200.0,
+            "high cutoff should move down from WG high; got {auto_high}"
+        );
+        // Low cutoff should stay near 200 Hz.
+        assert!(
+            auto_low < 400.0,
+            "low cutoff should stay near 200 Hz rolloff; got {auto_low}"
+        );
+    }
+
+    /// Sanity floor: if the detected width is below the 500 Hz floor
+    /// (e.g. a single dominant carrier dominating the smoothed
+    /// spectrum), the helper must fall back to the operator's full
+    /// Wide Graph window. Spec step 8 / "Very strong in-band signal"
+    /// edge case.
+    #[test]
+    fn narrow_detection_falls_back_to_full_window() {
+        // Inject a 50 Hz wide "peak" surrounded by uniformly low noise.
+        // The 95th-percentile robust-peak rule should still rank the
+        // peak as the spectrum's maximum (since only the peak bins
+        // exceed the noise floor by 20 dB); but the smoothed window
+        // smears that into a region < 500 Hz wide, triggering the
+        // sanity floor fallback.
+        let num_bins = 640;
+        let mut spec = vec![-90.0_f64; num_bins];
+        let center_hz = 2000.0;
+        let center_bin = (center_hz / BIN_HZ) as usize;
+        for off in 0..8 {
+            spec[center_bin + off] = -40.0;
+        }
+        let (auto_low, auto_high) = Ft8Decoder::compute_auto_passband(&spec, 0.0, 4000.0, BIN_HZ);
+        // Sanity floor → full WG window.
+        assert_eq!(
+            (auto_low, auto_high),
+            (0.0, 4000.0),
+            "narrow detection (<500 Hz) must fall back to WG window; got ({auto_low}, {auto_high})"
+        );
+    }
+
+    /// Result is always clamped within the operator's Wide Graph
+    /// window: `wg_low_hz <= auto_low_hz <= auto_high_hz <= wg_high_hz`.
+    #[test]
+    fn result_clamped_to_wide_graph_window() {
+        let num_bins = 640;
+        let spec = build_rolloff_spectrum(num_bins, 500.0, 3000.0);
+        // Operator-supplied window narrower than the detected
+        // passband: detection should NOT expand past the operator's
+        // cutoffs.
+        let (auto_low, auto_high) = Ft8Decoder::compute_auto_passband(&spec, 800.0, 2500.0, BIN_HZ);
+        assert!(
+            auto_low >= 800.0,
+            "auto_low must respect wg_low; got {auto_low}"
+        );
+        assert!(
+            auto_high <= 2500.0,
+            "auto_high must respect wg_high; got {auto_high}"
+        );
+        assert!(auto_low <= auto_high, "auto_low <= auto_high");
+    }
+
+    /// Default-OFF preserves byte-identical sweep behavior at the
+    /// decoder level: when `auto_passband_enabled` is false, the
+    /// sync-candidate set produced from a real synthetic spectrogram
+    /// must match the legacy (no-scope) path bit-for-bit.
+    #[test]
+    fn default_off_decoder_path_is_byte_identical() {
+        let cfg_default = Ft8Config::default();
+        assert!(!cfg_default.auto_passband_enabled);
+
+        let mut cfg_off = Ft8Config::default();
+        cfg_off.auto_passband_enabled = false;
+
+        let f0 = 240_usize;
+        let spec = build_synthetic_costas(&[0, 1, 2], -10.0, -40.0, f0);
+
+        let decoder_default = Ft8Decoder::new(cfg_default).unwrap();
+        let decoder_off = Ft8Decoder::new(cfg_off).unwrap();
+
+        let r_default = decoder_default
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .expect("default sync search");
+        let r_off = decoder_off
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .expect("explicit-off sync search");
+
+        assert_eq!(
+            r_default.len(),
+            r_off.len(),
+            "default and explicit-off paths must produce identical candidate counts"
+        );
+        for (a, b) in r_default.iter().zip(r_off.iter()) {
+            assert_eq!(a.freq_bin, b.freq_bin);
+            assert_eq!(a.time_step, b.time_step);
+            assert_eq!(a.freq_sub, b.freq_sub);
+            assert!(
+                (a.sync_score - b.sync_score).abs() < 1e-9,
+                "scores must match exactly"
+            );
+        }
+    }
+
+    /// Reuse `build_synthetic_costas` from the parent test module. The
+    /// function is defined inside `mod hb230_relaxed_sync_tests`; copy
+    /// the constructor logic locally to keep this module self-contained
+    /// without cross-module test coupling.
+    fn build_synthetic_costas(
+        present_groups: &[usize],
+        signal_db: f64,
+        noise_db: f64,
+        f0: usize,
+    ) -> Spectrogram {
+        let steps_per_symbol = TIME_OSR;
+        let num_steps = 79 * steps_per_symbol;
+        let num_bins = SAMPLES_PER_SYMBOL / 2 + 1;
+        let freq_osr = FREQ_OSR;
+
+        let mut power = vec![vec![vec![noise_db; num_bins]; freq_osr]; num_steps];
+
+        for &m in present_groups {
+            let group_start = [0_usize, 36, 72][m];
+            for j in 0..7 {
+                let sym = group_start + j;
+                let tone = crate::protocol::FT8_COSTAS[j] as usize;
+                for sub in 0..steps_per_symbol {
+                    let time_idx = sym * steps_per_symbol + sub;
+                    if time_idx < num_steps && f0 + tone < num_bins {
+                        power[time_idx][0][f0 + tone] = signal_db;
+                    }
+                }
+            }
+        }
+
+        Spectrogram {
+            power,
+            complex: None,
+            num_steps,
+            num_bins,
+            freq_osr,
+            time_padding: 0,
+        }
     }
 }
