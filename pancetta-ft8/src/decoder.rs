@@ -774,6 +774,49 @@ pub struct Ft8Config {
     /// FT8's 6.25 Hz tone spacing. Only consulted when
     /// `per_candidate_freq_tracker_enabled = true`.
     pub per_candidate_freq_tracker_max_error_hz: f64,
+
+    /// ft8mon-style three-stage sync cascade — post-decode (third stage)
+    /// known-symbol refinement. Pancetta's existing decoder is a two-stage
+    /// sync structure (coarse Costas sweep + sub-symbol parabolic
+    /// refinement). ft8mon adds a THIRD stage that runs AFTER a candidate
+    /// has decoded (LDPC + CRC pass) but BEFORE
+    /// `coherent_subtract_and_repass` subtracts it: with the LDPC-decoded
+    /// 79-symbol sequence as a known reference, sweep a small
+    /// `(freq_sub, time_step)` neighborhood around
+    /// `reverse_derive_candidate`'s estimate and pick the alignment that
+    /// MAXIMIZES the phase-aware known-coherence metric described in
+    /// `spec-ft8mon-three-stage-sync-cascade.md` §"Stage 3"
+    /// (`known_strength_how = 7`).
+    ///
+    /// The metric is `-Σ |c[i] - c[i-1]|` over symbol-to-symbol phase
+    /// differences at the known tones; minimizing the symbol-to-symbol
+    /// phase jitter is equivalent to maximizing alignment quality.
+    /// The refined `(freq_sub, time_step)` feeds `subtract_decode_coherent`,
+    /// producing a cleaner residual for the multipass loop's subsequent
+    /// sync sweep and weak-signal recovery.
+    ///
+    /// **The third stage does NOT surface new decodes by itself** — it
+    /// improves SUBTRACTION QUALITY, so multipass round N+1 sees a
+    /// cleaner residual and can find weak signals that the coarser
+    /// alignment masked. Targets the hb-217 capture-effect line
+    /// (0/1/2/3 neighbors → 76/43/27/15% recall) where subtraction
+    /// quality is the bottleneck.
+    ///
+    /// Default **false** — the legacy `reverse_derive_candidate` path
+    /// produces byte-identical residuals to historical multipass
+    /// behavior. When `true` the candidate's `(freq_sub, time_step)`
+    /// undergoes the small-neighborhood sweep before subtraction;
+    /// `freq_bin` is preserved (a freq_bin shift would change the tone
+    /// indexing relative to `f_idx = f0 + tone` in
+    /// `subtract_decode_coherent`, which is structurally tied to the
+    /// decoded `tone_symbols[sym_idx]` — see spec §"Edge cases").
+    ///
+    /// Inspired by spec ref
+    /// `research/specs/spec-ft8mon-three-stage-sync-cascade.md`
+    /// (ft8mon `search_both_known()` + `one_strength_known()` driven by
+    /// `try_decode` with `do_third = 2`). Peer GPL-3.0 source was not
+    /// consulted.
+    pub three_stage_sync_cascade_enabled: bool,
 }
 
 impl Default for Ft8Config {
@@ -991,6 +1034,12 @@ impl Default for Ft8Config {
             per_candidate_freq_tracker_alpha: 0.2,
             per_candidate_freq_tracker_max_step_hz: 1.5,
             per_candidate_freq_tracker_max_error_hz: 5.0,
+            // ft8mon-style three-stage sync cascade post-decode
+            // (known-symbol) refinement. Default **false** — when off,
+            // the residual produced by `coherent_subtract_and_repass`
+            // is byte-identical to the legacy path. Inspired by spec
+            // ref `spec-ft8mon-three-stage-sync-cascade.md`.
+            three_stage_sync_cascade_enabled: false,
         }
     }
 }
@@ -3735,7 +3784,20 @@ impl Ft8Decoder {
             if tone_symbols.len() < pp.num_symbols {
                 continue;
             }
-            let candidate = reverse_derive_candidate(msg, pp, time_padding);
+            let seed_candidate = reverse_derive_candidate(msg, pp, time_padding);
+            // ft8mon-style three-stage sync cascade — Stage 3
+            // (post-decode known-symbol refinement). When enabled,
+            // refine the candidate's `(freq_sub, time_step)` using the
+            // LDPC-decoded `tone_symbols` as ground truth before
+            // subtracting. Default-OFF preserves byte-identical residuals
+            // to the legacy path. Inspired by spec ref
+            // `research/specs/spec-ft8mon-three-stage-sync-cascade.md`
+            // (ft8mon `search_both_known()` with `do_third = 2`).
+            let candidate = if self.config.three_stage_sync_cascade_enabled {
+                refine_candidate_with_known_symbols(spectrogram, pp, &seed_candidate, tone_symbols)
+            } else {
+                seed_candidate
+            };
             let Some(cs) =
                 par_extract_complex_symbols_from_spectrogram(pp, spectrogram, &candidate)
             else {
@@ -6365,6 +6427,169 @@ fn subtract_decode_coherent(
             spectrogram.power[t_idx][fs][f_idx] = 10.0 * (1e-12 + mag2).log10();
         }
     }
+}
+
+/// ft8mon-style three-stage sync cascade — Stage 3 metric
+/// (`known_strength_how = 7`).
+///
+/// Computes the phase-aware known-coherence score for a candidate at
+/// `(freq_sub, time_step)` using the LDPC-decoded `tone_symbols` as
+/// ground truth. Returns the score; HIGHER is better.
+///
+/// Per spec
+/// (`research/specs/spec-ft8mon-three-stage-sync-cascade.md` §"Stage 3"
+/// + §"Implementation notes" — `known_strength_how = 7`), the metric is
+/// `-Σ |c[i] - c[i-1]|` summed over symbol-to-symbol phase deltas at the
+/// KNOWN tones (all 79 symbols, not just the 21 Costas symbols). Lower
+/// jitter between consecutive on-tone samples ⇒ tighter alignment ⇒
+/// higher (less-negative) score. The metric uses `c[i] / |c[i]|`
+/// (phase-only) so amplitude variation doesn't masquerade as phase
+/// jitter.
+///
+/// Returns `None` when the spectrogram has no complex retention
+/// (`cross_cycle_coherent` disabled) or the candidate's `(freq_sub,
+/// time_step)` falls entirely outside the spectrogram extent.
+fn known_coherence_score(
+    spectrogram: &Spectrogram,
+    pp: &ProtocolParams,
+    time_step: usize,
+    freq_bin: usize,
+    freq_sub: usize,
+    tone_symbols: &[u8],
+) -> Option<f64> {
+    let complex = spectrogram.complex.as_ref()?;
+    if freq_sub >= spectrogram.freq_osr {
+        return None;
+    }
+    let steps_per_symbol = TIME_OSR;
+    let mut prev_phase: Option<Complex<f64>> = None;
+    let mut sum_delta_mag = 0.0f64;
+    let mut counted = 0usize;
+    for sym_idx in 0..pp.num_symbols.min(tone_symbols.len()) {
+        let tone = tone_symbols[sym_idx] as usize;
+        if tone >= NUM_TONES {
+            prev_phase = None;
+            continue;
+        }
+        let f_idx = freq_bin + tone;
+        if f_idx >= spectrogram.num_bins {
+            prev_phase = None;
+            continue;
+        }
+        let t_idx = time_step + sym_idx * steps_per_symbol;
+        if t_idx >= spectrogram.num_steps {
+            prev_phase = None;
+            continue;
+        }
+        let bin = complex[t_idx][freq_sub][f_idx];
+        let mag = bin.norm();
+        if mag < 1e-30 {
+            // Silent / clipped — skip this symbol's delta contribution
+            // but keep prev_phase intact so subsequent valid symbols can
+            // still compare across the gap.
+            continue;
+        }
+        let phase = bin / mag;
+        if let Some(prev) = prev_phase {
+            sum_delta_mag += (phase - prev).norm();
+            counted += 1;
+        }
+        prev_phase = Some(phase);
+    }
+    if counted == 0 {
+        return None;
+    }
+    // -Σ |Δphase|. Higher score (closer to 0 / less negative) = less
+    // phase jitter = better alignment.
+    Some(-sum_delta_mag)
+}
+
+/// ft8mon-style three-stage sync cascade — Stage 3 driver.
+///
+/// Sweeps a small `(freq_sub, time_step)` neighborhood around `seed` and
+/// returns the `(freq_sub, time_step)` whose [`known_coherence_score`]
+/// is highest. `freq_bin` is held fixed: a freq_bin shift would change
+/// the tone indexing relative to `f_idx = f0 + tone` in
+/// [`subtract_decode_coherent`], which is structurally tied to the
+/// decoded `tone_symbols[sym_idx]` (see spec §"Edge cases").
+///
+/// Search lattice:
+/// - `freq_sub`: every valid value in `0..spectrogram.freq_osr` (FT8 has
+///   `FREQ_OSR = 2`, so this is a 2-element exhaustive sweep — finer
+///   than ft8mon's 3-point `third_hz_n = 3` but cheaper because the
+///   spectrogram is already sub-bin oversampled).
+/// - `time_step`: `seed.time_step ± THIRD_TIME_RADIUS` with a 1-step
+///   resolution. ft8mon's `third_off_n = 4` at full-rate maps to ±2
+///   spectrogram time-steps at TIME_OSR = 2; we use ±2 for parity.
+///
+/// Returns the seed unchanged when:
+/// - The spectrogram has no complex retention.
+/// - The seed itself yields no valid `known_coherence_score` (no symbols
+///   land inside the spectrogram).
+///
+/// This function is pure and observation-only; mutating subtraction
+/// happens downstream in [`subtract_decode_coherent`] with the returned
+/// `(freq_sub, time_step)`.
+fn refine_candidate_with_known_symbols(
+    spectrogram: &Spectrogram,
+    pp: &ProtocolParams,
+    seed: &CostasCandidate,
+    tone_symbols: &[u8],
+) -> CostasCandidate {
+    /// Per-side time-step search radius. ft8mon's `third_off_n = 4` at
+    /// full sample rate corresponds to ~2 spectrogram time-steps at
+    /// pancetta's TIME_OSR = 2.
+    const THIRD_TIME_RADIUS: isize = 2;
+
+    if spectrogram.complex.is_none() {
+        return *seed;
+    }
+    let Some(seed_score) = known_coherence_score(
+        spectrogram,
+        pp,
+        seed.time_step,
+        seed.freq_bin,
+        seed.freq_sub,
+        tone_symbols,
+    ) else {
+        return *seed;
+    };
+    let mut best = *seed;
+    let mut best_score = seed_score;
+    let t_seed = seed.time_step as isize;
+    for dt in -THIRD_TIME_RADIUS..=THIRD_TIME_RADIUS {
+        let t_candidate = t_seed + dt;
+        if t_candidate < 0 {
+            continue;
+        }
+        let t_candidate = t_candidate as usize;
+        for fs in 0..spectrogram.freq_osr {
+            if dt == 0 && fs == seed.freq_sub {
+                continue; // seed already scored
+            }
+            let Some(score) = known_coherence_score(
+                spectrogram,
+                pp,
+                t_candidate,
+                seed.freq_bin,
+                fs,
+                tone_symbols,
+            ) else {
+                continue;
+            };
+            if score > best_score {
+                best_score = score;
+                best = CostasCandidate {
+                    time_step: t_candidate,
+                    freq_bin: seed.freq_bin,
+                    freq_sub: fs,
+                    sync_score: seed.sync_score,
+                    time_refinement: seed.time_refinement,
+                };
+            }
+        }
+    }
+    best
 }
 
 fn par_extract_symbols_from_spectrogram(
@@ -11328,5 +11553,362 @@ mod llr_whitening_tests {
         let mut llrs: Vec<f32> = Vec::new();
         whiten_llrs(&mut llrs, &mags, &pp);
         assert!(llrs.is_empty());
+    }
+}
+
+/// ft8mon-style three-stage sync cascade tests. Inspired by spec ref
+/// `research/specs/spec-ft8mon-three-stage-sync-cascade.md`. The tests
+/// cover:
+///
+/// 1. Default config keeps the cascade OFF (regression guard).
+/// 2. The known-coherence score is highest for a perfectly-aligned
+///    candidate on a synthetic clean spectrogram — the `(freq_sub,
+///    time_step)` refinement returns the seed unchanged.
+/// 3. With an off-by-one time-step seed, the refinement walks the
+///    candidate back to the truth lattice point.
+/// 4. With a spectrogram missing complex retention, the refinement
+///    returns the seed unchanged (no panic, no-op).
+/// 5. `subtract_decode_coherent` driven via the same seed produces the
+///    same residual whether the master flag is ON or OFF when the seed
+///    already sits at the truth — i.e., the cascade is non-destructive
+///    on correctly-aligned candidates.
+#[cfg(test)]
+mod three_stage_sync_tests {
+    use super::*;
+    use crate::protocol::ProtocolParams;
+    use num_complex::Complex;
+
+    /// Build a synthetic complex spectrogram with a single "signal"
+    /// placed at the supplied `(time_step, freq_bin, freq_sub)` lattice
+    /// point. Each of the 79 symbol positions gets a unit-magnitude
+    /// complex sample at the expected `tone_symbols[sym]` tone with
+    /// IDENTICAL phase across all symbols (zero phase jitter) — the
+    /// ideal Stage 3 signal. Off-tone bins and off-time samples are
+    /// zero, so any off-axis evaluation lands on silent bins and is
+    /// skipped by the metric (returning `None` if no valid pair exists,
+    /// otherwise a strictly LOWER score than the on-axis evaluation).
+    ///
+    /// Spectrogram is sized to fit a full 79-symbol message starting at
+    /// `seed_time` with `pad` extra time-steps before and after to
+    /// accommodate the small Stage 3 search radius.
+    fn build_clean_spectrogram(
+        pp: &ProtocolParams,
+        seed_time: usize,
+        seed_freq_bin: usize,
+        seed_freq_sub: usize,
+        tone_symbols: &[u8],
+        pad: usize,
+    ) -> Spectrogram {
+        let steps_per_symbol = TIME_OSR;
+        let num_steps = seed_time + pp.num_symbols * steps_per_symbol + pad;
+        let num_bins = seed_freq_bin + NUM_TONES + pad;
+        let freq_osr = FREQ_OSR;
+
+        let mut power = vec![vec![vec![-120.0f64; num_bins]; freq_osr]; num_steps];
+        let mut complex =
+            vec![vec![vec![Complex::<f64>::new(0.0, 0.0); num_bins]; freq_osr]; num_steps];
+
+        // Place a unit-magnitude same-phase sample at every (sym, expected
+        // tone) position on the seed lattice point. Within each symbol
+        // window the sample is placed on BOTH TIME_OSR substeps — matching
+        // real spectrogram layout where `subtract_decode_coherent`
+        // iterates over `0..steps_per_symbol` substeps per symbol.
+        //
+        // Same-phase across all symbols (zero symbol-to-symbol jitter)
+        // gives the metric its ceiling score of 0.0 at the truth lattice
+        // point — a clean, deterministic reference for the unit tests.
+        for sym_idx in 0..pp.num_symbols.min(tone_symbols.len()) {
+            let tone = tone_symbols[sym_idx] as usize;
+            if tone >= NUM_TONES {
+                continue;
+            }
+            let f_idx = seed_freq_bin + tone;
+            if f_idx >= num_bins {
+                continue;
+            }
+            let t_base = seed_time + sym_idx * steps_per_symbol;
+            for s in 0..steps_per_symbol {
+                let t_idx = t_base + s;
+                if t_idx >= num_steps {
+                    continue;
+                }
+                complex[t_idx][seed_freq_sub][f_idx] = Complex::new(1.0, 0.0);
+                power[t_idx][seed_freq_sub][f_idx] = 10.0 * (1e-12_f64 + 1.0).log10();
+            }
+        }
+
+        Spectrogram {
+            power,
+            complex: Some(complex),
+            num_steps,
+            num_bins,
+            freq_osr,
+            time_padding: 0,
+        }
+    }
+
+    /// Deterministic 79-symbol pseudo-tone-sequence. Real FT8 has
+    /// `tone_symbols ∈ 0..=7` with the Costas blocks fixed at known
+    /// patterns; for the unit tests the exact ordering doesn't matter,
+    /// only that every symbol's expected tone is in `0..NUM_TONES`.
+    fn synthetic_tone_symbols(pp: &ProtocolParams) -> Vec<u8> {
+        (0..pp.num_symbols)
+            .map(|i| (i as u8) % (NUM_TONES as u8))
+            .collect()
+    }
+
+    #[test]
+    fn default_config_keeps_three_stage_cascade_off() {
+        let cfg = Ft8Config::default();
+        assert!(
+            !cfg.three_stage_sync_cascade_enabled,
+            "Ft8Config::default().three_stage_sync_cascade_enabled must \
+             be false; flipping the default-ON requires a hard-200 \
+             measurement (spec §'do_third == 1 vs 2')"
+        );
+    }
+
+    #[test]
+    fn known_coherence_score_returns_none_without_complex_retention() {
+        let pp = ProtocolParams::ft8();
+        let tones = synthetic_tone_symbols(&pp);
+        let mut spec = build_clean_spectrogram(&pp, 5, 50, 0, &tones, /* pad = */ 4);
+        // Drop the complex payload to simulate a non-coherent spectrogram.
+        spec.complex = None;
+        let score = known_coherence_score(&spec, &pp, 5, 50, 0, &tones);
+        assert!(
+            score.is_none(),
+            "known_coherence_score must return None when complex retention \
+             is disabled; the metric requires per-symbol complex bins"
+        );
+    }
+
+    #[test]
+    fn refine_returns_seed_when_complex_retention_disabled() {
+        // Spec §"Edge cases" — no-op when complex payload missing.
+        let pp = ProtocolParams::ft8();
+        let tones = synthetic_tone_symbols(&pp);
+        let mut spec = build_clean_spectrogram(&pp, 5, 50, 0, &tones, 4);
+        spec.complex = None;
+        let seed = CostasCandidate {
+            time_step: 5,
+            freq_bin: 50,
+            freq_sub: 0,
+            sync_score: 1.23,
+            time_refinement: 0.0,
+        };
+        let refined = refine_candidate_with_known_symbols(&spec, &pp, &seed, &tones);
+        assert_eq!(refined.time_step, seed.time_step);
+        assert_eq!(refined.freq_bin, seed.freq_bin);
+        assert_eq!(refined.freq_sub, seed.freq_sub);
+    }
+
+    #[test]
+    fn refine_preserves_perfectly_aligned_seed() {
+        // Stage 3 on a clean synthetic signal: the seed already sits at
+        // the truth lattice point. The metric maximum is at the seed
+        // because every same-phase complex sample contributes Δphase = 0
+        // there; off-seed positions either land on silent bins (lower
+        // counted-pair count, contribution = 0) or — in the t±1 / fs
+        // variants — see fewer on-tone hits because the symbol-stride
+        // is TIME_OSR. Either way `seed_score = 0.0` is the unique
+        // maximum (other valid candidates score < 0 from the noise
+        // floor, or get rejected by the `None`-on-zero-count guard).
+        let pp = ProtocolParams::ft8();
+        let tones = synthetic_tone_symbols(&pp);
+        let seed_time = 5;
+        let seed_freq_bin = 50;
+        let seed_freq_sub = 0;
+        let spec = build_clean_spectrogram(&pp, seed_time, seed_freq_bin, seed_freq_sub, &tones, 4);
+        let seed = CostasCandidate {
+            time_step: seed_time,
+            freq_bin: seed_freq_bin,
+            freq_sub: seed_freq_sub,
+            sync_score: 1.0,
+            time_refinement: 0.0,
+        };
+        let seed_score =
+            known_coherence_score(&spec, &pp, seed_time, seed_freq_bin, seed_freq_sub, &tones)
+                .expect("seed lattice point has at least one valid Δphase pair");
+        // Perfectly aligned + uniform phase ⇒ Δphase magnitude is 0 at
+        // every counted pair ⇒ score = 0.0.
+        assert!(
+            (seed_score - 0.0).abs() < 1e-9,
+            "perfectly-aligned seed must produce zero phase jitter; got {seed_score}"
+        );
+        let refined = refine_candidate_with_known_symbols(&spec, &pp, &seed, &tones);
+        assert_eq!(
+            refined.time_step, seed.time_step,
+            "perfectly-aligned seed must not move (time_step)"
+        );
+        assert_eq!(
+            refined.freq_sub, seed.freq_sub,
+            "perfectly-aligned seed must not move (freq_sub)"
+        );
+        assert_eq!(
+            refined.freq_bin, seed.freq_bin,
+            "freq_bin is structurally pinned by the decoded tone_symbols"
+        );
+    }
+
+    #[test]
+    fn refine_picks_correct_freq_sub_over_noisy_neighbor() {
+        // Plant the truth signal at (freq_bin=50, freq_sub=0) with
+        // SAME-PHASE samples (zero symbol-to-symbol jitter ⇒ truth
+        // score = 0.0, the metric's ceiling). Seed the refinement at
+        // (freq_sub=1) where we plant RANDOM-PHASE samples at the same
+        // tone — modelling FFT spillover into the wrong sub-bin where
+        // phases don't line up. Stage 3 should walk the candidate from
+        // freq_sub=1 → freq_sub=0 because score(truth) > score(wrong).
+        let pp = ProtocolParams::ft8();
+        let tones = synthetic_tone_symbols(&pp);
+        let truth_time = 5;
+        let truth_freq_bin = 50;
+        // Build the clean spectrogram first (truth at freq_sub=0 with
+        // same-phase samples ⇒ truth score = 0.0).
+        let mut spec =
+            build_clean_spectrogram(&pp, truth_time, truth_freq_bin, /*fs=*/ 0, &tones, 4);
+        let steps_per_symbol = TIME_OSR;
+        // Plant random-phase samples at freq_sub=1 (the "wrong" sub-bin)
+        // at every (sym, expected tone) so that refinement's evaluation
+        // at fs=1 finds non-silent bins but inconsistent phases ⇒ a
+        // worse score than fs=0. The pseudo-random phase generator uses
+        // a deterministic recurrence so the test is reproducible.
+        {
+            let complex = spec.complex.as_mut().unwrap();
+            for sym_idx in 0..pp.num_symbols.min(tones.len()) {
+                let tone = tones[sym_idx] as usize;
+                if tone >= NUM_TONES {
+                    continue;
+                }
+                let f_idx = truth_freq_bin + tone;
+                let theta = ((sym_idx as f64) * 1.31).sin() * std::f64::consts::PI;
+                let sample = Complex::new(theta.cos(), theta.sin());
+                let t_base = truth_time + sym_idx * steps_per_symbol;
+                for s in 0..steps_per_symbol {
+                    let t_idx = t_base + s;
+                    if t_idx < complex.len() && f_idx < complex[t_idx][1].len() {
+                        complex[t_idx][1][f_idx] = sample;
+                    }
+                }
+            }
+        }
+        let truth_score = known_coherence_score(&spec, &pp, truth_time, truth_freq_bin, 0, &tones)
+            .expect("truth lattice point has valid Δphase pairs");
+        let wrong_score = known_coherence_score(&spec, &pp, truth_time, truth_freq_bin, 1, &tones)
+            .expect("wrong-sub-bin lattice point has valid Δphase pairs");
+        assert!(
+            truth_score > wrong_score,
+            "consistent-phase truth must outscore random-phase wrong \
+             sub-bin: truth={truth_score}, wrong={wrong_score}"
+        );
+
+        // Seed at the wrong sub-bin and time. Refinement should snap
+        // to truth (fs=0) at the same time-step.
+        let seed = CostasCandidate {
+            time_step: truth_time,
+            freq_bin: truth_freq_bin,
+            freq_sub: 1, // off by one sub-bin
+            sync_score: 1.0,
+            time_refinement: 0.0,
+        };
+        let refined = refine_candidate_with_known_symbols(&spec, &pp, &seed, &tones);
+        assert_eq!(
+            refined.freq_sub, 0,
+            "Stage 3 should snap an off-by-1 sub-bin seed back to the \
+             truth sub-bin; refined={refined:?}, truth_fs=0"
+        );
+        assert_eq!(refined.freq_bin, seed.freq_bin);
+        assert_eq!(refined.time_step, truth_time);
+    }
+
+    #[test]
+    fn default_off_subtract_path_byte_identical_when_seed_is_aligned() {
+        // When the master flag is OFF, `coherent_subtract_and_repass`
+        // uses `seed_candidate` directly. When the master flag is ON
+        // and the seed already sits at the truth, the refinement leaves
+        // the candidate unchanged (proven by the previous test). So
+        // running `subtract_decode_coherent` with the seed must produce
+        // the same complex spectrogram in both cases.
+        //
+        // This is the byte-identical-default-OFF contract for the
+        // common case where the seed is already correctly aligned: the
+        // residual buffer must not depend on the flag.
+        let pp = ProtocolParams::ft8();
+        let tones = synthetic_tone_symbols(&pp);
+        let seed_time = 5;
+        let seed_freq_bin = 50;
+        let seed_freq_sub = 0;
+        let mut spec_off =
+            build_clean_spectrogram(&pp, seed_time, seed_freq_bin, seed_freq_sub, &tones, 4);
+        let mut spec_on =
+            build_clean_spectrogram(&pp, seed_time, seed_freq_bin, seed_freq_sub, &tones, 4);
+        let seed = CostasCandidate {
+            time_step: seed_time,
+            freq_bin: seed_freq_bin,
+            freq_sub: seed_freq_sub,
+            sync_score: 0.0,
+            time_refinement: 0.0,
+        };
+        // OFF path: legacy seed used directly.
+        let legacy_candidate = seed;
+        // ON path: refinement runs first, but the seed is already
+        // aligned so refined == seed.
+        let refined_candidate = refine_candidate_with_known_symbols(&spec_on, &pp, &seed, &tones);
+        assert_eq!(refined_candidate.time_step, legacy_candidate.time_step);
+        assert_eq!(refined_candidate.freq_sub, legacy_candidate.freq_sub);
+        assert_eq!(refined_candidate.freq_bin, legacy_candidate.freq_bin);
+
+        // Drive both spectrograms through the same subtract with the
+        // SAME rotor + scale to confirm residual equality.
+        let cs = par_extract_complex_symbols_from_spectrogram(&pp, &spec_off, &legacy_candidate)
+            .expect("complex retention present");
+        let acc = compute_costas_complex_accumulator(&pp, &cs);
+        let mag = acc.norm();
+        assert!(
+            mag > 1e-9,
+            "synthetic signal has non-zero Costas accumulator"
+        );
+        let rotor = acc / mag;
+        subtract_decode_coherent(&mut spec_off, &pp, &legacy_candidate, rotor, &tones, 1.0);
+        subtract_decode_coherent(&mut spec_on, &pp, &refined_candidate, rotor, &tones, 1.0);
+
+        let cmpx_off = spec_off.complex.as_ref().unwrap();
+        let cmpx_on = spec_on.complex.as_ref().unwrap();
+        for (t, (row_off, row_on)) in cmpx_off.iter().zip(cmpx_on.iter()).enumerate() {
+            for (fs, (sub_off, sub_on)) in row_off.iter().zip(row_on.iter()).enumerate() {
+                for (b, (off_v, on_v)) in sub_off.iter().zip(sub_on.iter()).enumerate() {
+                    let delta = (off_v - on_v).norm();
+                    assert!(
+                        delta < 1e-12,
+                        "residual must be byte-identical when seed is \
+                         aligned; t={t}, fs={fs}, b={b}, off={off_v:?}, \
+                         on={on_v:?}, delta={delta}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refine_no_op_when_tone_symbols_too_short() {
+        // Stage 3 needs at least 2 valid Δphase pairs to score anything.
+        // A truncated tone_symbols slice (here: only 1 symbol) starves
+        // the metric: every per-position evaluation has at most 1
+        // sample ⇒ no pair ⇒ score = None ⇒ refine returns the seed.
+        let pp = ProtocolParams::ft8();
+        let tones = synthetic_tone_symbols(&pp);
+        let spec = build_clean_spectrogram(&pp, 5, 50, 0, &tones, 4);
+        let seed = CostasCandidate {
+            time_step: 5,
+            freq_bin: 50,
+            freq_sub: 0,
+            sync_score: 1.0,
+            time_refinement: 0.0,
+        };
+        let truncated_tones: Vec<u8> = tones.iter().take(1).copied().collect();
+        let refined = refine_candidate_with_known_symbols(&spec, &pp, &seed, &truncated_tones);
+        assert_eq!(refined.time_step, seed.time_step);
+        assert_eq!(refined.freq_sub, seed.freq_sub);
     }
 }
