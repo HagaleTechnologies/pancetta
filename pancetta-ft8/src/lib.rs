@@ -125,7 +125,9 @@ pub mod transmit;
 pub mod tier_probe;
 
 // hb-244: JS8Call-Improved soft combiner across repeated receptions.
-// Default OFF until hard-200 / repeat-heavy corpus measurement validates.
+// Module shipped in be8d67e; decoder wiring is opt-in via
+// `Ft8Config::soft_combiner_enabled` (default OFF) pending hard-200
+// measurement validation.
 pub mod soft_combiner;
 pub use soft_combiner::{
     CombineResult, CombinerKey, Mode as SoftCombinerMode, SoftCombiner, SoftCombinerConfig,
