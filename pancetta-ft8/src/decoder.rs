@@ -673,7 +673,16 @@ impl Default for Ft8Config {
             // only wins when block A is degraded; otherwise full wins).
             // Targets the slot-edge negative-dt bucket (48.3% recall,
             // 1376 truths in hard-200).
-            costas_partial_metric_enabled: true,
+            //
+            // Batch 48 measurement: default-ON gave -18 TPs net on
+            // hard-200 (5301 → 5283). The mechanism never lowers a
+            // real signal's score, but it surfaces additional noise
+            // candidates that eat into the max_sync_candidates cap
+            // (default 300), displacing real TPs. Flipped to default-
+            // OFF; the mechanism is preserved for opt-in by slot-edge-
+            // specific corpora or future tuning that combines it with
+            // a higher max_sync_candidates budget.
+            costas_partial_metric_enabled: false,
             // Wide-lag two-baseline pathway: default OFF until corpus
             // measurement confirms the FP profile. The mechanism doubles
             // the candidate count on some bins (per-bin double-emission
