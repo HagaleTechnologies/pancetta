@@ -299,9 +299,22 @@ impl super::ApplicationCoordinator {
                         // the FT8 layer's `decode_window_with_ap_scoped`
                         // is the existing hb-091 hook that clamps the
                         // sync sweep to the supplied bin range.
+                        //
+                        // hb-230: paired with band-collapse, expose the
+                        // partner audio freq to the decoder so the
+                        // relaxed-sync-threshold branch fires inside the
+                        // narrow window. Same QSO-filter override gates
+                        // both signals (the two mechanisms compose; an
+                        // operator who wants wide decode also wants the
+                        // standard sync threshold).
                         let partner_freq_for_main = active_qso_freq_hz.read().ok().and_then(|g| *g);
                         let narrow_filter_bins =
                             super::qso_filter::compute_narrow_filter_bins_default(
+                                partner_freq_for_main,
+                                qso_filter_override_off,
+                            );
+                        let partner_freq_for_relaxed_sync =
+                            super::qso_filter::partner_freq_for_relaxed_sync(
                                 partner_freq_for_main,
                                 qso_filter_override_off,
                             );
@@ -314,7 +327,12 @@ impl super::ApplicationCoordinator {
                             );
                         }
                         let native_messages = decoder
-                            .decode_window_with_ap_scoped(&window, &ap_context, narrow_filter_bins)
+                            .decode_window_with_ap_scoped_partner(
+                                &window,
+                                &ap_context,
+                                narrow_filter_bins,
+                                partner_freq_for_relaxed_sync,
+                            )
                             .unwrap_or_default();
 
                         // Merge: start with ft8_lib results, add any native-only

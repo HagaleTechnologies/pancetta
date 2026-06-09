@@ -114,6 +114,35 @@ pub fn compute_narrow_filter_bins_default(
     )
 }
 
+/// hb-230 — partner-aware observer for the decoder's relaxed-sync window.
+///
+/// Returns `Some(partner_freq_hz)` when a QSO is active AND the operator
+/// hasn't overridden the QSO filter; `None` otherwise. Symmetric in shape
+/// to `compute_narrow_filter_bins` so the FT8 hot loop can consume both
+/// outputs from the same `Option<partner_freq_hz>` read.
+///
+/// The decoder uses the returned value to apply a relaxed Costas-sync
+/// threshold within `±relaxed_sync_near_partner_hz_radius` of the
+/// partner — see `Ft8Config::relaxed_sync_near_partner_hz_radius`. When
+/// the override is set or no QSO is active, returns `None`, which makes
+/// the relaxed-threshold branch a no-op (byte-identical to historical
+/// behaviour).
+///
+/// Note the override semantics intentionally piggyback on the hb-229
+/// `PANCETTA_QSO_FILTER_OFF` env var: an operator who wants the wide
+/// decode back also wants the global-threshold sync back. They are the
+/// same conceptual switch ("treat the QSO partner as just another
+/// signal in the band").
+pub fn partner_freq_for_relaxed_sync(
+    partner_freq_hz: Option<f64>,
+    override_off: bool,
+) -> Option<f64> {
+    if override_off {
+        return None;
+    }
+    partner_freq_hz.filter(|p| p.is_finite() && *p > 0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +261,33 @@ mod tests {
     fn observer_default_helper_respects_override() {
         let default = compute_narrow_filter_bins_default(Some(1500.0), true);
         assert!(default.is_none());
+    }
+
+    // ---------- partner_freq_for_relaxed_sync (hb-230) ----------------
+
+    #[test]
+    fn relaxed_sync_observer_returns_partner_when_active() {
+        let result = partner_freq_for_relaxed_sync(Some(1500.0), false);
+        assert_eq!(result, Some(1500.0));
+    }
+
+    #[test]
+    fn relaxed_sync_observer_returns_none_when_no_qso() {
+        let result = partner_freq_for_relaxed_sync(None, false);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn relaxed_sync_observer_returns_none_under_override() {
+        let result = partner_freq_for_relaxed_sync(Some(1500.0), true);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn relaxed_sync_observer_rejects_non_finite_or_negative() {
+        assert!(partner_freq_for_relaxed_sync(Some(f64::NAN), false).is_none());
+        assert!(partner_freq_for_relaxed_sync(Some(f64::INFINITY), false).is_none());
+        assert!(partner_freq_for_relaxed_sync(Some(0.0), false).is_none());
+        assert!(partner_freq_for_relaxed_sync(Some(-100.0), false).is_none());
     }
 }

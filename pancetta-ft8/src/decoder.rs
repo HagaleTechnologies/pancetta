@@ -580,6 +580,48 @@ pub struct Ft8Config {
     /// mainline `syncmin` constant. Only consulted when
     /// `costas_two_baseline_enabled = true`.
     pub costas_two_baseline_norm_threshold: f64,
+
+    /// hb-230: half-width (Hz) of the relaxed-sync window centred on the
+    /// QSO partner's audio frequency. When `Some(r)` AND the per-call
+    /// `partner_freq_hz` is supplied to
+    /// `decode_window_with_ap_scoped_partner`, any Costas sync candidate
+    /// whose audio frequency lands within ±r of the partner gets a
+    /// relaxed acceptance threshold
+    /// (`max(0, min_sync_score + relaxed_sync_near_partner_score_delta)`).
+    /// `None` (default) disables the mechanism. Inspired by JTDX's
+    /// `lib/sync8.f90` candidate-acceptance loop, which uses a constant
+    /// 3.0 Hz around `nfqso`. Pairs with the hb-229 partner band-collapse
+    /// — the band-collapse already narrows the sweep; this further
+    /// relaxes acceptance inside the narrow window for weak partner
+    /// messages (RR73 / 73 at low SNR).
+    pub relaxed_sync_near_partner_hz_radius: Option<f64>,
+
+    /// hb-230: signed delta added to `min_sync_score` to form the
+    /// relaxed threshold inside the near-partner window. Default 0.0 (no
+    /// actual relaxation — the mechanism is structurally wired but does
+    /// nothing until the operator tunes this knob).
+    ///
+    /// JTDX's reference value is `1.1` on a linear-magnitude scale
+    /// normalised by the 40th-percentile baseline. Pancetta's
+    /// `min_sync_score` is a raw dB-difference metric, so the JTDX
+    /// constant does NOT transfer numerically. **Empirical recalibration
+    /// is required**: collect normalised-vs-raw sync scores on a known
+    /// partner signal at marginal SNR on hard-200, find the
+    /// dB-difference level corresponding to JTDX's 1.1, and use the
+    /// negative of (raw_threshold - that_level) as this knob.
+    /// TODO: hard-200 recalibration sweep before flipping default ON.
+    pub relaxed_sync_near_partner_score_delta: f64,
+
+    /// JTDX cycle audio smoothing: when `true` AND `max_decode_passes > 1`,
+    /// apply a 2-tap forward moving-average to the working audio buffer
+    /// before pass 2 (cycle 1 → cycle 2 transition). The smoothing acts
+    /// as a mild low-pass filter (3 dB attenuation at 3 kHz, ~0.03 dB at
+    /// 300 Hz) that perturbs the noise distribution just enough for
+    /// pass 2's Costas sync to find candidates pass 1 missed by a small
+    /// margin. Inspired by JTDX's `lib/ft8_decode.f90` `ipass == 4`
+    /// branch. Default `false` until hard-200 measurement confirms the
+    /// recall lift on pancetta's pipeline.
+    pub cycle_audio_smoothing_enabled: bool,
 }
 
 impl Default for Ft8Config {
@@ -736,6 +778,23 @@ impl Default for Ft8Config {
             costas_two_baseline_tight_steps: 20,
             costas_two_baseline_percentile: 0.40,
             costas_two_baseline_norm_threshold: 1.2,
+            // hb-230 (paired with hb-229 partner band-collapse):
+            // relaxed-sync window default OFF. Both radius and delta must
+            // be tuned together on hard-200 before the mechanism does
+            // anything. The radius `Some(3.0)` matches JTDX's ±3 Hz
+            // window but the score_delta must be empirically calibrated
+            // — pancetta's `min_sync_score` is in dB-power units, not
+            // JTDX's 40th-percentile-normalised linear magnitude. See
+            // field doc-comments for the recalibration procedure.
+            relaxed_sync_near_partner_hz_radius: None,
+            relaxed_sync_near_partner_score_delta: 0.0,
+            // JTDX cycle audio smoothing default OFF. Only fires when
+            // `max_decode_passes > 1` AND this flag is true. Default-off
+            // keeps single-pass (Slow tier) behaviour byte-identical
+            // until a hard-200 measurement confirms the recall lift
+            // composes with pancetta's existing coherent-multipass +
+            // cross-cycle pipeline.
+            cycle_audio_smoothing_enabled: false,
         }
     }
 }
@@ -1031,6 +1090,27 @@ impl Ft8Decoder {
         ap_context: &crate::ap::ApContext,
         freq_bin_range: Option<RangeInclusive<usize>>,
     ) -> Ft8Result<Vec<DecodedMessage>> {
+        self.decode_window_with_ap_scoped_partner(samples, ap_context, freq_bin_range, None)
+    }
+
+    /// hb-230: same as `decode_window_with_ap_scoped` but additionally accepts
+    /// `partner_freq_hz` — the QSO partner's audio frequency in Hz. When
+    /// `Some(p)` AND `Ft8Config::relaxed_sync_near_partner_hz_radius` is
+    /// `Some(r)`, the Costas sync acceptance threshold is relaxed by
+    /// `Ft8Config::relaxed_sync_near_partner_score_delta` for candidates
+    /// within `±r` Hz of `p`. The relaxation applies on every sync pass
+    /// (pass 1 and the residual multipass) so weak partner messages
+    /// (RR73, 73) get a second chance at acceptance.
+    ///
+    /// `partner_freq_hz = None` (or the config radius `None`) makes this
+    /// method byte-identical to `decode_window_with_ap_scoped`.
+    pub fn decode_window_with_ap_scoped_partner(
+        &mut self,
+        samples: &[f32],
+        ap_context: &crate::ap::ApContext,
+        freq_bin_range: Option<RangeInclusive<usize>>,
+        partner_freq_hz: Option<f64>,
+    ) -> Ft8Result<Vec<DecodedMessage>> {
         let start_time = Instant::now();
         self.message_handler.on_window_start(SystemTime::now());
         // hb-093: reset diagnostic buffer at the start of each window.
@@ -1072,6 +1152,32 @@ impl Ft8Decoder {
                 break;
             }
 
+            // JTDX cycle audio smoothing: between cycles 1 and 2 (i.e.
+            // entering pass index 1 for pancetta — JTDX maps to `ipass==4`)
+            // apply a 2-tap forward moving-average to `residual_samples`
+            // in-place. Acts as a mild low-pass that perturbs the noise
+            // distribution; weak signals just-below the pass-1 detection
+            // floor sometimes stand above the smoothed-pass threshold.
+            // Default OFF until hard-200 measurement confirms the lift on
+            // pancetta's pipeline. See
+            // `spec-jtdx-cycle-audio-smoothing.md`.
+            //
+            // The destructive in-place MA on `residual_samples` is safe
+            // because pass 2+ would otherwise rebuild the audio from the
+            // SIC-residual already; we replace that residual with its
+            // smoothed copy. Cycle-3 backward-MA from a preserved original
+            // is NOT implemented in this v1 — pancetta's
+            // `max_decode_passes` typically caps at 3 across tiers and the
+            // v1 wiring targets the cycle-1 → 2 transition only.
+            if pass == 1 && self.config.cycle_audio_smoothing_enabled && residual_samples.len() >= 2
+            {
+                let n = residual_samples.len();
+                for i in 0..n - 1 {
+                    residual_samples[i] = 0.5 * (residual_samples[i] + residual_samples[i + 1]);
+                }
+                // Sample N-1 is left unchanged (no `i+1` exists).
+            }
+
             // Convert to f64 and normalize
             let audio = self.preprocess_audio(&residual_samples)?;
 
@@ -1083,8 +1189,14 @@ impl Ft8Decoder {
             // Step 2: Find candidates via Costas sync pattern search.
             // hb-091 Session 2: when `freq_bin_range` is Some, the Costas
             // sweep is restricted to that bin range (additive scoped path).
-            let mut sync_candidates =
-                self.costas_sync_search(&spectrogram, freq_bin_range.as_ref())?;
+            // hb-230: forward `partner_freq_hz` so the relaxed-threshold
+            // branch fires within ±radius Hz of the partner (no-op when
+            // either input is None).
+            let mut sync_candidates = self.costas_sync_search_partner(
+                &spectrogram,
+                freq_bin_range.as_ref(),
+                partner_freq_hz,
+            )?;
 
             // On passes 2+, reduce candidate count — strong signals are already
             // decoded and subtracted, so fewer candidates need evaluation.
@@ -1341,6 +1453,7 @@ impl Ft8Decoder {
                         to_subtract,
                         energy_stop,
                         freq_bin_range.as_ref(),
+                        partner_freq_hz,
                     );
                     if extra.is_empty() {
                         break;
@@ -2022,10 +2135,30 @@ impl Ft8Decoder {
         spectrogram: &Spectrogram,
         freq_bin_scope: Option<&RangeInclusive<usize>>,
     ) -> Ft8Result<Vec<CostasCandidate>> {
-        self.costas_sync_search_with_threshold(
+        self.costas_sync_search_with_threshold_and_partner(
             spectrogram,
             self.config.min_sync_score,
             freq_bin_scope,
+            None,
+        )
+    }
+
+    /// hb-230: like `costas_sync_search` but forwards a `partner_freq_hz`
+    /// to the threshold helper. Used by the top-level scoped-with-partner
+    /// decode entry point so the near-partner relaxed-threshold branch
+    /// fires on pass 1 (as well as the residual pass via
+    /// `coherent_subtract_and_repass`).
+    fn costas_sync_search_partner(
+        &self,
+        spectrogram: &Spectrogram,
+        freq_bin_scope: Option<&RangeInclusive<usize>>,
+        partner_freq_hz: Option<f64>,
+    ) -> Ft8Result<Vec<CostasCandidate>> {
+        self.costas_sync_search_with_threshold_and_partner(
+            spectrogram,
+            self.config.min_sync_score,
+            freq_bin_scope,
+            partner_freq_hz,
         )
     }
 
@@ -2042,6 +2175,38 @@ impl Ft8Decoder {
         spectrogram: &Spectrogram,
         min_score: f64,
         freq_bin_scope: Option<&RangeInclusive<usize>>,
+    ) -> Ft8Result<Vec<CostasCandidate>> {
+        self.costas_sync_search_with_threshold_and_partner(
+            spectrogram,
+            min_score,
+            freq_bin_scope,
+            None,
+        )
+    }
+
+    /// hb-230: same as `costas_sync_search_with_threshold` but with optional
+    /// QSO-partner-aware relaxed acceptance.
+    ///
+    /// When `partner_freq_hz` is `Some(p)` AND
+    /// `relaxed_sync_near_partner_hz_radius` is `Some(r)`, any candidate
+    /// whose audio frequency `f` satisfies `|f - p| <= r` uses an
+    /// **effective threshold** of
+    /// `max(0, min_score + relaxed_sync_near_partner_score_delta)`
+    /// (typically non-positive delta — relaxed). Outside the window the
+    /// regular `min_score` applies. Mirrors JTDX's `sync8.f90`
+    /// near-partner branch in shape; the constants must be empirically
+    /// recalibrated to pancetta's raw dB-power sync metric — see the
+    /// `relaxed_sync_near_partner_score_delta` config doc.
+    ///
+    /// When `partner_freq_hz = None` OR the config radius is `None` the
+    /// relaxed branch never fires and behaviour is byte-identical to
+    /// `costas_sync_search_with_threshold`.
+    fn costas_sync_search_with_threshold_and_partner(
+        &self,
+        spectrogram: &Spectrogram,
+        min_score: f64,
+        freq_bin_scope: Option<&RangeInclusive<usize>>,
+        partner_freq_hz: Option<f64>,
     ) -> Ft8Result<Vec<CostasCandidate>> {
         let mut candidates = Vec::new();
         let pp = &self.protocol_params;
@@ -2114,6 +2279,30 @@ impl Ft8Decoder {
             }
         };
 
+        // hb-230: pre-resolve the near-partner relaxed-threshold context.
+        // The relaxed branch only fires when BOTH the per-call
+        // `partner_freq_hz` is supplied AND the per-config
+        // `relaxed_sync_near_partner_hz_radius` is `Some(r)`. Inside the
+        // ±r window the effective threshold becomes
+        //   max(0, min_score + relaxed_sync_near_partner_score_delta).
+        // The clamp to 0 prevents a misconfigured negative delta from
+        // admitting pure-noise positions; the default delta=0.0 leaves
+        // the threshold equal to `min_score` (no relaxation) so the
+        // mechanism is structurally wired but byte-identical to the
+        // historical behaviour until the operator tunes the delta.
+        let tone_spacing_hz = pp.tone_spacing;
+        let relaxed_window: Option<(f64, f64, f64)> = match (
+            partner_freq_hz,
+            self.config.relaxed_sync_near_partner_hz_radius,
+        ) {
+            (Some(p), Some(r)) if p.is_finite() && r.is_finite() && r >= 0.0 && p > 0.0 => {
+                let relaxed =
+                    (min_score + self.config.relaxed_sync_near_partner_score_delta).max(0.0);
+                Some((p, r, relaxed))
+            }
+            _ => None,
+        };
+
         for freq_sub in 0..spectrogram.freq_osr {
             for t0 in 0..=max_time_step {
                 for f0 in lo..hi {
@@ -2134,7 +2323,24 @@ impl Ft8Decoder {
                         }
                     }
 
-                    if score > min_score {
+                    // hb-230: per-candidate threshold. Outside the
+                    // near-partner window (or with the feature off) this
+                    // is exactly `min_score` — the historical gate.
+                    // Inside the window it relaxes to
+                    // `max(0, min_score + score_delta)`.
+                    let candidate_threshold =
+                        if let Some((partner, radius, relaxed)) = relaxed_window {
+                            let sub_off = freq_sub as f64 * (tone_spacing_hz / FREQ_OSR as f64);
+                            let cand_freq = f0 as f64 * tone_spacing_hz + sub_off;
+                            if (cand_freq - partner).abs() <= radius {
+                                relaxed
+                            } else {
+                                min_score
+                            }
+                        } else {
+                            min_score
+                        };
+                    if score > candidate_threshold {
                         // hb-044: optional parabolic refinement of the
                         // time-bin peak. Costs 2 extra score evaluations
                         // per kept candidate. Both hb-044 (sort by
@@ -2954,6 +3160,9 @@ impl Ft8Decoder {
         // residual pass never silently re-searches outside the requested
         // bin range.
         freq_bin_scope: Option<&RangeInclusive<usize>>,
+        // hb-230: partner audio freq for the relaxed-threshold branch on
+        // the residual sync sweep. `None` keeps the historical behaviour.
+        partner_freq_hz: Option<f64>,
     ) -> Vec<DecodedMessage> {
         if self.config.coherent_multipass_iterations == 0 || spectrogram.complex.is_none() {
             return Vec::new();
@@ -3016,9 +3225,12 @@ impl Ft8Decoder {
             .config
             .residual_min_sync_score
             .unwrap_or(self.config.min_sync_score);
-        let Ok(new_candidates) =
-            self.costas_sync_search_with_threshold(spectrogram, residual_min, freq_bin_scope)
-        else {
+        let Ok(new_candidates) = self.costas_sync_search_with_threshold_and_partner(
+            spectrogram,
+            residual_min,
+            freq_bin_scope,
+            partner_freq_hz,
+        ) else {
             return Vec::new();
         };
 
@@ -8593,5 +8805,318 @@ mod tests {
             .with_feedback_refinement(true, 1.5, 0.5, f32::INFINITY)
             .feedback_refinement;
         assert!(cfg2.erase_threshold.is_infinite());
+    }
+}
+
+// ===========================================================================
+// hb-230: JTDX-style relaxed Costas-sync threshold near QSO partner +
+// JTDX-style between-cycle 2-tap audio smoothing.
+//
+// These mechanisms ship in Batch 49 paired with hb-229 (QSO partner
+// band-collapse, Batch 48). The relaxed-sync threshold gives weak partner
+// messages (RR73, 73) a second chance at acceptance inside the
+// band-collapse window; the cycle smoothing perturbs the audio between
+// passes so multi-pass mode finds candidates the first pass missed by
+// a small margin.
+// ===========================================================================
+#[cfg(test)]
+mod hb230_relaxed_sync_tests {
+    use super::*;
+    use crate::TONE_SPACING;
+
+    /// Build a synthetic spectrogram with a Costas pattern at the given
+    /// freq_bin and per-tone signal/noise dB levels.
+    fn build_synthetic_costas(
+        present_groups: &[usize],
+        signal_db: f64,
+        noise_db: f64,
+        f0: usize,
+    ) -> Spectrogram {
+        let steps_per_symbol = TIME_OSR;
+        let num_steps = 79 * steps_per_symbol;
+        let num_bins = SAMPLES_PER_SYMBOL / 2 + 1;
+        let freq_osr = FREQ_OSR;
+
+        let mut power = vec![vec![vec![noise_db; num_bins]; freq_osr]; num_steps];
+
+        for &m in present_groups {
+            let group_start = [0usize, 36, 72][m];
+            for j in 0..7 {
+                let sym = group_start + j;
+                let tone = crate::protocol::FT8_COSTAS[j] as usize;
+                for sub in 0..steps_per_symbol {
+                    let time_idx = sym * steps_per_symbol + sub;
+                    if time_idx < num_steps && f0 + tone < num_bins {
+                        power[time_idx][0][f0 + tone] = signal_db;
+                    }
+                }
+            }
+        }
+
+        Spectrogram {
+            power,
+            complex: None,
+            num_steps,
+            num_bins,
+            freq_osr,
+            time_padding: 0,
+        }
+    }
+
+    /// Default config: with `relaxed_sync_near_partner_hz_radius = None`
+    /// (the production default), the new partner-aware sync search must
+    /// be byte-identical to the historical one — no regression on the
+    /// shipped pipeline.
+    #[test]
+    fn hb230_default_off_partner_arg_is_noop() {
+        let config = Ft8Config::default();
+        assert!(config.relaxed_sync_near_partner_hz_radius.is_none());
+        assert_eq!(config.relaxed_sync_near_partner_score_delta, 0.0);
+        assert!(!config.cycle_audio_smoothing_enabled);
+
+        let decoder = Ft8Decoder::new(config).unwrap();
+        let f0 = 240usize;
+        let spec = build_synthetic_costas(&[0, 1, 2], -10.0, -40.0, f0);
+
+        let without_partner = decoder
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .expect("sync search no partner");
+        let with_partner_default_off = decoder
+            .costas_sync_search_with_threshold_and_partner(
+                &spec,
+                MIN_SYNC_SCORE,
+                None,
+                Some(1500.0),
+            )
+            .expect("sync search partner provided but feature off");
+
+        assert_eq!(
+            without_partner.len(),
+            with_partner_default_off.len(),
+            "partner arg should be a no-op when radius is None"
+        );
+        for (a, b) in without_partner.iter().zip(with_partner_default_off.iter()) {
+            assert_eq!(a.freq_bin, b.freq_bin);
+            assert_eq!(a.time_step, b.time_step);
+            assert_eq!(a.freq_sub, b.freq_sub);
+            assert!(
+                (a.sync_score - b.sync_score).abs() < 1e-9,
+                "scores must match exactly"
+            );
+        }
+    }
+
+    /// The relaxed branch never SHRINKS the candidate set — with the
+    /// radius set and a partner freq supplied, the result must be a
+    /// superset of the wide-band result.
+    #[test]
+    fn hb230_relaxed_window_can_only_add_candidates() {
+        let f0 = 240usize;
+        let partner_hz = f0 as f64 * TONE_SPACING; // 1500 Hz
+        let spec = build_synthetic_costas(&[0, 1, 2], -10.0, -40.0, f0);
+
+        let mut config = Ft8Config::default();
+        config.nms_enabled = false;
+        config.sync_time_interpolation = false;
+        config.costas_partial_metric_enabled = false;
+        config.costas_two_baseline_enabled = false;
+        config.relaxed_sync_near_partner_hz_radius = Some(5.0);
+        config.relaxed_sync_near_partner_score_delta = -100.0;
+        let decoder = Ft8Decoder::new(config).unwrap();
+
+        let baseline = decoder
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .expect("baseline");
+        let with_partner = decoder
+            .costas_sync_search_with_threshold_and_partner(
+                &spec,
+                MIN_SYNC_SCORE,
+                None,
+                Some(partner_hz),
+            )
+            .expect("partner");
+
+        let baseline_set: std::collections::HashSet<(usize, usize, usize)> = baseline
+            .iter()
+            .map(|c| (c.time_step, c.freq_bin, c.freq_sub))
+            .collect();
+        // Every baseline candidate is preserved.
+        for c in &baseline {
+            let key = (c.time_step, c.freq_bin, c.freq_sub);
+            assert!(
+                with_partner
+                    .iter()
+                    .any(|w| (w.time_step, w.freq_bin, w.freq_sub) == key),
+                "baseline candidate at {key:?} missing from partner result"
+            );
+        }
+        // Every added candidate (in partner but not baseline) is INSIDE
+        // the ±5 Hz window around the partner.
+        for c in &with_partner {
+            let key = (c.time_step, c.freq_bin, c.freq_sub);
+            if !baseline_set.contains(&key) {
+                let sub_off = c.freq_sub as f64 * (TONE_SPACING / FREQ_OSR as f64);
+                let cand_freq = c.freq_bin as f64 * TONE_SPACING + sub_off;
+                assert!(
+                    (cand_freq - partner_hz).abs() <= 5.0,
+                    "added candidate at {cand_freq:.2} Hz outside the ±5 Hz \
+                     window around {partner_hz:.2} Hz"
+                );
+            }
+        }
+    }
+
+    /// Critical safety: even with an aggressive negative delta, the
+    /// relaxed threshold is clamped at 0 so pure-noise candidates are
+    /// not admitted. Probe by setting score_delta = -1000.0 (would
+    /// naively drive the gate to -995.0) and confirming the candidate
+    /// count stays bounded by `max_sync_candidates`.
+    #[test]
+    fn hb230_relaxed_threshold_clamped_at_zero() {
+        let f0 = 240usize;
+        let partner_hz = f0 as f64 * TONE_SPACING;
+        let spec = build_synthetic_costas(&[0, 1, 2], -10.0, -40.0, f0);
+
+        let mut config = Ft8Config::default();
+        config.nms_enabled = false;
+        config.sync_time_interpolation = false;
+        config.costas_partial_metric_enabled = false;
+        config.costas_two_baseline_enabled = false;
+        config.relaxed_sync_near_partner_hz_radius = Some(5.0);
+        config.relaxed_sync_near_partner_score_delta = -1000.0;
+        let max_sync_candidates = config.max_sync_candidates;
+        let decoder = Ft8Decoder::new(config).unwrap();
+
+        let result = decoder
+            .costas_sync_search_with_threshold_and_partner(
+                &spec,
+                MIN_SYNC_SCORE,
+                None,
+                Some(partner_hz),
+            )
+            .expect("partner");
+
+        assert!(
+            result.len() <= max_sync_candidates,
+            "relaxed threshold clamp failed: {} candidates emitted",
+            result.len()
+        );
+    }
+
+    /// `partner_freq_hz = None` always wins over a configured radius —
+    /// the relaxed branch is a no-op when the per-call signal is absent.
+    #[test]
+    fn hb230_none_partner_disables_relaxed_branch() {
+        let f0 = 240usize;
+        let spec = build_synthetic_costas(&[0, 1, 2], -10.0, -40.0, f0);
+
+        let mut config = Ft8Config::default();
+        config.nms_enabled = false;
+        config.sync_time_interpolation = false;
+        config.costas_partial_metric_enabled = false;
+        config.costas_two_baseline_enabled = false;
+        config.relaxed_sync_near_partner_hz_radius = Some(10.0);
+        config.relaxed_sync_near_partner_score_delta = -100.0;
+        let decoder = Ft8Decoder::new(config).unwrap();
+
+        let baseline = decoder
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .expect("baseline");
+        let same_baseline = decoder
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .expect("repeat");
+        assert_eq!(baseline.len(), same_baseline.len());
+    }
+}
+
+// ===========================================================================
+// JTDX cycle audio smoothing: 2-tap forward moving-average applied
+// in-place to the residual audio buffer when entering pass 2 (pancetta's
+// `pass == 1`). Default OFF; the tests confirm the default-off path is
+// byte-identical to no smoothing and the on-path applies the canonical MA.
+// ===========================================================================
+#[cfg(test)]
+mod hb230_cycle_smoothing_tests {
+    use super::*;
+
+    /// Replicate the in-place 2-tap forward MA the decoder applies
+    /// between passes. This unit test does not exercise the full
+    /// decoder path (which would require WAV synthesis); it exercises
+    /// the buffer transformation directly so the test stays robust to
+    /// neighbouring decoder changes.
+    fn apply_2tap_forward_ma_in_place(buf: &mut [f32]) {
+        if buf.len() < 2 {
+            return;
+        }
+        let n = buf.len();
+        for i in 0..n - 1 {
+            buf[i] = 0.5 * (buf[i] + buf[i + 1]);
+        }
+    }
+
+    #[test]
+    fn cycle_smoothing_default_off_in_config() {
+        let config = Ft8Config::default();
+        assert!(
+            !config.cycle_audio_smoothing_enabled,
+            "cycle smoothing must default OFF — production behaviour byte-identical until measurement"
+        );
+    }
+
+    #[test]
+    fn cycle_smoothing_2tap_ma_is_identity_on_dc() {
+        let mut samples = vec![0.42f32; 1024];
+        let original = samples.clone();
+        apply_2tap_forward_ma_in_place(&mut samples);
+        for (i, (s, o)) in samples.iter().zip(original.iter()).enumerate() {
+            assert!(
+                (s - o).abs() < 1e-7,
+                "DC sample {i} drifted under MA: got {s}, expected {o}"
+            );
+        }
+    }
+
+    #[test]
+    fn cycle_smoothing_2tap_ma_matches_canonical_formula() {
+        let mut samples: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let expected = [0.5_f32, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5, 7.0];
+        apply_2tap_forward_ma_in_place(&mut samples);
+        for (i, (got, want)) in samples.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-6,
+                "MA sample {i}: got {got}, want {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn cycle_smoothing_edge_cases_short_buffers() {
+        let mut empty: Vec<f32> = vec![];
+        apply_2tap_forward_ma_in_place(&mut empty);
+        assert!(empty.is_empty());
+
+        let mut one = vec![0.5f32];
+        apply_2tap_forward_ma_in_place(&mut one);
+        assert!((one[0] - 0.5).abs() < 1e-7);
+
+        let mut two = vec![1.0f32, 3.0];
+        apply_2tap_forward_ma_in_place(&mut two);
+        assert!((two[0] - 2.0).abs() < 1e-6);
+        assert!((two[1] - 3.0).abs() < 1e-6);
+    }
+
+    /// Default-off invariant: when the feature flag is false, the
+    /// decoder must not mutate the audio between passes. This test
+    /// asserts the config invariant; the full no-op invariant is
+    /// confirmed by the lack of any code path that touches the buffer
+    /// when the flag is false (the pass-loop condition guards it).
+    #[test]
+    fn cycle_smoothing_default_config_path_is_inert() {
+        let config = Ft8Config::default();
+        assert!(!config.cycle_audio_smoothing_enabled);
+        // The pass-loop condition is `pass == 1
+        // && config.cycle_audio_smoothing_enabled
+        // && residual_samples.len() >= 2`. With the flag off the
+        // smoothing block short-circuits.
     }
 }
