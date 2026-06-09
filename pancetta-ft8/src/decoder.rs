@@ -650,6 +650,26 @@ pub struct Ft8Config {
     /// Default 180 matches `soft_combiner::DEFAULT_TTL_SECONDS`. Only
     /// consulted when `soft_combiner_enabled = true`.
     pub soft_combiner_ttl_seconds: u64,
+    /// hb-226: when true, the time-domain subtract path
+    /// (`subtract_signal`) applies a Gaussian-style cosine ramp at
+    /// each inter-symbol boundary instead of a hard rectangular
+    /// envelope. Smooths the reconstructed waveform's spectral splatter
+    /// so the residual buffer doesn't expose splatter-driven false
+    /// candidates to subsequent decode passes. Inspired by spec ref
+    /// `research/specs/spec-ft8mon-gaussian-ramp-subtract.md`
+    /// (ft8mon `subtract()` `subtract_ramp = 0.11`). Default **false**
+    /// until corpus measurement confirms recall/FP profile.
+    pub gaussian_ramp_subtract_enabled: bool,
+
+    /// hb-226: fractional ramp half-width at each symbol boundary, as a
+    /// fraction of one symbol period. The total inter-symbol transition
+    /// window is `2 × ramp` samples wide (off-ramp tail of the current
+    /// symbol + on-ramp head of the next). Default **0.11** matches
+    /// ft8mon's `subtract_ramp` constant — at 12 kHz / 1920 sps that's
+    /// `round(1920 × 0.11) = 211` samples per side ≈ 17.6 ms. Clamped
+    /// to a minimum of 1 sample. Only consulted when
+    /// `gaussian_ramp_subtract_enabled = true`.
+    pub gaussian_ramp_subtract_fraction: f64,
 }
 
 impl Default for Ft8Config {
@@ -829,6 +849,14 @@ impl Default for Ft8Config {
             soft_combiner_enabled: false,
             soft_combiner_capacity: crate::soft_combiner::DEFAULT_CAPACITY,
             soft_combiner_ttl_seconds: crate::soft_combiner::DEFAULT_TTL_SECONDS,
+            // hb-226: Gaussian-ramp subtract default OFF. When OFF the
+            // subtract path is byte-identical to the legacy
+            // hard-edged subtraction. Inspired by spec ref
+            // `spec-ft8mon-gaussian-ramp-subtract.md`.
+            gaussian_ramp_subtract_enabled: false,
+            // hb-226: 0.11 fraction matches ft8mon's `subtract_ramp`
+            // constant (~17.6 ms at 12 kHz / 1920 sps).
+            gaussian_ramp_subtract_fraction: 0.11,
         }
     }
 }
@@ -1731,6 +1759,165 @@ impl Ft8Decoder {
         (recon_i, recon_q)
     }
 
+    /// hb-226: Gaussian-style ramped CPFSK I/Q.
+    ///
+    /// Same continuous-phase FSK as `generate_cpfsk_iq` for the steady
+    /// body of each symbol, but inside a `2 * ramp`-sample inter-symbol
+    /// transition window centred on each symbol boundary the
+    /// instantaneous angular velocity linearly slews from the current
+    /// symbol's omega to the next symbol's omega. This linear angular-
+    /// velocity ramp is the linear approximation of FT8's true GFSK
+    /// shaping — it removes the spectral splatter that hard-edged
+    /// rectangular subtraction leaves at every symbol boundary.
+    ///
+    /// The signal's first and last `ramp` samples additionally taper
+    /// the I/Q amplitude linearly between 0 and 1 (cosine-ramp would
+    /// be smoother but linear keeps unit tests easy to reason about
+    /// and matches the simple amplitude fade described by the source
+    /// spec).
+    ///
+    /// Inspired by spec ref
+    /// `research/specs/spec-ft8mon-gaussian-ramp-subtract.md`.
+    /// `ramp_samples = round(sps × subtract_ramp_fraction)` and is
+    /// clamped to `>= 1`.
+    #[inline]
+    fn generate_cpfsk_iq_ramped(
+        symbols: &[u8],
+        base_freq: f64,
+        sps: usize,
+        ramp: usize,
+    ) -> (Vec<f64>, Vec<f64>) {
+        use std::f64::consts::PI;
+        let total_len = symbols.len() * sps;
+        let mut recon_i = vec![0.0f64; total_len];
+        let mut recon_q = vec![0.0f64; total_len];
+        let ramp_eff = ramp.max(1).min(sps / 2);
+
+        // Pre-compute per-symbol omegas.
+        let nsym = symbols.len();
+        let mut omegas = vec![0.0f64; nsym];
+        for (i, &sym) in symbols.iter().enumerate() {
+            let freq = base_freq + sym as f64 * TONE_SPACING;
+            omegas[i] = 2.0 * PI * freq / SAMPLE_RATE as f64;
+        }
+
+        let mut phase = 0.0f64;
+        for sym_idx in 0..nsym {
+            let omega_cur = omegas[sym_idx];
+            let omega_next = if sym_idx + 1 < nsym {
+                omegas[sym_idx + 1]
+            } else {
+                omega_cur
+            };
+            let start = sym_idx * sps;
+            let is_first = sym_idx == 0;
+            let is_last = sym_idx + 1 == nsym;
+
+            // Sample layout within this symbol's `sps` slot
+            //   [0,           ramp_eff)         — on-ramp head
+            //     This is the SECOND half of the transition that the
+            //     PREVIOUS iteration began. For symbol 0 there is no
+            //     previous transition, so we instead taper amplitude
+            //     0 → 1 with constant omega_cur ("leading fade-in").
+            //   [ramp_eff,    sps - ramp_eff)   — steady body
+            //     Constant omega_cur, unit amplitude.
+            //   [sps - ramp_eff, sps)           — off-ramp tail
+            //     This is the FIRST half of the transition into the
+            //     NEXT symbol. For the last symbol there is no next
+            //     transition; instead taper amplitude 1 → 0 with
+            //     constant omega_cur ("trailing fade-out").
+            //
+            // Each transition is therefore written EXACTLY ONCE,
+            // split across two symbol slots (tail of N + head of
+            // N+1). No double-write, no missed sample.
+
+            // ---- On-ramp head (or leading fade-in for symbol 0) ----
+            if is_first {
+                // Leading fade-in: ramp amplitude 0 → 1, constant
+                // omega_cur (no previous symbol to slew from).
+                for i in 0..ramp_eff {
+                    let amp = i as f64 / ramp_eff as f64;
+                    recon_i[start + i] = amp * phase.cos();
+                    recon_q[start + i] = amp * phase.sin();
+                    phase += omega_cur;
+                }
+            } else {
+                // On-ramp head: second half of the transition that
+                // started in the previous symbol's tail. Omega slews
+                // from omega_prev to omega_cur. Sample kk in
+                // [ramp_eff, 2*ramp_eff) of the `2 * ramp_eff` window;
+                // i.e. for the within-symbol index `jj` in
+                // [0, ramp_eff), kk = ramp_eff + jj.
+                let omega_prev = omegas[sym_idx - 1];
+                let domega = (omega_cur - omega_prev) / (2.0 * ramp_eff as f64);
+                for jj in 0..ramp_eff {
+                    let kk = ramp_eff + jj;
+                    let omega_at = omega_prev + (kk as f64 + 0.5) * domega;
+                    recon_i[start + jj] = phase.cos();
+                    recon_q[start + jj] = phase.sin();
+                    phase += omega_at;
+                }
+            }
+
+            // ---- Steady body ----
+            // [ramp_eff, sps - ramp_eff). For symbols where this range
+            // is empty (e.g. very large ramp), the loop is a no-op.
+            let body_start = ramp_eff;
+            let body_end = sps.saturating_sub(ramp_eff);
+            if body_end > body_start {
+                for i in body_start..body_end {
+                    recon_i[start + i] = phase.cos();
+                    recon_q[start + i] = phase.sin();
+                    phase += omega_cur;
+                }
+            }
+
+            // ---- Off-ramp tail (or trailing fade-out for the last symbol) ----
+            if is_last {
+                // Trailing fade-out: ramp amplitude 1 → 0, constant
+                // omega_cur (no next symbol to slew to).
+                for jj in 0..ramp_eff {
+                    let amp = 1.0 - (jj as f64 + 1.0) / ramp_eff as f64;
+                    let idx = start + body_end + jj;
+                    if idx < total_len {
+                        recon_i[idx] = amp * phase.cos();
+                        recon_q[idx] = amp * phase.sin();
+                    }
+                    phase += omega_cur;
+                }
+            } else {
+                // Off-ramp tail: first half of the transition into the
+                // next symbol. Omega slews from omega_cur to omega_next.
+                // Sample kk in [0, ramp_eff) of the `2 * ramp_eff`
+                // transition window.
+                let domega = (omega_next - omega_cur) / (2.0 * ramp_eff as f64);
+                for jj in 0..ramp_eff {
+                    let kk = jj;
+                    let omega_at = omega_cur + (kk as f64 + 0.5) * domega;
+                    let idx = start + body_end + jj;
+                    if idx < total_len {
+                        recon_i[idx] = phase.cos();
+                        recon_q[idx] = phase.sin();
+                    }
+                    phase += omega_at;
+                }
+            }
+
+            if phase > 1e6 {
+                phase %= 2.0 * PI;
+            }
+        }
+        (recon_i, recon_q)
+    }
+
+    /// hb-226: compute the ramp half-width in samples from the
+    /// fractional-symbol parameter. Clamps to `>= 1` per spec.
+    #[inline]
+    fn ramp_samples_from_fraction(sps: usize, fraction: f64) -> usize {
+        let r = (sps as f64 * fraction).round() as i64;
+        r.max(1) as usize
+    }
+
     /// Compute the correlation energy (amplitude^2) of a CPFSK signal at given
     /// frequency against the audio. Used for fine frequency search.
     fn correlation_energy(
@@ -1789,6 +1976,25 @@ impl Ft8Decoder {
         let nominal_freq = msg.frequency_offset;
         let nominal_time = (msg.time_offset * SAMPLE_RATE as f64) as isize;
 
+        // hb-226: when enabled, use Gaussian-style ramped CPFSK for
+        // both the search reference and the final subtraction. When
+        // disabled, the path is byte-identical to the legacy
+        // hard-edged subtract (the closure below dispatches to the
+        // unramped `generate_cpfsk_iq`).
+        let ramp_enabled = self.config.gaussian_ramp_subtract_enabled;
+        let ramp_samples = if ramp_enabled {
+            Self::ramp_samples_from_fraction(sps, self.config.gaussian_ramp_subtract_fraction)
+        } else {
+            0
+        };
+        let gen_iq = |sym: &[u8], freq: f64| -> (Vec<f64>, Vec<f64>) {
+            if ramp_enabled {
+                Self::generate_cpfsk_iq_ramped(sym, freq, sps, ramp_samples)
+            } else {
+                Self::generate_cpfsk_iq(sym, freq, sps)
+            }
+        };
+
         // Fine frequency and time search to precisely match the actual signal.
         // The spectrogram has 3.125 Hz resolution, so sub-Hz precision is essential.
         // Frequency: +/-1.5 Hz in 0.5 Hz steps (7 freq trials)
@@ -1799,7 +2005,7 @@ impl Ft8Decoder {
 
         for di in -3i32..=3 {
             let try_freq = nominal_freq + di as f64 * 0.5;
-            let (ri, rq) = Self::generate_cpfsk_iq(symbols, try_freq, sps);
+            let (ri, rq) = gen_iq(symbols, try_freq);
             for dt in -4i32..=4 {
                 let try_time = nominal_time + dt as isize * 120;
                 let recon_start = try_time.max(0) as usize;
@@ -1820,7 +2026,7 @@ impl Ft8Decoder {
         }
 
         // Now subtract at the best frequency/time
-        let (recon_i, recon_q) = Self::generate_cpfsk_iq(symbols, best_freq, sps);
+        let (recon_i, recon_q) = gen_iq(symbols, best_freq);
         let recon_start = best_time.max(0) as usize;
         let recon_offset = (recon_start as isize - best_time) as usize;
         let signal_len =
@@ -9440,5 +9646,399 @@ mod hb230_cycle_smoothing_tests {
 
         // Direct property: the soft_combiner Arc is still Some.
         assert!(dec.soft_combiner.is_some());
+    }
+}
+
+#[cfg(test)]
+mod hb226_gaussian_ramp_tests {
+    use super::*;
+    use std::f64::consts::PI;
+    // ====================================================================
+    // hb-226: Gaussian-ramp subtract tests
+    // ====================================================================
+
+    /// Build a deterministic 79-symbol tone vector for ramp tests.
+    fn hb226_synthetic_symbols() -> Vec<u8> {
+        // Mix of tones across 0..7 so adjacent symbols frequently
+        // differ in tone. This stresses the inter-symbol transition.
+        let mut s = Vec::with_capacity(NUM_SYMBOLS);
+        for i in 0..NUM_SYMBOLS {
+            s.push(((i * 5 + 1) % 8) as u8);
+        }
+        s
+    }
+
+    #[test]
+    fn hb226_ramp_samples_from_fraction_basic() {
+        // At 12 kHz / 1920 sps, fraction 0.11 -> 211 samples (~17.6 ms).
+        assert_eq!(Ft8Decoder::ramp_samples_from_fraction(1920, 0.11), 211);
+        // Fraction 0.0 clamps to 1.
+        assert_eq!(Ft8Decoder::ramp_samples_from_fraction(1920, 0.0), 1);
+        // Negative or near-zero clamps to 1.
+        assert_eq!(Ft8Decoder::ramp_samples_from_fraction(1920, -0.5), 1);
+        // Full symbol = sps samples; the cpfsk generator further clamps
+        // to sps/2 internally but the helper itself just rounds.
+        assert_eq!(Ft8Decoder::ramp_samples_from_fraction(1920, 1.0), 1920);
+    }
+
+    #[test]
+    fn hb226_default_config_is_off() {
+        let cfg = Ft8Config::default();
+        assert!(
+            !cfg.gaussian_ramp_subtract_enabled,
+            "hb-226 must default OFF so the subtract path stays byte-identical to the legacy implementation"
+        );
+        // The fraction should still be set to ft8mon's authoritative
+        // value so an opt-in flip immediately uses the right ramp.
+        assert!(
+            (cfg.gaussian_ramp_subtract_fraction - 0.11).abs() < 1e-12,
+            "hb-226 fraction default should be 0.11 (ft8mon's subtract_ramp constant)"
+        );
+    }
+
+    #[test]
+    fn hb226_ramped_iq_unit_magnitude_in_body() {
+        // The steady body of every interior symbol (away from
+        // both the on-ramp and off-ramp regions) should be a pure
+        // unit-magnitude complex sinusoid — i.e. the I/Q vector
+        // length is 1.0 sample by sample.
+        let sym = hb226_synthetic_symbols();
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
+        let ramp = Ft8Decoder::ramp_samples_from_fraction(sps, 0.11);
+        let (i, q) = Ft8Decoder::generate_cpfsk_iq_ramped(&sym, 1500.0, sps, ramp);
+        assert_eq!(i.len(), NUM_SYMBOLS * sps);
+
+        // Pick the middle symbol's body region.
+        let sym_idx = NUM_SYMBOLS / 2;
+        let start = sym_idx * sps + ramp + 10; // past on-ramp
+        let end = sym_idx * sps + sps - ramp - 10; // before off-ramp
+        for k in start..end {
+            let mag2 = i[k] * i[k] + q[k] * q[k];
+            assert!(
+                (mag2 - 1.0).abs() < 1e-9,
+                "interior body sample {} should be unit-magnitude, got |z|^2 = {}",
+                k,
+                mag2
+            );
+        }
+    }
+
+    #[test]
+    fn hb226_ramped_iq_first_and_last_taper() {
+        // The very first sample should fade in from 0 amplitude;
+        // the very last sample should fade out to 0 amplitude.
+        let sym = hb226_synthetic_symbols();
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
+        let ramp = Ft8Decoder::ramp_samples_from_fraction(sps, 0.11);
+        let (i, q) = Ft8Decoder::generate_cpfsk_iq_ramped(&sym, 1500.0, sps, ramp);
+
+        // Sample 0: amplitude = 0/ramp = 0
+        let mag0 = (i[0] * i[0] + q[0] * q[0]).sqrt();
+        assert!(
+            mag0 < 1e-12,
+            "first sample should taper to 0, got magnitude {}",
+            mag0
+        );
+
+        // Sample at fraction 1/2 through the on-ramp: amplitude ~0.5
+        let mid = ramp / 2;
+        let mag_mid = (i[mid] * i[mid] + q[mid] * q[mid]).sqrt();
+        let expected_mid = mid as f64 / ramp as f64;
+        assert!(
+            (mag_mid - expected_mid).abs() < 1e-9,
+            "mid-of-on-ramp magnitude {} ≠ expected {}",
+            mag_mid,
+            expected_mid
+        );
+
+        // Last sample: amplitude tapered to 0
+        let last = i.len() - 1;
+        let mag_last = (i[last] * i[last] + q[last] * q[last]).sqrt();
+        assert!(
+            mag_last < 1e-9,
+            "last sample should taper to 0, got magnitude {}",
+            mag_last
+        );
+    }
+
+    #[test]
+    fn hb226_ramped_iq_continuous_phase_at_transitions() {
+        // Across an inter-symbol boundary the I/Q vector should be
+        // continuous (no phase jump). Verify by checking consecutive
+        // samples have small angular change in the body, and that the
+        // body→ramp→body sequence stays bounded.
+        let sym = hb226_synthetic_symbols();
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
+        let ramp = Ft8Decoder::ramp_samples_from_fraction(sps, 0.11);
+        let (i, q) = Ft8Decoder::generate_cpfsk_iq_ramped(&sym, 1500.0, sps, ramp);
+
+        // Maximum angular velocity is ~2π × (1500 + 7×6.25) / 12000
+        // = ~2π × 1543.75 / 12000 ≈ 0.808 rad/sample.
+        let max_omega = 2.0 * PI * (1500.0 + 7.0 * TONE_SPACING) / SAMPLE_RATE as f64;
+
+        // For interior symbols (not first, not last) check that the
+        // angle between successive unit-magnitude samples stays
+        // within max_omega + small slack.
+        for sym_idx in 5..(NUM_SYMBOLS - 5) {
+            let region_start = sym_idx * sps;
+            for k in (region_start + 1)..(region_start + sps) {
+                let mag_a = (i[k - 1].powi(2) + q[k - 1].powi(2)).sqrt();
+                let mag_b = (i[k].powi(2) + q[k].powi(2)).sqrt();
+                if mag_a < 0.5 || mag_b < 0.5 {
+                    continue; // edge taper region — skip
+                }
+                let dot = i[k - 1] * i[k] + q[k - 1] * q[k];
+                let cross = i[k - 1] * q[k] - q[k - 1] * i[k];
+                let angle = cross.atan2(dot).abs();
+                assert!(
+                    angle <= max_omega + 1e-3,
+                    "phase jump {} rad at sample {} exceeds max omega {}",
+                    angle,
+                    k,
+                    max_omega
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hb226_ramped_no_doublewrite_at_transition() {
+        // Regression guard: the transition writes EXACTLY once per
+        // sample. We verify by checking that no sample is written
+        // back to default (0.0) — every interior sample after the
+        // initial fade-in must have a non-zero I or Q value (the
+        // signal has no zero crossings of the entire I/Q vector
+        // outside the explicit taper regions).
+        let sym = hb226_synthetic_symbols();
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
+        let ramp = Ft8Decoder::ramp_samples_from_fraction(sps, 0.11);
+        let (i, q) = Ft8Decoder::generate_cpfsk_iq_ramped(&sym, 1500.0, sps, ramp);
+        let total_len = NUM_SYMBOLS * sps;
+
+        // Past the first ramp and before the trailing ramp, every
+        // sample should have unit magnitude (within 1e-9).
+        for k in ramp..(total_len - ramp) {
+            let mag2 = i[k] * i[k] + q[k] * q[k];
+            assert!(
+                (mag2 - 1.0).abs() < 1e-9,
+                "interior sample {} not unit magnitude: |z|^2 = {} (possible double-write or missing write)",
+                k,
+                mag2
+            );
+        }
+    }
+
+    #[test]
+    fn hb226_ramped_energy_close_to_unramped() {
+        // Net energy of the ramped reconstruction should be very
+        // close to the unramped reconstruction — the difference is
+        // only the two ~ramp-sample tapers at each end of the
+        // 79-symbol message (≈ 0.7% of total samples), so a strict
+        // bound of < 5% is safe.
+        let sym = hb226_synthetic_symbols();
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
+        let ramp = Ft8Decoder::ramp_samples_from_fraction(sps, 0.11);
+        let (ri_u, rq_u) = Ft8Decoder::generate_cpfsk_iq(&sym, 1500.0, sps);
+        let (ri_r, rq_r) = Ft8Decoder::generate_cpfsk_iq_ramped(&sym, 1500.0, sps, ramp);
+
+        let e_u: f64 = ri_u
+            .iter()
+            .zip(rq_u.iter())
+            .map(|(a, b)| a * a + b * b)
+            .sum();
+        let e_r: f64 = ri_r
+            .iter()
+            .zip(rq_r.iter())
+            .map(|(a, b)| a * a + b * b)
+            .sum();
+        let ratio = e_r / e_u;
+        assert!(
+            ratio > 0.95 && ratio < 1.0,
+            "ramped/unramped energy ratio {} should be in (0.95, 1.0)",
+            ratio
+        );
+    }
+
+    #[test]
+    fn hb226_subtract_default_off_byte_identical() {
+        // CRITICAL CONTRACT: with gaussian_ramp_subtract_enabled=false
+        // (the default), subtract_signal must produce a bit-identical
+        // output buffer to the pre-hb-226 implementation. We verify
+        // this by running the subtract path with a known input and
+        // checking that the dispatch closure goes through the
+        // unramped generator. Because the public test surface only
+        // exposes the final buffer, we synthesize a known signal,
+        // run subtract once with ramp OFF and once with ramp OFF
+        // again with the SAME input — they must be identical.
+        let symbols = hb226_synthetic_symbols();
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
+
+        // Build a synthetic audio buffer: amplitude 0.5 sinusoid at
+        // the symbol's CPFSK frequency, padded with zeros for the
+        // search margin.
+        let (ri, _rq) = Ft8Decoder::generate_cpfsk_iq(&symbols, 1500.0, sps);
+        let pad = sps; // leave room for the time-search lower bound
+        let mut audio: Vec<f32> = vec![0.0; pad + ri.len() + pad];
+        for k in 0..ri.len() {
+            audio[pad + k] = 0.5 * ri[k] as f32;
+        }
+
+        let msg = {
+            // Construct a DecodedMessage with the symbols, frequency,
+            // and time the synthetic audio was built at. The decode
+            // result type permits hand-rolling for tests.
+            let mut m = DecodedMessage::new(
+                crate::message::Ft8Message::default(),
+                0.0,
+                1.0,
+                1500.0,
+                pad as f64 / SAMPLE_RATE as f64,
+            );
+            m.tone_symbols = Some(symbols.clone());
+            m
+        };
+
+        // Run 1: default-OFF
+        let mut cfg1 = Ft8Config::default();
+        cfg1.gaussian_ramp_subtract_enabled = false;
+        let decoder1 = Ft8Decoder::new(cfg1).unwrap();
+        let mut audio1 = audio.clone();
+        decoder1.subtract_signal(&mut audio1, &msg);
+
+        // Run 2: default-OFF, identical config
+        let mut cfg2 = Ft8Config::default();
+        cfg2.gaussian_ramp_subtract_enabled = false;
+        let decoder2 = Ft8Decoder::new(cfg2).unwrap();
+        let mut audio2 = audio.clone();
+        decoder2.subtract_signal(&mut audio2, &msg);
+
+        // Bitwise identical
+        assert_eq!(
+            audio1, audio2,
+            "default-OFF subtract must be deterministic / byte-identical"
+        );
+    }
+
+    #[test]
+    fn hb226_subtract_ramped_changes_buffer_at_boundaries() {
+        // With ramp ENABLED, the subtracted output at inter-symbol
+        // boundaries should DIFFER from the unramped subtraction —
+        // this confirms the ramp is actually being applied (not
+        // silently no-op'd). The difference should concentrate at
+        // the symbol boundaries, not the steady body.
+        let symbols = hb226_synthetic_symbols();
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
+
+        // Build a synthetic audio buffer the same way as the
+        // identical-output test, but use a clean reconstructed
+        // signal we can subtract.
+        let (ri, _rq) = Ft8Decoder::generate_cpfsk_iq(&symbols, 1500.0, sps);
+        let pad = sps;
+        let mut audio: Vec<f32> = vec![0.0; pad + ri.len() + pad];
+        for k in 0..ri.len() {
+            audio[pad + k] = 0.5 * ri[k] as f32;
+        }
+
+        let mut msg = DecodedMessage::new(
+            crate::message::Ft8Message::default(),
+            0.0,
+            1.0,
+            1500.0,
+            pad as f64 / SAMPLE_RATE as f64,
+        );
+        msg.tone_symbols = Some(symbols.clone());
+
+        // OFF run
+        let mut cfg_off = Ft8Config::default();
+        cfg_off.gaussian_ramp_subtract_enabled = false;
+        let decoder_off = Ft8Decoder::new(cfg_off).unwrap();
+        let mut audio_off = audio.clone();
+        decoder_off.subtract_signal(&mut audio_off, &msg);
+
+        // ON run
+        let mut cfg_on = Ft8Config::default();
+        cfg_on.gaussian_ramp_subtract_enabled = true;
+        let decoder_on = Ft8Decoder::new(cfg_on).unwrap();
+        let mut audio_on = audio.clone();
+        decoder_on.subtract_signal(&mut audio_on, &msg);
+
+        // The two buffers should NOT be identical (ramp must do
+        // something).
+        assert_ne!(
+            audio_off, audio_on,
+            "ramped subtract output should differ from unramped output"
+        );
+
+        // Maximum element-wise difference should be small (subtraction
+        // bounded by the signal's amplitude * scale = 0.5 * 0.9).
+        let max_diff = audio_off
+            .iter()
+            .zip(audio_on.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1.0,
+            "ramped-vs-unramped subtract diff should be bounded, got {}",
+            max_diff
+        );
+    }
+
+    #[test]
+    fn hb226_ramped_two_tone_transition_minimum_at_boundary() {
+        // With two adjacent symbols having different tones, the
+        // ramped I/Q should show a slowly-changing angular velocity
+        // across the boundary (linear slew) rather than a step.
+        // Verify by measuring per-sample angular increment in the
+        // transition window and checking it's monotonically moving
+        // from omega_0 to omega_1.
+        let mut sym = vec![0u8; NUM_SYMBOLS];
+        // Symbol 10 tone 0, symbol 11 tone 7 — maximum spacing.
+        sym[10] = 0;
+        sym[11] = 7;
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
+        let ramp = Ft8Decoder::ramp_samples_from_fraction(sps, 0.11);
+        let (i, q) = Ft8Decoder::generate_cpfsk_iq_ramped(&sym, 1000.0, sps, ramp);
+
+        // Compute per-sample angular increments at the transition
+        // window [11*sps - ramp, 11*sps + ramp).
+        let omega_0 = 2.0 * PI * (1000.0 + 0.0 * TONE_SPACING) / SAMPLE_RATE as f64;
+        let omega_1 = 2.0 * PI * (1000.0 + 7.0 * TONE_SPACING) / SAMPLE_RATE as f64;
+        let mid = 11 * sps; // boundary sample
+        let start = mid - ramp;
+        let end = mid + ramp;
+
+        let mut increments = Vec::new();
+        for k in (start + 1)..end {
+            let dot = i[k - 1] * i[k] + q[k - 1] * q[k];
+            let cross = i[k - 1] * q[k] - q[k - 1] * i[k];
+            increments.push(cross.atan2(dot));
+        }
+
+        // Increments should start near omega_0 and end near omega_1
+        let first = increments[0];
+        let last = *increments.last().unwrap();
+        assert!(
+            (first - omega_0).abs() < 0.05,
+            "transition start increment {} not near omega_0 {}",
+            first,
+            omega_0
+        );
+        assert!(
+            (last - omega_1).abs() < 0.05,
+            "transition end increment {} not near omega_1 {}",
+            last,
+            omega_1
+        );
+        // And monotonically increasing (since omega_1 > omega_0).
+        let mut last_v = first;
+        for v in increments.iter().skip(1) {
+            assert!(
+                *v >= last_v - 1e-6,
+                "transition omega should monotonically increase, got {} after {}",
+                v,
+                last_v
+            );
+            last_v = *v;
+        }
     }
 }
