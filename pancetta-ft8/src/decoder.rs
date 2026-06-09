@@ -1105,6 +1105,40 @@ pub struct WaterfallData {
 }
 
 // ============================================================================
+// Cross-sequence A7 seed (hb-237 Session 2)
+// ============================================================================
+
+/// hb-237 Session 2: seed entry for the cross-sequence A7 consumer.
+///
+/// One entry per callsign decoded in the previous slot of the opposite
+/// parity. The decoder uses the seed's `freq_hz` to gate which sync
+/// candidates in the current window are evaluated against the seed's
+/// templates (spec §5 baseband-extract is centered on `prev_freq`).
+///
+/// The seed type is deliberately decoupled from
+/// `pancetta_qso::A7SeedEntry` — the decoder lives below pancetta-qso in
+/// the dep graph. The coordinator translates between the two at the
+/// invocation boundary.
+///
+/// Inspired by spec ref `research/specs/spec-wsjtr-cross-sequence-a7.md`.
+#[derive(Debug, Clone)]
+pub struct CrossSequenceSeed {
+    /// Callsign (uppercase, no portable suffix). Templates are generated
+    /// rooted at this callsign as the "C" in WSJT-X's a7 parlance.
+    pub callsign: String,
+    /// Optional partner callsign heard with `callsign` in the previous
+    /// slot. When present, templates of the form `C OTHER` and
+    /// `OTHER C` are generated. When absent, the existing a7 fallback
+    /// bank seeds the partner slot.
+    pub partner_callsign: Option<String>,
+    /// Audio frequency (Hz from dial) at which `callsign` was decoded in
+    /// the previous slot. Sync candidates outside ±freq_window of this
+    /// value are skipped per spec §5 (the QSO partner replies on the
+    /// same audio freq within a small drift band).
+    pub freq_hz: f64,
+}
+
+// ============================================================================
 // Ft8Decoder
 // ============================================================================
 
@@ -2023,6 +2057,200 @@ impl Ft8Decoder {
         self.message_handler.on_window_complete(&self.last_metrics);
 
         Ok(all_decoded_messages)
+    }
+
+    /// hb-237 Session 2: cross-sequence A7 decoder consumer.
+    ///
+    /// Given a slice of `seeds` (callsigns decoded in the previous
+    /// opposite-parity slot, supplied by the coordinator from the
+    /// `CrossSequenceCallCache`), enumerate a small set of canonical
+    /// reply messages rooted at each seed and cross-correlate them
+    /// against the current window's sync candidates near the seed's
+    /// `freq_hz`. Successful matches are emitted as `DecodedMessage`s
+    /// flagged with `via_cross_sequence_a7 = true`.
+    ///
+    /// # Default-OFF
+    ///
+    /// This method is a no-op (returns `Ok(vec![])` without touching the
+    /// audio) unless **both**:
+    ///   - `self.config.cross_sequence_a7_enabled == true`, AND
+    ///   - `seeds` is non-empty.
+    ///
+    /// The coordinator gates the call on the same flag; this internal
+    /// guard is a defense-in-depth.
+    ///
+    /// # Scope (Session 2)
+    ///
+    /// - Reuses the existing `a7::generate_templates` enumeration. The
+    ///   spec's full 206-candidate set (§8) — 100 SNR + 100 R-SNR per
+    ///   ordering — is deferred to a follow-on session along with the
+    ///   `dmin`/`dmin2` gate. Session 2 ships the basic + status + grid
+    ///   shapes, which cover the common reply messages (RR73 / 73 /
+    ///   grid) and exercise the wiring end-to-end.
+    /// - Acceptance uses the existing `a7_snr7_threshold` /
+    ///   `a7_snr7b_threshold` gates that have been calibrated for
+    ///   pancetta's LLR scale (see Session 1 spec note).
+    /// - Sync candidates are gated by `a7_freq_window_hz` of each seed
+    ///   (per spec §5: "downsample … centered on `prev_freq`").
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ft8Error::InvalidWindowSize` if `samples` is too short
+    /// for one FT8 frame. All other errors fall through into an empty
+    /// result for that seed; one bad seed does not block the rest.
+    ///
+    /// Inspired by spec ref `research/specs/spec-wsjtr-cross-sequence-a7.md`.
+    pub fn try_cross_sequence_decodes(
+        &mut self,
+        samples: &[f32],
+        seeds: &[CrossSequenceSeed],
+    ) -> Ft8Result<Vec<DecodedMessage>> {
+        // Default-OFF byte-identical guard. The caller may forget to gate
+        // on the flag; we defend in depth.
+        if !self.config.cross_sequence_a7_enabled || seeds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let min_samples = self.protocol_params.total_samples(SAMPLE_RATE);
+        if samples.len() < min_samples {
+            return Err(Ft8Error::InvalidWindowSize {
+                expected: min_samples,
+                actual: samples.len(),
+            });
+        }
+
+        // Without the `transmit` feature the FT8 encoder isn't compiled
+        // and `a7::generate_templates` returns an empty vec — the pass
+        // would be a guaranteed no-op. Short-circuit early to avoid the
+        // spectrogram + sync cost.
+        #[cfg(not(feature = "transmit"))]
+        {
+            return Ok(Vec::new());
+        }
+
+        #[cfg(feature = "transmit")]
+        {
+            // 1. Spectrogram + sync candidates on the fresh audio. We do
+            //    not reuse any in-flight residual; cross-sequence A7
+            //    operates on the same fresh window the standard pipeline
+            //    saw. Spec §5 calls for the post-subtraction residual; a
+            //    follow-on session can thread that through. For Session
+            //    2 the fresh-spectrogram path is sufficient to exercise
+            //    the consumer end-to-end.
+            let audio = self.preprocess_audio(samples)?;
+            let spectrogram = self.compute_spectrogram(&audio)?;
+            let sync_candidates = self.costas_sync_search(&spectrogram, None)?;
+            if sync_candidates.is_empty() {
+                return Ok(Vec::new());
+            }
+
+            let pp = &self.protocol_params;
+            let tone_spacing = pp.tone_spacing;
+            let sps = pp.samples_per_symbol(SAMPLE_RATE);
+            let spec_step = sps / TIME_OSR;
+            let lin = self.config.sync_time_interp_linear_power;
+            let freq_window_hz = self.config.a7_freq_window_hz;
+            let snr7_threshold = self.config.a7_snr7_threshold;
+            let snr7b_threshold = self.config.a7_snr7b_threshold;
+            let llr_target_variance = self.config.llr_target_variance;
+
+            let mut decoded_new: Vec<DecodedMessage> = Vec::new();
+            let mut emitted_texts: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut seen_seeds: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
+            for seed in seeds {
+                let bare = seed
+                    .callsign
+                    .split('/')
+                    .next()
+                    .unwrap_or(&seed.callsign)
+                    .to_uppercase();
+                if bare.is_empty() {
+                    continue;
+                }
+                if !seen_seeds.insert(bare.clone()) {
+                    continue;
+                }
+                let mut ec = crate::a7::A7ExpectedCall::new(
+                    bare.clone(),
+                    seed.freq_hz as f32,
+                    // Parity is unused by template generation; pick a
+                    // canonical value.
+                    crate::a7::A7SlotParity::Even,
+                );
+                if let Some(ref other) = seed.partner_callsign {
+                    if !other.is_empty() {
+                        ec = ec.with_heard_with(other.clone());
+                    }
+                }
+                let templates = crate::a7::generate_templates(&ec);
+                if templates.is_empty() {
+                    continue;
+                }
+                let seed_freq = seed.freq_hz;
+
+                for cand in &sync_candidates {
+                    let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+                    let cand_freq = cand.freq_bin as f64 * tone_spacing + sub_bin_offset;
+                    if (cand_freq - seed_freq).abs() > freq_window_hz {
+                        continue;
+                    }
+
+                    let tone_mags =
+                        par_extract_symbols_from_spectrogram(pp, &spectrogram, cand, lin);
+                    let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
+                    normalize_llrs(&mut llrs, llr_target_variance);
+
+                    let Some((best_idx, snr7, snr7b)) =
+                        crate::a7::best_template_score(&templates, &llrs)
+                    else {
+                        continue;
+                    };
+                    if !snr7.is_finite() || snr7 < snr7_threshold {
+                        continue;
+                    }
+                    if !snr7b.is_finite() || snr7b < snr7b_threshold {
+                        continue;
+                    }
+
+                    let template_text = templates[best_idx].message_text.clone();
+                    // Spec §10: A7 is for replies, never CQs.
+                    if template_text.starts_with("CQ ") || template_text == "CQ" {
+                        continue;
+                    }
+                    if !emitted_texts.insert(template_text.clone()) {
+                        continue;
+                    }
+
+                    let ft8_message = crate::message::Ft8Message::from_text(&template_text);
+                    if !ft8_message.is_plausible() {
+                        continue;
+                    }
+
+                    let base_frequency = cand_freq;
+                    let coarse_offset = (cand.time_step as isize
+                        - spectrogram.time_padding as isize)
+                        * spec_step as isize;
+                    let time_offset_s = coarse_offset as f64 / SAMPLE_RATE as f64;
+                    let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
+                    let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
+
+                    let mut msg = DecodedMessage::new(
+                        ft8_message,
+                        snr_db,
+                        confidence,
+                        base_frequency,
+                        time_offset_s,
+                    );
+                    msg.via_cross_sequence_a7 = true;
+                    decoded_new.push(msg);
+                }
+            }
+
+            Ok(decoded_new)
+        }
     }
 
     /// Reconstruct FT8 tone symbols from LDPC codeword bits.
@@ -9387,6 +9615,7 @@ mod tests {
             ap_level: 0,
             slot_parity: None,
             decode_time_into_window: None,
+            via_cross_sequence_a7: false,
         };
 
         decoder.subtract_signal(&mut audio, &msg);
@@ -11910,5 +12139,320 @@ mod three_stage_sync_tests {
         let refined = refine_candidate_with_known_symbols(&spec, &pp, &seed, &truncated_tones);
         assert_eq!(refined.time_step, seed.time_step);
         assert_eq!(refined.freq_sub, seed.freq_sub);
+    }
+}
+
+// ============================================================================
+// hb-237 Session 2 — cross-sequence A7 decoder consumer tests
+// ============================================================================
+
+#[cfg(test)]
+mod cross_sequence_a7_consumer_tests {
+    use super::*;
+    use crate::{CrossSequenceSeed, Ft8Config, Ft8Decoder, WINDOW_SAMPLES};
+
+    /// Default-OFF byte-identical guard: even with a non-empty seed list,
+    /// the cross-sequence consumer must return an empty vec when the
+    /// master flag is false. This is the production-baseline contract:
+    /// shipping the wiring does not perturb decode output.
+    #[test]
+    fn default_off_returns_empty_even_with_seeds() {
+        // Default Ft8Config sets `cross_sequence_a7_enabled = false`.
+        let cfg = Ft8Config::default();
+        assert!(
+            !cfg.cross_sequence_a7_enabled,
+            "default config must keep cross-sequence A7 OFF"
+        );
+
+        let mut dec = Ft8Decoder::new(cfg).expect("decoder ctor");
+        let samples = vec![0.0f32; WINDOW_SAMPLES];
+        let seeds = vec![CrossSequenceSeed {
+            callsign: "K1ABC".to_string(),
+            partner_callsign: Some("W1AW".to_string()),
+            freq_hz: 1200.0,
+        }];
+
+        let out = dec
+            .try_cross_sequence_decodes(&samples, &seeds)
+            .expect("default-off must not error");
+        assert!(
+            out.is_empty(),
+            "default-off + non-empty seeds must return empty (got {} decodes)",
+            out.len()
+        );
+    }
+
+    /// Empty-seed no-op contract: when the flag is enabled but no seeds
+    /// are supplied, the consumer must short-circuit without invoking
+    /// the spectrogram / sync pipeline. We can't directly assert the
+    /// spectrogram wasn't computed, but we CAN assert the result is
+    /// empty and the call returns Ok.
+    #[test]
+    fn enabled_with_empty_seeds_is_noop() {
+        let cfg = Ft8Config {
+            cross_sequence_a7_enabled: true,
+            ..Ft8Config::default()
+        };
+        let mut dec = Ft8Decoder::new(cfg).expect("decoder ctor");
+        let samples = vec![0.0f32; WINDOW_SAMPLES];
+
+        let out = dec
+            .try_cross_sequence_decodes(&samples, &[])
+            .expect("empty seeds must not error");
+        assert!(
+            out.is_empty(),
+            "empty seeds must produce empty output (got {} decodes)",
+            out.len()
+        );
+    }
+
+    /// Wiring contract: standard `decode_window` path is byte-identical
+    /// to the legacy path even when the cross-sequence config flag is
+    /// flipped on. The standard pipeline never consults
+    /// `try_cross_sequence_decodes` — only the coordinator does.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn enabling_flag_does_not_perturb_standard_decode() {
+        let mut encoder = crate::Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = crate::Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let cfg_off = Ft8Config::default();
+        let cfg_on = Ft8Config {
+            cross_sequence_a7_enabled: true,
+            ..Ft8Config::default()
+        };
+
+        let mut dec_off = Ft8Decoder::new(cfg_off).expect("decoder ctor");
+        let mut dec_on = Ft8Decoder::new(cfg_on).expect("decoder ctor");
+
+        let decoded_off = dec_off.decode_window(&tx).expect("decode off");
+        let decoded_on = dec_on.decode_window(&tx).expect("decode on");
+
+        // The standard pipeline ignores `cross_sequence_a7_enabled`
+        // entirely — the wiring is consumer-side only. Decode counts
+        // and texts must match.
+        let texts_off: Vec<&str> = decoded_off.iter().map(|m| m.text.as_str()).collect();
+        let texts_on: Vec<&str> = decoded_on.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(
+            texts_off, texts_on,
+            "flipping cross_sequence_a7_enabled must not perturb the standard \
+             decode_window path; off={:?} on={:?}",
+            texts_off, texts_on
+        );
+
+        // And none of the standard-pipeline decodes carry the
+        // cross-sequence provenance flag.
+        for m in &decoded_off {
+            assert!(
+                !m.via_cross_sequence_a7,
+                "standard pipeline decode must NEVER set via_cross_sequence_a7=true; got {:?}",
+                m.text
+            );
+        }
+        for m in &decoded_on {
+            assert!(
+                !m.via_cross_sequence_a7,
+                "standard pipeline decode must NEVER set via_cross_sequence_a7=true; got {:?}",
+                m.text
+            );
+        }
+    }
+
+    /// End-to-end consumer test: synthesize a WAV that contains a reply
+    /// rooted at a seeded callsign, point a single seed at that
+    /// callsign+freq, and confirm `try_cross_sequence_decodes` returns
+    /// at least one decode flagged with `via_cross_sequence_a7 = true`.
+    ///
+    /// Note: spec §10 says A7 is for *replies*, never CQs — the consumer
+    /// drops candidate text starting with `CQ `. So this test seeds a
+    /// non-CQ message ("K1ABC K5ARH 73") instead. Modulator base is
+    /// 1500 Hz; modulate_symbols(_, 500.0) emits at 2000 Hz. The seed
+    /// entry asserts "K1ABC was decoded in the previous slot at 2000 Hz",
+    /// and the fresh window contains the reply at 2000 Hz. Template
+    /// enumeration generates the "C OTHER 73" shape rooted on K1ABC;
+    /// cross-correlation against the WAV's sync candidate at 2000 Hz
+    /// should win on the matching template.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn seeded_consumer_emits_cross_sequence_provenance() {
+        // Synthesize the reply message at 2000 Hz (BASE 1500 + offset 500).
+        let reply_text = "K1ABC K5ARH 73";
+        let mut encoder = crate::Ft8Encoder::new();
+        let symbols = encoder.encode_message(reply_text, None).expect("encode");
+        let mut modulator = crate::Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        // Enable cross-sequence A7. Also lower a7 thresholds slightly —
+        // the WSJT-X defaults (6.0 / 1.8) are calibrated for noisy
+        // real-world residuals; on a synthetic clean signal the template
+        // bank's second-best score is essentially the same matched
+        // filter, so snr7b is close to 1.0. We still want a non-trivial
+        // gate to confirm the wiring respects it, but the test must not
+        // depend on a fragile calibration constant.
+        let cfg = Ft8Config {
+            cross_sequence_a7_enabled: true,
+            a7_snr7_threshold: 2.0,
+            a7_snr7b_threshold: 1.05,
+            ..Ft8Config::default()
+        };
+        let mut dec = Ft8Decoder::new(cfg).expect("decoder ctor");
+
+        // Seed: K1ABC was decoded in the prior slot at 2000 Hz.
+        let seeds = vec![CrossSequenceSeed {
+            callsign: "K1ABC".to_string(),
+            partner_callsign: Some("K5ARH".to_string()),
+            freq_hz: 2000.0,
+        }];
+
+        let decoded = dec
+            .try_cross_sequence_decodes(&tx, &seeds)
+            .expect("cross-sequence call should not error");
+
+        // At least one decode must come back flagged.
+        assert!(
+            !decoded.is_empty(),
+            "cross-sequence consumer should produce at least one decode for a seeded reply"
+        );
+        let has_target = decoded
+            .iter()
+            .any(|m| m.text == reply_text && m.via_cross_sequence_a7);
+        assert!(
+            has_target,
+            "cross-sequence consumer should emit the seeded reply '{}' with provenance flag set; \
+             got texts: {:?} (via_cross flags: {:?})",
+            reply_text,
+            decoded.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            decoded
+                .iter()
+                .map(|m| m.via_cross_sequence_a7)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Spec §10 negative-case: a candidate template that starts with
+    /// `CQ ` must be filtered out by the consumer (CQs are same-sequence
+    /// decodes; A7 is for *replies* in the opposite-parity window).
+    /// We seed at a freq with a CQ in the WAV; the consumer must NOT
+    /// emit a CrossSequenceA7-flagged decode of the CQ.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn cq_messages_never_emitted_via_cross_sequence() {
+        let cq_text = "CQ K5ARH EM10";
+        let mut encoder = crate::Ft8Encoder::new();
+        let symbols = encoder.encode_message(cq_text, None).expect("encode");
+        let mut modulator = crate::Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let cfg = Ft8Config {
+            cross_sequence_a7_enabled: true,
+            a7_snr7_threshold: 2.0,
+            a7_snr7b_threshold: 1.05,
+            ..Ft8Config::default()
+        };
+        let mut dec = Ft8Decoder::new(cfg).expect("decoder ctor");
+        // Seed K5ARH; if the consumer were to template a CQ from K5ARH
+        // it would match the WAV. Spec §10 says we must NOT emit it.
+        // Signal is at 2000 Hz (BASE 1500 + offset 500).
+        let seeds = vec![CrossSequenceSeed {
+            callsign: "K5ARH".to_string(),
+            partner_callsign: None,
+            freq_hz: 2000.0,
+        }];
+
+        let decoded = dec
+            .try_cross_sequence_decodes(&tx, &seeds)
+            .expect("call should not error");
+        for m in &decoded {
+            assert!(
+                !m.text.starts_with("CQ "),
+                "cross-sequence consumer must drop CQ-prefixed templates; got {:?}",
+                m.text
+            );
+        }
+    }
+
+    /// Default `via_cross_sequence_a7` value on a freshly constructed
+    /// DecodedMessage is `false`. Regression guard so nobody flips the
+    /// constructor default by accident.
+    #[test]
+    fn fresh_decoded_message_default_is_not_cross_sequence() {
+        let m = crate::message::Ft8Message::default();
+        let dm = crate::message::DecodedMessage::new(m, -10.0, 0.5, 1500.0, 0.0);
+        assert!(
+            !dm.via_cross_sequence_a7,
+            "DecodedMessage::new must default via_cross_sequence_a7 to false"
+        );
+    }
+
+    /// Configuration default: `cross_sequence_a7_enabled` must default to
+    /// `false`. Regression guard against accidental default flip.
+    #[test]
+    fn default_config_keeps_cross_sequence_off() {
+        let cfg = Ft8Config::default();
+        assert!(
+            !cfg.cross_sequence_a7_enabled,
+            "Ft8Config::default().cross_sequence_a7_enabled must be false; \
+             toggling default-ON requires a hard-200 measurement"
+        );
+    }
+
+    /// Short-audio guard: when samples are too short for a full FT8
+    /// frame, the consumer must return `Err(InvalidWindowSize)` rather
+    /// than panic. This mirrors `decode_window_with_ap_scoped_partner`.
+    #[test]
+    fn short_samples_return_error_when_enabled() {
+        let cfg = Ft8Config {
+            cross_sequence_a7_enabled: true,
+            ..Ft8Config::default()
+        };
+        let mut dec = Ft8Decoder::new(cfg).expect("decoder ctor");
+        // Far below the minimum window length.
+        let samples = vec![0.0f32; 100];
+        let seeds = vec![CrossSequenceSeed {
+            callsign: "K1ABC".to_string(),
+            partner_callsign: Some("W1AW".to_string()),
+            freq_hz: 1200.0,
+        }];
+
+        let result = dec.try_cross_sequence_decodes(&samples, &seeds);
+        assert!(
+            matches!(result, Err(crate::Ft8Error::InvalidWindowSize { .. })),
+            "short samples + enabled should return InvalidWindowSize; got {:?}",
+            result.map(|v| v.len())
+        );
+    }
+
+    /// Short-audio guard (default-OFF): even with too-short samples, the
+    /// default-OFF guard short-circuits before the size check and
+    /// returns Ok([]). This is intentional: the consumer must NEVER
+    /// error when disabled, regardless of input.
+    #[test]
+    fn short_samples_no_error_when_disabled() {
+        let cfg = Ft8Config::default();
+        let mut dec = Ft8Decoder::new(cfg).expect("decoder ctor");
+        let samples = vec![0.0f32; 100];
+        let seeds = vec![CrossSequenceSeed {
+            callsign: "K1ABC".to_string(),
+            partner_callsign: None,
+            freq_hz: 1200.0,
+        }];
+
+        let out = dec
+            .try_cross_sequence_decodes(&samples, &seeds)
+            .expect("default-OFF must never error");
+        assert!(out.is_empty());
     }
 }

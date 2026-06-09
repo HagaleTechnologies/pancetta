@@ -990,6 +990,14 @@ pub struct DecodedMessage {
     /// Used by the research harness to compute Time-To-First-Decode (TTFD)
     /// per WAV — see `research/ideation/2026-06-01-metric.md` M1.
     pub decode_time_into_window: Option<Duration>,
+    /// hb-237 Session 2: provenance marker for the cross-sequence A7 consumer.
+    /// `true` when this decode was emitted by
+    /// [`crate::decoder::Ft8Decoder::try_cross_sequence_decodes`]; `false`
+    /// for every other code path (standard pipeline, ft8_lib FFI, within-slot
+    /// a7, etc.). Used downstream by the coordinator's log/FP-filter path
+    /// to tell A7 decodes apart. Inspired by spec ref
+    /// `research/specs/spec-wsjtr-cross-sequence-a7.md` §12 ("output marking").
+    pub via_cross_sequence_a7: bool,
 }
 
 impl DecodedMessage {
@@ -1015,6 +1023,7 @@ impl DecodedMessage {
             ap_level: 0,
             slot_parity: None,
             decode_time_into_window: None,
+            via_cross_sequence_a7: false,
         }
     }
 
@@ -1039,6 +1048,7 @@ impl DecodedMessage {
             ap_level: 0,
             slot_parity: None,
             decode_time_into_window: None,
+            via_cross_sequence_a7: false,
         }
     }
 }
