@@ -672,6 +672,28 @@ pub struct Ft8Config {
     /// Default 180 matches `soft_combiner::DEFAULT_TTL_SECONDS`. Only
     /// consulted when `soft_combiner_enabled = true`.
     pub soft_combiner_ttl_seconds: u64,
+
+    /// JS8Call-Improved-inspired LLR whitening (per-tone × per-symbol
+    /// noise normalisation). When `true`, after the symbol demapper
+    /// computes the soft LLR vector and before `normalize_llrs`, each
+    /// LLR triplet for symbol position `sym` (winner tone `w`) is
+    /// scaled by `1 / sqrt(n_tone[w] × n_symbol[sym])`, where
+    /// - `n_tone[w]` is the median of the magnitudes at tone `w` across
+    ///   all data symbol positions where tone `w` was NOT the winner
+    /// - `n_symbol[sym]` is the median of the (NUM_TONES − 1)
+    ///   non-winning tone magnitudes at symbol position `sym`
+    ///
+    /// Both estimates are floored at `1e-6` to avoid division-by-zero
+    /// when a tone row or symbol slot is identically zero. The
+    /// subsequent `normalize_llrs` pass then re-standardises the
+    /// vector's variance to `llr_target_variance`.
+    ///
+    /// Inspired by spec ref `research/specs/spec-js8call-llr-whitening.md`.
+    /// Default `false` — the whitening pass is byte-identical to the
+    /// legacy path when off (no math executes). Flip on for hard-200
+    /// A/B; expected lift on band-edge / non-uniform-noise signals.
+    pub llr_whitening_enabled: bool,
+
     /// hb-226: when true, the time-domain subtract path
     /// (`subtract_signal`) applies a Gaussian-style cosine ramp at
     /// each inter-symbol boundary instead of a hard rectangular
@@ -889,6 +911,11 @@ impl Default for Ft8Config {
             soft_combiner_enabled: false,
             soft_combiner_capacity: crate::soft_combiner::DEFAULT_CAPACITY,
             soft_combiner_ttl_seconds: crate::soft_combiner::DEFAULT_TTL_SECONDS,
+            // JS8Call-Improved-inspired LLR whitening default OFF. When
+            // OFF the whitening helper is never invoked, leaving the LLR
+            // pipeline byte-identical to the legacy path. Inspired by
+            // spec ref `spec-js8call-llr-whitening.md`.
+            llr_whitening_enabled: false,
             // hb-226: Gaussian-ramp subtract default OFF. When OFF the
             // subtract path is byte-identical to the legacy
             // hard-edged subtraction. Inspired by spec ref
@@ -1503,6 +1530,10 @@ impl Ft8Decoder {
                 // disabled — the AP0 hot path collapses to a single
                 // branch test in that case.
                 soft_combiner: self.soft_combiner.as_ref(),
+                // JS8Call-Improved-inspired LLR whitening flag. The
+                // whitening helper is a no-op when this is false, so
+                // the disabled hot path runs zero whitening code.
+                llr_whitening_enabled: self.config.llr_whitening_enabled,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -3169,7 +3200,16 @@ impl Ft8Decoder {
             };
             let tone_magnitudes =
                 self.extract_symbols_from_spectrogram(spectrogram, &trial_candidate);
-            let base_llrs = self.compute_soft_llrs_db(&tone_magnitudes);
+            let mut base_llrs = self.compute_soft_llrs_db(&tone_magnitudes);
+            // JS8Call-Improved-style LLR whitening (inspired by spec ref
+            // `spec-js8call-llr-whitening.md`). No-op when disabled, so
+            // the legacy AP path stays byte-identical.
+            maybe_whiten_llrs(
+                self.config.llr_whitening_enabled,
+                &mut base_llrs,
+                &tone_magnitudes,
+                &self.protocol_params,
+            );
 
             // Compute frequency and time for building DecodedMessage
             let sub_bin_offset = trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
@@ -3514,6 +3554,7 @@ impl Ft8Decoder {
             // OR CRC fails OR message is implausible, the averaged
             // candidate yields nothing (additive, so harmless).
             let mut llrs = par_compute_soft_llrs_db(pp, &avg_mags);
+            maybe_whiten_llrs(self.config.llr_whitening_enabled, &mut llrs, &avg_mags, pp);
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
                 continue;
@@ -3816,6 +3857,7 @@ impl Ft8Decoder {
                 }
             }
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
+            maybe_whiten_llrs(self.config.llr_whitening_enabled, &mut llrs, &tone_mags, pp);
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
                 if diagnostic_on {
@@ -3954,6 +3996,7 @@ impl Ft8Decoder {
                 }
             }
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
+            maybe_whiten_llrs(self.config.llr_whitening_enabled, &mut llrs, &tone_mags, pp);
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
                 if diagnostic_on {
@@ -4240,6 +4283,14 @@ impl Ft8Decoder {
                     let tone_mags =
                         par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
                     let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
+                    // NOTE: JS8Call-Improved-style LLR whitening
+                    // intentionally NOT applied here. a7 uses LLRs for
+                    // cross-correlation against pre-encoded templates
+                    // (snr7/snr7b thresholds are tuned against the
+                    // legacy LLR scale); whitening would shift the
+                    // distribution and require re-calibrating
+                    // a7_snr7_threshold / a7_snr7b_threshold. The spec
+                    // scopes whitening to LDPC BP input only.
                     normalize_llrs(&mut llrs, llr_target_variance);
 
                     let Some((best_idx, snr7, snr7b)) =
@@ -4409,6 +4460,7 @@ impl Ft8Decoder {
         for cand in &new_candidates {
             let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
+            maybe_whiten_llrs(self.config.llr_whitening_enabled, &mut llrs, &tone_mags, pp);
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
                 continue;
@@ -4569,6 +4621,12 @@ impl Ft8Decoder {
             let tone_magnitudes =
                 self.extract_symbols_from_spectrogram(spectrogram, &trial_candidate);
             let mut llrs = self.compute_soft_llrs_db(&tone_magnitudes);
+            maybe_whiten_llrs(
+                self.config.llr_whitening_enabled,
+                &mut llrs,
+                &tone_magnitudes,
+                &self.protocol_params,
+            );
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
 
             if let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) {
@@ -4714,6 +4772,12 @@ impl Ft8Decoder {
                 };
 
                 let mut llrs = self.compute_soft_llrs(&tone_magnitudes);
+                maybe_whiten_llrs(
+                    self.config.llr_whitening_enabled,
+                    &mut llrs,
+                    &tone_magnitudes,
+                    &self.protocol_params,
+                );
 
                 // LLR normalization: scale to target variance (ft8_lib's ftx_normalize_logl)
                 normalize_llrs(&mut llrs, self.config.llr_target_variance);
@@ -5278,6 +5342,10 @@ struct DecodeContext<'a> {
     /// is wrapped in a `Mutex` and only locked when present, so the
     /// disabled hot path is a single `Option::as_ref()` branch test.
     soft_combiner: Option<&'a std::sync::Arc<std::sync::Mutex<SoftCombiner>>>,
+    /// JS8Call-Improved-inspired per-tone × per-symbol LLR whitening.
+    /// When `false` the whitening helper is never invoked, leaving the
+    /// LLR pipeline byte-identical to the legacy path.
+    llr_whitening_enabled: bool,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -5338,6 +5406,21 @@ fn par_decode_candidate(
             ctx.sync_time_interp_linear_power,
         );
         let mut llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes);
+        // JS8Call-Improved-inspired LLR whitening (inspired by spec ref
+        // `spec-js8call-llr-whitening.md`). Applied BEFORE normalisation
+        // so the per-tone × per-symbol divisive step sees raw demapper
+        // LLRs; normalize_llrs then re-standardises variance. The
+        // whitened LLRs feed the soft combiner, which accumulates
+        // already-whitened receptions; the post-combine path falls back
+        // to plain normalize_llrs (the combiner does not retain per-
+        // reception magnitudes, so re-whitening after combine would
+        // have no input).
+        maybe_whiten_llrs(
+            ctx.llr_whitening_enabled,
+            &mut llrs,
+            &tone_magnitudes,
+            ctx.protocol_params,
+        );
         normalize_llrs(&mut llrs, ctx.llr_target_variance);
 
         // hb-244: soft combiner integration. When enabled, the combiner
@@ -5467,6 +5550,12 @@ fn par_decode_candidate(
             };
 
             let mut llrs = par_compute_soft_llrs(ctx.protocol_params, &tone_magnitudes);
+            maybe_whiten_llrs(
+                ctx.llr_whitening_enabled,
+                &mut llrs,
+                &tone_magnitudes,
+                ctx.protocol_params,
+            );
             normalize_llrs(&mut llrs, ctx.llr_target_variance);
 
             let corrected_bits = match ldpc.decode_soft(&llrs) {
@@ -5547,7 +5636,19 @@ fn par_try_ap_decode(
             &trial_candidate,
             ctx.sync_time_interp_linear_power,
         );
-        let base_llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes);
+        let mut base_llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes);
+        // JS8Call-Improved-style LLR whitening (inspired by spec ref
+        // `spec-js8call-llr-whitening.md`). Whitening is applied to
+        // `base_llrs` here so that AP injection (which clones base_llrs
+        // into a new vector) sees the whitened scale; the downstream
+        // `par_try_ldpc_with_ap` then re-normalises variance after AP
+        // bits are written. No-op when the master flag is OFF.
+        maybe_whiten_llrs(
+            ctx.llr_whitening_enabled,
+            &mut base_llrs,
+            &tone_magnitudes,
+            ctx.protocol_params,
+        );
 
         let sub_bin_offset = trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
         let base_frequency = candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
@@ -6590,6 +6691,175 @@ fn normalize_llrs(llrs: &mut [f32], target_variance: f32) {
             *llr *= norm_factor;
         }
     }
+}
+
+/// JS8Call-Improved-inspired per-tone × per-symbol LLR whitening.
+///
+/// Inspired by spec ref `research/specs/spec-js8call-llr-whitening.md`.
+///
+/// Estimates a non-uniform noise floor over the symbol-magnitude matrix
+/// and divides each LLR triplet at symbol position `sym` by the
+/// geometric mean of the noise estimates at `(winner_tone(sym), sym)`.
+/// The intent is to give the LDPC decoder LLRs on a comparable scale
+/// across bit positions even when the local noise floor varies by
+/// frequency (band edge vs middle) or by time (QRN bursts, neighbouring
+/// stations bleeding into nearby tones).
+///
+/// Algorithm steps (from the spec, simplified to operate on a single
+/// LLR vector and stay byte-identical with the existing pipeline when
+/// disabled):
+///
+/// 1. **Per-tone noise estimate** (`n_tone[0..NUM_TONES]`): for each
+///    of the eight tone rows, compute the median of the magnitudes
+///    across all data-symbol positions where that tone is **not** the
+///    winner.
+/// 2. **Per-symbol noise estimate** (`n_symbol[0..ND]`): for each
+///    data-symbol position, compute the median over the
+///    `(NUM_TONES - 1)` non-winning tone magnitudes.
+/// 3. **Divisive normalisation**: for each data symbol position
+///    `sym` with winner tone `w`, divide each of its three LLRs by
+///    `sqrt(max(n_tone[w], floor) * max(n_symbol[sym], floor))`.
+///
+/// The variance-standardisation step from the spec is handled by the
+/// existing `normalize_llrs` pass that immediately follows this helper.
+///
+/// Numerical safety:
+/// - A `1e-6` floor is applied to both noise estimates to prevent
+///   division-by-zero on identically-zero tone rows or symbol slots.
+/// - Uniform magnitudes produce uniform noise estimates → the divisor
+///   is a single scalar across the whole vector → after
+///   `normalize_llrs` the output is identical to the no-whitening
+///   path (uniform-scale identity).
+/// - All-zero magnitudes leave LLRs unchanged (divisor stays at the
+///   floor, but every LLR is already zero so the scaling is a no-op).
+fn whiten_llrs(llrs: &mut [f32], tone_magnitudes: &[[f64; NUM_TONES]], pp: &ProtocolParams) {
+    const NOISE_FLOOR: f64 = 1e-6;
+    let data_positions = pp.data_symbol_indices();
+    let nd = data_positions.len();
+    let bps = pp.bits_per_symbol;
+    if nd == 0 || bps == 0 || llrs.is_empty() {
+        return;
+    }
+    debug_assert_eq!(llrs.len(), nd * bps);
+
+    // Determine the winning tone at each data symbol position. We use
+    // the raw FFT-bin argmax (not the Gray-decoded label) because the
+    // whitening step operates on the magnitude matrix BEFORE the
+    // Gray-coded LLR formula and only needs "which tone was loudest".
+    let mut winners: Vec<usize> = Vec::with_capacity(nd);
+    for &sym_idx in &data_positions {
+        let mags = &tone_magnitudes[sym_idx];
+        let mut best_tone = 0usize;
+        let mut best_mag = f64::NEG_INFINITY;
+        for (t, &m) in mags.iter().enumerate() {
+            if m > best_mag {
+                best_mag = m;
+                best_tone = t;
+            }
+        }
+        winners.push(best_tone);
+    }
+
+    // Per-tone noise estimate: median of magnitudes across positions
+    // where the tone was NOT the winner.
+    let mut n_tone = [0.0f64; NUM_TONES];
+    let mut scratch: Vec<f64> = Vec::with_capacity(nd);
+    for tone in 0..NUM_TONES {
+        scratch.clear();
+        for (i, &sym_idx) in data_positions.iter().enumerate() {
+            if winners[i] != tone {
+                scratch.push(tone_magnitudes[sym_idx][tone]);
+            }
+        }
+        n_tone[tone] = if scratch.is_empty() {
+            // Pathological: this tone was the winner at EVERY data
+            // symbol position (would require all 58 data symbols to
+            // peak at the same tone). Fall back to the all-positions
+            // median to keep the divisor well-defined.
+            for &sym_idx in &data_positions {
+                scratch.push(tone_magnitudes[sym_idx][tone]);
+            }
+            median_inplace(&mut scratch).max(NOISE_FLOOR)
+        } else {
+            median_inplace(&mut scratch).max(NOISE_FLOOR)
+        };
+    }
+
+    // Per-symbol noise estimate: median over the (NUM_TONES - 1)
+    // non-winning tones for each data symbol position.
+    let mut n_symbol: Vec<f64> = Vec::with_capacity(nd);
+    let mut per_sym_scratch: Vec<f64> = Vec::with_capacity(NUM_TONES.saturating_sub(1));
+    for (i, &sym_idx) in data_positions.iter().enumerate() {
+        per_sym_scratch.clear();
+        let w = winners[i];
+        for (t, &m) in tone_magnitudes[sym_idx].iter().enumerate() {
+            if t != w {
+                per_sym_scratch.push(m);
+            }
+        }
+        let med = median_inplace(&mut per_sym_scratch).max(NOISE_FLOOR);
+        n_symbol.push(med);
+    }
+
+    // Apply divisive normalisation. Each symbol's three LLRs share the
+    // same divisor (the per-(winner-tone, symbol) geometric mean noise
+    // estimate), which after the downstream `normalize_llrs` collapses
+    // to a no-op when the noise field is uniform.
+    for (i, _sym_idx) in data_positions.iter().enumerate() {
+        let w = winners[i];
+        let denom_sq = n_tone[w] * n_symbol[i];
+        // Floor again on the product (paranoia: both factors are
+        // already floored, so denom_sq >= 1e-12; sqrt cannot underflow
+        // f32 here, but the explicit floor keeps the contract clear).
+        let denom = denom_sq.max(NOISE_FLOOR * NOISE_FLOOR).sqrt() as f32;
+        if denom <= 0.0 || !denom.is_finite() {
+            continue;
+        }
+        let inv = 1.0f32 / denom;
+        let base = i * bps;
+        for k in 0..bps {
+            let v = llrs[base + k] * inv;
+            // Defensive NaN/Inf clamp: while the floor guarantees a
+            // finite divisor, the input LLRs could theoretically be
+            // non-finite if upstream produced one. Replace with 0.0 so
+            // LDPC sees a benign value rather than a NaN that would
+            // poison every check-node update.
+            llrs[base + k] = if v.is_finite() { v } else { 0.0 };
+        }
+    }
+}
+
+/// Gated wrapper around `whiten_llrs` that no-ops when `enabled` is
+/// false. Centralises the default-OFF byte-identical contract: when
+/// disabled, ZERO whitening code runs (one branch test only).
+#[inline]
+fn maybe_whiten_llrs(
+    enabled: bool,
+    llrs: &mut [f32],
+    tone_magnitudes: &[[f64; NUM_TONES]],
+    pp: &ProtocolParams,
+) {
+    if enabled {
+        whiten_llrs(llrs, tone_magnitudes, pp);
+    }
+}
+
+/// Compute the median of a mutable slice of f64, in-place.
+///
+/// Uses `sort_by` (O(n log n)) rather than quickselect because the
+/// inputs are at most `NUM_TONES - 1 = 7` (per-symbol case) or
+/// `nd ≈ 58` (per-tone case), so the asymptotic difference is
+/// irrelevant and `sort_by` keeps the helper allocation-free in
+/// std. For an even-length slice returns the lower of the two middle
+/// values (the spec uses "median" without specifying tie-breaking,
+/// and sample-variance differences from the chosen tie-break are
+/// negligible at these sizes).
+fn median_inplace(values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    values[values.len() / 2]
 }
 
 /// Convert bit slice to u16
@@ -10518,5 +10788,336 @@ mod fourth_pass_a7_tests {
             2,
             "max_passes floor of 1 + 1 extra = 2"
         );
+    }
+}
+
+// ============================================================================
+// JS8Call-Improved-style LLR whitening tests (spec ref:
+// `research/specs/spec-js8call-llr-whitening.md`).
+// ============================================================================
+
+#[cfg(test)]
+mod llr_whitening_tests {
+    use super::*;
+    use crate::protocol::ProtocolParams;
+
+    /// Helper: build a uniform tone_magnitudes matrix where every
+    /// (symbol, tone) entry has the same magnitude `m`.
+    fn uniform_mags(num_symbols: usize, m: f64) -> Vec<[f64; NUM_TONES]> {
+        vec![[m; NUM_TONES]; num_symbols]
+    }
+
+    /// Helper: build a tone_magnitudes matrix where each data symbol's
+    /// winner tone is `winners[sym_in_data]` with magnitude `signal` and
+    /// every other tone has magnitude `noise`. Sync symbols (non-data
+    /// positions) get zero magnitudes (they're not consulted by the
+    /// whitening helper).
+    fn winner_mags(
+        pp: &ProtocolParams,
+        winners: &[usize],
+        signal: f64,
+        noise: f64,
+    ) -> Vec<[f64; NUM_TONES]> {
+        let mut out = vec![[0.0f64; NUM_TONES]; pp.num_symbols];
+        let data_positions = pp.data_symbol_indices();
+        assert_eq!(data_positions.len(), winners.len());
+        for (i, &sym_idx) in data_positions.iter().enumerate() {
+            for t in 0..NUM_TONES {
+                out[sym_idx][t] = noise;
+            }
+            out[sym_idx][winners[i]] = signal;
+        }
+        out
+    }
+
+    /// Build a synthetic LLR vector with non-uniform per-position
+    /// magnitudes (here just an identity 0..174 sequence) so the
+    /// whitening scaling is measurable.
+    fn synthetic_llrs(n: usize) -> Vec<f32> {
+        (0..n).map(|i| (i as f32 + 1.0) * 0.5).collect()
+    }
+
+    #[test]
+    fn whiten_llrs_uniform_magnitudes_is_uniform_rescale() {
+        // When every tone × symbol magnitude is identical, the per-tone
+        // and per-symbol medians are all equal to that magnitude, so
+        // every divisor is the SAME scalar. Whitening then becomes a
+        // global uniform rescale — which `normalize_llrs` cancels by
+        // restoring the target variance. We verify the divisor is
+        // uniform by checking that the RATIO between any two LLRs is
+        // preserved by whitening.
+        let pp = ProtocolParams::ft8();
+        let mags = uniform_mags(pp.num_symbols, 1.5);
+        let mut llrs = synthetic_llrs(174);
+        let originals = llrs.clone();
+
+        whiten_llrs(&mut llrs, &mags, &pp);
+
+        // Pick two non-zero LLR indices and check ratios match.
+        let ratio_before = originals[3] / originals[170];
+        let ratio_after = llrs[3] / llrs[170];
+        let rel_err = (ratio_before - ratio_after).abs() / ratio_before.abs().max(1e-6);
+        assert!(
+            rel_err < 1e-4,
+            "uniform-magnitude whitening should preserve LLR ratios: \
+             ratio_before={ratio_before}, ratio_after={ratio_after}, rel_err={rel_err}"
+        );
+
+        // And after re-normalising variance, the post-whiten LLRs are
+        // identical to the legacy path that only ran `normalize_llrs`.
+        let mut whitened = llrs.clone();
+        normalize_llrs(&mut whitened, LLR_TARGET_VARIANCE);
+
+        let mut legacy = originals.clone();
+        normalize_llrs(&mut legacy, LLR_TARGET_VARIANCE);
+
+        for (i, (&w, &l)) in whitened.iter().zip(legacy.iter()).enumerate() {
+            let rel = (w - l).abs() / l.abs().max(1e-6);
+            assert!(
+                rel < 1e-4,
+                "uniform-magnitude whitening followed by normalize_llrs must \
+                 equal legacy normalize_llrs at index {i}: whitened={w}, legacy={l}, rel={rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn whiten_llrs_per_tone_noise_smaller_for_cleaner_tones() {
+        // Build a magnitude matrix where one tone (tone 0) has a much
+        // lower non-winner noise floor than the others. After whitening,
+        // symbols whose winner is tone 0 should be amplified MORE
+        // (smaller divisor) than symbols whose winner is a noisier tone.
+        let pp = ProtocolParams::ft8();
+        let data_positions = pp.data_symbol_indices();
+        let nd = data_positions.len();
+
+        // First half of symbols win on tone 0, second half win on tone 4.
+        let half = nd / 2;
+        let mut winners = vec![0usize; nd];
+        for w in winners.iter_mut().take(half) {
+            *w = 0;
+        }
+        for w in winners.iter_mut().skip(half) {
+            *w = 4;
+        }
+        let mut mags = vec![[0.0f64; NUM_TONES]; pp.num_symbols];
+        for (i, &sym_idx) in data_positions.iter().enumerate() {
+            // Tone 0 has very low noise EVERYWHERE; tone 4 has high noise.
+            for t in 0..NUM_TONES {
+                mags[sym_idx][t] = if t == 0 { 0.1 } else { 1.0 };
+            }
+            // Winner tone gets the loudest magnitude (irrelevant to the
+            // per-tone noise estimate, which excludes winners).
+            mags[sym_idx][winners[i]] = 5.0;
+        }
+
+        // Confirm per-tone medians: tone 0 sees only its winner-positions
+        // excluded, so its non-winner samples are at value 0.1; tone 4
+        // sees positions where it was the winner excluded (also 5.0) so
+        // remaining samples are at 1.0.
+        // We don't have direct access to the internal `n_tone` vector,
+        // but we can verify the *behaviour*: whitening a uniform-LLR
+        // vector should produce LLRs with smaller divisor at tone-0-winner
+        // positions than at tone-4-winner positions.
+        let mut llrs = vec![10.0f32; 174];
+        whiten_llrs(&mut llrs, &mags, &pp);
+
+        let bps = pp.bits_per_symbol;
+        let first_sym_llr_avg: f32 = llrs[..bps].iter().map(|l| l.abs()).sum::<f32>() / bps as f32;
+        let last_sym_llr_avg: f32 = llrs[(nd - 1) * bps..nd * bps]
+            .iter()
+            .map(|l| l.abs())
+            .sum::<f32>()
+            / bps as f32;
+
+        // First symbol's winner is tone 0 (clean) → small divisor → LARGE
+        // post-whiten LLR. Last symbol's winner is tone 4 (noisy) → big
+        // divisor → small post-whiten LLR.
+        assert!(
+            first_sym_llr_avg > last_sym_llr_avg,
+            "tone-0-winner (cleaner) symbols should produce larger \
+             whitened |LLR| than tone-4-winner (noisier) symbols. \
+             tone0_winner_avg={first_sym_llr_avg}, tone4_winner_avg={last_sym_llr_avg}"
+        );
+    }
+
+    #[test]
+    fn whiten_llrs_then_normalize_yields_unit_variance() {
+        // After whitening + normalize_llrs, the LLR vector should have
+        // variance equal to LLR_TARGET_VARIANCE (modulo float rounding).
+        let pp = ProtocolParams::ft8();
+        let data_positions = pp.data_symbol_indices();
+        let nd = data_positions.len();
+        let winners: Vec<usize> = (0..nd).map(|i| i % NUM_TONES).collect();
+        let mags = winner_mags(&pp, &winners, 4.0, 1.0);
+
+        let mut llrs = synthetic_llrs(174);
+        whiten_llrs(&mut llrs, &mags, &pp);
+        normalize_llrs(&mut llrs, LLR_TARGET_VARIANCE);
+
+        let n = llrs.len() as f32;
+        let sum: f32 = llrs.iter().sum();
+        let sum2: f32 = llrs.iter().map(|&x| x * x).sum();
+        let variance = (sum2 - sum * sum / n) / n;
+        let rel_err = (variance - LLR_TARGET_VARIANCE).abs() / LLR_TARGET_VARIANCE;
+        assert!(
+            rel_err < 1e-3,
+            "whitened+normalized LLRs should hit target variance {}; got {} (rel_err={})",
+            LLR_TARGET_VARIANCE,
+            variance,
+            rel_err
+        );
+    }
+
+    #[test]
+    fn whiten_llrs_handles_all_zero_magnitudes_without_nan() {
+        // All-zero magnitudes is the pathological floor case: per-tone
+        // and per-symbol medians collapse to the NOISE_FLOOR. Every LLR
+        // is divided by `sqrt(floor * floor) = floor`. As long as no
+        // NaN / Inf escapes, the helper is safe — LDPC will reject the
+        // codeword downstream.
+        let pp = ProtocolParams::ft8();
+        let mags = uniform_mags(pp.num_symbols, 0.0);
+        let mut llrs = synthetic_llrs(174);
+
+        whiten_llrs(&mut llrs, &mags, &pp);
+
+        for (i, &v) in llrs.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "whitening with all-zero magnitudes must never \
+                 produce NaN/Inf; got {v} at index {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn whiten_llrs_handles_non_finite_input_without_propagating() {
+        // If upstream produces a NaN LLR for any reason, the whitening
+        // helper must clamp it to 0.0 rather than poisoning subsequent
+        // BP check-node updates.
+        let pp = ProtocolParams::ft8();
+        let mags = uniform_mags(pp.num_symbols, 1.0);
+        let mut llrs = synthetic_llrs(174);
+        llrs[42] = f32::NAN;
+        llrs[100] = f32::INFINITY;
+        llrs[101] = f32::NEG_INFINITY;
+
+        whiten_llrs(&mut llrs, &mags, &pp);
+
+        for (i, &v) in llrs.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "whitening must clamp non-finite inputs to 0.0; \
+                 got {v} at index {i}"
+            );
+        }
+        assert_eq!(
+            llrs[42], 0.0,
+            "NaN input should be clamped to 0.0 after whitening"
+        );
+        assert_eq!(
+            llrs[100], 0.0,
+            "+Inf input should be clamped to 0.0 after whitening"
+        );
+        assert_eq!(
+            llrs[101], 0.0,
+            "-Inf input should be clamped to 0.0 after whitening"
+        );
+    }
+
+    #[test]
+    fn maybe_whiten_llrs_disabled_is_no_op() {
+        // Default-OFF byte-identical contract: when the master flag is
+        // false, the LLR vector is bit-for-bit unchanged.
+        let pp = ProtocolParams::ft8();
+        let data_positions = pp.data_symbol_indices();
+        let nd = data_positions.len();
+        let winners: Vec<usize> = (0..nd).map(|i| (i * 3) % NUM_TONES).collect();
+        let mags = winner_mags(&pp, &winners, 3.5, 0.4);
+
+        let mut llrs = synthetic_llrs(174);
+        let original = llrs.clone();
+
+        maybe_whiten_llrs(false, &mut llrs, &mags, &pp);
+
+        assert_eq!(
+            llrs, original,
+            "disabled maybe_whiten_llrs must leave the LLR vector \
+             bit-for-bit unchanged (byte-identical default-OFF contract)"
+        );
+    }
+
+    #[test]
+    fn maybe_whiten_llrs_enabled_modifies_non_uniform_input() {
+        // Sanity check that the master flag actually routes to
+        // `whiten_llrs` when ON, by verifying the LLR vector changes
+        // on a non-uniform magnitude field.
+        //
+        // The test uses an asymmetric noise field: tone 0 has clean
+        // non-winner noise (low n_tone[0]); all other tones have noisy
+        // non-winner samples (high n_tone[t]). Symbols 0..half win on
+        // tone 0 (clean), symbols half..nd win on tone 1 (noisy). The
+        // resulting (n_tone[w] × n_symbol[sym]) product differs
+        // sharply across the two halves, so the LLR vector must change.
+        let pp = ProtocolParams::ft8();
+        let data_positions = pp.data_symbol_indices();
+        let nd = data_positions.len();
+        let half = nd / 2;
+        let mut mags = vec![[0.0f64; NUM_TONES]; pp.num_symbols];
+        for (i, &sym_idx) in data_positions.iter().enumerate() {
+            // Per-tone noise field: tone 0 very clean, others noisy.
+            for t in 0..NUM_TONES {
+                mags[sym_idx][t] = if t == 0 { 0.05 } else { 1.5 };
+            }
+            // Add a winner-tone burst at the chosen winner.
+            let w = if i < half { 0 } else { 1 };
+            mags[sym_idx][w] = 10.0;
+        }
+
+        let mut llrs = synthetic_llrs(174);
+        let original = llrs.clone();
+
+        maybe_whiten_llrs(true, &mut llrs, &mags, &pp);
+
+        let max_delta = llrs
+            .iter()
+            .zip(original.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_delta > 1e-3,
+            "enabled maybe_whiten_llrs must modify the LLR vector on \
+             non-uniform magnitudes; max delta was {max_delta}"
+        );
+    }
+
+    #[test]
+    fn default_config_keeps_whitening_off() {
+        // The default-OFF promise lives in the Ft8Config::default impl.
+        // Regression guard against accidental flips.
+        let cfg = Ft8Config::default();
+        assert!(
+            !cfg.llr_whitening_enabled,
+            "Ft8Config::default().llr_whitening_enabled must be false; \
+             toggling default-ON requires a hard-200 measurement"
+        );
+    }
+
+    #[test]
+    fn whiten_llrs_empty_llrs_returns_early() {
+        // Defensive guard: empty LLR slice must return early without
+        // touching the magnitude matrix (otherwise the helper would
+        // attempt to compute per-tone medians and still mutate state
+        // for no reason). The early-return path is the
+        // `llrs.is_empty()` branch.
+        let pp = ProtocolParams::ft8();
+        // Use a valid (full-size) tone_magnitudes matrix so that the
+        // function CAN'T accidentally index out-of-bounds even if the
+        // early return is broken.
+        let mags = uniform_mags(pp.num_symbols, 1.0);
+        let mut llrs: Vec<f32> = Vec::new();
+        whiten_llrs(&mut llrs, &mags, &pp);
+        assert!(llrs.is_empty());
     }
 }
