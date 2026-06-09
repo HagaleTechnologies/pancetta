@@ -272,6 +272,41 @@ pub struct Ft8Config {
     /// Sweep candidate range: 0.5 to 4.0.
     pub bp_offset_subtract: f32,
 
+    /// JS8Call-Improved-style LDPC feedback refinement (clean-room port from
+    /// `spec-js8call-ldpc-feedback-refinement.md`). When true, a failed first
+    /// BP pass triggers a meta-loop:
+    /// 1. Capture the iter-1 hard-decision codeword (output_llrs sign bits).
+    /// 2. For each bit, compare hard-decision to original LLR sign.
+    ///    - Agreement → multiply |LLR| by `ldpc_feedback_boost_factor`.
+    ///    - Disagreement → multiply |LLR| by `ldpc_feedback_attenuate_factor`.
+    ///    - If |original LLR| < `ldpc_feedback_erase_threshold`, force to 0.
+    /// 3. Re-run BP on the refined LLRs; if converged, return.
+    /// 4. Otherwise fall through to OSD as before.
+    ///
+    /// Default `false` — pending hard-200 measurement validation. Inspired
+    /// by JS8Call-Improved `ldpc_feedback.h` (GPL-3.0 source code NOT read;
+    /// clean-room implementation from prose spec only).
+    pub ldpc_feedback_refinement_enabled: bool,
+
+    /// Multiplier applied to `|LLR|` for bits where the original LLR sign
+    /// agrees with the iter-1 hard-decision codeword. Typical 1.1-2.0;
+    /// default 1.5. Sign is preserved. Magnitude clamped to ±30 to avoid
+    /// downstream saturation.
+    pub ldpc_feedback_boost_factor: f32,
+
+    /// Multiplier applied to `|LLR|` for bits where the original LLR sign
+    /// disagrees with the iter-1 hard-decision codeword (and `|LLR|` is
+    /// above the erase threshold). Typical 0.3-0.7; default 0.5. Sign is
+    /// preserved.
+    pub ldpc_feedback_attenuate_factor: f32,
+
+    /// `|LLR|` below this threshold is forced to 0 (erasure) on the
+    /// disagreement path, treating the bit as "unknown" so LDPC fills it
+    /// from parity on the second BP pass. Set to `f32::INFINITY` to disable
+    /// erasure (disagreement always attenuates). Default 1.0 — small
+    /// fraction of pancetta's typical LLR scale (±10 after normalization).
+    pub ldpc_feedback_erase_threshold: f32,
+
     /// hb-056 cross-cycle non-coherent averaging: when true, after the
     /// regular per-candidate decode loop, group repeating-station
     /// candidates (same `freq_sub`+`freq_bin`±1, `t0` apart by a multiple
@@ -592,6 +627,14 @@ impl Default for Ft8Config {
             // hard-200 residual cost without regressing other tiers.
             sync_time_interp_linear_power: false,
             bp_offset_subtract: 0.0,
+            // JS8Call-Improved-style LDPC feedback refinement: DEFAULT OFF
+            // pending hard-200 measurement validation. When flipped on, a
+            // failed BP pass triggers one extra meta-loop with refined LLRs
+            // before falling through to OSD.
+            ldpc_feedback_refinement_enabled: false,
+            ldpc_feedback_boost_factor: 1.5,
+            ldpc_feedback_attenuate_factor: 0.5,
+            ldpc_feedback_erase_threshold: 1.0,
             // hb-063 (batch 10): layered BP is the production default —
             // +18 hard-200 recovered (composite +0.00105), -16% decode
             // wall-clock, no guard-tier regression.
@@ -846,7 +889,13 @@ impl Ft8Decoder {
         )?
         .with_max_parity_errors_for_osd(config.max_parity_errors_for_osd)
         .with_bp_offset_subtract(config.bp_offset_subtract)
-        .with_layered(config.layered_bp);
+        .with_layered(config.layered_bp)
+        .with_feedback_refinement(
+            config.ldpc_feedback_refinement_enabled,
+            config.ldpc_feedback_boost_factor,
+            config.ldpc_feedback_attenuate_factor,
+            config.ldpc_feedback_erase_threshold,
+        );
 
         // Pre-compute FFT plan and Hann window for symbol extraction
         let sps = protocol_params.samples_per_symbol(SAMPLE_RATE);
@@ -1122,6 +1171,10 @@ impl Ft8Decoder {
                 max_parity_errors_for_osd: self.config.max_parity_errors_for_osd,
                 bp_offset_subtract: self.config.bp_offset_subtract,
                 layered_bp: self.config.layered_bp,
+                ldpc_feedback_refinement_enabled: self.config.ldpc_feedback_refinement_enabled,
+                ldpc_feedback_boost_factor: self.config.ldpc_feedback_boost_factor,
+                ldpc_feedback_attenuate_factor: self.config.ldpc_feedback_attenuate_factor,
+                ldpc_feedback_erase_threshold: self.config.ldpc_feedback_erase_threshold,
                 sync_time_interp_linear_power: self.config.sync_time_interp_linear_power,
                 window_start: start_time,
             };
@@ -1166,17 +1219,35 @@ impl Ft8Decoder {
                             .expect("LDPC decoder init failed")
                             .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
                             .with_bp_offset_subtract(ctx.bp_offset_subtract)
-                            .with_layered(ctx.layered_bp);
+                            .with_layered(ctx.layered_bp)
+                            .with_feedback_refinement(
+                                ctx.ldpc_feedback_refinement_enabled,
+                                ctx.ldpc_feedback_boost_factor,
+                                ctx.ldpc_feedback_attenuate_factor,
+                                ctx.ldpc_feedback_erase_threshold,
+                            );
                         let ldpc_mid = LdpcDecoder::new_with_osd(iters_mid, osd_cfg)
                             .expect("LDPC decoder init failed")
                             .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
                             .with_bp_offset_subtract(ctx.bp_offset_subtract)
-                            .with_layered(ctx.layered_bp);
+                            .with_layered(ctx.layered_bp)
+                            .with_feedback_refinement(
+                                ctx.ldpc_feedback_refinement_enabled,
+                                ctx.ldpc_feedback_boost_factor,
+                                ctx.ldpc_feedback_attenuate_factor,
+                                ctx.ldpc_feedback_erase_threshold,
+                            );
                         let ldpc_high = LdpcDecoder::new_with_osd(iters_high, osd_cfg)
                             .expect("LDPC decoder init failed")
                             .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
                             .with_bp_offset_subtract(ctx.bp_offset_subtract)
-                            .with_layered(ctx.layered_bp);
+                            .with_layered(ctx.layered_bp)
+                            .with_feedback_refinement(
+                                ctx.ldpc_feedback_refinement_enabled,
+                                ctx.ldpc_feedback_boost_factor,
+                                ctx.ldpc_feedback_attenuate_factor,
+                                ctx.ldpc_feedback_erase_threshold,
+                            );
                         let fft_buffer = vec![Complex::new(0.0, 0.0); sps];
                         (ldpc_low, ldpc_mid, ldpc_high, fft_buffer)
                     },
@@ -4540,6 +4611,15 @@ struct DecodeContext<'a> {
     bp_offset_subtract: f32,
     /// hb-063 layered (row-sequential) BP schedule.
     layered_bp: bool,
+    /// JS8Call-Improved-style LDPC feedback refinement: master switch.
+    ldpc_feedback_refinement_enabled: bool,
+    /// JS8Call-Improved-style LDPC feedback refinement: agree-boost factor.
+    ldpc_feedback_boost_factor: f32,
+    /// JS8Call-Improved-style LDPC feedback refinement: disagree-attenuate
+    /// factor.
+    ldpc_feedback_attenuate_factor: f32,
+    /// JS8Call-Improved-style LDPC feedback refinement: erase threshold.
+    ldpc_feedback_erase_threshold: f32,
     /// hb-069 linear-power spectrogram interpolation gate.
     sync_time_interp_linear_power: bool,
     /// hb-129: window-start instant. Used to stamp each successful decode
@@ -6097,6 +6177,119 @@ struct LdpcDecoder {
     /// hb-063: when true, `belief_propagation_with_trajectory` uses a
     /// layered (row-sequential) schedule instead of flooding.
     layered: bool,
+    /// JS8Call-Improved-style feedback refinement config (clean-room port
+    /// from `spec-js8call-ldpc-feedback-refinement.md`). When `enabled` is
+    /// false (default), `decode_soft` is byte-identical to its pre-feedback
+    /// behavior. When true, a failed first BP pass triggers one meta-loop
+    /// with refined LLRs before falling through to OSD.
+    feedback_refinement: FeedbackRefinementConfig,
+}
+
+/// Configuration for the JS8Call-Improved-style LDPC feedback refinement
+/// meta-loop. See `Ft8Config::ldpc_feedback_refinement_enabled` for the
+/// caller-facing surface; `LdpcDecoder` stores a flattened copy.
+#[derive(Debug, Clone, Copy)]
+struct FeedbackRefinementConfig {
+    /// Master switch. When false, `decode_soft` skips refinement entirely.
+    enabled: bool,
+    /// Multiplier applied to `|LLR|` when the original sign agrees with the
+    /// iter-1 hard-decision codeword bit.
+    boost_factor: f32,
+    /// Multiplier applied to `|LLR|` when the original sign disagrees with
+    /// the iter-1 hard-decision codeword bit (and is not erased).
+    attenuate_factor: f32,
+    /// On the disagreement path, if the original `|LLR|` is below this
+    /// threshold the bit is forced to 0 (erasure). Set to `f32::INFINITY`
+    /// to disable erasure.
+    erase_threshold: f32,
+}
+
+impl Default for FeedbackRefinementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            boost_factor: 1.5,
+            attenuate_factor: 0.5,
+            erase_threshold: 1.0,
+        }
+    }
+}
+
+/// Telemetry from one application of the JS8Call-Improved-style feedback
+/// refinement. Returned by `refine_llrs_from_hard_decisions` so callers can
+/// log the agree/disagree split (useful for the research scorecard) and
+/// decide whether to keep looping.
+#[derive(Debug, Clone, Copy, Default)]
+struct FeedbackStats {
+    /// Bits where the original LLR sign agreed with the iter-1 hard decision
+    /// (magnitude was boosted).
+    confident_bits: u16,
+    /// Bits where the original LLR sign disagreed with the iter-1 hard
+    /// decision (magnitude was attenuated or erased).
+    uncertain_bits: u16,
+    /// Subset of `uncertain_bits` whose magnitude was forced to 0.
+    erased_bits: u16,
+}
+
+/// Clamp factor for refined LLR magnitudes — guards against numerical
+/// overflow on repeated boosts when the meta-loop is invoked in a future
+/// multi-iteration regime. Per the spec: "clamp LLR magnitude to a
+/// reasonable maximum (e.g., ±30 in log-base-e LLR units)".
+const FEEDBACK_REFINEMENT_LLR_CLAMP: f32 = 30.0;
+
+/// Apply the JS8Call-Improved-style feedback refinement to `llrs` in place,
+/// using `hard_decisions[i] = 1` to indicate "iter-1 BP decided bit i = 1"
+/// (i.e. its output LLR was negative).
+///
+/// Returns telemetry counters for diagnostics. The transform is deterministic
+/// and free of randomness: callers may unit-test it directly.
+fn refine_llrs_from_hard_decisions(
+    llrs: &mut [f32; 174],
+    hard_decisions: &[u8; 174],
+    cfg: &FeedbackRefinementConfig,
+) -> FeedbackStats {
+    let mut stats = FeedbackStats::default();
+    for i in 0..174 {
+        let original = llrs[i];
+        let abs = original.abs();
+        // "Bit = 1 according to original LLR" iff original < 0 (matches
+        // `llrs_to_bits` and `check_syndrome_fast`).
+        let llr_bit: u8 = u8::from(original < 0.0);
+        let hd_bit = hard_decisions[i] & 1;
+
+        if llr_bit == hd_bit {
+            // Agreement: amplify magnitude, preserve sign. A zero LLR stays
+            // zero (no information to amplify); this matches the spec which
+            // treats erased bits as "unknown" and lets parity drive the
+            // decision.
+            let scaled = abs * cfg.boost_factor;
+            let clamped = scaled.min(FEEDBACK_REFINEMENT_LLR_CLAMP);
+            llrs[i] = if original == 0.0 {
+                0.0
+            } else {
+                original.signum() * clamped
+            };
+            stats.confident_bits += 1;
+        } else {
+            // Disagreement: erase if shallow, else attenuate. Sign preserved
+            // when attenuating so the demapper's vote is not discarded
+            // outright — the candidate codeword merely casts doubt on it.
+            // `erase_threshold = +infinity` (or non-finite) is the
+            // documented sentinel meaning "disable erasure" — gate on
+            // finiteness so it always falls through to attenuation.
+            if cfg.erase_threshold.is_finite() && abs < cfg.erase_threshold {
+                llrs[i] = 0.0;
+                stats.uncertain_bits += 1;
+                stats.erased_bits += 1;
+            } else {
+                let scaled = abs * cfg.attenuate_factor;
+                let clamped = scaled.min(FEEDBACK_REFINEMENT_LLR_CLAMP);
+                llrs[i] = original.signum() * clamped;
+                stats.uncertain_bits += 1;
+            }
+        }
+    }
+    stats
 }
 
 impl LdpcDecoder {
@@ -6130,6 +6323,7 @@ impl LdpcDecoder {
             max_parity_errors_for_osd: 4,
             bp_offset_subtract: 0.0,
             layered: false,
+            feedback_refinement: FeedbackRefinementConfig::default(),
         })
     }
 
@@ -6151,6 +6345,46 @@ impl LdpcDecoder {
 
     fn with_layered(mut self, on: bool) -> Self {
         self.layered = on;
+        self
+    }
+
+    /// Enable / configure the JS8Call-Improved-style LDPC feedback refinement
+    /// meta-loop. Passing `enabled = false` (default) preserves byte-identical
+    /// `decode_soft` behavior; passing `enabled = true` activates one extra
+    /// BP pass on refined LLRs whenever the first pass fails to converge.
+    ///
+    /// Factors and threshold must be finite; non-finite values are silently
+    /// replaced with their defaults to avoid downstream NaN propagation.
+    fn with_feedback_refinement(
+        mut self,
+        enabled: bool,
+        boost_factor: f32,
+        attenuate_factor: f32,
+        erase_threshold: f32,
+    ) -> Self {
+        let boost = if boost_factor.is_finite() && boost_factor > 0.0 {
+            boost_factor
+        } else {
+            1.5
+        };
+        let atten = if attenuate_factor.is_finite() && attenuate_factor >= 0.0 {
+            attenuate_factor
+        } else {
+            0.5
+        };
+        // `erase_threshold` may be `f32::INFINITY` (disable erasure) — that is
+        // intentional and finite-check would reject it.
+        let erase = if erase_threshold.is_nan() || erase_threshold < 0.0 {
+            1.0
+        } else {
+            erase_threshold
+        };
+        self.feedback_refinement = FeedbackRefinementConfig {
+            enabled,
+            boost_factor: boost,
+            attenuate_factor: atten,
+            erase_threshold: erase,
+        };
         self
     }
 
@@ -6182,6 +6416,53 @@ impl LdpcDecoder {
         if bp_converged {
             return self.llrs_to_bits(&decoded_llrs);
         }
+
+        // JS8Call-Improved-style feedback refinement meta-loop. When the
+        // first BP pass fails, the partial codeword it produced still encodes
+        // BP's current best hypothesis; we use it to reshape the input LLRs
+        // (boost agreeing bits, attenuate / erase disagreeing bits) and run
+        // BP once more. Default OFF — gated by `feedback_refinement.enabled`.
+        //
+        // Spec: `research/specs/spec-js8call-ldpc-feedback-refinement.md`.
+        let (decoded_llrs, trajectory) = if self.feedback_refinement.enabled {
+            // Capture iter-1 hard decisions as 0/1 bytes (sign of output
+            // LLRs; matches `llrs_to_bits` / `check_syndrome_fast`).
+            let mut hard_decisions = [0u8; 174];
+            for i in 0..174 {
+                hard_decisions[i] = u8::from(decoded_llrs[i] < 0.0);
+            }
+
+            // Refine the original channel LLRs in place.
+            let mut refined = [0.0f32; 174];
+            refined.copy_from_slice(&llrs[..174]);
+            let _stats = refine_llrs_from_hard_decisions(
+                &mut refined,
+                &hard_decisions,
+                &self.feedback_refinement,
+            );
+
+            // Run BP iteration 2 on the refined LLRs.
+            let (refined_decoded, refined_trajectory) =
+                self.belief_propagation_with_trajectory(&refined)?;
+
+            // If the refined pass converged, return immediately — the
+            // meta-loop did its job and OSD is unnecessary.
+            let refined_converged = {
+                let arr: &[f32; 174] = refined_decoded[..174].try_into().unwrap();
+                self.check_syndrome_fast(arr)
+            };
+            if refined_converged {
+                return self.llrs_to_bits(&refined_decoded);
+            }
+
+            // Refined pass also failed: hand its output (and any new
+            // trajectory) downstream to OSD. The trajectory is what neural
+            // OSD scores against, so using the refined trajectory keeps the
+            // bit-flip ordering consistent with what OSD actually sees.
+            (refined_decoded, refined_trajectory)
+        } else {
+            (decoded_llrs, trajectory)
+        };
 
         // hb-064: BP did not converge — note channel LLRs + trajectory
         // before potentially handing off to OSD, so the research
@@ -7993,5 +8274,324 @@ mod tests {
             "time_refinement {} out of [-0.5, +0.5]",
             cand.time_refinement
         );
+    }
+
+    // ====================================================================
+    // JS8Call-Improved-style LDPC feedback refinement (clean-room port from
+    // spec-js8call-ldpc-feedback-refinement.md).
+    //
+    // The mechanism is a meta-loop around BP: when first-pass BP fails,
+    // the iter-1 hard-decision codeword is used to reshape input LLRs
+    // (boost agreeing bits, attenuate / erase disagreeing bits) before a
+    // second BP pass.
+    //
+    // These tests focus on the transform's mathematical properties and
+    // the default-off guarantee. Bit-accuracy / corpus measurement happens
+    // separately in the hard-200 sweep.
+    // ====================================================================
+
+    #[test]
+    fn test_feedback_refinement_default_off_preserves_decode_soft() {
+        // Default Ft8Config disables refinement; decode_soft must behave
+        // identically to the legacy path. We construct a converging-clean
+        // input and a noisy-non-converging input and confirm the default
+        // decoder reaches the same bits as one with refinement off via
+        // explicit builder.
+        let default_decoder = LdpcDecoder::new_with_osd(50, None).unwrap();
+        let explicit_off = LdpcDecoder::new_with_osd(50, None)
+            .unwrap()
+            .with_feedback_refinement(false, 1.5, 0.5, 1.0);
+
+        // Clean all-zero codeword: trivially converges.
+        let clean = vec![5.0f32; 174];
+        let a = default_decoder.decode_soft(&clean).unwrap();
+        let b = explicit_off.decode_soft(&clean).unwrap();
+        for i in 0..174 {
+            assert_eq!(a[i], b[i], "default vs explicit-off mismatch at {i}");
+        }
+
+        // Lightly-corrupted input: must still match between default-off and
+        // explicit-off configurations.
+        let mut noisy = vec![5.0f32; 174];
+        noisy[10] = -1.0;
+        noisy[50] = -0.5;
+        let a2 = default_decoder.decode_soft(&noisy).unwrap();
+        let b2 = explicit_off.decode_soft(&noisy).unwrap();
+        for i in 0..174 {
+            assert_eq!(
+                a2[i], b2[i],
+                "noisy default vs explicit-off mismatch at {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_feedback_refinement_agreement_boosts_magnitude() {
+        // Spec step 1.3: when the original LLR sign matches the candidate
+        // codeword bit, multiply |LLR| by the boost factor with sign
+        // preserved.
+        let cfg = FeedbackRefinementConfig {
+            enabled: true,
+            boost_factor: 2.0,
+            attenuate_factor: 0.5,
+            erase_threshold: 0.0, // erasure disabled for this test
+        };
+
+        let mut llrs = [0.0f32; 174];
+        let mut hard = [0u8; 174];
+
+        // Original LLR = +3.0 (positive -> llr_bit = 0); HD = 0 -> AGREE.
+        llrs[0] = 3.0;
+        hard[0] = 0;
+        // Original LLR = -4.0 (negative -> llr_bit = 1); HD = 1 -> AGREE.
+        llrs[1] = -4.0;
+        hard[1] = 1;
+        // Filler: all-agreement so the counters add up cleanly.
+        for i in 2..174 {
+            llrs[i] = 2.0;
+            hard[i] = 0;
+        }
+
+        let stats = refine_llrs_from_hard_decisions(&mut llrs, &hard, &cfg);
+
+        assert!(
+            (llrs[0] - 6.0).abs() < 1e-6,
+            "expected boost 3.0 -> 6.0, got {}",
+            llrs[0]
+        );
+        assert!(
+            (llrs[1] - -8.0).abs() < 1e-6,
+            "expected boost -4.0 -> -8.0, got {}",
+            llrs[1]
+        );
+        assert_eq!(stats.confident_bits, 174);
+        assert_eq!(stats.uncertain_bits, 0);
+        assert_eq!(stats.erased_bits, 0);
+    }
+
+    #[test]
+    fn test_feedback_refinement_disagreement_attenuates_magnitude() {
+        // Spec step 1.4: when the original LLR sign disagrees with the
+        // candidate codeword bit AND |LLR| >= erase threshold, attenuate
+        // magnitude (multiply by < 1) with sign preserved.
+        let cfg = FeedbackRefinementConfig {
+            enabled: true,
+            boost_factor: 1.5,
+            attenuate_factor: 0.25,
+            erase_threshold: 0.0, // never erase (force pure attenuation)
+        };
+
+        let mut llrs = [0.0f32; 174];
+        let mut hard = [0u8; 174];
+
+        // Original LLR = +4.0 (llr_bit = 0); HD = 1 -> DISAGREE.
+        llrs[0] = 4.0;
+        hard[0] = 1;
+        // Original LLR = -8.0 (llr_bit = 1); HD = 0 -> DISAGREE.
+        llrs[1] = -8.0;
+        hard[1] = 0;
+        // Pad with all-agreement.
+        for i in 2..174 {
+            llrs[i] = 2.0;
+            hard[i] = 0;
+        }
+
+        let stats = refine_llrs_from_hard_decisions(&mut llrs, &hard, &cfg);
+
+        assert!(
+            (llrs[0] - 1.0).abs() < 1e-6,
+            "expected 4.0 -> 1.0 (x0.25), got {}",
+            llrs[0]
+        );
+        assert!(
+            (llrs[1] - -2.0).abs() < 1e-6,
+            "expected -8.0 -> -2.0 (x0.25), got {}",
+            llrs[1]
+        );
+        assert_eq!(stats.confident_bits, 172);
+        assert_eq!(stats.uncertain_bits, 2);
+        assert_eq!(stats.erased_bits, 0);
+    }
+
+    #[test]
+    fn test_feedback_refinement_shallow_disagreement_erases() {
+        // Spec step 1.4 erasure branch: when |LLR| < erase threshold AND
+        // disagreement, force the LLR to 0 (treat as erased).
+        let cfg = FeedbackRefinementConfig {
+            enabled: true,
+            boost_factor: 1.5,
+            attenuate_factor: 0.5,
+            erase_threshold: 1.5,
+        };
+
+        let mut llrs = [0.0f32; 174];
+        let mut hard = [0u8; 174];
+
+        // |LLR| = 0.5 < threshold; disagrees -> ERASE.
+        llrs[0] = 0.5;
+        hard[0] = 1;
+        // |LLR| = -0.7 (abs=0.7) < threshold; disagrees -> ERASE.
+        llrs[1] = -0.7;
+        hard[1] = 0;
+        // |LLR| = 3.0 >= threshold; disagrees -> ATTENUATE (not erase).
+        llrs[2] = 3.0;
+        hard[2] = 1;
+        // Filler agrees so counters are easy to verify.
+        for i in 3..174 {
+            llrs[i] = 2.0;
+            hard[i] = 0;
+        }
+
+        let stats = refine_llrs_from_hard_decisions(&mut llrs, &hard, &cfg);
+
+        assert_eq!(llrs[0], 0.0, "shallow disagreement must erase");
+        assert_eq!(llrs[1], 0.0, "shallow negative disagreement must erase");
+        assert!(
+            (llrs[2] - 1.5).abs() < 1e-6,
+            "deep disagreement must attenuate: 3.0 -> 1.5"
+        );
+
+        assert_eq!(stats.confident_bits, 171);
+        assert_eq!(stats.uncertain_bits, 3);
+        assert_eq!(stats.erased_bits, 2);
+    }
+
+    #[test]
+    fn test_feedback_refinement_clamps_runaway_magnitude() {
+        // Spec edge-case: "clamp LLR magnitude to a reasonable maximum to
+        // avoid saturation issues downstream". Large input * large boost
+        // must not exceed FEEDBACK_REFINEMENT_LLR_CLAMP.
+        let cfg = FeedbackRefinementConfig {
+            enabled: true,
+            boost_factor: 10.0,
+            attenuate_factor: 0.5,
+            erase_threshold: 0.0,
+        };
+
+        let mut llrs = [0.0f32; 174];
+        let mut hard = [0u8; 174];
+
+        // Original LLR 100.0 with agreement: 100 * 10 = 1000 -> must clamp.
+        llrs[0] = 100.0;
+        hard[0] = 0;
+        // Same on the negative side.
+        llrs[1] = -100.0;
+        hard[1] = 1;
+        for i in 2..174 {
+            llrs[i] = 1.0;
+            hard[i] = 0;
+        }
+
+        let _ = refine_llrs_from_hard_decisions(&mut llrs, &hard, &cfg);
+
+        assert!(
+            llrs[0] <= FEEDBACK_REFINEMENT_LLR_CLAMP + 1e-6,
+            "positive boost must be clamped to <= {FEEDBACK_REFINEMENT_LLR_CLAMP}; got {}",
+            llrs[0]
+        );
+        assert!(
+            llrs[0] > 0.0,
+            "positive clamp must preserve sign; got {}",
+            llrs[0]
+        );
+        assert!(
+            llrs[1] >= -FEEDBACK_REFINEMENT_LLR_CLAMP - 1e-6,
+            "negative boost must be clamped to >= -{FEEDBACK_REFINEMENT_LLR_CLAMP}; got {}",
+            llrs[1]
+        );
+        assert!(
+            llrs[1] < 0.0,
+            "negative clamp must preserve sign; got {}",
+            llrs[1]
+        );
+    }
+
+    #[test]
+    fn test_feedback_refinement_infinity_threshold_disables_erasure() {
+        // Spec edge-case: erasure-disabled mode (threshold = +infinity).
+        // Disagreement bits must always attenuate, never erase.
+        let cfg = FeedbackRefinementConfig {
+            enabled: true,
+            boost_factor: 1.5,
+            attenuate_factor: 0.5,
+            erase_threshold: f32::INFINITY,
+        };
+
+        let mut llrs = [0.0f32; 174];
+        let mut hard = [0u8; 174];
+
+        // Shallow disagreement: would normally erase, must attenuate.
+        llrs[0] = 0.1;
+        hard[0] = 1;
+        for i in 1..174 {
+            llrs[i] = 1.0;
+            hard[i] = 0;
+        }
+
+        let stats = refine_llrs_from_hard_decisions(&mut llrs, &hard, &cfg);
+
+        assert!(
+            (llrs[0] - 0.05).abs() < 1e-6,
+            "infinity threshold must skip erasure: 0.1 -> 0.05 (x0.5), got {}",
+            llrs[0]
+        );
+        assert_eq!(stats.erased_bits, 0);
+        assert_eq!(stats.uncertain_bits, 1);
+    }
+
+    #[test]
+    fn test_feedback_refinement_clean_codeword_short_circuits() {
+        // Spec edge-case: all-bits-agreement means the BP decoder already
+        // converged. The decode_soft meta-loop should never trigger
+        // refinement on a converging input; it returns at the
+        // bp_converged check.
+        let with_refinement = LdpcDecoder::new_with_osd(50, None)
+            .unwrap()
+            .with_feedback_refinement(true, 1.5, 0.5, 1.0);
+        let without_refinement = LdpcDecoder::new_with_osd(50, None).unwrap();
+
+        // Confident all-zero codeword: BP converges in iter 1.
+        let clean = vec![5.0f32; 174];
+        let a = with_refinement.decode_soft(&clean).unwrap();
+        let b = without_refinement.decode_soft(&clean).unwrap();
+        for i in 0..174 {
+            assert_eq!(
+                a[i], b[i],
+                "refinement must short-circuit on clean codeword at bit {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_feedback_refinement_invalid_factors_fall_back_to_defaults() {
+        // `with_feedback_refinement` must guard against pathological inputs
+        // (NaN, negative boost) by silently using the defaults. This
+        // protects downstream from NaN propagation when configs come from
+        // hot-reload or research sweeps.
+        let cfg = LdpcDecoder::new(10)
+            .unwrap()
+            .with_feedback_refinement(true, f32::NAN, -1.0, f32::NAN)
+            .feedback_refinement;
+
+        assert!(cfg.enabled);
+        assert!(
+            (cfg.boost_factor - 1.5).abs() < 1e-6,
+            "NaN boost must fall back to 1.5"
+        );
+        assert!(
+            (cfg.attenuate_factor - 0.5).abs() < 1e-6,
+            "negative attenuate must fall back to 0.5"
+        );
+        assert!(
+            (cfg.erase_threshold - 1.0).abs() < 1e-6,
+            "NaN erase threshold must fall back to 1.0"
+        );
+
+        // Infinity erase threshold must be passed through unchanged.
+        let cfg2 = LdpcDecoder::new(10)
+            .unwrap()
+            .with_feedback_refinement(true, 1.5, 0.5, f32::INFINITY)
+            .feedback_refinement;
+        assert!(cfg2.erase_threshold.is_infinite());
     }
 }
