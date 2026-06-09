@@ -728,6 +728,43 @@ pub struct Ft8Config {
     /// `pancetta_qso::CrossSequenceCallCache`; this flag gates the
     /// coordinator-side wiring.
     pub cross_sequence_a7_enabled: bool,
+
+    /// JS8Call-Improved-inspired per-candidate adaptive frequency
+    /// tracker. When `true`, the fine-FFT decode path
+    /// (`par_extract_symbols_complex`) instantiates a
+    /// [`crate::freq_tracker::FrequencyTracker`] per candidate and uses
+    /// each Costas pilot block's residual frequency measurement to
+    /// damped-update a running offset that's applied as a phase rotation
+    /// to subsequent symbols. Closes residual drift error that the
+    /// one-shot WSJT-X-style fine refinement leaves on the table —
+    /// especially for cheap radios, mobile / chirpy / solar-flare
+    /// conditions.
+    ///
+    /// Default **false**: the wiring is in place but disabled until a
+    /// drift-heavy corpus measurement confirms a net recall gain. When
+    /// off the hot path is byte-identical to the legacy fine-FFT path
+    /// (no tracker is constructed, no rotation is applied). Inspired by
+    /// spec ref `research/specs/spec-js8call-per-candidate-frequency-tracker.md`;
+    /// peer source GPL-3.0 was NOT consulted.
+    pub per_candidate_freq_tracker_enabled: bool,
+
+    /// Damping factor for the adaptive frequency tracker's running
+    /// estimate (typical 0.1–0.3). Smaller = smoother. Default 0.2.
+    /// Only consulted when `per_candidate_freq_tracker_enabled = true`.
+    pub per_candidate_freq_tracker_alpha: f64,
+
+    /// Per-update cap on how much the tracker can move in one update,
+    /// in Hz. Prevents a single noisy pilot from yanking the tracker
+    /// off-course. Default 1.5. Only consulted when
+    /// `per_candidate_freq_tracker_enabled = true`.
+    pub per_candidate_freq_tracker_max_step_hz: f64,
+
+    /// Absolute bound on the tracker's running offset (Hz, relative to
+    /// the coarse estimate). Stops the tracker from wandering far from
+    /// coarse on a noisy candidate. Default 5.0 ≈ ±0.8 FFT bins at
+    /// FT8's 6.25 Hz tone spacing. Only consulted when
+    /// `per_candidate_freq_tracker_enabled = true`.
+    pub per_candidate_freq_tracker_max_error_hz: f64,
 }
 
 impl Default for Ft8Config {
@@ -931,6 +968,15 @@ impl Default for Ft8Config {
             // a no-op for recall (the cache populates but no consumer
             // reads from it yet).
             cross_sequence_a7_enabled: false,
+            // JS8Call-Improved-inspired per-candidate frequency tracker.
+            // Default OFF — wiring shipped behind the gate. Defaults
+            // mirror the prose-spec recommendations (alpha=0.2,
+            // max_step=1.5 Hz, max_error=5.0 Hz). Inspired by spec ref
+            // `spec-js8call-per-candidate-frequency-tracker.md`.
+            per_candidate_freq_tracker_enabled: false,
+            per_candidate_freq_tracker_alpha: 0.2,
+            per_candidate_freq_tracker_max_step_hz: 1.5,
+            per_candidate_freq_tracker_max_error_hz: 5.0,
         }
     }
 }
@@ -1534,6 +1580,18 @@ impl Ft8Decoder {
                 // whitening helper is a no-op when this is false, so
                 // the disabled hot path runs zero whitening code.
                 llr_whitening_enabled: self.config.llr_whitening_enabled,
+                // Per-candidate adaptive frequency tracker plumbing.
+                // Default-OFF preserves byte-identity on the fine-FFT
+                // path. Inspired by spec ref
+                // `spec-js8call-per-candidate-frequency-tracker.md`.
+                per_candidate_freq_tracker_enabled: self.config.per_candidate_freq_tracker_enabled,
+                per_candidate_freq_tracker_alpha: self.config.per_candidate_freq_tracker_alpha,
+                per_candidate_freq_tracker_max_step_hz: self
+                    .config
+                    .per_candidate_freq_tracker_max_step_hz,
+                per_candidate_freq_tracker_max_error_hz: self
+                    .config
+                    .per_candidate_freq_tracker_max_error_hz,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -5346,6 +5404,18 @@ struct DecodeContext<'a> {
     /// When `false` the whitening helper is never invoked, leaving the
     /// LLR pipeline byte-identical to the legacy path.
     llr_whitening_enabled: bool,
+    /// JS8Call-Improved-style per-candidate frequency tracker: master
+    /// switch. When false, `par_extract_symbols_complex` skips the
+    /// tracker entirely and produces byte-identical output to the
+    /// legacy path. Inspired by spec ref
+    /// `spec-js8call-per-candidate-frequency-tracker.md`.
+    per_candidate_freq_tracker_enabled: bool,
+    /// Tracker damping factor (`FreqTrackerConfig::alpha`).
+    per_candidate_freq_tracker_alpha: f64,
+    /// Tracker per-update step cap, Hz (`FreqTrackerConfig::max_step_hz`).
+    per_candidate_freq_tracker_max_step_hz: f64,
+    /// Tracker absolute-offset bound, Hz (`FreqTrackerConfig::max_error_hz`).
+    per_candidate_freq_tracker_max_error_hz: f64,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -5536,6 +5606,27 @@ fn par_decode_candidate(
             }
             let base_frequency = freq_hz;
 
+            // Per-candidate adaptive frequency tracker (default-OFF).
+            // A fresh tracker per (dt, df) fine-tune trial — single-use
+            // per the spec. When disabled at config level, pass `None`
+            // and the extractor is byte-identical to the legacy path.
+            // Inspired by spec ref
+            // `spec-js8call-per-candidate-frequency-tracker.md`.
+            let mut tracker_opt = if ctx.per_candidate_freq_tracker_enabled {
+                Some(crate::freq_tracker::FrequencyTracker::new(
+                    base_frequency,
+                    SAMPLE_RATE as f64,
+                    crate::freq_tracker::FreqTrackerConfig {
+                        alpha: ctx.per_candidate_freq_tracker_alpha,
+                        max_step_hz: ctx.per_candidate_freq_tracker_max_step_hz,
+                        max_error_hz: ctx.per_candidate_freq_tracker_max_error_hz,
+                        ..crate::freq_tracker::FreqTrackerConfig::default()
+                    },
+                ))
+            } else {
+                None
+            };
+
             let tone_magnitudes = match par_extract_symbols_complex(
                 ctx.protocol_params,
                 ctx.audio,
@@ -5544,6 +5635,7 @@ fn par_decode_candidate(
                 ctx.symbol_fft,
                 ctx.symbol_window,
                 fft_buffer,
+                tracker_opt.as_mut(),
             ) {
                 Ok((_symbols, mags)) => mags,
                 Err(_) => continue,
@@ -6521,6 +6613,14 @@ fn par_compute_soft_llrs(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES
 }
 
 /// Extract symbols using per-thread FFT buffer (parallel-safe version of extract_symbols_complex).
+///
+/// When `freq_tracker` is `Some`, the JS8Call-Improved-inspired per-candidate
+/// adaptive frequency tracker rotates each symbol's audio chunk by the
+/// running offset before the FFT, and consumes a residual measurement
+/// from the dominant-tone parabolic-peak offset of each Costas block.
+/// When `None`, the function is byte-identical to the legacy fine-FFT
+/// path. Inspired by spec ref
+/// `research/specs/spec-js8call-per-candidate-frequency-tracker.md`.
 fn par_extract_symbols_complex(
     pp: &ProtocolParams,
     audio: &[f64],
@@ -6529,6 +6629,7 @@ fn par_extract_symbols_complex(
     symbol_fft: &std::sync::Arc<dyn rustfft::Fft<f64>>,
     symbol_window: &[f64],
     fft_buffer: &mut Vec<Complex<f64>>,
+    freq_tracker: Option<&mut crate::freq_tracker::FrequencyTracker>,
 ) -> Ft8Result<(Vec<u8>, Vec<[f64; NUM_TONES]>)> {
     let sps = pp.samples_per_symbol(SAMPLE_RATE);
     let end_sample = time_offset_samples + pp.num_symbols * sps;
@@ -6546,6 +6647,28 @@ fn par_extract_symbols_complex(
     let mut symbols = Vec::with_capacity(pp.num_symbols);
     let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
 
+    // Per-Costas-block residual accumulators. Reset at the start of each
+    // Costas block; consumed (and `tracker.update`d) at the end.
+    let mut tracker = freq_tracker;
+    // Bin width in Hz for the sps-length FFT: 12000 / 1920 = 6.25 Hz/bin.
+    let hz_per_bin = SAMPLE_RATE as f64 / sps as f64;
+
+    // Build a map symbol_index -> expected_costas_tone (or None for data).
+    // This is local + small; mirrors the protocol's known sync pattern.
+    let expected_costas_tone = |sym_idx: usize| -> Option<u8> {
+        for (group_idx, &start) in pp.costas_positions.iter().enumerate() {
+            if sym_idx >= start && sym_idx < start + pp.costas_length {
+                let local = sym_idx - start;
+                let arr = pp.costas_arrays[group_idx];
+                return Some(arr[local]);
+            }
+        }
+        None
+    };
+    // Residual accumulator for the current Costas block: (sum_residual_hz, count).
+    let mut block_residual_sum: f64 = 0.0;
+    let mut block_residual_count: usize = 0;
+
     for sym_idx in 0..pp.num_symbols {
         let sym_start = time_offset_samples + sym_idx * sps;
         let symbol_audio = &audio[sym_start..sym_start + sps];
@@ -6553,6 +6676,7 @@ fn par_extract_symbols_complex(
         let initial_angle = -pi2 * base_frequency * sym_start as f64 / SAMPLE_RATE as f64;
         let mut rotator = Complex::new(initial_angle.cos(), initial_angle.sin());
 
+        // Step 1: build the rotated, windowed input buffer for the FFT.
         for i in 0..sps {
             let w = symbol_window[i];
             fft_buffer[i] = Complex::new(
@@ -6560,6 +6684,14 @@ fn par_extract_symbols_complex(
                 symbol_audio[i] * w * rotator.im,
             );
             rotator = rotator * phase_step;
+        }
+
+        // Step 2 (optional): apply tracker's running offset as an
+        // additional in-place rotation. When tracker is None or its
+        // offset is exactly 0.0 this is a no-op (apply early-returns),
+        // preserving byte-identity with the legacy path.
+        if let Some(t) = tracker.as_deref() {
+            t.apply(&mut fft_buffer[..sps], sym_start);
         }
 
         symbol_fft.process(&mut fft_buffer[..sps]);
@@ -6579,6 +6711,51 @@ fn par_extract_symbols_complex(
 
         symbols.push(best_tone);
         tone_magnitudes.push(mags);
+
+        // Step 3 (optional): if a tracker is wired AND this symbol is a
+        // Costas pilot, fold its residual into the current block's
+        // accumulator; at the END of a block, push the average residual
+        // to the tracker.
+        if tracker.is_some() {
+            if let Some(expected_tone) = expected_costas_tone(sym_idx) {
+                // Parabolic peak refinement around the *expected* tone
+                // (not the dominant tone), because at low SNR the
+                // dominant tone may be noise — but the Costas tones are
+                // known a priori. δ ∈ [-0.5, +0.5] bins.
+                let e = expected_tone as usize;
+                if e > 0 && e + 1 < pp.num_tones {
+                    let y0 = mags[e - 1];
+                    let y1 = mags[e];
+                    let y2 = mags[e + 1];
+                    let denom = (y0 - 2.0 * y1 + y2) * 2.0;
+                    if denom.abs() > 1e-12 {
+                        let delta = (y0 - y2) / denom;
+                        // Clamp to physical bounds [-0.5, 0.5] bins.
+                        let delta_clamped = delta.clamp(-0.5, 0.5);
+                        let residual_hz = delta_clamped * hz_per_bin;
+                        if residual_hz.is_finite() {
+                            block_residual_sum += residual_hz;
+                            block_residual_count += 1;
+                        }
+                    }
+                }
+                // Check if this is the LAST symbol of the current Costas
+                // block — push residual + reset.
+                for &start in pp.costas_positions.iter() {
+                    if sym_idx + 1 == start + pp.costas_length {
+                        if block_residual_count > 0 {
+                            let avg = block_residual_sum / block_residual_count as f64;
+                            if let Some(ref mut t) = tracker {
+                                t.update(avg);
+                            }
+                        }
+                        block_residual_sum = 0.0;
+                        block_residual_count = 0;
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     Ok((symbols, tone_magnitudes))
