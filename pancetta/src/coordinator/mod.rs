@@ -146,6 +146,16 @@ pub struct ApplicationCoordinator {
     /// own `RwLock`s so locks never cross tables.
     cross_time_state: std::sync::Arc<pancetta_qso::CrossTimeState>,
 
+    /// hb-237: cross-sequence A7 callsign cache. Populated by the FT8
+    /// decoder thread after each successful, FP-filter-accepted decode
+    /// when `Ft8Config::cross_sequence_a7_enabled` is true. The cache
+    /// holds the prior slot's decoded callsigns as A7 seed candidates
+    /// for the next slot's opposite-parity decode. Default behavior is
+    /// inert — the cache populates but no decoder consumer reads from
+    /// it yet (per-seed enumeration is a follow-on; see spec ref
+    /// `research/specs/spec-wsjtr-cross-sequence-a7.md`).
+    cross_sequence_cache: std::sync::Arc<std::sync::RwLock<pancetta_qso::CrossSequenceCallCache>>,
+
     /// TUI relay OS thread handle (joined on shutdown)
     tui_relay_handle: Option<std::thread::JoinHandle<()>>,
 
@@ -370,6 +380,9 @@ impl ApplicationCoordinator {
             active_qso_freq_hz: std::sync::Arc::new(std::sync::RwLock::new(None)),
             fp_filter: None,
             cross_time_state: std::sync::Arc::new(pancetta_qso::CrossTimeState::empty()),
+            cross_sequence_cache: std::sync::Arc::new(std::sync::RwLock::new(
+                pancetta_qso::CrossSequenceCallCache::default(),
+            )),
             tui_relay_handle: None,
             // Initialize to 0 — hamlib will read the actual rig frequency on startup.
             // If hamlib isn't available, the TUI default (14.074) takes over.

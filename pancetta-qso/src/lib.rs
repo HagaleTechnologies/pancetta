@@ -185,6 +185,13 @@ pub use cross_time_state::{
     DtSighting, QsoKey, WithinQsoContext,
 };
 
+pub mod cross_sequence;
+pub use cross_sequence::{
+    A7SeedEntry, CrossSequenceCallCache, DEFAULT_CAPACITY as CROSS_SEQUENCE_DEFAULT_CAPACITY,
+    DEFAULT_MAX_AGE_SLOTS as CROSS_SEQUENCE_DEFAULT_MAX_AGE_SLOTS,
+    SLOT_DURATION_SECS as CROSS_SEQUENCE_SLOT_DURATION_SECS,
+};
+
 // Common error type for the entire library
 use crate::async_database::AsyncDatabaseError;
 use crate::async_logger::AsyncLoggerError;

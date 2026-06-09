@@ -101,6 +101,15 @@ impl super::ApplicationCoordinator {
         // ingest decodes the continuity filter judged false.
         let cross_time_state = self.cross_time_state.clone();
 
+        // hb-237: cross-sequence A7 callsign cache. Populated post-FP-filter
+        // so the cache only ever ingests trusted callsigns; the trust-gate
+        // is an additional defense (the spec calls out FP-amplification
+        // risk if seed callsigns are FPs). The cache is read at the start
+        // of each subsequent slot to surface opposite-parity seeds. Inert
+        // until `Ft8Config::cross_sequence_a7_enabled` flips true.
+        let cross_sequence_cache = self.cross_sequence_cache.clone();
+        let cross_sequence_fp_filter = self.fp_filter.clone();
+
         // Run FT8 decoder on a dedicated thread to avoid tokio starvation
         let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -143,9 +152,14 @@ impl super::ApplicationCoordinator {
                         // window, rebuild the decoder. `try_read` keeps the
                         // hot loop non-blocking; on contention, we skip the
                         // check this iteration and pick it up on the next.
+                        // hb-237: cache the cross-sequence A7 enable flag
+                        // alongside the config-rebuild check so we read the
+                        // shared Ft8Config at most once per window.
+                        let mut cross_seq_enabled = false;
                         if let Ok(cfg_guard) = ft8_config_shared.try_read() {
                             let cur_max = cfg_guard.max_decode_passes;
                             let cur_osd = cfg_guard.osd_depth;
+                            cross_seq_enabled = cfg_guard.cross_sequence_a7_enabled;
                             if cur_max != last_max_passes || cur_osd != last_osd_depth {
                                 let new_cfg = cfg_guard.clone();
                                 drop(cfg_guard);
@@ -163,6 +177,44 @@ impl super::ApplicationCoordinator {
                                         "FT8 decoder rebuild failed (keeping previous): {}",
                                         e
                                     ),
+                                }
+                            }
+                        }
+
+                        // hb-237 cross-sequence A7 — pre-decode hint read.
+                        // When enabled, look up the prior slot's opposite-
+                        // parity callsigns from the cross-sequence cache.
+                        // The seeds are reported only (log + count) until
+                        // a follow-on session wires them into the
+                        // per-seed enumeration / fine-sync pipeline
+                        // described in spec ref
+                        // `research/specs/spec-wsjtr-cross-sequence-a7.md`
+                        // §5-10. Inert by default.
+                        if cross_seq_enabled {
+                            // The next slot's parity is the opposite of the
+                            // current window's parity (we treat the current
+                            // window as "slot N+1" for the look-up).
+                            let now_slot_start =
+                                window_received_utc - chrono::Duration::seconds(13);
+                            let current_parity =
+                                pancetta_core::slot::SlotParity::of(now_slot_start);
+                            let opposite_parity: u8 = match current_parity {
+                                pancetta_core::slot::SlotParity::Even => 1,
+                                pancetta_core::slot::SlotParity::Odd => 0,
+                            };
+                            if let Ok(cache_guard) = cross_sequence_cache.read() {
+                                let seeds = cache_guard.get_a7_candidates_with_parity(
+                                    std::time::SystemTime::now(),
+                                    pancetta_qso::CROSS_SEQUENCE_DEFAULT_MAX_AGE_SLOTS,
+                                    opposite_parity,
+                                );
+                                if !seeds.is_empty() {
+                                    debug!(
+                                        target: "hb237",
+                                        "cross-sequence A7: {} prior-slot opposite-parity seeds available (parity={}); per-seed enumeration not yet wired",
+                                        seeds.len(),
+                                        opposite_parity,
+                                    );
                                 }
                             }
                         }
@@ -407,6 +459,51 @@ impl super::ApplicationCoordinator {
                                 slot_parity: parity_u8,
                                 at: decoded_msg.timestamp,
                             });
+
+                            // hb-237: cross-sequence A7 cache populate.
+                            // Only when the master flag is on, only for
+                            // decodes with a sender callsign and parity
+                            // tag, and only via the trust-gated insert
+                            // (FP-amplification mitigation; see hb-237
+                            // spec §"FP risk"). The trust filter is
+                            // shared with hb-062; when the filter is
+                            // absent we still admit on the assumption
+                            // that the post-FP-filter loop position
+                            // already filtered (the trust-gate is an
+                            // additional defense, not the only one).
+                            if cross_seq_enabled {
+                                if let (Some(ref call), Some(parity)) =
+                                    (&decoded_msg.message.from_callsign, parity_u8)
+                                {
+                                    if let Ok(mut cache_guard) = cross_sequence_cache.write() {
+                                        let admitted =
+                                            if let Some(ref filter) = cross_sequence_fp_filter {
+                                                cache_guard.record_decoded_trusted(
+                                                    call,
+                                                    decoded_msg.frequency_offset,
+                                                    parity,
+                                                    decoded_msg.timestamp,
+                                                    filter,
+                                                )
+                                            } else {
+                                                cache_guard.record_decoded(
+                                                    call,
+                                                    decoded_msg.frequency_offset,
+                                                    parity,
+                                                    decoded_msg.timestamp,
+                                                );
+                                                true
+                                            };
+                                        if !admitted {
+                                            debug!(
+                                                target: "hb237",
+                                                "cross-sequence A7: callsign {} not in trust set; not seeded",
+                                                call,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         for decoded_msg in &decoded_messages {

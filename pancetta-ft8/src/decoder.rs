@@ -692,6 +692,20 @@ pub struct Ft8Config {
     /// to a minimum of 1 sample. Only consulted when
     /// `gaussian_ramp_subtract_enabled = true`.
     pub gaussian_ramp_subtract_fraction: f64,
+
+    /// hb-237: cross-sequence A7 master switch. When `true`, the
+    /// coordinator's FT8 decode loop populates the
+    /// `CrossSequenceCallCache` after each successful decode and
+    /// retrieves the prior slot's opposite-parity seeds at the start
+    /// of the next slot. Default `false` — the cache and any wired
+    /// query points are inert until a corpus measurement confirms
+    /// the recall lift. Inspired by spec ref
+    /// `research/specs/spec-wsjtr-cross-sequence-a7.md` (WSJT-X
+    /// `ft8_a7.f90` `iaptype=7`, shipped since v2.6.0). The state
+    /// container itself lives in
+    /// `pancetta_qso::CrossSequenceCallCache`; this flag gates the
+    /// coordinator-side wiring.
+    pub cross_sequence_a7_enabled: bool,
 }
 
 impl Default for Ft8Config {
@@ -883,6 +897,13 @@ impl Default for Ft8Config {
             // hb-226: 0.11 fraction matches ft8mon's `subtract_ramp`
             // constant (~17.6 ms at 12 kHz / 1920 sps).
             gaussian_ramp_subtract_fraction: 0.11,
+            // hb-237: cross-sequence A7 default OFF. Only the cache +
+            // coordinator-side wiring is shipped in the first session;
+            // the per-seed enumeration / fine-sync / soft-symbol pipeline
+            // is a follow-on. Flipping this on without the follow-on is
+            // a no-op for recall (the cache populates but no consumer
+            // reads from it yet).
+            cross_sequence_a7_enabled: false,
         }
     }
 }
