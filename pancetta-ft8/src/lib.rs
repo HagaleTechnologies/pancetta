@@ -124,6 +124,13 @@ pub mod transmit;
 // hb-216: runtime hardware-tier classifier.
 pub mod tier_probe;
 
+// hb-244: JS8Call-Improved soft combiner across repeated receptions.
+// Default OFF until hard-200 / repeat-heavy corpus measurement validates.
+pub mod soft_combiner;
+pub use soft_combiner::{
+    CombineResult, CombinerKey, Mode as SoftCombinerMode, SoftCombiner, SoftCombinerConfig,
+};
+
 // Protocol exports
 pub use protocol::{ModulationType, Protocol, ProtocolParams};
 
