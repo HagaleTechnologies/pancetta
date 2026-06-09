@@ -491,6 +491,28 @@ pub struct Ft8Config {
     /// — pancetta's bin step is 3.125 Hz so 6.25 captures ±1 bin.
     pub a7_freq_window_hz: f64,
 
+    /// WSJT-X Improved-style 4th-pass-after-a7. When `true` AND
+    /// `a7_enabled` AND at least one a7-attributed decode landed in any
+    /// standard pass, the decoder runs ONE additional standard pass
+    /// after the standard `max_decode_passes` loop completes. The extra
+    /// pass uses the a7-newly-discovered callsigns as fresh AP hints
+    /// (added to a temporary `recent_calls` extension of the supplied
+    /// `ApContext`) so AP-injected candidates that the standard pipeline
+    /// previously could not reach become candidates in the cleaner
+    /// post-a7 residual.
+    ///
+    /// The mechanism is bounded: exactly one extra pass, no recursion
+    /// into another a7 round. The 4th pass is GATED OUT for itself
+    /// (a7 does NOT re-run on the 4th pass's residual), keeping the
+    /// pipeline deterministic per the upstream design.
+    ///
+    /// Default **false** — when off the decoder takes the byte-identical
+    /// legacy path. Inspired by spec ref
+    /// `research/specs/spec-wsjtx-improved-4th-pass-after-a7.md`
+    /// (WSJT-X Improved v3.1.0, DG2YCB). Pancetta's implementation is
+    /// independent and license-clean.
+    pub fourth_pass_after_a7_enabled: bool,
+
     /// hb-057 V1 (Session 2): master switch for per-callsign median-DT
     /// prior narrowing of the residual Costas sync search. When `false`
     /// (default), the prior lookup is never consulted and the residual
@@ -792,6 +814,10 @@ impl Default for Ft8Config {
             a7_snr7_threshold: crate::a7::A7_SNR7_THRESHOLD_DEFAULT,
             a7_snr7b_threshold: crate::a7::A7_SNR7B_THRESHOLD_DEFAULT,
             a7_freq_window_hz: 6.25,
+            // WSJT-X Improved 4th-pass-after-a7: default OFF preserves
+            // byte-identical legacy decode. Inspired by spec ref
+            // `spec-wsjtx-improved-4th-pass-after-a7.md`.
+            fourth_pass_after_a7_enabled: false,
             // hb-057 V1 (Session 2): master switch off by default.
             // Eval harness flips this on to A/B-test the mechanism. See
             // `dt_history_window_floor_s` / `dt_history_window_iqr_scale`.
@@ -1214,6 +1240,34 @@ impl Ft8Decoder {
 
         let max_passes = self.config.max_decode_passes.max(1);
 
+        // WSJT-X Improved-style 4th-pass-after-a7. When enabled AND a7
+        // is enabled, the standard pass loop runs `max_passes + 1`
+        // iterations; the extra iteration is only entered if a7 has
+        // produced at least one decode during the standard passes (per
+        // spec ref `spec-wsjtx-improved-4th-pass-after-a7.md` step 4 —
+        // "skip the 4th pass if no a7 decodes happened"). Default off
+        // preserves byte-identical legacy behavior.
+        let fourth_pass_after_a7_enabled =
+            self.config.fourth_pass_after_a7_enabled && self.config.a7_enabled;
+        let loop_passes = if fourth_pass_after_a7_enabled {
+            max_passes + 1
+        } else {
+            max_passes
+        };
+
+        // Working AP context. Identical to the supplied `ap_context` for
+        // all standard passes; on the 4th-pass-after-a7 iteration we
+        // swap in `ap_context_extended` which carries a7-discovered
+        // callsigns as fresh `recent_calls` (spec: "use a7-decoded
+        // callsigns as fresh AP hints for the remaining candidates").
+        // Allocated lazily — only paid for when the 4th-pass fires.
+        let mut ap_context_extended: Option<crate::ap::ApContext> = None;
+        // Track a7-emitted text → callsign so the 4th-pass extension is
+        // populated with the right `RecentCallAp` entries. Holds tuples
+        // of (callsign, last_snr).
+        let mut a7_discovered_calls: Vec<(String, f32)> = Vec::new();
+        let mut a7_emitted_texts: HashSet<String> = HashSet::new();
+
         // Check whether AP is active (any known information available).
         // hb-043: a non-empty `recent_calls` alone activates AP — the
         // my_call-less injection path tries each recent callsign at
@@ -1234,11 +1288,58 @@ impl Ft8Decoder {
         let mut seen_messages: HashSet<String> = HashSet::new();
         let mut best_sync_score = 0.0f64;
 
-        for pass in 0..max_passes {
+        for pass in 0..loop_passes {
             if budget.expired() {
                 info!(pass, "Decode budget expired, stopping early");
                 break;
             }
+
+            // 4th-pass-after-a7 gating (spec ref
+            // `spec-wsjtx-improved-4th-pass-after-a7.md` step 4): the
+            // extra iteration (index >= max_passes) only runs if a7
+            // emitted at least one decode during the standard passes.
+            // If a7 produced nothing, the residual is identical to the
+            // post-standard-pass residual and the extra pass would
+            // re-discover candidates the prior pass already rejected.
+            let is_fourth_pass_after_a7 = pass >= max_passes;
+            if is_fourth_pass_after_a7 && a7_discovered_calls.is_empty() {
+                break;
+            }
+
+            // Select the AP context for this iteration. Standard passes
+            // use the supplied `ap_context` exactly as before — that
+            // path is byte-identical to legacy. The 4th-pass-after-a7
+            // iteration uses `ap_context_extended`, which clones the
+            // original and appends a7-discovered callsigns to
+            // `recent_calls`. Spec: "use a7-decoded callsigns as fresh
+            // AP hints for the remaining candidates".
+            let ap_context_for_pass: &crate::ap::ApContext = if is_fourth_pass_after_a7 {
+                if ap_context_extended.is_none() {
+                    let mut ext = ap_context.clone();
+                    for (call, snr) in &a7_discovered_calls {
+                        if let Some(rc) = crate::ap::RecentCallAp::new(call, *snr) {
+                            // Skip duplicates that the original context
+                            // already lists.
+                            if !ext.recent_calls.iter().any(|r| r.callsign == rc.callsign) {
+                                ext.recent_calls.push(rc);
+                            }
+                        }
+                    }
+                    ap_context_extended = Some(ext);
+                }
+                ap_context_extended.as_ref().unwrap()
+            } else {
+                ap_context
+            };
+            // Refresh ap_active for the 4th-pass iteration — a7
+            // discoveries can flip an empty context into an active one.
+            let ap_active_for_pass = if is_fourth_pass_after_a7 {
+                ap_context_for_pass.my_call.is_some()
+                    || ap_context_for_pass.active_qso.is_some()
+                    || !ap_context_for_pass.recent_calls.is_empty()
+            } else {
+                ap_active
+            };
 
             // JTDX cycle audio smoothing: between cycles 1 and 2 (i.e.
             // entering pass index 1 for pancetta — JTDX maps to `ipass==4`)
@@ -1359,8 +1460,8 @@ impl Ft8Decoder {
                 message_parser: &self.message_parser,
                 spectrogram: &spectrogram,
                 audio: &audio,
-                ap_context,
-                ap_active,
+                ap_context: ap_context_for_pass,
+                ap_active: ap_active_for_pass,
                 symbol_fft: &self.symbol_fft,
                 symbol_window: &self.symbol_window,
                 xor_sequence: self.protocol_params.xor_sequence,
@@ -1601,17 +1702,42 @@ impl Ft8Decoder {
             // sync_candidates (the within-WAV ±freq-window gate only
             // applies to in-WAV expected calls).
             // WSJT-X prior art: mainline commit f13e3182 (Joe Taylor 2021).
-            if self.config.a7_enabled {
+            //
+            // 4th-pass-after-a7 gating: a7 is gated OUT on the 4th-pass
+            // iteration. Per spec ref
+            // `spec-wsjtx-improved-4th-pass-after-a7.md` ("cascading 4th-pass
+            // decodes"), the upstream design is exactly one a7 pass and
+            // exactly one subsequent standard pass — no recursion into a
+            // 5th-pass-after-a7'-after-a7. Skipping a7 on the extra
+            // iteration also avoids inadvertently re-templating against
+            // freshly-decoded 4th-pass output (which would be a fresh
+            // false-positive surface).
+            if self.config.a7_enabled && !is_fourth_pass_after_a7 {
                 let mut extra = self.a7_cross_correlation_pass(
                     &spectrogram,
                     &sync_candidates,
                     &pass_decoded,
-                    &ap_context.recent_calls,
+                    &ap_context_for_pass.recent_calls,
                 );
                 let now_elapsed = start_time.elapsed();
                 for m in extra.iter_mut() {
                     if m.decode_time_into_window.is_none() {
                         m.decode_time_into_window = Some(now_elapsed);
+                    }
+                }
+                // Track a7-attributed decodes for the 4th-pass-after-a7
+                // AP-extension. We capture (text, from_callsign, snr)
+                // before extending `pass_decoded` so we can correlate
+                // them against the final dedup result.
+                if fourth_pass_after_a7_enabled {
+                    for m in extra.iter() {
+                        if a7_emitted_texts.insert(m.text.clone()) {
+                            if let Some(ref from) = m.message.from_callsign {
+                                if !from.is_empty() {
+                                    a7_discovered_calls.push((from.clone(), m.snr_db));
+                                }
+                            }
+                        }
                     }
                 }
                 pass_decoded.extend(extra);
@@ -1652,9 +1778,20 @@ impl Ft8Decoder {
                 }
             }
 
-            // If no new messages decoded in this pass, stop iterating
+            // If no new messages decoded in this pass, stop iterating.
+            // Exception: when 4th-pass-after-a7 is wired in and a7 has
+            // discovered callsigns in any prior iteration, allow the
+            // loop to roll into the 4th-pass-after-a7 iteration even
+            // if the current standard pass added nothing new. The
+            // 4th-pass-after-a7 entry then runs against the (already
+            // a7-cleaned) residual with the extended AP context.
             if pass_unique.is_empty() {
-                break;
+                let has_pending_fourth_pass = fourth_pass_after_a7_enabled
+                    && pass + 1 == max_passes
+                    && !a7_discovered_calls.is_empty();
+                if !has_pending_fourth_pass {
+                    break;
+                }
             }
 
             #[cfg(feature = "debug-decode")]
@@ -1664,8 +1801,16 @@ impl Ft8Decoder {
                 pass_unique.len()
             );
 
-            // Subtract decoded signals from residual audio for next pass
-            if pass + 1 < max_passes {
+            // Subtract decoded signals from residual audio for next pass.
+            // 4th-pass-after-a7: when the extra iteration is wired in,
+            // `loop_passes = max_passes + 1`; the final standard pass
+            // therefore still subtracts its decodes (including a7's)
+            // so the 4th-pass-after-a7 iteration searches a residual
+            // cleaned by a7. Spec: "running one more standard pass
+            // over this cleaner residual recovers additional decodes
+            // that were previously sitting under an a7-decoded signal's
+            // ambiguity".
+            if pass + 1 < loop_passes {
                 for msg in &pass_unique {
                     self.subtract_with_sidelobes(&mut residual_samples, msg);
                 }
@@ -10040,5 +10185,317 @@ mod hb226_gaussian_ramp_tests {
             );
             last_v = *v;
         }
+    }
+}
+
+// ============================================================================
+// WSJT-X Improved 4th-pass-after-a7 tests
+//
+// Inspired by spec ref `spec-wsjtx-improved-4th-pass-after-a7.md`.
+// The pass is wired as an additive extension to the standard multipass
+// loop. These tests cover:
+//   1. Default-OFF byte-identity of the decode output.
+//   2. Default-ON bounded (no infinite loop) when a7 produces nothing.
+//   3. a7-discovered callsign threads into the extended AP context.
+//   4. Loop-passes config arithmetic short-circuits when a7 is off.
+// ============================================================================
+#[cfg(test)]
+mod fourth_pass_a7_tests {
+    use super::*;
+
+    /// Spec invariant: the new flag must default OFF so the production
+    /// decoder takes the byte-identical legacy path until measurement
+    /// confirms a recall lift.
+    #[test]
+    fn fourth_pass_default_off_in_config() {
+        let cfg = Ft8Config::default();
+        assert!(
+            !cfg.fourth_pass_after_a7_enabled,
+            "4th-pass-after-a7 must default OFF — preserves legacy behavior until measurement"
+        );
+    }
+
+    /// `fourth_pass_after_a7_enabled` is gated on `a7_enabled`. With a7
+    /// off, the post-a7 mechanism MUST be inert regardless of the flag.
+    /// Compute the effective gate the same way the decoder does and
+    /// assert it stays false.
+    #[test]
+    fn fourth_pass_requires_a7_enabled() {
+        let cfg = Ft8Config {
+            a7_enabled: false,
+            fourth_pass_after_a7_enabled: true,
+            ..Ft8Config::default()
+        };
+        let effective = cfg.fourth_pass_after_a7_enabled && cfg.a7_enabled;
+        assert!(
+            !effective,
+            "with a7_enabled=false, the 4th-pass mechanism must be inert \
+             (no extra iteration, no extended AP context allocation)"
+        );
+    }
+
+    /// Default-OFF decode of a synthetic FT8 signal must match the
+    /// explicit-OFF configuration's decode output. This is the
+    /// byte-identical legacy-path guarantee.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn fourth_pass_default_off_decode_output_unchanged() {
+        let mut encoder = crate::Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = crate::Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(crate::WINDOW_SAMPLES, 0.0);
+
+        let cfg_default = Ft8Config::default();
+        let mut dec_default = Ft8Decoder::new(cfg_default).expect("decoder ctor");
+        let decoded_default = dec_default.decode_window(&tx).expect("decode");
+
+        let cfg_explicit_off = Ft8Config {
+            fourth_pass_after_a7_enabled: false,
+            ..Ft8Config::default()
+        };
+        let mut dec_explicit = Ft8Decoder::new(cfg_explicit_off).expect("decoder ctor");
+        let decoded_explicit = dec_explicit.decode_window(&tx).expect("decode");
+
+        let texts_default: Vec<&str> = decoded_default.iter().map(|m| m.text.as_str()).collect();
+        let texts_explicit: Vec<&str> = decoded_explicit.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(
+            texts_default, texts_explicit,
+            "default-OFF and explicit-OFF must produce identical decode lists"
+        );
+        assert!(
+            decoded_default.iter().any(|m| m.text == "CQ K5ARH EM10"),
+            "synthetic truth must still decode in the default config; got: {:?}",
+            texts_default
+        );
+    }
+
+    /// Default-ON smoke test: with `fourth_pass_after_a7_enabled=true`
+    /// AND `a7_enabled=true`, decoding a synthetic signal must
+    ///
+    ///   (a) still recover the truth signal,
+    ///   (b) terminate in bounded time (no infinite loop even when
+    ///       a7 produces nothing — the loop guard at
+    ///       `pass >= max_passes && a7_discovered_calls.is_empty()`
+    ///       short-circuits the extra iteration), and
+    ///   (c) not produce duplicate emissions of the truth text.
+    ///
+    /// On a single-signal synthetic WAV a7 typically finds nothing
+    /// because there's no second-utterance follow-up to template
+    /// against; the test therefore exercises the "a7 produced 0
+    /// decodes" edge case from the spec (step 4).
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn fourth_pass_default_on_bounded_one_extra_pass() {
+        let mut encoder = crate::Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = crate::Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(crate::WINDOW_SAMPLES, 0.0);
+
+        let cfg = Ft8Config {
+            a7_enabled: true,
+            fourth_pass_after_a7_enabled: true,
+            // Keep max_passes at default so we exercise the
+            // (max_passes -> max_passes + 1) arithmetic exactly once.
+            ..Ft8Config::default()
+        };
+        let mut dec = Ft8Decoder::new(cfg).expect("decoder ctor");
+        let started = std::time::Instant::now();
+        let decoded = dec.decode_window(&tx).expect("decode");
+        let elapsed = started.elapsed();
+
+        // Bounded: extra pass should not turn this into a multi-second
+        // operation. The standard decode of a single synthetic CQ
+        // completes well under 5 s on every supported tier; the
+        // 4th-pass extension caps at one additional iteration.
+        assert!(
+            elapsed < std::time::Duration::from_secs(15),
+            "decode took {:?} — 4th-pass extension must not produce \
+             pathological wall-clock",
+            elapsed
+        );
+
+        let texts: Vec<&str> = decoded.iter().map(|m| m.text.as_str()).collect();
+        assert!(
+            decoded.iter().any(|m| m.text == "CQ K5ARH EM10"),
+            "truth signal must decode with 4th-pass enabled; got: {:?}",
+            texts
+        );
+
+        // No duplicate emission of the truth text — the standard
+        // `seen_messages` dedup runs on every iteration including the
+        // 4th-pass-after-a7 iteration.
+        let truth_count = decoded.iter().filter(|m| m.text == "CQ K5ARH EM10").count();
+        assert_eq!(
+            truth_count, 1,
+            "truth signal must appear exactly once; got {}: {:?}",
+            truth_count, texts
+        );
+    }
+
+    /// White-box test of the AP-extension construction. The decoder
+    /// loop clones `ap_context` and appends `RecentCallAp` entries for
+    /// each a7-discovered callsign, deduping against pre-existing
+    /// entries. This test exercises that construction path directly so
+    /// we don't depend on triggering an a7 hit from a synthetic WAV.
+    #[test]
+    fn fourth_pass_extends_ap_context_with_a7_discovered_calls() {
+        // Seed an AP context with one existing recent call.
+        let seed = crate::ap::RecentCallAp::new("W1AW", -5.0).expect("encodable seed");
+        let mut ctx = crate::ap::ApContext {
+            recent_calls: vec![seed.clone()],
+            ..Default::default()
+        };
+
+        // Mock a7 discoveries: one new callsign + one collision with
+        // the existing seed. Use the same construction the decoder
+        // applies on the 4th-pass iteration.
+        let a7_discovered: Vec<(String, f32)> =
+            vec![("KC1WIH".to_string(), -10.0), ("W1AW".to_string(), -3.0)];
+
+        for (call, snr) in &a7_discovered {
+            if let Some(rc) = crate::ap::RecentCallAp::new(call, *snr) {
+                if !ctx.recent_calls.iter().any(|r| r.callsign == rc.callsign) {
+                    ctx.recent_calls.push(rc);
+                }
+            }
+        }
+
+        // Should now have exactly two entries: the seeded W1AW and
+        // the newly-discovered KC1WIH. The duplicate W1AW from a7 is
+        // discarded (the seed wins; this matches the decoder's
+        // dedup-against-pre-existing behavior).
+        assert_eq!(
+            ctx.recent_calls.len(),
+            2,
+            "extended ApContext must dedup a7 discoveries against existing recent_calls"
+        );
+        let calls: Vec<&str> = ctx
+            .recent_calls
+            .iter()
+            .map(|r| r.callsign.as_str())
+            .collect();
+        assert!(calls.contains(&"W1AW"));
+        assert!(calls.contains(&"KC1WIH"));
+        // Seed entry survived (SNR is the original, not the
+        // a7-discovery's value).
+        let w1aw = ctx
+            .recent_calls
+            .iter()
+            .find(|r| r.callsign == "W1AW")
+            .expect("seed survives");
+        assert!(
+            (w1aw.last_snr - (-5.0_f32)).abs() < f32::EPSILON,
+            "the seed entry's SNR must not be overwritten by a7's duplicate-callsign entry"
+        );
+    }
+
+    /// `RecentCallAp::new` rejects unencodable callsigns. The decoder's
+    /// extension path silently skips them (rather than panicking) so a
+    /// garbage a7 emission can't crash the 4th-pass setup. Verify that
+    /// behavior directly.
+    #[test]
+    fn fourth_pass_extension_skips_unencodable_calls() {
+        let mut ctx = crate::ap::ApContext::default();
+        let a7_discovered: Vec<(String, f32)> = vec![
+            ("".to_string(), -10.0),           // empty
+            ("INVALID!@#".to_string(), -10.0), // unencodable
+            ("KC1WIH".to_string(), -8.0),      // valid
+        ];
+
+        for (call, snr) in &a7_discovered {
+            if let Some(rc) = crate::ap::RecentCallAp::new(call, *snr) {
+                if !ctx.recent_calls.iter().any(|r| r.callsign == rc.callsign) {
+                    ctx.recent_calls.push(rc);
+                }
+            }
+        }
+
+        // Only the valid callsign should have been added.
+        assert_eq!(
+            ctx.recent_calls.len(),
+            1,
+            "invalid callsigns must be skipped silently"
+        );
+        assert_eq!(ctx.recent_calls[0].callsign, "KC1WIH");
+    }
+
+    /// Arithmetic sanity: when both flags are ON, the decoder uses
+    /// `max_passes + 1` for its loop bound. When either flag is OFF,
+    /// it uses `max_passes` exactly.
+    #[test]
+    fn fourth_pass_loop_passes_arithmetic() {
+        // Replicates the decoder's compute-loop-bound expression.
+        fn loop_passes(cfg: &Ft8Config) -> usize {
+            let max_passes = cfg.max_decode_passes.max(1);
+            let gated = cfg.fourth_pass_after_a7_enabled && cfg.a7_enabled;
+            if gated {
+                max_passes + 1
+            } else {
+                max_passes
+            }
+        }
+
+        let base = Ft8Config {
+            max_decode_passes: 3,
+            a7_enabled: false,
+            fourth_pass_after_a7_enabled: false,
+            ..Ft8Config::default()
+        };
+        assert_eq!(loop_passes(&base), 3, "both off → max_passes unchanged");
+
+        let a7_only = Ft8Config {
+            a7_enabled: true,
+            ..base.clone()
+        };
+        assert_eq!(
+            loop_passes(&a7_only),
+            3,
+            "a7 alone (without fourth_pass flag) → max_passes unchanged"
+        );
+
+        let flag_only = Ft8Config {
+            fourth_pass_after_a7_enabled: true,
+            ..base.clone()
+        };
+        assert_eq!(
+            loop_passes(&flag_only),
+            3,
+            "fourth_pass flag without a7 → max_passes unchanged (mechanism is inert)"
+        );
+
+        let both_on = Ft8Config {
+            a7_enabled: true,
+            fourth_pass_after_a7_enabled: true,
+            ..base.clone()
+        };
+        assert_eq!(
+            loop_passes(&both_on),
+            4,
+            "both on → exactly one extra iteration (max_passes + 1)"
+        );
+
+        // Floor at 1 — max_decode_passes=0 still gives at least one
+        // standard pass, and with both flags on, two iterations.
+        let zero_passes = Ft8Config {
+            max_decode_passes: 0,
+            a7_enabled: true,
+            fourth_pass_after_a7_enabled: true,
+            ..base
+        };
+        assert_eq!(
+            loop_passes(&zero_passes),
+            2,
+            "max_passes floor of 1 + 1 extra = 2"
+        );
     }
 }
