@@ -133,6 +133,15 @@ pub struct Ft8Config {
     /// additional validation. OSD-1 (92 trials) is the safe default.
     pub osd_depth: Option<u8>,
 
+    /// WSJT-X mainline-style npre2 OSD preprocessing — hash-table-driven
+    /// complementary-bit-pair warm start ahead of the OSD-3 trial loop.
+    /// Active only when `osd_depth >= 3`; preserves byte-identical OSD
+    /// behavior at shallower depths. Inspired by `osd174_91.f90`'s
+    /// `boxit91`/`fetchit91` rule (spec:
+    /// `research/specs/spec-wsjtx-mainline-osd174.md`). Default `false`
+    /// — pending hard-200 measurement validation.
+    pub osd_npre2_preprocessing_enabled: bool,
+
     /// Maximum candidates retained from Costas sync search before NMS.
     /// Default matches the historical hard-coded MAX_SYNC_CANDIDATES (100).
     /// Raising this lets weaker sync candidates survive into NMS + LDPC
@@ -777,6 +786,11 @@ impl Default for Ft8Config {
             time_range: 2.0,
             max_decode_passes: 1,
             osd_depth: Some(2),
+            // WSJT-X mainline-style npre2 OSD preprocessing: DEFAULT OFF
+            // pending hard-200 measurement validation. Active only at
+            // `osd_depth >= 3`. Spec:
+            // `research/specs/spec-wsjtx-mainline-osd174.md`.
+            osd_npre2_preprocessing_enabled: false,
             max_sync_candidates: MAX_SYNC_CANDIDATES,
             llr_target_variance: LLR_TARGET_VARIANCE,
             nms_enabled: false,
@@ -1134,7 +1148,10 @@ impl Ft8Decoder {
         let message_parser = MessageParser::new();
         let ldpc_decoder = LdpcDecoder::new_with_osd(
             config.ldpc_iterations,
-            config.osd_depth.map(|d| OsdConfig { max_depth: d }),
+            config.osd_depth.map(|d| OsdConfig {
+                max_depth: d,
+                npre2_preprocessing_enabled: config.osd_npre2_preprocessing_enabled,
+            }),
         )?
         .with_max_parity_errors_for_osd(config.max_parity_errors_for_osd)
         .with_bp_offset_subtract(config.bp_offset_subtract)
@@ -1561,6 +1578,7 @@ impl Ft8Decoder {
                 xor_sequence: self.protocol_params.xor_sequence,
                 ldpc_iterations: self.config.ldpc_iterations,
                 osd_depth: self.config.osd_depth,
+                osd_npre2_preprocessing_enabled: self.config.osd_npre2_preprocessing_enabled,
                 llr_target_variance: self.config.llr_target_variance,
                 adaptive_ldpc_iters: self.config.adaptive_ldpc_iters,
                 max_parity_errors_for_osd: self.config.max_parity_errors_for_osd,
@@ -1620,7 +1638,10 @@ impl Ft8Decoder {
                 .map_init(
                     // Per-thread initialization: create LDPC decoders and FFT buffer
                     || {
-                        let osd_cfg = ctx.osd_depth.map(|d| OsdConfig { max_depth: d });
+                        let osd_cfg = ctx.osd_depth.map(|d| OsdConfig {
+                            max_depth: d,
+                            npre2_preprocessing_enabled: ctx.osd_npre2_preprocessing_enabled,
+                        });
                         let (iters_low, iters_mid, iters_high) = if ctx.adaptive_ldpc_iters {
                             (ADAPTIVE_ITERS_LOW, ctx.ldpc_iterations, ADAPTIVE_ITERS_HIGH)
                         } else {
@@ -5369,6 +5390,10 @@ struct DecodeContext<'a> {
     /// OSD config for creating per-thread LDPC decoders
     ldpc_iterations: usize,
     osd_depth: Option<u8>,
+    /// WSJT-X mainline-style npre2 OSD preprocessing flag (forwarded to
+    /// `OsdConfig::npre2_preprocessing_enabled`). Active only when
+    /// `osd_depth >= 3`.
+    osd_npre2_preprocessing_enabled: bool,
     /// LLR normalization target variance (matches Ft8Config field).
     llr_target_variance: f32,
     /// When true, per-thread LDPC decoders are created in 3 buckets
@@ -9043,7 +9068,14 @@ mod tests {
         use crate::osd::OsdConfig;
 
         // Create decoder with OSD enabled (1 BP iteration = won't converge)
-        let decoder = LdpcDecoder::new_with_osd(1, Some(OsdConfig { max_depth: 2 })).unwrap();
+        let decoder = LdpcDecoder::new_with_osd(
+            1,
+            Some(OsdConfig {
+                max_depth: 2,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
 
         // Create LLRs for a known valid codeword with 2 unreliable bits
         // We need the encoder for this, so gate behind transmit feature
