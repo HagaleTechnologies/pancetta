@@ -817,6 +817,32 @@ pub struct Ft8Config {
     /// `try_decode` with `do_third = 2`). Peer GPL-3.0 source was not
     /// consulted.
     pub three_stage_sync_cascade_enabled: bool,
+    /// WSJT-X Improved-style a8 sequenced-QSO-state AP. When `true`
+    /// AND the supplied `ApContext.active_qso` carries a non-empty
+    /// `expected_next_message_texts` list AND `ApContext.my_call` is
+    /// set, AP3/AP4 decodes whose parsed text matches one of the
+    /// enumerated templates are accepted at the standard (non-AP)
+    /// confidence floor (`MIN_DECODE_CONFIDENCE = 0.41`) with the
+    /// suspicion-score check skipped. The intent is to surface the
+    /// QSO partner's expected next message earlier / at weaker SNR
+    /// than the legacy AP3/AP4 path (which gates at
+    /// `MIN_AP_DECODE_CONFIDENCE = 0.55` and applies the suspicion
+    /// check).
+    ///
+    /// The relaxation is gated by template-match: when the decoded
+    /// text is NOT in the enumerated list, the standard AP floor
+    /// still applies. Combined with the existing
+    /// `ap_injection_survived` check (which already verifies the
+    /// decoded `from_callsign` equals the active QSO partner), the
+    /// gate is safe even when an arbitrary CRC-coincidence noise
+    /// decode happens to clear LDPC at low confidence.
+    ///
+    /// Default **false** — when off the decoder path is
+    /// byte-identical to the legacy AP3/AP4 confidence-gate. Inspired
+    /// by spec ref `research/specs/spec-wsjtx-improved-a8-decoding.md`
+    /// (WSJT-X Improved v3.0.0, DG2YCB). Pancetta's implementation
+    /// is independent of upstream GPL source.
+    pub a8_qso_state_ap_enabled: bool,
 }
 
 impl Default for Ft8Config {
@@ -1040,6 +1066,13 @@ impl Default for Ft8Config {
             // is byte-identical to the legacy path. Inspired by spec
             // ref `spec-ft8mon-three-stage-sync-cascade.md`.
             three_stage_sync_cascade_enabled: false,
+            // WSJT-X Improved-style a8 sequenced-QSO-state AP. Default
+            // OFF — preserves byte-identical legacy AP3/AP4 confidence
+            // gating. Flip on to relax the AP floor for decodes that
+            // match coordinator-supplied expected-next-message
+            // templates. Inspired by spec ref
+            // `spec-wsjtx-improved-a8-decoding.md`.
+            a8_qso_state_ap_enabled: false,
         }
     }
 }
@@ -1693,6 +1726,11 @@ impl Ft8Decoder {
                 per_candidate_freq_tracker_max_error_hz: self
                     .config
                     .per_candidate_freq_tracker_max_error_hz,
+                // WSJT-X Improved-style a8 sequenced-QSO-state AP flag.
+                // Default-OFF makes the parallel AP path byte-identical
+                // to the legacy AP3/AP4 confidence gate. Inspired by
+                // spec ref `spec-wsjtx-improved-a8-decoding.md`.
+                a8_qso_state_ap_enabled: self.config.a8_qso_state_ap_enabled,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -3758,7 +3796,20 @@ impl Ft8Decoder {
         const MIN_DECODE_CONFIDENCE: f32 = 0.41;
         const MIN_AP_DECODE_CONFIDENCE: f32 = 0.55;
         const SCRUTINY_THRESHOLD: f32 = 0.65;
-        let floor = if matches!(ap_level, crate::ap::ApLevel::Ap0) {
+
+        // WSJT-X Improved-style a8: when enabled AND this is an AP3/AP4
+        // attempt AND the decoded text matches one of the coordinator-
+        // supplied expected next-message templates, treat the decode
+        // as high-confidence (use the standard-decode floor + skip
+        // suspicion). The match is gated on the existing
+        // `ap_injection_survived` (verified above) so the partner
+        // callsign in `from_callsign` was already confirmed.
+        // Inspired by spec ref `spec-wsjtx-improved-a8-decoding.md`.
+        let a8_match = self.config.a8_qso_state_ap_enabled
+            && matches!(ap_level, crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4)
+            && a8_text_matches(ap_context, &ft8_message.to_string());
+
+        let floor = if matches!(ap_level, crate::ap::ApLevel::Ap0) || a8_match {
             MIN_DECODE_CONFIDENCE
         } else {
             MIN_AP_DECODE_CONFIDENCE
@@ -3766,7 +3817,7 @@ impl Ft8Decoder {
         if confidence < floor {
             return Ok(None);
         }
-        if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
+        if !a8_match && confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
             return Ok(None);
         }
 
@@ -5731,6 +5782,10 @@ struct DecodeContext<'a> {
     per_candidate_freq_tracker_max_step_hz: f64,
     /// Tracker absolute-offset bound, Hz (`FreqTrackerConfig::max_error_hz`).
     per_candidate_freq_tracker_max_error_hz: f64,
+    /// WSJT-X Improved-style a8 sequenced-QSO-state AP master switch.
+    /// When false the parallel AP path is byte-identical to the
+    /// legacy AP3/AP4 confidence gate.
+    a8_qso_state_ap_enabled: bool,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -6265,7 +6320,20 @@ fn par_try_ldpc_with_ap(
     const MIN_AP_CONFIDENCE: f32 = 0.55;
     const MIN_DECODE_CONFIDENCE: f32 = 0.41;
     const SCRUTINY_THRESHOLD: f32 = 0.65;
-    let min_conf = if ap_level_num > 0 {
+
+    // WSJT-X Improved-style a8: when enabled AND this is an AP3/AP4
+    // decode whose parsed text matches one of the coordinator-supplied
+    // expected next-message templates, relax the floor from
+    // `MIN_AP_CONFIDENCE` to `MIN_DECODE_CONFIDENCE` and skip the
+    // suspicion check. `ap_injection_survived` (verified above)
+    // already confirmed the partner callsign in `from_callsign`,
+    // so a template match adds a content-level confirmation.
+    // Inspired by spec ref `spec-wsjtx-improved-a8-decoding.md`.
+    let a8_match = ctx.a8_qso_state_ap_enabled
+        && matches!(ap_level, crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4)
+        && a8_text_matches(ap_context, &ft8_message.to_string());
+
+    let min_conf = if ap_level_num > 0 && !a8_match {
         MIN_AP_CONFIDENCE
     } else {
         MIN_DECODE_CONFIDENCE
@@ -6273,7 +6341,7 @@ fn par_try_ldpc_with_ap(
     if confidence < min_conf {
         return None;
     }
-    if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
+    if !a8_match && confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
         return None;
     }
 
@@ -6437,6 +6505,28 @@ pub(crate) fn ap_injection_survived(
             true
         }
     }
+}
+
+/// WSJT-X Improved-style a8 helper: returns `true` when the decoded
+/// `text` matches one of the active-QSO `expected_next_message_texts`
+/// templates (case-insensitive, whitespace-collapsed). Returns `false`
+/// when the active QSO is absent, the template list is empty, or no
+/// template matches.
+///
+/// Inspired by spec ref `spec-wsjtx-improved-a8-decoding.md`. The
+/// match is a confidence-gate relaxation, NOT an LDPC seed — the
+/// LDPC pass already converged before this check fires.
+pub(crate) fn a8_text_matches(ap_context: &crate::ap::ApContext, decoded_text: &str) -> bool {
+    let Some(ref qso) = ap_context.active_qso else {
+        return false;
+    };
+    if qso.expected_next_message_texts.is_empty() {
+        return false;
+    }
+    let candidate = crate::ap::normalize_for_a8_match(decoded_text);
+    qso.expected_next_message_texts
+        .iter()
+        .any(|t| crate::ap::normalize_for_a8_match(t) == candidate)
 }
 
 // ---- Parallel-safe helpers (free functions operating on shared state) ----
@@ -12456,3 +12546,195 @@ mod cross_sequence_a7_consumer_tests {
         assert!(out.is_empty());
     }
 }
+
+// =============================================================================
+// WSJT-X Improved-style a8 sequenced-QSO-state AP tests
+// =============================================================================
+//
+// Validates the a8 confidence-gate relaxation path. The test surface is the
+// pure-helper `a8_text_matches` plus the `Ft8Config` default contract — the
+// in-decoder integration is exercised indirectly by the existing AP test
+// suite (which would fail if the default-OFF behaviour ever regressed).
+// Inspired by spec ref `spec-wsjtx-improved-a8-decoding.md`.
+
+#[cfg(test)]
+mod a8_qso_state_tests {
+    use super::*;
+    use crate::ap::{enumerate_a8_expected_texts, ApContext, MyCallAp, QsoAp, QsoApProgress};
+
+    fn ctx_for(dx: &str, my: &str, progress: QsoApProgress, with_a8: bool) -> ApContext {
+        let mut qso = QsoAp::new(dx, progress).expect("QsoAp::new");
+        if with_a8 {
+            let texts = enumerate_a8_expected_texts(my, dx, progress);
+            qso = qso.with_expected_texts(texts);
+        }
+        ApContext {
+            my_call: MyCallAp::new(my),
+            recent_calls: vec![],
+            active_qso: Some(qso),
+        }
+    }
+
+    #[test]
+    fn default_config_keeps_a8_off() {
+        // The default-OFF promise lives in the Ft8Config::default impl.
+        // Regression guard against accidental flips. Inspired by spec ref
+        // `spec-wsjtx-improved-a8-decoding.md` — a8 must opt in.
+        let cfg = Ft8Config::default();
+        assert!(
+            !cfg.a8_qso_state_ap_enabled,
+            "Ft8Config::default().a8_qso_state_ap_enabled must be false; \
+             toggling default-ON requires a hard-200 measurement"
+        );
+    }
+
+    #[test]
+    fn a8_no_active_qso_is_no_op() {
+        // Without an active QSO the helper must return false, even when
+        // the master flag is on at the call site. The decoder code path
+        // explicitly gates on `active_qso` via `ap_injection_survived`,
+        // but a8_text_matches has its own short-circuit for safety.
+        let ctx = ApContext {
+            my_call: MyCallAp::new("K1ABC"),
+            recent_calls: vec![],
+            active_qso: None,
+        };
+        assert!(!a8_text_matches(&ctx, "K1ABC W1AW RR73"));
+    }
+
+    #[test]
+    fn a8_empty_template_list_is_no_op() {
+        // QsoAp with no expected templates must NOT match anything,
+        // even on a structurally-plausible partner reply. This preserves
+        // the legacy AP3/AP4 confidence-gate when the coordinator
+        // hasn't yet populated the template list (e.g. first slot
+        // after a state transition).
+        let ctx = ctx_for(
+            "W1AW",
+            "K1ABC",
+            QsoApProgress::WaitingForConfirmation,
+            false,
+        );
+        assert!(
+            ctx.active_qso
+                .as_ref()
+                .unwrap()
+                .expected_next_message_texts
+                .is_empty(),
+            "without with_expected_texts the template list must be empty"
+        );
+        assert!(!a8_text_matches(&ctx, "W1AW K1ABC RR73"));
+    }
+
+    #[test]
+    fn a8_matches_expected_rr73_when_waiting_confirmation() {
+        // QSO state = "expecting RR73 from W1AW": the enumeration must
+        // include the canonical RR73 message and a8_text_matches must
+        // accept it (template-driven confidence-gate relaxation per
+        // spec ref `spec-wsjtx-improved-a8-decoding.md` step 7).
+        let ctx = ctx_for("W1AW", "K1ABC", QsoApProgress::WaitingForConfirmation, true);
+        let templates = &ctx.active_qso.as_ref().unwrap().expected_next_message_texts;
+        assert!(
+            templates.iter().any(|t| t.contains("RR73")),
+            "WaitingForConfirmation enumeration must include an RR73 template; got: {:?}",
+            templates
+        );
+        assert!(
+            a8_text_matches(&ctx, "W1AW K1ABC RR73"),
+            "RR73 reply must match the a8 template list"
+        );
+        assert!(
+            a8_text_matches(&ctx, "W1AW K1ABC 73"),
+            "73 reply must match the a8 template list"
+        );
+    }
+
+    #[test]
+    fn a8_matches_expected_report_when_waiting_report() {
+        // QSO state = "expecting report from W1AW": enumeration includes
+        // both R-NN and bare -NN variants across the canonical SNR
+        // range. A correctly-formatted partner report must match.
+        let ctx = ctx_for("W1AW", "K1ABC", QsoApProgress::WaitingForReport, true);
+        assert!(
+            a8_text_matches(&ctx, "W1AW K1ABC R-10"),
+            "R-NN reply must match a8 template list"
+        );
+        assert!(
+            a8_text_matches(&ctx, "W1AW K1ABC -06"),
+            "bare -NN reply must match a8 template list"
+        );
+    }
+
+    #[test]
+    fn a8_rejects_non_template_text() {
+        // A structurally-plausible but template-foreign decode (e.g.
+        // a CQ from the partner, or a different my_callsign on the
+        // called side) must NOT match. Keeps the relaxation tight to
+        // the enumerated set.
+        let ctx = ctx_for("W1AW", "K1ABC", QsoApProgress::WaitingForConfirmation, true);
+        assert!(
+            !a8_text_matches(&ctx, "W1AW K1ABC -10"),
+            "report-shaped text must not match the RR73/73/RRR-only enumeration"
+        );
+        assert!(
+            !a8_text_matches(&ctx, "CQ W1AW FN42"),
+            "CQ-shaped text must not match the partner-addressing enumeration"
+        );
+        assert!(
+            !a8_text_matches(&ctx, "W1AW N0CALL RR73"),
+            "wrong called-station text must not match"
+        );
+    }
+
+    #[test]
+    fn a8_match_is_whitespace_and_case_insensitive() {
+        // Decoded message text from `Ft8Message::Display` is uppercase
+        // and whitespace-collapsed in practice, but the matcher must
+        // be robust to lowercase input or interior runs of spaces so
+        // that the relaxation works across slightly different text
+        // formatters (loopback tests, mock messages, etc.).
+        let ctx = ctx_for("W1AW", "K1ABC", QsoApProgress::WaitingForConfirmation, true);
+        assert!(a8_text_matches(&ctx, "w1aw k1abc rr73"));
+        assert!(a8_text_matches(&ctx, "W1AW  K1ABC   RR73"));
+        assert!(a8_text_matches(&ctx, " W1AW K1ABC RR73 "));
+    }
+
+    #[test]
+    fn a8_enumeration_uses_uppercase_canonical_form() {
+        // The enumeration helper must always emit uppercase canonical
+        // texts, so that the matcher's case-folding is symmetric.
+        // Defensive guard against future refactors that might forget
+        // the trim/uppercase pipeline.
+        let texts =
+            enumerate_a8_expected_texts("k1abc", "w1aw", QsoApProgress::WaitingForConfirmation);
+        assert!(
+            !texts.is_empty(),
+            "WaitingForConfirmation enumeration must be non-empty"
+        );
+        for t in &texts {
+            assert_eq!(
+                *t,
+                t.to_uppercase(),
+                "enumerated text must be uppercase; got {:?}",
+                t
+            );
+            assert!(
+                t.starts_with("W1AW K1ABC"),
+                "enumerated text must address us (DX MY ...); got {:?}",
+                t
+            );
+        }
+    }
+
+    #[test]
+    fn a8_enumeration_empty_when_callsigns_invalid() {
+        // Empty/whitespace inputs must produce an empty enumeration
+        // (the coordinator passes whatever the QSO state carries; we
+        // refuse to invent templates for missing callsigns).
+        let texts = enumerate_a8_expected_texts("", "W1AW", QsoApProgress::WaitingForConfirmation);
+        assert!(texts.is_empty());
+        let texts = enumerate_a8_expected_texts("K1ABC", "  ", QsoApProgress::WaitingForReport);
+        assert!(texts.is_empty());
+    }
+}
+

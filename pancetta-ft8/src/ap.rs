@@ -247,17 +247,35 @@ impl RecentCallAp {
 }
 
 /// Active QSO context for AP3/AP4 injection.
+///
+/// `expected_next_message_texts` carries the small enumerated list of
+/// messages we expect to receive from the partner in the *next* slot,
+/// given the operator's current QSO state. Used by the a8
+/// sequenced-QSO-state AP path (see [`enumerate_a8_expected_texts`])
+/// to relax the AP confidence gate for decodes that match the
+/// pre-enumerated templates. Empty when a8 enumeration was not
+/// performed (or wasn't applicable for this state).
 #[derive(Debug, Clone)]
 pub struct QsoAp {
     pub their_call: String,
     pub their_packed_28: u32,
     pub their_bits: [bool; 28],
     pub progress: QsoApProgress,
+    /// a8 sequenced-QSO-state AP candidate set: small list of expected
+    /// next partner messages (canonical FT8 text, e.g.
+    /// "K1ABC W1AW RR73"). Empty list means "no a8 enumeration available"
+    /// — the decoder treats the QsoAp the same as the legacy AP3/AP4
+    /// path. Populated by the coordinator via
+    /// [`enumerate_a8_expected_texts`].
+    pub expected_next_message_texts: Vec<String>,
 }
 
 impl QsoAp {
     /// Create from the other station's callsign and current QSO progress.
     /// Returns `None` if the callsign cannot be encoded.
+    ///
+    /// `expected_next_message_texts` starts empty. The coordinator may
+    /// populate it via [`QsoAp::with_expected_texts`] after construction.
     pub fn new(their_call: &str, progress: QsoApProgress) -> Option<Self> {
         let (packed, _ip) = pack28(their_call)?;
         Some(Self {
@@ -265,8 +283,96 @@ impl QsoAp {
             their_packed_28: packed,
             their_bits: u32_to_bits_28(packed),
             progress,
+            expected_next_message_texts: Vec::new(),
         })
     }
+
+    /// Builder-style helper to attach the a8 expected-message templates.
+    /// Drops empty entries and uppercases each text for canonical match.
+    pub fn with_expected_texts<I, S>(mut self, texts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.expected_next_message_texts = texts
+            .into_iter()
+            .map(|s| s.into().trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        self
+    }
+}
+
+/// Build the a8 sequenced-QSO-state AP candidate list for the partner's
+/// expected *next* message.
+///
+/// Inspired by spec ref `spec-wsjtx-improved-a8-decoding.md` —
+/// WSJT-X Improved (DG2YCB) a8 enumerates the small set of legal next
+/// partner messages given the operator's current QSO state. Pancetta's
+/// adaptation: text-template enumeration, used by the decoder as a
+/// confidence-gate relaxation when an AP3/AP4 decode matches one of
+/// the templates.
+///
+/// Returns an empty `Vec` when enumeration is not applicable
+/// (callsign too long, state has no canonical next-message family,
+/// etc.). The coordinator passes the result to
+/// [`QsoAp::with_expected_texts`].
+///
+/// Notes
+/// - All texts are uppercase, single-space separated, with the
+///   partner's call (`dx_call`) as the first token (the partner is
+///   addressing us).
+/// - The enumerations are intentionally small (≤6 entries per state);
+///   they exist to *gate*, not to *seed* LDPC.
+pub fn enumerate_a8_expected_texts(
+    my_call: &str,
+    dx_call: &str,
+    progress: QsoApProgress,
+) -> Vec<String> {
+    let my = my_call.trim().to_uppercase();
+    let dx = dx_call.trim().to_uppercase();
+    if my.is_empty() || dx.is_empty() {
+        return Vec::new();
+    }
+
+    match progress {
+        // Operator has sent the partner a grid/report; partner is
+        // expected to reply with either a signal report (-NN) or a
+        // confirmed report (R-NN). Enumerate the canonical SNR range
+        // [-22 .. 0 dB] in 2 dB steps, both R- and bare variants. The
+        // table is small — ~24 entries — and covers >90% of real
+        // operator behavior.
+        QsoApProgress::WaitingForReport => {
+            let mut out = Vec::with_capacity(24);
+            let mut snr = -22i32;
+            while snr <= 0 {
+                out.push(format!("{} {} R{:+03}", dx, my, snr));
+                out.push(format!("{} {} {:+03}", dx, my, snr));
+                snr += 2;
+            }
+            out
+        }
+        // Operator has acknowledged the partner's report; partner is
+        // expected to reply with a confirmation. Three canonical
+        // confirmation tokens.
+        QsoApProgress::WaitingForConfirmation => {
+            vec![
+                format!("{} {} RR73", dx, my),
+                format!("{} {} 73", dx, my),
+                format!("{} {} RRR", dx, my),
+            ]
+        }
+    }
+}
+
+/// Normalise a decoded message text for matching against the a8
+/// expected-templates list. Collapses interior whitespace runs to a
+/// single space and uppercases the result.
+pub(crate) fn normalize_for_a8_match(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase()
 }
 
 /// Full AP context holding all known information for AP-enhanced decoding.

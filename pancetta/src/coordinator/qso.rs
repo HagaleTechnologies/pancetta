@@ -285,7 +285,18 @@ impl super::ApplicationCoordinator {
                     while !tx_shutdown.load(Ordering::Acquire) {
                         match qso_events.recv().await {
                             Ok(pancetta_qso::QsoEvent::StateChanged { new_state, .. }) => {
-                                // Map QSO state to AP context for AP3/AP4 decoding
+                                // Map QSO state to AP context for AP3/AP4 decoding.
+                                //
+                                // WSJT-X Improved-style a8 wiring: also enumerate
+                                // the expected next-message texts from the
+                                // partner so that the FT8 decoder's a8 path
+                                // (gated on `Ft8Config::a8_qso_state_ap_enabled`)
+                                // can relax the AP confidence floor for decodes
+                                // that match. Inspired by spec ref
+                                // `spec-wsjtx-improved-a8-decoding.md`. When
+                                // a8 is disabled the templates are still
+                                // populated but never consulted, so wiring
+                                // is byte-safe.
                                 let new_ap = match &new_state {
                                     pancetta_qso::QsoState::RespondingToCq {
                                         target_callsign,
@@ -301,7 +312,15 @@ impl super::ApplicationCoordinator {
                                     } => pancetta_ft8::QsoAp::new(
                                         target_callsign,
                                         pancetta_ft8::QsoApProgress::WaitingForReport,
-                                    ),
+                                    )
+                                    .map(|q| {
+                                        let texts = pancetta_ft8::ap::enumerate_a8_expected_texts(
+                                            &tx_callsign,
+                                            target_callsign,
+                                            pancetta_ft8::QsoApProgress::WaitingForReport,
+                                        );
+                                        q.with_expected_texts(texts)
+                                    }),
                                     pancetta_qso::QsoState::WaitingForConfirmation {
                                         their_callsign,
                                         ..
@@ -312,7 +331,15 @@ impl super::ApplicationCoordinator {
                                     } => pancetta_ft8::QsoAp::new(
                                         their_callsign,
                                         pancetta_ft8::QsoApProgress::WaitingForConfirmation,
-                                    ),
+                                    )
+                                    .map(|q| {
+                                        let texts = pancetta_ft8::ap::enumerate_a8_expected_texts(
+                                            &tx_callsign,
+                                            their_callsign,
+                                            pancetta_ft8::QsoApProgress::WaitingForConfirmation,
+                                        );
+                                        q.with_expected_texts(texts)
+                                    }),
                                     // Terminal or idle states clear the AP context
                                     _ => None,
                                 };
