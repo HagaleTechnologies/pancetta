@@ -71,8 +71,8 @@ fn run(entries: &[Value], cfg: &Ft8Config) -> Result<(usize, usize)> {
         let sha = entry["wav_sha256"].as_str().context("wav_sha256")?;
         let samples = load_wav(Path::new(wav_path))?;
         let truth = load_truth(&ws, sha);
-        let mut decoder = Ft8Decoder::new(cfg.clone())
-            .map_err(|e| anyhow::anyhow!("Ft8Decoder::new: {e}"))?;
+        let mut decoder =
+            Ft8Decoder::new(cfg.clone()).map_err(|e| anyhow::anyhow!("Ft8Decoder::new: {e}"))?;
         let decoded = decoder
             .decode_window(&samples)
             .map_err(|e| anyhow::anyhow!("decode_window: {e}"))?;
@@ -121,7 +121,9 @@ fn main() -> Result<()> {
     let (t, p) = run(&entries, &cfg_h242)?;
     println!(
         "\n### hb-242 sync_bc ON (new default): {} decodes / {} TPs (Δ {:+})",
-        t, p, p as i64 - b_tps as i64
+        t,
+        p,
+        p as i64 - b_tps as i64
     );
 
     // hb-242 + wide-lag baseline ON
@@ -131,12 +133,20 @@ fn main() -> Result<()> {
     let (t2, p2) = run(&entries, &cfg_both)?;
     println!(
         "\n### hb-242 + wide-lag baseline ON: {} decodes / {} TPs (Δ {:+})",
-        t2, p2, p2 as i64 - b_tps as i64
+        t2,
+        p2,
+        p2 as i64 - b_tps as i64
     );
 
     println!("\n### Summary");
-    println!("  hb-242 sync_bc alone:           Δ {:+} TPs", p as i64 - b_tps as i64);
-    println!("  hb-242 + wide-lag baseline:    Δ {:+} TPs", p2 as i64 - b_tps as i64);
+    println!(
+        "  hb-242 sync_bc alone:           Δ {:+} TPs",
+        p as i64 - b_tps as i64
+    );
+    println!(
+        "  hb-242 + wide-lag baseline:    Δ {:+} TPs",
+        p2 as i64 - b_tps as i64
+    );
 
     Ok(())
 }
