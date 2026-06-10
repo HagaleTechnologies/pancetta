@@ -8597,7 +8597,10 @@ impl LdpcDecoder {
                     None
                 };
 
-                let osd_result = osd.decode(llr_arr, neural_ordering.as_ref());
+                // FDR Session 3: use decode_with_features so the caller
+                // sees per-success (depth, nharderrs) telemetry.
+                let osd_result_with_features =
+                    osd.decode_with_features(llr_arr, neural_ordering.as_ref());
 
                 // hb-064: record (trajectory, OSD outcome) for the
                 // research dataset. Only fires when capture is enabled
@@ -8605,8 +8608,8 @@ impl LdpcDecoder {
                 // passed) — those are the cases the future model will
                 // see in production.
                 if capture_enabled {
-                    let (osd_recovered, osd_codeword) = match &osd_result {
-                        Some(bv) => {
+                    let (osd_recovered, osd_codeword) = match &osd_result_with_features {
+                        Some((bv, _, _)) => {
                             let mut arr = [0u8; 174];
                             for (i, slot) in arr.iter_mut().enumerate() {
                                 *slot = u8::from(bv.get(i).map(|b| *b).unwrap_or(false));
@@ -8628,12 +8631,17 @@ impl LdpcDecoder {
                     );
                 }
 
-                if let Some(codeword) = osd_result {
-                    // Session 3 will populate osd_depth_used + nharderrs;
-                    // for Session 2 we ship BP-only features so the
-                    // caller can still discriminate fast-vs-late
-                    // convergence.
-                    return Ok((codeword, features_bp_only));
+                if let Some((codeword, depth_used, nharderrs)) = osd_result_with_features {
+                    // FDR Session 3: stamp the OSD-side features alongside
+                    // the BP-side ones. depth_used ∈ {0,1,2,3}; nharderrs
+                    // ∈ {0,1,2,3} (npre2 records depth=3, nharderrs=2).
+                    let features = crate::message::ConfidenceFeatures {
+                        bp_iterations_used: features_bp_only.bp_iterations_used,
+                        osd_depth_used: Some(depth_used),
+                        nharderrs: Some(nharderrs),
+                        min_llr_magnitude: features_bp_only.min_llr_magnitude,
+                    };
+                    return Ok((codeword, features));
                 }
             } else if capture_enabled {
                 // Parity-gate rejected. Record with `osd_recovered = false`

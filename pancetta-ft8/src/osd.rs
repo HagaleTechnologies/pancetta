@@ -480,12 +480,33 @@ impl OsdDecoder {
     ///
     /// Returns `Some(BitVec)` of 174 bits if a valid codeword (passing CRC-14) is found,
     /// or `None` if no valid candidate is found at the configured depth.
+    ///
+    /// FDR Session 3 wrapper: callers that want OSD telemetry should use
+    /// [`Self::decode_with_features`]; this method discards the per-success
+    /// depth and hard-error count.
     #[allow(clippy::needless_range_loop)]
     pub fn decode(
         &self,
         llrs: &[f32; LDPC_CODEWORD_BITS],
         neural_ordering: Option<&[f32; LDPC_INFO_BITS]>,
     ) -> Option<BitVec> {
+        self.decode_with_features(llrs, neural_ordering)
+            .map(|(bits, _depth, _nharderrs)| bits)
+    }
+
+    /// FDR Session 3: like [`Self::decode`] but returns
+    /// `Some((codeword, depth_used, nharderrs))`. `depth_used` is the
+    /// OSD depth at which `try_solution` first succeeded (0/1/2/3, where
+    /// 3 covers both the npre2 warm-start and the full triple loop).
+    /// `nharderrs` is the number of info bits flipped at the successful
+    /// trial (0 / 1 / 2 / 2 [npre2 pair] / 3 [triple]).
+    /// Inspired by spec ref `spec-wsjtx-improved-fdr.md` §"Inputs".
+    #[allow(clippy::needless_range_loop)]
+    pub fn decode_with_features(
+        &self,
+        llrs: &[f32; LDPC_CODEWORD_BITS],
+        neural_ordering: Option<&[f32; LDPC_INFO_BITS]>,
+    ) -> Option<(BitVec, u8, u8)> {
         // 1. Sort indices by reliability
         let mut sorted_indices: [usize; LDPC_CODEWORD_BITS] = [0; LDPC_CODEWORD_BITS];
         for i in 0..LDPC_CODEWORD_BITS {
@@ -564,7 +585,7 @@ impl OsdDecoder {
 
         // Try OSD-0
         if let Some(result) = self.try_solution(&info_hard, &base_parity, &final_perm) {
-            return Some(result);
+            return Some((result, 0, 0));
         }
 
         if self.config.max_depth < 1 {
@@ -589,7 +610,7 @@ impl OsdDecoder {
                 }
             }
             if let Some(result) = self.try_solution(&info, &parity, &final_perm) {
-                return Some(result);
+                return Some((result, 1, 1));
             }
         }
 
@@ -613,7 +634,7 @@ impl OsdDecoder {
                     }
                 }
                 if let Some(result) = self.try_solution(&info, &parity, &final_perm) {
-                    return Some(result);
+                    return Some((result, 2, 2));
                 }
             }
         }
@@ -660,7 +681,9 @@ impl OsdDecoder {
                         }
                     }
                     if let Some(result) = self.try_solution(&info, &parity, &final_perm) {
-                        return Some(result);
+                        // npre2 warm-start always flips a marginal pair,
+                        // even though it's enumerated within the depth-3 budget.
+                        return Some((result, 3, 2));
                     }
                 }
             }
@@ -695,7 +718,7 @@ impl OsdDecoder {
                         }
                     }
                     if let Some(result) = self.try_solution(&info, &parity, &final_perm) {
-                        return Some(result);
+                        return Some((result, 3, 3));
                     }
                 }
             }
@@ -964,6 +987,63 @@ mod tests {
             let decoded = result.unwrap();
             assert_eq!(decoded.len(), LDPC_CODEWORD_BITS);
             assert_eq!(decoded, codeword, "Decoded codeword should match original");
+        }
+
+        // FDR Session 3: decode_with_features contract tests. Pin the
+        // (depth_used, nharderrs) tuple so future implementations
+        // honor the convention.
+
+        #[test]
+        fn decode_with_features_reports_depth_0_on_clean_codeword() {
+            // A clean codeword should converge at OSD-0 with 0 flips.
+            let (_message, codeword) = make_test_codeword();
+            let llrs = codeword_to_llrs(&codeword, 4.0);
+            let decoder = OsdDecoder::new(OsdConfig {
+                max_depth: 0,
+                ..Default::default()
+            });
+            let result = decoder.decode_with_features(&llrs, None);
+            assert!(result.is_some(), "decode_with_features must produce Some");
+            let (bits, depth, nharderrs) = result.unwrap();
+            assert_eq!(bits, codeword);
+            assert_eq!(depth, 0, "clean codeword should converge at OSD-0");
+            assert_eq!(nharderrs, 0, "no bits flipped on clean input");
+        }
+
+        #[test]
+        fn decode_with_features_reports_depth_1_on_one_bad_bit() {
+            // One corrupted bit forces OSD-1; depth=1, nharderrs=1.
+            let (_message, codeword) = make_test_codeword();
+            let mut llrs = codeword_to_llrs(&codeword, 4.0);
+            llrs[5] = if codeword[5] { 0.1 } else { -0.1 };
+            let decoder = OsdDecoder::new(OsdConfig {
+                max_depth: 1,
+                ..Default::default()
+            });
+            let result = decoder.decode_with_features(&llrs, None);
+            assert!(result.is_some());
+            let (_bits, depth, nharderrs) = result.unwrap();
+            assert_eq!(depth, 1, "single-flip path should report depth=1");
+            assert_eq!(nharderrs, 1, "single-flip path should report nharderrs=1");
+        }
+
+        #[test]
+        fn decode_returns_byte_identical_to_decode_with_features() {
+            // The wrapper must produce identical BitVecs to the
+            // feature-returning variant — this is the byte-identical
+            // contract for the 10+ existing decode() call sites.
+            let (_message, codeword) = make_test_codeword();
+            let mut llrs = codeword_to_llrs(&codeword, 4.0);
+            llrs[5] = if codeword[5] { 0.1 } else { -0.1 };
+            let decoder = OsdDecoder::new(OsdConfig {
+                max_depth: 1,
+                ..Default::default()
+            });
+            let a = decoder.decode(&llrs, None);
+            let b = decoder
+                .decode_with_features(&llrs, None)
+                .map(|(bits, _, _)| bits);
+            assert_eq!(a, b, "decode and decode_with_features must agree");
         }
 
         #[test]
