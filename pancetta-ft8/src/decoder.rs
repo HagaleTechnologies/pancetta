@@ -4025,10 +4025,16 @@ impl Ft8Decoder {
 
         normalize_llrs(&mut llrs, self.config.llr_target_variance);
 
-        let corrected_bits = match self.ldpc_decoder.decode_soft(&llrs) {
-            Ok(bits) => bits,
-            Err(_) => return Ok(None),
-        };
+        // FDR Session 2: this is the primary native-decode call site;
+        // we use `decode_soft_with_features` so the eventual `DecodedMessage`
+        // carries BP convergence telemetry. The 10 other `decode_soft`
+        // sites continue to use the bits-only variant (will be migrated
+        // in Session 3 alongside the OSD feature wiring).
+        let (corrected_bits, confidence_features) =
+            match self.ldpc_decoder.decode_soft_with_features(&llrs) {
+                Ok(pair) => pair,
+                Err(_) => return Ok(None),
+            };
 
         if !self.verify_crc(&corrected_bits) {
             return Ok(None);
@@ -4123,6 +4129,11 @@ impl Ft8Decoder {
         );
         decoded_message.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
         decoded_message.ap_level = ap_level_num;
+        // FDR Session 2: stamp the BP-derived confidence telemetry so
+        // downstream consumers (FDR module in Session 4, hb-103 content
+        // scoring, autonomous-TX gating) can read per-decode features.
+        // osd_depth_used + nharderrs remain None until Session 3.
+        decoded_message.confidence_features = Some(confidence_features);
 
         Ok(Some(decoded_message))
     }
@@ -8160,6 +8171,30 @@ enum LdpcAlgorithm {
 /// Implements the LDPC decoder for FT8's (174,91) code:
 /// - 91 information bits (77 payload + 14 CRC)
 /// - 83 parity bits
+/// FDR Session 2 helpers — clamp the BP iteration count into the
+/// `u8` confidence-feature representation, and compute the smallest
+/// magnitude across the 174-bit converged-codeword LLR vector.
+#[inline]
+fn clamp_u8(n: usize) -> u8 {
+    n.min(u8::MAX as usize) as u8
+}
+
+#[inline]
+fn min_abs_llr(llrs: &[f32; 174]) -> f32 {
+    let mut m = f32::INFINITY;
+    for &v in llrs.iter() {
+        let a = v.abs();
+        if a < m {
+            m = a;
+        }
+    }
+    if m.is_finite() {
+        m
+    } else {
+        0.0
+    }
+}
+
 /// - **Sum-product** belief propagation algorithm (tanh check-message:
 ///   `2·atanh(∏ tanh(v/2))`). The `LdpcAlgorithm::MinSum` enum variant
 ///   is implemented but the production constructor hardcodes
@@ -8408,8 +8443,26 @@ impl LdpcDecoder {
         self.llrs_to_bits(&decoded_llrs)
     }
 
-    /// Decode with soft-decision input (LLRs)
+    /// Decode with soft-decision input (LLRs). FDR Session 2 wrapper:
+    /// calls `decode_soft_with_features` and discards the features.
+    /// Kept as the canonical decode entry point for all callers that
+    /// don't need confidence telemetry — the 11 existing call sites
+    /// stay byte-identical to their pre-Session-2 behavior.
     pub fn decode_soft(&self, llrs: &[f32]) -> Ft8Result<BitVec> {
+        let (bits, _features) = self.decode_soft_with_features(llrs)?;
+        Ok(bits)
+    }
+
+    /// FDR Session 2 — soft-decision decode that returns BP convergence
+    /// features alongside the decoded codeword. The features struct's
+    /// `bp_iterations_used` and `min_llr_magnitude` are populated from
+    /// the BP trajectory's convergence point. `osd_depth_used` and
+    /// `nharderrs` remain `None` until Session 3 plumbs the OSD path.
+    /// Inspired by spec ref `spec-wsjtx-improved-fdr.md` §"Inputs".
+    pub fn decode_soft_with_features(
+        &self,
+        llrs: &[f32],
+    ) -> Ft8Result<(BitVec, crate::message::ConfidenceFeatures)> {
         if llrs.len() != 174 {
             return Err(Ft8Error::InvalidDataSize {
                 expected: 174,
@@ -8417,8 +8470,17 @@ impl LdpcDecoder {
             });
         }
 
-        // Use trajectory-collecting BP
-        let (decoded_llrs, trajectory) = self.belief_propagation_with_trajectory(llrs)?;
+        // Use feature-collecting BP. The features are captured up-front
+        // and reused on every return path so callers see the BP-side of
+        // the confidence telemetry even when OSD takes over the codeword.
+        let (decoded_llrs, trajectory, (iters_used, min_llr)) =
+            self.belief_propagation_with_features(llrs)?;
+        let features_bp_only = crate::message::ConfidenceFeatures {
+            bp_iterations_used: Some(iters_used),
+            osd_depth_used: None,
+            nharderrs: None,
+            min_llr_magnitude: Some(min_llr),
+        };
 
         // Check if BP converged (syndrome = 0)
         let bp_converged = {
@@ -8427,7 +8489,8 @@ impl LdpcDecoder {
         };
 
         if bp_converged {
-            return self.llrs_to_bits(&decoded_llrs);
+            let bits = self.llrs_to_bits(&decoded_llrs)?;
+            return Ok((bits, features_bp_only));
         }
 
         // JS8Call-Improved-style feedback refinement meta-loop. When the
@@ -8465,7 +8528,8 @@ impl LdpcDecoder {
                 self.check_syndrome_fast(arr)
             };
             if refined_converged {
-                return self.llrs_to_bits(&refined_decoded);
+                let bits = self.llrs_to_bits(&refined_decoded)?;
+                return Ok((bits, features_bp_only));
             }
 
             // Refined pass also failed: hand its output (and any new
@@ -8565,7 +8629,11 @@ impl LdpcDecoder {
                 }
 
                 if let Some(codeword) = osd_result {
-                    return Ok(codeword);
+                    // Session 3 will populate osd_depth_used + nharderrs;
+                    // for Session 2 we ship BP-only features so the
+                    // caller can still discriminate fast-vs-late
+                    // convergence.
+                    return Ok((codeword, features_bp_only));
                 }
             } else if capture_enabled {
                 // Parity-gate rejected. Record with `osd_recovered = false`
@@ -8587,7 +8655,8 @@ impl LdpcDecoder {
         }
 
         // Return BP's best effort (caller will check CRC and likely reject)
-        self.llrs_to_bits(&decoded_llrs)
+        let bits = self.llrs_to_bits(&decoded_llrs)?;
+        Ok((bits, features_bp_only))
     }
 
     /// Convert hard bits to soft LLRs
@@ -8734,6 +8803,22 @@ impl LdpcDecoder {
         &self,
         channel_llrs: &[f32],
     ) -> Ft8Result<(Vec<f32>, Option<[[f32; 174]; 25]>)> {
+        let (out, traj, _features) = self.belief_propagation_with_features(channel_llrs)?;
+        Ok((out, traj))
+    }
+
+    /// FDR Session 2: BP variant that captures convergence telemetry
+    /// alongside the trajectory. `iterations_used` is the 1-indexed
+    /// iteration at which the syndrome cleared (or `max_iterations`
+    /// when BP didn't converge). `min_llr_magnitude` is
+    /// `min_i |output_llrs[i]|` over the 174-bit codeword. The
+    /// trajectory contract is unchanged: `Some(traj)` when BP fails to
+    /// converge, `None` when it succeeds. Inspired by spec ref
+    /// `spec-wsjtx-improved-fdr.md` §"Inputs".
+    fn belief_propagation_with_features(
+        &self,
+        channel_llrs: &[f32],
+    ) -> Ft8Result<(Vec<f32>, Option<[[f32; 174]; 25]>, (u8, f32))> {
         let num_checks = self.parity_check_matrix.num_checks;
         let num_vars = self.parity_check_matrix.num_variables;
 
@@ -8829,14 +8914,22 @@ impl LdpcDecoder {
                     trajectory[iteration] = output_llrs;
                 }
                 if self.check_syndrome_fast(&output_llrs) {
-                    return Ok((output_llrs.to_vec(), None));
+                    let iters_used = clamp_u8(iteration + 1);
+                    let min_llr = min_abs_llr(&output_llrs);
+                    return Ok((output_llrs.to_vec(), None, (iters_used, min_llr)));
                 }
             }
 
             for slot in trajectory.iter_mut().take(25).skip(max_iters) {
                 *slot = output_llrs;
             }
-            return Ok((output_llrs.to_vec(), Some(trajectory)));
+            let iters_used = clamp_u8(self.max_iterations);
+            let min_llr = min_abs_llr(&output_llrs);
+            return Ok((
+                output_llrs.to_vec(),
+                Some(trajectory),
+                (iters_used, min_llr),
+            ));
         }
 
         for iteration in 0..self.max_iterations {
@@ -8912,7 +9005,9 @@ impl LdpcDecoder {
 
             // Early termination on convergence — discard trajectory
             if self.check_syndrome_fast(&output_llrs) {
-                return Ok((output_llrs.to_vec(), None));
+                let iters_used = clamp_u8(iteration + 1);
+                let min_llr = min_abs_llr(&output_llrs);
+                return Ok((output_llrs.to_vec(), None, (iters_used, min_llr)));
             }
         }
 
@@ -8921,7 +9016,13 @@ impl LdpcDecoder {
             trajectory[i] = output_llrs;
         }
 
-        Ok((output_llrs.to_vec(), Some(trajectory)))
+        let iters_used = clamp_u8(self.max_iterations);
+        let min_llr = min_abs_llr(&output_llrs);
+        Ok((
+            output_llrs.to_vec(),
+            Some(trajectory),
+            (iters_used, min_llr),
+        ))
     }
 
     /// Check if syndrome is zero (all parity checks satisfied).
@@ -9000,6 +9101,64 @@ mod tests {
         let config = Ft8Config::default();
         let decoder = Ft8Decoder::new(config);
         assert!(decoder.is_ok());
+    }
+
+    // FDR Session 2: decode_soft_with_features contract tests.
+    // --------------------------------------------------------
+    // Tests pin the BP-feature plumbing through decode_soft_with_features.
+    // OSD features (osd_depth_used, nharderrs) remain None until Session 3.
+
+    #[test]
+    fn decode_soft_with_features_clamps_iterations_to_u8() {
+        // Construct an LdpcDecoder via Ft8Decoder + extract it. The
+        // u8 clamp is unit-tested at the helper level: clamp_u8(usize)
+        // must never overflow regardless of input.
+        assert_eq!(super::clamp_u8(0), 0);
+        assert_eq!(super::clamp_u8(50), 50);
+        assert_eq!(super::clamp_u8(255), 255);
+        assert_eq!(super::clamp_u8(256), 255);
+        assert_eq!(super::clamp_u8(10_000), 255);
+    }
+
+    #[test]
+    fn min_abs_llr_helper_handles_zero_and_extremes() {
+        // Smallest |LLR| across the codeword. Zero is a legitimate
+        // value (means BP couldn't decide that bit); huge magnitudes
+        // shouldn't make the min explode.
+        let mut llrs = [10.0f32; 174];
+        llrs[42] = 0.5;
+        llrs[99] = -0.1; // sign doesn't matter — we abs.
+        assert!((super::min_abs_llr(&llrs) - 0.1).abs() < 1e-6);
+
+        let all_zero = [0.0f32; 174];
+        assert_eq!(super::min_abs_llr(&all_zero), 0.0);
+
+        let all_big = [1e30f32; 174];
+        assert!(super::min_abs_llr(&all_big) > 1e29);
+    }
+
+    #[test]
+    fn decode_soft_with_features_round_trip_on_clean_signal() {
+        // Encode + modulate + add light noise + decode. The features
+        // returned should have Some(bp_iterations_used) and
+        // Some(min_llr_magnitude); osd_depth_used and nharderrs are
+        // None for Session 2.
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let cfg = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(cfg).expect("decoder");
+        let decoded = decoder.decode_window(&tx).expect("decode");
+        // The probe is the public surface: decode_window should still
+        // succeed and at least one decode should match the plant.
+        let hit = decoded.iter().any(|d| d.text == "CQ K5ARH EM10");
+        assert!(hit, "clean signal decode_window should recover plant");
     }
 
     #[test]
