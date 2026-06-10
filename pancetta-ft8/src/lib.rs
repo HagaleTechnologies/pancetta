@@ -146,7 +146,7 @@ pub use protocol::{ModulationType, Protocol, ProtocolParams};
 
 // Core decoding exports
 pub use decoder::{CrossSequenceSeed, Ft8Config, Ft8Decoder, WaterfallData};
-pub use message::{DecodedMessage, Ft8Message, MessageType};
+pub use message::{ConfidenceFeatures, DecodedMessage, Ft8Message, MessageType};
 pub use signal_processing::{FftProcessor, WindowFunction};
 pub use sync::{SyncResult, TimeSync};
 

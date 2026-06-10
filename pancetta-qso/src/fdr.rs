@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 /// Inspired by spec ref `spec-wsjtx-improved-fdr.md` §"Algorithm
 /// description" — three-state level dial; Level2 auto-disabled in
 /// special operating modes (release notes line ~1555).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum FdrLevel {
     /// Pass-through; no candidates rejected.
     #[default]
@@ -61,7 +61,7 @@ impl FdrLevel {
 /// pancetta-qso-local view of FT8 message types as the FDR gate
 /// classifies them. The coordinator translates from
 /// `pancetta_ft8::MessageType` into this enum at the call boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MessageCategory {
     /// Standard callsign-pair traffic (Standard, Extended) — the "easy"
     /// set per the FDR spec. Never gated regardless of level.
