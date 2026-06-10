@@ -1,0 +1,80 @@
+{
+  "decodes_p50": 25,
+  "decodes_p90": 30,
+  "decodes_p99": 34,
+  "earliest_ts": 1778945053,
+  "latest_ts": 1778949538,
+  "max_repeats_one_callsign": 195,
+  "mean_decodes_per_slot": 24.846666666666668,
+  "median_freq_drift_hz": 354.11398860232754,
+  "name": "chrono_replay.manifest",
+  "qso_continuity_index": 0.9899665551839465,
+  "sequential_continuity_hits": 296,
+  "sequential_pairs_examined": 299,
+  "slot_count": 300,
+  "snr_buckets": {
+    "-10": 1558,
+    "-15": 173,
+    "-20": 1,
+    "-5": 2564,
+    "0": 2132,
+    "10": 96,
+    "15": 32,
+    "20": 25,
+    "25": 10,
+    "30": 3,
+    "35": 2,
+    "40": 2,
+    "5": 855,
+    "50": 1
+  },
+  "time_span_seconds": 4485,
+  "top10_repeat_callers": [
+    {
+      "call": "NG7E",
+      "count": 195
+    },
+    {
+      "call": "W8ASH",
+      "count": 175
+    },
+    {
+      "call": "KB9RP",
+      "count": 174
+    },
+    {
+      "call": "KN4RNO",
+      "count": 173
+    },
+    {
+      "call": "KG5FI",
+      "count": 149
+    },
+    {
+      "call": "KG4OJT",
+      "count": 137
+    },
+    {
+      "call": "VE9NM",
+      "count": 134
+    },
+    {
+      "call": "KD5QJQ",
+      "count": 133
+    },
+    {
+      "call": "KZ4GN",
+      "count": 132
+    },
+    {
+      "call": "WA4TED",
+      "count": 130
+    }
+  ],
+  "total_decodes": 7454,
+  "type_counts": {
+    "NonStdCall": 51,
+    "Standard": 7403
+  },
+  "unique_callsigns": 2450
+}
