@@ -1066,11 +1066,14 @@ impl Default for Ft8Config {
             soft_combiner_enabled: false,
             soft_combiner_capacity: crate::soft_combiner::DEFAULT_CAPACITY,
             soft_combiner_ttl_seconds: crate::soft_combiner::DEFAULT_TTL_SECONDS,
-            // JS8Call-Improved-inspired LLR whitening default OFF. When
-            // OFF the whitening helper is never invoked, leaving the LLR
-            // pipeline byte-identical to the legacy path. Inspired by
-            // spec ref `spec-js8call-llr-whitening.md`.
-            llr_whitening_enabled: false,
+            // JS8Call-Improved-inspired LLR whitening — graduated to
+            // default-ON in Batch 53 (2026-06-09). Hard_1000 measurement:
+            // +4 TPs (16365 → 16369) AND −713 FPs (precision 0.7317 →
+            // 0.7559, +3.3% relative). Precision lift survived 5× corpus
+            // scale-out from the original Batch 50 hard-200 finding
+            // (+2 TPs / +2.7% precision). Inspired by spec ref
+            // `spec-js8call-llr-whitening.md`.
+            llr_whitening_enabled: true,
             // hb-226: Gaussian-ramp subtract default OFF. When OFF the
             // subtract path is byte-identical to the legacy
             // hard-edged subtraction. Inspired by spec ref
@@ -12136,14 +12139,18 @@ mod llr_whitening_tests {
     }
 
     #[test]
-    fn default_config_keeps_whitening_off() {
-        // The default-OFF promise lives in the Ft8Config::default impl.
-        // Regression guard against accidental flips.
+    fn default_config_keeps_whitening_on() {
+        // LLR whitening graduated to default-ON in Batch 53 after a
+        // hard_1000 measurement showed +4 TPs and -713 FPs (precision
+        // 0.7317 → 0.7559, +3.3% relative). The flip is the active
+        // production stance; this test pins the default so a future
+        // refactor doesn't silently revert. To re-shelve, re-measure
+        // and flip back with a journal entry.
         let cfg = Ft8Config::default();
         assert!(
-            !cfg.llr_whitening_enabled,
-            "Ft8Config::default().llr_whitening_enabled must be false; \
-             toggling default-ON requires a hard-200 measurement"
+            cfg.llr_whitening_enabled,
+            "Ft8Config::default().llr_whitening_enabled must be true; \
+             graduated in Batch 53 — re-shelve requires re-measurement"
         );
     }
 
