@@ -149,6 +149,15 @@ pub struct SoftCombinerConfig {
     /// Maximum Hamming distance between signatures that still counts as
     /// the same payload for combining purposes.
     pub hamming_tolerance: u32,
+    /// Batch 63: bin-tolerance for coarse-key lookup. When > 0,
+    /// `combine()` also consults buckets within ±tolerance bins in
+    /// freq AND ±tolerance bins in time, finding the best Hamming
+    /// match across all candidate buckets. Default 0 = exact-match
+    /// (byte-identical to pre-Batch-63 behavior). The Batch 62
+    /// finding (cache-key drift on noise-jittered repeats) motivates
+    /// this knob — natural sync jitter shifts freq_bin by 1-2 bins
+    /// per reception, breaking exact-match accumulation.
+    pub key_tolerance: u32,
 }
 
 impl Default for SoftCombinerConfig {
@@ -157,6 +166,7 @@ impl Default for SoftCombinerConfig {
             capacity: DEFAULT_CAPACITY,
             ttl: Duration::from_secs(DEFAULT_TTL_SECONDS),
             hamming_tolerance: DEFAULT_HAMMING_TOLERANCE,
+            key_tolerance: 0,
         }
     }
 }
@@ -250,27 +260,49 @@ impl SoftCombiner {
         let signature = Self::compute_signature(llrs);
         let now = Instant::now();
 
-        // Look up the bucket; find the closest match within Hamming
-        // tolerance. We pick the *closest* match (smallest Hamming
-        // distance) so deterministic signatures cluster correctly.
-        let mut best_match: Option<usize> = None;
+        // Look up the closest match within Hamming tolerance. When
+        // `key_tolerance > 0`, the search spans nearby coarse buckets
+        // (±tol in freq AND ±tol in time) to catch cross-reception
+        // sync jitter — Batch 63 finding. The exact-key bucket is
+        // searched first so it always wins ties.
+        let mut best: Option<(CombinerKey, usize)> = None;
         let mut best_distance: u32 = u32::MAX;
-        if let Some(bucket) = self.cache.get(&key) {
-            for (idx, entry) in bucket.iter().enumerate() {
-                let xor = entry.signature ^ signature;
-                let distance = xor.count_ones();
-                if distance <= self.cfg.hamming_tolerance && distance < best_distance {
-                    best_distance = distance;
-                    best_match = Some(idx);
+        let tol = self.cfg.key_tolerance as i32;
+        let freq_lo = (key.freq_bin as i64).saturating_sub(tol as i64).max(0) as u32;
+        let freq_hi = (key.freq_bin as i64 + tol as i64).min(u32::MAX as i64) as u32;
+        let time_lo = key.time_bin.saturating_sub(tol);
+        let time_hi = key.time_bin.saturating_add(tol);
+
+        // Iterate candidate keys: exact first, then nearby. For
+        // tol=0 the inner loops produce just the exact key.
+        for f in freq_lo..=freq_hi {
+            for t in time_lo..=time_hi {
+                let candidate_key = CombinerKey {
+                    mode: key.mode,
+                    freq_bin: f,
+                    time_bin: t,
+                };
+                if let Some(bucket) = self.cache.get(&candidate_key) {
+                    for (idx, entry) in bucket.iter().enumerate() {
+                        let xor = entry.signature ^ signature;
+                        let distance = xor.count_ones();
+                        if distance <= self.cfg.hamming_tolerance && distance < best_distance {
+                            best_distance = distance;
+                            best = Some((candidate_key, idx));
+                        }
+                    }
                 }
             }
         }
 
-        if let Some(match_idx) = best_match {
-            // Cache hit: combine in place and return a copy.
+        if let Some((match_key, match_idx)) = best {
+            // Cache hit: combine in place and return a copy. The
+            // match may be at a NEIGHBOR bucket; we update that one
+            // (not necessarily the input key's bucket) since that's
+            // where the running average lives.
             let bucket = self
                 .cache
-                .get_mut(&key)
+                .get_mut(&match_key)
                 .expect("bucket existed during lookup");
             let entry = &mut bucket[match_idx];
             for i in 0..LLR_LEN {
@@ -675,5 +707,70 @@ mod tests {
             "bit 0 should be sign-positive after clean receptions dominate"
         );
         assert_eq!(result.repeat_count, 3);
+    }
+
+    #[test]
+    fn key_tolerance_zero_is_exact_match() {
+        // Default tolerance = 0: neighbor buckets are NOT consulted.
+        let mut combiner = SoftCombiner::new(SoftCombinerConfig {
+            key_tolerance: 0,
+            ..Default::default()
+        });
+        let bits = vec![1u8; 32];
+        let llrs = llrs_from_bits(&bits);
+        // Reception 1 at freq_bin 100, time_bin 0.
+        let key_a = CombinerKey::new(Mode::Ft8, 100, 0);
+        let r1 = combiner.combine(key_a, &llrs);
+        assert_eq!(r1.repeat_count, 1, "first reception establishes the bucket");
+        // Reception 2 at NEIGHBOR freq_bin 101 (drift of 1). With
+        // tolerance=0, this must be a fresh bucket.
+        let key_b = CombinerKey::new(Mode::Ft8, 101, 0);
+        let r2 = combiner.combine(key_b, &llrs);
+        assert_eq!(
+            r2.repeat_count, 1,
+            "neighbor bucket must not be consulted at tolerance 0"
+        );
+    }
+
+    #[test]
+    fn key_tolerance_one_finds_neighbor_bucket() {
+        // Tolerance = 1: a reception at freq_bin 101 should match
+        // the existing bucket at freq_bin 100 (within ±1).
+        let mut combiner = SoftCombiner::new(SoftCombinerConfig {
+            key_tolerance: 1,
+            ..Default::default()
+        });
+        let bits = vec![1u8; 32];
+        let llrs = llrs_from_bits(&bits);
+        let key_a = CombinerKey::new(Mode::Ft8, 100, 0);
+        let r1 = combiner.combine(key_a, &llrs);
+        assert_eq!(r1.repeat_count, 1);
+        // Drift of 1 in freq_bin: should land in the same accumulated bucket.
+        let key_b = CombinerKey::new(Mode::Ft8, 101, 0);
+        let r2 = combiner.combine(key_b, &llrs);
+        assert_eq!(
+            r2.repeat_count, 2,
+            "neighbor freq_bin must combine into the existing bucket at tolerance 1"
+        );
+    }
+
+    #[test]
+    fn key_tolerance_one_does_not_find_two_apart() {
+        // Tolerance = 1: a reception at freq_bin 102 (drift of 2)
+        // must NOT match a freq_bin 100 bucket.
+        let mut combiner = SoftCombiner::new(SoftCombinerConfig {
+            key_tolerance: 1,
+            ..Default::default()
+        });
+        let bits = vec![1u8; 32];
+        let llrs = llrs_from_bits(&bits);
+        let key_a = CombinerKey::new(Mode::Ft8, 100, 0);
+        combiner.combine(key_a, &llrs);
+        let key_far = CombinerKey::new(Mode::Ft8, 102, 0);
+        let r = combiner.combine(key_far, &llrs);
+        assert_eq!(
+            r.repeat_count, 1,
+            "drift of 2 must NOT match at tolerance 1"
+        );
     }
 }

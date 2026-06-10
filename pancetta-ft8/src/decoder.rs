@@ -682,6 +682,16 @@ pub struct Ft8Config {
     /// consulted when `soft_combiner_enabled = true`.
     pub soft_combiner_ttl_seconds: u64,
 
+    /// Batch 63: per-axis bin tolerance for the soft combiner's coarse-
+    /// key lookup. When `> 0`, `SoftCombiner::combine()` consults
+    /// neighbor buckets within ±tolerance in (freq_bin, time_bin)
+    /// addition to the exact key, finding the best Hamming match
+    /// across all candidate buckets. Default 0 = exact-match (byte-
+    /// identical to pre-Batch-63 behavior). Set to 1-2 to catch
+    /// natural sync jitter on noise-jittered repeats (Batch 62
+    /// finding). Only consulted when `soft_combiner_enabled = true`.
+    pub soft_combiner_key_tolerance: u32,
+
     /// JS8Call-Improved-inspired LLR whitening (per-tone × per-symbol
     /// noise normalisation). When `true`, after the symbol demapper
     /// computes the soft LLR vector and before `normalize_llrs`, each
@@ -1066,6 +1076,10 @@ impl Default for Ft8Config {
             soft_combiner_enabled: false,
             soft_combiner_capacity: crate::soft_combiner::DEFAULT_CAPACITY,
             soft_combiner_ttl_seconds: crate::soft_combiner::DEFAULT_TTL_SECONDS,
+            // Batch 63: default-0 = exact-match (preserves byte-identical
+            // behavior pre-Batch-63). The hb-244 line is opt-in; this
+            // tolerance only changes anything when both flags are set.
+            soft_combiner_key_tolerance: 0,
             // JS8Call-Improved-inspired LLR whitening — graduated to
             // default-ON in Batch 53 (2026-06-09). Hard_1000 measurement:
             // +4 TPs (16365 → 16369) AND −713 FPs (precision 0.7317 →
@@ -1357,6 +1371,7 @@ impl Ft8Decoder {
             let combiner_cfg = SoftCombinerConfig {
                 capacity: config.soft_combiner_capacity,
                 ttl: std::time::Duration::from_secs(config.soft_combiner_ttl_seconds),
+                key_tolerance: config.soft_combiner_key_tolerance,
                 ..SoftCombinerConfig::default()
             };
             Some(std::sync::Arc::new(std::sync::Mutex::new(
