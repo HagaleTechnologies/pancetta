@@ -1174,6 +1174,14 @@ impl AutonomousOperator {
                                         confidence: conf,
                                         snr_db: cq.snr as f32,
                                         time_offset: dt,
+                                        // Batch 64: ConfidenceFeatures
+                                        // not plumbed through to the
+                                        // autonomous-CQ path yet; v1
+                                        // formula ignores these anyway.
+                                        bp_iterations_used: None,
+                                        osd_depth_used: None,
+                                        nharderrs: None,
+                                        min_llr_magnitude: None,
                                     },
                                     f,
                                 );

@@ -175,6 +175,10 @@ fn main() -> Result<()> {
                     confidence: d.confidence,
                     snr_db: d.snr_db,
                     time_offset: d.time_offset,
+                    bp_iterations_used: None,
+                    osd_depth_used: None,
+                    nharderrs: None,
+                    min_llr_magnitude: None,
                 },
                 &filter,
             );
@@ -200,6 +204,10 @@ fn main() -> Result<()> {
                     confidence: d.confidence,
                     snr_db: d.snr_db,
                     time_offset: d.time_offset,
+                    bp_iterations_used: None,
+                    osd_depth_used: None,
+                    nharderrs: None,
+                    min_llr_magnitude: None,
                 },
                 &filter,
             );
