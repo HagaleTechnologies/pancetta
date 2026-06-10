@@ -9999,6 +9999,7 @@ mod tests {
             slot_parity: None,
             decode_time_into_window: None,
             via_cross_sequence_a7: false,
+            confidence_features: None,
         };
 
         decoder.subtract_signal(&mut audio, &msg);

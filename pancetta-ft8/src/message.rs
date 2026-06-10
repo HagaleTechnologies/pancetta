@@ -998,6 +998,41 @@ pub struct DecodedMessage {
     /// to tell A7 decodes apart. Inspired by spec ref
     /// `research/specs/spec-wsjtr-cross-sequence-a7.md` §12 ("output marking").
     pub via_cross_sequence_a7: bool,
+    /// FDR Session 1: per-decode confidence telemetry from the BP/OSD
+    /// pipeline. `Some(_)` when the native pancetta-ft8 pipeline produced
+    /// the decode and the new feature-tracking API was used; `None` for
+    /// older code paths (ft8_lib FFI, scaffolding constructors, AP
+    /// injection paths that don't run the BP/OSD telemetry path).
+    /// Inputs to the FDR per-message-type confidence gate (Sessions 2-4);
+    /// also a useful diagnostic for hb-103 content scoring and tier-aware
+    /// behaviors. Inspired by spec ref `spec-wsjtx-improved-fdr.md`.
+    pub confidence_features: Option<ConfidenceFeatures>,
+}
+
+/// FDR per-decode confidence features captured by the BP/OSD path.
+/// All fields are `Option<_>` so individual telemetry sources can be
+/// missing without forcing the others to be absent. Inspired by spec
+/// ref `spec-wsjtx-improved-fdr.md` §"Inputs".
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ConfidenceFeatures {
+    /// Number of BP iterations the decoder ran before convergence
+    /// (LDPC syndrome cleared). Bounded by `Ft8Config::ldpc_iterations`,
+    /// so `0..=255` is safe in a `u8`. `None` when BP didn't run or
+    /// the code path doesn't report it.
+    pub bp_iterations_used: Option<u8>,
+    /// OSD depth at which the decoder accepted the codeword. `None`
+    /// when BP converged without OSD, or when the code path doesn't
+    /// report it. Range `0..=4`.
+    pub osd_depth_used: Option<u8>,
+    /// Number of hard-decision bit errors OSD corrected on top of the
+    /// failing BP output. Higher = OSD did more work, which (per FDR
+    /// theory) maps to lower confidence in the result.
+    pub nharderrs: Option<u8>,
+    /// Smallest LLR magnitude across the converged codeword's 174
+    /// bits. Higher = more confident; below ~1.0 in log-base-e LLR
+    /// units signals "this bit was nearly a coin-flip."
+    pub min_llr_magnitude: Option<f32>,
 }
 
 impl DecodedMessage {
@@ -1024,6 +1059,7 @@ impl DecodedMessage {
             slot_parity: None,
             decode_time_into_window: None,
             via_cross_sequence_a7: false,
+            confidence_features: None,
         }
     }
 
@@ -1049,6 +1085,7 @@ impl DecodedMessage {
             slot_parity: None,
             decode_time_into_window: None,
             via_cross_sequence_a7: false,
+            confidence_features: None,
         }
     }
 }
@@ -3129,5 +3166,51 @@ mod tests {
         m.from_callsign = Some("K1ABC".to_string());
         m.grid_square = Some("FN42".to_string());
         assert!(m.is_plausible(), "CQ + grid should pass plausibility");
+    }
+
+    // FDR Session 1: ConfidenceFeatures scaffolding tests.
+    // ----------------------------------------------------
+    // Sessions 2-4 will populate fields from the BP/OSD path. Session 1
+    // ships the type + Default impl + DecodedMessage attachment. These
+    // tests pin the shape so future sessions know what they're hitting.
+
+    #[test]
+    fn confidence_features_default_is_all_none() {
+        let cf = ConfidenceFeatures::default();
+        assert!(cf.bp_iterations_used.is_none());
+        assert!(cf.osd_depth_used.is_none());
+        assert!(cf.nharderrs.is_none());
+        assert!(cf.min_llr_magnitude.is_none());
+    }
+
+    #[test]
+    fn confidence_features_copy_is_byte_identical() {
+        let cf = ConfidenceFeatures {
+            bp_iterations_used: Some(17),
+            osd_depth_used: Some(2),
+            nharderrs: Some(3),
+            min_llr_magnitude: Some(0.42),
+        };
+        let copy = cf;
+        assert_eq!(cf, copy);
+    }
+
+    #[test]
+    fn decoded_message_new_has_no_confidence_features() {
+        // The basic ctor path leaves features unset; Sessions 2-4 will
+        // populate via a `with_confidence_features` builder or the
+        // upcoming `decode_soft_with_features` LDPC variant.
+        let m = Ft8Message::default();
+        let d = DecodedMessage::new(m, -10.0, 1.0, 1500.0, 0.0);
+        assert!(d.confidence_features.is_none());
+    }
+
+    #[test]
+    fn decoded_message_from_ft8lib_has_no_confidence_features() {
+        // FFI-sourced decodes never have native ConfidenceFeatures (the
+        // ft8_lib path doesn't return BP iteration counts). This is the
+        // permanent contract for the FFI bridge.
+        let d = DecodedMessage::from_ft8lib("CQ K1ABC FN42", 1500.0, -10.0, 0);
+        assert!(d.confidence_features.is_none());
     }
 }
