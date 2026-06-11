@@ -2021,7 +2021,6 @@ impl Ft8Decoder {
                     .residual_energy_stop_db
                     .map(|margin| (noise_floor_db_median(&spectrogram.power), margin));
                 let mut to_subtract: &[DecodedMessage] = &pass_decoded;
-                let mut round_start_offset = 0;
                 // Auto-passband scope (when active) flows into the
                 // residual multipass too — the spec is explicit that the
                 // detected window applies to all sync passes within
@@ -2054,7 +2053,7 @@ impl Ft8Decoder {
                     }
                     let added = extra.len();
                     pass_decoded.extend(extra);
-                    round_start_offset = pass_decoded.len() - added;
+                    let round_start_offset = pass_decoded.len() - added;
                     to_subtract = &pass_decoded[round_start_offset..];
                 }
             }
