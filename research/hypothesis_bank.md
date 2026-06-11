@@ -6405,10 +6405,10 @@ search to in-repo sources.
 
     Reference: [wsjtr osd-depth-enhancement.md](https://github.com/bodiya/wsjtr/blob/main/docs/osd-depth-enhancement.md)
 
-### hb-242 — wsjtr `sync_bc` partial Costas metric for slot-edge recovery  [PRIORITY: 0.65, spawned 2026-06-08 Batch 45 — HIGHEST NEW PRIORITY]
+### hb-242 — wsjtr `sync_bc` partial Costas metric for slot-edge recovery  [SHELVED-CONFIRMED 2026-06-11 Batch 75 — implemented Batch 48 (default-OFF, -18 TPs hard-200); raw_530_full ft8_lib re-test: +0 TPs / -19 FPs, inert. The predicted +50-150 slot-edge truths did not materialize on a realistic corpus. Re-open only with a slot-edge-specific corpus + paired max_sync_candidates bump.]
   mode: ft8
   status: PROPOSED-FROM-RESEARCH — wsjtr (Bodiya KC1WIH) uses 3-position Costas correlation with `sync_bc` partial metric (uses only Costas positions 2 + 3 when position 1 falls outside recorded window). Directly addresses pancetta's slot-edge negative-dt 48.3% recall miss bucket (Batch 40 finding).
-  priority_score: 0.65
+  priority_score: 0.15 (was 0.65 pre-measurement)
   estimated_effort: 1-2 sessions (algorithm publicly documented; pancetta writes implementation from docs, not GPL code — license-clean)
   expected_delta: +50-150 RR73-class slot-edge truths on hard-1000 per agent estimate
   defensible_prior: YES — wsjtr ships this; targets a documented pancetta miss bucket; license-clean port path
@@ -6463,7 +6463,7 @@ search to in-repo sources.
 
     Source: [wsjtr docs/jt9r.md §Downsampling](https://github.com/bodiya/wsjtr/blob/main/docs/jt9r.md)
 
-### hb-245 — Cross-day callsign trust DB (hb-103 v2 feature / hb-237 AP source)  [MEASURED-DIAGNOSTIC 2026-06-11 Batch 76 — PRIORITY: 0.35]
+### hb-246 — Cross-day callsign trust DB (hb-103 v2 feature / hb-237 AP source)  [MEASURED-DIAGNOSTIC 2026-06-11 Batch 76 — PRIORITY: 0.35]
 
   spawn: user iteration plan #3 (Batch 72 journal); measured Batch 76 before any decoder wiring
   mechanism: persistent callsign->day-set DB built from ft8_lib truth over all
