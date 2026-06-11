@@ -6462,3 +6462,29 @@ search to in-repo sources.
     candidate. Currently pancetta uses NMS only.
 
     Source: [wsjtr docs/jt9r.md §Downsampling](https://github.com/bodiya/wsjtr/blob/main/docs/jt9r.md)
+
+### hb-245 — Cross-day callsign trust DB (hb-103 v2 feature / hb-237 AP source)  [MEASURED-DIAGNOSTIC 2026-06-11 Batch 76 — PRIORITY: 0.35]
+
+  spawn: user iteration plan #3 (Batch 72 journal); measured Batch 76 before any decoder wiring
+  mechanism: persistent callsign->day-set DB built from ft8_lib truth over all
+    raw recordings (25k slots / 12 days). "Trusted" = callsign decoded on >= K
+    distinct prior days. Candidate uses: (a) feature in hb-103 v2 continuous
+    trust score; (b) AP-candidate callsign list for hb-237 cross-sequence A7.
+  measured (Batch 76, scripts/batch76_cross_day_trust.py, leave-5/30-out on
+    the 2066-slot 5/30 scan, ft8_lib truth):
+    - Hard gate at any K: DEAD. K>=1 loses 24.3% TPs for -56.7% FPs; K>=3
+      loses 75.4% TPs.
+    - Feature signal real at K>=1: P(TP|all trusted)=79.3% vs
+      P(TP|none trusted)=48.7%; ~30-point conditional-precision spread,
+      75% TP coverage.
+    - Coverage ceiling: 76% of unique callsigns appear on exactly 1 of 12
+      days (band-population churn + 66% of corpus slots near-dead band).
+    - Side-signal: no-parseable-callsign messages 14x more FP-prone.
+  expected_delta: no standalone ship; folds into hb-103 v2 as one feature.
+    Post-Batch-72 FP pool (osd=Some(0)) is 2.4x smaller than what this was
+    measured against, shrinking its absolute headroom.
+  defensible_prior: yes — operator "known callsign" heuristics, PSKReporter
+    reputation, SSH-known-hosts-style accumulation. Pancetta-invented as a
+    decoder feature (label: cross-day trust DB).
+  note: production wiring would need a persistent store under ~/.pancetta and
+    a decay policy (callsign churn makes stale trust actively misleading).
