@@ -100,8 +100,10 @@ fn two_processes_serialize_on_single_slot_pool() {
     // CI runner under contention). Batch 46 raised this from 1500ms to
     // 3000ms after observing flakes where B's cargo startup ate enough
     // of a 1500ms hold that b_acquired_after_ms fell below the 500ms
-    // threshold.
-    let a_hold_ms: u64 = 3000;
+    // threshold. Batch 73 raised again to 6000ms after observing the
+    // same flake under --release builds where cargo recompilation
+    // takes longer (B observed only 324ms wait under check.sh load).
+    let a_hold_ms: u64 = 6000;
 
     // Spawn child A and block until it prints its "acquired_after_ms"
     // line on stdout. This avoids racing against cargo's variable

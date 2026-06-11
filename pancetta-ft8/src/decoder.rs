@@ -899,7 +899,22 @@ impl Default for Ft8Config {
             ldpc_iterations: LDPC_MAX_ITERATIONS,
             time_range: 2.0,
             max_decode_passes: 1,
-            osd_depth: Some(2),
+            // Batch 73 (2026-06-11): dropped from Some(2) to Some(0).
+            // OSD depth sweep on raw_530_full (2066 slots, ft8_lib truth)
+            // AND hard_1000 confirmed that osd_depth=Some(2) was
+            // producing ~7000 spurious FPs on real recordings + ~3500
+            // on hard_1000 for ZERO net TP gain. Cross-corpus precision
+            // improvements: +0.099 absolute on raw_530_full and +0.128
+            // on hard_1000. Largest precision improvement of the entire
+            // recovery push (10× LLR whitening's −713 FPs). osd=Some(0)
+            // keeps the depth-0 trial (a single hard-decision attempt
+            // costing one branch) which adds zero FPs in measurement;
+            // osd=None is operationally equivalent but skips the OSD
+            // initialization. Some(0) is chosen for explicitness — the
+            // OSD machinery stays wired and ready for the rare
+            // signal-fidelity case where it might help. Spec:
+            // `research/experiments/2026-06-09-batch-72.md`.
+            osd_depth: Some(0),
             // WSJT-X mainline-style npre2 OSD preprocessing: DEFAULT OFF
             // pending hard-200 measurement validation. Active only at
             // `osd_depth >= 3`. Spec:
