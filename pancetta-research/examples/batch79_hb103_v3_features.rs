@@ -76,7 +76,9 @@ fn day_of(path: &str) -> Option<String> {
     let name = path.rsplit('/').next()?;
     let rest = name.strip_prefix("ft8_")?;
     let day = rest.get(..8)?;
-    day.chars().all(|c| c.is_ascii_digit()).then(|| day.to_string())
+    day.chars()
+        .all(|c| c.is_ascii_digit())
+        .then(|| day.to_string())
 }
 
 /// callsign -> set of days it appears in, over ALL ft8_lib truth files.
@@ -135,8 +137,16 @@ fn auc(tp: &[f64], fp: &[f64]) -> f64 {
 }
 
 fn auc_of(samples: &[&Sample], score: impl Fn(&Sample) -> f64) -> f64 {
-    let tp: Vec<f64> = samples.iter().filter(|s| s.is_tp).map(|s| score(s)).collect();
-    let fp: Vec<f64> = samples.iter().filter(|s| !s.is_tp).map(|s| score(s)).collect();
+    let tp: Vec<f64> = samples
+        .iter()
+        .filter(|s| s.is_tp)
+        .map(|s| score(s))
+        .collect();
+    let fp: Vec<f64> = samples
+        .iter()
+        .filter(|s| !s.is_tp)
+        .map(|s| score(s))
+        .collect();
     auc(&tp, &fp)
 }
 
@@ -188,9 +198,9 @@ fn collect_corpus(
                 let hits = calls
                     .iter()
                     .filter(|c| {
-                        call_days.get(*c).is_some_and(|days| {
-                            days.iter().any(|dd| Some(dd) != day.as_ref())
-                        })
+                        call_days
+                            .get(*c)
+                            .is_some_and(|days| days.iter().any(|dd| Some(dd) != day.as_ref()))
                     })
                     .count();
                 hits as f64 / calls.len() as f64
@@ -248,7 +258,9 @@ fn evaluate(label: &str, samples: &[Sample], body: &mut String) {
         let mut best = (0.0f64, 0.0f64, f64::MIN);
         for &wt in &grid {
             for &wc in &grid {
-                let a = auc_of(train, |s| s.v2 + wt * (s.time_norm / tmax) + wc * s.trust_frac);
+                let a = auc_of(train, |s| {
+                    s.v2 + wt * (s.time_norm / tmax) + wc * s.trust_frac
+                });
                 if a > best.2 {
                     best = (wt, wc, a);
                 }
@@ -257,7 +269,9 @@ fn evaluate(label: &str, samples: &[Sample], body: &mut String) {
         let (wt, wc, _) = best;
         chosen.push((wt, wc));
         held_out_v2.push(auc_of(test, |s| s.v2));
-        held_out_v3.push(auc_of(test, |s| s.v2 + wt * (s.time_norm / tmax) + wc * s.trust_frac));
+        held_out_v3.push(auc_of(test, |s| {
+            s.v2 + wt * (s.time_norm / tmax) + wc * s.trust_frac
+        }));
 
         // Slot-max-normalized variant, time feature only (trust is dead).
         let mut best_s = (0.0f64, f64::MIN);

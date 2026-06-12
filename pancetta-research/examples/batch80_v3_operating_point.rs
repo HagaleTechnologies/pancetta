@@ -198,8 +198,7 @@ fn main() -> Result<()> {
             ("all decodes", rows.iter().collect::<Vec<&Row>>()),
         ] {
             let tau3 = tau_full_recall(&pop);
-            let (r1, f1, r3, f3) =
-                gate_stats(&pop, MessageContentScore::SHIP_CONSERVATIVE, tau3);
+            let (r1, f1, r3, f3) = gate_stats(&pop, MessageContentScore::SHIP_CONSERVATIVE, tau3);
             let n_tp = pop.iter().filter(|r| r.is_tp).count();
             let n_fp = pop.len() - n_tp;
             body.push_str(&format!(

@@ -105,7 +105,10 @@ fn configs() -> Vec<(String, Ft8Config)> {
     // max_sync_candidates at default parity, plus the default itself.
     if let Ok(spec) = std::env::var("PANCETTA_B78_CANDS") {
         out.push(("cands=300 [DEFAULT]".to_string(), base.clone()));
-        for cands in spec.split(',').filter_map(|s| s.trim().parse::<usize>().ok()) {
+        for cands in spec
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+        {
             out.push((
                 format!("cands={cands}"),
                 Ft8Config {
