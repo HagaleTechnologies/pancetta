@@ -101,6 +101,27 @@ fn run(label: &str, entries: &[Value], cfg: &Ft8Config) -> Result<(usize, usize,
 fn configs() -> Vec<(String, Ft8Config)> {
     let base = Ft8Config::default();
     let mut out = Vec::new();
+    // LDPC mode (Batch 82): PANCETTA_B78_LDPC="100,150,300" sweeps
+    // ldpc_iterations at the current defaults, plus the default itself.
+    if let Ok(spec) = std::env::var("PANCETTA_B78_LDPC") {
+        out.push((
+            format!("ldpc={} [DEFAULT]", base.ldpc_iterations),
+            base.clone(),
+        ));
+        for ldpc in spec
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+        {
+            out.push((
+                format!("ldpc={ldpc}"),
+                Ft8Config {
+                    ldpc_iterations: ldpc,
+                    ..base.clone()
+                },
+            ));
+        }
+        return out;
+    }
     // Refinement mode: PANCETTA_B78_CANDS="75,100,200" sweeps just
     // max_sync_candidates at default parity, plus the default itself.
     if let Ok(spec) = std::env::var("PANCETTA_B78_CANDS") {

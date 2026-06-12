@@ -27,3 +27,11 @@ tightens recovery-pass decodes; τ=0.90 / τ* raise the bar globally.
 |---|---|---|---|---|
 | hard_200 | 1.0000 / 0.1131 | 1.0000 / 0.1131 | 1.0000 / 0.1519 | 1.0000 / 0.1590 |
 | raw_530 subset-200 | 1.0000 / 0.0350 | 1.0000 / 0.0490 | 1.0000 / 0.0979 | 1.0000 / 0.1189 |
+
+## Post-ship addendum: w=-2 evaluated from the sample dumps
+
+The AUC folds preferred w=-2.0; at the gate operating point (τ=0.35) it
+adds +2.1pp FP rejection on hard_200, +0.0pp on raw, recall 100% both —
+but cuts the min-TP margin from 0.965/1.069 to 0.465/0.764. Not worth
+quartering the recovery-pass recall margin for one corpus's +2pp;
+**w stays -1.0**.

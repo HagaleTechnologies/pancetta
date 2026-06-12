@@ -6489,7 +6489,7 @@ search to in-repo sources.
   note: production wiring would need a persistent store under ~/.pancetta and
     a decay policy (callsign churn makes stale trust actively misleading).
 
-### hb-247 — Deterministic decode-origin ordinal (replaces wall-clock lateness in hb-103 v3)  [GRADUATED 2026-06-11 Batch 81 — decode_origin shipped in decoder (6 stamp sites, 100% coverage); ΔAUC +0.040/+0.047 byte-identical across runs (beats timing proxy +33%/+150% rel); autonomous CQ gate flipped to v3 at unchanged τ=0.35 (strictly dominant-or-equal at every τ, control-verified vs v1-at-same-τ). OPERATOR-DECISION-PENDING: τ→0.90 lever (+9-12pp FP rej, recall margin 0.72→0.17) — revisit with Phase 5 on-air experience.]
+### hb-247 — Deterministic decode-origin ordinal (replaces wall-clock lateness in hb-103 v3)  [GRADUATED 2026-06-11 Batch 81 — decode_origin shipped in decoder (6 stamp sites, 100% coverage); ΔAUC +0.040/+0.047 byte-identical across runs (beats timing proxy +33%/+150% rel); autonomous CQ gate flipped to v3 at unchanged τ=0.35 (strictly dominant-or-equal at every τ, control-verified vs v1-at-same-τ). OPERATOR-DECISION-PENDING: τ→0.90 lever (+9-12pp FP rej, recall margin 0.72→0.17) — revisit with Phase 5 on-air experience. Symmetric recall lever measured Batch 82: ldpc_iterations 100→300 = +42/+17 TPs at +93/+40 FPs (uniform ~2.3 FP/TP, 1.8-2.2x wall) on raw_530_full/hard_1000 — the two levers bracket the operating point in both directions.]
 
   mode: ft8
   status: PROPOSED — Batch 79 validated decode-lateness as a content-score
