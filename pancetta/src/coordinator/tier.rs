@@ -22,7 +22,7 @@
 //! |---------|--------------|--------------|----------------------------------------|
 //! | unset   | Fast         | false        | Fast preset (mp=2, ldpc_iters=200)     |
 //! | unset   | Moderate     | true         | none (defaults)                        |
-//! | unset   | Slow         | true         | Slow preset (mp=1, osd_depth=Some(1))  |
+//! | unset   | Slow         | true         | Slow preset (mp=1, max_sync_candidates=150) |
 //! | `"1"`   | (any)        | true         | none (operator chose)                  |
 //! | `"0"`   | (any)        | false        | none (operator chose)                  |
 //!
@@ -282,8 +282,16 @@ pub(crate) async fn apply_tier(
             HardwareTier::Slow => {
                 let mut cfg = ft8_config.write().await;
                 cfg.max_decode_passes = 1;
-                cfg.osd_depth = Some(1);
-                " + Ft8Config slow preset (max_decode_passes=1, osd_depth=Some(1))"
+                // osd_depth deliberately left at the default (Some(0)
+                // since Batch 72). The old `Some(1)` here predated that
+                // ship: it was a *reduction* from the Some(2)-era
+                // default, but on top of Some(0) it would now ADD ~77
+                // FPs for +1 TP (Batch 72 hard_1000 OSD sweep).
+                // Batch 78: cap sync candidates at 150 on slow hardware
+                // (−0.06..−0.15% recall, −16% FPs, 2.3× decode speed on
+                // raw_530_full/hard_1000 with ft8_lib truth).
+                cfg.max_sync_candidates = 150;
+                " + Ft8Config slow preset (max_decode_passes=1, max_sync_candidates=150)"
             }
         }
     } else {
@@ -560,7 +568,10 @@ mod tests {
         assert!(atomic.load(Ordering::Acquire));
         let c = cfg.read().await;
         assert_eq!(c.max_decode_passes, 1);
-        assert_eq!(c.osd_depth, Some(1));
+        // Batch 78: Slow preset caps sync candidates and leaves
+        // osd_depth at the (Batch 72) default.
+        assert_eq!(c.max_sync_candidates, 150);
+        assert_eq!(c.osd_depth, Ft8Config::default().osd_depth);
     }
 
     #[tokio::test]

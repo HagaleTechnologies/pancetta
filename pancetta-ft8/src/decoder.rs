@@ -84,7 +84,16 @@ const MIN_SYNC_SCORE: f64 = 3.0;
 /// 200: composite +0.0023, hard-200 +40 rec, hard-1000 +96 rec, no
 /// regressions; wall-clock +92% per 5-tier (still well within the
 /// 3000 ms per-WAV budget).
-const MAX_SYNC_CANDIDATES: usize = 300;
+///
+/// Lowered back to 200 on 2026-06-11 (Batch 78): under ft8_lib truth
+/// and the post-Batch-72 `osd_depth=Some(0)` baseline, the 200→300
+/// step measures +3..+5 TPs for +260..+653 FPs across raw_530_full and
+/// hard_1000 — the hb-038-era gains do not reproduce on neutral truth
+/// (same pattern as the osd_depth and Batch 77 corrections). 200 keeps
+/// recall within 0.03% at −7% FPs and ~1.5× decode speed. The Slow
+/// hardware tier further lowers this to 150 (−0.06..−0.15% recall,
+/// −16% FPs, 2.3× speed; coordinator/tier.rs).
+const MAX_SYNC_CANDIDATES: usize = 200;
 
 /// Minimum frequency bin for FT8 search (0 = full passband coverage)
 const MIN_FREQ_BIN: usize = 0;

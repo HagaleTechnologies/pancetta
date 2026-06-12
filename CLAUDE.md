@@ -76,7 +76,9 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
   env-var read in the FT8 hot loop). Tier-driven `Ft8Config` rewrites
   (Batch 36 B1, Batch 41): Fast tier bumps `max_decode_passes = 2`
   (+32 TPs/hard-200) AND `ldpc_iterations = 200` (+16 TPs); Slow tier
-  rewrites to `max_decode_passes = 1` + `osd_depth = Some(1)`;
+  rewrites to `max_decode_passes = 1` + `max_sync_candidates = 150` (Batch 78;
+  the pre-Batch-72 `osd_depth = Some(1)` rewrite was dropped — it would now
+  *raise* OSD depth above the `Some(0)` default);
   Moderate stays at defaults. Operator override: `PANCETTA_SCOPED_FAST_PATH=1` forces
   on, `=0` forces off, both skip the tier-driven preset. Spec:
   `docs/superpowers/specs/2026-06-04-hb-216-s2-tier-wiring-design.md`.
