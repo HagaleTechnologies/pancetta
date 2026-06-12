@@ -6616,3 +6616,109 @@ search to in-repo sources.
     - any future NMS-on default would change this calculus (NMS would
       suppress the plateau twin anyway — re-measure before enabling
       nms_enabled + this flag together)
+
+
+### hb-252 — BICM-ID: iterative demodulation-decoding for noncoherent 8-FSK  [PRIORITY: 0.70 — HIGHEST OPEN, spawned 2026-06-12 Batch 96 web scan]
+
+  mode: ft8
+  status: PROPOSED — highest-evidence candidate from the inaugural deep-research sweep (12-0 adversarial verification)
+  mechanism: feed LDPC extrinsic LLRs back into the per-symbol tone-LLR
+    computation (SOMAP demodulator). Pancetta's current max-log extraction
+    is EXACTLY the degenerate case with all a-priori LLRs zeroed
+    (Valenti & Cheng, IEEE JSAC 2005, eq. 8) — the upgrade is a published
+    closed-form formula, not an invention. Each global iteration updates
+    demod statistics using the decoder's beliefs about the other 2 bits
+    of each 8-FSK symbol label.
+  expected_delta: literature 0.34-1.04 dB by modulation order (M=8
+    interpolates ~0.4-0.7 dB); attacks the B91 signal-limited frontier
+    directly. Caveat: measured with long turbo codes; FT8's 174-bit
+    block may realize less — measure, don't assume.
+  defensible_prior: YES — two independent peer-reviewed sources with
+    verbatim-verified numbers (Valenti/Cheng JSAC 2005; Guillén i
+    Fàbregas & Grant TWC). Receiver-side only; protocol unchanged.
+  license: academic equations, no clean-room needed.
+  estimated_effort: 1-2 sessions (SOMAP feedback into llr extraction +
+    global loop; cost is per-iteration stat updates, not extra passes)
+  conflict_analysis: subsumes/extends max-log path; composes with
+    hb-253 (exact metric) and hb-259 (EM channel re-estimation).
+
+### hb-253 — Exact Bessel noncoherent LLR metric (vs dual-max approximation)  [PRIORITY: 0.55, spawned 2026-06-12 Batch 96 web scan]
+
+  mode: ft8
+  mechanism: replace dual-max LLR with exact log I0(2·sqrt(Es)·a·|y|/N0)
+    Bessel metric; requires per-candidate Es/N0 estimation. ~0.6 dB
+    measured gap under iterative decoding (perfect-CSI upper bound);
+    JSAC 2024 (Gomez-Vilardebo) adds Doppler-uncertainty-aware and
+    estimation-free variants benchmarked with LDPC-coded FSK.
+  license: academic. effort: 1 session probe (synthetic SNR sweep first).
+  pairs with hb-252/hb-259.
+
+### hb-254 — Post-BP-failure saturation/perturbation retry lists  [PRIORITY: 0.55, spawned 2026-06-12 Batch 96 web scan]
+
+  mode: ft8
+  mechanism: after BP failure, saturate channel LLRs of selected
+    unreliable variable nodes (EQML, Kang et al. ITW 2019) or re-run BP
+    with perturbed VNs (MRBP; learned VN selection arXiv 2507.03461),
+    producing a candidate list re-decoded per entry. Near-ML reported on
+    short LDPC. Distinct from OSD (works in BP domain, not ordered
+    re-encoding) and from signal-domain multipass.
+  honesty note: pancetta's truth-adjacent BP failures sit at ~68% LLR
+    sign-agreement (B91) — far from the waterfall regime of the papers;
+    probe on the NEAR-CONVERGED failure subpopulation (few unsatisfied
+    checks) first, with the candidate-dump instrument from B91.
+  license: academic. effort: 1-2 sessions.
+
+### hb-255 — BP-RNN decoder diversity + OSD post-processing  [PRIORITY: 0.40 (GPU meatspace), spawned 2026-06-12 Batch 96 web scan]
+
+  mode: ft8
+  mechanism: N BP-RNN decoders specialized to absorbing-set error classes
+    + OSD-2 each + ML selection; within 0.2 dB of ML on CCSDS(128,64)
+    (Rosseel et al. TCOMM 2022). Extends pancetta's neural-OSD line;
+    needs training (multi-machine GPU item in meatspace ledger).
+  license: academic.
+
+### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [PRIORITY: 0.50, spawned 2026-06-12 Batch 96 web scan]
+
+  mode: ft8
+  mechanism: closed-form robust LLR sign(y)·min(a|y|, b/|y|) — linear
+    small-amplitude, inverse large-amplitude — best BER among robust
+    receivers under alpha-stable impulsive noise (Clavier et al. EURASIP
+    2021). HF's dominant non-Gaussian noise is lightning static.
+  probe: corpus characterization has per-day noise stats — test on the
+    most impulsive recorded days first; synthetic alpha-stable plant
+    corpus as fallback.
+  license: academic. effort: 1 session probe.
+
+### hb-257 — Parallel ensemble decoding with ML selection  [PRIORITY: 0.35, spawned 2026-06-12 Batch 96 web scan]
+
+  mode: ft8
+  mechanism: parallel constituent decoders (parity-check basis diversity,
+    automorphism permutations, schedule diversity, noise injection,
+    saturated BP) + ML candidate selection (Krieg et al. 2024 comparative
+    study). Pancetta's existing variants are sequential fallbacks; the
+    parallel-ensemble + ML-selection FORM is untried. Mind hb-117/hb-092
+    precedents: input-perturbation ensembles died before — the live axes
+    here are basis/permutation/schedule diversity, not gain.
+  license: academic.
+
+### hb-258 — Trajectory-informed neural OSD bit ordering  [PRIORITY: 0.35, spawned 2026-06-12 Batch 96 web scan]
+
+  mode: ft8
+  mechanism: order OSD bits by a small NN over per-bit LLR trajectories
+    across min-sum iterations instead of final |LLR| (arXiv 2404.14165):
+    order-3 with NN ordering beat truncated order-4 by ~0.2 dB at equal
+    TEP budget. In-tree head start: bp_trajectory_capture.rs already
+    records trajectories.
+  license: academic. note: OSD currently ships depth 0 — this would only
+    matter if a deeper-OSD operating point ever returns (recall lever).
+
+### hb-259 — Per-iteration EM channel re-estimation in the demod-decode loop  [PRIORITY: 0.40, spawned 2026-06-12 Batch 96 web scan]
+
+  mode: ft8
+  mechanism: re-estimate Es and N0 separately each global iteration via
+    EM fed by decoder extrinsics (Cheng/Valenti/Torrieri MILCOM 2005);
+    within 0.6 dB of perfect-CSI for 16-NFSK without AGC assumptions.
+    Companion to hb-252; supplies the estimates hb-253 needs.
+  license: academic.
+
+### hb-260 — GRAND-family decoders  [DOCUMENTED-DEAD-END 2026-06-12 Batch 96 — do not pursue: GRAND/ORBGRAND target short HIGH-RATE codes; FT8's LDPC(174,91) at rate 0.52 with 83 redundancy bits is far outside the tractable guessing regime, and query counts explode at weak-signal SNRs (Wan & Zhang 2024; Duffy/Médard foundational scope statements). Banked so future scans don't resurface it.]
