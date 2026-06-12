@@ -2491,6 +2491,19 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-architectural.md (entry A4).
 
+    PREMISE DIAGNOSTIC QUEUED (2026-06-12, Batch 85): before any
+    implementation, quantify the addressable population — what
+    fraction of pancetta misses sit within ~25 Hz of a decoded
+    signal (interferer-dominated)? BLOCKED ON an FFI fix: ft8_lib
+    truth files all carry freq_hz=0.0 because ftx_decode_candidate's
+    status.freq is never populated — derive freq from the candidate's
+    (freq_offset, freq_sub, freq_osr) instead. Bonus defect found:
+    the ft8lib_decode_audio tuple comment says (text, freq, TIME,
+    ldpc_errors) but DecodedMessage::from_ft8lib consumes arg3 as
+    SNR — truth snr_db fields are actually time values. Fix both,
+    relabel all 25k truths (~193s via batch71_ft8lib_truth_all),
+    then run the overlap analysis on existing scans.
+
 ### hb-105 — Decoder fusion at LLR level with jt9 (cross-decoder LLR sum)  [PRIORITY: 0.35, spawned 2026-06-01 from architectural ideation]
   mode: ft8
   status: pending
