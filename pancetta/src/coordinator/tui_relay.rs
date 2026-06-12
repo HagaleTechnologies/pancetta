@@ -88,6 +88,12 @@ impl super::ApplicationCoordinator {
         // (tokio::spawn was causing starvation -- same pattern as DSP/FT8 fixes)
         let relay_shutdown = shutdown.clone();
         let tui_msg_tx_relay = tui_msg_tx.clone();
+        // Runtime autonomous gate (the flag Shift+Q clears and `a`
+        // re-sets). The relay reads it (never writes) so the live
+        // `[AUTO]` panel shows enabled=false while the operator
+        // override is active, even though the qso-crate operator's
+        // internal `enabled` stays true.
+        let relay_autonomous_gate = self.autonomous_enabled_runtime.clone();
         let health_audio_alive_relay = health_audio_alive.clone();
         let health_dsp_windows_relay = health_dsp_windows.clone();
         let health_last_rms_relay = health_last_rms.clone();
@@ -181,12 +187,33 @@ impl super::ApplicationCoordinator {
                     Ok(bus_msg) => {
                         match bus_msg.message_type {
                             MessageType::AutonomousStatus(ref status) => {
-                                // Forward as status update for now
+                                // Batch 93: forward the STRUCTURED status so the
+                                // live `[AUTO]` panel renders (previously this was
+                                // flattened to a transient status-bar string and
+                                // `app.autonomous_status` stayed None forever).
+                                let mapped = map_autonomous_status(
+                                    status,
+                                    relay_autonomous_gate.load(Ordering::Acquire),
+                                );
+                                let _ = tui_msg_tx_relay.send(
+                                    pancetta_tui::tui_runner::TuiMessage::AutonomousStatusUpdate(
+                                        mapped,
+                                    ),
+                                );
+                                // Keep the status-bar text line too (additive).
                                 let _ = tui_msg_tx_relay.send(
                                     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                         component: "Autonomous".to_string(),
                                         status: status.state.clone(),
                                     },
+                                );
+                            }
+                            MessageType::TxStatus { active } => {
+                                // Batch 93: TX worker brackets every transmission
+                                // (PTT-on → PTT-off, including aborts) with these.
+                                // Drives the title-bar " TX " badge.
+                                let _ = tui_msg_tx_relay.send(
+                                    pancetta_tui::tui_runner::TuiMessage::TxStatus { active },
                                 );
                             }
                             MessageType::ActiveQsosSnapshot { ref qsos } => {
@@ -335,6 +362,18 @@ impl super::ApplicationCoordinator {
         let cmd_cq_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_abort_current_tx = self.abort_current_tx.clone();
         let cmd_autonomous_enabled = self.autonomous_enabled_runtime.clone();
+        // Whether the autonomous component is running at all (config
+        // gate). If it's config-disabled there is no decision loop to
+        // re-enable — `a` should say so honestly instead of flipping a
+        // gate nothing reads.
+        let cmd_autonomous_config_enabled = {
+            let cfg = self.config.read().await;
+            cfg.autonomous.enabled
+        };
+        // Direct path back to the TUI so ToggleAutonomous can confirm
+        // immediately (the structured panel update follows on the next
+        // autonomous slot tick, ≤15s later).
+        let cmd_tui_msg_tx = tui_msg_tx.clone();
         // F4 toggle state: Some(t) when a tune is in flight and expected
         // to auto-stop at instant t. None when no tune is queued. The
         // coordinator owns this — TUI just emits ToggleTune events.
@@ -459,8 +498,10 @@ impl super::ApplicationCoordinator {
                             //   4. Cancel any active tune tone.
                             // Logged at WARN with target=operator.override
                             // so it stands out in the journal. The
-                            // operator re-enables autonomous explicitly
-                            // (TUI `a` key); we don't auto-restore.
+                            // operator re-enables autonomous explicitly:
+                            // the TUI `a` key sends ToggleAutonomous,
+                            // which re-sets this same runtime gate
+                            // (Batch 93). We don't auto-restore.
                             warn!(
                                 target: "operator.override",
                                 "Operator emergency stop (Shift+Q): aborting TX, disabling \
@@ -524,6 +565,56 @@ impl super::ApplicationCoordinator {
                                     *cmd_tune_until.write().await =
                                         Some(now + Duration::from_secs(TUNE_DURATION_SECS as u64));
                                 }
+                            }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::ToggleAutonomous => {
+                            // Batch 93: operator pressed `a`. Flip the SAME
+                            // runtime gate OperatorEmergencyStop clears — this
+                            // is the documented Shift+Q → `a` recovery path.
+                            // Re-enabling NEVER starts a TX directly: the gate
+                            // is only read by the autonomous loop before
+                            // dispatching TX items its decision engine (with
+                            // its own slot/priority/QSO gates) produced.
+                            if !cmd_autonomous_config_enabled {
+                                info!(
+                                    "TUI ToggleAutonomous: autonomous disabled in config; \
+                                     no decision loop to toggle"
+                                );
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "Autonomous".to_string(),
+                                        status: "Autonomous disabled in config — restart with \
+                                                 autonomous.enabled=true"
+                                            .to_string(),
+                                    },
+                                );
+                            } else {
+                                let was = cmd_autonomous_enabled.load(Ordering::Acquire);
+                                let now_enabled = !was;
+                                cmd_autonomous_enabled.store(now_enabled, Ordering::Release);
+                                if now_enabled {
+                                    warn!(
+                                        target: "operator.override",
+                                        "Operator re-enabled autonomous TX (a key)"
+                                    );
+                                } else {
+                                    warn!(
+                                        target: "operator.override",
+                                        "Operator disabled autonomous TX (a key)"
+                                    );
+                                }
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "Autonomous".to_string(),
+                                        status: if now_enabled {
+                                            "Autonomous TX re-enabled (runtime gate open)"
+                                                .to_string()
+                                        } else {
+                                            "Autonomous TX disabled (runtime gate closed)"
+                                                .to_string()
+                                        },
+                                    },
+                                );
                             }
                         }
                         pancetta_tui::tui_runner::TuiCommand::TogglePtt => {
@@ -626,5 +717,115 @@ impl super::ApplicationCoordinator {
 
         info!("TUI component started");
         Ok(())
+    }
+}
+
+/// Map the bus's `AutonomousStatusData` into the TUI's structured
+/// `AutonomousStatus`, AND-ing the operator engine's internal `enabled`
+/// with the runtime gate (`autonomous_enabled_runtime` — the flag
+/// Shift+Q clears and the `a` key re-sets). The panel should show what
+/// the station will actually do: when the operator override is active,
+/// the qso-crate engine still reports `enabled: true` (it keeps its
+/// state so re-enabling picks up cleanly) but no TX will be dispatched,
+/// so the TUI must render it as disabled.
+fn map_autonomous_status(
+    data: &crate::message_bus::AutonomousStatusData,
+    runtime_gate_open: bool,
+) -> pancetta_tui::AutonomousStatus {
+    pancetta_tui::AutonomousStatus {
+        enabled: data.enabled && runtime_gate_open,
+        state: data.state.clone(),
+        slot_parity: data.slot_parity.clone(),
+        listen_counter: data.listen_counter.clone(),
+        active_qsos: data.active_qsos,
+        max_qsos: data.max_qsos,
+        idle_cycles: data.idle_cycles,
+        band_name: data.band_name.clone(),
+        tx_offset_hz: data.tx_offset_hz,
+    }
+}
+
+#[cfg(test)]
+mod tui_relay_tests {
+    use super::*;
+
+    fn sample_status(enabled: bool) -> crate::message_bus::AutonomousStatusData {
+        crate::message_bus::AutonomousStatusData {
+            enabled,
+            state: "Hunting".to_string(),
+            slot_parity: Some("Odd".to_string()),
+            listen_counter: "3/5".to_string(),
+            active_qsos: 2,
+            max_qsos: 3,
+            idle_cycles: 7,
+            band_name: "20m".to_string(),
+            tx_offset_hz: 1750.0,
+        }
+    }
+
+    /// Field-for-field forwarding when both the engine and the runtime
+    /// gate agree autonomous is on.
+    #[test]
+    fn map_forwards_all_fields_when_gate_open() {
+        let mapped = map_autonomous_status(&sample_status(true), true);
+        assert!(mapped.enabled);
+        assert_eq!(mapped.state, "Hunting");
+        assert_eq!(mapped.slot_parity.as_deref(), Some("Odd"));
+        assert_eq!(mapped.listen_counter, "3/5");
+        assert_eq!(mapped.active_qsos, 2);
+        assert_eq!(mapped.max_qsos, 3);
+        assert_eq!(mapped.idle_cycles, 7);
+        assert_eq!(mapped.band_name, "20m");
+        assert_eq!(mapped.tx_offset_hz, 1750.0);
+    }
+
+    /// After Shift+Q the runtime gate is closed but the engine still
+    /// reports enabled=true (it keeps internal state for clean resume).
+    /// The TUI must show disabled — that's what the station will do.
+    #[test]
+    fn map_shows_disabled_while_operator_override_active() {
+        let mapped = map_autonomous_status(&sample_status(true), false);
+        assert!(
+            !mapped.enabled,
+            "closed runtime gate must render as disabled"
+        );
+        // Non-enabled fields still forward so the panel keeps context.
+        assert_eq!(mapped.state, "Hunting");
+    }
+
+    /// Config-disabled engine stays disabled regardless of the gate.
+    #[test]
+    fn map_engine_disabled_wins_over_open_gate() {
+        let mapped = map_autonomous_status(&sample_status(false), true);
+        assert!(!mapped.enabled);
+    }
+
+    /// End-to-end gate semantics for the Shift+Q → `a` recovery path,
+    /// exercised the same way the command-forwarding loop does it:
+    /// emergency stop stores `false`; ToggleAutonomous flips it back.
+    /// (The full async loop isn't unit-testable without a live bus,
+    /// but the gate IS the seam — both handlers only touch this one
+    /// AtomicBool, which the autonomous loop checks before TX.)
+    #[test]
+    fn emergency_stop_then_toggle_reopens_gate() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let gate = AtomicBool::new(true); // seeded from config.autonomous.enabled
+
+        // Shift+Q → OperatorEmergencyStop handler:
+        gate.store(false, Ordering::Release);
+        assert!(!gate.load(Ordering::Acquire), "stop must close the gate");
+
+        // `a` → ToggleAutonomous handler:
+        let was = gate.load(Ordering::Acquire);
+        gate.store(!was, Ordering::Release);
+        assert!(
+            gate.load(Ordering::Acquire),
+            "toggle after stop must reopen the gate (autonomous resumes)"
+        );
+
+        // `a` again disables symmetrically.
+        let was = gate.load(Ordering::Acquire);
+        gate.store(!was, Ordering::Release);
+        assert!(!gate.load(Ordering::Acquire));
     }
 }

@@ -145,6 +145,14 @@ pub enum MessageType {
         duration_ms: u64,
     },
 
+    /// TX-active indicator for the TUI title-bar badge (Batch 93).
+    /// The TX worker sends `active: true` when PTT is asserted and
+    /// `active: false` when the transmission ends — via an RAII
+    /// observer guard, so abort paths (F8, Shift+Q, shutdown) clear
+    /// it just like normal completion. Observation only: this message
+    /// never drives PTT or audio.
+    TxStatus { active: bool },
+
     /// Autonomous operator status update
     AutonomousStatus(AutonomousStatusData),
 

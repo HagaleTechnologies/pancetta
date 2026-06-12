@@ -1103,7 +1103,10 @@ impl App {
                 }
             );
         } else {
-            self.status_message = "Autonomous mode not available".to_string();
+            // No live status yet (the autonomous loop pushes one per
+            // 15s slot). The toggle command still goes to the
+            // coordinator; the runtime gate flips regardless.
+            self.status_message = "Autonomous toggle sent (waiting for live status)".to_string();
         }
     }
 

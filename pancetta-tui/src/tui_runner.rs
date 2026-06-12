@@ -111,6 +111,17 @@ pub enum TuiMessage {
     ActiveQsosUpdate {
         qsos: Vec<crate::app::ActiveQsoBanner>,
     },
+    /// Structured autonomous-operator status, forwarded by the
+    /// coordinator's relay from the autonomous loop (one per 15s
+    /// slot). Replaces the old flattened status-bar-text-only path —
+    /// the relay still sends the text line too (additive), but this
+    /// is what drives the live `[AUTO]` panel in station_info.
+    AutonomousStatusUpdate(crate::app::AutonomousStatus),
+    /// TX-active indicator. `active: true` is sent by the coordinator's
+    /// TX worker when PTT is asserted; `false` when the transmission
+    /// ends — normal completion, operator abort (F8 / Shift+Q), or
+    /// shutdown all clear it. Drives the title-bar " TX " badge.
+    TxStatus { active: bool },
 }
 
 /// Commands sent from TUI
@@ -173,6 +184,15 @@ pub enum TuiCommand {
     /// - `StopTx` (halt current TX only; autonomous keeps running)
     /// - `StopCq` (turn off repeating CQ only)
     OperatorEmergencyStop,
+    /// Operator pressed `a` — toggle the autonomous runtime gate.
+    /// The coordinator flips the SAME `autonomous_enabled_runtime`
+    /// flag that `OperatorEmergencyStop` clears, so Shift+Q → `a`
+    /// is the documented safety-recovery path: emergency stop
+    /// disables autonomous TX, `a` re-enables it. Re-enabling never
+    /// starts a transmission directly — it only re-opens the gate
+    /// the autonomous decision loop checks before dispatching TX
+    /// (which has its own slot/priority/QSO gates).
+    ToggleAutonomous,
 }
 
 /// TUI performance metrics
@@ -389,6 +409,12 @@ impl TuiRunner {
             }
             TuiMessage::ActiveQsosUpdate { qsos } => {
                 app.active_qsos = qsos;
+            }
+            TuiMessage::AutonomousStatusUpdate(status) => {
+                app.update_autonomous_status(status);
+            }
+            TuiMessage::TxStatus { active } => {
+                app.is_transmitting = active;
             }
         }
 
@@ -608,7 +634,18 @@ impl TuiRunner {
 
             // === Autonomous controls ===
             KeyCode::Char('a') => {
+                // Flip local state optimistically for immediate feedback,
+                // then send the toggle to the coordinator — it flips the
+                // authoritative `autonomous_enabled_runtime` gate (the
+                // same one Shift+Q clears) and the next live
+                // AutonomousStatusUpdate confirms/corrects the panel.
+                // Also clear the operator-stop banner: pressing `a` is
+                // the documented re-engagement action after Shift+Q.
                 app.toggle_autonomous();
+                if app.stopped_by_operator {
+                    app.stopped_by_operator = false;
+                }
+                self.message_tx.send(TuiCommand::ToggleAutonomous)?;
             }
             KeyCode::Char('P') => {
                 // Shift-P: pause/resume autonomous (uppercase to disambiguate from p=PTT).
@@ -1322,6 +1359,86 @@ mod key_tests {
             matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq)),
             "c key must still emit StartCq even with banner visible"
         );
+    }
+
+    // === Batch 93: autonomous toggle + live status + TX indicator ===
+
+    /// `a` must emit ToggleAutonomous to the coordinator — the local
+    /// state flip alone is not enough (that was the pre-Batch-93 bug:
+    /// the key only mutated TUI-local state and the runtime gate never
+    /// moved, so Shift+Q could not be recovered from).
+    #[tokio::test]
+    async fn key_a_emits_toggle_autonomous() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key('a')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::ToggleAutonomous)),
+            "a key must emit ToggleAutonomous"
+        );
+    }
+
+    /// Safety-recovery path (Shift+Q → a): pressing `a` while the
+    /// operator-stop banner is up clears the banner AND emits the
+    /// toggle so the coordinator re-opens the runtime gate.
+    #[tokio::test]
+    async fn key_a_clears_operator_stop_banner_and_emits_toggle() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        // Simulate the emergency stop having happened.
+        app.write().await.stopped_by_operator = true;
+        r.handle_key_event(key('a')).await.unwrap();
+        assert!(
+            !app.read().await.stopped_by_operator,
+            "a must clear the operator-stop banner"
+        );
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::ToggleAutonomous)),
+            "a must emit ToggleAutonomous after an emergency stop"
+        );
+    }
+
+    /// AutonomousStatusUpdate populates `app.autonomous_status` so the
+    /// `[AUTO]` panel renders from live data instead of staying on the
+    /// muted "Disabled" placeholder forever.
+    #[tokio::test]
+    async fn autonomous_status_update_populates_app_state() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        assert!(app.read().await.autonomous_status.is_none());
+        let status = crate::app::AutonomousStatus {
+            enabled: true,
+            state: "Hunting".to_string(),
+            slot_parity: Some("Even".to_string()),
+            listen_counter: "2/5".to_string(),
+            active_qsos: 1,
+            max_qsos: 3,
+            idle_cycles: 0,
+            band_name: "20m".to_string(),
+            tx_offset_hz: 1500.0,
+        };
+        r.handle_message(TuiMessage::AutonomousStatusUpdate(status))
+            .await
+            .unwrap();
+        let app = app.read().await;
+        let live = app.autonomous_status.as_ref().expect("status must be set");
+        assert!(live.enabled);
+        assert_eq!(live.state, "Hunting");
+        assert_eq!(live.active_qsos, 1);
+        assert_eq!(live.band_name, "20m");
+    }
+
+    /// TxStatus drives `app.is_transmitting` (the title-bar " TX "
+    /// badge) — true lights it, false clears it.
+    #[tokio::test]
+    async fn tx_status_sets_and_clears_is_transmitting() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        assert!(!app.read().await.is_transmitting);
+        r.handle_message(TuiMessage::TxStatus { active: true })
+            .await
+            .unwrap();
+        assert!(app.read().await.is_transmitting, "TX badge must light");
+        r.handle_message(TuiMessage::TxStatus { active: false })
+            .await
+            .unwrap();
+        assert!(!app.read().await.is_transmitting, "TX badge must clear");
     }
 }
 
