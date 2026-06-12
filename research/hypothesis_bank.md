@@ -6618,25 +6618,40 @@ search to in-repo sources.
       nms_enabled + this flag together)
 
 
-### hb-252 — BICM-ID: iterative demodulation-decoding for noncoherent 8-FSK  [MECHANISM-CONFIRMED-FP-PENDING 2026-06-12 Batch 97 — synthetic kill-switch PASSED: 50%-threshold shift +0.384 dB @ 2 global iterations (+0.439 @ 4) on FT8's 174-bit block, inside the literature band; −19 dB decode rate 38%→58-64%. Real-corpus spot (hard_200/50): ΔTP +3 / ΔFP +21 — rescued BP runs sometimes converge to wrong CRC-passing codewords. Graduation blocked on FP control: Batch 98 = stamp rescued decodes with a dedicated decode_origin level (v3 gate prices them) + restrict rescue to low-unsatisfied-check candidates + full-corpus re-measure. Flag bicm_id_iterations default 0 (byte-identical, tested). FIRST genuine sensitivity-gain mechanism of the recovery push, sourced from the Batch 96 web sweep.]
+### hb-252 — BICM-ID: iterative demodulation-decoding for noncoherent 8-FSK  [SHIP-OPT-IN 2026-06-12 Batch 98 — FP-control attempt measured: near-converged gating does NOT separate true from wrong-CRC rescues (cumulative unsat curves track within ~1pp: T=18 keeps 80.9% true / 79.8% fp of 299/104 instrumented rescue emissions on hard_200/50). Gated spot frontier: T=5 → ΔTP+0/ΔFP+1; T=8 → +0/+8; T=18 → +2/+17; ungated (B97) +3/+21 — no operating point passes ΔFP ≤ 2×ΔTP with ΔTP>0, so the pre-registered full-corpus graduation never triggered. Synthetic mechanism survives the gate: +0.500 dB at T=18 (10 trials/pt). Shipped as opt-in: bicm_id_iterations stays default 0; rescued decodes now stamped decode_origin=Some(7) (v3 gate prices at max lateness penalty, 7/6→clamp 1.0), suspicion scrutiny unconditional for rescues, near-converged gate default 18 prunes 24.5% of futile rescue work. The mechanism is real physics but hard_200's marginal rescue population is FP-dominated — same shape that demoted osd_depth=Some(2) in Batch 72.]
 
   mode: ft8
-  status: MECHANISM-CONFIRMED-CORPUS-PENDING (Batch 97, 2026-06-12) —
-    kill-switch shipped behind `Ft8Config::bicm_id_iterations` (default
-    0 = byte-identical, test-guarded). Synthetic paired-AWGN sweep
-    (20 msgs × 50 trials/point, −24..−16 dB): 50%-threshold shift
-    **+0.384 dB at 2 iterations, +0.439 dB at 4** — clears the
-    pre-registered 0.2 dB bar, monotone across the waterfall, low end
-    of the literature 0.4-0.7 dB interpolation as the short-block
-    caveat predicted. Real-corpus spot (hard_200 first 50, ft8_lib
-    truth): ΔTP +3 / ΔFP +21 (7× ΔTP; PROCEED bar was ≤2×) — B91
-    signal-limited + CRC-14 lottery on noise-candidate retries. DO NOT
-    default-ON as-is. Next step before graduation: gate the rescue to
-    near-converged BP failures (hb-254's subpopulation) and/or raise
-    the rescue-decode confidence floor, then re-spot. Note:
-    `research/notes/2026-06-12-batch97-bicm-id.md`; harness:
-    `batch97_bicm_id_kill_switch.rs`.
-    (was: PROPOSED — highest-evidence candidate from the inaugural deep-research sweep, 12-0 adversarial verification)
+  status: SHIP-OPT-IN (Batch 98, 2026-06-12) — FP control measured, no
+    default flip. Batch 98 instrumented every rescue on hard_200/50
+    (gate off): 299 truth-matching emissions, 104 wrong-CRC emissions,
+    10,734 failed rescue attempts, 11 suspicion-rejected. The
+    unsatisfied-check distributions of true and wrong-CRC rescues are
+    nearly identical (cum. keep at T=18: 80.9% vs 79.8%) — the
+    near-converged-gate premise is REFUTED as an FP discriminator on
+    this corpus; it survives only as a wall-cost pruner (-24.5% of
+    futile rescues at T=18). Gated spot frontier (hard_200/50,
+    iters 0→2): T=5 ΔTP+0/ΔFP+1, T=8 +0/+8, T=18 +2/+17 vs ungated
+    +3/+21 — marginal rescued decodes are FP-dominated at every
+    threshold, the pre-registered proceed bar (ΔFP ≤ 2×ΔTP, ΔTP>0)
+    fails everywhere, full-corpus graduation run not triggered (per
+    pre-registration). Synthetic re-check at gated default T=18:
+    +0.500 dB threshold shift (10 trials/pt, bar ≥0.2 dB PASSED) — the
+    gate does not destroy the mechanism; true synthetic rescues are
+    near-converged. Shipped FP-control infrastructure (active whenever
+    an operator opts in with bicm_id_iterations ≥ 1):
+    `bicm_id_max_unsatisfied_checks` (default 18, pinned by test),
+    `decode_origin = Some(7)` stamping (hb-103 v3 prices rescues at
+    the max lateness penalty: 7/6 clamps to 1.0 — divisor 6 kept by
+    design), and unconditional suspicion-score scrutiny for rescued
+    decodes. Re-open only with a genuinely different discriminator
+    (hb-253 exact Bessel metric changing the rescue's LLR quality, or
+    per-candidate Es/N0 from hb-259), not another unsat-threshold
+    tune. Note: `research/notes/2026-06-12-batch98-bicm-id-gated.md`;
+    harness: `batch98_bicm_id_gated.rs`.
+    (was: MECHANISM-CONFIRMED-FP-PENDING Batch 97 — synthetic +0.384 dB
+    @ 2 iters PASSED, spot ΔTP +3 / ΔFP +21 FAILED the ≤2× bar; was:
+    PROPOSED — highest-evidence candidate from the inaugural
+    deep-research sweep, 12-0 adversarial verification)
   mechanism: feed LDPC extrinsic LLRs back into the per-symbol tone-LLR
     computation (SOMAP demodulator). Pancetta's current max-log extraction
     is EXACTLY the degenerate case with all a-priori LLRs zeroed

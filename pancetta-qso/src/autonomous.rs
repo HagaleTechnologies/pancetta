@@ -247,8 +247,10 @@ pub struct DecodedMessageInfo {
     pub time_offset_s: Option<f64>,
     /// hb-247 (Batch 81): deterministic decode-origin ordinal from
     /// `ConfidenceFeatures::decode_origin` (0 = primary pass … 6 =
-    /// sync relaxation). Feeds the v3 content score's lateness term
-    /// (`origin / 6`). `None` for pre-hb-247 paths and test scaffolding.
+    /// sync relaxation, 7 = hb-252 BICM-ID rescue). Feeds the v3
+    /// content score's lateness term (`origin / 6`, clamped to 1.0 —
+    /// origin 7 saturates at the max penalty by design). `None` for
+    /// pre-hb-247 paths and test scaffolding.
     pub decode_origin: Option<u8>,
 }
 

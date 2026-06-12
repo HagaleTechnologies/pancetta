@@ -1046,6 +1046,11 @@ pub struct ConfidenceFeatures {
     ///     (hb-048) and the extra standard pass it triggers
     ///     (fourth_pass_after_a7)
     /// 6 = sync-relaxation hook
+    /// 7 = hb-252 BICM-ID SOMAP rescue (Batch 98) — iterative
+    ///     demodulation rescue of a CRC-failed primary-pass candidate.
+    ///     NOTE: the shipped hb-103 v3 content gate maps
+    ///     `lateness_frac = origin/6` clamped to `[0, 1]`, so 7
+    ///     intentionally saturates at the maximum lateness penalty.
     /// `None` = decode predates stamping or came from a path that
     /// doesn't stamp (FFI, tests constructing messages directly).
     #[cfg_attr(feature = "serde", serde(default))]

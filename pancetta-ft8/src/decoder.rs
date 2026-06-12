@@ -933,6 +933,25 @@ pub struct Ft8Config {
     /// **0** — byte-identical to the legacy path.
     pub bicm_id_iterations: usize,
 
+    /// hb-252 (Batch 98): near-converged gate for the BICM-ID rescue.
+    /// Before the SOMAP feedback loop runs on a CRC-failed candidate,
+    /// the unsatisfied-parity-check count of the final BP hard
+    /// decision is computed (the LDPC code has 83 checks); candidates
+    /// with more than this many unsatisfied checks are skipped. The
+    /// Batch 97 spot check showed the ungated rescue is too
+    /// promiscuous: every noise candidate that fails BP gets extra
+    /// CRC-14 lottery tickets (ΔTP +3 / ΔFP +21 on hard_200/50). The
+    /// Batch 98 instrumentation run measured the unsatisfied-check
+    /// distribution of true rescues vs wrong-CRC rescues vs failures
+    /// and picked the default as the smallest threshold keeping ≥80%
+    /// of true rescues. Measured caveat: the wrong-CRC distribution
+    /// tracks the true-rescue distribution closely, so this gate
+    /// mainly prunes futile rescue work; FP control comes from the
+    /// unconditional suspicion gate and the origin-7 content pricing
+    /// (see `research/notes/2026-06-12-batch98-bicm-id-gated.md`).
+    /// Inert when `bicm_id_iterations == 0` (the default).
+    pub bicm_id_max_unsatisfied_checks: usize,
+
     /// WSJT-X Improved-style automatic passband baseline (v3.1.0,
     /// DG2YCB). When `true` AND no explicit `freq_bin_range` is supplied
     /// by the caller, the decoder analyses the per-bin average power of
@@ -1230,6 +1249,18 @@ impl Default for Ft8Config {
             // eq. 8). Raise to 2-4 to enable SOMAP feedback rescue
             // after BP-CRC failure.
             bicm_id_iterations: 0,
+            // hb-252 (Batch 98): near-converged gate for the rescue.
+            // Default 18 — smallest threshold keeping >=80% of
+            // truth-matching rescues in the Batch 98 instrumentation
+            // distribution on hard_200/50 (80.9% true kept). Honesty
+            // note: the unsat distribution of wrong-CRC rescues tracks
+            // the true-rescue distribution closely (79.8% kept at 18),
+            // so this gate mostly prunes futile rescue attempts
+            // (-24.5% of failed-rescue work); FP control comes from
+            // the unconditional suspicion gate + origin-7 pricing. See
+            // `research/notes/2026-06-12-batch98-bicm-id-gated.md`.
+            // Inert while bicm_id_iterations == 0.
+            bicm_id_max_unsatisfied_checks: 18,
             // WSJT-X Improved-style auto-passband (v3.1.0, DG2YCB).
             // Default OFF — preserves byte-identical legacy fixed-range
             // sweep behavior. Flip on to narrow the Costas sweep to the
@@ -2028,6 +2059,8 @@ impl Ft8Decoder {
                 // hb-252 BICM-ID iterative demodulation. 0 = disabled
                 // (default) — the rescue helper is never invoked.
                 bicm_id_iterations: self.config.bicm_id_iterations,
+                // hb-252 (Batch 98) near-converged rescue gate.
+                bicm_id_max_unsatisfied_checks: self.config.bicm_id_max_unsatisfied_checks,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -6372,6 +6405,10 @@ struct DecodeContext<'a> {
     /// hb-252 BICM-ID global iterations (0 = disabled, byte-identical
     /// legacy path). See `Ft8Config::bicm_id_iterations`.
     bicm_id_iterations: usize,
+    /// hb-252 (Batch 98) near-converged gate: maximum unsatisfied
+    /// parity checks (of 83) in the final BP hard decision for the
+    /// rescue to run. See `Ft8Config::bicm_id_max_unsatisfied_checks`.
+    bicm_id_max_unsatisfied_checks: usize,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -6462,14 +6499,26 @@ fn bicm_id_somap_refresh(metrics: &[[f64; 8]], apriori: &[f32]) -> Vec<f32> {
 /// what BP expects.
 ///
 /// FT8 (3 bits/symbol) only; other protocols return `None`. Returns
-/// CRC-verified codeword bits on success.
+/// CRC-verified codeword bits on success, paired with the
+/// unsatisfied-parity-check count of the seed BP hard decision (the
+/// Batch 98 near-converged gate input; also feeds the research
+/// instrumentation).
+///
+/// **Near-converged gate (Batch 98)**: after the seed BP re-run, the
+/// unsatisfied-check count of its hard decision is computed
+/// (`count_parity_errors`, 0..=83). If it exceeds `max_unsatisfied`
+/// the rescue is skipped — Batch 97 measured that running the loop on
+/// far-from-convergence (noise) candidates buys mostly CRC-14 lottery
+/// tickets (ΔFP 7× ΔTP on hard_200/50), while true rescues come from
+/// the near-converged population.
 fn par_bicm_id_rescue(
     pp: &ProtocolParams,
     ldpc: &LdpcDecoder,
     tone_magnitudes: &[[f64; NUM_TONES]],
     channel_llrs: &[f32],
     iterations: usize,
-) -> Option<BitVec> {
+    max_unsatisfied: usize,
+) -> Option<(BitVec, usize)> {
     if iterations == 0 || pp.bits_per_symbol != 3 || channel_llrs.len() != 174 {
         return None;
     }
@@ -6508,6 +6557,16 @@ fn par_bicm_id_rescue(
     let mut chan: Vec<f32> = channel_llrs.to_vec();
     let mut posterior = ldpc.belief_propagation(&chan).ok()?;
 
+    // Batch 98 near-converged gate: unsatisfied checks of the seed BP
+    // hard decision. Far-from-convergence candidates are noise-like
+    // and rescuing them is mostly a CRC-collision lottery.
+    let seed_arr: &[f32; 174] = posterior[..174].try_into().ok()?;
+    let unsatisfied = ldpc.count_parity_errors(seed_arr);
+    if unsatisfied > max_unsatisfied {
+        bicm_id_instrument(&format!("gated {unsatisfied}"));
+        return None;
+    }
+
     for _ in 0..iterations {
         // Decoder extrinsic in pancetta convention = posterior − channel.
         let extrinsic: Vec<f32> = posterior
@@ -6522,12 +6581,51 @@ fn par_bicm_id_rescue(
         if ldpc.check_syndrome_fast(arr) {
             if let Ok(bits) = ldpc.llrs_to_bits(&posterior) {
                 if par_verify_crc(&bits) {
-                    return Some(bits);
+                    return Some((bits, unsatisfied));
                 }
             }
         }
     }
+    bicm_id_instrument(&format!("fail {unsatisfied}"));
     None
+}
+
+/// Batch 98 research instrumentation for the BICM-ID rescue. When the
+/// `PANCETTA_BICM_ID_INSTRUMENT_FILE` env var names a writable path
+/// (checked once per process), appends one line per rescue event:
+///
+/// ```text
+/// gated <unsat>           rescue skipped by the near-converged gate
+/// fail <unsat>            rescue ran, never reached a CRC pass
+/// reject <unsat>          rescue passed CRC but the decode was
+///                         dropped by parse/plausibility/suspicion
+/// ok <unsat> <text>       rescue produced an emitted decode
+/// ```
+///
+/// The harness (`batch98_bicm_id_gated.rs`) classifies `ok` lines
+/// against ft8_lib truth to build the unsatisfied-check distribution
+/// of true vs wrong-CRC rescues. Disabled (one relaxed atomic load)
+/// in normal operation.
+fn bicm_id_instrument(line: &str) {
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    static SINK: OnceLock<Option<Mutex<std::fs::File>>> = OnceLock::new();
+    let sink = SINK.get_or_init(|| {
+        std::env::var("PANCETTA_BICM_ID_INSTRUMENT_FILE")
+            .ok()
+            .and_then(|p| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                    .ok()
+            })
+            .map(Mutex::new)
+    });
+    if let Some(file) = sink {
+        let mut guard = file.lock().expect("bicm-id instrument mutex poisoned");
+        let _ = writeln!(guard, "{line}");
+    }
 }
 
 /// Decode a single candidate in parallel — AP0 path (spectrogram + fine-timing FFT).
@@ -6631,16 +6729,24 @@ fn par_decode_candidate(
         // try the SOMAP feedback rescue loop on the same tone
         // magnitudes. `bicm_id_iterations == 0` (default) never invokes
         // the rescue helper, keeping the path byte-identical to legacy.
-        let corrected_bits_opt = match ldpc.decode_soft(&llrs) {
-            Ok(bits) if par_verify_crc(&bits) => Some(bits),
-            _ if ctx.bicm_id_iterations > 0 => par_bicm_id_rescue(
+        // `rescue_unsat` is `Some(seed-BP unsatisfied-check count)` iff
+        // the bits came from the rescue (Batch 98: rescued decodes get
+        // origin stamping, unconditional suspicion scrutiny, and
+        // instrumentation).
+        let (corrected_bits_opt, rescue_unsat) = match ldpc.decode_soft(&llrs) {
+            Ok(bits) if par_verify_crc(&bits) => (Some(bits), None),
+            _ if ctx.bicm_id_iterations > 0 => match par_bicm_id_rescue(
                 ctx.protocol_params,
                 ldpc,
                 &tone_magnitudes,
                 &llrs,
                 ctx.bicm_id_iterations,
-            ),
-            _ => None,
+                ctx.bicm_id_max_unsatisfied_checks,
+            ) {
+                Some((bits, unsat)) => (Some(bits), Some(unsat)),
+                None => (None, None),
+            },
+            _ => (None, None),
         };
         if let Some(corrected_bits) = corrected_bits_opt {
             // hb-244: payload cleared CRC at this coarse key — evict
@@ -6657,10 +6763,18 @@ fn par_decode_candidate(
             let payload_bits = par_apply_xor(xor_sequence, &corrected_bits);
             let ft8_message = match ctx.message_parser.parse_payload(&payload_bits) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(_) => {
+                    if let Some(unsat) = rescue_unsat {
+                        bicm_id_instrument(&format!("reject {unsat}"));
+                    }
+                    continue;
+                }
             };
 
             if !ft8_message.is_plausible() {
+                if let Some(unsat) = rescue_unsat {
+                    bicm_id_instrument(&format!("reject {unsat}"));
+                }
                 continue;
             }
 
@@ -6670,12 +6784,25 @@ fn par_decode_candidate(
             // Progressive confidence gate: hard floor + suspicion check.
             // High confidence (≥0.65): accept if plausible.
             // Low confidence (<0.65): apply extra scrutiny via suspicion score.
+            // Batch 98: BICM-ID-rescued decodes get the suspicion
+            // scrutiny UNCONDITIONALLY — a rescue is an aggressive
+            // recovery whose wrong-CRC failure mode is exactly the
+            // CRC-collision shape suspicion_score targets, so high
+            // sync confidence must not exempt it.
             const MIN_DECODE_CONFIDENCE: f32 = 0.41;
             const SCRUTINY_THRESHOLD: f32 = 0.65;
             if confidence < MIN_DECODE_CONFIDENCE {
+                if let Some(unsat) = rescue_unsat {
+                    bicm_id_instrument(&format!("reject {unsat}"));
+                }
                 continue;
             }
-            if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
+            if (rescue_unsat.is_some() || confidence < SCRUTINY_THRESHOLD)
+                && ft8_message.suspicion_score() >= 2
+            {
+                if let Some(unsat) = rescue_unsat {
+                    bicm_id_instrument(&format!("reject {unsat}"));
+                }
                 continue;
             }
 
@@ -6688,6 +6815,15 @@ fn par_decode_candidate(
             );
             decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
             decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
+            if let Some(unsat) = rescue_unsat {
+                // hb-252 (Batch 98): dedicated origin ordinal for the
+                // BICM-ID rescue. The shipped hb-103 v3 content gate
+                // derives lateness_frac = origin/6 and clamps to [0, 1],
+                // so 7 prices rescued decodes at the maximum-penalty
+                // 1.0 — intentional (documented in content_score.rs).
+                decoded_message.stamp_decode_origin(7);
+                bicm_id_instrument(&format!("ok {unsat} {}", decoded_message.text));
+            }
 
             return Some(decoded_message);
         }
@@ -14094,7 +14230,48 @@ mod bicm_id_tests {
         let ldpc = LdpcDecoder::new(50).unwrap();
         let tone_mags = vec![[0.0f64; NUM_TONES]; pp.num_symbols];
         let llrs = vec![1.0f32; 174];
-        assert!(par_bicm_id_rescue(&pp, &ldpc, &tone_mags, &llrs, 0).is_none());
+        assert!(par_bicm_id_rescue(&pp, &ldpc, &tone_mags, &llrs, 0, 83).is_none());
+    }
+
+    /// Batch 98 near-converged gate: `max_unsatisfied == 0` must block
+    /// the rescue on any candidate whose seed BP hard decision has at
+    /// least one unsatisfied parity check (i.e. every CRC-failed
+    /// candidate, by construction).
+    #[test]
+    fn rescue_gate_zero_blocks_non_converged_candidate() {
+        let pp = ProtocolParams::ft8();
+        let ldpc = LdpcDecoder::new(50).unwrap();
+        // Random-ish tone magnitudes / LLRs — guaranteed not a codeword.
+        let mut state = 0xDEADBEEFCAFEF00Du64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f32) / (u32::MAX as f32) * 4.0 - 2.0
+        };
+        let tone_mags = vec![[1.0f64; NUM_TONES]; pp.num_symbols];
+        let llrs: Vec<f32> = (0..174).map(|_| next()).collect();
+        // Sanity: the seed BP must not converge on this noise input
+        // (otherwise the gate has nothing to block).
+        let posterior = ldpc.belief_propagation(&llrs).unwrap();
+        let arr: &[f32; 174] = posterior[..174].try_into().unwrap();
+        assert!(
+            ldpc.count_parity_errors(arr) > 0,
+            "noise input unexpectedly converged — pick a different seed"
+        );
+        assert!(
+            par_bicm_id_rescue(&pp, &ldpc, &tone_mags, &llrs, 2, 0).is_none(),
+            "max_unsatisfied = 0 must gate out a non-converged candidate"
+        );
+    }
+
+    /// Batch 98 default for the near-converged gate, pinned so a
+    /// re-tune is a deliberate, journaled act (the value was chosen
+    /// from the instrumentation distribution in
+    /// `research/notes/2026-06-12-batch98-bicm-id-gated.md`).
+    #[test]
+    fn default_config_gate_value_is_pinned() {
+        assert_eq!(Ft8Config::default().bicm_id_max_unsatisfied_checks, 18);
     }
 
     /// Zero-feedback SOMAP must reduce exactly to the legacy max-log

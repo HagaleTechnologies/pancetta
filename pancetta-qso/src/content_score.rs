@@ -111,6 +111,10 @@ pub struct ContentFeatures<'a> {
     /// Preferred source (Batch 81, deterministic): `decode_origin / 6`
     /// from `ConfidenceFeatures::decode_origin` (hb-247) — held-out
     /// ΔAUC +0.040/+0.047 over v2 and byte-identical across runs.
+    /// The divisor stays 6 by design: origin 7 (hb-252 BICM-ID rescue,
+    /// Batch 98) yields 7/6 which the v3 clamp saturates at 1.0 —
+    /// rescued decodes intentionally take the maximum lateness
+    /// penalty.
     /// Legacy source (Batch 79, wall-clock proxy): decode time into
     /// window normalized by the slot max — load-sensitive, kept for
     /// research comparison only. `None` contributes nothing — v3
