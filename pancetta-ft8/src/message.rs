@@ -1033,6 +1033,23 @@ pub struct ConfidenceFeatures {
     /// bits. Higher = more confident; below ~1.0 in log-base-e LLR
     /// units signals "this bit was nearly a coin-flip."
     pub min_llr_magnitude: Option<f32>,
+    /// hb-247: deterministic ordinal recording which pipeline stage
+    /// produced this decode. Higher = more aggressive recovery, which
+    /// correlates with FP risk (Batches 79-80 measured the wall-clock
+    /// proxy at +0.03 AUC; this replaces it run-stably).
+    /// 0 = primary standard pass (pass 0)
+    /// 1 = later standard pass (pass >= 1)
+    /// 2 = cross-cycle averaging (hb-056)
+    /// 3 = coherent-multipass residual round
+    /// 4 = joint-pair retry (hb-086)
+    /// 5 = a7-family recovery: the a7 template cross-correlation pass
+    ///     (hb-048) and the extra standard pass it triggers
+    ///     (fourth_pass_after_a7)
+    /// 6 = sync-relaxation hook
+    /// `None` = decode predates stamping or came from a path that
+    /// doesn't stamp (FFI, tests constructing messages directly).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub decode_origin: Option<u8>,
 }
 
 impl DecodedMessage {
@@ -1086,6 +1103,22 @@ impl DecodedMessage {
             decode_time_into_window: None,
             via_cross_sequence_a7: false,
             confidence_features: None,
+        }
+    }
+
+    /// Stamp the decode-origin ordinal if not already set (hb-247).
+    ///
+    /// Idempotent like the `decode_time_into_window` stamp: the first
+    /// aggregation site to see this message wins, so later passes can't
+    /// overwrite earlier provenance. Creates a default
+    /// [`ConfidenceFeatures`] (all other telemetry `None`) when the
+    /// message doesn't carry one yet.
+    pub fn stamp_decode_origin(&mut self, origin: u8) {
+        let features = self
+            .confidence_features
+            .get_or_insert_with(Default::default);
+        if features.decode_origin.is_none() {
+            features.decode_origin = Some(origin);
         }
     }
 }
@@ -3190,6 +3223,7 @@ mod tests {
             osd_depth_used: Some(2),
             nharderrs: Some(3),
             min_llr_magnitude: Some(0.42),
+            decode_origin: Some(5),
         };
         let copy = cf;
         assert_eq!(cf, copy);
@@ -3212,5 +3246,61 @@ mod tests {
         // permanent contract for the FFI bridge.
         let d = DecodedMessage::from_ft8lib("CQ K1ABC FN42", 1500.0, -10.0, 0);
         assert!(d.confidence_features.is_none());
+    }
+}
+
+/// hb-247: tests for the decode-origin ordinal stamping helper.
+#[cfg(test)]
+mod decode_origin_tests {
+    use super::*;
+
+    fn fresh_message() -> DecodedMessage {
+        DecodedMessage::new(Ft8Message::default(), -10.0, 1.0, 1500.0, 0.0)
+    }
+
+    #[test]
+    fn stamp_decode_origin_sets_when_absent() {
+        let mut d = fresh_message();
+        assert!(d.confidence_features.is_none());
+        d.stamp_decode_origin(3);
+        assert_eq!(
+            d.confidence_features
+                .expect("stamping must create features when absent")
+                .decode_origin,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn stamp_decode_origin_does_not_overwrite() {
+        let mut d = fresh_message();
+        d.stamp_decode_origin(0);
+        d.stamp_decode_origin(3);
+        assert_eq!(
+            d.confidence_features.unwrap().decode_origin,
+            Some(0),
+            "first stamp wins — later aggregation passes must not overwrite provenance"
+        );
+    }
+
+    #[test]
+    fn stamp_decode_origin_preserves_existing_features() {
+        let mut d = fresh_message();
+        d.confidence_features = Some(ConfidenceFeatures {
+            bp_iterations_used: Some(7),
+            osd_depth_used: None,
+            nharderrs: None,
+            min_llr_magnitude: None,
+            decode_origin: None,
+        });
+        d.stamp_decode_origin(1);
+        let cf = d.confidence_features.unwrap();
+        assert_eq!(cf.bp_iterations_used, Some(7));
+        assert_eq!(cf.decode_origin, Some(1));
+    }
+
+    #[test]
+    fn confidence_features_default_has_no_decode_origin() {
+        assert!(ConfidenceFeatures::default().decode_origin.is_none());
     }
 }

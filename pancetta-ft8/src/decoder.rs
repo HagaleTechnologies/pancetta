@@ -1982,10 +1982,22 @@ impl Ft8Decoder {
             // themselves for fine-grained timing).
             {
                 let now_elapsed = start_time.elapsed();
+                // hb-247: deterministic origin ordinal for the standard
+                // pass loop. The extra fourth-pass-after-a7 iteration is
+                // a7-triggered recovery, so it shares ordinal 5 with the
+                // a7 cross-correlation pass below.
+                let pass_origin = if is_fourth_pass_after_a7 {
+                    5
+                } else if pass == 0 {
+                    0
+                } else {
+                    1
+                };
                 for m in pass_decoded.iter_mut() {
                     if m.decode_time_into_window.is_none() {
                         m.decode_time_into_window = Some(now_elapsed);
                     }
+                    m.stamp_decode_origin(pass_origin);
                 }
             }
 
@@ -2002,6 +2014,7 @@ impl Ft8Decoder {
                     if m.decode_time_into_window.is_none() {
                         m.decode_time_into_window = Some(now_elapsed);
                     }
+                    m.stamp_decode_origin(2);
                 }
                 pass_decoded.extend(extra);
             }
@@ -2059,6 +2072,7 @@ impl Ft8Decoder {
                         if m.decode_time_into_window.is_none() {
                             m.decode_time_into_window = Some(now_elapsed);
                         }
+                        m.stamp_decode_origin(3);
                     }
                     let added = extra.len();
                     pass_decoded.extend(extra);
@@ -2084,6 +2098,7 @@ impl Ft8Decoder {
                     if m.decode_time_into_window.is_none() {
                         m.decode_time_into_window = Some(now_elapsed);
                     }
+                    m.stamp_decode_origin(4);
                 }
                 pass_decoded.extend(extra);
             }
@@ -2124,6 +2139,7 @@ impl Ft8Decoder {
                     if m.decode_time_into_window.is_none() {
                         m.decode_time_into_window = Some(now_elapsed);
                     }
+                    m.stamp_decode_origin(5);
                 }
                 // Track a7-attributed decodes for the 4th-pass-after-a7
                 // AP-extension. We capture (text, from_callsign, snr)
@@ -2162,6 +2178,7 @@ impl Ft8Decoder {
                     if m.decode_time_into_window.is_none() {
                         m.decode_time_into_window = Some(now_elapsed);
                     }
+                    m.stamp_decode_origin(6);
                 }
                 pass_decoded.extend(extra);
             }
@@ -8518,6 +8535,9 @@ impl LdpcDecoder {
             osd_depth_used: None,
             nharderrs: None,
             min_llr_magnitude: Some(min_llr),
+            // hb-247: origin is stamped at the decode_window aggregation
+            // sites, not down here in the LDPC path.
+            decode_origin: None,
         };
 
         // Check if BP converged (syndrome = 0)
@@ -8678,6 +8698,7 @@ impl LdpcDecoder {
                         osd_depth_used: Some(depth_used),
                         nharderrs: Some(nharderrs),
                         min_llr_magnitude: features_bp_only.min_llr_magnitude,
+                        decode_origin: features_bp_only.decode_origin,
                     };
                     return Ok((codeword, features));
                 }
@@ -13509,5 +13530,59 @@ mod auto_passband_tests {
             freq_osr,
             time_padding: 0,
         }
+    }
+}
+
+/// hb-247: end-to-end test for decode-origin stamping. Helper-level
+/// behavior (set-when-absent, no-overwrite, feature preservation) is
+/// pinned in `message.rs::decode_origin_tests`; this module checks the
+/// pipeline actually stamps.
+#[cfg(test)]
+mod decode_origin_e2e_tests {
+    use super::*;
+
+    /// Mirrors `test_ttfd_stamping_on_synth_signal`: a clean synthetic
+    /// FT8 transmission must decode on the primary standard pass and
+    /// carry `decode_origin == Some(0)`.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn synth_signal_decode_carries_origin_zero() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let config = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(config).unwrap();
+        let decoded = decoder.decode_window(&tx).expect("decode");
+
+        assert!(
+            !decoded.is_empty(),
+            "synth FT8 signal should produce at least one decode"
+        );
+        for msg in &decoded {
+            let origin = msg
+                .confidence_features
+                .expect("every pipeline decode must carry ConfidenceFeatures after hb-247")
+                .decode_origin
+                .expect("every pipeline decode must carry a decode_origin stamp");
+            assert!(origin <= 6, "origin ordinal out of range: {origin}");
+        }
+        // The clean strong signal itself must come from the primary pass.
+        let cq = decoded
+            .iter()
+            .find(|m| m.text.contains("K5ARH"))
+            .expect("the encoded CQ must be among the decodes");
+        assert_eq!(
+            cq.confidence_features.unwrap().decode_origin,
+            Some(0),
+            "a clean strong signal decodes on the primary standard pass"
+        );
     }
 }
