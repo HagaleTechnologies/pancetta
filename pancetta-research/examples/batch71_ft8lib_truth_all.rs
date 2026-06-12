@@ -101,7 +101,8 @@ fn main() -> Result<()> {
             Err(_) => continue,
         };
         let out = baselines.join(format!("{sha}.ft8lib.json"));
-        if out.exists() {
+        let force = std::env::var("PANCETTA_B71_FORCE").is_ok();
+        if out.exists() && !force {
             skipped += 1;
             if (i + 1) % 500 == 0 {
                 eprintln!(
@@ -124,8 +125,12 @@ fn main() -> Result<()> {
             .map(|d| {
                 json!({
                     "message": d.text,
+                    // Batch 85: ft8_lib reports no SNR through this FFI;
+                    // snr_db is 0.0 by construction (kept for schema
+                    // compatibility). freq/time now real (FFI fix).
                     "snr_db": d.snr_db,
                     "freq_hz": d.frequency_offset,
+                    "time_sec": d.time_offset,
                 })
             })
             .collect();

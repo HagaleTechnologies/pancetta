@@ -322,12 +322,28 @@ pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
                 let c_str = unsafe { CStr::from_ptr(text_buf.as_ptr() as *const c_char) };
                 let text = c_str.to_string_lossy().trim().to_string();
 
+                // ft8_lib's ftx_decode_candidate never populates
+                // status.freq / status.time (upstream behavior — only
+                // ldpc_errors and the CRCs are written). Derive both
+                // from the candidate exactly like the upstream demo
+                // (demo/decode_ft8.c):
+                //   freq_hz  = (min_bin + freq_offset + freq_sub/freq_osr) / symbol_period
+                //   time_sec = (time_offset + time_sub/time_osr) * symbol_period
+                let cand = &candidates[i];
+                let freq_hz = (mon.min_bin as f32
+                    + cand.freq_offset as f32
+                    + cand.freq_sub as f32 / mon.wf.freq_osr as f32)
+                    / mon.symbol_period;
+                let time_sec = (cand.time_offset as f32
+                    + cand.time_sub as f32 / mon.wf.time_osr as f32)
+                    * mon.symbol_period;
+
                 // Deduplicate
                 if !messages
                     .iter()
                     .any(|(t, _, _, _): &(String, f32, f32, i32)| *t == text)
                 {
-                    messages.push((text, status.freq, status.time, status.ldpc_errors));
+                    messages.push((text, freq_hz, time_sec, status.ldpc_errors));
                 }
             }
         }

@@ -1468,8 +1468,15 @@ impl Ft8Decoder {
         let tuples = crate::ft8_lib_ffi::ft8lib_decode_audio(samples);
         tuples
             .into_iter()
-            .map(|(text, freq, snr, ldpc_errors)| {
-                DecodedMessage::from_ft8lib(&text, freq, snr, ldpc_errors)
+            .map(|(text, freq, time_sec, ldpc_errors)| {
+                // Batch 85: the FFI tuple is (text, freq_hz, TIME_sec,
+                // ldpc_errors) — this call site used to feed time into
+                // the snr slot, so every ft8_lib-sourced snr_db was
+                // actually a time offset. ft8_lib's pipeline reports no
+                // SNR here; record 0.0 and carry time where it belongs.
+                let mut m = DecodedMessage::from_ft8lib(&text, freq, 0.0, ldpc_errors);
+                m.time_offset = time_sec as f64;
+                m
             })
             .collect()
     }

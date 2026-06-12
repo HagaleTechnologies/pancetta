@@ -1,1 +1,1 @@
-{"decodes":[{"freq_hz":0.0,"message":"KO3B K1JBP EM67","snr_db":0.0}],"schema_version":1,"source":"ft8_lib_ffi","wav_path":"/Users/thagale/.pancetta/recordings/ft8_20260419_195300.wav","wav_sha256":"3955a709bff929461098c88cc3c5fb0999455ab3c2e300117d0c7801b6347d43"}
+{"decodes":[{"freq_hz":300.0,"message":"KO3B K1JBP EM67","snr_db":0.0,"time_sec":-1.1999999284744263}],"schema_version":1,"source":"ft8_lib_ffi","wav_path":"/Users/thagale/.pancetta/recordings/ft8_20260419_195300.wav","wav_sha256":"3955a709bff929461098c88cc3c5fb0999455ab3c2e300117d0c7801b6347d43"}
