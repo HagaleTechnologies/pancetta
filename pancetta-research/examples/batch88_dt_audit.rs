@@ -28,6 +28,10 @@
 //!   cargo run --release -p pancetta-research --example batch88_dt_audit
 //!
 //! Optional: pass `--fast` to halve Part B's decode list (top-1/slot).
+//! Batch 92: pass `--half-loop-off` to set
+//! `costas_half_loop_disabled = true` (sync kernel evaluates half=0
+//! only) in every decode; pass `--only-a` to run just the synthetic
+//! Part A (the before/after early-emission check).
 
 use anyhow::{Context, Result};
 use num_complex::Complex;
@@ -274,14 +278,13 @@ fn pearson(xs: &[f64], ys: &[f64]) -> f64 {
 // Part A: synthetic ground truth
 // ============================================================
 
-fn part_a() -> Result<()> {
+fn part_a(cfg: &Ft8Config) -> Result<()> {
     println!("== Part A: synthetic ground truth (reported - true, samples) ==");
     let symbols = Ft8Encoder::new()
         .encode_message("CQ W9XYZ EN50", None)
         .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
     let mut rng = rand::rngs::StdRng::seed_from_u64(0xB88);
     let noise = Normal::new(0.0f64, 0.02).unwrap();
-    let cfg = Ft8Config::default();
     let mut deltas: Vec<f64> = Vec::new();
     let mut rows: Vec<String> = Vec::new();
     for &freq in &[887.5f64, 1512.5, 2287.5, 1505.6] {
@@ -332,9 +335,8 @@ fn part_a() -> Result<()> {
 // Part B: real-corpus LS-fit audit
 // ============================================================
 
-fn part_b(worklist: &WorkList, fast: bool) -> Result<()> {
+fn part_b(worklist: &WorkList, fast: bool, cfg: &Ft8Config) -> Result<()> {
     println!("\n== Part B: real-corpus LS-fit audit (fitted - reported, samples) ==");
-    let cfg = Ft8Config::default();
     let per_slot = if fast { 1 } else { 2 };
     let mut deltas: Vec<f64> = Vec::new();
     let mut freqs: Vec<f64> = Vec::new();
@@ -403,7 +405,7 @@ fn part_b(worklist: &WorkList, fast: bool) -> Result<()> {
 // Part C: ft8_lib truth dt comparison (hash-normalized matching)
 // ============================================================
 
-fn part_c(ws: &Path, worklist: &WorkList) -> Result<()> {
+fn part_c(ws: &Path, worklist: &WorkList, cfg: &Ft8Config) -> Result<()> {
     println!("\n== Part C: pancetta dt - ft8_lib time_sec (matched decodes, samples) ==");
     #[derive(Deserialize)]
     struct TruthFile {
@@ -414,7 +416,6 @@ fn part_c(ws: &Path, worklist: &WorkList) -> Result<()> {
         message: String,
         time_sec: f64,
     }
-    let cfg = Ft8Config::default();
     let mut deltas: Vec<f64> = Vec::new();
     for entry in &worklist.entries {
         let truth_path = ws
@@ -463,11 +464,21 @@ fn part_c(ws: &Path, worklist: &WorkList) -> Result<()> {
 fn main() -> Result<()> {
     let ws = workspace_root()?;
     let fast = std::env::args().any(|a| a == "--fast");
+    let half_loop_off = std::env::args().any(|a| a == "--half-loop-off");
+    let only_a = std::env::args().any(|a| a == "--only-a");
+    let mut cfg = Ft8Config::default();
+    if half_loop_off {
+        cfg.costas_half_loop_disabled = true;
+        println!("(Batch 92: costas_half_loop_disabled = true)");
+    }
+    part_a(&cfg)?;
+    if only_a {
+        return Ok(());
+    }
     let worklist: WorkList = serde_json::from_str(&std::fs::read_to_string(
         ws.join("research/corpus/curated/ft8/hb104_kill_switch.json"),
     )?)?;
-    part_a()?;
-    part_b(&worklist, fast)?;
-    part_c(&ws, &worklist)?;
+    part_b(&worklist, fast, &cfg)?;
+    part_c(&ws, &worklist, &cfg)?;
     Ok(())
 }

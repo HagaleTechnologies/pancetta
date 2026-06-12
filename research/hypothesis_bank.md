@@ -6594,3 +6594,25 @@ search to in-repo sources.
     - vs hb-086 joint-pair retry: same candidate population, different
       mechanism (re-demod vs residual re-extraction); could stack
     - vs hb-090: inverts it — coherent demod where sync SUCCEEDS
+
+
+### hb-251 — Costas half-loop plateau removal  [SHELVED-MEASURED 2026-06-12 Batch 92 — redundancy analysis VERIFIED (kernel at (t0,half=1) reads identical cells to (t0+1,half=0); executable plateau-identity assertion in test_costas_half_loop_disabled_plateau_identity_and_sharpening), but removal is HARMFUL: raw_530_full ft8_lib-truth hash-normalized A/B, 200 slots TP −64 / FP −11, full 2066 slots TP −635 / FP −256 (wall −27%), and the Batch 88 Part A dt distribution is BYTE-IDENTICAL with the flag on — the −960 early-emission skew is absorbed downstream and never reaches reported dt. Mechanism: with nms_enabled=false the plateau emits TWO candidates 960 samples apart per strong signal; the time-domain fine search is only ±720, so the pair jointly covers ~2400 samples of alignment and LDPC sometimes converges from only one — the half loop is a free adjacent-alignment retry, redundant for scoring but load-bearing for recall. Flag `costas_half_loop_disabled` kept default-OFF (guards TIME_OSR≥2; documents the knob). Closes Batch 88 residual #1. Note: research/notes/2026-06-12-batch92-costas-half-loop.md]
+
+  mode: ft8
+  status: SHELVED-MEASURED — Batch 92 (was Batch 88 residual #1)
+  mechanism: remove the max-over-half ∈ {0,1} in
+    compute_costas_score_groups since TIME_OSR=2's t0 sweep already
+    covers half-symbol offsets; hypothesis was sharper time
+    localization (kill the −960 early-emission bucket) at no recall
+    cost.
+  expected_delta: was "dt distribution tightens, candidates unchanged";
+    measured: dt unchanged, TP −64/200 slots and −635/2066 slots (−1.6%).
+  defensible_prior: yes — pancetta-invented, score-level redundancy
+    proven by executable assertion; the operational claim is what
+    failed.
+  wild_card: false
+  estimated_effort: done (1 session)
+  conflict_analysis:
+    - any future NMS-on default would change this calculus (NMS would
+      suppress the plateau twin anyway — re-measure before enabling
+      nms_enabled + this flag together)

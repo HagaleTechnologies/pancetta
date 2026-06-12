@@ -651,6 +651,31 @@ pub struct Ft8Config {
     /// `costas_two_baseline_enabled = true`.
     pub costas_two_baseline_norm_threshold: f64,
 
+    /// Batch 92 (Batch 88 residual #1): disable the half-symbol inner
+    /// loop in `compute_costas_score_groups`. The kernel historically
+    /// takes `max` over `half ∈ {0, 1}` — a holdover from TIME_OSR=1
+    /// code. With `TIME_OSR = 2` the outer t0 sweep already visits
+    /// half-symbol offsets, and the kernel at `(t0, half=1)` reads
+    /// exactly the same spectrogram cells as `(t0+1, half=0)`, so the
+    /// max produces a two-step score plateau: `score(t0) =
+    /// max(g(t0), g(t0+1))`. Tie-breaking on the plateau emits ~8% of
+    /// candidates one sync step (960 samples ≈ 80 ms) early — the
+    /// −960 bucket in the Batch 88 dt audit. When `true`, only
+    /// `half = 0` is evaluated. Guarded: the flag is ignored (full half
+    /// loop runs) if `TIME_OSR < 2`, where the half loop is NOT
+    /// redundant.
+    ///
+    /// MEASURED (Batch 92, hb-251): keep this **false**. The plateau is
+    /// redundant for scoring but load-bearing for recall — with NMS off
+    /// it emits two candidates 960 samples apart per strong signal, and
+    /// the time-domain fine search (±720 samples) only jointly covers
+    /// the true alignment through the pair. Flag-ON on raw_530_full
+    /// (ft8_lib truth, hash-normalized): TP −64/FP −11 at 200 slots,
+    /// TP −635/FP −256 at 2066 slots (wall −27%), and the Batch 88
+    /// Part A dt distribution is byte-identical (no localization
+    /// benefit). See research/notes/2026-06-12-batch92-costas-half-loop.md.
+    pub costas_half_loop_disabled: bool,
+
     /// hb-230: half-width (Hz) of the relaxed-sync window centred on the
     /// QSO partner's audio frequency. When `Some(r)` AND the per-call
     /// `partner_freq_hz` is supplied to
@@ -1106,6 +1131,11 @@ impl Default for Ft8Config {
             costas_two_baseline_tight_steps: 20,
             costas_two_baseline_percentile: 0.40,
             costas_two_baseline_norm_threshold: 1.2,
+            // Batch 92: Costas half-loop removal default OFF pending
+            // A/B measurement (probe-baseline discipline). When false
+            // the sync kernel is byte-identical to the historical
+            // max-over-half behaviour.
+            costas_half_loop_disabled: false,
             // hb-230 (paired with hb-229 partner band-collapse):
             // relaxed-sync window default OFF. Both radius and delta must
             // be tuned together on hard-200 before the mechanism does
@@ -3924,7 +3954,21 @@ impl Ft8Decoder {
         let steps_per_symbol = TIME_OSR;
         let mut best_score = 0.0f64;
 
-        for half in 0..2 {
+        // Batch 92: with TIME_OSR >= 2 the outer t0 sweep already visits
+        // half-symbol offsets — the kernel at (t0, half=1) reads exactly
+        // the same cells as (t0+1, half=0) — so the half loop creates a
+        // two-step score plateau (`score(t0) = max(g(t0), g(t0+1))`)
+        // whose tie-break emits candidates one sync step early. When
+        // `costas_half_loop_disabled` is set, evaluate half=0 only.
+        // Guard: at TIME_OSR < 2 the half loop is NOT redundant (the t0
+        // grid is whole-symbol), so the flag is ignored there.
+        let half_count = if self.config.costas_half_loop_disabled && TIME_OSR >= 2 {
+            1
+        } else {
+            2
+        };
+
+        for half in 0..half_count {
             let mut score = 0.0f64;
             let mut num_average = 0usize;
 
@@ -9532,6 +9576,96 @@ mod tests {
             "Correct score {:.2} should be >> wrong score {:.2}",
             score,
             wrong_score
+        );
+    }
+
+    /// Batch 92: `costas_half_loop_disabled` semantics.
+    ///
+    /// 1. Plateau identity (the redundancy claim as an executable
+    ///    assertion): with the flag OFF, `score(t0) == max(g(t0),
+    ///    g(t0+1))` where `g` is the flag-ON (half=0 only) kernel —
+    ///    i.e. the half loop only re-reads cells the t0 sweep already
+    ///    visits, so flag OFF adds no information beyond a one-step
+    ///    look-ahead max.
+    /// 2. Sharpening: for a signal aligned at the odd half-offset
+    ///    (true peak at t0=1), flag OFF plateaus `score(0) ==
+    ///    score(1)` (the early-emission ambiguity) while flag ON
+    ///    resolves `score(1) > score(0)`.
+    /// 3. Zero-diff when false: a default-config decoder and an
+    ///    explicit flag-false decoder produce identical scores.
+    #[test]
+    fn test_costas_half_loop_disabled_plateau_identity_and_sharpening() {
+        let steps_per_symbol = TIME_OSR;
+        let num_steps = 79 * steps_per_symbol + 16; // headroom for t0 offsets
+        let num_bins = SAMPLES_PER_SYMBOL / 2 + 1;
+        let freq_osr = FREQ_OSR;
+        let noise_db = -40.0;
+        let signal_db = -10.0;
+        let f0 = 240usize; // 1500 Hz
+
+        // Place Costas tones aligned at the ODD half-offset: the true
+        // sync position is t0 = 1 (time_idx = 1 + sym * TIME_OSR).
+        let mut power = vec![vec![vec![noise_db; num_bins]; freq_osr]; num_steps];
+        for &group_start in &[0usize, 36, 72] {
+            for j in 0..7 {
+                let sym = group_start + j;
+                let tone = COSTAS[j] as usize;
+                let time_idx = 1 + sym * steps_per_symbol;
+                if time_idx < num_steps && f0 + tone < num_bins {
+                    power[time_idx][0][f0 + tone] = signal_db;
+                }
+            }
+        }
+        let spec = Spectrogram {
+            power,
+            complex: None,
+            num_steps,
+            num_bins,
+            freq_osr,
+            time_padding: 0,
+        };
+
+        let dec_off = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let dec_explicit_off = Ft8Decoder::new(Ft8Config {
+            costas_half_loop_disabled: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let dec_on = Ft8Decoder::new(Ft8Config {
+            costas_half_loop_disabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        // (1) + (3): plateau identity and zero-diff across a t0 range.
+        for t0 in 0..12 {
+            let off = dec_off.compute_costas_score(&spec, t0, f0, 0);
+            let off_explicit = dec_explicit_off.compute_costas_score(&spec, t0, f0, 0);
+            assert_eq!(
+                off, off_explicit,
+                "flag=false must be byte-identical to default at t0={t0}"
+            );
+            let g0 = dec_on.compute_costas_score(&spec, t0, f0, 0);
+            let g1 = dec_on.compute_costas_score(&spec, t0 + 1, f0, 0);
+            assert!(
+                (off - g0.max(g1)).abs() < 1e-12,
+                "plateau identity violated at t0={t0}: off={off:.6} vs max(g0,g1)={:.6}",
+                g0.max(g1)
+            );
+        }
+
+        // (2) Sharpening: true peak at t0=1.
+        let off0 = dec_off.compute_costas_score(&spec, 0, f0, 0);
+        let off1 = dec_off.compute_costas_score(&spec, 1, f0, 0);
+        assert!(
+            (off0 - off1).abs() < 1e-12,
+            "flag OFF should plateau across t0=0/1: {off0:.6} vs {off1:.6}"
+        );
+        let on0 = dec_on.compute_costas_score(&spec, 0, f0, 0);
+        let on1 = dec_on.compute_costas_score(&spec, 1, f0, 0);
+        assert!(
+            on1 > on0,
+            "flag ON should resolve the peak at t0=1: on0={on0:.6} on1={on1:.6}"
         );
     }
 
