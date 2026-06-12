@@ -6652,6 +6652,14 @@ search to in-repo sources.
     rescue discrimination. Remaining re-open path: hb-259 per-candidate
     Es/N0 re-estimation only. Synthetic mechanism re-reproduced a third
     time (dualmax iters 0→2: +0.306 dB under the T=18 gate).
+    Batch 100 UPDATE: the hb-259 re-open branch is also MEASURED-DEAD —
+    EM (Es, N0) re-estimation gives ΔTP +1 / ΔFP +29 on hard_200/50
+    (vs static Bessel +1/+27). All three discriminators now measured
+    (unsat gate B98, Bessel metric B99, EM estimation B100): the
+    wrong-CRC rescue population is a CRC-collision floor, and the
+    corpus-side re-open question is CLOSED. Validation continues only
+    via the on-air Phase 5 A/B (meatspace ledger) or a future
+    marginal-signal corpus.
     Note: `research/notes/2026-06-12-batch98-bicm-id-gated.md`;
     harness: `batch98_bicm_id_gated.rs`.
     (was: MECHANISM-CONFIRMED-FP-PENDING Batch 97 — synthetic +0.384 dB
@@ -6703,6 +6711,14 @@ search to in-repo sources.
     wrong-codeword BP convergence. Re-attack path: per-symbol /
     per-tone interference-aware N0 (= hb-259), NOT another demapper
     variant. (was: PROPOSED, PRIORITY 0.55, spawned Batch 96 web scan)
+    Batch 100 UPDATE: the hb-259 re-attack was run and is
+    MEASURED-NO-RESCUE-FIX (EM-refined (Es, N0) → ΔTP +1 / ΔFP +29 vs
+    static +1/+27 on hard_200/50; synthetic parity +0.017 dB). The
+    failure-mode attribution shifts from "block-constant estimation
+    wrong on interference" to the CRC-collision floor; estimator
+    variants are no longer a promising lane. hb-253 stays opt-in
+    (`llr_metric = Bessel`, +0.273 dB solo / +0.506 dB composed
+    synthetic); on-air A/B is the remaining validation path.
   mode: ft8
   mechanism: replace dual-max LLR with exact log I0(2·sqrt(Es)·a·|y|/N0)
     Bessel metric; requires per-candidate Es/N0 estimation. ~0.6 dB
@@ -6773,6 +6789,38 @@ search to in-repo sources.
 
 ### hb-259 — Per-iteration EM channel re-estimation in the demod-decode loop  [MEASURED-NO-RESCUE-FIX 2026-06-12 Batch 100 — EM-on rescue economics ΔTP +1/ΔFP +29 vs EM-off +1/+27 (Batch 99 reproduced exactly): channel-estimation quality is NOT the rescue-FP cause. Attribution: CRC-collision floor — extra BP attempts on noise candidates re-roll CRC-14's ~1/16k dice; no estimator fixes that. Closes the hb-252/253 corpus-graduation question definitively (3 discriminators measured: syndrome flat, Bessel no, EM no). Family stands as SHIP-OPT-IN +0.506 dB composed synthetic; on-air A/B (meatspace) or a marginal-signal corpus are the remaining validation paths. EM code kept behind bicm_id_em_reestimation default-false.]
 
+  status: Batch 100 probe (`batch100_em_reestimation.rs`, note
+    `research/notes/2026-06-12-batch100-em-reestimation.md`). Primary
+    source read directly (Cheng dissertation ch. 6 = the Turbo-NFSK
+    MILCOM 2005 material; the MILCOM PDF fetch timed out): E-step
+    eqs. (6.11)/(6.13) implemented verbatim — posterior tone probs
+    from current Bessel likelihoods × extrinsic-prior labels (6.13),
+    Costas symbols as pilots, log-domain LSE-normalized. M-step
+    implemented as power-domain moment matching (N0 =
+    posterior-weighted mean believed-noise tone power, exact ML for
+    the exponential noise tones; Es = posterior-weighted mean
+    believed-signal tone power − N0, floor 0.05·N0) — a documented
+    simplification of the paper's implicit F=I1/I0 amplitude
+    recursion (6.16), the same reduction family the paper itself
+    ships at ≤0.15 dB extra loss. Inner schedule per paper (<10%
+    change or 20 iterations); Batch 99 static estimator seeds
+    iteration 0; LS scale refit each global iteration against the
+    fixed normalized seed LLRs. 5 new unit tests (540 total, was
+    535): recovers an 8×-wrong seed to within 2× truth from uniform
+    priors; contradicting extrinsics verifiably inflate N0 (the
+    feedback path is live); default-false + byte-identity pinned.
+    MEASURED — synthetic (50 trials/pt, paired, batch99 seeds):
+    bessel/it2 EM-off −19.23 dB → EM-on −19.25 dB (+0.017 dB; bar
+    "no regression" PASSED; all three non-EM columns reproduce
+    Batch 99 to 0.01 dB, refactor fidelity confirmed; EM wall +3.7%
+    on the rescue path). Decisive spot (hard_200/50, ft8_lib truth):
+    EM-off ΔTP +1/ΔFP +27 (Batch 99 reproduced EXACTLY), EM-on
+    ΔTP +1/ΔFP +29 — re-open bar (ΔTP>0 AND ΔFP ≤ 2×ΔTP) NOT MET;
+    full raw_530_full/hard_1000 run not triggered (per
+    pre-registration). Do NOT re-attack with estimator variants: the
+    E-step already re-weights symbols through the posterior, so
+    per-symbol/per-tone N0 flavors have low expected value too.
+    (was: PRIORITY 0.50 raised Batch 99, spawned Batch 96 web scan)
   batch99_note: priority raised. Batch 99 (hb-253) identified the exact
     failure mode this attacks: the Bessel metric's block-constant N0
     estimate is correct on synthetic AWGN (+0.273 dB real shift) but
@@ -6781,7 +6829,8 @@ search to in-repo sources.
     The Bessel demapper + LSE SOMAP infrastructure is now in-tree
     (`Ft8Config::llr_metric`); hb-259 only needs to supply better
     (Es, N0) inside it. This is ALSO the sole remaining re-open path
-    for hb-252's rescue economics.
+    for hb-252's rescue economics. [Batch 100: tested — it wasn't
+    the cause; see status above.]
   mode: ft8
   mechanism: re-estimate Es and N0 separately each global iteration via
     EM fed by decoder extrinsics (Cheng/Valenti/Torrieri MILCOM 2005);
