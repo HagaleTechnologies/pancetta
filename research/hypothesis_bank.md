@@ -6618,7 +6618,7 @@ search to in-repo sources.
       nms_enabled + this flag together)
 
 
-### hb-252 — BICM-ID: iterative demodulation-decoding for noncoherent 8-FSK  [PRIORITY: 0.70 — HIGHEST OPEN, spawned 2026-06-12 Batch 96 web scan]
+### hb-252 — BICM-ID: iterative demodulation-decoding for noncoherent 8-FSK  [MECHANISM-CONFIRMED-FP-PENDING 2026-06-12 Batch 97 — synthetic kill-switch PASSED: 50%-threshold shift +0.384 dB @ 2 global iterations (+0.439 @ 4) on FT8's 174-bit block, inside the literature band; −19 dB decode rate 38%→58-64%. Real-corpus spot (hard_200/50): ΔTP +3 / ΔFP +21 — rescued BP runs sometimes converge to wrong CRC-passing codewords. Graduation blocked on FP control: Batch 98 = stamp rescued decodes with a dedicated decode_origin level (v3 gate prices them) + restrict rescue to low-unsatisfied-check candidates + full-corpus re-measure. Flag bicm_id_iterations default 0 (byte-identical, tested). FIRST genuine sensitivity-gain mechanism of the recovery push, sourced from the Batch 96 web sweep.]
 
   mode: ft8
   status: MECHANISM-CONFIRMED-CORPUS-PENDING (Batch 97, 2026-06-12) —
