@@ -150,8 +150,10 @@ fn configs() -> Vec<(String, Ft8Config)> {
 
 fn main() -> Result<()> {
     let ws = workspace_root()?;
+    let manifest_name = std::env::var("PANCETTA_B78_MANIFEST")
+        .unwrap_or_else(|_| "raw_530_full.manifest.json".to_string());
     let manifest: Value = serde_json::from_str(&std::fs::read_to_string(
-        ws.join("research/corpus/curated/ft8/raw_530_full.manifest.json"),
+        ws.join("research/corpus/curated/ft8").join(&manifest_name),
     )?)?;
     let all_entries: Vec<Value> = manifest["entries"]
         .as_array()
@@ -220,8 +222,9 @@ fn main() -> Result<()> {
             "| {ci} | {label} | {tot} | {tps} | {dtps:+} | {fps} | {dfps:+} | {prec:.4} | {dprec:+.4} | {secs:.0}s |\n"
         ));
     }
+    let corpus_stem = manifest_name.trim_end_matches(".manifest.json");
     let notes_path = ws.join(format!(
-        "research/notes/2026-06-11-batch78-knob-audit-{stage}.md"
+        "research/notes/2026-06-11-batch78-knob-audit-{stage}-{corpus_stem}.md"
     ));
     std::fs::write(&notes_path, &body)?;
     println!("\n{body}\nwrote {}", notes_path.display());

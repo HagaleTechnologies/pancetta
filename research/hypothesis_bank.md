@@ -6463,7 +6463,7 @@ search to in-repo sources.
 
     Source: [wsjtr docs/jt9r.md §Downsampling](https://github.com/bodiya/wsjtr/blob/main/docs/jt9r.md)
 
-### hb-246 — Cross-day callsign trust DB (hb-103 v2 feature / hb-237 AP source)  [MEASURED-DIAGNOSTIC 2026-06-11 Batch 76 — PRIORITY: 0.35]
+### hb-246 — Cross-day callsign trust DB (hb-103 v2 feature / hb-237 AP source)  [SCORE-FEATURE-CLOSED 2026-06-11 Batch 79: REDUNDANT-WITH-V2 (solo AUC 0.49, fitted weight ~0 stacked on v2 across all folds/corpora); hb-237 AP-source use remains open — PRIORITY: 0.20]
 
   spawn: user iteration plan #3 (Batch 72 journal); measured Batch 76 before any decoder wiring
   mechanism: persistent callsign->day-set DB built from ft8_lib truth over all
@@ -6488,3 +6488,32 @@ search to in-repo sources.
     decoder feature (label: cross-day trust DB).
   note: production wiring would need a persistent store under ~/.pancetta and
     a decay policy (callsign churn makes stale trust actively misleading).
+
+### hb-247 — Deterministic decode-origin ordinal (replaces wall-clock lateness in hb-103 v3)  [PRIORITY: 0.55, spawned 2026-06-11 Batch 80]
+
+  mode: ft8
+  status: PROPOSED — Batch 79 validated decode-lateness as a content-score
+    feature (+0.032/+0.012 held-out ΔAUC over v2), but the underlying
+    decode_time_into_window is wall-clock: 100%-recall τ calibration moved
+    73% between identical runs under different CPU load (Batch 80), so the
+    autonomous CQ-gate flip was deferred.
+  mechanism: ordinal `decode_origin: Option<u8>` on ConfidenceFeatures,
+    stamped at the ~8 existing decode_time emission sites in decoder.rs:
+    0 = primary pass-0, 1 = later standard pass, 2 = cross-cycle averaging
+    (hb-056), 3 = coherent-multipass residual round, 4 = joint-pair retry
+    (hb-086), 5 = a7-extra passes, 6 = relaxation hook. v3' replaces the
+    timing term with W·(origin/6).
+  expected_delta: ≥ Batch 79's lift with a run-stable τ; if domination at
+    fixed τ* holds (Batch 80 method), flip the autonomous CQ gate to v3'.
+  estimated_effort: 1 session (struct field + 8 stamp sites + plumb to
+    CqCandidate + re-run batch79/batch80 probes on origin)
+  defensible_prior: yes — the timing proxy already measured; provenance is
+    the thing it proxies. Pancetta-invented label: decode_origin ordinal.
+  evidence_for:
+    - Batch 79: timing proxy lifts AUC on both corpora, every fold
+    - Batch 80: per-corpus domination of v1 gate at equal recall
+    - Diagnostic V: solo AUC 0.695 inverted (the original signal)
+  conflict_analysis:
+    - vs hb-103 v2/v3: strict refinement, replaces the unstable term
+    - vs hb-129 TTFD: complementary — TTFD keeps wall-clock for operator
+      telemetry; decode_origin is for scoring

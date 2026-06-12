@@ -99,6 +99,7 @@ fn main() -> Result<()> {
     let ws = workspace_root()?;
     let mut body =
         String::from("# Batch 80 — hb-103 v3 operating point for the autonomous CQ gate\n\n");
+    let mut corpora_rows: Vec<(String, Vec<Row>)> = Vec::new();
 
     for (label, manifest_name, take) in [
         ("hard_200", "hard_200.manifest.json", usize::MAX),
@@ -215,7 +216,26 @@ fn main() -> Result<()> {
                 "{label} / {pop_label}: v1 recall {r1:.4} fp_rej {f1:.4} | v3@τ={tau3:.3} recall {r3:.4} fp_rej {f3:.4}"
             );
         }
+        corpora_rows.push((label.to_string(), rows));
     }
+
+    // Cross-corpus-safe operating point: one fixed τ* = min over both
+    // corpora's CQ-population 100%-recall τ. The gate ships one constant,
+    // so this is the number the flip decision rides on.
+    let tau_star = corpora_rows
+        .iter()
+        .map(|(_, rows)| tau_full_recall(&rows.iter().filter(|r| r.is_cq).collect::<Vec<&Row>>()))
+        .fold(f64::INFINITY, f64::min);
+    body.push_str(&format!(
+        "## Cross-corpus-safe τ* = {tau_star:.3} (CQ population)\n\n         | Corpus | v1 FP rejection | v3 @ τ* recall | v3 @ τ* FP rejection |\n|---|---:|---:|---:|\n"
+    ));
+    for (label, rows) in &corpora_rows {
+        let pop: Vec<&Row> = rows.iter().filter(|r| r.is_cq).collect();
+        let (_, f1, r3, f3) = gate_stats(&pop, MessageContentScore::SHIP_CONSERVATIVE, tau_star);
+        body.push_str(&format!("| {label} | {f1:.4} | {r3:.4} | {f3:.4} |\n"));
+        println!("τ*={tau_star:.3} {label}: v3 recall {r3:.4} fp_rej {f3:.4} (v1 fp_rej {f1:.4})");
+    }
+    body.push('\n');
 
     let notes_path = ws.join("research/notes/2026-06-11-batch80-v3-operating-point.md");
     std::fs::write(&notes_path, &body)?;
