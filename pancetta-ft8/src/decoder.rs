@@ -917,6 +917,22 @@ pub struct Ft8Config {
     /// is independent of upstream GPL source.
     pub a8_qso_state_ap_enabled: bool,
 
+    /// hb-252 (Batch 97): BICM-ID global demodulation↔decoding
+    /// iterations. When `> 0`, a candidate whose standard BP(/OSD)
+    /// attempt fails CRC gets up to this many SOMAP feedback
+    /// iterations: the LDPC extrinsic LLRs (BP posterior − channel
+    /// input) for the other two bits of each 8-FSK symbol label are
+    /// fed back as per-bit a-priori values into the symbol-level
+    /// max-log LLR computation (Valenti & Cheng, "Iterative
+    /// Demodulation and Decoding of Turbo-Coded M-ary Noncoherent
+    /// Orthogonal Modulation", IEEE JSAC 23(9) 2005, eq. 8), and BP
+    /// re-runs on the refreshed channel LLRs. Pancetta's standard
+    /// max-log extraction is exactly the zero-feedback degenerate
+    /// case of that formula. Applies to the primary parallel
+    /// spectrogram decode path (`par_decode_candidate`). Default
+    /// **0** — byte-identical to the legacy path.
+    pub bicm_id_iterations: usize,
+
     /// WSJT-X Improved-style automatic passband baseline (v3.1.0,
     /// DG2YCB). When `true` AND no explicit `freq_bin_range` is supplied
     /// by the caller, the decoder analyses the per-bin average power of
@@ -1208,6 +1224,12 @@ impl Default for Ft8Config {
             // templates. Inspired by spec ref
             // `spec-wsjtx-improved-a8-decoding.md`.
             a8_qso_state_ap_enabled: false,
+            // hb-252 BICM-ID iterative demodulation. Default 0 —
+            // byte-identical legacy max-log LLR extraction (the
+            // zero-feedback degenerate case of Valenti & Cheng 2005
+            // eq. 8). Raise to 2-4 to enable SOMAP feedback rescue
+            // after BP-CRC failure.
+            bicm_id_iterations: 0,
             // WSJT-X Improved-style auto-passband (v3.1.0, DG2YCB).
             // Default OFF — preserves byte-identical legacy fixed-range
             // sweep behavior. Flip on to narrow the Costas sweep to the
@@ -2003,6 +2025,9 @@ impl Ft8Decoder {
                 // to the legacy AP3/AP4 confidence gate. Inspired by
                 // spec ref `spec-wsjtx-improved-a8-decoding.md`.
                 a8_qso_state_ap_enabled: self.config.a8_qso_state_ap_enabled,
+                // hb-252 BICM-ID iterative demodulation. 0 = disabled
+                // (default) — the rescue helper is never invoked.
+                bicm_id_iterations: self.config.bicm_id_iterations,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -6344,11 +6369,165 @@ struct DecodeContext<'a> {
     /// When false the parallel AP path is byte-identical to the
     /// legacy AP3/AP4 confidence gate.
     a8_qso_state_ap_enabled: bool,
+    /// hb-252 BICM-ID global iterations (0 = disabled, byte-identical
+    /// legacy path). See `Ft8Config::bicm_id_iterations`.
+    bicm_id_iterations: usize,
 }
 
 /// Result from parallel candidate decoding (one candidate).
 struct ParDecodedCandidate {
     msg: DecodedMessage,
+}
+
+/// hb-252 (Batch 97): one SOMAP refresh of the 174 channel LLRs with
+/// per-bit a-priori feedback (Valenti & Cheng, IEEE JSAC 2005, eq. 8,
+/// max-log form).
+///
+/// `metrics[di][j]` is the log-likelihood-scaled tone metric of data
+/// symbol `di` for **binary label** `j` (i.e. already Gray-demapped:
+/// `metrics[di][j] = g * dB[gray(j)]`), and `apriori[3*di + i]` is the
+/// a-priori LLR of bit `i` of that symbol in **pancetta convention**
+/// (positive ⇒ bit 0; bit 0 is the label MSB). For output bit `i`:
+///
+///   LLR_i = max over labels with b_i=0 of (metric_j + Σ_{p≠i} v_p·b_p(j))
+///         − max over labels with b_i=1 of (metric_j + Σ_{p≠i} v_p·b_p(j))
+///
+/// with v_p = −apriori_p (the paper's log P(1)/P(0) convention). The
+/// `p ≠ i` exclusion makes the output the demodulator's *extrinsic*
+/// LLR, which is what BP consumes as its channel input. With all
+/// a-priori zero this reduces exactly to the legacy max-log extraction
+/// scaled by whatever scale `metrics` carries.
+fn bicm_id_somap_refresh(metrics: &[[f64; 8]], apriori: &[f32]) -> Vec<f32> {
+    debug_assert_eq!(metrics.len() * 3, apriori.len());
+    let mut out = vec![0.0f32; apriori.len()];
+    for (di, s2) in metrics.iter().enumerate() {
+        // Paper-convention a-priori v = log P(1)/P(0) for the 3 bits.
+        let v = [
+            -(apriori[3 * di] as f64),
+            -(apriori[3 * di + 1] as f64),
+            -(apriori[3 * di + 2] as f64),
+        ];
+        for i in 0..3 {
+            let mut m0 = f64::NEG_INFINITY;
+            let mut m1 = f64::NEG_INFINITY;
+            for (j, &metric) in s2.iter().enumerate() {
+                let mut t = metric;
+                for (p, &vp) in v.iter().enumerate() {
+                    // bit p of label j; bit 0 = MSB (matches the
+                    // llr0/llr1/llr2 masks in compute_soft_llrs_db).
+                    if p != i && (j >> (2 - p)) & 1 == 1 {
+                        t += vp;
+                    }
+                }
+                if (j >> (2 - i)) & 1 == 1 {
+                    m1 = m1.max(t);
+                } else {
+                    m0 = m0.max(t);
+                }
+            }
+            // Pancetta convention: positive ⇒ bit 0.
+            out[3 * di + i] = (m0 - m1) as f32;
+        }
+    }
+    out
+}
+
+/// hb-252 (Batch 97): BICM-ID rescue loop — iterative SOMAP
+/// demodulation ↔ LDPC BP decoding for a candidate whose standard
+/// attempt failed CRC.
+///
+/// Mechanism (Valenti & Cheng, "Iterative Demodulation and Decoding of
+/// Turbo-Coded M-ary Noncoherent Orthogonal Modulation", IEEE JSAC
+/// 23(9) 2005): pancetta's per-symbol max-log tone-LLR extraction is
+/// the zero-feedback degenerate case of the SOMAP demodulator (eq. 8).
+/// Each global iteration (1) computes the decoder's extrinsic LLRs
+/// (BP posterior − channel input), (2) feeds them back as per-bit
+/// a-priori values into the symbol-level LLR computation, and (3)
+/// re-runs BP on the refreshed channel LLRs. Stops early on a CRC pass.
+///
+/// **Units / scaling decision**: the paper's per-label metric
+/// f(y|s) must be in log-likelihood units commensurate with the
+/// a-priori LLRs. Pancetta's tone metrics are dB-spectrogram
+/// magnitudes, and the channel LLRs BP consumed have been (optionally
+/// whitened and) variance-normalized (`normalize_llrs`). We therefore
+/// fit a single per-candidate least-squares scale
+/// `g = Σ raw·chan / Σ raw²` mapping the raw dB max-log LLRs onto the
+/// normalized channel LLRs and evaluate the SOMAP with per-label
+/// metric `g·dB`. With whitening off this reproduces the normalized
+/// LLRs exactly at zero feedback (normalization is one global
+/// multiplicative factor); with whitening on it is the best
+/// single-scalar approximation. A fixed multiplicative LLR scale is
+/// the documented calibration choice — max-log outputs are linear in
+/// the metric scale, and `llr_target_variance` already standardizes
+/// what BP expects.
+///
+/// FT8 (3 bits/symbol) only; other protocols return `None`. Returns
+/// CRC-verified codeword bits on success.
+fn par_bicm_id_rescue(
+    pp: &ProtocolParams,
+    ldpc: &LdpcDecoder,
+    tone_magnitudes: &[[f64; NUM_TONES]],
+    channel_llrs: &[f32],
+    iterations: usize,
+) -> Option<BitVec> {
+    if iterations == 0 || pp.bits_per_symbol != 3 || channel_llrs.len() != 174 {
+        return None;
+    }
+
+    // Per-candidate least-squares scale raw-dB-LLR → normalized LLR.
+    let raw = par_compute_soft_llrs_db(pp, tone_magnitudes);
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for (r, c) in raw.iter().zip(channel_llrs.iter()) {
+        num += (*r as f64) * (*c as f64);
+        den += (*r as f64) * (*r as f64);
+    }
+    let g = num / den;
+    if !g.is_finite() || g <= 0.0 {
+        return None;
+    }
+
+    // Per-data-symbol scaled metrics indexed by binary label j
+    // (same Gray demap as compute_soft_llrs_db).
+    let data_positions = pp.data_symbol_indices();
+    debug_assert_eq!(data_positions.len() * 3, 174);
+    let metrics: Vec<[f64; 8]> = data_positions
+        .iter()
+        .map(|&sym_idx| {
+            let mags = &tone_magnitudes[sym_idx];
+            let mut s2 = [0.0f64; 8];
+            for (j, slot) in s2.iter_mut().enumerate() {
+                *slot = g * mags[crate::ldpc::binary_to_gray(j as u8) as usize];
+            }
+            s2
+        })
+        .collect();
+
+    // Re-run BP on the channel LLRs the failed standard attempt saw, to
+    // obtain its posterior (decode_soft does not expose posteriors).
+    let mut chan: Vec<f32> = channel_llrs.to_vec();
+    let mut posterior = ldpc.belief_propagation(&chan).ok()?;
+
+    for _ in 0..iterations {
+        // Decoder extrinsic in pancetta convention = posterior − channel.
+        let extrinsic: Vec<f32> = posterior
+            .iter()
+            .zip(chan.iter())
+            .map(|(p, c)| p - c)
+            .collect();
+        // SOMAP refresh with the extrinsic as a-priori.
+        chan = bicm_id_somap_refresh(&metrics, &extrinsic);
+        posterior = ldpc.belief_propagation(&chan).ok()?;
+        let arr: &[f32; 174] = posterior[..174].try_into().ok()?;
+        if ldpc.check_syndrome_fast(arr) {
+            if let Ok(bits) = ldpc.llrs_to_bits(&posterior) {
+                if par_verify_crc(&bits) {
+                    return Some(bits);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Decode a single candidate in parallel — AP0 path (spectrogram + fine-timing FFT).
@@ -6447,57 +6626,70 @@ fn par_decode_candidate(
             }
         }
 
-        if let Ok(corrected_bits) = ldpc.decode_soft(&llrs) {
-            if par_verify_crc(&corrected_bits) {
-                // hb-244: payload cleared CRC at this coarse key — evict
-                // the cached bucket so future receptions at the same
-                // (freq_bin, time_step) start fresh.
-                if let (Some(combiner_arc), Some(key)) = (ctx.soft_combiner, combiner_key) {
-                    let mut guard = combiner_arc.lock().expect("soft combiner mutex poisoned");
-                    guard.mark_decoded(key);
-                }
-
-                let sub_bin_offset = trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
-                let base_frequency = candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
-
-                let payload_bits = par_apply_xor(xor_sequence, &corrected_bits);
-                let ft8_message = match ctx.message_parser.parse_payload(&payload_bits) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-
-                if !ft8_message.is_plausible() {
-                    continue;
-                }
-
-                let snr_db = par_estimate_snr_spectrogram(ctx.protocol_params, &tone_magnitudes);
-                let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
-
-                // Progressive confidence gate: hard floor + suspicion check.
-                // High confidence (≥0.65): accept if plausible.
-                // Low confidence (<0.65): apply extra scrutiny via suspicion score.
-                const MIN_DECODE_CONFIDENCE: f32 = 0.41;
-                const SCRUTINY_THRESHOLD: f32 = 0.65;
-                if confidence < MIN_DECODE_CONFIDENCE {
-                    continue;
-                }
-                if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
-                    continue;
-                }
-
-                let mut decoded_message = DecodedMessage::new(
-                    ft8_message,
-                    snr_db,
-                    confidence,
-                    base_frequency,
-                    coarse_offset as f64 / SAMPLE_RATE as f64,
-                );
-                decoded_message.tone_symbols =
-                    Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
-                decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
-
-                return Some(decoded_message);
+        // Standard attempt: BP (+ OSD fallback inside decode_soft) then
+        // CRC. When the attempt fails CRC and hb-252 BICM-ID is enabled,
+        // try the SOMAP feedback rescue loop on the same tone
+        // magnitudes. `bicm_id_iterations == 0` (default) never invokes
+        // the rescue helper, keeping the path byte-identical to legacy.
+        let corrected_bits_opt = match ldpc.decode_soft(&llrs) {
+            Ok(bits) if par_verify_crc(&bits) => Some(bits),
+            _ if ctx.bicm_id_iterations > 0 => par_bicm_id_rescue(
+                ctx.protocol_params,
+                ldpc,
+                &tone_magnitudes,
+                &llrs,
+                ctx.bicm_id_iterations,
+            ),
+            _ => None,
+        };
+        if let Some(corrected_bits) = corrected_bits_opt {
+            // hb-244: payload cleared CRC at this coarse key — evict
+            // the cached bucket so future receptions at the same
+            // (freq_bin, time_step) start fresh.
+            if let (Some(combiner_arc), Some(key)) = (ctx.soft_combiner, combiner_key) {
+                let mut guard = combiner_arc.lock().expect("soft combiner mutex poisoned");
+                guard.mark_decoded(key);
             }
+
+            let sub_bin_offset = trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+            let base_frequency = candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
+
+            let payload_bits = par_apply_xor(xor_sequence, &corrected_bits);
+            let ft8_message = match ctx.message_parser.parse_payload(&payload_bits) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            if !ft8_message.is_plausible() {
+                continue;
+            }
+
+            let snr_db = par_estimate_snr_spectrogram(ctx.protocol_params, &tone_magnitudes);
+            let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
+
+            // Progressive confidence gate: hard floor + suspicion check.
+            // High confidence (≥0.65): accept if plausible.
+            // Low confidence (<0.65): apply extra scrutiny via suspicion score.
+            const MIN_DECODE_CONFIDENCE: f32 = 0.41;
+            const SCRUTINY_THRESHOLD: f32 = 0.65;
+            if confidence < MIN_DECODE_CONFIDENCE {
+                continue;
+            }
+            if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
+                continue;
+            }
+
+            let mut decoded_message = DecodedMessage::new(
+                ft8_message,
+                snr_db,
+                confidence,
+                base_frequency,
+                coarse_offset as f64 / SAMPLE_RATE as f64,
+            );
+            decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
+            decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
+
+            return Some(decoded_message);
         }
     }
 
@@ -13873,6 +14065,212 @@ mod decode_origin_e2e_tests {
             cq.confidence_features.unwrap().decode_origin,
             Some(0),
             "a clean strong signal decodes on the primary standard pass"
+        );
+    }
+}
+
+#[cfg(test)]
+mod bicm_id_tests {
+    use super::*;
+
+    /// hb-252 default-OFF promise: BICM-ID must be opt-in. Regression
+    /// guard against accidental flips — toggling default-ON requires a
+    /// graduation measurement per the verdict bars in
+    /// `research/notes/2026-06-12-batch97-bicm-id.md`.
+    #[test]
+    fn default_config_keeps_bicm_id_off() {
+        let cfg = Ft8Config::default();
+        assert_eq!(
+            cfg.bicm_id_iterations, 0,
+            "Ft8Config::default().bicm_id_iterations must be 0"
+        );
+    }
+
+    /// With `iterations == 0` the rescue helper is a guaranteed no-op
+    /// (and the call site additionally gates on `> 0`).
+    #[test]
+    fn rescue_with_zero_iterations_is_none() {
+        let pp = ProtocolParams::ft8();
+        let ldpc = LdpcDecoder::new(50).unwrap();
+        let tone_mags = vec![[0.0f64; NUM_TONES]; pp.num_symbols];
+        let llrs = vec![1.0f32; 174];
+        assert!(par_bicm_id_rescue(&pp, &ldpc, &tone_mags, &llrs, 0).is_none());
+    }
+
+    /// Zero-feedback SOMAP must reduce exactly to the legacy max-log
+    /// extraction: for every bit,
+    ///   LLR = max(metrics with bit=0) − max(metrics with bit=1).
+    /// This is the "degenerate case" identity from Valenti & Cheng 2005
+    /// eq. 8 with all v_j = 0.
+    #[test]
+    fn somap_zero_feedback_equals_legacy_maxlog() {
+        // Deterministic pseudo-random metrics for 58 data symbols.
+        let mut state = 0x9E3779B97F4A7C15u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / (u32::MAX as f64) * 40.0 - 20.0
+        };
+        let metrics: Vec<[f64; 8]> = (0..58)
+            .map(|_| {
+                let mut s2 = [0.0f64; 8];
+                for slot in s2.iter_mut() {
+                    *slot = next();
+                }
+                s2
+            })
+            .collect();
+        let zero_apriori = vec![0.0f32; 174];
+        let out = bicm_id_somap_refresh(&metrics, &zero_apriori);
+        for (di, s2) in metrics.iter().enumerate() {
+            for i in 0..3 {
+                let mut m0 = f64::NEG_INFINITY;
+                let mut m1 = f64::NEG_INFINITY;
+                for (j, &m) in s2.iter().enumerate() {
+                    if (j >> (2 - i)) & 1 == 1 {
+                        m1 = m1.max(m);
+                    } else {
+                        m0 = m0.max(m);
+                    }
+                }
+                let expected = (m0 - m1) as f32;
+                assert!(
+                    (out[3 * di + i] - expected).abs() < 1e-6,
+                    "sym {di} bit {i}: somap {} != legacy {}",
+                    out[3 * di + i],
+                    expected
+                );
+            }
+        }
+    }
+
+    /// Fairness check demanded by the hb-252 pre-registration: nonzero
+    /// a-priori feedback must actually CHANGE the refreshed LLRs — a
+    /// no-op bug must not masquerade as a SHELVE-grade null result.
+    #[test]
+    fn somap_nonzero_feedback_changes_llrs() {
+        // Ambiguous metrics (two near-tied labels) so feedback has a
+        // decision to influence.
+        let mut metrics = vec![[0.0f64; 8]; 58];
+        for s2 in metrics.iter_mut() {
+            s2[5] = 10.0; // binary 101
+            s2[3] = 9.5; // binary 011
+        }
+        let zero = vec![0.0f32; 174];
+        let base = bicm_id_somap_refresh(&metrics, &zero);
+        // A-priori: bit 0 of every symbol strongly believed = 1
+        // (pancetta convention: negative LLR ⇒ bit 1).
+        let mut apriori = vec![0.0f32; 174];
+        for di in 0..58 {
+            apriori[3 * di] = -6.0;
+        }
+        let fed = bicm_id_somap_refresh(&metrics, &apriori);
+        let max_delta = base
+            .iter()
+            .zip(fed.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_delta > 0.1,
+            "feedback produced no LLR change (max delta {max_delta}) — \
+             the SOMAP feedback path is a no-op"
+        );
+        // Direction sanity: believing bit0=1 favors label 101 (b0=1)
+        // over 011 (b0=0), so bit1 (0 in 101, 1 in 011) must move
+        // positive (toward 0). Hand-check: m0(bit1) = s2[5]+v0 = 16,
+        // m1(bit1) = s2[3] = 9.5 → fed[1] = +6.5 vs base 10−9.5 = +0.5.
+        assert!(
+            fed[1] > base[1] + 1.0,
+            "bit1 LLR must move toward 0 (got {} vs base {})",
+            fed[1],
+            base[1]
+        );
+        // Extrinsic property: bit0's own a-priori must NOT feed back
+        // into bit0's output (the j != i exclusion).
+        assert!(
+            (fed[0] - base[0]).abs() < 1e-6,
+            "bit0 output must exclude bit0's own a-priori (extrinsic), \
+             delta {}",
+            (fed[0] - base[0]).abs()
+        );
+        // Near-tie resolution — the core BICM-ID gain pattern: the
+        // 101-vs-011 ambiguity makes bit0 nearly erased at zero
+        // feedback (10 − 9.5 = −0.5). Believing bit1=0 (consistent
+        // with 101, pancetta La1 = +6) must sharpen bit0 toward 1:
+        // m1(bit0) = s2[5] = 10, m0(bit0) = max(0, s2[3]+v1) =
+        // max(0, 3.5) → fed2[0] = −10 vs base −0.5.
+        let mut apriori_b1 = vec![0.0f32; 174];
+        for di in 0..58 {
+            apriori_b1[3 * di + 1] = 6.0;
+        }
+        let fed2 = bicm_id_somap_refresh(&metrics, &apriori_b1);
+        assert!(
+            fed2[0] < base[0] - 1.0,
+            "believing bit1=0 must sharpen near-tied bit0 toward 1 \
+             (got {} vs base {})",
+            fed2[0],
+            base[0]
+        );
+    }
+
+    /// hb-252 byte-identity promise: a decode with an explicit
+    /// `bicm_id_iterations: 0` must produce exactly the same decode list
+    /// as `Ft8Config::default()` (which is 0), on a synthetic
+    /// signal-plus-deterministic-noise window. Guards the
+    /// `par_decode_candidate` restructure around the rescue gate.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn bicm_id_zero_is_byte_identical_to_default() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+        // Deterministic pseudo-noise so the comparison is reproducible.
+        let mut state = 0x243F6A8885A308D3u64;
+        for s in tx.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((state >> 33) as f32) / (u32::MAX as f32) - 0.5;
+            *s += u * 0.3;
+        }
+
+        let mut dec_default = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let mut dec_zero = Ft8Decoder::new(Ft8Config {
+            bicm_id_iterations: 0,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let a = dec_default.decode_window(&tx).expect("decode default");
+        let b = dec_zero.decode_window(&tx).expect("decode zero");
+        let key = |msgs: &[DecodedMessage]| {
+            let mut v: Vec<(String, i64, i64)> = msgs
+                .iter()
+                .map(|m| {
+                    (
+                        m.text.clone(),
+                        (m.frequency_offset * 100.0).round() as i64,
+                        (m.time_offset * 1000.0).round() as i64,
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            key(&a),
+            key(&b),
+            "bicm_id_iterations: 0 must be byte-identical to default"
+        );
+        assert!(
+            a.iter().any(|m| m.text == "CQ K5ARH EM10"),
+            "synthetic signal must decode"
         );
     }
 }

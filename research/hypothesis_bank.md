@@ -6621,7 +6621,22 @@ search to in-repo sources.
 ### hb-252 — BICM-ID: iterative demodulation-decoding for noncoherent 8-FSK  [PRIORITY: 0.70 — HIGHEST OPEN, spawned 2026-06-12 Batch 96 web scan]
 
   mode: ft8
-  status: PROPOSED — highest-evidence candidate from the inaugural deep-research sweep (12-0 adversarial verification)
+  status: MECHANISM-CONFIRMED-CORPUS-PENDING (Batch 97, 2026-06-12) —
+    kill-switch shipped behind `Ft8Config::bicm_id_iterations` (default
+    0 = byte-identical, test-guarded). Synthetic paired-AWGN sweep
+    (20 msgs × 50 trials/point, −24..−16 dB): 50%-threshold shift
+    **+0.384 dB at 2 iterations, +0.439 dB at 4** — clears the
+    pre-registered 0.2 dB bar, monotone across the waterfall, low end
+    of the literature 0.4-0.7 dB interpolation as the short-block
+    caveat predicted. Real-corpus spot (hard_200 first 50, ft8_lib
+    truth): ΔTP +3 / ΔFP +21 (7× ΔTP; PROCEED bar was ≤2×) — B91
+    signal-limited + CRC-14 lottery on noise-candidate retries. DO NOT
+    default-ON as-is. Next step before graduation: gate the rescue to
+    near-converged BP failures (hb-254's subpopulation) and/or raise
+    the rescue-decode confidence floor, then re-spot. Note:
+    `research/notes/2026-06-12-batch97-bicm-id.md`; harness:
+    `batch97_bicm_id_kill_switch.rs`.
+    (was: PROPOSED — highest-evidence candidate from the inaugural deep-research sweep, 12-0 adversarial verification)
   mechanism: feed LDPC extrinsic LLRs back into the per-symbol tone-LLR
     computation (SOMAP demodulator). Pancetta's current max-log extraction
     is EXACTLY the degenerate case with all a-priori LLRs zeroed
