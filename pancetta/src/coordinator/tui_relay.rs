@@ -84,6 +84,17 @@ impl super::ApplicationCoordinator {
             config.station.callsign.clone()
         };
 
+        // Batch 95: worked-before enrichment. This is the SAME
+        // Arc<CachedStationLookup> the autonomous priority scorer reads
+        // for its duplicate penalty — seeded from ~/.pancetta/qso.db at
+        // QSO-component startup and updated in-memory by record_worked
+        // on every completed QSO — so the TUI's worked-before flag can
+        // never disagree with the scorer. Lookups are an in-memory
+        // HashSet probe behind a parking_lot read lock; the relay
+        // thread (not the render loop) pays that cost, and the TUI just
+        // renders the precomputed bool.
+        let relay_station_lookup = self.cached_lookup.clone();
+
         // Relay decoded messages from FT8 -> TUI on a dedicated thread
         // (tokio::spawn was causing starvation -- same pattern as DSP/FT8 fixes)
         let relay_shutdown = shutdown.clone();
@@ -149,11 +160,26 @@ impl super::ApplicationCoordinator {
                                 _ => (None, None),
                             };
 
+                            // Worked-before: same semantics as the scorer's
+                            // duplicate penalty — band-scoped (current
+                            // operating frequency), uppercase-exact match on
+                            // the full callsign. We deliberately do NOT strip
+                            // /P-style suffixes: record_worked stores the
+                            // callsign exactly as logged, and adding
+                            // stripping on the TUI side only would make the
+                            // TUI flag stations the scorer still treats as
+                            // new (divergence).
+                            let dial_mhz =
+                                f64::from_bits(operating_freq_relay.load(Ordering::Relaxed));
+                            let worked_before = worked_before_for(
+                                &relay_station_lookup,
+                                call_sign.as_deref(),
+                                dial_mhz * 1_000_000.0,
+                            );
+
                             let tui_decoded = pancetta_tui::DecodedMessageView {
                                 timestamp: chrono::Utc::now(),
-                                frequency: f64::from_bits(
-                                    operating_freq_relay.load(Ordering::Relaxed),
-                                ),
+                                frequency: dial_mhz,
                                 mode: "FT8".to_string(),
                                 snr: decoded_msg.snr_db as i32,
                                 delta_time: decoded_msg.time_offset as f32,
@@ -165,6 +191,7 @@ impl super::ApplicationCoordinator {
                                 bearing,
                                 slot_parity: decoded_msg.slot_parity,
                                 is_directed_at_us,
+                                worked_before,
                             };
 
                             match tui_msg_tx_relay.send(
@@ -249,17 +276,40 @@ impl super::ApplicationCoordinator {
                                     },
                                 );
                             }
+                            MessageType::RigControl(
+                                crate::message_bus::RigControlMessage::SignalStrengthResponse {
+                                    db_over_s9,
+                                },
+                            ) => {
+                                // Batch 95: real rig S-meter read (hamlib
+                                // STRENGTH, dB relative to S9) from the
+                                // polling loop — forward verbatim.
+                                let _ = tui_msg_tx_relay.send(
+                                    pancetta_tui::tui_runner::TuiMessage::SignalStrengthUpdate {
+                                        db_over_s9,
+                                    },
+                                );
+                            }
                             MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
                                 callsign,
                                 frequency,
                                 spotter,
                                 ..
                             }) => {
+                                // Worked-before keyed on the SPOT's frequency
+                                // (cluster spots carry their own), same
+                                // lookup/semantics as the decode path above.
+                                let worked_before = worked_before_for(
+                                    &relay_station_lookup,
+                                    Some(callsign.as_str()),
+                                    frequency as f64,
+                                );
                                 let _ = tui_msg_tx_relay.send(
                                     pancetta_tui::tui_runner::TuiMessage::DxSpot {
                                         callsign,
                                         frequency,
                                         spotter,
+                                        worked_before,
                                     },
                                 );
                             }
@@ -747,6 +797,27 @@ fn map_qso_snapshot_item(
     }
 }
 
+/// Worked-before check for TUI enrichment (Batch 95).
+///
+/// Delegates to `CachedStationLookup::is_duplicate` — the exact method
+/// the autonomous priority scorer calls for its duplicate penalty — so
+/// the TUI's worked-before flag is consistent with the scorer by
+/// construction: band-scoped on `freq_hz`, uppercase-exact match on the
+/// full callsign as logged (no /P-style suffix stripping, because the
+/// scorer doesn't strip either). `None`/empty callsigns (unparsed
+/// decodes) are never "worked".
+fn worked_before_for(
+    lookup: &crate::priority_evaluator::CachedStationLookup,
+    callsign: Option<&str>,
+    freq_hz: f64,
+) -> bool {
+    use pancetta_qso::priority::WorkedStationLookup;
+    match callsign {
+        Some(c) if !c.is_empty() => lookup.is_duplicate(c, freq_hz),
+        _ => false,
+    }
+}
+
 fn map_autonomous_status(
     data: &crate::message_bus::AutonomousStatusData,
     runtime_gate_open: bool,
@@ -913,5 +984,60 @@ mod tui_relay_tests {
         let was = gate.load(Ordering::Acquire);
         gate.store(!was, Ordering::Release);
         assert!(!gate.load(Ordering::Acquire));
+    }
+
+    /// Batch 95: the TUI's worked-before flag and the autonomous
+    /// scorer's duplicate penalty must come from the SAME lookup with
+    /// the SAME semantics. Exercise both through the shared
+    /// CachedStationLookup and assert they agree on every case.
+    #[test]
+    fn worked_before_matches_scorer_duplicate_semantics() {
+        use pancetta_qso::priority::WorkedStationLookup;
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        lookup.record_worked("ja1abc", "20m"); // lowercase in, uppercased internally
+
+        let cases = [
+            ("JA1ABC", 14_074_000.0),   // worked, same band → true
+            ("ja1abc", 14_074_000.0),   // case-insensitive → true
+            ("JA1ABC", 7_074_000.0),    // other band → false (band-scoped)
+            ("JA1ABC/P", 14_074_000.0), // suffix NOT stripped → false (matches scorer)
+            ("DL5XYZ", 14_074_000.0),   // never worked → false
+        ];
+        for (call, freq) in cases {
+            assert_eq!(
+                worked_before_for(&lookup, Some(call), freq),
+                lookup.is_duplicate(call, freq),
+                "TUI and scorer disagree for {} at {} Hz",
+                call,
+                freq
+            );
+        }
+
+        // Spot checks on the actual values.
+        assert!(worked_before_for(&lookup, Some("JA1ABC"), 14_074_000.0));
+        assert!(worked_before_for(&lookup, Some("ja1abc"), 14_074_000.0));
+        assert!(!worked_before_for(&lookup, Some("JA1ABC"), 7_074_000.0));
+        assert!(!worked_before_for(&lookup, Some("JA1ABC/P"), 14_074_000.0));
+    }
+
+    /// Unparsed decodes (no callsign) and empty strings are never
+    /// flagged as worked.
+    #[test]
+    fn worked_before_handles_missing_callsign() {
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        lookup.record_worked("K1ABC", "20m");
+        assert!(!worked_before_for(&lookup, None, 14_074_000.0));
+        assert!(!worked_before_for(&lookup, Some(""), 14_074_000.0));
+    }
+
+    /// A QSO completing mid-session (record_worked) must flip the flag
+    /// for subsequent decodes — the live-update path, not just the
+    /// startup seed.
+    #[test]
+    fn worked_before_updates_live_on_record_worked() {
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        assert!(!worked_before_for(&lookup, Some("VK2DEF"), 14_074_000.0));
+        lookup.record_worked("VK2DEF", "20m");
+        assert!(worked_before_for(&lookup, Some("VK2DEF"), 14_074_000.0));
     }
 }

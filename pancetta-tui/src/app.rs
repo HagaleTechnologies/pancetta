@@ -67,6 +67,16 @@ pub struct DecodedMessageView {
     /// in bold + accent color so the operator can't miss someone calling
     /// them. Defaults to `false` in test fixtures.
     pub is_directed_at_us: bool,
+    /// `true` if this station has already been worked **on the current
+    /// band**. Computed at the tui_relay layer from the coordinator's
+    /// `CachedStationLookup::is_duplicate` — the exact same instance and
+    /// method the autonomous priority scorer uses for its duplicate
+    /// penalty, so the TUI and the scorer can never disagree. Matching
+    /// is uppercase-exact on the full logged callsign (no /P-style
+    /// suffix stripping), again because that is what the scorer does.
+    /// Defaults to `false` in test fixtures and legacy paths.
+    #[serde(default)]
+    pub worked_before: bool,
 }
 
 /// One in-progress QSO surfaced to the operator. Coordinator-side QSO
@@ -375,6 +385,13 @@ pub struct App {
     pub audio_device: Option<String>,
     pub is_monitoring: bool,
     pub audio_level: f32,
+    /// Last rig S-meter reading, in hamlib STRENGTH convention: dB
+    /// relative to S9 (0 = S9, -54 ≈ S0, +20 = S9+20). `None` until the
+    /// first reading arrives (no rig, or rig doesn't report STRENGTH).
+    pub signal_strength_db: Option<i32>,
+    /// When `signal_strength_db` was last updated. Used to render the
+    /// S-meter as stale ("---") if the rig stops reporting.
+    pub signal_strength_at: Option<DateTime<Utc>>,
     pub pipeline_health: Option<PipelineHealth>,
     pub color_capability: ColorCapability,
     pub waterfall_data: Vec<Vec<f32>>,
@@ -481,6 +498,8 @@ impl App {
             audio_device,
             is_monitoring: false,
             audio_level: 0.0,
+            signal_strength_db: None,
+            signal_strength_at: None,
             pipeline_health: None,
             color_capability: ColorCapability::detect(),
             waterfall_data: Vec::new(),
@@ -726,7 +745,10 @@ impl App {
                 snr: message.snr,
                 distance: message.distance,
                 bearing: message.bearing,
-                worked_before: false, // TODO: Check logbook
+                // Carried from the relay's CachedStationLookup check —
+                // same source as the autonomous scorer's duplicate
+                // penalty (band-scoped, uppercase-exact match).
+                worked_before: message.worked_before,
                 priority_score: self.calculate_dx_priority(&message),
                 source: SpotSource::Local,
                 rarity_tier: None,
@@ -885,8 +907,29 @@ impl App {
             .map(|radio_mhz| (radio_mhz - self.station_info.operating_frequency) * 1000.0)
     }
 
-    pub fn update_signal_strength(&mut self, strength: f32) {
-        self.audio_level = strength;
+    /// Record a rig S-meter reading (hamlib STRENGTH convention: dB
+    /// relative to S9). Batch 95: previously this clobbered
+    /// `audio_level` (a 0.0-1.0 RMS ratio) with a dB value, which would
+    /// have pegged/broken the audio gauge the moment a real reading
+    /// arrived — nothing produced the message until now, so the bug was
+    /// latent. S-meter and audio level are now separate fields.
+    pub fn update_signal_strength(&mut self, db_over_s9: i32) {
+        self.signal_strength_db = Some(db_over_s9);
+        self.signal_strength_at = Some(Utc::now());
+    }
+
+    /// S-meter display, or `None` when no reading exists or the last
+    /// reading is stale (rig stopped reporting > 10s ago). Formatting
+    /// follows the hamlib STRENGTH convention (0 dB = S9, 6 dB per
+    /// S-unit below S9).
+    pub fn s_meter_display(&self) -> Option<String> {
+        const STALE_AFTER_SECS: i64 = 10;
+        let db = self.signal_strength_db?;
+        let at = self.signal_strength_at?;
+        if (Utc::now() - at).num_seconds() > STALE_AFTER_SECS {
+            return None;
+        }
+        Some(format_s_meter(db))
     }
 
     /// Get the primary (first) QSO status, or a default standby entry.
@@ -939,7 +982,14 @@ impl App {
         self.active_qsos = qsos;
     }
 
-    pub fn add_dx_spot(&mut self, callsign: String, freq: f64, mode: String, snr: i32) {
+    pub fn add_dx_spot(
+        &mut self,
+        callsign: String,
+        freq: f64,
+        mode: String,
+        snr: i32,
+        worked_before: bool,
+    ) {
         let dx_station = DxStation {
             call_sign: callsign.clone(),
             grid_square: None,
@@ -949,7 +999,10 @@ impl App {
             snr,
             distance: None,
             bearing: None,
-            worked_before: false,
+            // Computed at the tui_relay layer against the coordinator's
+            // CachedStationLookup (same source as the autonomous
+            // scorer's duplicate penalty), keyed on the spot frequency.
+            worked_before,
             priority_score: 0,
             source: SpotSource::Local,
             rarity_tier: None,
@@ -1297,6 +1350,24 @@ impl App {
     }
 }
 
+/// Format a hamlib STRENGTH reading (dB relative to S9) as a
+/// conventional S-meter string: "S0".."S9" below S9, "S9+NN" above.
+/// One S-unit = 6 dB. Examples: -54 → "S0", -12 → "S7", 0 → "S9",
+/// +20 → "S9+20".
+pub fn format_s_meter(db_over_s9: i32) -> String {
+    if db_over_s9 >= 0 {
+        if db_over_s9 == 0 {
+            "S9".to_string()
+        } else {
+            format!("S9+{}", db_over_s9)
+        }
+    } else {
+        // 6 dB per S-unit below S9; clamp at S0 for very weak readings.
+        let s_unit = (9 + db_over_s9.div_euclid(6)).max(0);
+        format!("S{}", s_unit)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1316,6 +1387,7 @@ mod tests {
             bearing: None,
             slot_parity: None,
             is_directed_at_us: false,
+            worked_before: false,
         }
     }
 
@@ -1655,5 +1727,65 @@ mod tests {
         v.slot_parity = Some(parity);
         v.timestamp = timestamp;
         v
+    }
+
+    /// Batch 95: worked_before computed at the relay must flow through
+    /// add_decoded_message into the DxStation entry the DX hunter
+    /// renders (previously hardcoded false with a TODO).
+    #[tokio::test]
+    async fn add_decoded_message_carries_worked_before_into_dx_station() {
+        let mut app = fixture_app().await;
+
+        let mut worked = fixture_view("JA1ABC", -10);
+        worked.worked_before = true;
+        app.add_decoded_message(worked).await.unwrap();
+        assert!(
+            app.dx_stations.get("JA1ABC").unwrap().worked_before,
+            "worked_before=true must reach the DX station entry"
+        );
+
+        let fresh = fixture_view("DL5XYZ", -10);
+        app.add_decoded_message(fresh).await.unwrap();
+        assert!(!app.dx_stations.get("DL5XYZ").unwrap().worked_before);
+    }
+
+    /// Batch 95 regression: an S-meter reading must NOT clobber the
+    /// audio level gauge (the old update_signal_strength wrote the dB
+    /// value into audio_level, a 0.0-1.0 RMS ratio).
+    #[tokio::test]
+    async fn s_meter_update_does_not_clobber_audio_level() {
+        let mut app = fixture_app().await;
+        app.audio_level = 0.42;
+        app.update_signal_strength(-12);
+        assert_eq!(app.audio_level, 0.42, "audio level must be untouched");
+        assert_eq!(app.signal_strength_db, Some(-12));
+        assert_eq!(app.s_meter_display().as_deref(), Some("S7"));
+    }
+
+    /// A stale S-meter reading (rig stopped reporting) renders as None
+    /// so the UI shows "---" instead of a misleading frozen value.
+    #[tokio::test]
+    async fn s_meter_display_goes_stale() {
+        let mut app = fixture_app().await;
+        assert_eq!(app.s_meter_display(), None, "no reading yet");
+        app.update_signal_strength(0);
+        assert_eq!(app.s_meter_display().as_deref(), Some("S9"));
+        // Backdate the reading past the staleness window.
+        app.signal_strength_at = Some(Utc::now() - chrono::Duration::seconds(11));
+        assert_eq!(app.s_meter_display(), None, "stale reading must hide");
+    }
+
+    /// hamlib STRENGTH convention: 0 dB = S9, 6 dB per S-unit below.
+    #[test]
+    fn format_s_meter_follows_hamlib_convention() {
+        assert_eq!(format_s_meter(-54), "S0");
+        assert_eq!(format_s_meter(-24), "S5");
+        assert_eq!(format_s_meter(-12), "S7");
+        assert_eq!(format_s_meter(-6), "S8");
+        assert_eq!(format_s_meter(0), "S9");
+        assert_eq!(format_s_meter(20), "S9+20");
+        assert_eq!(format_s_meter(60), "S9+60");
+        // Very weak readings clamp at S0 rather than going negative.
+        assert_eq!(format_s_meter(-120), "S0");
     }
 }

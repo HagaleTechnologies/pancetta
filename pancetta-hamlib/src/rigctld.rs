@@ -539,7 +539,9 @@ impl RigControl for RigctldClient {
         // Get signal strength
         let response = self.send_command_with_retry("\\get_level STRENGTH").await?;
 
-        // Parse as dBm (rigctld returns values like "-54"). On parse failure
+        // Parse the integer reading (rigctld returns values like "-54").
+        // Per hamlib convention, STRENGTH is dB relative to S9: 0 = S9,
+        // -54 ≈ S0, +20 = S9 + 20 dB. On parse failure
         // return an error rather than the silent -120 fallback that would
         // be indistinguishable from a real "very weak signal" reading and
         // poison the SNR / band-noise displays in the TUI.

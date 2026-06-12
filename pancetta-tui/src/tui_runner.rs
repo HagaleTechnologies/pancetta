@@ -82,13 +82,20 @@ pub enum TuiMessage {
     DecodedMessage(DecodedMessageView),
     /// Frequency update
     FrequencyUpdate { vfo: u8, frequency: u64 },
-    /// Signal strength update
-    SignalStrengthUpdate { dbm: i32 },
+    /// Rig S-meter update. Value follows the hamlib STRENGTH
+    /// convention: dB relative to S9 (0 = S9, -54 ≈ S0, +20 = S9+20).
+    /// Produced by the coordinator's rig polling loop (Batch 95); only
+    /// real rig readings arrive here — never synthesized data.
+    SignalStrengthUpdate { db_over_s9: i32 },
     /// DX spot
     DxSpot {
         callsign: String,
         frequency: u64,
         spotter: String,
+        /// Worked-before flag computed by the coordinator relay against
+        /// the same CachedStationLookup the autonomous scorer uses
+        /// (band-scoped on the spot frequency, uppercase-exact match).
+        worked_before: bool,
     },
     /// Error message
     Error { component: String, message: String },
@@ -369,16 +376,23 @@ impl TuiRunner {
             TuiMessage::FrequencyUpdate { vfo: _, frequency } => {
                 app.update_frequency(frequency);
             }
-            TuiMessage::SignalStrengthUpdate { dbm } => {
-                app.update_signal_strength(dbm as f32);
+            TuiMessage::SignalStrengthUpdate { db_over_s9 } => {
+                app.update_signal_strength(db_over_s9);
             }
             TuiMessage::DxSpot {
                 callsign,
                 frequency,
                 spotter: _,
+                worked_before,
             } => {
                 // For now use FT8 as default mode
-                app.add_dx_spot(callsign, frequency as f64, "FT8".to_string(), 0);
+                app.add_dx_spot(
+                    callsign,
+                    frequency as f64,
+                    "FT8".to_string(),
+                    0,
+                    worked_before,
+                );
             }
             TuiMessage::Error {
                 component: _,

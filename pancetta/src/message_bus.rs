@@ -272,8 +272,12 @@ pub enum RigControlMessage {
     SetPtt { state: bool },
     /// Get signal strength
     GetSignalStrength,
-    /// Signal strength response
-    SignalStrengthResponse { dbm: i32 },
+    /// Signal strength response from the rig's S-meter. Value follows
+    /// the hamlib STRENGTH convention: dB relative to S9 (0 = S9,
+    /// -54 ≈ S0, +20 = S9+20). Produced by the hamlib polling loop
+    /// (Batch 95) from real `\get_level STRENGTH` reads — never
+    /// synthesized.
+    SignalStrengthResponse { db_over_s9: i32 },
 }
 
 /// QSO management messages

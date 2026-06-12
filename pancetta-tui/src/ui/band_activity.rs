@@ -165,6 +165,11 @@ fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
 
     let call_style = if msg.is_directed_at_us {
         directed_style
+    } else if msg.worked_before {
+        // Already in the log on this band — dim the callsign the same
+        // way the DX hunter panel does, so the operator's eye skips
+        // stations the autonomous scorer would also dup-penalize.
+        Style::default().fg(app.theme.muted_color())
     } else if msg.call_sign.is_some() {
         Style::default()
             .fg(app.theme.success_color())
