@@ -6646,7 +6646,13 @@ search to in-repo sources.
     decodes. Re-open only with a genuinely different discriminator
     (hb-253 exact Bessel metric changing the rescue's LLR quality, or
     per-candidate Es/N0 from hb-259), not another unsat-threshold
-    tune. Note: `research/notes/2026-06-12-batch98-bicm-id-gated.md`;
+    tune. Batch 99 UPDATE: the hb-253 re-open branch is MEASURED-DEAD —
+    Bessel × iters=2 on hard_200/50 gives ΔTP +1 / ΔFP +27 (worse than
+    dual-max's +2/+17); the exact metric does not sharpen true-vs-wrong
+    rescue discrimination. Remaining re-open path: hb-259 per-candidate
+    Es/N0 re-estimation only. Synthetic mechanism re-reproduced a third
+    time (dualmax iters 0→2: +0.306 dB under the T=18 gate).
+    Note: `research/notes/2026-06-12-batch98-bicm-id-gated.md`;
     harness: `batch98_bicm_id_gated.rs`.
     (was: MECHANISM-CONFIRMED-FP-PENDING Batch 97 — synthetic +0.384 dB
     @ 2 iters PASSED, spot ΔTP +3 / ΔFP +21 FAILED the ≤2× bar; was:
@@ -6672,8 +6678,31 @@ search to in-repo sources.
   conflict_analysis: subsumes/extends max-log path; composes with
     hb-253 (exact metric) and hb-259 (EM channel re-estimation).
 
-### hb-253 — Exact Bessel noncoherent LLR metric (vs dual-max approximation)  [PRIORITY: 0.55, spawned 2026-06-12 Batch 96 web scan]
+### hb-253 — Exact Bessel noncoherent LLR metric (vs dual-max approximation)  [MECHANISM-CONFIRMED-FP-PENDING 2026-06-12 Batch 99 — shipped opt-in behind `Ft8Config::llr_metric` (default DualMax, byte-identity test-pinned)]
 
+  status: Batch 99 kill-switch probe (`batch99_bessel_llr_kill_switch.rs`,
+    note `research/notes/2026-06-12-batch99-bessel-llr.md`). Paper
+    fetched and read (Guillén i Fàbregas & Grant, IEEE TWC): pancetta's
+    production dB dual-max IS their estimation-free dual-max eq. (13);
+    the upgrade implemented is the exact Bessel metric eqs. (1)/(6)
+    with exact log-sum-exp label marginalization. Estimator
+    (block-constant per candidate): N0 = median non-max tone power
+    across 79 symbols ÷ ln 2; Es = mean max-tone power − N0 (floor
+    0.05·N0); ln I0 via A&S 9.8.1/9.8.2 polynomials, unit-tested
+    against the power series. Synthetic 50%-threshold (50 trials/pt,
+    paired AWGN): −18.73 → −19.00 dB (**+0.273 dB, bar ≥0.15 PASSED —
+    metric is real on FT8 blocks with estimated CSI**); composes
+    additively with hb-252 BICM-ID (bessel×iters2 = +0.506 dB
+    combined). Wall cost +1.7%. BUT hard_200/50 spot: bessel/it0
+    ΔTP +1 / ΔFP +14, bessel/it2 ΔTP +1 / ΔFP +27 (vs dual-max it2
+    +2/+17) — real-corpus FP-negative, default unchanged, no
+    full-corpus run (per pre-registration). Failure mode: the
+    block-constant N0 assumption is correct on the synthetic AWGN
+    plant and wrong on interference-dominated hard_200 — the exact
+    metric's extra confidence on interference-hit symbols becomes
+    wrong-codeword BP convergence. Re-attack path: per-symbol /
+    per-tone interference-aware N0 (= hb-259), NOT another demapper
+    variant. (was: PROPOSED, PRIORITY 0.55, spawned Batch 96 web scan)
   mode: ft8
   mechanism: replace dual-max LLR with exact log I0(2·sqrt(Es)·a·|y|/N0)
     Bessel metric; requires per-candidate Es/N0 estimation. ~0.6 dB
@@ -6742,8 +6771,17 @@ search to in-repo sources.
   license: academic. note: OSD currently ships depth 0 — this would only
     matter if a deeper-OSD operating point ever returns (recall lever).
 
-### hb-259 — Per-iteration EM channel re-estimation in the demod-decode loop  [PRIORITY: 0.40, spawned 2026-06-12 Batch 96 web scan]
+### hb-259 — Per-iteration EM channel re-estimation in the demod-decode loop  [PRIORITY: 0.50 (raised from 0.40, Batch 99), spawned 2026-06-12 Batch 96 web scan]
 
+  batch99_note: priority raised. Batch 99 (hb-253) identified the exact
+    failure mode this attacks: the Bessel metric's block-constant N0
+    estimate is correct on synthetic AWGN (+0.273 dB real shift) but
+    FP-negative on interference-dominated hard_200 (+1 TP / +14 FP) —
+    interference-hit symbols need per-symbol/per-tone noise pricing.
+    The Bessel demapper + LSE SOMAP infrastructure is now in-tree
+    (`Ft8Config::llr_metric`); hb-259 only needs to supply better
+    (Es, N0) inside it. This is ALSO the sole remaining re-open path
+    for hb-252's rescue economics.
   mode: ft8
   mechanism: re-estimate Es and N0 separately each global iteration via
     EM fed by decoder extrinsics (Cheng/Valenti/Torrieri MILCOM 2005);

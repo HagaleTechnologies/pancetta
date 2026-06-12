@@ -138,6 +138,34 @@ const NMS_FREQ_RADIUS: usize = 2;
 // ============================================================================
 
 /// Decoder configuration for FT8/FT4/FT2 protocols
+/// hb-253 (Batch 99): demapper metric used for per-symbol bit-LLR
+/// extraction from the tone metrics.
+///
+/// Pancetta's historical extraction — max-vs-max over dB tone powers —
+/// is exactly the "parameter free dual-max" metric of Guillén i
+/// Fàbregas & Grant, *Capacity Approaching Codes for Non-Coherent
+/// Orthogonal Modulation* (IEEE Trans. Wireless Commun.), eq. (13):
+/// `max_{b∈B0} log(|y_b|²) − max_{b∈B1} log(|y_b|²)` (dB is a fixed
+/// 10/ln10 multiple of log-power, absorbed by `normalize_llrs`). The
+/// paper's exact noncoherent metric (eqs. (1)/(6)) replaces
+/// `log |y_b|²` with `ln I0(2·√Es·|y_b|/N0)` and the max with a true
+/// sum over labels; its measured gap to dual-max is ~0.6 dB when
+/// Es/N0 is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum LlrMetric {
+    /// Parameter-free dual-max over dB tone powers (eq. (13)) — the
+    /// historical pancetta path. Requires no channel-state estimates.
+    #[default]
+    DualMax,
+    /// Exact noncoherent Bessel metric `ln I0(2·√Es·|y_b|/N0)`
+    /// (eqs. (1)/(6)) with exact log-sum-exp marginalization over
+    /// labels. Es and N0 are estimated per candidate, block-constant,
+    /// from the tone powers (see `estimate_es_n0`). FT8 (8-FSK) only;
+    /// other protocols fall back to dual-max.
+    Bessel,
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Ft8Config {
@@ -952,6 +980,19 @@ pub struct Ft8Config {
     /// Inert when `bicm_id_iterations == 0` (the default).
     pub bicm_id_max_unsatisfied_checks: usize,
 
+    /// hb-253 (Batch 99): demapper metric for bit-LLR extraction on
+    /// the primary parallel decode paths (`par_decode_candidate`,
+    /// spectrogram + fine-FFT) and inside the hb-252 BICM-ID rescue.
+    /// `DualMax` (default) is byte-identical to the historical
+    /// max-vs-max-over-dB extraction. `Bessel` switches to the exact
+    /// noncoherent metric `ln I0(2·√Es·|y_b|/N0)` with per-candidate
+    /// block-constant (Es, N0) estimation and exact log-sum-exp
+    /// label marginalization (Guillén i Fàbregas & Grant, IEEE TWC,
+    /// eqs. (1)/(6); pancetta's dual-max is their eq. (13)). FT8
+    /// only; FT4/FT2 candidates fall back to dual-max. Default
+    /// **`DualMax`** — byte-identical to the legacy path.
+    pub llr_metric: LlrMetric,
+
     /// WSJT-X Improved-style automatic passband baseline (v3.1.0,
     /// DG2YCB). When `true` AND no explicit `freq_bin_range` is supplied
     /// by the caller, the decoder analyses the per-bin average power of
@@ -1261,6 +1302,9 @@ impl Default for Ft8Config {
             // `research/notes/2026-06-12-batch98-bicm-id-gated.md`.
             // Inert while bicm_id_iterations == 0.
             bicm_id_max_unsatisfied_checks: 18,
+            // hb-253 (Batch 99): dual-max is the historical default;
+            // Bessel is the probe-gated exact noncoherent metric.
+            llr_metric: LlrMetric::DualMax,
             // WSJT-X Improved-style auto-passband (v3.1.0, DG2YCB).
             // Default OFF — preserves byte-identical legacy fixed-range
             // sweep behavior. Flip on to narrow the Costas sweep to the
@@ -2061,6 +2105,9 @@ impl Ft8Decoder {
                 bicm_id_iterations: self.config.bicm_id_iterations,
                 // hb-252 (Batch 98) near-converged rescue gate.
                 bicm_id_max_unsatisfied_checks: self.config.bicm_id_max_unsatisfied_checks,
+                // hb-253 (Batch 99) demapper metric. DualMax (default)
+                // keeps the parallel paths byte-identical to legacy.
+                llr_metric: self.config.llr_metric,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -6409,6 +6456,10 @@ struct DecodeContext<'a> {
     /// parity checks (of 83) in the final BP hard decision for the
     /// rescue to run. See `Ft8Config::bicm_id_max_unsatisfied_checks`.
     bicm_id_max_unsatisfied_checks: usize,
+    /// hb-253 (Batch 99): demapper metric for bit-LLR extraction.
+    /// `DualMax` (default) is byte-identical to the legacy path. See
+    /// `Ft8Config::llr_metric`.
+    llr_metric: LlrMetric,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -6434,7 +6485,16 @@ struct ParDecodedCandidate {
 /// LLR, which is what BP consumes as its channel input. With all
 /// a-priori zero this reduces exactly to the legacy max-log extraction
 /// scaled by whatever scale `metrics` carries.
-fn bicm_id_somap_refresh(metrics: &[[f64; 8]], apriori: &[f32]) -> Vec<f32> {
+///
+/// hb-253 (Batch 99): when `use_lse` is true the two `max` operators
+/// are replaced by exact log-sum-exp accumulation — this is the full
+/// eq. (6) of Guillén i Fàbregas & Grant (sum over labels weighted by
+/// the extrinsic priors `q_{k,i}(b)`; the label-independent
+/// `−Σ ln(1+e^{v_p})` prior-normalization terms cancel in the LLR
+/// difference, so adding `v_p` only for set bits remains correct).
+/// Used with Bessel label metrics; `use_lse = false` is byte-identical
+/// to the historical max-log refresh.
+fn bicm_id_somap_refresh(metrics: &[[f64; 8]], apriori: &[f32], use_lse: bool) -> Vec<f32> {
     debug_assert_eq!(metrics.len() * 3, apriori.len());
     let mut out = vec![0.0f32; apriori.len()];
     for (di, s2) in metrics.iter().enumerate() {
@@ -6457,9 +6517,9 @@ fn bicm_id_somap_refresh(metrics: &[[f64; 8]], apriori: &[f32]) -> Vec<f32> {
                     }
                 }
                 if (j >> (2 - i)) & 1 == 1 {
-                    m1 = m1.max(t);
+                    m1 = if use_lse { lse2(m1, t) } else { m1.max(t) };
                 } else {
-                    m0 = m0.max(t);
+                    m0 = if use_lse { lse2(m0, t) } else { m0.max(t) };
                 }
             }
             // Pancetta convention: positive ⇒ bit 0.
@@ -6518,13 +6578,45 @@ fn par_bicm_id_rescue(
     channel_llrs: &[f32],
     iterations: usize,
     max_unsatisfied: usize,
+    llr_metric: LlrMetric,
 ) -> Option<(BitVec, usize)> {
     if iterations == 0 || pp.bits_per_symbol != 3 || channel_llrs.len() != 174 {
         return None;
     }
 
-    // Per-candidate least-squares scale raw-dB-LLR → normalized LLR.
-    let raw = par_compute_soft_llrs_db(pp, tone_magnitudes);
+    // hb-253 (Batch 99): per-label metric family. DualMax = raw dB
+    // tone metrics (historical); Bessel = ln I0 of the linear-power
+    // tone metrics with the per-candidate (Es, N0) estimate. The raw
+    // zero-feedback LLRs of the SAME family anchor the least-squares
+    // scale below, and the SOMAP refresh marginalizes with max (eq. 7
+    // shape) for DualMax vs exact log-sum-exp (eq. 6) for Bessel.
+    let use_lse = llr_metric == LlrMetric::Bessel;
+    let (raw, unscaled_metrics): (Vec<f32>, Vec<[f64; 8]>) = match llr_metric {
+        LlrMetric::DualMax => {
+            let raw = par_compute_soft_llrs_db(pp, tone_magnitudes);
+            let data_positions = pp.data_symbol_indices();
+            let metrics: Vec<[f64; 8]> = data_positions
+                .iter()
+                .map(|&sym_idx| {
+                    let mags = &tone_magnitudes[sym_idx];
+                    let mut s2 = [0.0f64; 8];
+                    for (j, slot) in s2.iter_mut().enumerate() {
+                        *slot = mags[crate::ldpc::binary_to_gray(j as u8) as usize];
+                    }
+                    s2
+                })
+                .collect();
+            (raw, metrics)
+        }
+        LlrMetric::Bessel => {
+            let powers = tone_powers_from_db(tone_magnitudes);
+            let raw = par_compute_soft_llrs_bessel(pp, &powers);
+            let (metrics, _es, _n0) = bessel_label_metrics(pp, &powers);
+            (raw, metrics)
+        }
+    };
+
+    // Per-candidate least-squares scale raw-metric-LLR → normalized LLR.
     let mut num = 0.0f64;
     let mut den = 0.0f64;
     for (r, c) in raw.iter().zip(channel_llrs.iter()) {
@@ -6538,17 +6630,15 @@ fn par_bicm_id_rescue(
 
     // Per-data-symbol scaled metrics indexed by binary label j
     // (same Gray demap as compute_soft_llrs_db).
-    let data_positions = pp.data_symbol_indices();
-    debug_assert_eq!(data_positions.len() * 3, 174);
-    let metrics: Vec<[f64; 8]> = data_positions
+    debug_assert_eq!(unscaled_metrics.len() * 3, 174);
+    let metrics: Vec<[f64; 8]> = unscaled_metrics
         .iter()
-        .map(|&sym_idx| {
-            let mags = &tone_magnitudes[sym_idx];
-            let mut s2 = [0.0f64; 8];
-            for (j, slot) in s2.iter_mut().enumerate() {
-                *slot = g * mags[crate::ldpc::binary_to_gray(j as u8) as usize];
+        .map(|s2| {
+            let mut scaled = [0.0f64; 8];
+            for (out, &m) in scaled.iter_mut().zip(s2.iter()) {
+                *out = g * m;
             }
-            s2
+            scaled
         })
         .collect();
 
@@ -6575,7 +6665,7 @@ fn par_bicm_id_rescue(
             .map(|(p, c)| p - c)
             .collect();
         // SOMAP refresh with the extrinsic as a-priori.
-        chan = bicm_id_somap_refresh(&metrics, &extrinsic);
+        chan = bicm_id_somap_refresh(&metrics, &extrinsic, use_lse);
         posterior = ldpc.belief_propagation(&chan).ok()?;
         let arr: &[f32; 174] = posterior[..174].try_into().ok()?;
         if ldpc.check_syndrome_fast(arr) {
@@ -6680,7 +6770,19 @@ fn par_decode_candidate(
             &trial_candidate,
             ctx.sync_time_interp_linear_power,
         );
-        let mut llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes);
+        // hb-253 (Batch 99): demapper metric selection. DualMax keeps
+        // the historical dB max-vs-max extraction byte-identical;
+        // Bessel (FT8 only) converts the dB tone metrics to linear
+        // power and applies the exact noncoherent metric.
+        let mut llrs =
+            if ctx.llr_metric == LlrMetric::Bessel && ctx.protocol_params.bits_per_symbol == 3 {
+                par_compute_soft_llrs_bessel(
+                    ctx.protocol_params,
+                    &tone_powers_from_db(&tone_magnitudes),
+                )
+            } else {
+                par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes)
+            };
         // JS8Call-Improved-inspired LLR whitening (inspired by spec ref
         // `spec-js8call-llr-whitening.md`). Applied BEFORE normalisation
         // so the per-tone × per-symbol divisive step sees raw demapper
@@ -6742,6 +6844,7 @@ fn par_decode_candidate(
                 &llrs,
                 ctx.bicm_id_iterations,
                 ctx.bicm_id_max_unsatisfied_checks,
+                ctx.llr_metric,
             ) {
                 Some((bits, unsat)) => (Some(bits), Some(unsat)),
                 None => (None, None),
@@ -6897,7 +7000,19 @@ fn par_decode_candidate(
                 Err(_) => continue,
             };
 
-            let mut llrs = par_compute_soft_llrs(ctx.protocol_params, &tone_magnitudes);
+            // hb-253 (Batch 99): fine-FFT path stores linear tone
+            // magnitudes; Bessel squares them into powers. DualMax is
+            // byte-identical to the historical extraction.
+            let mut llrs = if ctx.llr_metric == LlrMetric::Bessel
+                && ctx.protocol_params.bits_per_symbol == 3
+            {
+                par_compute_soft_llrs_bessel(
+                    ctx.protocol_params,
+                    &tone_powers_from_mag(&tone_magnitudes),
+                )
+            } else {
+                par_compute_soft_llrs(ctx.protocol_params, &tone_magnitudes)
+            };
             maybe_whiten_llrs(
                 ctx.llr_whitening_enabled,
                 &mut llrs,
@@ -8063,6 +8178,202 @@ fn par_compute_soft_llrs(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES
         }
     }
 
+    debug_assert_eq!(llrs.len(), 174);
+    llrs
+}
+
+// ============================================================================
+// hb-253 (Batch 99): exact noncoherent Bessel LLR metric
+// ============================================================================
+
+/// Numerically stable `ln I0(x)` — natural log of the zeroth-order
+/// modified Bessel function of the first kind.
+///
+/// Uses the Abramowitz & Stegun §9.8.1/§9.8.2 polynomial
+/// approximations (|relative error| ≲ 2e-7 on I0):
+/// * `x < 3.75`: `ln(poly(t))` with `t = (x/3.75)²` — for small `x`
+///   this behaves as `ln(1 + x²/4 + …) ≈ x²/4`.
+/// * `x ≥ 3.75`: `x − ½·ln(x) + ln(poly(3.75/x))` — the standard
+///   asymptotic shape `x − ½·ln(2πx) + O(1/x)` with the `1/√(2π)`
+///   constant folded into the polynomial. Never forms `e^x`, so it is
+///   overflow-free for arbitrarily large arguments.
+fn ln_i0(x: f64) -> f64 {
+    let ax = x.abs();
+    if ax < 3.75 {
+        let t = (ax / 3.75) * (ax / 3.75);
+        let i0 = 1.0
+            + t * (3.5156229
+                + t * (3.0899424
+                    + t * (1.2067492 + t * (0.2659732 + t * (0.0360768 + t * 0.0045813)))));
+        i0.ln()
+    } else {
+        let t = 3.75 / ax;
+        let poly = 0.39894228
+            + t * (0.01328592
+                + t * (0.00225319
+                    + t * (-0.00157565
+                        + t * (0.00916281
+                            + t * (-0.02057706
+                                + t * (0.02635537 + t * (-0.01647633 + t * 0.00392377)))))));
+        ax - 0.5 * ax.ln() + poly.ln()
+    }
+}
+
+/// Stable two-argument log-sum-exp: `ln(e^a + e^b)`.
+#[inline]
+fn lse2(a: f64, b: f64) -> f64 {
+    if a == f64::NEG_INFINITY {
+        return b;
+    }
+    if b == f64::NEG_INFINITY {
+        return a;
+    }
+    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+    hi + (lo - hi).exp().ln_1p()
+}
+
+/// hb-253: linear tone powers from dB tone magnitudes (the spectrogram
+/// path stores `10·log10(mag²)` per bin; `-120 dB` sentinel → 1e-12).
+fn tone_powers_from_db(tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<[f64; NUM_TONES]> {
+    tone_magnitudes
+        .iter()
+        .map(|row| {
+            let mut out = [0.0f64; NUM_TONES];
+            for (o, &db) in out.iter_mut().zip(row.iter()) {
+                *o = 10f64.powf(db / 10.0);
+            }
+            out
+        })
+        .collect()
+}
+
+/// hb-253: linear tone powers from linear tone magnitudes (the fine-FFT
+/// path stores `|y|` per bin; power = `|y|²`).
+fn tone_powers_from_mag(tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<[f64; NUM_TONES]> {
+    tone_magnitudes
+        .iter()
+        .map(|row| {
+            let mut out = [0.0f64; NUM_TONES];
+            for (o, &mag) in out.iter_mut().zip(row.iter()) {
+                *o = mag * mag;
+            }
+            out
+        })
+        .collect()
+}
+
+/// hb-253: simplest defensible block-constant (Es, N0) estimator from
+/// per-symbol linear tone powers at the candidate's bins.
+///
+/// * **N0**: median of the 7 non-max tone powers across all symbols
+///   (79 × 7 = 553 samples for FT8), divided by ln 2 — the median of
+///   an Exponential(N0) noise-power sample is `N0·ln 2`, so the
+///   correction makes the estimator unbiased-in-median under the
+///   paper's CN(0, N0) noise model. The median (vs mean) is robust to
+///   a minority of interferer-contaminated symbols on busy bands.
+/// * **Es**: mean over symbols of (max tone power) − N0 — the signal
+///   tone's expected power is `Es·a² + N0` (AWGN `a = 1`). Floored at
+///   `0.05·N0` so near-noise candidates still produce finite, graded
+///   metrics instead of a divide-degenerate flat vector. Caveat
+///   (documented, accepted for the probe): taking the per-symbol max
+///   adds positive selection bias at marginal SNR, so Es is somewhat
+///   overestimated for the weakest candidates; the paper's
+///   estimation-free metrics (eqs. (12)/(13)) are the fallback if this
+///   estimator proves too noisy.
+///
+/// Both estimates are scale-invariant in the Bessel argument
+/// `2·√(Es·p)/N0` (Es, p, N0 all carry the spectrogram's arbitrary
+/// power scale), preserving the decoder's gain invariance (hb-117).
+fn estimate_es_n0(tone_powers: &[[f64; NUM_TONES]], num_tones: usize) -> (f64, f64) {
+    let mut noise: Vec<f64> = Vec::with_capacity(tone_powers.len() * num_tones.saturating_sub(1));
+    let mut max_sum = 0.0f64;
+    for row in tone_powers {
+        let mut max_p = f64::MIN;
+        let mut max_idx = 0usize;
+        for (t, &p) in row.iter().take(num_tones).enumerate() {
+            if p > max_p {
+                max_p = p;
+                max_idx = t;
+            }
+        }
+        max_sum += max_p;
+        for (t, &p) in row.iter().take(num_tones).enumerate() {
+            if t != max_idx {
+                noise.push(p);
+            }
+        }
+    }
+    noise.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if noise.is_empty() {
+        0.0
+    } else {
+        noise[noise.len() / 2]
+    };
+    let n0 = (median / std::f64::consts::LN_2).max(1e-300);
+    let mean_max = max_sum / tone_powers.len().max(1) as f64;
+    let es = (mean_max - n0).max(0.05 * n0);
+    (es, n0)
+}
+
+/// hb-253: per-data-symbol Bessel label metrics
+/// `m[j] = ln I0(2·√(Es·p_{gray(j)})/N0)` for binary label `j`
+/// (Gray-demapped, same mapping as `par_compute_soft_llrs_db`), plus
+/// the (Es, N0) estimates used. FT8 (3 bits/symbol) only.
+fn bessel_label_metrics(
+    pp: &ProtocolParams,
+    tone_powers: &[[f64; NUM_TONES]],
+) -> (Vec<[f64; 8]>, f64, f64) {
+    debug_assert_eq!(pp.bits_per_symbol, 3);
+    let (es, n0) = estimate_es_n0(tone_powers, pp.num_tones);
+    let scale = 2.0 * es.sqrt() / n0;
+    let metrics: Vec<[f64; 8]> = pp
+        .data_symbol_indices()
+        .iter()
+        .map(|&sym_idx| {
+            let powers = &tone_powers[sym_idx];
+            let mut m = [0.0f64; 8];
+            for (j, slot) in m.iter_mut().enumerate() {
+                let tone_idx = crate::ldpc::binary_to_gray(j as u8) as usize;
+                *slot = ln_i0(scale * powers[tone_idx].sqrt());
+            }
+            m
+        })
+        .collect();
+    (metrics, es, n0)
+}
+
+/// hb-253 (Batch 99): exact noncoherent Bessel-metric bit-LLR
+/// extraction (Guillén i Fàbregas & Grant, IEEE TWC, eqs. (1)/(6),
+/// zero a-priori).
+///
+/// Per data symbol the per-label metric is
+/// `m_j = ln I0(2·√Es·|y_{gray(j)}|/N0)` (with `|y| = √p` from the
+/// linear tone power), and the bit LLR is the **exact** marginal
+///
+/// ```text
+///   LLR_i = ln Σ_{j: b_i(j)=0} e^{m_j}  −  ln Σ_{j: b_i(j)=1} e^{m_j}
+/// ```
+///
+/// in pancetta convention (positive ⇒ bit 0; bit 0 is the label MSB —
+/// the same masks as `par_compute_soft_llrs_db`). Downstream pipeline
+/// (optional whitening, variance normalization, BP) is unchanged.
+fn par_compute_soft_llrs_bessel(pp: &ProtocolParams, tone_powers: &[[f64; NUM_TONES]]) -> Vec<f32> {
+    let (metrics, _es, _n0) = bessel_label_metrics(pp, tone_powers);
+    let mut llrs = Vec::with_capacity(174);
+    for m in &metrics {
+        for i in 0..3 {
+            let mut l0 = f64::NEG_INFINITY;
+            let mut l1 = f64::NEG_INFINITY;
+            for (j, &mj) in m.iter().enumerate() {
+                if (j >> (2 - i)) & 1 == 1 {
+                    l1 = lse2(l1, mj);
+                } else {
+                    l0 = lse2(l0, mj);
+                }
+            }
+            llrs.push((l0 - l1) as f32);
+        }
+    }
     debug_assert_eq!(llrs.len(), 174);
     llrs
 }
@@ -14230,7 +14541,9 @@ mod bicm_id_tests {
         let ldpc = LdpcDecoder::new(50).unwrap();
         let tone_mags = vec![[0.0f64; NUM_TONES]; pp.num_symbols];
         let llrs = vec![1.0f32; 174];
-        assert!(par_bicm_id_rescue(&pp, &ldpc, &tone_mags, &llrs, 0, 83).is_none());
+        assert!(
+            par_bicm_id_rescue(&pp, &ldpc, &tone_mags, &llrs, 0, 83, LlrMetric::DualMax).is_none()
+        );
     }
 
     /// Batch 98 near-converged gate: `max_unsatisfied == 0` must block
@@ -14260,7 +14573,7 @@ mod bicm_id_tests {
             "noise input unexpectedly converged — pick a different seed"
         );
         assert!(
-            par_bicm_id_rescue(&pp, &ldpc, &tone_mags, &llrs, 2, 0).is_none(),
+            par_bicm_id_rescue(&pp, &ldpc, &tone_mags, &llrs, 2, 0, LlrMetric::DualMax).is_none(),
             "max_unsatisfied = 0 must gate out a non-converged candidate"
         );
     }
@@ -14299,7 +14612,7 @@ mod bicm_id_tests {
             })
             .collect();
         let zero_apriori = vec![0.0f32; 174];
-        let out = bicm_id_somap_refresh(&metrics, &zero_apriori);
+        let out = bicm_id_somap_refresh(&metrics, &zero_apriori, false);
         for (di, s2) in metrics.iter().enumerate() {
             for i in 0..3 {
                 let mut m0 = f64::NEG_INFINITY;
@@ -14335,14 +14648,14 @@ mod bicm_id_tests {
             s2[3] = 9.5; // binary 011
         }
         let zero = vec![0.0f32; 174];
-        let base = bicm_id_somap_refresh(&metrics, &zero);
+        let base = bicm_id_somap_refresh(&metrics, &zero, false);
         // A-priori: bit 0 of every symbol strongly believed = 1
         // (pancetta convention: negative LLR ⇒ bit 1).
         let mut apriori = vec![0.0f32; 174];
         for di in 0..58 {
             apriori[3 * di] = -6.0;
         }
-        let fed = bicm_id_somap_refresh(&metrics, &apriori);
+        let fed = bicm_id_somap_refresh(&metrics, &apriori, false);
         let max_delta = base
             .iter()
             .zip(fed.iter())
@@ -14381,7 +14694,7 @@ mod bicm_id_tests {
         for di in 0..58 {
             apriori_b1[3 * di + 1] = 6.0;
         }
-        let fed2 = bicm_id_somap_refresh(&metrics, &apriori_b1);
+        let fed2 = bicm_id_somap_refresh(&metrics, &apriori_b1, false);
         assert!(
             fed2[0] < base[0] - 1.0,
             "believing bit1=0 must sharpen near-tied bit0 toward 1 \
@@ -14448,6 +14761,228 @@ mod bicm_id_tests {
         assert!(
             a.iter().any(|m| m.text == "CQ K5ARH EM10"),
             "synthetic signal must decode"
+        );
+    }
+}
+
+#[cfg(test)]
+mod llr_metric_tests {
+    use super::*;
+
+    /// Reference `I0(x)` via direct power-series summation
+    /// `Σ_k ((x/2)^{2k}) / (k!)²` in f64 — exact to machine precision
+    /// for the tested range (x ≤ 30 keeps every term finite).
+    fn ln_i0_reference(x: f64) -> f64 {
+        let mut term = 1.0f64;
+        let mut sum = 1.0f64;
+        for k in 1..200 {
+            term *= (x / 2.0) * (x / 2.0) / ((k * k) as f64);
+            sum += term;
+            if term < sum * 1e-18 {
+                break;
+            }
+        }
+        sum.ln()
+    }
+
+    /// A&S polynomial `ln_i0` must match the reference series across
+    /// both branches (boundary at x = 3.75) to the documented ~2e-7
+    /// accuracy.
+    #[test]
+    fn ln_i0_matches_reference_series() {
+        for &x in &[
+            0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 3.0, 3.74, 3.75, 3.76, 5.0, 8.0, 10.0, 15.0, 20.0, 30.0,
+        ] {
+            let approx = ln_i0(x);
+            let exact = ln_i0_reference(x);
+            assert!(
+                (approx - exact).abs() < 1e-5,
+                "ln_i0({x}) = {approx}, reference {exact}"
+            );
+        }
+    }
+
+    /// Large-argument branch must follow the standard asymptotics
+    /// `ln I0(x) → x − ½·ln(2πx) + ln(1 + 1/(8x) + 9/(128x²) + …)`
+    /// and never overflow.
+    #[test]
+    fn ln_i0_large_x_asymptotic() {
+        for &x in &[50.0, 100.0, 1000.0, 1e6] {
+            let approx = ln_i0(x);
+            let asym = x - 0.5 * (2.0 * std::f64::consts::PI * x).ln()
+                + (1.0 + 1.0 / (8.0 * x) + 9.0 / (128.0 * x * x)).ln();
+            assert!(
+                (approx - asym).abs() < 1e-3,
+                "ln_i0({x}) = {approx}, asymptotic {asym}"
+            );
+            assert!(approx.is_finite());
+        }
+    }
+
+    /// `lse2` sanity: exact on equal arguments, dominated by the max,
+    /// and -inf-identity.
+    #[test]
+    fn lse2_basics() {
+        assert!((lse2(0.0, 0.0) - std::f64::consts::LN_2).abs() < 1e-12);
+        assert!((lse2(100.0, -100.0) - 100.0).abs() < 1e-12);
+        assert_eq!(lse2(f64::NEG_INFINITY, 3.0), 3.0);
+        assert_eq!(lse2(3.0, f64::NEG_INFINITY), 3.0);
+    }
+
+    /// hb-253 default promise: the metric must default to DualMax.
+    #[test]
+    fn default_config_metric_is_dual_max() {
+        assert_eq!(Ft8Config::default().llr_metric, LlrMetric::DualMax);
+        assert_eq!(LlrMetric::default(), LlrMetric::DualMax);
+    }
+
+    /// (Es, N0) estimator sanity on a synthetic block: one tone per
+    /// symbol carries signal+noise power, the rest carry noise. The
+    /// estimates must land within a factor of ~2 of truth (the probe
+    /// only needs the Bessel argument's order of magnitude right).
+    #[test]
+    fn estimate_es_n0_recovers_synthetic_block() {
+        let n0_true = 2.0f64;
+        let es_true = 40.0f64;
+        let mut state = 0xC0FFEE123456789u64;
+        let mut next_exp = |mean: f64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            // 31 random bits mapped to [0, 1).
+            let u = (((state >> 33) as f64) / ((1u64 << 31) as f64)).clamp(1e-9, 1.0 - 1e-9);
+            -mean * (1.0 - u).ln()
+        };
+        let powers: Vec<[f64; NUM_TONES]> = (0..79)
+            .map(|s| {
+                let mut row = [0.0f64; NUM_TONES];
+                for slot in row.iter_mut() {
+                    *slot = next_exp(n0_true);
+                }
+                row[s % 8] += es_true;
+                row
+            })
+            .collect();
+        let (es, n0) = estimate_es_n0(&powers, 8);
+        assert!(
+            n0 > n0_true / 2.0 && n0 < n0_true * 2.0,
+            "N0 estimate {n0} vs truth {n0_true}"
+        );
+        assert!(
+            es > es_true / 2.0 && es < es_true * 2.0,
+            "Es estimate {es} vs truth {es_true}"
+        );
+    }
+
+    /// Bessel LLR polarity: a block whose every data symbol carries a
+    /// dominant tone at Gray label 0b101 must produce LLR signs
+    /// matching that label (pancetta convention: positive ⇒ bit 0, so
+    /// bits (1,0,1) ⇒ signs (−,+,−)).
+    #[test]
+    fn bessel_llrs_polarity_matches_dominant_label() {
+        let pp = ProtocolParams::ft8();
+        let strong_tone = crate::ldpc::binary_to_gray(0b101u8) as usize;
+        let powers: Vec<[f64; NUM_TONES]> = (0..pp.num_symbols)
+            .map(|_| {
+                let mut row = [1.0f64; NUM_TONES];
+                row[strong_tone] = 50.0;
+                row
+            })
+            .collect();
+        let llrs = par_compute_soft_llrs_bessel(&pp, &powers);
+        assert_eq!(llrs.len(), 174);
+        for sym in 0..58 {
+            assert!(llrs[3 * sym] < 0.0, "bit0 of sym {sym} must lean 1");
+            assert!(llrs[3 * sym + 1] > 0.0, "bit1 of sym {sym} must lean 0");
+            assert!(llrs[3 * sym + 2] < 0.0, "bit2 of sym {sym} must lean 1");
+        }
+    }
+
+    /// hb-253 byte-identity promise: an explicit `llr_metric: DualMax`
+    /// must produce exactly the same decode list as
+    /// `Ft8Config::default()` on a synthetic
+    /// signal-plus-deterministic-noise window. Guards the metric
+    /// branch points in `par_decode_candidate` (both paths) and the
+    /// rescue.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn dual_max_is_byte_identical_to_default() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+        let mut state = 0x13198A2E03707344u64;
+        for s in tx.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((state >> 33) as f32) / (u32::MAX as f32) - 0.5;
+            *s += u * 0.3;
+        }
+
+        let mut dec_default = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let mut dec_dual = Ft8Decoder::new(Ft8Config {
+            llr_metric: LlrMetric::DualMax,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let a = dec_default.decode_window(&tx).expect("decode default");
+        let b = dec_dual.decode_window(&tx).expect("decode dual-max");
+        let key = |msgs: &[DecodedMessage]| {
+            let mut v: Vec<(String, i64, i64)> = msgs
+                .iter()
+                .map(|m| {
+                    (
+                        m.text.clone(),
+                        (m.frequency_offset * 100.0).round() as i64,
+                        (m.time_offset * 1000.0).round() as i64,
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            key(&a),
+            key(&b),
+            "llr_metric: DualMax must be byte-identical to default"
+        );
+        assert!(
+            a.iter().any(|m| m.text == "CQ K5ARH EM10"),
+            "synthetic signal must decode"
+        );
+    }
+
+    /// End-to-end: the Bessel metric must decode a clean synthetic
+    /// signal (the estimator + ln I0 + LSE pipeline is wired through
+    /// the parallel decode path, not just unit-correct in isolation).
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn bessel_metric_decodes_clean_signal() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let mut dec = Ft8Decoder::new(Ft8Config {
+            llr_metric: LlrMetric::Bessel,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let decoded = dec.decode_window(&tx).expect("decode bessel");
+        assert!(
+            decoded.iter().any(|m| m.text == "CQ K5ARH EM10"),
+            "Bessel metric must decode a clean synthetic signal"
         );
     }
 }
