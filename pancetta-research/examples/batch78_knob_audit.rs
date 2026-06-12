@@ -101,6 +101,38 @@ fn run(label: &str, entries: &[Value], cfg: &Ft8Config) -> Result<(usize, usize,
 fn configs() -> Vec<(String, Ft8Config)> {
     let base = Ft8Config::default();
     let mut out = Vec::new();
+    // MP mode (Batch 83): PANCETTA_B78_MP=1 measures the pass-count /
+    // tier-preset family at the current defaults — the Fast-tier
+    // preset's mp=2/ldpc=200 rests on pancetta-truth-era numbers.
+    if std::env::var("PANCETTA_B78_MP").is_ok() {
+        out.push((
+            "default (mp=1 ldpc=100) [DEFAULT]".to_string(),
+            base.clone(),
+        ));
+        out.push((
+            "mp=2".to_string(),
+            Ft8Config {
+                max_decode_passes: 2,
+                ..base.clone()
+            },
+        ));
+        out.push((
+            "Fast preset (mp=2 ldpc=200)".to_string(),
+            Ft8Config {
+                max_decode_passes: 2,
+                ldpc_iterations: 200,
+                ..base.clone()
+            },
+        ));
+        out.push((
+            "mp=3".to_string(),
+            Ft8Config {
+                max_decode_passes: 3,
+                ..base.clone()
+            },
+        ));
+        return out;
+    }
     // LDPC mode (Batch 82): PANCETTA_B78_LDPC="100,150,300" sweeps
     // ldpc_iterations at the current defaults, plus the default itself.
     if let Ok(spec) = std::env::var("PANCETTA_B78_LDPC") {
