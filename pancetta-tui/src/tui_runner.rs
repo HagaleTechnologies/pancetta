@@ -84,8 +84,6 @@ pub enum TuiMessage {
     FrequencyUpdate { vfo: u8, frequency: u64 },
     /// Signal strength update
     SignalStrengthUpdate { dbm: i32 },
-    /// QSO state update
-    QsoStateUpdate { qso_id: String, state: String },
     /// DX spot
     DxSpot {
         callsign: String,
@@ -107,7 +105,9 @@ pub enum TuiMessage {
     /// Snapshot of QSOs currently in progress, pushed by the QSO
     /// coordinator on every state change. The TUI replaces its
     /// previous active-QSOs list with this snapshot — sender
-    /// owns the truth, receiver is a passive renderer.
+    /// owns the truth, receiver is a passive renderer. Batch 94:
+    /// also rebuilds the QSO-detail panel entries (`qso_statuses`)
+    /// from the same snapshot via `App::apply_active_qsos`.
     ActiveQsosUpdate {
         qsos: Vec<crate::app::ActiveQsoBanner>,
     },
@@ -372,12 +372,6 @@ impl TuiRunner {
             TuiMessage::SignalStrengthUpdate { dbm } => {
                 app.update_signal_strength(dbm as f32);
             }
-            TuiMessage::QsoStateUpdate { qso_id, state: _ } => {
-                // Parse QSO state - for now just check if active
-                let active = !qso_id.is_empty();
-                let callsign = if active { Some(qso_id) } else { None };
-                app.update_qso_state(active, callsign);
-            }
             TuiMessage::DxSpot {
                 callsign,
                 frequency,
@@ -408,7 +402,7 @@ impl TuiRunner {
                 app.pipeline_health = Some(health);
             }
             TuiMessage::ActiveQsosUpdate { qsos } => {
-                app.active_qsos = qsos;
+                app.apply_active_qsos(qsos);
             }
             TuiMessage::AutonomousStatusUpdate(status) => {
                 app.update_autonomous_status(status);
@@ -1423,6 +1417,49 @@ mod key_tests {
         assert_eq!(live.state, "Hunting");
         assert_eq!(live.active_qsos, 1);
         assert_eq!(live.band_name, "20m");
+    }
+
+    /// Batch 94: ActiveQsosUpdate feeds BOTH the banner list and the
+    /// QSO-detail panel; an empty follow-up snapshot clears both (this
+    /// is how completed/failed QSOs leave the panel).
+    #[tokio::test]
+    async fn active_qsos_update_drives_detail_panel() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        let banner = crate::app::ActiveQsoBanner {
+            their_callsign: "JA1ABC".to_string(),
+            state: "wait rpt".to_string(),
+            started_at: chrono::Utc::now(),
+            frequency_hz: 1500.0,
+            tx_parity: None,
+            last_tx_text: Some("JA1ABC K5ARH EM10".to_string()),
+            last_tx_at: Some(chrono::Utc::now()),
+            last_rx_text: Some("K5ARH JA1ABC -12".to_string()),
+            last_rx_at: Some(chrono::Utc::now()),
+            snr_rx: Some(-12),
+            report_sent: Some(-8),
+            report_received: Some(-15),
+            exchange_count: 2,
+        };
+        r.handle_message(TuiMessage::ActiveQsosUpdate { qsos: vec![banner] })
+            .await
+            .unwrap();
+        {
+            let app = app.read().await;
+            assert_eq!(app.active_qsos.len(), 1, "banner list populated");
+            assert_eq!(app.qso_statuses.len(), 1, "detail panel populated");
+            let q = &app.qso_statuses[0];
+            assert_eq!(q.call_sign.as_deref(), Some("JA1ABC"));
+            assert_eq!(q.state.as_deref(), Some("wait rpt"));
+            assert_eq!(q.last_rx_text.as_deref(), Some("K5ARH JA1ABC -12"));
+        }
+
+        // Completed/failed QSOs vanish from the next snapshot → panel clears.
+        r.handle_message(TuiMessage::ActiveQsosUpdate { qsos: Vec::new() })
+            .await
+            .unwrap();
+        let app = app.read().await;
+        assert!(app.active_qsos.is_empty());
+        assert!(app.qso_statuses.is_empty());
     }
 
     /// TxStatus drives `app.is_transmitting` (the title-bar " TX "

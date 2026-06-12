@@ -88,6 +88,23 @@ pub struct ActiveQsoBanner {
     pub frequency_hz: f64,
     /// Parity our station transmits in for this QSO. None when unknown.
     pub tx_parity: Option<pancetta_core::slot::SlotParity>,
+    /// Raw text of the last message we transmitted in this QSO (Batch 94:
+    /// QSO-detail panel TX line).
+    pub last_tx_text: Option<String>,
+    /// When the last TX message was recorded.
+    pub last_tx_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Raw text of the last message we received from the contra station.
+    pub last_rx_text: Option<String>,
+    /// When the last RX message was recorded.
+    pub last_rx_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Measured SNR (dB) of the last message received from them.
+    pub snr_rx: Option<i32>,
+    /// Signal report we sent them (their signal at our end).
+    pub report_sent: Option<i32>,
+    /// Signal report we received from them (our signal at their end).
+    pub report_received: Option<i32>,
+    /// Total messages exchanged (both directions) so far in this QSO.
+    pub exchange_count: u32,
 }
 
 /// Pipeline component health snapshot, forwarded from coordinator
@@ -105,17 +122,34 @@ pub struct PipelineHealth {
     pub total_decodes: u64,
 }
 
-#[derive(Debug, Clone)]
+/// Per-QSO entry for the QSO-detail panel. Batch 94: populated live
+/// from `ActiveQsosUpdate` snapshots (see `App::apply_active_qsos`) —
+/// the coordinator's QSO state machine is the source of truth and this
+/// is a passive view of it.
+#[derive(Debug, Clone, Default)]
 pub struct QsoStatus {
     pub active: bool,
     pub call_sign: Option<String>,
+    /// Audio frequency in Hz where this QSO is being worked.
     pub frequency: Option<f64>,
     pub mode: Option<String>,
+    /// QSO state-machine phase ("wait rpt", "sending RR73", ...).
+    pub state: Option<String>,
+    /// Their report of our signal (how they hear us) — drives the TX SNR gauge.
     pub snr_tx: Option<i32>,
+    /// Measured SNR of their last received message — drives the RX SNR gauge.
     pub snr_rx: Option<i32>,
     pub started_at: Option<DateTime<Utc>>,
     pub last_tx: Option<DateTime<Utc>>,
     pub last_rx: Option<DateTime<Utc>>,
+    /// Raw text of the last message we sent in this QSO.
+    pub last_tx_text: Option<String>,
+    /// Raw text of the last message we received in this QSO.
+    pub last_rx_text: Option<String>,
+    /// Signal report we sent them.
+    pub report_sent: Option<i32>,
+    /// Signal report we received from them.
+    pub report_received: Option<i32>,
     pub exchange_count: u32,
 }
 
@@ -857,47 +891,52 @@ impl App {
 
     /// Get the primary (first) QSO status, or a default standby entry.
     pub fn qso_status(&self) -> &QsoStatus {
-        static DEFAULT: std::sync::LazyLock<QsoStatus> = std::sync::LazyLock::new(|| QsoStatus {
-            active: false,
-            call_sign: None,
-            frequency: None,
-            mode: None,
-            snr_tx: None,
-            snr_rx: None,
-            started_at: None,
-            last_tx: None,
-            last_rx: None,
-            exchange_count: 0,
-        });
+        static DEFAULT: std::sync::LazyLock<QsoStatus> =
+            std::sync::LazyLock::new(QsoStatus::default);
         self.qso_statuses.first().unwrap_or(&DEFAULT)
     }
 
     /// Get a mutable reference to the primary QSO, creating one if needed.
     pub fn qso_status_mut(&mut self) -> &mut QsoStatus {
         if self.qso_statuses.is_empty() {
-            self.qso_statuses.push(QsoStatus {
-                active: false,
-                call_sign: None,
-                frequency: None,
-                mode: None,
-                snr_tx: None,
-                snr_rx: None,
-                started_at: None,
-                last_tx: None,
-                last_rx: None,
-                exchange_count: 0,
-            });
+            self.qso_statuses.push(QsoStatus::default());
         }
         &mut self.qso_statuses[0]
     }
 
-    pub fn update_qso_state(&mut self, active: bool, callsign: Option<String>) {
-        let qso = self.qso_status_mut();
-        qso.active = active;
-        qso.call_sign = callsign;
-        if active {
-            qso.started_at = Some(Utc::now());
-        }
+    /// Apply an active-QSOs snapshot from the coordinator (Batch 94).
+    ///
+    /// Replaces BOTH views derived from the snapshot: the one-row banner
+    /// (`active_qsos`) and the QSO-detail panel entries (`qso_statuses`).
+    /// The sender owns the truth — completed/failed QSOs simply stop
+    /// appearing in the next snapshot, so they leave the detail panel
+    /// the same way they leave the banner. An empty snapshot clears the
+    /// panel back to STANDBY.
+    pub fn apply_active_qsos(&mut self, qsos: Vec<ActiveQsoBanner>) {
+        self.qso_statuses = qsos
+            .iter()
+            .map(|q| QsoStatus {
+                active: true,
+                call_sign: Some(q.their_callsign.clone()),
+                frequency: Some(q.frequency_hz),
+                mode: Some("FT8".to_string()),
+                state: Some(q.state.clone()),
+                // TX gauge: their report of our signal.
+                snr_tx: q.report_received,
+                // RX gauge: measured SNR of their last message; fall back
+                // to the report we sent (same quantity, coarser).
+                snr_rx: q.snr_rx.or(q.report_sent),
+                started_at: Some(q.started_at),
+                last_tx: q.last_tx_at,
+                last_rx: q.last_rx_at,
+                last_tx_text: q.last_tx_text.clone(),
+                last_rx_text: q.last_rx_text.clone(),
+                report_sent: q.report_sent,
+                report_received: q.report_received,
+                exchange_count: q.exchange_count,
+            })
+            .collect();
+        self.active_qsos = qsos;
     }
 
     pub fn add_dx_spot(&mut self, callsign: String, freq: f64, mode: String, snr: i32) {
@@ -1407,17 +1446,87 @@ mod tests {
     #[tokio::test]
     async fn resolves_parity_from_active_qso_when_present() {
         let mut app = App::new(Config::default(), None).await.unwrap();
-        app.active_qsos = vec![ActiveQsoBanner {
-            their_callsign: "W1AW".into(),
-            state: "Calling".into(),
-            started_at: chrono::Utc::now(),
-            frequency_hz: 1234.0,
-            tx_parity: Some(pancetta_core::slot::SlotParity::Even),
-        }];
+        app.active_qsos = vec![fixture_banner(
+            "W1AW",
+            "Calling",
+            Some(pancetta_core::slot::SlotParity::Even),
+        )];
         assert_eq!(
             app.resolve_tx_parity(),
             Some(pancetta_core::slot::SlotParity::Even)
         );
+    }
+
+    fn fixture_banner(
+        call: &str,
+        state: &str,
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+    ) -> ActiveQsoBanner {
+        ActiveQsoBanner {
+            their_callsign: call.into(),
+            state: state.into(),
+            started_at: chrono::Utc::now(),
+            frequency_hz: 1234.0,
+            tx_parity,
+            last_tx_text: Some(format!("{} K5ARH EM10", call)),
+            last_tx_at: Some(chrono::Utc::now()),
+            last_rx_text: Some(format!("K5ARH {} -12", call)),
+            last_rx_at: Some(chrono::Utc::now()),
+            snr_rx: Some(-12),
+            report_sent: Some(-8),
+            report_received: Some(-15),
+            exchange_count: 3,
+        }
+    }
+
+    /// Batch 94: an active-QSOs snapshot populates the QSO-detail panel
+    /// entries (qso_statuses) alongside the banner list.
+    #[tokio::test]
+    async fn apply_active_qsos_populates_detail_panel() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        assert!(app.qso_statuses.is_empty());
+
+        app.apply_active_qsos(vec![fixture_banner("JA1ABC", "wait rpt", None)]);
+
+        assert_eq!(app.active_qsos.len(), 1);
+        assert_eq!(app.qso_statuses.len(), 1);
+        let q = &app.qso_statuses[0];
+        assert!(q.active);
+        assert_eq!(q.call_sign.as_deref(), Some("JA1ABC"));
+        assert_eq!(q.state.as_deref(), Some("wait rpt"));
+        assert_eq!(q.frequency, Some(1234.0));
+        assert_eq!(q.last_tx_text.as_deref(), Some("JA1ABC K5ARH EM10"));
+        assert_eq!(q.last_rx_text.as_deref(), Some("K5ARH JA1ABC -12"));
+        assert_eq!(q.report_sent, Some(-8));
+        assert_eq!(q.report_received, Some(-15));
+        // TX gauge = their report of us; RX gauge = measured RX SNR.
+        assert_eq!(q.snr_tx, Some(-15));
+        assert_eq!(q.snr_rx, Some(-12));
+        assert_eq!(q.exchange_count, 3);
+    }
+
+    /// Stale QSOs leave the detail panel when the next snapshot omits
+    /// them — and an empty snapshot returns the panel to STANDBY.
+    #[tokio::test]
+    async fn apply_active_qsos_empty_snapshot_clears_panel() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.apply_active_qsos(vec![fixture_banner("JA1ABC", "wait rpt", None)]);
+        assert_eq!(app.qso_statuses.len(), 1);
+
+        app.apply_active_qsos(Vec::new());
+        assert!(app.qso_statuses.is_empty());
+        assert!(app.active_qsos.is_empty());
+        assert!(!app.qso_status().active, "default entry is STANDBY");
+    }
+
+    /// Measured RX SNR missing → fall back to the report we sent.
+    #[tokio::test]
+    async fn apply_active_qsos_snr_rx_falls_back_to_report_sent() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let mut banner = fixture_banner("JA1ABC", "wait rpt", None);
+        banner.snr_rx = None;
+        app.apply_active_qsos(vec![banner]);
+        assert_eq!(app.qso_statuses[0].snr_rx, Some(-8));
     }
 
     #[tokio::test]

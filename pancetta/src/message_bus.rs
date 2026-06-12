@@ -203,9 +203,9 @@ pub struct TransmitRequestItem {
 }
 
 /// One item in a `MessageType::ActiveQsosSnapshot` payload — flattened
-/// view of an in-progress QSO with just the fields the TUI banner
-/// needs. Decoupled from `pancetta-qso::QsoState` so the TUI doesn't
-/// link the QSO crate.
+/// view of an in-progress QSO with the fields the TUI banner AND the
+/// QSO-detail panel need. Decoupled from `pancetta-qso::QsoState` so
+/// the TUI doesn't link the QSO crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveQsoSnapshotItem {
     /// Other station's callsign.
@@ -220,6 +220,23 @@ pub struct ActiveQsoSnapshotItem {
     /// waterfall to color the occupancy strip and TX cursor by "is this
     /// slot mine."
     pub tx_parity: Option<pancetta_core::slot::SlotParity>,
+    /// Raw text of the last message we transmitted in this QSO (Batch 94:
+    /// drives the QSO-detail panel's TX line).
+    pub last_tx_text: Option<String>,
+    /// When the last TX message was recorded.
+    pub last_tx_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Raw text of the last message we received from the contra station.
+    pub last_rx_text: Option<String>,
+    /// When the last RX message was recorded.
+    pub last_rx_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Measured SNR (dB) of the last message received from them.
+    pub snr_rx: Option<i32>,
+    /// Signal report we sent them (their signal at our end).
+    pub report_sent: Option<i32>,
+    /// Signal report we received from them (our signal at their end).
+    pub report_received: Option<i32>,
+    /// Total messages exchanged (both directions) so far in this QSO.
+    pub exchange_count: u32,
 }
 
 /// Status data from the autonomous operator for TUI consumption.
@@ -272,8 +289,6 @@ pub enum QsoMessage {
     EndQso { qso_id: String },
     /// Log QSO
     LogQso { qso_data: String },
-    /// QSO state update
-    QsoStateUpdate { qso_id: String, state: String },
 }
 
 /// DX cluster messages

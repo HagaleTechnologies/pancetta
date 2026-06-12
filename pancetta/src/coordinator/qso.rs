@@ -647,52 +647,223 @@ impl super::ApplicationCoordinator {
 }
 
 /// Build a flat snapshot of in-progress QSOs from the QSO manager,
-/// suitable for `MessageType::ActiveQsosSnapshot`. The TUI banner uses
-/// this to render who's mid-conversation.
+/// suitable for `MessageType::ActiveQsosSnapshot`. The TUI banner and
+/// QSO-detail panel both render from this.
 async fn build_active_qso_snapshot(
     qso_manager: &pancetta_qso::QsoManager,
 ) -> Vec<crate::message_bus::ActiveQsoSnapshotItem> {
-    use pancetta_qso::QsoState;
     let active = qso_manager.get_active_qsos().await;
     active
         .into_iter()
-        .filter_map(|(_id, progress)| {
-            let their = progress
-                .state
-                .their_callsign()
-                .map(str::to_string)
-                .or_else(|| progress.metadata.their_callsign.clone())?;
-            let frequency_hz = progress
-                .state
-                .frequency()
-                .unwrap_or(progress.metadata.frequency);
-            let state = match &progress.state {
-                QsoState::Idle => "idle",
-                QsoState::CallingCq { .. } => "calling CQ",
-                QsoState::RespondingToCq { .. } => "→ called",
-                QsoState::WaitingForReport { .. } => "wait rpt",
-                QsoState::SendingReport { .. } => "sending rpt",
-                QsoState::WaitingForConfirmation { .. } => "wait RR73",
-                QsoState::SendingConfirmation { .. } => "sending RR73",
-                QsoState::Completed { .. } => "done",
-                QsoState::Failed { .. } => "failed",
-                QsoState::Contest(pancetta_qso::ContestState::ExchangingInfo { .. }) => {
-                    "contest exch"
-                }
-                QsoState::Contest(pancetta_qso::ContestState::ContestCompleted { .. }) => {
-                    "contest done"
-                }
-            }
-            .to_string();
-            Some(crate::message_bus::ActiveQsoSnapshotItem {
-                their_callsign: their,
-                state,
-                started_at: progress.metadata.start_time,
-                frequency_hz,
-                tx_parity: progress.metadata.tx_parity,
-            })
-        })
+        .filter_map(|(_id, progress)| snapshot_item_from_progress(&progress))
         .collect()
+}
+
+/// Flatten one `QsoProgress` into the bus snapshot item. Pure read of
+/// state the QSO engine already tracks — no behavioral change to the
+/// engine. Returns `None` when the contra callsign is unknown (nothing
+/// useful to render yet).
+///
+/// Batch 94: in addition to the banner fields, derives the QSO-detail
+/// panel fields — last message exchanged in each direction (from
+/// `progress.messages`), measured RX SNR (signal strength of the last
+/// received message), reports sent/received (from
+/// `metadata.reports`), and the exchange count.
+fn snapshot_item_from_progress(
+    progress: &pancetta_qso::QsoProgress,
+) -> Option<crate::message_bus::ActiveQsoSnapshotItem> {
+    use pancetta_qso::{MessageDirection, QsoState};
+    let their = progress
+        .state
+        .their_callsign()
+        .map(str::to_string)
+        .or_else(|| progress.metadata.their_callsign.clone())?;
+    let frequency_hz = progress
+        .state
+        .frequency()
+        .unwrap_or(progress.metadata.frequency);
+    let state = match &progress.state {
+        QsoState::Idle => "idle",
+        QsoState::CallingCq { .. } => "calling CQ",
+        QsoState::RespondingToCq { .. } => "→ called",
+        QsoState::WaitingForReport { .. } => "wait rpt",
+        QsoState::SendingReport { .. } => "sending rpt",
+        QsoState::WaitingForConfirmation { .. } => "wait RR73",
+        QsoState::SendingConfirmation { .. } => "sending RR73",
+        QsoState::Completed { .. } => "done",
+        QsoState::Failed { .. } => "failed",
+        QsoState::Contest(pancetta_qso::ContestState::ExchangingInfo { .. }) => "contest exch",
+        QsoState::Contest(pancetta_qso::ContestState::ContestCompleted { .. }) => "contest done",
+    }
+    .to_string();
+
+    let last_tx = progress
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.direction == MessageDirection::Sent);
+    let last_rx = progress
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.direction == MessageDirection::Received);
+
+    Some(crate::message_bus::ActiveQsoSnapshotItem {
+        their_callsign: their,
+        state,
+        started_at: progress.metadata.start_time,
+        frequency_hz,
+        tx_parity: progress.metadata.tx_parity,
+        last_tx_text: last_tx.map(|m| m.raw_text.clone()),
+        last_tx_at: last_tx.map(|m| m.timestamp),
+        last_rx_text: last_rx.map(|m| m.raw_text.clone()),
+        last_rx_at: last_rx.map(|m| m.timestamp),
+        snr_rx: last_rx.and_then(|m| m.signal_strength).map(|s| s as i32),
+        report_sent: progress.metadata.reports.sent.map(i32::from),
+        report_received: progress.metadata.reports.received.map(i32::from),
+        exchange_count: progress.messages.len() as u32,
+    })
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::snapshot_item_from_progress;
+    use chrono::{Duration, Utc};
+    use pancetta_qso::{
+        GridSquares, MessageDirection, QsoMetadata, QsoProgress, QsoState, SignalReports,
+    };
+
+    /// Build a QsoProgress mid-exchange: we called them, sent our grid,
+    /// and just received their report.
+    fn fixture_progress() -> QsoProgress {
+        let start = Utc::now() - Duration::seconds(45);
+        let their_call = "JA1ABC".to_string();
+        let messages = vec![
+            pancetta_qso::states::QsoMessage {
+                timestamp: start + Duration::seconds(15),
+                direction: MessageDirection::Sent,
+                message_type: pancetta_qso::states::MessageType::CqResponse {
+                    calling_station: their_call.clone(),
+                    responding_station: "K5ARH".to_string(),
+                    grid: Some("EM10".to_string()),
+                },
+                raw_text: "JA1ABC K5ARH EM10".to_string(),
+                signal_strength: None,
+                frequency: 1500.0,
+            },
+            pancetta_qso::states::QsoMessage {
+                timestamp: start + Duration::seconds(30),
+                direction: MessageDirection::Received,
+                message_type: pancetta_qso::states::MessageType::SignalReport {
+                    to_station: "K5ARH".to_string(),
+                    from_station: their_call.clone(),
+                    report: -12,
+                },
+                raw_text: "K5ARH JA1ABC -12".to_string(),
+                signal_strength: Some(-12.4),
+                frequency: 1500.0,
+            },
+        ];
+        QsoProgress {
+            state: QsoState::SendingReport {
+                their_callsign: their_call.clone(),
+                their_report: Some(-12),
+                our_report: -8,
+                frequency: 1500.0,
+                started_at: start,
+            },
+            state_history: Vec::new(),
+            messages,
+            metadata: QsoMetadata {
+                qso_id: pancetta_qso::QsoId::new_v4(),
+                our_callsign: "K5ARH".to_string(),
+                their_callsign: Some(their_call),
+                frequency: 1500.0,
+                mode: "FT8".to_string(),
+                start_time: start,
+                end_time: None,
+                reports: SignalReports {
+                    sent: Some(-8),
+                    received: Some(-12),
+                },
+                grids: GridSquares::default(),
+                contest_info: None,
+                tags: std::collections::HashMap::new(),
+                notes: None,
+                tx_parity: Some(pancetta_core::slot::SlotParity::Odd),
+            },
+        }
+    }
+
+    /// All detail-panel fields derive from state the engine already
+    /// tracks: last message per direction, measured RX SNR, reports,
+    /// exchange count, plus the original banner fields.
+    #[test]
+    fn snapshot_derives_detail_fields_from_progress() {
+        let item = snapshot_item_from_progress(&fixture_progress()).expect("item");
+        assert_eq!(item.their_callsign, "JA1ABC");
+        assert_eq!(item.state, "sending rpt");
+        assert_eq!(item.frequency_hz, 1500.0);
+        assert_eq!(item.tx_parity, Some(pancetta_core::slot::SlotParity::Odd));
+        assert_eq!(item.last_tx_text.as_deref(), Some("JA1ABC K5ARH EM10"));
+        assert_eq!(item.last_rx_text.as_deref(), Some("K5ARH JA1ABC -12"));
+        assert!(item.last_tx_at.is_some());
+        assert!(item.last_rx_at.is_some());
+        assert_eq!(item.snr_rx, Some(-12));
+        assert_eq!(item.report_sent, Some(-8));
+        assert_eq!(item.report_received, Some(-12));
+        assert_eq!(item.exchange_count, 2);
+    }
+
+    /// The most recent message per direction wins, not the first.
+    #[test]
+    fn snapshot_picks_latest_message_per_direction() {
+        let mut progress = fixture_progress();
+        progress.messages.push(pancetta_qso::states::QsoMessage {
+            timestamp: Utc::now(),
+            direction: MessageDirection::Sent,
+            message_type: pancetta_qso::states::MessageType::ReportAck {
+                to_station: "JA1ABC".to_string(),
+                from_station: "K5ARH".to_string(),
+                report: -8,
+            },
+            raw_text: "JA1ABC K5ARH R-8".to_string(),
+            signal_strength: None,
+            frequency: 1500.0,
+        });
+        let item = snapshot_item_from_progress(&progress).expect("item");
+        assert_eq!(item.last_tx_text.as_deref(), Some("JA1ABC K5ARH R-8"));
+        // RX side unchanged by a new TX.
+        assert_eq!(item.last_rx_text.as_deref(), Some("K5ARH JA1ABC -12"));
+        assert_eq!(item.exchange_count, 3);
+    }
+
+    /// No callsign known yet (e.g. CallingCq with empty metadata) →
+    /// nothing useful to render → None.
+    #[test]
+    fn snapshot_skips_qso_without_callsign() {
+        let mut progress = fixture_progress();
+        progress.state = QsoState::CallingCq {
+            frequency: 1500.0,
+            started_at: Utc::now(),
+            call_count: 1,
+        };
+        progress.metadata.their_callsign = None;
+        assert!(snapshot_item_from_progress(&progress).is_none());
+    }
+
+    /// A QSO with no messages yet (just started) still produces an item
+    /// with empty detail fields — the panel renders placeholders.
+    #[test]
+    fn snapshot_handles_empty_message_history() {
+        let mut progress = fixture_progress();
+        progress.messages.clear();
+        let item = snapshot_item_from_progress(&progress).expect("item");
+        assert!(item.last_tx_text.is_none());
+        assert!(item.last_rx_text.is_none());
+        assert!(item.snr_rx.is_none());
+        assert_eq!(item.exchange_count, 0);
+    }
 }
 
 /// Spawn a background task that listens for `QsoEvent::QsoCompleted` and

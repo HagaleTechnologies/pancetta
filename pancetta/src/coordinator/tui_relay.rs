@@ -221,16 +221,11 @@ impl super::ApplicationCoordinator {
                                 // (decoupled struct so the TUI doesn't link
                                 // pancetta_qso). Push as a TuiMessage; the
                                 // TUI replaces its previous list with this.
-                                let banner_qsos: Vec<pancetta_tui::app::ActiveQsoBanner> = qsos
-                                    .iter()
-                                    .map(|q| pancetta_tui::app::ActiveQsoBanner {
-                                        their_callsign: q.their_callsign.clone(),
-                                        state: q.state.clone(),
-                                        started_at: q.started_at,
-                                        frequency_hz: q.frequency_hz,
-                                        tx_parity: q.tx_parity,
-                                    })
-                                    .collect();
+                                // Batch 94: carries the QSO-detail panel
+                                // fields too (last TX/RX message, SNR,
+                                // reports, exchange count).
+                                let banner_qsos: Vec<pancetta_tui::app::ActiveQsoBanner> =
+                                    qsos.iter().map(map_qso_snapshot_item).collect();
                                 let _ = tui_msg_tx_relay.send(
                                     pancetta_tui::tui_runner::TuiMessage::ActiveQsosUpdate {
                                         qsos: banner_qsos,
@@ -728,6 +723,30 @@ impl super::ApplicationCoordinator {
 /// the qso-crate engine still reports `enabled: true` (it keeps its
 /// state so re-enabling picks up cleanly) but no TX will be dispatched,
 /// so the TUI must render it as disabled.
+/// Map one bus `ActiveQsoSnapshotItem` into the TUI's `ActiveQsoBanner`
+/// (decoupled struct so pancetta-tui doesn't link pancetta-qso).
+/// Field-for-field copy — the QSO coordinator already derived everything
+/// from the state machine; the relay just re-shapes.
+fn map_qso_snapshot_item(
+    q: &crate::message_bus::ActiveQsoSnapshotItem,
+) -> pancetta_tui::app::ActiveQsoBanner {
+    pancetta_tui::app::ActiveQsoBanner {
+        their_callsign: q.their_callsign.clone(),
+        state: q.state.clone(),
+        started_at: q.started_at,
+        frequency_hz: q.frequency_hz,
+        tx_parity: q.tx_parity,
+        last_tx_text: q.last_tx_text.clone(),
+        last_tx_at: q.last_tx_at,
+        last_rx_text: q.last_rx_text.clone(),
+        last_rx_at: q.last_rx_at,
+        snr_rx: q.snr_rx,
+        report_sent: q.report_sent,
+        report_received: q.report_received,
+        exchange_count: q.exchange_count,
+    }
+}
+
 fn map_autonomous_status(
     data: &crate::message_bus::AutonomousStatusData,
     runtime_gate_open: bool,
@@ -748,6 +767,73 @@ fn map_autonomous_status(
 #[cfg(test)]
 mod tui_relay_tests {
     use super::*;
+
+    /// Batch 94: the relay's snapshot→banner mapping must carry every
+    /// QSO-detail field through field-for-field — a dropped field here
+    /// silently renders as "---" in the panel.
+    #[test]
+    fn map_qso_snapshot_item_carries_all_detail_fields() {
+        let started = chrono::Utc::now() - chrono::Duration::seconds(30);
+        let tx_at = started + chrono::Duration::seconds(15);
+        let rx_at = started + chrono::Duration::seconds(28);
+        let item = crate::message_bus::ActiveQsoSnapshotItem {
+            their_callsign: "JA1ABC".to_string(),
+            state: "sending rpt".to_string(),
+            started_at: started,
+            frequency_hz: 1500.0,
+            tx_parity: Some(pancetta_core::slot::SlotParity::Odd),
+            last_tx_text: Some("JA1ABC K5ARH EM10".to_string()),
+            last_tx_at: Some(tx_at),
+            last_rx_text: Some("K5ARH JA1ABC -12".to_string()),
+            last_rx_at: Some(rx_at),
+            snr_rx: Some(-12),
+            report_sent: Some(-8),
+            report_received: Some(-12),
+            exchange_count: 2,
+        };
+        let banner = map_qso_snapshot_item(&item);
+        assert_eq!(banner.their_callsign, "JA1ABC");
+        assert_eq!(banner.state, "sending rpt");
+        assert_eq!(banner.started_at, started);
+        assert_eq!(banner.frequency_hz, 1500.0);
+        assert_eq!(banner.tx_parity, Some(pancetta_core::slot::SlotParity::Odd));
+        assert_eq!(banner.last_tx_text.as_deref(), Some("JA1ABC K5ARH EM10"));
+        assert_eq!(banner.last_tx_at, Some(tx_at));
+        assert_eq!(banner.last_rx_text.as_deref(), Some("K5ARH JA1ABC -12"));
+        assert_eq!(banner.last_rx_at, Some(rx_at));
+        assert_eq!(banner.snr_rx, Some(-12));
+        assert_eq!(banner.report_sent, Some(-8));
+        assert_eq!(banner.report_received, Some(-12));
+        assert_eq!(banner.exchange_count, 2);
+    }
+
+    /// Fresh QSO with no traffic yet: None/0 detail fields map through
+    /// unchanged (the panel renders placeholders).
+    #[test]
+    fn map_qso_snapshot_item_handles_empty_details() {
+        let item = crate::message_bus::ActiveQsoSnapshotItem {
+            their_callsign: "W1AW".to_string(),
+            state: "→ called".to_string(),
+            started_at: chrono::Utc::now(),
+            frequency_hz: 900.0,
+            tx_parity: None,
+            last_tx_text: None,
+            last_tx_at: None,
+            last_rx_text: None,
+            last_rx_at: None,
+            snr_rx: None,
+            report_sent: None,
+            report_received: None,
+            exchange_count: 0,
+        };
+        let banner = map_qso_snapshot_item(&item);
+        assert!(banner.last_tx_text.is_none());
+        assert!(banner.last_rx_text.is_none());
+        assert!(banner.snr_rx.is_none());
+        assert!(banner.report_sent.is_none());
+        assert!(banner.report_received.is_none());
+        assert_eq!(banner.exchange_count, 0);
+    }
 
     fn sample_status(enabled: bool) -> crate::message_bus::AutonomousStatusData {
         crate::message_bus::AutonomousStatusData {
