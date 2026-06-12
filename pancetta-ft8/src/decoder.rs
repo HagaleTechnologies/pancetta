@@ -1015,6 +1015,34 @@ pub struct Ft8Config {
     /// — byte-identical to the legacy path.
     pub bicm_id_em_reestimation: bool,
 
+    /// hb-256 (Batch 101): impulse-robust per-symbol LLR weighting for
+    /// impulsive (lightning-static / alpha-stable) HF noise.
+    ///
+    /// Translated from the robust LLR approximation
+    /// `LLR(y) = sign(y)·min(a|y|, b/|y|)` of Clavier, Peters, Septier
+    /// & Nevat, *Experimental evidence for heavy tailed interference in
+    /// the IoT*, EURASIP JWCN 2021, eq. (15): under sub-exponential
+    /// impulsive noise the optimal LLR is non-monotonic — large
+    /// received amplitudes must be ATTENUATED (∝ 1/|y|) rather than
+    /// trusted (∝ |y|). The paper's `y` is a time-domain matched-filter
+    /// output; pancetta's LLRs are dB tone-power differences in the
+    /// spectrogram domain with no per-bit scalar amplitude, so the
+    /// literal form does not map. The faithful translation: a lightning
+    /// crash is broadband + short-time, so it inflates ALL tone bins of
+    /// 1-3 symbols — the per-symbol total tone power is the amplitude
+    /// statistic analogous to |y|. A data symbol whose total 8-tone
+    /// linear power `P_s` exceeds `k×` the candidate's median symbol
+    /// power `P_med` is impulse-suspect: its LLRs are multiplied by
+    /// `w = k·P_med / P_s` (< 1, the inverse branch); symbols at or
+    /// below the knee are untouched (the linear branch — the existing
+    /// demapper output). Continuous at the knee (`w → 1`).
+    ///
+    /// `None` (default) = off, byte-identical to the legacy path.
+    /// `Some(k)` = attenuation knee in units of median symbol power
+    /// (k=3 aggressive, k=6 conservative). Applied after LLR whitening
+    /// and before variance normalisation on every demapper output path.
+    pub impulse_robust_llr: Option<f64>,
+
     /// WSJT-X Improved-style automatic passband baseline (v3.1.0,
     /// DG2YCB). When `true` AND no explicit `freq_bin_range` is supplied
     /// by the caller, the decoder analyses the per-bin average power of
@@ -1333,6 +1361,11 @@ impl Default for Ft8Config {
             // Inert unless llr_metric == Bessel AND
             // bicm_id_iterations >= 1.
             bicm_id_em_reestimation: false,
+            // hb-256 (Batch 101): impulse-robust per-symbol LLR
+            // weighting. Default None — byte-identical legacy path;
+            // Some(k) attenuates LLRs of symbols whose total tone
+            // power exceeds k× the median symbol power.
+            impulse_robust_llr: None,
             // WSJT-X Improved-style auto-passband (v3.1.0, DG2YCB).
             // Default OFF — preserves byte-identical legacy fixed-range
             // sweep behavior. Flip on to narrow the Costas sweep to the
@@ -2140,6 +2173,9 @@ impl Ft8Decoder {
                 // the BICM-ID rescue. false (default) = static
                 // Batch 99 estimator throughout, byte-identical.
                 bicm_id_em_reestimation: self.config.bicm_id_em_reestimation,
+                // hb-256 (Batch 101) impulse-robust per-symbol LLR
+                // weighting knee. None (default) = byte-identical.
+                impulse_robust_llr: self.config.impulse_robust_llr,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -4281,6 +4317,14 @@ impl Ft8Decoder {
                 &tone_magnitudes,
                 &self.protocol_params,
             );
+            // hb-256: impulse-robust per-symbol weighting (no-op when None).
+            maybe_impulse_robust_llrs(
+                self.config.impulse_robust_llr,
+                &mut base_llrs,
+                &tone_magnitudes,
+                ToneUnits::Db,
+                &self.protocol_params,
+            );
 
             // Compute frequency and time for building DecodedMessage
             let sub_bin_offset = trial_freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
@@ -4650,6 +4694,14 @@ impl Ft8Decoder {
             // candidate yields nothing (additive, so harmless).
             let mut llrs = par_compute_soft_llrs_db(pp, &avg_mags);
             maybe_whiten_llrs(self.config.llr_whitening_enabled, &mut llrs, &avg_mags, pp);
+            // hb-256: impulse-robust per-symbol weighting (no-op when None).
+            maybe_impulse_robust_llrs(
+                self.config.impulse_robust_llr,
+                &mut llrs,
+                &avg_mags,
+                ToneUnits::Db,
+                pp,
+            );
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
                 continue;
@@ -4970,6 +5022,14 @@ impl Ft8Decoder {
             }
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
             maybe_whiten_llrs(self.config.llr_whitening_enabled, &mut llrs, &tone_mags, pp);
+            // hb-256: impulse-robust per-symbol weighting (no-op when None).
+            maybe_impulse_robust_llrs(
+                self.config.impulse_robust_llr,
+                &mut llrs,
+                &tone_mags,
+                ToneUnits::Db,
+                pp,
+            );
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
                 if diagnostic_on {
@@ -5109,6 +5169,14 @@ impl Ft8Decoder {
             }
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
             maybe_whiten_llrs(self.config.llr_whitening_enabled, &mut llrs, &tone_mags, pp);
+            // hb-256: impulse-robust per-symbol weighting (no-op when None).
+            maybe_impulse_robust_llrs(
+                self.config.impulse_robust_llr,
+                &mut llrs,
+                &tone_mags,
+                ToneUnits::Db,
+                pp,
+            );
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
                 if diagnostic_on {
@@ -5575,6 +5643,14 @@ impl Ft8Decoder {
             let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
             maybe_whiten_llrs(self.config.llr_whitening_enabled, &mut llrs, &tone_mags, pp);
+            // hb-256: impulse-robust per-symbol weighting (no-op when None).
+            maybe_impulse_robust_llrs(
+                self.config.impulse_robust_llr,
+                &mut llrs,
+                &tone_mags,
+                ToneUnits::Db,
+                pp,
+            );
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
             let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) else {
                 continue;
@@ -5742,6 +5818,14 @@ impl Ft8Decoder {
                 &tone_magnitudes,
                 &self.protocol_params,
             );
+            // hb-256: impulse-robust per-symbol weighting (no-op when None).
+            maybe_impulse_robust_llrs(
+                self.config.impulse_robust_llr,
+                &mut llrs,
+                &tone_magnitudes,
+                ToneUnits::Db,
+                &self.protocol_params,
+            );
             normalize_llrs(&mut llrs, self.config.llr_target_variance);
 
             if let Ok(corrected_bits) = self.ldpc_decoder.decode_soft(&llrs) {
@@ -5891,6 +5975,15 @@ impl Ft8Decoder {
                     self.config.llr_whitening_enabled,
                     &mut llrs,
                     &tone_magnitudes,
+                    &self.protocol_params,
+                );
+                // hb-256: impulse-robust per-symbol weighting (no-op
+                // when None). Fine-FFT path stores linear magnitudes.
+                maybe_impulse_robust_llrs(
+                    self.config.impulse_robust_llr,
+                    &mut llrs,
+                    &tone_magnitudes,
+                    ToneUnits::LinearMag,
                     &self.protocol_params,
                 );
 
@@ -6496,6 +6589,10 @@ struct DecodeContext<'a> {
     /// inside the BICM-ID rescue (Bessel metric path only). See
     /// `Ft8Config::bicm_id_em_reestimation`.
     bicm_id_em_reestimation: bool,
+    /// hb-256 (Batch 101): impulse-robust per-symbol LLR weighting
+    /// knee. `None` (default) = the weighting helper is never invoked,
+    /// byte-identical legacy path. See `Ft8Config::impulse_robust_llr`.
+    impulse_robust_llr: Option<f64>,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -6876,6 +6973,14 @@ fn par_decode_candidate(
             &tone_magnitudes,
             ctx.protocol_params,
         );
+        // hb-256: impulse-robust per-symbol weighting (no-op when None).
+        maybe_impulse_robust_llrs(
+            ctx.impulse_robust_llr,
+            &mut llrs,
+            &tone_magnitudes,
+            ToneUnits::Db,
+            ctx.protocol_params,
+        );
         normalize_llrs(&mut llrs, ctx.llr_target_variance);
 
         // hb-244: soft combiner integration. When enabled, the combiner
@@ -7098,6 +7203,15 @@ fn par_decode_candidate(
                 &tone_magnitudes,
                 ctx.protocol_params,
             );
+            // hb-256: impulse-robust per-symbol weighting (no-op when
+            // None). Fine-FFT path stores linear magnitudes.
+            maybe_impulse_robust_llrs(
+                ctx.impulse_robust_llr,
+                &mut llrs,
+                &tone_magnitudes,
+                ToneUnits::LinearMag,
+                ctx.protocol_params,
+            );
             normalize_llrs(&mut llrs, ctx.llr_target_variance);
 
             let corrected_bits = match ldpc.decode_soft(&llrs) {
@@ -7189,6 +7303,14 @@ fn par_try_ap_decode(
             ctx.llr_whitening_enabled,
             &mut base_llrs,
             &tone_magnitudes,
+            ctx.protocol_params,
+        );
+        // hb-256: impulse-robust per-symbol weighting (no-op when None).
+        maybe_impulse_robust_llrs(
+            ctx.impulse_robust_llr,
+            &mut base_llrs,
+            &tone_magnitudes,
+            ToneUnits::Db,
             ctx.protocol_params,
         );
 
@@ -9015,6 +9137,103 @@ fn maybe_whiten_llrs(
     if enabled {
         whiten_llrs(llrs, tone_magnitudes, pp);
     }
+}
+
+/// hb-256: units of the per-symbol tone matrix handed to the
+/// impulse-robust LLR weighting. The two demapper families store
+/// different things: the spectrogram paths extract dB log-power, the
+/// fine-FFT paths extract linear magnitude `|y|`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToneUnits {
+    /// dB log-power (spectrogram extraction paths).
+    Db,
+    /// Linear magnitude `|y|` (fine-FFT paths); power = `|y|²`.
+    LinearMag,
+}
+
+/// hb-256 (Batch 101): impulse-robust per-symbol LLR weighting —
+/// translated form of the robust LLR `sign(y)·min(a|y|, b/|y|)`
+/// (Clavier et al., EURASIP JWCN 2021, eq. (15)). See
+/// `Ft8Config::impulse_robust_llr` for the translation rationale.
+///
+/// Operates on per-symbol LINEAR tone powers:
+/// 1. `P_s` = total tone power (sum over `NUM_TONES` bins) at each
+///    data-symbol position.
+/// 2. `P_med` = median of `P_s` over the data symbols (the candidate's
+///    own typical symbol power — scale-free, so the weighting is
+///    invariant to input gain, dB reference, and whitening order).
+/// 3. Symbols with `P_s > k·P_med` are impulse-suspect: their
+///    `bits_per_symbol` LLRs are multiplied by `w = k·P_med / P_s`
+///    (< 1, the paper's inverse `b/|y|` branch). Symbols at or below
+///    the knee keep their demapper LLRs (the linear `a|y|` branch).
+///    `w → 1` at the knee, so the transfer function is continuous.
+///
+/// Numerical safety: degenerate inputs (empty LLRs, non-positive
+/// median, non-finite totals, `k ≤ 0`) leave the LLRs unchanged; the
+/// weighted values are NaN/Inf-clamped to 0.0 like `whiten_llrs`.
+fn impulse_robust_weight_llrs(
+    k: f64,
+    llrs: &mut [f32],
+    tone_powers: &[[f64; NUM_TONES]],
+    pp: &ProtocolParams,
+) {
+    let data_positions = pp.data_symbol_indices();
+    let nd = data_positions.len();
+    let bps = pp.bits_per_symbol;
+    if nd == 0 || bps == 0 || llrs.is_empty() || !(k > 0.0) {
+        return;
+    }
+    debug_assert_eq!(llrs.len(), nd * bps);
+
+    // Per-symbol total linear power across all tone bins.
+    let totals: Vec<f64> = data_positions
+        .iter()
+        .map(|&sym_idx| tone_powers[sym_idx].iter().sum::<f64>())
+        .collect();
+
+    let mut scratch = totals.clone();
+    let p_med = median_inplace(&mut scratch);
+    if !(p_med > 0.0) || !p_med.is_finite() {
+        return;
+    }
+
+    let knee_power = k * p_med;
+    for (i, &total) in totals.iter().enumerate() {
+        if !(total > knee_power) {
+            continue; // linear branch: at/below knee (or non-finite) — untouched
+        }
+        let w = (knee_power / total) as f32;
+        if !(w.is_finite() && w > 0.0) {
+            continue;
+        }
+        let base = i * bps;
+        for b in 0..bps {
+            let v = llrs[base + b] * w;
+            llrs[base + b] = if v.is_finite() { v } else { 0.0 };
+        }
+    }
+}
+
+/// hb-256: gated wrapper around `impulse_robust_weight_llrs` that
+/// no-ops when the knee is `None`. Centralises the default-OFF
+/// byte-identical contract: when disabled, ZERO impulse-weighting code
+/// runs (one branch test only) and no power-conversion allocation is
+/// made. When enabled, the tone matrix is converted to linear powers
+/// according to its declared units before weighting.
+#[inline]
+fn maybe_impulse_robust_llrs(
+    knee: Option<f64>,
+    llrs: &mut [f32],
+    tone_magnitudes: &[[f64; NUM_TONES]],
+    units: ToneUnits,
+    pp: &ProtocolParams,
+) {
+    let Some(k) = knee else { return };
+    let powers = match units {
+        ToneUnits::Db => tone_powers_from_db(tone_magnitudes),
+        ToneUnits::LinearMag => tone_powers_from_mag(tone_magnitudes),
+    };
+    impulse_robust_weight_llrs(k, llrs, &powers, pp);
 }
 
 /// Compute the median of a mutable slice of f64, in-place.
@@ -15429,6 +15648,292 @@ mod em_reestimation_tests {
         assert!(
             a.iter().any(|m| m.text == "CQ K5ARH EM10"),
             "synthetic signal must decode"
+        );
+    }
+}
+
+// ============================================================================
+// hb-256 (Batch 101): impulse-robust per-symbol LLR weighting tests
+// ============================================================================
+
+#[cfg(test)]
+mod impulse_robust_llr_tests {
+    use super::*;
+    use crate::protocol::ProtocolParams;
+
+    /// Uniform per-symbol tone-power matrix: every (symbol, tone) entry
+    /// has the same linear power `p`.
+    fn uniform_powers(num_symbols: usize, p: f64) -> Vec<[f64; NUM_TONES]> {
+        vec![[p; NUM_TONES]; num_symbols]
+    }
+
+    /// Synthetic non-uniform LLR vector (measurable scaling).
+    fn synthetic_llrs(n: usize) -> Vec<f32> {
+        (0..n).map(|i| (i as f32 + 1.0) * 0.5 - 40.0).collect()
+    }
+
+    #[test]
+    fn uniform_powers_leave_llrs_unchanged() {
+        // Every symbol's total power equals the median → nothing is
+        // above the knee → byte-identical LLRs.
+        let pp = ProtocolParams::ft8();
+        let powers = uniform_powers(pp.num_symbols, 2.0);
+        let mut llrs = synthetic_llrs(174);
+        let original = llrs.clone();
+        impulse_robust_weight_llrs(3.0, &mut llrs, &powers, &pp);
+        assert_eq!(llrs, original, "uniform powers must not change any LLR");
+    }
+
+    #[test]
+    fn inflated_symbol_is_attenuated_by_inverse_branch() {
+        // One data symbol's total power is 10× the median with knee
+        // k=3 → its LLRs must be scaled by exactly w = 3·P_med/P_s =
+        // 0.3; all other symbols untouched (linear branch).
+        let pp = ProtocolParams::ft8();
+        let mut powers = uniform_powers(pp.num_symbols, 1.0); // P_s = 8.0/symbol
+        let data_positions = pp.data_symbol_indices();
+        let hot_data_idx = 17usize; // arbitrary data symbol
+        let hot_sym = data_positions[hot_data_idx];
+        for t in 0..NUM_TONES {
+            powers[hot_sym][t] = 10.0; // P_hot = 80.0 = 10× median
+        }
+        let mut llrs = synthetic_llrs(174);
+        let original = llrs.clone();
+        impulse_robust_weight_llrs(3.0, &mut llrs, &powers, &pp);
+
+        let bps = pp.bits_per_symbol;
+        let expected_w = 3.0f32 * 8.0 / 80.0; // 0.3
+        for i in 0..data_positions.len() {
+            for b in 0..bps {
+                let idx = i * bps + b;
+                if i == hot_data_idx {
+                    let expected = original[idx] * expected_w;
+                    assert!(
+                        (llrs[idx] - expected).abs() < 1e-5,
+                        "hot symbol LLR {idx}: got {}, expected {expected}",
+                        llrs[idx]
+                    );
+                } else {
+                    assert_eq!(
+                        llrs[idx], original[idx],
+                        "below-knee symbol {i} bit {b} must be untouched"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transfer_is_continuous_at_knee() {
+        // A symbol exactly AT k× median is on the linear branch
+        // (untouched); a symbol just above gets weight ≈ 1. Continuity
+        // means no jump across the knee.
+        let pp = ProtocolParams::ft8();
+        let data_positions = pp.data_symbol_indices();
+        let bps = pp.bits_per_symbol;
+        let k = 3.0;
+
+        // At-knee: P_s = 3× median exactly.
+        let mut powers = uniform_powers(pp.num_symbols, 1.0);
+        let sym = data_positions[5];
+        for t in 0..NUM_TONES {
+            powers[sym][t] = 3.0;
+        }
+        let mut llrs = synthetic_llrs(174);
+        let original = llrs.clone();
+        impulse_robust_weight_llrs(k, &mut llrs, &powers, &pp);
+        assert_eq!(llrs, original, "at-knee symbol must be untouched");
+
+        // Just-above-knee: P_s = 3.000003× median → w within 1e-5 of 1.
+        for t in 0..NUM_TONES {
+            powers[sym][t] = 3.000_003;
+        }
+        let mut llrs2 = synthetic_llrs(174);
+        impulse_robust_weight_llrs(k, &mut llrs2, &powers, &pp);
+        for b in 0..bps {
+            let idx = 5 * bps + b;
+            let rel = (llrs2[idx] - original[idx]).abs() / original[idx].abs().max(1e-6);
+            assert!(
+                rel < 1e-4,
+                "just-above-knee weight must be ≈1 (continuity): idx {idx} rel {rel}"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_inputs_are_no_ops() {
+        let pp = ProtocolParams::ft8();
+        let original = synthetic_llrs(174);
+
+        // All-zero powers (median 0) → unchanged.
+        let mut llrs = original.clone();
+        impulse_robust_weight_llrs(3.0, &mut llrs, &uniform_powers(pp.num_symbols, 0.0), &pp);
+        assert_eq!(llrs, original, "zero-power matrix must be a no-op");
+
+        // Non-positive knee → unchanged.
+        let mut llrs = original.clone();
+        impulse_robust_weight_llrs(0.0, &mut llrs, &uniform_powers(pp.num_symbols, 1.0), &pp);
+        assert_eq!(llrs, original, "k=0 must be a no-op");
+
+        // Empty LLRs: must not panic.
+        let mut empty: Vec<f32> = Vec::new();
+        impulse_robust_weight_llrs(3.0, &mut empty, &uniform_powers(pp.num_symbols, 1.0), &pp);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn gated_wrapper_none_is_zero_work() {
+        // `None` knee leaves the LLRs byte-identical even on a wildly
+        // impulsive power matrix.
+        let pp = ProtocolParams::ft8();
+        let mut powers = uniform_powers(pp.num_symbols, 1.0);
+        for row in powers.iter_mut().take(6) {
+            for t in 0..NUM_TONES {
+                row[t] = 1e6;
+            }
+        }
+        // Wrapper takes dB inputs for the Db units path.
+        let db: Vec<[f64; NUM_TONES]> = powers
+            .iter()
+            .map(|row| {
+                let mut out = [0.0f64; NUM_TONES];
+                for (o, &p) in out.iter_mut().zip(row.iter()) {
+                    *o = 10.0 * p.log10();
+                }
+                out
+            })
+            .collect();
+        let original = synthetic_llrs(174);
+        let mut llrs = original.clone();
+        maybe_impulse_robust_llrs(None, &mut llrs, &db, ToneUnits::Db, &pp);
+        assert_eq!(llrs, original, "None must be byte-identical");
+    }
+
+    #[test]
+    fn db_and_linear_mag_units_agree() {
+        // The same physical scene expressed in dB log-power and in
+        // linear magnitude must produce identical weighting.
+        let pp = ProtocolParams::ft8();
+        let mut powers = uniform_powers(pp.num_symbols, 1.0);
+        let data_positions = pp.data_symbol_indices();
+        let hot = data_positions[9];
+        for t in 0..NUM_TONES {
+            powers[hot][t] = 25.0;
+        }
+        let db: Vec<[f64; NUM_TONES]> = powers
+            .iter()
+            .map(|row| {
+                let mut out = [0.0f64; NUM_TONES];
+                for (o, &p) in out.iter_mut().zip(row.iter()) {
+                    *o = 10.0 * p.log10();
+                }
+                out
+            })
+            .collect();
+        let mag: Vec<[f64; NUM_TONES]> = powers
+            .iter()
+            .map(|row| {
+                let mut out = [0.0f64; NUM_TONES];
+                for (o, &p) in out.iter_mut().zip(row.iter()) {
+                    *o = p.sqrt();
+                }
+                out
+            })
+            .collect();
+        let mut llrs_db = synthetic_llrs(174);
+        let mut llrs_mag = synthetic_llrs(174);
+        maybe_impulse_robust_llrs(Some(4.0), &mut llrs_db, &db, ToneUnits::Db, &pp);
+        maybe_impulse_robust_llrs(Some(4.0), &mut llrs_mag, &mag, ToneUnits::LinearMag, &pp);
+        for (i, (&a, &b)) in llrs_db.iter().zip(llrs_mag.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "dB and linear-mag unit paths must agree at index {i}: {a} vs {b}"
+            );
+        }
+    }
+
+    /// End-to-end: `impulse_robust_llr = None` (default) must produce
+    /// byte-identical decodes to `Ft8Config::default()` on a noisy
+    /// synthetic signal through the full parallel decode path.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn none_is_byte_identical_to_default() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+        let mut state = 0x13198A2E03707344u64;
+        for s in tx.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((state >> 33) as f32) / (u32::MAX as f32) - 0.5;
+            *s += u * 0.3;
+        }
+
+        let mut dec_default = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let mut dec_none = Ft8Decoder::new(Ft8Config {
+            impulse_robust_llr: None,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let a = dec_default.decode_window(&tx).expect("decode default");
+        let b = dec_none.decode_window(&tx).expect("decode none");
+        let key = |msgs: &[DecodedMessage]| {
+            let mut v: Vec<(String, i64, i64)> = msgs
+                .iter()
+                .map(|m| {
+                    (
+                        m.text.clone(),
+                        (m.frequency_offset * 100.0).round() as i64,
+                        (m.time_offset * 1000.0).round() as i64,
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            key(&a),
+            key(&b),
+            "impulse_robust_llr: None must be byte-identical to default"
+        );
+        assert!(
+            a.iter().any(|m| m.text == "CQ K5ARH EM10"),
+            "synthetic signal must decode"
+        );
+    }
+
+    /// End-to-end: the weighting enabled at a conservative knee must
+    /// still decode a clean synthetic signal (wired through the
+    /// parallel decode path, not just unit-correct in isolation).
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn enabled_decodes_clean_signal() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let mut dec = Ft8Decoder::new(Ft8Config {
+            impulse_robust_llr: Some(6.0),
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let decoded = dec.decode_window(&tx).expect("decode impulse-robust");
+        assert!(
+            decoded.iter().any(|m| m.text == "CQ K5ARH EM10"),
+            "impulse-robust weighting must decode a clean synthetic signal"
         );
     }
 }

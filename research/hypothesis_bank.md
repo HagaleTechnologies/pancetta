@@ -6752,7 +6752,7 @@ search to in-repo sources.
     needs training (multi-machine GPU item in meatspace ledger).
   license: academic.
 
-### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [PRIORITY: 0.50, spawned 2026-06-12 Batch 96 web scan]
+### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [SHELVED-OPT-IN-AVAILABLE 2026-06-12 Batch 101 — translated mechanism real but below pre-registered bar: impulsive-plant threshold +0.219 dB (k=3) / +0.253 dB (k=6) vs the +0.3 dB bar; pure-AWGN cost exactly 0.000 dB (curves byte-level identical); hard_200/50 spot ΔTP +1 / ΔFP −1. Pre-registered SHELVE applied.]
 
   mode: ft8
   mechanism: closed-form robust LLR sign(y)·min(a|y|, b/|y|) — linear
@@ -6763,6 +6763,31 @@ search to in-repo sources.
     most impulsive recorded days first; synthetic alpha-stable plant
     corpus as fallback.
   license: academic. effort: 1 session probe.
+  status: Batch 101 probe (`batch101_impulse_robust_llr_kill_switch.rs`,
+    note `research/notes/2026-06-12-batch101-impulse-llr.md`). Primary
+    source PDF read directly (eq. (15), Sect. 3.4.5). Applicability
+    check FIRST: the paper's y is a time-domain matched-filter output;
+    pancetta's LLRs are spectrogram-domain dB tone-power differences
+    with no per-bit scalar amplitude — the literal form does NOT map.
+    TRANSLATED mechanism implemented (faithful adaptation): a lightning
+    crash is broadband + short-time, inflating all 8 tone bins of 1-3
+    symbols, so per-symbol TOTAL tone power plays the role of |y|;
+    symbols with P_s > k·median get LLRs × (k·P_med/P_s) (the inverse
+    branch), others untouched (the linear branch), continuous at the
+    knee. Shipped opt-in: `Ft8Config::impulse_robust_llr: Option<f64>`
+    (default None, byte-identical, 8 new tests incl. end-to-end
+    None-identity + dB/linear-mag unit agreement; 548 total). Wired at
+    all 10 demapper sites after whitening, before normalization.
+    Synthetic plant: AWGN + Bernoulli bursts (p=0.02/symbol, 1-3 sym,
+    10-30 dB over floor, ~4% duty). Impulsive plant costs baseline
+    0.79 dB; the knee recovers ~1/3 of that. Why below bar (hypotheses):
+    default-on LLR whitening already divides by a per-symbol noise
+    median (partial overlap); sync misses under bursts are not
+    LLR-recoverable; 4% duty caps the margin. Re-open paths: storm-day
+    real corpus (corpus framework has NO impulsiveness metric today —
+    a per-day kurtosis/crest-factor sweep would find candidate days),
+    or on-air A/B in lightning season (meatspace). Operators in heavy
+    QRN can set Some(6.0) at zero nominal-channel cost.
 
 ### hb-257 — Parallel ensemble decoding with ML selection  [PRIORITY: 0.35, spawned 2026-06-12 Batch 96 web scan]
 
