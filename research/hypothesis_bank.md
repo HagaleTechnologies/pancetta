@@ -6529,7 +6529,7 @@ search to in-repo sources.
       telemetry; decode_origin is for scoring
 
 
-### hb-248 — Hash-normalized truth scoring (eval-harness correctness)  [PRIORITY: 0.75 — HIGHEST OPEN, spawned 2026-06-12 Batch 86]
+### hb-248 — Hash-normalized truth scoring (eval-harness correctness)  [SHIPPED-INFRA 2026-06-12 Batch 87 — pancetta_research::metrics::hash_normalize_message (+5 tests) is the mandatory scoring path for all future ft8_lib-truth probes. Corrected headlines: raw_530_full precision 0.8067→0.8230, miss 4.61%→2.68% (766 reclassified); hard_1000 0.8146→0.8270, miss 5.48%→4.04% (220). Resolved-hash residual 0 on both. Historical probes not retrofitted (same-scoring deltas, all verdicts stand).]
 
   mode: ft8 (eval infrastructure)
   status: PROPOSED — quick win, affects every ft8_lib-truth measurement

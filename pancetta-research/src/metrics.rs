@@ -372,3 +372,70 @@ mod tests {
         assert!((back.total_offset() - 0.0123).abs() < 1e-12);
     }
 }
+
+/// hb-248 (Batch 87): normalize hashed-callsign display tokens so that
+/// pancetta and ft8_lib renderings of the SAME decode compare equal.
+///
+/// ft8_lib renders an unresolved hashed callsign as `<...>`; pancetta
+/// renders the 12-bit hash value as `<...NNNN>` (message.rs
+/// `CallsignField::Hash`). Exact-text truth intersection therefore
+/// counts every pancetta decode of a hashed message as BOTH a phantom
+/// miss and a phantom FP (Batch 86 audit: 43.4% of nominal misses on
+/// the 5/30 corpus were such aliases).
+///
+/// Rule (conservative): any whitespace-delimited token matching
+/// `<...` + digits + `>` (including bare `<...>`) is canonicalized to
+/// `<...>`. RESOLVED hash tokens (`<K1ABC>`) are left untouched — a
+/// pancetta-resolved hash vs ft8_lib's `<...>` still mismatches; the
+/// consuming probe should count that residual separately.
+pub fn hash_normalize_message(text: &str) -> String {
+    text.split_whitespace()
+        .map(|tok| {
+            let inner = tok.strip_prefix("<...").and_then(|r| r.strip_suffix('>'));
+            match inner {
+                Some(digits) if digits.chars().all(|c| c.is_ascii_digit()) => "<...>",
+                _ => tok,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+mod hash_normalize_tests {
+    use super::hash_normalize_message;
+
+    #[test]
+    fn pancetta_hash_value_token_normalizes() {
+        assert_eq!(
+            hash_normalize_message("<...3631> WZ8DX EM79"),
+            "<...> WZ8DX EM79"
+        );
+    }
+
+    #[test]
+    fn bare_ellipsis_token_unchanged() {
+        assert_eq!(
+            hash_normalize_message("<...> WZ8DX EM79"),
+            "<...> WZ8DX EM79"
+        );
+    }
+
+    #[test]
+    fn resolved_hash_token_left_alone() {
+        assert_eq!(
+            hash_normalize_message("<K1ABC> W9XYZ 73"),
+            "<K1ABC> W9XYZ 73"
+        );
+    }
+
+    #[test]
+    fn non_digit_suffix_left_alone() {
+        assert_eq!(hash_normalize_message("<...X1> CQ"), "<...X1> CQ");
+    }
+
+    #[test]
+    fn plain_messages_untouched() {
+        assert_eq!(hash_normalize_message("CQ K5ARH EM10"), "CQ K5ARH EM10");
+    }
+}
