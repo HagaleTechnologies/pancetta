@@ -2469,7 +2469,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-architectural.md (entry A3).
 
-### hb-104 — Joint multi-candidate decoder (vector decode, not sequence)  [PRIORITY: 0.70 — PREMISE CONFIRMED 2026-06-12 Batch 85: 46.5% of all pancetta misses on the 5/30 corpus sit within ONE TONE SPACING (6.25 Hz) of a time-overlapping decoded signal (821/1766 misses; 48.5% within 25 Hz). Largest single remaining recall opportunity (~+270 TPs at 1/3 recovery vs +42 from the whole knob lever ladder). Kill-switch experiment now precisely targetable at the <6.25 Hz pairs. HIGHEST OPEN.]
+### hb-104 — Joint multi-candidate decoder (vector decode, not sequence)  [SHELVED-PREMISE-ARTIFACT 2026-06-12 Batch 86 — the Batch 85 '46.5% co-channel misses' was a truth-matching artifact: ft8_lib renders unresolved hashed callsigns <...> vs pancetta's <...NNNN>, so exact-text scoring counts pancetta's OWN hashed decodes as misses at Δf=0 from themselves (766/1766 = 43.4% alias-confirmed by in-program audit). Hash-normalized: 0/1000 genuine misses within 6.25 Hz of a truth-confirmed decode, 6 (0.6%) within 25 Hz — the joint-decode population does not exist on this corpus. Kill-switch run anyway: 0/54 recoveries (all 54 were aliases). The one-step-LS subtract MACHINERY validated sound (victim-band energy ratio 0.26 after per-block+fine-shift fit; best <0.05) — reusable for hb-090/subtract work. Spawned hb-248 (hash-normalized scoring) + hb-249 (dt offset).]
   mode: ft8
   status: pending
   priority_score: 0.48
@@ -6527,3 +6527,41 @@ search to in-repo sources.
     - vs hb-103 v2/v3: strict refinement, replaces the unstable term
     - vs hb-129 TTFD: complementary — TTFD keeps wall-clock for operator
       telemetry; decode_origin is for scoring
+
+
+### hb-248 — Hash-normalized truth scoring (eval-harness correctness)  [PRIORITY: 0.75 — HIGHEST OPEN, spawned 2026-06-12 Batch 86]
+
+  mode: ft8 (eval infrastructure)
+  status: PROPOSED — quick win, affects every ft8_lib-truth measurement
+  mechanism: ft8_lib renders unresolved hashed callsigns as <...>;
+    pancetta renders <...NNNN>-style tokens. Exact-text set intersection
+    therefore double-penalizes EVERY pancetta decode of a hashed message:
+    +1 phantom miss AND +1 phantom FP. On 5/30: 766/1766 nominal misses
+    (43.4%) are aliases; true miss rate is 2.5% not 4.5%, and FP counts
+    are correspondingly overstated in every batch that scored against
+    ft8_lib truth (B66-86).
+  expected_delta: scoring-only — normalize hash tokens (e.g. map any
+    <...> token to a canonical <HASH>) before intersection in all probes
+    + eval.rs; re-derive headline precision numbers. SHIP DECISIONS
+    UNAFFECTED (all were config-vs-config deltas under identical scoring)
+    but absolute precision is better than reported everywhere.
+  defensible_prior: yes — artifact demonstrated by Batch 86 in-program
+    audit; standard practice (WSJT-X comparisons normalize hashed calls).
+  estimated_effort: 1 session (shared helper + probe sweep + re-derive)
+
+### hb-249 — Systematic decode dt offset (~0.2 s, sync-chain)  [PRIORITY: 0.45, spawned 2026-06-12 Batch 86]
+
+  mode: ft8
+  status: PROPOSED — diagnostic lead from kill-switch fit refinement
+  mechanism: per-slot --dt-scan on strongest decodes locked the true
+    signal position 360-2160 samples (0.03-0.18 s) EARLIER than the
+    decoder's reported time_offset, consistently negative. LDPC tolerates
+    it; any coherent processing (subtract quality, hb-090 matched filter)
+    does not. Candidate sources: spectrogram block alignment, Costas
+    refinement sign, symbol_period accumulation.
+  expected_delta: if reported dt tightens to ±1 subblock, production
+    subtract quality improves for free (multipass residual cleanliness);
+    prerequisite for any future coherent mechanism.
+  defensible_prior: yes — measured in-program on real slots (Batch 86
+    note); pancetta-invented diagnostic.
+  estimated_effort: 1-2 sessions (instrument + locate + fix + re-measure)
