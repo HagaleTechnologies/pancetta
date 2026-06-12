@@ -6567,10 +6567,10 @@ search to in-repo sources.
   estimated_effort: 1-2 sessions (instrument + locate + fix + re-measure)
 
 
-### hb-250 — Matched-filter demod for MARGINAL sync-passing candidates  [PRIORITY: 0.40, spawned 2026-06-12 Batch 90]
+### hb-250 — Matched-filter demod for MARGINAL sync-passing candidates  [SHELVED 2026-06-12 Batch 91 — premise probe (batch91_hb250_failed_candidates.rs, top-20 hard-200 + 20 kill-switch slots, ft8_lib truth): the opportunity pool is TINY and the demod is not the differentiator there. 2360 deduped sync-passing/LDPC-failing candidates across 40 WAVs; only 35 (1.5%) truth-adjacent (6.25 Hz/0.16 s) to a missed ft8_lib truth, 27 evaluable after hash-token encode skips → below the pre-registered n>=30 floor (SHELVE-POPULATION) AND the distribution misses both bars anyway: matched-filter p50 sign-agreement 67.2% (refine 67.8%) vs max-log 67.8% — delta ≈ 0 pts vs bars of >=85% or >=75%+8pts. Controls re-validated (max-log 95.4% / mf+refine 96.6% p50, n=954, matching Batch 90). The Batch-90 control-population matched-filter edge does NOT transfer to failed candidates: at sync-passing-but-LDPC-failing positions both demods plateau at ~68%, i.e. the limit is signal corruption (collision/interference), not front-end incoherence. 97.7% of failed candidates point at nothing real production missed — forcing OSD on them is pure FP risk.]
 
   mode: ft8
-  status: PROPOSED — side-finding of the hb-090 kill-switch
+  status: SHELVED (Batch 91 premise probe; was PROPOSED — side-finding of the hb-090 kill-switch)
   mechanism: the phase-coherent matched-filter demod (batch90 example,
     phasor-recurrence complex correlation + ±240-sample refinement)
     BEATS the production spectrogram max-log demod on real decoded

@@ -1236,6 +1236,35 @@ struct CostasCandidate {
     time_refinement: f64,
 }
 
+/// hb-250 premise probe (Batch 91): one record per sync candidate that
+/// entered the per-pass AP0/AP candidate loop, with whether THAT loop
+/// produced a CRC-valid decode for it. Research-side diagnostic only —
+/// populated exclusively via [`Ft8Decoder::decode_window_with_candidate_dump`];
+/// the production decode path never allocates these.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct SyncCandidateRecord {
+    /// Decode pass index (0-based) the candidate was emitted on. Passes
+    /// >= 1 run on the subtraction residual, not the original audio.
+    pub pass: usize,
+    /// Candidate base tone frequency in Hz
+    /// (`freq_bin * tone_spacing + freq_sub * tone_spacing / FREQ_OSR`) —
+    /// identical to the `base_frequency` a successful decode would report.
+    pub freq_hz: f64,
+    /// Candidate time offset in seconds (signed; `start_sample / 12000`).
+    /// Same convention as `DecodedMessage::time_offset` on the
+    /// spectrogram-extraction path.
+    pub dt_s: f64,
+    /// Signed audio sample offset where the candidate's signal starts,
+    /// per `candidate_offset_samples` (time-padding already removed).
+    pub start_sample: isize,
+    /// Costas sync correlation score.
+    pub sync_score: f64,
+    /// Whether the per-candidate loop (AP0 + AP retry) emitted a
+    /// CRC-valid decode for this candidate on this pass.
+    pub decoded: bool,
+}
+
 /// Waterfall display data for visualization
 #[derive(Debug, Clone)]
 pub struct WaterfallData {
@@ -1347,6 +1376,17 @@ pub struct Ft8Decoder {
     /// in a `Mutex` because `combine()` requires `&mut self` and the
     /// AP0 candidate loop runs across rayon workers.
     soft_combiner: Option<std::sync::Arc<std::sync::Mutex<SoftCombiner>>>,
+
+    /// hb-250 premise probe: when true, the per-pass candidate loop
+    /// additionally records a [`SyncCandidateRecord`] per sync candidate.
+    /// Default false — the disabled hot path is the exact pre-existing
+    /// `flatten().collect()` pipeline (no per-candidate buffering).
+    candidate_dump_enabled: bool,
+
+    /// hb-250 premise probe accumulator. Populated only when
+    /// `candidate_dump_enabled` is true; drained by
+    /// `take_candidate_dump`.
+    candidate_dump: Vec<SyncCandidateRecord>,
 }
 
 impl Ft8Decoder {
@@ -1452,6 +1492,8 @@ impl Ft8Decoder {
             residual_snr_records: Vec::new(),
             dt_priors: None,
             soft_combiner,
+            candidate_dump_enabled: false,
+            candidate_dump: Vec::new(),
         })
     }
 
@@ -1474,6 +1516,27 @@ impl Ft8Decoder {
     /// `config.residual_snr_diagnostic` is true.
     pub fn take_residual_snr_diagnostic(&mut self) -> Vec<(f64, f32, bool)> {
         std::mem::take(&mut self.residual_snr_records)
+    }
+
+    /// hb-250 premise probe (Batch 91): decode a window AND return one
+    /// [`SyncCandidateRecord`] per sync candidate that entered the
+    /// per-pass candidate loop, tagged with whether that loop produced
+    /// a CRC-valid decode for it. Diagnostic-only wrapper around
+    /// `decode_window`; positions from passes >= 1 refer to the
+    /// subtraction residual, not the original audio. Zero-cost when
+    /// unused: the flag this sets is false on every other entry point,
+    /// and the disabled candidate loop is byte-identical to the
+    /// pre-existing pipeline.
+    #[doc(hidden)]
+    pub fn decode_window_with_candidate_dump(
+        &mut self,
+        samples: &[f32],
+    ) -> Ft8Result<(Vec<DecodedMessage>, Vec<SyncCandidateRecord>)> {
+        self.candidate_dump_enabled = true;
+        let result = self.decode_window(samples);
+        self.candidate_dump_enabled = false;
+        let dump = std::mem::take(&mut self.candidate_dump);
+        Ok((result?, dump))
     }
 
     /// Get the current protocol parameters
@@ -1578,6 +1641,8 @@ impl Ft8Decoder {
         self.message_handler.on_window_start(SystemTime::now());
         // hb-093: reset diagnostic buffer at the start of each window.
         self.residual_snr_records.clear();
+        // hb-250: reset the candidate dump at the start of each window.
+        self.candidate_dump.clear();
 
         let min_samples = self.protocol_params.total_samples(SAMPLE_RATE);
         if samples.len() < min_samples {
@@ -1931,88 +1996,130 @@ impl Ft8Decoder {
             const ADAPTIVE_ITERS_LOW: usize = 50; // = default, no cut on high-SNR
             const ADAPTIVE_ITERS_HIGH: usize = 100; // for low-SNR (more BP budget)
 
-            let mut pass_decoded: Vec<DecodedMessage> = sync_candidates
-                .par_iter()
-                .map_init(
-                    // Per-thread initialization: create LDPC decoders and FFT buffer
-                    || {
-                        let osd_cfg = ctx.osd_depth.map(|d| OsdConfig {
-                            max_depth: d,
-                            npre2_preprocessing_enabled: ctx.osd_npre2_preprocessing_enabled,
-                        });
-                        let (iters_low, iters_mid, iters_high) = if ctx.adaptive_ldpc_iters {
-                            (ADAPTIVE_ITERS_LOW, ctx.ldpc_iterations, ADAPTIVE_ITERS_HIGH)
-                        } else {
-                            (
-                                ctx.ldpc_iterations,
-                                ctx.ldpc_iterations,
-                                ctx.ldpc_iterations,
-                            )
-                        };
-                        let ldpc_low = LdpcDecoder::new_with_osd(iters_low, osd_cfg)
-                            .expect("LDPC decoder init failed")
-                            .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
-                            .with_bp_offset_subtract(ctx.bp_offset_subtract)
-                            .with_layered(ctx.layered_bp)
-                            .with_feedback_refinement(
-                                ctx.ldpc_feedback_refinement_enabled,
-                                ctx.ldpc_feedback_boost_factor,
-                                ctx.ldpc_feedback_attenuate_factor,
-                                ctx.ldpc_feedback_erase_threshold,
-                            );
-                        let ldpc_mid = LdpcDecoder::new_with_osd(iters_mid, osd_cfg)
-                            .expect("LDPC decoder init failed")
-                            .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
-                            .with_bp_offset_subtract(ctx.bp_offset_subtract)
-                            .with_layered(ctx.layered_bp)
-                            .with_feedback_refinement(
-                                ctx.ldpc_feedback_refinement_enabled,
-                                ctx.ldpc_feedback_boost_factor,
-                                ctx.ldpc_feedback_attenuate_factor,
-                                ctx.ldpc_feedback_erase_threshold,
-                            );
-                        let ldpc_high = LdpcDecoder::new_with_osd(iters_high, osd_cfg)
-                            .expect("LDPC decoder init failed")
-                            .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
-                            .with_bp_offset_subtract(ctx.bp_offset_subtract)
-                            .with_layered(ctx.layered_bp)
-                            .with_feedback_refinement(
-                                ctx.ldpc_feedback_refinement_enabled,
-                                ctx.ldpc_feedback_boost_factor,
-                                ctx.ldpc_feedback_attenuate_factor,
-                                ctx.ldpc_feedback_erase_threshold,
-                            );
-                        let fft_buffer = vec![Complex::new(0.0, 0.0); sps];
-                        (ldpc_low, ldpc_mid, ldpc_high, fft_buffer)
-                    },
-                    |(ldpc_low, ldpc_mid, ldpc_high, fft_buffer), candidate| {
-                        let ldpc = if candidate.sync_score > ADAPTIVE_HIGH_SCORE {
-                            &*ldpc_low
-                        } else if candidate.sync_score > ADAPTIVE_MID_SCORE {
-                            &*ldpc_mid
-                        } else {
-                            &*ldpc_high
-                        };
-                        // First try standard AP0 decode
-                        if let Some(msg) = par_decode_candidate(&ctx, candidate, ldpc, fft_buffer) {
-                            return Some(msg);
-                        }
-                        // AP0 failed — try AP-enhanced decoding if AP is active
-                        if !ctx.ap_active {
-                            return None;
-                        }
-                        // Only attempt AP decoding on candidates with reasonable sync quality.
-                        // Sync scores below 4.0 are likely noise — AP injection on noise produces
-                        // false decodes by forcing the user's callsign into random bit patterns.
-                        const MIN_SYNC_SCORE_FOR_AP: f64 = 3.0;
-                        if candidate.sync_score < MIN_SYNC_SCORE_FOR_AP {
-                            return None;
-                        }
-                        par_try_ap_decode(&ctx, candidate, ldpc, &decoded_calls, pass)
-                    },
-                )
-                .flatten()
-                .collect();
+            // hb-250: the per-thread init and per-candidate closures are
+            // bound to names so the candidate-dump branch can reuse them
+            // with per-candidate result buffering while the disabled
+            // (default) branch keeps the exact pre-existing
+            // flatten().collect() pipeline.
+            // Per-thread initialization: create LDPC decoders and FFT buffer
+            let ldpc_init = || {
+                let osd_cfg = ctx.osd_depth.map(|d| OsdConfig {
+                    max_depth: d,
+                    npre2_preprocessing_enabled: ctx.osd_npre2_preprocessing_enabled,
+                });
+                let (iters_low, iters_mid, iters_high) = if ctx.adaptive_ldpc_iters {
+                    (ADAPTIVE_ITERS_LOW, ctx.ldpc_iterations, ADAPTIVE_ITERS_HIGH)
+                } else {
+                    (
+                        ctx.ldpc_iterations,
+                        ctx.ldpc_iterations,
+                        ctx.ldpc_iterations,
+                    )
+                };
+                let ldpc_low = LdpcDecoder::new_with_osd(iters_low, osd_cfg)
+                    .expect("LDPC decoder init failed")
+                    .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
+                    .with_bp_offset_subtract(ctx.bp_offset_subtract)
+                    .with_layered(ctx.layered_bp)
+                    .with_feedback_refinement(
+                        ctx.ldpc_feedback_refinement_enabled,
+                        ctx.ldpc_feedback_boost_factor,
+                        ctx.ldpc_feedback_attenuate_factor,
+                        ctx.ldpc_feedback_erase_threshold,
+                    );
+                let ldpc_mid = LdpcDecoder::new_with_osd(iters_mid, osd_cfg)
+                    .expect("LDPC decoder init failed")
+                    .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
+                    .with_bp_offset_subtract(ctx.bp_offset_subtract)
+                    .with_layered(ctx.layered_bp)
+                    .with_feedback_refinement(
+                        ctx.ldpc_feedback_refinement_enabled,
+                        ctx.ldpc_feedback_boost_factor,
+                        ctx.ldpc_feedback_attenuate_factor,
+                        ctx.ldpc_feedback_erase_threshold,
+                    );
+                let ldpc_high = LdpcDecoder::new_with_osd(iters_high, osd_cfg)
+                    .expect("LDPC decoder init failed")
+                    .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
+                    .with_bp_offset_subtract(ctx.bp_offset_subtract)
+                    .with_layered(ctx.layered_bp)
+                    .with_feedback_refinement(
+                        ctx.ldpc_feedback_refinement_enabled,
+                        ctx.ldpc_feedback_boost_factor,
+                        ctx.ldpc_feedback_attenuate_factor,
+                        ctx.ldpc_feedback_erase_threshold,
+                    );
+                let fft_buffer = vec![Complex::new(0.0, 0.0); sps];
+                (ldpc_low, ldpc_mid, ldpc_high, fft_buffer)
+            };
+            let decode_candidate_op = |(ldpc_low, ldpc_mid, ldpc_high, fft_buffer): &mut (
+                LdpcDecoder,
+                LdpcDecoder,
+                LdpcDecoder,
+                Vec<Complex<f64>>,
+            ),
+                                       candidate: &CostasCandidate|
+             -> Option<DecodedMessage> {
+                let ldpc = if candidate.sync_score > ADAPTIVE_HIGH_SCORE {
+                    &*ldpc_low
+                } else if candidate.sync_score > ADAPTIVE_MID_SCORE {
+                    &*ldpc_mid
+                } else {
+                    &*ldpc_high
+                };
+                // First try standard AP0 decode
+                if let Some(msg) = par_decode_candidate(&ctx, candidate, ldpc, fft_buffer) {
+                    return Some(msg);
+                }
+                // AP0 failed — try AP-enhanced decoding if AP is active
+                if !ctx.ap_active {
+                    return None;
+                }
+                // Only attempt AP decoding on candidates with reasonable sync quality.
+                // Sync scores below 4.0 are likely noise — AP injection on noise produces
+                // false decodes by forcing the user's callsign into random bit patterns.
+                const MIN_SYNC_SCORE_FOR_AP: f64 = 3.0;
+                if candidate.sync_score < MIN_SYNC_SCORE_FOR_AP {
+                    return None;
+                }
+                par_try_ap_decode(&ctx, candidate, ldpc, &decoded_calls, pass)
+            };
+
+            let mut pass_decoded: Vec<DecodedMessage> = if self.candidate_dump_enabled {
+                // hb-250 premise probe: buffer per-candidate results so
+                // each sync candidate can be tagged with its decode
+                // outcome, then flatten to the same Vec the legacy
+                // pipeline produces (rayon preserves order either way).
+                let per_candidate: Vec<Option<DecodedMessage>> = sync_candidates
+                    .par_iter()
+                    .map_init(ldpc_init, decode_candidate_op)
+                    .collect();
+                let dump_spec_step = sps / TIME_OSR;
+                let dump_tone_spacing = self.protocol_params.tone_spacing;
+                for (c, r) in sync_candidates.iter().zip(per_candidate.iter()) {
+                    let start_sample = candidate_offset_samples(
+                        c.time_step,
+                        spectrogram.time_padding,
+                        dump_spec_step,
+                    );
+                    self.candidate_dump.push(SyncCandidateRecord {
+                        pass,
+                        freq_hz: c.freq_bin as f64 * dump_tone_spacing
+                            + c.freq_sub as f64 * (dump_tone_spacing / FREQ_OSR as f64),
+                        dt_s: start_sample as f64 / SAMPLE_RATE as f64,
+                        start_sample,
+                        sync_score: c.sync_score,
+                        decoded: r.is_some(),
+                    });
+                }
+                per_candidate.into_iter().flatten().collect()
+            } else {
+                sync_candidates
+                    .par_iter()
+                    .map_init(ldpc_init, decode_candidate_op)
+                    .flatten()
+                    .collect()
+            };
 
             // hb-129: safety net — stamp any par_iter outputs that
             // weren't tagged at their CRC-pass site (par_decode_candidate /
