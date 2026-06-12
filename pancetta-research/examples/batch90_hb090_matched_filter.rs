@@ -1,69 +1,66 @@
-//! hb-088 OSD-without-Costas-pre-gate — feasibility / kill-switch diagnostic.
+//! hb-090 Stage B — phase-coherent matched-filter demod at truth coordinates.
 //!
-//! Spawned 2026-05-31 from the hb-086 V3 SHELVE (Costas-relaxation surfaces
-//! noise, not signal). hb-087 attacks the same wall via callsign priors;
-//! this hypothesis is the structurally different sibling: BYPASS Costas
-//! pre-gate entirely by feeding residual-extracted LLRs DIRECTLY to OSD's
-//! flip-pattern enumeration at positions whose Costas sync_score is below
-//! the production `min_sync_score` threshold (so sync_search wouldn't even
-//! hand them to LDPC BP).
+//! Batch 90 Stage A (hb088_osd_without_costas_feasibility +
+//! PANCETTA_HB088_STEP_OFFSET sweep) established that the correct
+//! row convention for mapping (freq_hz, dt_s) into the example's
+//! spectrogram is offset **+2** (controls peak at 91.4% sign-agreement
+//! there, confirming Batch 88's SLIDING_FRAME_LOOKBACK_STEPS = 2), and
+//! that sub-Costas misses sit at 50.6% sign-agreement at EVERY offset
+//! under the existing max-log spectrogram-magnitude demod.
 //!
-//! ## Why this might work where V3 didn't
+//! hb-090's pre-registered kill-switch: replace the max-log demod with a
+//! phase-coherent matched filter at the same (corrected, +2) coordinates.
 //!
-//! V3 ran Costas → BP → OSD at relaxed sync threshold. BP failed → CRC
-//! failed → 0 decodes. V3's mechanism trace: 100-131 truly-new candidates
-//! per worst-WAV, all BP-converge on noise, ~98% CRC FP-rejected, last 2%
-//! plausibility-rejected.
+//!   PROCEED: sub-Costas median sign-agreement >= 70%
+//!   WEAK:    58% - 70% (above-noise but below OSD viability)
+//!   SHELVE:  < 58%
 //!
-//! This proposal SKIPS BP entirely. OSD's flip enumeration is independent
-//! of BP convergence. The structural argument: at a position with a real
-//! weak signal, the LLR signs are mostly correct (signal beats noise on
-//! most tones) but some bits are wrong; OSD-2's 4095 flip patterns
-//! enumerate the most-reliable basis and might find the truth. At a
-//! noise-only position, the LLR sign pattern is random and no 2-flip
-//! pattern produces a valid codeword + valid CRC.
+//! ## What changes vs the hb088 example
 //!
-//! ## Why this might NOT work (kill switch)
+//! ONLY the demod front-end. For every evaluated position (control or
+//! sub-Costas target) we additionally extract 79 x 8 tone magnitudes by
+//! correlating the raw audio against the 8 complex tone templates
+//! exp(-j 2π (f0 + k·6.25) t), k = 0..7 (the audio is real, so this is
+//! cos + j·sin correlation; |correlation| is the phase-coherent matched
+//! filter output). The 8-tone magnitudes (converted to dB) then flow
+//! through the IDENTICAL gray-code max-log LLR function the spectrogram
+//! path uses, so the only delta is spectrogram-magnitude vs
+//! matched-filter front-end.
 //!
-//! If LLR magnitudes are too small (sub-Costas positions have weak energy
-//! on all tones), the parity-check matrix is poorly conditioned and many
-//! flip patterns produce CRC-passing codewords by coincidence. CRC-14
-//! catches 1 in 16384 by chance; OSD-2 enumerates 4095 patterns; combined
-//! FP rate ~25% per position. At 300+ positions per WAV, that's ~75 FPs
-//! per WAV — devastating.
+//! ## Sample-offset mapping (row convention +2)
 //!
-//! ## What this diagnostic measures
+//! `pos_from_freq_dt` here bakes in STEP_OFFSET = +2:
+//!     time_step t0 = round(dt_s / 0.08) + 2.
+//! Per the decoder's one-true-convention helper
+//! (`candidate_offset_samples` in pancetta-ft8/src/decoder.rs:93, with
+//! time_padding = 0 because this example's spectrogram prepends nothing):
+//!     start_sample = (t0 - SLIDING_FRAME_LOOKBACK_STEPS) * 960
+//!                  = (t0 - 2) * 960
+//!                  = round(dt_s / 0.08) * 960  ≈  dt_s * 12000.
+//! i.e. with the +2 row convention the time_step ALREADY points at the
+//! row whose symbol starts at (t0 - 2)·960; subtracting the same 2 the
+//! convention added recovers the plain dt → sample mapping (quantized to
+//! the 80 ms step grid, so up to ±480 samples of residual quantization —
+//! which is exactly what the optional ±240-sample refinement probes).
+//! Symbol s (0..78) then starts at start_sample + s·1920.
 //!
-//! On refreshed top-20 hard-200 WAVs, the diagnostic:
-//!   1. Builds the production-equivalent spectrogram from raw audio.
-//!   2. Decodes the WAV with production `Ft8Decoder` to get control
-//!      positions (successful decodes — sync_score >= MIN_SYNC_SCORE).
-//!   3. For each missed truth (truth not in production decodes): converts
-//!      (freq_hz, dt_s) to (freq_bin, time_step, freq_sub); computes
-//!      Costas sync_score at that position; extracts 79 symbols' tone
-//!      magnitudes; computes 174 max-log-LLRs.
-//!   4. For each control position: same LLR extraction.
-//!   5. For each truth (target OR control): encodes the truth message
-//!      via `Ft8Encoder::encode_message` to get the 79 tone-symbols,
-//!      reverses Gray code to recover the 174-bit reference codeword.
-//!   6. Reports LLR magnitude distribution and sign-agreement with the
-//!      reference codeword for sub-Costas targets vs control.
+//! ## Frequency mapping
 //!
-//! ## Kill-switch criteria
+//! (f0, fs) from `pos_from_freq_dt` are the 6.25 Hz bin and the 3.125 Hz
+//! sub-bin, so the candidate's base tone frequency is
+//!     base_hz = f0 · 6.25 + fs · 3.125,
+//! and tone k sits at base_hz + k · 6.25 — the same quantization the
+//! spectrogram path reads, keeping the two demods at identical
+//! coordinates.
 //!
-//! PROCEED iff BOTH conditions hold on the aggregate of all sub-Costas
-//! missed truths:
-//!   (a) mean |LLR| at sub-Costas positions >= 10% of mean |LLR| at
-//!       control positions (i.e., not dominated by noise floor); AND
-//!   (b) median LLR-sign-agreement with truth codeword >= 85% (so a
-//!       2-flip OSD has a reasonable shot at finding the truth — ~26
-//!       wrong bits is way over OSD-2's budget; we need fewer than ~14).
+//! ## Optional refinement (reported separately)
 //!
-//! If only (a) and sign-agreement is in [60%, 85%], note as OSD-4
-//! follow-up (not in OSD-2's flip budget but reachable with deeper OSD).
+//! ±240-sample local time refinement per position: shifts
+//! −240..=+240 in steps of 60; pick the shift maximizing total filter
+//! energy Σ_symbols max_tone |C|². Labeled `mf+refine` in the output.
 //!
 //! Run:
-//!   cargo run --release -p pancetta-research --example hb088_osd_without_costas_feasibility
+//!   cargo run --release -p pancetta-research --example batch90_hb090_matched_filter
 
 use anyhow::Context;
 use num_complex::Complex;
@@ -83,9 +80,21 @@ const MIN_SYNC_SCORE: f64 = 3.0;
 const SLOT_S: f64 = 15.0;
 /// Take the top-K worst hard-200 WAVs.
 const TOP_K_WAVS: usize = 20;
+/// Stage A's empirically confirmed row convention (+2).
+const STEP_OFFSET: i64 = 2;
+/// Samples per FT8 symbol @ 12 kHz.
+const SAMPLES_PER_SYMBOL: usize = 1920;
+/// Samples per spectrogram time step (TIME_OSR = 2).
+const SAMPLES_PER_STEP: isize = 960;
+/// Tone spacing in Hz.
+const TONE_SPACING_HZ: f64 = 6.25;
+/// Refinement: shifts −240..=+240 step 60.
+const REFINE_RANGE: isize = 240;
+const REFINE_STEP: isize = 60;
 
 // ============================================================================
 // Spectrogram (matches Ft8Decoder::compute_spectrogram for FT8 @ 12 kHz)
+// — identical to the hb088 example; used for sync gating + max-log baseline.
 // ============================================================================
 
 struct Spec {
@@ -244,7 +253,7 @@ fn compute_costas_score(spec: &Spec, pp: &ProtocolParams, t0: usize, f0: usize, 
 }
 
 // ============================================================================
-// Symbol extraction + LLR computation (matches Ft8Decoder paths)
+// Demod front-end A: spectrogram max-log magnitudes (identical to hb088)
 // ============================================================================
 
 /// Returns Vec<[f64; NUM_TONES]> with 79 rows of tone magnitudes (dB).
@@ -275,6 +284,98 @@ fn extract_symbols(spec: &Spec, t0: usize, f0: usize, fs: usize) -> Vec<[f64; NU
     }
     out
 }
+
+// ============================================================================
+// Demod front-end B: phase-coherent matched filter on raw audio
+// ============================================================================
+
+/// Phase-coherent matched-filter demod at a fixed sample shift.
+///
+/// For each of the 79 symbols, correlates the 1920-sample window starting
+/// at `start_sample + shift + sym·1920` against the 8 complex tone
+/// templates exp(-j 2π (base_hz + k·6.25) n / 12000) and returns both the
+/// dB magnitudes (for the LLR path, same units as the spectrogram path up
+/// to a constant offset that max-log differences cancel) and the total
+/// filter energy Σ_sym max_k |C_k|² (for the refinement search).
+///
+/// Out-of-range samples contribute zero (phasors still advance so the
+/// template stays phase-continuous).
+fn matched_filter_symbols(
+    audio: &[f64],
+    start_sample: isize,
+    base_hz: f64,
+    shift: isize,
+) -> (Vec<[f64; NUM_TONES]>, f64) {
+    let dt = 1.0 / SAMPLE_RATE as f64;
+    // Per-sample rotation constants for the 8 tones.
+    let rot: Vec<Complex<f64>> = (0..NUM_TONES)
+        .map(|k| {
+            let f = base_hz + k as f64 * TONE_SPACING_HZ;
+            Complex::from_polar(1.0, -2.0 * std::f64::consts::PI * f * dt)
+        })
+        .collect();
+
+    let mut out = Vec::with_capacity(NUM_SYMBOLS);
+    let mut total_energy = 0.0f64;
+    let n_audio = audio.len() as isize;
+
+    for sym_idx in 0..NUM_SYMBOLS {
+        let win_start = start_sample + shift + (sym_idx * SAMPLES_PER_SYMBOL) as isize;
+        let mut acc = [Complex::new(0.0f64, 0.0f64); NUM_TONES];
+        let mut ph = [Complex::new(1.0f64, 0.0f64); NUM_TONES];
+        for m in 0..SAMPLES_PER_SYMBOL as isize {
+            let idx = win_start + m;
+            if idx >= 0 && idx < n_audio {
+                let x = audio[idx as usize];
+                for k in 0..NUM_TONES {
+                    acc[k] += ph[k] * x;
+                }
+            }
+            for k in 0..NUM_TONES {
+                ph[k] *= rot[k];
+            }
+        }
+        let mut mags = [-120.0f64; NUM_TONES];
+        let mut best_e = 0.0f64;
+        for k in 0..NUM_TONES {
+            let e = acc[k].norm_sqr();
+            // Same dB form as the spectrogram (10·log10(eps + power)); the
+            // absolute scale differs by a constant, which cancels in the
+            // max-log LLR differences.
+            mags[k] = 10.0 * (1e-12_f64 + e).log10();
+            if e > best_e {
+                best_e = e;
+            }
+        }
+        total_energy += best_e;
+        out.push(mags);
+    }
+    (out, total_energy)
+}
+
+/// Matched filter with ±REFINE_RANGE local time refinement: evaluates
+/// shifts −240..=+240 step 60 and returns (mags at best shift, best shift).
+fn matched_filter_refined(
+    audio: &[f64],
+    start_sample: isize,
+    base_hz: f64,
+) -> (Vec<[f64; NUM_TONES]>, isize) {
+    let mut best: Option<(Vec<[f64; NUM_TONES]>, f64, isize)> = None;
+    let mut shift = -REFINE_RANGE;
+    while shift <= REFINE_RANGE {
+        let (mags, energy) = matched_filter_symbols(audio, start_sample, base_hz, shift);
+        if best.as_ref().map(|b| energy > b.1).unwrap_or(true) {
+            best = Some((mags, energy, shift));
+        }
+        shift += REFINE_STEP;
+    }
+    let (mags, _, s) = best.expect("at least one shift evaluated");
+    (mags, s)
+}
+
+// ============================================================================
+// LLR computation — shared by BOTH demods (the only delta is the front-end)
+// ============================================================================
 
 /// 174 max-log LLRs from 79 symbols' tone magnitudes (dB).
 /// Convention (matches pancetta-ft8 OSD): llr < 0 => bit=1, llr > 0 => bit=0.
@@ -314,7 +415,6 @@ fn gray_to_binary(g: u8) -> u8 {
 
 // ============================================================================
 // Tone symbols (length 79) → 174 codeword bits.
-// Drop 21 Costas symbols, reverse Gray on the 58 data symbols.
 // ============================================================================
 
 fn tone_symbols_to_codeword(
@@ -326,7 +426,6 @@ fn tone_symbols_to_codeword(
     for sym_idx in pp.data_symbol_indices() {
         let gray = symbols[sym_idx];
         let bits3 = gray_to_binary(gray);
-        // 3 bits MSB-first per the encoder's generate_symbols_protocol path.
         out[bit_idx] = (bits3 >> 2) & 1;
         out[bit_idx + 1] = (bits3 >> 1) & 1;
         out[bit_idx + 2] = bits3 & 1;
@@ -337,35 +436,28 @@ fn tone_symbols_to_codeword(
 }
 
 // ============================================================================
-// Coordinate mapping
+// Coordinate mapping (STEP_OFFSET = +2 baked in per Stage A)
 // ============================================================================
 
-/// (freq_hz, dt_s) → (time_step, freq_bin, freq_sub) for the production
-/// spectrogram. tone_spacing = 6.25 Hz, freq_osr = 2 ⇒ 3.125 Hz per
-/// sub-bin. samples_per_symbol = 1920 @ 12 kHz; time_osr = 2 ⇒
-/// 80 ms per time_step. dt_s = 0 corresponds to t0 = 0 (the Costas
-/// alignment offset matches sync_search's t0).
+/// (freq_hz, dt_s) → (time_step, freq_bin, freq_sub).
 fn pos_from_freq_dt(freq_hz: f64, dt_s: f64) -> (usize, usize, usize) {
-    let sub_bin_hz = 6.25 / FREQ_OSR as f64; // 3.125
+    let sub_bin_hz = TONE_SPACING_HZ / FREQ_OSR as f64; // 3.125
     let total_sub = (freq_hz / sub_bin_hz).round() as i64;
     let freq_bin = (total_sub.max(0) / FREQ_OSR as i64) as usize;
     let freq_sub = (total_sub.max(0) % FREQ_OSR as i64) as usize;
-    // Each time_step is 80 ms (samples_per_symbol / time_osr / 12000).
     let step_s = 0.08;
-    // Batch 90 (hb-090 Stage A): the original mapping assumed row t
-    // represents the symbol starting at t*960 samples — the same
-    // convention bug Batch 88 fixed in the decoder (row t actually
-    // represents the symbol starting at (t-2)*960, so the row FOR a
-    // symbol at dt is dt/0.08 + 2). Rather than assert the +2, sweep
-    // it: PANCETTA_HB088_STEP_OFFSET (default 0 = historical behavior)
-    // shifts the row; sign-agreement vs offset locates the true
-    // convention empirically.
-    let step_offset: i64 = std::env::var("PANCETTA_HB088_STEP_OFFSET")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let time_step = ((dt_s / step_s).round() as i64 + step_offset).max(0) as usize;
+    let time_step = ((dt_s / step_s).round() as i64 + STEP_OFFSET).max(0) as usize;
     (time_step, freq_bin, freq_sub)
+}
+
+/// (time_step, freq_bin, freq_sub) → (start_sample, base_hz) for the
+/// matched filter. See module docs: with the +2 row convention,
+/// start_sample = (t0 − 2)·960 per `candidate_offset_samples`
+/// (pancetta-ft8/src/decoder.rs:93, time_padding = 0 here).
+fn sample_coords(t0: usize, f0: usize, fs: usize) -> (isize, f64) {
+    let start_sample = (t0 as isize - STEP_OFFSET as isize) * SAMPLES_PER_STEP;
+    let base_hz = f0 as f64 * TONE_SPACING_HZ + fs as f64 * (TONE_SPACING_HZ / FREQ_OSR as f64);
+    (start_sample, base_hz)
 }
 
 // ============================================================================
@@ -378,14 +470,11 @@ struct LlrStats {
     mean_abs_llr: f64,
     sum_abs_llr: f64,
     max_abs_llr: f64,
-    /// fraction in [0, 1] of bits whose LLR sign matches the truth codeword
     sign_agreements: Vec<f64>,
-    /// Costas sync_scores at the position the LLRs were extracted from
-    sync_scores: Vec<f64>,
 }
 
 impl LlrStats {
-    fn record(&mut self, llrs: &[f32], truth_bits: &[u8; NUM_CODEWORD_BITS], sync_score: f64) {
+    fn record(&mut self, llrs: &[f32], truth_bits: &[u8; NUM_CODEWORD_BITS]) {
         let mut sum_abs = 0.0_f64;
         let mut max_abs = 0.0_f64;
         let mut agree = 0usize;
@@ -395,7 +484,6 @@ impl LlrStats {
             if mag > max_abs {
                 max_abs = mag;
             }
-            // LLR sign convention: llr<0 => bit=1, llr>0 => bit=0.
             let bit_inferred: u8 = if llrs[i] < 0.0 { 1 } else { 0 };
             if bit_inferred == truth_bits[i] {
                 agree += 1;
@@ -409,7 +497,6 @@ impl LlrStats {
         }
         self.sign_agreements
             .push(agree as f64 / NUM_CODEWORD_BITS as f64);
-        self.sync_scores.push(sync_score);
         self.mean_abs_llr = self.sum_abs_llr / self.n as f64;
     }
 }
@@ -459,6 +546,29 @@ fn load_wav(path: &PathBuf) -> anyhow::Result<Vec<f32>> {
 // Main
 // ============================================================================
 
+/// All three demods at one position. Returns (maxlog, mf, mf_refined, best_shift).
+#[allow(clippy::type_complexity)]
+fn eval_position(
+    spec: &Spec,
+    audio: &[f64],
+    pp: &ProtocolParams,
+    t0: usize,
+    f0: usize,
+    fs: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, isize) {
+    let tone_mags = extract_symbols(spec, t0, f0, fs);
+    let llrs_maxlog = compute_llrs_db(&tone_mags, pp);
+
+    let (start_sample, base_hz) = sample_coords(t0, f0, fs);
+    let (mf_mags, _) = matched_filter_symbols(audio, start_sample, base_hz, 0);
+    let llrs_mf = compute_llrs_db(&mf_mags, pp);
+
+    let (mf_ref_mags, best_shift) = matched_filter_refined(audio, start_sample, base_hz);
+    let llrs_mf_ref = compute_llrs_db(&mf_ref_mags, pp);
+
+    (llrs_maxlog, llrs_mf, llrs_mf_ref, best_shift)
+}
+
 fn main() -> anyhow::Result<()> {
     let ws = workspace_root()?;
 
@@ -485,14 +595,20 @@ fn main() -> anyhow::Result<()> {
     }
 
     let pp = ProtocolParams::ft8();
-    let mut sub_costas_stats = LlrStats::default();
-    let mut control_stats = LlrStats::default();
-    let mut all_subcostas_stats = LlrStats::default(); // includes truths whose sync passes too
-    let mut per_wav: Vec<(String, usize, usize, usize, usize)> = Vec::new(); // sha, truth, rec, missed_w_encode, sub_costas
+    // Stats buckets: [control, sub-Costas] x [maxlog, mf, mf+refine].
+    let mut ctl_maxlog = LlrStats::default();
+    let mut ctl_mf = LlrStats::default();
+    let mut ctl_mf_ref = LlrStats::default();
+    let mut sub_maxlog = LlrStats::default();
+    let mut sub_mf = LlrStats::default();
+    let mut sub_mf_ref = LlrStats::default();
+    let mut sub_best_shifts: Vec<f64> = Vec::new();
+    let mut ctl_best_shifts: Vec<f64> = Vec::new();
+    let mut per_wav: Vec<(String, usize, usize, usize, usize)> = Vec::new();
 
     eprintln!(
-        "Loading top-{TOP_K_WAVS} hard-200 WAVs, building spectrogram + LLR diagnostic at \
-         truth positions vs control positions...",
+        "hb-090 Stage B: matched-filter vs max-log demod at +2-convention truth coordinates \
+         on top-{TOP_K_WAVS} hard-200 WAVs...",
     );
 
     let cfg = Ft8Config::default();
@@ -530,11 +646,9 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
-        // Build our spectrogram.
         let audio_f64: Vec<f64> = samples.iter().map(|&s| s as f64).collect();
         let spec = compute_spectrogram(&audio_f64);
 
-        // Run production decode for control + missed-truth identification.
         let mut decoder =
             Ft8Decoder::new(cfg.clone()).map_err(|e| anyhow::anyhow!("Ft8Decoder::new: {e}"))?;
         let production_decodes = decoder
@@ -565,7 +679,6 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
 
-            // Try to encode the truth message to derive reference codeword bits.
             let truth_symbols = match encoder.encode_message(truth_msg, None) {
                 Ok(s) => s,
                 Err(_) => continue,
@@ -573,10 +686,7 @@ fn main() -> anyhow::Result<()> {
             wav_missed_encodable += 1;
             let truth_bits = tone_symbols_to_codeword(&truth_symbols, &pp);
 
-            // Map (freq, dt) to spectrogram coords.
             let (t0, f0, fs) = pos_from_freq_dt(*freq_hz, *dt_s);
-            // Pull tone_magnitudes + LLRs + sync_score from MY spectrogram at
-            // that position.
             if t0 + NUM_SYMBOLS * TIME_OSR + 1 >= spec.num_steps {
                 continue;
             }
@@ -584,20 +694,22 @@ fn main() -> anyhow::Result<()> {
                 continue;
             }
             let sync_score = compute_costas_score(&spec, &pp, t0, f0, fs);
-            let tone_mags = extract_symbols(&spec, t0, f0, fs);
-            let llrs = compute_llrs_db(&tone_mags, &pp);
-
-            all_subcostas_stats.record(&llrs, &truth_bits, sync_score);
-            if sync_score < MIN_SYNC_SCORE {
-                sub_costas_stats.record(&llrs, &truth_bits, sync_score);
-                wav_subcostas += 1;
+            if sync_score >= MIN_SYNC_SCORE {
+                continue; // only the sub-Costas target population
             }
+            wav_subcostas += 1;
+
+            let (llrs_maxlog, llrs_mf, llrs_mf_ref, best_shift) =
+                eval_position(&spec, &audio_f64, &pp, t0, f0, fs);
+            sub_maxlog.record(&llrs_maxlog, &truth_bits);
+            sub_mf.record(&llrs_mf, &truth_bits);
+            sub_mf_ref.record(&llrs_mf_ref, &truth_bits);
+            sub_best_shifts.push(best_shift as f64);
         }
 
-        // Control: at each successful pancetta decode, extract LLRs and
-        // measure against the decoded message's encoded reference. This
-        // gives the "what does a real signal look like at OUR spectrogram"
-        // anchor.
+        // Controls: successful production decodes (sanity anchor — matched-
+        // filter controls should be >= max-log controls' ~91%; if they're
+        // LOW the sample mapping is wrong).
         for d in &production_decodes {
             let txt = d.text.trim().to_string();
             let sym = match encoder.encode_message(&txt, None) {
@@ -613,10 +725,12 @@ fn main() -> anyhow::Result<()> {
             if f0 + NUM_TONES >= spec.num_bins {
                 continue;
             }
-            let sync_score = compute_costas_score(&spec, &pp, t0, f0, fs);
-            let tone_mags = extract_symbols(&spec, t0, f0, fs);
-            let llrs = compute_llrs_db(&tone_mags, &pp);
-            control_stats.record(&llrs, &bits, sync_score);
+            let (llrs_maxlog, llrs_mf, llrs_mf_ref, best_shift) =
+                eval_position(&spec, &audio_f64, &pp, t0, f0, fs);
+            ctl_maxlog.record(&llrs_maxlog, &bits);
+            ctl_mf.record(&llrs_mf, &bits);
+            ctl_mf_ref.record(&llrs_mf_ref, &bits);
+            ctl_best_shifts.push(best_shift as f64);
         }
 
         per_wav.push((
@@ -636,7 +750,10 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    println!("\n=== hb-088 OSD-without-Costas feasibility (top-{TOP_K_WAVS} hard-200) ===\n");
+    println!(
+        "\n=== hb-090 Stage B: matched-filter vs max-log demod (top-{TOP_K_WAVS} hard-200, \
+         STEP_OFFSET=+2) ===\n"
+    );
     println!("Per-WAV breakdown:");
     println!(
         "  {:>9} {:>6} {:>5} {:>14} {:>11}",
@@ -646,99 +763,82 @@ fn main() -> anyhow::Result<()> {
         println!("  {:>9} {:>6} {:>5} {:>14} {:>11}", w.0, w.1, w.2, w.3, w.4);
     }
 
-    let report = |label: &str, s: &LlrStats| {
-        println!("\n[{label}]  n = {}", s.n);
+    let row = |label: &str, s: &LlrStats| {
         if s.n == 0 {
-            println!("  (empty)");
+            println!("  {label:<26} (empty)");
             return;
         }
-        let agree_mean = mean(&s.sign_agreements) * 100.0;
-        let agree_p10 = percentile(&s.sign_agreements, 10.0) * 100.0;
-        let agree_p50 = percentile(&s.sign_agreements, 50.0) * 100.0;
-        let agree_p90 = percentile(&s.sign_agreements, 90.0) * 100.0;
-        let sync_mean = mean(&s.sync_scores);
-        let sync_p10 = percentile(&s.sync_scores, 10.0);
-        let sync_p90 = percentile(&s.sync_scores, 90.0);
         println!(
-            "  mean |LLR|      = {:.3}    max |LLR| seen = {:.3}",
-            s.mean_abs_llr, s.max_abs_llr,
-        );
-        println!(
-            "  sign-agreement  mean={:.1}%  p10={:.1}%  p50={:.1}%  p90={:.1}%",
-            agree_mean, agree_p10, agree_p50, agree_p90,
-        );
-        println!(
-            "  sync_score      mean={:.2}  p10={:.2}  p90={:.2}",
-            sync_mean, sync_p10, sync_p90,
+            "  {label:<26} n={:>4}  agree mean={:5.1}%  p10={:5.1}%  p50={:5.1}%  p90={:5.1}%  \
+             mean|LLR|={:7.3}",
+            s.n,
+            mean(&s.sign_agreements) * 100.0,
+            percentile(&s.sign_agreements, 10.0) * 100.0,
+            percentile(&s.sign_agreements, 50.0) * 100.0,
+            percentile(&s.sign_agreements, 90.0) * 100.0,
+            s.mean_abs_llr,
         );
     };
 
-    report("CONTROL (production-decode positions)", &control_stats);
-    report("MISSED + sub-Costas (target population)", &sub_costas_stats);
-    report("MISSED (all encodable, any sync)", &all_subcostas_stats);
-
-    // Kill switch
-    let llr_ratio = if control_stats.mean_abs_llr > 0.0 {
-        sub_costas_stats.mean_abs_llr / control_stats.mean_abs_llr
-    } else {
-        0.0
-    };
-    let agree_median = if sub_costas_stats.sign_agreements.is_empty() {
-        0.0
-    } else {
-        percentile(&sub_costas_stats.sign_agreements, 50.0) * 100.0
-    };
+    println!("\nSide-by-side (same positions, same LLR function; only the demod differs):");
+    println!("\n[CONTROLS — production-decode positions]");
+    row("max-log (spectrogram)", &ctl_maxlog);
+    row("matched filter", &ctl_mf);
+    row("matched filter +refine", &ctl_mf_ref);
+    println!("\n[SUB-COSTAS TARGETS — missed truths, sync < {MIN_SYNC_SCORE}]");
+    row("max-log (spectrogram)", &sub_maxlog);
+    row("matched filter", &sub_mf);
+    row("matched filter +refine", &sub_mf_ref);
 
     println!(
-        "\n--- Kill-switch ---\nLLR-magnitude ratio (sub-Costas / control) = {:.3}  (gate: >= 0.10)",
-        llr_ratio,
+        "\nRefinement best-shift distribution (samples): controls mean={:.0} p50={:.0}; \
+         sub-Costas mean={:.0} p50={:.0}",
+        mean(&ctl_best_shifts),
+        percentile(&ctl_best_shifts, 50.0),
+        mean(&sub_best_shifts),
+        percentile(&sub_best_shifts, 50.0),
+    );
+
+    // Controls sanity gate.
+    let ctl_maxlog_p50 = percentile(&ctl_maxlog.sign_agreements, 50.0) * 100.0;
+    let ctl_mf_p50 = percentile(&ctl_mf.sign_agreements, 50.0) * 100.0;
+    println!(
+        "\nControls sanity: matched-filter p50 = {:.1}% vs max-log p50 = {:.1}%  ({})",
+        ctl_mf_p50,
+        ctl_maxlog_p50,
+        if ctl_mf_p50 >= ctl_maxlog_p50 - 1.0 {
+            "OK — sample mapping validated"
+        } else {
+            "LOW — sample mapping suspect; do NOT trust the sub-Costas numbers"
+        },
+    );
+
+    // Pre-registered kill-switch on the unrefined matched filter.
+    let sub_mf_p50 = percentile(&sub_mf.sign_agreements, 50.0) * 100.0;
+    let sub_mf_ref_p50 = percentile(&sub_mf_ref.sign_agreements, 50.0) * 100.0;
+    println!(
+        "\n--- Pre-registered kill-switch (hb-090) ---\n\
+         sub-Costas median sign-agreement, matched filter         = {sub_mf_p50:.1}%\n\
+         sub-Costas median sign-agreement, matched filter +refine = {sub_mf_ref_p50:.1}%\n\
+         Bars: PROCEED >= 70%, WEAK 58-70%, SHELVE < 58%",
+    );
+    let verdict_for = |p50: f64| -> &'static str {
+        if p50 >= 70.0 {
+            "PROCEED"
+        } else if p50 >= 58.0 {
+            "WEAK"
+        } else {
+            "SHELVE"
+        }
+    };
+    println!(
+        "\nVerdict (matched filter, primary): {}",
+        verdict_for(sub_mf_p50)
     );
     println!(
-        "Median sign-agreement at sub-Costas positions    = {:.1}%  (OSD-2 gate: >= 85%)",
-        agree_median,
+        "Verdict (matched filter +refine, secondary): {}",
+        verdict_for(sub_mf_ref_p50)
     );
-
-    let mag_ok = llr_ratio >= 0.10;
-    let agree_ok_osd2 = agree_median >= 85.0;
-    let agree_ok_osd4 = (60.0..85.0).contains(&agree_median);
-
-    let verdict = if mag_ok && agree_ok_osd2 {
-        format!(
-            "PROCEED — sub-Costas LLR magnitudes are within {:.0}% of control AND median \
-             sign-agreement is {:.1}% (within OSD-2's flip budget of ~14 wrong bits over 91 \
-             info positions). OSD-without-Costas has structural footing; specify implementation.",
-            llr_ratio * 100.0,
-            agree_median,
-        )
-    } else if mag_ok && agree_ok_osd4 {
-        format!(
-            "WEAK PROCEED — LLR magnitudes pass ({:.0}% of control) but sign-agreement is \
-             {:.1}% — within OSD-4's reach (3-4 flip budget per LDPC orbit) but NOT OSD-2's. \
-             Consider as OSD-4 follow-up only; OSD-4 enumerates C(91,4)=2.6M patterns — \
-             expensive. Spec primary as OSD-2; defer OSD-4 variant.",
-            llr_ratio * 100.0,
-            agree_median,
-        )
-    } else if !mag_ok {
-        format!(
-            "SHELVE — sub-Costas LLR magnitudes are only {:.1}% of control. LLRs at \
-             sub-Costas positions are dominated by noise; OSD's flip enumeration will \
-             produce mostly random CRC-passing codewords (~75 FP/WAV expected). The \
-             mechanism does not have signal to find.",
-            llr_ratio * 100.0,
-        )
-    } else {
-        format!(
-            "SHELVE — even with adequate LLR magnitudes ({:.0}% of control), sign-agreement \
-             with truth codeword is only {:.1}% (would require flipping {} bits — far \
-             beyond OSD-2's 2-flip budget or OSD-3's 3-flip budget). The LLR sign pattern \
-             at sub-Costas positions does not encode the truth.",
-            llr_ratio * 100.0,
-            agree_median,
-            ((100.0 - agree_median) / 100.0 * 174.0) as usize,
-        )
-    };
-    println!("\nVerdict: {verdict}");
 
     Ok(())
 }
