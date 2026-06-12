@@ -156,7 +156,7 @@ fn main() -> Result<()> {
                 osd_depth_used: cf.and_then(|c| c.osd_depth_used),
                 nharderrs: cf.and_then(|c| c.nharderrs),
                 min_llr_magnitude: cf.and_then(|c| c.min_llr_magnitude),
-                decode_time_frac: None,
+                lateness_frac: None,
             };
             let s1 = content_score_from_features(feat, &trust);
             let s2 = content_score_v2_from_features(feat, &trust);

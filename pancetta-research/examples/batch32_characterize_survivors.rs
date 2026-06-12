@@ -178,7 +178,7 @@ fn main() -> Result<()> {
                     osd_depth_used: None,
                     nharderrs: None,
                     min_llr_magnitude: None,
-                    decode_time_frac: None,
+                    lateness_frac: None,
                 },
                 &filter,
             );
@@ -213,7 +213,7 @@ fn main() -> Result<()> {
                     osd_depth_used: None,
                     nharderrs: None,
                     min_llr_magnitude: None,
-                    decode_time_frac: None,
+                    lateness_frac: None,
                 },
                 &filter,
             );

@@ -163,7 +163,7 @@ fn main() -> Result<()> {
                     osd_depth_used: cf.and_then(|c| c.osd_depth_used),
                     nharderrs: cf.and_then(|c| c.nharderrs),
                     min_llr_magnitude: cf.and_then(|c| c.min_llr_magnitude),
-                    decode_time_frac: frac,
+                    lateness_frac: frac,
                 };
                 // v1 gate mirrors production: no FDR telemetry on that path.
                 let v1 = content_score_from_features(
@@ -172,7 +172,7 @@ fn main() -> Result<()> {
                         osd_depth_used: None,
                         nharderrs: None,
                         min_llr_magnitude: None,
-                        decode_time_frac: None,
+                        lateness_frac: None,
                         ..mk(None)
                     },
                     &trust,
