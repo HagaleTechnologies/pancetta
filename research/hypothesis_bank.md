@@ -1837,7 +1837,7 @@ current_ratio: 0.051
     Source: mr-008 ideation,
     research/experiments/2026-05-31-mr-008-ideation.md (territory A).
 
-### hb-090 — Phase-coherent matched filter at truth coordinates  [PRIORITY: 0.38, spawned 2026-05-31 from mr-008 ideation]
+### hb-090 — Phase-coherent matched filter at truth coordinates  [SHELVED-DEFINITIVE 2026-06-12 Batch 90 — kill-switch run at CORRECTED coordinates (Batch 88 +2 row convention, empirically confirmed by Stage A offset sweep: controls 52.9%@0 → 91.4%@+2): matched filter beats max-log on CONTROLS (p50 95.4% vs 94.3%; 96.6% with ±240 refine; mean|LLR| +24%) proving the demod, yet sub-Costas misses are EXACTLY chance (p50 50.0%) for all three demods. No phase-coherent truth energy exists at those positions for any linear front-end — closes hb-088's 'what WOULD work' escape hatch on the same corpus. NOTE: hb-088's original control baseline was itself misaligned (Stage A), so its historical control numbers were invalid; its sub-Costas conclusion stands on the now-valid 91.4-vs-50.6 contrast. Side-spawn: hb-250.]
   mode: ft8
   status: pending
   priority_score: 0.38
@@ -6565,3 +6565,32 @@ search to in-repo sources.
   defensible_prior: yes — measured in-program on real slots (Batch 86
     note); pancetta-invented diagnostic.
   estimated_effort: 1-2 sessions (instrument + locate + fix + re-measure)
+
+
+### hb-250 — Matched-filter demod for MARGINAL sync-passing candidates  [PRIORITY: 0.40, spawned 2026-06-12 Batch 90]
+
+  mode: ft8
+  status: PROPOSED — side-finding of the hb-090 kill-switch
+  mechanism: the phase-coherent matched-filter demod (batch90 example,
+    phasor-recurrence complex correlation + ±240-sample refinement)
+    BEATS the production spectrogram max-log demod on real decoded
+    signals: controls p50 sign-agreement 96.6% vs 94.3%, mean|LLR|
+    11.79 vs 9.53 (+24%). Production demods marginal candidates from
+    incoherent spectrogram magnitudes; a coherent second-chance demod
+    on candidates that pass sync but FAIL LDPC/CRC could flip enough
+    bits to converge some of them.
+  expected_delta: bounded — applies only to sync-passing LDPC-failures
+    (the population hb-086 joint-pair retry also mines). Premise probe:
+    count how many hard-200/raw misses pass sync but fail LDPC at
+    default config, then measure their matched-filter LLR agreement vs
+    spectrogram LLR agreement (truth-known, batch90 scaffolding reusable
+    as-is).
+  defensible_prior: yes — matched filter optimal linear detector;
+    measured +2.3pp on controls in-tree (Batch 90 table)
+  wild_card: false
+  estimated_effort: 1 session premise probe; 1-2 sessions wiring if it
+    pays
+  conflict_analysis:
+    - vs hb-086 joint-pair retry: same candidate population, different
+      mechanism (re-demod vs residual re-extraction); could stack
+    - vs hb-090: inverts it — coherent demod where sync SUCCEEDS
