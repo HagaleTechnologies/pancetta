@@ -6549,10 +6549,10 @@ search to in-repo sources.
     audit; standard practice (WSJT-X comparisons normalize hashed calls).
   estimated_effort: 1 session (shared helper + probe sweep + re-derive)
 
-### hb-249 — Systematic decode dt offset (~0.2 s, sync-chain)  [PRIORITY: 0.45, spawned 2026-06-12 Batch 86]
+### hb-249 — Systematic decode dt offset (~0.2 s, sync-chain)  [SHIPPED 2026-06-12 Batch 88 — root cause: sliding-frame window-centring convention. Spectrogram row t holds samples ENDING at (t+1)*960 (ft8_lib monitor.c port), so its Hann window is centred at (t-1)*960 and the represented symbol STARTS at (t-2)*960; every time_step→samples conversion omitted the 2-step look-back → reported dt exactly +1920 samples (one symbol period, 0.16 s) late, frequency- and dt-independent (synthetic ground truth, n=64, median +1920; ±480 sync quantization). ft8_lib's own time_sec carries the IDENTICAL offset (378 matched pairs, median Δ=0) — truth comparisons were structurally blind to it. Fixed via candidate_offset_samples() helper (SLIDING_FRAME_LOOKBACK_STEPS=2) at all 12 conversion sites + reverse_derive_candidate inverse. Side effects: subtract_signal's ±480 fine search and the 21-FFT fine-timing fallback were misaligned by a full symbol (structurally dead) and are now live. 200-slot guard: TP-identical 3563/3563, +11/−2 changed non-truth decodes whose callsigns are all active same-day stations (6/11 texts verbatim in other slots' truth) = real decodes beyond ft8_lib via aligned multipass subtract. All 519 ft8 tests + 64 workspace suites pass unchanged. Residual: Costas half-loop max(g(t0),g(t0+1)) plateau still emits ~8% of candidates one step (960) early — separate bank candidate. Note: research/notes/2026-06-12-batch88-dt-audit.md]
 
   mode: ft8
-  status: PROPOSED — diagnostic lead from kill-switch fit refinement
+  status: SHIPPED — Batch 88 (was PROPOSED — diagnostic lead from kill-switch fit refinement)
   mechanism: per-slot --dt-scan on strongest decodes locked the true
     signal position 360-2160 samples (0.03-0.18 s) EARLIER than the
     decoder's reported time_offset, consistently negative. LDPC tolerates

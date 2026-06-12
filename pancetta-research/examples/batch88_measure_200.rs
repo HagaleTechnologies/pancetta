@@ -36,6 +36,15 @@ fn load_wav(path: &Path) -> Result<Vec<f32>> {
 
 fn main() -> Result<()> {
     let ws = workspace_root()?;
+    // Optional: --dump <path> writes "slot\tTP|FP\ttext\tfreq\tdt" lines for
+    // before/after decode-set diffing.
+    let args: Vec<String> = std::env::args().collect();
+    let mut dump: Option<std::fs::File> = args
+        .iter()
+        .position(|a| a == "--dump")
+        .and_then(|i| args.get(i + 1))
+        .map(std::fs::File::create)
+        .transpose()?;
     let manifest: Value = serde_json::from_str(&std::fs::read_to_string(
         ws.join("research/corpus/curated/ft8/raw_530_full.manifest.json"),
     )?)?;
@@ -85,6 +94,22 @@ fn main() -> Result<()> {
                 tp += 1;
             } else {
                 fp += 1;
+            }
+        }
+        if let Some(f) = dump.as_mut() {
+            use std::io::Write;
+            for d in &decoded {
+                let norm = hash_normalize_message(&d.text);
+                let cls = if truth_norm.contains(&norm) {
+                    "TP"
+                } else {
+                    "FP"
+                };
+                writeln!(
+                    f,
+                    "{wav_path}\t{cls}\t{}\t{:.1}\t{:.2}",
+                    d.text, d.frequency_offset, d.time_offset
+                )?;
             }
         }
         truth_n += truth_norm.len();
