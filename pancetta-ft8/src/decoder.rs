@@ -65,6 +65,35 @@ const FREQ_OSR: usize = 2;
 /// Each symbol occupies TIME_OSR time steps in the spectrogram.
 const TIME_OSR: usize = 2;
 
+/// hb-249 (Batch 88): sliding-frame look-back of the spectrogram, in time
+/// steps. `compute_spectrogram` fills its persistent analysis frame the
+/// way ft8_lib's monitor.c does: at time step `t` the nfft-sample frame
+/// holds the samples *ending* at `(t + 1) * subblock_size`, so the
+/// symmetric Hann window is centred at `(t - 1) * subblock_size` and the
+/// symbol that best aligns with row `t` *starts* at
+/// `(t - 2) * subblock_size`. Mapping a candidate `time_step` to audio
+/// samples therefore needs a constant 2-step (one symbol period, 0.16 s)
+/// look-back. Omitting it (the pre-Batch-88 behaviour, inherited from
+/// ft8_lib's own reporting convention) made every reported `time_offset`
+/// one symbol period late — measured at exactly +1920 samples median
+/// against synthetic ground truth, frequency- and dt-independent — and
+/// misaligned every sample-domain consumer of the reported dt (the
+/// fine-timing time-domain extraction fallback and `subtract_signal`'s
+/// ±480-sample search could never reach the true position).
+const SLIDING_FRAME_LOOKBACK_STEPS: isize = 2;
+
+/// Convert a sync candidate's spectrogram `time_step` into the audio
+/// sample offset where the decoded signal starts (signed: candidates in
+/// the first two steps, or inside prepended `time_padding`, map to
+/// negative offsets). This is THE one place the
+/// `time_step -> sample-offset` convention lives; every reporting and
+/// sample-domain site must go through it, and
+/// `reverse_derive_candidate` is its exact inverse.
+#[inline]
+fn candidate_offset_samples(time_step: usize, time_padding: usize, spec_step: usize) -> isize {
+    (time_step as isize - time_padding as isize - SLIDING_FRAME_LOOKBACK_STEPS) * spec_step as isize
+}
+
 /// Target LLR variance for normalization (matches ft8_lib's ftx_normalize_logl)
 /// LLR normalization target variance. Default raised from 24.0 (ft8_lib's
 /// `ftx_normalize_logl` value) to 32.0 on 2026-05-22 (hb-006 sweep): tiny
@@ -1181,8 +1210,10 @@ struct Spectrogram {
     num_bins: usize,
     /// Frequency oversampling rate
     freq_osr: usize,
-    /// Number of time steps prepended for negative-time search. Subtract this from
-    /// candidate.time_step to get the real time offset relative to nominal slot start.
+    /// Number of time steps prepended for negative-time search. Always
+    /// convert `candidate.time_step` to a sample offset via
+    /// `candidate_offset_samples` (which subtracts this AND the
+    /// `SLIDING_FRAME_LOOKBACK_STEPS` window-centring correction).
     time_padding: usize,
 }
 
@@ -2440,9 +2471,11 @@ impl Ft8Decoder {
                     }
 
                     let base_frequency = cand_freq;
-                    let coarse_offset = (cand.time_step as isize
-                        - spectrogram.time_padding as isize)
-                        * spec_step as isize;
+                    let coarse_offset = candidate_offset_samples(
+                        cand.time_step,
+                        spectrogram.time_padding,
+                        spec_step,
+                    );
                     let time_offset_s = coarse_offset as f64 / SAMPLE_RATE as f64;
                     let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
                     let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
@@ -3934,7 +3967,8 @@ impl Ft8Decoder {
         let tone_spacing = self.protocol_params.tone_spacing;
         let sps = self.protocol_params.samples_per_symbol(SAMPLE_RATE);
         let spec_step = sps / TIME_OSR;
-        let coarse_offset = candidate.time_step * spec_step;
+        let coarse_offset =
+            candidate_offset_samples(candidate.time_step, spectrogram.time_padding, spec_step);
 
         // Try both freq_sub values, same as the spectrogram path in decode_candidate
         let freq_sub_trials = [
@@ -4349,8 +4383,8 @@ impl Ft8Decoder {
             let anchor = &candidates[group[0]];
             let sub_bin_offset = anchor.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
             let base_frequency = anchor.freq_bin as f64 * tone_spacing + sub_bin_offset;
-            let coarse_offset = (anchor.time_step as isize - spectrogram.time_padding as isize)
-                * spec_step as isize;
+            let coarse_offset =
+                candidate_offset_samples(anchor.time_step, spectrogram.time_padding, spec_step);
             let snr_db = par_estimate_snr_spectrogram(pp, &avg_mags);
             let confidence = (anchor.sync_score / 12.0).min(1.0) as f32;
             decoded.push(DecodedMessage::new(
@@ -4562,9 +4596,11 @@ impl Ft8Decoder {
                                 // Cold-start for THIS candidate's freq — keep.
                                 return true;
                             }
-                            let coarse_offset = (nc.time_step as isize
-                                - spectrogram.time_padding as isize)
-                                * spec_step_local as isize;
+                            let coarse_offset = candidate_offset_samples(
+                                nc.time_step,
+                                spectrogram.time_padding,
+                                spec_step_local,
+                            );
                             let t_s = coarse_offset as f64 / SAMPLE_RATE as f64;
                             priors.iter().any(|p| {
                                 let radius = floor.max(p.iqr * scale);
@@ -4595,9 +4631,11 @@ impl Ft8Decoder {
                         new_candidates
                             .into_iter()
                             .filter(|nc| {
-                                let coarse_offset = (nc.time_step as isize
-                                    - spectrogram.time_padding as isize)
-                                    * spec_step_local as isize;
+                                let coarse_offset = candidate_offset_samples(
+                                    nc.time_step,
+                                    spectrogram.time_padding,
+                                    spec_step_local,
+                                );
                                 let t_s = coarse_offset as f64 / SAMPLE_RATE as f64;
                                 prior_windows
                                     .iter()
@@ -4680,7 +4718,7 @@ impl Ft8Decoder {
             let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
             let base_frequency = cand.freq_bin as f64 * tone_spacing + sub_bin_offset;
             let coarse_offset =
-                (cand.time_step as isize - spectrogram.time_padding as isize) * spec_step as isize;
+                candidate_offset_samples(cand.time_step, spectrogram.time_padding, spec_step);
             let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
             let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
             let mut new_msg = DecodedMessage::new(
@@ -4819,7 +4857,7 @@ impl Ft8Decoder {
             let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
             let base_frequency = cand.freq_bin as f64 * tone_spacing + sub_bin_offset;
             let coarse_offset =
-                (cand.time_step as isize - spectrogram.time_padding as isize) * spec_step as isize;
+                candidate_offset_samples(cand.time_step, spectrogram.time_padding, spec_step);
             let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
             let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
             let mut new_msg = DecodedMessage::new(
@@ -5105,9 +5143,11 @@ impl Ft8Decoder {
                     }
 
                     let base_frequency = cand_freq;
-                    let coarse_offset = (cand.time_step as isize
-                        - spectrogram.time_padding as isize)
-                        * spec_step as isize;
+                    let coarse_offset = candidate_offset_samples(
+                        cand.time_step,
+                        spectrogram.time_padding,
+                        spec_step,
+                    );
                     let time_offset_s = coarse_offset as f64 / SAMPLE_RATE as f64;
                     let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
                     let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
@@ -5265,7 +5305,7 @@ impl Ft8Decoder {
             let sub_bin_offset = cand.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
             let base_frequency = cand.freq_bin as f64 * tone_spacing + sub_bin_offset;
             let coarse_offset =
-                (cand.time_step as isize - spectrogram.time_padding as isize) * spec_step as isize;
+                candidate_offset_samples(cand.time_step, spectrogram.time_padding, spec_step);
             let snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
             let confidence = (cand.sync_score / 12.0).min(1.0) as f32;
             let mut new_msg = DecodedMessage::new(
@@ -5389,7 +5429,8 @@ impl Ft8Decoder {
         let tone_spacing = self.protocol_params.tone_spacing;
         let xor_sequence = self.protocol_params.xor_sequence;
         let spec_step = sps / TIME_OSR;
-        let coarse_offset = candidate.time_step * spec_step;
+        let coarse_offset =
+            candidate_offset_samples(candidate.time_step, spectrogram.time_padding, spec_step);
 
         // ---- Spectrogram-based symbol extraction: try both freq_sub values ----
         // The spectrogram uses a 3840-pt FFT (3.125 Hz resolution), which
@@ -5534,7 +5575,7 @@ impl Ft8Decoder {
         let mut best_decode = None;
 
         for &dt in &time_deltas {
-            let time_offset = coarse_offset as isize + dt;
+            let time_offset = coarse_offset + dt;
             if time_offset < 0 {
                 continue;
             }
@@ -6175,7 +6216,7 @@ fn par_decode_candidate(
     let xor_sequence = ctx.xor_sequence;
     let spec_step = sps / TIME_OSR;
     let coarse_offset =
-        (candidate.time_step as isize - ctx.spectrogram.time_padding as isize) * spec_step as isize;
+        candidate_offset_samples(candidate.time_step, ctx.spectrogram.time_padding, spec_step);
 
     // ---- Spectrogram-based symbol extraction: try both freq_sub values ----
     let freq_sub_trials = [
@@ -6446,7 +6487,7 @@ fn par_try_ap_decode(
     let sps = ctx.protocol_params.samples_per_symbol(SAMPLE_RATE);
     let spec_step = sps / TIME_OSR;
     let coarse_offset =
-        (candidate.time_step as isize - ctx.spectrogram.time_padding as isize) * spec_step as isize;
+        candidate_offset_samples(candidate.time_step, ctx.spectrogram.time_padding, spec_step);
 
     let freq_sub_trials = [
         candidate.freq_sub,
@@ -7034,7 +7075,8 @@ fn reverse_derive_candidate(
     let sps = pp.samples_per_symbol(SAMPLE_RATE);
     let spec_step = sps / TIME_OSR;
     let time_step_rel = (msg.time_offset * SAMPLE_RATE as f64 / spec_step as f64).round() as isize;
-    let time_step = (time_step_rel + time_padding as isize).max(0) as usize;
+    let time_step =
+        (time_step_rel + time_padding as isize + SLIDING_FRAME_LOOKBACK_STEPS).max(0) as usize;
     CostasCandidate {
         time_step,
         freq_bin,
