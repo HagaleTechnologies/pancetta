@@ -1093,7 +1093,12 @@ impl AutonomousOperator {
                             message_text: msg,
                             frequency_offset: freq,
                             qso_id,
-                            // TODO: thread parity from heard slot (Task 15)
+                            // No parity here by design: this path is only fed via
+                            // {set,add}_pending_sequencer_message, which production
+                            // never calls — live mid-QSO TX flows through
+                            // QsoManager::send_message → QsoEvent::MessageToSend,
+                            // which carries the tx_parity latched at QSO start.
+                            // The TX scheduler falls back to config self-parity.
                             tx_parity: None,
                         });
                         tx_count += 1;
