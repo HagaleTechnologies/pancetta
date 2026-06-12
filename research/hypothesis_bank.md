@@ -6771,7 +6771,7 @@ search to in-repo sources.
   license: academic. note: OSD currently ships depth 0 — this would only
     matter if a deeper-OSD operating point ever returns (recall lever).
 
-### hb-259 — Per-iteration EM channel re-estimation in the demod-decode loop  [PRIORITY: 0.50 (raised from 0.40, Batch 99), spawned 2026-06-12 Batch 96 web scan]
+### hb-259 — Per-iteration EM channel re-estimation in the demod-decode loop  [MEASURED-NO-RESCUE-FIX 2026-06-12 Batch 100 — EM-on rescue economics ΔTP +1/ΔFP +29 vs EM-off +1/+27 (Batch 99 reproduced exactly): channel-estimation quality is NOT the rescue-FP cause. Attribution: CRC-collision floor — extra BP attempts on noise candidates re-roll CRC-14's ~1/16k dice; no estimator fixes that. Closes the hb-252/253 corpus-graduation question definitively (3 discriminators measured: syndrome flat, Bessel no, EM no). Family stands as SHIP-OPT-IN +0.506 dB composed synthetic; on-air A/B (meatspace) or a marginal-signal corpus are the remaining validation paths. EM code kept behind bicm_id_em_reestimation default-false.]
 
   batch99_note: priority raised. Batch 99 (hb-253) identified the exact
     failure mode this attacks: the Bessel metric's block-constant N0

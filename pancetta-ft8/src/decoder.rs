@@ -993,6 +993,28 @@ pub struct Ft8Config {
     /// **`DualMax`** — byte-identical to the legacy path.
     pub llr_metric: LlrMetric,
 
+    /// hb-259 (Batch 100): per-iteration EM re-estimation of the
+    /// block-constant (Es, N0) channel parameters inside the hb-252
+    /// BICM-ID rescue loop (Cheng, Valenti & Torrieri, "Turbo-NFSK:
+    /// Iterative Estimation, Noncoherent Demodulation, and Decoding
+    /// for Fast Fading Channels", MILCOM 2005; Cheng dissertation
+    /// ch. 6, eqs. (6.9)–(6.17)). Each global rescue iteration runs
+    /// an inner EM loop: the E-step forms per-symbol posterior tone
+    /// probabilities from the current Bessel channel likelihoods and
+    /// the decoder's extrinsic bit LLRs (eqs. (6.11)/(6.13)); the
+    /// M-step re-estimates Es as the posterior-weighted mean
+    /// believed-signal tone power (minus N0) and N0 as the
+    /// posterior-weighted mean believed-noise tone power — the
+    /// power-domain moment-matching simplification of the paper's
+    /// implicit amplitude update (6.16) (which needs a recursive
+    /// F = I1/I0 solve; the paper itself ships reduced-complexity
+    /// variants at ≤0.15 dB extra loss). Batch 99's static
+    /// median/max estimator seeds iteration 0. Only meaningful with
+    /// `llr_metric = Bessel` (where Es/N0 enter the metric) and
+    /// `bicm_id_iterations ≥ 1`; inert otherwise. Default **false**
+    /// — byte-identical to the legacy path.
+    pub bicm_id_em_reestimation: bool,
+
     /// WSJT-X Improved-style automatic passband baseline (v3.1.0,
     /// DG2YCB). When `true` AND no explicit `freq_bin_range` is supplied
     /// by the caller, the decoder analyses the per-bin average power of
@@ -1305,6 +1327,12 @@ impl Default for Ft8Config {
             // hb-253 (Batch 99): dual-max is the historical default;
             // Bessel is the probe-gated exact noncoherent metric.
             llr_metric: LlrMetric::DualMax,
+            // hb-259 (Batch 100): EM (Es, N0) re-estimation inside the
+            // BICM-ID rescue. Default false — byte-identical legacy
+            // path; the Batch 99 static estimator is used throughout.
+            // Inert unless llr_metric == Bessel AND
+            // bicm_id_iterations >= 1.
+            bicm_id_em_reestimation: false,
             // WSJT-X Improved-style auto-passband (v3.1.0, DG2YCB).
             // Default OFF — preserves byte-identical legacy fixed-range
             // sweep behavior. Flip on to narrow the Costas sweep to the
@@ -2108,6 +2136,10 @@ impl Ft8Decoder {
                 // hb-253 (Batch 99) demapper metric. DualMax (default)
                 // keeps the parallel paths byte-identical to legacy.
                 llr_metric: self.config.llr_metric,
+                // hb-259 (Batch 100) EM channel re-estimation inside
+                // the BICM-ID rescue. false (default) = static
+                // Batch 99 estimator throughout, byte-identical.
+                bicm_id_em_reestimation: self.config.bicm_id_em_reestimation,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -6460,6 +6492,10 @@ struct DecodeContext<'a> {
     /// `DualMax` (default) is byte-identical to the legacy path. See
     /// `Ft8Config::llr_metric`.
     llr_metric: LlrMetric,
+    /// hb-259 (Batch 100): per-iteration EM (Es, N0) re-estimation
+    /// inside the BICM-ID rescue (Bessel metric path only). See
+    /// `Ft8Config::bicm_id_em_reestimation`.
+    bicm_id_em_reestimation: bool,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -6571,6 +6607,7 @@ fn bicm_id_somap_refresh(metrics: &[[f64; 8]], apriori: &[f32], use_lse: bool) -
 /// far-from-convergence (noise) candidates buys mostly CRC-14 lottery
 /// tickets (ΔFP 7× ΔTP on hard_200/50), while true rescues come from
 /// the near-converged population.
+#[allow(clippy::too_many_arguments)] // research-flag plumbing; mirrors the Ft8Config knobs 1:1
 fn par_bicm_id_rescue(
     pp: &ProtocolParams,
     ldpc: &LdpcDecoder,
@@ -6579,68 +6616,90 @@ fn par_bicm_id_rescue(
     iterations: usize,
     max_unsatisfied: usize,
     llr_metric: LlrMetric,
+    em_reestimation: bool,
 ) -> Option<(BitVec, usize)> {
     if iterations == 0 || pp.bits_per_symbol != 3 || channel_llrs.len() != 174 {
         return None;
     }
 
+    // Per-candidate least-squares scale raw-metric-LLR → normalized
+    // LLR. Factored out because the hb-259 EM path refits the scale
+    // after every channel re-estimation (against the same fixed
+    // anchor: the normalized seed LLRs BP consumed).
+    let fit_scale = |raw: &[f32]| -> Option<f64> {
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for (r, c) in raw.iter().zip(channel_llrs.iter()) {
+            num += (*r as f64) * (*c as f64);
+            den += (*r as f64) * (*r as f64);
+        }
+        let g = num / den;
+        if g.is_finite() && g > 0.0 {
+            Some(g)
+        } else {
+            None
+        }
+    };
+    let scale_metrics = |unscaled: &[[f64; 8]], g: f64| -> Vec<[f64; 8]> {
+        unscaled
+            .iter()
+            .map(|s2| {
+                let mut scaled = [0.0f64; 8];
+                for (out, &m) in scaled.iter_mut().zip(s2.iter()) {
+                    *out = g * m;
+                }
+                scaled
+            })
+            .collect()
+    };
+
     // hb-253 (Batch 99): per-label metric family. DualMax = raw dB
     // tone metrics (historical); Bessel = ln I0 of the linear-power
     // tone metrics with the per-candidate (Es, N0) estimate. The raw
     // zero-feedback LLRs of the SAME family anchor the least-squares
-    // scale below, and the SOMAP refresh marginalizes with max (eq. 7
+    // scale, and the SOMAP refresh marginalizes with max (eq. 7
     // shape) for DualMax vs exact log-sum-exp (eq. 6) for Bessel.
+    //
+    // hb-259 (Batch 100): for the Bessel family the linear tone
+    // powers and the static-seed (Es, N0) are retained so the EM
+    // loop can re-estimate the channel each global iteration.
     let use_lse = llr_metric == LlrMetric::Bessel;
-    let (raw, unscaled_metrics): (Vec<f32>, Vec<[f64; 8]>) = match llr_metric {
-        LlrMetric::DualMax => {
-            let raw = par_compute_soft_llrs_db(pp, tone_magnitudes);
-            let data_positions = pp.data_symbol_indices();
-            let metrics: Vec<[f64; 8]> = data_positions
-                .iter()
-                .map(|&sym_idx| {
-                    let mags = &tone_magnitudes[sym_idx];
-                    let mut s2 = [0.0f64; 8];
-                    for (j, slot) in s2.iter_mut().enumerate() {
-                        *slot = mags[crate::ldpc::binary_to_gray(j as u8) as usize];
-                    }
-                    s2
-                })
-                .collect();
-            (raw, metrics)
-        }
-        LlrMetric::Bessel => {
-            let powers = tone_powers_from_db(tone_magnitudes);
-            let raw = par_compute_soft_llrs_bessel(pp, &powers);
-            let (metrics, _es, _n0) = bessel_label_metrics(pp, &powers);
-            (raw, metrics)
-        }
-    };
+    /// hb-259 EM state: (linear tone powers, Es, N0). `Some` only when
+    /// EM re-estimation is active on the Bessel path.
+    type BesselEmState = Option<(Vec<[f64; NUM_TONES]>, f64, f64)>;
+    let (raw, unscaled_metrics, mut bessel_state): (Vec<f32>, Vec<[f64; 8]>, BesselEmState) =
+        match llr_metric {
+            LlrMetric::DualMax => {
+                let raw = par_compute_soft_llrs_db(pp, tone_magnitudes);
+                let data_positions = pp.data_symbol_indices();
+                let metrics: Vec<[f64; 8]> = data_positions
+                    .iter()
+                    .map(|&sym_idx| {
+                        let mags = &tone_magnitudes[sym_idx];
+                        let mut s2 = [0.0f64; 8];
+                        for (j, slot) in s2.iter_mut().enumerate() {
+                            *slot = mags[crate::ldpc::binary_to_gray(j as u8) as usize];
+                        }
+                        s2
+                    })
+                    .collect();
+                (raw, metrics, None)
+            }
+            LlrMetric::Bessel => {
+                let powers = tone_powers_from_db(tone_magnitudes);
+                let raw = par_compute_soft_llrs_bessel(pp, &powers);
+                let (metrics, es, n0) = bessel_label_metrics(pp, &powers);
+                let state = em_reestimation.then_some((powers, es, n0));
+                (raw, metrics, state)
+            }
+        };
 
-    // Per-candidate least-squares scale raw-metric-LLR → normalized LLR.
-    let mut num = 0.0f64;
-    let mut den = 0.0f64;
-    for (r, c) in raw.iter().zip(channel_llrs.iter()) {
-        num += (*r as f64) * (*c as f64);
-        den += (*r as f64) * (*r as f64);
-    }
-    let g = num / den;
-    if !g.is_finite() || g <= 0.0 {
-        return None;
-    }
+    let g = fit_scale(&raw)?;
 
     // Per-data-symbol scaled metrics indexed by binary label j
     // (same Gray demap as compute_soft_llrs_db).
     debug_assert_eq!(unscaled_metrics.len() * 3, 174);
-    let metrics: Vec<[f64; 8]> = unscaled_metrics
-        .iter()
-        .map(|s2| {
-            let mut scaled = [0.0f64; 8];
-            for (out, &m) in scaled.iter_mut().zip(s2.iter()) {
-                *out = g * m;
-            }
-            scaled
-        })
-        .collect();
+    let mut metrics = scale_metrics(&unscaled_metrics, g);
 
     // Re-run BP on the channel LLRs the failed standard attempt saw, to
     // obtain its posterior (decode_soft does not expose posteriors).
@@ -6664,6 +6723,25 @@ fn par_bicm_id_rescue(
             .zip(chan.iter())
             .map(|(p, c)| p - c)
             .collect();
+        // hb-259 (Batch 100): EM (Es, N0) re-estimation. The E-step
+        // uses the current Bessel likelihoods + decoder extrinsics;
+        // the M-step moment-matches signal/noise tone powers. The
+        // refreshed estimates rebuild the per-label metrics, and the
+        // least-squares scale is refit against the (fixed) normalized
+        // seed LLRs so the SOMAP metric stays commensurate with the
+        // extrinsic a-priori units.
+        if let Some((powers, es, n0)) = bessel_state.as_mut() {
+            let (es_new, n0_new) = bicm_id_em_reestimate(pp, powers, &extrinsic, *es, *n0);
+            *es = es_new;
+            *n0 = n0_new;
+            let unscaled = bessel_label_metrics_with(pp, powers, es_new, n0_new);
+            let raw_new = bessel_llrs_from_metrics(&unscaled);
+            if let Some(g_new) = fit_scale(&raw_new) {
+                metrics = scale_metrics(&unscaled, g_new);
+            }
+            // Degenerate refit (flat metrics) keeps the previous
+            // iteration's metrics rather than aborting the rescue.
+        }
         // SOMAP refresh with the extrinsic as a-priori.
         chan = bicm_id_somap_refresh(&metrics, &extrinsic, use_lse);
         posterior = ldpc.belief_propagation(&chan).ok()?;
@@ -6845,6 +6923,7 @@ fn par_decode_candidate(
                 ctx.bicm_id_iterations,
                 ctx.bicm_id_max_unsatisfied_checks,
                 ctx.llr_metric,
+                ctx.bicm_id_em_reestimation,
             ) {
                 Some((bits, unsat)) => (Some(bits), Some(unsat)),
                 None => (None, None),
@@ -8325,9 +8404,22 @@ fn bessel_label_metrics(
 ) -> (Vec<[f64; 8]>, f64, f64) {
     debug_assert_eq!(pp.bits_per_symbol, 3);
     let (es, n0) = estimate_es_n0(tone_powers, pp.num_tones);
+    let metrics = bessel_label_metrics_with(pp, tone_powers, es, n0);
+    (metrics, es, n0)
+}
+
+/// hb-259 (Batch 100): `bessel_label_metrics` core with caller-supplied
+/// (Es, N0) — the EM re-estimation path rebuilds the per-label metrics
+/// from refreshed channel estimates without re-running the static
+/// estimator. Identical float operations to the Batch 99 inline loop.
+fn bessel_label_metrics_with(
+    pp: &ProtocolParams,
+    tone_powers: &[[f64; NUM_TONES]],
+    es: f64,
+    n0: f64,
+) -> Vec<[f64; 8]> {
     let scale = 2.0 * es.sqrt() / n0;
-    let metrics: Vec<[f64; 8]> = pp
-        .data_symbol_indices()
+    pp.data_symbol_indices()
         .iter()
         .map(|&sym_idx| {
             let powers = &tone_powers[sym_idx];
@@ -8338,8 +8430,138 @@ fn bessel_label_metrics(
             }
             m
         })
-        .collect();
-    (metrics, es, n0)
+        .collect()
+}
+
+/// hb-259 (Batch 100): per-iteration EM re-estimation of the
+/// block-constant (Es, N0) inside the BICM-ID rescue (Cheng, Valenti &
+/// Torrieri, "Turbo-NFSK", MILCOM 2005; Cheng dissertation ch. 6).
+///
+/// The paper parametrizes `A = N0`, `B = 2a√Es` and iterates, per
+/// BICM-ID iteration, an inner EM loop on the block:
+///
+/// * **E-step** (eqs. (6.9)–(6.13)): per-symbol posterior tone
+///   probabilities under the *current* estimates,
+///   `p_{k,i} = α_i · I0(B̂|y_{k,i}|/Â) · p(q_i = k)`, with the symbol
+///   prior built from the decoder's extrinsic bit LLRs:
+///   `p(q_i|v_i) = Π_j e^{v_{j,i}·b_j(q_i)} / (1 + e^{v_{j,i}})`. The
+///   bit-independent `1/(1+e^v)` factors cancel in the α_i
+///   normalization, so only the `Σ_j v_j·b_j(label)` term is applied
+///   (log domain, normalized by log-sum-exp).
+/// * **M-step**: the paper's exact amplitude update (6.16) is implicit
+///   (`F(x) = I1/I0`, solved recursively); pancetta instead
+///   moment-matches in the **power** domain — under the model the
+///   believed-signal tone power has mean `Es + N0` and each
+///   believed-noise tone power has mean `N0`, so
+///   `N0 ← Σ_i Σ_j q_{i,j} · (noise-tone power sum) / (N·(M−1))` and
+///   `Es ← Σ_i Σ_j q_{i,j} · (signal-tone power) / N − N0` (floored at
+///   `0.05·N0`, the Batch 99 floor). This is the same family of
+///   reduced-complexity simplification the paper itself ships
+///   (≤0.15 dB extra loss measured there); for the exponential noise
+///   tones the mean IS the ML estimate.
+/// * The 21 Costas symbols enter as **pilots** (posterior = δ at the
+///   known sync tone), exactly as the framework allows for known
+///   symbols; the 58 data symbols use the extrinsic-prior posterior.
+/// * Stopping (paper §6.1.2 shape): halt when both estimates change
+///   by <10% in an inner iteration, or after 20 inner iterations.
+///
+/// `extrinsic` is the 174-element decoder extrinsic in pancetta
+/// convention (positive ⇒ bit 0); paper-convention `v = −extrinsic`.
+/// Returns the refreshed `(Es, N0)`; degenerate inputs return the
+/// seeds unchanged. FT8 (3 bits/symbol, 8 tones) only.
+fn bicm_id_em_reestimate(
+    pp: &ProtocolParams,
+    tone_powers: &[[f64; NUM_TONES]],
+    extrinsic: &[f32],
+    es_seed: f64,
+    n0_seed: f64,
+) -> (f64, f64) {
+    debug_assert_eq!(pp.bits_per_symbol, 3);
+    debug_assert_eq!(extrinsic.len(), 174);
+    if !(es_seed.is_finite() && n0_seed.is_finite()) || es_seed <= 0.0 || n0_seed <= 0.0 {
+        return (es_seed, n0_seed);
+    }
+    let m_tones = pp.num_tones;
+    let data_positions = pp.data_symbol_indices();
+    let n_symbols = pp.num_symbols;
+
+    // Pilot (Costas) contributions are estimate-independent: the
+    // posterior is a delta at the known sync tone. Accumulate once.
+    let mut pilot_sig = 0.0f64;
+    let mut pilot_noise = 0.0f64;
+    let mut pilot_count = 0usize;
+    for (sym_idx, row) in tone_powers.iter().enumerate().take(n_symbols) {
+        if let Some(tone) = pp.costas_value(sym_idx) {
+            let total: f64 = row.iter().take(m_tones).sum();
+            let sig = row[tone as usize];
+            pilot_sig += sig;
+            pilot_noise += total - sig;
+            pilot_count += 1;
+        }
+    }
+
+    let mut es = es_seed;
+    let mut n0 = n0_seed;
+    for _ in 0..20 {
+        let scale = 2.0 * es.sqrt() / n0;
+        if !scale.is_finite() || scale <= 0.0 {
+            return (es_seed, n0_seed);
+        }
+        let mut sig_sum = pilot_sig;
+        let mut noise_sum = pilot_noise;
+        for (di, &sym_idx) in data_positions.iter().enumerate() {
+            let row = &tone_powers[sym_idx];
+            let total: f64 = row.iter().take(m_tones).sum();
+            // Paper-convention a-priori v = log P(1)/P(0) per bit.
+            let v = [
+                -(extrinsic[3 * di] as f64),
+                -(extrinsic[3 * di + 1] as f64),
+                -(extrinsic[3 * di + 2] as f64),
+            ];
+            // E-step in log domain over the 8 binary labels.
+            let mut log_w = [0.0f64; 8];
+            let mut log_norm = f64::NEG_INFINITY;
+            for (j, slot) in log_w.iter_mut().enumerate() {
+                let tone_idx = crate::ldpc::binary_to_gray(j as u8) as usize;
+                let mut t = ln_i0(scale * row[tone_idx].sqrt());
+                for (p, &vp) in v.iter().enumerate() {
+                    // bit p of label j; bit 0 = MSB (same masks as
+                    // bicm_id_somap_refresh / compute_soft_llrs_db).
+                    if (j >> (2 - p)) & 1 == 1 {
+                        t += vp;
+                    }
+                }
+                *slot = t;
+                log_norm = lse2(log_norm, t);
+            }
+            if !log_norm.is_finite() {
+                continue;
+            }
+            for (j, &lw) in log_w.iter().enumerate() {
+                let q = (lw - log_norm).exp();
+                let tone_idx = crate::ldpc::binary_to_gray(j as u8) as usize;
+                let sig = row[tone_idx];
+                sig_sum += q * sig;
+                noise_sum += q * (total - sig);
+            }
+        }
+        let n_used = (data_positions.len() + pilot_count).max(1) as f64;
+        // M-step: power-domain moment matching.
+        let n0_new = (noise_sum / (n_used * (m_tones.saturating_sub(1)).max(1) as f64)).max(1e-300);
+        let es_new = (sig_sum / n_used - n0_new).max(0.05 * n0_new);
+        let converged =
+            (es_new - es).abs() < 0.10 * es.abs() && (n0_new - n0).abs() < 0.10 * n0.abs();
+        es = es_new;
+        n0 = n0_new;
+        if converged {
+            break;
+        }
+    }
+    if es.is_finite() && n0.is_finite() && es > 0.0 && n0 > 0.0 {
+        (es, n0)
+    } else {
+        (es_seed, n0_seed)
+    }
 }
 
 /// hb-253 (Batch 99): exact noncoherent Bessel-metric bit-LLR
@@ -8359,8 +8581,16 @@ fn bessel_label_metrics(
 /// (optional whitening, variance normalization, BP) is unchanged.
 fn par_compute_soft_llrs_bessel(pp: &ProtocolParams, tone_powers: &[[f64; NUM_TONES]]) -> Vec<f32> {
     let (metrics, _es, _n0) = bessel_label_metrics(pp, tone_powers);
+    bessel_llrs_from_metrics(&metrics)
+}
+
+/// hb-259 (Batch 100): zero-a-priori exact-LSE bit-LLR marginalization
+/// from per-label Bessel metrics — factored out of
+/// `par_compute_soft_llrs_bessel` (identical float operations) so the
+/// EM path can rebuild raw LLRs from re-estimated metrics.
+fn bessel_llrs_from_metrics(metrics: &[[f64; 8]]) -> Vec<f32> {
     let mut llrs = Vec::with_capacity(174);
-    for m in &metrics {
+    for m in metrics {
         for i in 0..3 {
             let mut l0 = f64::NEG_INFINITY;
             let mut l1 = f64::NEG_INFINITY;
@@ -14541,9 +14771,17 @@ mod bicm_id_tests {
         let ldpc = LdpcDecoder::new(50).unwrap();
         let tone_mags = vec![[0.0f64; NUM_TONES]; pp.num_symbols];
         let llrs = vec![1.0f32; 174];
-        assert!(
-            par_bicm_id_rescue(&pp, &ldpc, &tone_mags, &llrs, 0, 83, LlrMetric::DualMax).is_none()
-        );
+        assert!(par_bicm_id_rescue(
+            &pp,
+            &ldpc,
+            &tone_mags,
+            &llrs,
+            0,
+            83,
+            LlrMetric::DualMax,
+            false
+        )
+        .is_none());
     }
 
     /// Batch 98 near-converged gate: `max_unsatisfied == 0` must block
@@ -14573,7 +14811,17 @@ mod bicm_id_tests {
             "noise input unexpectedly converged — pick a different seed"
         );
         assert!(
-            par_bicm_id_rescue(&pp, &ldpc, &tone_mags, &llrs, 2, 0, LlrMetric::DualMax).is_none(),
+            par_bicm_id_rescue(
+                &pp,
+                &ldpc,
+                &tone_mags,
+                &llrs,
+                2,
+                0,
+                LlrMetric::DualMax,
+                false
+            )
+            .is_none(),
             "max_unsatisfied = 0 must gate out a non-converged candidate"
         );
     }
@@ -14983,6 +15231,204 @@ mod llr_metric_tests {
         assert!(
             decoded.iter().any(|m| m.text == "CQ K5ARH EM10"),
             "Bessel metric must decode a clean synthetic signal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod em_reestimation_tests {
+    use super::*;
+
+    /// hb-259 default-OFF promise: EM re-estimation must be opt-in.
+    #[test]
+    fn default_config_keeps_em_reestimation_off() {
+        assert!(
+            !Ft8Config::default().bicm_id_em_reestimation,
+            "Ft8Config::default().bicm_id_em_reestimation must be false"
+        );
+    }
+
+    /// Build a synthetic 79-symbol block of exponential noise-tone
+    /// powers (mean `n0_true`) with `es_true` added on the signal
+    /// tone. Costas symbols carry their KNOWN sync tone (the EM
+    /// treats them as pilots); data symbols cycle through labels.
+    fn synthetic_block(es_true: f64, n0_true: f64) -> Vec<[f64; NUM_TONES]> {
+        let pp = ProtocolParams::ft8();
+        let mut state = 0xFEED_F00D_DEAD_BEEFu64;
+        let mut next_exp = |mean: f64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = (((state >> 33) as f64) / ((1u64 << 31) as f64)).clamp(1e-9, 1.0 - 1e-9);
+            -mean * (1.0 - u).ln()
+        };
+        (0..pp.num_symbols)
+            .map(|s| {
+                let mut row = [0.0f64; NUM_TONES];
+                for slot in row.iter_mut() {
+                    *slot = next_exp(n0_true);
+                }
+                let tone = match pp.costas_value(s) {
+                    Some(t) => t as usize,
+                    None => crate::ldpc::binary_to_gray((s % 8) as u8) as usize,
+                };
+                row[tone] += es_true;
+                row
+            })
+            .collect()
+    }
+
+    /// The EM loop must walk a badly-wrong seed (8× off in both
+    /// directions) back to within a factor of 2 of the true channel,
+    /// from zero extrinsics (uniform priors) — the pilots + posterior
+    /// E-step carry it.
+    #[test]
+    fn em_reestimate_recovers_from_bad_seed() {
+        let pp = ProtocolParams::ft8();
+        let (es_true, n0_true) = (40.0f64, 2.0f64);
+        let powers = synthetic_block(es_true, n0_true);
+        let extrinsic = vec![0.0f32; 174];
+        // Seed 8× wrong both ways: Es low, N0 high.
+        let (es, n0) =
+            bicm_id_em_reestimate(&pp, &powers, &extrinsic, es_true / 8.0, n0_true * 8.0);
+        assert!(
+            es > es_true / 2.0 && es < es_true * 2.0,
+            "EM Es estimate {es} vs truth {es_true}"
+        );
+        assert!(
+            n0 > n0_true / 2.0 && n0 < n0_true * 2.0,
+            "EM N0 estimate {n0} vs truth {n0_true}"
+        );
+    }
+
+    /// Degenerate seeds must be returned unchanged (no NaN poisoning
+    /// of the rescue metrics).
+    #[test]
+    fn em_reestimate_degenerate_seed_is_identity() {
+        let pp = ProtocolParams::ft8();
+        let powers = synthetic_block(10.0, 1.0);
+        let extrinsic = vec![0.0f32; 174];
+        assert_eq!(
+            bicm_id_em_reestimate(&pp, &powers, &extrinsic, 0.0, 1.0),
+            (0.0, 1.0)
+        );
+        assert_eq!(
+            bicm_id_em_reestimate(&pp, &powers, &extrinsic, 1.0, -1.0),
+            (1.0, -1.0)
+        );
+        let (es_nan, n0_nan) = bicm_id_em_reestimate(&pp, &powers, &extrinsic, f64::NAN, 1.0);
+        assert!(es_nan.is_nan() && n0_nan == 1.0);
+    }
+
+    /// Confident extrinsics must steer the E-step posterior: with the
+    /// signal placed on label 0b101 for every data symbol and
+    /// extrinsics that *contradict* it (believing 0b010), the EM noise
+    /// estimate inflates relative to truth-consistent extrinsics —
+    /// the believed-signal tone is then a noise-only bin and the true
+    /// signal tone is priced as interference. Guards against an EM
+    /// that ignores the decoder feedback.
+    #[test]
+    fn em_reestimate_uses_extrinsic_priors() {
+        let pp = ProtocolParams::ft8();
+        let (es_true, n0_true) = (40.0f64, 2.0f64);
+        // All data symbols on label 0b101.
+        let mut powers = synthetic_block(es_true, n0_true);
+        let sig_tone = crate::ldpc::binary_to_gray(0b101u8) as usize;
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let mut next_exp = |mean: f64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = (((state >> 33) as f64) / ((1u64 << 31) as f64)).clamp(1e-9, 1.0 - 1e-9);
+            -mean * (1.0 - u).ln()
+        };
+        for (s, row) in powers.iter_mut().enumerate() {
+            if pp.costas_value(s).is_none() {
+                for slot in row.iter_mut() {
+                    *slot = next_exp(n0_true);
+                }
+                row[sig_tone] += es_true;
+            }
+        }
+        // Pancetta convention: positive ⇒ bit 0. Label 101 ⇒ (−,+,−);
+        // contradicting label 010 ⇒ (+,−,+).
+        let mut consistent = vec![0.0f32; 174];
+        let mut contradicting = vec![0.0f32; 174];
+        for di in 0..58 {
+            consistent[3 * di] = -8.0;
+            consistent[3 * di + 1] = 8.0;
+            consistent[3 * di + 2] = -8.0;
+            contradicting[3 * di] = 8.0;
+            contradicting[3 * di + 1] = -8.0;
+            contradicting[3 * di + 2] = 8.0;
+        }
+        let (_, n0_good) =
+            bicm_id_em_reestimate(&pp, &powers, &consistent, es_true / 4.0, n0_true * 4.0);
+        let (_, n0_bad) =
+            bicm_id_em_reestimate(&pp, &powers, &contradicting, es_true / 4.0, n0_true * 4.0);
+        assert!(
+            n0_bad > n0_good * 1.5,
+            "contradicting extrinsics must inflate the noise estimate \
+             (got n0_bad {n0_bad} vs n0_good {n0_good})"
+        );
+    }
+
+    /// hb-259 byte-identity promise: an explicit
+    /// `bicm_id_em_reestimation: true` with everything else default
+    /// (BICM-ID off, DualMax metric — the rescue never runs) must
+    /// produce exactly the same decode list as `Ft8Config::default()`.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn em_flag_alone_is_byte_identical_to_default() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+        let mut state = 0xA409_3822_299F_31D0u64;
+        for s in tx.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((state >> 33) as f32) / (u32::MAX as f32) - 0.5;
+            *s += u * 0.3;
+        }
+
+        let mut dec_default = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let mut dec_em = Ft8Decoder::new(Ft8Config {
+            bicm_id_em_reestimation: true,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let a = dec_default.decode_window(&tx).expect("decode default");
+        let b = dec_em.decode_window(&tx).expect("decode em-flagged");
+        let key = |msgs: &[DecodedMessage]| {
+            let mut v: Vec<(String, i64, i64)> = msgs
+                .iter()
+                .map(|m| {
+                    (
+                        m.text.clone(),
+                        (m.frequency_offset * 100.0).round() as i64,
+                        (m.time_offset * 1000.0).round() as i64,
+                    )
+                })
+                .collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            key(&a),
+            key(&b),
+            "bicm_id_em_reestimation: true (with BICM-ID off) must be \
+             byte-identical to default"
+        );
+        assert!(
+            a.iter().any(|m| m.text == "CQ K5ARH EM10"),
+            "synthetic signal must decode"
         );
     }
 }
