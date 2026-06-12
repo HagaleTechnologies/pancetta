@@ -106,6 +106,14 @@ pub struct ContentFeatures<'a> {
     pub nharderrs: Option<u8>,
     /// Smallest `|LLR|` across the converged codeword (FDR Session 2).
     pub min_llr_magnitude: Option<f32>,
+    /// hb-103 v3 (Batch 79): the decode's `decode_time_into_window`
+    /// normalized to `[0, 1]` by the SLOT's maximum decode time —
+    /// late (multipass/retry) decodes within a slot are markedly more
+    /// FP-prone (solo AUC 0.63-0.73 inverted; Diagnostic V + Batch 79).
+    /// Slot-relative normalization keeps the feature hardware- and
+    /// load-independent. `None` (telemetry absent, or single-decode
+    /// slot context unavailable) contributes nothing — v3 reduces to v2.
+    pub decode_time_frac: Option<f64>,
 }
 
 /// Compute the fused content score for a decode given the active trust
@@ -196,6 +204,33 @@ pub fn content_score_v2_from_features(
     v1 + llr_term + bp_term + osd_term + nhe_term
 }
 
+/// hb-103 v3 — v2 plus the decode-lateness term (Batch 79):
+///
+/// ```text
+/// v3_score = v2_score + W_TIME * decode_time_frac
+/// ```
+///
+/// `decode_time_frac` is the decode's wall-time into the decode window
+/// normalized by the slot's max (see [`ContentFeatures::decode_time_frac`]).
+/// `W_TIME = -1.0` was selected by split-half grid search on hard_200 and
+/// raw_530 (Batch 79: mean held-out ΔAUC +0.032 / +0.012 over v2 with
+/// slot-max normalization; the weight was the held-out optimum on every
+/// fold of both corpora). `None` contributes nothing, so v3 reduces to v2
+/// (and to v1 when FDR telemetry is also absent) on decodes without the
+/// feature — pre-existing consumers are byte-identical.
+pub fn content_score_v3_from_features(
+    feat: ContentFeatures<'_>,
+    filter: &CallsignContinuityFilter,
+) -> f64 {
+    /// Batch 79 split-half optimum; negative because later = more FP-ish.
+    const W_TIME: f64 = -1.0;
+    let time_term = match feat.decode_time_frac {
+        Some(f) => W_TIME * f.clamp(0.0, 1.0),
+        None => 0.0,
+    };
+    content_score_v2_from_features(feat, filter) + time_term
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +247,7 @@ mod tests {
             osd_depth_used: None,
             nharderrs: None,
             min_llr_magnitude: None,
+            decode_time_frac: None,
         }
     }
 
@@ -294,7 +330,48 @@ mod tests {
             osd_depth_used: osd,
             nharderrs: nhe,
             min_llr_magnitude: llr,
+            decode_time_frac: None,
         }
+    }
+
+    // hb-103 v3 — decode-lateness term tests (Batch 80).
+
+    #[test]
+    fn v3_with_no_time_feature_equals_v2() {
+        let mut filter = CallsignContinuityFilter::new(100);
+        filter.extend_from_iter(["K1ABC"]);
+        let f = v2_feat("CQ K1ABC FN42", Some(20), None, None, Some(1.5));
+        let v2 = content_score_v2_from_features(f, &filter);
+        let v3 = content_score_v3_from_features(f, &filter);
+        assert!(
+            (v2 - v3).abs() < 1e-9,
+            "v3 with decode_time_frac=None must equal v2 (v2={v2}, v3={v3})"
+        );
+    }
+
+    #[test]
+    fn v3_late_decode_scores_below_early() {
+        let mut filter = CallsignContinuityFilter::new(100);
+        filter.extend_from_iter(["K1ABC"]);
+        let mut early = v2_feat("CQ K1ABC FN42", None, None, None, None);
+        early.decode_time_frac = Some(0.05);
+        let mut late = early;
+        late.decode_time_frac = Some(1.0);
+        let s_early = content_score_v3_from_features(early, &filter);
+        let s_late = content_score_v3_from_features(late, &filter);
+        // W_TIME = -1.0 → a full-window-late decode loses 0.95 vs the early one.
+        assert!((s_early - s_late - 0.95).abs() < 1e-9);
+    }
+
+    #[test]
+    fn v3_time_frac_is_clamped() {
+        let filter = CallsignContinuityFilter::new(100);
+        let mut f = v2_feat("CQ K1ABC FN42", None, None, None, None);
+        f.decode_time_frac = Some(7.5); // out-of-range input
+        let clamped = content_score_v3_from_features(f, &filter);
+        f.decode_time_frac = Some(1.0);
+        let unit = content_score_v3_from_features(f, &filter);
+        assert!((clamped - unit).abs() < 1e-9, "frac must clamp to [0,1]");
     }
 
     #[test]

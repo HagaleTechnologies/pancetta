@@ -1187,6 +1187,10 @@ impl AutonomousOperator {
                                         osd_depth_used: None,
                                         nharderrs: None,
                                         min_llr_magnitude: None,
+                                        // Batch 80: not yet plumbed to the
+                                        // autonomous-CQ path; v1 gate
+                                        // ignores it.
+                                        decode_time_frac: None,
                                     },
                                     f,
                                 );
