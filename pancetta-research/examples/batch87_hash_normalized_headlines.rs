@@ -65,7 +65,15 @@ fn main() -> Result<()> {
          batches); norm = `hash_normalize_message` on both sides.\n\n",
     );
 
-    for manifest_name in ["raw_530_full.manifest.json", "hard_1000.manifest.json"] {
+    // Default corpora, or a single manifest via PANCETTA_HEADLINE_MANIFEST
+    // (e.g. a freshly-captured day) for a quick regression-sentinel pass.
+    let default_corpora = ["raw_530_full.manifest.json", "hard_1000.manifest.json"];
+    let override_manifest = std::env::var("PANCETTA_HEADLINE_MANIFEST").ok();
+    let corpora: Vec<&str> = match &override_manifest {
+        Some(m) => vec![m.as_str()],
+        None => default_corpora.to_vec(),
+    };
+    for manifest_name in corpora {
         let manifest: Value = serde_json::from_str(&std::fs::read_to_string(
             ws.join("research/corpus/curated/ft8").join(manifest_name),
         )?)?;
@@ -156,7 +164,15 @@ fn main() -> Result<()> {
         );
     }
 
-    let notes_path = ws.join("research/notes/2026-06-12-batch87-hash-normalized.md");
+    // Default run writes the canonical batch87 note; a manifest override
+    // writes a manifest-specific note so it never clobbers the headline.
+    let notes_path = match &override_manifest {
+        Some(m) => ws.join(format!(
+            "research/notes/headline-{}.md",
+            m.trim_end_matches(".manifest.json")
+        )),
+        None => ws.join("research/notes/2026-06-12-batch87-hash-normalized.md"),
+    };
     std::fs::write(&notes_path, &body)?;
     println!("wrote {}", notes_path.display());
     Ok(())
