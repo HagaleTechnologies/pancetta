@@ -235,6 +235,66 @@ impl Config {
         Ok(())
     }
 
+    /// Targeted persist of the audio input/output device names into an
+    /// existing config TOML, without clobbering unrelated keys.
+    ///
+    /// Used by the TUI device picker: the operator chooses an output (and
+    /// optionally input) device and we write just `[audio] output_device`
+    /// / `input_device` back to `~/.pancetta/pancetta.toml`. We parse the
+    /// file as a generic `toml::Table`, set the two keys under the `audio`
+    /// table, and re-serialize — so every other section/value the operator
+    /// has set is preserved verbatim. `None` arguments are left untouched.
+    /// If the file does not yet exist, a minimal one is created containing
+    /// only the `[audio]` section (the loader fills the rest from
+    /// defaults).
+    pub fn set_audio_devices_in_file<P: AsRef<std::path::Path>>(
+        &self,
+        path: P,
+        input_device: Option<&str>,
+        output_device: Option<&str>,
+    ) -> ConfigResult<()> {
+        let path = path.as_ref();
+
+        // Load the existing document as a generic table, or start fresh.
+        let mut root: toml::Table = match std::fs::read_to_string(path) {
+            Ok(contents) => contents
+                .parse::<toml::Table>()
+                .map_err(|e| ConfigError::Validation(format!("Failed to parse config: {}", e)))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+            Err(e) => return Err(e.into()),
+        };
+
+        // Ensure an [audio] table exists.
+        let audio = root
+            .entry("audio".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let audio_table = audio.as_table_mut().ok_or_else(|| {
+            ConfigError::Validation("[audio] in config is not a table".to_string())
+        })?;
+
+        if let Some(out) = output_device {
+            audio_table.insert(
+                "output_device".to_string(),
+                toml::Value::String(out.to_string()),
+            );
+        }
+        if let Some(inp) = input_device {
+            audio_table.insert(
+                "input_device".to_string(),
+                toml::Value::String(inp.to_string()),
+            );
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let serialized = toml::to_string_pretty(&root)
+            .map_err(|e| ConfigError::Validation(format!("Failed to serialize config: {}", e)))?;
+        std::fs::write(path, serialized)?;
+        info!("Audio device selection persisted to: {}", path.display());
+        Ok(())
+    }
+
     /// Get a summary of the current configuration
     pub fn summary(&self) -> String {
         format!(
@@ -331,5 +391,57 @@ mod tests {
         let summary = config.summary();
         assert!(summary.contains("N0CALL"));
         assert!(summary.contains("Pancetta Configuration Summary"));
+    }
+
+    /// Targeted device persist writes output_device under [audio] and does
+    /// not clobber unrelated keys the operator already set.
+    #[test]
+    fn set_audio_devices_in_file_writes_output_and_preserves_other_keys() {
+        let temp = NamedTempFile::new().unwrap();
+        // Pre-existing config with a custom station callsign + a custom
+        // audio sample_rate that must survive the targeted write.
+        std::fs::write(
+            temp.path(),
+            "[station]\ncallsign = \"K5ARH\"\n\n[audio]\nsample_rate = 48000\ninput_device = \"OldMic\"\n",
+        )
+        .unwrap();
+
+        let config = Config::default();
+        config
+            .set_audio_devices_in_file(temp.path(), None, Some("USB Codec"))
+            .unwrap();
+
+        let written = std::fs::read_to_string(temp.path()).unwrap();
+        let parsed: toml::Table = written.parse().unwrap();
+        let audio = parsed["audio"].as_table().unwrap();
+        assert_eq!(
+            audio["output_device"].as_str(),
+            Some("USB Codec"),
+            "output_device must be written"
+        );
+        // Unrelated keys preserved.
+        assert_eq!(audio["sample_rate"].as_integer(), Some(48000));
+        assert_eq!(audio["input_device"].as_str(), Some("OldMic"));
+        assert_eq!(
+            parsed["station"].as_table().unwrap()["callsign"].as_str(),
+            Some("K5ARH")
+        );
+    }
+
+    /// Writing into a non-existent file creates a minimal [audio] section.
+    #[test]
+    fn set_audio_devices_in_file_creates_minimal_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("pancetta.toml");
+        let config = Config::default();
+        config
+            .set_audio_devices_in_file(&path, Some("Mic X"), Some("Spk Y"))
+            .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Table = written.parse().unwrap();
+        let audio = parsed["audio"].as_table().unwrap();
+        assert_eq!(audio["output_device"].as_str(), Some("Spk Y"));
+        assert_eq!(audio["input_device"].as_str(), Some("Mic X"));
     }
 }

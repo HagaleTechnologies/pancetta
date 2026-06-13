@@ -419,6 +419,9 @@ impl super::ApplicationCoordinator {
         // immediately (the structured panel update follows on the next
         // autonomous slot tick, ≤15s later).
         let cmd_tui_msg_tx = tui_msg_tx.clone();
+        // Shared config — the SelectDevice handler persists the operator's
+        // chosen output device into it (and into ~/.pancetta/pancetta.toml).
+        let cmd_config = self.config.clone();
         // F4 toggle state: Some(t) when a tune is in flight and expected
         // to auto-stop at instant t. None when no tune is queued. The
         // coordinator owns this — TUI just emits ToggleTune events.
@@ -428,6 +431,32 @@ impl super::ApplicationCoordinator {
         const TUNE_TONE_HZ: f64 = 1500.0;
         let cmd_handle = tokio::spawn(async move {
             let mut next_cq_time: Option<tokio::time::Instant> = None;
+
+            // Push the available audio devices to the TUI once at startup so
+            // the `d` device-selection picker can list them. The coordinator
+            // owns the pancetta-audio host; the TUI is a passive renderer.
+            {
+                let current_output = {
+                    let cfg = cmd_config.read().await;
+                    let dev = cfg.audio.output_device.clone();
+                    if dev.is_empty() {
+                        None
+                    } else {
+                        Some(dev)
+                    }
+                };
+                let input = pancetta_audio::device::list_input_devices();
+                let output = pancetta_audio::device::list_output_devices();
+                if let Err(e) =
+                    cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::DeviceListUpdate {
+                        input,
+                        output,
+                        current_output,
+                    })
+                {
+                    debug!("Failed to send initial device list to TUI: {}", e);
+                }
+            }
 
             while !cmd_shutdown.load(Ordering::Acquire) {
                 // Send repeating CQ every 15 seconds when active
@@ -679,6 +708,72 @@ impl super::ApplicationCoordinator {
                             );
                             if let Err(e) = cmd_message_bus.send_message(msg).await {
                                 warn!("Failed to toggle PTT: {}", e);
+                            }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::SelectDevice {
+                            input_device,
+                            output_device,
+                        } => {
+                            info!(
+                                "TUI SelectDevice: in={:?} out={:?}",
+                                input_device, output_device
+                            );
+                            // Persist the operator's choice to the in-memory
+                            // config and to ~/.pancetta/pancetta.toml so it
+                            // survives a restart. We do NOT reopen the live
+                            // cpal output stream here — that lives in
+                            // pancetta-audio's stream layer.
+                            // TODO(coordinator): live output-stream switch on
+                            // SelectDevice (reopen the cpal output stream
+                            // without a restart).
+                            {
+                                let mut cfg = cmd_config.write().await;
+                                if let Some(ref out) = output_device {
+                                    cfg.audio.output_device = out.clone();
+                                }
+                                if let Some(ref inp) = input_device {
+                                    cfg.audio.input_device = inp.clone();
+                                }
+                            }
+                            let config_path = dirs::home_dir()
+                                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                .join(".pancetta")
+                                .join("pancetta.toml");
+                            let persist_result = {
+                                let cfg = cmd_config.read().await;
+                                cfg.set_audio_devices_in_file(
+                                    &config_path,
+                                    input_device.as_deref(),
+                                    output_device.as_deref(),
+                                )
+                            };
+                            match persist_result {
+                                Ok(()) => {
+                                    info!(
+                                        "Persisted audio device selection to {}",
+                                        config_path.display()
+                                    );
+                                    if let Err(e) = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "audio".to_string(),
+                                            status: format!(
+                                                "Output device set to {} — restart to apply",
+                                                output_device.as_deref().unwrap_or("(unchanged)")
+                                            ),
+                                        },
+                                    ) {
+                                        debug!("Failed to send device-set status: {}", e);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to persist audio device selection: {}", e);
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "audio".to_string(),
+                                            status: format!("Failed to save device choice: {}", e),
+                                        },
+                                    );
+                                }
                             }
                         }
                         _ => {

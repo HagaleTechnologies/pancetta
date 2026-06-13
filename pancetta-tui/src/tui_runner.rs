@@ -129,6 +129,16 @@ pub enum TuiMessage {
     /// ends — normal completion, operator abort (F8 / Shift+Q), or
     /// shutdown all clear it. Drives the title-bar " TX " badge.
     TxStatus { active: bool },
+    /// Available audio devices, enumerated by the coordinator (which owns
+    /// the `pancetta-audio` host) and pushed to the TUI once at startup so
+    /// the `d` device-selection picker can list them. Each entry is
+    /// `(name, is_default)`. The TUI is a passive renderer — it never
+    /// enumerates hardware itself.
+    DeviceListUpdate {
+        input: Vec<(String, bool)>,
+        output: Vec<(String, bool)>,
+        current_output: Option<String>,
+    },
 }
 
 /// Commands sent from TUI
@@ -423,6 +433,13 @@ impl TuiRunner {
             }
             TuiMessage::TxStatus { active } => {
                 app.is_transmitting = active;
+            }
+            TuiMessage::DeviceListUpdate {
+                input,
+                output,
+                current_output,
+            } => {
+                app.set_audio_devices(input, output, current_output);
             }
         }
 

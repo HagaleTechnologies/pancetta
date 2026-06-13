@@ -29,15 +29,17 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
 
     let header = Row::new(header_cells).height(1).bottom_margin(0);
 
-    // Sort DX stations by priority score (highest first)
-    let mut dx_list: Vec<&DxStation> = app.dx_stations.values().collect();
-    dx_list.sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
+    // Single source of truth for ordering — the SAME list (and comparator)
+    // that `App::get_selected_station` indexes with `dx_hunter_scroll`, so
+    // the highlighted row is always the Space call-target. Do NOT re-sort
+    // or `.skip()` here: let `TableState` own the viewport offset from the
+    // selected index, so the cursor and the chooser can never disagree.
+    let dx_list: Vec<&DxStation> = app.displayed_dx_stations();
 
-    // Convert to table rows
+    // Convert ALL stations to rows; TableState scrolls the viewport to keep
+    // the selected row visible.
     let mut rows: Vec<Row> = dx_list
         .iter()
-        .skip(app.dx_hunter_scroll)
-        .take((area.height as usize).saturating_sub(4)) // Account for borders and header
         .map(|station| create_dx_row(station, app))
         .collect();
 
@@ -79,12 +81,24 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
         .header(header)
         .block(block)
         .column_spacing(1)
-        .style(Style::default().fg(app.theme.foreground_color()));
+        .style(Style::default().fg(app.theme.foreground_color()))
+        // Visible cursor: reversed video + a leading marker on the
+        // selected row so the operator can see exactly which station
+        // Space will call.
+        .row_highlight_style(
+            Style::default()
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
 
-    // Create table state for potential selection
+    // The selected index is `dx_hunter_scroll` into the displayed list.
+    // `TableState` clamps the viewport so the selection stays on screen,
+    // so we no longer hand-roll a skip offset.
     let mut table_state = TableState::default();
     if is_active && !dx_list.is_empty() {
-        table_state.select(Some(app.dx_hunter_scroll));
+        let sel = app.dx_hunter_scroll.min(dx_list.len().saturating_sub(1));
+        table_state.select(Some(sel));
     }
 
     f.render_stateful_widget(table, area, &mut table_state);
@@ -417,6 +431,8 @@ mod tests {
             confidence: None,
             best_snr_network: None,
             last_seen_network: None,
+            audio_offset_hz: None,
+            slot_parity: None,
         };
 
         let score = calculate_dx_priority(&station, "FN20", false, true, false);
