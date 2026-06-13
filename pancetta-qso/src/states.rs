@@ -335,6 +335,30 @@ pub struct QsoMetadata {
     /// carries the same value, ensuring all of our transmissions stay
     /// on the slot the contra station expects.
     pub tx_parity: Option<pancetta_core::slot::SlotParity>,
+
+    /// How this QSO was initiated. Manual calls bypass the self-duplicate
+    /// gate and keep-call under the manual watchdog; auto calls do not.
+    /// Defaults to `Auto` (the pre-existing behavior for every internal
+    /// constructor that does not set it explicitly).
+    #[serde(default)]
+    pub initiated_by: CallInitiation,
+
+    /// Number of times we have transmitted the initial call for this QSO
+    /// (relevant only for manual keep-calling). Starts at 1 when the QSO
+    /// is created (the first call is emitted immediately) and increments
+    /// on each watchdog re-arm. Drives the `manual_call_max_calls` cap.
+    #[serde(default)]
+    pub call_count: u32,
+
+    /// Timestamp of the first call transmitted for this QSO. Used by the
+    /// manual watchdog's elapsed-time bound (`manual_call_watchdog_minutes`).
+    #[serde(default)]
+    pub first_call_at: Option<DateTime<Utc>>,
+
+    /// Timestamp of the most recent call transmitted (manual keep-calling).
+    /// Used to rate-limit re-arms to roughly one per FT8 slot.
+    #[serde(default)]
+    pub last_call_at: Option<DateTime<Utc>>,
 }
 
 /// Signal reports exchanged
@@ -384,6 +408,25 @@ pub struct ContestSerials {
 
     /// Serial number we received
     pub received: Option<SerialNumber>,
+}
+
+/// How a QSO was initiated.
+///
+/// Distinguishes operator-driven manual calls from autonomous-operator
+/// calls. Manual calls bypass the self-duplicate gate (the operator
+/// explicitly chose to call this station) and keep-call every TX slot
+/// under a watchdog; autonomous calls retain the duplicate gate and the
+/// autonomous operator's own cadence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CallInitiation {
+    /// Operator pressed call / Space — explicit, bypasses duplicate check
+    /// and keep-calls under the manual watchdog.
+    Manual,
+
+    /// Autonomous operator initiated — duplicate check applies, autonomous
+    /// cadence drives re-calls (no manual keep-calling).
+    #[default]
+    Auto,
 }
 
 /// QSO validation result

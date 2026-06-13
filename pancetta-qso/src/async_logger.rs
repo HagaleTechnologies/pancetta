@@ -852,6 +852,10 @@ impl AsyncQsoLogger {
                 tags: std::collections::HashMap::new(),
                 notes: adif_qso.notes.clone(),
                 tx_parity: None,
+                initiated_by: Default::default(),
+                call_count: 0,
+                first_call_at: None,
+                last_call_at: None,
             },
         }
     }

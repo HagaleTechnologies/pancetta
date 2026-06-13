@@ -473,6 +473,10 @@ impl AdifProcessor {
             tags: adif_qso.additional_fields.clone(),
             notes: adif_qso.comment.clone(),
             tx_parity: None,
+            initiated_by: Default::default(),
+            call_count: 0,
+            first_call_at: None,
+            last_call_at: None,
         }
     }
 

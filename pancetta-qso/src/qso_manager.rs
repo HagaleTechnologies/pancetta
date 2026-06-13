@@ -79,6 +79,17 @@ pub struct TimeoutConfig {
 
     /// Cleanup interval for completed QSOs (seconds)
     pub cleanup_interval: u64,
+
+    /// Manual keep-calling watchdog: stop calling after this many minutes
+    /// have elapsed since the first manual call, regardless of call count.
+    /// Whichever of this and `manual_call_max_calls` fires first ends the
+    /// manual call attempt. Default: 5 minutes.
+    pub manual_call_watchdog_minutes: u64,
+
+    /// Manual keep-calling watchdog: stop after transmitting this many
+    /// calls to the DX. Whichever of this and `manual_call_watchdog_minutes`
+    /// fires first ends the manual call attempt. Default: 10 calls.
+    pub manual_call_max_calls: u32,
 }
 
 /// Contest configuration
@@ -196,6 +207,8 @@ impl Default for TimeoutConfig {
             confirmation_timeout: 30,
             max_qso_duration: 300,
             cleanup_interval: 60,
+            manual_call_watchdog_minutes: 5,
+            manual_call_max_calls: 10,
         }
     }
 }
@@ -354,6 +367,12 @@ impl QsoManager {
             tags: HashMap::new(),
             notes: None,
             tx_parity,
+            // Calling CQ is not a manual keep-calling QSO; it has its own
+            // CallingCq timeout and call_count in the state itself.
+            initiated_by: CallInitiation::Auto,
+            call_count: 1,
+            first_call_at: Some(now),
+            last_call_at: Some(now),
         };
 
         let progress = QsoProgress {
@@ -384,16 +403,58 @@ impl QsoManager {
         Ok(qso_id)
     }
 
-    /// Respond to a CQ call
+    /// Respond to a CQ call (autonomous/internal path).
     ///
     /// `dx_parity` is the slot parity of the DX station's CQ, used to
     /// derive our `tx_parity` (opposite of theirs). May be `None` if
     /// the CQ came from a DX cluster spot rather than an on-air decode.
+    ///
+    /// This is the autonomous path: the self-duplicate gate applies and
+    /// there is no manual keep-calling. For operator-initiated manual
+    /// calls use [`Self::respond_to_cq_manual`] (or
+    /// [`Self::respond_to_cq_with`] with [`CallInitiation::Manual`]).
     pub async fn respond_to_cq(
         &self,
         target_callsign: String,
         frequency: f64,
         dx_parity: Option<pancetta_core::slot::SlotParity>,
+    ) -> Result<QsoId, QsoManagerError> {
+        self.respond_to_cq_with(target_callsign, frequency, dx_parity, CallInitiation::Auto)
+            .await
+    }
+
+    /// Respond to a CQ call as an operator-initiated **manual** call.
+    ///
+    /// Bypasses the self-duplicate gate (the operator explicitly chose to
+    /// call this station, e.g. to re-work it) and marks the QSO so the
+    /// manual keep-calling watchdog re-arms a call every TX slot until the
+    /// DX answers or the watchdog fires.
+    pub async fn respond_to_cq_manual(
+        &self,
+        target_callsign: String,
+        frequency: f64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+    ) -> Result<QsoId, QsoManagerError> {
+        self.respond_to_cq_with(
+            target_callsign,
+            frequency,
+            dx_parity,
+            CallInitiation::Manual,
+        )
+        .await
+    }
+
+    /// Respond to a CQ call, explicitly choosing the initiation mode.
+    ///
+    /// [`CallInitiation::Auto`] preserves the historical behavior
+    /// (duplicate gate enforced, no keep-calling). [`CallInitiation::Manual`]
+    /// bypasses the duplicate gate and enables manual keep-calling.
+    pub async fn respond_to_cq_with(
+        &self,
+        target_callsign: String,
+        frequency: f64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+        initiated_by: CallInitiation,
     ) -> Result<QsoId, QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
@@ -403,8 +464,12 @@ impl QsoManager {
                 ),
             });
         }
-        // Check for duplicate
-        if self.check_duplicate(&target_callsign, frequency).await? {
+        // Check for duplicate — but only for autonomous calls. A manual
+        // call is an explicit operator decision to work (or re-work) this
+        // station, so the self-duplicate gate must not block it.
+        if initiated_by == CallInitiation::Auto
+            && self.check_duplicate(&target_callsign, frequency).await?
+        {
             return Err(QsoManagerError::DuplicateQso {
                 callsign: target_callsign,
                 frequency,
@@ -438,6 +503,12 @@ impl QsoManager {
             tags: HashMap::new(),
             notes: None,
             tx_parity,
+            initiated_by,
+            // The first call is emitted immediately below (the CqResponse
+            // MessageToSend), so the count starts at 1.
+            call_count: 1,
+            first_call_at: Some(now),
+            last_call_at: Some(now),
         };
 
         let progress = QsoProgress {
@@ -996,7 +1067,100 @@ impl QsoManager {
 
         loop {
             interval_timer.tick().await;
+            // Re-arm manual keep-calling BEFORE the watchdog so a re-call
+            // that pushes the count to the cap is still counted, then the
+            // watchdog can retire it on the same or next tick.
+            self.rearm_manual_calls().await;
             self.check_timeouts().await;
+        }
+    }
+
+    /// Re-arm manual keep-calling at the current time. See
+    /// [`Self::rearm_manual_calls_at`].
+    async fn rearm_manual_calls(&self) {
+        self.rearm_manual_calls_at(Utc::now()).await;
+    }
+
+    /// For every manual-initiated QSO still in `RespondingToCq` (waiting
+    /// for the DX to come back), re-emit the call (a `CqResponse`
+    /// `MessageToSend`) at most once per FT8 slot so the operator keeps
+    /// calling the DX every slot until they answer or the manual watchdog
+    /// fires. The TX scheduler downstream resolves slot parity from the
+    /// `tx_parity` latched on the QSO, so re-emitting more often than a
+    /// slot is harmless, but we gate to ~one per slot to avoid flooding
+    /// the bus.
+    ///
+    /// Re-arming increments `call_count` and updates `last_call_at`; the
+    /// watchdog ([`Self::check_timeouts_at`]) reads `call_count` and
+    /// `first_call_at` to decide when to stop.
+    pub async fn rearm_manual_calls_at(&self, now: DateTime<Utc>) {
+        // One FT8 slot is 15s; re-arm only when at least a slot has
+        // elapsed since the last call to keep ~one call per slot.
+        const SLOT_SECONDS: i64 = 15;
+
+        let mut to_recall: Vec<(QsoId, String, f64, Option<pancetta_core::slot::SlotParity>)> =
+            Vec::new();
+
+        {
+            let mut qsos = self.qsos.write().await;
+            for (&qso_id, progress) in qsos.iter_mut() {
+                if progress.metadata.initiated_by != CallInitiation::Manual {
+                    continue;
+                }
+                let target = match &progress.state {
+                    QsoState::RespondingToCq {
+                        target_callsign, ..
+                    } => target_callsign.clone(),
+                    // Once the DX has come back (any later state) keep-calling
+                    // stops — the normal sequence drives the rest of the QSO.
+                    _ => continue,
+                };
+
+                // Stop re-arming once the watchdog bound is reached; the
+                // watchdog itself will retire the QSO on its own pass.
+                let max_calls = self.config.timeouts.manual_call_max_calls;
+                if progress.metadata.call_count >= max_calls {
+                    continue;
+                }
+
+                let elapsed_since_last = progress
+                    .metadata
+                    .last_call_at
+                    .map(|t| (now - t).num_seconds())
+                    .unwrap_or(i64::MAX);
+                if elapsed_since_last < SLOT_SECONDS {
+                    continue;
+                }
+
+                progress.metadata.call_count += 1;
+                progress.metadata.last_call_at = Some(now);
+
+                to_recall.push((
+                    qso_id,
+                    target,
+                    progress.metadata.frequency,
+                    progress.metadata.tx_parity,
+                ));
+            }
+        }
+
+        for (qso_id, target, frequency, tx_parity) in to_recall {
+            debug!(
+                "Manual keep-calling: re-sending call to {} on {:.1} Hz (qso={})",
+                target, frequency, qso_id
+            );
+            let message = MessageType::CqResponse {
+                calling_station: target,
+                responding_station: self.config.our_callsign.clone(),
+                grid: self.config.our_grid.clone(),
+            };
+            self.emit_event(QsoEvent::MessageToSend {
+                qso_id,
+                message,
+                frequency,
+                tx_parity,
+            })
+            .await;
         }
     }
 
@@ -1027,11 +1191,44 @@ impl QsoManager {
     }
 
     async fn check_timeouts(&self) {
-        let now = Utc::now();
+        self.check_timeouts_at(Utc::now()).await;
+    }
+
+    /// Watchdog pass at an explicit time (for testability).
+    ///
+    /// In addition to the standard per-state timeouts, this enforces the
+    /// **manual keep-calling watchdog**: a manual-initiated QSO that is
+    /// still in `RespondingToCq` is retired (→ `Failed`/idle, callsign
+    /// mapping cleared) once it has either transmitted
+    /// `manual_call_max_calls` calls OR `manual_call_watchdog_minutes`
+    /// have elapsed since the first call — whichever comes first.
+    pub async fn check_timeouts_at(&self, now: DateTime<Utc>) {
         let mut qsos = self.qsos.write().await;
         let mut timeouts = Vec::new();
 
         for (&qso_id, progress) in qsos.iter() {
+            // Manual keep-calling watchdog (RespondingToCq only — once the
+            // DX answers, the normal state timeouts take over).
+            if progress.metadata.initiated_by == CallInitiation::Manual
+                && matches!(progress.state, QsoState::RespondingToCq { .. })
+            {
+                let max_calls = self.config.timeouts.manual_call_max_calls;
+                let watchdog =
+                    Duration::minutes(self.config.timeouts.manual_call_watchdog_minutes as i64);
+                let elapsed = progress
+                    .metadata
+                    .first_call_at
+                    .map(|t| now - t)
+                    .unwrap_or_else(Duration::zero);
+
+                if progress.metadata.call_count >= max_calls || elapsed >= watchdog {
+                    timeouts.push((qso_id, QsoFailureReason::Timeout));
+                }
+                // Manual calls do not use the (much shorter) report_timeout
+                // while still in RespondingToCq; the watchdog above governs.
+                continue;
+            }
+
             if let Some(duration) = progress.state.state_duration(now) {
                 let timeout_seconds = match &progress.state {
                     QsoState::CallingCq { .. } => self.config.timeouts.cq_timeout,
@@ -1125,6 +1322,194 @@ mod tests {
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert!(matches!(progress.state, QsoState::RespondingToCq { .. }));
         assert_eq!(progress.metadata.their_callsign, Some("K1DEF".to_string()));
+    }
+
+    // --- Manual-vs-auto calling semantics (operator policy) --------------
+
+    /// An auto response to a callsign we already have an active QSO with is
+    /// rejected by the self-duplicate gate (unchanged behavior).
+    #[tokio::test]
+    async fn auto_recall_to_same_dx_is_rejected_as_duplicate() {
+        let manager = QsoManager::new(test_config());
+        let _first = manager
+            .respond_to_cq("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let second = manager
+            .respond_to_cq("K1DEF".to_string(), 14074000.0, None)
+            .await;
+        assert!(
+            matches!(second, Err(QsoManagerError::DuplicateQso { .. })),
+            "auto re-call should be a duplicate, got {:?}",
+            second
+        );
+    }
+
+    /// A MANUAL call bypasses the self-duplicate gate even when an active
+    /// QSO with that callsign already exists.
+    #[tokio::test]
+    async fn manual_call_bypasses_duplicate_gate() {
+        let manager = QsoManager::new(test_config());
+        let _first = manager
+            .respond_to_cq("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let manual = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await;
+        assert!(
+            manual.is_ok(),
+            "manual call must not be blocked by duplicate gate, got {:?}",
+            manual
+        );
+        let progress = manager.get_qso(manual.unwrap()).await.unwrap();
+        assert_eq!(progress.metadata.initiated_by, CallInitiation::Manual);
+        assert_eq!(progress.metadata.call_count, 1);
+    }
+
+    /// Two consecutive manual calls to the same DX are both allowed (the
+    /// operator hit the duplicate-QSO bug doing exactly this).
+    #[tokio::test]
+    async fn manual_recall_to_same_dx_is_allowed() {
+        let manager = QsoManager::new(test_config());
+        let a = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await;
+        let b = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await;
+        assert!(a.is_ok() && b.is_ok(), "both manual calls allowed");
+    }
+
+    /// The manual watchdog retires a RespondingToCq QSO once the call count
+    /// reaches `manual_call_max_calls`.
+    #[tokio::test]
+    async fn manual_watchdog_fires_on_max_calls() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 3;
+        config.timeouts.manual_call_watchdog_minutes = 60; // not the binding bound here
+        let manager = QsoManager::new(config);
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+
+        // Simulate keep-calling: re-arm enough times (one slot apart) to
+        // hit the cap. call_count starts at 1; re-arm to 3.
+        let mut t = Utc::now();
+        for _ in 0..5 {
+            t += Duration::seconds(15);
+            manager.rearm_manual_calls_at(t).await;
+        }
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            progress.metadata.call_count >= 3,
+            "expected call_count to reach cap, got {}",
+            progress.metadata.call_count
+        );
+
+        // Watchdog must now retire it.
+        manager.check_timeouts_at(t).await;
+        let after = manager.get_qso(qso_id).await;
+        assert!(
+            matches!(after, Err(QsoManagerError::QsoNotFound { .. })),
+            "watchdog should have removed the QSO, got {:?}",
+            after.map(|p| p.state)
+        );
+    }
+
+    /// The manual watchdog retires a RespondingToCq QSO once the elapsed
+    /// time exceeds `manual_call_watchdog_minutes`, even below the call cap.
+    #[tokio::test]
+    async fn manual_watchdog_fires_on_elapsed_time() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 1000; // not binding
+        config.timeouts.manual_call_watchdog_minutes = 5;
+        let manager = QsoManager::new(config);
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+
+        // Just under 5 minutes: still alive.
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+        manager
+            .check_timeouts_at(start + Duration::seconds(4 * 60 + 59))
+            .await;
+        assert!(manager.get_qso(qso_id).await.is_ok());
+
+        // Past 5 minutes: retired.
+        manager
+            .check_timeouts_at(start + Duration::seconds(5 * 60 + 1))
+            .await;
+        assert!(matches!(
+            manager.get_qso(qso_id).await,
+            Err(QsoManagerError::QsoNotFound { .. })
+        ));
+    }
+
+    /// rearm_manual_calls re-emits a CqResponse MessageToSend and increments
+    /// the call count — but only once per slot, and not for auto QSOs.
+    #[tokio::test]
+    async fn rearm_emits_call_once_per_slot_for_manual_only() {
+        let manager = QsoManager::new(test_config());
+        let mut events = manager.subscribe();
+
+        let manual_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let _auto_id = manager
+            .respond_to_cq("K9ZZ".to_string(), 14076000.0, None)
+            .await
+            .unwrap();
+
+        // Drain the two initial MessageToSend events from the responses.
+        let mut initial = 0;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, QsoEvent::MessageToSend { .. }) {
+                initial += 1;
+            }
+        }
+        assert_eq!(initial, 2, "two initial calls (one manual, one auto)");
+
+        // Re-arm too soon (same instant as start): no new call.
+        let start = manager
+            .get_qso(manual_id)
+            .await
+            .unwrap()
+            .metadata
+            .start_time;
+        manager.rearm_manual_calls_at(start).await;
+        let mut too_soon = 0;
+        while let Ok(ev) = events.try_recv() {
+            if matches!(ev, QsoEvent::MessageToSend { .. }) {
+                too_soon += 1;
+            }
+        }
+        assert_eq!(too_soon, 0, "re-arm within a slot must not re-call");
+
+        // Re-arm a slot later: exactly one new call, for the manual QSO.
+        manager
+            .rearm_manual_calls_at(start + Duration::seconds(15))
+            .await;
+        let mut recalls = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::MessageToSend { qso_id, .. } = ev {
+                recalls.push(qso_id);
+            }
+        }
+        assert_eq!(recalls.len(), 1, "exactly one re-call");
+        assert_eq!(recalls[0], manual_id, "only the manual QSO is re-called");
+        assert_eq!(
+            manager
+                .get_qso(manual_id)
+                .await
+                .unwrap()
+                .metadata
+                .call_count,
+            2
+        );
     }
 }
 
