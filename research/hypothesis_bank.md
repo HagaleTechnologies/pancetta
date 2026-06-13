@@ -1837,7 +1837,7 @@ current_ratio: 0.051
     Source: mr-008 ideation,
     research/experiments/2026-05-31-mr-008-ideation.md (territory A).
 
-### hb-090 — Phase-coherent matched filter at truth coordinates  [PRIORITY: 0.38, spawned 2026-05-31 from mr-008 ideation]
+### hb-090 — Phase-coherent matched filter at truth coordinates  [SHELVED-DEFINITIVE 2026-06-12 Batch 90 — kill-switch run at CORRECTED coordinates (Batch 88 +2 row convention, empirically confirmed by Stage A offset sweep: controls 52.9%@0 → 91.4%@+2): matched filter beats max-log on CONTROLS (p50 95.4% vs 94.3%; 96.6% with ±240 refine; mean|LLR| +24%) proving the demod, yet sub-Costas misses are EXACTLY chance (p50 50.0%) for all three demods. No phase-coherent truth energy exists at those positions for any linear front-end — closes hb-088's 'what WOULD work' escape hatch on the same corpus. NOTE: hb-088's original control baseline was itself misaligned (Stage A), so its historical control numbers were invalid; its sub-Costas conclusion stands on the now-valid 91.4-vs-50.6 contrast. Side-spawn: hb-250.]
   mode: ft8
   status: pending
   priority_score: 0.38
@@ -2469,7 +2469,7 @@ current_ratio: 0.051
 
     See research/ideation/2026-06-01-architectural.md (entry A3).
 
-### hb-104 — Joint multi-candidate decoder (vector decode, not sequence)  [PRIORITY: 0.48, spawned 2026-06-01 from architectural ideation]
+### hb-104 — Joint multi-candidate decoder (vector decode, not sequence)  [SHELVED-PREMISE-ARTIFACT 2026-06-12 Batch 86 — the Batch 85 '46.5% co-channel misses' was a truth-matching artifact: ft8_lib renders unresolved hashed callsigns <...> vs pancetta's <...NNNN>, so exact-text scoring counts pancetta's OWN hashed decodes as misses at Δf=0 from themselves (766/1766 = 43.4% alias-confirmed by in-program audit). Hash-normalized: 0/1000 genuine misses within 6.25 Hz of a truth-confirmed decode, 6 (0.6%) within 25 Hz — the joint-decode population does not exist on this corpus. Kill-switch run anyway: 0/54 recoveries (all 54 were aliases). The one-step-LS subtract MACHINERY validated sound (victim-band energy ratio 0.26 after per-block+fine-shift fit; best <0.05) — reusable for hb-090/subtract work. Spawned hb-248 (hash-normalized scoring) + hb-249 (dt offset).]
   mode: ft8
   status: pending
   priority_score: 0.48
@@ -2490,6 +2490,16 @@ current_ratio: 0.051
     decodes, one-step ALS recovers ≥5% more decodes than greedy.
 
     See research/ideation/2026-06-01-architectural.md (entry A4).
+
+    PREMISE DIAGNOSTIC DONE (2026-06-12, Batch 85; FFI freq/time fix
+    + full truth regeneration unblocked it). Miss-to-decode proximity
+    on the 5/30 scan (39,668 truths / 1,766 misses, ±2s time gate):
+    46.5% of misses < 6.25 Hz from a decoded signal, 2.0% in
+    6.25-25 Hz, 35.3% in 25-100 Hz, 16.2% beyond/no-overlap.
+    The addressable population is overwhelmingly CO-CHANNEL (one tone
+    spacing) — the capture-effect regime hb-100 mapped. Scoping spec
+    is the next step; kill-switch ALS experiment should select slots
+    by <6.25 Hz truth-pair density.
 
 ### hb-105 — Decoder fusion at LLR level with jt9 (cross-decoder LLR sum)  [PRIORITY: 0.35, spawned 2026-06-01 from architectural ideation]
   mode: ft8
@@ -6156,9 +6166,9 @@ search to in-repo sources.
 
     Reference: ft8mon ft8.cc:2186-2225
 
-### hb-225 — ft8mon 2-D coarse sub-bin Costas search grid  [PRIORITY: 0.45, spawned 2026-06-07 Batch 42]
+### hb-225 — ft8mon 2-D coarse sub-bin Costas search grid  [PRIORITY: 0.55, spawned 2026-06-07 Batch 42, RAISED by Batch 45 freq-dither corroboration]
   mode: ft8
-  status: PROPOSED-FROM-RESEARCH
+  status: PROPOSED-FROM-RESEARCH (corroborated: Batch 45 sub-Hz freq dither measured +33 TPs on hard-200 N=200, demonstrating sub-bin offset surfaces sync candidates pancetta currently misses)
   priority_score: 0.45
   estimated_effort: 1 session (~250 LOC including cached-FFT-with-bin-shift optimization)
   expected_delta: targets pancetta's band-middle 1000-2000 Hz recall hole (Batch 34 finding); potentially +30-50 TPs
@@ -6292,3 +6302,565 @@ search to in-repo sources.
     Pairs naturally with hb-229.
 
     Reference: JTDX lib/sync8.f90
+
+### hb-231 — RS-ORBGRAND (Reshuffling ORBGRAND for short-block LDPC)  [PRIORITY: 0.40, spawned 2026-06-08 Batch 44 arXiv]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — arXiv:2401.15946 (Liu/Duffy/Médard). Reshuffles ORBGRAND query order, "0.1 dB from ML at BLER 1e-6". FT8 (174,87) high-rate code is ORBGRAND's sweet spot.
+  priority_score: 0.40
+  estimated_effort: plan-sized — need ORBGRAND baseline first (also new to pancetta), then RS-ORBGRAND is a query-ordering change
+  expected_delta: literature claim "0.1 dB from ML"; pancetta-corpus impact unknown
+  notes: |
+    Source: [arXiv:2401.15946](https://arxiv.org/abs/2401.15946)
+    Build ORBGRAND first, then RS-ORBGRAND as variant.
+
+### hb-232 — ORDEPT (Ordered Reliability Direct Error-Pattern Testing)  [PRIORITY: 0.35, spawned 2026-06-08]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — arXiv:2310.12039 + 2506.20079. Universal soft-decision decoder for binary block codes; faster than Chase-II, ORBGRAND, GCD per 2025 follow-on.
+  priority_score: 0.35
+  notes: |
+    Demonstrated on BCH(256,239), BCH(32,21), polar(128,116). FT8 (174,87) in range. Effort: medium.
+    Source: [arXiv:2310.12039](https://arxiv.org/abs/2310.12039), [arXiv:2506.20079](https://arxiv.org/abs/2506.20079)
+
+### hb-233 — MP-WSD (Multipoint Code-Weight Sphere Decoding)  [PRIORITY: 0.35, spawned 2026-06-08]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — arXiv:2602.08501. Precomputes low-weight codeword list; two-stage decoder, near-ML on misses.
+  priority_score: 0.35
+  notes: |
+    Could compose with mp=2 as "round 3" post-pass.
+    Offline: enumerate low-weight codewords of (174,87) ft8_lib LDPC.
+    Source: [arXiv:2602.08501](https://arxiv.org/abs/2602.08501)
+
+### hb-234 — Soft-Output GRAND for calibrated bit posteriors  [PRIORITY: 0.45, spawned 2026-06-08]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — arXiv:2310.10737. Calibrated per-bit posteriors improve hb-103 content scoring and any joint-message reasoning (hb-218 family).
+  priority_score: 0.45
+  notes: |
+    Even pre-GRAND-decoder, the SO machinery is useful. Composable.
+    Source: [arXiv:2310.10737](https://arxiv.org/abs/2310.10737)
+
+### hb-235 — IBA-LDPC iterative phase-tracking ↔ LDPC loop  [PRIORITY: 0.50, spawned 2026-06-08 HIGH POTENTIAL]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — arXiv:2604.07004. Models bursty differential phase noise as Wiener process; iterates between channel estimator and LDPC decoder. **HF ionospheric phase noise on FT8 = exactly the regime they model.** 1.4 dB BER@4e-3, 3 dB PER@1e-2 vs conventional.
+  priority_score: 0.50
+  estimated_effort: HIGH (plan-sized) — requires phase-tracking instrumentation inside symbol-demap loop + feedback from LDPC posteriors
+  defensible_prior: YES — only finding that addresses FT8's *channel*, not its *code*. Pancetta has no closed-loop between phase tracking and LDPC.
+  notes: |
+    Source: [arXiv:2604.07004](https://arxiv.org/abs/2604.07004)
+    Theoretically grounded. Potential 1.4-3 dB sensitivity gain.
+
+### hb-236 — Policy-Guided MCTS / RL-OSD  [PRIORITY: 0.30, spawned 2026-06-08]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — arXiv:2511.09054. RL policy replaces OSD's Gaussian elimination. 95% search reduction vs non-GE OSD.
+  priority_score: 0.30
+  notes: |
+    Complexity-reduction angle — if OSD eats budget after hb-222/223 ship, this is the cleanup tool.
+    Source: [arXiv:2511.09054](https://arxiv.org/abs/2511.09054)
+
+### hb-237 — Cross-sequence A7 (callsign-from-prior-window AP correlation)  [PRIORITY: 0.60, spawned 2026-06-08 Batch 44 — HIGHEST NEW]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH (Bodiya's wsjtr docs/cross_sequence_decoding.md; WSJT-X mainline since v2.6.0 Jun 2022)
+  priority_score: 0.60
+  estimated_effort: 1-2 sessions — pancetta-qso already has QSO state; need cross-sequence decode table + correlation
+  expected_delta: estimated ~30% of pancetta's response-shaped misses recoverable (per agent assessment)
+  defensible_prior: YES — WSJT-X has had this for 4 years; pancetta has callsign trust set (hb-062, hb-103) but NOT AP-driven candidate-message correlation in decoder
+  wild_card: false
+  evidence_for:
+    - Bodiya wsjtr (https://github.com/bodiya/wsjtr) — Rust implementation reference, 200+ LOC docs
+    - WSJT-X v2.6.0+ has shipped this as production
+    - Conceptually orthogonal to pancetta's existing AP wiring (hb-050)
+  notes: |
+    Mechanism: maintain `prev[Even][N]` and `prev[Odd][N]` decode tables
+    indexed by sequence. At each window, take previous opposite-sequence
+    decodes, downsample current window at each (DT, freq), do fine sync
+    + 4 LLR metric variants, generate up to 206 candidate messages from
+    the two callsigns and exchange-stage variants ("CALL1 CALL2", "+
+    RRR/RR73/73", reports −50 to +49, hashed `<call>` variants for
+    non-standard), correlate, accept if dmin ≤ 100 AND dmin2/dmin ≥ 1.3.
+
+    Implementation surface: pancetta-qso has QSO state machine that
+    knows partner callsign + expected exchange. Wire that into a new
+    candidate-message generator that feeds into a7 module.
+
+    Insertion point: pancetta-ft8/src/a7.rs already has template
+    cross-correlation. Extend to generate the 206-message template set
+    from QSO context.
+
+    Risk: cross-sequence is a new data-flow direction (pancetta-qso →
+    pancetta-ft8). May require coordinator-level callsign forwarding.
+
+    Reference: [wsjtr cross_sequence_decoding.md](https://github.com/bodiya/wsjtr/blob/main/docs/cross_sequence_decoding.md)
+
+### hb-238 — OSD dmin initialization audit (FP reduction)  [CLOSED 2026-06-08 Batch 45 — NOT APPLICABLE to pancetta]
+  mode: ft8
+  status: CLOSED-NOT-APPLICABLE — Batch 45 audit (research/notes/2026-06-08-hb238-audit.md) found pancetta's OSD has NO dmin tracking at all. Pancetta uses "lexicographically first CRC-pass wins" design (return on first try_solution() success at OSD-0, OSD-1, OSD-2, OSD-3 in order). Bodiya's INFINITY-init bug doesn't apply because pancetta doesn't track distance. Downstream filters (hb-062, hb-103, is_plausible) handle FP cases that "first wins" would accept.
+  priority_score: 0.0 (closed)
+  estimated_effort: complete
+  expected_delta: REFUTED — Bodiya bug doesn't apply
+  defensible_prior: original prior was based on assuming pancetta matched WSJT-X's design; audit shows it doesn't
+  wild_card: false
+  evidence_for:
+    - Bodiya's documented bug: ~40 FPs / 10 windows from wrong dmin init
+    - WSJT-X's seeding is the proven-correct reference behavior
+    - Pancetta's OSD implementation may have the same bug
+  notes: |
+    Action: read pancetta-ft8 OSD implementation. Find dmin initialization.
+    Verify it's seeded from order-0's distance (the no-bit-flips solve),
+    NOT from INFINITY. If wrong, fix is 1-line.
+
+    Insertion point: pancetta-ft8/src/decoder.rs — search for "osd"
+    code paths.
+
+    Risk: pancetta's OSD might already be correct. Audit is cheap; do
+    it before assuming there's a fix.
+
+    Reference: [wsjtr osd-depth-enhancement.md](https://github.com/bodiya/wsjtr/blob/main/docs/osd-depth-enhancement.md)
+
+### hb-242 — wsjtr `sync_bc` partial Costas metric for slot-edge recovery  [SHELVED-CONFIRMED 2026-06-11 Batch 75 — implemented Batch 48 (default-OFF, -18 TPs hard-200); raw_530_full ft8_lib re-test: +0 TPs / -19 FPs, inert. The predicted +50-150 slot-edge truths did not materialize on a realistic corpus. Re-open only with a slot-edge-specific corpus + paired max_sync_candidates bump.]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — wsjtr (Bodiya KC1WIH) uses 3-position Costas correlation with `sync_bc` partial metric (uses only Costas positions 2 + 3 when position 1 falls outside recorded window). Directly addresses pancetta's slot-edge negative-dt 48.3% recall miss bucket (Batch 40 finding).
+  priority_score: 0.15 (was 0.65 pre-measurement)
+  estimated_effort: 1-2 sessions (algorithm publicly documented; pancetta writes implementation from docs, not GPL code — license-clean)
+  expected_delta: +50-150 RR73-class slot-edge truths on hard-1000 per agent estimate
+  defensible_prior: YES — wsjtr ships this; targets a documented pancetta miss bucket; license-clean port path
+  wild_card: false
+  evidence_for:
+    - Bodiya wsjtr docs/jt9r.md §Sync Detection — implementation reference
+    - Pancetta Batch 40 finding: slot-edge negative-dt 48.3% recall
+    - Pancetta Batch 36 C2: 1376 truths at slot-edge (broader bucket)
+  conflict_analysis:
+    - vs hb-220 (slot-edge sync expansion): COMPLEMENTARY — hb-220 is
+      coordinator-side audio buffering; hb-242 is decoder-side sync
+      partial metric. Could stack.
+    - vs hb-044 (Costas parabolic): NO conflict. hb-044 refines time
+      axis; hb-242 generates more candidates pre-refinement.
+    - vs hb-228 (3-method spectral sweep): COMPLEMENTARY — different
+      mechanism (magnitude variation vs sync partial)
+  notes: |
+    Mechanism: standard Costas correlation requires all 3 sync arrays
+    (positions 0-6, 36-42, 72-78) to be present. When signal starts
+    before WAV begins (negative dt), position 0 (first array) falls
+    outside the recording. WSJT-X's `sync_bc` uses ONLY positions 2 + 3
+    (arrays 36-42 and 72-78) to generate a partial sync candidate.
+    Higher false-positive rate but catches slot-edge cases otherwise
+    lost.
+
+    Implementation:
+    1. Add a second Costas correlation path that scores using only
+       arrays 2 + 3
+    2. Apply higher sync threshold to compensate for fewer arrays
+       (Bodiya's tuning: TBD, read docs)
+    3. Mark candidates as "partial-sync" and apply stricter downstream
+       filters
+
+    Source: [wsjtr docs/jt9r.md](https://github.com/bodiya/wsjtr/blob/main/docs/jt9r.md)
+
+### hb-243 — wsjtr-style cached-bandpass downsampler + fine-sync  [PRIORITY: 0.55, spawned 2026-06-08 Batch 45]
+  mode: ft8
+  status: PROPOSED-FROM-RESEARCH — wsjtr ports WSJT-X's ft8_downsample.f90 directly: cached 192k-point forward FFT + per-candidate band extraction + 3200-point IFFT → 200 Hz complex baseband at 32 samples/symbol. Single biggest documented sensitivity gap between pancetta and WSJT-X.
+  priority_score: 0.55
+  estimated_effort: 3-4 sessions (significant decoder restructure; license-clean port from public docs)
+  expected_delta: closes 1-2 dB of the documented 5-10% pancetta-vs-WSJT-X sensitivity gap
+  defensible_prior: YES — wsjtr ships this; ft8_downsample.f90 is original WSJT-X mechanism
+  wild_card: false
+  notes: |
+    Pancetta currently operates on spectrogram power bins throughout
+    decode. Cached-bandpass downsampler gives complex baseband samples
+    that can be refined via ±10-sample time × ±2.5-Hz frequency search
+    using complex frequency-shift vectors.
+
+    Refinement: 5×5 grid (dt, freq) via time-domain Goertzel per
+    candidate. Currently pancetta uses NMS only.
+
+    Source: [wsjtr docs/jt9r.md §Downsampling](https://github.com/bodiya/wsjtr/blob/main/docs/jt9r.md)
+
+### hb-246 — Cross-day callsign trust DB (hb-103 v2 feature / hb-237 AP source)  [SCORE-FEATURE-CLOSED 2026-06-11 Batch 79: REDUNDANT-WITH-V2 (solo AUC 0.49, fitted weight ~0 stacked on v2 across all folds/corpora); hb-237 AP-source use remains open — PRIORITY: 0.20]
+
+  spawn: user iteration plan #3 (Batch 72 journal); measured Batch 76 before any decoder wiring
+  mechanism: persistent callsign->day-set DB built from ft8_lib truth over all
+    raw recordings (25k slots / 12 days). "Trusted" = callsign decoded on >= K
+    distinct prior days. Candidate uses: (a) feature in hb-103 v2 continuous
+    trust score; (b) AP-candidate callsign list for hb-237 cross-sequence A7.
+  measured (Batch 76, scripts/batch76_cross_day_trust.py, leave-5/30-out on
+    the 2066-slot 5/30 scan, ft8_lib truth):
+    - Hard gate at any K: DEAD. K>=1 loses 24.3% TPs for -56.7% FPs; K>=3
+      loses 75.4% TPs.
+    - Feature signal real at K>=1: P(TP|all trusted)=79.3% vs
+      P(TP|none trusted)=48.7%; ~30-point conditional-precision spread,
+      75% TP coverage.
+    - Coverage ceiling: 76% of unique callsigns appear on exactly 1 of 12
+      days (band-population churn + 66% of corpus slots near-dead band).
+    - Side-signal: no-parseable-callsign messages 14x more FP-prone.
+  expected_delta: no standalone ship; folds into hb-103 v2 as one feature.
+    Post-Batch-72 FP pool (osd=Some(0)) is 2.4x smaller than what this was
+    measured against, shrinking its absolute headroom.
+  defensible_prior: yes — operator "known callsign" heuristics, PSKReporter
+    reputation, SSH-known-hosts-style accumulation. Pancetta-invented as a
+    decoder feature (label: cross-day trust DB).
+  note: production wiring would need a persistent store under ~/.pancetta and
+    a decay policy (callsign churn makes stale trust actively misleading).
+
+### hb-247 — Deterministic decode-origin ordinal (replaces wall-clock lateness in hb-103 v3)  [GRADUATED 2026-06-11 Batch 81 — decode_origin shipped in decoder (6 stamp sites, 100% coverage); ΔAUC +0.040/+0.047 byte-identical across runs (beats timing proxy +33%/+150% rel); autonomous CQ gate flipped to v3 at unchanged τ=0.35 (strictly dominant-or-equal at every τ, control-verified vs v1-at-same-τ). OPERATOR-DECISION-PENDING: τ→0.90 lever (+9-12pp FP rej, recall margin 0.72→0.17) — revisit with Phase 5 on-air experience. Symmetric recall lever measured Batch 82: ldpc_iterations 100→300 = +42/+17 TPs at +93/+40 FPs (uniform ~2.3 FP/TP, 1.8-2.2x wall) on raw_530_full/hard_1000 — the two levers bracket the operating point in both directions. Batch 83 adds the lever ladder's floor: multipass mp=2 = 7.7-10 FP/TP (strictly dominated by ldpc; Fast-tier preset retired); mp=3 saturates at mp=2.]
+
+  mode: ft8
+  status: PROPOSED — Batch 79 validated decode-lateness as a content-score
+    feature (+0.032/+0.012 held-out ΔAUC over v2), but the underlying
+    decode_time_into_window is wall-clock: 100%-recall τ calibration moved
+    73% between identical runs under different CPU load (Batch 80), so the
+    autonomous CQ-gate flip was deferred.
+  mechanism: ordinal `decode_origin: Option<u8>` on ConfidenceFeatures,
+    stamped at the ~8 existing decode_time emission sites in decoder.rs:
+    0 = primary pass-0, 1 = later standard pass, 2 = cross-cycle averaging
+    (hb-056), 3 = coherent-multipass residual round, 4 = joint-pair retry
+    (hb-086), 5 = a7-extra passes, 6 = relaxation hook. v3' replaces the
+    timing term with W·(origin/6).
+  expected_delta: ≥ Batch 79's lift with a run-stable τ; if domination at
+    fixed τ* holds (Batch 80 method), flip the autonomous CQ gate to v3'.
+  estimated_effort: 1 session (struct field + 8 stamp sites + plumb to
+    CqCandidate + re-run batch79/batch80 probes on origin)
+  defensible_prior: yes — the timing proxy already measured; provenance is
+    the thing it proxies. Pancetta-invented label: decode_origin ordinal.
+  evidence_for:
+    - Batch 79: timing proxy lifts AUC on both corpora, every fold
+    - Batch 80: per-corpus domination of v1 gate at equal recall
+    - Diagnostic V: solo AUC 0.695 inverted (the original signal)
+  conflict_analysis:
+    - vs hb-103 v2/v3: strict refinement, replaces the unstable term
+    - vs hb-129 TTFD: complementary — TTFD keeps wall-clock for operator
+      telemetry; decode_origin is for scoring
+
+
+### hb-248 — Hash-normalized truth scoring (eval-harness correctness)  [SHIPPED-INFRA 2026-06-12 Batch 87 — pancetta_research::metrics::hash_normalize_message (+5 tests) is the mandatory scoring path for all future ft8_lib-truth probes. Corrected headlines: raw_530_full precision 0.8067→0.8230, miss 4.61%→2.68% (766 reclassified); hard_1000 0.8146→0.8270, miss 5.48%→4.04% (220). Resolved-hash residual 0 on both. Historical probes not retrofitted (same-scoring deltas, all verdicts stand).]
+
+  mode: ft8 (eval infrastructure)
+  status: PROPOSED — quick win, affects every ft8_lib-truth measurement
+  mechanism: ft8_lib renders unresolved hashed callsigns as <...>;
+    pancetta renders <...NNNN>-style tokens. Exact-text set intersection
+    therefore double-penalizes EVERY pancetta decode of a hashed message:
+    +1 phantom miss AND +1 phantom FP. On 5/30: 766/1766 nominal misses
+    (43.4%) are aliases; true miss rate is 2.5% not 4.5%, and FP counts
+    are correspondingly overstated in every batch that scored against
+    ft8_lib truth (B66-86).
+  expected_delta: scoring-only — normalize hash tokens (e.g. map any
+    <...> token to a canonical <HASH>) before intersection in all probes
+    + eval.rs; re-derive headline precision numbers. SHIP DECISIONS
+    UNAFFECTED (all were config-vs-config deltas under identical scoring)
+    but absolute precision is better than reported everywhere.
+  defensible_prior: yes — artifact demonstrated by Batch 86 in-program
+    audit; standard practice (WSJT-X comparisons normalize hashed calls).
+  estimated_effort: 1 session (shared helper + probe sweep + re-derive)
+
+### hb-249 — Systematic decode dt offset (~0.2 s, sync-chain)  [SHIPPED 2026-06-12 Batch 88 — root cause: sliding-frame window-centring convention. Spectrogram row t holds samples ENDING at (t+1)*960 (ft8_lib monitor.c port), so its Hann window is centred at (t-1)*960 and the represented symbol STARTS at (t-2)*960; every time_step→samples conversion omitted the 2-step look-back → reported dt exactly +1920 samples (one symbol period, 0.16 s) late, frequency- and dt-independent (synthetic ground truth, n=64, median +1920; ±480 sync quantization). ft8_lib's own time_sec carries the IDENTICAL offset (378 matched pairs, median Δ=0) — truth comparisons were structurally blind to it. Fixed via candidate_offset_samples() helper (SLIDING_FRAME_LOOKBACK_STEPS=2) at all 12 conversion sites + reverse_derive_candidate inverse. Side effects: subtract_signal's ±480 fine search and the 21-FFT fine-timing fallback were misaligned by a full symbol (structurally dead) and are now live. 200-slot guard: TP-identical 3563/3563, +11/−2 changed non-truth decodes whose callsigns are all active same-day stations (6/11 texts verbatim in other slots' truth) = real decodes beyond ft8_lib via aligned multipass subtract. All 519 ft8 tests + 64 workspace suites pass unchanged. Residual: Costas half-loop max(g(t0),g(t0+1)) plateau still emits ~8% of candidates one step (960) early — separate bank candidate. Note: research/notes/2026-06-12-batch88-dt-audit.md]
+
+  mode: ft8
+  status: SHIPPED — Batch 88 (was PROPOSED — diagnostic lead from kill-switch fit refinement)
+  mechanism: per-slot --dt-scan on strongest decodes locked the true
+    signal position 360-2160 samples (0.03-0.18 s) EARLIER than the
+    decoder's reported time_offset, consistently negative. LDPC tolerates
+    it; any coherent processing (subtract quality, hb-090 matched filter)
+    does not. Candidate sources: spectrogram block alignment, Costas
+    refinement sign, symbol_period accumulation.
+  expected_delta: if reported dt tightens to ±1 subblock, production
+    subtract quality improves for free (multipass residual cleanliness);
+    prerequisite for any future coherent mechanism.
+  defensible_prior: yes — measured in-program on real slots (Batch 86
+    note); pancetta-invented diagnostic.
+  estimated_effort: 1-2 sessions (instrument + locate + fix + re-measure)
+
+
+### hb-250 — Matched-filter demod for MARGINAL sync-passing candidates  [SHELVED 2026-06-12 Batch 91 — premise probe (batch91_hb250_failed_candidates.rs, top-20 hard-200 + 20 kill-switch slots, ft8_lib truth): the opportunity pool is TINY and the demod is not the differentiator there. 2360 deduped sync-passing/LDPC-failing candidates across 40 WAVs; only 35 (1.5%) truth-adjacent (6.25 Hz/0.16 s) to a missed ft8_lib truth, 27 evaluable after hash-token encode skips → below the pre-registered n>=30 floor (SHELVE-POPULATION) AND the distribution misses both bars anyway: matched-filter p50 sign-agreement 67.2% (refine 67.8%) vs max-log 67.8% — delta ≈ 0 pts vs bars of >=85% or >=75%+8pts. Controls re-validated (max-log 95.4% / mf+refine 96.6% p50, n=954, matching Batch 90). The Batch-90 control-population matched-filter edge does NOT transfer to failed candidates: at sync-passing-but-LDPC-failing positions both demods plateau at ~68%, i.e. the limit is signal corruption (collision/interference), not front-end incoherence. 97.7% of failed candidates point at nothing real production missed — forcing OSD on them is pure FP risk.]
+
+  mode: ft8
+  status: SHELVED (Batch 91 premise probe; was PROPOSED — side-finding of the hb-090 kill-switch)
+  mechanism: the phase-coherent matched-filter demod (batch90 example,
+    phasor-recurrence complex correlation + ±240-sample refinement)
+    BEATS the production spectrogram max-log demod on real decoded
+    signals: controls p50 sign-agreement 96.6% vs 94.3%, mean|LLR|
+    11.79 vs 9.53 (+24%). Production demods marginal candidates from
+    incoherent spectrogram magnitudes; a coherent second-chance demod
+    on candidates that pass sync but FAIL LDPC/CRC could flip enough
+    bits to converge some of them.
+  expected_delta: bounded — applies only to sync-passing LDPC-failures
+    (the population hb-086 joint-pair retry also mines). Premise probe:
+    count how many hard-200/raw misses pass sync but fail LDPC at
+    default config, then measure their matched-filter LLR agreement vs
+    spectrogram LLR agreement (truth-known, batch90 scaffolding reusable
+    as-is).
+  defensible_prior: yes — matched filter optimal linear detector;
+    measured +2.3pp on controls in-tree (Batch 90 table)
+  wild_card: false
+  estimated_effort: 1 session premise probe; 1-2 sessions wiring if it
+    pays
+  conflict_analysis:
+    - vs hb-086 joint-pair retry: same candidate population, different
+      mechanism (re-demod vs residual re-extraction); could stack
+    - vs hb-090: inverts it — coherent demod where sync SUCCEEDS
+
+
+### hb-251 — Costas half-loop plateau removal  [SHELVED-MEASURED 2026-06-12 Batch 92 — redundancy analysis VERIFIED (kernel at (t0,half=1) reads identical cells to (t0+1,half=0); executable plateau-identity assertion in test_costas_half_loop_disabled_plateau_identity_and_sharpening), but removal is HARMFUL: raw_530_full ft8_lib-truth hash-normalized A/B, 200 slots TP −64 / FP −11, full 2066 slots TP −635 / FP −256 (wall −27%), and the Batch 88 Part A dt distribution is BYTE-IDENTICAL with the flag on — the −960 early-emission skew is absorbed downstream and never reaches reported dt. Mechanism: with nms_enabled=false the plateau emits TWO candidates 960 samples apart per strong signal; the time-domain fine search is only ±720, so the pair jointly covers ~2400 samples of alignment and LDPC sometimes converges from only one — the half loop is a free adjacent-alignment retry, redundant for scoring but load-bearing for recall. Flag `costas_half_loop_disabled` kept default-OFF (guards TIME_OSR≥2; documents the knob). Closes Batch 88 residual #1. Note: research/notes/2026-06-12-batch92-costas-half-loop.md]
+
+  mode: ft8
+  status: SHELVED-MEASURED — Batch 92 (was Batch 88 residual #1)
+  mechanism: remove the max-over-half ∈ {0,1} in
+    compute_costas_score_groups since TIME_OSR=2's t0 sweep already
+    covers half-symbol offsets; hypothesis was sharper time
+    localization (kill the −960 early-emission bucket) at no recall
+    cost.
+  expected_delta: was "dt distribution tightens, candidates unchanged";
+    measured: dt unchanged, TP −64/200 slots and −635/2066 slots (−1.6%).
+  defensible_prior: yes — pancetta-invented, score-level redundancy
+    proven by executable assertion; the operational claim is what
+    failed.
+  wild_card: false
+  estimated_effort: done (1 session)
+  conflict_analysis:
+    - any future NMS-on default would change this calculus (NMS would
+      suppress the plateau twin anyway — re-measure before enabling
+      nms_enabled + this flag together)
+
+
+### hb-252 — BICM-ID: iterative demodulation-decoding for noncoherent 8-FSK  [SHIP-OPT-IN 2026-06-12 Batch 98 — FP-control attempt measured: near-converged gating does NOT separate true from wrong-CRC rescues (cumulative unsat curves track within ~1pp: T=18 keeps 80.9% true / 79.8% fp of 299/104 instrumented rescue emissions on hard_200/50). Gated spot frontier: T=5 → ΔTP+0/ΔFP+1; T=8 → +0/+8; T=18 → +2/+17; ungated (B97) +3/+21 — no operating point passes ΔFP ≤ 2×ΔTP with ΔTP>0, so the pre-registered full-corpus graduation never triggered. Synthetic mechanism survives the gate: +0.500 dB at T=18 (10 trials/pt). Shipped as opt-in: bicm_id_iterations stays default 0; rescued decodes now stamped decode_origin=Some(7) (v3 gate prices at max lateness penalty, 7/6→clamp 1.0), suspicion scrutiny unconditional for rescues, near-converged gate default 18 prunes 24.5% of futile rescue work. The mechanism is real physics but hard_200's marginal rescue population is FP-dominated — same shape that demoted osd_depth=Some(2) in Batch 72.]
+
+  mode: ft8
+  status: SHIP-OPT-IN (Batch 98, 2026-06-12) — FP control measured, no
+    default flip. Batch 98 instrumented every rescue on hard_200/50
+    (gate off): 299 truth-matching emissions, 104 wrong-CRC emissions,
+    10,734 failed rescue attempts, 11 suspicion-rejected. The
+    unsatisfied-check distributions of true and wrong-CRC rescues are
+    nearly identical (cum. keep at T=18: 80.9% vs 79.8%) — the
+    near-converged-gate premise is REFUTED as an FP discriminator on
+    this corpus; it survives only as a wall-cost pruner (-24.5% of
+    futile rescues at T=18). Gated spot frontier (hard_200/50,
+    iters 0→2): T=5 ΔTP+0/ΔFP+1, T=8 +0/+8, T=18 +2/+17 vs ungated
+    +3/+21 — marginal rescued decodes are FP-dominated at every
+    threshold, the pre-registered proceed bar (ΔFP ≤ 2×ΔTP, ΔTP>0)
+    fails everywhere, full-corpus graduation run not triggered (per
+    pre-registration). Synthetic re-check at gated default T=18:
+    +0.500 dB threshold shift (10 trials/pt, bar ≥0.2 dB PASSED) — the
+    gate does not destroy the mechanism; true synthetic rescues are
+    near-converged. Shipped FP-control infrastructure (active whenever
+    an operator opts in with bicm_id_iterations ≥ 1):
+    `bicm_id_max_unsatisfied_checks` (default 18, pinned by test),
+    `decode_origin = Some(7)` stamping (hb-103 v3 prices rescues at
+    the max lateness penalty: 7/6 clamps to 1.0 — divisor 6 kept by
+    design), and unconditional suspicion-score scrutiny for rescued
+    decodes. Re-open only with a genuinely different discriminator
+    (hb-253 exact Bessel metric changing the rescue's LLR quality, or
+    per-candidate Es/N0 from hb-259), not another unsat-threshold
+    tune. Batch 99 UPDATE: the hb-253 re-open branch is MEASURED-DEAD —
+    Bessel × iters=2 on hard_200/50 gives ΔTP +1 / ΔFP +27 (worse than
+    dual-max's +2/+17); the exact metric does not sharpen true-vs-wrong
+    rescue discrimination. Remaining re-open path: hb-259 per-candidate
+    Es/N0 re-estimation only. Synthetic mechanism re-reproduced a third
+    time (dualmax iters 0→2: +0.306 dB under the T=18 gate).
+    Batch 100 UPDATE: the hb-259 re-open branch is also MEASURED-DEAD —
+    EM (Es, N0) re-estimation gives ΔTP +1 / ΔFP +29 on hard_200/50
+    (vs static Bessel +1/+27). All three discriminators now measured
+    (unsat gate B98, Bessel metric B99, EM estimation B100): the
+    wrong-CRC rescue population is a CRC-collision floor, and the
+    corpus-side re-open question is CLOSED. Validation continues only
+    via the on-air Phase 5 A/B (meatspace ledger) or a future
+    marginal-signal corpus.
+    Note: `research/notes/2026-06-12-batch98-bicm-id-gated.md`;
+    harness: `batch98_bicm_id_gated.rs`.
+    (was: MECHANISM-CONFIRMED-FP-PENDING Batch 97 — synthetic +0.384 dB
+    @ 2 iters PASSED, spot ΔTP +3 / ΔFP +21 FAILED the ≤2× bar; was:
+    PROPOSED — highest-evidence candidate from the inaugural
+    deep-research sweep, 12-0 adversarial verification)
+  mechanism: feed LDPC extrinsic LLRs back into the per-symbol tone-LLR
+    computation (SOMAP demodulator). Pancetta's current max-log extraction
+    is EXACTLY the degenerate case with all a-priori LLRs zeroed
+    (Valenti & Cheng, IEEE JSAC 2005, eq. 8) — the upgrade is a published
+    closed-form formula, not an invention. Each global iteration updates
+    demod statistics using the decoder's beliefs about the other 2 bits
+    of each 8-FSK symbol label.
+  expected_delta: literature 0.34-1.04 dB by modulation order (M=8
+    interpolates ~0.4-0.7 dB); attacks the B91 signal-limited frontier
+    directly. Caveat: measured with long turbo codes; FT8's 174-bit
+    block may realize less — measure, don't assume.
+  defensible_prior: YES — two independent peer-reviewed sources with
+    verbatim-verified numbers (Valenti/Cheng JSAC 2005; Guillén i
+    Fàbregas & Grant TWC). Receiver-side only; protocol unchanged.
+  license: academic equations, no clean-room needed.
+  estimated_effort: 1-2 sessions (SOMAP feedback into llr extraction +
+    global loop; cost is per-iteration stat updates, not extra passes)
+  conflict_analysis: subsumes/extends max-log path; composes with
+    hb-253 (exact metric) and hb-259 (EM channel re-estimation).
+
+### hb-253 — Exact Bessel noncoherent LLR metric (vs dual-max approximation)  [MECHANISM-CONFIRMED-FP-PENDING 2026-06-12 Batch 99 — shipped opt-in behind `Ft8Config::llr_metric` (default DualMax, byte-identity test-pinned)]
+
+  status: Batch 99 kill-switch probe (`batch99_bessel_llr_kill_switch.rs`,
+    note `research/notes/2026-06-12-batch99-bessel-llr.md`). Paper
+    fetched and read (Guillén i Fàbregas & Grant, IEEE TWC): pancetta's
+    production dB dual-max IS their estimation-free dual-max eq. (13);
+    the upgrade implemented is the exact Bessel metric eqs. (1)/(6)
+    with exact log-sum-exp label marginalization. Estimator
+    (block-constant per candidate): N0 = median non-max tone power
+    across 79 symbols ÷ ln 2; Es = mean max-tone power − N0 (floor
+    0.05·N0); ln I0 via A&S 9.8.1/9.8.2 polynomials, unit-tested
+    against the power series. Synthetic 50%-threshold (50 trials/pt,
+    paired AWGN): −18.73 → −19.00 dB (**+0.273 dB, bar ≥0.15 PASSED —
+    metric is real on FT8 blocks with estimated CSI**); composes
+    additively with hb-252 BICM-ID (bessel×iters2 = +0.506 dB
+    combined). Wall cost +1.7%. BUT hard_200/50 spot: bessel/it0
+    ΔTP +1 / ΔFP +14, bessel/it2 ΔTP +1 / ΔFP +27 (vs dual-max it2
+    +2/+17) — real-corpus FP-negative, default unchanged, no
+    full-corpus run (per pre-registration). Failure mode: the
+    block-constant N0 assumption is correct on the synthetic AWGN
+    plant and wrong on interference-dominated hard_200 — the exact
+    metric's extra confidence on interference-hit symbols becomes
+    wrong-codeword BP convergence. Re-attack path: per-symbol /
+    per-tone interference-aware N0 (= hb-259), NOT another demapper
+    variant. (was: PROPOSED, PRIORITY 0.55, spawned Batch 96 web scan)
+    Batch 100 UPDATE: the hb-259 re-attack was run and is
+    MEASURED-NO-RESCUE-FIX (EM-refined (Es, N0) → ΔTP +1 / ΔFP +29 vs
+    static +1/+27 on hard_200/50; synthetic parity +0.017 dB). The
+    failure-mode attribution shifts from "block-constant estimation
+    wrong on interference" to the CRC-collision floor; estimator
+    variants are no longer a promising lane. hb-253 stays opt-in
+    (`llr_metric = Bessel`, +0.273 dB solo / +0.506 dB composed
+    synthetic); on-air A/B is the remaining validation path.
+  mode: ft8
+  mechanism: replace dual-max LLR with exact log I0(2·sqrt(Es)·a·|y|/N0)
+    Bessel metric; requires per-candidate Es/N0 estimation. ~0.6 dB
+    measured gap under iterative decoding (perfect-CSI upper bound);
+    JSAC 2024 (Gomez-Vilardebo) adds Doppler-uncertainty-aware and
+    estimation-free variants benchmarked with LDPC-coded FSK.
+  license: academic. effort: 1 session probe (synthetic SNR sweep first).
+  pairs with hb-252/hb-259.
+
+### hb-254 — Post-BP-failure saturation/perturbation retry lists  [PRIORITY: 0.55, spawned 2026-06-12 Batch 96 web scan]
+
+  mode: ft8
+  mechanism: after BP failure, saturate channel LLRs of selected
+    unreliable variable nodes (EQML, Kang et al. ITW 2019) or re-run BP
+    with perturbed VNs (MRBP; learned VN selection arXiv 2507.03461),
+    producing a candidate list re-decoded per entry. Near-ML reported on
+    short LDPC. Distinct from OSD (works in BP domain, not ordered
+    re-encoding) and from signal-domain multipass.
+  honesty note: pancetta's truth-adjacent BP failures sit at ~68% LLR
+    sign-agreement (B91) — far from the waterfall regime of the papers;
+    probe on the NEAR-CONVERGED failure subpopulation (few unsatisfied
+    checks) first, with the candidate-dump instrument from B91.
+  license: academic. effort: 1-2 sessions.
+
+### hb-255 — BP-RNN decoder diversity + OSD post-processing  [PRIORITY: 0.40 (GPU meatspace), spawned 2026-06-12 Batch 96 web scan]
+
+  mode: ft8
+  mechanism: N BP-RNN decoders specialized to absorbing-set error classes
+    + OSD-2 each + ML selection; within 0.2 dB of ML on CCSDS(128,64)
+    (Rosseel et al. TCOMM 2022). Extends pancetta's neural-OSD line;
+    needs training (multi-machine GPU item in meatspace ledger).
+  license: academic.
+
+### hb-256 — Robust impulsive-noise LLR for lightning-static HF  [SHELVED-OPT-IN-AVAILABLE 2026-06-12 Batch 101 — translated mechanism real but below pre-registered bar: impulsive-plant threshold +0.219 dB (k=3) / +0.253 dB (k=6) vs the +0.3 dB bar; pure-AWGN cost exactly 0.000 dB (curves byte-level identical); hard_200/50 spot ΔTP +1 / ΔFP −1. Pre-registered SHELVE applied.]
+
+  mode: ft8
+  mechanism: closed-form robust LLR sign(y)·min(a|y|, b/|y|) — linear
+    small-amplitude, inverse large-amplitude — best BER among robust
+    receivers under alpha-stable impulsive noise (Clavier et al. EURASIP
+    2021). HF's dominant non-Gaussian noise is lightning static.
+  probe: corpus characterization has per-day noise stats — test on the
+    most impulsive recorded days first; synthetic alpha-stable plant
+    corpus as fallback.
+  license: academic. effort: 1 session probe.
+  status: Batch 101 probe (`batch101_impulse_robust_llr_kill_switch.rs`,
+    note `research/notes/2026-06-12-batch101-impulse-llr.md`). Primary
+    source PDF read directly (eq. (15), Sect. 3.4.5). Applicability
+    check FIRST: the paper's y is a time-domain matched-filter output;
+    pancetta's LLRs are spectrogram-domain dB tone-power differences
+    with no per-bit scalar amplitude — the literal form does NOT map.
+    TRANSLATED mechanism implemented (faithful adaptation): a lightning
+    crash is broadband + short-time, inflating all 8 tone bins of 1-3
+    symbols, so per-symbol TOTAL tone power plays the role of |y|;
+    symbols with P_s > k·median get LLRs × (k·P_med/P_s) (the inverse
+    branch), others untouched (the linear branch), continuous at the
+    knee. Shipped opt-in: `Ft8Config::impulse_robust_llr: Option<f64>`
+    (default None, byte-identical, 8 new tests incl. end-to-end
+    None-identity + dB/linear-mag unit agreement; 548 total). Wired at
+    all 10 demapper sites after whitening, before normalization.
+    Synthetic plant: AWGN + Bernoulli bursts (p=0.02/symbol, 1-3 sym,
+    10-30 dB over floor, ~4% duty). Impulsive plant costs baseline
+    0.79 dB; the knee recovers ~1/3 of that. Why below bar (hypotheses):
+    default-on LLR whitening already divides by a per-symbol noise
+    median (partial overlap); sync misses under bursts are not
+    LLR-recoverable; 4% duty caps the margin. Re-open paths: storm-day
+    real corpus (corpus framework has NO impulsiveness metric today —
+    a per-day kurtosis/crest-factor sweep would find candidate days),
+    or on-air A/B in lightning season (meatspace). Operators in heavy
+    QRN can set Some(6.0) at zero nominal-channel cost.
+
+### hb-257 — Parallel ensemble decoding with ML selection  [PRIORITY: 0.35, spawned 2026-06-12 Batch 96 web scan]
+
+  mode: ft8
+  mechanism: parallel constituent decoders (parity-check basis diversity,
+    automorphism permutations, schedule diversity, noise injection,
+    saturated BP) + ML candidate selection (Krieg et al. 2024 comparative
+    study). Pancetta's existing variants are sequential fallbacks; the
+    parallel-ensemble + ML-selection FORM is untried. Mind hb-117/hb-092
+    precedents: input-perturbation ensembles died before — the live axes
+    here are basis/permutation/schedule diversity, not gain.
+  license: academic.
+
+### hb-258 — Trajectory-informed neural OSD bit ordering  [PRIORITY: 0.35, spawned 2026-06-12 Batch 96 web scan]
+
+  mode: ft8
+  mechanism: order OSD bits by a small NN over per-bit LLR trajectories
+    across min-sum iterations instead of final |LLR| (arXiv 2404.14165):
+    order-3 with NN ordering beat truncated order-4 by ~0.2 dB at equal
+    TEP budget. In-tree head start: bp_trajectory_capture.rs already
+    records trajectories.
+  license: academic. note: OSD currently ships depth 0 — this would only
+    matter if a deeper-OSD operating point ever returns (recall lever).
+
+### hb-259 — Per-iteration EM channel re-estimation in the demod-decode loop  [MEASURED-NO-RESCUE-FIX 2026-06-12 Batch 100 — EM-on rescue economics ΔTP +1/ΔFP +29 vs EM-off +1/+27 (Batch 99 reproduced exactly): channel-estimation quality is NOT the rescue-FP cause. Attribution: CRC-collision floor — extra BP attempts on noise candidates re-roll CRC-14's ~1/16k dice; no estimator fixes that. Closes the hb-252/253 corpus-graduation question definitively (3 discriminators measured: syndrome flat, Bessel no, EM no). Family stands as SHIP-OPT-IN +0.506 dB composed synthetic; on-air A/B (meatspace) or a marginal-signal corpus are the remaining validation paths. EM code kept behind bicm_id_em_reestimation default-false.]
+
+  status: Batch 100 probe (`batch100_em_reestimation.rs`, note
+    `research/notes/2026-06-12-batch100-em-reestimation.md`). Primary
+    source read directly (Cheng dissertation ch. 6 = the Turbo-NFSK
+    MILCOM 2005 material; the MILCOM PDF fetch timed out): E-step
+    eqs. (6.11)/(6.13) implemented verbatim — posterior tone probs
+    from current Bessel likelihoods × extrinsic-prior labels (6.13),
+    Costas symbols as pilots, log-domain LSE-normalized. M-step
+    implemented as power-domain moment matching (N0 =
+    posterior-weighted mean believed-noise tone power, exact ML for
+    the exponential noise tones; Es = posterior-weighted mean
+    believed-signal tone power − N0, floor 0.05·N0) — a documented
+    simplification of the paper's implicit F=I1/I0 amplitude
+    recursion (6.16), the same reduction family the paper itself
+    ships at ≤0.15 dB extra loss. Inner schedule per paper (<10%
+    change or 20 iterations); Batch 99 static estimator seeds
+    iteration 0; LS scale refit each global iteration against the
+    fixed normalized seed LLRs. 5 new unit tests (540 total, was
+    535): recovers an 8×-wrong seed to within 2× truth from uniform
+    priors; contradicting extrinsics verifiably inflate N0 (the
+    feedback path is live); default-false + byte-identity pinned.
+    MEASURED — synthetic (50 trials/pt, paired, batch99 seeds):
+    bessel/it2 EM-off −19.23 dB → EM-on −19.25 dB (+0.017 dB; bar
+    "no regression" PASSED; all three non-EM columns reproduce
+    Batch 99 to 0.01 dB, refactor fidelity confirmed; EM wall +3.7%
+    on the rescue path). Decisive spot (hard_200/50, ft8_lib truth):
+    EM-off ΔTP +1/ΔFP +27 (Batch 99 reproduced EXACTLY), EM-on
+    ΔTP +1/ΔFP +29 — re-open bar (ΔTP>0 AND ΔFP ≤ 2×ΔTP) NOT MET;
+    full raw_530_full/hard_1000 run not triggered (per
+    pre-registration). Do NOT re-attack with estimator variants: the
+    E-step already re-weights symbols through the posterior, so
+    per-symbol/per-tone N0 flavors have low expected value too.
+    (was: PRIORITY 0.50 raised Batch 99, spawned Batch 96 web scan)
+  batch99_note: priority raised. Batch 99 (hb-253) identified the exact
+    failure mode this attacks: the Bessel metric's block-constant N0
+    estimate is correct on synthetic AWGN (+0.273 dB real shift) but
+    FP-negative on interference-dominated hard_200 (+1 TP / +14 FP) —
+    interference-hit symbols need per-symbol/per-tone noise pricing.
+    The Bessel demapper + LSE SOMAP infrastructure is now in-tree
+    (`Ft8Config::llr_metric`); hb-259 only needs to supply better
+    (Es, N0) inside it. This is ALSO the sole remaining re-open path
+    for hb-252's rescue economics. [Batch 100: tested — it wasn't
+    the cause; see status above.]
+  mode: ft8
+  mechanism: re-estimate Es and N0 separately each global iteration via
+    EM fed by decoder extrinsics (Cheng/Valenti/Torrieri MILCOM 2005);
+    within 0.6 dB of perfect-CSI for 16-NFSK without AGC assumptions.
+    Companion to hb-252; supplies the estimates hb-253 needs.
+  license: academic.
+
+### hb-260 — GRAND-family decoders  [DOCUMENTED-DEAD-END 2026-06-12 Batch 96 — do not pursue: GRAND/ORBGRAND target short HIGH-RATE codes; FT8's LDPC(174,91) at rate 0.52 with 83 redundancy bits is far outside the tractable guessing regime, and query counts explode at weak-signal SNRs (Wan & Zhang 2024; Duffy/Médard foundational scope statements). Banked so future scans don't resurface it.]

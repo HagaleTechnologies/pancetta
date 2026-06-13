@@ -475,6 +475,7 @@ fn test_hunt_mode_picks_best_cq() {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         },
         DecodedMessageInfo {
             callsign: Some("JA1ABC".into()),
@@ -484,6 +485,7 @@ fn test_hunt_mode_picks_best_cq() {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         },
     ];
 
@@ -543,6 +545,7 @@ fn test_hunt_mode_response_survives_audio_roundtrip() {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         })
         .collect();
     op.feed_decoded_messages(&decoded_infos, &evaluator);
@@ -718,6 +721,7 @@ fn test_priority_scorer_skips_duplicate() {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         },
         DecodedMessageInfo {
             callsign: Some("JA1ABC".into()),
@@ -727,6 +731,7 @@ fn test_priority_scorer_skips_duplicate() {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         },
     ];
 
@@ -785,6 +790,7 @@ fn test_priority_scorer_prefers_pota() {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         },
         DecodedMessageInfo {
             callsign: Some("W5ABC/P".into()),
@@ -794,6 +800,7 @@ fn test_priority_scorer_prefers_pota() {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         },
     ];
 

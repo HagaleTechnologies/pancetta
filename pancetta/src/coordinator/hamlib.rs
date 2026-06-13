@@ -224,9 +224,17 @@ impl super::ApplicationCoordinator {
                     let mut poll_interval = interval(Duration::from_millis(500));
                     let mut consecutive_failures: u32 = 0;
                     const CRASH_WARN_THRESHOLD: u32 = 10; // 5 seconds of failures
+                    // S-meter poll: every 4th frequency tick (one
+                    // STRENGTH read per 2s). Modest on purpose — each
+                    // read is a rigctld round-trip on the same serial
+                    // CAT link the TX path uses, and the TUI only
+                    // renders it for situational awareness.
+                    const S_METER_EVERY_N_TICKS: u32 = 4;
+                    let mut tick_count: u32 = 0;
 
                     while !shutdown_for_polling.load(Ordering::Acquire) {
                         poll_interval.tick().await;
+                        tick_count = tick_count.wrapping_add(1);
 
                         let poll_ok = if let Ok(status) = rig_for_polling.get_status().await {
                             if status.connection_state
@@ -250,6 +258,29 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     let _ = message_bus.send_message(message).await;
+
+                                    // Batch 95: real rig S-meter for the
+                                    // TUI. Best-effort — a failed read
+                                    // (rig busy, no STRENGTH support)
+                                    // skips the update rather than
+                                    // counting as a poll failure; the
+                                    // TUI shows the reading as stale
+                                    // after 10s of silence.
+                                    if tick_count.is_multiple_of(S_METER_EVERY_N_TICKS) {
+                                        if let Ok(db) = rig_for_polling.get_s_meter().await {
+                                            let s_msg = ComponentMessage::new(
+                                                ComponentId::Hamlib,
+                                                ComponentId::Tui,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::SignalStrengthResponse {
+                                                        db_over_s9: db,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(s_msg).await;
+                                        }
+                                    }
                                     true
                                 } else {
                                     false

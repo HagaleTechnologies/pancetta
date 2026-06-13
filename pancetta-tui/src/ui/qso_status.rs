@@ -54,7 +54,7 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Header
     lines.push(Line::from(vec![Span::styled(
-        " Call       Freq     Mode  SNR  Exch ",
+        " Call       Freq     State         SNR  Exch ",
         Style::default()
             .fg(app.theme.accent_color())
             .add_modifier(Modifier::BOLD),
@@ -69,7 +69,7 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
         let freq = qso
             .frequency
             .map_or("---".to_string(), |f| format!("{:.0}", f));
-        let mode = qso.mode.as_deref().unwrap_or("FT8");
+        let state = qso.state.as_deref().unwrap_or("---");
         let snr = qso.snr_rx.map_or("---".to_string(), |s| format!("{:+}", s));
 
         lines.push(Line::from(vec![
@@ -84,7 +84,7 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(app.theme.warning_color()),
             ),
             Span::styled(
-                format!("{:<5}", mode),
+                format!("{:<13}", state),
                 Style::default().fg(app.theme.accent_color()),
             ),
             Span::styled(
@@ -125,8 +125,15 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
     let call_text = qso.call_sign.as_deref().unwrap_or("---");
     let freq_text = qso
         .frequency
-        .map_or("---".to_string(), |f| format!("{:.3}", f));
+        .map_or("---".to_string(), |f| format!("{:.0} Hz", f));
     let mode_text = qso.mode.as_deref().unwrap_or("---");
+    let state_text = qso.state.as_deref().unwrap_or("---");
+    let sent_text = qso
+        .report_sent
+        .map_or("---".to_string(), |r| format!("{:+}", r));
+    let rcvd_text = qso
+        .report_received
+        .map_or("---".to_string(), |r| format!("{:+}", r));
 
     let lines = vec![
         Line::from(vec![
@@ -160,6 +167,23 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(app.theme.success_color()),
             ),
         ]),
+        // Batch 94: state-machine phase + reports exchanged. The QSO
+        // engine pushes these live via ActiveQsosUpdate snapshots.
+        Line::from(vec![
+            Span::styled("State: ", Style::default().fg(app.theme.foreground_color())),
+            Span::styled(
+                state_text,
+                Style::default()
+                    .fg(app.theme.accent_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("Sent: ", Style::default().fg(app.theme.foreground_color())),
+            Span::styled(sent_text, Style::default().fg(app.theme.warning_color())),
+            Span::raw("  "),
+            Span::styled("Rcvd: ", Style::default().fg(app.theme.foreground_color())),
+            Span::styled(rcvd_text, Style::default().fg(app.theme.success_color())),
+        ]),
     ];
 
     let paragraph = Paragraph::new(lines);
@@ -169,26 +193,40 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     let qso = app.qso_status();
 
-    let tx_status = if let Some(last_tx) = qso.last_tx {
-        format!("TX: {}", format_time_ago(last_tx))
-    } else {
-        "TX: Never".to_string()
-    };
+    // Batch 94: show the last message exchanged in each direction, with
+    // a time-ago suffix when the timestamp is known.
+    let tx_status = format_direction_line("TX", qso.last_tx_text.as_deref(), qso.last_tx);
+    let rx_status = format_direction_line("RX", qso.last_rx_text.as_deref(), qso.last_rx);
 
-    let rx_status = if let Some(last_rx) = qso.last_rx {
-        format!("RX: {}", format_time_ago(last_rx))
-    } else {
-        "RX: Never".to_string()
-    };
-
-    let lines = vec![Line::from(vec![
-        Span::styled(tx_status, Style::default().fg(app.theme.warning_color())),
-        Span::raw("    "),
-        Span::styled(rx_status, Style::default().fg(app.theme.success_color())),
-    ])];
+    let lines = vec![
+        Line::from(Span::styled(
+            tx_status,
+            Style::default().fg(app.theme.warning_color()),
+        )),
+        Line::from(Span::styled(
+            rx_status,
+            Style::default().fg(app.theme.success_color()),
+        )),
+    ];
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
+}
+
+/// Build a "TX: JA1ABC K5ARH EM10 (12s ago)" style line for one
+/// direction of the last-message display. Falls back gracefully when
+/// only the timestamp or neither is known.
+fn format_direction_line(
+    label: &str,
+    text: Option<&str>,
+    at: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
+    match (text, at) {
+        (Some(text), Some(at)) => format!("{}: {} ({})", label, text, format_time_ago(at)),
+        (Some(text), None) => format!("{}: {}", label, text),
+        (None, Some(at)) => format!("{}: {}", label, format_time_ago(at)),
+        (None, None) => format!("{}: Never", label),
+    }
 }
 
 fn render_snr_meters(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -320,75 +358,9 @@ fn get_audio_level_color(level: f32, theme: &crate::config::Theme) -> ratatui::s
     }
 }
 
-/// Update QSO status based on new message
-pub fn update_qso_from_message(app: &mut App, message: &crate::app::DecodedMessageView) {
-    let our_call = &app.station_info.call_sign.to_uppercase();
-    let message_upper = message.message.to_uppercase();
-
-    // Check if this message involves our station
-    if message_upper.contains(our_call) {
-        // Extract the other station's call sign
-        if let Some(other_call) = extract_other_callsign(&message_upper, our_call) {
-            let qso = app.qso_status_mut();
-
-            if !qso.active {
-                // Start new QSO
-                qso.active = true;
-                qso.call_sign = Some(other_call);
-                qso.frequency = Some(message.frequency);
-                qso.mode = Some(message.mode.clone());
-                qso.started_at = Some(message.timestamp);
-                qso.exchange_count = 0;
-            }
-
-            // Update receive time and SNR
-            qso.last_rx = Some(message.timestamp);
-            qso.snr_rx = Some(message.snr);
-            qso.exchange_count += 1;
-        }
-    }
-}
-
-fn extract_other_callsign(message: &str, our_call: &str) -> Option<String> {
-    let parts: Vec<&str> = message.split_whitespace().collect();
-
-    for part in parts {
-        if part != our_call && is_valid_callsign(part) {
-            return Some(part.to_string());
-        }
-    }
-
-    None
-}
-
-fn is_valid_callsign(s: &str) -> bool {
-    // Basic callsign validation
-    s.len() >= 3
-        && s.len() <= 10
-        && s.chars().any(|c| c.is_ascii_alphabetic())
-        && s.chars().any(|c| c.is_ascii_digit())
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_extract_other_callsign() {
-        assert_eq!(
-            extract_other_callsign("K1ABC W2XYZ RRR", "K1ABC"),
-            Some("W2XYZ".to_string())
-        );
-        assert_eq!(
-            extract_other_callsign("W2XYZ K1ABC 73", "K1ABC"),
-            Some("W2XYZ".to_string())
-        );
-        assert_eq!(
-            extract_other_callsign("CQ DX K1ABC FN42", "W2XYZ"),
-            Some("K1ABC".to_string())
-        );
-    }
 
     #[test]
     fn test_snr_gauge_color() {
@@ -398,5 +370,24 @@ mod tests {
         assert_eq!(get_snr_gauge_color(15, &theme), theme.success_color());
         assert_eq!(get_snr_gauge_color(5, &theme), theme.warning_color());
         assert_eq!(get_snr_gauge_color(-15, &theme), theme.error_color());
+    }
+
+    /// Batch 94: the TX/RX line shows the last message text plus a
+    /// time-ago suffix, degrading gracefully when either is missing.
+    #[test]
+    fn test_format_direction_line() {
+        let at = chrono::Utc::now() - chrono::Duration::seconds(12);
+        let line = format_direction_line("TX", Some("JA1ABC K5ARH EM10"), Some(at));
+        assert!(line.starts_with("TX: JA1ABC K5ARH EM10 ("));
+        assert!(line.ends_with(')'));
+
+        assert_eq!(
+            format_direction_line("RX", Some("K5ARH JA1ABC -12"), None),
+            "RX: K5ARH JA1ABC -12"
+        );
+        assert_eq!(format_direction_line("RX", None, None), "RX: Never");
+        let only_time = format_direction_line("TX", None, Some(at));
+        assert!(only_time.starts_with("TX: "));
+        assert_ne!(only_time, "TX: Never");
     }
 }

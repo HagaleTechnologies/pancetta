@@ -23,6 +23,75 @@ use tracing::{debug, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
+/// hb-237 Session 3 — pure helper: translate the pancetta-qso
+/// [`pancetta_qso::A7SeedEntry`] cache entries into the decoder's ABI-
+/// stable [`pancetta_ft8::CrossSequenceSeed`] inputs.
+///
+/// The two types are deliberately decoupled: `A7SeedEntry` lives in
+/// pancetta-qso (which depends on pancetta-ft8), so pancetta-ft8 cannot
+/// see it. The coordinator owns the translation at the invocation
+/// boundary. See `research/specs/spec-wsjtr-cross-sequence-a7.md`
+/// §"State lives in pancetta-qso, not pancetta-ft8".
+///
+/// Partner callsign is currently left `None`; the cache records only
+/// the call1. A follow-on session can plumb call2 through.
+pub(crate) fn a7_seeds_to_cross_sequence_seeds(
+    seeds: &[pancetta_qso::A7SeedEntry],
+) -> Vec<pancetta_ft8::CrossSequenceSeed> {
+    seeds
+        .iter()
+        .map(|e| pancetta_ft8::CrossSequenceSeed {
+            callsign: e.callsign.clone(),
+            partner_callsign: None,
+            freq_hz: e.freq_hz,
+        })
+        .collect()
+}
+
+/// hb-237 Session 3 — pure helper: invoke the cross-sequence consumer
+/// and return the deduplicated subset of recovered decodes (those whose
+/// text is not already in `seen_texts`). Mutates `seen_texts` to absorb
+/// the newly added texts — keeping a single source of truth for what's
+/// been emitted to downstream.
+///
+/// Returns `(new_decodes, recovered_count)`. When the flag is OFF or
+/// seeds are empty, returns `(vec![], 0)` without touching the audio.
+///
+/// Inspired by spec ref `research/specs/spec-wsjtr-cross-sequence-a7.md`.
+pub(crate) fn invoke_cross_sequence_consumer(
+    decoder: &mut Ft8Decoder,
+    cross_seq_enabled: bool,
+    samples: &[f32],
+    seeds: &[pancetta_qso::A7SeedEntry],
+    seen_texts: &mut std::collections::HashSet<String>,
+) -> (Vec<pancetta_ft8::DecodedMessage>, usize) {
+    if !cross_seq_enabled || seeds.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let cs_seeds = a7_seeds_to_cross_sequence_seeds(seeds);
+    match decoder.try_cross_sequence_decodes(samples, &cs_seeds) {
+        Ok(extra) => {
+            let mut out = Vec::new();
+            let mut recovered = 0usize;
+            for msg in extra {
+                if seen_texts.insert(msg.text.clone()) {
+                    recovered += 1;
+                    out.push(msg);
+                }
+            }
+            (out, recovered)
+        }
+        Err(e) => {
+            warn!(
+                target: "hb237",
+                "cross-sequence A7 consumer error (continuing without): {}",
+                e,
+            );
+            (Vec::new(), 0)
+        }
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Start FT8 decoder with point-to-point channels.
     pub(crate) async fn start_ft8_pipeline(
@@ -72,7 +141,25 @@ impl super::ApplicationCoordinator {
         // p50=862ms / p99=2332ms), reliably finishing inside the slot
         // budget. Standard pipeline still runs after as the
         // authoritative result; the QSO state machine deduplicates.
+        //
+        // hb-229 — QSO partner band-collapse: the same shared state is
+        // ALSO consumed by the main native decode below. When a QSO is
+        // in flight (and `PANCETTA_QSO_FILTER_OFF` is not set), the
+        // main decode is narrowed to ±60 Hz around the partner. Pure
+        // operational CPU win; same recall in the target band.
         let active_qso_freq_hz = self.active_qso_freq_hz.clone();
+
+        // hb-229: cache the operator override once at thread start so
+        // the hot loop doesn't pay a syscall on every window. The
+        // env var is documented as set-at-startup; live re-reads would
+        // race the QSO state machine anyway.
+        let qso_filter_override_off = super::qso_filter::filter_disabled_by_env();
+        if qso_filter_override_off {
+            info!(
+                "hb-229: QSO partner band-collapse disabled by {}=1",
+                super::qso_filter::QSO_FILTER_OFF_ENV
+            );
+        }
 
         // hb-062: shared FP filter (Option<Arc<...>>). When Some, applied
         // between decode-merge and broadcast loop. None = no filtering.
@@ -82,6 +169,15 @@ impl super::ApplicationCoordinator {
         // Populated post-FP-filter so the three downstream tables never
         // ingest decodes the continuity filter judged false.
         let cross_time_state = self.cross_time_state.clone();
+
+        // hb-237: cross-sequence A7 callsign cache. Populated post-FP-filter
+        // so the cache only ever ingests trusted callsigns; the trust-gate
+        // is an additional defense (the spec calls out FP-amplification
+        // risk if seed callsigns are FPs). The cache is read at the start
+        // of each subsequent slot to surface opposite-parity seeds. Inert
+        // until `Ft8Config::cross_sequence_a7_enabled` flips true.
+        let cross_sequence_cache = self.cross_sequence_cache.clone();
+        let cross_sequence_fp_filter = self.fp_filter.clone();
 
         // Run FT8 decoder on a dedicated thread to avoid tokio starvation
         let handle = tokio::task::spawn_blocking(move || {
@@ -125,9 +221,14 @@ impl super::ApplicationCoordinator {
                         // window, rebuild the decoder. `try_read` keeps the
                         // hot loop non-blocking; on contention, we skip the
                         // check this iteration and pick it up on the next.
+                        // hb-237: cache the cross-sequence A7 enable flag
+                        // alongside the config-rebuild check so we read the
+                        // shared Ft8Config at most once per window.
+                        let mut cross_seq_enabled = false;
                         if let Ok(cfg_guard) = ft8_config_shared.try_read() {
                             let cur_max = cfg_guard.max_decode_passes;
                             let cur_osd = cfg_guard.osd_depth;
+                            cross_seq_enabled = cfg_guard.cross_sequence_a7_enabled;
                             if cur_max != last_max_passes || cur_osd != last_osd_depth {
                                 let new_cfg = cfg_guard.clone();
                                 drop(cfg_guard);
@@ -148,6 +249,55 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                         }
+
+                        // hb-237 cross-sequence A7 — pre-decode seed read
+                        // (Session 3 wiring).
+                        //
+                        // When `cross_sequence_a7_enabled` is true, look up
+                        // the prior slot's opposite-parity callsigns from
+                        // the cross-sequence cache. The seeds are kept in
+                        // scope for invocation AFTER the main decode merge
+                        // below; that's where the consumer
+                        // `decoder.try_cross_sequence_decodes` runs.
+                        // Inert by default (flag default-OFF).
+                        //
+                        // Inspired by spec ref
+                        // `research/specs/spec-wsjtr-cross-sequence-a7.md`
+                        // §1-§5 (state lifecycle + seed handoff).
+                        let cross_seq_seeds: Vec<pancetta_qso::A7SeedEntry> = if cross_seq_enabled {
+                            // The current window's parity (we treat the
+                            // current window as "slot N+1" for the
+                            // look-up — seeds are from slot N which is the
+                            // opposite parity).
+                            let now_slot_start =
+                                window_received_utc - chrono::Duration::seconds(13);
+                            let current_parity =
+                                pancetta_core::slot::SlotParity::of(now_slot_start);
+                            let opposite_parity: u8 = match current_parity {
+                                pancetta_core::slot::SlotParity::Even => 1,
+                                pancetta_core::slot::SlotParity::Odd => 0,
+                            };
+                            let seeds = cross_sequence_cache
+                                .read()
+                                .ok()
+                                .map(|cache_guard| {
+                                    cache_guard.get_a7_candidates_with_parity(
+                                        std::time::SystemTime::now(),
+                                        pancetta_qso::CROSS_SEQUENCE_DEFAULT_MAX_AGE_SLOTS,
+                                        opposite_parity,
+                                    )
+                                })
+                                .unwrap_or_default();
+                            debug!(
+                                target: "hb237",
+                                "cross-sequence A7: {} prior-slot opposite-parity seeds available (parity={})",
+                                seeds.len(),
+                                opposite_parity,
+                            );
+                            seeds
+                        } else {
+                            Vec::new()
+                        };
 
                         info!("FT8 decoder: received window ({} samples)", window.len());
 
@@ -272,8 +422,49 @@ impl super::ApplicationCoordinator {
                             recent_calls: recent_pool.clone(),
                             active_qso: current_qso_ap,
                         };
+
+                        // hb-229: QSO partner band-collapse. When a QSO is
+                        // active and the operator hasn't overridden via env
+                        // var, narrow the Costas sweep to ±60 Hz around the
+                        // partner's audio freq. The pure observer in
+                        // `qso_filter` maps Option<freq_hz> → Option<range>;
+                        // the FT8 layer's `decode_window_with_ap_scoped`
+                        // is the existing hb-091 hook that clamps the
+                        // sync sweep to the supplied bin range.
+                        //
+                        // hb-230: paired with band-collapse, expose the
+                        // partner audio freq to the decoder so the
+                        // relaxed-sync-threshold branch fires inside the
+                        // narrow window. Same QSO-filter override gates
+                        // both signals (the two mechanisms compose; an
+                        // operator who wants wide decode also wants the
+                        // standard sync threshold).
+                        let partner_freq_for_main = active_qso_freq_hz.read().ok().and_then(|g| *g);
+                        let narrow_filter_bins =
+                            super::qso_filter::compute_narrow_filter_bins_default(
+                                partner_freq_for_main,
+                                qso_filter_override_off,
+                            );
+                        let partner_freq_for_relaxed_sync =
+                            super::qso_filter::partner_freq_for_relaxed_sync(
+                                partner_freq_for_main,
+                                qso_filter_override_off,
+                            );
+                        if let Some(ref range) = narrow_filter_bins {
+                            debug!(
+                                "hb-229: narrowing main decode to freq_bins {}..={} (partner {:.1} Hz)",
+                                range.start(),
+                                range.end(),
+                                partner_freq_for_main.unwrap_or(0.0),
+                            );
+                        }
                         let native_messages = decoder
-                            .decode_window_with_ap(&window, &ap_context)
+                            .decode_window_with_ap_scoped_partner(
+                                &window,
+                                &ap_context,
+                                narrow_filter_bins,
+                                partner_freq_for_relaxed_sync,
+                            )
                             .unwrap_or_default();
 
                         // Merge: start with ft8_lib results, add any native-only
@@ -286,6 +477,50 @@ impl super::ApplicationCoordinator {
                                 decoded_messages.push(msg);
                             }
                         }
+
+                        // hb-237 cross-sequence A7 — consumer invocation
+                        // (Session 3). Runs AFTER the main decode merge so
+                        // the post-pass only attempts to recover decodes
+                        // that the standard pipeline missed. The consumer
+                        // itself defends-in-depth on
+                        // `cross_sequence_a7_enabled` (returns Ok([]) when
+                        // OFF) and on `seeds.is_empty()` (no-op).
+                        //
+                        // The consumer takes `CrossSequenceSeed` (the
+                        // decoder's own ABI-stable seed type), not
+                        // `A7SeedEntry` (the pancetta-qso cache entry) —
+                        // we translate at this boundary. Per the hb-237
+                        // spec §"State lives in pancetta-qso", the
+                        // decoder is stateless across slots; the
+                        // coordinator owns the translation.
+                        //
+                        // Partner callsign is left `None` in this session;
+                        // the cache currently records only the call1.
+                        // Without partner the consumer enumerates only
+                        // single-callsign templates from the existing a7
+                        // bank (see decoder §"Per-seed attempt — candidate
+                        // enumeration"). A follow-on session can plumb
+                        // call2 through the save filter.
+                        //
+                        // Inspired by spec ref
+                        // `research/specs/spec-wsjtr-cross-sequence-a7.md`
+                        // §4, §8-§11.
+                        let (new_decodes, cross_seq_recovered) = invoke_cross_sequence_consumer(
+                            &mut decoder,
+                            cross_seq_enabled,
+                            &window,
+                            &cross_seq_seeds,
+                            &mut seen_texts,
+                        );
+                        if cross_seq_enabled && !cross_seq_seeds.is_empty() {
+                            debug!(
+                                target: "hb237",
+                                "cross-sequence A7: seeds={} recovered={} (after dedup)",
+                                cross_seq_seeds.len(),
+                                cross_seq_recovered,
+                            );
+                        }
+                        decoded_messages.extend(new_decodes);
 
                         // Update decode timestamp
                         rt.block_on(async {
@@ -348,6 +583,51 @@ impl super::ApplicationCoordinator {
                                 slot_parity: parity_u8,
                                 at: decoded_msg.timestamp,
                             });
+
+                            // hb-237: cross-sequence A7 cache populate.
+                            // Only when the master flag is on, only for
+                            // decodes with a sender callsign and parity
+                            // tag, and only via the trust-gated insert
+                            // (FP-amplification mitigation; see hb-237
+                            // spec §"FP risk"). The trust filter is
+                            // shared with hb-062; when the filter is
+                            // absent we still admit on the assumption
+                            // that the post-FP-filter loop position
+                            // already filtered (the trust-gate is an
+                            // additional defense, not the only one).
+                            if cross_seq_enabled {
+                                if let (Some(ref call), Some(parity)) =
+                                    (&decoded_msg.message.from_callsign, parity_u8)
+                                {
+                                    if let Ok(mut cache_guard) = cross_sequence_cache.write() {
+                                        let admitted =
+                                            if let Some(ref filter) = cross_sequence_fp_filter {
+                                                cache_guard.record_decoded_trusted(
+                                                    call,
+                                                    decoded_msg.frequency_offset,
+                                                    parity,
+                                                    decoded_msg.timestamp,
+                                                    filter,
+                                                )
+                                            } else {
+                                                cache_guard.record_decoded(
+                                                    call,
+                                                    decoded_msg.frequency_offset,
+                                                    parity,
+                                                    decoded_msg.timestamp,
+                                                );
+                                                true
+                                            };
+                                        if !admitted {
+                                            debug!(
+                                                target: "hb237",
+                                                "cross-sequence A7: callsign {} not in trust set; not seeded",
+                                                call,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
 
                         for decoded_msg in &decoded_messages {
@@ -445,5 +725,223 @@ impl super::ApplicationCoordinator {
             .push((ComponentId::Ft8Decoder, handle));
         info!("FT8 component started");
         Ok(())
+    }
+}
+
+// =============================================================================
+// hb-237 Session 3 — coordinator-side cross-sequence A7 invocation tests
+// =============================================================================
+//
+// The hot loop inside `start_ft8_pipeline` is a `spawn_blocking` thread that
+// owns shared coordinator state and a real `Ft8Decoder` — exercising it
+// directly is impractical. Instead these tests target the pure helpers
+// extracted above: `a7_seeds_to_cross_sequence_seeds` (the boundary
+// translation) and `invoke_cross_sequence_consumer` (the invocation
+// wrapper). The helpers carry the same default-OFF guard and the same
+// dedup semantics the hot loop uses.
+//
+// Inspired by spec ref `research/specs/spec-wsjtr-cross-sequence-a7.md`.
+
+#[cfg(test)]
+mod cross_sequence_invocation_tests {
+    use super::{a7_seeds_to_cross_sequence_seeds, invoke_cross_sequence_consumer};
+    use pancetta_ft8::{Ft8Config, Ft8Decoder, WINDOW_SAMPLES};
+    use pancetta_qso::A7SeedEntry;
+    use std::collections::HashSet;
+    use std::time::SystemTime;
+
+    fn make_seed(call: &str, freq_hz: f64) -> A7SeedEntry {
+        A7SeedEntry {
+            callsign: call.to_string(),
+            freq_hz,
+            slot_parity: 0,
+            decoded_at: SystemTime::now(),
+        }
+    }
+
+    /// Translation correctness: callsign and freq are preserved 1:1;
+    /// partner is set to None in this session.
+    #[test]
+    fn seed_translation_preserves_callsign_and_freq() {
+        let seeds = vec![make_seed("K1ABC", 1200.0), make_seed("W2XYZ", 1500.5)];
+        let cs = a7_seeds_to_cross_sequence_seeds(&seeds);
+        assert_eq!(cs.len(), 2);
+        assert_eq!(cs[0].callsign, "K1ABC");
+        assert_eq!(cs[0].freq_hz, 1200.0);
+        assert!(cs[0].partner_callsign.is_none());
+        assert_eq!(cs[1].callsign, "W2XYZ");
+        assert_eq!(cs[1].freq_hz, 1500.5);
+        assert!(cs[1].partner_callsign.is_none());
+    }
+
+    /// Default-OFF contract: even with a non-empty seed list and a
+    /// non-empty audio buffer, the wrapper must return (vec![], 0)
+    /// without invoking the decoder. We confirm by also asserting
+    /// `seen_texts` is unchanged.
+    #[test]
+    fn default_off_returns_empty_without_invoking_decoder() {
+        let cfg = Ft8Config::default();
+        assert!(
+            !cfg.cross_sequence_a7_enabled,
+            "default config must keep cross-sequence A7 OFF"
+        );
+        let mut dec = Ft8Decoder::new(cfg).expect("decoder ctor");
+        let samples = vec![0.0f32; WINDOW_SAMPLES];
+        let seeds = vec![make_seed("K1ABC", 1200.0)];
+        let mut seen = HashSet::new();
+        seen.insert("already-emitted".to_string());
+
+        let (new_decodes, recovered) = invoke_cross_sequence_consumer(
+            &mut dec, /* enabled (coordinator-side gate) */ false, &samples, &seeds, &mut seen,
+        );
+        assert!(
+            new_decodes.is_empty(),
+            "default-OFF must produce no decodes"
+        );
+        assert_eq!(recovered, 0, "default-OFF must report 0 recovered");
+        assert_eq!(
+            seen.len(),
+            1,
+            "default-OFF must not perturb the seen-texts dedup set"
+        );
+    }
+
+    /// Empty-seed no-op: coordinator-side flag ON but empty cache.
+    /// Consumer's own empty-seed guard short-circuits.
+    #[test]
+    fn enabled_with_empty_seeds_is_noop() {
+        let cfg = Ft8Config {
+            cross_sequence_a7_enabled: true,
+            ..Ft8Config::default()
+        };
+        let mut dec = Ft8Decoder::new(cfg).expect("decoder ctor");
+        let samples = vec![0.0f32; WINDOW_SAMPLES];
+        let seeds: Vec<A7SeedEntry> = Vec::new();
+        let mut seen = HashSet::new();
+
+        let (new_decodes, recovered) =
+            invoke_cross_sequence_consumer(&mut dec, true, &samples, &seeds, &mut seen);
+        assert!(new_decodes.is_empty(), "empty-seed must produce no decodes");
+        assert_eq!(recovered, 0);
+    }
+
+    /// End-to-end: with the flag ON, a populated seed list, and a
+    /// synthetic WAV containing a reply rooted at the seeded callsign,
+    /// the wrapper must return at least one decode flagged with
+    /// `via_cross_sequence_a7 = true`. This mirrors the decoder's own
+    /// `seeded_consumer_emits_cross_sequence_provenance` test but
+    /// exercises the coordinator-side wrapper end-to-end.
+    ///
+    /// Note: this session's coordinator translation passes
+    /// `partner_callsign: None` (the cache only stores call1). The
+    /// decoder's a7 template generator falls back to
+    /// `A7_FALLBACK_CALLS = ["K1ABC", "W1AW", ...]` for the "other"
+    /// party. The synthesized reply uses W1AW (a fallback callsign)
+    /// so the templates match. A follow-on session can plumb call2
+    /// through the cache to remove the fallback dependence.
+    #[test]
+    fn enabled_with_seeded_reply_recovers_via_cross_sequence() {
+        let reply_text = "W1AW K1ABC 73";
+        let mut encoder = pancetta_ft8::Ft8Encoder::new();
+        let symbols = encoder.encode_message(reply_text, None).expect("encode");
+        let mut modulator = pancetta_ft8::Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        // Relax the a7 thresholds for the synthetic clean signal (see
+        // the decoder-side seeded test's rationale).
+        let cfg = Ft8Config {
+            cross_sequence_a7_enabled: true,
+            a7_snr7_threshold: 2.0,
+            a7_snr7b_threshold: 1.05,
+            ..Ft8Config::default()
+        };
+        let mut dec = Ft8Decoder::new(cfg).expect("decoder ctor");
+
+        // Seed: K1ABC was decoded in the prior slot at 2000 Hz (base
+        // 1500 + offset 500 from the modulator).
+        let seeds = vec![make_seed("K1ABC", 2000.0)];
+        let mut seen = HashSet::new();
+
+        let (new_decodes, recovered) =
+            invoke_cross_sequence_consumer(&mut dec, true, &tx, &seeds, &mut seen);
+        assert!(
+            !new_decodes.is_empty(),
+            "wrapper should emit at least one decode for a seeded reply; recovered={}",
+            recovered
+        );
+        // All recovered decodes must carry the provenance flag.
+        for m in &new_decodes {
+            assert!(
+                m.via_cross_sequence_a7,
+                "all wrapper-recovered decodes must have via_cross_sequence_a7=true; got {:?}",
+                m.text
+            );
+        }
+        let has_target = new_decodes
+            .iter()
+            .any(|m| m.text == reply_text && m.via_cross_sequence_a7);
+        assert!(
+            has_target,
+            "wrapper should emit reply '{}' with via_cross_sequence_a7=true; got texts: {:?}",
+            reply_text,
+            new_decodes
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>()
+        );
+        // And `seen` must contain the recovered text now — proving the
+        // dedup substrate was mutated.
+        assert!(
+            seen.contains(reply_text),
+            "wrapper must update the seen-texts dedup set with recovered decodes"
+        );
+    }
+
+    /// Dedup contract: a recovered decode whose text is already in
+    /// `seen_texts` must NOT be re-emitted by the wrapper (the main
+    /// pipeline already handled it). The recovered counter must
+    /// reflect post-dedup additions only. Uses the same W1AW-fallback
+    /// reply as the recovery test so it actually matches a template.
+    #[test]
+    fn dedup_skips_recovered_decodes_already_in_seen_set() {
+        let reply_text = "W1AW K1ABC 73";
+        let mut encoder = pancetta_ft8::Ft8Encoder::new();
+        let symbols = encoder.encode_message(reply_text, None).expect("encode");
+        let mut modulator = pancetta_ft8::Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let cfg = Ft8Config {
+            cross_sequence_a7_enabled: true,
+            a7_snr7_threshold: 2.0,
+            a7_snr7b_threshold: 1.05,
+            ..Ft8Config::default()
+        };
+        let mut dec = Ft8Decoder::new(cfg).expect("decoder ctor");
+        let seeds = vec![make_seed("K1ABC", 2000.0)];
+
+        // Pre-populate `seen` with the very text we expect to recover.
+        // The consumer may emit OTHER templates the WAV also matches —
+        // the dedup contract is per-text, not all-or-nothing — so we
+        // only assert the seeded text is suppressed.
+        let mut seen = HashSet::new();
+        seen.insert(reply_text.to_string());
+
+        let (new_decodes, _recovered) =
+            invoke_cross_sequence_consumer(&mut dec, true, &tx, &seeds, &mut seen);
+        let leaked = new_decodes.iter().any(|m| m.text == reply_text);
+        assert!(
+            !leaked,
+            "dedup must suppress the specific text already in seen-set; new_decodes={:?}",
+            new_decodes
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 }

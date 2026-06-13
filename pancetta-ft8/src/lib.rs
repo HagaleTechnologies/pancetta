@@ -124,12 +124,31 @@ pub mod transmit;
 // hb-216: runtime hardware-tier classifier.
 pub mod tier_probe;
 
+// hb-244: JS8Call-Improved soft combiner across repeated receptions.
+// Module shipped in be8d67e; decoder wiring is opt-in via
+// `Ft8Config::soft_combiner_enabled` (default OFF) pending hard-200
+// measurement validation.
+pub mod soft_combiner;
+pub use soft_combiner::{
+    CombineResult, CombinerKey, Mode as SoftCombinerMode, SoftCombiner, SoftCombinerConfig,
+};
+
+// JS8Call-Improved-style per-candidate adaptive frequency tracker. Module
+// is wired into the decoder's fine-FFT path; gated OFF by default via
+// `Ft8Config::per_candidate_freq_tracker_enabled`. Inspired by spec ref
+// `research/specs/spec-js8call-per-candidate-frequency-tracker.md`
+// (peer source GPL-3.0 not consulted).
+pub mod freq_tracker;
+pub use freq_tracker::{FreqTrackerConfig, FrequencyTracker};
+
 // Protocol exports
 pub use protocol::{ModulationType, Protocol, ProtocolParams};
 
 // Core decoding exports
-pub use decoder::{Ft8Config, Ft8Decoder, WaterfallData};
-pub use message::{DecodedMessage, Ft8Message, MessageType};
+pub use decoder::{
+    CrossSequenceSeed, Ft8Config, Ft8Decoder, LlrMetric, SyncCandidateRecord, WaterfallData,
+};
+pub use message::{ConfidenceFeatures, DecodedMessage, Ft8Message, MessageType};
 pub use signal_processing::{FftProcessor, WindowFunction};
 pub use sync::{SyncResult, TimeSync};
 

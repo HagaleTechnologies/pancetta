@@ -145,6 +145,14 @@ pub enum MessageType {
         duration_ms: u64,
     },
 
+    /// TX-active indicator for the TUI title-bar badge (Batch 93).
+    /// The TX worker sends `active: true` when PTT is asserted and
+    /// `active: false` when the transmission ends — via an RAII
+    /// observer guard, so abort paths (F8, Shift+Q, shutdown) clear
+    /// it just like normal completion. Observation only: this message
+    /// never drives PTT or audio.
+    TxStatus { active: bool },
+
     /// Autonomous operator status update
     AutonomousStatus(AutonomousStatusData),
 
@@ -195,9 +203,9 @@ pub struct TransmitRequestItem {
 }
 
 /// One item in a `MessageType::ActiveQsosSnapshot` payload — flattened
-/// view of an in-progress QSO with just the fields the TUI banner
-/// needs. Decoupled from `pancetta-qso::QsoState` so the TUI doesn't
-/// link the QSO crate.
+/// view of an in-progress QSO with the fields the TUI banner AND the
+/// QSO-detail panel need. Decoupled from `pancetta-qso::QsoState` so
+/// the TUI doesn't link the QSO crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveQsoSnapshotItem {
     /// Other station's callsign.
@@ -212,6 +220,23 @@ pub struct ActiveQsoSnapshotItem {
     /// waterfall to color the occupancy strip and TX cursor by "is this
     /// slot mine."
     pub tx_parity: Option<pancetta_core::slot::SlotParity>,
+    /// Raw text of the last message we transmitted in this QSO (Batch 94:
+    /// drives the QSO-detail panel's TX line).
+    pub last_tx_text: Option<String>,
+    /// When the last TX message was recorded.
+    pub last_tx_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Raw text of the last message we received from the contra station.
+    pub last_rx_text: Option<String>,
+    /// When the last RX message was recorded.
+    pub last_rx_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Measured SNR (dB) of the last message received from them.
+    pub snr_rx: Option<i32>,
+    /// Signal report we sent them (their signal at our end).
+    pub report_sent: Option<i32>,
+    /// Signal report we received from them (our signal at their end).
+    pub report_received: Option<i32>,
+    /// Total messages exchanged (both directions) so far in this QSO.
+    pub exchange_count: u32,
 }
 
 /// Status data from the autonomous operator for TUI consumption.
@@ -247,8 +272,12 @@ pub enum RigControlMessage {
     SetPtt { state: bool },
     /// Get signal strength
     GetSignalStrength,
-    /// Signal strength response
-    SignalStrengthResponse { dbm: i32 },
+    /// Signal strength response from the rig's S-meter. Value follows
+    /// the hamlib STRENGTH convention: dB relative to S9 (0 = S9,
+    /// -54 ≈ S0, +20 = S9+20). Produced by the hamlib polling loop
+    /// (Batch 95) from real `\get_level STRENGTH` reads — never
+    /// synthesized.
+    SignalStrengthResponse { db_over_s9: i32 },
 }
 
 /// QSO management messages
@@ -264,8 +293,6 @@ pub enum QsoMessage {
     EndQso { qso_id: String },
     /// Log QSO
     LogQso { qso_data: String },
-    /// QSO state update
-    QsoStateUpdate { qso_id: String, state: String },
 }
 
 /// DX cluster messages

@@ -245,6 +245,13 @@ pub struct DecodedMessageInfo {
     /// seconds. `None` for messages from test scaffolding or pre-hb-103
     /// code paths. Used as a content-score input.
     pub time_offset_s: Option<f64>,
+    /// hb-247 (Batch 81): deterministic decode-origin ordinal from
+    /// `ConfidenceFeatures::decode_origin` (0 = primary pass … 6 =
+    /// sync relaxation, 7 = hb-252 BICM-ID rescue). Feeds the v3
+    /// content score's lateness term (`origin / 6`, clamped to 1.0 —
+    /// origin 7 saturates at the max penalty by design). `None` for
+    /// pre-hb-247 paths and test scaffolding.
+    pub decode_origin: Option<u8>,
 }
 
 /// Result of a collision check on a listen slot.
@@ -334,6 +341,9 @@ pub struct CqCandidate {
     /// hb-103 (Batch 32): time offset of the decode within its slot.
     /// `None` for pre-hb-103 code paths.
     pub time_offset_s: Option<f64>,
+    /// hb-247 (Batch 81): decode-origin ordinal carried from the
+    /// originating `DecodedMessageInfo`; v3 content-score input.
+    pub decode_origin: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -869,6 +879,7 @@ impl AutonomousOperator {
                         message_text: msg.message_text.clone(),
                         confidence: msg.confidence,
                         time_offset_s: msg.time_offset_s,
+                        decode_origin: msg.decode_origin,
                     });
                 }
             }
@@ -1093,7 +1104,12 @@ impl AutonomousOperator {
                             message_text: msg,
                             frequency_offset: freq,
                             qso_id,
-                            // TODO: thread parity from heard slot (Task 15)
+                            // No parity here by design: this path is only fed via
+                            // {set,add}_pending_sequencer_message, which production
+                            // never calls — live mid-QSO TX flows through
+                            // QsoManager::send_message → QsoEvent::MessageToSend,
+                            // which carries the tx_parity latched at QSO start.
+                            // The TX scheduler falls back to config self-parity.
                             tx_parity: None,
                         });
                         tx_count += 1;
@@ -1167,13 +1183,39 @@ impl AutonomousOperator {
                         // pre-hb-103 paths) pass through.
                         .filter(|cq| match (fp.as_ref(), cq.confidence, cq.time_offset_s) {
                             (Some(f), Some(conf), Some(dt)) => {
-                                use crate::content_score::{content_score_from_features, ContentFeatures, MessageContentScore};
-                                let score = content_score_from_features(
+                                use crate::content_score::{content_score_v3_from_features, ContentFeatures, MessageContentScore};
+                                // hb-103 v3 gate (Batch 81): v3 at the
+                                // unchanged SHIP_CONSERVATIVE threshold is
+                                // byte-identical to the old v1 gate for
+                                // primary-pass decodes (origin 0 → lateness
+                                // term 0, FDR telemetry None → v2 ≡ v1) and
+                                // strictly tightens recovery-pass decodes
+                                // (-origin/6). Measured strictly dominant-
+                                // or-equal to v1 at every τ on hard_200 +
+                                // raw_530 CQ populations (Batch 81 note).
+                                // The threshold itself is a separate
+                                // operator-posture lever: 0.90 would add
+                                // +9-12pp FP rejection at 100% measured
+                                // recall but cuts the recall margin from
+                                // 0.72 to 0.17 (v1 min-TP score = 1.07).
+                                let score = content_score_v3_from_features(
                                     ContentFeatures {
                                         text: &cq.message_text,
                                         confidence: conf,
                                         snr_db: cq.snr as f32,
                                         time_offset: dt,
+                                        // Batch 64: FDR ConfidenceFeatures
+                                        // still not plumbed to this path;
+                                        // v3 reduces to v1 + lateness term.
+                                        bp_iterations_used: None,
+                                        osd_depth_used: None,
+                                        nharderrs: None,
+                                        min_llr_magnitude: None,
+                                        // hb-247 (Batch 81): deterministic
+                                        // decode-origin ordinal / 6.
+                                        lateness_frac: cq
+                                            .decode_origin
+                                            .map(|o| f64::from(o) / 6.0),
                                     },
                                     f,
                                 );
@@ -1181,11 +1223,12 @@ impl AutonomousOperator {
                                 if !pass {
                                     debug!(
                                         target: "qso.security",
-                                        "rejecting CQ response: hb-103 content score (callsign={}, dx_score={:.2}, content_score={:.3}, threshold={:.3})",
+                                        "rejecting CQ response: hb-103 v3 content score (callsign={}, dx_score={:.2}, content_score={:.3}, threshold={:.3}, decode_origin={:?})",
                                         cq.callsign,
                                         cq.dx_score,
                                         score,
                                         MessageContentScore::SHIP_CONSERVATIVE,
+                                        cq.decode_origin,
                                     );
                                 }
                                 pass
@@ -1428,6 +1471,7 @@ mod tests {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         }];
 
         let result = detector.check_for_collision(&messages);
@@ -1445,6 +1489,7 @@ mod tests {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         }];
 
         let result = detector.check_for_collision(&messages);
@@ -1541,6 +1586,7 @@ mod tests {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         }];
         let evaluator = NullDxEvaluator; // returns 0.5, above our 0.3 threshold
         op.feed_decoded_messages(&messages, &evaluator);
@@ -1587,6 +1633,7 @@ mod tests {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         }];
         op.feed_decoded_messages(&messages, &NullDxEvaluator);
 
@@ -1630,6 +1677,7 @@ mod tests {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         }];
         op.feed_decoded_messages(&messages, &NullDxEvaluator);
 
@@ -1677,6 +1725,7 @@ mod tests {
             slot_parity: None,
             confidence: Some(0.1),
             time_offset_s: Some(12.0),
+            decode_origin: None,
         }];
         op.feed_decoded_messages(&messages, &NullDxEvaluator);
 
@@ -1692,6 +1741,68 @@ mod tests {
         assert!(
             !has_response,
             "Expected hb-103 content-score gate to block low-score CQ even when callsign is trusted"
+        );
+    }
+
+    #[test]
+    fn test_v3_gate_origin_penalty_rejects_recovery_pass_cq() {
+        // hb-247 (Batch 81): the v3 gate subtracts decode_origin/6.
+        // Build a CQ whose v1-equivalent score sits between
+        // SHIP_CONSERVATIVE and SHIP_CONSERVATIVE + 1 so that an
+        // aggressive-recovery origin (6 → penalty 1.0) pushes it below
+        // the threshold, while the same decode at origin 0 / None passes.
+        // Trusted callsign (mirrors the existing gate fixtures):
+        // 1 (any-trust) + 0.5 (conf) - 0.1*4 (dt) + 0.05*-5 (snr)
+        // = 0.85 → above +0.35; minus 6/6 = -0.15 → below.
+        let make_op = || {
+            let mut config = AutonomousConfig::default();
+            config.enabled = true;
+            config.slot_parity = SlotParityConfig::Even;
+            config.min_dx_score = 0.0;
+            config.listen_cycle.initial_interval = 100;
+            let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+            let mut filter = crate::callsign_continuity::CallsignContinuityFilter::new(100);
+            filter.extend_from_iter(["K9ZZ"]);
+            op.set_fp_filter(Some(std::sync::Arc::new(filter)));
+            op
+        };
+        let msg = |origin: Option<u8>| {
+            vec![DecodedMessageInfo {
+                callsign: Some("K9ZZ".into()),
+                frequency_hz: 1500.0,
+                snr: -5,
+                message_text: "CQ K9ZZ EM48".into(),
+                slot_parity: None,
+                confidence: Some(0.5),
+                time_offset_s: Some(4.0),
+                decode_origin: origin,
+            }]
+        };
+        let responded = |actions: &[OperatorAction]| {
+            actions.iter().any(|a| {
+                matches!(a, OperatorAction::Transmit { message_text, .. } if message_text.contains("K9ZZ"))
+            })
+        };
+
+        let mut op = make_op();
+        op.feed_decoded_messages(&msg(None), &NullDxEvaluator);
+        assert!(
+            responded(&op.decide_at(0)),
+            "origin=None must behave like the old v1 gate (score 0.85 > 0.35)"
+        );
+
+        let mut op = make_op();
+        op.feed_decoded_messages(&msg(Some(0)), &NullDxEvaluator);
+        assert!(
+            responded(&op.decide_at(0)),
+            "origin=0 (primary pass) must be byte-identical to v1 gate"
+        );
+
+        let mut op = make_op();
+        op.feed_decoded_messages(&msg(Some(6)), &NullDxEvaluator);
+        assert!(
+            !responded(&op.decide_at(0)),
+            "origin=6 penalty (-1.0) must push 0.85 below SHIP_CONSERVATIVE"
         );
     }
 
@@ -1723,6 +1834,7 @@ mod tests {
             slot_parity: None,
             confidence: Some(0.95),
             time_offset_s: Some(1.0),
+            decode_origin: None,
         }];
         op.feed_decoded_messages(&messages, &NullDxEvaluator);
 
@@ -1888,6 +2000,7 @@ mod tests {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         }];
         let evaluator = NullDxEvaluator;
         op.feed_decoded_messages(&messages, &evaluator);
@@ -1934,6 +2047,7 @@ mod tests {
             slot_parity: None,
             confidence: None,
             time_offset_s: None,
+            decode_origin: None,
         }];
         let evaluator = NullDxEvaluator;
         op.feed_decoded_messages(&messages, &evaluator);
@@ -1995,6 +2109,7 @@ mod tests {
                 slot_parity: None,
                 confidence: None,
                 time_offset_s: None,
+                decode_origin: None,
             }],
             &evaluator,
         );
@@ -2047,6 +2162,7 @@ mod tests {
                 slot_parity: None,
                 confidence: None,
                 time_offset_s: None,
+                decode_origin: None,
             }],
             &evaluator,
         );
@@ -2102,6 +2218,7 @@ mod tests {
                 slot_parity: None,
                 confidence: None,
                 time_offset_s: None,
+                decode_origin: None,
             }],
             &evaluator,
         );

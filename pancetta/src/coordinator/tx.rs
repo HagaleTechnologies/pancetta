@@ -140,6 +140,59 @@ impl PttGuard {
     }
 }
 
+/// Observer-only RAII guard for the TUI's TX-active badge (Batch 93).
+///
+/// Constructed right after `PttGuard` when PTT is asserted; its `Drop`
+/// sends `MessageType::TxStatus { active: false }` to the TUI relay.
+/// Because every exit from a TX arm — normal completion, operator abort
+/// (F8 / Shift+Q `continue`), or shutdown `break` — drops the guard,
+/// the badge clears on abort paths too, not just clean completion.
+///
+/// Strictly observational: it never touches PTT, audio, or scheduling.
+/// The corresponding `active: true` is sent explicitly via
+/// `send_tx_status` at PTT assert (async context is available there;
+/// `Drop` is not async, hence the spawned fire-and-forget task).
+struct TxStatusGuard {
+    message_bus: MessageBus,
+}
+
+impl TxStatusGuard {
+    fn new(message_bus: MessageBus) -> Self {
+        Self { message_bus }
+    }
+}
+
+impl Drop for TxStatusGuard {
+    fn drop(&mut self) {
+        let bus = self.message_bus.clone();
+        let _ = tokio::task::spawn(async move {
+            let msg = ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Tui,
+                MessageType::TxStatus { active: false },
+                Instant::now(),
+            );
+            if let Err(e) = bus.send_message(msg).await {
+                tracing::debug!("TxStatus(false) relay failed (no TUI?): {}", e);
+            }
+        });
+    }
+}
+
+/// Notify the TUI of TX activity. Best-effort: failure (e.g. headless,
+/// no TUI channel) is logged at debug and never affects the TX path.
+async fn send_tx_status(message_bus: &MessageBus, active: bool) {
+    let msg = ComponentMessage::new(
+        ComponentId::Ft8Transmitter,
+        ComponentId::Tui,
+        MessageType::TxStatus { active },
+        Instant::now(),
+    );
+    if let Err(e) = message_bus.send_message(msg).await {
+        tracing::debug!("TxStatus({}) relay failed (no TUI?): {}", active, e);
+    }
+}
+
 impl Drop for PttGuard {
     fn drop(&mut self) {
         if self.armed {
@@ -363,6 +416,10 @@ impl super::ApplicationCoordinator {
 
                                     // --- Step 5: Assert PTT ---
                                     let mut ptt_guard = PttGuard::new(message_bus.clone());
+                                    // TX badge on; guard drop clears it on every
+                                    // exit path (complete / abort / shutdown).
+                                    let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
+                                    send_tx_status(&message_bus, true).await;
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -638,6 +695,10 @@ impl super::ApplicationCoordinator {
 
                                     // --- Step 5: Assert PTT ---
                                     let mut ptt_guard = PttGuard::new(message_bus.clone());
+                                    // TX badge on; guard drop clears it on every
+                                    // exit path (complete / abort / shutdown).
+                                    let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
+                                    send_tx_status(&message_bus, true).await;
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -776,6 +837,10 @@ impl super::ApplicationCoordinator {
                                     // Engage PTT immediately. No slot
                                     // scheduling: tune happens NOW.
                                     let mut ptt_guard = PttGuard::new(message_bus.clone());
+                                    // TX badge on; guard drop clears it on every
+                                    // exit path (complete / abort / shutdown).
+                                    let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
+                                    send_tx_status(&message_bus, true).await;
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,

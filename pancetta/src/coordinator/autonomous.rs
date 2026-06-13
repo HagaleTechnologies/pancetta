@@ -475,6 +475,11 @@ impl super::ApplicationCoordinator {
                                                 // content-score TX gate in autonomous.decide().
                                                 confidence: Some(decoded_msg.confidence),
                                                 time_offset_s: Some(decoded_msg.time_offset),
+                                                // hb-247 (Batch 81): v3 lateness term source.
+                                                decode_origin: decoded_msg
+                                                    .confidence_features
+                                                    .as_ref()
+                                                    .and_then(|c| c.decode_origin),
                                             });
                                         }
                                     }

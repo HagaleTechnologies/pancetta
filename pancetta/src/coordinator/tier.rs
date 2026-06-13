@@ -20,9 +20,9 @@
 //!
 //! | env var | probe result | atomic final | Ft8Config preset                       |
 //! |---------|--------------|--------------|----------------------------------------|
-//! | unset   | Fast         | false        | Fast preset (mp=2, ldpc_iters=200)     |
+//! | unset   | Fast         | false        | none (defaults; preset retired Batch 83) |
 //! | unset   | Moderate     | true         | none (defaults)                        |
-//! | unset   | Slow         | true         | Slow preset (mp=1, osd_depth=Some(1))  |
+//! | unset   | Slow         | true         | Slow preset (mp=1, max_sync_candidates=150) |
 //! | `"1"`   | (any)        | true         | none (operator chose)                  |
 //! | `"0"`   | (any)        | false        | none (operator chose)                  |
 //!
@@ -272,18 +272,30 @@ pub(crate) async fn apply_tier(
     // — the operator's env var settings always win.
     let config_change = if override_ == Override::None {
         match tier {
-            HardwareTier::Fast => {
-                let mut cfg = ft8_config.write().await;
-                cfg.max_decode_passes = 2;
-                cfg.ldpc_iterations = 200;
-                " + Ft8Config fast preset (max_decode_passes=2, ldpc_iterations=200)"
-            }
+            // Batch 83: the old Fast preset (max_decode_passes=2,
+            // ldpc_iterations=200, from Batch 36 B1's pancetta-truth-era
+            // "+32 TPs") was re-measured under ft8_lib truth at the
+            // current defaults: +24..+57 TPs for +142..+387 FPs
+            // (5.9-10 FPs per TP) at 2.6-3.9x decode time on
+            // hard_1000 / raw_530_full — strictly dominated by the
+            // ldpc_iterations=300 recall lever (~2.3 FP/TP, Batch 82).
+            // Fast hardware now runs plain defaults; the recall levers
+            // are operator decisions (see hypothesis bank, hb-247 note).
+            HardwareTier::Fast => "",
             HardwareTier::Moderate => "",
             HardwareTier::Slow => {
                 let mut cfg = ft8_config.write().await;
                 cfg.max_decode_passes = 1;
-                cfg.osd_depth = Some(1);
-                " + Ft8Config slow preset (max_decode_passes=1, osd_depth=Some(1))"
+                // osd_depth deliberately left at the default (Some(0)
+                // since Batch 72). The old `Some(1)` here predated that
+                // ship: it was a *reduction* from the Some(2)-era
+                // default, but on top of Some(0) it would now ADD ~77
+                // FPs for +1 TP (Batch 72 hard_1000 OSD sweep).
+                // Batch 78: cap sync candidates at 150 on slow hardware
+                // (−0.06..−0.15% recall, −16% FPs, 2.3× decode speed on
+                // raw_530_full/hard_1000 with ft8_lib truth).
+                cfg.max_sync_candidates = 150;
+                " + Ft8Config slow preset (max_decode_passes=1, max_sync_candidates=150)"
             }
         }
     } else {
@@ -514,21 +526,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_tier_fast_no_override_writes_fast_preset() {
-        // Batch 36 B1: Fast tier bumps max_decode_passes to 2 to spend
-        // available compute budget on the ~+32-TP multipass=2 lift.
-        // Batch 41: also bumps ldpc_iterations to 200 for the ~+16 TP
-        // LDPC-iter lift on hard-200.
+    async fn apply_tier_fast_no_override_leaves_config_at_defaults() {
+        // Batch 83: the Batch 36/41 Fast preset (mp=2, ldpc=200) was
+        // retired — under ft8_lib truth it bought +24..+57 TPs for
+        // +142..+387 FPs at 2.6-3.9x decode time, strictly dominated
+        // by the ldpc=300 recall lever. Fast tier now runs defaults.
         let atomic = AtomicBool::new(true); // pre-set to verify it gets cleared
         let cfg = RwLock::new(Ft8Config::default());
-        let before_osd = cfg.read().await.osd_depth;
+        let before = cfg.read().await.clone();
         apply_tier(HardwareTier::Fast, Override::None, &atomic, &cfg).await;
         assert!(!atomic.load(Ordering::Acquire));
         let c = cfg.read().await;
-        assert_eq!(c.max_decode_passes, 2);
-        assert_eq!(c.ldpc_iterations, 200);
-        // osd_depth left alone on Fast tier (only Slow rewrites it).
-        assert_eq!(c.osd_depth, before_osd);
+        assert_eq!(c.max_decode_passes, before.max_decode_passes);
+        assert_eq!(c.ldpc_iterations, before.ldpc_iterations);
+        assert_eq!(c.osd_depth, before.osd_depth);
+        assert_eq!(c.max_sync_candidates, before.max_sync_candidates);
     }
 
     #[tokio::test]
@@ -560,7 +572,10 @@ mod tests {
         assert!(atomic.load(Ordering::Acquire));
         let c = cfg.read().await;
         assert_eq!(c.max_decode_passes, 1);
-        assert_eq!(c.osd_depth, Some(1));
+        // Batch 78: Slow preset caps sync candidates and leaves
+        // osd_depth at the (Batch 72) default.
+        assert_eq!(c.max_sync_candidates, 150);
+        assert_eq!(c.osd_depth, Ft8Config::default().osd_depth);
     }
 
     #[tokio::test]

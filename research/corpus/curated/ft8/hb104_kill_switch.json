@@ -1,0 +1,709 @@
+{
+ "schema_version": 1,
+ "label": "hb104_kill_switch",
+ "source": "batch86_select_slots.py (scan=raw_20260530, truth=ft8_lib batch85)",
+ "freq_gate_hz": 6.25,
+ "time_gate_sec": 2.0,
+ "entries": [
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_154228.wav",
+   "wav_sha256": "70ad8e7032847b6ad8086f145b92e346ee5c0428cdcaa16e9d72aa3fdc8b606b",
+   "n_pairs": 5,
+   "pairs": [
+    {
+     "miss_message": "<...> WZ8DX EM79",
+     "miss_freq_hz": 1321.875,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> WZ8DX EM79",
+     "neighbor_freq_hz": 1321.875,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> WZ8DX EM79",
+     "miss_freq_hz": 1321.875,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3118> E19GDJ/P EM71",
+     "neighbor_freq_hz": 1325.0,
+     "neighbor_dt_sec": 2.64
+    },
+    {
+     "miss_message": "<...> WB8TLI EN70",
+     "miss_freq_hz": 925.0,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> WB8TLI EN70",
+     "neighbor_freq_hz": 925.0,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> N0CVP DM41",
+     "miss_freq_hz": 1931.25,
+     "miss_time_sec": 2.879999876022339,
+     "neighbor_text": "<...476> N0CVP DM41",
+     "neighbor_freq_hz": 1931.25,
+     "neighbor_dt_sec": 2.88
+    },
+    {
+     "miss_message": "<...> K2BAG DM33",
+     "miss_freq_hz": 831.25,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...476> K2BAG DM33",
+     "neighbor_freq_hz": 831.25,
+     "neighbor_dt_sec": 2.72
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_170958.wav",
+   "wav_sha256": "99191c6681f9b3649e089afa88c070f4dd13b5398bd5e0ded1a8d781005dce44",
+   "n_pairs": 5,
+   "pairs": [
+    {
+     "miss_message": "<...> KF0RRJ R-07",
+     "miss_freq_hz": 2196.875,
+     "miss_time_sec": 1.9199999570846558,
+     "neighbor_text": "<...3631> KF0RRJ R-07",
+     "neighbor_freq_hz": 2196.875,
+     "neighbor_dt_sec": 1.92
+    },
+    {
+     "miss_message": "<...> KB9DED EN54",
+     "miss_freq_hz": 2387.5,
+     "miss_time_sec": 2.559999942779541,
+     "neighbor_text": "<...3631> KB9DED EN54",
+     "neighbor_freq_hz": 2387.5,
+     "neighbor_dt_sec": 2.56
+    },
+    {
+     "miss_message": "<...> KB9DED EN54",
+     "miss_freq_hz": 2387.5,
+     "miss_time_sec": 2.559999942779541,
+     "neighbor_text": "<...622> KE5UJF FA34",
+     "neighbor_freq_hz": 2384.375,
+     "neighbor_dt_sec": 2.56
+    },
+    {
+     "miss_message": "<...> KR4FK EM85",
+     "miss_freq_hz": 1984.375,
+     "miss_time_sec": 2.6399998664855957,
+     "neighbor_text": "<...3631> KR4FK EM85",
+     "neighbor_freq_hz": 1984.375,
+     "neighbor_dt_sec": 2.64
+    },
+    {
+     "miss_message": "<...> K7CTV DM42",
+     "miss_freq_hz": 2459.375,
+     "miss_time_sec": 2.879999876022339,
+     "neighbor_text": "<...673> K7CTV DM42",
+     "neighbor_freq_hz": 2456.25,
+     "neighbor_dt_sec": 2.88
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_171858.wav",
+   "wav_sha256": "330f6e092bbc45dfe391b50c56cae5fa89473bb6960c82c5351514d7c96cba18",
+   "n_pairs": 5,
+   "pairs": [
+    {
+     "miss_message": "<...> KF9UG EN71",
+     "miss_freq_hz": 2562.5,
+     "miss_time_sec": 2.879999876022339,
+     "neighbor_text": "<...3462> KF9UG EN71",
+     "neighbor_freq_hz": 2562.5,
+     "neighbor_dt_sec": 2.88
+    },
+    {
+     "miss_message": "<...> KF9UG EN71",
+     "miss_freq_hz": 2562.5,
+     "miss_time_sec": 2.879999876022339,
+     "neighbor_text": "2W9XHD JU4YID/P R JN15",
+     "neighbor_freq_hz": 2562.5,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> KR4FK EM85",
+     "miss_freq_hz": 684.375,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> KR4FK EM85",
+     "neighbor_freq_hz": 684.375,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> KA4UPC EL88",
+     "miss_freq_hz": 996.875,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...3631> KA4UPC EL88",
+     "neighbor_freq_hz": 996.875,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> WI0K DM79",
+     "miss_freq_hz": 940.625,
+     "miss_time_sec": 2.6399998664855957,
+     "neighbor_text": "<...3631> WI0K DM79",
+     "neighbor_freq_hz": 940.625,
+     "neighbor_dt_sec": 2.56
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_154358.wav",
+   "wav_sha256": "b07e6bc38361d1475ebd2be403506dd2025f6e913408f85b46ac4164653c1e1b",
+   "n_pairs": 4,
+   "pairs": [
+    {
+     "miss_message": "<...> K2BAG DM33",
+     "miss_freq_hz": 828.125,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...476> K2BAG DM33",
+     "neighbor_freq_hz": 828.125,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> K2BAG DM33",
+     "miss_freq_hz": 828.125,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "4W2QHU KW9CJ DR63",
+     "neighbor_freq_hz": 825.0,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> AC6F R-14",
+     "miss_freq_hz": 1850.0,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3559> AC6F R-14",
+     "neighbor_freq_hz": 1850.0,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> WB8TLI EN70",
+     "miss_freq_hz": 1271.875,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> WB8TLI EN70",
+     "neighbor_freq_hz": 1271.875,
+     "neighbor_dt_sec": 2.72
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_163143.wav",
+   "wav_sha256": "cd01e84195b8e513534415b439faafdfb182c7db665ab6309427abbea1185a60",
+   "n_pairs": 4,
+   "pairs": [
+    {
+     "miss_message": "<...> KD9UJM EM78",
+     "miss_freq_hz": 1546.875,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...2829> KD9UJM EM78",
+     "neighbor_freq_hz": 1546.875,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> K5VJZ R-11",
+     "miss_freq_hz": 2815.625,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...3303> K5VJZ R-11",
+     "neighbor_freq_hz": 2815.625,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> K5VJZ R-11",
+     "miss_freq_hz": 2815.625,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "4W3MHU L43ULE R HI64",
+     "neighbor_freq_hz": 2815.625,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> AE1AA FN43",
+     "miss_freq_hz": 2546.875,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...2829> AE1AA FN43",
+     "neighbor_freq_hz": 2546.875,
+     "neighbor_dt_sec": 2.72
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_171828.wav",
+   "wav_sha256": "cb4f6809a1396eedc791b21c2a466c3dae9d81e85c57172800ddb1c7ba5520aa",
+   "n_pairs": 4,
+   "pairs": [
+    {
+     "miss_message": "<...> KR4FK EM85",
+     "miss_freq_hz": 684.375,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> KR4FK EM85",
+     "neighbor_freq_hz": 684.375,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> KF9UG EN71",
+     "miss_freq_hz": 2562.5,
+     "miss_time_sec": 2.879999876022339,
+     "neighbor_text": "<...3462> KF9UG EN71",
+     "neighbor_freq_hz": 2562.5,
+     "neighbor_dt_sec": 2.88
+    },
+    {
+     "miss_message": "<...> KA4UPC EL88",
+     "miss_freq_hz": 996.875,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...3631> KA4UPC EL88",
+     "neighbor_freq_hz": 996.875,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> KA4UPC EL88",
+     "miss_freq_hz": 996.875,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "RD5YCE/P KM5UWL BC01",
+     "neighbor_freq_hz": 1000.0,
+     "neighbor_dt_sec": 2.4
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_191028.wav",
+   "wav_sha256": "19199656e20a82ef0d398832d1d3357aa553fe49691a5e5c3a4c954c91030671",
+   "n_pairs": 4,
+   "pairs": [
+    {
+     "miss_message": "<...> AD9P R+09",
+     "miss_freq_hz": 2078.125,
+     "miss_time_sec": 2.3999998569488525,
+     "neighbor_text": "<...3346> AD9P R+09",
+     "neighbor_freq_hz": 2078.125,
+     "neighbor_dt_sec": 2.4
+    },
+    {
+     "miss_message": "<...> K7CTV DM42",
+     "miss_freq_hz": 2459.375,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...673> K7CTV DM42",
+     "neighbor_freq_hz": 2459.375,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> K7CTV DM42",
+     "miss_freq_hz": 2459.375,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...1689> K7CTV DM43",
+     "neighbor_freq_hz": 2462.5,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> K7CTV DM42",
+     "miss_freq_hz": 2459.375,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...2776>/P K7CYO AE02",
+     "neighbor_freq_hz": 2462.5,
+     "neighbor_dt_sec": 2.72
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_152443.wav",
+   "wav_sha256": "74e64b38e91fa4872dcd77d1e562dcdd7d358b82ad4e9eae841483621938d15c",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "KE8IFR <...> -10",
+     "miss_freq_hz": 1046.875,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "KE8IFR <...3631> -10",
+     "neighbor_freq_hz": 1046.875,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> K4SSL EM60",
+     "miss_freq_hz": 621.875,
+     "miss_time_sec": 3.0399999618530273,
+     "neighbor_text": "<...2993> K4SSL EM60",
+     "neighbor_freq_hz": 621.875,
+     "neighbor_dt_sec": 3.04
+    },
+    {
+     "miss_message": "<...> K4SSL EM60",
+     "miss_freq_hz": 621.875,
+     "miss_time_sec": 3.0399999618530273,
+     "neighbor_text": "<...2977> J39RVE GP32",
+     "neighbor_freq_hz": 625.0,
+     "neighbor_dt_sec": 3.04
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_152828.wav",
+   "wav_sha256": "6b9ee33977a67a96fda3f6ce4af95e8a22d48f873449ea4cee947b3bdb7bc56d",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "<...> KB9SCT EN43",
+     "miss_freq_hz": 1046.875,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> KB9SCT EN43",
+     "neighbor_freq_hz": 1046.875,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> WB8TLI EN70",
+     "miss_freq_hz": 1418.75,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> WB8TLI EN70",
+     "neighbor_freq_hz": 1415.625,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> KO4KYM EM85",
+     "miss_freq_hz": 2859.375,
+     "miss_time_sec": 3.119999885559082,
+     "neighbor_text": "<...3631> KO4KYM EM85",
+     "neighbor_freq_hz": 2859.375,
+     "neighbor_dt_sec": 3.12
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_152928.wav",
+   "wav_sha256": "3d9cb28ee49842fd9933efd0406196ec6d6ccb783285dc2cd4f8f5a1656bc4bf",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "<...> WB8TLI EN70",
+     "miss_freq_hz": 1415.625,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> WB8TLI EN70",
+     "neighbor_freq_hz": 1415.625,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> WB8TLI EN70",
+     "miss_freq_hz": 1415.625,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> WE5JQI LK58",
+     "neighbor_freq_hz": 1418.75,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> KO4KYM EM85",
+     "miss_freq_hz": 2856.25,
+     "miss_time_sec": 3.119999885559082,
+     "neighbor_text": "<...3631> KO4KYM EM85",
+     "neighbor_freq_hz": 2859.375,
+     "neighbor_dt_sec": 3.12
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_153258.wav",
+   "wav_sha256": "bd36a60fe537053d9a7ad9121d38f944d7511746eb22b7d9a8b05f21146124cf",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "<...> KN6NW DM33",
+     "miss_freq_hz": 853.125,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...3631> KN6NW DM33",
+     "neighbor_freq_hz": 850.0,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> WB8TLI EN70",
+     "miss_freq_hz": 1409.375,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> WB8TLI EN70",
+     "neighbor_freq_hz": 1409.375,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> WB8TLI EN70",
+     "miss_freq_hz": 1409.375,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "RG1QOB E85AUG/P R KF02",
+     "neighbor_freq_hz": 1406.25,
+     "neighbor_dt_sec": 2.0
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_154258.wav",
+   "wav_sha256": "83554e9fdb4dd37733f66edaddb3541f6ce37ca68e5ee446c95af666a9bbcc33",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "<...> WZ8DX R+11",
+     "miss_freq_hz": 1321.875,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> WZ8DX R+11",
+     "neighbor_freq_hz": 1321.875,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> AC6F DM13",
+     "miss_freq_hz": 1850.0,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3559> AC6F DM13",
+     "neighbor_freq_hz": 1850.0,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> K2BAG DM33",
+     "miss_freq_hz": 831.25,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...476> K2BAG DM33",
+     "neighbor_freq_hz": 828.125,
+     "neighbor_dt_sec": 2.8
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_154328.wav",
+   "wav_sha256": "dadbefcbc675470fce56268cacdfd90d07df30e0e05edc60ad90188b0a28c3b9",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "<...> AC6F DM13",
+     "miss_freq_hz": 1850.0,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3559> AC6F DM13",
+     "neighbor_freq_hz": 1850.0,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> K2BAG DM33",
+     "miss_freq_hz": 831.25,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...476> K2BAG DM33",
+     "neighbor_freq_hz": 828.125,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> WB8TLI EN70",
+     "miss_freq_hz": 1271.875,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> WB8TLI EN70",
+     "neighbor_freq_hz": 1271.875,
+     "neighbor_dt_sec": 2.72
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_160958.wav",
+   "wav_sha256": "e3dc3630a325639beba99c102c61f75a545c7d0e867b433ee99991567be80ac5",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "<...> WF4RC EM65",
+     "miss_freq_hz": 1512.5,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...3631> WF4RC EM65",
+     "neighbor_freq_hz": 1512.5,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> K0VM EN42",
+     "miss_freq_hz": 2687.5,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...3631> K0VM EN42",
+     "neighbor_freq_hz": 2687.5,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> W2HAC FM18",
+     "miss_freq_hz": 790.625,
+     "miss_time_sec": 2.6399998664855957,
+     "neighbor_text": "<...3631> W2HAC FM18",
+     "neighbor_freq_hz": 790.625,
+     "neighbor_dt_sec": 2.64
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_161058.wav",
+   "wav_sha256": "b0d47225acbcfc7d5ecdbb7f989e51c941ca85edf657f7401cc30081858a0078",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "<...> K0VM R+04",
+     "miss_freq_hz": 2687.5,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...3631> K0VM R+04",
+     "neighbor_freq_hz": 2687.5,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> K0VM R+04",
+     "miss_freq_hz": 2687.5,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...43>/P J5TNF PN42",
+     "neighbor_freq_hz": 2690.625,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> AC7WY DN61",
+     "miss_freq_hz": 2246.875,
+     "miss_time_sec": 2.6399998664855957,
+     "neighbor_text": "<...673> AC7WY DN61",
+     "neighbor_freq_hz": 2246.875,
+     "neighbor_dt_sec": 2.72
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_161928.wav",
+   "wav_sha256": "78f4a05c385327b86c8120854c55d20e978510ad98cdb76e32ad8f0ebcfa0c02",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "CQ WA4TED EM75",
+     "miss_freq_hz": 1200.0,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "CQ M XH0YDP EM74",
+     "neighbor_freq_hz": 1196.875,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> KJ5DZV -15",
+     "miss_freq_hz": 1340.625,
+     "miss_time_sec": 2.559999942779541,
+     "neighbor_text": "<...442> KJ5DZV -15",
+     "neighbor_freq_hz": 1340.625,
+     "neighbor_dt_sec": 2.56
+    },
+    {
+     "miss_message": "<...> KJ5DZV -15",
+     "miss_freq_hz": 1340.625,
+     "miss_time_sec": 2.559999942779541,
+     "neighbor_text": "XV4GHU/P JE7BUY KA93",
+     "neighbor_freq_hz": 1340.625,
+     "neighbor_dt_sec": 3.36
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_163513.wav",
+   "wav_sha256": "3cd6c0b69fa759e45fa02b772943335464f1365d5f49cfa397d8a83f7fa1cbd4",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "<...> KD9UJM EM78",
+     "miss_freq_hz": 1546.875,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...2829> KD9UJM EM78",
+     "neighbor_freq_hz": 1546.875,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "AJ4W <...> -14",
+     "miss_freq_hz": 2493.75,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "AJ4W <...3631> -14",
+     "neighbor_freq_hz": 2493.75,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> K7AC R-10",
+     "miss_freq_hz": 865.625,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...2829> K7AC R-10",
+     "neighbor_freq_hz": 865.625,
+     "neighbor_dt_sec": 2.8
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_171958.wav",
+   "wav_sha256": "409f04d1af5a6fe2560642ecd61631285d320ecdb3aa18db151addcca8f769f3",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "<...> KA4UPC R+12",
+     "miss_freq_hz": 996.875,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...3631> KA4UPC R+12",
+     "neighbor_freq_hz": 996.875,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> KA4UPC R+12",
+     "miss_freq_hz": 996.875,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...3625> LH1EHK R IJ53",
+     "neighbor_freq_hz": 993.75,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> K2BLA EL99",
+     "miss_freq_hz": 2053.125,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...3631> K2BLA EL99",
+     "neighbor_freq_hz": 2053.125,
+     "neighbor_dt_sec": 2.8
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_174028.wav",
+   "wav_sha256": "ced51d9299981cd0ae6d820c4e8d2fa333ad225b31b71e210e2e3b5bc4ee587a",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "<...> KF9UG EN71",
+     "miss_freq_hz": 2565.625,
+     "miss_time_sec": 2.879999876022339,
+     "neighbor_text": "<...3462> KF9UG EN71",
+     "neighbor_freq_hz": 2565.625,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> KF9UG EN71",
+     "miss_freq_hz": 2565.625,
+     "miss_time_sec": 2.879999876022339,
+     "neighbor_text": "<...3714> JU6RAJ FA03",
+     "neighbor_freq_hz": 2568.75,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> K6AGA DM04",
+     "miss_freq_hz": 1275.0,
+     "miss_time_sec": 2.879999876022339,
+     "neighbor_text": "<...673> K6AGA DM04",
+     "neighbor_freq_hz": 1275.0,
+     "neighbor_dt_sec": 2.88
+    }
+   ]
+  },
+  {
+   "wav_path": "/Users/thagale/.pancetta/recordings/ft8_20260530_185458.wav",
+   "wav_sha256": "f647ef6e8d3f042bc639551246bb53878bb89d87adaa670c0cd6ff22e2b48a22",
+   "n_pairs": 3,
+   "pairs": [
+    {
+     "miss_message": "<...> KI4YDQ EM95",
+     "miss_freq_hz": 1784.375,
+     "miss_time_sec": 2.799999952316284,
+     "neighbor_text": "<...3631> KI4YDQ EM95",
+     "neighbor_freq_hz": 1784.375,
+     "neighbor_dt_sec": 2.8
+    },
+    {
+     "miss_message": "<...> KK4VKM EM76",
+     "miss_freq_hz": 2800.0,
+     "miss_time_sec": 2.7200000286102295,
+     "neighbor_text": "<...3631> KK4VKM EM76",
+     "neighbor_freq_hz": 2800.0,
+     "neighbor_dt_sec": 2.72
+    },
+    {
+     "miss_message": "<...> KC4OBY EM74",
+     "miss_freq_hz": 1021.875,
+     "miss_time_sec": 2.879999876022339,
+     "neighbor_text": "<...3631> KC4OBY EM74",
+     "neighbor_freq_hz": 1021.875,
+     "neighbor_dt_sec": 2.8
+    }
+   ]
+  }
+ ]
+}

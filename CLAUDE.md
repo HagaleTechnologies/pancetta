@@ -20,7 +20,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-dx` | DX cluster + PSKReporter + scaffolded LoTW | Live + scaffolded |
 | `pancetta-hamlib` | Hamlib CAT control FFI | Bindings done, integration stub |
 | `pancetta-cqdx` | cqdx.io HTTP client, cache, types | Delta-adapted, needs live API validation |
-| `pancetta-tui` | Terminal UI | Scaffold, not wired to pipeline |
+| `pancetta-tui` | Terminal UI | Wired to pipeline (default UI; `--headless` to disable); live autonomous panel + `a` toggle (Shift+Q recovery) + TX-active badge; QSO-detail panel live (per-QSO state/last TX+RX message/reports via enriched ActiveQsosSnapshot, Batch 94); worked-before flags in Band Activity + DX hunter (same `CachedStationLookup` the autonomous scorer uses) and real rig S-meter via hamlib STRENGTH polling (Batch 95) |
 | `pancetta-core` | Shared types, error handling | Stable |
 | `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 | `pancetta-research` | Local-only iteration harness for decoder improvements (scorecards, eval, hypothesis bank). **Excluded from CI; never builds in GitHub Actions.** | Plan 1 of 3 in progress |
@@ -73,11 +73,15 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
   (or a cache hit from `~/.pancetta/tier_cache.json` keyed on
   `(cpu_model, core_count, pancetta_version)`). Moderate/Slow tiers
   flip the `scoped_fast_path: Arc<AtomicBool>` (replaces the old
-  env-var read in the FT8 hot loop). Tier-driven `Ft8Config` rewrites
-  (Batch 36 B1, Batch 41): Fast tier bumps `max_decode_passes = 2`
-  (+32 TPs/hard-200) AND `ldpc_iterations = 200` (+16 TPs); Slow tier
-  rewrites to `max_decode_passes = 1` + `osd_depth = Some(1)`;
-  Moderate stays at defaults. Operator override: `PANCETTA_SCOPED_FAST_PATH=1` forces
+  env-var read in the FT8 hot loop). Tier-driven `Ft8Config` rewrites:
+  Fast and Moderate tiers run plain defaults (the Batch 36/41 Fast
+  preset `mp=2, ldpc=200` was retired in Batch 83 — under ft8_lib truth
+  it bought +24..+57 TPs for +142..+387 FPs at 2.6-3.9× decode time,
+  strictly dominated by the documented `ldpc_iterations=300` recall
+  lever); Slow tier rewrites to `max_decode_passes = 1` +
+  `max_sync_candidates = 150` (Batch 78; its pre-Batch-72
+  `osd_depth = Some(1)` rewrite was dropped — it would now *raise* OSD
+  depth above the `Some(0)` default). Operator override: `PANCETTA_SCOPED_FAST_PATH=1` forces
   on, `=0` forces off, both skip the tier-driven preset. Spec:
   `docs/superpowers/specs/2026-06-04-hb-216-s2-tier-wiring-design.md`.
 - **QSO sender verification**: The QSO state machine (`pancetta-qso/src/qso_manager.rs::determine_state_transition` and `is_message_relevant`) verifies `from_station == expected DX callsign` on every state-advance. Mismatches are logged at `warn!` level (`target: "qso.security"`) and discarded. Frequency tolerance is 15 Hz. The autonomous responder (`autonomous.rs`) tracks per-callsign response timestamps in `recently_responded_to` and skips CQs from callsigns it responded to within the last 60s. Both defenses landed 2026-04-29 in response to Security Review C-1 and I-1; see `docs/security-review-2026-04-29.md`.
@@ -96,7 +100,7 @@ Design spec: `docs/superpowers/specs/2026-04-02-end-to-end-qso-design.md`
 
 - Grid "needed" set never populated (cqdx.io has no grid-needed endpoint yet); `is_needed_grid` returns `false` when empty to avoid inflating scores
 - cqdx.io `GET /api/v1/spots?live=true` response envelope key (`groups`) unverified against live API — a gated live test exists: `CQDX_TOKEN=pat_xxx cargo test -p pancetta-cqdx test_live_spots_envelope -- --ignored --nocapture`
-- `auto_sequencer::evaluate_cq_call` does not yet thread `slot_parity` from the original `DecodedMessage` into `respond_to_cq` — it currently passes `None`, causing the TX scheduler to use the configured self-parity instead of opposite-of-DX parity. Functional but suboptimal for autonomous responses; manual Space-press path is correct.
+- ~~`auto_sequencer::evaluate_cq_call` slot_parity gap~~ — RESOLVED-AS-STALE (2026-06-11 audit): the autonomous CQ-response path threads `tx_parity = cq.slot_parity.opposite()` (`autonomous.rs` RespondToCq build), and live mid-QSO TX flows through `QsoManager::send_message` → `QsoEvent::MessageToSend`, which carries the parity latched at QSO start. The only `tx_parity: None` site (`autonomous.rs` pending_sequencer_messages drain) has no production caller; documented in-code.
 
 ## Documentation Maintenance
 

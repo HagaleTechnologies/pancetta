@@ -215,6 +215,11 @@ fn render_audio_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     let device_text = app.audio_device.as_deref().unwrap_or("Default");
     let sample_rate = app.config.audio.sample_rate;
 
+    // Rig S-meter (real STRENGTH reads from hamlib, Batch 95). "---"
+    // when no rig is connected or the last reading went stale — we
+    // never synthesize a value here.
+    let s_meter_text = app.s_meter_display().unwrap_or_else(|| "---".to_string());
+
     let device_lines = vec![
         Line::from(vec![
             Span::styled(
@@ -229,6 +234,12 @@ fn render_audio_status(f: &mut Frame<'_>, area: Rect, app: &App) {
                 format!("{} Hz", sample_rate),
                 Style::default().fg(app.theme.foreground_color()),
             ),
+            Span::raw("  "),
+            Span::styled(
+                "S-meter: ",
+                Style::default().fg(app.theme.foreground_color()),
+            ),
+            Span::styled(s_meter_text, Style::default().fg(app.theme.accent_color())),
         ]),
     ];
 

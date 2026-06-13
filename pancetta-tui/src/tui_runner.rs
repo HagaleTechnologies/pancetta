@@ -82,15 +82,20 @@ pub enum TuiMessage {
     DecodedMessage(DecodedMessageView),
     /// Frequency update
     FrequencyUpdate { vfo: u8, frequency: u64 },
-    /// Signal strength update
-    SignalStrengthUpdate { dbm: i32 },
-    /// QSO state update
-    QsoStateUpdate { qso_id: String, state: String },
+    /// Rig S-meter update. Value follows the hamlib STRENGTH
+    /// convention: dB relative to S9 (0 = S9, -54 ≈ S0, +20 = S9+20).
+    /// Produced by the coordinator's rig polling loop (Batch 95); only
+    /// real rig readings arrive here — never synthesized data.
+    SignalStrengthUpdate { db_over_s9: i32 },
     /// DX spot
     DxSpot {
         callsign: String,
         frequency: u64,
         spotter: String,
+        /// Worked-before flag computed by the coordinator relay against
+        /// the same CachedStationLookup the autonomous scorer uses
+        /// (band-scoped on the spot frequency, uppercase-exact match).
+        worked_before: bool,
     },
     /// Error message
     Error { component: String, message: String },
@@ -107,10 +112,23 @@ pub enum TuiMessage {
     /// Snapshot of QSOs currently in progress, pushed by the QSO
     /// coordinator on every state change. The TUI replaces its
     /// previous active-QSOs list with this snapshot — sender
-    /// owns the truth, receiver is a passive renderer.
+    /// owns the truth, receiver is a passive renderer. Batch 94:
+    /// also rebuilds the QSO-detail panel entries (`qso_statuses`)
+    /// from the same snapshot via `App::apply_active_qsos`.
     ActiveQsosUpdate {
         qsos: Vec<crate::app::ActiveQsoBanner>,
     },
+    /// Structured autonomous-operator status, forwarded by the
+    /// coordinator's relay from the autonomous loop (one per 15s
+    /// slot). Replaces the old flattened status-bar-text-only path —
+    /// the relay still sends the text line too (additive), but this
+    /// is what drives the live `[AUTO]` panel in station_info.
+    AutonomousStatusUpdate(crate::app::AutonomousStatus),
+    /// TX-active indicator. `active: true` is sent by the coordinator's
+    /// TX worker when PTT is asserted; `false` when the transmission
+    /// ends — normal completion, operator abort (F8 / Shift+Q), or
+    /// shutdown all clear it. Drives the title-bar " TX " badge.
+    TxStatus { active: bool },
 }
 
 /// Commands sent from TUI
@@ -173,6 +191,15 @@ pub enum TuiCommand {
     /// - `StopTx` (halt current TX only; autonomous keeps running)
     /// - `StopCq` (turn off repeating CQ only)
     OperatorEmergencyStop,
+    /// Operator pressed `a` — toggle the autonomous runtime gate.
+    /// The coordinator flips the SAME `autonomous_enabled_runtime`
+    /// flag that `OperatorEmergencyStop` clears, so Shift+Q → `a`
+    /// is the documented safety-recovery path: emergency stop
+    /// disables autonomous TX, `a` re-enables it. Re-enabling never
+    /// starts a transmission directly — it only re-opens the gate
+    /// the autonomous decision loop checks before dispatching TX
+    /// (which has its own slot/priority/QSO gates).
+    ToggleAutonomous,
 }
 
 /// TUI performance metrics
@@ -349,22 +376,23 @@ impl TuiRunner {
             TuiMessage::FrequencyUpdate { vfo: _, frequency } => {
                 app.update_frequency(frequency);
             }
-            TuiMessage::SignalStrengthUpdate { dbm } => {
-                app.update_signal_strength(dbm as f32);
-            }
-            TuiMessage::QsoStateUpdate { qso_id, state: _ } => {
-                // Parse QSO state - for now just check if active
-                let active = !qso_id.is_empty();
-                let callsign = if active { Some(qso_id) } else { None };
-                app.update_qso_state(active, callsign);
+            TuiMessage::SignalStrengthUpdate { db_over_s9 } => {
+                app.update_signal_strength(db_over_s9);
             }
             TuiMessage::DxSpot {
                 callsign,
                 frequency,
                 spotter: _,
+                worked_before,
             } => {
                 // For now use FT8 as default mode
-                app.add_dx_spot(callsign, frequency as f64, "FT8".to_string(), 0);
+                app.add_dx_spot(
+                    callsign,
+                    frequency as f64,
+                    "FT8".to_string(),
+                    0,
+                    worked_before,
+                );
             }
             TuiMessage::Error {
                 component: _,
@@ -388,7 +416,13 @@ impl TuiRunner {
                 app.pipeline_health = Some(health);
             }
             TuiMessage::ActiveQsosUpdate { qsos } => {
-                app.active_qsos = qsos;
+                app.apply_active_qsos(qsos);
+            }
+            TuiMessage::AutonomousStatusUpdate(status) => {
+                app.update_autonomous_status(status);
+            }
+            TuiMessage::TxStatus { active } => {
+                app.is_transmitting = active;
             }
         }
 
@@ -608,7 +642,18 @@ impl TuiRunner {
 
             // === Autonomous controls ===
             KeyCode::Char('a') => {
+                // Flip local state optimistically for immediate feedback,
+                // then send the toggle to the coordinator — it flips the
+                // authoritative `autonomous_enabled_runtime` gate (the
+                // same one Shift+Q clears) and the next live
+                // AutonomousStatusUpdate confirms/corrects the panel.
+                // Also clear the operator-stop banner: pressing `a` is
+                // the documented re-engagement action after Shift+Q.
                 app.toggle_autonomous();
+                if app.stopped_by_operator {
+                    app.stopped_by_operator = false;
+                }
+                self.message_tx.send(TuiCommand::ToggleAutonomous)?;
             }
             KeyCode::Char('P') => {
                 // Shift-P: pause/resume autonomous (uppercase to disambiguate from p=PTT).
@@ -1322,6 +1367,129 @@ mod key_tests {
             matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq)),
             "c key must still emit StartCq even with banner visible"
         );
+    }
+
+    // === Batch 93: autonomous toggle + live status + TX indicator ===
+
+    /// `a` must emit ToggleAutonomous to the coordinator — the local
+    /// state flip alone is not enough (that was the pre-Batch-93 bug:
+    /// the key only mutated TUI-local state and the runtime gate never
+    /// moved, so Shift+Q could not be recovered from).
+    #[tokio::test]
+    async fn key_a_emits_toggle_autonomous() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key('a')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::ToggleAutonomous)),
+            "a key must emit ToggleAutonomous"
+        );
+    }
+
+    /// Safety-recovery path (Shift+Q → a): pressing `a` while the
+    /// operator-stop banner is up clears the banner AND emits the
+    /// toggle so the coordinator re-opens the runtime gate.
+    #[tokio::test]
+    async fn key_a_clears_operator_stop_banner_and_emits_toggle() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        // Simulate the emergency stop having happened.
+        app.write().await.stopped_by_operator = true;
+        r.handle_key_event(key('a')).await.unwrap();
+        assert!(
+            !app.read().await.stopped_by_operator,
+            "a must clear the operator-stop banner"
+        );
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::ToggleAutonomous)),
+            "a must emit ToggleAutonomous after an emergency stop"
+        );
+    }
+
+    /// AutonomousStatusUpdate populates `app.autonomous_status` so the
+    /// `[AUTO]` panel renders from live data instead of staying on the
+    /// muted "Disabled" placeholder forever.
+    #[tokio::test]
+    async fn autonomous_status_update_populates_app_state() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        assert!(app.read().await.autonomous_status.is_none());
+        let status = crate::app::AutonomousStatus {
+            enabled: true,
+            state: "Hunting".to_string(),
+            slot_parity: Some("Even".to_string()),
+            listen_counter: "2/5".to_string(),
+            active_qsos: 1,
+            max_qsos: 3,
+            idle_cycles: 0,
+            band_name: "20m".to_string(),
+            tx_offset_hz: 1500.0,
+        };
+        r.handle_message(TuiMessage::AutonomousStatusUpdate(status))
+            .await
+            .unwrap();
+        let app = app.read().await;
+        let live = app.autonomous_status.as_ref().expect("status must be set");
+        assert!(live.enabled);
+        assert_eq!(live.state, "Hunting");
+        assert_eq!(live.active_qsos, 1);
+        assert_eq!(live.band_name, "20m");
+    }
+
+    /// Batch 94: ActiveQsosUpdate feeds BOTH the banner list and the
+    /// QSO-detail panel; an empty follow-up snapshot clears both (this
+    /// is how completed/failed QSOs leave the panel).
+    #[tokio::test]
+    async fn active_qsos_update_drives_detail_panel() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        let banner = crate::app::ActiveQsoBanner {
+            their_callsign: "JA1ABC".to_string(),
+            state: "wait rpt".to_string(),
+            started_at: chrono::Utc::now(),
+            frequency_hz: 1500.0,
+            tx_parity: None,
+            last_tx_text: Some("JA1ABC K5ARH EM10".to_string()),
+            last_tx_at: Some(chrono::Utc::now()),
+            last_rx_text: Some("K5ARH JA1ABC -12".to_string()),
+            last_rx_at: Some(chrono::Utc::now()),
+            snr_rx: Some(-12),
+            report_sent: Some(-8),
+            report_received: Some(-15),
+            exchange_count: 2,
+        };
+        r.handle_message(TuiMessage::ActiveQsosUpdate { qsos: vec![banner] })
+            .await
+            .unwrap();
+        {
+            let app = app.read().await;
+            assert_eq!(app.active_qsos.len(), 1, "banner list populated");
+            assert_eq!(app.qso_statuses.len(), 1, "detail panel populated");
+            let q = &app.qso_statuses[0];
+            assert_eq!(q.call_sign.as_deref(), Some("JA1ABC"));
+            assert_eq!(q.state.as_deref(), Some("wait rpt"));
+            assert_eq!(q.last_rx_text.as_deref(), Some("K5ARH JA1ABC -12"));
+        }
+
+        // Completed/failed QSOs vanish from the next snapshot → panel clears.
+        r.handle_message(TuiMessage::ActiveQsosUpdate { qsos: Vec::new() })
+            .await
+            .unwrap();
+        let app = app.read().await;
+        assert!(app.active_qsos.is_empty());
+        assert!(app.qso_statuses.is_empty());
+    }
+
+    /// TxStatus drives `app.is_transmitting` (the title-bar " TX "
+    /// badge) — true lights it, false clears it.
+    #[tokio::test]
+    async fn tx_status_sets_and_clears_is_transmitting() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        assert!(!app.read().await.is_transmitting);
+        r.handle_message(TuiMessage::TxStatus { active: true })
+            .await
+            .unwrap();
+        assert!(app.read().await.is_transmitting, "TX badge must light");
+        r.handle_message(TuiMessage::TxStatus { active: false })
+            .await
+            .unwrap();
+        assert!(!app.read().await.is_transmitting, "TX badge must clear");
     }
 }
 

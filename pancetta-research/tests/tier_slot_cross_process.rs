@@ -95,8 +95,15 @@ fn prewarm_child_build() {
 fn two_processes_serialize_on_single_slot_pool() {
     prewarm_child_build();
     let pool_dir = tmp_pool_dir("serial");
-    // A holds long enough that B is forced to wait observably.
-    let a_hold_ms: u64 = 1500;
+    // A holds long enough that B is forced to wait observably even
+    // when cargo startup for B is slow (loaded host, fresh build cache,
+    // CI runner under contention). Batch 46 raised this from 1500ms to
+    // 3000ms after observing flakes where B's cargo startup ate enough
+    // of a 1500ms hold that b_acquired_after_ms fell below the 500ms
+    // threshold. Batch 73 raised again to 6000ms after observing the
+    // same flake under --release builds where cargo recompilation
+    // takes longer (B observed only 324ms wait under check.sh load).
+    let a_hold_ms: u64 = 6000;
 
     // Spawn child A and block until it prints its "acquired_after_ms"
     // line on stdout. This avoids racing against cargo's variable

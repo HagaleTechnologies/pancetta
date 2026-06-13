@@ -84,10 +84,27 @@ impl super::ApplicationCoordinator {
             config.station.callsign.clone()
         };
 
+        // Batch 95: worked-before enrichment. This is the SAME
+        // Arc<CachedStationLookup> the autonomous priority scorer reads
+        // for its duplicate penalty — seeded from ~/.pancetta/qso.db at
+        // QSO-component startup and updated in-memory by record_worked
+        // on every completed QSO — so the TUI's worked-before flag can
+        // never disagree with the scorer. Lookups are an in-memory
+        // HashSet probe behind a parking_lot read lock; the relay
+        // thread (not the render loop) pays that cost, and the TUI just
+        // renders the precomputed bool.
+        let relay_station_lookup = self.cached_lookup.clone();
+
         // Relay decoded messages from FT8 -> TUI on a dedicated thread
         // (tokio::spawn was causing starvation -- same pattern as DSP/FT8 fixes)
         let relay_shutdown = shutdown.clone();
         let tui_msg_tx_relay = tui_msg_tx.clone();
+        // Runtime autonomous gate (the flag Shift+Q clears and `a`
+        // re-sets). The relay reads it (never writes) so the live
+        // `[AUTO]` panel shows enabled=false while the operator
+        // override is active, even though the qso-crate operator's
+        // internal `enabled` stays true.
+        let relay_autonomous_gate = self.autonomous_enabled_runtime.clone();
         let health_audio_alive_relay = health_audio_alive.clone();
         let health_dsp_windows_relay = health_dsp_windows.clone();
         let health_last_rms_relay = health_last_rms.clone();
@@ -143,11 +160,26 @@ impl super::ApplicationCoordinator {
                                 _ => (None, None),
                             };
 
+                            // Worked-before: same semantics as the scorer's
+                            // duplicate penalty — band-scoped (current
+                            // operating frequency), uppercase-exact match on
+                            // the full callsign. We deliberately do NOT strip
+                            // /P-style suffixes: record_worked stores the
+                            // callsign exactly as logged, and adding
+                            // stripping on the TUI side only would make the
+                            // TUI flag stations the scorer still treats as
+                            // new (divergence).
+                            let dial_mhz =
+                                f64::from_bits(operating_freq_relay.load(Ordering::Relaxed));
+                            let worked_before = worked_before_for(
+                                &relay_station_lookup,
+                                call_sign.as_deref(),
+                                dial_mhz * 1_000_000.0,
+                            );
+
                             let tui_decoded = pancetta_tui::DecodedMessageView {
                                 timestamp: chrono::Utc::now(),
-                                frequency: f64::from_bits(
-                                    operating_freq_relay.load(Ordering::Relaxed),
-                                ),
+                                frequency: dial_mhz,
                                 mode: "FT8".to_string(),
                                 snr: decoded_msg.snr_db as i32,
                                 delta_time: decoded_msg.time_offset as f32,
@@ -159,6 +191,7 @@ impl super::ApplicationCoordinator {
                                 bearing,
                                 slot_parity: decoded_msg.slot_parity,
                                 is_directed_at_us,
+                                worked_before,
                             };
 
                             match tui_msg_tx_relay.send(
@@ -181,7 +214,20 @@ impl super::ApplicationCoordinator {
                     Ok(bus_msg) => {
                         match bus_msg.message_type {
                             MessageType::AutonomousStatus(ref status) => {
-                                // Forward as status update for now
+                                // Batch 93: forward the STRUCTURED status so the
+                                // live `[AUTO]` panel renders (previously this was
+                                // flattened to a transient status-bar string and
+                                // `app.autonomous_status` stayed None forever).
+                                let mapped = map_autonomous_status(
+                                    status,
+                                    relay_autonomous_gate.load(Ordering::Acquire),
+                                );
+                                let _ = tui_msg_tx_relay.send(
+                                    pancetta_tui::tui_runner::TuiMessage::AutonomousStatusUpdate(
+                                        mapped,
+                                    ),
+                                );
+                                // Keep the status-bar text line too (additive).
                                 let _ = tui_msg_tx_relay.send(
                                     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                         component: "Autonomous".to_string(),
@@ -189,21 +235,24 @@ impl super::ApplicationCoordinator {
                                     },
                                 );
                             }
+                            MessageType::TxStatus { active } => {
+                                // Batch 93: TX worker brackets every transmission
+                                // (PTT-on → PTT-off, including aborts) with these.
+                                // Drives the title-bar " TX " badge.
+                                let _ = tui_msg_tx_relay.send(
+                                    pancetta_tui::tui_runner::TuiMessage::TxStatus { active },
+                                );
+                            }
                             MessageType::ActiveQsosSnapshot { ref qsos } => {
                                 // Re-shape into the TUI's ActiveQsoBanner
                                 // (decoupled struct so the TUI doesn't link
                                 // pancetta_qso). Push as a TuiMessage; the
                                 // TUI replaces its previous list with this.
-                                let banner_qsos: Vec<pancetta_tui::app::ActiveQsoBanner> = qsos
-                                    .iter()
-                                    .map(|q| pancetta_tui::app::ActiveQsoBanner {
-                                        their_callsign: q.their_callsign.clone(),
-                                        state: q.state.clone(),
-                                        started_at: q.started_at,
-                                        frequency_hz: q.frequency_hz,
-                                        tx_parity: q.tx_parity,
-                                    })
-                                    .collect();
+                                // Batch 94: carries the QSO-detail panel
+                                // fields too (last TX/RX message, SNR,
+                                // reports, exchange count).
+                                let banner_qsos: Vec<pancetta_tui::app::ActiveQsoBanner> =
+                                    qsos.iter().map(map_qso_snapshot_item).collect();
                                 let _ = tui_msg_tx_relay.send(
                                     pancetta_tui::tui_runner::TuiMessage::ActiveQsosUpdate {
                                         qsos: banner_qsos,
@@ -227,17 +276,40 @@ impl super::ApplicationCoordinator {
                                     },
                                 );
                             }
+                            MessageType::RigControl(
+                                crate::message_bus::RigControlMessage::SignalStrengthResponse {
+                                    db_over_s9,
+                                },
+                            ) => {
+                                // Batch 95: real rig S-meter read (hamlib
+                                // STRENGTH, dB relative to S9) from the
+                                // polling loop — forward verbatim.
+                                let _ = tui_msg_tx_relay.send(
+                                    pancetta_tui::tui_runner::TuiMessage::SignalStrengthUpdate {
+                                        db_over_s9,
+                                    },
+                                );
+                            }
                             MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
                                 callsign,
                                 frequency,
                                 spotter,
                                 ..
                             }) => {
+                                // Worked-before keyed on the SPOT's frequency
+                                // (cluster spots carry their own), same
+                                // lookup/semantics as the decode path above.
+                                let worked_before = worked_before_for(
+                                    &relay_station_lookup,
+                                    Some(callsign.as_str()),
+                                    frequency as f64,
+                                );
                                 let _ = tui_msg_tx_relay.send(
                                     pancetta_tui::tui_runner::TuiMessage::DxSpot {
                                         callsign,
                                         frequency,
                                         spotter,
+                                        worked_before,
                                     },
                                 );
                             }
@@ -335,6 +407,18 @@ impl super::ApplicationCoordinator {
         let cmd_cq_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_abort_current_tx = self.abort_current_tx.clone();
         let cmd_autonomous_enabled = self.autonomous_enabled_runtime.clone();
+        // Whether the autonomous component is running at all (config
+        // gate). If it's config-disabled there is no decision loop to
+        // re-enable — `a` should say so honestly instead of flipping a
+        // gate nothing reads.
+        let cmd_autonomous_config_enabled = {
+            let cfg = self.config.read().await;
+            cfg.autonomous.enabled
+        };
+        // Direct path back to the TUI so ToggleAutonomous can confirm
+        // immediately (the structured panel update follows on the next
+        // autonomous slot tick, ≤15s later).
+        let cmd_tui_msg_tx = tui_msg_tx.clone();
         // F4 toggle state: Some(t) when a tune is in flight and expected
         // to auto-stop at instant t. None when no tune is queued. The
         // coordinator owns this — TUI just emits ToggleTune events.
@@ -459,8 +543,10 @@ impl super::ApplicationCoordinator {
                             //   4. Cancel any active tune tone.
                             // Logged at WARN with target=operator.override
                             // so it stands out in the journal. The
-                            // operator re-enables autonomous explicitly
-                            // (TUI `a` key); we don't auto-restore.
+                            // operator re-enables autonomous explicitly:
+                            // the TUI `a` key sends ToggleAutonomous,
+                            // which re-sets this same runtime gate
+                            // (Batch 93). We don't auto-restore.
                             warn!(
                                 target: "operator.override",
                                 "Operator emergency stop (Shift+Q): aborting TX, disabling \
@@ -524,6 +610,56 @@ impl super::ApplicationCoordinator {
                                     *cmd_tune_until.write().await =
                                         Some(now + Duration::from_secs(TUNE_DURATION_SECS as u64));
                                 }
+                            }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::ToggleAutonomous => {
+                            // Batch 93: operator pressed `a`. Flip the SAME
+                            // runtime gate OperatorEmergencyStop clears — this
+                            // is the documented Shift+Q → `a` recovery path.
+                            // Re-enabling NEVER starts a TX directly: the gate
+                            // is only read by the autonomous loop before
+                            // dispatching TX items its decision engine (with
+                            // its own slot/priority/QSO gates) produced.
+                            if !cmd_autonomous_config_enabled {
+                                info!(
+                                    "TUI ToggleAutonomous: autonomous disabled in config; \
+                                     no decision loop to toggle"
+                                );
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "Autonomous".to_string(),
+                                        status: "Autonomous disabled in config — restart with \
+                                                 autonomous.enabled=true"
+                                            .to_string(),
+                                    },
+                                );
+                            } else {
+                                let was = cmd_autonomous_enabled.load(Ordering::Acquire);
+                                let now_enabled = !was;
+                                cmd_autonomous_enabled.store(now_enabled, Ordering::Release);
+                                if now_enabled {
+                                    warn!(
+                                        target: "operator.override",
+                                        "Operator re-enabled autonomous TX (a key)"
+                                    );
+                                } else {
+                                    warn!(
+                                        target: "operator.override",
+                                        "Operator disabled autonomous TX (a key)"
+                                    );
+                                }
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "Autonomous".to_string(),
+                                        status: if now_enabled {
+                                            "Autonomous TX re-enabled (runtime gate open)"
+                                                .to_string()
+                                        } else {
+                                            "Autonomous TX disabled (runtime gate closed)"
+                                                .to_string()
+                                        },
+                                    },
+                                );
                             }
                         }
                         pancetta_tui::tui_runner::TuiCommand::TogglePtt => {
@@ -626,5 +762,282 @@ impl super::ApplicationCoordinator {
 
         info!("TUI component started");
         Ok(())
+    }
+}
+
+/// Map the bus's `AutonomousStatusData` into the TUI's structured
+/// `AutonomousStatus`, AND-ing the operator engine's internal `enabled`
+/// with the runtime gate (`autonomous_enabled_runtime` — the flag
+/// Shift+Q clears and the `a` key re-sets). The panel should show what
+/// the station will actually do: when the operator override is active,
+/// the qso-crate engine still reports `enabled: true` (it keeps its
+/// state so re-enabling picks up cleanly) but no TX will be dispatched,
+/// so the TUI must render it as disabled.
+/// Map one bus `ActiveQsoSnapshotItem` into the TUI's `ActiveQsoBanner`
+/// (decoupled struct so pancetta-tui doesn't link pancetta-qso).
+/// Field-for-field copy — the QSO coordinator already derived everything
+/// from the state machine; the relay just re-shapes.
+fn map_qso_snapshot_item(
+    q: &crate::message_bus::ActiveQsoSnapshotItem,
+) -> pancetta_tui::app::ActiveQsoBanner {
+    pancetta_tui::app::ActiveQsoBanner {
+        their_callsign: q.their_callsign.clone(),
+        state: q.state.clone(),
+        started_at: q.started_at,
+        frequency_hz: q.frequency_hz,
+        tx_parity: q.tx_parity,
+        last_tx_text: q.last_tx_text.clone(),
+        last_tx_at: q.last_tx_at,
+        last_rx_text: q.last_rx_text.clone(),
+        last_rx_at: q.last_rx_at,
+        snr_rx: q.snr_rx,
+        report_sent: q.report_sent,
+        report_received: q.report_received,
+        exchange_count: q.exchange_count,
+    }
+}
+
+/// Worked-before check for TUI enrichment (Batch 95).
+///
+/// Delegates to `CachedStationLookup::is_duplicate` — the exact method
+/// the autonomous priority scorer calls for its duplicate penalty — so
+/// the TUI's worked-before flag is consistent with the scorer by
+/// construction: band-scoped on `freq_hz`, uppercase-exact match on the
+/// full callsign as logged (no /P-style suffix stripping, because the
+/// scorer doesn't strip either). `None`/empty callsigns (unparsed
+/// decodes) are never "worked".
+fn worked_before_for(
+    lookup: &crate::priority_evaluator::CachedStationLookup,
+    callsign: Option<&str>,
+    freq_hz: f64,
+) -> bool {
+    use pancetta_qso::priority::WorkedStationLookup;
+    match callsign {
+        Some(c) if !c.is_empty() => lookup.is_duplicate(c, freq_hz),
+        _ => false,
+    }
+}
+
+fn map_autonomous_status(
+    data: &crate::message_bus::AutonomousStatusData,
+    runtime_gate_open: bool,
+) -> pancetta_tui::AutonomousStatus {
+    pancetta_tui::AutonomousStatus {
+        enabled: data.enabled && runtime_gate_open,
+        state: data.state.clone(),
+        slot_parity: data.slot_parity.clone(),
+        listen_counter: data.listen_counter.clone(),
+        active_qsos: data.active_qsos,
+        max_qsos: data.max_qsos,
+        idle_cycles: data.idle_cycles,
+        band_name: data.band_name.clone(),
+        tx_offset_hz: data.tx_offset_hz,
+    }
+}
+
+#[cfg(test)]
+mod tui_relay_tests {
+    use super::*;
+
+    /// Batch 94: the relay's snapshot→banner mapping must carry every
+    /// QSO-detail field through field-for-field — a dropped field here
+    /// silently renders as "---" in the panel.
+    #[test]
+    fn map_qso_snapshot_item_carries_all_detail_fields() {
+        let started = chrono::Utc::now() - chrono::Duration::seconds(30);
+        let tx_at = started + chrono::Duration::seconds(15);
+        let rx_at = started + chrono::Duration::seconds(28);
+        let item = crate::message_bus::ActiveQsoSnapshotItem {
+            their_callsign: "JA1ABC".to_string(),
+            state: "sending rpt".to_string(),
+            started_at: started,
+            frequency_hz: 1500.0,
+            tx_parity: Some(pancetta_core::slot::SlotParity::Odd),
+            last_tx_text: Some("JA1ABC K5ARH EM10".to_string()),
+            last_tx_at: Some(tx_at),
+            last_rx_text: Some("K5ARH JA1ABC -12".to_string()),
+            last_rx_at: Some(rx_at),
+            snr_rx: Some(-12),
+            report_sent: Some(-8),
+            report_received: Some(-12),
+            exchange_count: 2,
+        };
+        let banner = map_qso_snapshot_item(&item);
+        assert_eq!(banner.their_callsign, "JA1ABC");
+        assert_eq!(banner.state, "sending rpt");
+        assert_eq!(banner.started_at, started);
+        assert_eq!(banner.frequency_hz, 1500.0);
+        assert_eq!(banner.tx_parity, Some(pancetta_core::slot::SlotParity::Odd));
+        assert_eq!(banner.last_tx_text.as_deref(), Some("JA1ABC K5ARH EM10"));
+        assert_eq!(banner.last_tx_at, Some(tx_at));
+        assert_eq!(banner.last_rx_text.as_deref(), Some("K5ARH JA1ABC -12"));
+        assert_eq!(banner.last_rx_at, Some(rx_at));
+        assert_eq!(banner.snr_rx, Some(-12));
+        assert_eq!(banner.report_sent, Some(-8));
+        assert_eq!(banner.report_received, Some(-12));
+        assert_eq!(banner.exchange_count, 2);
+    }
+
+    /// Fresh QSO with no traffic yet: None/0 detail fields map through
+    /// unchanged (the panel renders placeholders).
+    #[test]
+    fn map_qso_snapshot_item_handles_empty_details() {
+        let item = crate::message_bus::ActiveQsoSnapshotItem {
+            their_callsign: "W1AW".to_string(),
+            state: "→ called".to_string(),
+            started_at: chrono::Utc::now(),
+            frequency_hz: 900.0,
+            tx_parity: None,
+            last_tx_text: None,
+            last_tx_at: None,
+            last_rx_text: None,
+            last_rx_at: None,
+            snr_rx: None,
+            report_sent: None,
+            report_received: None,
+            exchange_count: 0,
+        };
+        let banner = map_qso_snapshot_item(&item);
+        assert!(banner.last_tx_text.is_none());
+        assert!(banner.last_rx_text.is_none());
+        assert!(banner.snr_rx.is_none());
+        assert!(banner.report_sent.is_none());
+        assert!(banner.report_received.is_none());
+        assert_eq!(banner.exchange_count, 0);
+    }
+
+    fn sample_status(enabled: bool) -> crate::message_bus::AutonomousStatusData {
+        crate::message_bus::AutonomousStatusData {
+            enabled,
+            state: "Hunting".to_string(),
+            slot_parity: Some("Odd".to_string()),
+            listen_counter: "3/5".to_string(),
+            active_qsos: 2,
+            max_qsos: 3,
+            idle_cycles: 7,
+            band_name: "20m".to_string(),
+            tx_offset_hz: 1750.0,
+        }
+    }
+
+    /// Field-for-field forwarding when both the engine and the runtime
+    /// gate agree autonomous is on.
+    #[test]
+    fn map_forwards_all_fields_when_gate_open() {
+        let mapped = map_autonomous_status(&sample_status(true), true);
+        assert!(mapped.enabled);
+        assert_eq!(mapped.state, "Hunting");
+        assert_eq!(mapped.slot_parity.as_deref(), Some("Odd"));
+        assert_eq!(mapped.listen_counter, "3/5");
+        assert_eq!(mapped.active_qsos, 2);
+        assert_eq!(mapped.max_qsos, 3);
+        assert_eq!(mapped.idle_cycles, 7);
+        assert_eq!(mapped.band_name, "20m");
+        assert_eq!(mapped.tx_offset_hz, 1750.0);
+    }
+
+    /// After Shift+Q the runtime gate is closed but the engine still
+    /// reports enabled=true (it keeps internal state for clean resume).
+    /// The TUI must show disabled — that's what the station will do.
+    #[test]
+    fn map_shows_disabled_while_operator_override_active() {
+        let mapped = map_autonomous_status(&sample_status(true), false);
+        assert!(
+            !mapped.enabled,
+            "closed runtime gate must render as disabled"
+        );
+        // Non-enabled fields still forward so the panel keeps context.
+        assert_eq!(mapped.state, "Hunting");
+    }
+
+    /// Config-disabled engine stays disabled regardless of the gate.
+    #[test]
+    fn map_engine_disabled_wins_over_open_gate() {
+        let mapped = map_autonomous_status(&sample_status(false), true);
+        assert!(!mapped.enabled);
+    }
+
+    /// End-to-end gate semantics for the Shift+Q → `a` recovery path,
+    /// exercised the same way the command-forwarding loop does it:
+    /// emergency stop stores `false`; ToggleAutonomous flips it back.
+    /// (The full async loop isn't unit-testable without a live bus,
+    /// but the gate IS the seam — both handlers only touch this one
+    /// AtomicBool, which the autonomous loop checks before TX.)
+    #[test]
+    fn emergency_stop_then_toggle_reopens_gate() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let gate = AtomicBool::new(true); // seeded from config.autonomous.enabled
+
+        // Shift+Q → OperatorEmergencyStop handler:
+        gate.store(false, Ordering::Release);
+        assert!(!gate.load(Ordering::Acquire), "stop must close the gate");
+
+        // `a` → ToggleAutonomous handler:
+        let was = gate.load(Ordering::Acquire);
+        gate.store(!was, Ordering::Release);
+        assert!(
+            gate.load(Ordering::Acquire),
+            "toggle after stop must reopen the gate (autonomous resumes)"
+        );
+
+        // `a` again disables symmetrically.
+        let was = gate.load(Ordering::Acquire);
+        gate.store(!was, Ordering::Release);
+        assert!(!gate.load(Ordering::Acquire));
+    }
+
+    /// Batch 95: the TUI's worked-before flag and the autonomous
+    /// scorer's duplicate penalty must come from the SAME lookup with
+    /// the SAME semantics. Exercise both through the shared
+    /// CachedStationLookup and assert they agree on every case.
+    #[test]
+    fn worked_before_matches_scorer_duplicate_semantics() {
+        use pancetta_qso::priority::WorkedStationLookup;
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        lookup.record_worked("ja1abc", "20m"); // lowercase in, uppercased internally
+
+        let cases = [
+            ("JA1ABC", 14_074_000.0),   // worked, same band → true
+            ("ja1abc", 14_074_000.0),   // case-insensitive → true
+            ("JA1ABC", 7_074_000.0),    // other band → false (band-scoped)
+            ("JA1ABC/P", 14_074_000.0), // suffix NOT stripped → false (matches scorer)
+            ("DL5XYZ", 14_074_000.0),   // never worked → false
+        ];
+        for (call, freq) in cases {
+            assert_eq!(
+                worked_before_for(&lookup, Some(call), freq),
+                lookup.is_duplicate(call, freq),
+                "TUI and scorer disagree for {} at {} Hz",
+                call,
+                freq
+            );
+        }
+
+        // Spot checks on the actual values.
+        assert!(worked_before_for(&lookup, Some("JA1ABC"), 14_074_000.0));
+        assert!(worked_before_for(&lookup, Some("ja1abc"), 14_074_000.0));
+        assert!(!worked_before_for(&lookup, Some("JA1ABC"), 7_074_000.0));
+        assert!(!worked_before_for(&lookup, Some("JA1ABC/P"), 14_074_000.0));
+    }
+
+    /// Unparsed decodes (no callsign) and empty strings are never
+    /// flagged as worked.
+    #[test]
+    fn worked_before_handles_missing_callsign() {
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        lookup.record_worked("K1ABC", "20m");
+        assert!(!worked_before_for(&lookup, None, 14_074_000.0));
+        assert!(!worked_before_for(&lookup, Some(""), 14_074_000.0));
+    }
+
+    /// A QSO completing mid-session (record_worked) must flip the flag
+    /// for subsequent decodes — the live-update path, not just the
+    /// startup seed.
+    #[test]
+    fn worked_before_updates_live_on_record_worked() {
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        assert!(!worked_before_for(&lookup, Some("VK2DEF"), 14_074_000.0));
+        lookup.record_worked("VK2DEF", "20m");
+        assert!(worked_before_for(&lookup, Some("VK2DEF"), 14_074_000.0));
     }
 }

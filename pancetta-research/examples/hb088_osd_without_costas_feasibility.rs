@@ -352,7 +352,19 @@ fn pos_from_freq_dt(freq_hz: f64, dt_s: f64) -> (usize, usize, usize) {
     let freq_sub = (total_sub.max(0) % FREQ_OSR as i64) as usize;
     // Each time_step is 80 ms (samples_per_symbol / time_osr / 12000).
     let step_s = 0.08;
-    let time_step = (dt_s / step_s).round().max(0.0) as usize;
+    // Batch 90 (hb-090 Stage A): the original mapping assumed row t
+    // represents the symbol starting at t*960 samples — the same
+    // convention bug Batch 88 fixed in the decoder (row t actually
+    // represents the symbol starting at (t-2)*960, so the row FOR a
+    // symbol at dt is dt/0.08 + 2). Rather than assert the +2, sweep
+    // it: PANCETTA_HB088_STEP_OFFSET (default 0 = historical behavior)
+    // shifts the row; sign-agreement vs offset locates the true
+    // convention empirically.
+    let step_offset: i64 = std::env::var("PANCETTA_HB088_STEP_OFFSET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let time_step = ((dt_s / step_s).round() as i64 + step_offset).max(0) as usize;
     (time_step, freq_bin, freq_sub)
 }
 
