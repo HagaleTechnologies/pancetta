@@ -473,6 +473,33 @@ impl AudioStreamManager {
         };
         let output_device = &cpal_output_device;
 
+        // Always surface which output device TX audio actually goes to —
+        // previously the "default"/unset paths logged nothing, so an
+        // operator whose rig isn't the system default would silently hear
+        // FT8 on the laptop speakers while PTT keyed the rig (the classic
+        // "PTT keys, no RF, audio on speakers" misconfig). Name the device
+        // on every path, and warn when we fell back to the system default
+        // without an explicit rig CODEC match.
+        let resolved_output_name = output_device
+            .name()
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        let explicit_match = self
+            .config
+            .output_device_name
+            .as_deref()
+            .is_some_and(|n| !n.eq_ignore_ascii_case("default"));
+        if explicit_match {
+            tracing::info!("TX audio output device: '{}'", resolved_output_name);
+        } else {
+            tracing::warn!(
+                "TX audio output device: '{}' (SYSTEM DEFAULT — not an explicit rig CODEC). \
+                 If your transceiver is not the system default output, TX audio is going to \
+                 the wrong device (e.g. speakers) while PTT still keys the rig. Set \
+                 [audio] output_device to the rig's CODEC name (see `pancetta --list-audio`).",
+                resolved_output_name
+            );
+        }
+
         // FT8 audio is mono. Force mono regardless of what
         // find_optimal_output_config returned — many USB CODECs report
         // stereo capability but the TX path produces single-channel

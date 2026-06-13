@@ -30,7 +30,7 @@ SCAN = WS / "research/corpus/scans/raw_20260530_scan.jsonl"
 MANIFEST = WS / "research/corpus/curated/ft8/raw_530_full.manifest.json"
 NOTE = WS / "research/notes/2026-06-11-batch76-cross-day-trust.md"
 
-DAY_RE = re.compile(r"ft8_(\d{8})_\d{6}\.wav$")
+DAY_RE = re.compile(r"ft8_(\d{8})_\d{6}")  # tolerant of optional _<band> suffix (Batch 103)
 
 
 def extract_callsigns(text: str):

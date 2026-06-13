@@ -431,7 +431,7 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     if let Err(e) = message_bus.send_message(ptt_msg).await {
-                                        debug!("PTT on failed (no rig?): {}", e);
+                                        warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
                                     }
 
                                     // --- Step 6: Sleep precisely until target slot start ---
@@ -512,7 +512,7 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     if let Err(e) = message_bus.send_message(ptt_off_msg).await {
-                                        debug!("PTT off failed (no rig?): {}", e);
+                                        warn!("PTT OFF failed (rig may be stuck in TX!): {}", e);
                                     }
                                     ptt_guard.disarm();
 
@@ -710,7 +710,7 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     if let Err(e) = message_bus.send_message(ptt_msg).await {
-                                        debug!("PTT on failed (no rig?): {}", e);
+                                        warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
                                     }
 
                                     // --- Step 6: Sleep precisely until target slot ---
@@ -789,7 +789,7 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     if let Err(e) = message_bus.send_message(ptt_off_msg).await {
-                                        debug!("PTT off failed (no rig?): {}", e);
+                                        warn!("PTT OFF failed (rig may be stuck in TX!): {}", e);
                                     }
                                     ptt_guard.disarm();
 
@@ -852,7 +852,7 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     if let Err(e) = message_bus.send_message(ptt_msg).await {
-                                        debug!("Tune: PTT on failed (no rig?): {}", e);
+                                        warn!("Tune: PTT ON failed (rig not keyed): {}", e);
                                     }
 
                                     // Emit the audio buffer.
@@ -904,7 +904,10 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     if let Err(e) = message_bus.send_message(ptt_off_msg).await {
-                                        debug!("Tune: PTT off failed (no rig?): {}", e);
+                                        warn!(
+                                            "Tune: PTT OFF failed (rig may be stuck in TX!): {}",
+                                            e
+                                        );
                                     }
                                     ptt_guard.disarm();
                                     info!("Tune: complete");

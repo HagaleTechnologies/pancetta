@@ -23,6 +23,30 @@ use crate::message_bus::ComponentId;
 /// Maximum total disk space for WAV recordings (bytes).
 const WAV_RECORDING_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 
+/// Map a rig dial frequency (Hz) to a ham-band label for recording
+/// filenames. Returns `None` outside the standard HF/VHF amateur bands
+/// (or when the frequency is unknown, i.e. 0 — no rig / not yet polled),
+/// in which case the filename carries no band suffix and stays backward
+/// compatible with the legacy `ft8_<date>_<time>.wav` form.
+fn band_for_freq_hz(hz: u64) -> Option<&'static str> {
+    let khz = hz / 1000;
+    Some(match khz {
+        1_800..=2_000 => "160m",
+        3_500..=4_000 => "80m",
+        5_300..=5_410 => "60m",
+        7_000..=7_300 => "40m",
+        10_100..=10_150 => "30m",
+        14_000..=14_350 => "20m",
+        18_068..=18_168 => "17m",
+        21_000..=21_450 => "15m",
+        24_890..=24_990 => "12m",
+        28_000..=29_700 => "10m",
+        50_000..=54_000 => "6m",
+        144_000..=148_000 => "2m",
+        _ => return None,
+    })
+}
+
 /// Manage WAV recording of 12kHz mono FT8 windows for decoder validation.
 ///
 /// Writes one WAV file per FT8 window (12.64 seconds @ 12kHz mono i16).
@@ -65,7 +89,18 @@ impl WavRecorder {
     }
 
     /// Write a 12kHz mono f32 window to a timestamped WAV file.
-    fn write_window(&mut self, samples: &[f32], timestamp: &chrono::DateTime<chrono::Utc>) {
+    ///
+    /// `dial_freq_hz` is the rig's current dial frequency; when it maps to a
+    /// known ham band the filename gains a `_<band>` suffix
+    /// (`ft8_<date>_<time>_<band>.wav`) so the corpus is band-stratifiable.
+    /// `0`/unknown → no suffix (legacy `ft8_<date>_<time>.wav`, still parsed
+    /// by all downstream tooling, which splits on `_` and ignores extras).
+    fn write_window(
+        &mut self,
+        samples: &[f32],
+        timestamp: &chrono::DateTime<chrono::Utc>,
+        dial_freq_hz: u64,
+    ) {
         // Enforce cap by deleting oldest files
         while self.total_bytes >= WAV_RECORDING_MAX_BYTES {
             if !self.delete_oldest() {
@@ -74,7 +109,10 @@ impl WavRecorder {
             }
         }
 
-        let filename = format!("ft8_{}.wav", timestamp.format("%Y%m%d_%H%M%S"));
+        let filename = match band_for_freq_hz(dial_freq_hz) {
+            Some(band) => format!("ft8_{}_{}.wav", timestamp.format("%Y%m%d_%H%M%S"), band),
+            None => format!("ft8_{}.wav", timestamp.format("%Y%m%d_%H%M%S")),
+        };
         let path = self.dir.join(&filename);
 
         let spec = hound::WavSpec {
@@ -157,6 +195,10 @@ impl super::ApplicationCoordinator {
 
         let shutdown = self.shutdown_signal.clone();
         let message_count = self.message_count.clone();
+        // Current rig dial frequency (Hz), updated by hamlib FrequencyResponse.
+        // Read per-window so recordings can be band-stamped. 0 = unknown
+        // (no rig / not yet polled) → recording filename omits the band.
+        let operating_frequency_hz = self.operating_frequency_hz.clone();
 
         let config = self.config.read().await;
         let input_rate = config.audio.sample_rate;
@@ -384,9 +426,11 @@ impl super::ApplicationCoordinator {
                                 now.format("%H:%M:%S.%3f")
                             );
 
-                            // Record window to WAV for decoder validation
+                            // Record window to WAV for decoder validation,
+                            // band-stamped with the current rig dial frequency.
                             if let Some(ref mut recorder) = wav_recorder {
-                                recorder.write_window(&window, &now);
+                                let dial_hz = operating_frequency_hz.load(Ordering::Relaxed);
+                                recorder.write_window(&window, &now, dial_hz);
                             }
 
                             if dsp_to_ft8_tx.send(window).is_err() {
@@ -436,6 +480,35 @@ fn rolling_median(samples: &[f32]) -> f32 {
     let mut sorted: Vec<f32> = samples.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     sorted[sorted.len() / 2]
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::band_for_freq_hz;
+
+    #[test]
+    fn maps_common_bands() {
+        assert_eq!(band_for_freq_hz(14_074_000), Some("20m"));
+        assert_eq!(band_for_freq_hz(7_074_000), Some("40m"));
+        assert_eq!(band_for_freq_hz(3_573_000), Some("80m"));
+        assert_eq!(band_for_freq_hz(28_074_000), Some("10m"));
+        assert_eq!(band_for_freq_hz(50_313_000), Some("6m"));
+    }
+
+    #[test]
+    fn unknown_and_zero_have_no_band() {
+        assert_eq!(band_for_freq_hz(0), None); // no rig / not polled
+        assert_eq!(band_for_freq_hz(12_000_000), None); // between 30m and 20m
+        assert_eq!(band_for_freq_hz(100_000_000), None); // FM broadcast, not ham
+    }
+
+    #[test]
+    fn band_edges_inclusive() {
+        assert_eq!(band_for_freq_hz(14_000_000), Some("20m"));
+        assert_eq!(band_for_freq_hz(14_350_000), Some("20m"));
+        assert_eq!(band_for_freq_hz(13_999_000), None);
+        assert_eq!(band_for_freq_hz(14_351_000), None);
+    }
 }
 
 #[cfg(test)]
