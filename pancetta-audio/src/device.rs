@@ -289,6 +289,27 @@ impl AudioDeviceManager {
             .collect()
     }
 
+    /// List output device names paired with their default flag.
+    /// `(name, is_default_output)`. Used by the TUI device picker so it
+    /// can mark the system-default output.
+    pub fn list_output_devices_with_default(&self) -> Vec<(String, bool)> {
+        self.devices
+            .iter()
+            .filter(|(_, info)| info.supports_output)
+            .map(|(_, info)| (info.name.clone(), info.is_default_output))
+            .collect()
+    }
+
+    /// List input device names paired with their default flag.
+    /// `(name, is_default_input)`.
+    pub fn list_input_devices_with_default(&self) -> Vec<(String, bool)> {
+        self.devices
+            .iter()
+            .filter(|(_, info)| info.supports_input)
+            .map(|(_, info)| (info.name.clone(), info.is_default_input))
+            .collect()
+    }
+
     /// Find optimal configuration for a device
     pub fn find_optimal_config(
         &self,
@@ -618,6 +639,33 @@ impl AudioDeviceManager {
 impl Default for AudioDeviceManager {
     fn default() -> Self {
         Self::new().expect("Failed to create audio device manager")
+    }
+}
+
+/// Enumerate output devices as `(name, is_default)` pairs without the
+/// caller having to hold an [`AudioDeviceManager`]. Convenience entry point
+/// for the TUI output-device picker. Returns an empty vec on enumeration
+/// error (e.g. no audio host) rather than failing — the picker treats an
+/// empty list as "no devices reported".
+pub fn list_output_devices() -> Vec<(String, bool)> {
+    match AudioDeviceManager::new() {
+        Ok(mgr) => mgr.list_output_devices_with_default(),
+        Err(e) => {
+            tracing::warn!("Could not enumerate output devices: {}", e);
+            Vec::new()
+        }
+    }
+}
+
+/// Enumerate input devices as `(name, is_default)` pairs. See
+/// [`list_output_devices`].
+pub fn list_input_devices() -> Vec<(String, bool)> {
+    match AudioDeviceManager::new() {
+        Ok(mgr) => mgr.list_input_devices_with_default(),
+        Err(e) => {
+            tracing::warn!("Could not enumerate input devices: {}", e);
+            Vec::new()
+        }
     }
 }
 

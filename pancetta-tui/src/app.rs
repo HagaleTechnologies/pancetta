@@ -215,6 +215,18 @@ pub struct DxStation {
     pub confidence: Option<f64>,
     pub best_snr_network: Option<i32>,
     pub last_seen_network: Option<i64>,
+    /// Audio offset (Hz, within the FT8 passband) where a LOCAL decode
+    /// placed this station. `Some` only for stations seen via a local
+    /// decode (`add_decoded_message`); `None` for network-only DX-cluster
+    /// spots, which carry only the dial frequency. The Space call-target
+    /// uses this so we reply on the operator's-heard offset for local
+    /// decodes instead of hard-coding 1500 Hz.
+    pub audio_offset_hz: Option<u64>,
+    /// Which 15-second slot a LOCAL decode placed this station on. `None`
+    /// for network spots (no slot information). Threaded into the
+    /// `CallStation` command so the QSO layer can reply on the opposite
+    /// parity.
+    pub slot_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
 /// Status data received from the autonomous operator.
@@ -736,31 +748,76 @@ impl App {
                     .get(call_sign)
                     .and_then(|s| s.grid_square.clone())
             });
-            let dx_station = DxStation {
-                call_sign: call_sign.clone(),
-                grid_square,
-                frequency: message.frequency,
-                mode: message.mode.clone(),
-                last_seen: message.timestamp,
-                snr: message.snr,
-                distance: message.distance,
-                bearing: message.bearing,
-                // Carried from the relay's CachedStationLookup check —
-                // same source as the autonomous scorer's duplicate
-                // penalty (band-scoped, uppercase-exact match).
-                worked_before: message.worked_before,
-                priority_score: self.calculate_dx_priority(&message),
-                source: SpotSource::Local,
-                rarity_tier: None,
-                reporter_count: None,
-                is_notable: false,
-                notable_type: None,
-                confidence: None,
-                best_snr_network: None,
-                last_seen_network: None,
-            };
+            // Audio offset where we heard this station, clamped into the
+            // FT8 passband. Used by the Space call-target.
+            let audio_offset_hz = (message.delta_freq as u64).clamp(200, 2500);
+            let local_score = self.calculate_dx_priority(&message);
 
-            self.dx_stations.insert(call_sign.clone(), dx_station);
+            // Merge into any existing entry rather than wholesale-replacing
+            // it. A blanket `insert` would clobber network metadata
+            // (rarity_tier / reporter_count / is_notable / confidence /
+            // best_snr_network) every time the same callsign is re-decoded
+            // locally, making rows churn between rich (network-scored) and
+            // bare (local-only) on each 15s slot. We update the fields a
+            // local decode actually knows about and leave network metadata
+            // intact.
+            match self.dx_stations.get_mut(call_sign) {
+                Some(entry) => {
+                    entry.grid_square = grid_square;
+                    entry.frequency = message.frequency;
+                    entry.mode = message.mode.clone();
+                    entry.last_seen = message.timestamp;
+                    entry.snr = message.snr;
+                    entry.distance = message.distance;
+                    entry.bearing = message.bearing;
+                    entry.worked_before = message.worked_before;
+                    entry.audio_offset_hz = Some(audio_offset_hz);
+                    entry.slot_parity = message.slot_parity;
+                    // A station previously known only from the network is
+                    // now also heard locally → upgrade to Both. A
+                    // local-only station stays Local.
+                    entry.source = match entry.source {
+                        SpotSource::Network | SpotSource::Both => SpotSource::Both,
+                        SpotSource::Local => SpotSource::Local,
+                    };
+                    // Re-score from the richer of local vs whatever network
+                    // metadata is still attached. For purely local entries
+                    // this is just the local score; network spots keep
+                    // their score raised on merge() and we don't lower it.
+                    entry.priority_score = entry.priority_score.max(local_score);
+                }
+                None => {
+                    self.dx_stations.insert(
+                        call_sign.clone(),
+                        DxStation {
+                            call_sign: call_sign.clone(),
+                            grid_square,
+                            frequency: message.frequency,
+                            mode: message.mode.clone(),
+                            last_seen: message.timestamp,
+                            snr: message.snr,
+                            distance: message.distance,
+                            bearing: message.bearing,
+                            // Carried from the relay's CachedStationLookup
+                            // check — same source as the autonomous scorer's
+                            // duplicate penalty (band-scoped, uppercase-exact
+                            // match).
+                            worked_before: message.worked_before,
+                            priority_score: local_score,
+                            source: SpotSource::Local,
+                            rarity_tier: None,
+                            reporter_count: None,
+                            is_notable: false,
+                            notable_type: None,
+                            confidence: None,
+                            best_snr_network: None,
+                            last_seen_network: None,
+                            audio_offset_hz: Some(audio_offset_hz),
+                            slot_parity: message.slot_parity,
+                        },
+                    );
+                }
+            }
         }
 
         self.status_message = format!("Decoded: {}", message.message);
@@ -1012,6 +1069,8 @@ impl App {
             confidence: None,
             best_snr_network: None,
             last_seen_network: None,
+            audio_offset_hz: None,
+            slot_parity: None,
         };
         self.dx_stations.insert(callsign, dx_station);
     }
@@ -1095,6 +1154,37 @@ impl App {
         directed
     }
 
+    /// DX stations in display order — the single source of truth for both
+    /// the DX Hunter renderer and `get_selected_station`. Walk this exact
+    /// ordering in both places so the highlighted row is always the Space
+    /// call-target; if the renderer and the chooser sorted differently
+    /// (the historic bug: renderer by `priority_score`, chooser by
+    /// `last_seen`), Space would call a station the operator never
+    /// highlighted.
+    ///
+    /// Comparator is a stable total order:
+    ///   1. needed first (`worked_before == false` before `== true`)
+    ///   2. `priority_score` descending
+    ///   3. `snr` descending
+    ///   4. `frequency` ascending
+    ///   5. `call_sign` ascending (final tiebreak → deterministic)
+    pub fn displayed_dx_stations(&self) -> Vec<&DxStation> {
+        let mut list: Vec<&DxStation> = self.dx_stations.values().collect();
+        list.sort_by(|a, b| {
+            a.worked_before
+                .cmp(&b.worked_before)
+                .then(b.priority_score.cmp(&a.priority_score))
+                .then(b.snr.cmp(&a.snr))
+                .then(
+                    a.frequency
+                        .partial_cmp(&b.frequency)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+                .then(a.call_sign.cmp(&b.call_sign))
+        });
+        list
+    }
+
     /// Get the callsign, audio offset (Hz, within FT8 passband), and slot
     /// parity of the currently selected station. Returns the AUDIO frequency
     /// offset, not the dial frequency — the TransmitRequest pipeline expects
@@ -1124,17 +1214,22 @@ impl App {
                 Some((callsign.clone(), audio_hz, msg.slot_parity))
             }
             ActivePanel::DxHunter => {
-                let mut stations: Vec<&DxStation> = self.dx_stations.values().collect();
-                stations.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
-                let station = stations.get(self.dx_hunter_scroll)?;
+                // Walk the SAME ordering the renderer draws (needed-first,
+                // priority desc, then snr/freq/call tiebreaks) so the
+                // highlighted row is exactly the Space call-target.
+                let displayed = self.displayed_dx_stations();
+                let station = displayed.get(self.dx_hunter_scroll)?;
                 if station.call_sign.is_empty() {
                     return None;
                 }
-                // DX Hunter spots only carry the dial frequency, not where in
-                // the passband the station was. Default to the FT8 calling
-                // convention (1500 Hz). Tuning is the operator's job after
-                // the call kicks off. No slot parity is available from spots.
-                Some((station.call_sign.clone(), 1500, None))
+                // Local decodes carry the audio offset where we actually
+                // heard the station — reply there. Network-only DX-cluster
+                // spots have no passband info, so fall back to the FT8
+                // calling convention (1500 Hz); tuning is then the
+                // operator's job. Slot parity is `Some` only for local
+                // decodes (network spots can't tell us the slot).
+                let audio_hz = station.audio_offset_hz.unwrap_or(1500);
+                Some((station.call_sign.clone(), audio_hz, station.slot_parity))
             }
             _ => None,
         }
@@ -1178,6 +1273,47 @@ impl App {
         self.autonomous_status = Some(status);
     }
 
+    /// Install the audio device lists enumerated by the coordinator into
+    /// the device-selection picker. `current_output` (the configured
+    /// output device name) is pre-selected so the picker opens on the
+    /// active choice. Matched case-insensitively against the enumerated
+    /// names; "default"/empty falls back to the OS-default entry.
+    pub fn set_audio_devices(
+        &mut self,
+        input: Vec<(String, bool)>,
+        output: Vec<(String, bool)>,
+        current_output: Option<String>,
+    ) {
+        self.device_selection.input_devices = input;
+        self.device_selection.output_devices = output;
+
+        // Pre-select the current output device.
+        let want = current_output.unwrap_or_default();
+        let want_default = want.is_empty() || want.eq_ignore_ascii_case("default");
+        let out_idx = self
+            .device_selection
+            .output_devices
+            .iter()
+            .position(|(name, is_default)| {
+                if want_default {
+                    *is_default
+                } else {
+                    name.eq_ignore_ascii_case(&want)
+                }
+            })
+            .unwrap_or(0);
+        self.device_selection.selected_output_idx = out_idx;
+
+        // Default the input cursor to the OS-default input if present.
+        let in_idx = self
+            .device_selection
+            .input_devices
+            .iter()
+            .position(|(_, is_default)| *is_default)
+            .unwrap_or(0);
+        self.device_selection.selected_input_idx = in_idx;
+    }
+
     pub fn toggle_autonomous(&mut self) {
         if let Some(ref mut status) = self.autonomous_status {
             status.enabled = !status.enabled;
@@ -1203,7 +1339,14 @@ impl App {
     }
 
     /// Merge live spot groups from cqdx.io into the DX station list.
+    ///
+    /// Network spots used to land with `priority_score: 0`, so they always
+    /// sorted to the bottom of the DX Hunter list regardless of how rare
+    /// they were. We now run the richer `dx_hunter::calculate_dx_priority`
+    /// scorer — which weights rarity_tier, distance, SNR and recency — so a
+    /// "legendary"/"very_rare" cluster spot ranks where it belongs.
     pub fn merge_spot_groups(&mut self, spots: &[crate::tui_runner::CqdxSpotInfo]) {
+        let our_grid = self.station_info.grid_square.clone();
         for spot in spots {
             let entry = self
                 .dx_stations
@@ -1227,6 +1370,9 @@ impl App {
                     confidence: Some(spot.confidence),
                     best_snr_network: spot.best_snr,
                     last_seen_network: Some(spot.last_seen),
+                    // Network spots carry no passband / slot information.
+                    audio_offset_hz: None,
+                    slot_parity: None,
                 });
 
             // If already exists from local decode, upgrade source
@@ -1241,6 +1387,21 @@ impl App {
             entry.confidence = Some(spot.confidence);
             entry.best_snr_network = spot.best_snr;
             entry.last_seen_network = Some(spot.last_seen);
+
+            // Score the spot. `is_new_dxcc` / `is_new_band` aren't tracked
+            // in the TUI (the coordinator owns the worked-set), so pass
+            // false; rarity_tier is the dominant term for cluster spots
+            // anyway. Keep the higher of any pre-existing local score and
+            // the network score so a station heard both ways doesn't lose
+            // rank on a merge tick.
+            let net_score = crate::ui::dx_hunter::calculate_dx_priority(
+                entry,
+                &our_grid,
+                entry.worked_before,
+                false,
+                false,
+            );
+            entry.priority_score = entry.priority_score.max(net_score);
         }
     }
 
@@ -1787,5 +1948,247 @@ mod tests {
         assert_eq!(format_s_meter(60), "S9+60");
         // Very weak readings clamp at S0 rather than going negative.
         assert_eq!(format_s_meter(-120), "S0");
+    }
+
+    // === Task A: DX Hunter unified sort + cursor ===
+
+    fn dx_fixture(
+        call: &str,
+        priority: u32,
+        snr: i32,
+        freq: f64,
+        worked_before: bool,
+    ) -> DxStation {
+        DxStation {
+            call_sign: call.to_string(),
+            grid_square: None,
+            frequency: freq,
+            mode: "FT8".to_string(),
+            last_seen: Utc::now(),
+            snr,
+            distance: None,
+            bearing: None,
+            worked_before,
+            priority_score: priority,
+            source: SpotSource::Local,
+            rarity_tier: None,
+            reporter_count: None,
+            is_notable: false,
+            notable_type: None,
+            confidence: None,
+            best_snr_network: None,
+            last_seen_network: None,
+            audio_offset_hz: Some(1200),
+            slot_parity: None,
+        }
+    }
+
+    /// The comparator must put needed (worked_before==false) stations first,
+    /// then sort by priority desc, then snr desc, then freq asc, then call
+    /// asc — a stable TOTAL order so the same set always renders the same way.
+    #[tokio::test]
+    async fn displayed_dx_stations_orders_needed_first_then_priority() {
+        let mut app = fixture_app().await;
+        // Worked station with very high priority should still sort AFTER
+        // any needed station.
+        app.dx_stations
+            .insert("WORKED".into(), dx_fixture("WORKED", 999, 30, 14.074, true));
+        app.dx_stations
+            .insert("LOWPRI".into(), dx_fixture("LOWPRI", 10, 0, 14.074, false));
+        app.dx_stations.insert(
+            "HIGHPRI".into(),
+            dx_fixture("HIGHPRI", 200, 5, 14.074, false),
+        );
+
+        let order: Vec<&str> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| s.call_sign.as_str())
+            .collect();
+        assert_eq!(order, vec!["HIGHPRI", "LOWPRI", "WORKED"]);
+    }
+
+    /// Ties on priority break by snr desc, then freq asc, then call asc —
+    /// deterministic regardless of HashMap iteration order.
+    #[tokio::test]
+    async fn displayed_dx_stations_tiebreak_is_deterministic() {
+        let mut app = fixture_app().await;
+        // Same priority + same snr + same freq → fall through to call asc.
+        app.dx_stations
+            .insert("ZZ9ZZ".into(), dx_fixture("ZZ9ZZ", 50, 10, 14.074, false));
+        app.dx_stations
+            .insert("AA1AA".into(), dx_fixture("AA1AA", 50, 10, 14.074, false));
+        // Higher snr wins over the call tiebreak.
+        app.dx_stations
+            .insert("MM5MM".into(), dx_fixture("MM5MM", 50, 20, 14.074, false));
+
+        let order: Vec<&str> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| s.call_sign.as_str())
+            .collect();
+        assert_eq!(order, vec!["MM5MM", "AA1AA", "ZZ9ZZ"]);
+    }
+
+    /// The Space call-target (`get_selected_station`) MUST return the same
+    /// station shown under the cursor — i.e. it walks the SAME order as
+    /// `displayed_dx_stations`. This is the core bug Task A fixes (the old
+    /// chooser sorted by last_seen, the renderer by priority).
+    #[tokio::test]
+    async fn get_selected_station_matches_displayed_cursor() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        app.dx_stations
+            .insert("WORKED".into(), dx_fixture("WORKED", 999, 30, 14.074, true));
+        app.dx_stations
+            .insert("LOWPRI".into(), dx_fixture("LOWPRI", 10, 0, 14.075, false));
+        app.dx_stations.insert(
+            "HIGHPRI".into(),
+            dx_fixture("HIGHPRI", 200, 5, 14.073, false),
+        );
+
+        let expected_order: Vec<String> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| s.call_sign.clone())
+            .collect();
+        // For every cursor position, the selected callsign equals the
+        // displayed row at that index.
+        for (idx, expected) in expected_order.iter().enumerate() {
+            app.dx_hunter_scroll = idx;
+            let (call, _freq, _parity) = app.get_selected_station().expect("station at cursor");
+            assert_eq!(&call, expected, "cursor {idx} must select the shown row");
+        }
+    }
+
+    /// Local decodes carry the audio offset where we heard the station;
+    /// network-only spots fall back to 1500 Hz. The Space target must
+    /// preserve the local offset.
+    #[tokio::test]
+    async fn get_selected_station_preserves_local_audio_offset() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        let mut local = dx_fixture("LOCAL", 100, 10, 14.074, false);
+        local.audio_offset_hz = Some(871);
+        app.dx_stations.insert("LOCAL".into(), local);
+
+        app.dx_hunter_scroll = 0;
+        let (call, freq, _) = app.get_selected_station().unwrap();
+        assert_eq!(call, "LOCAL");
+        assert_eq!(freq, 871, "local audio offset must be preserved, not 1500");
+    }
+
+    #[tokio::test]
+    async fn get_selected_station_network_spot_defaults_to_1500() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        let mut net = dx_fixture("NETONLY", 100, 10, 14.074, false);
+        net.source = SpotSource::Network;
+        net.audio_offset_hz = None; // network spots carry no passband info
+        app.dx_stations.insert("NETONLY".into(), net);
+
+        app.dx_hunter_scroll = 0;
+        let (_, freq, _) = app.get_selected_station().unwrap();
+        assert_eq!(freq, 1500, "network-only spot falls back to 1500 Hz");
+    }
+
+    /// A local re-decode of a callsign already known from the network must
+    /// NOT blank the network metadata (rarity/reporter/notable). Before the
+    /// fix, `add_decoded_message` did a blanket insert that wiped those.
+    #[tokio::test]
+    async fn add_decoded_message_preserves_network_metadata() {
+        let mut app = fixture_app().await;
+        // Seed a rich network entry.
+        let mut net = dx_fixture("DX1ABC", 100, 5, 14.074, false);
+        net.source = SpotSource::Network;
+        net.rarity_tier = Some("legendary".to_string());
+        net.reporter_count = Some(42);
+        net.is_notable = true;
+        app.dx_stations.insert("DX1ABC".into(), net);
+
+        // Local re-decode of the same callsign.
+        let view = fixture_view("DX1ABC", 12);
+        app.add_decoded_message(view).await.unwrap();
+
+        let entry = app.dx_stations.get("DX1ABC").unwrap();
+        assert_eq!(
+            entry.rarity_tier.as_deref(),
+            Some("legendary"),
+            "network rarity must survive a local re-decode"
+        );
+        assert_eq!(entry.reporter_count, Some(42));
+        assert!(entry.is_notable);
+        assert_eq!(entry.source, SpotSource::Both, "now heard both ways");
+        assert_eq!(entry.snr, 12, "local snr updates");
+        assert_eq!(
+            entry.audio_offset_hz,
+            Some(1500),
+            "local audio offset captured"
+        );
+    }
+
+    // === Task E: device picker state + config persistence ===
+
+    #[tokio::test]
+    async fn set_audio_devices_preselects_current_output() {
+        let mut app = fixture_app().await;
+        let input = vec![("Mic A".to_string(), true), ("Mic B".to_string(), false)];
+        let output = vec![
+            ("Speakers".to_string(), true),
+            ("USB Codec".to_string(), false),
+            ("HDMI".to_string(), false),
+        ];
+        app.set_audio_devices(input, output, Some("USB Codec".to_string()));
+        assert_eq!(app.device_selection.selected_output_idx, 1);
+        assert_eq!(
+            app.device_selection.selected_output_name().as_deref(),
+            Some("USB Codec")
+        );
+        // Input cursor defaults to the OS-default input.
+        assert_eq!(app.device_selection.selected_input_idx, 0);
+    }
+
+    #[tokio::test]
+    async fn set_audio_devices_default_falls_back_to_os_default() {
+        let mut app = fixture_app().await;
+        let output = vec![
+            ("Speakers".to_string(), false),
+            ("Default Out".to_string(), true),
+        ];
+        app.set_audio_devices(Vec::new(), output, Some("default".to_string()));
+        assert_eq!(
+            app.device_selection.selected_output_idx, 1,
+            "'default' selects the OS-default entry"
+        );
+    }
+
+    #[test]
+    fn device_selection_nav_and_select_transitions() {
+        let mut st = DeviceSelectionState::new();
+        st.input_devices = vec![("In0".into(), true), ("In1".into(), false)];
+        st.output_devices = vec![
+            ("Out0".into(), true),
+            ("Out1".into(), false),
+            ("Out2".into(), false),
+        ];
+
+        // Starts on Input panel.
+        assert_eq!(st.active_panel, DevicePanel::Input);
+        st.move_down();
+        assert_eq!(st.selected_input_idx, 1);
+        st.move_down(); // clamp
+        assert_eq!(st.selected_input_idx, 1);
+        st.move_up();
+        assert_eq!(st.selected_input_idx, 0);
+
+        // Switch to Output and navigate independently.
+        st.toggle_panel();
+        assert_eq!(st.active_panel, DevicePanel::Output);
+        st.move_down();
+        st.move_down();
+        assert_eq!(st.selected_output_idx, 2);
+        assert_eq!(st.selected_output_name().as_deref(), Some("Out2"));
+        // Input selection was untouched by output navigation.
+        assert_eq!(st.selected_input_name().as_deref(), Some("In0"));
     }
 }
