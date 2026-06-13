@@ -147,11 +147,18 @@ pub enum TuiCommand {
     /// Change frequency
     SetFrequency { vfo: u8, frequency: u64 },
     /// Start CQ
-    StartCq,
+    StartCq {
+        /// Operator's TX audio offset (Hz) from the waterfall cursor.
+        frequency_offset: f64,
+    },
     /// Stop CQ
     StopCq,
     /// Send message
-    SendMessage { text: String },
+    SendMessage {
+        text: String,
+        /// Operator's TX audio offset (Hz) from the waterfall cursor.
+        frequency_offset: f64,
+    },
     /// Toggle PTT
     TogglePtt,
     /// Abort the in-flight TX without exiting pancetta. Operator-pressed `h`.
@@ -624,7 +631,9 @@ impl TuiRunner {
 
             // === CQ + QSO actions ===
             KeyCode::Char('c') => {
-                self.message_tx.send(TuiCommand::StartCq)?;
+                self.message_tx.send(TuiCommand::StartCq {
+                    frequency_offset: app.tx_frequency_offset,
+                })?;
             }
             KeyCode::Char('s') => {
                 self.message_tx.send(TuiCommand::StopCq)?;
@@ -702,7 +711,10 @@ impl TuiRunner {
             KeyCode::Enter => {
                 let text = app.get_input_text();
                 if !text.is_empty() {
-                    self.message_tx.send(TuiCommand::SendMessage { text })?;
+                    self.message_tx.send(TuiCommand::SendMessage {
+                        text,
+                        frequency_offset: app.tx_frequency_offset,
+                    })?;
                     app.clear_input();
                 }
             }
@@ -1147,7 +1159,7 @@ mod key_tests {
     async fn key_c_emits_start_cq() {
         let (mut r, cmd_rx, _app) = make_runner().await;
         r.handle_key_event(key('c')).await.unwrap();
-        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq)));
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq { .. })));
     }
 
     #[tokio::test]
@@ -1381,7 +1393,7 @@ mod key_tests {
         app.write().await.stopped_by_operator = true;
         r.handle_key_event(key('c')).await.unwrap();
         assert!(
-            matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq)),
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq { .. })),
             "c key must still emit StartCq even with banner visible"
         );
     }

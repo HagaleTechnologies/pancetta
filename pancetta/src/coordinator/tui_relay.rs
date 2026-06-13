@@ -431,6 +431,10 @@ impl super::ApplicationCoordinator {
         const TUNE_TONE_HZ: f64 = 1500.0;
         let cmd_handle = tokio::spawn(async move {
             let mut next_cq_time: Option<tokio::time::Instant> = None;
+            // Operator's TX audio offset (Hz) for repeating CQ, set from the
+            // waterfall cursor on StartCq. Default 1500 until the operator
+            // moves the cursor (was previously hard-coded, ignoring the cursor).
+            let mut cq_frequency_offset: f64 = 1500.0;
 
             // Push the available audio devices to the TUI once at startup so
             // the `d` device-selection picker can list them. The coordinator
@@ -470,7 +474,7 @@ impl super::ApplicationCoordinator {
                             ComponentId::Ft8Transmitter,
                             MessageType::TransmitRequest {
                                 message_text: cq_text,
-                                frequency_offset: 1500.0,
+                                frequency_offset: cq_frequency_offset,
                                 qso_id: None,
                                 tx_parity: None, // TUI CQ repeat: no DX context
                             },
@@ -485,14 +489,20 @@ impl super::ApplicationCoordinator {
 
                 match tui_cmd_rx.try_recv() {
                     Ok(cmd) => match cmd {
-                        pancetta_tui::tui_runner::TuiCommand::SendMessage { text } => {
-                            info!("TUI SendMessage: '{}'", text);
+                        pancetta_tui::tui_runner::TuiCommand::SendMessage {
+                            text,
+                            frequency_offset,
+                        } => {
+                            info!(
+                                "TUI SendMessage: '{}' at {:.0} Hz (waterfall cursor)",
+                                text, frequency_offset
+                            );
                             let msg = ComponentMessage::new(
                                 ComponentId::Tui,
                                 ComponentId::Ft8Transmitter,
                                 MessageType::TransmitRequest {
                                     message_text: text,
-                                    frequency_offset: 1500.0,
+                                    frequency_offset,
                                     qso_id: None,
                                     tx_parity: None, // TUI manual send: no DX context
                                 },
@@ -548,8 +558,12 @@ impl super::ApplicationCoordinator {
                             cmd_shutdown.store(true, Ordering::Release);
                             break;
                         }
-                        pancetta_tui::tui_runner::TuiCommand::StartCq => {
-                            info!("TUI StartCq: enabling repeating CQ");
+                        pancetta_tui::tui_runner::TuiCommand::StartCq { frequency_offset } => {
+                            info!(
+                                "TUI StartCq: enabling repeating CQ at {:.0} Hz (waterfall cursor)",
+                                frequency_offset
+                            );
+                            cq_frequency_offset = frequency_offset;
                             cmd_cq_active.store(true, Ordering::Relaxed);
                             // Send first CQ immediately by resetting the timer
                             next_cq_time = None;
