@@ -544,11 +544,27 @@ impl super::ApplicationCoordinator {
                                             dx_parity,
                                         } => {
                                             info!(
-                                                "Starting QSO with {} on {} Hz",
+                                                "Starting QSO with {} on {} Hz (manual)",
                                                 callsign, frequency
                                             );
+                                            // Operator-initiated MANUAL call:
+                                            //  - bypasses the self-duplicate gate (operator
+                                            //    explicitly chose to work/re-work this DX), and
+                                            //  - keep-calls every TX slot under the manual
+                                            //    watchdog (5 min / 10 calls).
+                                            //
+                                            // respond_to_cq_manual emits the first
+                                            // CqResponse as a QsoEvent::MessageToSend,
+                                            // which the event-forwarding task above turns
+                                            // into a TransmitRequest with the latched
+                                            // tx_parity. The watchdog re-arm
+                                            // (QsoManager::rearm_manual_calls) re-emits the
+                                            // same MessageToSend once per slot until the DX
+                                            // answers or the watchdog fires — so there is no
+                                            // separate TransmitRequest here (that would
+                                            // double-send the first call).
                                             match qso_manager
-                                                .respond_to_cq(
+                                                .respond_to_cq_manual(
                                                     callsign.clone(),
                                                     frequency as f64,
                                                     dx_parity,
@@ -557,53 +573,18 @@ impl super::ApplicationCoordinator {
                                             {
                                                 Ok(qso_id) => {
                                                     info!(
-                                                        "QSO started with {}: {}",
+                                                        "Manual QSO started with {}: {} \
+                                                         (keep-calling under watchdog)",
                                                         callsign, qso_id
                                                     );
-                                                    // Send grid reply as TX request
-                                                    let grid =
-                                                        our_grid.as_deref().unwrap_or("AA00");
-                                                    let reply = format!(
-                                                        "{} {} {}",
-                                                        callsign, our_callsign, grid
-                                                    );
-                                                    let tx_msg = ComponentMessage::new(
-                                                        ComponentId::Qso,
-                                                        ComponentId::Ft8Transmitter,
-                                                        MessageType::TransmitRequest {
-                                                            message_text: reply.clone(),
-                                                            frequency_offset: frequency as f64,
-                                                            qso_id: Some(qso_id.to_string()),
-                                                            tx_parity: dx_parity
-                                                                .map(|p| p.opposite()),
-                                                        },
-                                                        Instant::now(),
-                                                    );
-                                                    if let Err(e) =
-                                                        message_bus.send_message(tx_msg).await
-                                                    {
-                                                        warn!(
-                                                            "Failed to send QSO TX request: {}",
-                                                            e
-                                                        );
-                                                        emit_status(
-                                                            &message_bus,
-                                                            format!(
-                                                                "Call {}: TX bus send failed: {}",
-                                                                callsign, e
-                                                            ),
-                                                        )
-                                                        .await;
-                                                    } else {
-                                                        emit_status(
-                                                            &message_bus,
-                                                            format!(
-                                                                "Calling {} — TX queued ({} Hz)",
-                                                                callsign, frequency
-                                                            ),
-                                                        )
-                                                        .await;
-                                                    }
+                                                    emit_status(
+                                                        &message_bus,
+                                                        format!(
+                                                            "Calling {} — TX queued ({} Hz)",
+                                                            callsign, frequency
+                                                        ),
+                                                    )
+                                                    .await;
                                                 }
                                                 Err(e) => {
                                                     warn!(
@@ -791,6 +772,10 @@ mod snapshot_tests {
                 tags: std::collections::HashMap::new(),
                 notes: None,
                 tx_parity: Some(pancetta_core::slot::SlotParity::Odd),
+                initiated_by: Default::default(),
+                call_count: 0,
+                first_call_at: None,
+                last_call_at: None,
             },
         }
     }

@@ -188,6 +188,8 @@ async fn test_loopback_state_machine_driven_qso() {
             confirmation_timeout: 120,
             max_qso_duration: 600,
             cleanup_interval: 600,
+            manual_call_watchdog_minutes: 5,
+            manual_call_max_calls: 10,
         },
         contest_mode: None,
         auto_sequence: AutoSequenceConfig {

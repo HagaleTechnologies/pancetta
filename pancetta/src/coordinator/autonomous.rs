@@ -118,6 +118,9 @@ impl super::ApplicationCoordinator {
                 neighbor_guard_hz: config.autonomous.frequency.neighbor_guard_hz,
                 ..Default::default()
             },
+            // DX-busy suppression window. Not yet plumbed to pancetta-config;
+            // use the AutonomousConfig default (90 s).
+            dx_busy_window_secs: pancetta_qso::AutonomousConfig::default().dx_busy_window_secs,
         };
 
         let dry_run = config.autonomous.dry_run;

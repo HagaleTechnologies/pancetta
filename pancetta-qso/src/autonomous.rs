@@ -502,6 +502,12 @@ pub struct AutonomousConfig {
     pub band_hopping: BandHoppingConfig,
     /// Frequency allocator settings for smart TX offset selection.
     pub frequency: FrequencyAllocatorConfig,
+    /// DX-busy suppression window (seconds). If a DX station was seen
+    /// participating in a non-CQ exchange (report / RR73 / 73 not directed
+    /// at us) within this window, the autonomous operator will not start a
+    /// new call to it even if it briefly CQs again — it is presumed busy
+    /// with a third party. Default: 90 s.
+    pub dx_busy_window_secs: u64,
 }
 
 impl Default for AutonomousConfig {
@@ -518,6 +524,7 @@ impl Default for AutonomousConfig {
             listen_cycle: ListenCycleConfig::default(),
             band_hopping: BandHoppingConfig::default(),
             frequency: FrequencyAllocatorConfig::default(),
+            dx_busy_window_secs: 90,
         }
     }
 }
@@ -765,6 +772,13 @@ pub struct AutonomousOperator {
     /// FAKECALL FN42` every cycle to flood pancetta's QSO slots and
     /// log. (Security review 2026-04-29 I-1.)
     recently_responded_to: HashMap<String, std::time::Instant>,
+    /// DX-busy tracker: callsign → time it was last seen participating in
+    /// a non-CQ exchange (report / RR73 / 73) that was NOT directed at us
+    /// and was NOT a CQ. If a station appears here within
+    /// `config.dx_busy_window_secs`, the autonomous operator presumes it is
+    /// working a third party and suppresses any auto-response to its CQ.
+    /// Populated from `feed_decoded_messages`.
+    recently_in_qso: HashMap<String, std::time::Instant>,
     /// Phase-5 hardening #1: optional callsign-continuity FP filter
     /// consulted before responding to any CQ. Defends against OSD
     /// fabrications (`R44XYB`, `OR1QRD`, ...) reaching the TX path.
@@ -803,6 +817,7 @@ impl AutonomousOperator {
             paused: false,
             live_spot_frequencies: Vec::new(),
             recently_responded_to: HashMap::new(),
+            recently_in_qso: HashMap::new(),
             fp_filter: None,
         }
     }
@@ -854,6 +869,21 @@ impl AutonomousOperator {
             })
             .collect();
         self.decode_history.push_cycle(records);
+
+        // DX-busy tracking: record any station seen in a non-CQ exchange
+        // (report / RR73 / 73 not directed at us) so we can yield to a DX
+        // that is mid-QSO with a third party. Prune entries older than the
+        // configured busy window so the map stays bounded.
+        let busy_now = std::time::Instant::now();
+        let busy_window = std::time::Duration::from_secs(self.config.dx_busy_window_secs);
+        if let Some(cutoff) = busy_now.checked_sub(busy_window) {
+            self.recently_in_qso.retain(|_, t| *t > cutoff);
+        }
+        for msg in messages {
+            for call in third_party_exchange_callsigns(&msg.message_text, &self.our_callsign) {
+                self.recently_in_qso.insert(call, busy_now);
+            }
+        }
 
         // Extract CQ candidates.
         self.pending_cqs.clear();
@@ -912,6 +942,17 @@ impl AutonomousOperator {
         self.recently_responded_to
             .get(callsign)
             .is_some_and(|t| now.duration_since(*t) < RECENT_RESPONSE_WINDOW)
+    }
+
+    /// Returns `true` if `callsign` was seen working a third party (a
+    /// non-CQ exchange not directed at us) within
+    /// `config.dx_busy_window_secs`. The autonomous operator suppresses
+    /// new auto-responses to such a station even if it briefly CQs again.
+    pub fn is_dx_busy(&self, callsign: &str, now: std::time::Instant) -> bool {
+        let window = std::time::Duration::from_secs(self.config.dx_busy_window_secs);
+        self.recently_in_qso
+            .get(callsign)
+            .is_some_and(|t| now.duration_since(*t) < window)
     }
 
     /// Record that we just initiated a response to `callsign`. Also
@@ -1149,6 +1190,20 @@ impl AutonomousOperator {
                         .iter()
                         .filter(|cq| cq.dx_score >= threshold)
                         .filter(|cq| !self.is_recently_responded_to(&cq.callsign, now))
+                        // DX-busy gate: do not start an auto-response to a
+                        // station that was just working a third party, even
+                        // if it CQs again mid-sequence.
+                        .filter(|cq| {
+                            let busy = self.is_dx_busy(&cq.callsign, now);
+                            if busy {
+                                debug!(
+                                    target: "qso.security",
+                                    "suppressing CQ response: DX recently working a third party (callsign={}, window={}s)",
+                                    cq.callsign, self.config.dx_busy_window_secs
+                                );
+                            }
+                            !busy
+                        })
                         .filter(|cq| match fp.as_ref() {
                             None => true,
                             Some(f) => {
@@ -1384,6 +1439,63 @@ impl AutonomousOperator {
 fn is_cq_message(text: &str) -> bool {
     let upper = text.to_uppercase();
     upper.starts_with("CQ ")
+}
+
+/// Returns `true` if `tok` looks like a report / RR73 / RRR / 73 payload —
+/// the trailing token of a standard FT8 exchange (vs. a grid in a reply).
+fn is_exchange_payload(tok: &str) -> bool {
+    let u = tok.to_uppercase();
+    if u == "RR73" || u == "RRR" || u == "73" || u == "RR" {
+        return true;
+    }
+    // Signal reports: "-12", "+05", "R-12", "R+05".
+    let body = u.strip_prefix('R').unwrap_or(&u);
+    if let Some(rest) = body.strip_prefix(['-', '+']) {
+        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+    }
+    false
+}
+
+/// Inspect a decoded message and, if it is a **third-party exchange** —
+/// two callsign tokens followed by a report/RR73/RRR/73 payload, where it
+/// is neither a CQ nor directed at/from us — return the participant
+/// callsigns. These are the stations to mark "busy" so the autonomous
+/// operator yields to a DX mid-QSO with someone else.
+///
+/// Returns an empty vec for CQs, messages involving `our_callsign`, replies
+/// that carry a grid (not yet a committed exchange), and anything that does
+/// not parse as a 3-token `<to> <from> <payload>` exchange.
+fn third_party_exchange_callsigns(text: &str, our_callsign: &str) -> Vec<String> {
+    if is_cq_message(text) {
+        return Vec::new();
+    }
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    // Standard exchange is exactly "<to> <from> <payload>".
+    if parts.len() != 3 {
+        return Vec::new();
+    }
+    let (to, from, payload) = (parts[0], parts[1], parts[2]);
+    if !is_exchange_payload(payload) {
+        // Grid replies ("CALL CALL FN42") or anything else: not a
+        // committed exchange we should yield to.
+        return Vec::new();
+    }
+    // If either party is us, this is our own QSO traffic, not a third party.
+    if to.eq_ignore_ascii_case(our_callsign) || from.eq_ignore_ascii_case(our_callsign) {
+        return Vec::new();
+    }
+    // Both tokens must look like callsigns (contain a digit) to avoid
+    // treating tokens like "TNX" or directed-CQ words as callsigns.
+    let looks_like_call =
+        |s: &str| s.len() >= 3 && s.chars().any(|c| c.is_ascii_digit()) && s != "73";
+    let mut calls = Vec::new();
+    if looks_like_call(to) {
+        calls.push(to.to_uppercase());
+    }
+    if looks_like_call(from) {
+        calls.push(from.to_uppercase());
+    }
+    calls
 }
 
 fn extract_grid_from_cq(text: &str) -> Option<String> {
@@ -2285,5 +2397,110 @@ mod rate_limit_tests {
         // Stale should be pruned (older than 5 × 60s = 300s).
         assert!(!op.recently_responded_to.contains_key("STALE"));
         assert!(op.recently_responded_to.contains_key("FRESH"));
+    }
+}
+
+#[cfg(test)]
+mod dx_busy_tests {
+    use super::*;
+
+    fn op_even(our: &str) -> AutonomousOperator {
+        let config = AutonomousConfig {
+            enabled: true,
+            slot_parity: SlotParityConfig::Even,
+            min_dx_score: 0.3,
+            // Force CQ responses, never our own CQ, deterministic slot.
+            listen_cycle: ListenCycleConfig {
+                initial_interval: 100,
+                ..ListenCycleConfig::default()
+            },
+            ..AutonomousConfig::default()
+        };
+        AutonomousOperator::new(config, our.into(), Some("FN42".into()))
+    }
+
+    fn dmi(text: &str, call: Option<&str>, freq: f64) -> DecodedMessageInfo {
+        DecodedMessageInfo {
+            callsign: call.map(|c| c.to_string()),
+            frequency_hz: freq,
+            snr: -5,
+            message_text: text.to_string(),
+            slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
+            decode_origin: None,
+        }
+    }
+
+    #[test]
+    fn parser_detects_third_party_exchange() {
+        // "<to> <from> <report>" with neither being us → both busy.
+        let calls = third_party_exchange_callsigns("JA1ABC W1XYZ -12", "K5ARH");
+        assert_eq!(calls, vec!["JA1ABC".to_string(), "W1XYZ".to_string()]);
+        // RR73 / 73 also count.
+        assert_eq!(
+            third_party_exchange_callsigns("JA1ABC W1XYZ RR73", "K5ARH").len(),
+            2
+        );
+        // A reply carrying a grid is NOT a committed exchange.
+        assert!(third_party_exchange_callsigns("JA1ABC W1XYZ FN42", "K5ARH").is_empty());
+        // CQ never counts.
+        assert!(third_party_exchange_callsigns("CQ JA1ABC PM95", "K5ARH").is_empty());
+        // If WE are a party, it is our own QSO, not a third party.
+        assert!(third_party_exchange_callsigns("K5ARH JA1ABC -12", "K5ARH").is_empty());
+        assert!(third_party_exchange_callsigns("JA1ABC K5ARH R-12", "K5ARH").is_empty());
+    }
+
+    #[test]
+    fn busy_dx_response_is_suppressed_then_permitted_after_window() {
+        let mut op = op_even("K5ARH");
+        let evaluator = NullDxEvaluator; // 0.5 ≥ 0.3 threshold
+
+        // Slot A: JA1ABC is working W1XYZ (a third party).
+        op.feed_decoded_messages(
+            &[dmi("JA1ABC W1XYZ -12", Some("W1XYZ"), 1500.0)],
+            &evaluator,
+        );
+        let now = std::time::Instant::now();
+        assert!(
+            op.is_dx_busy("JA1ABC", now),
+            "JA1ABC should be flagged busy after a third-party exchange"
+        );
+
+        // Slot B: JA1ABC briefly CQs again. Because it was just busy, the
+        // autonomous operator must NOT respond.
+        op.feed_decoded_messages(&[dmi("CQ JA1ABC PM95", Some("JA1ABC"), 1500.0)], &evaluator);
+        let actions = op.decide_at(0); // even slot → our TX slot
+        let responded = actions.iter().any(|a| {
+            matches!(a, OperatorAction::Transmit { message_text, .. } if message_text.contains("JA1ABC"))
+        });
+        assert!(!responded, "must suppress response to a busy DX");
+    }
+
+    #[test]
+    fn non_busy_dx_cq_is_answered() {
+        let mut op = op_even("K5ARH");
+        let evaluator = NullDxEvaluator;
+
+        // JA1ABC simply CQs; never seen in an exchange → answerable.
+        op.feed_decoded_messages(&[dmi("CQ JA1ABC PM95", Some("JA1ABC"), 1500.0)], &evaluator);
+        assert!(!op.is_dx_busy("JA1ABC", std::time::Instant::now()));
+        let actions = op.decide_at(0);
+        let responded = actions.iter().any(|a| {
+            matches!(a, OperatorAction::Transmit { message_text, .. } if message_text.contains("JA1ABC"))
+        });
+        assert!(responded, "a non-busy DX CQ should be answered");
+    }
+
+    #[test]
+    fn busy_flag_expires_after_window() {
+        let mut op = op_even("K5ARH");
+        // Manually seed an old busy timestamp beyond the 90s window.
+        let stale = std::time::Instant::now() - std::time::Duration::from_secs(120);
+        op.recently_in_qso.insert("JA1ABC".to_string(), stale);
+        assert!(
+            !op.is_dx_busy("JA1ABC", std::time::Instant::now()),
+            "busy flag older than dx_busy_window_secs (90s) must expire"
+        );
     }
 }

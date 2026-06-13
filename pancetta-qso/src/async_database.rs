@@ -941,6 +941,10 @@ mod tests {
                 tags: HashMap::new(),
                 notes: None,
                 tx_parity: None,
+                initiated_by: Default::default(),
+                call_count: 0,
+                first_call_at: None,
+                last_call_at: None,
             },
         };
 
@@ -975,6 +979,10 @@ mod tests {
                 tags: HashMap::new(),
                 notes: None,
                 tx_parity: None,
+                initiated_by: Default::default(),
+                call_count: 0,
+                first_call_at: None,
+                last_call_at: None,
             },
         };
 
