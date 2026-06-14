@@ -130,9 +130,10 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
         )));
     }
 
-    // Control hint for the multi-QSO view.
+    // Control hint for the multi-QSO view. r/k act only while this panel is
+    // focused (so they can't abort a QSO from another panel).
     lines.push(Line::from(Span::styled(
-        " [k] abort  [r] re-send  Up/Down select",
+        " [k] abort  [r] re-send  Up/Down select  (this panel only)",
         Style::default().fg(app.theme.muted_color()),
     )));
 
@@ -299,7 +300,7 @@ fn render_ladder(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// One-line control hint at the bottom of the single-detail QSO panel.
 fn render_control_hint(f: &mut Frame<'_>, area: Rect, app: &App) {
     let paragraph = Paragraph::new(Line::from(Span::styled(
-        "[k] abort  [r] re-send  Up/Down select",
+        "[k] abort  [r] re-send  Up/Down select  (this panel only)",
         Style::default().fg(app.theme.muted_color()),
     )));
     f.render_widget(paragraph, area);

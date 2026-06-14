@@ -349,10 +349,21 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(app.theme.foreground_color()),
         ),
         Span::raw(" | "),
-        Span::styled(
-            &app.status_message,
-            Style::default().fg(app.theme.accent_color()),
-        ),
+        // While composing a free-text TX message, show the live input line
+        // (with cursor) in bold instead of the transient status text so the
+        // operator sees exactly what they're about to send.
+        match app.compose_prompt() {
+            Some(prompt) => Span::styled(
+                prompt,
+                Style::default()
+                    .fg(app.theme.warning_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            None => Span::styled(
+                app.status_message.clone(),
+                Style::default().fg(app.theme.accent_color()),
+            ),
+        },
     ]);
 
     let help_line = Line::from(vec![

@@ -3070,7 +3070,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
- "clap",
  "crossbeam-channel",
  "crossterm 0.28.1",
  "dirs",
@@ -3086,8 +3085,6 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
- "tracing-appender",
- "tracing-subscriber",
 ]
 
 [[package]]

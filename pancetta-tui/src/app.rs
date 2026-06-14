@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::MouseEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
@@ -442,9 +442,25 @@ pub struct App {
     pub dx_stations: HashMap<String, DxStation>,
     pub band_activity_scroll: usize,
     pub dx_hunter_scroll: usize,
+    /// The callsign the DX-Hunter cursor is pinned to. The DX-Hunter list
+    /// re-sorts and grows under the cursor (needed-first / priority-desc),
+    /// so a bare positional index silently retargets Space/Enter onto a
+    /// different station when a higher-priority spot arrives. We pin the
+    /// SELECTED callsign and re-derive `dx_hunter_scroll` from it after
+    /// every list mutation (`clamp_dx_hunter_selection`), falling back to a
+    /// clamp if the pinned call left the list. `None` means "not yet pinned"
+    /// (track whatever is at `dx_hunter_scroll`).
+    dx_hunter_pinned_call: Option<String>,
     /// Selection cursor into the Callers panel (the list of stations calling
     /// us). Indexes `App::displayed_callers()`; clamped when that list changes.
     pub callers_scroll: usize,
+    /// The callsign the Callers cursor is pinned to. The Callers list is
+    /// newest-first and grows as new callers arrive at row 0, which would
+    /// otherwise shift the operator's selection (and the Enter reply-target)
+    /// onto whoever just called. We pin the SELECTED caller's callsign and
+    /// re-derive `callers_scroll` from it on every list change
+    /// (`clamp_callers_selection`). `None` means "not yet pinned".
+    callers_pinned_call: Option<String>,
     /// Operator override for the reply sequence step in the Callers panel.
     /// `None` means "use the smart default classified from the selected
     /// caller's last message". Reset to `None` whenever the selected caller
@@ -497,6 +513,13 @@ pub struct App {
     // TX input
     pub tx_input_buffer: String,
     pub tx_input_cursor: usize,
+    /// `true` while the operator is composing a free-text TX message (entered
+    /// with `/`). In compose mode every `Char`/`Backspace` edits
+    /// `tx_input_buffer` instead of triggering a command, Enter sends + exits,
+    /// and Esc cancels + exits. Outside compose mode, letters are commands
+    /// only — stray keystrokes never feed the TX buffer (the historic bug:
+    /// command keys and free-text input shared the same flat keymap).
+    pub compose_mode: bool,
     pub is_transmitting: bool,
     pub tx_frequency_offset: f64,
 
@@ -581,7 +604,9 @@ impl App {
             dx_stations: HashMap::new(),
             band_activity_scroll: 0,
             dx_hunter_scroll: 0,
+            dx_hunter_pinned_call: None,
             callers_scroll: 0,
+            callers_pinned_call: None,
             caller_reply_override: None,
             caller_override_for: None,
             audio_device,
@@ -599,6 +624,7 @@ impl App {
             stopped_by_operator: false,
             tx_input_buffer: String::new(),
             tx_input_cursor: 0,
+            compose_mode: false,
             is_transmitting: false,
             tx_frequency_offset: 1500.0,
             tx_policy: pancetta_core::TxPolicy::default(),
@@ -654,71 +680,6 @@ impl App {
         self.cleanup_old_data();
 
         Ok(())
-    }
-
-    pub async fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
-        // When help is visible, consume Escape/? to close it and swallow all other keys
-        if self.help_visible {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('?') => {
-                    self.toggle_help();
-                }
-                _ => {} // swallow all other keys
-            }
-            return Ok(false);
-        }
-
-        match key.code {
-            // Global shortcuts
-            KeyCode::Esc => {
-                self.should_quit = true;
-                return Ok(true);
-            }
-
-            // Panel navigation
-            KeyCode::Tab => {
-                self.active_panel = self.active_panel.next();
-                debug!("Switched to panel: {:?}", self.active_panel);
-            }
-            KeyCode::BackTab => {
-                self.active_panel = self.active_panel.previous();
-                debug!("Switched to panel: {:?}", self.active_panel);
-            }
-
-            // Panel-specific shortcuts
-            KeyCode::Char('1') => self.active_panel = ActivePanel::BandActivity,
-            KeyCode::Char('2') => self.active_panel = ActivePanel::QsoStatus,
-            KeyCode::Char('3') => self.active_panel = ActivePanel::StationInfo,
-            KeyCode::Char('4') => self.active_panel = ActivePanel::Callers,
-            KeyCode::Char('5') => self.active_panel = ActivePanel::DxHunter,
-
-            // Scrolling
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.scroll_up();
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.scroll_down();
-            }
-            KeyCode::PageUp => {
-                for _ in 0..10 {
-                    self.scroll_up();
-                }
-            }
-            KeyCode::PageDown => {
-                for _ in 0..10 {
-                    self.scroll_down();
-                }
-            }
-
-            // Clear messages
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.clear_messages();
-            }
-
-            _ => {}
-        }
-
-        Ok(false)
     }
 
     pub async fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {
@@ -901,6 +862,14 @@ impl App {
             }
         }
 
+        // A new decode can grow/reorder both the DX-Hunter and Callers lists
+        // (a new caller arrives at row 0; a higher-priority spot re-sorts the
+        // DX list). Re-derive both cursors from their pinned callsigns so the
+        // operator's Space/Enter target doesn't silently shift onto whoever
+        // just appeared.
+        self.clamp_dx_hunter_selection();
+        self.clamp_callers_selection();
+
         self.status_message = format!("Decoded: {}", message.message);
         Ok(())
     }
@@ -943,11 +912,13 @@ impl App {
                 if self.dx_hunter_scroll > 0 {
                     self.dx_hunter_scroll -= 1;
                 }
+                self.repin_dx_hunter();
             }
             ActivePanel::Callers => {
                 if self.callers_scroll > 0 {
                     self.callers_scroll -= 1;
                 }
+                self.repin_callers();
             }
             _ => {}
         }
@@ -962,18 +933,46 @@ impl App {
                 }
             }
             ActivePanel::DxHunter => {
-                let max_scroll = self.dx_stations.len().saturating_sub(1);
+                let max_scroll = self.displayed_dx_stations().len().saturating_sub(1);
                 if self.dx_hunter_scroll < max_scroll {
                     self.dx_hunter_scroll += 1;
                 }
+                self.repin_dx_hunter();
             }
             ActivePanel::Callers => {
                 let max_scroll = self.displayed_callers().len().saturating_sub(1);
                 if self.callers_scroll < max_scroll {
                     self.callers_scroll += 1;
                 }
+                self.repin_callers();
             }
             _ => {}
+        }
+    }
+
+    /// Pin the DX-Hunter selection to whatever callsign currently sits under
+    /// `dx_hunter_scroll`. Called after a deliberate cursor move so a later
+    /// list mutation re-derives the index from this callsign rather than
+    /// snapping back to a stale position.
+    fn repin_dx_hunter(&mut self) {
+        self.dx_hunter_pinned_call = self
+            .displayed_dx_stations()
+            .get(self.dx_hunter_scroll)
+            .map(|s| s.call_sign.clone());
+    }
+
+    /// Pin the Callers selection to whatever callsign currently sits under
+    /// `callers_scroll`, and reset the reply override when the pinned caller
+    /// changes. Called after a deliberate cursor move.
+    fn repin_callers(&mut self) {
+        let current = self
+            .displayed_callers()
+            .get(self.callers_scroll)
+            .and_then(|m| m.call_sign.clone());
+        self.callers_pinned_call = current.clone();
+        if current != self.caller_override_for {
+            self.caller_reply_override = None;
+            self.caller_override_for = current;
         }
     }
 
@@ -986,8 +985,14 @@ impl App {
     pub fn scroll_to_top(&mut self) {
         match self.active_panel {
             ActivePanel::BandActivity => self.band_activity_scroll = 0,
-            ActivePanel::DxHunter => self.dx_hunter_scroll = 0,
-            ActivePanel::Callers => self.callers_scroll = 0,
+            ActivePanel::DxHunter => {
+                self.dx_hunter_scroll = 0;
+                self.repin_dx_hunter();
+            }
+            ActivePanel::Callers => {
+                self.callers_scroll = 0;
+                self.repin_callers();
+            }
             _ => {}
         }
     }
@@ -1000,10 +1005,12 @@ impl App {
                 self.band_activity_scroll = self.decoded_messages.len().saturating_sub(1);
             }
             ActivePanel::DxHunter => {
-                self.dx_hunter_scroll = self.dx_stations.len().saturating_sub(1);
+                self.dx_hunter_scroll = self.displayed_dx_stations().len().saturating_sub(1);
+                self.repin_dx_hunter();
             }
             ActivePanel::Callers => {
                 self.callers_scroll = self.displayed_callers().len().saturating_sub(1);
+                self.repin_callers();
             }
             _ => {}
         }
@@ -1018,9 +1025,11 @@ impl App {
             }
             ActivePanel::DxHunter => {
                 self.dx_hunter_scroll = self.dx_hunter_scroll.saturating_sub(Self::SCROLL_PAGE);
+                self.repin_dx_hunter();
             }
             ActivePanel::Callers => {
                 self.callers_scroll = self.callers_scroll.saturating_sub(Self::SCROLL_PAGE);
+                self.repin_callers();
             }
             _ => {}
         }
@@ -1035,12 +1044,14 @@ impl App {
                     (self.band_activity_scroll + Self::SCROLL_PAGE).min(max);
             }
             ActivePanel::DxHunter => {
-                let max = self.dx_stations.len().saturating_sub(1);
+                let max = self.displayed_dx_stations().len().saturating_sub(1);
                 self.dx_hunter_scroll = (self.dx_hunter_scroll + Self::SCROLL_PAGE).min(max);
+                self.repin_dx_hunter();
             }
             ActivePanel::Callers => {
                 let max = self.displayed_callers().len().saturating_sub(1);
                 self.callers_scroll = (self.callers_scroll + Self::SCROLL_PAGE).min(max);
+                self.repin_callers();
             }
             _ => {}
         }
@@ -1225,6 +1236,16 @@ impl App {
         Some(self.active_qsos[idx].qso_id.clone())
     }
 
+    /// The DX callsign of the currently selected QSO, for operator feedback
+    /// on abort/re-send ("Aborting QSO with W1AW").
+    pub fn selected_qso_callsign(&self) -> Option<String> {
+        if self.active_qsos.is_empty() {
+            return None;
+        }
+        let idx = self.qso_cursor.min(self.active_qsos.len() - 1);
+        Some(self.active_qsos[idx].their_callsign.clone())
+    }
+
     /// Move the QSO selection cursor up (toward index 0), saturating.
     pub fn qso_cursor_up(&mut self) {
         self.qso_cursor = self.qso_cursor.saturating_sub(1);
@@ -1271,6 +1292,8 @@ impl App {
             slot_parity: None,
         };
         self.dx_stations.insert(callsign, dx_station);
+        // Adding a spot can re-sort the DX-Hunter list; keep the cursor pinned.
+        self.clamp_dx_hunter_selection();
     }
 
     pub fn add_error_message(&mut self, error: String) {
@@ -1482,26 +1505,82 @@ impl App {
         out
     }
 
-    /// Clamp `callers_scroll` to the current Callers list, and reset the reply
+    /// Re-derive `callers_scroll` from the pinned callsign and reset the reply
     /// override if the selected caller changed (so each newly-selected caller
-    /// starts at its own smart default). Call this when the Callers list or
-    /// selection may have shifted.
+    /// starts at its own smart default). Call this on EVERY path that can move
+    /// the cursor or mutate the Callers list — Up/Down, Home/End/PgUp/PgDn,
+    /// and decode arrival (`add_decoded_message`).
+    ///
+    /// The Callers list is newest-first and grows at row 0 as new callers
+    /// arrive, so a bare positional index would slide the operator's selection
+    /// (and the Enter reply-target) onto whoever just called. To prevent that
+    /// we pin the SELECTED caller's callsign: if the pinned call is still in
+    /// the list we re-point `callers_scroll` at its new index; if it's gone we
+    /// clamp to the current bounds and adopt whatever caller now sits there.
     pub fn clamp_callers_selection(&mut self) {
-        let (len, current) = {
-            let callers = self.displayed_callers();
-            let len = callers.len();
-            let idx = self.callers_scroll.min(len.saturating_sub(1));
-            let current = callers.get(idx).and_then(|m| m.call_sign.clone());
-            (len, current)
-        };
+        // Snapshot the callsigns in display order (owned) so we can mutate the
+        // cursor without holding a borrow of `self` through `displayed_callers`.
+        let calls: Vec<Option<String>> = self
+            .displayed_callers()
+            .iter()
+            .map(|m| m.call_sign.clone())
+            .collect();
+        let len = calls.len();
+
+        // First, re-derive the index from the pinned callsign so a list
+        // growth/re-order doesn't retarget the operator.
+        if let Some(ref pin) = self.callers_pinned_call {
+            if let Some(pos) = calls
+                .iter()
+                .position(|c| c.as_deref() == Some(pin.as_str()))
+            {
+                self.callers_scroll = pos;
+            }
+        }
+
         let max = len.saturating_sub(1);
         if self.callers_scroll > max {
             self.callers_scroll = max;
         }
+        // Adopt whatever caller the cursor now resolves to as the new pin.
+        let current = calls.get(self.callers_scroll).cloned().flatten();
+        self.callers_pinned_call = current.clone();
         if current != self.caller_override_for {
             self.caller_reply_override = None;
             self.caller_override_for = current;
         }
+    }
+
+    /// Re-derive `dx_hunter_scroll` from the pinned callsign so a list
+    /// re-sort/growth doesn't silently retarget the Space call-target. Mirror
+    /// of [`clamp_callers_selection`] for the DX-Hunter panel. Call this on
+    /// every cursor-move and on every DX-list mutation (decode arrival,
+    /// network-spot merge).
+    ///
+    /// If the pinned callsign is still present we re-point the cursor at its
+    /// new index; if it left the list we clamp to bounds and adopt whatever
+    /// station now sits under the cursor as the new pin.
+    pub fn clamp_dx_hunter_selection(&mut self) {
+        // Snapshot callsigns in display order (owned) to avoid holding a borrow
+        // of `self` while we mutate the cursor.
+        let calls: Vec<String> = self
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| s.call_sign.clone())
+            .collect();
+        let len = calls.len();
+
+        if let Some(ref pin) = self.dx_hunter_pinned_call {
+            if let Some(pos) = calls.iter().position(|c| c == pin) {
+                self.dx_hunter_scroll = pos;
+            }
+        }
+
+        let max = len.saturating_sub(1);
+        if self.dx_hunter_scroll > max {
+            self.dx_hunter_scroll = max;
+        }
+        self.dx_hunter_pinned_call = calls.get(self.dx_hunter_scroll).cloned();
     }
 
     /// The currently-selected caller, if any.
@@ -1600,6 +1679,30 @@ impl App {
             self.tx_input_cursor -= 1;
             self.tx_input_buffer.remove(self.tx_input_cursor);
             self.status_message = format!("TX: {}", self.tx_input_buffer);
+        }
+    }
+
+    /// Enter free-text compose mode. Shows the TX-message input line; while
+    /// active, Char/Backspace edit the buffer and command letters are inert.
+    pub fn enter_compose_mode(&mut self) {
+        self.compose_mode = true;
+        self.status_message = "Compose TX message — type, Enter to send, Esc to cancel".to_string();
+    }
+
+    /// Leave compose mode, discarding the in-progress buffer.
+    pub fn cancel_compose_mode(&mut self) {
+        self.compose_mode = false;
+        self.clear_input();
+        self.status_message = "Compose cancelled".to_string();
+    }
+
+    /// A small compose prompt for the status / input line, e.g.
+    /// `TX> CQ K5ARH EM00_`. Returns `None` when not composing.
+    pub fn compose_prompt(&self) -> Option<String> {
+        if self.compose_mode {
+            Some(format!("TX> {}_", self.tx_input_buffer))
+        } else {
+            None
         }
     }
 
@@ -1737,6 +1840,10 @@ impl App {
             );
             entry.priority_score = entry.priority_score.max(net_score);
         }
+
+        // A network-spot merge can re-sort the DX-Hunter list; keep the cursor
+        // pinned to the operator's selected callsign.
+        self.clamp_dx_hunter_selection();
     }
 
     pub fn toggle_autonomous_pause(&mut self) {
@@ -2827,5 +2934,110 @@ mod tests {
         assert!(app.is_caller_busy("JA1ABC"));
         assert!(app.is_caller_busy("W1XYZ"));
         assert!(!app.is_caller_busy("K9ZZ"));
+    }
+
+    // === UX audit Batch 1: callsign-pinned cursors ====================
+
+    /// Selecting a DX-Hunter station then having a higher-priority spot
+    /// arrive must keep the cursor on the operator's chosen callsign, not
+    /// slide it to whatever sorts to the same row.
+    #[tokio::test]
+    async fn dx_hunter_cursor_pins_to_callsign_across_resort() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+
+        // Two local decodes; both worked_before=false, same priority. Order is
+        // by the stable comparator (snr desc then call asc). Add LOWPRI first.
+        app.add_decoded_message(fixture_view("AA1AA", -15))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("BB2BB", -15))
+            .await
+            .unwrap();
+
+        // Select whichever station is at row 1.
+        let displayed = app.displayed_dx_stations();
+        assert_eq!(displayed.len(), 2);
+        let chosen = displayed[1].call_sign.clone();
+        app.dx_hunter_scroll = 1;
+        app.repin_dx_hunter();
+
+        // A NEW higher-SNR station arrives — it sorts to the top, shifting rows.
+        app.add_decoded_message(fixture_view("CC3CC", 10))
+            .await
+            .unwrap();
+
+        // The cursor must still resolve to the operator's chosen callsign.
+        let (sel, _, _) = app.get_selected_station().expect("a station selected");
+        assert_eq!(sel, chosen, "DX-Hunter cursor must stay on pinned callsign");
+    }
+
+    /// A new caller arriving at row 0 must not shift the operator's selection
+    /// off the caller they had pinned.
+    #[tokio::test]
+    async fn callers_cursor_pins_across_new_arrival() {
+        let mut app = fixture_app().await;
+        app.station_info.call_sign = "K5ARH".to_string();
+        app.active_panel = ActivePanel::Callers;
+
+        app.add_decoded_message(fixture_view_directed("AA1AA", -10))
+            .await
+            .unwrap();
+        // Single caller selected at row 0.
+        app.clamp_callers_selection();
+        assert_eq!(
+            app.selected_caller()
+                .and_then(|m| m.call_sign.clone())
+                .as_deref(),
+            Some("AA1AA")
+        );
+
+        // A new caller arrives — newest-first puts it at row 0.
+        app.add_decoded_message(fixture_view_directed("BB2BB", -8))
+            .await
+            .unwrap();
+
+        // The selection must still be the originally-pinned caller.
+        assert_eq!(
+            app.selected_caller()
+                .and_then(|m| m.call_sign.clone())
+                .as_deref(),
+            Some("AA1AA"),
+            "Callers cursor must stay on pinned callsign across list growth"
+        );
+    }
+
+    /// When the pinned caller leaves the list, the cursor clamps to bounds and
+    /// the reply override resets (new pinned callsign).
+    #[tokio::test]
+    async fn callers_cursor_falls_back_when_pinned_call_gone() {
+        let mut app = fixture_app().await;
+        app.station_info.call_sign = "K5ARH".to_string();
+        app.active_panel = ActivePanel::Callers;
+        app.add_decoded_message(fixture_view_directed("AA1AA", -10))
+            .await
+            .unwrap();
+        app.clamp_callers_selection();
+        // Pin to AA1AA, set an override.
+        app.caller_reply_override = Some(pancetta_core::ResponseStep::Rr73);
+        app.caller_override_for = Some("AA1AA".to_string());
+
+        // Wipe the list (simulating the caller aging out) and add a different one.
+        app.decoded_messages.clear();
+        app.add_decoded_message(fixture_view_directed("ZZ9ZZ", -5))
+            .await
+            .unwrap();
+
+        // Cursor clamps; pin + override reset to the new caller's default.
+        assert_eq!(
+            app.selected_caller()
+                .and_then(|m| m.call_sign.clone())
+                .as_deref(),
+            Some("ZZ9ZZ")
+        );
+        assert!(
+            app.caller_reply_override.is_none(),
+            "override resets when pinned callsign changes"
+        );
     }
 }

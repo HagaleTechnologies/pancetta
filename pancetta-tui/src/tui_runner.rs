@@ -575,6 +575,41 @@ impl TuiRunner {
             return Ok(true);
         }
 
+        // Compose (free-text TX) mode. While active, the keyboard is a text
+        // editor — Char/Backspace edit the TX buffer, Enter sends + exits, Esc
+        // cancels + exits. Command letters are intentionally inert here so the
+        // operator can type a callsign/message without firing c/s/k/g. This is
+        // the explicit command-vs-text-input split (UX audit Batch 1).
+        if app.compose_mode {
+            match key.code {
+                KeyCode::Esc => {
+                    app.cancel_compose_mode();
+                }
+                KeyCode::Enter => {
+                    let text = app.get_input_text();
+                    if text.trim().is_empty() {
+                        app.cancel_compose_mode();
+                    } else {
+                        self.message_tx.send(TuiCommand::SendMessage {
+                            text: text.clone(),
+                            frequency_offset: app.tx_frequency_offset,
+                        })?;
+                        app.clear_input();
+                        app.compose_mode = false;
+                        app.status_message = format!("TX sent: {}", text);
+                    }
+                }
+                KeyCode::Backspace => {
+                    app.delete_char();
+                }
+                KeyCode::Char(c) => {
+                    app.input_char(c);
+                }
+                _ => {} // swallow other keys while composing
+            }
+            return Ok(true);
+        }
+
         match key.code {
             // hb-161: Esc clears the operator-stop banner without re-enabling
             // anything. Re-enabling autonomous still requires `a`. Bound here
@@ -686,6 +721,29 @@ impl TuiRunner {
                 })?;
             }
 
+            // Panel jump 1-5 (advertised in help; map matches the historic
+            // app.rs binding). 1=Band, 2=QSO, 3=Station, 4=Callers, 5=DX.
+            KeyCode::Char('1') => {
+                app.active_panel = crate::app::ActivePanel::BandActivity;
+                app.status_message = "Panel: Band Activity".to_string();
+            }
+            KeyCode::Char('2') => {
+                app.active_panel = crate::app::ActivePanel::QsoStatus;
+                app.status_message = "Panel: QSO Status".to_string();
+            }
+            KeyCode::Char('3') => {
+                app.active_panel = crate::app::ActivePanel::StationInfo;
+                app.status_message = "Panel: Station Info".to_string();
+            }
+            KeyCode::Char('4') => {
+                app.active_panel = crate::app::ActivePanel::Callers;
+                app.status_message = "Panel: Callers".to_string();
+            }
+            KeyCode::Char('5') => {
+                app.active_panel = crate::app::ActivePanel::DxHunter;
+                app.status_message = "Panel: DX Hunter".to_string();
+            }
+
             // === Quit (with confirm modal) ===
             KeyCode::Char('q') => {
                 app.quit_confirm_visible = true;
@@ -750,34 +808,74 @@ impl TuiRunner {
                 self.message_tx.send(TuiCommand::StopTx)?;
             }
             KeyCode::Char('p') => {
-                self.message_tx.send(TuiCommand::TogglePtt)?;
+                // TX-policy safety gate (mirror of the relay's authoritative
+                // check): refuse keying PTT while TX is Disabled. The relay
+                // can't tell a key-up from a key-down across the toggle, but
+                // the common operator intent for `p` after a Shift+Q is to
+                // key up — so we hard-refuse here for instant feedback and the
+                // relay enforces the real ON-transition gate. PTT-OFF is never
+                // blocked there.
+                if !app.tx_policy.allows_any_tx() {
+                    app.status_message =
+                        "Can't key PTT — TX is DISABLED (press g to re-enable)".to_string();
+                } else {
+                    self.message_tx.send(TuiCommand::TogglePtt)?;
+                }
             }
 
             // === QSO management (operate on the selected QSO) ===
+            // r / k are gated to the QSO Status panel so the operator can't
+            // accidentally re-send or abort the selected QSO while scrolling
+            // Band Activity or DX Hunter (the historic foot-gun: `k` aborting a
+            // QSO from an unrelated panel). Both echo the target callsign.
             // r - re-send our most recent message in the selected QSO.
-            KeyCode::Char('r') => {
-                if let Some(qso_id) = app.selected_qso_id() {
-                    self.message_tx.send(TuiCommand::ResendQso { qso_id })?;
-                    app.status_message = "Re-sending last TX for selected QSO".to_string();
-                } else {
-                    app.status_message = "No active QSO to re-send".to_string();
+            KeyCode::Char('r')
+                if matches!(app.active_panel, crate::app::ActivePanel::QsoStatus) =>
+            {
+                match (app.selected_qso_id(), app.selected_qso_callsign()) {
+                    (Some(qso_id), Some(call)) => {
+                        self.message_tx.send(TuiCommand::ResendQso { qso_id })?;
+                        app.status_message = format!("Re-sending last TX to {}", call);
+                    }
+                    _ => {
+                        app.status_message = "No active QSO to re-send".to_string();
+                    }
                 }
             }
             // k - kill/abort the selected QSO.
-            KeyCode::Char('k') => {
-                if let Some(qso_id) = app.selected_qso_id() {
-                    self.message_tx.send(TuiCommand::AbortQso { qso_id })?;
-                    app.status_message = "Aborting selected QSO".to_string();
-                } else {
-                    app.status_message = "No active QSO to abort".to_string();
+            KeyCode::Char('k')
+                if matches!(app.active_panel, crate::app::ActivePanel::QsoStatus) =>
+            {
+                match (app.selected_qso_id(), app.selected_qso_callsign()) {
+                    (Some(qso_id), Some(call)) => {
+                        self.message_tx.send(TuiCommand::AbortQso { qso_id })?;
+                        app.status_message = format!("Aborting QSO with {}", call);
+                    }
+                    _ => {
+                        app.status_message = "No active QSO to abort".to_string();
+                    }
                 }
+            }
+            // r / k pressed outside the QSO Status panel: hint, don't act.
+            KeyCode::Char('r') | KeyCode::Char('k') => {
+                app.status_message =
+                    "Focus the QSO Status panel (2) to re-send (r) / abort (k)".to_string();
             }
 
             // === Tune / clear-offset (case-sensitive) ===
             KeyCode::Char('T') => {
                 // Shift-T: 12-second single-tone tune. Shift requirement is a
                 // small barrier against accidental TX during keyboard fumbling.
-                self.message_tx.send(TuiCommand::ToggleTune)?;
+                // TX-policy safety gate: a tune carrier is a transmission, so
+                // refuse it while TX is Disabled (RX-only). A tune can never be
+                // in flight while Disabled — cycling to Disabled aborts any
+                // active tune — so blocking the toggle wholesale is safe.
+                if !app.tx_policy.allows_any_tx() {
+                    app.status_message =
+                        "Can't tune — TX is DISABLED (press g to re-enable)".to_string();
+                } else {
+                    self.message_tx.send(TuiCommand::ToggleTune)?;
+                }
             }
             KeyCode::Char('t') => {
                 // Lowercase t: jump the cursor to the best TX offset. Always
@@ -832,6 +930,15 @@ impl TuiRunner {
                 app.toggle_monitoring().await?;
             }
 
+            // === Compose free-text TX ===
+            // `/` enters compose mode (a visible TX input line). Outside
+            // compose, letters are commands only — this is the single entry
+            // point for typing a free-text message so command keys never fire
+            // mid-typing.
+            KeyCode::Char('/') => {
+                app.enter_compose_mode();
+            }
+
             // === Display / housekeeping ===
             KeyCode::Char('x') => {
                 app.clear_messages();
@@ -850,10 +957,11 @@ impl TuiRunner {
                 app.activate_selected();
             }
 
-            // Enter - Send message or confirm. Globally this commits the
-            // free-text TX buffer, BUT when the Callers panel is focused and a
-            // caller is selected it commits the caller reply at the shown
-            // sequence step instead.
+            // Enter - confirm the selected caller reply. When the Callers panel
+            // is focused and a caller is selected, this commits the reply at the
+            // shown sequence step. Free-text TX now lives in compose mode (`/`),
+            // so outside Callers there's nothing for Enter to send — it hints
+            // the operator toward compose instead.
             KeyCode::Enter => {
                 if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
                     if let Some((callsign, frequency, dx_parity)) = app.get_selected_station() {
@@ -871,25 +979,15 @@ impl TuiRunner {
                         app.status_message = "No caller selected".to_string();
                     }
                 } else {
-                    let text = app.get_input_text();
-                    if !text.is_empty() {
-                        self.message_tx.send(TuiCommand::SendMessage {
-                            text,
-                            frequency_offset: app.tx_frequency_offset,
-                        })?;
-                        app.clear_input();
-                    }
+                    app.status_message = "Press / to compose a free-text TX message".to_string();
                 }
             }
 
-            // Text input (catch-all — must come after all explicit Char arms)
-            KeyCode::Char(c) => {
-                app.input_char(c);
-            }
-            KeyCode::Backspace => {
-                app.delete_char();
-            }
-
+            // NOTE: there is intentionally NO `Char(c)` text catch-all here.
+            // Outside compose mode every letter is a command; free-text input
+            // is reachable only via `/` (compose mode), so a stray keystroke
+            // can never silently fill the TX buffer or fire a command while the
+            // operator means to type.
             _ => {}
         }
 
@@ -1081,14 +1179,15 @@ impl TuiRunner {
             ("[ / ]", "TX offset −/+ 50 Hz"),
             ("= / -", "Band up / down"),
             ("Space", "Call selected station"),
-            ("Enter", "Send TX message (Callers: reply at shown step)"),
+            ("/", "Compose free-text TX (Enter sends, Esc cancels)"),
+            ("Enter", "Callers: reply at shown step"),
             ("c / s", "Start / stop CQ"),
-            ("k", "Abort selected QSO"),
-            ("r", "Re-send last TX (selected QSO)"),
+            ("k", "Abort selected QSO (QSO Status panel only)"),
+            ("r", "Re-send last TX (QSO Status panel only)"),
             ("t", "Find clear TX offset"),
-            ("Shift+T", "Tune (12 s tone)"),
+            ("Shift+T", "Tune (12 s tone; blocked while TX DISABLED)"),
             ("h", "Halt current TX"),
-            ("p", "Toggle PTT"),
+            ("p", "Toggle PTT (blocked while TX DISABLED)"),
             ("a", "Toggle autonomous mode"),
             ("Shift+P", "Pause / resume autonomous"),
             ("m", "Toggle audio monitoring"),
@@ -1761,6 +1860,195 @@ mod key_tests {
         );
         assert_eq!(app.tx_queued.len(), 1);
         assert_eq!(app.tx_queued[0].freq_hz, 1200.0);
+    }
+
+    // === UX audit Batch 1 ===========================================
+
+    /// Build a minimal active-QSO banner for the r/k panel-gating tests.
+    fn banner(call: &str, qso_id: &str) -> crate::app::ActiveQsoBanner {
+        crate::app::ActiveQsoBanner {
+            their_callsign: call.to_string(),
+            state: "wait rpt".to_string(),
+            started_at: chrono::Utc::now(),
+            frequency_hz: 1500.0,
+            tx_parity: None,
+            last_tx_text: None,
+            last_tx_at: None,
+            last_rx_text: None,
+            last_rx_at: None,
+            snr_rx: None,
+            report_sent: None,
+            report_received: None,
+            exchange_count: 0,
+            qso_id: qso_id.to_string(),
+            initiated_by: "Manual".to_string(),
+            ladder_labels: vec![],
+            ladder_ours: vec![],
+            ladder_index: 0,
+            now_line: String::new(),
+            next_line: String::new(),
+        }
+    }
+
+    /// `p` (PTT) must NOT emit TogglePtt while the local policy mirror is
+    /// Disabled — keying the rig there would put a carrier on the air after
+    /// Shift+Q / cycle-to-Disabled.
+    #[tokio::test]
+    async fn key_p_refused_while_tx_disabled() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.tx_policy = pancetta_core::TxPolicy::Disabled;
+        r.handle_key_event(key('p')).await.unwrap();
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "p must not emit TogglePtt while TX is Disabled"
+        );
+        assert!(app.read().await.status_message.contains("Can't key PTT"));
+    }
+
+    /// `p` still keys PTT under Full / RespondOnly.
+    #[tokio::test]
+    async fn key_p_allowed_while_respond_only() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.tx_policy = pancetta_core::TxPolicy::RespondOnly;
+        r.handle_key_event(key('p')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::TogglePtt)));
+    }
+
+    /// Shift+T (tune) must be refused while TX is Disabled.
+    #[tokio::test]
+    async fn key_tune_refused_while_tx_disabled() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.tx_policy = pancetta_core::TxPolicy::Disabled;
+        r.handle_key_event(key_shift('T')).await.unwrap();
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "Shift+T must not emit ToggleTune while TX is Disabled"
+        );
+        assert!(app.read().await.status_message.contains("Can't tune"));
+    }
+
+    /// `k` aborts ONLY when the QSO Status panel is focused, and echoes the
+    /// target callsign.
+    #[tokio::test]
+    async fn key_k_gated_to_qso_status_panel() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.apply_active_qsos(vec![banner("W1AW", "qso-1")]);
+            a.active_panel = crate::app::ActivePanel::BandActivity;
+        }
+        // Wrong panel: no abort, just a hint.
+        r.handle_key_event(key('k')).await.unwrap();
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "k must not abort while not on QSO Status panel"
+        );
+
+        // Focus QSO Status, then k aborts with callsign echo.
+        app.write().await.active_panel = crate::app::ActivePanel::QsoStatus;
+        r.handle_key_event(key('k')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+        assert!(app.read().await.status_message.contains("W1AW"));
+    }
+
+    /// `r` (re-send) is likewise gated to the QSO Status panel.
+    #[tokio::test]
+    async fn key_r_gated_to_qso_status_panel() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.apply_active_qsos(vec![banner("K5ARH", "qso-9")]);
+            a.active_panel = crate::app::ActivePanel::DxHunter;
+        }
+        r.handle_key_event(key('r')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err(), "r gated off DX Hunter panel");
+
+        app.write().await.active_panel = crate::app::ActivePanel::QsoStatus;
+        r.handle_key_event(key('r')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::ResendQso { qso_id }) if qso_id == "qso-9"
+        ));
+    }
+
+    /// Digit keys 1-5 jump panels in the production handler (were dead before).
+    #[tokio::test]
+    async fn digits_jump_panels() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('5')).await.unwrap();
+        assert_eq!(
+            app.read().await.active_panel,
+            crate::app::ActivePanel::DxHunter
+        );
+        r.handle_key_event(key('2')).await.unwrap();
+        assert_eq!(
+            app.read().await.active_panel,
+            crate::app::ActivePanel::QsoStatus
+        );
+        r.handle_key_event(key('1')).await.unwrap();
+        assert_eq!(
+            app.read().await.active_panel,
+            crate::app::ActivePanel::BandActivity
+        );
+    }
+
+    /// `/` enters compose mode; outside compose, command letters fire instead
+    /// of feeding the TX buffer.
+    #[tokio::test]
+    async fn slash_enters_compose_and_routes_text() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        // Outside compose: 'c' is the StartCq command, NOT text.
+        r.handle_key_event(key('c')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq { .. })));
+        assert!(app.read().await.tx_input_buffer.is_empty());
+
+        // Enter compose with '/'.
+        r.handle_key_event(key('/')).await.unwrap();
+        assert!(app.read().await.compose_mode, "/ enters compose mode");
+
+        // Now letters edit the buffer (uppercased) and no command fires.
+        for c in "cq".chars() {
+            r.handle_key_event(key(c)).await.unwrap();
+        }
+        assert!(cmd_rx.try_recv().is_err(), "no command fires in compose");
+        assert_eq!(app.read().await.tx_input_buffer, "CQ");
+    }
+
+    /// Enter in compose mode sends the buffer and exits compose.
+    #[tokio::test]
+    async fn compose_enter_sends_and_exits() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('/')).await.unwrap();
+        for c in "test".chars() {
+            r.handle_key_event(key(c)).await.unwrap();
+        }
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::SendMessage { text, .. }) if text == "TEST"
+        ));
+        assert!(!app.read().await.compose_mode, "Enter exits compose");
+        assert!(app.read().await.tx_input_buffer.is_empty());
+    }
+
+    /// Esc in compose mode cancels without sending.
+    #[tokio::test]
+    async fn compose_esc_cancels() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('/')).await.unwrap();
+        r.handle_key_event(key('x')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(cmd_rx.try_recv().is_err(), "Esc must not send");
+        let a = app.read().await;
+        assert!(!a.compose_mode);
+        assert!(a.tx_input_buffer.is_empty());
     }
 }
 

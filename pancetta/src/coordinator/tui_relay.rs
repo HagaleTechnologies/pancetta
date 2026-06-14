@@ -802,6 +802,18 @@ impl super::ApplicationCoordinator {
                                 prev.label(),
                                 next.label()
                             );
+                            // Cycling to Disabled must abort the CURRENT
+                            // transmission, not just gate the next one. Set the
+                            // same abort flag Shift+Q uses so the in-flight TX
+                            // (up to 12.64s of FT8, or an active tune) stops
+                            // within ~50ms via the worker's interruptible_sleep.
+                            // Also stop the repeating-CQ loop so we don't re-arm.
+                            if next == pancetta_core::TxPolicy::Disabled {
+                                cmd_abort_current_tx.store(true, Ordering::Release);
+                                cmd_cq_active.store(false, Ordering::Relaxed);
+                                *cmd_tune_until.write().await = None;
+                                next_cq_time = None;
+                            }
                             let _ = cmd_tui_msg_tx.send(
                                 pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
                                     policy: next,
@@ -847,6 +859,29 @@ impl super::ApplicationCoordinator {
                                 cmd_abort_current_tx.store(true, Ordering::Release);
                                 *cmd_tune_until.write().await = None;
                             } else {
+                                // TX-policy safety gate: starting a tune puts a
+                                // carrier on the air. Refuse it when the global
+                                // policy is Disabled (RX-only). (Aborting an
+                                // in-flight tune above is always allowed.)
+                                let policy = pancetta_core::TxPolicy::from_u8(
+                                    cmd_tx_policy.load(Ordering::Acquire),
+                                );
+                                if !policy.allows_any_tx() {
+                                    warn!(
+                                        target: "tx.policy",
+                                        "Refusing tune start: TX policy is {} (RX-only)",
+                                        policy.label()
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX".to_string(),
+                                            status: "Can't tune — TX is DISABLED (press g \
+                                                     to re-enable)"
+                                                .to_string(),
+                                        },
+                                    );
+                                    continue;
+                                }
                                 info!(
                                     "TUI ToggleTune: starting {}s tone at {} Hz",
                                     TUNE_DURATION_SECS, TUNE_TONE_HZ
@@ -921,6 +956,34 @@ impl super::ApplicationCoordinator {
                         pancetta_tui::tui_runner::TuiCommand::TogglePtt => {
                             let current = cmd_ptt_state.load(Ordering::Acquire);
                             let new_state = !current;
+                            // TX-policy safety gate: a PTT key-UP (state=true)
+                            // is a transmission. Refuse it when the global
+                            // policy is Disabled (RX-only) — keying the rig
+                            // there would put a carrier on the air after the
+                            // operator hit Shift+Q / cycled to Disabled.
+                            // PTT-OFF (state=false) is ALWAYS allowed: it can
+                            // only ever stop TX, never start it.
+                            if new_state {
+                                let policy = pancetta_core::TxPolicy::from_u8(
+                                    cmd_tx_policy.load(Ordering::Acquire),
+                                );
+                                if !policy.allows_any_tx() {
+                                    warn!(
+                                        target: "tx.policy",
+                                        "Refusing PTT key-up: TX policy is {} (RX-only)",
+                                        policy.label()
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX".to_string(),
+                                            status: "Can't key PTT — TX is DISABLED (press g \
+                                                     to re-enable)"
+                                                .to_string(),
+                                        },
+                                    );
+                                    continue;
+                                }
+                            }
                             cmd_ptt_state.store(new_state, Ordering::Release);
                             info!("TUI TogglePtt: {} -> {}", current, new_state);
                             let msg = ComponentMessage::new(

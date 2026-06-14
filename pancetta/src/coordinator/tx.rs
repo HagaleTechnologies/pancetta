@@ -982,6 +982,25 @@ impl super::ApplicationCoordinator {
                                 } => {
                                     info!("Tune: {}s tone at {} Hz", duration_secs, tone_offset_hz);
 
+                                    // --- TX-policy hard mute ---
+                                    // A tune carrier is a transmission. If the
+                                    // global policy is Disabled (RX-only), never
+                                    // key PTT / emit the tone. This is the
+                                    // catch-all gate matching the
+                                    // TransmitRequest / MultiTransmitRequest
+                                    // arms — defends against any TuneRequest
+                                    // source, not just the TUI relay.
+                                    if current_tx_policy(&tx_policy)
+                                        == pancetta_core::TxPolicy::Disabled
+                                    {
+                                        info!(
+                                            target: "tx.policy",
+                                            "TX DISABLED (RX-only): blocking tune ({}s @ {} Hz)",
+                                            duration_secs, tone_offset_hz
+                                        );
+                                        continue;
+                                    }
+
                                     // Generate a continuous sine wave
                                     // (single tone, zero-bandwidth on air).
                                     // Amplitude 0.5 — operator manages rig
@@ -1340,5 +1359,24 @@ mod schedule_tx_tests {
             "wake latency exceeded one chunk (elapsed={:?})",
             elapsed
         );
+    }
+
+    /// `current_tx_policy` round-trips the shared atomic. The TuneRequest /
+    /// TransmitRequest / MultiTransmitRequest worker arms all hard-mute when
+    /// this reads `Disabled`; assert the encoding so a stray atomic value can't
+    /// silently un-mute the tune carrier (UX audit Batch 1).
+    #[test]
+    fn current_tx_policy_reads_disabled_for_tune_mute() {
+        use std::sync::atomic::AtomicU8;
+        use std::sync::Arc;
+        let p = Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Disabled.as_u8()));
+        assert_eq!(current_tx_policy(&p), pancetta_core::TxPolicy::Disabled);
+        p.store(pancetta_core::TxPolicy::Full.as_u8(), Ordering::Release);
+        assert_eq!(current_tx_policy(&p), pancetta_core::TxPolicy::Full);
+        p.store(
+            pancetta_core::TxPolicy::RespondOnly.as_u8(),
+            Ordering::Release,
+        );
+        assert_eq!(current_tx_policy(&p), pancetta_core::TxPolicy::RespondOnly);
     }
 }

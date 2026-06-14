@@ -1,6 +1,12 @@
 [package]
 name = "pancetta-tui"
 description = "Terminal User Interface for Pancetta"
+# This crate is a library only — the production TUI runs inside the `pancetta`
+# binary via `TuiRunner` (the single source of truth for the keymap). The old
+# standalone `src/main.rs` monitor (a divergent keymap that never had a
+# coordinator/message-bus) was removed in the 2026-06-14 UX audit. Disable
+# bin auto-discovery so a stray `src/main.rs` can't resurrect that fork.
+autobins = false
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -32,11 +38,6 @@ thiserror = "1.0"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-
-# CLI parsing
-clap = { version = "4.6", features = ["derive"] }
 
 # Additional utility crates
 dirs = "5.0"
@@ -49,7 +50,3 @@ pancetta-config = { path = "../pancetta-config" }
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.27"
-
-[[bin]]
-name = "pancetta-tui"
-path = "src/main.rs"
