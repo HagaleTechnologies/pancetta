@@ -153,6 +153,37 @@ pub enum MessageType {
     /// never drives PTT or audio.
     TxStatus { active: bool },
 
+    /// Richer TX-queue snapshot for the TUI's NOW-SENDING / QUEUED view.
+    /// Sent by the TX worker alongside the boolean `TxStatus` badge:
+    /// `sending` is `Some(item)` while a transmission is keyed (text +
+    /// audio frequency on the air RIGHT NOW), `None` otherwise; `queued`
+    /// lists items the worker has dequeued and is scheduling but has not
+    /// yet started transmitting (waiting for the next slot of the correct
+    /// parity). Observation only — never drives PTT or audio.
+    ///
+    /// Scope note: the TX worker processes one request at a time and sleeps
+    /// through the slot, so `queued` reflects the request the worker is
+    /// currently scheduling (between dequeue and PTT-assert), not a deep
+    /// look into the crossbeam channel backlog. This is the lightweight
+    /// scope documented in the design — it surfaces NOW + the in-flight
+    /// pending item(s) without instrumenting the channel internals.
+    TxQueueStatus {
+        /// What is being transmitted right now (keyed). `None` = idle.
+        sending: Option<TxItem>,
+        /// Items dequeued and scheduled but not yet on the air.
+        queued: Vec<TxItem>,
+    },
+
+    /// TX-policy state echo for the TUI banner. Sent by the coordinator's
+    /// command relay whenever the operator changes the global TX policy
+    /// (cycle key) or triggers an emergency stop (Shift+Q → Disabled).
+    /// The TUI mirrors this into its bold, color-coded TX banner.
+    /// Observation only.
+    TxPolicyStatus {
+        /// Current global TX policy.
+        policy: pancetta_core::TxPolicy,
+    },
+
     /// Autonomous operator status update
     AutonomousStatus(AutonomousStatusData),
 
@@ -199,6 +230,21 @@ pub enum MessageType {
 pub struct TransmitRequestItem {
     pub message_text: String,
     pub frequency_offset: f64,
+    pub qso_id: Option<String>,
+}
+
+/// One row in a `MessageType::TxQueueStatus` payload — a compact,
+/// display-oriented view of a TX item the worker is sending or has
+/// queued. Decoupled from `TransmitRequest`/`TransmitRequestItem` so the
+/// TUI renders just what it needs (text + audio frequency) without
+/// pulling scheduling internals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxItem {
+    /// FT8 message text being / to-be transmitted.
+    pub text: String,
+    /// Absolute audio frequency (Hz) for this item.
+    pub freq_hz: f64,
+    /// QSO id this item belongs to, if any (`None` = CQ / manual send).
     pub qso_id: Option<String>,
 }
 

@@ -105,6 +105,23 @@ pub struct ApplicationCoordinator {
     /// latter is reserved for future use; today it's one-shot off).
     /// Separate from `shutdown_signal` and `abort_current_tx`.
     autonomous_enabled_runtime: Arc<AtomicBool>,
+
+    /// Global tri-state TX policy (`pancetta_core::TxPolicy` encoded via
+    /// `as_u8`/`from_u8`). Initialized to `Full`. Orthogonal to
+    /// `autonomous_enabled_runtime`: the autonomous-initiation gate
+    /// requires BOTH the autonomous runtime gate open AND the policy to
+    /// allow initiation. Read by:
+    ///   - the TX worker (`tx.rs`) as the hard mute — `Disabled` consumes
+    ///     a `TransmitRequest`/`MultiTransmitRequest` without keying PTT;
+    ///   - the autonomous loop (`autonomous.rs`) — `RespondOnly`/`Disabled`
+    ///     suppress autonomous *initiations* (CQ-self, hunt/pounce);
+    ///   - the command relay (`tui_relay.rs`) — refuses `StartCq` and
+    ///     `CallStation` when the policy is not `Full`, and echoes the
+    ///     policy back to the TUI banner.
+    ///
+    /// QSO-in-progress messages and answering callers stay allowed under
+    /// `RespondOnly` (only `Disabled` mutes them, at the TX worker).
+    tx_policy: Arc<std::sync::atomic::AtomicU8>,
     startup_time: Instant,
 
     /// Configuration
@@ -373,6 +390,11 @@ impl ApplicationCoordinator {
             // Q-press before component start still records the operator's
             // intent (the autonomous start path also respects this gate).
             autonomous_enabled_runtime: Arc::new(AtomicBool::new(true)),
+            // Default global TX policy = Full (initiate + respond, the
+            // historical behavior). Operator cycles it from the TUI.
+            tx_policy: Arc::new(std::sync::atomic::AtomicU8::new(
+                pancetta_core::TxPolicy::default().as_u8(),
+            )),
             startup_time,
             audio_device,
             no_audio,

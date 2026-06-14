@@ -196,6 +196,14 @@ impl super::ApplicationCoordinator {
         let cqdx_bridge_for_auto = self.cqdx_bridge.clone();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         let autonomous_runtime_gate = self.autonomous_enabled_runtime.clone();
+        // Global tri-state TX policy. Orthogonal to the autonomous runtime
+        // gate: autonomous *initiation* (calling CQ ourselves, or
+        // hunting/pouncing on a station calling CQ — both carry
+        // `qso_id == None` from the decision engine) requires the policy to
+        // allow initiation (Full). RespondOnly keeps QSO-in-progress
+        // responses (`qso_id == Some`) flowing; Disabled is additionally
+        // hard-muted at the TX worker.
+        let tx_policy = self.tx_policy.clone();
         let auto_handle = {
             let shutdown = self.shutdown_signal.clone();
             let operator = operator.clone();
@@ -387,6 +395,36 @@ impl super::ApplicationCoordinator {
                                     tx_items.len()
                                 );
                                 tx_items.clear();
+                            }
+
+                            // Tri-state TX policy: when the policy disallows
+                            // initiation (RespondOnly or Disabled), drop the
+                            // autonomous *initiation* items — calling CQ
+                            // ourselves and hunting/pouncing on a CQer, both
+                            // identified by `qso_id == None`. Items belonging
+                            // to a QSO already in progress (`qso_id == Some`)
+                            // are kept so RespondOnly continues those exchanges;
+                            // Disabled additionally hard-mutes them at the TX
+                            // worker. The decision engine's internal state is
+                            // untouched, so returning to Full resumes cleanly.
+                            {
+                                let policy = pancetta_core::TxPolicy::from_u8(
+                                    tx_policy.load(Ordering::Acquire),
+                                );
+                                if !policy.allows_initiation() {
+                                    let before = tx_items.len();
+                                    tx_items.retain(|(item, _)| item.qso_id.is_some());
+                                    let dropped = before - tx_items.len();
+                                    if dropped > 0 {
+                                        info!(
+                                            target: "tx.policy",
+                                            "TX policy {}: suppressing {} autonomous initiation \
+                                             item(s) this cycle (QSO-in-progress items kept)",
+                                            policy.label(),
+                                            dropped
+                                        );
+                                    }
+                                }
                             }
 
                             // Bundle collected TX items into a single message.

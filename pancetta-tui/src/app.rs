@@ -403,6 +403,19 @@ impl ActivePanel {
     }
 }
 
+/// A compact, display-oriented TX item for the NOW-SENDING / QUEUED view.
+/// Mirrors the coordinator's `message_bus::TxItem` but lives in the TUI so
+/// the TUI doesn't depend on the main `pancetta` crate.
+#[derive(Debug, Clone)]
+pub struct TxQueueItem {
+    /// FT8 message text being / to-be transmitted.
+    pub text: String,
+    /// Absolute audio frequency (Hz).
+    pub freq_hz: f64,
+    /// QSO id this item belongs to, if any.
+    pub qso_id: Option<String>,
+}
+
 pub struct App {
     pub config: Config,
     pub should_quit: bool,
@@ -486,6 +499,17 @@ pub struct App {
     pub tx_input_cursor: usize,
     pub is_transmitting: bool,
     pub tx_frequency_offset: f64,
+
+    /// Global tri-state TX policy, mirrored from the coordinator's
+    /// `TxPolicyUpdate` echo (and flipped optimistically on the `g` /
+    /// Shift+Q keys for instant feedback). Drives the bold, color-coded
+    /// TX-policy banner. Defaults to `Full`.
+    pub tx_policy: pancetta_core::TxPolicy,
+    /// The message currently being transmitted (NOW-SENDING), if any.
+    /// Updated from the coordinator's `TxQueueUpdate`.
+    pub tx_now_sending: Option<TxQueueItem>,
+    /// Items queued for an upcoming slot but not yet on the air.
+    pub tx_queued: Vec<TxQueueItem>,
 
     // Band/frequency tracking
     pub current_band_index: usize,
@@ -577,6 +601,9 @@ impl App {
             tx_input_cursor: 0,
             is_transmitting: false,
             tx_frequency_offset: 1500.0,
+            tx_policy: pancetta_core::TxPolicy::default(),
+            tx_now_sending: None,
+            tx_queued: Vec::new(),
             current_band_index: default_band_index,
             radio_frequency: None,
             message_rx: None,

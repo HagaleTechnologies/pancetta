@@ -32,8 +32,9 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // Title bar
+            Constraint::Length(1), // Title bar (incl. bold TX-policy banner)
             Constraint::Min(1),    // Main content
+            Constraint::Length(1), // TX queue / now-sending strip
             Constraint::Length(3), // Status bar
         ])
         .split(size);
@@ -80,7 +81,10 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     render_dx_hunter(f, right_chunks[2], app)?;
 
     // Render status bar
-    render_status_bar(f, chunks[2], app);
+    // TX queue / now-sending strip (between content and status bar).
+    render_tx_strip(f, chunks[2], app);
+
+    render_status_bar(f, chunks[3], app);
 
     // Render active panel highlight
     // Indices map to ActivePanel enum order: BandActivity, QsoStatus, StationInfo, DxHunter
@@ -145,6 +149,24 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         ),
     ];
 
+    // Bold, color-coded global TX-policy banner chip. Always visible so
+    // the operator can tell at a glance which of the three states is
+    // active: GREEN "TX: FULL", YELLOW "TX: RESPOND-ONLY", RED
+    // "TX: DISABLED — RX ONLY". Reversed/bold for visual dominance.
+    let (policy_text, policy_bg) = match app.tx_policy {
+        pancetta_core::TxPolicy::Full => (" TX: FULL ".to_string(), Color::Green),
+        pancetta_core::TxPolicy::RespondOnly => (" TX: RESPOND-ONLY ".to_string(), Color::Yellow),
+        pancetta_core::TxPolicy::Disabled => (" TX: DISABLED — RX ONLY ".to_string(), Color::Red),
+    };
+    left_spans.push(Span::raw(" "));
+    left_spans.push(Span::styled(
+        policy_text,
+        Style::default()
+            .fg(Color::Black)
+            .bg(policy_bg)
+            .add_modifier(Modifier::BOLD),
+    ));
+
     // TX indicator
     if app.is_transmitting {
         left_spans.push(Span::raw(" "));
@@ -178,6 +200,75 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             .fg(app.theme.foreground_color()),
     );
 
+    f.render_widget(paragraph, area);
+}
+
+/// One-row TX strip showing what's transmitting RIGHT NOW and what's
+/// queued for an upcoming slot. Lightweight: reuses the coordinator's
+/// `TxQueueUpdate` snapshot already in `App`.
+fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let mut spans: Vec<Span> = Vec::new();
+
+    match &app.tx_now_sending {
+        Some(item) => {
+            spans.push(Span::styled(
+                "▶ NOW: ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                format!(" {} @{:.0}Hz ", item.text, item.freq_hz),
+                Style::default()
+                    .fg(app.theme.foreground_color())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        None => {
+            spans.push(Span::styled(
+                "▶ NOW: (idle) ",
+                Style::default().fg(app.theme.foreground_color()),
+            ));
+        }
+    }
+
+    spans.push(Span::raw("  "));
+
+    if app.tx_queued.is_empty() {
+        spans.push(Span::styled(
+            "⋯ QUEUED: (none)",
+            Style::default().fg(app.theme.foreground_color()),
+        ));
+    } else {
+        spans.push(Span::styled(
+            format!("⋯ QUEUED ({}): ", app.tx_queued.len()),
+            Style::default()
+                .fg(app.theme.warning_color())
+                .add_modifier(Modifier::BOLD),
+        ));
+        // Show up to the first three queued items so the strip stays 1 row.
+        let shown: Vec<String> = app
+            .tx_queued
+            .iter()
+            .take(3)
+            .map(|it| format!("{} @{:.0}Hz", it.text, it.freq_hz))
+            .collect();
+        let mut text = shown.join(" | ");
+        if app.tx_queued.len() > 3 {
+            text.push_str(&format!(" | +{} more", app.tx_queued.len() - 3));
+        }
+        spans.push(Span::styled(
+            text,
+            Style::default().fg(app.theme.foreground_color()),
+        ));
+    }
+
+    let paragraph = Paragraph::new(Line::from(spans)).style(
+        Style::default()
+            .bg(app.theme.background_color())
+            .fg(app.theme.foreground_color()),
+    );
     f.render_widget(paragraph, area);
 }
 
@@ -279,6 +370,13 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(":Band | "),
+        Span::styled(
+            "g",
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(":TX-policy | "),
         Span::styled(
             "Ctrl+Q",
             Style::default()

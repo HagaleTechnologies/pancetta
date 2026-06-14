@@ -175,6 +175,21 @@ impl Drop for TxStatusGuard {
             if let Err(e) = bus.send_message(msg).await {
                 tracing::debug!("TxStatus(false) relay failed (no TUI?): {}", e);
             }
+            // Also clear the richer NOW-SENDING / QUEUED view so every
+            // exit path (complete / abort / shutdown) returns the TX
+            // panel to idle, mirroring the boolean badge.
+            let idle = ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Tui,
+                MessageType::TxQueueStatus {
+                    sending: None,
+                    queued: Vec::new(),
+                },
+                Instant::now(),
+            );
+            if let Err(e) = bus.send_message(idle).await {
+                tracing::debug!("TxQueueStatus(idle) relay failed (no TUI?): {}", e);
+            }
         });
     }
 }
@@ -191,6 +206,31 @@ async fn send_tx_status(message_bus: &MessageBus, active: bool) {
     if let Err(e) = message_bus.send_message(msg).await {
         tracing::debug!("TxStatus({}) relay failed (no TUI?): {}", active, e);
     }
+}
+
+/// Push a richer TX-queue snapshot (NOW-SENDING + QUEUED) to the TUI.
+/// Best-effort, observation-only: never touches PTT/audio/scheduling.
+async fn send_tx_queue_status(
+    message_bus: &MessageBus,
+    sending: Option<crate::message_bus::TxItem>,
+    queued: Vec<crate::message_bus::TxItem>,
+) {
+    let msg = ComponentMessage::new(
+        ComponentId::Ft8Transmitter,
+        ComponentId::Tui,
+        MessageType::TxQueueStatus { sending, queued },
+        Instant::now(),
+    );
+    if let Err(e) = message_bus.send_message(msg).await {
+        tracing::debug!("TxQueueStatus relay failed (no TUI?): {}", e);
+    }
+}
+
+/// Read the current global TX policy from the shared atomic.
+fn current_tx_policy(
+    tx_policy: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+) -> pancetta_core::TxPolicy {
+    pancetta_core::TxPolicy::from_u8(tx_policy.load(Ordering::Acquire))
 }
 
 impl Drop for PttGuard {
@@ -246,6 +286,12 @@ impl super::ApplicationCoordinator {
         let tx_handle = {
             let shutdown = self.shutdown_signal.clone();
             let abort_current_tx = self.abort_current_tx.clone();
+            // Tri-state TX policy. The TX worker only enforces the hard
+            // mute: when policy == Disabled it consumes a request without
+            // keying PTT / playing audio / modulating, then reports the
+            // block to the TUI. RespondOnly is gated upstream (at the
+            // initiation sources) so in-progress QSOs keep flowing here.
+            let tx_policy = self.tx_policy.clone();
 
             tokio::spawn(async move {
                 info!("FT8 transmitter component ready");
@@ -277,6 +323,49 @@ impl super::ApplicationCoordinator {
                                         "Transmit request: '{}' at offset {:.0} Hz (qso: {:?})",
                                         message_text, frequency_offset, qso_id
                                     );
+
+                                    // --- Step 0: TX-policy hard mute ---
+                                    // If the global policy is Disabled (RX-only),
+                                    // do NOT key PTT / play audio / modulate. Consume
+                                    // the request, tell the TUI it was blocked, and
+                                    // report a failed TransmitComplete so any awaiting
+                                    // QSO state machine doesn't hang. This is the
+                                    // catch-all hard gate for every TX source.
+                                    if current_tx_policy(&tx_policy)
+                                        == pancetta_core::TxPolicy::Disabled
+                                    {
+                                        info!(
+                                            target: "tx.policy",
+                                            "TX DISABLED (RX-only): blocking '{}' at {:.0} Hz (qso: {:?})",
+                                            message_text, frequency_offset, qso_id
+                                        );
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        let complete_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Autonomous,
+                                            MessageType::TransmitComplete {
+                                                success: false,
+                                                message_text,
+                                                duration_ms: 0,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus.send_message(complete_msg).await;
+                                        continue;
+                                    }
+
+                                    // Report this item as QUEUED (dequeued and now
+                                    // scheduling, but not yet on the air).
+                                    send_tx_queue_status(
+                                        &message_bus,
+                                        None,
+                                        vec![crate::message_bus::TxItem {
+                                            text: message_text.clone(),
+                                            freq_hz: frequency_offset,
+                                            qso_id: qso_id.clone(),
+                                        }],
+                                    )
+                                    .await;
 
                                     // --- Step 1: Encode + modulate up front ---
                                     // Do this BEFORE any timing-critical work so encoding
@@ -420,6 +509,17 @@ impl super::ApplicationCoordinator {
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
                                     send_tx_status(&message_bus, true).await;
+                                    // NOW-SENDING: this message is keyed and on the air.
+                                    send_tx_queue_status(
+                                        &message_bus,
+                                        Some(crate::message_bus::TxItem {
+                                            text: message_text.clone(),
+                                            freq_hz: frequency_offset,
+                                            qso_id: qso_id.clone(),
+                                        }),
+                                        Vec::new(),
+                                    )
+                                    .await;
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,
@@ -534,6 +634,51 @@ impl super::ApplicationCoordinator {
 
                                 MessageType::MultiTransmitRequest { items, tx_parity } => {
                                     info!("Multi-TX request: {} messages", items.len());
+
+                                    // --- Step 0: TX-policy hard mute ---
+                                    // Disabled (RX-only): never key PTT / play audio /
+                                    // modulate. Consume the bundle, clear the TUI TX
+                                    // view, and report each item failed so any awaiting
+                                    // state doesn't hang.
+                                    if current_tx_policy(&tx_policy)
+                                        == pancetta_core::TxPolicy::Disabled
+                                    {
+                                        info!(
+                                            target: "tx.policy",
+                                            "TX DISABLED (RX-only): blocking multi-TX bundle of {} items",
+                                            items.len()
+                                        );
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: item.message_text.clone(),
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
+                                        continue;
+                                    }
+
+                                    // Report the bundle items as QUEUED.
+                                    send_tx_queue_status(
+                                        &message_bus,
+                                        None,
+                                        items
+                                            .iter()
+                                            .map(|it| crate::message_bus::TxItem {
+                                                text: it.message_text.clone(),
+                                                freq_hz: it.frequency_offset,
+                                                qso_id: it.qso_id.clone(),
+                                            })
+                                            .collect(),
+                                    )
+                                    .await;
 
                                     // --- Step 1: Encode + modulate up front ---
                                     let ft8_params = pancetta_ft8::ProtocolParams::ft8();
@@ -699,6 +844,25 @@ impl super::ApplicationCoordinator {
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
                                     send_tx_status(&message_bus, true).await;
+                                    // NOW-SENDING: bundle is keyed and on the air. Show
+                                    // the first item as the headline "now" and the rest
+                                    // (concurrent multi-TX) as queued alongside it.
+                                    {
+                                        let mut bundle: Vec<crate::message_bus::TxItem> = items
+                                            .iter()
+                                            .map(|it| crate::message_bus::TxItem {
+                                                text: it.message_text.clone(),
+                                                freq_hz: it.frequency_offset,
+                                                qso_id: it.qso_id.clone(),
+                                            })
+                                            .collect();
+                                        let head = if bundle.is_empty() {
+                                            None
+                                        } else {
+                                            Some(bundle.remove(0))
+                                        };
+                                        send_tx_queue_status(&message_bus, head, bundle).await;
+                                    }
                                     let ptt_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Hamlib,

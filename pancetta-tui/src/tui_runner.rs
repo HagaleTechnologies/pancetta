@@ -129,6 +129,22 @@ pub enum TuiMessage {
     /// ends — normal completion, operator abort (F8 / Shift+Q), or
     /// shutdown all clear it. Drives the title-bar " TX " badge.
     TxStatus { active: bool },
+    /// Richer TX-queue snapshot: what is on the air RIGHT NOW and what is
+    /// queued for an upcoming slot. Forwarded by the coordinator relay from
+    /// the TX worker's `TxQueueStatus`. Drives the "TX" NOW/QUEUED lines.
+    TxQueueUpdate {
+        /// Message + frequency being transmitted now (`None` = idle).
+        sending: Option<crate::app::TxQueueItem>,
+        /// Items dequeued/scheduled but not yet on the air.
+        queued: Vec<crate::app::TxQueueItem>,
+    },
+    /// Current global tri-state TX policy. Echoed by the coordinator relay
+    /// whenever the operator changes it (cycle key `g`, or Shift+Q →
+    /// Disabled). Drives the bold, color-coded TX-policy banner.
+    TxPolicyUpdate {
+        /// New global TX policy.
+        policy: pancetta_core::TxPolicy,
+    },
     /// Available audio devices, enumerated by the coordinator (which owns
     /// the `pancetta-audio` host) and pushed to the TUI once at startup so
     /// the `d` device-selection picker can list them. Each entry is
@@ -239,6 +255,13 @@ pub enum TuiCommand {
     /// Operator pressed `r` — re-send the most recent message we
     /// transmitted in the selected QSO. No-op when no QSO is selected.
     ResendQso { qso_id: String },
+    /// Operator pressed `g` — cycle the global tri-state TX policy
+    /// (Full → RespondOnly → Disabled → Full). The coordinator updates
+    /// the shared `tx_policy` atomic and echoes the new state back as a
+    /// `TxPolicyUpdate` for the bold TX banner. RespondOnly suppresses all
+    /// new initiations (CQ, hunting) while keeping in-progress QSOs and
+    /// answering callers; Disabled is a hard RX-only mute.
+    CycleTxPolicy,
 }
 
 /// TUI performance metrics
@@ -463,6 +486,13 @@ impl TuiRunner {
             TuiMessage::TxStatus { active } => {
                 app.is_transmitting = active;
             }
+            TuiMessage::TxQueueUpdate { sending, queued } => {
+                app.tx_now_sending = sending;
+                app.tx_queued = queued;
+            }
+            TuiMessage::TxPolicyUpdate { policy } => {
+                app.tx_policy = policy;
+            }
             TuiMessage::DeviceListUpdate {
                 input,
                 output,
@@ -673,6 +703,10 @@ impl TuiRunner {
             // visual signal.
             KeyCode::Char('Q') => {
                 app.stopped_by_operator = true;
+                // Emergency stop hard-mutes TX: reflect Disabled in the local
+                // banner immediately; the coordinator confirms via
+                // TxPolicyUpdate.
+                app.tx_policy = pancetta_core::TxPolicy::Disabled;
                 app.status_message =
                     "STOPPED BY OPERATOR — autonomous off, TX aborted (press Esc to clear banner)"
                         .to_string();
@@ -782,6 +816,17 @@ impl TuiRunner {
             KeyCode::Char('P') => {
                 // Shift-P: pause/resume autonomous (uppercase to disambiguate from p=PTT).
                 app.toggle_autonomous_pause();
+            }
+
+            // === Global TX policy (tri-state) ===
+            // g - cycle Full → RespondOnly → Disabled → Full. Optimistically
+            // flip the local banner for instant feedback; the coordinator
+            // echoes the authoritative state back via TxPolicyUpdate.
+            KeyCode::Char('g') => {
+                let next = app.tx_policy.cycle();
+                app.tx_policy = next;
+                app.status_message = format!("TX policy: {}", next.label());
+                self.message_tx.send(TuiCommand::CycleTxPolicy)?;
             }
             KeyCode::Char('m') => {
                 app.toggle_monitoring().await?;
@@ -1652,6 +1697,70 @@ mod key_tests {
             .await
             .unwrap();
         assert!(!app.read().await.is_transmitting, "TX badge must clear");
+    }
+
+    /// `g` emits CycleTxPolicy and optimistically advances the local banner
+    /// state Full → RespondOnly.
+    #[tokio::test]
+    async fn key_g_cycles_tx_policy() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        assert_eq!(
+            app.read().await.tx_policy,
+            pancetta_core::TxPolicy::Full,
+            "default policy is Full"
+        );
+        r.handle_key_event(key('g')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::CycleTxPolicy)),
+            "g must emit CycleTxPolicy"
+        );
+        assert_eq!(
+            app.read().await.tx_policy,
+            pancetta_core::TxPolicy::RespondOnly,
+            "local banner advances optimistically"
+        );
+    }
+
+    /// TxPolicyUpdate (coordinator echo) drives the authoritative banner.
+    #[tokio::test]
+    async fn tx_policy_update_sets_banner() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(TuiMessage::TxPolicyUpdate {
+            policy: pancetta_core::TxPolicy::Disabled,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.read().await.tx_policy,
+            pancetta_core::TxPolicy::Disabled
+        );
+    }
+
+    /// TxQueueUpdate populates the NOW-SENDING / QUEUED view.
+    #[tokio::test]
+    async fn tx_queue_update_populates_view() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(TuiMessage::TxQueueUpdate {
+            sending: Some(crate::app::TxQueueItem {
+                text: "K5ARH JA1ABC -12".to_string(),
+                freq_hz: 1500.0,
+                qso_id: Some("q1".to_string()),
+            }),
+            queued: vec![crate::app::TxQueueItem {
+                text: "CQ K5ARH EM00".to_string(),
+                freq_hz: 1200.0,
+                qso_id: None,
+            }],
+        })
+        .await
+        .unwrap();
+        let app = app.read().await;
+        assert_eq!(
+            app.tx_now_sending.as_ref().map(|i| i.text.as_str()),
+            Some("K5ARH JA1ABC -12")
+        );
+        assert_eq!(app.tx_queued.len(), 1);
+        assert_eq!(app.tx_queued[0].freq_hz, 1200.0);
     }
 }
 

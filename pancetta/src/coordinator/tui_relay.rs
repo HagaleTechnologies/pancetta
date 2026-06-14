@@ -243,6 +243,34 @@ impl super::ApplicationCoordinator {
                                     pancetta_tui::tui_runner::TuiMessage::TxStatus { active },
                                 );
                             }
+                            MessageType::TxQueueStatus {
+                                ref sending,
+                                ref queued,
+                            } => {
+                                // Richer NOW-SENDING / QUEUED view. Re-shape the
+                                // coordinator's TxItem into the TUI's local
+                                // TxQueueItem (decoupled so the TUI doesn't link
+                                // the main crate).
+                                let map = |it: &crate::message_bus::TxItem| {
+                                    pancetta_tui::app::TxQueueItem {
+                                        text: it.text.clone(),
+                                        freq_hz: it.freq_hz,
+                                        qso_id: it.qso_id.clone(),
+                                    }
+                                };
+                                let _ = tui_msg_tx_relay.send(
+                                    pancetta_tui::tui_runner::TuiMessage::TxQueueUpdate {
+                                        sending: sending.as_ref().map(map),
+                                        queued: queued.iter().map(map).collect(),
+                                    },
+                                );
+                            }
+                            MessageType::TxPolicyStatus { policy } => {
+                                // Echo the global TX policy to the bold banner.
+                                let _ = tui_msg_tx_relay.send(
+                                    pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy },
+                                );
+                            }
                             MessageType::ActiveQsosSnapshot { ref qsos } => {
                                 // Re-shape into the TUI's ActiveQsoBanner
                                 // (decoupled struct so the TUI doesn't link
@@ -407,6 +435,11 @@ impl super::ApplicationCoordinator {
         let cmd_cq_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_abort_current_tx = self.abort_current_tx.clone();
         let cmd_autonomous_enabled = self.autonomous_enabled_runtime.clone();
+        // Global tri-state TX policy (Full/RespondOnly/Disabled). The
+        // command handler updates this on CycleTxPolicy and Shift+Q, gates
+        // initiation commands (StartCq, CallStation) on it, and echoes the
+        // resulting state back to the TUI banner.
+        let cmd_tx_policy = self.tx_policy.clone();
         // Whether the autonomous component is running at all (config
         // gate). If it's config-disabled there is no decision loop to
         // re-enable — `a` should say so honestly instead of flipping a
@@ -463,7 +496,24 @@ impl super::ApplicationCoordinator {
             }
 
             while !cmd_shutdown.load(Ordering::Acquire) {
-                // Send repeating CQ every 15 seconds when active
+                // Send repeating CQ every 15 seconds when active. CQ is an
+                // initiation: if the operator cycled the TX policy away from
+                // Full while a CQ loop was running, stop emitting (and clear
+                // the active flag so it doesn't silently resume on return to
+                // Full — the operator must re-press `c`).
+                if cmd_cq_active.load(Ordering::Relaxed) {
+                    let policy =
+                        pancetta_core::TxPolicy::from_u8(cmd_tx_policy.load(Ordering::Acquire));
+                    if !policy.allows_initiation() {
+                        info!(
+                            target: "tx.policy",
+                            "Stopping repeating CQ: TX policy is now {}",
+                            policy.label()
+                        );
+                        cmd_cq_active.store(false, Ordering::Relaxed);
+                        next_cq_time = None;
+                    }
+                }
                 if cmd_cq_active.load(Ordering::Relaxed) {
                     let now = tokio::time::Instant::now();
                     if next_cq_time.map_or(true, |t| now >= t) {
@@ -517,6 +567,32 @@ impl super::ApplicationCoordinator {
                             frequency,
                             dx_parity,
                         } => {
+                            // CallStation initiates a NEW contact with a CQer
+                            // (DX-hunter pounce). Gated by the TX policy: only
+                            // Full permits initiation. RespondOnly/Disabled
+                            // refuse and warn the operator.
+                            let policy = pancetta_core::TxPolicy::from_u8(
+                                cmd_tx_policy.load(Ordering::Acquire),
+                            );
+                            if !policy.allows_initiation() {
+                                warn!(
+                                    target: "tx.policy",
+                                    "Refusing CallStation {} ({} Hz): TX policy is {} \
+                                     (initiation disallowed)",
+                                    callsign, frequency, policy.label()
+                                );
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "TX".to_string(),
+                                        status: format!(
+                                            "Can't call {} — TX policy is {} (press g for Full)",
+                                            callsign,
+                                            policy.label()
+                                        ),
+                                    },
+                                );
+                                continue;
+                            }
                             info!("TUI CallStation: {} at {} Hz", callsign, frequency);
                             let msg = ComponentMessage::new(
                                 ComponentId::Tui,
@@ -616,6 +692,28 @@ impl super::ApplicationCoordinator {
                             break;
                         }
                         pancetta_tui::tui_runner::TuiCommand::StartCq { frequency_offset } => {
+                            // Calling CQ is an initiation. Gated by TX policy:
+                            // only Full permits it.
+                            let policy = pancetta_core::TxPolicy::from_u8(
+                                cmd_tx_policy.load(Ordering::Acquire),
+                            );
+                            if !policy.allows_initiation() {
+                                warn!(
+                                    target: "tx.policy",
+                                    "Refusing StartCq: TX policy is {} (initiation disallowed)",
+                                    policy.label()
+                                );
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "TX".to_string(),
+                                        status: format!(
+                                            "Can't start CQ — TX policy is {} (press g for Full)",
+                                            policy.label()
+                                        ),
+                                    },
+                                );
+                                continue;
+                            }
                             info!(
                                 "TUI StartCq: enabling repeating CQ at {:.0} Hz (waterfall cursor)",
                                 frequency_offset
@@ -657,6 +755,47 @@ impl super::ApplicationCoordinator {
                             cmd_cq_active.store(false, Ordering::Relaxed);
                             *cmd_tune_until.write().await = None;
                             next_cq_time = None;
+                            // Emergency stop also hard-mutes all TX: set the
+                            // global policy to Disabled (RX-only) and echo it
+                            // to the TUI banner. The operator restores TX with
+                            // the policy cycle key (`g`).
+                            cmd_tx_policy.store(
+                                pancetta_core::TxPolicy::Disabled.as_u8(),
+                                Ordering::Release,
+                            );
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
+                                    policy: pancetta_core::TxPolicy::Disabled,
+                                },
+                            );
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::CycleTxPolicy => {
+                            // Operator pressed `g`: cycle the global TX policy
+                            // Full → RespondOnly → Disabled → Full. Update the
+                            // shared atomic and echo the new state to the TUI
+                            // banner (mirrors ToggleAutonomous's echo pattern).
+                            let prev = pancetta_core::TxPolicy::from_u8(
+                                cmd_tx_policy.load(Ordering::Acquire),
+                            );
+                            let next = prev.cycle();
+                            cmd_tx_policy.store(next.as_u8(), Ordering::Release);
+                            warn!(
+                                target: "tx.policy",
+                                "Operator cycled global TX policy: {} -> {}",
+                                prev.label(),
+                                next.label()
+                            );
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
+                                    policy: next,
+                                },
+                            );
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                    component: "TX".to_string(),
+                                    status: format!("TX policy: {}", next.label()),
+                                },
+                            );
                         }
                         pancetta_tui::tui_runner::TuiCommand::StopTx => {
                             // Operator F8: abort the in-flight TX without
