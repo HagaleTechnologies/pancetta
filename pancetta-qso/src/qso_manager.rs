@@ -679,9 +679,17 @@ impl QsoManager {
         let qso_initiated_by = progress.metadata.initiated_by;
         progress.messages.push(message.clone());
 
-        // Determine state transition based on current state and message
+        // Determine state transition based on current state and message.
+        // `initiated_by` is threaded through so the manual-only state-regression
+        // arms ("back up to where the DX thinks we are") never fire for
+        // autonomous QSOs.
         let new_state = self
-            .determine_state_transition(&old_state, &message.message_type, message.signal_strength)
+            .determine_state_transition(
+                &old_state,
+                &message.message_type,
+                message.signal_strength,
+                qso_initiated_by,
+            )
             .await?;
 
         // Auto-sequence the outbound reply for MANUAL-initiated QSOs only.
@@ -693,8 +701,22 @@ impl QsoManager {
         // `reply_to_emit` is captured here (under the lock) and emitted after
         // the write guard is released, since `emit_event` only needs the
         // broadcast channel, not the QSO map.
+        // Detect a manual state regression: the DX sent an EARLIER-stage
+        // message and `determine_state_transition` either backed us up the
+        // ladder (rank decreased) or kept us in SendingReport on a repeated
+        // report. Used to (a) count the re-send against the manual watchdog cap
+        // and (b) gate the per-slot rearm so it does not double-send in the
+        // same slot.
+        let is_manual_regression = qso_initiated_by == CallInitiation::Manual
+            && (Self::ladder_rank(&new_state) < Self::ladder_rank(&old_state)
+                || (matches!(old_state, QsoState::SendingReport { .. })
+                    && matches!(new_state, QsoState::SendingReport { .. })
+                    && matches!(message.message_type, MessageType::SignalReport { .. })));
+
         let mut reply_to_emit: Option<MessageType> = None;
-        if new_state != old_state && qso_initiated_by == CallInitiation::Manual {
+        if (new_state != old_state || is_manual_regression)
+            && qso_initiated_by == CallInitiation::Manual
+        {
             let exchange = crate::exchange::MessageExchange::new(self.config.our_callsign.clone());
             match exchange.generate_response(
                 &old_state,
@@ -755,6 +777,21 @@ impl QsoManager {
             }
         }
 
+        // Count a manual regression re-send against the keep-calling watchdog
+        // so a DX that keeps repeating an earlier message cannot drive an
+        // unbounded ping-pong. We bump `call_count` and stamp `last_call_at`
+        // to `message.timestamp`; the latter also gates `rearm_manual_calls_at`
+        // (which only re-emits when ≥1 slot has elapsed since `last_call_at`),
+        // so the in-slot transition re-send and the per-slot rearm never both
+        // fire in the same slot. `first_call_at` is left untouched — a
+        // regression must not reset the watchdog clock.
+        if is_manual_regression {
+            if let Some(progress) = qsos.get_mut(&qso_id) {
+                progress.metadata.call_count += 1;
+                progress.metadata.last_call_at = Some(message.timestamp);
+            }
+        }
+
         self.emit_event(QsoEvent::MessageReceived { qso_id, message })
             .await;
 
@@ -779,11 +816,29 @@ impl QsoManager {
         Ok(())
     }
 
+    /// Forward position of a state on the responder's FT8 QSO ladder:
+    /// RespondingToCq → SendingReport → WaitingForConfirmation → Completed.
+    /// Higher means later in the conversation. Used only to detect a manual
+    /// state *regression* (a transition whose rank decreased). States off this
+    /// ladder (CallingCq, Idle, Failed, Contest, …) return `None` so they never
+    /// register as a regression.
+    fn ladder_rank(state: &QsoState) -> Option<u8> {
+        match state {
+            QsoState::RespondingToCq { .. } => Some(0),
+            QsoState::SendingReport { .. } => Some(1),
+            QsoState::WaitingForConfirmation { .. } => Some(2),
+            QsoState::SendingConfirmation { .. } => Some(2),
+            QsoState::Completed { .. } => Some(3),
+            _ => None,
+        }
+    }
+
     async fn determine_state_transition(
         &self,
         current_state: &QsoState,
         message_type: &MessageType,
         signal_strength: Option<f32>,
+        initiated_by: CallInitiation,
     ) -> Result<QsoState, QsoManagerError> {
         match (current_state, message_type) {
             // CQ call received response
@@ -953,6 +1008,157 @@ impl QsoManager {
                     grid_square: grid_square.clone(),
                     completed_at: Utc::now(),
                     duration_seconds: duration,
+                })
+            }
+
+            // === STATE REGRESSION (manual-initiated QSOs only) ===========
+            // Operator principle: "if a DX station re-sends something EARLIER
+            // in the conversation, they obviously didn't receive our response —
+            // back ourselves up to where THEY think we are."
+            //
+            // These arms are gated on CallInitiation::Manual so autonomous
+            // QSOs are unaffected. Sender verification (from == DX && to == us)
+            // is preserved on every regression exactly as on forward arms.
+
+            // REGRESSION 1: we sent RR73 (WaitingForConfirmation) but the DX is
+            // still sending us their SignalReport — they never copied our R.
+            // Back up two steps to SendingReport and re-send our R-report (the
+            // reply emitter answers a ReportAck for this (state, msg) pair).
+            // Latch the newest report value the DX sent.
+            (
+                QsoState::WaitingForConfirmation {
+                    their_callsign,
+                    our_report,
+                    frequency,
+                    ..
+                },
+                MessageType::SignalReport {
+                    from_station,
+                    to_station,
+                    report,
+                },
+            ) if initiated_by == CallInitiation::Manual => {
+                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %their_callsign,
+                        got_from = %from_station,
+                        got_to = %to_station,
+                        "spurious SignalReport in WaitingForConfirmation ignored — no regression"
+                    );
+                    return Ok(current_state.clone());
+                }
+                // Recompute our report from the freshest SNR (fall back to the
+                // already-latched value), and latch the DX's newest report.
+                let our_report = signal_strength
+                    .map(|snr| (snr.round() as i8).clamp(-30, 50))
+                    .unwrap_or(*our_report);
+                info!(
+                    target: "qso.regression",
+                    %their_callsign,
+                    "manual QSO regressing WaitingForConfirmation → SendingReport \
+                     (DX repeated their report; they never copied our R)"
+                );
+                Ok(QsoState::SendingReport {
+                    their_callsign: their_callsign.clone(),
+                    their_report: Some(*report),
+                    our_report,
+                    frequency: *frequency,
+                    started_at: Utc::now(),
+                })
+            }
+
+            // REGRESSION 2: we sent our R (SendingReport) and the DX re-sends
+            // their SignalReport — they didn't copy our R. STAY in
+            // SendingReport (do not advance); the per-slot rearm
+            // (`rearm_manual_calls_at`, FIX 4) keeps re-sending our R-report.
+            // We update the latched reports to the newest values the DX sent so
+            // the eventual log carries the most recent exchange. Returning a
+            // (possibly value-changed) SendingReport here drives a report
+            // update without the reply emitter double-sending: exchange.rs has
+            // no (SendingReport, SignalReport) response arm, so the in-slot
+            // emit path is a no-op and the rearm owns the re-send.
+            (
+                QsoState::SendingReport {
+                    their_callsign,
+                    our_report,
+                    frequency,
+                    started_at,
+                    ..
+                },
+                MessageType::SignalReport {
+                    from_station,
+                    to_station,
+                    report,
+                },
+            ) if initiated_by == CallInitiation::Manual => {
+                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %their_callsign,
+                        got_from = %from_station,
+                        got_to = %to_station,
+                        "spurious SignalReport in SendingReport ignored — no regression"
+                    );
+                    return Ok(current_state.clone());
+                }
+                let our_report = signal_strength
+                    .map(|snr| (snr.round() as i8).clamp(-30, 50))
+                    .unwrap_or(*our_report);
+                Ok(QsoState::SendingReport {
+                    their_callsign: their_callsign.clone(),
+                    their_report: Some(*report),
+                    our_report,
+                    frequency: *frequency,
+                    // Preserve started_at so the manual watchdog keeps measuring
+                    // from the original QSO start — a regression must not reset
+                    // the keep-calling clock.
+                    started_at: *started_at,
+                })
+            }
+
+            // REGRESSION 3: we sent RR73 (WaitingForConfirmation) but the DX
+            // re-sends their original grid/call (CqResponse) — they restarted
+            // the whole exchange. Back up to RespondingToCq and re-send our
+            // grid/call. Only observable when the repeated message parses as a
+            // CqResponse directed appropriately for this QSO.
+            (
+                QsoState::WaitingForConfirmation {
+                    their_callsign,
+                    frequency,
+                    ..
+                },
+                MessageType::CqResponse {
+                    calling_station,
+                    responding_station,
+                    ..
+                },
+            ) if initiated_by == CallInitiation::Manual => {
+                // A "DX K5ARH GRID" repeat parses with calling_station = us,
+                // responding_station = DX. Verify both directions before
+                // regressing so a spurious station cannot reset our QSO.
+                if responding_station != their_callsign
+                    || calling_station != &self.config.our_callsign
+                {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %their_callsign,
+                        got_from = %responding_station,
+                        got_to = %calling_station,
+                        "spurious CqResponse in WaitingForConfirmation ignored — no regression"
+                    );
+                    return Ok(current_state.clone());
+                }
+                info!(
+                    target: "qso.regression",
+                    %their_callsign,
+                    "manual QSO regressing WaitingForConfirmation → RespondingToCq \
+                     (DX restarted the exchange)"
+                );
+                Ok(QsoState::RespondingToCq {
+                    target_callsign: their_callsign.clone(),
+                    frequency: *frequency,
+                    started_at: Utc::now(),
                 })
             }
 
@@ -1927,7 +2133,7 @@ mod sender_verification_tests {
             report: -12,
         };
         let new_state = manager
-            .determine_state_transition(&state, &spoof, None)
+            .determine_state_transition(&state, &spoof, None, CallInitiation::Auto)
             .await
             .unwrap();
         // State must NOT advance.
@@ -1948,7 +2154,7 @@ mod sender_verification_tests {
             report: -12,
         };
         let new_state = manager
-            .determine_state_transition(&state, &legit, None)
+            .determine_state_transition(&state, &legit, None, CallInitiation::Auto)
             .await
             .unwrap();
         assert!(
@@ -2043,7 +2249,7 @@ mod sender_verification_tests {
             report: -10,
         };
         let new_state = manager
-            .determine_state_transition(&state, &spoof, None)
+            .determine_state_transition(&state, &spoof, None, CallInitiation::Auto)
             .await
             .unwrap();
         assert!(matches!(new_state, QsoState::SendingReport { .. }));
@@ -2065,7 +2271,7 @@ mod sender_verification_tests {
             from_station: "NF4KE".into(),
         };
         let new_state = manager
-            .determine_state_transition(&state, &spoof, None)
+            .determine_state_transition(&state, &spoof, None, CallInitiation::Auto)
             .await
             .unwrap();
         assert!(matches!(new_state, QsoState::WaitingForConfirmation { .. }));
@@ -2087,7 +2293,7 @@ mod sender_verification_tests {
             from_station: "K9ZZ".into(),
         };
         let new_state = manager
-            .determine_state_transition(&state, &legit, None)
+            .determine_state_transition(&state, &legit, None, CallInitiation::Auto)
             .await
             .unwrap();
         assert!(matches!(new_state, QsoState::Completed { .. }));
@@ -2546,6 +2752,420 @@ mod reply_emitter_tests {
             matches!(progress.state, QsoState::RespondingToCq { .. }),
             "spurious report must not advance state, got {:?}",
             progress.state
+        );
+    }
+}
+
+#[cfg(test)]
+mod state_regression_tests {
+    //! State-regression intelligence ("back up to where the DX thinks we are").
+    //!
+    //! When a MANUAL QSO's DX re-sends an EARLIER-stage message — meaning they
+    //! never copied our most-recent transmission — the QSO machine regresses to
+    //! match the DX and re-sends the appropriate response instead of stalling.
+    //!
+    //! Re-send duty split:
+    //! - REGRESSION 1 (WaitingForConfirmation + repeated report → SendingReport):
+    //!   `process_message_for_qso` emits the R-report IMMEDIATELY this slot (via
+    //!   the reply emitter's new (WaitingForConfirmation, SignalReport) arm); the
+    //!   per-slot `rearm_manual_calls_at` owns subsequent slots.
+    //! - REGRESSION 2 (SendingReport + repeated report → stays SendingReport):
+    //!   the transition does NOT emit (exchange has no (SendingReport,
+    //!   SignalReport) arm); `rearm_manual_calls_at` (FIX 4) owns the R re-send.
+    //!   The transition only updates the latched reports. Stamping `last_call_at`
+    //!   on the regression gates rearm so the two never double-send in one slot.
+    use super::*;
+
+    const OUR: &str = "K5ARH";
+    const DX: &str = "K9ZZ";
+    const FREQ: f64 = 1500.0;
+
+    fn manager_with(max_calls: u32, watchdog_min: u64) -> QsoManager {
+        let mut config = QsoManagerConfig {
+            our_callsign: OUR.into(),
+            our_grid: Some("EM12".into()),
+            timeouts: TimeoutConfig::default(),
+            contest_mode: None,
+            auto_sequence: AutoSequenceConfig::default(),
+            duplicate_checking: DuplicateCheckConfig::default(),
+        };
+        config.timeouts.manual_call_max_calls = max_calls;
+        config.timeouts.manual_call_watchdog_minutes = watchdog_min;
+        QsoManager::new(config)
+    }
+
+    fn manager() -> QsoManager {
+        manager_with(10, 5)
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn sends(events: &[QsoEvent]) -> Vec<MessageType> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                QsoEvent::MessageToSend { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Drive a manual QSO to WaitingForConfirmation (CqResponse → R → RR73 to
+    /// the DX), returning the qso_id.
+    async fn manual_to_waiting_confirmation(manager: &QsoManager) -> QsoId {
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} R-07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_id).await.unwrap().state,
+            QsoState::WaitingForConfirmation { .. }
+        ));
+        qso_id
+    }
+
+    /// REGRESSION 1: WaitingForConfirmation + repeated report → SendingReport,
+    /// an R-report is re-emitted, and reports are updated to the newest value.
+    #[tokio::test]
+    async fn manual_waiting_confirmation_plus_repeated_report_regresses_to_sending_report() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manual_to_waiting_confirmation(&manager).await;
+        let _ = drain(&mut rx);
+
+        // DX re-sends their report — with a NEW value — having never copied
+        // our RR73. snr -9 → our report -9.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -3,
+                },
+                format!("{} {} -03", OUR, DX),
+                FREQ,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        // Regressed two steps back.
+        match &progress.state {
+            QsoState::SendingReport {
+                their_report,
+                our_report,
+                ..
+            } => {
+                assert_eq!(*their_report, Some(-3), "their report updated to newest");
+                assert_eq!(*our_report, -9, "our report recomputed from newest SNR");
+            }
+            other => panic!("expected SendingReport, got {:?}", other),
+        }
+
+        // R-report re-emitted this slot.
+        let emitted = sends(&drain(&mut rx));
+        assert_eq!(
+            emitted.len(),
+            1,
+            "expected one R re-send, got {:?}",
+            emitted
+        );
+        match &emitted[0] {
+            MessageType::ReportAck {
+                to_station,
+                from_station,
+                report,
+            } => {
+                assert_eq!(to_station, DX);
+                assert_eq!(from_station, OUR);
+                assert_eq!(*report, -9);
+            }
+            other => panic!("expected ReportAck, got {:?}", other),
+        }
+    }
+
+    /// REGRESSION 2: SendingReport + repeated report → stays SendingReport (no
+    /// spurious double-advance); rearm re-sends R (transition itself does not,
+    /// avoiding a same-slot double-send).
+    #[tokio::test]
+    async fn manual_sending_report_repeated_report_stays_and_resends() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        // Advance to SendingReport.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_id).await.unwrap().state,
+            QsoState::SendingReport { .. }
+        ));
+        let _ = drain(&mut rx);
+
+        // DX re-sends their report (didn't copy our R).
+        let result = manager
+            .determine_state_transition(
+                &manager.get_qso(qso_id).await.unwrap().state,
+                &MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                Some(-15.0),
+                CallInitiation::Manual,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, QsoState::SendingReport { .. }),
+            "must stay in SendingReport, got {:?}",
+            result
+        );
+
+        // Now exercise the full path: it must NOT emit from the transition (no
+        // exchange arm); the per-slot rearm owns the R re-send.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let from_transition = sends(&drain(&mut rx));
+        assert!(
+            from_transition.is_empty(),
+            "transition must not re-send (rearm owns it), got {:?}",
+            from_transition
+        );
+
+        // A slot later, rearm re-sends our R-report (and not before — the
+        // regression stamped last_call_at, so no double-send in this slot).
+        let last = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(last + Duration::seconds(15))
+            .await;
+        let rearmed = sends(&drain(&mut rx));
+        assert_eq!(rearmed.len(), 1, "rearm re-sends R, got {:?}", rearmed);
+        assert!(
+            matches!(rearmed[0], MessageType::ReportAck { .. }),
+            "rearm must re-send ReportAck, got {:?}",
+            rearmed[0]
+        );
+    }
+
+    /// Regression re-sends count against the watchdog cap: a DX that keeps
+    /// repeating an earlier report cannot drive an unbounded ping-pong — the
+    /// QSO retires once the cap is exceeded.
+    #[tokio::test]
+    async fn regression_respects_watchdog_cap() {
+        // Small cap, large time window so the call cap is the binding bound.
+        let manager = manager_with(3, 60);
+        let qso_id = manual_to_waiting_confirmation(&manager).await;
+        // call_count is 1 at QSO start; each regression bumps it.
+
+        // DX repeats their report several times — each is a regression re-send.
+        for _ in 0..5 {
+            manager
+                .process_message(
+                    MessageType::SignalReport {
+                        to_station: OUR.into(),
+                        from_station: DX.into(),
+                        report: -7,
+                    },
+                    format!("{} {} -07", OUR, DX),
+                    FREQ,
+                    Some(-15.0),
+                )
+                .await
+                .unwrap();
+            // After the first regression we are in SendingReport; subsequent
+            // repeats are REGRESSION 2 (stay) and still count.
+        }
+
+        let count = manager.get_qso(qso_id).await.unwrap().metadata.call_count;
+        assert!(
+            count >= 3,
+            "regressions must count against cap, got {}",
+            count
+        );
+
+        // The watchdog now retires the QSO rather than looping forever.
+        manager.check_timeouts_at(Utc::now()).await;
+        assert!(
+            matches!(
+                manager.get_qso(qso_id).await,
+                Err(QsoManagerError::QsoNotFound { .. })
+            ),
+            "watchdog should retire the QSO once the cap is exceeded"
+        );
+    }
+
+    /// A spurious sender (correct to:, wrong from:) does NOT trigger regression.
+    #[tokio::test]
+    async fn regression_requires_matching_sender() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manual_to_waiting_confirmation(&manager).await;
+        let before = manager.get_qso(qso_id).await.unwrap().metadata.call_count;
+        let _ = drain(&mut rx);
+
+        // Properly-addressed report but from a DIFFERENT callsign.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: "NF4KE".into(),
+                    report: -7,
+                },
+                format!("{} NF4KE -07", OUR),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        // No regression: still WaitingForConfirmation, no re-send, no count bump.
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::WaitingForConfirmation { .. }),
+            "spurious sender must not regress, got {:?}",
+            progress.state
+        );
+        assert!(
+            sends(&drain(&mut rx)).is_empty(),
+            "spurious sender must not re-send"
+        );
+        assert_eq!(
+            progress.metadata.call_count, before,
+            "spurious sender must not count against cap"
+        );
+    }
+
+    /// An AUTO-initiated QSO with a repeated earlier-stage message does NOT
+    /// regress or auto-resend (manual-only gate).
+    #[tokio::test]
+    async fn auto_qso_does_not_regress() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        // Build an AUTO QSO and drive it forward to WaitingForConfirmation. The
+        // auto path does not auto-reply, so we drive the state directly via
+        // process_message (state machine advances regardless of mode).
+        let qso_id = manager.respond_to_cq(DX.into(), FREQ, None).await.unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} R-07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_id).await.unwrap().state,
+            QsoState::WaitingForConfirmation { .. }
+        ));
+        let _ = drain(&mut rx);
+
+        // DX repeats their report. Auto QSO must NOT regress and must NOT
+        // auto-resend.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::WaitingForConfirmation { .. }),
+            "auto QSO must NOT regress, got {:?}",
+            progress.state
+        );
+        assert!(
+            sends(&drain(&mut rx)).is_empty(),
+            "auto QSO must not auto-resend on regression"
         );
     }
 }

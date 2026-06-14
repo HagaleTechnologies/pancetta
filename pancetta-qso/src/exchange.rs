@@ -344,6 +344,33 @@ impl MessageExchange {
                 from_station: self.our_callsign.clone(),
             })),
 
+            // STATE REGRESSION (manual QSOs): we sent RR73 but the DX is still
+            // sending us their report — they never copied our R. The state
+            // machine has just regressed us to SendingReport; re-send our
+            // R-report so the DX can advance. Mirrors the
+            // (RespondingToCq, SignalReport) arm above.
+            (
+                QsoState::WaitingForConfirmation { their_callsign, .. },
+                MessageType::SignalReport { .. },
+            ) => Ok(Some(MessageType::ReportAck {
+                to_station: their_callsign.clone(),
+                from_station: self.our_callsign.clone(),
+                report: computed_report,
+            })),
+
+            // STATE REGRESSION (manual QSOs): we sent RR73 but the DX re-sent
+            // their original grid/call (CqResponse) — they restarted the
+            // exchange. The state machine has regressed us to RespondingToCq;
+            // re-send our grid/call (CqResponse) so the DX can re-sync.
+            (
+                QsoState::WaitingForConfirmation { their_callsign, .. },
+                MessageType::CqResponse { .. },
+            ) => Ok(Some(MessageType::CqResponse {
+                calling_station: their_callsign.clone(),
+                responding_station: self.our_callsign.clone(),
+                grid: None,
+            })),
+
             // Contest mode responses
             _ if self.contest_mode.is_some() => {
                 self.generate_contest_response(current_state, received_message, computed_report)
