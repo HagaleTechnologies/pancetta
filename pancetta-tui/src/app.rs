@@ -115,6 +115,20 @@ pub struct ActiveQsoBanner {
     pub report_received: Option<i32>,
     /// Total messages exchanged (both directions) so far in this QSO.
     pub exchange_count: u32,
+    /// Stable id of this QSO (UUID string) — target for abort/re-send.
+    pub qso_id: String,
+    /// How the QSO was initiated: "Manual" or "Auto".
+    pub initiated_by: String,
+    /// Display-ladder rung labels, left-to-right. Empty when no ladder.
+    pub ladder_labels: Vec<String>,
+    /// Per-rung flag: `true` if the rung's message is one WE transmit.
+    pub ladder_ours: Vec<bool>,
+    /// Index of the current rung in `ladder_labels`.
+    pub ladder_index: usize,
+    /// Human-readable "now" line (what we're doing this moment).
+    pub now_line: String,
+    /// Human-readable "next" line (what we expect next).
+    pub next_line: String,
 }
 
 /// Pipeline component health snapshot, forwarded from coordinator
@@ -161,6 +175,20 @@ pub struct QsoStatus {
     /// Signal report we received from them.
     pub report_received: Option<i32>,
     pub exchange_count: u32,
+    /// Stable id of this QSO (UUID string) — target for abort/re-send.
+    pub qso_id: Option<String>,
+    /// How the QSO was initiated: "Manual" or "Auto".
+    pub initiated_by: Option<String>,
+    /// Display-ladder rung labels, left-to-right. Empty when no ladder.
+    pub ladder_labels: Vec<String>,
+    /// Per-rung flag: `true` if the rung's message is one WE transmit.
+    pub ladder_ours: Vec<bool>,
+    /// Index of the current rung in `ladder_labels`.
+    pub ladder_index: usize,
+    /// Human-readable "now" line (what we're doing this moment).
+    pub now_line: String,
+    /// Human-readable "next" line (what we expect next).
+    pub next_line: String,
 }
 
 #[derive(Debug, Clone)]
@@ -388,6 +416,10 @@ pub struct App {
     /// QSO state change. Rendered in a 1-row banner above Band Activity
     /// so operators see who they're mid-conversation with at all times.
     pub active_qsos: Vec<ActiveQsoBanner>,
+    /// Selection cursor into the active-QSO set (and the QSO Status panel),
+    /// driving which QSO the abort/re-send management keys target. Clamped
+    /// to the active set whenever it changes.
+    pub qso_cursor: usize,
     pub station_info: StationInfo,
     pub dx_stations: HashMap<String, DxStation>,
     pub band_activity_scroll: usize,
@@ -503,6 +535,7 @@ impl App {
             decoded_messages: VecDeque::with_capacity(1000),
             qso_statuses: Vec::new(),
             active_qsos: Vec::new(),
+            qso_cursor: 0,
             station_info,
             dx_stations: HashMap::new(),
             band_activity_scroll: 0,
@@ -1092,9 +1125,46 @@ impl App {
                 report_sent: q.report_sent,
                 report_received: q.report_received,
                 exchange_count: q.exchange_count,
+                qso_id: Some(q.qso_id.clone()),
+                initiated_by: Some(q.initiated_by.clone()),
+                ladder_labels: q.ladder_labels.clone(),
+                ladder_ours: q.ladder_ours.clone(),
+                ladder_index: q.ladder_index,
+                now_line: q.now_line.clone(),
+                next_line: q.next_line.clone(),
             })
             .collect();
         self.active_qsos = qsos;
+        // Clamp the selection cursor into the new active set.
+        if self.active_qsos.is_empty() {
+            self.qso_cursor = 0;
+        } else if self.qso_cursor >= self.active_qsos.len() {
+            self.qso_cursor = self.active_qsos.len() - 1;
+        }
+    }
+
+    /// Id of the currently selected QSO for management actions, or the
+    /// sole QSO when exactly one is active. `None` when there are no
+    /// active QSOs. Selection ordering matches the banner/panel sort
+    /// (the order the snapshot arrived in).
+    pub fn selected_qso_id(&self) -> Option<String> {
+        if self.active_qsos.is_empty() {
+            return None;
+        }
+        let idx = self.qso_cursor.min(self.active_qsos.len() - 1);
+        Some(self.active_qsos[idx].qso_id.clone())
+    }
+
+    /// Move the QSO selection cursor up (toward index 0), saturating.
+    pub fn qso_cursor_up(&mut self) {
+        self.qso_cursor = self.qso_cursor.saturating_sub(1);
+    }
+
+    /// Move the QSO selection cursor down, clamped to the active set.
+    pub fn qso_cursor_down(&mut self) {
+        if !self.active_qsos.is_empty() {
+            self.qso_cursor = (self.qso_cursor + 1).min(self.active_qsos.len() - 1);
+        }
     }
 
     pub fn add_dx_spot(
@@ -1798,6 +1868,13 @@ mod tests {
             report_sent: Some(-8),
             report_received: Some(-15),
             exchange_count: 3,
+            qso_id: format!("{}-id", call),
+            initiated_by: "Manual".into(),
+            ladder_labels: vec!["Grid".into(), "Rpt".into(), "R-Rpt".into()],
+            ladder_ours: vec![true, false, true],
+            ladder_index: 1,
+            now_line: "waiting".into(),
+            next_line: "their signal report".into(),
         }
     }
 

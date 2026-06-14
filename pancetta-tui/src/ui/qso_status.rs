@@ -32,18 +32,22 @@ pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()>
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3), // QSO info
+                Constraint::Length(3), // Sequence ladder + Now/Next
                 Constraint::Length(2), // TX/RX status
                 Constraint::Length(2), // SNR meters
                 Constraint::Min(1),    // Progress/timing
+                Constraint::Length(1), // Control hint
             ])
             .split(block.inner(area));
 
         f.render_widget(block, area);
 
         render_qso_info(f, chunks[0], app);
-        render_tx_rx_status(f, chunks[1], app);
-        render_snr_meters(f, chunks[2], app);
-        render_timing_progress(f, chunks[3], app);
+        render_ladder(f, chunks[1], app);
+        render_tx_rx_status(f, chunks[2], app);
+        render_snr_meters(f, chunks[3], app);
+        render_timing_progress(f, chunks[4], app);
+        render_control_hint(f, chunks[5], app);
     }
 
     Ok(())
@@ -54,31 +58,48 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Header
     lines.push(Line::from(vec![Span::styled(
-        " Call       Freq     State         SNR  Exch ",
+        "  Call       Freq     State         Step    SNR  Exch ",
         Style::default()
             .fg(app.theme.accent_color())
             .add_modifier(Modifier::BOLD),
     )]));
 
-    // Each active QSO
-    for qso in &app.qso_statuses {
+    // Each active QSO. `cursor` selects which row is highlighted; it indexes
+    // into the stored `active_qsos`/`qso_statuses` order (same order the
+    // selection cursor uses), so the highlight and the abort/re-send target
+    // always agree.
+    let cursor = app.qso_cursor.min(app.active_qsos.len().saturating_sub(1));
+    for (idx, qso) in app.qso_statuses.iter().enumerate() {
         if !qso.active {
             continue;
         }
+        let selected = idx == cursor;
+        let marker = if selected { "▶ " } else { "  " };
         let call = qso.call_sign.as_deref().unwrap_or("---");
         let freq = qso
             .frequency
             .map_or("---".to_string(), |f| format!("{:.0}", f));
         let state = qso.state.as_deref().unwrap_or("---");
+        // Current rung label from the ladder, if any.
+        let step = qso
+            .ladder_labels
+            .get(qso.ladder_index)
+            .map(|s| s.as_str())
+            .unwrap_or("-");
         let snr = qso.snr_rx.map_or("---".to_string(), |s| format!("{:+}", s));
 
+        let base_fg = if selected {
+            app.theme.accent_color()
+        } else {
+            app.theme.foreground_color()
+        };
+        let mut call_style = Style::default().fg(base_fg).add_modifier(Modifier::BOLD);
+        if selected {
+            call_style = call_style.add_modifier(Modifier::REVERSED);
+        }
+
         lines.push(Line::from(vec![
-            Span::styled(
-                format!(" {:<10}", call),
-                Style::default()
-                    .fg(app.theme.foreground_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
+            Span::styled(format!("{}{:<10}", marker, call), call_style),
             Span::styled(
                 format!("{:>7}  ", freq),
                 Style::default().fg(app.theme.warning_color()),
@@ -86,6 +107,10 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(
                 format!("{:<13}", state),
                 Style::default().fg(app.theme.accent_color()),
+            ),
+            Span::styled(
+                format!("{:<7} ", step),
+                Style::default().fg(app.theme.warning_color()),
             ),
             Span::styled(
                 format!("{:>4}  ", snr),
@@ -104,6 +129,12 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(app.theme.muted_color()),
         )));
     }
+
+    // Control hint for the multi-QSO view.
+    lines.push(Line::from(Span::styled(
+        " [k] abort  [r] re-send  Up/Down select",
+        Style::default().fg(app.theme.muted_color()),
+    )));
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
@@ -187,6 +218,90 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
     ];
 
     let paragraph = Paragraph::new(lines);
+    f.render_widget(paragraph, area);
+}
+
+/// Render the role-aware sequence ladder plus the Now/Next lines for the
+/// selected (single-detail) QSO. The ladder shows the canonical exchange
+/// as a row of rungs joined by " ── "; rungs we transmit are prefixed with
+/// a small marker, the current rung is wrapped in [ ] and highlighted.
+fn render_ladder(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let qso = app.qso_status();
+
+    // No ladder available (terminal/idle/contest, or no QSO yet): render
+    // a quiet placeholder so the layout stays stable.
+    if !qso.active || qso.ladder_labels.is_empty() {
+        let paragraph = Paragraph::new(Line::from(Span::styled(
+            "Seq : ---",
+            Style::default().fg(app.theme.muted_color()),
+        )));
+        f.render_widget(paragraph, area);
+        return;
+    }
+
+    let mut spans: Vec<Span> = vec![Span::styled(
+        "Seq : ",
+        Style::default().fg(app.theme.foreground_color()),
+    )];
+
+    for (i, label) in qso.ladder_labels.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(
+                " ── ",
+                Style::default().fg(app.theme.muted_color()),
+            ));
+        }
+        let ours = qso.ladder_ours.get(i).copied().unwrap_or(false);
+        let prefix = if ours { "·" } else { "" };
+        let is_current = i == qso.ladder_index;
+        let text = if is_current {
+            format!("[{}{}]", prefix, label)
+        } else {
+            format!("{}{}", prefix, label)
+        };
+        let style = if is_current {
+            Style::default()
+                .fg(app.theme.warning_color())
+                .add_modifier(Modifier::BOLD)
+        } else if ours {
+            Style::default().fg(app.theme.accent_color())
+        } else {
+            Style::default().fg(app.theme.foreground_color())
+        };
+        spans.push(Span::styled(text, style));
+    }
+
+    let now = if qso.now_line.is_empty() {
+        "---".to_string()
+    } else {
+        qso.now_line.clone()
+    };
+    let next = if qso.next_line.is_empty() {
+        "---".to_string()
+    } else {
+        qso.next_line.clone()
+    };
+
+    let lines = vec![
+        Line::from(spans),
+        Line::from(vec![
+            Span::styled("Now : ", Style::default().fg(app.theme.muted_color())),
+            Span::styled(now, Style::default().fg(app.theme.foreground_color())),
+            Span::styled("   Next: ", Style::default().fg(app.theme.muted_color())),
+            Span::styled(next, Style::default().fg(app.theme.muted_color())),
+        ]),
+    ];
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(paragraph, area);
+}
+
+/// One-line control hint at the bottom of the single-detail QSO panel.
+fn render_control_hint(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let paragraph = Paragraph::new(Line::from(Span::styled(
+        "[k] abort  [r] re-send  Up/Down select",
+        Style::default().fg(app.theme.muted_color()),
+    )));
     f.render_widget(paragraph, area);
 }
 

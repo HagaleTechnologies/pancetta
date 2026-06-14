@@ -522,22 +522,31 @@ impl QsoManager {
             last_call_at: Some(now),
         };
 
-        let progress = QsoProgress {
-            state: state.clone(),
-            state_history: vec![],
-            messages: vec![],
-            metadata,
-        };
-
-        self.qsos.write().await.insert(qso_id, progress);
-        self.add_callsign_mapping(&target_callsign, qso_id).await;
-
         // Send response message
         let message = MessageType::CqResponse {
             calling_station: target_callsign.clone(),
             responding_station: self.config.our_callsign.clone(),
             grid: self.config.our_grid.clone(),
         };
+
+        // Record the initial outbound call as a Sent message so it can be
+        // re-sent later (see `resend_last_tx`) and surfaced to the UI.
+        let progress = QsoProgress {
+            state: state.clone(),
+            state_history: vec![],
+            messages: vec![QsoMessage {
+                timestamp: now,
+                direction: MessageDirection::Sent,
+                message_type: message.clone(),
+                raw_text: String::new(),
+                signal_strength: None,
+                frequency,
+            }],
+            metadata,
+        };
+
+        self.qsos.write().await.insert(qso_id, progress);
+        self.add_callsign_mapping(&target_callsign, qso_id).await;
 
         self.emit_event(QsoEvent::MessageToSend {
             qso_id,
@@ -648,6 +657,36 @@ impl QsoManager {
             tx_parity,
         })
         .await;
+    }
+
+    /// Re-send the most recent outbound message for a QSO.
+    ///
+    /// Looks up the QSO, finds the most-recent `Sent` message in its message
+    /// log, and re-emits it via the same `MessageToSend` path `send_message`
+    /// uses (carrying the QSO's frequency and latched `tx_parity`). Returns
+    /// `QsoNotFound` for an unknown id; returns `Ok(())` (a benign no-op) when
+    /// the QSO has no prior outbound message to resend.
+    pub async fn resend_last_tx(&self, qso_id: QsoId) -> Result<(), QsoManagerError> {
+        let (message, frequency) = {
+            let qsos = self.qsos.read().await;
+            let progress = qsos
+                .get(&qso_id)
+                .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
+            match progress
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.direction == MessageDirection::Sent)
+            {
+                Some(m) => (m.message_type.clone(), progress.metadata.frequency),
+                None => {
+                    info!("resend_last_tx: no prior Sent message for QSO {}", qso_id);
+                    return Ok(());
+                }
+            }
+        };
+        self.send_message(qso_id, message, frequency).await;
+        Ok(())
     }
 
     /// Get next contest serial number
@@ -794,6 +833,21 @@ impl QsoManager {
 
         self.emit_event(QsoEvent::MessageReceived { qso_id, message })
             .await;
+
+        // Record the auto-sequenced reply as a Sent message (under the lock)
+        // so it is available to `resend_last_tx` and the UI snapshot.
+        if let Some(reply) = reply_to_emit.as_ref() {
+            if let Some(progress) = qsos.get_mut(&qso_id) {
+                progress.messages.push(QsoMessage {
+                    timestamp: Utc::now(),
+                    direction: MessageDirection::Sent,
+                    message_type: reply.clone(),
+                    raw_text: String::new(),
+                    signal_strength: None,
+                    frequency: qso_frequency,
+                });
+            }
+        }
 
         // Release the QSO map write lock before emitting the reply so the
         // emission path holds no locks (and a future change to send_message-
@@ -1994,6 +2048,47 @@ mod tests {
                 .call_count,
             2
         );
+    }
+
+    /// resend_last_tx on a QSO with a prior Sent message re-emits a
+    /// MessageToSend carrying that message.
+    #[tokio::test]
+    async fn resend_last_tx_reemits_last_sent() {
+        let manager = QsoManager::new(test_config());
+        let mut events = manager.subscribe();
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+
+        // Drain the initial call event.
+        while events.try_recv().is_ok() {}
+
+        manager.resend_last_tx(qso_id).await.unwrap();
+
+        // Expect exactly one MessageToSend, re-emitting the initial CqResponse.
+        let mut resends = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::MessageToSend {
+                qso_id, message, ..
+            } = ev
+            {
+                resends.push((qso_id, message));
+            }
+        }
+        assert_eq!(resends.len(), 1, "exactly one resend event");
+        assert_eq!(resends[0].0, qso_id);
+        assert!(matches!(resends[0].1, MessageType::CqResponse { .. }));
+    }
+
+    /// resend_last_tx on an unknown QSO id returns QsoNotFound.
+    #[tokio::test]
+    async fn resend_last_tx_unknown_id_not_found() {
+        let manager = QsoManager::new(test_config());
+        let bogus = QsoId::new_v4();
+        let err = manager.resend_last_tx(bogus).await.unwrap_err();
+        assert!(matches!(err, QsoManagerError::QsoNotFound { .. }));
     }
 
     /// FIX 4: a manual QSO in SendingReport (we sent R, DX has not advanced)

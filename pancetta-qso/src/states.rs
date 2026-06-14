@@ -515,6 +515,90 @@ impl QsoState {
     }
 }
 
+/// A read-only, role-aware display ladder for an in-progress QSO.
+///
+/// Derived from a [`QsoState`] plus the [`CallInitiation`] of the QSO. The
+/// ladder shows the canonical FT8 exchange sequence as a row of rungs, which
+/// rungs are ours to transmit, where we currently are, and human-readable
+/// "now"/"next" lines. Intended purely for the UI; carries no QSO-engine
+/// semantics over the bus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QsoLadderView {
+    /// Rung labels, left-to-right.
+    pub labels: Vec<&'static str>,
+    /// Per-rung flag: `true` if the message at that rung is one WE transmit.
+    pub ours: Vec<bool>,
+    /// Index of the current rung (where we are right now).
+    pub index: usize,
+    /// What we're doing this moment (e.g. "sending R-15").
+    pub now: String,
+    /// What we expect next (e.g. "expect their RR73").
+    pub next: String,
+}
+
+impl QsoState {
+    /// Derive a [`QsoLadderView`] for this state given how the QSO was
+    /// initiated. Returns `None` for terminal states (Completed/Failed),
+    /// Idle, and Contest.
+    pub fn ladder_view(&self, _initiated_by: CallInitiation) -> Option<QsoLadderView> {
+        // CQer ladder: we called CQ.
+        const CQER_LABELS: [&str; 5] = ["CQ", "Grid", "Rpt", "R-Rpt", "RR73"];
+        const CQER_OURS: [bool; 5] = [true, false, true, false, true];
+        // Caller ladder: we answered/called them.
+        const CALLER_LABELS: [&str; 5] = ["Grid", "Rpt", "R-Rpt", "RR73", "73"];
+        const CALLER_OURS: [bool; 5] = [true, false, true, false, true];
+
+        match self {
+            QsoState::CallingCq { .. } => Some(QsoLadderView {
+                labels: CQER_LABELS.to_vec(),
+                ours: CQER_OURS.to_vec(),
+                index: 0,
+                now: "calling CQ".to_string(),
+                next: "expect a caller".to_string(),
+            }),
+            QsoState::SendingConfirmation { .. } => Some(QsoLadderView {
+                labels: CQER_LABELS.to_vec(),
+                ours: CQER_OURS.to_vec(),
+                index: 4,
+                now: "sending RR73".to_string(),
+                next: "their 73 — QSO logged".to_string(),
+            }),
+            QsoState::RespondingToCq { .. } => Some(QsoLadderView {
+                labels: CALLER_LABELS.to_vec(),
+                ours: CALLER_OURS.to_vec(),
+                index: 0,
+                now: "sending our grid/call".to_string(),
+                next: "expect their report".to_string(),
+            }),
+            QsoState::WaitingForReport { .. } => Some(QsoLadderView {
+                labels: CALLER_LABELS.to_vec(),
+                ours: CALLER_OURS.to_vec(),
+                index: 1,
+                now: "waiting".to_string(),
+                next: "their signal report".to_string(),
+            }),
+            QsoState::SendingReport { our_report, .. } => Some(QsoLadderView {
+                labels: CALLER_LABELS.to_vec(),
+                ours: CALLER_OURS.to_vec(),
+                index: 2,
+                now: format!("sending R{our_report:+}"),
+                next: "expect their RR73".to_string(),
+            }),
+            QsoState::WaitingForConfirmation { .. } => Some(QsoLadderView {
+                labels: CALLER_LABELS.to_vec(),
+                ours: CALLER_OURS.to_vec(),
+                index: 3,
+                now: "waiting".to_string(),
+                next: "their RR73 — we log + send 73".to_string(),
+            }),
+            QsoState::Idle
+            | QsoState::Completed { .. }
+            | QsoState::Failed { .. }
+            | QsoState::Contest(_) => None,
+        }
+    }
+}
+
 impl MessageType {
     /// Check if this message type is addressed to a specific station
     pub fn is_addressed_to(&self, callsign: &str) -> bool {
@@ -577,6 +661,125 @@ mod tests {
         let idle = QsoState::Idle;
         assert!(!idle.is_terminal());
         assert!(!idle.is_active());
+    }
+
+    #[test]
+    fn test_ladder_view_caller_flow() {
+        let resp = QsoState::RespondingToCq {
+            target_callsign: "W1ABC".to_string(),
+            frequency: 14074000.0,
+            started_at: Utc::now(),
+        };
+        let v = resp.ladder_view(CallInitiation::Manual).unwrap();
+        assert_eq!(v.index, 0);
+        assert_eq!(v.ours, vec![true, false, true, false, true]);
+        assert_eq!(v.labels, vec!["Grid", "Rpt", "R-Rpt", "RR73", "73"]);
+        assert!(v.now.contains("grid"));
+        assert!(!v.next.is_empty());
+
+        let wait_rpt = QsoState::WaitingForReport {
+            their_callsign: "W1ABC".to_string(),
+            frequency: 14074000.0,
+            started_at: Utc::now(),
+        };
+        let v = wait_rpt.ladder_view(CallInitiation::Auto).unwrap();
+        assert_eq!(v.index, 1);
+        assert!(v.now.contains("waiting"));
+        assert!(v.next.contains("report"));
+
+        let send_rpt = QsoState::SendingReport {
+            their_callsign: "W1ABC".to_string(),
+            their_report: Some(-12),
+            our_report: -15,
+            frequency: 14074000.0,
+            started_at: Utc::now(),
+        };
+        let v = send_rpt.ladder_view(CallInitiation::Manual).unwrap();
+        assert_eq!(v.index, 2);
+        assert!(
+            v.now.contains("-15"),
+            "now-string should contain signed report: {}",
+            v.now
+        );
+        assert!(!v.next.is_empty());
+
+        let send_rpt_pos = QsoState::SendingReport {
+            their_callsign: "W1ABC".to_string(),
+            their_report: None,
+            our_report: 5,
+            frequency: 14074000.0,
+            started_at: Utc::now(),
+        };
+        let v = send_rpt_pos.ladder_view(CallInitiation::Auto).unwrap();
+        assert!(
+            v.now.contains("+5"),
+            "now-string should contain signed report: {}",
+            v.now
+        );
+
+        let wait_conf = QsoState::WaitingForConfirmation {
+            their_callsign: "W1ABC".to_string(),
+            their_report: -10,
+            our_report: -15,
+            frequency: 14074000.0,
+            grid_square: None,
+            started_at: Utc::now(),
+        };
+        let v = wait_conf.ladder_view(CallInitiation::Auto).unwrap();
+        assert_eq!(v.index, 3);
+        assert!(v.now.contains("waiting"));
+        assert!(!v.next.is_empty());
+    }
+
+    #[test]
+    fn test_ladder_view_cqer_flow() {
+        let cq = QsoState::CallingCq {
+            frequency: 14074000.0,
+            started_at: Utc::now(),
+            call_count: 1,
+        };
+        let v = cq.ladder_view(CallInitiation::Auto).unwrap();
+        assert_eq!(v.index, 0);
+        assert_eq!(v.labels, vec!["CQ", "Grid", "Rpt", "R-Rpt", "RR73"]);
+        assert_eq!(v.ours, vec![true, false, true, false, true]);
+        assert!(v.now.contains("CQ"));
+        assert!(!v.next.is_empty());
+
+        let send_conf = QsoState::SendingConfirmation {
+            their_callsign: "W1ABC".to_string(),
+            their_report: -10,
+            our_report: -15,
+            frequency: 14074000.0,
+            grid_square: None,
+            started_at: Utc::now(),
+        };
+        let v = send_conf.ladder_view(CallInitiation::Auto).unwrap();
+        assert_eq!(v.index, 4);
+        assert!(v.now.contains("RR73"));
+        assert!(!v.next.is_empty());
+    }
+
+    #[test]
+    fn test_ladder_view_terminal_none() {
+        let completed = QsoState::Completed {
+            their_callsign: "W1ABC".to_string(),
+            their_report: -15,
+            our_report: -10,
+            frequency: 14074000.0,
+            grid_square: None,
+            completed_at: Utc::now(),
+            duration_seconds: 120,
+        };
+        assert!(completed.ladder_view(CallInitiation::Auto).is_none());
+
+        let failed = QsoState::Failed {
+            reason: QsoFailureReason::UserCancelled,
+            failed_at: Utc::now(),
+            last_state: Box::new(QsoState::Idle),
+        };
+        assert!(failed.ladder_view(CallInitiation::Auto).is_none());
+
+        assert!(QsoState::Idle.ladder_view(CallInitiation::Auto).is_none());
     }
 
     #[test]

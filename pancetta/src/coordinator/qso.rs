@@ -602,7 +602,48 @@ impl super::ApplicationCoordinator {
                                         crate::message_bus::QsoMessage::LogQso { qso_data } => {
                                             debug!("Manual log QSO: {}", qso_data);
                                         }
-                                        _ => {}
+                                        // Abort / End both cancel the QSO
+                                        // (→ Failed{UserCancelled}, mapping cleared).
+                                        crate::message_bus::QsoMessage::AbortQso { qso_id }
+                                        | crate::message_bus::QsoMessage::EndQso { qso_id } => {
+                                            match qso_id.parse::<pancetta_qso::QsoId>() {
+                                                Ok(id) => {
+                                                    if let Err(e) = qso_manager.cancel_qso(id).await
+                                                    {
+                                                        warn!(
+                                                            "Failed to abort QSO {}: {}",
+                                                            qso_id, e
+                                                        );
+                                                    } else {
+                                                        info!("Aborted QSO {}", qso_id);
+                                                    }
+                                                }
+                                                Err(e) => warn!(
+                                                    "AbortQso: bad QSO id '{}': {}",
+                                                    qso_id, e
+                                                ),
+                                            }
+                                        }
+                                        crate::message_bus::QsoMessage::ResendQso { qso_id } => {
+                                            match qso_id.parse::<pancetta_qso::QsoId>() {
+                                                Ok(id) => {
+                                                    if let Err(e) =
+                                                        qso_manager.resend_last_tx(id).await
+                                                    {
+                                                        warn!(
+                                                            "Failed to re-send QSO {}: {}",
+                                                            qso_id, e
+                                                        );
+                                                    } else {
+                                                        info!("Re-sent last TX for QSO {}", qso_id);
+                                                    }
+                                                }
+                                                Err(e) => warn!(
+                                                    "ResendQso: bad QSO id '{}': {}",
+                                                    qso_id, e
+                                                ),
+                                            }
+                                        }
                                     }
                                 }
 
@@ -716,6 +757,27 @@ fn snapshot_item_from_progress(
         .rev()
         .find(|m| m.direction == MessageDirection::Received);
 
+    let initiated_by = match progress.metadata.initiated_by {
+        pancetta_qso::CallInitiation::Manual => "Manual",
+        pancetta_qso::CallInitiation::Auto => "Auto",
+    }
+    .to_string();
+
+    // Derive the role-aware display ladder + now/next lines. Terminal/Idle/
+    // Contest states return None (shouldn't appear in the active set, but we
+    // handle it by leaving the ladder empty and now/next blank).
+    let ladder = progress.state.ladder_view(progress.metadata.initiated_by);
+    let (ladder_labels, ladder_ours, ladder_index, now_line, next_line) = match ladder {
+        Some(v) => (
+            v.labels.iter().map(|s| s.to_string()).collect(),
+            v.ours,
+            v.index,
+            v.now,
+            v.next,
+        ),
+        None => (Vec::new(), Vec::new(), 0, String::new(), String::new()),
+    };
+
     Some(crate::message_bus::ActiveQsoSnapshotItem {
         their_callsign: their,
         state,
@@ -730,6 +792,13 @@ fn snapshot_item_from_progress(
         report_sent: progress.metadata.reports.sent.map(i32::from),
         report_received: progress.metadata.reports.received.map(i32::from),
         exchange_count: progress.messages.len() as u32,
+        qso_id: progress.metadata.qso_id.to_string(),
+        initiated_by,
+        ladder_labels,
+        ladder_ours,
+        ladder_index,
+        now_line,
+        next_line,
     })
 }
 

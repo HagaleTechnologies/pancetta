@@ -237,6 +237,22 @@ pub struct ActiveQsoSnapshotItem {
     pub report_received: Option<i32>,
     /// Total messages exchanged (both directions) so far in this QSO.
     pub exchange_count: u32,
+    /// Stable id of this QSO (UUID string). Used by the TUI to target
+    /// abort/re-send management commands at a specific QSO.
+    pub qso_id: String,
+    /// How the QSO was initiated: "Manual" or "Auto".
+    pub initiated_by: String,
+    /// Display-ladder rung labels, left-to-right (derived from the QSO
+    /// state + initiation role). Empty for states with no ladder.
+    pub ladder_labels: Vec<String>,
+    /// Per-rung flag: `true` if the rung's message is one WE transmit.
+    pub ladder_ours: Vec<bool>,
+    /// Index of the current rung in `ladder_labels`.
+    pub ladder_index: usize,
+    /// Human-readable "now" line (what we're doing this moment).
+    pub now_line: String,
+    /// Human-readable "next" line (what we expect next).
+    pub next_line: String,
 }
 
 /// Status data from the autonomous operator for TUI consumption.
@@ -293,6 +309,10 @@ pub enum QsoMessage {
     EndQso { qso_id: String },
     /// Log QSO
     LogQso { qso_data: String },
+    /// Abort an in-progress QSO (operator-initiated cancel).
+    AbortQso { qso_id: String },
+    /// Re-send the most recent message we transmitted in this QSO.
+    ResendQso { qso_id: String },
 }
 
 /// DX cluster messages

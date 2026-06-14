@@ -217,6 +217,13 @@ pub enum TuiCommand {
     /// the autonomous decision loop checks before dispatching TX
     /// (which has its own slot/priority/QSO gates).
     ToggleAutonomous,
+    /// Operator pressed `k` — abort the currently selected QSO. The
+    /// coordinator cancels it (→ Failed{UserCancelled}, callsign mapping
+    /// cleared). No-op when no QSO is selected.
+    AbortQso { qso_id: String },
+    /// Operator pressed `r` — re-send the most recent message we
+    /// transmitted in the selected QSO. No-op when no QSO is selected.
+    ResendQso { qso_id: String },
 }
 
 /// TUI performance metrics
@@ -541,12 +548,22 @@ impl TuiRunner {
                 app.previous_panel();
             }
 
-            // Arrow keys for list navigation
+            // Arrow keys for list navigation. When the QSO Status panel is
+            // focused, Up/Down move the QSO selection cursor instead (which
+            // drives the abort/re-send target).
             KeyCode::Up => {
-                app.previous_item();
+                if matches!(app.active_panel, crate::app::ActivePanel::QsoStatus) {
+                    app.qso_cursor_up();
+                } else {
+                    app.previous_item();
+                }
             }
             KeyCode::Down => {
-                app.next_item();
+                if matches!(app.active_panel, crate::app::ActivePanel::QsoStatus) {
+                    app.qso_cursor_down();
+                } else {
+                    app.next_item();
+                }
             }
             // Jump/page navigation for the focused list (Band Activity is
             // newest-first, so Home = back to realtime — no more holding Up).
@@ -661,6 +678,26 @@ impl TuiRunner {
             }
             KeyCode::Char('p') => {
                 self.message_tx.send(TuiCommand::TogglePtt)?;
+            }
+
+            // === QSO management (operate on the selected QSO) ===
+            // r - re-send our most recent message in the selected QSO.
+            KeyCode::Char('r') => {
+                if let Some(qso_id) = app.selected_qso_id() {
+                    self.message_tx.send(TuiCommand::ResendQso { qso_id })?;
+                    app.status_message = "Re-sending last TX for selected QSO".to_string();
+                } else {
+                    app.status_message = "No active QSO to re-send".to_string();
+                }
+            }
+            // k - kill/abort the selected QSO.
+            KeyCode::Char('k') => {
+                if let Some(qso_id) = app.selected_qso_id() {
+                    self.message_tx.send(TuiCommand::AbortQso { qso_id })?;
+                    app.status_message = "Aborting selected QSO".to_string();
+                } else {
+                    app.status_message = "No active QSO to abort".to_string();
+                }
             }
 
             // === Tune / clear-offset (case-sensitive) ===
@@ -938,6 +975,8 @@ impl TuiRunner {
             ("Space", "Call selected station"),
             ("Enter", "Send TX message"),
             ("c / s", "Start / stop CQ"),
+            ("k", "Abort selected QSO"),
+            ("r", "Re-send last TX (selected QSO)"),
             ("t", "Find clear TX offset"),
             ("Shift+T", "Tune (12 s tone)"),
             ("h", "Halt current TX"),
@@ -1506,6 +1545,13 @@ mod key_tests {
             report_sent: Some(-8),
             report_received: Some(-15),
             exchange_count: 2,
+            qso_id: "33333333-3333-3333-3333-333333333333".to_string(),
+            initiated_by: "Manual".to_string(),
+            ladder_labels: vec!["Grid".to_string(), "Rpt".to_string()],
+            ladder_ours: vec![true, false],
+            ladder_index: 1,
+            now_line: "waiting".to_string(),
+            next_line: "their signal report".to_string(),
         };
         r.handle_message(TuiMessage::ActiveQsosUpdate { qsos: vec![banner] })
             .await

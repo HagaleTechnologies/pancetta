@@ -532,6 +532,34 @@ impl super::ApplicationCoordinator {
                                 warn!("Failed to forward CallStation command: {}", e);
                             }
                         }
+                        pancetta_tui::tui_runner::TuiCommand::AbortQso { qso_id } => {
+                            info!("TUI AbortQso: {}", qso_id);
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Qso,
+                                MessageType::QsoMessage(crate::message_bus::QsoMessage::AbortQso {
+                                    qso_id,
+                                }),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to forward AbortQso command: {}", e);
+                            }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::ResendQso { qso_id } => {
+                            info!("TUI ResendQso: {}", qso_id);
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Qso,
+                                MessageType::QsoMessage(
+                                    crate::message_bus::QsoMessage::ResendQso { qso_id },
+                                ),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to forward ResendQso command: {}", e);
+                            }
+                        }
                         pancetta_tui::tui_runner::TuiCommand::SetFrequency { vfo, frequency } => {
                             info!("TUI SetFrequency: VFO {} -> {} Hz", vfo, frequency);
                             let freq_mhz = frequency as f64 / 1_000_000.0;
@@ -903,6 +931,13 @@ fn map_qso_snapshot_item(
         report_sent: q.report_sent,
         report_received: q.report_received,
         exchange_count: q.exchange_count,
+        qso_id: q.qso_id.clone(),
+        initiated_by: q.initiated_by.clone(),
+        ladder_labels: q.ladder_labels.clone(),
+        ladder_ours: q.ladder_ours.clone(),
+        ladder_index: q.ladder_index,
+        now_line: q.now_line.clone(),
+        next_line: q.next_line.clone(),
     }
 }
 
@@ -970,8 +1005,19 @@ mod tui_relay_tests {
             report_sent: Some(-8),
             report_received: Some(-12),
             exchange_count: 2,
+            qso_id: "11111111-1111-1111-1111-111111111111".to_string(),
+            initiated_by: "Manual".to_string(),
+            ladder_labels: vec!["Grid".to_string(), "Rpt".to_string()],
+            ladder_ours: vec![true, false],
+            ladder_index: 1,
+            now_line: "waiting".to_string(),
+            next_line: "their signal report".to_string(),
         };
         let banner = map_qso_snapshot_item(&item);
+        assert_eq!(banner.qso_id, "11111111-1111-1111-1111-111111111111");
+        assert_eq!(banner.initiated_by, "Manual");
+        assert_eq!(banner.ladder_index, 1);
+        assert_eq!(banner.now_line, "waiting");
         assert_eq!(banner.their_callsign, "JA1ABC");
         assert_eq!(banner.state, "sending rpt");
         assert_eq!(banner.started_at, started);
@@ -1005,6 +1051,13 @@ mod tui_relay_tests {
             report_sent: None,
             report_received: None,
             exchange_count: 0,
+            qso_id: "22222222-2222-2222-2222-222222222222".to_string(),
+            initiated_by: "Auto".to_string(),
+            ladder_labels: Vec::new(),
+            ladder_ours: Vec::new(),
+            ladder_index: 0,
+            now_line: String::new(),
+            next_line: String::new(),
         };
         let banner = map_qso_snapshot_item(&item);
         assert!(banner.last_tx_text.is_none());
