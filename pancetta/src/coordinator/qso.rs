@@ -76,7 +76,11 @@ impl super::ApplicationCoordinator {
                     ..Default::default()
                 };
 
-                let qso_manager = QsoManager::new(qso_config);
+                let mut qso_manager = QsoManager::new(qso_config);
+                // Share the rig dial-frequency source so completed QSOs log the
+                // real RF frequency (dial + audio offset), not the bare offset
+                // (was producing ADIF FREQ ~0.001 / BAND 0MHZ).
+                qso_manager.set_dial_frequency_source(operating_frequency_hz.clone());
                 if let Err(e) = qso_manager.start().await {
                     error!("Failed to start QSO manager: {}", e);
                     return Err(anyhow::anyhow!("QSO manager startup failed"));

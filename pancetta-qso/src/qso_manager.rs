@@ -8,6 +8,7 @@ use crate::states::*;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::{broadcast, RwLock};
@@ -258,6 +259,13 @@ pub struct QsoManager {
 
     /// Optional database for persistent duplicate checking
     database: Option<Arc<AsyncQsoDatabase>>,
+
+    /// Rig dial frequency in Hz, shared from the coordinator's hamlib poll
+    /// (0 if unknown / no rig). `metadata.frequency` holds the *audio offset*;
+    /// the logged RF frequency of a completed QSO is `dial + offset` (WSJT-X
+    /// convention). Used only when stamping completed-QSO metadata so the ADIF
+    /// records a real FREQ/BAND instead of the bare offset.
+    dial_frequency_hz: Arc<AtomicU64>,
 }
 
 impl QsoManager {
@@ -278,7 +286,16 @@ impl QsoManager {
             next_serial: Arc::new(RwLock::new(next_serial)),
             cleanup_interval: Arc::new(RwLock::new(None)),
             database: None,
+            dial_frequency_hz: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Share the coordinator's rig dial-frequency source so completed QSOs log
+    /// the true RF frequency (dial + audio offset) instead of the bare offset.
+    /// Pass the same `Arc<AtomicU64>` the hamlib poll loop updates; if never
+    /// called, completed metadata keeps the offset value (e.g. unit tests).
+    pub fn set_dial_frequency_source(&mut self, source: Arc<AtomicU64>) {
+        self.dial_frequency_hz = source;
     }
 
     /// Create a new QSO manager with a database for persistent duplicate checking
@@ -794,7 +811,16 @@ impl QsoManager {
             }
 
             let completed_metadata = if matches!(&new_state, QsoState::Completed { .. }) {
-                Some(progress.metadata.clone())
+                let mut m = progress.metadata.clone();
+                // `m.frequency` is the audio offset within the slot. The logged
+                // RF frequency is the rig dial plus that offset (WSJT-X logs the
+                // actual on-air frequency, not the dial). Without this the ADIF
+                // recorded BAND 0MHZ / FREQ ~0.001 from the bare offset.
+                let dial = self.dial_frequency_hz.load(Ordering::Relaxed);
+                if dial > 0 {
+                    m.frequency = dial as f64 + m.frequency;
+                }
+                Some(m)
             } else {
                 None
             };
@@ -1764,6 +1790,7 @@ impl Clone for QsoManager {
             next_serial: Arc::clone(&self.next_serial),
             cleanup_interval: Arc::clone(&self.cleanup_interval),
             database: self.database.clone(),
+            dial_frequency_hz: Arc::clone(&self.dial_frequency_hz),
         }
     }
 }
@@ -2706,6 +2733,102 @@ mod reply_emitter_tests {
                 .any(|e| matches!(e, QsoEvent::QsoCompleted { .. })),
             "expected a QsoCompleted event (ADIF log)"
         );
+    }
+
+    /// A completed QSO logs the RF frequency (dial + audio offset), not the
+    /// bare offset, when a dial-frequency source is shared. Regression for the
+    /// ADIF FREQ ~0.001 / BAND 0MHZ bug.
+    #[tokio::test]
+    async fn completed_metadata_logs_dial_plus_offset() {
+        let mut manager = manager();
+        manager.set_dial_frequency_source(Arc::new(AtomicU64::new(14_074_000)));
+        let mut rx = manager.subscribe();
+        let _qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let _ = drain(&mut rx);
+        manager
+            .process_message(
+                MessageType::FinalConfirmation {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                },
+                format!("{} {} RR73", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        let completed = events.iter().find_map(|e| match e {
+            QsoEvent::QsoCompleted { metadata, .. } => Some(metadata.clone()),
+            _ => None,
+        });
+        let metadata = completed.expect("expected a QsoCompleted event");
+        // dial 14_074_000 + offset 1500 = 14_075_500 Hz (20m).
+        assert_eq!(metadata.frequency, 14_074_000.0 + FREQ);
+    }
+
+    /// Without a dial source (e.g. unit tests / no rig), completed metadata
+    /// keeps the value it was created with — no spurious offset added.
+    #[tokio::test]
+    async fn completed_metadata_unchanged_without_dial_source() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let _ = drain(&mut rx);
+        manager
+            .process_message(
+                MessageType::FinalConfirmation {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                },
+                format!("{} {} RR73", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let events = drain(&mut rx);
+        let metadata = events
+            .iter()
+            .find_map(|e| match e {
+                QsoEvent::QsoCompleted { metadata, .. } => Some(metadata.clone()),
+                _ => None,
+            })
+            .expect("expected a QsoCompleted event");
+        assert_eq!(metadata.frequency, FREQ);
     }
 
     /// FIX 2: Manual QSO in SendingReport + a bare "73" (DX skipped RR73) →
