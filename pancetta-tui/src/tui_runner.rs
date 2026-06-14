@@ -548,6 +548,22 @@ impl TuiRunner {
             KeyCode::Down => {
                 app.next_item();
             }
+            // Jump/page navigation for the focused list (Band Activity is
+            // newest-first, so Home = back to realtime — no more holding Up).
+            KeyCode::Home => {
+                app.scroll_to_top();
+                app.status_message = "Jumped to newest (realtime)".to_string();
+            }
+            KeyCode::End => {
+                app.scroll_to_bottom();
+                app.status_message = "Jumped to oldest".to_string();
+            }
+            KeyCode::PageUp => {
+                app.page_up();
+            }
+            KeyCode::PageDown => {
+                app.page_down();
+            }
             KeyCode::Left => {
                 app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(100.0);
                 app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
@@ -654,14 +670,20 @@ impl TuiRunner {
                 self.message_tx.send(TuiCommand::ToggleTune)?;
             }
             KeyCode::Char('t') => {
-                // Lowercase t: find clear TX offset and jump the cursor there.
+                // Lowercase t: jump the cursor to the best TX offset. Always
+                // picks something (least-congested if nothing is truly clear).
                 match app.find_clear_offset() {
-                    Some(hz) => {
+                    Some((hz, true)) => {
                         app.tx_frequency_offset = hz;
                         app.status_message = format!("TX cursor → {:.0} Hz (clear)", hz);
                     }
+                    Some((hz, false)) => {
+                        app.tx_frequency_offset = hz;
+                        app.status_message =
+                            format!("TX cursor → {:.0} Hz (best available — band is busy)", hz);
+                    }
                     None => {
-                        app.status_message = "No clear offset found in your parity".to_string();
+                        app.status_message = "No TX offset available".to_string();
                     }
                 }
             }
@@ -908,6 +930,8 @@ impl TuiRunner {
             ("?", "Toggle this help"),
             ("Tab / Shift+Tab", "Switch panel"),
             ("Up / Down", "Scroll list"),
+            ("Home / End", "Jump to newest (realtime) / oldest"),
+            ("PgUp / PgDn", "Page scroll"),
             ("Left / Right", "TX offset −/+ 50 Hz"),
             ("[ / ]", "TX offset −/+ 50 Hz"),
             ("= / -", "Band up / down"),

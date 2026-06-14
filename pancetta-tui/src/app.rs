@@ -885,6 +885,64 @@ impl App {
         }
     }
 
+    /// Number of rows a PageUp/PageDown moves the focused list.
+    const SCROLL_PAGE: usize = 10;
+
+    /// Jump the focused list to the top — for Band Activity that's the
+    /// newest decode (realtime), since the list is newest-first. This is the
+    /// "get me back to live" shortcut (Home / `g`), no more holding the arrow.
+    pub fn scroll_to_top(&mut self) {
+        match self.active_panel {
+            ActivePanel::BandActivity => self.band_activity_scroll = 0,
+            ActivePanel::DxHunter => self.dx_hunter_scroll = 0,
+            _ => {}
+        }
+    }
+
+    /// Jump the focused list to the bottom — for Band Activity the oldest
+    /// retained decode (End / `G`).
+    pub fn scroll_to_bottom(&mut self) {
+        match self.active_panel {
+            ActivePanel::BandActivity => {
+                self.band_activity_scroll = self.decoded_messages.len().saturating_sub(1);
+            }
+            ActivePanel::DxHunter => {
+                self.dx_hunter_scroll = self.dx_stations.len().saturating_sub(1);
+            }
+            _ => {}
+        }
+    }
+
+    /// Page toward the top (newest/realtime for Band Activity).
+    pub fn page_up(&mut self) {
+        match self.active_panel {
+            ActivePanel::BandActivity => {
+                self.band_activity_scroll =
+                    self.band_activity_scroll.saturating_sub(Self::SCROLL_PAGE);
+            }
+            ActivePanel::DxHunter => {
+                self.dx_hunter_scroll = self.dx_hunter_scroll.saturating_sub(Self::SCROLL_PAGE);
+            }
+            _ => {}
+        }
+    }
+
+    /// Page toward the bottom (older entries).
+    pub fn page_down(&mut self) {
+        match self.active_panel {
+            ActivePanel::BandActivity => {
+                let max = self.decoded_messages.len().saturating_sub(1);
+                self.band_activity_scroll =
+                    (self.band_activity_scroll + Self::SCROLL_PAGE).min(max);
+            }
+            ActivePanel::DxHunter => {
+                let max = self.dx_stations.len().saturating_sub(1);
+                self.dx_hunter_scroll = (self.dx_hunter_scroll + Self::SCROLL_PAGE).min(max);
+            }
+            _ => {}
+        }
+    }
+
     fn toggle_theme(&mut self) {
         self.theme = match self.theme {
             Theme::Dark => Theme::Light,
@@ -1433,7 +1491,12 @@ impl App {
     ///
     /// Hard reject: any candidate with decode_penalty > 0 or own_penalty > 0.
     /// Among the remaining, lowest spectral + center_bias wins.
-    pub fn find_clear_offset(&self) -> Option<f64> {
+    /// Find the best TX audio offset. Returns `(offset_hz, is_truly_clear)`.
+    /// Always returns `Some` when the search range is non-empty — on a busy
+    /// band it picks the least-congested slot rather than giving up (a fully
+    /// clear slot is rare in practice). `is_truly_clear` is false when the
+    /// pick is a best-effort gap with stations within `SEPARATION_HZ`.
+    pub fn find_clear_offset(&self) -> Option<(f64, bool)> {
         use pancetta_core::slot::SlotParity;
 
         const MIN_HZ: f64 = 200.0;
@@ -1465,30 +1528,56 @@ impl App {
             .map(|m| m.delta_freq as f64)
             .collect();
 
-        let mut best: Option<(f64, f64)> = None; // (offset, score)
+        // Always return a best-effort offset: a fully clear slot is rare on a
+        // live band, so instead of rejecting congested candidates we SCORE
+        // every one and pick the least-congested. Tiered penalties guarantee
+        // any truly-clear slot beats any congested slot, an occupied-but-
+        // distant slot beats a nearer one, and our own running QSO is avoided
+        // hardest. The returned bool is whether the chosen slot is truly clear
+        // (no station within SEPARATION_HZ), for an honest status message.
+        let mut best: Option<(f64, f64, bool)> = None; // (offset, score, is_clear)
         let mut hz = MIN_HZ;
         while hz <= MAX_HZ {
-            let near_decode = recent_decodes_in_parity
+            let nearest_decode = recent_decodes_in_parity
                 .iter()
-                .any(|&f| (f - hz).abs() <= SEPARATION_HZ);
-            let near_own = own_freqs.iter().any(|&f| (f - hz).abs() <= SEPARATION_HZ);
+                .map(|&f| (f - hz).abs())
+                .fold(f64::INFINITY, f64::min);
+            let nearest_own = own_freqs
+                .iter()
+                .map(|&f| (f - hz).abs())
+                .fold(f64::INFINITY, f64::min);
+            let near_decode = nearest_decode <= SEPARATION_HZ;
+            let near_own = nearest_own <= SEPARATION_HZ;
+            let is_clear = !near_decode && !near_own;
 
-            if !near_decode && !near_own {
-                let spectral = if let Some(row) = latest_row {
-                    spectral_peak(row, hz, NEIGHBOR_HZ, SPECTRAL_RANGE_HZ)
-                } else {
-                    0.0
-                };
-                let center_bias = ((hz - 1500.0).abs() / 1300.0) * 0.3;
-                let score = spectral as f64 + center_bias;
-                best = match best {
-                    Some((_, prev)) if prev <= score => best,
-                    _ => Some((hz, score)),
-                };
-            }
+            let spectral = if let Some(row) = latest_row {
+                spectral_peak(row, hz, NEIGHBOR_HZ, SPECTRAL_RANGE_HZ) as f64
+            } else {
+                0.0
+            };
+            let center_bias = ((hz - 1500.0).abs() / 1300.0) * 0.3;
+            // Congestion penalties (base ensures tiering: clear < decode-near
+            // < own-near; spectral ~[0,1] and center_bias ~[0,0.3] only break
+            // ties within a tier). Graded by distance so we drift toward the
+            // widest gap when nothing is clear.
+            let decode_pen = if near_decode {
+                10.0 + (SEPARATION_HZ - nearest_decode)
+            } else {
+                0.0
+            };
+            let own_pen = if near_own {
+                100.0 + (SEPARATION_HZ - nearest_own)
+            } else {
+                0.0
+            };
+            let score = spectral + center_bias + decode_pen + own_pen;
+            best = match best {
+                Some((_, prev, _)) if prev <= score => best,
+                _ => Some((hz, score, is_clear)),
+            };
             hz += STEP_HZ;
         }
-        best.map(|(hz, _)| hz)
+        best.map(|(hz, _, is_clear)| (hz, is_clear))
     }
 
     /// The parity our station will TX in. Active QSO wins; otherwise fall
@@ -1839,7 +1928,11 @@ mod tests {
         }
         app.waterfall_data.push(row);
 
-        let pick = app.find_clear_offset().expect("should find a clear spot");
+        let (pick, is_clear) = app.find_clear_offset().expect("should find a clear spot");
+        assert!(
+            is_clear,
+            "mostly-empty band should yield a truly clear slot"
+        );
         // Should land outside 1400-1600 ± 75 Hz separation.
         assert!(
             pick < 1325.0 || pick > 1675.0,
@@ -1851,7 +1944,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_clear_offset_returns_none_when_band_saturated() {
+    async fn find_clear_offset_best_effort_when_band_saturated() {
         use chrono::{Duration, Utc};
         use pancetta_core::slot::SlotParity;
 
@@ -1869,11 +1962,54 @@ mod tests {
             ));
         }
 
-        let pick = app.find_clear_offset();
-        assert!(
-            pick.is_none(),
-            "should refuse to pick when nothing is clear"
-        );
+        // Even with the band saturated, t must still pick a best-effort
+        // offset (never give up) — flagged as not-truly-clear.
+        let (pick, is_clear) = app
+            .find_clear_offset()
+            .expect("must still return a best-effort offset on a busy band");
+        assert!(!is_clear, "saturated band cannot yield a truly clear slot");
+        assert!(pick >= 200.0 && pick <= 2800.0);
+    }
+
+    #[tokio::test]
+    async fn band_activity_jump_and_page_navigation() {
+        use chrono::Utc;
+        use pancetta_core::slot::SlotParity;
+
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.active_panel = ActivePanel::BandActivity;
+        let now = Utc::now();
+        for i in 0..50 {
+            app.decoded_messages.push_back(fixture_view_at(
+                "Z",
+                1000.0 + i as f32,
+                SlotParity::Even,
+                now,
+            ));
+        }
+
+        // Scrolled deep into history, then Home snaps back to realtime (0).
+        app.band_activity_scroll = 40;
+        app.scroll_to_top();
+        assert_eq!(app.band_activity_scroll, 0, "Home → newest/realtime");
+
+        // End jumps to the oldest (len-1).
+        app.scroll_to_bottom();
+        assert_eq!(app.band_activity_scroll, 49, "End → oldest");
+
+        // Page up moves toward realtime by a page; clamps at 0.
+        app.page_up();
+        assert_eq!(app.band_activity_scroll, 39);
+        app.band_activity_scroll = 3;
+        app.page_up();
+        assert_eq!(app.band_activity_scroll, 0, "page up clamps at top");
+
+        // Page down moves toward older; clamps at len-1.
+        app.page_down();
+        assert_eq!(app.band_activity_scroll, 10);
+        app.band_activity_scroll = 45;
+        app.page_down();
+        assert_eq!(app.band_activity_scroll, 49, "page down clamps at bottom");
     }
 
     // Helper for the tests above.
