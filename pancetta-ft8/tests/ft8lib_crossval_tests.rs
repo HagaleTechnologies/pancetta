@@ -150,7 +150,7 @@ fn test_ft8lib_decode_generated_cq() {
         "ft8_lib should decode the CQ message from generated WAV"
     );
 
-    let (text, _freq, _time, _ldpc) = &messages[0];
+    let (text, _freq, _time, _ldpc, _snr) = &messages[0];
     assert_eq!(text.trim(), "CQ K1ABC FN42");
 }
 
@@ -165,7 +165,7 @@ fn test_ft8lib_decode_generated_report() {
         "ft8_lib should decode the signal report from generated WAV"
     );
 
-    let (text, _freq, _time, _ldpc) = &messages[0];
+    let (text, _freq, _time, _ldpc, _snr) = &messages[0];
     assert_eq!(text.trim(), "K1DEF W1ABC -12");
 }
 
@@ -180,7 +180,7 @@ fn test_ft8lib_decode_generated_rr73() {
         "ft8_lib should decode the RR73 message from generated WAV"
     );
 
-    let (text, _freq, _time, _ldpc) = &messages[0];
+    let (text, _freq, _time, _ldpc, _snr) = &messages[0];
     assert_eq!(text.trim(), "K1DEF W1ABC RR73");
 }
 
@@ -293,7 +293,7 @@ fn test_our_audio_decoded_by_ft8lib() {
             msg
         );
 
-        let (decoded_text, _freq, _time, _ldpc) = &decoded[0];
+        let (decoded_text, _freq, _time, _ldpc, _snr) = &decoded[0];
         assert_eq!(
             decoded_text.trim(),
             msg.trim(),

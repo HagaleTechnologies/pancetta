@@ -394,16 +394,87 @@ fn test_gfsk_decoded_by_ft8lib() {
         message,
         decoded.len()
     );
-    for (text, freq, _time, _ldpc) in &decoded {
-        println!("  [ft8lib] {:.1} Hz  {}", freq, text);
+    for (text, freq, _time, _ldpc, snr) in &decoded {
+        println!("  [ft8lib] {:+.1} dB  {:.1} Hz  {}", snr, freq, text);
     }
 
     assert!(
-        decoded.iter().any(|(text, _, _, _)| text.contains("W1ABC")),
+        decoded
+            .iter()
+            .any(|(text, _, _, _, _)| text.contains("W1ABC")),
         "ft8_lib should decode our GFSK signal for '{}': got {:?}",
         message,
-        decoded.iter().map(|(t, _, _, _)| t).collect::<Vec<_>>()
+        decoded.iter().map(|(t, _, _, _, _)| t).collect::<Vec<_>>()
     );
+}
+
+/// Two synthetic FT8 signals at different amplitudes must decode with
+/// different (non-zero, monotonically-ordered) SNRs via the ft8_lib path.
+///
+/// Regression for the "every decode shows SNR +0" bug: the FFI now
+/// computes a real SNR from the waterfall, so the louder signal must read
+/// a higher SNR than the quieter one, and neither may be the old hard-coded
+/// 0.0.
+#[test]
+fn test_ft8lib_snr_tracks_amplitude_two_signals() {
+    let loud_msg = "CQ W1ABC FN42";
+    let quiet_msg = "CQ K9XYZ EM79";
+
+    let loud = modulate_symbols(&encode_message(loud_msg), 200.0); // ~1700 Hz
+    let quiet = modulate_symbols(&encode_message(quiet_msg), 800.0); // ~2300 Hz
+
+    // Sum at very different amplitudes over a common white-noise floor so
+    // the SNR metric (signal-vs-local-noise) has something to reference and
+    // the ordering is unambiguous. A deterministic LCG keeps the test
+    // reproducible without an rng dependency.
+    let n = loud.len().max(quiet.len());
+    let mut mixed = vec![0.0f32; n];
+    let mut state: u32 = 0x1234_5678;
+    for i in 0..n {
+        // xorshift-ish noise in roughly [-1, 1].
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let noise = (state as f32 / u32::MAX as f32) * 2.0 - 1.0;
+        let l = loud.get(i).copied().unwrap_or(0.0) * 0.80;
+        let q = quiet.get(i).copied().unwrap_or(0.0) * 0.12;
+        mixed[i] = l + q + noise * 0.02;
+    }
+
+    let decoded = ft8lib_decode_audio(&mixed);
+    let snr_of = |needle: &str| -> Option<f32> {
+        decoded
+            .iter()
+            .find(|(t, _, _, _, _)| t == needle)
+            .map(|(_, _, _, _, snr)| *snr)
+    };
+
+    let loud_snr =
+        snr_of(loud_msg).unwrap_or_else(|| panic!("loud signal not decoded; got {:?}", decoded));
+    let quiet_snr =
+        snr_of(quiet_msg).unwrap_or_else(|| panic!("quiet signal not decoded; got {:?}", decoded));
+
+    // Neither is the old constant-0 bug.
+    assert_ne!(loud_snr, 0.0, "loud SNR is the hard-coded 0.0");
+    assert_ne!(quiet_snr, 0.0, "quiet SNR is the hard-coded 0.0");
+
+    // Louder signal reads a higher SNR.
+    assert!(
+        loud_snr > quiet_snr,
+        "expected louder signal SNR ({:.1}) > quieter ({:.1})",
+        loud_snr,
+        quiet_snr
+    );
+
+    // Both in a plausible WSJT-X-referenced range.
+    for (label, snr) in [("loud", loud_snr), ("quiet", quiet_snr)] {
+        assert!(
+            (-30.0..=40.0).contains(&snr),
+            "{} SNR {:.1} dB out of plausible range",
+            label,
+            snr
+        );
+    }
 }
 
 // =========================================================================

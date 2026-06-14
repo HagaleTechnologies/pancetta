@@ -256,10 +256,121 @@ pub fn ft8lib_decode_payload(payload: &[u8; 10]) -> Option<String> {
     Some(c_str.to_string_lossy().trim().to_string())
 }
 
-/// Decode audio samples to FT8 messages using ft8_lib's full pipeline.
-/// Returns a vector of (message_text, frequency_hz, time_sec, ldpc_errors).
+/// Number of FSK tones in an FT8 symbol.
 #[cfg(not(ft8lib_stub))]
-pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
+const FT8_NUM_TONES: usize = 8;
+/// Number of FT8 data symbols (non-Costas).
+#[cfg(not(ft8lib_stub))]
+const FT8_ND: usize = 58;
+
+/// Read the dB magnitude of one waterfall cell from the `uint8_t` mag buffer.
+///
+/// ft8_lib's default build stores magnitudes as `uint8_t` and recovers the
+/// dB value as `mag * 0.5 - 120.0` (see `WF_ELEM_MAG` in `ft8/decode.h`).
+#[cfg(not(ft8lib_stub))]
+#[inline]
+unsafe fn wf_mag_db(mag: *const u8, idx: usize) -> f64 {
+    f64::from(*mag.add(idx)) * 0.5 - 120.0
+}
+
+/// Estimate SNR (dB, referenced to a 2500 Hz noise bandwidth, WSJT-X
+/// convention) for one decoded candidate, directly from the ft8_lib
+/// waterfall magnitudes.
+///
+/// This intentionally mirrors pancetta's native
+/// `Ft8Decoder::estimate_snr_spectrogram` so the two decode paths report
+/// comparable numbers: for each of the 58 FT8 data symbols we take the
+/// strongest tone bin (`best`) and weakest tone bin (`worst`) across the 8
+/// tones, average each across symbols, and form
+/// `snr_bin_db = avg_best - avg_worst`. We then subtract the same
+/// bandwidth correction `10*log10(2500/6.25)` that the native path uses
+/// to reference the per-bin (6.25 Hz) ratio to a 2500 Hz noise bandwidth.
+///
+/// The waterfall `mag` buffer is laid out as
+/// `uint8_t[blocks][time_osr][freq_osr][num_bins]`. The base offset for a
+/// candidate is
+/// `((((time_offset*time_osr)+time_sub)*freq_osr)+freq_sub)*num_bins + freq_offset`,
+/// and consecutive channel symbols are `block_stride = time_osr*freq_osr*num_bins`
+/// elements apart (matching `get_cand_mag` / the symbol loop in `ft8/decode.c`).
+/// Data symbol `k` (0..58) sits at channel symbol index `k + (k<29 ? 7 : 14)`,
+/// skipping the three Costas sync arrays.
+///
+/// Returns `None` if the candidate's tone bins or symbol blocks fall
+/// outside the waterfall (so the caller can fall back rather than read OOB).
+#[cfg(not(ft8lib_stub))]
+fn estimate_snr_from_waterfall(wf: &ftx_waterfall_t, cand: &ftx_candidate_t) -> Option<f64> {
+    if wf.mag.is_null() {
+        return None;
+    }
+    let num_bins = wf.num_bins as i64;
+    let time_osr = wf.time_osr as i64;
+    let freq_osr = wf.freq_osr as i64;
+    let block_stride = wf.block_stride as i64;
+    let num_blocks = wf.num_blocks as i64;
+    if num_bins <= 0 || time_osr <= 0 || freq_osr <= 0 || block_stride <= 0 {
+        return None;
+    }
+
+    // Base offset of the candidate's first channel symbol (block 0).
+    let base = ((((cand.time_offset as i64 * time_osr) + cand.time_sub as i64) * freq_osr)
+        + cand.freq_sub as i64)
+        * num_bins
+        + cand.freq_offset as i64;
+
+    let mut signal_sum = 0.0f64;
+    let mut noise_sum = 0.0f64;
+    let mut count = 0usize;
+
+    for k in 0..FT8_ND {
+        // Channel-symbol index of data symbol k (skip the Costas arrays).
+        let sym_idx = (k + if k < 29 { 7 } else { 14 }) as i64;
+        let block_abs = cand.time_offset as i64 + sym_idx;
+        if block_abs < 0 || block_abs >= num_blocks {
+            continue;
+        }
+        let sym_off = base + sym_idx * block_stride;
+        // The 8 tone bins of this symbol must be in range.
+        if sym_off < 0 || cand.freq_offset as i64 + (FT8_NUM_TONES as i64) > num_bins {
+            continue;
+        }
+        let mut best = f64::NEG_INFINITY;
+        let mut worst = f64::INFINITY;
+        for t in 0..FT8_NUM_TONES {
+            let v = unsafe { wf_mag_db(wf.mag, (sym_off as usize) + t) };
+            if v > best {
+                best = v;
+            }
+            if v < worst {
+                worst = v;
+            }
+        }
+        signal_sum += best;
+        noise_sum += worst;
+        count += 1;
+    }
+
+    if count == 0 {
+        return None;
+    }
+    let avg_signal_db = signal_sum / count as f64;
+    let avg_noise_db = noise_sum / count as f64;
+    let snr_bin_db = avg_signal_db - avg_noise_db;
+    // Match estimate_snr_spectrogram: reference the 6.25 Hz bin ratio to a
+    // 2500 Hz noise bandwidth (WSJT-X convention).
+    let bw_correction = 10.0 * (2500.0f64 / 6.25).log10();
+    Some(snr_bin_db - bw_correction)
+}
+
+/// Decode audio samples to FT8 messages using ft8_lib's full pipeline.
+/// Returns a vector of (message_text, frequency_hz, time_sec, ldpc_errors, snr_db).
+///
+/// `snr_db` is computed from the ft8_lib waterfall magnitudes at the decoded
+/// candidate's position using [`estimate_snr_from_waterfall`], which mirrors
+/// pancetta's native SNR definition (WSJT-X 2500 Hz reference). If the
+/// waterfall position is out of range the value falls back to `-24.0` dB (the
+/// same floor the native estimator uses).
+#[cfg(not(ft8lib_stub))]
+pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32, f32)> {
     let cfg = monitor_config_t {
         f_min: 100.0,
         f_max: 3000.0,
@@ -338,12 +449,17 @@ pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
                     + cand.time_sub as f32 / mon.wf.time_osr as f32)
                     * mon.symbol_period;
 
+                // Real SNR from the waterfall at the decoded position; fall
+                // back to the native estimator's -24 dB floor when the
+                // candidate position is out of the waterfall's range.
+                let snr_db = estimate_snr_from_waterfall(&mon.wf, cand).unwrap_or(-24.0) as f32;
+
                 // Deduplicate
                 if !messages
                     .iter()
-                    .any(|(t, _, _, _): &(String, f32, f32, i32)| *t == text)
+                    .any(|(t, _, _, _, _): &(String, f32, f32, i32, f32)| *t == text)
                 {
-                    messages.push((text, freq_hz, time_sec, status.ldpc_errors));
+                    messages.push((text, freq_hz, time_sec, status.ldpc_errors, snr_db));
                 }
             }
         }
@@ -377,7 +493,7 @@ pub fn ft8lib_decode_payload(_payload: &[u8; 10]) -> Option<String> {
 
 /// Stub: returns empty results when ft8_lib C library is not available.
 #[cfg(ft8lib_stub)]
-pub fn ft8lib_decode_audio(_samples: &[f32]) -> Vec<(String, f32, f32, i32)> {
+pub fn ft8lib_decode_audio(_samples: &[f32]) -> Vec<(String, f32, f32, i32, f32)> {
     Vec::new()
 }
 

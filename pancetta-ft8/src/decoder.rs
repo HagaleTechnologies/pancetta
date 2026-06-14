@@ -1750,13 +1750,16 @@ impl Ft8Decoder {
         let tuples = crate::ft8_lib_ffi::ft8lib_decode_audio(samples);
         tuples
             .into_iter()
-            .map(|(text, freq, time_sec, ldpc_errors)| {
-                // Batch 85: the FFI tuple is (text, freq_hz, TIME_sec,
-                // ldpc_errors) — this call site used to feed time into
-                // the snr slot, so every ft8_lib-sourced snr_db was
-                // actually a time offset. ft8_lib's pipeline reports no
-                // SNR here; record 0.0 and carry time where it belongs.
-                let mut m = DecodedMessage::from_ft8lib(&text, freq, 0.0, ldpc_errors);
+            .map(|(text, freq, time_sec, ldpc_errors, snr_db)| {
+                // The FFI tuple is (text, freq_hz, TIME_sec, ldpc_errors,
+                // snr_db). `snr_db` is computed in `ft8lib_decode_audio`
+                // from the ft8_lib waterfall magnitudes at the decoded
+                // candidate position, using the same definition as the
+                // native `estimate_snr_spectrogram` (WSJT-X 2500 Hz
+                // reference), so both decode paths report comparable SNR.
+                // (Fixes the earlier bug where every ft8_lib-sourced
+                // snr_db was hard-coded 0.0.)
+                let mut m = DecodedMessage::from_ft8lib(&text, freq, snr_db, ldpc_errors);
                 m.time_offset = time_sec as f64;
                 m
             })

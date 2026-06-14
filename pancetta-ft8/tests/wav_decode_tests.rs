@@ -200,14 +200,14 @@ fn test_cross_validate_against_ft8lib() {
             };
             println!("  [ours]   {:6.1} dB  {}{}", m.snr_db, m.text, ap_tag);
         }
-        for (text, freq, _time, _ldpc) in &ft8lib_decoded {
-            println!("  [ft8lib] {:6.1} Hz  {}", freq, text);
+        for (text, freq, _time, _ldpc, snr) in &ft8lib_decoded {
+            println!("  [ft8lib] {:+6.1} dB  {:6.1} Hz  {}", snr, freq, text);
         }
 
         // Count decodes unique to our decoder that look like false positives
         let ft8lib_texts: std::collections::HashSet<&str> = ft8lib_decoded
             .iter()
-            .map(|(text, _, _, _)| text.as_str())
+            .map(|(text, _, _, _, _)| text.as_str())
             .collect();
         for m in &our_decoded {
             if !ft8lib_texts.contains(m.text.as_str()) {
@@ -348,7 +348,7 @@ fn test_live_20m_wav() {
     // ft8_lib
     let ft8lib = ft8lib_decode_audio(&samples);
     eprintln!("ft8_lib: {} decodes", ft8lib.len());
-    for (msg, freq, snr, _) in &ft8lib {
+    for (msg, freq, _time, _ldpc, snr) in &ft8lib {
         eprintln!("  [ft8_lib] {:+.0} dB  {:.1} Hz  {}", snr, freq, msg);
     }
 
@@ -435,7 +435,7 @@ fn test_raw_vs_dsp_decimated() {
                     ft8lib.len(),
                     ours.len()
                 );
-                for (msg, freq, snr, _) in &ft8lib {
+                for (msg, freq, _time, _ldpc, snr) in &ft8lib {
                     eprintln!("    [ft8_lib] {:+.0} dB  {:.1} Hz  {}", snr, freq, msg);
                 }
                 for msg in &ours {
@@ -489,5 +489,56 @@ fn test_python_fir_vs_naive() {
             offset += step;
         }
         eprintln!("{}: ft8_lib decoded {} total", label, total);
+    }
+}
+
+/// Regression test for the "every ft8_lib decode shows SNR +0" bug.
+///
+/// `decode_window_ft8lib` used to hard-code `snr_db = 0.0`. It now computes
+/// a real SNR from the ft8_lib waterfall magnitudes (see
+/// `ft8_lib_ffi::estimate_snr_from_waterfall`). On a real multi-signal
+/// WSJT-X recording the SNRs must:
+///   - not all be 0.0 (the bug),
+///   - vary across decodes (a spread), and
+///   - sit in a sane WSJT-X-like range (~ -24..+30 dB).
+#[cfg(not(ft8lib_stub))]
+#[test]
+fn ft8lib_decode_snr_is_nonconstant_and_in_range() {
+    let samples = read_wav_file(&fixture("wsjt/210703_133430.wav"));
+    let decoded = Ft8Decoder::decode_window_ft8lib(&samples);
+    assert!(
+        decoded.len() >= 3,
+        "expected several decodes from the WSJT-X test recording, got {}",
+        decoded.len()
+    );
+
+    let snrs: Vec<f32> = decoded.iter().map(|m| m.snr_db).collect();
+
+    // Not the old constant-0 bug.
+    assert!(
+        snrs.iter().any(|&s| s != 0.0),
+        "every ft8_lib SNR was 0.0 — the constant-0 bug is back: {:?}",
+        snrs
+    );
+
+    // The SNRs must actually vary (a spread), not be one repeated value.
+    let min = snrs.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max = snrs.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    assert!(
+        max - min > 2.0,
+        "ft8_lib SNRs show no meaningful spread (min={:.1} max={:.1}): {:?}",
+        min,
+        max,
+        snrs
+    );
+
+    // Every value must land in a plausible WSJT-X-referenced range.
+    for &s in &snrs {
+        assert!(
+            (-30.0..=35.0).contains(&s),
+            "ft8_lib SNR {:.1} dB outside the plausible range: {:?}",
+            s,
+            snrs
+        );
     }
 }

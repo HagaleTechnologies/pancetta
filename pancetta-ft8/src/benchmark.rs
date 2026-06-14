@@ -180,11 +180,11 @@ pub fn decode_wav_to_results(path: &str) -> Result<BenchmarkResult, String> {
 
     let ft8lib_decodes: Vec<DecodeResult> = ft8lib_raw
         .into_iter()
-        .map(|(msg, freq, time, _ldpc_errors)| DecodeResult {
+        .map(|(msg, freq, time, _ldpc_errors, snr_db)| DecodeResult {
             message: msg,
             frequency_hz: freq as f64,
             time_offset_s: time as f64,
-            snr_db: 0.0, // ft8_lib FFI does not return SNR
+            snr_db: snr_db as f64,
         })
         .collect();
 
