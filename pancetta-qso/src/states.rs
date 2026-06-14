@@ -142,6 +142,11 @@ pub enum QsoFailureReason {
     /// User cancelled the QSO
     UserCancelled,
 
+    /// Replaced by a more recent QSO with the same station on the same band.
+    /// Operator policy: when two exchanges exist for one (callsign, band),
+    /// the more recent one wins and the older is superseded.
+    Superseded,
+
     /// Other station went QRT
     StationQrt,
 

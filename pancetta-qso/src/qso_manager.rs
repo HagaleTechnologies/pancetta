@@ -476,6 +476,17 @@ impl QsoManager {
             });
         }
 
+        // FIX 3: supersede any existing active QSO with this callsign on the
+        // same band before creating the new one. Operator policy: "if there
+        // are two exchanges on the same band from the same callsign, use the
+        // state of whichever is more recent." Re-calling a station already in
+        // an active QSO previously spawned a SECOND concurrent QSO; both
+        // transmitted to the same DX on the same freq. We retire the older
+        // one (→ Failed{Superseded}, mapping removed) so exactly one QSO per
+        // (callsign, band) remains active.
+        self.supersede_active_qsos_for(&target_callsign, frequency)
+            .await;
+
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
         let tx_parity = dx_parity.map(|p| p.opposite());
@@ -858,6 +869,52 @@ impl QsoManager {
                 })
             }
 
+            // FIX 2: the DX rogered our R-report directly with RR73 (or a
+            // plain 73). Real FT8 is a 4-message QSO and RR73 is the close,
+            // so we must complete (and the reply emitter answers our 73).
+            // Without this arm the QSO stalled one message short — the DX's
+            // RR73 was ignored and the contact was never logged. We accept
+            // both FinalConfirmation (RR73/RRR-class close) and a bare
+            // SeventyThree (73) here.
+            (
+                QsoState::SendingReport {
+                    their_callsign,
+                    their_report,
+                    our_report,
+                    frequency,
+                    started_at,
+                },
+                MessageType::FinalConfirmation {
+                    from_station,
+                    to_station,
+                }
+                | MessageType::SeventyThree {
+                    from_station,
+                    to_station,
+                },
+            ) => {
+                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %their_callsign,
+                        got_from = %from_station,
+                        got_to = %to_station,
+                        "spurious RR73/73 in SendingReport ignored"
+                    );
+                    return Ok(current_state.clone());
+                }
+                let duration = (Utc::now() - *started_at).num_seconds() as u32;
+                Ok(QsoState::Completed {
+                    their_callsign: their_callsign.clone(),
+                    their_report: their_report.unwrap_or(-15),
+                    our_report: *our_report,
+                    frequency: *frequency,
+                    grid_square: None,
+                    completed_at: Utc::now(),
+                    duration_seconds: duration,
+                })
+            }
+
             // Received final confirmation
             (
                 QsoState::WaitingForConfirmation {
@@ -869,6 +926,10 @@ impl QsoManager {
                     started_at,
                 },
                 MessageType::FinalConfirmation {
+                    from_station,
+                    to_station,
+                }
+                | MessageType::SeventyThree {
                     from_station,
                     to_station,
                 },
@@ -973,10 +1034,30 @@ impl QsoManager {
                 },
             ) => from_station == their_callsign && to_station == &self.config.our_callsign,
 
-            // Awaiting RR73 — verify both directions.
+            // FIX 2: the DX may close directly from our R-report with RR73
+            // (or a plain 73) instead of acking first — accept it here so it
+            // routes to this QSO. Both directions verified.
+            (
+                QsoState::SendingReport { their_callsign, .. },
+                MessageType::FinalConfirmation {
+                    to_station,
+                    from_station,
+                }
+                | MessageType::SeventyThree {
+                    to_station,
+                    from_station,
+                },
+            ) => from_station == their_callsign && to_station == &self.config.our_callsign,
+
+            // Awaiting RR73 — verify both directions. Accept a plain 73 too
+            // (DX skipped RR73).
             (
                 QsoState::WaitingForConfirmation { their_callsign, .. },
                 MessageType::FinalConfirmation {
+                    to_station,
+                    from_station,
+                }
+                | MessageType::SeventyThree {
                     to_station,
                     from_station,
                 },
@@ -1062,6 +1143,68 @@ impl QsoManager {
             .entry(callsign.to_string())
             .or_insert_with(Vec::new)
             .push(qso_id);
+    }
+
+    /// FIX 3: retire every active (non-terminal) QSO with `callsign` on the
+    /// same band as `frequency`, marking each `Failed{Superseded}` and
+    /// clearing its callsign mapping. Emits a `StateChanged` per superseded
+    /// QSO (terminal Failed → AP/snapshot clears in the coordinator). Called
+    /// just before a new manual QSO is created so only the most-recent one
+    /// remains active.
+    ///
+    /// "Same band" is derived from the QSO frequency via
+    /// [`crate::utils::frequency_to_band`]. Within a single operating session
+    /// every active QSO shares the RF band, so in practice this collapses to
+    /// "same callsign"; deriving the band keeps the rule correct should
+    /// per-QSO RF frequencies ever be threaded through.
+    async fn supersede_active_qsos_for(&self, callsign: &str, frequency: f64) {
+        let new_band = crate::utils::frequency_to_band(frequency);
+
+        // Collect the QSO IDs to supersede under the read lock, then mutate.
+        let to_supersede: Vec<QsoId> = {
+            let qsos = self.qsos.read().await;
+            let ids = match self.qsos_by_callsign.read().await.get(callsign) {
+                Some(ids) => ids.clone(),
+                None => Vec::new(),
+            };
+            ids.into_iter()
+                .filter(|id| {
+                    qsos.get(id).is_some_and(|p| {
+                        p.state.is_active()
+                            && crate::utils::frequency_to_band(p.metadata.frequency) == new_band
+                    })
+                })
+                .collect()
+        };
+
+        for qso_id in to_supersede {
+            let old_state = {
+                let mut qsos = self.qsos.write().await;
+                match qsos.get_mut(&qso_id) {
+                    Some(progress) => {
+                        let old_state = progress.state.clone();
+                        progress.state = QsoState::Failed {
+                            reason: QsoFailureReason::Superseded,
+                            failed_at: Utc::now(),
+                            last_state: Box::new(old_state.clone()),
+                        };
+                        Some(old_state)
+                    }
+                    None => None,
+                }
+            };
+            if let Some(old_state) = old_state {
+                let new_state = self.qsos.read().await.get(&qso_id).map(|p| p.state.clone());
+                if let Some(new_state) = new_state {
+                    self.emit_state_change(qso_id, old_state, new_state).await;
+                }
+                self.remove_callsign_mapping(callsign, qso_id).await;
+                info!(
+                    "Superseded older active QSO {} with {} on band {} (re-call)",
+                    qso_id, callsign, new_band
+                );
+            }
+        }
     }
 
     async fn remove_callsign_mapping(&self, callsign: &str, qso_id: QsoId) {
@@ -1151,8 +1294,15 @@ impl QsoManager {
         // elapsed since the last call to keep ~one call per slot.
         const SLOT_SECONDS: i64 = 15;
 
-        let mut to_recall: Vec<(QsoId, String, f64, Option<pancetta_core::slot::SlotParity>)> =
-            Vec::new();
+        // Each entry carries the exact MessageType to re-emit so a
+        // RespondingToCq QSO re-sends the call (CqResponse) while a
+        // SendingReport QSO re-sends our R-report (ReportAck) — FIX 4.
+        let mut to_recall: Vec<(
+            QsoId,
+            MessageType,
+            f64,
+            Option<pancetta_core::slot::SlotParity>,
+        )> = Vec::new();
 
         {
             let mut qsos = self.qsos.write().await;
@@ -1160,12 +1310,30 @@ impl QsoManager {
                 if progress.metadata.initiated_by != CallInitiation::Manual {
                     continue;
                 }
-                let target = match &progress.state {
+                let message = match &progress.state {
                     QsoState::RespondingToCq {
                         target_callsign, ..
-                    } => target_callsign.clone(),
-                    // Once the DX has come back (any later state) keep-calling
-                    // stops — the normal sequence drives the rest of the QSO.
+                    } => MessageType::CqResponse {
+                        calling_station: target_callsign.clone(),
+                        responding_station: self.config.our_callsign.clone(),
+                        grid: self.config.our_grid.clone(),
+                    },
+                    // FIX 4: we sent R and the DX re-sent their report (they
+                    // did not copy our R) — re-send our R-report each slot,
+                    // under the SAME watchdog, until the DX advances (RR73)
+                    // or the watchdog retires us. Without this we went silent
+                    // and stalled. Reconstruct the R-report from the report
+                    // latched in the state.
+                    QsoState::SendingReport {
+                        their_callsign,
+                        our_report,
+                        ..
+                    } => MessageType::ReportAck {
+                        to_station: their_callsign.clone(),
+                        from_station: self.config.our_callsign.clone(),
+                        report: *our_report,
+                    },
+                    // Any later state: the normal sequence drives the rest.
                     _ => continue,
                 };
 
@@ -1190,23 +1358,18 @@ impl QsoManager {
 
                 to_recall.push((
                     qso_id,
-                    target,
+                    message,
                     progress.metadata.frequency,
                     progress.metadata.tx_parity,
                 ));
             }
         }
 
-        for (qso_id, target, frequency, tx_parity) in to_recall {
+        for (qso_id, message, frequency, tx_parity) in to_recall {
             debug!(
-                "Manual keep-calling: re-sending call to {} on {:.1} Hz (qso={})",
-                target, frequency, qso_id
+                "Manual keep-calling: re-emitting {:?} on {:.1} Hz (qso={})",
+                message, frequency, qso_id
             );
-            let message = MessageType::CqResponse {
-                calling_station: target,
-                responding_station: self.config.our_callsign.clone(),
-                grid: self.config.our_grid.clone(),
-            };
             self.emit_event(QsoEvent::MessageToSend {
                 qso_id,
                 message,
@@ -1260,10 +1423,19 @@ impl QsoManager {
         let mut timeouts = Vec::new();
 
         for (&qso_id, progress) in qsos.iter() {
-            // Manual keep-calling watchdog (RespondingToCq only — once the
-            // DX answers, the normal state timeouts take over).
+            // Manual keep-calling watchdog. Covers both RespondingToCq
+            // (re-calling the DX) and SendingReport (FIX 4: re-sending our
+            // R-report when the DX repeats their report). In both phases the
+            // operator is actively keep-calling, and `call_count` /
+            // `first_call_at` span the whole QSO, so the 10-calls / 5-min
+            // bound applies to the QSO as a whole. Once the DX advances past
+            // these states (ReportAck/RR73 received), the normal state
+            // timeouts take over.
             if progress.metadata.initiated_by == CallInitiation::Manual
-                && matches!(progress.state, QsoState::RespondingToCq { .. })
+                && matches!(
+                    progress.state,
+                    QsoState::RespondingToCq { .. } | QsoState::SendingReport { .. }
+                )
             {
                 let max_calls = self.config.timeouts.manual_call_max_calls;
                 let watchdog =
@@ -1277,8 +1449,8 @@ impl QsoManager {
                 if progress.metadata.call_count >= max_calls || elapsed >= watchdog {
                     timeouts.push((qso_id, QsoFailureReason::Timeout));
                 }
-                // Manual calls do not use the (much shorter) report_timeout
-                // while still in RespondingToCq; the watchdog above governs.
+                // Manual calls do not use the (much shorter) per-state
+                // timeout while keep-calling; the watchdog above governs.
                 continue;
             }
 
@@ -1434,6 +1606,59 @@ mod tests {
         assert!(a.is_ok() && b.is_ok(), "both manual calls allowed");
     }
 
+    /// FIX 3: two manual calls to the same callsign on the same band leave
+    /// exactly ONE active QSO (the newer); the older is superseded and
+    /// removed from the active set and its callsign mapping.
+    #[tokio::test]
+    async fn manual_recall_supersedes_older_active_qso() {
+        let manager = QsoManager::new(test_config());
+        let first = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let second = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+
+        // Exactly one active QSO for this callsign, and it is the newer one.
+        let active = manager.get_active_qsos().await;
+        let active_for_dx: Vec<_> = active
+            .iter()
+            .filter(|(_, p)| p.metadata.their_callsign.as_deref() == Some("K1DEF"))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            active_for_dx,
+            vec![second],
+            "only the newer QSO should remain active"
+        );
+
+        // The older QSO is Failed{Superseded} (still retrievable until cleanup).
+        let old = manager.get_qso(first).await.unwrap();
+        assert!(
+            matches!(
+                old.state,
+                QsoState::Failed {
+                    reason: QsoFailureReason::Superseded,
+                    ..
+                }
+            ),
+            "older QSO must be Superseded, got {:?}",
+            old.state
+        );
+
+        // The callsign mapping points only to the newer QSO so subsequent
+        // routing / re-arm operates on exactly one QSO.
+        let mapping = manager.qsos_by_callsign.read().await;
+        assert_eq!(
+            mapping.get("K1DEF").map(|v| v.as_slice()),
+            Some([second].as_slice()),
+            "mapping must point only to the newer QSO"
+        );
+    }
+
     /// The manual watchdog retires a RespondingToCq QSO once the call count
     /// reaches `manual_call_max_calls`.
     #[tokio::test]
@@ -1563,6 +1788,110 @@ mod tests {
                 .call_count,
             2
         );
+    }
+
+    /// FIX 4: a manual QSO in SendingReport (we sent R, DX has not advanced)
+    /// re-emits our R-report (ReportAck) each slot when re-armed.
+    #[tokio::test]
+    async fn rearm_resends_r_report_in_sending_report() {
+        let manager = QsoManager::new(test_config());
+        let mut events = manager.subscribe();
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        // Advance to SendingReport: DX sends us a report; we send R-report.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -7,
+                },
+                "W1ABC K1DEF -07".to_string(),
+                14074000.0,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(matches!(progress.state, QsoState::SendingReport { .. }));
+        // Drain the initial call + the auto-sequenced R-report.
+        while events.try_recv().is_ok() {}
+
+        // A slot later, with the DX still not advancing, re-arm re-sends our
+        // R-report (ReportAck), not a fresh call.
+        let last = progress.metadata.last_call_at.unwrap();
+        manager
+            .rearm_manual_calls_at(last + Duration::seconds(15))
+            .await;
+        let mut resends = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::MessageToSend { message, .. } = ev {
+                resends.push(message);
+            }
+        }
+        assert_eq!(resends.len(), 1, "exactly one re-send, got {:?}", resends);
+        match &resends[0] {
+            MessageType::ReportAck {
+                to_station,
+                from_station,
+                report,
+            } => {
+                assert_eq!(to_station, "K1DEF");
+                assert_eq!(from_station, "W1ABC");
+                assert_eq!(*report, -12, "re-sends our latched R-report");
+            }
+            other => panic!("expected ReportAck re-send, got {:?}", other),
+        }
+    }
+
+    /// FIX 4: the watchdog still retires a SendingReport manual QSO that
+    /// never advances — re-sending our R-report cannot loop forever.
+    #[tokio::test]
+    async fn watchdog_retires_stalled_sending_report() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 1000; // not the binding bound
+        config.timeouts.manual_call_watchdog_minutes = 5;
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -7,
+                },
+                "W1ABC K1DEF -07".to_string(),
+                14074000.0,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_id).await.unwrap().state,
+            QsoState::SendingReport { .. }
+        ));
+
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+        // Just under the watchdog: still alive.
+        manager
+            .check_timeouts_at(start + Duration::seconds(4 * 60 + 59))
+            .await;
+        assert!(manager.get_qso(qso_id).await.is_ok());
+        // Past the watchdog: retired.
+        manager
+            .check_timeouts_at(start + Duration::seconds(5 * 60 + 1))
+            .await;
+        assert!(matches!(
+            manager.get_qso(qso_id).await,
+            Err(QsoManagerError::QsoNotFound { .. })
+        ));
     }
 }
 
@@ -2007,6 +2336,133 @@ mod reply_emitter_tests {
                 .iter()
                 .any(|e| matches!(e, QsoEvent::QsoCompleted { .. })),
             "expected a QsoCompleted event"
+        );
+    }
+
+    /// FIX 2: Manual QSO in SendingReport + RR73 (FinalConfirmation) → the
+    /// DX rogered our R-report directly. We emit our 73, the QSO completes,
+    /// and a QsoCompleted event fires (drives ADIF logging). This is the
+    /// "never sent 73 / QSO stalled one message short" bug.
+    #[tokio::test]
+    async fn manual_sending_report_plus_rr73_emits_73_and_completes() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        // Advance to SendingReport (DX sent their report; we send R-report).
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(matches!(progress.state, QsoState::SendingReport { .. }));
+        let _ = drain(&mut rx);
+
+        // DX closes directly with RR73 (skips a separate RRR/report-ack).
+        manager
+            .process_message(
+                MessageType::FinalConfirmation {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                },
+                format!("{} {} RR73", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        let sends = messages_to_send(&events);
+        assert_eq!(sends.len(), 1, "expected one reply (73), got {:?}", sends);
+        assert!(
+            matches!(sends[0], MessageType::SeventyThree { .. }),
+            "expected SeventyThree, got {:?}",
+            sends[0]
+        );
+        assert_eq!(on_air(&sends[0]), "K9ZZ K5ARH 73");
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::Completed { .. }),
+            "expected Completed, got {:?}",
+            progress.state
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::QsoCompleted { .. })),
+            "expected a QsoCompleted event (ADIF log)"
+        );
+    }
+
+    /// FIX 2: Manual QSO in SendingReport + a bare "73" (DX skipped RR73) →
+    /// QSO completes and logs, and we do NOT re-send a 73 (they are done).
+    #[tokio::test]
+    async fn manual_sending_report_plus_bare_73_completes_without_resend() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                },
+                format!("{} {} 73", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        let sends = messages_to_send(&events);
+        assert!(
+            sends.is_empty(),
+            "bare 73 close must not re-send a 73, got {:?}",
+            sends
+        );
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::Completed { .. }),
+            "expected Completed, got {:?}",
+            progress.state
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::QsoCompleted { .. })),
+            "expected a QsoCompleted event (ADIF log)"
         );
     }
 

@@ -634,9 +634,36 @@ async fn build_active_qso_snapshot(
     qso_manager: &pancetta_qso::QsoManager,
 ) -> Vec<crate::message_bus::ActiveQsoSnapshotItem> {
     let active = qso_manager.get_active_qsos().await;
-    active
-        .into_iter()
-        .filter_map(|(_id, progress)| snapshot_item_from_progress(&progress))
+
+    // FIX 3 (defense-in-depth): the QSO engine now supersedes older active
+    // QSOs per (callsign, band) at start time, so a callsign should appear at
+    // most once here. Dedup anyway, keeping the most-recently-started QSO, so
+    // the TUI "exchanges" list never shows two entries for one (callsign,
+    // band) even if a transient race ever surfaced both.
+    let mut latest: std::collections::HashMap<(String, String), pancetta_qso::QsoProgress> =
+        std::collections::HashMap::new();
+    for (_id, progress) in active {
+        let Some(their) = progress
+            .state
+            .their_callsign()
+            .map(str::to_string)
+            .or_else(|| progress.metadata.their_callsign.clone())
+        else {
+            continue;
+        };
+        let band = pancetta_qso::utils::frequency_to_band(progress.metadata.frequency);
+        let key = (their, band);
+        match latest.get(&key) {
+            Some(existing) if existing.metadata.start_time >= progress.metadata.start_time => {}
+            _ => {
+                latest.insert(key, progress);
+            }
+        }
+    }
+
+    latest
+        .values()
+        .filter_map(snapshot_item_from_progress)
         .collect()
 }
 

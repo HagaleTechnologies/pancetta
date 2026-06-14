@@ -1114,3 +1114,41 @@ fn schedule_tx_no_collision_on_late_press_near_boundary() {
     assert_eq!(secs, 15);
     assert_ne!(secs, 30);
 }
+
+/// FIX 1 (end-to-end): a 6-char configured grid produces a STANDARD FT8
+/// call/grid message that survives encode → modulate → decode unchanged.
+///
+/// Regression for the on-air "bare callsign" bug: `generate_ft8_message`
+/// must truncate "EM10CH" to "EM10" so the message encodes as a standard
+/// type-1 message. The pre-fix text "PY2GIG K5ARH EM10CH" silently dropped
+/// the grid in the encoder (6-char grid is not a valid 4-char locator),
+/// transmitting a bare "PY2GIG K5ARH".
+#[test]
+fn test_six_char_grid_encodes_standard_callgrid() {
+    use pancetta_qso::utils::generate_ft8_message;
+
+    // The QSO engine carries the full configured grid; the message-gen
+    // boundary narrows it to the 4-char standard field.
+    let msg = MessageType::CqResponse {
+        calling_station: "PY2GIG".to_string(),
+        responding_station: "K5ARH".to_string(),
+        grid: Some("EM10ch".to_string()),
+    };
+    let text = generate_ft8_message(&msg, "K5ARH").unwrap();
+    assert_eq!(
+        text, "PY2GIG K5ARH EM10",
+        "grid must be 4-char standard form"
+    );
+
+    // Encode → modulate → decode round-trip: the grid must survive (i.e.
+    // it encoded as a standard message, not a grid-dropped bare callsign).
+    let mut tx = Station::new("K5ARH", "EM10ch");
+    let mut rx = Station::new("PY2GIG", "GG66");
+    let audio = tx.encode_and_modulate(&text, 500.0);
+    let decoded = rx.decode(&audio);
+    assert!(
+        find_message(&decoded, "PY2GIG K5ARH EM10").is_some(),
+        "decoded call/grid must retain the 4-char grid. Got: {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+}

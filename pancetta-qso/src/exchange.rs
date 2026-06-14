@@ -188,28 +188,22 @@ impl MessageExchange {
     /// Generate an outgoing FT8 message
     pub fn generate_message(&self, message_type: &MessageType) -> Result<String, ExchangeError> {
         match message_type {
-            MessageType::Cq { callsign, grid } => {
-                if let Some(grid) = grid {
-                    Ok(format!("CQ {} {}", callsign, grid))
-                } else {
-                    Ok(format!("CQ {}", callsign))
-                }
-            }
+            MessageType::Cq { callsign, grid } => match outbound_grid_field(grid.as_deref()) {
+                Some(grid) => Ok(format!("CQ {} {}", callsign, grid)),
+                None => Ok(format!("CQ {}", callsign)),
+            },
 
             MessageType::CqResponse {
                 calling_station,
                 responding_station,
                 grid,
-            } => {
-                if let Some(grid) = grid {
-                    Ok(format!(
-                        "{} {} {}",
-                        calling_station, responding_station, grid
-                    ))
-                } else {
-                    Ok(format!("{} {}", calling_station, responding_station))
-                }
-            }
+            } => match outbound_grid_field(grid.as_deref()) {
+                Some(grid) => Ok(format!(
+                    "{} {} {}",
+                    calling_station, responding_station, grid
+                )),
+                None => Ok(format!("{} {}", calling_station, responding_station)),
+            },
 
             MessageType::SignalReport {
                 to_station,
@@ -325,6 +319,21 @@ impl MessageExchange {
                     from_station: self.our_callsign.clone(),
                 }))
             }
+
+            // FIX 2: the DX rogered our R-report directly with RR73 — answer
+            // our 73 to close (then the QSO completes and logs).
+            (
+                QsoState::SendingReport { their_callsign, .. },
+                MessageType::FinalConfirmation { .. },
+            ) => Ok(Some(MessageType::SeventyThree {
+                to_station: their_callsign.clone(),
+                from_station: self.our_callsign.clone(),
+            })),
+
+            // FIX 2: the DX closed with a plain 73 (not RR73). The QSO is
+            // already complete from their side; we log it and do NOT re-send
+            // a 73 (they are done — re-sending only adds QRM).
+            (QsoState::SendingReport { .. }, MessageType::SeventyThree { .. }) => Ok(None),
 
             // Received final confirmation, send 73
             (
@@ -578,6 +587,32 @@ impl MessageExchange {
     }
 }
 
+/// Normalize a configured grid square into the field carried by a standard
+/// FT8 type-1 "call call grid" message.
+///
+/// The standard message only carries a **4-character** Maidenhead grid.
+/// Passing a 6-character grid (e.g. `"EM10ch"`) to the FT8 encoder silently
+/// drops the grid (it is not a valid 4-char locator, so `packgrid` falls back
+/// to the no-grid token) — the transmission degrades to a bare callsign. To
+/// avoid that, we truncate to the first 4 characters and uppercase them here,
+/// at the single message-generation boundary, so a 6-char configured grid is
+/// still displayed in full elsewhere but the transmitted standard message
+/// uses the proper 4-char form.
+///
+/// Returns:
+/// - `Some(grid4)` — uppercased, first 4 chars — when a non-empty grid is set
+/// - `None` — when the grid is `None` or empty (CQ / call without grid)
+fn outbound_grid_field(grid: Option<&str>) -> Option<String> {
+    let grid = grid?.trim();
+    if grid.is_empty() {
+        return None;
+    }
+    // First 4 chars (the 4-char Maidenhead field), uppercased. `chars` so a
+    // non-ASCII grid never panics on a byte-slice boundary; real grids are
+    // ASCII so this matches `[..4]` for them.
+    Some(grid.chars().take(4).collect::<String>().to_uppercase())
+}
+
 /// Message validation result
 #[derive(Debug, Clone, PartialEq)]
 pub enum ValidationResult {
@@ -725,5 +760,74 @@ mod tests {
 
         let report = exchange.calculate_signal_report(-20.0, -25.0);
         assert_eq!(report, 6); // SNR of 5 dB, rounded to 6
+    }
+
+    // --- FIX 1: 4-char grid in standard messages -----------------------
+
+    /// A 6-char configured grid (e.g. EM10ch) must produce a *standard*
+    /// "DX K5ARH EM10" call/grid message — 4-char, uppercased — not a
+    /// free-text-mangled bare callsign.
+    #[test]
+    fn cq_response_truncates_six_char_grid_to_four() {
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let msg = MessageType::CqResponse {
+            calling_station: "PY2GIG".to_string(),
+            responding_station: "K5ARH".to_string(),
+            grid: Some("EM10ch".to_string()),
+        };
+        let text = exchange.generate_message(&msg).unwrap();
+        assert_eq!(text, "PY2GIG K5ARH EM10");
+        // Three fields, the third a 4-char Maidenhead grid → encodes as a
+        // standard FT8 type-1 message (not free-text-mangled). Full standard
+        // encodability is asserted end-to-end in the loopback integration test
+        // (pancetta crate, which depends on the FT8 encoder).
+        let fields: Vec<&str> = text.split_whitespace().collect();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[2].len(), 4, "grid field must be 4-char: {:?}", text);
+    }
+
+    /// CQ with a 6-char grid is likewise truncated to 4 chars.
+    #[test]
+    fn cq_truncates_six_char_grid_to_four() {
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let msg = MessageType::Cq {
+            callsign: "K5ARH".to_string(),
+            grid: Some("EM10ch".to_string()),
+        };
+        assert_eq!(exchange.generate_message(&msg).unwrap(), "CQ K5ARH EM10");
+    }
+
+    /// An already-4-char grid is passed through unchanged (uppercased).
+    #[test]
+    fn four_char_grid_unchanged() {
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let msg = MessageType::CqResponse {
+            calling_station: "PY2GIG".to_string(),
+            responding_station: "K5ARH".to_string(),
+            grid: Some("EM10".to_string()),
+        };
+        assert_eq!(
+            exchange.generate_message(&msg).unwrap(),
+            "PY2GIG K5ARH EM10"
+        );
+    }
+
+    /// Empty/absent grid still produces a CQ/call without grid (today's
+    /// behavior — must not regress).
+    #[test]
+    fn empty_or_absent_grid_omits_grid_field() {
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let none = MessageType::CqResponse {
+            calling_station: "PY2GIG".to_string(),
+            responding_station: "K5ARH".to_string(),
+            grid: None,
+        };
+        assert_eq!(exchange.generate_message(&none).unwrap(), "PY2GIG K5ARH");
+        let empty = MessageType::CqResponse {
+            calling_station: "PY2GIG".to_string(),
+            responding_station: "K5ARH".to_string(),
+            grid: Some(String::new()),
+        };
+        assert_eq!(exchange.generate_message(&empty).unwrap(), "PY2GIG K5ARH");
     }
 }
