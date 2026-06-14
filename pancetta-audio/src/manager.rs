@@ -176,6 +176,18 @@ impl AudioManager {
         })
     }
 
+    /// Whether the resolved TX OUTPUT device is the system default rather than
+    /// an explicitly configured rig CODEC. Only meaningful after [`start`](Self::start).
+    /// `true` means TX audio may be going to the wrong device (e.g. laptop
+    /// speakers) while PTT keys the rig — surfaced to the TUI so the operator
+    /// sees the misconfig instead of it being log-only.
+    pub fn output_is_system_default(&self) -> bool {
+        self.stream
+            .as_ref()
+            .map(|s| s.output_is_system_default())
+            .unwrap_or(false)
+    }
+
     /// List available audio devices
     pub fn list_devices(&self) -> Vec<AudioDeviceInfo> {
         self.device_manager

@@ -109,11 +109,19 @@ impl super::ApplicationCoordinator {
         let health_dsp_windows_relay = health_dsp_windows.clone();
         let health_last_rms_relay = health_last_rms.clone();
         let health_total_decodes_relay = health_total_decodes.clone();
+        // Rig-connection + TX-output-misconfig badges (read on the 2s health
+        // tick; pushed only on change so the TUI render stays cheap).
+        let rig_conn_state_relay = self.rig_conn_state.clone();
+        let audio_output_default_relay = self.audio_output_default.clone();
         let tui_relay_jh = std::thread::Builder::new()
             .name("tui-relay".to_string())
             .spawn(move || {
             let mut ft8_disconnected = false;
             let mut last_health_send = std::time::Instant::now();
+            // Last-pushed badge state, so we only emit on change (and force the
+            // first push by seeding sentinels that differ from any real value).
+            let mut last_rig_state: Option<u8> = None;
+            let mut last_audio_default: Option<bool> = None;
             while !relay_shutdown.load(Ordering::Acquire) {
                 if !ft8_disconnected {
                     match ft8_to_tui_rx.try_recv() {
@@ -256,6 +264,7 @@ impl super::ApplicationCoordinator {
                                         text: it.text.clone(),
                                         freq_hz: it.freq_hz,
                                         qso_id: it.qso_id.clone(),
+                                        deferred: it.deferred,
                                     }
                                 };
                                 let _ = tui_msg_tx_relay.send(
@@ -411,6 +420,37 @@ impl super::ApplicationCoordinator {
                         pancetta_tui::tui_runner::TuiMessage::PipelineHealth(health),
                     );
                     last_health_send = std::time::Instant::now();
+
+                    // Rig-connection badge — push only when it changes.
+                    let rig_u8 = rig_conn_state_relay.load(Ordering::Relaxed);
+                    if last_rig_state != Some(rig_u8) {
+                        last_rig_state = Some(rig_u8);
+                        let state = match super::hamlib::RigConnState::from_u8(rig_u8) {
+                            super::hamlib::RigConnState::Connected => {
+                                pancetta_tui::app::RigConnDisplay::Connected
+                            }
+                            super::hamlib::RigConnState::PollingFailed => {
+                                pancetta_tui::app::RigConnDisplay::PollingFailed
+                            }
+                            super::hamlib::RigConnState::NotConnected => {
+                                pancetta_tui::app::RigConnDisplay::NotConnected
+                            }
+                        };
+                        let _ = tui_msg_tx_relay.send(
+                            pancetta_tui::tui_runner::TuiMessage::RigStatusUpdate { state },
+                        );
+                    }
+
+                    // TX-output misconfig badge — push only when it changes.
+                    let audio_default = audio_output_default_relay.load(Ordering::Relaxed);
+                    if last_audio_default != Some(audio_default) {
+                        last_audio_default = Some(audio_default);
+                        let _ = tui_msg_tx_relay.send(
+                            pancetta_tui::tui_runner::TuiMessage::AudioOutputDefault {
+                                is_default: audio_default,
+                            },
+                        );
+                    }
                 }
             }
             info!("TUI relay thread stopped");
@@ -460,6 +500,10 @@ impl super::ApplicationCoordinator {
         // coordinator owns this — TUI just emits ToggleTune events.
         let cmd_tune_until: std::sync::Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>> =
             std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        // Non-fatal config-load warnings to surface to the TUI as an error
+        // banner once at startup (e.g. a pancetta.toml that failed to parse
+        // and silently reverted to defaults).
+        let cmd_config_warnings = self.config_warnings.clone();
         const TUNE_DURATION_SECS: u32 = 12;
         const TUNE_TONE_HZ: f64 = 1500.0;
         let cmd_handle = tokio::spawn(async move {
@@ -493,6 +537,29 @@ impl super::ApplicationCoordinator {
                 {
                     debug!("Failed to send initial device list to TUI: {}", e);
                 }
+            }
+
+            // Seed the TX-policy banner so it is authoritative from frame 1.
+            // The banner otherwise defaults to TxPolicy::default() and is only
+            // ever corrected on an explicit operator change — push the real
+            // atomic value once at startup so a non-default seeded policy is
+            // shown correctly.
+            {
+                let policy =
+                    pancetta_core::TxPolicy::from_u8(cmd_tx_policy.load(Ordering::Acquire));
+                let _ = cmd_tui_msg_tx
+                    .send(pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy });
+            }
+
+            // Surface any non-fatal config-load warnings to the operator as an
+            // error banner (the same path audio-init failures use). A partial
+            // or broken pancetta.toml silently reverting to defaults is exactly
+            // the trap this closes — the operator now sees it in the TUI.
+            for w in &cmd_config_warnings {
+                let _ = cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::Error {
+                    component: "config".to_string(),
+                    message: w.clone(),
+                });
             }
 
             while !cmd_shutdown.load(Ordering::Acquire) {

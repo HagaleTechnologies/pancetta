@@ -127,6 +127,7 @@ impl super::ApplicationCoordinator {
             // thread can dispatch async sends without owning a runtime.
             let audio_bus = self.message_bus.clone();
             let runtime_handle = tokio::runtime::Handle::current();
+            let audio_output_default = self.audio_output_default.clone();
 
             std::thread::spawn(move || {
                 let report_audio_error = {
@@ -168,6 +169,24 @@ impl super::ApplicationCoordinator {
                 }
 
                 info!("AudioManager started in dedicated thread");
+
+                // TX-output misconfig: the resolved OUTPUT device fell back to
+                // the system default rather than an explicit rig CODEC. This is
+                // the classic "PTT keys the rig, but TX audio goes to the laptop
+                // speakers" trap — previously only a log line. Surface it to the
+                // operator via the TUI error path AND latch a flag the TUI uses
+                // for a persistent station-panel badge.
+                if audio_manager.output_is_system_default() {
+                    audio_output_default.store(true, Ordering::Relaxed);
+                    report_audio_error(
+                        "TX audio is routed to the SYSTEM DEFAULT output (e.g. speakers), \
+                         not an explicit rig CODEC. PTT will key the rig but no RF audio \
+                         reaches it. Set [audio] output_device (run `pancetta test-audio --list`)."
+                            .to_string(),
+                    );
+                } else {
+                    audio_output_default.store(false, Ordering::Relaxed);
+                }
 
                 // Rate-limit recurring runtime errors so a wedged device
                 // doesn't flood the TUI status with hundreds of identical

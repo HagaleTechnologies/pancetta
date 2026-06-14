@@ -9,6 +9,9 @@ use std::collections::HashMap;
 
 /// Rig control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Container-level serde default: omitted fields fall back to defaults rather
+// than failing to deserialize a partial config.
+#[serde(default)]
 pub struct RigConfig {
     /// Transceiver model/manufacturer
     pub model: String,

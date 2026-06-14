@@ -197,6 +197,17 @@ pub struct ApplicationCoordinator {
     last_audio_timestamp: Arc<RwLock<Option<Instant>>>,
     last_decode_timestamp: Arc<RwLock<Option<Instant>>>,
 
+    /// `true` when the resolved TX OUTPUT device fell back to the system
+    /// default rather than an explicit rig CODEC (the classic "PTT keys, audio
+    /// on speakers" misconfig). Set by the audio thread once at start; read by
+    /// the TUI relay to drive a persistent station-panel badge.
+    audio_output_default: Arc<AtomicBool>,
+
+    /// Rig connection state for the TUI badge. Encodes
+    /// [`crate::coordinator::hamlib::RigConnState`] via `as_u8`/`from_u8`.
+    /// Written by the hamlib connect/poll loop, read by the TUI relay.
+    rig_conn_state: Arc<std::sync::atomic::AtomicU8>,
+
     /// hb-216 S2 — scoped-fast-path activation flag. Seeded from
     /// `PANCETTA_SCOPED_FAST_PATH` env var at startup; rewritten by the
     /// hardware-tier probe (background) when it lands. The FT8 hot loop
@@ -210,6 +221,12 @@ pub struct ApplicationCoordinator {
     /// the host; the FT8 thread rebuilds its decoder when the
     /// `(max_decode_passes, osd_depth)` tuple changes.
     pub(crate) ft8_config: Arc<RwLock<Ft8Config>>,
+
+    /// Non-fatal config-load warnings (e.g. a `pancetta.toml` that existed but
+    /// failed to parse and was silently reverted to defaults). Surfaced to the
+    /// TUI as an error banner at startup so the operator is never left guessing
+    /// why their callsign/audio came up as defaults. Empty on a clean load.
+    pub(crate) config_warnings: Vec<String>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -351,6 +368,7 @@ impl ApplicationCoordinator {
         test_tx: Option<String>,
         test_tx_offset: f64,
         shutdown_signal: Arc<AtomicBool>,
+        config_warnings: Vec<String>,
     ) -> Result<Self> {
         let span = span!(Level::INFO, "coordinator_init");
         let _enter = span.enter();
@@ -425,8 +443,13 @@ impl ApplicationCoordinator {
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(RwLock::new(None)),
             last_decode_timestamp: Arc::new(RwLock::new(None)),
+            audio_output_default: Arc::new(AtomicBool::new(false)),
+            rig_conn_state: Arc::new(std::sync::atomic::AtomicU8::new(
+                crate::coordinator::hamlib::RigConnState::default().as_u8(),
+            )),
             scoped_fast_path,
             ft8_config,
+            config_warnings,
         };
 
         info!("Application Coordinator initialized with ID: {}", id);
@@ -712,12 +735,17 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let coordinator = ApplicationCoordinator::new(
-            config, None, true,  // no_audio
+            config,
+            None,
+            true,  // no_audio
             true,  // headless
             false, // metrics
-            9090, None, // no WAV
+            9090,
+            None, // no WAV
             None, // no test-tx
-            1500.0, shutdown,
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
         )
         .await;
 
@@ -776,6 +804,7 @@ mod tests {
             None, // no test-tx
             1500.0,
             shutdown,
+            Vec::new(), // no config warnings
         )
         .await
         .expect("coordinator creation should succeed");

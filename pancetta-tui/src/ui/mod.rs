@@ -209,17 +209,42 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
     let mut spans: Vec<Span> = Vec::new();
 
+    // Non-deferred queued items that share the on-air slot are CONCURRENT
+    // multi-TX streams (all keyed in the same 15s slot at different audio
+    // frequencies), not a future-slot queue. Deferred items are genuinely
+    // waiting for a later slot.
+    let concurrent: Vec<&crate::app::TxQueueItem> = if app.tx_now_sending.is_some() {
+        app.tx_queued.iter().filter(|it| !it.deferred).collect()
+    } else {
+        Vec::new()
+    };
+    let deferred: Vec<&crate::app::TxQueueItem> =
+        app.tx_queued.iter().filter(|it| it.deferred).collect();
+
     match &app.tx_now_sending {
         Some(item) => {
+            // Concurrent count = headline + companions all on the air at once.
+            let now_count = 1 + concurrent.len();
+            let label = if now_count > 1 {
+                format!("▶ NOW ×{}: ", now_count)
+            } else {
+                "▶ NOW: ".to_string()
+            };
             spans.push(Span::styled(
-                "▶ NOW: ",
+                label,
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Red)
                     .add_modifier(Modifier::BOLD),
             ));
+            let mut on_air: Vec<String> = vec![format!("{} @{:.0}Hz", item.text, item.freq_hz)];
+            on_air.extend(
+                concurrent
+                    .iter()
+                    .map(|it| format!("{} @{:.0}Hz", it.text, it.freq_hz)),
+            );
             spans.push(Span::styled(
-                format!(" {} @{:.0}Hz ", item.text, item.freq_hz),
+                format!(" {} ", on_air.join(" | ")),
                 Style::default()
                     .fg(app.theme.foreground_color())
                     .add_modifier(Modifier::BOLD),
@@ -235,32 +260,31 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     spans.push(Span::raw("  "));
 
-    if app.tx_queued.is_empty() {
+    if deferred.is_empty() {
         spans.push(Span::styled(
             "⋯ QUEUED: (none)",
             Style::default().fg(app.theme.foreground_color()),
         ));
     } else {
         spans.push(Span::styled(
-            format!("⋯ QUEUED ({}): ", app.tx_queued.len()),
+            format!("⋯ QUEUED ({}): ", deferred.len()),
             Style::default()
                 .fg(app.theme.warning_color())
                 .add_modifier(Modifier::BOLD),
         ));
-        // Show up to the first three queued items so the strip stays 1 row.
-        let shown: Vec<String> = app
-            .tx_queued
+        // Show up to the first three deferred items so the strip stays 1 row.
+        let shown: Vec<String> = deferred
             .iter()
             .take(3)
-            .map(|it| format!("{} @{:.0}Hz", it.text, it.freq_hz))
+            .map(|it| format!("{} @{:.0}Hz → deferred 30s", it.text, it.freq_hz))
             .collect();
         let mut text = shown.join(" | ");
-        if app.tx_queued.len() > 3 {
-            text.push_str(&format!(" | +{} more", app.tx_queued.len() - 3));
+        if deferred.len() > 3 {
+            text.push_str(&format!(" | +{} more", deferred.len() - 3));
         }
         spans.push(Span::styled(
             text,
-            Style::default().fg(app.theme.foreground_color()),
+            Style::default().fg(app.theme.warning_color()),
         ));
     }
 
@@ -455,7 +479,20 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
         .collect();
     let tx_parity = app.resolve_tx_parity();
 
-    let title = format!(" Waterfall [/]: TX {:.0} Hz ", app.tx_frequency_offset);
+    // When something is actually on the air (autonomous/QSO TX), the green TX
+    // cursor and its label should follow the LIVE TX frequency, not the manual
+    // waterfall offset (the 1350→2300 visual bug). Fall back to the operator's
+    // manual offset only when idle.
+    let (cursor_offset, title) = match &app.tx_now_sending {
+        Some(item) => (
+            item.freq_hz,
+            format!(" Waterfall [/]: TX {:.0} Hz (LIVE) ", item.freq_hz),
+        ),
+        None => (
+            app.tx_frequency_offset,
+            format!(" Waterfall [/]: TX {:.0} Hz ", app.tx_frequency_offset),
+        ),
+    };
     let waterfall_block = Block::default()
         .title(Span::styled(
             title,
@@ -466,7 +503,7 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     let waterfall = Waterfall::new(&app.waterfall_data)
         .block(waterfall_block)
-        .tx_offset(app.tx_frequency_offset)
+        .tx_offset(cursor_offset)
         .signal_freqs(signal_freqs)
         .color_capability(app.color_capability)
         .decoded_for_occupancy(&decoded_for_occupancy)

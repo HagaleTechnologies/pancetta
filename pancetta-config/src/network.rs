@@ -9,6 +9,9 @@ use std::collections::HashMap;
 
 /// Network services configuration
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+// Container-level serde default: omitted fields fall back to defaults rather
+// than failing to deserialize a partial config.
+#[serde(default)]
 pub struct NetworkConfig {
     /// PSKReporter service configuration
     pub psk_reporter: PskReporterConfig,

@@ -430,6 +430,22 @@ pub struct TxQueueItem {
     pub freq_hz: f64,
     /// QSO id this item belongs to, if any.
     pub qso_id: Option<String>,
+    /// When `true`, this item could not be sent in the current slot and was
+    /// deferred to a later slot (the WSJT-X-style late-TX 30s defer). The
+    /// strip renders it as "deferred" instead of looking dead.
+    pub deferred: bool,
+}
+
+/// Rig connection state shown as a station-panel badge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RigConnDisplay {
+    /// No CAT link (mock rig / rig control disabled / connect failed).
+    #[default]
+    NotConnected,
+    /// Connected to the rig and polling normally.
+    Connected,
+    /// Was connected but polls are now failing.
+    PollingFailed,
 }
 
 pub struct App {
@@ -557,6 +573,15 @@ pub struct App {
     /// Items queued for an upcoming slot but not yet on the air.
     pub tx_queued: Vec<TxQueueItem>,
 
+    /// Rig connection state for the station-panel badge, mirrored from the
+    /// coordinator's `RigStatusUpdate`. Defaults to `NotConnected`.
+    pub rig_connected: RigConnDisplay,
+    /// `true` when TX audio is routed to the system default output rather than
+    /// an explicit rig CODEC (the "PTT keys, audio on speakers" misconfig).
+    /// Drives a persistent station-panel warning badge. Mirrored from the
+    /// coordinator's `AudioOutputDefault` message.
+    pub tx_output_default: bool,
+
     // Band/frequency tracking
     pub current_band_index: usize,
     /// Frequency reported by the radio (via hamlib), if known. In MHz.
@@ -654,6 +679,8 @@ impl App {
             tx_policy: pancetta_core::TxPolicy::default(),
             tx_now_sending: None,
             tx_queued: Vec::new(),
+            rig_connected: RigConnDisplay::default(),
+            tx_output_default: false,
             current_band_index: default_band_index,
             radio_frequency: None,
             message_rx: None,

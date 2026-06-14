@@ -34,6 +34,11 @@ pub struct ConfigLoader {
 
     /// Cache for parsed configurations
     config_cache: Arc<Mutex<HashMap<PathBuf, (SystemTime, Config)>>>,
+
+    /// Human-readable warnings accumulated during the last `load()` (e.g. a
+    /// config file that failed to parse and was skipped). Surfaced to the
+    /// operator (console + TUI) so a silent revert-to-defaults is visible.
+    load_warnings: Arc<Mutex<Vec<String>>>,
 }
 
 /// Configuration source definition
@@ -118,6 +123,7 @@ impl ConfigLoader {
             sources: Vec::new(),
             reload_callback: Arc::new(Mutex::new(None)),
             config_cache: Arc::new(Mutex::new(HashMap::new())),
+            load_warnings: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -131,6 +137,7 @@ impl ConfigLoader {
             sources: Vec::new(),
             reload_callback: Arc::new(Mutex::new(None)),
             config_cache: Arc::new(Mutex::new(HashMap::new())),
+            load_warnings: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -182,6 +189,11 @@ impl ConfigLoader {
     pub fn load(&self) -> ConfigResult<Config> {
         debug!("Loading configuration from all sources");
 
+        // Fresh warning slate for this load.
+        if let Ok(mut w) = self.load_warnings.lock() {
+            w.clear();
+        }
+
         // Start with default configuration
         let mut config = Config::default();
 
@@ -209,11 +221,27 @@ impl ConfigLoader {
                             source.name, e
                         );
                         return Err(e);
-                    } else {
+                    } else if matches!(e, ConfigError::FileNotFound(_)) {
+                        // A missing optional file is normal; stay quiet.
                         debug!(
                             "Skipped optional configuration source '{}': {}",
                             source.name, e
                         );
+                    } else {
+                        // The file EXISTS but failed to parse/validate. This is the
+                        // silent-revert-to-defaults trap: warn loudly AND record a
+                        // human-readable warning the caller can surface (console + TUI).
+                        warn!(
+                            "Config source '{}' failed to load — IGNORING it and using \
+                             defaults for its settings: {}",
+                            source.name, e
+                        );
+                        if let Ok(mut wlist) = self.load_warnings.lock() {
+                            wlist.push(format!(
+                                "Config '{}' failed to parse — using defaults for it ({})",
+                                source.name, e
+                            ));
+                        }
                     }
                 }
             }
@@ -239,6 +267,16 @@ impl ConfigLoader {
             sources.len()
         );
         Ok(config)
+    }
+
+    /// Warnings accumulated during the last [`load`](Self::load) call (e.g. a
+    /// config file that existed but failed to parse and was skipped, so its
+    /// settings silently reverted to defaults). Empty on a clean load.
+    pub fn load_warnings(&self) -> Vec<String> {
+        self.load_warnings
+            .lock()
+            .map(|w| w.clone())
+            .unwrap_or_default()
     }
 
     /// Load configuration from a specific file

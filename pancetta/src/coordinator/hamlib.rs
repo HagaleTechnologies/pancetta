@@ -8,6 +8,44 @@ use tracing::{debug, error, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
+/// Rig connection state surfaced to the TUI as a station-panel badge.
+///
+/// The coordinator stores this in an [`std::sync::atomic::AtomicU8`] (see
+/// [`ApplicationCoordinator::rig_conn_state`](super::ApplicationCoordinator))
+/// written by the hamlib connect/poll loop. Round-trips via
+/// [`RigConnState::as_u8`] / [`RigConnState::from_u8`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum RigConnState {
+    /// No connection attempted yet, or rig control disabled (mock rig).
+    #[default]
+    NotConnected,
+    /// Connected to rigctld and last poll succeeded.
+    Connected,
+    /// Was connected but recent polls are failing (rigctld may have crashed).
+    PollingFailed,
+}
+
+impl RigConnState {
+    /// Stable `u8` encoding for atomic storage (fixed mapping).
+    pub(crate) fn as_u8(self) -> u8 {
+        match self {
+            RigConnState::NotConnected => 0,
+            RigConnState::Connected => 1,
+            RigConnState::PollingFailed => 2,
+        }
+    }
+
+    /// Decode from the stable `u8` encoding; unknown values map to the safe
+    /// default ([`RigConnState::NotConnected`]).
+    pub(crate) fn from_u8(v: u8) -> Self {
+        match v {
+            1 => RigConnState::Connected,
+            2 => RigConnState::PollingFailed,
+            _ => RigConnState::NotConnected,
+        }
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Map rig model name to hamlib model number.
     /// See: https://github.com/Hamlib/Hamlib/wiki/Supported-Radios
@@ -169,6 +207,7 @@ impl super::ApplicationCoordinator {
         }
 
         let operating_frequency_hz = self.operating_frequency_hz.clone();
+        let rig_conn_state = self.rig_conn_state.clone();
 
         let hamlib_handle = {
             let shutdown = self.shutdown_signal.clone();
@@ -191,6 +230,13 @@ impl super::ApplicationCoordinator {
                 match rig.connect().await {
                     Ok(_) => {
                         info!("Rig connected successfully");
+                        // Only flag a *real* CAT link as Connected — a mock rig
+                        // (rig control disabled) stays NotConnected so the TUI
+                        // badge never claims a radio is attached when none is.
+                        if rig_enabled {
+                            rig_conn_state
+                                .store(RigConnState::Connected.as_u8(), Ordering::Relaxed);
+                        }
                         // Read the rig's current frequency immediately so we start
                         // on whatever band the radio is already tuned to, rather
                         // than assuming 20m.
@@ -210,6 +256,7 @@ impl super::ApplicationCoordinator {
                     }
                     Err(e) => {
                         error!("Failed to connect to rig: {}. Continuing without.", e);
+                        rig_conn_state.store(RigConnState::NotConnected.as_u8(), Ordering::Relaxed);
                     }
                 }
 
@@ -218,6 +265,7 @@ impl super::ApplicationCoordinator {
                 let rig_for_polling = Arc::clone(&rig_poll);
                 let shutdown_for_polling = shutdown.clone();
                 let op_freq_for_polling = operating_frequency_hz.clone();
+                let rig_conn_state_poll = rig_conn_state.clone();
                 let mut spawned_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
                 spawned_handles.push(tokio::spawn(async move {
@@ -293,6 +341,14 @@ impl super::ApplicationCoordinator {
                         };
 
                         if poll_ok {
+                            // Recovered (or steady) — reflect Connected for a
+                            // real rig so a transient blip clears the badge.
+                            if consecutive_failures > 0 && rig_enabled {
+                                rig_conn_state_poll.store(
+                                    RigConnState::Connected.as_u8(),
+                                    Ordering::Relaxed,
+                                );
+                            }
                             consecutive_failures = 0;
                         } else {
                             consecutive_failures += 1;
@@ -302,6 +358,13 @@ impl super::ApplicationCoordinator {
                                      Check rigctld process and restart Pancetta if needed.",
                                     consecutive_failures
                                 );
+                                // Surface the degraded state to the TUI badge.
+                                if rig_enabled {
+                                    rig_conn_state_poll.store(
+                                        RigConnState::PollingFailed.as_u8(),
+                                        Ordering::Relaxed,
+                                    );
+                                }
                             }
                         }
                     }

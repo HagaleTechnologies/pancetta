@@ -107,18 +107,23 @@ pub type ConfigResult<T> = Result<T, ConfigError>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Station configuration (callsign, grid, power)
+    #[serde(default)]
     pub station: StationConfig,
 
     /// Audio device and processing settings
+    #[serde(default)]
     pub audio: AudioConfig,
 
     /// Rig control and interface settings
+    #[serde(default)]
     pub rig: RigConfig,
 
     /// User interface preferences
+    #[serde(default)]
     pub ui: UiConfig,
 
     /// Network services configuration
+    #[serde(default)]
     pub network: NetworkConfig,
 
     /// Autonomous operator configuration
@@ -170,6 +175,19 @@ impl Config {
     pub fn load_default() -> ConfigResult<Self> {
         let loader = ConfigLoader::new()?;
         loader.load()
+    }
+
+    /// Load configuration using the default search paths and hierarchy,
+    /// additionally returning any non-fatal load warnings (e.g. a config file
+    /// that existed but failed to parse and was skipped, silently reverting
+    /// its settings to defaults). The caller should surface these to the
+    /// operator so a partial/broken config is never invisible. A clean load
+    /// returns an empty warnings vec.
+    pub fn load_default_with_warnings() -> ConfigResult<(Self, Vec<String>)> {
+        let loader = ConfigLoader::new()?;
+        let config = loader.load()?;
+        let warnings = loader.load_warnings();
+        Ok((config, warnings))
     }
 
     /// Load configuration from a specific file
@@ -426,6 +444,59 @@ mod tests {
             parsed["station"].as_table().unwrap()["callsign"].as_str(),
             Some("K5ARH")
         );
+    }
+
+    /// A partial config (only [station]) must merge OVER defaults rather than
+    /// failing to deserialize and silently reverting EVERYTHING to defaults.
+    /// This is the serde(default) fix: the missing sections fill from defaults
+    /// while the present one keeps its values.
+    #[test]
+    fn partial_config_only_station_keeps_callsign_and_defaults_elsewhere() {
+        let toml = "[station]\ncallsign = \"K5ARH\"\ngrid_square = \"EM00\"\n";
+        let parsed: Config = toml::from_str(toml).expect("partial config must deserialize");
+        // The present section is honored.
+        assert_eq!(parsed.station.callsign, "K5ARH");
+        assert_eq!(parsed.station.grid_square, "EM00");
+        // Missing sections fall back to defaults (NOT a deserialize failure).
+        let defaults = Config::default();
+        assert_eq!(parsed.audio.sample_rate, defaults.audio.sample_rate);
+        assert_eq!(parsed.rig.model, defaults.rig.model);
+        assert_eq!(parsed.ui.theme, defaults.ui.theme);
+    }
+
+    /// An [audio]-only file (the device-picker persistence shape) must load —
+    /// previously it failed because the other four sections were required,
+    /// which broke launch after the picker wrote it.
+    #[test]
+    fn audio_only_config_loads_with_defaults_elsewhere() {
+        let toml = "[audio]\noutput_device = \"USB Codec\"\ninput_device = \"USB Codec\"\n";
+        let parsed: Config = toml::from_str(toml).expect("[audio]-only config must deserialize");
+        assert_eq!(parsed.audio.output_device, "USB Codec");
+        assert_eq!(parsed.audio.input_device, "USB Codec");
+        // Default callsign etc. fill in — no panic, no required-field error.
+        assert_eq!(parsed.station.callsign, Config::default().station.callsign);
+    }
+
+    /// Round-trip an [audio]-only file through the device-picker persist helper,
+    /// then load it back as a full Config (relies on the serde-default fix).
+    #[test]
+    fn audio_only_file_roundtrips_through_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        // Persist an [audio]-only file (no pre-existing file).
+        Config::default()
+            .set_audio_devices_in_file(&path, Some("Mic Z"), Some("Spk Z"))
+            .unwrap();
+        // The written file is [audio]-only...
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let table: toml::Table = raw.parse().unwrap();
+        assert!(table.contains_key("audio"));
+        assert!(!table.contains_key("station"));
+        // ...and it still loads into a full Config thanks to serde(default).
+        let loaded = Config::load_from_file(&path).unwrap();
+        assert_eq!(loaded.audio.output_device, "Spk Z");
+        assert_eq!(loaded.audio.input_device, "Mic Z");
+        assert_eq!(loaded.station.callsign, Config::default().station.callsign);
     }
 
     /// Writing into a non-existent file creates a minimal [audio] section.

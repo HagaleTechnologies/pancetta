@@ -68,8 +68,8 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
         Constraint::Length(7), // Freq
         Constraint::Length(4), // Mode
         Constraint::Length(4), // SNR
-        Constraint::Length(4), // DT
-        Constraint::Length(4), // DF
+        Constraint::Length(5), // DT  (fits "-15.2")
+        Constraint::Length(6), // DF  (fits "+2800")
         Constraint::Length(8), // Call
         Constraint::Length(4), // Grid
         Constraint::Length(6), // Dist

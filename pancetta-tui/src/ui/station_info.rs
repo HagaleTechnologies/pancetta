@@ -220,14 +220,40 @@ fn render_audio_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     // never synthesize a value here.
     let s_meter_text = app.s_meter_display().unwrap_or_else(|| "---".to_string());
 
+    // Rig connection badge — clear "connected / not connected" state so the
+    // operator isn't left inferring it from a "---" S-meter alone.
+    let (rig_badge, rig_badge_color) = match app.rig_connected {
+        crate::app::RigConnDisplay::Connected => ("RIG: ✓ connected", app.theme.success_color()),
+        crate::app::RigConnDisplay::PollingFailed => {
+            ("RIG: ⚠ polling failed", app.theme.warning_color())
+        }
+        crate::app::RigConnDisplay::NotConnected => {
+            ("RIG: ✗ not connected", app.theme.error_color())
+        }
+    };
+
+    let mut device_first_line = vec![
+        Span::styled(
+            "Device: ",
+            Style::default().fg(app.theme.foreground_color()),
+        ),
+        Span::styled(device_text, Style::default().fg(app.theme.accent_color())),
+    ];
+    // Persistent warning badge when TX audio is going to the system default
+    // output instead of an explicit rig CODEC (the "PTT keys, audio on
+    // speakers" misconfig).
+    if app.tx_output_default {
+        device_first_line.push(Span::raw("  "));
+        device_first_line.push(Span::styled(
+            "⚠ TX→system default",
+            Style::default()
+                .fg(app.theme.error_color())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let device_lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "Device: ",
-                Style::default().fg(app.theme.foreground_color()),
-            ),
-            Span::styled(device_text, Style::default().fg(app.theme.accent_color())),
-        ]),
+        Line::from(device_first_line),
         Line::from(vec![
             Span::styled("Rate: ", Style::default().fg(app.theme.foreground_color())),
             Span::styled(
@@ -240,6 +266,13 @@ fn render_audio_status(f: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(app.theme.foreground_color()),
             ),
             Span::styled(s_meter_text, Style::default().fg(app.theme.accent_color())),
+            Span::raw("  "),
+            Span::styled(
+                rig_badge,
+                Style::default()
+                    .fg(rig_badge_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
     ];
 

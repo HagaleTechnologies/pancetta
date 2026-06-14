@@ -187,12 +187,12 @@ struct TestAudioArgs {
     #[arg(short, long)]
     list: bool,
 
-    /// Test specific audio device
-    #[arg(short, long)]
+    /// Test specific audio device (long flag only — `-d` is taken by global --debug)
+    #[arg(long)]
     device: Option<String>,
 
-    /// Test duration in seconds
-    #[arg(short, long, default_value = "10")]
+    /// Test duration in seconds (long flag only)
+    #[arg(long, default_value = "10")]
     duration: u64,
 }
 
@@ -295,7 +295,7 @@ async fn main() -> Result<()> {
 
 async fn run_application(cli: Cli) -> Result<()> {
     // Load configuration
-    let config = load_configuration(&cli).await?;
+    let (config, config_warnings) = load_configuration_with_warnings(&cli).await?;
 
     info!("Configuration loaded successfully");
     debug!("Configuration: {}", config.summary());
@@ -330,6 +330,7 @@ async fn run_application(cli: Cli) -> Result<()> {
         cli.test_tx,
         cli.test_tx_offset,
         shutdown.clone(),
+        config_warnings,
     )
     .await?;
 
@@ -440,9 +441,50 @@ async fn export_command(args: ExportArgs) -> Result<()> {
     Ok(())
 }
 
-async fn test_audio_command(_args: TestAudioArgs) -> Result<()> {
-    eprintln!("Error: audio testing is not yet implemented");
+async fn test_audio_command(args: TestAudioArgs) -> Result<()> {
+    if args.list {
+        list_audio_devices();
+        return Ok(());
+    }
+    eprintln!("Error: audio device testing is not yet implemented.");
+    eprintln!("       Use `pancetta test-audio --list` to enumerate audio devices.");
     std::process::exit(1);
+}
+
+/// Print the available audio input and output devices, flagging the system
+/// default in each list. Backs the `pancetta test-audio --list` command and
+/// the misconfig hint shown when TX audio is routed to the system default
+/// output instead of an explicit rig CODEC.
+fn list_audio_devices() {
+    let inputs = pancetta_audio::device::list_input_devices();
+    let outputs = pancetta_audio::device::list_output_devices();
+
+    println!("Audio input devices:");
+    if inputs.is_empty() {
+        println!("  (none found)");
+    } else {
+        for (name, is_default) in &inputs {
+            let mark = if *is_default { " (system default)" } else { "" };
+            println!("  - {name}{mark}");
+        }
+    }
+
+    println!();
+    println!("Audio output devices:");
+    if outputs.is_empty() {
+        println!("  (none found)");
+    } else {
+        for (name, is_default) in &outputs {
+            let mark = if *is_default { " (system default)" } else { "" };
+            println!("  - {name}{mark}");
+        }
+    }
+
+    println!();
+    println!(
+        "Set the rig's CODEC in ~/.pancetta/pancetta.toml under [audio] \
+         input_device / output_device."
+    );
 }
 
 async fn config_command(args: ConfigArgs, cli: &Cli) -> Result<()> {
@@ -498,8 +540,8 @@ async fn info_command() -> Result<()> {
     println!("  pancetta-dsp: {}", pancetta_dsp::VERSION);
     println!();
 
-    // Audio devices require the audio subsystem — use `pancetta test-audio --list` when implemented
-    println!("Audio devices: (use test-audio --list when implemented)");
+    // Audio devices require the audio subsystem — enumerate via `pancetta test-audio --list`.
+    println!("Audio devices: (run `pancetta test-audio --list`)");
 
     Ok(())
 }
@@ -598,12 +640,31 @@ async fn benchmark_decode_command(args: BenchmarkDecodeArgs) -> Result<()> {
 }
 
 async fn load_configuration(cli: &Cli) -> Result<Config> {
-    let mut config = if let Some(config_path) = &cli.config {
-        Config::load_from_file(config_path)
-            .with_context(|| format!("Failed to load config from {}", config_path.display()))?
+    let (config, _warnings) = load_configuration_with_warnings(cli).await?;
+    Ok(config)
+}
+
+/// Like [`load_configuration`] but also returns non-fatal config-load warnings
+/// (e.g. a `pancetta.toml` that existed but failed to parse and was silently
+/// reverted to defaults). The warnings are printed to the console here and also
+/// returned so they can be surfaced in the TUI.
+async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<String>)> {
+    let (mut config, warnings) = if let Some(config_path) = &cli.config {
+        let config = Config::load_from_file(config_path)
+            .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
+        (config, Vec::new())
     } else {
-        Config::load_default().with_context(|| "Failed to load default configuration")?
+        Config::load_default_with_warnings()
+            .with_context(|| "Failed to load default configuration")?
     };
+
+    // Surface parse failures to the console at startup — a broken/partial config
+    // silently reverting to defaults (N0CALL, default audio) is exactly the trap
+    // we are closing here.
+    for w in &warnings {
+        eprintln!("WARNING: {w}");
+        warn!("{w}");
+    }
 
     // First-run setup: if callsign is still the default, prompt the user.
     // Only run when stdin is a TTY — non-interactive invocations (config --show,
@@ -615,7 +676,7 @@ async fn load_configuration(cli: &Cli) -> Result<Config> {
         }
     }
 
-    Ok(config)
+    Ok((config, warnings))
 }
 
 /// Interactive first-run setup wizard.
@@ -1221,6 +1282,20 @@ mod tests {
         cmd.assert()
             .success()
             .stdout(predicate::str::contains("high-performance amateur radio"));
+    }
+
+    /// `test-audio --list` enumerates devices and exits 0 (the previous stub
+    /// printed "not implemented" and exited 1). We don't assert specific device
+    /// names — CI hosts vary — only that the command succeeds and prints the
+    /// input/output section headers.
+    #[test]
+    fn test_cli_test_audio_list_runs() {
+        let mut cmd = Command::cargo_bin("pancetta").unwrap();
+        cmd.args(["test-audio", "--list"]);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("Audio input devices:"))
+            .stdout(predicate::str::contains("Audio output devices:"));
     }
 
     #[test]

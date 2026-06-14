@@ -98,6 +98,12 @@ pub struct AudioStreamManager {
     /// Shared atomic state (stop flag, counters)
     shared: AudioCommShared,
     is_running: bool,
+    /// Set true when the resolved TX OUTPUT device fell back to the system
+    /// default rather than an explicit, configured rig CODEC. Surfaced to the
+    /// coordinator/TUI so the operator can see the classic "PTT keys, audio
+    /// on speakers" misconfig instead of it being log-only. Recomputed each
+    /// time the output stream is (re)created.
+    output_is_system_default: bool,
 }
 
 impl AudioStreamManager {
@@ -124,7 +130,17 @@ impl AudioStreamManager {
             output_consumer: Some(output_consumer),
             shared,
             is_running: false,
+            output_is_system_default: false,
         })
+    }
+
+    /// Whether the resolved TX OUTPUT device is the system default rather than
+    /// an explicitly configured rig CODEC. Only meaningful after [`start`](Self::start)
+    /// (i.e. after the output stream has been created). When `true`, TX audio
+    /// may be going to the wrong device (e.g. laptop speakers) while PTT keys
+    /// the rig — the classic "PTT keys, no RF, audio on speakers" misconfig.
+    pub fn output_is_system_default(&self) -> bool {
+        self.output_is_system_default
     }
 
     /// Take the consumer half out of this manager.
@@ -488,6 +504,7 @@ impl AudioStreamManager {
             .output_device_name
             .as_deref()
             .is_some_and(|n| !n.eq_ignore_ascii_case("default"));
+        self.output_is_system_default = !explicit_match;
         if explicit_match {
             tracing::info!("TX audio output device: '{}'", resolved_output_name);
         } else {
@@ -495,7 +512,7 @@ impl AudioStreamManager {
                 "TX audio output device: '{}' (SYSTEM DEFAULT — not an explicit rig CODEC). \
                  If your transceiver is not the system default output, TX audio is going to \
                  the wrong device (e.g. speakers) while PTT still keys the rig. Set \
-                 [audio] output_device to the rig's CODEC name (see `pancetta --list-audio`).",
+                 [audio] output_device to the rig's CODEC name (run `pancetta test-audio --list`).",
                 resolved_output_name
             );
         }

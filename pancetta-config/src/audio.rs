@@ -9,6 +9,10 @@ use std::collections::HashMap;
 
 /// Audio system configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Container-level serde default: omitted fields in a partial [audio] section
+// fall back to defaults instead of failing to deserialize (which would revert
+// the whole config). Lets an [audio]-only device-picker file load cleanly.
+#[serde(default)]
 pub struct AudioConfig {
     /// Input audio device name or ID
     pub input_device: String,

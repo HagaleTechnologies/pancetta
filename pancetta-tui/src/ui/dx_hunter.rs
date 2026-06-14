@@ -8,7 +8,19 @@ use ratatui::{
 };
 
 use super::{create_panel_block, format_bearing, format_distance, format_time_ago};
-use crate::app::{ActivePanel, App, DxStation};
+use crate::app::{ActivePanel, App, DxStation, SpotSource};
+
+/// Format the DX Hunter SNR cell. A pure NETWORK spot that carried no SNR
+/// stores `snr: 0`, which is indistinguishable from a real 0 dB — render that
+/// case as "---" so a missing value isn't read as a strong-but-zero signal.
+/// Local (and Both) spots always carry a measured SNR and render with a sign.
+fn format_dx_snr(source: &SpotSource, snr: i32, best_snr_network: Option<i32>) -> String {
+    if *source == SpotSource::Network && best_snr_network.is_none() {
+        "---".to_string()
+    } else {
+        format!("{snr:+}")
+    }
+}
 
 pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let is_active = matches!(app.active_panel, ActivePanel::DxHunter);
@@ -127,8 +139,6 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
 }
 
 fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
-    use crate::app::SpotSource;
-
     // Source indicator
     let src_str = station.source.to_string();
     let src_style = match station.source {
@@ -181,7 +191,11 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
 
     let grid_str = station.grid_square.as_deref().unwrap_or("---").to_string();
     let freq_str = format!("{:.3}", station.frequency);
-    let snr_str = format!("{:+}", station.snr);
+    // A pure network spot with no reported SNR stores snr:0, which is
+    // indistinguishable from a real 0 dB. Render it as "---" so the operator
+    // doesn't read a missing value as a strong-but-zero signal. Local decodes
+    // (and Both) always carry a real measured SNR.
+    let snr_str = format_dx_snr(&station.source, station.snr, station.best_snr_network);
     let rarity_str = station.rarity_tier.as_deref().unwrap_or("-").to_string();
     let rpt_str = station
         .reporter_count
@@ -437,5 +451,20 @@ mod tests {
 
         let score = calculate_dx_priority(&station, "FN20", false, true, false);
         assert!(score > 100); // Should have good score for new DXCC + good SNR + distance
+    }
+
+    #[test]
+    fn network_spot_without_snr_renders_dashes() {
+        // Pure network spot, no reported SNR -> "---" (not "+0").
+        assert_eq!(
+            format_dx_snr(&SpotSource::Network, 0, None),
+            "---",
+            "network-no-SNR must show ---"
+        );
+        // Network spot WITH a real SNR renders it.
+        assert_eq!(format_dx_snr(&SpotSource::Network, -7, Some(-7)), "-7");
+        // A local 0 dB decode is a real measurement -> "+0", never "---".
+        assert_eq!(format_dx_snr(&SpotSource::Local, 0, None), "+0");
+        assert_eq!(format_dx_snr(&SpotSource::Both, 12, Some(12)), "+12");
     }
 }

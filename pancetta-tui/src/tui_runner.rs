@@ -155,6 +155,19 @@ pub enum TuiMessage {
         output: Vec<(String, bool)>,
         current_output: Option<String>,
     },
+    /// Rig connection state for the station-panel badge. Pushed by the
+    /// coordinator relay from the hamlib connect/poll loop.
+    RigStatusUpdate {
+        /// Current rig connection state.
+        state: crate::app::RigConnDisplay,
+    },
+    /// Whether TX audio is routed to the system default output rather than an
+    /// explicit rig CODEC (the "PTT keys, audio on speakers" misconfig).
+    /// Drives a persistent station-panel warning badge.
+    AudioOutputDefault {
+        /// `true` = system-default fallback (misconfig).
+        is_default: bool,
+    },
 }
 
 /// Commands sent from TUI
@@ -500,6 +513,12 @@ impl TuiRunner {
             } => {
                 app.set_audio_devices(input, output, current_output);
             }
+            TuiMessage::RigStatusUpdate { state } => {
+                app.rig_connected = state;
+            }
+            TuiMessage::AudioOutputDefault { is_default } => {
+                app.tx_output_default = is_default;
+            }
         }
 
         Ok(())
@@ -679,7 +698,7 @@ impl TuiRunner {
                     let step = app.current_caller_reply_step();
                     app.status_message = format!("Reply step: {:?}", step);
                 } else {
-                    app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(100.0);
+                    app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(200.0);
                     app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
                 }
             }
@@ -689,18 +708,21 @@ impl TuiRunner {
                     let step = app.current_caller_reply_step();
                     app.status_message = format!("Reply step: {:?}", step);
                 } else {
-                    app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(3000.0);
+                    app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(2500.0);
                     app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
                 }
             }
 
-            // TX frequency offset: [ = down 50 Hz, ] = up 50 Hz
+            // TX frequency offset: [ = down 50 Hz, ] = up 50 Hz. Clamped to
+            // 200–2500 Hz to match the modulator/passband and find_clear_offset
+            // — below 200 Hz multi-TX offsets go negative and single-TX
+            // silently encode-rejects.
             KeyCode::Char('[') => {
-                app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(100.0);
+                app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(200.0);
                 app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
             }
             KeyCode::Char(']') => {
-                app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(3000.0);
+                app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(2500.0);
                 app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
             }
 
@@ -1847,11 +1869,13 @@ mod key_tests {
                 text: "K5ARH JA1ABC -12".to_string(),
                 freq_hz: 1500.0,
                 qso_id: Some("q1".to_string()),
+                deferred: false,
             }),
             queued: vec![crate::app::TxQueueItem {
                 text: "CQ K5ARH EM00".to_string(),
                 freq_hz: 1200.0,
                 qso_id: None,
+                deferred: true,
             }],
         })
         .await
@@ -1863,6 +1887,64 @@ mod key_tests {
         );
         assert_eq!(app.tx_queued.len(), 1);
         assert_eq!(app.tx_queued[0].freq_hz, 1200.0);
+    }
+
+    // === UX audit Batch 3 ===========================================
+
+    /// The TX offset clamp matches the modulator/passband (200–2500 Hz):
+    /// hammering `[` never goes below 200, hammering `]` never exceeds 2500.
+    #[tokio::test]
+    async fn tx_offset_clamps_to_modulator_passband() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        // Drive far below the floor with `[` (down 50 Hz each press).
+        for _ in 0..200 {
+            r.handle_key_event(key('[')).await.unwrap();
+        }
+        assert_eq!(
+            app.read().await.tx_frequency_offset,
+            200.0,
+            "TX offset must clamp at the 200 Hz floor"
+        );
+        // Drive far above the ceiling with `]` (up 50 Hz each press).
+        for _ in 0..200 {
+            r.handle_key_event(key(']')).await.unwrap();
+        }
+        assert_eq!(
+            app.read().await.tx_frequency_offset,
+            2500.0,
+            "TX offset must clamp at the 2500 Hz ceiling"
+        );
+    }
+
+    /// The waterfall TX cursor follows the LIVE TX frequency while sending,
+    /// and falls back to the manual offset when idle (the 1350→2300 fix lives
+    /// in `render_waterfall`; here we assert the App state the renderer reads).
+    #[tokio::test]
+    async fn waterfall_cursor_prefers_live_tx_freq_when_sending() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        // Idle: cursor source is the manual offset (default 1500).
+        {
+            let a = app.read().await;
+            assert!(a.tx_now_sending.is_none());
+            assert_eq!(a.tx_frequency_offset, 1500.0);
+        }
+        // Now sending at a different live frequency.
+        r.handle_message(TuiMessage::TxQueueUpdate {
+            sending: Some(crate::app::TxQueueItem {
+                text: "K5ARH W1AW -10".to_string(),
+                freq_hz: 2300.0,
+                qso_id: Some("q1".to_string()),
+                deferred: false,
+            }),
+            queued: vec![],
+        })
+        .await
+        .unwrap();
+        let a = app.read().await;
+        // The renderer uses tx_now_sending.freq_hz (2300) over the manual
+        // offset (still 1500) — the exact state branch the cursor reads.
+        assert_eq!(a.tx_now_sending.as_ref().unwrap().freq_hz, 2300.0);
+        assert_eq!(a.tx_frequency_offset, 1500.0);
     }
 
     // === UX audit Batch 1 ===========================================

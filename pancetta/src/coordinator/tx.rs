@@ -31,6 +31,11 @@ pub struct TxSchedule {
     pub silent_pad_samples: usize,
     /// Sample offset into the waveform — caller emits `waveform[cursor..]`.
     pub cursor_offset_samples: usize,
+    /// `true` when we could NOT use the current slot and deferred to a later
+    /// slot of the required parity (the "too late" / wrong-parity branch). The
+    /// caller surfaces this to the TUI strip so a deferred item shows
+    /// "deferred 30s" instead of looking dead.
+    pub deferred: bool,
 }
 
 /// WSJT-X-style late-start TX scheduler.
@@ -60,11 +65,13 @@ pub fn schedule_tx(
 
     // Decide which slot to target. The current slot is viable iff its
     // parity matches AND we haven't burned past tx_late_max_ms.
-    let target = if cur_parity == required_parity && mstr_in_cur_slot <= tx_late_max_ms {
+    let use_current = cur_parity == required_parity && mstr_in_cur_slot <= tx_late_max_ms;
+    let target = if use_current {
         cur_start
     } else {
         next_slot_with_parity(now, required_parity)
     };
+    let deferred = !use_current;
 
     // mstr relative to the chosen target. When target is in the future,
     // (now - target) is negative; clamp so we hit the early branch.
@@ -81,6 +88,7 @@ pub fn schedule_tx(
         target_slot: target,
         silent_pad_samples: (silent_pad_ms as usize) * (sample_rate as usize) / 1000,
         cursor_offset_samples: (cursor_ms as usize) * (sample_rate as usize) / 1000,
+        deferred,
     }
 }
 
@@ -363,6 +371,7 @@ impl super::ApplicationCoordinator {
                                             text: message_text.clone(),
                                             freq_hz: frequency_offset,
                                             qso_id: qso_id.clone(),
+                                            deferred: false,
                                         }],
                                     )
                                     .await;
@@ -445,12 +454,31 @@ impl super::ApplicationCoordinator {
                                     );
 
                                     info!(
-                                        "TX scheduled: parity={:?} target_slot={} pad={} samples cursor={} samples",
+                                        "TX scheduled: parity={:?} target_slot={} pad={} samples cursor={} samples deferred={}",
                                         required_parity,
                                         schedule.target_slot.format("%H:%M:%S%.3f UTC"),
                                         schedule.silent_pad_samples,
                                         schedule.cursor_offset_samples,
+                                        schedule.deferred,
                                     );
+
+                                    // If we missed the current slot and deferred to a
+                                    // later one (~30s), refresh the QUEUED strip with
+                                    // the deferred flag so it shows "deferred 30s"
+                                    // instead of looking dead during the long wait.
+                                    if schedule.deferred {
+                                        send_tx_queue_status(
+                                            &message_bus,
+                                            None,
+                                            vec![crate::message_bus::TxItem {
+                                                text: message_text.clone(),
+                                                freq_hz: frequency_offset,
+                                                qso_id: qso_id.clone(),
+                                                deferred: true,
+                                            }],
+                                        )
+                                        .await;
+                                    }
 
                                     // --- Step 3: Build the audio buffer to ship ---
                                     // Pad zeros in front (early branch); skip cursor into
@@ -500,6 +528,11 @@ impl super::ApplicationCoordinator {
                                             break;
                                         }
                                         info!("TX aborted before PTT engage by operator (F8)");
+                                        // This abort happens BEFORE the TxStatusGuard is
+                                        // constructed, so its Drop-based clear never runs.
+                                        // Clear the strip explicitly so the QUEUED row
+                                        // doesn't sit stale until the next status push.
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         continue;
                                     }
 
@@ -516,6 +549,7 @@ impl super::ApplicationCoordinator {
                                             text: message_text.clone(),
                                             freq_hz: frequency_offset,
                                             qso_id: qso_id.clone(),
+                                            deferred: false,
                                         }),
                                         Vec::new(),
                                     )
@@ -675,6 +709,7 @@ impl super::ApplicationCoordinator {
                                                 text: it.message_text.clone(),
                                                 freq_hz: it.frequency_offset,
                                                 qso_id: it.qso_id.clone(),
+                                                deferred: false,
                                             })
                                             .collect(),
                                     )
@@ -844,9 +879,11 @@ impl super::ApplicationCoordinator {
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
                                     send_tx_status(&message_bus, true).await;
-                                    // NOW-SENDING: bundle is keyed and on the air. Show
-                                    // the first item as the headline "now" and the rest
-                                    // (concurrent multi-TX) as queued alongside it.
+                                    // NOW-SENDING: the whole bundle is keyed and on the
+                                    // air CONCURRENTLY in this one slot. Show the first
+                                    // item as the headline "now" and the rest as
+                                    // non-deferred companions — the strip renders these as
+                                    // concurrent ("NOW ×N"), not as future-slot queue.
                                     {
                                         let mut bundle: Vec<crate::message_bus::TxItem> = items
                                             .iter()
@@ -854,6 +891,7 @@ impl super::ApplicationCoordinator {
                                                 text: it.message_text.clone(),
                                                 freq_hz: it.frequency_offset,
                                                 qso_id: it.qso_id.clone(),
+                                                deferred: false,
                                             })
                                             .collect();
                                         let head = if bundle.is_empty() {

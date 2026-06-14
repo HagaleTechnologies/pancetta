@@ -9,6 +9,9 @@ use std::collections::HashMap;
 
 /// User interface configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+// Container-level serde default: omitted fields fall back to defaults rather
+// than failing to deserialize a partial config.
+#[serde(default)]
 pub struct UiConfig {
     /// Color theme settings
     pub theme: String,

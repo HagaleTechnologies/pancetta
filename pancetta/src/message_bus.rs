@@ -246,6 +246,11 @@ pub struct TxItem {
     pub freq_hz: f64,
     /// QSO id this item belongs to, if any (`None` = CQ / manual send).
     pub qso_id: Option<String>,
+    /// `true` when this item missed its target slot and was deferred to a
+    /// later slot (the WSJT-X-style late-TX 30s defer). Lets the TUI strip
+    /// show "QUEUED → deferred 30s" instead of looking dead.
+    #[serde(default)]
+    pub deferred: bool,
 }
 
 /// One item in a `MessageType::ActiveQsosSnapshot` payload — flattened

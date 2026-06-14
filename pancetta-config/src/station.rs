@@ -10,6 +10,10 @@ use validator::Validate;
 
 /// Station configuration settings
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+// Container-level serde default: any field omitted from a partial config file
+// falls back to this struct's `Default` impl rather than failing to
+// deserialize (which previously reverted the WHOLE config to defaults).
+#[serde(default)]
 pub struct StationConfig {
     /// Amateur radio callsign (e.g., "N1ABC", "VK2DEF/P")
     #[validate(length(min = 3, max = 20))]
