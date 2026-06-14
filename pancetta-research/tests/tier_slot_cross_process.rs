@@ -37,26 +37,32 @@ fn tmp_pool_dir(suffix: &str) -> PathBuf {
     dir
 }
 
+/// Path to the pre-built example binary. Running the binary DIRECTLY (rather
+/// than via `cargo run --example`) keeps cargo's freshness check + any
+/// recompile OUT of the timing-critical path. With `cargo run`, a dirty work
+/// tree (e.g. mid-edit) makes the second child recompile under load, and that
+/// recompile can consume most of child A's hold window — child B then observes
+/// a wait far shorter than the hold and the serialization assertion flakes.
+/// `prewarm_child_build` guarantees this binary exists before we spawn.
+fn child_bin_path() -> PathBuf {
+    // Respect CARGO_TARGET_DIR if set, else <workspace>/target.
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("target"));
+    target
+        .join("debug")
+        .join("examples")
+        .join("tier_slot_child")
+}
+
 fn spawn_child(pool_dir: &Path, hold_ms: u64, label: &str) -> std::process::Child {
-    Command::new("cargo")
-        .args([
-            "run",
-            "--quiet",
-            "--example",
-            "tier_slot_child",
-            "-p",
-            "pancetta-research",
-            "--",
-            pool_dir.to_str().unwrap(),
-            "1",
-            &hold_ms.to_string(),
-            label,
-        ])
+    Command::new(child_bin_path())
+        .args([pool_dir.to_str().unwrap(), "1", &hold_ms.to_string(), label])
         .current_dir(workspace_root())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn tier_slot_child child")
+        .expect("spawn tier_slot_child child (run prewarm_child_build first)")
 }
 
 fn parse_acquired_after_ms(stdout: &str) -> Option<u64> {
