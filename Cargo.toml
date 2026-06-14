@@ -83,10 +83,10 @@ num_cpus = "1.0"
 
 # Signal handling
 signal-hook = "0.3"
-signal-hook-tokio = { version = "0.3", features = ["futures-v0_3"] }
+signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
 
 # Performance monitoring
-metrics = "0.23"
+metrics = "0.24"
 
 # HTTP client and networking
 reqwest = { version = "0.12", features = ["json", "stream", "multipart", "cookies"] }

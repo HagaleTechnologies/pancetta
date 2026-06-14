@@ -67,8 +67,8 @@ dirs = "5.0"
 num_cpus = "1.0"
 
 # Performance monitoring
-metrics = "0.23"
-metrics-exporter-prometheus = { version = "0.15", optional = true }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", optional = true }
 
 # Audio output for examples
 cpal = { workspace = true }
@@ -85,7 +85,6 @@ criterion = { version = "0.5", features = ["html_reports"] }
 assert_cmd = "2.2"
 predicates = "3.1"
 tracing-test = "0.2"
-sysinfo = "0.30"
 
 [features]
 default = ["metrics", "pancetta-hamlib"]

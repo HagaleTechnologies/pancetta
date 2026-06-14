@@ -659,6 +659,10 @@ impl ApplicationCoordinator {
 
         #[cfg(feature = "prometheus")]
         {
+            // `.context()` on the exporter's `Result<(), BuildError>` needs the
+            // anyhow extension trait in scope (only `anyhow::Result` is imported
+            // at module level). BuildError: std::error::Error, so Context applies.
+            use anyhow::Context as _;
             use metrics_exporter_prometheus::PrometheusBuilder;
 
             let builder =
