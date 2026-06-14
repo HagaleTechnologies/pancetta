@@ -99,8 +99,8 @@ lazy_static! {
         Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)(?:\s+([A-R]{2}[0-9]{2}(?:[A-X]{2})?))?$").unwrap(),
         // Signal report: "K1DEF W1ABC -15" or "K1DEF W1ABC R-12"
         Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)\s+(R? ?[+-]?\d{1,2})$").unwrap(),
-        // Final confirmation: "W1ABC K1DEF RR73" or "W1ABC K1DEF 73"
-        Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)\s+(RR73|73)$").unwrap(),
+        // Final confirmation: "W1ABC K1DEF RR73" / "W1ABC K1DEF RRR" / "W1ABC K1DEF 73"
+        Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)\s+(RR73|RRR|73)$").unwrap(),
         // Contest exchange: "W1ABC K1DEF 599 001"
         Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)\s+(\d{3})\s+(\d{3,4})$").unwrap(),
     ];
@@ -499,7 +499,14 @@ impl MessageExchange {
             // NP4VA/T46FCR stall. The FT8 convention is unambiguous: "RR73" /
             // "73" in the third field after two callsigns is always the close,
             // never a grid.
-            if third_field == "RR73" {
+            if third_field == "RR73" || third_field == "RRR" {
+                // RRR is the plain roger ("all received"); RR73 folds in the 73.
+                // Both are closes from our state machine's perspective — they
+                // advance us to completion and the reply emitter answers 73.
+                // (RRR has no digits so it never collides with the grid regex,
+                // but it must still be matched before the grid branch for
+                // symmetry with RR73 and to keep the close-token logic in one
+                // place.)
                 Ok(MessageType::FinalConfirmation {
                     to_station: station1,
                     from_station: station2,
@@ -777,6 +784,25 @@ mod tests {
                 assert_eq!(from_station, "NP4VA");
             }
             other => panic!("Expected FinalConfirmation for RR73, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_rrr_is_final_confirmation() {
+        // Regression: "RRR" (plain roger) is a valid FT8 close token. It was
+        // unhandled (fell through to NonStandard) so a DX that rogered with RRR
+        // instead of RR73 left the QSO stalled (K9HJZ on-air, 2026-06-14).
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let result = exchange.parse_message("K5ARH K9HJZ RRR").unwrap();
+        match result {
+            MessageType::FinalConfirmation {
+                to_station,
+                from_station,
+            } => {
+                assert_eq!(to_station, "K5ARH");
+                assert_eq!(from_station, "K9HJZ");
+            }
+            other => panic!("Expected FinalConfirmation for RRR, got {other:?}"),
         }
     }
 
