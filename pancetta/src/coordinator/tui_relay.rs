@@ -768,6 +768,23 @@ impl super::ApplicationCoordinator {
                                     policy: pancetta_core::TxPolicy::Disabled,
                                 },
                             );
+                            // Clear the TX *source*, not just mute it: cancel
+                            // every active QSO so manual keep-calling (and any
+                            // duplicate QSO objects) stops re-emitting each slot.
+                            // Without this, returning the policy to Full would
+                            // resume the runaway. This is the real fix for
+                            // "h + k didn't stop it; only restart did."
+                            let cancel_all = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Qso,
+                                MessageType::QsoMessage(
+                                    crate::message_bus::QsoMessage::CancelAllQsos,
+                                ),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(cancel_all).await {
+                                warn!("Emergency stop: failed to send CancelAllQsos: {}", e);
+                            }
                         }
                         pancetta_tui::tui_runner::TuiCommand::CycleTxPolicy => {
                             // Operator pressed `g`: cycle the global TX policy

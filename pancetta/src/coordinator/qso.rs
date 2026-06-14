@@ -732,6 +732,29 @@ impl super::ApplicationCoordinator {
                                                 ),
                                             }
                                         }
+                                        // Cancel EVERY active QSO. This is the
+                                        // loop-breaker: manual QSOs keep-call
+                                        // every slot via rearm_manual_calls_at,
+                                        // and per-callsign `k`/AbortQso only
+                                        // clears one — duplicate QSO objects or
+                                        // an unseen QSO can keep re-emitting TX
+                                        // forever. The emergency stop sends this
+                                        // so a single Shift+Q clears the source
+                                        // (not just mutes via TX policy).
+                                        crate::message_bus::QsoMessage::CancelAllQsos => {
+                                            let active = qso_manager.get_active_qsos().await;
+                                            let n = active.len();
+                                            for (id, _) in active {
+                                                if let Err(e) = qso_manager.cancel_qso(id).await {
+                                                    warn!("CancelAllQsos: {} failed: {}", id, e);
+                                                }
+                                            }
+                                            info!(
+                                                target: "operator.override",
+                                                "CancelAllQsos: cancelled {} active QSO(s)",
+                                                n
+                                            );
+                                        }
                                     }
                                 }
 

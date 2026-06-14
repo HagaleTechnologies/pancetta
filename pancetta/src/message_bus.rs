@@ -376,6 +376,10 @@ pub enum QsoMessage {
     AbortQso { qso_id: String },
     /// Re-send the most recent message we transmitted in this QSO.
     ResendQso { qso_id: String },
+    /// Cancel ALL active QSOs at once. The emergency stop sends this so a
+    /// single Shift+Q clears every keep-calling source (including duplicate
+    /// QSO objects), not just the one selected by `AbortQso`.
+    CancelAllQsos,
 }
 
 /// DX cluster messages
