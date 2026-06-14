@@ -36,6 +36,17 @@ mod wav_playback;
 
 pub use tx::{schedule_tx, TxSchedule};
 
+/// Lead-in (seconds) before the UTC slot boundary at which the live decode
+/// window starts. The DSP pipeline slices the emitted window so that sample 0
+/// corresponds to `slot_boundary − WINDOW_LEAD_SECS`, and the FT8 pipeline
+/// subtracts this same lead from every decoded message's `time_offset` so the
+/// reported DT is boundary-relative (≈0 for a station transmitting on the
+/// boundary). The lead-in gives a small margin for stations that start a touch
+/// early (FT8 DT can be slightly negative) and absorbs emit-trigger jitter.
+/// Shared between `dsp.rs` (window slice anchor) and `ft8.rs` (DT correction)
+/// so the two halves of the fix can never drift apart.
+pub(crate) const WINDOW_LEAD_SECS: f64 = 0.5;
+
 use anyhow::Result;
 use pancetta_config::Config;
 use pancetta_ft8::{Ft8Config, Ft8Decoder};

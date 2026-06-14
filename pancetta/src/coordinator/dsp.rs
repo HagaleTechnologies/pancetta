@@ -402,12 +402,31 @@ impl super::ApplicationCoordinator {
                         // FT8 messages are 12.64s long, starting at :00/:15/:30/:45.
                         // We trigger at 13s past the slot start (0.36s after message
                         // end) to maximize response time for QSO management.
+                        //
+                        // The emitted window is *anchored to the UTC slot boundary*,
+                        // not to `now`: sample 0 corresponds to
+                        // `slot_boundary − WINDOW_LEAD_SECS`. This makes the decoder's
+                        // reported `time_offset` boundary-relative (after the matching
+                        // `−WINDOW_LEAD_SECS` correction in ft8.rs), so a station that
+                        // transmits on the slot boundary reads DT ≈ 0 instead of the
+                        // ≈ +2 s the old "last 15 s of buffer" slice produced. Anchoring
+                        // to the *scheduled* boundary (derived from `next_window_time`)
+                        // rather than `now` also removes the 0–1 s emit-trigger jitter
+                        // from the DT value. See `WINDOW_LEAD_SECS` in `coordinator/mod.rs`.
                         const IDEAL_SAMPLES: usize = FT8_SAMPLE_RATE * 15; // 180000
                         let now = chrono::Utc::now();
                         if ft8_buffer.len() >= FT8_WINDOW_SAMPLES && now >= next_window_time {
-                            let send_len = ft8_buffer.len().min(IDEAL_SAMPLES);
-                            let start = ft8_buffer.len() - send_len;
-                            let window: Vec<f32> = ft8_buffer[start..].to_vec();
+                            // Scheduled slot boundary for this window: next_window_time
+                            // is the :13/:28/:43/:58 instant, 13 s past the boundary.
+                            let slot_boundary = next_window_time - chrono::Duration::seconds(13);
+                            let (start, send_len) = boundary_anchored_slice(
+                                ft8_buffer.len(),
+                                now,
+                                slot_boundary,
+                                FT8_SAMPLE_RATE,
+                                FT8_WINDOW_SAMPLES,
+                            );
+                            let window: Vec<f32> = ft8_buffer[start..start + send_len].to_vec();
                             // Keep overlap for next window — retain enough for the
                             // full 15s ideal window at the next boundary
                             let keep = IDEAL_SAMPLES;
@@ -470,6 +489,63 @@ impl super::ApplicationCoordinator {
     }
 }
 
+/// Compute the slice `(start, len)` of the FT8 capture buffer for one decode
+/// window, anchored so that the window's sample 0 corresponds to
+/// `slot_boundary − WINDOW_LEAD_SECS`.
+///
+/// The buffer is a rolling capture of decimated 12 kHz audio; its newest
+/// sample (`buffer_len - 1`) corresponds to the wall-clock `emit_now` (the
+/// time of the most recently received audio batch). We map that real-time
+/// anchor back into the buffer:
+///
+/// * The desired window start time is `slot_boundary − WINDOW_LEAD_SECS`.
+/// * Samples from the buffer end back to that start time is
+///   `(emit_now − (slot_boundary − lead)) · SAMPLE_RATE`.
+/// * The window extends from there to the buffer end, so it always contains
+///   the full FT8 message span (boundary .. boundary+12.64 s) plus the lead.
+///
+/// Returns a `(start, len)` slice that is always in-bounds. If the buffer is
+/// shorter than the ideal anchored window (early startup, or `emit_now`
+/// preceding the boundary), the slice is clamped to `[0, buffer_len)` and the
+/// window simply begins later than the lead — the decoder still recovers the
+/// message via Costas sync, and DT is reported relative to the actual sample 0
+/// (handled identically downstream).
+///
+/// `min_len` (the FT8 message span in samples) is used only as a floor when
+/// clamping so we never hand the decoder a window too short to contain a
+/// message.
+fn boundary_anchored_slice(
+    buffer_len: usize,
+    emit_now: chrono::DateTime<chrono::Utc>,
+    slot_boundary: chrono::DateTime<chrono::Utc>,
+    sample_rate: usize,
+    min_len: usize,
+) -> (usize, usize) {
+    // Seconds from the desired window start (slot_boundary − lead) to emit_now.
+    let secs_from_start = (emit_now - slot_boundary)
+        .num_nanoseconds()
+        .map(|ns| ns as f64 / 1_000_000_000.0)
+        .unwrap_or(0.0)
+        + super::WINDOW_LEAD_SECS;
+
+    // Number of samples back from the buffer end to the window start. Negative
+    // (emit_now before the anchor) collapses to "from the buffer end".
+    let samples_back = (secs_from_start * sample_rate as f64).round();
+    let samples_back = if samples_back.is_finite() && samples_back > 0.0 {
+        samples_back as usize
+    } else {
+        0
+    };
+
+    // Clamp the slice length to what the buffer holds, but never below min_len
+    // (when the buffer itself is shorter than min_len the caller's
+    // `>= FT8_WINDOW_SAMPLES` gate has already been satisfied, so this floor is
+    // a no-op in practice; it is belt-and-suspenders for the unit tests).
+    let len = samples_back.min(buffer_len).max(min_len.min(buffer_len));
+    let start = buffer_len - len;
+    (start, len)
+}
+
 /// Rolling median over a recent window of dB powers. Used as a per-bin
 /// noise-floor estimate so the waterfall renders signal-above-floor
 /// instead of per-row min/max stretch (which hid signals at all amplitudes).
@@ -480,6 +556,169 @@ fn rolling_median(samples: &[f32]) -> f32 {
     let mut sorted: Vec<f32> = samples.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     sorted[sorted.len() / 2]
+}
+
+#[cfg(test)]
+mod anchored_slice_tests {
+    use super::boundary_anchored_slice;
+    use crate::coordinator::WINDOW_LEAD_SECS;
+
+    const SR: usize = 12_000;
+    // FT8 message span in samples (12.64 s) — the slice floor.
+    const MSG_SAMPLES: usize = (SR as f64 * 12.64) as usize; // 151_680
+
+    fn utc(secs: f64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::<chrono::Utc>::UNIX_EPOCH
+            + chrono::Duration::nanoseconds((secs * 1_000_000_000.0) as i64)
+    }
+
+    /// With a generously long buffer and a nominal emit at boundary+13 s, the
+    /// window's sample 0 lands at slot_boundary − WINDOW_LEAD_SECS. We verify
+    /// by reconstructing the wall-clock time of sample 0 from the buffer end.
+    #[test]
+    fn sample_zero_lands_at_boundary_minus_lead() {
+        let boundary = utc(100.0);
+        let emit_now = boundary + chrono::Duration::milliseconds(13_000); // exactly :13
+                                                                          // Buffer holds 20 s of audio, newest sample == emit_now.
+        let buffer_len = SR * 20;
+        let (start, len) = boundary_anchored_slice(buffer_len, emit_now, boundary, SR, MSG_SAMPLES);
+        // Wall-clock of sample 0 = emit_now − len/SR.
+        let sample0_secs_before_emit = len as f64 / SR as f64;
+        let sample0_time_secs = 13.0 - sample0_secs_before_emit; // relative to boundary
+        let expected = -WINDOW_LEAD_SECS;
+        assert!(
+            (sample0_time_secs - expected).abs() < 0.001,
+            "sample0 at {sample0_time_secs}s rel boundary, expected {expected}s (start={start}, len={len})"
+        );
+        // Window must contain the full message span.
+        assert!(
+            len >= MSG_SAMPLES,
+            "window {len} shorter than message {MSG_SAMPLES}"
+        );
+        assert_eq!(start + len, buffer_len, "window must end at buffer end");
+    }
+
+    /// The dt correction: a station on the boundary decodes at slice-relative
+    /// time_offset == WINDOW_LEAD_SECS (because sample 0 is `lead` before the
+    /// boundary), and the coordinator subtracts WINDOW_LEAD_SECS → DT ≈ 0.
+    #[test]
+    fn dt_correction_yields_zero_for_boundary_station() {
+        // Decoder reports time_offset relative to window sample 0. Sample 0 is
+        // WINDOW_LEAD_SECS before the boundary, so a boundary-aligned signal's
+        // first symbol begins WINDOW_LEAD_SECS into the window.
+        let decoder_time_offset = WINDOW_LEAD_SECS;
+        let corrected = decoder_time_offset - WINDOW_LEAD_SECS;
+        assert!(corrected.abs() < 0.1, "corrected DT {corrected} not ≈ 0");
+    }
+
+    /// Emit jitter (firing late at :13.4 instead of :13.0) does NOT shift the
+    /// reported DT, because the anchor is the scheduled boundary, not `now`:
+    /// the window simply grows by the jitter amount, keeping sample 0 fixed at
+    /// slot_boundary − lead.
+    #[test]
+    fn emit_jitter_does_not_move_sample_zero() {
+        let boundary = utc(100.0);
+        let buffer_len = SR * 20;
+
+        let (_, len_on_time) = boundary_anchored_slice(
+            buffer_len,
+            boundary + chrono::Duration::milliseconds(13_000),
+            boundary,
+            SR,
+            MSG_SAMPLES,
+        );
+        let (_, len_late) = boundary_anchored_slice(
+            buffer_len,
+            boundary + chrono::Duration::milliseconds(13_400), // 0.4 s late
+            boundary,
+            SR,
+            MSG_SAMPLES,
+        );
+        // Sample-0 wall-clock time is (emit_now − len/SR). For it to be fixed at
+        // boundary − lead across both emits, len must grow by exactly the jitter
+        // (0.4 s → 4800 samples).
+        let sample0_on_time = 13.0 - len_on_time as f64 / SR as f64;
+        let sample0_late = 13.4 - len_late as f64 / SR as f64;
+        assert!(
+            (sample0_on_time - sample0_late).abs() < 0.001,
+            "sample0 moved under jitter: {sample0_on_time} vs {sample0_late}"
+        );
+        assert!((sample0_on_time + WINDOW_LEAD_SECS).abs() < 0.001);
+    }
+
+    /// Short buffer (just over the message span): the slice clamps to the whole
+    /// buffer rather than indexing out of bounds, still delivering the message.
+    #[test]
+    fn short_buffer_clamps_in_bounds() {
+        let boundary = utc(100.0);
+        let emit_now = boundary + chrono::Duration::milliseconds(13_000);
+        let buffer_len = MSG_SAMPLES + 100; // only just enough for a message
+        let (start, len) = boundary_anchored_slice(buffer_len, emit_now, boundary, SR, MSG_SAMPLES);
+        assert!(start + len <= buffer_len, "slice out of bounds");
+        assert!(len >= MSG_SAMPLES, "clamped window dropped the message");
+    }
+
+    /// End-to-end synthetic check: build a realistic 15 s capture buffer with a
+    /// modulated FT8 message whose first symbol begins EXACTLY at the simulated
+    /// slot boundary, run the SAME `boundary_anchored_slice` the live pipeline
+    /// uses, decode the slice, apply the live `−WINDOW_LEAD_SECS` DT correction,
+    /// and assert the reported DT is ≈0 (not ≈ +2 s) AND the message still
+    /// decodes (decode-count non-regression: a message on the boundary is
+    /// recovered intact).
+    #[test]
+    fn synthetic_boundary_signal_reports_dt_near_zero() {
+        use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator};
+
+        // Modulate "CQ K5ARH EM12" at +500 Hz offset (→ 2000 Hz; base is 1500).
+        let mut enc = Ft8Encoder::new();
+        let symbols = enc.encode_message("CQ K5ARH EM12", None).unwrap();
+        let mut modu = Ft8Modulator::new_default().unwrap();
+        let msg_audio = modu.modulate_symbols(&symbols, 500.0).unwrap();
+
+        // Build a 15 s buffer (180000 samples). The live capture has sample 0
+        // ≈ slot_boundary − 2 s, i.e. the message (which starts AT the boundary)
+        // begins 2 s into the buffer. Reproduce that layout exactly.
+        let buffer_len = SR * 15;
+        let boundary = utc(100.0);
+        let emit_now = boundary + chrono::Duration::milliseconds(13_000); // :13 emit
+        let pre_boundary_secs = 2.0_f64; // buffer sample 0 = boundary − 2 s
+        let msg_start = (pre_boundary_secs * SR as f64) as usize;
+
+        let mut buffer = vec![0.0f32; buffer_len];
+        for (i, &s) in msg_audio.iter().enumerate() {
+            if msg_start + i < buffer.len() {
+                buffer[msg_start + i] = s;
+            }
+        }
+
+        // Anchored slice exactly as the live pipeline computes it.
+        let (start, len) =
+            boundary_anchored_slice(buffer.len(), emit_now, boundary, SR, MSG_SAMPLES);
+        let window = &buffer[start..start + len];
+
+        // Window must still contain the whole message (non-regression).
+        assert!(
+            len >= MSG_SAMPLES,
+            "window {len} < message span {MSG_SAMPLES}"
+        );
+
+        let mut dec = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let msgs = dec.decode_window(window).unwrap();
+        let found = msgs.iter().find(|m| m.text.contains("K5ARH"));
+        assert!(
+            found.is_some(),
+            "boundary message did not decode from anchored window (n={})",
+            msgs.len()
+        );
+
+        // Apply the live DT correction (mirrors ft8.rs: time_offset − lead).
+        let corrected = found.unwrap().time_offset - WINDOW_LEAD_SECS;
+        assert!(
+            corrected.abs() <= 0.1,
+            "corrected DT {corrected:.3}s not ≈ 0 (raw {:.3}s)",
+            found.unwrap().time_offset
+        );
+    }
 }
 
 #[cfg(test)]

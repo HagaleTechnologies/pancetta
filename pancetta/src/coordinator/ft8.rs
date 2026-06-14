@@ -385,6 +385,12 @@ impl super::ApplicationCoordinator {
                                 pancetta_core::slot::SlotParity::of(scoped_slot_start);
                             for mut decoded_msg in scoped_decodes {
                                 decoded_msg.slot_parity = Some(scoped_parity);
+                                // Boundary-relative DT: the DSP window's sample 0
+                                // sits at slot_boundary − WINDOW_LEAD_SECS, so the
+                                // decoder's slice-relative time_offset overstates DT
+                                // by exactly the lead. Subtract it so the reported DT
+                                // is ≈0 for a station on the slot boundary.
+                                decoded_msg.time_offset -= super::WINDOW_LEAD_SECS;
                                 info!(
                                     "FT8 scoped fast-path: {} (SNR: {:.0}, freq: {:.1})",
                                     decoded_msg.text,
@@ -547,6 +553,18 @@ impl super::ApplicationCoordinator {
 
                         for decoded_msg in decoded_messages.iter_mut() {
                             decoded_msg.slot_parity = Some(window_parity);
+                            // Boundary-relative DT correction (live path only). The
+                            // DSP window is anchored so sample 0 = slot_boundary −
+                            // WINDOW_LEAD_SECS; the decoder reports time_offset
+                            // relative to sample 0, so subtracting the lead yields a
+                            // DT that is ≈0 for a station transmitting on the slot
+                            // boundary (was ≈ +2 s with the old last-15-s slice).
+                            // Applied here, before any consumer (TUI delta_time,
+                            // cross-slot state, autonomous time_offset_s, PSKReporter)
+                            // reads decoded_msg.time_offset. The WAV-replay path
+                            // (wav_playback.rs) has its own slot-aligned slicing and
+                            // does NOT pass through this loop, so its DT is untouched.
+                            decoded_msg.time_offset -= super::WINDOW_LEAD_SECS;
                         }
 
                         // hb-062: apply FP filter post-decode, pre-broadcast.
