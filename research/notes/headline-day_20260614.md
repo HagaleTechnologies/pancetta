@@ -5,12 +5,12 @@ batches); norm = `hash_normalize_message` on both sides.
 
 ## day_20260614
 
-3879 decodes, 3409 truth messages.
+6706 decodes, 6194 truth messages.
 
 | Scoring | TPs | FPs | Precision | Truth found | Miss rate |
 |---|---:|---:|---:|---:|---:|
-| raw exact-text | 3163 | 716 | 0.8154 | 3163 | 7.22% |
-| hash-normalized | 3278 | 601 | 0.8451 | 3278 | 3.84% |
+| raw exact-text | 5747 | 959 | 0.8570 | 5747 | 7.22% |
+| hash-normalized | 5932 | 774 | 0.8846 | 5932 | 4.23% |
 
 Resolved-hash residual mismatches (conservative rule's leftover): 0
 
