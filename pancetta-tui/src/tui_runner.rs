@@ -184,6 +184,21 @@ pub enum TuiCommand {
         frequency: u64,
         dx_parity: Option<pancetta_core::slot::SlotParity>,
     },
+    /// Reply to a station calling US (from the Callers panel), opening the
+    /// exchange at the operator-chosen sequence step (smart default +
+    /// override) rather than always sending our grid.
+    RespondToCaller {
+        /// The caller's callsign.
+        callsign: String,
+        /// Audio offset (Hz) where we heard them / will reply.
+        frequency: u64,
+        /// The slot parity the caller transmits on, if known.
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+        /// Which rung of the exchange ladder to open at.
+        step: pancetta_core::ResponseStep,
+        /// Our measured SNR of the caller (drives the report we send).
+        snr: Option<f32>,
+    },
     /// Clear decoded messages
     ClearMessages,
     /// Request status
@@ -556,6 +571,11 @@ impl TuiRunner {
                     app.qso_cursor_up();
                 } else {
                     app.previous_item();
+                    // Moving the Callers selection resets the reply override
+                    // so each newly-selected caller starts at its smart default.
+                    if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
+                        app.clamp_callers_selection();
+                    }
                 }
             }
             KeyCode::Down => {
@@ -563,6 +583,9 @@ impl TuiRunner {
                     app.qso_cursor_down();
                 } else {
                     app.next_item();
+                    if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
+                        app.clamp_callers_selection();
+                    }
                 }
             }
             // Jump/page navigation for the focused list (Band Activity is
@@ -581,13 +604,29 @@ impl TuiRunner {
             KeyCode::PageDown => {
                 app.page_down();
             }
+            // Left/Right are globally TX-offset ±50 Hz, BUT when the Callers
+            // panel is focused they cycle the reply sequence step for the
+            // selected caller instead (so the operator can override the smart
+            // default without leaving the panel).
             KeyCode::Left => {
-                app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(100.0);
-                app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+                if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
+                    app.cycle_caller_reply(false);
+                    let step = app.current_caller_reply_step();
+                    app.status_message = format!("Reply step: {:?}", step);
+                } else {
+                    app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(100.0);
+                    app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+                }
             }
             KeyCode::Right => {
-                app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(3000.0);
-                app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+                if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
+                    app.cycle_caller_reply(true);
+                    let step = app.current_caller_reply_step();
+                    app.status_message = format!("Reply step: {:?}", step);
+                } else {
+                    app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(3000.0);
+                    app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
+                }
             }
 
             // TX frequency offset: [ = down 50 Hz, ] = up 50 Hz
@@ -766,15 +805,35 @@ impl TuiRunner {
                 app.activate_selected();
             }
 
-            // Enter - Send message or confirm
+            // Enter - Send message or confirm. Globally this commits the
+            // free-text TX buffer, BUT when the Callers panel is focused and a
+            // caller is selected it commits the caller reply at the shown
+            // sequence step instead.
             KeyCode::Enter => {
-                let text = app.get_input_text();
-                if !text.is_empty() {
-                    self.message_tx.send(TuiCommand::SendMessage {
-                        text,
-                        frequency_offset: app.tx_frequency_offset,
-                    })?;
-                    app.clear_input();
+                if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
+                    if let Some((callsign, frequency, dx_parity)) = app.get_selected_station() {
+                        let step = app.current_caller_reply_step();
+                        let snr = app.selected_caller().map(|m| m.snr as f32);
+                        self.message_tx.send(TuiCommand::RespondToCaller {
+                            callsign: callsign.clone(),
+                            frequency,
+                            dx_parity,
+                            step,
+                            snr,
+                        })?;
+                        app.status_message = format!("Replying to {} ({:?})", callsign, step);
+                    } else {
+                        app.status_message = "No caller selected".to_string();
+                    }
+                } else {
+                    let text = app.get_input_text();
+                    if !text.is_empty() {
+                        self.message_tx.send(TuiCommand::SendMessage {
+                            text,
+                            frequency_offset: app.tx_frequency_offset,
+                        })?;
+                        app.clear_input();
+                    }
                 }
             }
 
@@ -969,11 +1028,15 @@ impl TuiRunner {
             ("Up / Down", "Scroll list"),
             ("Home / End", "Jump to newest (realtime) / oldest"),
             ("PgUp / PgDn", "Page scroll"),
-            ("Left / Right", "TX offset −/+ 50 Hz"),
+            ("1/2/3/4/5", "Jump: Band/QSO/Station/Callers/DX"),
+            (
+                "Left / Right",
+                "TX offset −/+ 50 Hz (Callers: cycle reply step)",
+            ),
             ("[ / ]", "TX offset −/+ 50 Hz"),
             ("= / -", "Band up / down"),
             ("Space", "Call selected station"),
-            ("Enter", "Send TX message"),
+            ("Enter", "Send TX message (Callers: reply at shown step)"),
             ("c / s", "Start / stop CQ"),
             ("k", "Abort selected QSO"),
             ("r", "Re-send last TX (selected QSO)"),

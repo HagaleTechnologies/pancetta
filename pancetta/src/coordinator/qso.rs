@@ -624,6 +624,69 @@ impl super::ApplicationCoordinator {
                                                 }
                                             }
                                         }
+                                        crate::message_bus::QsoMessage::RespondToCaller {
+                                            callsign,
+                                            frequency,
+                                            dx_parity,
+                                            step,
+                                            snr,
+                                        } => {
+                                            info!(
+                                                "Responding to caller {} on {} Hz at step {:?} \
+                                                 (manual)",
+                                                callsign, frequency, step
+                                            );
+                                            // Operator picked a station calling US from the
+                                            // Callers panel and chose (or accepted the smart
+                                            // default for) which sequence step to open at.
+                                            // Manual call: bypasses the duplicate gate and
+                                            // keep-calls under the watchdog, exactly like
+                                            // StartQso — but starts at the correct rung
+                                            // (their report → our R-report, etc.) instead of
+                                            // always sending our grid. `their_report` is left
+                                            // None; the engine defaults it.
+                                            match qso_manager
+                                                .respond_to_caller(
+                                                    callsign.clone(),
+                                                    frequency as f64,
+                                                    dx_parity,
+                                                    step,
+                                                    snr,
+                                                    None,
+                                                )
+                                                .await
+                                            {
+                                                Ok(qso_id) => {
+                                                    info!(
+                                                        "Caller-response QSO started with {}: \
+                                                         {} (step {:?})",
+                                                        callsign, qso_id, step
+                                                    );
+                                                    emit_status(
+                                                        &message_bus,
+                                                        format!(
+                                                            "Replying to {} — TX queued ({} Hz)",
+                                                            callsign, frequency
+                                                        ),
+                                                    )
+                                                    .await;
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "Failed to respond to caller {}: {}",
+                                                        callsign, e
+                                                    );
+                                                    emit_status(
+                                                        &message_bus,
+                                                        format!(
+                                                            "Reply to {} failed: {}",
+                                                            callsign, e
+                                                        ),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                        }
                                         crate::message_bus::QsoMessage::LogQso { qso_data } => {
                                             debug!("Manual log QSO: {}", qso_data);
                                         }

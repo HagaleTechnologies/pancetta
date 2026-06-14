@@ -375,6 +375,9 @@ pub enum ActivePanel {
     BandActivity,
     QsoStatus,
     StationInfo,
+    /// Stations currently calling US (directed-at-us decodes). Operator picks
+    /// one and replies at the correct sequence step (smart default + override).
+    Callers,
     DxHunter,
 }
 
@@ -383,7 +386,8 @@ impl ActivePanel {
         match self {
             ActivePanel::BandActivity => ActivePanel::QsoStatus,
             ActivePanel::QsoStatus => ActivePanel::StationInfo,
-            ActivePanel::StationInfo => ActivePanel::DxHunter,
+            ActivePanel::StationInfo => ActivePanel::Callers,
+            ActivePanel::Callers => ActivePanel::DxHunter,
             ActivePanel::DxHunter => ActivePanel::BandActivity,
         }
     }
@@ -393,7 +397,8 @@ impl ActivePanel {
             ActivePanel::BandActivity => ActivePanel::DxHunter,
             ActivePanel::QsoStatus => ActivePanel::BandActivity,
             ActivePanel::StationInfo => ActivePanel::QsoStatus,
-            ActivePanel::DxHunter => ActivePanel::StationInfo,
+            ActivePanel::Callers => ActivePanel::StationInfo,
+            ActivePanel::DxHunter => ActivePanel::Callers,
         }
     }
 }
@@ -424,6 +429,18 @@ pub struct App {
     pub dx_stations: HashMap<String, DxStation>,
     pub band_activity_scroll: usize,
     pub dx_hunter_scroll: usize,
+    /// Selection cursor into the Callers panel (the list of stations calling
+    /// us). Indexes `App::displayed_callers()`; clamped when that list changes.
+    pub callers_scroll: usize,
+    /// Operator override for the reply sequence step in the Callers panel.
+    /// `None` means "use the smart default classified from the selected
+    /// caller's last message". Reset to `None` whenever the selected caller
+    /// changes, so each freshly-selected caller starts at its own smart
+    /// default. Left/Right (when the Callers panel is focused) cycle this.
+    pub caller_reply_override: Option<pancetta_core::ResponseStep>,
+    /// The callsign the `caller_reply_override` applies to. Used to detect a
+    /// selection change and reset the override.
+    caller_override_for: Option<String>,
 
     // Audio processing
     pub audio_device: Option<String>,
@@ -540,6 +557,9 @@ impl App {
             dx_stations: HashMap::new(),
             band_activity_scroll: 0,
             dx_hunter_scroll: 0,
+            callers_scroll: 0,
+            caller_reply_override: None,
+            caller_override_for: None,
             audio_device,
             is_monitoring: false,
             audio_level: 0.0,
@@ -642,7 +662,8 @@ impl App {
             KeyCode::Char('1') => self.active_panel = ActivePanel::BandActivity,
             KeyCode::Char('2') => self.active_panel = ActivePanel::QsoStatus,
             KeyCode::Char('3') => self.active_panel = ActivePanel::StationInfo,
-            KeyCode::Char('4') => self.active_panel = ActivePanel::DxHunter,
+            KeyCode::Char('4') => self.active_panel = ActivePanel::Callers,
+            KeyCode::Char('5') => self.active_panel = ActivePanel::DxHunter,
 
             // Scrolling
             KeyCode::Up | KeyCode::Char('k') => {
@@ -896,6 +917,11 @@ impl App {
                     self.dx_hunter_scroll -= 1;
                 }
             }
+            ActivePanel::Callers => {
+                if self.callers_scroll > 0 {
+                    self.callers_scroll -= 1;
+                }
+            }
             _ => {}
         }
     }
@@ -914,6 +940,12 @@ impl App {
                     self.dx_hunter_scroll += 1;
                 }
             }
+            ActivePanel::Callers => {
+                let max_scroll = self.displayed_callers().len().saturating_sub(1);
+                if self.callers_scroll < max_scroll {
+                    self.callers_scroll += 1;
+                }
+            }
             _ => {}
         }
     }
@@ -928,6 +960,7 @@ impl App {
         match self.active_panel {
             ActivePanel::BandActivity => self.band_activity_scroll = 0,
             ActivePanel::DxHunter => self.dx_hunter_scroll = 0,
+            ActivePanel::Callers => self.callers_scroll = 0,
             _ => {}
         }
     }
@@ -942,6 +975,9 @@ impl App {
             ActivePanel::DxHunter => {
                 self.dx_hunter_scroll = self.dx_stations.len().saturating_sub(1);
             }
+            ActivePanel::Callers => {
+                self.callers_scroll = self.displayed_callers().len().saturating_sub(1);
+            }
             _ => {}
         }
     }
@@ -955,6 +991,9 @@ impl App {
             }
             ActivePanel::DxHunter => {
                 self.dx_hunter_scroll = self.dx_hunter_scroll.saturating_sub(Self::SCROLL_PAGE);
+            }
+            ActivePanel::Callers => {
+                self.callers_scroll = self.callers_scroll.saturating_sub(Self::SCROLL_PAGE);
             }
             _ => {}
         }
@@ -971,6 +1010,10 @@ impl App {
             ActivePanel::DxHunter => {
                 let max = self.dx_stations.len().saturating_sub(1);
                 self.dx_hunter_scroll = (self.dx_hunter_scroll + Self::SCROLL_PAGE).min(max);
+            }
+            ActivePanel::Callers => {
+                let max = self.displayed_callers().len().saturating_sub(1);
+                self.callers_scroll = (self.callers_scroll + Self::SCROLL_PAGE).min(max);
             }
             _ => {}
         }
@@ -1359,6 +1402,18 @@ impl App {
                 let audio_hz = station.audio_offset_hz.unwrap_or(1500);
                 Some((station.call_sign.clone(), audio_hz, station.slot_parity))
             }
+            ActivePanel::Callers => {
+                let displayed = self.displayed_callers();
+                let msg = displayed.get(self.callers_scroll)?;
+                let callsign = msg.call_sign.as_ref()?;
+                if callsign.is_empty() {
+                    return None;
+                }
+                // delta_freq is the audio offset where we heard them; reply
+                // there. Clamp into the FT8 passband like the Band Activity arm.
+                let audio_hz = (msg.delta_freq.round() as u64).clamp(200, 2500);
+                Some((callsign.clone(), audio_hz, msg.slot_parity))
+            }
             _ => None,
         }
     }
@@ -1369,6 +1424,130 @@ impl App {
         } else {
             self.status_message = "No station selected".to_string();
         }
+    }
+
+    // === Callers panel ====================================================
+
+    /// Stations currently calling US, in display order (newest first), one row
+    /// per callsign (newest decode wins). Source is `decoded_messages`
+    /// filtered to `is_directed_at_us`. Both the Callers renderer and
+    /// `get_selected_station(Callers)` walk this exact list so the highlighted
+    /// row is always the Enter reply-target.
+    pub fn displayed_callers(&self) -> Vec<&DecodedMessageView> {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut out: Vec<&DecodedMessageView> = Vec::new();
+        // newest-first: iterate the deque in reverse (it is push-back oldest→newest)
+        for msg in self.decoded_messages.iter().rev() {
+            if !msg.is_directed_at_us {
+                continue;
+            }
+            let Some(call) = msg.call_sign.as_ref() else {
+                continue;
+            };
+            if call.is_empty() {
+                continue;
+            }
+            let key = call.to_uppercase();
+            if seen.insert(key) {
+                out.push(msg);
+            }
+        }
+        out
+    }
+
+    /// Clamp `callers_scroll` to the current Callers list, and reset the reply
+    /// override if the selected caller changed (so each newly-selected caller
+    /// starts at its own smart default). Call this when the Callers list or
+    /// selection may have shifted.
+    pub fn clamp_callers_selection(&mut self) {
+        let (len, current) = {
+            let callers = self.displayed_callers();
+            let len = callers.len();
+            let idx = self.callers_scroll.min(len.saturating_sub(1));
+            let current = callers.get(idx).and_then(|m| m.call_sign.clone());
+            (len, current)
+        };
+        let max = len.saturating_sub(1);
+        if self.callers_scroll > max {
+            self.callers_scroll = max;
+        }
+        if current != self.caller_override_for {
+            self.caller_reply_override = None;
+            self.caller_override_for = current;
+        }
+    }
+
+    /// The currently-selected caller, if any.
+    pub fn selected_caller(&self) -> Option<&DecodedMessageView> {
+        self.displayed_callers().get(self.callers_scroll).copied()
+    }
+
+    /// The reply step to use for the selected caller: the operator override if
+    /// set, otherwise the smart default classified from the caller's last
+    /// directed message.
+    pub fn current_caller_reply_step(&self) -> pancetta_core::ResponseStep {
+        let smart = self
+            .selected_caller()
+            .map(|m| classify_caller_reply(&m.message, &self.station_info.call_sign))
+            .unwrap_or_default();
+        self.caller_reply_override.unwrap_or(smart)
+    }
+
+    /// Cycle the Callers reply override forward (Right) or backward (Left)
+    /// through the ladder. Initializes from the current smart default on the
+    /// first press, then steps from there.
+    pub fn cycle_caller_reply(&mut self, forward: bool) {
+        use pancetta_core::ResponseStep::*;
+        const LADDER: [pancetta_core::ResponseStep; 5] =
+            [Grid, Report, ReportAck, Rr73, SeventyThree];
+        let current = self.current_caller_reply_step();
+        let idx = LADDER.iter().position(|s| *s == current).unwrap_or(0);
+        let next = if forward {
+            (idx + 1) % LADDER.len()
+        } else {
+            (idx + LADDER.len() - 1) % LADDER.len()
+        };
+        self.caller_reply_override = Some(LADDER[next]);
+        // Pin the override to the selected caller so a later selection change
+        // resets it.
+        self.caller_override_for = self.selected_caller().and_then(|m| m.call_sign.clone());
+    }
+
+    /// Signal report (dB) we would send the selected caller, derived from the
+    /// decode's SNR with the same round/clamp/default the QSO engine uses.
+    pub fn caller_report_value(&self) -> i8 {
+        self.selected_caller()
+            .map(|m| (m.snr as f32).round() as i8)
+            .map(|r| r.clamp(-30, 50))
+            .unwrap_or(-15)
+    }
+
+    /// `true` if `callsign` is in an active QSO of ours (MINE flag).
+    pub fn is_caller_mine(&self, callsign: &str) -> bool {
+        self.active_qsos
+            .iter()
+            .any(|q| q.their_callsign.eq_ignore_ascii_case(callsign))
+    }
+
+    /// `true` if `callsign` appears to be mid-exchange with a THIRD party
+    /// (BUSY flag): seen within the last ~90s in a 3-token `<to> <from>
+    /// <payload>` exchange where neither party is us and the payload is a
+    /// committed report/RR73/RRR/73. Mirrors
+    /// `pancetta_qso::autonomous::third_party_exchange_callsigns` /
+    /// `is_exchange_payload` (re-implemented here because `pancetta-tui` does
+    /// not depend on `pancetta-qso`); the canonical versions are `pub` + unit
+    /// tested in that crate to guard both copies against drift.
+    pub fn is_caller_busy(&self, callsign: &str) -> bool {
+        const BUSY_WINDOW_SECS: i64 = 90;
+        let now = chrono::Utc::now();
+        let our = self.station_info.call_sign.to_uppercase();
+        let target = callsign.to_uppercase();
+        self.decoded_messages.iter().any(|m| {
+            if now.signed_duration_since(m.timestamp).num_seconds() > BUSY_WINDOW_SECS {
+                return false;
+            }
+            third_party_exchange_participants(&m.message, &our).contains(&target)
+        })
     }
 
     pub fn get_input_text(&self) -> String {
@@ -1668,6 +1847,129 @@ impl App {
             pancetta_config::station::TxSelfParity::Auto => None,
         }
     }
+}
+
+/// Classify a station's directed-at-us message and pick the sequence step our
+/// reply should open at. This is the Callers panel's smart default.
+///
+/// Mirrors `pancetta_qso::exchange::MessageExchange::parse_message`'s
+/// classification, kept small and local because `pancetta-tui` does not depend
+/// on `pancetta-qso`. The mapping (third token after two callsigns):
+///
+/// | their last message | our smart-default reply |
+/// |--------------------|-------------------------|
+/// | their CQ           | `Grid`                  |
+/// | bare directed call (`US THEM`) | `Report`    |
+/// | grid (`US THEM FN42`) | `Report`             |
+/// | signal report (`US THEM -12`) | `ReportAck`  |
+/// | R-report (`US THEM R-12`) | `Rr73`           |
+/// | RR73 / RRR (`US THEM RR73`) | `SeventyThree` |
+/// | 73 (`US THEM 73`)  | `SeventyThree`          |
+/// | anything else      | `Grid`                  |
+///
+/// `our_call` is unused for the mapping itself (the message is already known
+/// to be directed at us) but is accepted for symmetry and future use.
+pub fn classify_caller_reply(msg_text: &str, _our_call: &str) -> pancetta_core::ResponseStep {
+    use pancetta_core::ResponseStep;
+    let text = msg_text.trim().to_uppercase();
+    if text.is_empty() {
+        return ResponseStep::Grid;
+    }
+    // Their CQ → start at the top with our grid.
+    if text.starts_with("CQ ") || text == "CQ" {
+        return ResponseStep::Grid;
+    }
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    match parts.as_slice() {
+        // Bare directed call "US THEM" — no payload yet: send our report
+        // (they are calling us and expect the report exchange to begin).
+        [_to, _from] => ResponseStep::Report,
+        // "US THEM <payload>"
+        [_to, _from, payload] => {
+            let p = *payload;
+            if p == "RR73" || p == "RRR" || p == "73" {
+                // They closed; we acknowledge with 73 (completes + logs).
+                ResponseStep::SeventyThree
+            } else if let Some(rest) = p.strip_prefix('R') {
+                // "R-12" / "R+05" → they already rogered our report; close.
+                // (Bare "R" with no sign falls through to Grid.)
+                if rest.starts_with(['-', '+']) && rest[1..].chars().all(|c| c.is_ascii_digit()) {
+                    ResponseStep::Rr73
+                } else {
+                    ResponseStep::Grid
+                }
+            } else if p.starts_with(['-', '+']) && p[1..].chars().all(|c| c.is_ascii_digit()) {
+                // "-12" / "+05" → a signal report; reply with our R-report.
+                ResponseStep::ReportAck
+            } else if is_maidenhead_grid(p) {
+                // A grid → they responded to our CQ; send our report.
+                ResponseStep::Report
+            } else {
+                ResponseStep::Grid
+            }
+        }
+        _ => ResponseStep::Grid,
+    }
+}
+
+/// `true` if `tok` looks like a 4- or 6-character Maidenhead grid.
+fn is_maidenhead_grid(tok: &str) -> bool {
+    let b = tok.as_bytes();
+    if b.len() != 4 && b.len() != 6 {
+        return false;
+    }
+    b[0].is_ascii_alphabetic()
+        && b[1].is_ascii_alphabetic()
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && (b.len() == 4 || (b[4].is_ascii_alphabetic() && b[5].is_ascii_alphabetic()))
+}
+
+/// Return the participant callsigns of a THIRD-PARTY exchange in `text`, or an
+/// empty vec. A third-party exchange is a 3-token `<to> <from> <payload>`
+/// message where the payload is a committed report/RR73/RRR/73 and neither
+/// party is `our_call`. Mirrors
+/// `pancetta_qso::autonomous::third_party_exchange_callsigns`.
+fn third_party_exchange_participants(text: &str, our_call: &str) -> Vec<String> {
+    let upper = text.trim().to_uppercase();
+    if upper.starts_with("CQ ") || upper == "CQ" {
+        return Vec::new();
+    }
+    let parts: Vec<&str> = upper.split_whitespace().collect();
+    if parts.len() != 3 {
+        return Vec::new();
+    }
+    let (to, from, payload) = (parts[0], parts[1], parts[2]);
+    if !is_committed_exchange_payload(payload) {
+        return Vec::new();
+    }
+    if to.eq_ignore_ascii_case(our_call) || from.eq_ignore_ascii_case(our_call) {
+        return Vec::new();
+    }
+    let looks_like_call =
+        |s: &str| s.len() >= 3 && s.chars().any(|c| c.is_ascii_digit()) && s != "73";
+    let mut calls = Vec::new();
+    if looks_like_call(to) {
+        calls.push(to.to_string());
+    }
+    if looks_like_call(from) {
+        calls.push(from.to_string());
+    }
+    calls
+}
+
+/// `true` if `tok` is the payload of a committed exchange (report / RR73 /
+/// RRR / 73 / RR). Mirrors `pancetta_qso::autonomous::is_exchange_payload`.
+fn is_committed_exchange_payload(tok: &str) -> bool {
+    let u = tok.to_uppercase();
+    if u == "RR73" || u == "RRR" || u == "73" || u == "RR" {
+        return true;
+    }
+    let body = u.strip_prefix('R').unwrap_or(&u);
+    if let Some(rest) = body.strip_prefix(['-', '+']) {
+        return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
+    }
+    false
 }
 
 /// Format a hamlib STRENGTH reading (dB relative to S9) as a
@@ -2403,5 +2705,100 @@ mod tests {
         assert_eq!(st.selected_output_name().as_deref(), Some("Out2"));
         // Input selection was untouched by output navigation.
         assert_eq!(st.selected_input_name().as_deref(), Some("In0"));
+    }
+
+    // === Callers panel ===================================================
+
+    #[test]
+    fn classify_caller_reply_smart_defaults() {
+        use pancetta_core::ResponseStep as RS;
+        let our = "K5ARH";
+        // Their CQ → grid.
+        assert_eq!(classify_caller_reply("CQ K9ZZ EM12", our), RS::Grid);
+        // Bare directed call → report.
+        assert_eq!(classify_caller_reply("K5ARH K9ZZ", our), RS::Report);
+        // Grid reply → report.
+        assert_eq!(classify_caller_reply("K5ARH K9ZZ FN42", our), RS::Report);
+        // Signal report → report-ack.
+        assert_eq!(classify_caller_reply("K5ARH K9ZZ -12", our), RS::ReportAck);
+        assert_eq!(classify_caller_reply("K5ARH K9ZZ +05", our), RS::ReportAck);
+        // R-report → RR73.
+        assert_eq!(classify_caller_reply("K5ARH K9ZZ R-12", our), RS::Rr73);
+        // Close tokens → 73.
+        assert_eq!(
+            classify_caller_reply("K5ARH K9ZZ RR73", our),
+            RS::SeventyThree
+        );
+        assert_eq!(
+            classify_caller_reply("K5ARH K9ZZ RRR", our),
+            RS::SeventyThree
+        );
+        assert_eq!(
+            classify_caller_reply("K5ARH K9ZZ 73", our),
+            RS::SeventyThree
+        );
+        // Garbage → grid.
+        assert_eq!(classify_caller_reply("???", our), RS::Grid);
+    }
+
+    #[test]
+    fn third_party_exchange_participants_matches_qso_logic() {
+        let our = "K5ARH";
+        // Third-party exchange: both participants returned.
+        let p = third_party_exchange_participants("JA1ABC W1XYZ -12", our);
+        assert_eq!(p, vec!["JA1ABC".to_string(), "W1XYZ".to_string()]);
+        // RR73 close also counts as an exchange.
+        assert_eq!(
+            third_party_exchange_participants("JA1ABC W1XYZ RR73", our).len(),
+            2
+        );
+        // Grid reply is not yet a committed exchange.
+        assert!(third_party_exchange_participants("JA1ABC W1XYZ FN42", our).is_empty());
+        // CQ is not an exchange.
+        assert!(third_party_exchange_participants("CQ JA1ABC PM95", our).is_empty());
+        // Involving us → our own traffic, not third-party.
+        assert!(third_party_exchange_participants("K5ARH JA1ABC -12", our).is_empty());
+        assert!(third_party_exchange_participants("JA1ABC K5ARH R-12", our).is_empty());
+    }
+
+    #[tokio::test]
+    async fn displayed_callers_dedups_newest_first() {
+        let mut app = fixture_app().await;
+        // Two directed-at-us decodes from K9ZZ (older then newer) + one from W1XYZ.
+        let mut older = fixture_view_directed("K9ZZ", -10);
+        older.timestamp = chrono::Utc::now() - chrono::Duration::seconds(30);
+        older.message = "K5ARH K9ZZ -15".to_string();
+        let newer = {
+            let mut v = fixture_view_directed("K9ZZ", -5);
+            v.message = "K5ARH K9ZZ R-10".to_string();
+            v
+        };
+        let other = fixture_view_directed("W1XYZ", -8);
+        let non_directed = fixture_view("NOTME", 0);
+
+        app.add_decoded_message(older).await.unwrap();
+        app.add_decoded_message(other).await.unwrap();
+        app.add_decoded_message(newer).await.unwrap();
+        app.add_decoded_message(non_directed).await.unwrap();
+
+        let callers = app.displayed_callers();
+        // Two unique callers (K9ZZ deduped), non-directed excluded.
+        assert_eq!(callers.len(), 2);
+        // K9ZZ's row is the NEWER decode (R-10), and it's newest-first.
+        assert_eq!(callers[0].call_sign.as_deref(), Some("K9ZZ"));
+        assert_eq!(callers[0].message, "K5ARH K9ZZ R-10");
+    }
+
+    #[tokio::test]
+    async fn is_caller_busy_detects_third_party_exchange() {
+        let mut app = fixture_app().await;
+        app.station_info.call_sign = "K5ARH".to_string();
+        // A third-party exchange decode (JA1ABC mid-QSO with W1XYZ).
+        let mut tp = fixture_view("JA1ABC", -10);
+        tp.message = "W1XYZ JA1ABC -12".to_string();
+        app.add_decoded_message(tp).await.unwrap();
+        assert!(app.is_caller_busy("JA1ABC"));
+        assert!(app.is_caller_busy("W1XYZ"));
+        assert!(!app.is_caller_busy("K9ZZ"));
     }
 }

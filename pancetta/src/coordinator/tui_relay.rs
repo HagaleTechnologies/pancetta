@@ -532,6 +532,35 @@ impl super::ApplicationCoordinator {
                                 warn!("Failed to forward CallStation command: {}", e);
                             }
                         }
+                        pancetta_tui::tui_runner::TuiCommand::RespondToCaller {
+                            callsign,
+                            frequency,
+                            dx_parity,
+                            step,
+                            snr,
+                        } => {
+                            info!(
+                                "TUI RespondToCaller: {} at {} Hz (step {:?})",
+                                callsign, frequency, step
+                            );
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Qso,
+                                MessageType::QsoMessage(
+                                    crate::message_bus::QsoMessage::RespondToCaller {
+                                        callsign,
+                                        frequency,
+                                        dx_parity,
+                                        step,
+                                        snr,
+                                    },
+                                ),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to forward RespondToCaller command: {}", e);
+                            }
+                        }
                         pancetta_tui::tui_runner::TuiCommand::AbortQso { qso_id } => {
                             info!("TUI AbortQso: {}", qso_id);
                             let msg = ComponentMessage::new(

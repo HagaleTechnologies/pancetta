@@ -305,6 +305,23 @@ pub enum QsoMessage {
         frequency: u64,
         dx_parity: Option<pancetta_core::slot::SlotParity>,
     },
+    /// Respond to a station **calling us**, opening the exchange at an
+    /// operator-chosen [`pancetta_core::ResponseStep`] rather than always
+    /// sending our grid. Driven by the TUI Callers panel (smart default +
+    /// override). Like `StartQso`, this is always a manual call.
+    RespondToCaller {
+        /// The caller's callsign.
+        callsign: String,
+        /// Audio offset (Hz, within the FT8 passband) to transmit on.
+        frequency: u64,
+        /// The slot parity the caller transmits on, if known. We reply on the
+        /// opposite parity.
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+        /// Which rung of the exchange ladder to open at.
+        step: pancetta_core::ResponseStep,
+        /// Our measured SNR of the caller, used to derive the report we send.
+        snr: Option<f32>,
+    },
     /// End QSO
     EndQso { qso_id: String },
     /// Log QSO

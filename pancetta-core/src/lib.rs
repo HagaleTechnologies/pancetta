@@ -24,10 +24,12 @@
 
 pub mod error;
 pub mod gridsquare;
+pub mod response_step;
 pub mod slot;
 pub mod types;
 
 // Re-export core types at the crate root for convenience
+pub use response_step::ResponseStep;
 pub use types::{Band, Mode, ModeValue, PancettaError, PancettaResult, StandardMode};
 
 // Re-export error handling types

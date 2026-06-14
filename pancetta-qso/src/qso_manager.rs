@@ -581,6 +581,222 @@ impl QsoManager {
         Ok(qso_id)
     }
 
+    /// Respond to a station **calling us**, opening the exchange at an
+    /// operator-chosen [`ResponseStep`] instead of always sending our grid.
+    ///
+    /// This is the engine half of the TUI "Callers" panel. The operator picks
+    /// a caller and pancetta classifies what they sent (their CQ/grid →
+    /// `Grid`, their report → `ReportAck`, etc.), with a manual override. We
+    /// reuse all of [`respond_to_cq_with`](Self::respond_to_cq_with)'s manual
+    /// machinery — self-duplicate-gate bypass, superseding a same-call QSO,
+    /// latching `tx_parity = dx_parity.opposite()`, and per-slot keep-calling
+    /// under the manual watchdog — but set the *initial* [`QsoState`] and emit
+    /// the *first* [`MessageType`] according to `step`:
+    ///
+    /// | step         | initial state          | first message      |
+    /// |--------------|------------------------|--------------------|
+    /// | `Grid`       | `RespondingToCq`       | `CqResponse` (grid)|
+    /// | `Report`     | `SendingReport`        | `SignalReport`     |
+    /// | `ReportAck`  | `SendingReport`        | `ReportAck`        |
+    /// | `Rr73`       | `WaitingForConfirmation` | `FinalConfirmation` |
+    /// | `SeventyThree` | `Completed`          | `SeventyThree` (+ QsoCompleted) |
+    ///
+    /// `our_snr_of_them` is our measurement of the caller's signal; it
+    /// produces the report we send (rounded, clamped to −30..50, defaulting to
+    /// −15 if absent). `their_report` is the report they sent us, if known —
+    /// used to populate the `their_report` field of the `SendingReport` /
+    /// `WaitingForConfirmation` state for `ReportAck`/`Rr73` opens.
+    ///
+    /// The `Grid` step is exactly equivalent to `respond_to_cq_manual`, so the
+    /// DX-Hunter path (which still uses `StartQso` → `respond_to_cq_manual`) is
+    /// unaffected.
+    pub async fn respond_to_caller(
+        &self,
+        target: String,
+        frequency: f64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+        step: pancetta_core::ResponseStep,
+        our_snr_of_them: Option<f32>,
+        their_report: Option<i8>,
+    ) -> Result<QsoId, QsoManagerError> {
+        use pancetta_core::ResponseStep;
+
+        // Grid is exactly the historical manual-call behavior; route through
+        // the existing path so there is a single source of truth for it.
+        if step == ResponseStep::Grid {
+            return self
+                .respond_to_cq_with(target, frequency, dx_parity, CallInitiation::Manual)
+                .await;
+        }
+
+        if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
+            return Err(QsoManagerError::Configuration {
+                message: format!(
+                    "Cannot transmit with placeholder callsign '{}'. Configure your callsign first.",
+                    self.config.our_callsign
+                ),
+            });
+        }
+
+        // Manual: supersede any same-call QSO on this band, then build the new
+        // one (no duplicate gate — the operator explicitly chose this caller).
+        self.supersede_active_qsos_for(&target, frequency).await;
+
+        let qso_id = Uuid::new_v4();
+        let now = Utc::now();
+        let tx_parity = dx_parity.map(|p| p.opposite());
+
+        // Our report of their signal (the report WE send), same formula the
+        // auto-sequencer uses in `MessageExchange::generate_response`, but
+        // defaulting to -15 when we have no measurement.
+        let our_report: SignalReport = our_snr_of_them
+            .map(|s| (s.round() as i8).clamp(-30, 50))
+            .unwrap_or(-15);
+        // Their report of us (only meaningful for ReportAck/Rr73 opens).
+        let their_report_val: SignalReport = their_report.unwrap_or(-15);
+
+        // Build (initial_state, first_message) for the chosen step.
+        let (state, message): (QsoState, MessageType) = match step {
+            ResponseStep::Grid => unreachable!("Grid handled above"),
+            ResponseStep::Report => (
+                QsoState::SendingReport {
+                    their_callsign: target.clone(),
+                    their_report: None,
+                    our_report,
+                    frequency,
+                    started_at: now,
+                },
+                MessageType::SignalReport {
+                    to_station: target.clone(),
+                    from_station: self.config.our_callsign.clone(),
+                    report: our_report,
+                },
+            ),
+            ResponseStep::ReportAck => (
+                QsoState::SendingReport {
+                    their_callsign: target.clone(),
+                    their_report: Some(their_report_val),
+                    our_report,
+                    frequency,
+                    started_at: now,
+                },
+                MessageType::ReportAck {
+                    to_station: target.clone(),
+                    from_station: self.config.our_callsign.clone(),
+                    report: our_report,
+                },
+            ),
+            ResponseStep::Rr73 => (
+                QsoState::WaitingForConfirmation {
+                    their_callsign: target.clone(),
+                    their_report: their_report_val,
+                    our_report,
+                    frequency,
+                    grid_square: None,
+                    started_at: now,
+                },
+                MessageType::FinalConfirmation {
+                    to_station: target.clone(),
+                    from_station: self.config.our_callsign.clone(),
+                },
+            ),
+            ResponseStep::SeventyThree => (
+                QsoState::Completed {
+                    their_callsign: target.clone(),
+                    their_report: their_report_val,
+                    our_report,
+                    frequency,
+                    grid_square: None,
+                    completed_at: now,
+                    duration_seconds: 0,
+                },
+                MessageType::SeventyThree {
+                    to_station: target.clone(),
+                    from_station: self.config.our_callsign.clone(),
+                },
+            ),
+        };
+
+        let mut metadata = QsoMetadata {
+            qso_id,
+            our_callsign: self.config.our_callsign.clone(),
+            their_callsign: Some(target.clone()),
+            frequency,
+            mode: "FT8".to_string(),
+            start_time: now,
+            end_time: None,
+            reports: SignalReports::default(),
+            grids: GridSquares {
+                ours: self.config.our_grid.clone(),
+                theirs: None,
+            },
+            contest_info: None,
+            tags: HashMap::new(),
+            notes: None,
+            tx_parity,
+            initiated_by: CallInitiation::Manual,
+            call_count: 1,
+            first_call_at: Some(now),
+            last_call_at: Some(now),
+        };
+
+        // If we are opening at the close (SeventyThree → Completed), stamp the
+        // completion reports/end-time so the logged record is well-formed.
+        let is_completed_open = matches!(state, QsoState::Completed { .. });
+        if is_completed_open {
+            metadata.reports = SignalReports {
+                sent: Some(our_report),
+                received: Some(their_report_val),
+            };
+            metadata.end_time = Some(now);
+        }
+
+        let progress = QsoProgress {
+            state: state.clone(),
+            state_history: vec![],
+            messages: vec![QsoMessage {
+                timestamp: now,
+                direction: MessageDirection::Sent,
+                message_type: message.clone(),
+                raw_text: String::new(),
+                signal_strength: None,
+                frequency,
+            }],
+            metadata: metadata.clone(),
+        };
+
+        self.qsos.write().await.insert(qso_id, progress);
+        self.add_callsign_mapping(&target, qso_id).await;
+
+        self.emit_event(QsoEvent::MessageToSend {
+            qso_id,
+            message,
+            frequency,
+            tx_parity,
+        })
+        .await;
+
+        info!(
+            "Responding to caller {} on {:.1} Hz at step {:?}: {}",
+            target, frequency, step, qso_id
+        );
+
+        // If we opened directly at the close, emit QsoCompleted so the logger
+        // records the QSO. Mirror the completion metadata path in
+        // `process_message_for_qso`, including the dial-frequency stamp so the
+        // ADIF carries the real on-air RF frequency, not the bare audio offset.
+        if is_completed_open {
+            let dial = self.dial_frequency_hz.load(Ordering::Relaxed);
+            if dial > 0 {
+                metadata.frequency += dial as f64;
+            }
+            self.emit_event(QsoEvent::QsoCompleted { qso_id, metadata })
+                .await;
+        }
+
+        Ok(qso_id)
+    }
+
     /// Process an incoming message
     pub async fn process_message(
         &self,
@@ -2829,6 +3045,261 @@ mod reply_emitter_tests {
             })
             .expect("expected a QsoCompleted event");
         assert_eq!(metadata.frequency, FREQ);
+    }
+
+    // --- respond_to_caller: open the exchange at a chosen ResponseStep ----
+
+    use pancetta_core::ResponseStep;
+
+    /// `Grid` opens exactly like the historical manual call: state
+    /// `RespondingToCq` and a first message of `CqResponse` carrying our grid.
+    #[tokio::test]
+    async fn respond_to_caller_grid_matches_legacy_manual() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_caller(DX.into(), FREQ, None, ResponseStep::Grid, Some(-12.0), None)
+            .await
+            .unwrap();
+        let sends = messages_to_send(&drain(&mut rx));
+        assert_eq!(sends.len(), 1);
+        match &sends[0] {
+            MessageType::CqResponse {
+                calling_station,
+                responding_station,
+                grid,
+            } => {
+                assert_eq!(calling_station, DX);
+                assert_eq!(responding_station, OUR);
+                assert_eq!(grid.as_deref(), Some("EM12"));
+            }
+            other => panic!("expected CqResponse, got {other:?}"),
+        }
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(matches!(progress.state, QsoState::RespondingToCq { .. }));
+        assert_eq!(progress.metadata.initiated_by, CallInitiation::Manual);
+    }
+
+    /// `Report` opens at state `SendingReport` (their_report None) and a first
+    /// message of `SignalReport` carrying the report derived from our SNR.
+    #[tokio::test]
+    async fn respond_to_caller_report_emits_signal_report() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::Report,
+                Some(-9.0),
+                None,
+            )
+            .await
+            .unwrap();
+        let sends = messages_to_send(&drain(&mut rx));
+        assert_eq!(sends.len(), 1);
+        match &sends[0] {
+            MessageType::SignalReport {
+                to_station,
+                from_station,
+                report,
+            } => {
+                assert_eq!(to_station, DX);
+                assert_eq!(from_station, OUR);
+                assert_eq!(*report, -9);
+            }
+            other => panic!("expected SignalReport, got {other:?}"),
+        }
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        match progress.state {
+            QsoState::SendingReport {
+                their_report,
+                our_report,
+                ..
+            } => {
+                assert_eq!(their_report, None);
+                assert_eq!(our_report, -9);
+            }
+            other => panic!("expected SendingReport, got {other:?}"),
+        }
+    }
+
+    /// `ReportAck` opens at state `SendingReport` (their_report Some) and a
+    /// first message of `ReportAck` (R-report).
+    #[tokio::test]
+    async fn respond_to_caller_report_ack_emits_report_ack() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::ReportAck,
+                Some(-10.0),
+                Some(-3),
+            )
+            .await
+            .unwrap();
+        let sends = messages_to_send(&drain(&mut rx));
+        assert_eq!(sends.len(), 1);
+        match &sends[0] {
+            MessageType::ReportAck {
+                to_station,
+                from_station,
+                report,
+            } => {
+                assert_eq!(to_station, DX);
+                assert_eq!(from_station, OUR);
+                assert_eq!(*report, -10);
+            }
+            other => panic!("expected ReportAck, got {other:?}"),
+        }
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        match progress.state {
+            QsoState::SendingReport { their_report, .. } => {
+                assert_eq!(their_report, Some(-3));
+            }
+            other => panic!("expected SendingReport, got {other:?}"),
+        }
+    }
+
+    /// `Rr73` opens at state `WaitingForConfirmation` and a first message of
+    /// `FinalConfirmation` (RR73).
+    #[tokio::test]
+    async fn respond_to_caller_rr73_emits_final_confirmation() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::Rr73,
+                Some(-5.0),
+                Some(-7),
+            )
+            .await
+            .unwrap();
+        let sends = messages_to_send(&drain(&mut rx));
+        assert_eq!(sends.len(), 1);
+        assert!(
+            matches!(sends[0], MessageType::FinalConfirmation { .. }),
+            "expected FinalConfirmation, got {:?}",
+            sends[0]
+        );
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(matches!(
+            progress.state,
+            QsoState::WaitingForConfirmation { .. }
+        ));
+    }
+
+    /// `SeventyThree` opens directly at `Completed`, emits a `SeventyThree`
+    /// first message AND a `QsoCompleted` event so the QSO is logged.
+    #[tokio::test]
+    async fn respond_to_caller_seventy_three_completes_and_logs() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::SeventyThree,
+                Some(-8.0),
+                Some(-4),
+            )
+            .await
+            .unwrap();
+        let events = drain(&mut rx);
+        let sends = messages_to_send(&events);
+        assert_eq!(sends.len(), 1);
+        assert!(
+            matches!(sends[0], MessageType::SeventyThree { .. }),
+            "expected SeventyThree, got {:?}",
+            sends[0]
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::QsoCompleted { .. })),
+            "expected a QsoCompleted event (ADIF log)"
+        );
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(matches!(progress.state, QsoState::Completed { .. }));
+    }
+
+    /// `our_snr_of_them = None` falls back to a sane default report (-15).
+    #[tokio::test]
+    async fn respond_to_caller_defaults_report_when_no_snr() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        manager
+            .respond_to_caller(DX.into(), FREQ, None, ResponseStep::Report, None, None)
+            .await
+            .unwrap();
+        let sends = messages_to_send(&drain(&mut rx));
+        match &sends[0] {
+            MessageType::SignalReport { report, .. } => assert_eq!(*report, -15),
+            other => panic!("expected SignalReport, got {other:?}"),
+        }
+    }
+
+    /// A full sequence opened at `ReportAck`: we send R-report, the DX answers
+    /// RR73, and the QSO completes (and logs) via the normal state machine.
+    #[tokio::test]
+    async fn respond_to_caller_report_ack_through_rr73_completes() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::ReportAck,
+                Some(-10.0),
+                Some(-3),
+            )
+            .await
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // DX rogers our R-report with RR73 → we close with 73 and complete.
+        manager
+            .process_message(
+                MessageType::FinalConfirmation {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                },
+                format!("{} {} RR73", OUR, DX),
+                FREQ,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        let sends = messages_to_send(&events);
+        assert_eq!(sends.len(), 1, "expected one reply (73), got {:?}", sends);
+        assert!(
+            matches!(sends[0], MessageType::SeventyThree { .. }),
+            "expected SeventyThree, got {:?}",
+            sends[0]
+        );
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::Completed { .. }),
+            "expected Completed, got {:?}",
+            progress.state
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::QsoCompleted { .. })),
+            "expected a QsoCompleted event"
+        );
     }
 
     /// FIX 2: Manual QSO in SendingReport + a bare "73" (DX skipped RR73) →

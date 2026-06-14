@@ -12,12 +12,14 @@ use crate::widgets::Waterfall;
 
 pub mod active_qsos;
 pub mod band_activity;
+pub mod callers;
 pub mod dx_hunter;
 pub mod qso_status;
 pub mod station_info;
 
 use active_qsos::render_active_qsos;
 use band_activity::render_band_activity;
+use callers::render_callers;
 use dx_hunter::render_dx_hunter;
 use qso_status::render_qso_status;
 use station_info::render_station_info;
@@ -57,9 +59,15 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
         ])
         .split(main_chunks[0]);
 
+    // Right column: Station Info (small), Callers (who's calling us), then
+    // DX Hunter (largest).
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(20), Constraint::Percentage(80)])
+        .constraints([
+            Constraint::Percentage(18), // Station Info
+            Constraint::Percentage(32), // Callers
+            Constraint::Percentage(50), // DX Hunter
+        ])
         .split(main_chunks[1]);
 
     // Render panels
@@ -68,7 +76,8 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     render_waterfall(f, left_chunks[2], app);
     render_qso_status(f, left_chunks[3], app)?;
     render_station_info(f, right_chunks[0], app)?;
-    render_dx_hunter(f, right_chunks[1], app)?;
+    render_callers(f, right_chunks[1], app)?;
+    render_dx_hunter(f, right_chunks[2], app)?;
 
     // Render status bar
     render_status_bar(f, chunks[2], app);
@@ -84,7 +93,8 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
             left_chunks[1],  // BandActivity
             left_chunks[3],  // QsoStatus
             right_chunks[0], // StationInfo
-            right_chunks[1], // DxHunter
+            right_chunks[1], // Callers
+            right_chunks[2], // DxHunter
         ],
     );
 
@@ -360,7 +370,8 @@ fn render_active_panel_highlight(f: &mut Frame<'_>, app: &App, panel_areas: &[Re
         ActivePanel::BandActivity => panel_areas[0],
         ActivePanel::QsoStatus => panel_areas[1],
         ActivePanel::StationInfo => panel_areas[2],
-        ActivePanel::DxHunter => panel_areas[3],
+        ActivePanel::Callers => panel_areas[3],
+        ActivePanel::DxHunter => panel_areas[4],
     };
 
     // Draw a subtle highlight border around the active panel

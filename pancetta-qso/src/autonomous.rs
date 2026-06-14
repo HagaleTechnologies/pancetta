@@ -1443,7 +1443,11 @@ fn is_cq_message(text: &str) -> bool {
 
 /// Returns `true` if `tok` looks like a report / RR73 / RRR / 73 payload —
 /// the trailing token of a standard FT8 exchange (vs. a grid in a reply).
-fn is_exchange_payload(tok: &str) -> bool {
+///
+/// `pub` so callers that need the same "is this the payload of a committed
+/// exchange" test (e.g. the TUI Callers panel's busy detector mirrors this
+/// logic) have a single canonical definition.
+pub fn is_exchange_payload(tok: &str) -> bool {
     let u = tok.to_uppercase();
     if u == "RR73" || u == "RRR" || u == "73" || u == "RR" {
         return true;
@@ -1465,7 +1469,12 @@ fn is_exchange_payload(tok: &str) -> bool {
 /// Returns an empty vec for CQs, messages involving `our_callsign`, replies
 /// that carry a grid (not yet a committed exchange), and anything that does
 /// not parse as a 3-token `<to> <from> <payload>` exchange.
-fn third_party_exchange_callsigns(text: &str, our_callsign: &str) -> Vec<String> {
+///
+/// `pub` so the TUI Callers panel's "BUSY" detector can share this exact
+/// definition (it re-implements an equivalent locally because `pancetta-tui`
+/// does not depend on `pancetta-qso`; keeping this canonical and tested
+/// guards both copies against drift).
+pub fn third_party_exchange_callsigns(text: &str, our_callsign: &str) -> Vec<String> {
     if is_cq_message(text) {
         return Vec::new();
     }
