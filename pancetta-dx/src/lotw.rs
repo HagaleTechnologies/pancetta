@@ -129,6 +129,11 @@ impl Default for LotwDownloadParams {
     }
 }
 
+// TODO(lotw): per-QSO auto-upload to LoTW is deferred. Unlike ClubLog/QRZ
+// (a raw ADIF POST — see `qso_upload.rs`), LoTW requires each record to be
+// digitally signed with the operator's TQSL certificate (TQSL produces a
+// signed .tq8). Until TQSL signing is wired in, the coordinator does not
+// auto-upload completed QSOs to LoTW; ClubLog + QRZ are the supported targets.
 /// LoTW client
 pub struct LotwClient {
     /// HTTP client

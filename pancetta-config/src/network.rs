@@ -37,9 +37,64 @@ pub struct NetworkConfig {
     /// cqdx.io integration configuration
     pub cqdx: CqdxConfig,
 
+    /// ClubLog real-time QSO upload configuration (opt-in; default disabled)
+    #[serde(default)]
+    pub clublog: ClubLogConfig,
+
+    /// QRZ Logbook QSO upload configuration (opt-in; default disabled)
+    #[serde(default)]
+    pub qrz_logbook: QrzLogbookConfig,
+
     /// Custom service integrations
     #[serde(default)]
     pub custom_services: HashMap<String, CustomServiceConfig>,
+}
+
+/// ClubLog real-time QSO upload configuration.
+///
+/// When [`enabled`](Self::enabled) is `true`, each completed QSO is POSTed as
+/// a single ADIF record to ClubLog's `realtime.php` endpoint. All credentials
+/// stay on the operator's machine (keep the config file `chmod 600`) and are
+/// never logged.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ClubLogConfig {
+    /// Enable per-QSO uploads to ClubLog.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Registered ClubLog account email address (NOT a callsign).
+    #[serde(default)]
+    pub email: String,
+
+    /// ClubLog account password (an Application Password is recommended).
+    #[serde(default)]
+    pub password: String,
+
+    /// Station callsign the log is uploaded into. When empty, the caller
+    /// falls back to the QSO's own (`our_callsign`) value.
+    #[serde(default)]
+    pub callsign: String,
+
+    /// ClubLog application API key (per-application, from the ClubLog API page).
+    #[serde(default)]
+    pub api_key: String,
+}
+
+/// QRZ Logbook QSO upload configuration.
+///
+/// When [`enabled`](Self::enabled) is `true`, each completed QSO is POSTed as
+/// a single ADIF record to the QRZ Logbook API (`logbook.qrz.com/api`). The
+/// API key is per-logbook (from the logbook's Settings page) and is never
+/// logged. Keep the config file `chmod 600`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct QrzLogbookConfig {
+    /// Enable per-QSO uploads to QRZ Logbook.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Per-logbook API access key (from the QRZ logbook Settings page).
+    #[serde(default)]
+    pub api_key: String,
 }
 
 /// PSKReporter service configuration
@@ -1098,6 +1153,34 @@ impl ConfigSection for NetworkConfig {
             }
         }
 
+        // ClubLog upload validation — enabling requires the credentials the
+        // realtime.php POST needs (email, password, api_key). The callsign may
+        // be left empty (the coordinator falls back to the QSO's own call).
+        if self.clublog.enabled {
+            if self.clublog.email.is_empty() {
+                return Err(ConfigError::Validation(
+                    "ClubLog upload enabled but no email configured".to_string(),
+                ));
+            }
+            if self.clublog.password.is_empty() {
+                return Err(ConfigError::Validation(
+                    "ClubLog upload enabled but no password configured".to_string(),
+                ));
+            }
+            if self.clublog.api_key.is_empty() {
+                return Err(ConfigError::Validation(
+                    "ClubLog upload enabled but no api_key configured".to_string(),
+                ));
+            }
+        }
+
+        // QRZ Logbook upload validation — enabling requires the per-logbook API key.
+        if self.qrz_logbook.enabled && self.qrz_logbook.api_key.is_empty() {
+            return Err(ConfigError::Validation(
+                "QRZ Logbook upload enabled but no api_key configured".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -1234,6 +1317,56 @@ mod tests {
         assert!(config.validate_section().is_err());
 
         config.cqdx.poll_interval_secs = 30;
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_clublog_defaults_disabled() {
+        let config = NetworkConfig::default();
+        assert!(!config.clublog.enabled);
+        assert!(config.clublog.email.is_empty());
+        assert!(config.clublog.password.is_empty());
+        assert!(config.clublog.callsign.is_empty());
+        assert!(config.clublog.api_key.is_empty());
+        // Disabled with empty creds must validate cleanly.
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_qrz_logbook_defaults_disabled() {
+        let config = NetworkConfig::default();
+        assert!(!config.qrz_logbook.enabled);
+        assert!(config.qrz_logbook.api_key.is_empty());
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_clublog_validation_enabled_without_creds_fails() {
+        let mut config = NetworkConfig::default();
+        config.clublog.enabled = true;
+        // No creds at all.
+        assert!(config.validate_section().is_err());
+
+        // Email only — still missing password + api_key.
+        config.clublog.email = "op@example.com".to_string();
+        assert!(config.validate_section().is_err());
+
+        // Email + password — still missing api_key.
+        config.clublog.password = "secret".to_string();
+        assert!(config.validate_section().is_err());
+
+        // All required creds present (callsign may stay empty).
+        config.clublog.api_key = "appkey123".to_string();
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_qrz_logbook_validation_enabled_without_key_fails() {
+        let mut config = NetworkConfig::default();
+        config.qrz_logbook.enabled = true;
+        assert!(config.validate_section().is_err());
+
+        config.qrz_logbook.api_key = "qrzkey123".to_string();
         assert!(config.validate_section().is_ok());
     }
 }

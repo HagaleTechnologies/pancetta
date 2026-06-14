@@ -57,10 +57,17 @@ impl super::ApplicationCoordinator {
         } else {
             Some(config.station.grid_square.clone())
         };
+        // Snapshot the opt-in QSO-upload settings. Only when at least one is
+        // enabled do we build clients + spawn the upload subscriber.
+        let clublog_cfg = config.network.clublog.clone();
+        let qrz_cfg = config.network.qrz_logbook.clone();
         drop(config);
+
+        let upload_enabled = clublog_cfg.enabled || qrz_cfg.enabled;
 
         let qso_lookup = self.cached_lookup.clone();
         let cqdx_bridge = self.cqdx_bridge.clone();
+        let upload_our_callsign = our_callsign.clone();
         let active_qso_ap = self.active_qso_ap.clone();
         let active_qso_freq_hz = self.active_qso_freq_hz.clone();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
@@ -153,6 +160,20 @@ impl super::ApplicationCoordinator {
                         None
                     }
                 };
+
+                // Per-QSO log-upload subscriber (ClubLog + QRZ Logbook).
+                // Opt-in: only spawned when at least one is enabled. Best-effort
+                // and fully decoupled from the QSO pipeline — each upload runs in
+                // its own task so a slow/failing service never blocks logging.
+                if upload_enabled {
+                    start_qso_upload_subscriber(
+                        clublog_cfg.clone(),
+                        qrz_cfg.clone(),
+                        upload_our_callsign.clone(),
+                        qso_manager.subscribe(),
+                        shutdown.clone(),
+                    );
+                }
 
                 // Seed worked-station history from the QSO database so that
                 // previously-worked stations are recognised as duplicates across restarts.
@@ -958,6 +979,136 @@ mod snapshot_tests {
 /// it indicates a real problem (disk full, permissions, etc.) that the operator
 /// should investigate. The task handles receiver lag and channel closure
 /// gracefully so it never blocks or panics.
+/// Spawn a background task that uploads each completed QSO to the operator's
+/// online logbooks (ClubLog and/or QRZ Logbook), one ADIF record per QSO.
+///
+/// The single ADIF record is rendered exactly as the source-of-truth ADIF
+/// writer renders it (`AdifProcessor::qso_to_adif` → `generate_record`), so the
+/// uploaded record matches `~/.pancetta/qsos.adi`.
+///
+/// Best-effort by design: uploads are decoupled from the QSO pipeline and never
+/// block it. Each per-service upload is spawned in its own task. Successes log
+/// at `info!`, duplicates at `info!`, failures at `warn!` (target
+/// `"qso.upload"`). Credentials are never logged.
+fn start_qso_upload_subscriber(
+    clublog_cfg: pancetta_config::network::ClubLogConfig,
+    qrz_cfg: pancetta_config::network::QrzLogbookConfig,
+    our_callsign: String,
+    mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::Arc;
+
+    // Build the enabled clients once and share them across uploads.
+    let clublog_client = if clublog_cfg.enabled {
+        // Fall back to the QSO's own call when no station call is configured.
+        let callsign = if clublog_cfg.callsign.is_empty() {
+            our_callsign.clone()
+        } else {
+            clublog_cfg.callsign.clone()
+        };
+        Some(Arc::new(pancetta_dx::ClubLogClient::new(
+            clublog_cfg.email.clone(),
+            clublog_cfg.password.clone(),
+            callsign,
+            clublog_cfg.api_key.clone(),
+        )))
+    } else {
+        None
+    };
+
+    let qrz_client = if qrz_cfg.enabled {
+        Some(Arc::new(pancetta_dx::QrzLogbookClient::new(
+            qrz_cfg.api_key.clone(),
+        )))
+    } else {
+        None
+    };
+
+    if clublog_client.is_some() {
+        info!(target: "qso.upload", "ClubLog per-QSO upload enabled");
+    }
+    if qrz_client.is_some() {
+        info!(target: "qso.upload", "QRZ Logbook per-QSO upload enabled");
+    }
+
+    tokio::spawn(async move {
+        let processor = pancetta_qso::AdifProcessor::new();
+
+        while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            match events.recv().await {
+                Ok(pancetta_qso::QsoEvent::QsoCompleted { metadata, .. }) => {
+                    // Render the single ADIF record the same way the
+                    // source-of-truth writer does.
+                    let adif_qso = processor.qso_to_adif(&metadata, metadata.contest_info.as_ref());
+                    let record = match processor.generate_record(&adif_qso) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            warn!(
+                                target: "qso.upload",
+                                "Skipping upload for QSO {}: ADIF render failed: {}",
+                                metadata.qso_id, e
+                            );
+                            continue;
+                        }
+                    };
+
+                    let their = metadata
+                        .their_callsign
+                        .clone()
+                        .unwrap_or_else(|| "?".to_string());
+
+                    if let Some(client) = clublog_client.clone() {
+                        let record = record.clone();
+                        let their = their.clone();
+                        tokio::spawn(async move {
+                            match client.upload_adif(&record).await {
+                                Ok(()) => info!(
+                                    target: "qso.upload",
+                                    "ClubLog: uploaded QSO with {}", their
+                                ),
+                                Err(e) => warn!(
+                                    target: "qso.upload",
+                                    "ClubLog: upload failed for {}: {}", their, e
+                                ),
+                            }
+                        });
+                    }
+
+                    if let Some(client) = qrz_client.clone() {
+                        let record = record.clone();
+                        let their = their.clone();
+                        tokio::spawn(async move {
+                            match client.upload_adif(&record).await {
+                                Ok(pancetta_dx::QrzInsertOutcome::Inserted { logid }) => info!(
+                                    target: "qso.upload",
+                                    "QRZ: uploaded QSO with {} (logid={})",
+                                    their,
+                                    logid.as_deref().unwrap_or("?")
+                                ),
+                                Ok(pancetta_dx::QrzInsertOutcome::Duplicate { .. }) => info!(
+                                    target: "qso.upload",
+                                    "QRZ: QSO with {} already logged (duplicate, skipped)",
+                                    their
+                                ),
+                                Err(e) => warn!(
+                                    target: "qso.upload",
+                                    "QRZ: upload failed for {}: {}", their, e
+                                ),
+                            }
+                        });
+                    }
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(target: "qso.upload", "QSO upload subscriber lagged by {n} events");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 fn start_adif_subscriber(
     writer: std::sync::Arc<pancetta_qso::AdifLogWriter>,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,

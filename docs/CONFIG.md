@@ -213,6 +213,58 @@ LoTW credential handling refuses to send the username/password unless
 (`https://lotw.arrl.org`) and protects you from a typo or hostile
 config override that would otherwise transmit credentials in cleartext.
 
+### Per-QSO log upload — ClubLog and QRZ Logbook
+
+When a QSO completes, pancetta can upload that single QSO (as one ADIF
+record) straight to your online logbooks. Both integrations are
+**opt-in and default `enabled = false`**. They run best-effort and never
+block or fail the QSO pipeline; results are logged under the
+`qso.upload` target. **Credentials stay local** — they are read from
+this file and never logged. Keep the file readable only by you:
+`chmod 600 ~/.pancetta/config.toml`.
+
+> **LoTW auto-upload is deferred.** Unlike ClubLog/QRZ, LoTW requires
+> each record to be digitally signed with your TQSL certificate, not a
+> raw ADIF POST, so per-QSO LoTW upload is not yet wired. Point WSJT-X /
+> TQSL at `~/.pancetta/qsos.adi` for LoTW in the meantime.
+
+```toml
+[network.clublog]
+enabled  = false
+email    = ""        # your ClubLog account email (NOT a callsign), plaintext on disk
+password = ""        # ClubLog password (an Application Password is recommended), plaintext
+callsign = ""        # station call the log uploads into; empty = use the QSO's own call
+api_key  = ""        # ClubLog application API key
+
+[network.qrz_logbook]
+enabled = false
+api_key = ""         # per-logbook API access key, plaintext on disk
+```
+
+| Key | Service | Notes |
+|---|---|---|
+| `clublog.enabled` | ClubLog | Master switch. When `true`, `email`, `password`, and `api_key` are all required (validation fails otherwise). |
+| `clublog.email` | ClubLog | The email registered with your ClubLog account. |
+| `clublog.password` | ClubLog | Account password. Plaintext on disk. |
+| `clublog.callsign` | ClubLog | The station callsign the log is filed under. Leave empty to use each QSO's own callsign. |
+| `clublog.api_key` | ClubLog | Application API key. |
+| `qrz_logbook.enabled` | QRZ | Master switch. When `true`, `api_key` is required. |
+| `qrz_logbook.api_key` | QRZ | Per-logbook API access key. |
+
+**Getting the keys:**
+
+- **ClubLog:** create a free account at <https://clublog.org>, then
+  request an application API key on the ClubLog API page
+  (<https://clublog.org/need_api.php>). The realtime upload POSTs to
+  `https://clublog.org/realtime.php` with your email + password +
+  callsign + API key. A duplicate QSO is accepted (HTTP 200) and is
+  harmless.
+- **QRZ Logbook:** open your logbook on <https://logbook.qrz.com>, go to
+  the logbook's **Settings**, and copy the **API access key** (this is a
+  per-logbook key, distinct from your QRZ XML subscription). Uploads POST
+  to `https://logbook.qrz.com/api` with `ACTION=INSERT`. A QSO that QRZ
+  already has is reported as a duplicate and skipped (non-fatal).
+
 ---
 
 ## `[ui]` — TUI behaviour

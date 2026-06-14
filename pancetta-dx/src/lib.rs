@@ -42,6 +42,9 @@
 pub mod cluster;
 pub mod lotw;
 pub mod pskreporter;
+pub mod qso_upload;
+
+pub use qso_upload::{ClubLogClient, QrzInsertOutcome, QrzLogbookClient};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
