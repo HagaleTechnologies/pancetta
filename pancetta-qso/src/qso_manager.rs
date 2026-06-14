@@ -660,12 +660,47 @@ impl QsoManager {
             .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
 
         let old_state = progress.state.clone();
+        // Capture per-QSO routing data while we hold the write lock so the
+        // reply emission below does not need to re-acquire it (which would
+        // deadlock against this guard).
+        let qso_frequency = progress.metadata.frequency;
+        let qso_tx_parity = progress.metadata.tx_parity;
+        let qso_initiated_by = progress.metadata.initiated_by;
         progress.messages.push(message.clone());
 
         // Determine state transition based on current state and message
         let new_state = self
             .determine_state_transition(&old_state, &message.message_type, message.signal_strength)
             .await?;
+
+        // Auto-sequence the outbound reply for MANUAL-initiated QSOs only.
+        // The reply is generated from the SAME (pre-transition state,
+        // received message) pair that drove the transition, so the two never
+        // disagree. Autonomous-initiated QSOs are deliberately left UNCHANGED
+        // (no auto-reply) — that remains gated for Phase 5.
+        //
+        // `reply_to_emit` is captured here (under the lock) and emitted after
+        // the write guard is released, since `emit_event` only needs the
+        // broadcast channel, not the QSO map.
+        let mut reply_to_emit: Option<MessageType> = None;
+        if new_state != old_state && qso_initiated_by == CallInitiation::Manual {
+            let exchange = crate::exchange::MessageExchange::new(self.config.our_callsign.clone());
+            match exchange.generate_response(
+                &old_state,
+                &message.message_type,
+                message.signal_strength,
+            ) {
+                Ok(Some(reply)) => reply_to_emit = Some(reply),
+                Ok(None) => {}
+                Err(e) => {
+                    warn!(
+                        qso_id = %qso_id,
+                        "failed to generate auto-sequence reply: {}",
+                        e
+                    );
+                }
+            }
+        }
 
         if new_state != old_state {
             // If transitioning to Completed, update metadata with signal reports and end time
@@ -711,6 +746,24 @@ impl QsoManager {
 
         self.emit_event(QsoEvent::MessageReceived { qso_id, message })
             .await;
+
+        // Release the QSO map write lock before emitting the reply so the
+        // emission path holds no locks (and a future change to send_message-
+        // style routing cannot deadlock).
+        drop(qsos);
+
+        // Emit the auto-sequenced reply for manual QSOs. We transmit on the
+        // QSO's own frequency and reuse the tx_parity latched at QSO start,
+        // exactly as the initial-call MessageToSend does.
+        if let Some(reply) = reply_to_emit {
+            self.emit_event(QsoEvent::MessageToSend {
+                qso_id,
+                message: reply,
+                frequency: qso_frequency,
+                tx_parity: qso_tx_parity,
+            })
+            .await;
+        }
 
         Ok(())
     }
@@ -1709,5 +1762,334 @@ mod sender_verification_tests {
             .await
             .unwrap();
         assert!(matches!(new_state, QsoState::Completed { .. }));
+    }
+}
+
+#[cfg(test)]
+mod reply_emitter_tests {
+    //! Auto-sequence reply emitter for MANUAL QSOs.
+    //!
+    //! Drives a manual QSO through the full inbound exchange and asserts the
+    //! outbound `MessageToSend` replies (R-report → RR73 → 73) are emitted,
+    //! that the QSO completes + logs, and that autonomous QSOs do NOT
+    //! auto-reply.
+    use super::*;
+
+    const OUR: &str = "K5ARH";
+    const DX: &str = "K9ZZ";
+    const FREQ: f64 = 1500.0;
+
+    fn manager() -> QsoManager {
+        let config = QsoManagerConfig {
+            our_callsign: OUR.into(),
+            our_grid: Some("EM12".into()),
+            timeouts: TimeoutConfig::default(),
+            contest_mode: None,
+            auto_sequence: AutoSequenceConfig::default(),
+            duplicate_checking: DuplicateCheckConfig::default(),
+        };
+        QsoManager::new(config)
+    }
+
+    /// Drain currently-buffered events into a Vec.
+    fn drain(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn messages_to_send(events: &[QsoEvent]) -> Vec<MessageType> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                QsoEvent::MessageToSend { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// On-air text the coordinator would generate for an emitted reply.
+    fn on_air(msg: &MessageType) -> String {
+        crate::utils::generate_ft8_message(msg, OUR).unwrap()
+    }
+
+    /// 1. Manual QSO in RespondingToCq + SignalReport → emits ReportAck
+    ///    (R+report) and state advances to SendingReport.
+    #[tokio::test]
+    async fn manual_signal_report_emits_report_ack() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let _ = drain(&mut rx); // discard the initial CqResponse call
+
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        let sends = messages_to_send(&events);
+        assert_eq!(
+            sends.len(),
+            1,
+            "expected exactly one reply, got {:?}",
+            sends
+        );
+        match &sends[0] {
+            MessageType::ReportAck {
+                to_station,
+                from_station,
+                report,
+            } => {
+                assert_eq!(to_station, DX);
+                assert_eq!(from_station, OUR);
+                // snr -15 → our report -15 (matches SendingReport.our_report).
+                assert_eq!(*report, -15);
+            }
+            other => panic!("expected ReportAck, got {:?}", other),
+        }
+        assert_eq!(on_air(&sends[0]), "K9ZZ K5ARH R-15");
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::SendingReport { .. }),
+            "expected SendingReport, got {:?}",
+            progress.state
+        );
+    }
+
+    /// 2. Manual QSO in SendingReport + ReportAck → emits FinalConfirmation
+    ///    (RR73) and state advances to WaitingForConfirmation.
+    #[tokio::test]
+    async fn manual_report_ack_emits_final_confirmation() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        // Advance to SendingReport.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} R-07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let sends = messages_to_send(&drain(&mut rx));
+        assert_eq!(sends.len(), 1, "expected one reply, got {:?}", sends);
+        match &sends[0] {
+            MessageType::FinalConfirmation {
+                to_station,
+                from_station,
+            } => {
+                assert_eq!(to_station, DX);
+                assert_eq!(from_station, OUR);
+            }
+            other => panic!("expected FinalConfirmation, got {:?}", other),
+        }
+        assert_eq!(on_air(&sends[0]), "K9ZZ K5ARH RR73");
+    }
+
+    /// 3. Manual QSO in WaitingForConfirmation + FinalConfirmation → emits
+    ///    SeventyThree (73), QSO → Completed, and a QsoCompleted event fires
+    ///    (so the ADIF logger logs it).
+    #[tokio::test]
+    async fn manual_final_confirmation_emits_73_and_completes() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} R-07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        manager
+            .process_message(
+                MessageType::FinalConfirmation {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                },
+                format!("{} {} RR73", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        let sends = messages_to_send(&events);
+        assert_eq!(sends.len(), 1, "expected one reply (73), got {:?}", sends);
+        match &sends[0] {
+            MessageType::SeventyThree {
+                to_station,
+                from_station,
+            } => {
+                assert_eq!(to_station, DX);
+                assert_eq!(from_station, OUR);
+            }
+            other => panic!("expected SeventyThree, got {:?}", other),
+        }
+        assert_eq!(on_air(&sends[0]), "K9ZZ K5ARH 73");
+
+        // QSO completed.
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::Completed { .. }),
+            "expected Completed, got {:?}",
+            progress.state
+        );
+        // QsoCompleted event fired (drives ADIF logging).
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::QsoCompleted { .. })),
+            "expected a QsoCompleted event"
+        );
+    }
+
+    /// 4. AUTONOMOUS QSO in RespondingToCq + SignalReport → state advances
+    ///    but NO reply is emitted (manual-only gate).
+    #[tokio::test]
+    async fn auto_qso_advances_but_emits_no_reply() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq(DX.into(), FREQ, None) // CallInitiation::Auto
+            .await
+            .unwrap();
+        let _ = drain(&mut rx); // discard initial CqResponse call
+
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{} {} -07", OUR, DX),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        let sends = messages_to_send(&events);
+        assert!(
+            sends.is_empty(),
+            "autonomous QSO must NOT auto-reply, got {:?}",
+            sends
+        );
+        // State still advanced (machine unchanged).
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::SendingReport { .. }),
+            "auto QSO state must still advance, got {:?}",
+            progress.state
+        );
+    }
+
+    /// 5. Spurious sender (wrong from/to) is still ignored: no state advance
+    ///    and no reply emitted, even for a manual QSO.
+    #[tokio::test]
+    async fn spurious_sender_ignored_no_reply() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // Properly-addressed report but from a DIFFERENT callsign.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: "NF4KE".into(),
+                    report: -7,
+                },
+                format!("{} NF4KE -07", OUR),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let sends = messages_to_send(&drain(&mut rx));
+        assert!(
+            sends.is_empty(),
+            "spurious sender must not trigger a reply, got {:?}",
+            sends
+        );
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "spurious report must not advance state, got {:?}",
+            progress.state
+        );
     }
 }
