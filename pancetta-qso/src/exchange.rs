@@ -489,8 +489,29 @@ impl MessageExchange {
                 })?
                 .as_str();
 
+            // Check for the protocol close tokens FIRST. "RR73" is a
+            // syntactically valid Maidenhead grid (field RR, square 73), so it
+            // ALSO matches GRID_REGEX — if we tested the grid first, a DX's
+            // closing "DX K5ARH RR73" would be misclassified as a CqResponse
+            // carrying grid "RR73", the FinalConfirmation arm would never fire,
+            // and the QSO would stall one message short of completion (the DX's
+            // RR73 ignored, our 73 never sent, nothing logged). This was the
+            // NP4VA/T46FCR stall. The FT8 convention is unambiguous: "RR73" /
+            // "73" in the third field after two callsigns is always the close,
+            // never a grid.
+            if third_field == "RR73" {
+                Ok(MessageType::FinalConfirmation {
+                    to_station: station1,
+                    from_station: station2,
+                })
+            } else if third_field == "73" {
+                Ok(MessageType::SeventyThree {
+                    to_station: station1,
+                    from_station: station2,
+                })
+            }
             // Check if it's a grid square
-            if GRID_REGEX.is_match(third_field) {
+            else if GRID_REGEX.is_match(third_field) {
                 Ok(MessageType::CqResponse {
                     calling_station: station1,
                     responding_station: station2,
@@ -514,18 +535,6 @@ impl MessageExchange {
                         report,
                     })
                 }
-            }
-            // Check if it's RR73 or 73
-            else if third_field == "RR73" {
-                Ok(MessageType::FinalConfirmation {
-                    to_station: station1,
-                    from_station: station2,
-                })
-            } else if third_field == "73" {
-                Ok(MessageType::SeventyThree {
-                    to_station: station1,
-                    from_station: station2,
-                })
             } else {
                 Err(ExchangeError::InvalidFormat {
                     message: message.to_string(),
@@ -748,6 +757,56 @@ mod tests {
             assert_eq!(report, -15);
         } else {
             panic!("Expected signal report message");
+        }
+    }
+
+    #[test]
+    fn test_parse_rr73_is_final_confirmation_not_grid() {
+        // Regression: "RR73" is a syntactically valid Maidenhead grid (RR + 73)
+        // and also matches the CqResponse grid pattern. The parser must treat
+        // it as the protocol close, not a grid — otherwise the DX's RR73 is
+        // swallowed as a CqResponse and the QSO never completes (NP4VA stall).
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let result = exchange.parse_message("K5ARH NP4VA RR73").unwrap();
+        match result {
+            MessageType::FinalConfirmation {
+                to_station,
+                from_station,
+            } => {
+                assert_eq!(to_station, "K5ARH");
+                assert_eq!(from_station, "NP4VA");
+            }
+            other => panic!("Expected FinalConfirmation for RR73, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_bare_73_is_seventy_three() {
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let result = exchange.parse_message("K5ARH NP4VA 73").unwrap();
+        assert!(
+            matches!(result, MessageType::SeventyThree { .. }),
+            "Expected SeventyThree for bare 73, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_real_grid_still_cqresponse() {
+        // A genuine grid in the third field must still parse as a CqResponse —
+        // the RR73/73 close check must not over-capture ordinary grids.
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let result = exchange.parse_message("K5ARH NP4VA FN42").unwrap();
+        match result {
+            MessageType::CqResponse {
+                calling_station,
+                responding_station,
+                grid,
+            } => {
+                assert_eq!(calling_station, "K5ARH");
+                assert_eq!(responding_station, "NP4VA");
+                assert_eq!(grid.as_deref(), Some("FN42"));
+            }
+            other => panic!("Expected CqResponse with grid, got {other:?}"),
         }
     }
 
