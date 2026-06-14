@@ -184,7 +184,7 @@ pub fn decode_wav_to_results(path: &str) -> Result<BenchmarkResult, String> {
             message: msg,
             frequency_hz: freq as f64,
             time_offset_s: time as f64,
-            snr_db: snr_db as f64,
+            snr_db,
         })
         .collect();
 
