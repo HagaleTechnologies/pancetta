@@ -129,6 +129,14 @@ pub struct ActiveQsoBanner {
     pub now_line: String,
     /// Human-readable "next" line (what we expect next).
     pub next_line: String,
+    /// Manual keep-calling watchdog: calls transmitted so far. `0` when not
+    /// keep-calling. Rendered as "Call N/M" so keep-calling reads as bounded.
+    pub call_count: u32,
+    /// Manual keep-calling watchdog: the call cap. `0` when not keep-calling.
+    pub max_calls: u32,
+    /// Manual keep-calling watchdog: when keep-calling stops (elapsed-time
+    /// bound). `None` when not keep-calling. Rendered as a live countdown.
+    pub watchdog_deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Pipeline component health snapshot, forwarded from coordinator
@@ -189,6 +197,14 @@ pub struct QsoStatus {
     pub now_line: String,
     /// Human-readable "next" line (what we expect next).
     pub next_line: String,
+    /// Manual keep-calling watchdog: calls transmitted so far. `0` when not
+    /// keep-calling.
+    pub call_count: u32,
+    /// Manual keep-calling watchdog: the call cap. `0` when not keep-calling.
+    pub max_calls: u32,
+    /// Manual keep-calling watchdog deadline (elapsed-time bound). `None`
+    /// when not keep-calling.
+    pub watchdog_deadline: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -438,6 +454,13 @@ pub struct App {
     /// driving which QSO the abort/re-send management keys target. Clamped
     /// to the active set whenever it changes.
     pub qso_cursor: usize,
+    /// The `qso_id` the QSO cursor is pinned to (Batch 2 #5). The active-QSO
+    /// list grows/shrinks and (pre-Batch-2) re-ordered between snapshots, so a
+    /// bare positional cursor silently retargeted `k`/`r` onto a different QSO.
+    /// We pin the SELECTED QSO's id and re-derive `qso_cursor` from it on every
+    /// snapshot (`clamp_qso_selection`); cursor moves re-pin. `None` = not yet
+    /// pinned (track whatever is at `qso_cursor`).
+    qso_pinned_id: Option<String>,
     pub station_info: StationInfo,
     pub dx_stations: HashMap<String, DxStation>,
     pub band_activity_scroll: usize,
@@ -600,6 +623,7 @@ impl App {
             qso_statuses: Vec::new(),
             active_qsos: Vec::new(),
             qso_cursor: 0,
+            qso_pinned_id: None,
             station_info,
             dx_stations: HashMap::new(),
             band_activity_scroll: 0,
@@ -1213,21 +1237,41 @@ impl App {
                 ladder_index: q.ladder_index,
                 now_line: q.now_line.clone(),
                 next_line: q.next_line.clone(),
+                call_count: q.call_count,
+                max_calls: q.max_calls,
+                watchdog_deadline: q.watchdog_deadline,
             })
             .collect();
         self.active_qsos = qsos;
-        // Clamp the selection cursor into the new active set.
+        // Batch 2 #5: re-derive the cursor from the pinned qso_id so the
+        // selection tracks the SAME QSO across snapshots (the emit order is now
+        // stable, but a QSO can still appear/disappear, shifting positions).
+        self.clamp_qso_selection();
+    }
+
+    /// Re-derive `qso_cursor` from `qso_pinned_id` so the selection follows the
+    /// same QSO across snapshots. Falls back to a positional clamp (and re-pins)
+    /// when the pinned QSO is gone or nothing is pinned yet.
+    fn clamp_qso_selection(&mut self) {
         if self.active_qsos.is_empty() {
             self.qso_cursor = 0;
-        } else if self.qso_cursor >= self.active_qsos.len() {
-            self.qso_cursor = self.active_qsos.len() - 1;
+            self.qso_pinned_id = None;
+            return;
         }
+        if let Some(ref pin) = self.qso_pinned_id {
+            if let Some(idx) = self.active_qsos.iter().position(|q| &q.qso_id == pin) {
+                self.qso_cursor = idx;
+                return;
+            }
+        }
+        // Pinned QSO gone (or none pinned): clamp the index and re-pin to it.
+        self.qso_cursor = self.qso_cursor.min(self.active_qsos.len() - 1);
+        self.qso_pinned_id = Some(self.active_qsos[self.qso_cursor].qso_id.clone());
     }
 
     /// Id of the currently selected QSO for management actions, or the
     /// sole QSO when exactly one is active. `None` when there are no
-    /// active QSOs. Selection ordering matches the banner/panel sort
-    /// (the order the snapshot arrived in).
+    /// active QSOs.
     pub fn selected_qso_id(&self) -> Option<String> {
         if self.active_qsos.is_empty() {
             return None;
@@ -1246,16 +1290,29 @@ impl App {
         Some(self.active_qsos[idx].their_callsign.clone())
     }
 
-    /// Move the QSO selection cursor up (toward index 0), saturating.
+    /// Move the QSO selection cursor up (toward index 0), saturating, and
+    /// re-pin to the now-selected QSO so it sticks across snapshots.
     pub fn qso_cursor_up(&mut self) {
         self.qso_cursor = self.qso_cursor.saturating_sub(1);
+        self.repin_qso_selection();
     }
 
-    /// Move the QSO selection cursor down, clamped to the active set.
+    /// Move the QSO selection cursor down, clamped to the active set, and
+    /// re-pin to the now-selected QSO.
     pub fn qso_cursor_down(&mut self) {
         if !self.active_qsos.is_empty() {
             self.qso_cursor = (self.qso_cursor + 1).min(self.active_qsos.len() - 1);
         }
+        self.repin_qso_selection();
+    }
+
+    /// Pin the selection to the QSO currently under the cursor (so the next
+    /// snapshot re-derives the index from this id, not the old position).
+    fn repin_qso_selection(&mut self) {
+        self.qso_pinned_id = self
+            .active_qsos
+            .get(self.qso_cursor)
+            .map(|q| q.qso_id.clone());
     }
 
     pub fn add_dx_spot(
@@ -2311,6 +2368,9 @@ mod tests {
             ladder_index: 1,
             now_line: "waiting".into(),
             next_line: "their signal report".into(),
+            call_count: 0,
+            max_calls: 0,
+            watchdog_deadline: None,
         }
     }
 
@@ -2362,6 +2422,71 @@ mod tests {
         banner.snr_rx = None;
         app.apply_active_qsos(vec![banner]);
         assert_eq!(app.qso_statuses[0].snr_rx, Some(-8));
+    }
+
+    /// Batch 2 #1: the watchdog fields map from banner → QsoStatus.
+    #[tokio::test]
+    async fn apply_active_qsos_carries_watchdog_fields() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let mut banner = fixture_banner("JA1ABC", "→ called", None);
+        banner.call_count = 4;
+        banner.max_calls = 10;
+        let deadline = chrono::Utc::now() + chrono::Duration::minutes(5);
+        banner.watchdog_deadline = Some(deadline);
+        app.apply_active_qsos(vec![banner]);
+        let q = &app.qso_statuses[0];
+        assert_eq!(q.call_count, 4);
+        assert_eq!(q.max_calls, 10);
+        assert_eq!(q.watchdog_deadline, Some(deadline));
+    }
+
+    /// Batch 2 #5: the QSO selection follows the SAME qso_id across snapshots
+    /// even when row order/membership changes. Select the 2nd QSO, then push a
+    /// new snapshot where a QSO was inserted at the front; the selection must
+    /// still point at the originally-selected qso_id.
+    #[tokio::test]
+    async fn qso_cursor_pins_to_qso_id_across_snapshots() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.apply_active_qsos(vec![
+            fixture_banner_id("AAA", "aaa-id"),
+            fixture_banner_id("BBB", "bbb-id"),
+        ]);
+        // Select BBB (index 1) and pin it.
+        app.qso_cursor_down();
+        assert_eq!(app.selected_qso_id().as_deref(), Some("bbb-id"));
+
+        // New snapshot inserts CCC at the front → BBB moves to index 2.
+        app.apply_active_qsos(vec![
+            fixture_banner_id("CCC", "ccc-id"),
+            fixture_banner_id("AAA", "aaa-id"),
+            fixture_banner_id("BBB", "bbb-id"),
+        ]);
+        assert_eq!(
+            app.selected_qso_id().as_deref(),
+            Some("bbb-id"),
+            "selection must track the pinned qso_id, not the old position"
+        );
+    }
+
+    /// When the pinned QSO disappears, the cursor falls back to a clamp and
+    /// re-pins (no panic, points at a valid QSO).
+    #[tokio::test]
+    async fn qso_cursor_falls_back_when_pinned_qso_gone() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.apply_active_qsos(vec![
+            fixture_banner_id("AAA", "aaa-id"),
+            fixture_banner_id("BBB", "bbb-id"),
+        ]);
+        app.qso_cursor_down(); // pin bbb-id
+                               // bbb-id gone; only aaa remains.
+        app.apply_active_qsos(vec![fixture_banner_id("AAA", "aaa-id")]);
+        assert_eq!(app.selected_qso_id().as_deref(), Some("aaa-id"));
+    }
+
+    fn fixture_banner_id(call: &str, qso_id: &str) -> ActiveQsoBanner {
+        let mut b = fixture_banner(call, "wait rpt", None);
+        b.qso_id = qso_id.to_string();
+        b
     }
 
     #[tokio::test]

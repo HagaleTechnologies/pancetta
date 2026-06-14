@@ -2294,6 +2294,7 @@ mod tests {
                 notes: None,
                 tx_parity: None,
                 initiated_by: Default::default(),
+                role: Default::default(),
                 call_count: 0,
                 first_call_at: None,
                 last_call_at: None,

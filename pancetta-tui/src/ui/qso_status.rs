@@ -98,7 +98,7 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
             call_style = call_style.add_modifier(Modifier::REVERSED);
         }
 
-        lines.push(Line::from(vec![
+        let mut row = vec![
             Span::styled(format!("{}{:<10}", marker, call), call_style),
             Span::styled(
                 format!("{:>7}  ", freq),
@@ -120,7 +120,18 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
                 format!("{:>3}", qso.exchange_count),
                 Style::default().fg(app.theme.foreground_color()),
             ),
-        ]));
+        ];
+        // Batch 2 #1: keep-calling watchdog ("Call 4/10 · stops 3:12") so a
+        // keep-calling QSO never reads as an infinite loop in the table.
+        if let Some(text) = watchdog_line(qso.call_count, qso.max_calls, qso.watchdog_deadline) {
+            row.push(Span::styled(
+                format!("  {}", text),
+                Style::default()
+                    .fg(app.theme.warning_color())
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        lines.push(Line::from(row));
     }
 
     if lines.len() == 1 {
@@ -218,8 +229,45 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
         ]),
     ];
 
+    // Batch 2 #1: when manually keep-calling, surface the watchdog so
+    // keep-calling never reads as an infinite loop ("Call 4/10 · stops 3:12").
+    let mut lines = lines;
+    if let Some(text) = watchdog_line(qso.call_count, qso.max_calls, qso.watchdog_deadline) {
+        lines.push(Line::from(vec![Span::styled(
+            text,
+            Style::default()
+                .fg(app.theme.warning_color())
+                .add_modifier(Modifier::BOLD),
+        )]));
+    }
+
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
+}
+
+/// Format the manual keep-calling watchdog as "Call N/M · stops M:SS".
+/// Returns `None` when not keep-calling (`max_calls == 0`). The countdown is
+/// recomputed against the live clock each frame from `deadline`; once past the
+/// deadline it shows "stops now".
+fn watchdog_line(
+    call_count: u32,
+    max_calls: u32,
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+) -> Option<String> {
+    if max_calls == 0 {
+        return None;
+    }
+    let mut s = format!("Call {}/{}", call_count, max_calls);
+    if let Some(deadline) = deadline {
+        let remaining = deadline.signed_duration_since(chrono::Utc::now());
+        let secs = remaining.num_seconds();
+        if secs > 0 {
+            s.push_str(&format!(" · stops {}:{:02}", secs / 60, secs % 60));
+        } else {
+            s.push_str(" · stops now");
+        }
+    }
+    Some(s)
 }
 
 /// Render the role-aware sequence ladder plus the Now/Next lines for the
@@ -486,6 +534,29 @@ mod tests {
         assert_eq!(get_snr_gauge_color(15, &theme), theme.success_color());
         assert_eq!(get_snr_gauge_color(5, &theme), theme.warning_color());
         assert_eq!(get_snr_gauge_color(-15, &theme), theme.error_color());
+    }
+
+    /// Batch 2 #1: the watchdog line reads "Call N/M · stops M:SS" while
+    /// keep-calling and is absent (None) otherwise.
+    #[test]
+    fn test_watchdog_line() {
+        // Not keep-calling (max_calls == 0) → None.
+        assert!(watchdog_line(0, 0, None).is_none());
+
+        // Keep-calling, future deadline → "Call 4/10 · stops M:SS".
+        let deadline = chrono::Utc::now() + chrono::Duration::seconds(192);
+        let line = watchdog_line(4, 10, Some(deadline)).expect("line");
+        assert!(line.starts_with("Call 4/10 · stops "), "got {line}");
+        // ~3:12 (allow drift): minutes component present, MM:SS format.
+        assert!(line.contains(':'), "got {line}");
+
+        // Past deadline → "stops now".
+        let past = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let line = watchdog_line(10, 10, Some(past)).expect("line");
+        assert_eq!(line, "Call 10/10 · stops now");
+
+        // No deadline → just the count.
+        assert_eq!(watchdog_line(2, 10, None).as_deref(), Some("Call 2/10"));
     }
 
     /// Batch 94: the TX/RX line shows the last message text plus a

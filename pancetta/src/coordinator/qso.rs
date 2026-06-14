@@ -35,6 +35,24 @@ async fn emit_status(message_bus: &MessageBus, text: impl Into<String>) {
     let _ = message_bus.send_message(msg).await;
 }
 
+/// Short, operator-facing description of why a QSO failed, for the TUI
+/// status line (Batch 2 #3). Terminal QSOs are dropped from the active
+/// snapshot, so this is the only place the operator learns the reason.
+fn failure_reason_text(reason: &pancetta_qso::QsoFailureReason) -> String {
+    use pancetta_qso::QsoFailureReason as R;
+    match reason {
+        R::Timeout => "watchdog timeout".to_string(),
+        R::SignalLost => "signal lost".to_string(),
+        R::Duplicate => "duplicate".to_string(),
+        R::InvalidCallsign => "invalid callsign".to_string(),
+        R::FrequencyConflict => "frequency conflict".to_string(),
+        R::UserCancelled => "cancelled by operator".to_string(),
+        R::Superseded => "superseded by a newer call".to_string(),
+        R::StationQrt => "station went QRT".to_string(),
+        R::ProtocolError(e) => format!("protocol error: {e}"),
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Start QSO management component
     ///
@@ -309,7 +327,11 @@ impl super::ApplicationCoordinator {
                 tokio::spawn(async move {
                     while !tx_shutdown.load(Ordering::Acquire) {
                         match qso_events.recv().await {
-                            Ok(pancetta_qso::QsoEvent::StateChanged { new_state, .. }) => {
+                            Ok(pancetta_qso::QsoEvent::StateChanged {
+                                old_state,
+                                new_state,
+                                ..
+                            }) => {
                                 // Map QSO state to AP context for AP3/AP4 decoding.
                                 //
                                 // WSJT-X Improved-style a8 wiring: also enumerate
@@ -400,6 +422,32 @@ impl super::ApplicationCoordinator {
                                 if let Err(e) = snapshot_bus.send_message(snap_msg).await {
                                     debug!("Failed to push active-QSOs snapshot: {}", e);
                                 }
+
+                                // Batch 2 #3: a QSO that just went terminal-Failed
+                                // is otherwise silently dropped from the snapshot.
+                                // Surface a one-line status so the operator learns
+                                // WHY (watchdog timeout, superseded, cancelled,
+                                // …) instead of the QSO just vanishing. We only
+                                // fire on the transition INTO Failed (old_state
+                                // was not already terminal).
+                                if let pancetta_qso::QsoState::Failed { reason, .. } = &new_state {
+                                    if !old_state.is_terminal() {
+                                        let who = new_state
+                                            .their_callsign()
+                                            .or_else(|| old_state.their_callsign())
+                                            .unwrap_or("?")
+                                            .to_string();
+                                        emit_status(
+                                            &snapshot_bus,
+                                            format!(
+                                                "QSO with {} failed: {}",
+                                                who,
+                                                failure_reason_text(reason)
+                                            ),
+                                        )
+                                        .await;
+                                    }
+                                }
                             }
                             Ok(pancetta_qso::QsoEvent::MessageToSend {
                                 qso_id,
@@ -466,6 +514,26 @@ impl super::ApplicationCoordinator {
                                 let _ = snapshot_bus.send_message(snap_msg).await;
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO completed with {}, marking as worked", their_call);
+
+                                    // Batch 2 #4: completed QSOs are filtered out
+                                    // of the active snapshot, so the operator never
+                                    // saw success. Surface a one-line confirmation
+                                    // with the reports exchanged (RST sent/received).
+                                    let rst = |r: Option<i8>| {
+                                        r.map(|v| format!("{v:+}"))
+                                            .unwrap_or_else(|| "--".to_string())
+                                    };
+                                    emit_status(
+                                        &snapshot_bus,
+                                        format!(
+                                            "QSO with {} logged (RST {}/{})",
+                                            their_call,
+                                            rst(metadata.reports.sent),
+                                            rst(metadata.reports.received),
+                                        ),
+                                    )
+                                    .await;
+
                                     let band =
                                         pancetta_qso::utils::frequency_to_band(metadata.frequency);
                                     qso_lookup.record_worked(their_call, &band);
@@ -786,6 +854,10 @@ async fn build_active_qso_snapshot(
     qso_manager: &pancetta_qso::QsoManager,
 ) -> Vec<crate::message_bus::ActiveQsoSnapshotItem> {
     let active = qso_manager.get_active_qsos().await;
+    // Watchdog config for the manual keep-calling countdown (Batch 2 #1).
+    let timeouts = &qso_manager.config().timeouts;
+    let max_calls = timeouts.manual_call_max_calls;
+    let watchdog_minutes = timeouts.manual_call_watchdog_minutes;
 
     // FIX 3 (defense-in-depth): the QSO engine now supersedes older active
     // QSOs per (callsign, band) at start time, so a callsign should appear at
@@ -813,9 +885,26 @@ async fn build_active_qso_snapshot(
         }
     }
 
-    latest
-        .values()
-        .filter_map(snapshot_item_from_progress)
+    // Batch 2 #5: emit in a STABLE order (start_time, then callsign). The
+    // HashMap iteration order is non-deterministic, which made multi-QSO row
+    // order jump between snapshots — a positional cursor then pointed at a
+    // different QSO each frame. The TUI also pins its selection by qso_id, but
+    // a stable emit order keeps the visible list from reshuffling.
+    let mut progresses: Vec<pancetta_qso::QsoProgress> = latest.into_values().collect();
+    progresses.sort_by(|a, b| {
+        a.metadata
+            .start_time
+            .cmp(&b.metadata.start_time)
+            .then_with(|| {
+                let ca = a.state.their_callsign().unwrap_or("");
+                let cb = b.state.their_callsign().unwrap_or("");
+                ca.cmp(cb)
+            })
+    });
+
+    progresses
+        .iter()
+        .filter_map(|p| snapshot_item_from_progress(p, max_calls, watchdog_minutes))
         .collect()
 }
 
@@ -829,10 +918,17 @@ async fn build_active_qso_snapshot(
 /// `progress.messages`), measured RX SNR (signal strength of the last
 /// received message), reports sent/received (from
 /// `metadata.reports`), and the exchange count.
+/// `max_calls` / `watchdog_minutes` come from the QSO manager's
+/// `TimeoutConfig`; they populate the manual keep-calling countdown
+/// fields (`call_count`/`max_calls`/`watchdog_deadline`), which are only
+/// meaningful while the QSO is in a manual keep-calling state
+/// (RespondingToCq / SendingReport).
 fn snapshot_item_from_progress(
     progress: &pancetta_qso::QsoProgress,
+    max_calls: u32,
+    watchdog_minutes: u64,
 ) -> Option<crate::message_bus::ActiveQsoSnapshotItem> {
-    use pancetta_qso::{MessageDirection, QsoState};
+    use pancetta_qso::{CallInitiation, MessageDirection, QsoState};
     let their = progress
         .state
         .their_callsign()
@@ -876,8 +972,10 @@ fn snapshot_item_from_progress(
 
     // Derive the role-aware display ladder + now/next lines. Terminal/Idle/
     // Contest states return None (shouldn't appear in the active set, but we
-    // handle it by leaving the ladder empty and now/next blank).
-    let ladder = progress.state.ladder_view(progress.metadata.initiated_by);
+    // handle it by leaving the ladder empty and now/next blank). The role
+    // (CQer vs Caller) is latched on the QSO at creation and disambiguates the
+    // shared middle states (Batch 2 #6).
+    let ladder = progress.state.ladder_view(progress.metadata.role);
     let (ladder_labels, ladder_ours, ladder_index, now_line, next_line) = match ladder {
         Some(v) => (
             v.labels.iter().map(|s| s.to_string()).collect(),
@@ -887,6 +985,24 @@ fn snapshot_item_from_progress(
             v.next,
         ),
         None => (Vec::new(), Vec::new(), 0, String::new(), String::new()),
+    };
+
+    // Manual keep-calling watchdog visibility (Batch 2 #1). Only meaningful
+    // while a MANUAL QSO is in a keep-calling state (RespondingToCq /
+    // SendingReport); otherwise zero/None so the TUI shows nothing misleading.
+    let keep_calling = progress.metadata.initiated_by == CallInitiation::Manual
+        && matches!(
+            progress.state,
+            QsoState::RespondingToCq { .. } | QsoState::SendingReport { .. }
+        );
+    let (wd_call_count, wd_max_calls, watchdog_deadline) = if keep_calling {
+        let deadline = progress
+            .metadata
+            .first_call_at
+            .map(|t| t + chrono::Duration::minutes(watchdog_minutes as i64));
+        (progress.metadata.call_count, max_calls, deadline)
+    } else {
+        (0, 0, None)
     };
 
     Some(crate::message_bus::ActiveQsoSnapshotItem {
@@ -910,6 +1026,9 @@ fn snapshot_item_from_progress(
         ladder_index,
         now_line,
         next_line,
+        call_count: wd_call_count,
+        max_calls: wd_max_calls,
+        watchdog_deadline,
     })
 }
 
@@ -980,6 +1099,7 @@ mod snapshot_tests {
                 notes: None,
                 tx_parity: Some(pancetta_core::slot::SlotParity::Odd),
                 initiated_by: Default::default(),
+                role: Default::default(),
                 call_count: 0,
                 first_call_at: None,
                 last_call_at: None,
@@ -987,12 +1107,22 @@ mod snapshot_tests {
         }
     }
 
+    /// Default watchdog config for snapshot tests (matches TimeoutConfig
+    /// defaults: 10 calls / 5 minutes).
+    const TEST_MAX_CALLS: u32 = 10;
+    const TEST_WATCHDOG_MIN: u64 = 5;
+
+    /// Thin wrapper so the existing tests don't each repeat the watchdog args.
+    fn snap(progress: &QsoProgress) -> Option<crate::message_bus::ActiveQsoSnapshotItem> {
+        snapshot_item_from_progress(progress, TEST_MAX_CALLS, TEST_WATCHDOG_MIN)
+    }
+
     /// All detail-panel fields derive from state the engine already
     /// tracks: last message per direction, measured RX SNR, reports,
     /// exchange count, plus the original banner fields.
     #[test]
     fn snapshot_derives_detail_fields_from_progress() {
-        let item = snapshot_item_from_progress(&fixture_progress()).expect("item");
+        let item = snap(&fixture_progress()).expect("item");
         assert_eq!(item.their_callsign, "JA1ABC");
         assert_eq!(item.state, "sending rpt");
         assert_eq!(item.frequency_hz, 1500.0);
@@ -1023,7 +1153,7 @@ mod snapshot_tests {
             signal_strength: None,
             frequency: 1500.0,
         });
-        let item = snapshot_item_from_progress(&progress).expect("item");
+        let item = snap(&progress).expect("item");
         assert_eq!(item.last_tx_text.as_deref(), Some("JA1ABC K5ARH R-8"));
         // RX side unchanged by a new TX.
         assert_eq!(item.last_rx_text.as_deref(), Some("K5ARH JA1ABC -12"));
@@ -1041,7 +1171,7 @@ mod snapshot_tests {
             call_count: 1,
         };
         progress.metadata.their_callsign = None;
-        assert!(snapshot_item_from_progress(&progress).is_none());
+        assert!(snap(&progress).is_none());
     }
 
     /// A QSO with no messages yet (just started) still produces an item
@@ -1050,11 +1180,68 @@ mod snapshot_tests {
     fn snapshot_handles_empty_message_history() {
         let mut progress = fixture_progress();
         progress.messages.clear();
-        let item = snapshot_item_from_progress(&progress).expect("item");
+        let item = snap(&progress).expect("item");
         assert!(item.last_tx_text.is_none());
         assert!(item.last_rx_text.is_none());
         assert!(item.snr_rx.is_none());
         assert_eq!(item.exchange_count, 0);
+    }
+
+    /// Batch 2 #1: a MANUAL QSO in a keep-calling state surfaces the
+    /// watchdog countdown fields (call N/M + deadline).
+    #[test]
+    fn snapshot_surfaces_watchdog_for_manual_keep_calling() {
+        let mut progress = fixture_progress();
+        let start = Utc::now() - Duration::seconds(20);
+        progress.state = QsoState::RespondingToCq {
+            target_callsign: "JA1ABC".to_string(),
+            frequency: 1500.0,
+            started_at: start,
+        };
+        progress.metadata.initiated_by = pancetta_qso::CallInitiation::Manual;
+        progress.metadata.call_count = 4;
+        progress.metadata.first_call_at = Some(start);
+        let item = snap(&progress).expect("item");
+        assert_eq!(item.call_count, 4);
+        assert_eq!(item.max_calls, TEST_MAX_CALLS);
+        let deadline = item.watchdog_deadline.expect("deadline");
+        assert_eq!(
+            deadline,
+            start + Duration::minutes(TEST_WATCHDOG_MIN as i64)
+        );
+    }
+
+    /// An AUTO QSO (or a manual QSO past the keep-calling phase) shows no
+    /// watchdog fields — they would be misleading.
+    #[test]
+    fn snapshot_no_watchdog_for_auto_qso() {
+        let mut progress = fixture_progress();
+        progress.metadata.initiated_by = pancetta_qso::CallInitiation::Auto;
+        progress.metadata.call_count = 3;
+        progress.metadata.first_call_at = Some(Utc::now());
+        let item = snap(&progress).expect("item");
+        assert_eq!(item.call_count, 0);
+        assert_eq!(item.max_calls, 0);
+        assert!(item.watchdog_deadline.is_none());
+    }
+
+    /// Batch 2 #3: every failure reason maps to an operator-readable string.
+    #[test]
+    fn failure_reason_text_is_human_readable() {
+        use pancetta_qso::QsoFailureReason as R;
+        assert_eq!(super::failure_reason_text(&R::Timeout), "watchdog timeout");
+        assert_eq!(
+            super::failure_reason_text(&R::Superseded),
+            "superseded by a newer call"
+        );
+        assert_eq!(
+            super::failure_reason_text(&R::UserCancelled),
+            "cancelled by operator"
+        );
+        assert_eq!(
+            super::failure_reason_text(&R::ProtocolError("boom".to_string())),
+            "protocol error: boom"
+        );
     }
 }
 

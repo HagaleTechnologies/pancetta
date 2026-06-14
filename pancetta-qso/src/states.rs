@@ -45,6 +45,11 @@ pub enum QsoState {
         their_callsign: String,
         frequency: f64,
         started_at: DateTime<Utc>,
+        /// Their grid square, latched from the opening CqResponse (CQer
+        /// flow) so it can be carried through to the logged QSO. `None`
+        /// when the response carried no grid.
+        #[serde(default)]
+        their_grid: Option<GridSquare>,
     },
 
     /// Sending signal report
@@ -348,6 +353,14 @@ pub struct QsoMetadata {
     #[serde(default)]
     pub initiated_by: CallInitiation,
 
+    /// Which side of the exchange we play. `Cqer` when the QSO began with
+    /// `start_cq` (we called CQ and a station answered), `Caller` otherwise
+    /// (the historical responder path). Drives the role-aware display
+    /// ladder; the state machine itself is role-agnostic. Defaults to
+    /// `Caller` for every internal constructor that does not set it.
+    #[serde(default)]
+    pub role: QsoRole,
+
     /// Number of times we have transmitted the initial call for this QSO
     /// (relevant only for manual keep-calling). Starts at 1 when the QSO
     /// is created (the first call is emitted immediately) and increments
@@ -413,6 +426,31 @@ pub struct ContestSerials {
 
     /// Serial number we received
     pub received: Option<SerialNumber>,
+}
+
+/// Which side of the QSO we play.
+///
+/// FT8 has two roles that share the middle states (`WaitingForReport`,
+/// `SendingReport`, `WaitingForConfirmation`) but ride DIFFERENT ladders:
+///
+/// - [`QsoRole::Cqer`] — we called CQ; a station answered. Our rungs are
+///   `CQ → Grid → Rpt → R-Rpt → RR73`.
+/// - [`QsoRole::Caller`] — we answered someone's CQ (or replied to a
+///   station calling us). Our rungs are `Grid → Rpt → R-Rpt → RR73 → 73`.
+///
+/// The role is latched once at QSO creation (CQer when started via
+/// `start_cq`, Caller otherwise) and carried in [`QsoMetadata`]. It is
+/// used purely to pick the correct [`QsoLadderView`] for display — the
+/// state-machine transitions are role-agnostic (they verify sender/target
+/// and the message type, which already disambiguate direction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum QsoRole {
+    /// We called CQ; the other station answered us.
+    Cqer,
+
+    /// We answered the other station (default — the historical responder path).
+    #[default]
+    Caller,
 }
 
 /// How a QSO was initiated.
@@ -537,16 +575,28 @@ pub struct QsoLadderView {
 }
 
 impl QsoState {
-    /// Derive a [`QsoLadderView`] for this state given how the QSO was
-    /// initiated. Returns `None` for terminal states (Completed/Failed),
-    /// Idle, and Contest.
-    pub fn ladder_view(&self, _initiated_by: CallInitiation) -> Option<QsoLadderView> {
-        // CQer ladder: we called CQ.
+    /// Derive a [`QsoLadderView`] for this state given the QSO's [`QsoRole`].
+    /// Returns `None` for terminal states (Completed/Failed), Idle, and
+    /// Contest.
+    ///
+    /// The middle states (`WaitingForReport`, `SendingReport`,
+    /// `WaitingForConfirmation`) are shared by both roles but ride DIFFERENT
+    /// ladders — a CQer in `WaitingForReport` has already sent CQ and our
+    /// report, and is waiting for the caller's R-report; a Caller in
+    /// `WaitingForReport` has sent its grid and is waiting for the CQer's
+    /// report. The `role` argument disambiguates so the panel shows the right
+    /// rungs and now/next lines for each side.
+    pub fn ladder_view(&self, role: QsoRole) -> Option<QsoLadderView> {
+        // CQer ladder: we called CQ. Rungs: CQ → Grid(theirs) → Rpt(ours) →
+        // R-Rpt(theirs) → RR73(ours).
         const CQER_LABELS: [&str; 5] = ["CQ", "Grid", "Rpt", "R-Rpt", "RR73"];
         const CQER_OURS: [bool; 5] = [true, false, true, false, true];
-        // Caller ladder: we answered/called them.
+        // Caller ladder: we answered/called them. Rungs: Grid(ours) →
+        // Rpt(theirs) → R-Rpt(ours) → RR73(theirs) → 73(ours).
         const CALLER_LABELS: [&str; 5] = ["Grid", "Rpt", "R-Rpt", "RR73", "73"];
         const CALLER_OURS: [bool; 5] = [true, false, true, false, true];
+
+        let cqer = matches!(role, QsoRole::Cqer);
 
         match self {
             QsoState::CallingCq { .. } => Some(QsoLadderView {
@@ -570,6 +620,15 @@ impl QsoState {
                 now: "sending our grid/call".to_string(),
                 next: "expect their report".to_string(),
             }),
+            // CQer: caller answered (our CQ → their grid), we now wait to send
+            // our report. Caller: we sent grid, we wait for their report.
+            QsoState::WaitingForReport { .. } if cqer => Some(QsoLadderView {
+                labels: CQER_LABELS.to_vec(),
+                ours: CQER_OURS.to_vec(),
+                index: 1,
+                now: "caller answered".to_string(),
+                next: "we send their report".to_string(),
+            }),
             QsoState::WaitingForReport { .. } => Some(QsoLadderView {
                 labels: CALLER_LABELS.to_vec(),
                 ours: CALLER_OURS.to_vec(),
@@ -577,12 +636,28 @@ impl QsoState {
                 now: "waiting".to_string(),
                 next: "their signal report".to_string(),
             }),
+            // CQer: sending the caller their report; expect their R-report.
+            QsoState::SendingReport { our_report, .. } if cqer => Some(QsoLadderView {
+                labels: CQER_LABELS.to_vec(),
+                ours: CQER_OURS.to_vec(),
+                index: 2,
+                now: format!("sending {our_report:+}"),
+                next: "expect their R-report".to_string(),
+            }),
             QsoState::SendingReport { our_report, .. } => Some(QsoLadderView {
                 labels: CALLER_LABELS.to_vec(),
                 ours: CALLER_OURS.to_vec(),
                 index: 2,
                 now: format!("sending R{our_report:+}"),
                 next: "expect their RR73".to_string(),
+            }),
+            // CQer: got the caller's R-report, we now send RR73 to close.
+            QsoState::WaitingForConfirmation { .. } if cqer => Some(QsoLadderView {
+                labels: CQER_LABELS.to_vec(),
+                ours: CQER_OURS.to_vec(),
+                index: 4,
+                now: "sending RR73".to_string(),
+                next: "their 73 — QSO logged".to_string(),
             }),
             QsoState::WaitingForConfirmation { .. } => Some(QsoLadderView {
                 labels: CALLER_LABELS.to_vec(),
@@ -654,6 +729,7 @@ mod tests {
             their_callsign: "W1ABC".to_string(),
             frequency: 14074000.0,
             started_at: Utc::now(),
+            their_grid: None,
         };
         assert!(!active.is_terminal());
         assert!(active.is_active());
@@ -670,7 +746,7 @@ mod tests {
             frequency: 14074000.0,
             started_at: Utc::now(),
         };
-        let v = resp.ladder_view(CallInitiation::Manual).unwrap();
+        let v = resp.ladder_view(QsoRole::Caller).unwrap();
         assert_eq!(v.index, 0);
         assert_eq!(v.ours, vec![true, false, true, false, true]);
         assert_eq!(v.labels, vec!["Grid", "Rpt", "R-Rpt", "RR73", "73"]);
@@ -681,8 +757,9 @@ mod tests {
             their_callsign: "W1ABC".to_string(),
             frequency: 14074000.0,
             started_at: Utc::now(),
+            their_grid: None,
         };
-        let v = wait_rpt.ladder_view(CallInitiation::Auto).unwrap();
+        let v = wait_rpt.ladder_view(QsoRole::Caller).unwrap();
         assert_eq!(v.index, 1);
         assert!(v.now.contains("waiting"));
         assert!(v.next.contains("report"));
@@ -694,7 +771,7 @@ mod tests {
             frequency: 14074000.0,
             started_at: Utc::now(),
         };
-        let v = send_rpt.ladder_view(CallInitiation::Manual).unwrap();
+        let v = send_rpt.ladder_view(QsoRole::Caller).unwrap();
         assert_eq!(v.index, 2);
         assert!(
             v.now.contains("-15"),
@@ -710,7 +787,7 @@ mod tests {
             frequency: 14074000.0,
             started_at: Utc::now(),
         };
-        let v = send_rpt_pos.ladder_view(CallInitiation::Auto).unwrap();
+        let v = send_rpt_pos.ladder_view(QsoRole::Caller).unwrap();
         assert!(
             v.now.contains("+5"),
             "now-string should contain signed report: {}",
@@ -725,10 +802,49 @@ mod tests {
             grid_square: None,
             started_at: Utc::now(),
         };
-        let v = wait_conf.ladder_view(CallInitiation::Auto).unwrap();
+        let v = wait_conf.ladder_view(QsoRole::Caller).unwrap();
         assert_eq!(v.index, 3);
         assert!(v.now.contains("waiting"));
         assert!(!v.next.is_empty());
+    }
+
+    #[test]
+    fn test_ladder_view_cqer_role_shared_states() {
+        // The middle states ride the CQer ladder when role == Cqer.
+        let wait_rpt = QsoState::WaitingForReport {
+            their_callsign: "W1ABC".to_string(),
+            frequency: 14074000.0,
+            started_at: Utc::now(),
+            their_grid: None,
+        };
+        let v = wait_rpt.ladder_view(QsoRole::Cqer).unwrap();
+        assert_eq!(v.labels, vec!["CQ", "Grid", "Rpt", "R-Rpt", "RR73"]);
+        assert_eq!(v.index, 1);
+
+        let send_rpt = QsoState::SendingReport {
+            their_callsign: "W1ABC".to_string(),
+            their_report: None,
+            our_report: -7,
+            frequency: 14074000.0,
+            started_at: Utc::now(),
+        };
+        let v = send_rpt.ladder_view(QsoRole::Cqer).unwrap();
+        assert_eq!(v.labels, vec!["CQ", "Grid", "Rpt", "R-Rpt", "RR73"]);
+        assert_eq!(v.index, 2);
+        assert!(v.now.contains("-7"), "cqer now: {}", v.now);
+
+        let wait_conf = QsoState::WaitingForConfirmation {
+            their_callsign: "W1ABC".to_string(),
+            their_report: -10,
+            our_report: -15,
+            frequency: 14074000.0,
+            grid_square: None,
+            started_at: Utc::now(),
+        };
+        let v = wait_conf.ladder_view(QsoRole::Cqer).unwrap();
+        assert_eq!(v.labels, vec!["CQ", "Grid", "Rpt", "R-Rpt", "RR73"]);
+        assert_eq!(v.index, 4);
+        assert!(v.now.contains("RR73"));
     }
 
     #[test]
@@ -738,7 +854,7 @@ mod tests {
             started_at: Utc::now(),
             call_count: 1,
         };
-        let v = cq.ladder_view(CallInitiation::Auto).unwrap();
+        let v = cq.ladder_view(QsoRole::Cqer).unwrap();
         assert_eq!(v.index, 0);
         assert_eq!(v.labels, vec!["CQ", "Grid", "Rpt", "R-Rpt", "RR73"]);
         assert_eq!(v.ours, vec![true, false, true, false, true]);
@@ -753,7 +869,7 @@ mod tests {
             grid_square: None,
             started_at: Utc::now(),
         };
-        let v = send_conf.ladder_view(CallInitiation::Auto).unwrap();
+        let v = send_conf.ladder_view(QsoRole::Cqer).unwrap();
         assert_eq!(v.index, 4);
         assert!(v.now.contains("RR73"));
         assert!(!v.next.is_empty());
@@ -770,16 +886,16 @@ mod tests {
             completed_at: Utc::now(),
             duration_seconds: 120,
         };
-        assert!(completed.ladder_view(CallInitiation::Auto).is_none());
+        assert!(completed.ladder_view(QsoRole::Caller).is_none());
 
         let failed = QsoState::Failed {
             reason: QsoFailureReason::UserCancelled,
             failed_at: Utc::now(),
             last_state: Box::new(QsoState::Idle),
         };
-        assert!(failed.ladder_view(CallInitiation::Auto).is_none());
+        assert!(failed.ladder_view(QsoRole::Caller).is_none());
 
-        assert!(QsoState::Idle.ladder_view(CallInitiation::Auto).is_none());
+        assert!(QsoState::Idle.ladder_view(QsoRole::Caller).is_none());
     }
 
     #[test]

@@ -474,6 +474,7 @@ impl AdifProcessor {
             notes: adif_qso.comment.clone(),
             tx_parity: None,
             initiated_by: Default::default(),
+            role: Default::default(),
             call_count: 0,
             first_call_at: None,
             last_call_at: None,

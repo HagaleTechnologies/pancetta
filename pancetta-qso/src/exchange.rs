@@ -320,6 +320,18 @@ impl MessageExchange {
                 }))
             }
 
+            // CQer flow: we called CQ, sent our report (landing in
+            // WaitingForReport), and the caller rogered with their R-report
+            // (ReportAck). Close with RR73 — the state machine advances us to
+            // WaitingForConfirmation and the (WaitingForConfirmation, 73/RR73)
+            // path completes + logs.
+            (QsoState::WaitingForReport { their_callsign, .. }, MessageType::ReportAck { .. }) => {
+                Ok(Some(MessageType::FinalConfirmation {
+                    to_station: their_callsign.clone(),
+                    from_station: self.our_callsign.clone(),
+                }))
+            }
+
             // FIX 2: the DX rogered our R-report directly with RR73 — answer
             // our 73 to close (then the QSO completes and logs).
             (

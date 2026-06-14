@@ -387,6 +387,8 @@ impl QsoManager {
             // Calling CQ is not a manual keep-calling QSO; it has its own
             // CallingCq timeout and call_count in the state itself.
             initiated_by: CallInitiation::Auto,
+            // We called CQ → CQer role (drives the role-aware display ladder).
+            role: QsoRole::Cqer,
             call_count: 1,
             first_call_at: Some(now),
             last_call_at: Some(now),
@@ -532,6 +534,8 @@ impl QsoManager {
             notes: None,
             tx_parity,
             initiated_by,
+            // We answered the DX's CQ → Caller role.
+            role: QsoRole::Caller,
             // The first call is emitted immediately below (the CqResponse
             // MessageToSend), so the count starts at 1.
             call_count: 1,
@@ -547,7 +551,10 @@ impl QsoManager {
         };
 
         // Record the initial outbound call as a Sent message so it can be
-        // re-sent later (see `resend_last_tx`) and surfaced to the UI.
+        // re-sent later (see `resend_last_tx`) and surfaced to the UI. The
+        // raw_text is the rendered FT8 text so the TUI "TX:" line shows what
+        // we sent (UX audit Batch 2 — was String::new() → blank line).
+        let raw_text = self.render_sent_text(&message);
         let progress = QsoProgress {
             state: state.clone(),
             state_history: vec![],
@@ -555,7 +562,7 @@ impl QsoManager {
                 timestamp: now,
                 direction: MessageDirection::Sent,
                 message_type: message.clone(),
-                raw_text: String::new(),
+                raw_text,
                 signal_strength: None,
                 frequency,
             }],
@@ -735,6 +742,8 @@ impl QsoManager {
             notes: None,
             tx_parity,
             initiated_by: CallInitiation::Manual,
+            // Replying to a station calling us → Caller role.
+            role: QsoRole::Caller,
             call_count: 1,
             first_call_at: Some(now),
             last_call_at: Some(now),
@@ -751,6 +760,7 @@ impl QsoManager {
             metadata.end_time = Some(now);
         }
 
+        let raw_text = self.render_sent_text(&message);
         let progress = QsoProgress {
             state: state.clone(),
             state_history: vec![],
@@ -758,7 +768,7 @@ impl QsoManager {
                 timestamp: now,
                 direction: MessageDirection::Sent,
                 message_type: message.clone(),
-                raw_text: String::new(),
+                raw_text,
                 signal_strength: None,
                 frequency,
             }],
@@ -932,6 +942,18 @@ impl QsoManager {
 
     // Internal helper methods
 
+    /// Render a `MessageType` to the FT8 text we would transmit, so the
+    /// recorded `Sent` `QsoMessage.raw_text` matches what goes on the air.
+    /// Without this, engine-emitted Sent records carried an empty string and
+    /// the TUI "TX:" line was blank (UX audit Batch 2). Falls back to an
+    /// empty string on the (unexpected) render error rather than failing the
+    /// QSO; the message still transmits via the separate encode path.
+    fn render_sent_text(&self, message: &MessageType) -> String {
+        crate::exchange::MessageExchange::new(self.config.our_callsign.clone())
+            .generate_message(message)
+            .unwrap_or_default()
+    }
+
     async fn process_message_for_qso(
         &self,
         qso_id: QsoId,
@@ -1007,7 +1029,33 @@ impl QsoManager {
             }
         }
 
+        // UX audit Batch 2 #8: latch the DX's grid the moment it arrives in a
+        // CqResponse (the opening "<us> <them> <grid>" / "CQ <them> <grid>"
+        // exchange). The common close arm (SendingReport → Completed) hard-codes
+        // grid_square: None, so without latching here the decoded grid never
+        // reaches the logged ADIF GRIDSQUARE. We only overwrite when the
+        // incoming grid is present so a later grid-less message can't clear it.
+        if let MessageType::CqResponse {
+            grid: Some(grid), ..
+        } = &message.message_type
+        {
+            if !grid.is_empty() {
+                progress.metadata.grids.theirs = Some(grid.clone());
+            }
+        }
+
         if new_state != old_state {
+            // CQer flow: the QSO was created by start_cq with their_callsign
+            // None (we didn't know who would answer). The moment a state
+            // advance reveals the contra callsign (caller answered), latch it
+            // so the logged ADIF/worked-station record carries the right call,
+            // and register the callsign mapping for relevance/supersede.
+            if progress.metadata.their_callsign.is_none() {
+                if let Some(call) = new_state.their_callsign() {
+                    progress.metadata.their_callsign = Some(call.to_string());
+                }
+            }
+
             // If transitioning to Completed, update metadata with signal reports and end time
             if let QsoState::Completed {
                 their_report,
@@ -1021,6 +1069,9 @@ impl QsoManager {
                     received: Some(*their_report),
                 };
                 progress.metadata.end_time = Some(Utc::now());
+                // Prefer the grid carried in the Completed state (CQer path
+                // threads it through WaitingForConfirmation); otherwise keep
+                // whatever was latched from the opening CqResponse above.
                 if let Some(grid) = grid_square {
                     progress.metadata.grids.theirs = Some(grid.clone());
                 }
@@ -1077,14 +1128,17 @@ impl QsoManager {
             .await;
 
         // Record the auto-sequenced reply as a Sent message (under the lock)
-        // so it is available to `resend_last_tx` and the UI snapshot.
+        // so it is available to `resend_last_tx` and the UI snapshot. Render
+        // the FT8 text so the TUI "TX:" line shows what we sent (UX audit
+        // Batch 2 — was String::new()).
         if let Some(reply) = reply_to_emit.as_ref() {
+            let reply_text = self.render_sent_text(reply);
             if let Some(progress) = qsos.get_mut(&qso_id) {
                 progress.messages.push(QsoMessage {
                     timestamp: Utc::now(),
                     direction: MessageDirection::Sent,
                     message_type: reply.clone(),
-                    raw_text: String::new(),
+                    raw_text: reply_text,
                     signal_strength: None,
                     frequency: qso_frequency,
                 });
@@ -1137,17 +1191,82 @@ impl QsoManager {
         initiated_by: CallInitiation,
     ) -> Result<QsoState, QsoManagerError> {
         match (current_state, message_type) {
-            // CQ call received response
+            // CQ call received response (CQer flow). A station answered our CQ
+            // with "<us> <them> <grid>". Verify the response is addressed to us
+            // (calling_station == our callsign) before advancing — a spurious
+            // CqResponse to another station must not hijack our CQ QSO. We latch
+            // their grid here (UX audit Batch 2 #8) so the eventual ADIF carries
+            // GRIDSQUARE; the relevance filter already directs only
+            // addressed-to-us responses here, but we re-verify for defence.
             (
                 QsoState::CallingCq { frequency, .. },
                 MessageType::CqResponse {
-                    responding_station, ..
+                    calling_station,
+                    responding_station,
+                    grid,
                 },
-            ) => Ok(QsoState::WaitingForReport {
-                their_callsign: responding_station.clone(),
-                frequency: *frequency,
-                started_at: Utc::now(),
-            }),
+            ) => {
+                if calling_station != &self.config.our_callsign {
+                    warn!(
+                        target: "qso.security",
+                        got_to = %calling_station,
+                        got_from = %responding_station,
+                        "CqResponse not addressed to us ignored — no CQ advance"
+                    );
+                    return Ok(current_state.clone());
+                }
+                Ok(QsoState::WaitingForReport {
+                    their_callsign: responding_station.clone(),
+                    frequency: *frequency,
+                    started_at: Utc::now(),
+                    their_grid: grid.clone(),
+                })
+            }
+
+            // CQer flow: we sent our SignalReport (on the CallingCq→
+            // WaitingForReport transition) and the caller rogered it with their
+            // R-report (ReportAck). Advance to WaitingForConfirmation; the reply
+            // emitter answers our FinalConfirmation (RR73). Carry the latched
+            // grid into the confirmation state so it reaches Completed/ADIF.
+            // Sender-verified (from == DX && to == us) like every other arm.
+            (
+                QsoState::WaitingForReport {
+                    their_callsign,
+                    frequency,
+                    their_grid,
+                    ..
+                },
+                MessageType::ReportAck {
+                    from_station,
+                    to_station,
+                    report,
+                },
+            ) => {
+                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %their_callsign,
+                        got_from = %from_station,
+                        got_to = %to_station,
+                        "spurious ReportAck in WaitingForReport ignored (CQer)"
+                    );
+                    return Ok(current_state.clone());
+                }
+                // The caller's R-report is their report OF US. Our report (of
+                // them) was computed when we sent it; recover it from SNR or
+                // fall back to the report they just acked.
+                let our_report = signal_strength
+                    .map(|snr| (snr.round() as i8).clamp(-30, 50))
+                    .unwrap_or(*report);
+                Ok(QsoState::WaitingForConfirmation {
+                    their_callsign: their_callsign.clone(),
+                    their_report: *report,
+                    our_report,
+                    frequency: *frequency,
+                    grid_square: their_grid.clone(),
+                    started_at: Utc::now(),
+                })
+            }
 
             // Response to CQ, waiting for report
             (
@@ -1513,6 +1632,19 @@ impl QsoManager {
                 },
             ) => calling_station == &self.config.our_callsign,
 
+            // CQer flow: we called CQ, the caller answered, and we sent our
+            // report (now WaitingForReport). The caller's R-report (ReportAck)
+            // is the next message — route it to this QSO so it can close.
+            // Verify both directions: from THEM, to US.
+            (
+                QsoState::WaitingForReport { their_callsign, .. },
+                MessageType::ReportAck {
+                    to_station,
+                    from_station,
+                    ..
+                },
+            ) => from_station == their_callsign && to_station == &self.config.our_callsign,
+
             // We responded to a CQ from `target_callsign` and are waiting for
             // their report. Verify both directions: from THEM, to US.
             (
@@ -1581,9 +1713,11 @@ impl QsoManager {
             return Ok(false);
         }
 
-        // Check in-memory active/recent QSOs first
+        // Check in-memory active/recent QSOs first (case-insensitive key,
+        // Batch 2 #7, matching add/remove_callsign_mapping).
+        let key = callsign.to_uppercase();
         let qsos_by_callsign = self.qsos_by_callsign.read().await;
-        if let Some(qso_ids) = qsos_by_callsign.get(callsign) {
+        if let Some(qso_ids) = qsos_by_callsign.get(&key) {
             let qsos = self.qsos.read().await;
             let time_window =
                 Duration::hours(self.config.duplicate_checking.time_window_hours as i64);
@@ -1640,9 +1774,15 @@ impl QsoManager {
     }
 
     async fn add_callsign_mapping(&self, callsign: &str, qso_id: QsoId) {
+        // UX audit Batch 2 #7: key the callsign map case-insensitively
+        // (uppercase). A case/format mismatch between a DX-Hunter call and a
+        // Callers reply for the same station would otherwise defeat supersede
+        // and re-spawn a duplicate QSO. Callsigns are conventionally uppercase;
+        // normalising here (and at every lookup) makes supersede robust.
+        let key = callsign.to_uppercase();
         let mut qsos_by_callsign = self.qsos_by_callsign.write().await;
         qsos_by_callsign
-            .entry(callsign.to_string())
+            .entry(key)
             .or_insert_with(Vec::new)
             .push(qso_id);
     }
@@ -1661,11 +1801,14 @@ impl QsoManager {
     /// per-QSO RF frequencies ever be threaded through.
     async fn supersede_active_qsos_for(&self, callsign: &str, frequency: f64) {
         let new_band = crate::utils::frequency_to_band(frequency);
+        // Look up case-insensitively (Batch 2 #7) so a case/format mismatch
+        // can't leak a duplicate active QSO past supersede.
+        let key = callsign.to_uppercase();
 
         // Collect the QSO IDs to supersede under the read lock, then mutate.
         let to_supersede: Vec<QsoId> = {
             let qsos = self.qsos.read().await;
-            let ids = match self.qsos_by_callsign.read().await.get(callsign) {
+            let ids = match self.qsos_by_callsign.read().await.get(&key) {
                 Some(ids) => ids.clone(),
                 None => Vec::new(),
             };
@@ -1710,11 +1853,13 @@ impl QsoManager {
     }
 
     async fn remove_callsign_mapping(&self, callsign: &str, qso_id: QsoId) {
+        // Match the uppercase keying of `add_callsign_mapping` (Batch 2 #7).
+        let key = callsign.to_uppercase();
         let mut qsos_by_callsign = self.qsos_by_callsign.write().await;
-        if let Some(qso_ids) = qsos_by_callsign.get_mut(callsign) {
+        if let Some(qso_ids) = qsos_by_callsign.get_mut(&key) {
             qso_ids.retain(|&id| id != qso_id);
             if qso_ids.is_empty() {
-                qsos_by_callsign.remove(callsign);
+                qsos_by_callsign.remove(&key);
             }
         }
     }
@@ -1857,6 +2002,21 @@ impl QsoManager {
 
                 progress.metadata.call_count += 1;
                 progress.metadata.last_call_at = Some(now);
+
+                // Record the re-emitted call as a Sent message so the TUI's
+                // last-TX line and activity counter advance during keep-calling
+                // (UX audit Batch 2 — the panel previously froze because rearm
+                // appended nothing, making keep-calling look like a hang). The
+                // raw_text is the rendered FT8 text we put on the air.
+                let raw_text = self.render_sent_text(&message);
+                progress.messages.push(QsoMessage {
+                    timestamp: now,
+                    direction: MessageDirection::Sent,
+                    message_type: message.clone(),
+                    raw_text,
+                    signal_strength: None,
+                    frequency: progress.metadata.frequency,
+                });
 
                 to_recall.push((
                     qso_id,
@@ -2436,6 +2596,313 @@ mod tests {
             manager.get_qso(qso_id).await,
             Err(QsoManagerError::QsoNotFound { .. })
         ));
+    }
+
+    // --- Batch 2 #6: CQer (we-CQed) completion path -----------------------
+
+    /// A full we-CQed exchange must advance all the way to Completed and emit
+    /// QsoCompleted (it previously stalled in WaitingForReport — no arm out).
+    /// We drive it via `process_message`, feeding the caller's messages, and
+    /// assert the QSO completes and logs the caller's grid (Batch 2 #8).
+    #[tokio::test]
+    async fn cqer_full_sequence_completes_and_logs_grid() {
+        // our_callsign = W1ABC (from test_config).
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        let qso_id = manager.start_cq(freq, None).await.unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_id).await.unwrap().state,
+            QsoState::CallingCq { .. }
+        ));
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.role,
+            QsoRole::Cqer
+        );
+
+        // Caller answers our CQ with their grid: "W1ABC K1DEF FN31".
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                freq,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        let p = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(p.state, QsoState::WaitingForReport { .. }),
+            "CallingCq + CqResponse → WaitingForReport, got {:?}",
+            p.state
+        );
+
+        // Caller rogers our report with their R-report: "W1ABC K1DEF R-12".
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -12,
+                },
+                "W1ABC K1DEF R-12".to_string(),
+                freq,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        let p = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(p.state, QsoState::WaitingForConfirmation { .. }),
+            "WaitingForReport + ReportAck → WaitingForConfirmation, got {:?}",
+            p.state
+        );
+
+        // Caller closes with 73: "W1ABC K1DEF 73" → Completed.
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                },
+                "W1ABC K1DEF 73".to_string(),
+                freq,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        let p = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(p.state, QsoState::Completed { .. }),
+            "WaitingForConfirmation + 73 → Completed, got {:?}",
+            p.state
+        );
+        // Batch 2 #8: the caller's grid latched from the opening CqResponse is
+        // carried into the logged metadata.
+        assert_eq!(p.metadata.grids.theirs.as_deref(), Some("FN31"));
+        assert_eq!(p.metadata.their_callsign.as_deref(), Some("K1DEF"));
+        assert!(p.metadata.end_time.is_some());
+    }
+
+    /// The manual CQer also EMITS the right reply at each step (the auto-reply
+    /// path is Manual-gated). Drive a manual CQ QSO and verify the reply
+    /// sequence SignalReport → FinalConfirmation reaches the event bus.
+    #[tokio::test]
+    async fn manual_cqer_emits_report_then_rr73() {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        // Build a manual CallingCq QSO directly (start_cq is Auto-only; the
+        // operator-CQ-as-QSO wiring is a separate deferred item — see report).
+        let qso_id = Uuid::new_v4();
+        let now = Utc::now();
+        let progress = QsoProgress {
+            state: QsoState::CallingCq {
+                frequency: freq,
+                started_at: now,
+                call_count: 1,
+            },
+            state_history: vec![],
+            messages: vec![],
+            metadata: QsoMetadata {
+                qso_id,
+                our_callsign: "W1ABC".to_string(),
+                their_callsign: None,
+                frequency: freq,
+                mode: "FT8".to_string(),
+                start_time: now,
+                end_time: None,
+                reports: SignalReports::default(),
+                grids: GridSquares::default(),
+                contest_info: None,
+                tags: HashMap::new(),
+                notes: None,
+                tx_parity: None,
+                initiated_by: CallInitiation::Manual,
+                role: QsoRole::Cqer,
+                call_count: 1,
+                first_call_at: Some(now),
+                last_call_at: Some(now),
+            },
+        };
+        manager.qsos.write().await.insert(qso_id, progress);
+
+        let mut events = manager.subscribe();
+
+        // Caller answers → we should emit a SignalReport.
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                freq,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        let mut saw_report = false;
+        loop {
+            match events.try_recv() {
+                Ok(QsoEvent::MessageToSend { message, .. }) => {
+                    if matches!(message, MessageType::SignalReport { .. }) {
+                        saw_report = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                Err(TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        assert!(saw_report, "manual CQer should emit a SignalReport reply");
+
+        // Caller R-reports → we should emit a FinalConfirmation (RR73).
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -12,
+                },
+                "W1ABC K1DEF R-12".to_string(),
+                freq,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        let mut saw_rr73 = false;
+        loop {
+            match events.try_recv() {
+                Ok(QsoEvent::MessageToSend { message, .. }) => {
+                    if matches!(message, MessageType::FinalConfirmation { .. }) {
+                        saw_rr73 = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                Err(TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        assert!(
+            saw_rr73,
+            "manual CQer should emit a FinalConfirmation (RR73)"
+        );
+    }
+
+    // --- Batch 2 #7: case-insensitive supersede ---------------------------
+
+    /// A manual call to "k1def" must supersede an existing active QSO with
+    /// "K1DEF" (case-insensitive), not spawn a duplicate.
+    #[tokio::test]
+    async fn supersede_is_case_insensitive() {
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        let first = manager
+            .respond_to_cq_manual("K1DEF".to_string(), freq, None)
+            .await
+            .unwrap();
+        // Re-call with different case — should supersede `first`.
+        let second = manager
+            .respond_to_cq_manual("k1def".to_string(), freq, None)
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+        // The first QSO is retired (Failed{Superseded}); only `second` active.
+        let first_state = manager.get_qso(first).await.unwrap().state;
+        assert!(
+            matches!(
+                first_state,
+                QsoState::Failed {
+                    reason: QsoFailureReason::Superseded,
+                    ..
+                }
+            ),
+            "first QSO should be superseded, got {:?}",
+            first_state
+        );
+        let active = manager.get_active_qsos().await;
+        assert_eq!(
+            active.len(),
+            1,
+            "exactly one active QSO after case-different re-call"
+        );
+        assert_eq!(active[0].0, second);
+    }
+
+    // --- Batch 2 #8: grid latched into Completed (Caller path) ------------
+
+    /// In the Caller flow the DX's grid arrives in the opening CqResponse and
+    /// must reach the logged metadata even though the close arm hard-codes
+    /// grid_square: None. Drive a manual caller QSO and complete it.
+    #[tokio::test]
+    async fn caller_grid_latched_into_completed_metadata() {
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), freq, None)
+            .await
+            .unwrap();
+
+        // The DX re-sends "W1ABC K1DEF FN31" (their grid) — latch it.
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                freq,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+
+        // DX sends our report → SendingReport.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -9,
+                },
+                "W1ABC K1DEF -09".to_string(),
+                freq,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_id).await.unwrap().state,
+            QsoState::SendingReport { .. }
+        ));
+
+        // DX closes from our R directly with RR73 → Completed (grid_square None
+        // in the state, but metadata.grids.theirs already latched FN31).
+        manager
+            .process_message(
+                MessageType::FinalConfirmation {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                },
+                "W1ABC K1DEF RR73".to_string(),
+                freq,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+        let p = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(p.state, QsoState::Completed { .. }),
+            "got {:?}",
+            p.state
+        );
+        assert_eq!(p.metadata.grids.theirs.as_deref(), Some("FN31"));
     }
 }
 

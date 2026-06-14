@@ -1759,6 +1759,9 @@ mod key_tests {
             ladder_index: 1,
             now_line: "waiting".to_string(),
             next_line: "their signal report".to_string(),
+            call_count: 0,
+            max_calls: 0,
+            watchdog_deadline: None,
         };
         r.handle_message(TuiMessage::ActiveQsosUpdate { qsos: vec![banner] })
             .await
@@ -1887,6 +1890,9 @@ mod key_tests {
             ladder_index: 0,
             now_line: String::new(),
             next_line: String::new(),
+            call_count: 0,
+            max_calls: 0,
+            watchdog_deadline: None,
         }
     }
 

@@ -1186,6 +1186,9 @@ fn map_qso_snapshot_item(
         ladder_index: q.ladder_index,
         now_line: q.now_line.clone(),
         next_line: q.next_line.clone(),
+        call_count: q.call_count,
+        max_calls: q.max_calls,
+        watchdog_deadline: q.watchdog_deadline,
     }
 }
 
@@ -1260,6 +1263,9 @@ mod tui_relay_tests {
             ladder_index: 1,
             now_line: "waiting".to_string(),
             next_line: "their signal report".to_string(),
+            call_count: 4,
+            max_calls: 10,
+            watchdog_deadline: Some(started + chrono::Duration::minutes(5)),
         };
         let banner = map_qso_snapshot_item(&item);
         assert_eq!(banner.qso_id, "11111111-1111-1111-1111-111111111111");
@@ -1279,6 +1285,13 @@ mod tui_relay_tests {
         assert_eq!(banner.report_sent, Some(-8));
         assert_eq!(banner.report_received, Some(-12));
         assert_eq!(banner.exchange_count, 2);
+        // Batch 2 #1: watchdog fields carry through.
+        assert_eq!(banner.call_count, 4);
+        assert_eq!(banner.max_calls, 10);
+        assert_eq!(
+            banner.watchdog_deadline,
+            Some(started + chrono::Duration::minutes(5))
+        );
     }
 
     /// Fresh QSO with no traffic yet: None/0 detail fields map through
@@ -1306,6 +1319,9 @@ mod tui_relay_tests {
             ladder_index: 0,
             now_line: String::new(),
             next_line: String::new(),
+            call_count: 0,
+            max_calls: 0,
+            watchdog_deadline: None,
         };
         let banner = map_qso_snapshot_item(&item);
         assert!(banner.last_tx_text.is_none());

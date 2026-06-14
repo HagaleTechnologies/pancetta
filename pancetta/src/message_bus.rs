@@ -299,6 +299,19 @@ pub struct ActiveQsoSnapshotItem {
     pub now_line: String,
     /// Human-readable "next" line (what we expect next).
     pub next_line: String,
+    /// Manual keep-calling watchdog: number of calls transmitted so far.
+    /// Only meaningful for manual keep-calling states (RespondingToCq /
+    /// SendingReport); `0` otherwise. The TUI renders "Call N/M" so the
+    /// operator can see keep-calling is bounded (not an infinite loop).
+    pub call_count: u32,
+    /// Manual keep-calling watchdog: the call cap (`manual_call_max_calls`).
+    /// `0` when not keep-calling.
+    pub max_calls: u32,
+    /// Manual keep-calling watchdog: when keep-calling will stop on the
+    /// elapsed-time bound (`first_call_at + manual_call_watchdog_minutes`).
+    /// The TUI renders a live countdown ("stops 3:12"). `None` when this QSO
+    /// is not in a manual keep-calling state.
+    pub watchdog_deadline: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Status data from the autonomous operator for TUI consumption.
