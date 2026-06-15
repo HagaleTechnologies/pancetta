@@ -82,6 +82,19 @@
 //!   ([`Sim::inject_collision`]) — useful for asserting frequency-tolerance and
 //!   relevance behavior.
 //!
+//! # High-fidelity mode (`sim-hifi` feature)
+//!
+//! The default harness injects *decoded text* directly — it tests the QSO
+//! engine, taking the decoder as given. With the `sim-hifi` feature,
+//! `Sim::inject_signal` instead injects a transmitted **signal** (text + SNR +
+//! [`FadingProfile`]) and runs it through the *real* pancetta-ft8 pipeline:
+//! encode → modulate → apply fading → add calibrated AWGN → `decode_window`.
+//! At low SNR or under deep fading the message may **MISS** entirely (no
+//! decode), exactly as on a real band; the decoder's *actual* recovered
+//! text/freq/SNR is what drives the engine. This tests the decoder's
+//! weak-signal behavior together with the QSO logic. See `Sim::inject_signal`
+//! for the SNR convention and determinism guarantees.
+//!
 //! # Asserting the outcome
 //!
 //! Drive the scenario, then call assertion helpers on the [`Timeline`]:
@@ -315,6 +328,9 @@ pub struct Timeline {
     pub completions: Vec<Completion>,
     /// Every failure, in order.
     pub failures: Vec<Failure>,
+    /// Every high-fidelity signal injection ([`Sim::inject_signal`]), decoded
+    /// or missed, in order. Empty for direct-inject (`inject_decode`) runs.
+    pub signals: Vec<SignalOutcome>,
     /// The highest slot index reached.
     pub last_slot: u64,
 }
@@ -419,6 +435,17 @@ impl Timeline {
         );
     }
 
+    /// Number of high-fidelity signal injections that the decoder recovered.
+    pub fn signals_decoded(&self) -> usize {
+        self.signals.iter().filter(|s| s.decoded).count()
+    }
+
+    /// Number of high-fidelity signal injections that were MISSED (lost in
+    /// noise / fading — the decoder produced no copy of our message).
+    pub fn signals_missed(&self) -> usize {
+        self.signals.iter().filter(|s| !s.decoded).count()
+    }
+
     /// Assert no `Superseded` failure occurred (a duplicate-QSO smell).
     pub fn assert_no_superseded(&self) {
         assert!(
@@ -438,12 +465,44 @@ impl fmt::Display for Timeline {
         )?;
         writeln!(f, "{}", "-".repeat(100))?;
         for slot in 0..=self.last_slot {
-            let rx: Vec<String> = self
-                .receptions
+            // High-fidelity signal outcomes for this slot render in the RX
+            // column, showing decoded-vs-missed plus the requested SNR.
+            let mut rx: Vec<String> = self
+                .signals
                 .iter()
-                .filter(|r| r.slot == slot)
-                .map(|r| format!("{} ({:.0}Hz {:+.0}dB)", r.text, r.freq_hz, r.snr_db))
+                .filter(|s| s.slot == slot)
+                .map(|s| {
+                    if s.decoded {
+                        format!(
+                            "signal@{:+.0}dB DECODED -> {} ({:.0}Hz {:+.0}dB)",
+                            s.requested_snr_db,
+                            s.decoded_text.as_deref().unwrap_or(""),
+                            s.measured_freq_hz.unwrap_or(s.sent_freq_hz),
+                            s.measured_snr_db.unwrap_or(0.0),
+                        )
+                    } else {
+                        format!(
+                            "signal@{:+.0}dB MISSED [{}]",
+                            s.requested_snr_db, s.sent_text
+                        )
+                    }
+                })
                 .collect();
+            rx.extend(
+                self.receptions
+                    .iter()
+                    .filter(|r| r.slot == slot)
+                    // Don't double-print a reception that a hi-fi decode already
+                    // surfaced (same slot+text).
+                    .filter(|r| {
+                        !self.signals.iter().any(|s| {
+                            s.slot == slot
+                                && s.decoded
+                                && s.decoded_text.as_deref() == Some(r.text.as_str())
+                        })
+                    })
+                    .map(|r| format!("{} ({:.0}Hz {:+.0}dB)", r.text, r.freq_hz, r.snr_db)),
+            );
             let tx: Vec<String> = self
                 .transmissions
                 .iter()
@@ -674,6 +733,8 @@ pub struct Sim {
     /// Virtual band model for the allocator.
     band: BandModel,
     allocator: SmartFrequencyAllocator,
+    /// Base seed for the high-fidelity AWGN generator (deterministic replay).
+    hifi_seed: u64,
 }
 
 impl Sim {
@@ -708,7 +769,16 @@ impl Sim {
             timeline: Timeline::default(),
             band: BandModel::clear(),
             allocator: SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default()),
+            hifi_seed: 0xF18_C0DE,
         }
+    }
+
+    /// Set the base seed for the high-fidelity AWGN generator
+    /// ([`Sim::inject_signal`]). The same seed + same scenario replays
+    /// byte-identically. Returns `self` for chaining after [`Sim::new`].
+    pub fn with_hifi_seed(mut self, seed: u64) -> Self {
+        self.hifi_seed = seed;
+        self
     }
 
     /// Access the underlying real [`QsoManager`] (for advanced assertions on
@@ -1081,6 +1151,331 @@ impl Sim {
     pub fn our_callsign(&self) -> &str {
         &self.our_callsign
     }
+
+    // --- High-fidelity virtual band (real encode -> noise/fading -> decode) ---
+
+    /// Inject a transmitted **signal** (not pre-decoded text) into the current
+    /// slot, running it through the *real* pancetta-ft8 pipeline:
+    ///
+    /// ```text
+    ///   text --(Ft8Encoder)--> 79 symbols --(Ft8Modulator @ freq_hz)--> audio
+    ///        --(apply FadingProfile)--> --(add calibrated AWGN @ snr_db)-->
+    ///        --(Ft8Decoder::decode_window)--> decode(s) or NOTHING
+    /// ```
+    ///
+    /// Unlike [`Sim::inject_decode`] (which hands the engine perfect text), this
+    /// path exercises the decoder's weak-signal behavior: at low SNR or under
+    /// deep fading the message may **MISS** entirely (no decode), exactly as on
+    /// a real band. Whatever the decoder actually recovers — its text, its
+    /// measured audio offset, and its *own* measured SNR — is what gets fed into
+    /// the QSO engine, via the same [`process_message`](QsoManager::process_message)
+    /// path [`inject_decode`](Sim::inject_decode) uses.
+    ///
+    /// # SNR convention
+    ///
+    /// `snr_db` is the **wideband RMS SNR** the research synthetic corpus uses
+    /// (`gen_synth`): the AWGN RMS is set so that
+    /// `20·log10(signal_rms / noise_rms) == snr_db` over the full 12 kHz buffer.
+    /// This is a *generation* convention; the decoder reports its own
+    /// spectrogram SNR (WSJT-X 2500 Hz reference,
+    /// `estimate_snr_spectrogram`-style), which differs by a roughly constant
+    /// offset (the signal occupies ~50 Hz while the noise spreads across the
+    /// full Nyquist band, so the in-band SNR the decoder sees is higher). The
+    /// engine is fed the decoder's measured SNR, not the requested one, so the
+    /// QSO logic always sees a realistic value. The example prints both for
+    /// comparison.
+    ///
+    /// # Decoder
+    ///
+    /// Decoding uses `Ft8Decoder::decode_window` — the native pancetta-ft8
+    /// pipeline, which is the path the production coordinator runs (the ft8_lib
+    /// FFI path is a research/baseline comparison tool, not the live decode).
+    ///
+    /// # Determinism
+    ///
+    /// The AWGN is generated from a per-call seed derived from
+    /// `(self.hifi_seed, slot, freq, snr)`, so a given scenario replays
+    /// byte-identically. Set the base seed with [`Sim::with_hifi_seed`].
+    ///
+    /// Returns the [`SignalOutcome`] for this injection (decoded vs missed),
+    /// also recorded in the [`Timeline`].
+    #[cfg(feature = "sim-hifi")]
+    pub fn inject_signal(
+        &mut self,
+        text: &str,
+        freq_hz: f64,
+        snr_db: f32,
+        fading: FadingProfile,
+    ) -> SignalOutcome {
+        let slot = self.clock.slot();
+        let parity = self.clock.parity();
+
+        // 1. Encode + modulate to a full 12.64 s / 12 kHz window at freq_hz.
+        let mut encoder = pancetta_ft8::Ft8Encoder::new();
+        let symbols = match encoder.encode_message(text, None) {
+            Ok(s) => s,
+            Err(e) => panic!("inject_signal: failed to encode {text:?}: {e}"),
+        };
+        // Place the signal at the absolute audio offset `freq_hz` by using it
+        // as the modulator base (the lowest tone) and modulating at offset 0.
+        // This matches `inject_decode`'s "audio offset in Hz" convention, and
+        // the decoder reports `frequency_offset` as the absolute audio freq.
+        // The 8-FSK tones span ~44 Hz above the base, and the modulator caps
+        // the top tone at 2500 Hz, so usable `freq_hz` is ~[200, 2456].
+        let mut modulator = pancetta_ft8::Ft8Modulator::new(
+            pancetta_ft8::SAMPLE_RATE,
+            freq_hz,
+            pancetta_ft8::modulator::DEFAULT_TX_POWER,
+        )
+        .unwrap_or_else(|e| {
+            panic!("inject_signal: FT8 modulator at {freq_hz} Hz should construct: {e}")
+        });
+        let mut audio = modulator
+            .modulate_symbols(&symbols, 0.0)
+            .unwrap_or_else(|e| panic!("inject_signal: failed to modulate {text:?}: {e}"));
+        audio.resize(pancetta_ft8::WINDOW_SAMPLES, 0.0);
+
+        // 2. Apply fading (time-varying attenuation / dropout) to the signal
+        //    BEFORE adding noise, so the AWGN floor stays constant across the
+        //    frame and the faded portions genuinely sink toward the noise.
+        fading.apply(&mut audio, pancetta_ft8::SAMPLE_RATE);
+
+        // 3. Add calibrated AWGN at the requested wideband SNR (research
+        //    `gen_synth` convention). RMS is measured over the (post-fading)
+        //    signal so a faded frame is noisier relative to its own energy.
+        let seed = hifi_noise_seed(self.hifi_seed, slot, freq_hz, snr_db);
+        add_calibrated_awgn(&mut audio, snr_db, seed);
+
+        // 4. Decode through the REAL native pipeline (production path).
+        let mut decoder = pancetta_ft8::Ft8Decoder::new(pancetta_ft8::Ft8Config::default())
+            .expect("inject_signal: default FT8 decoder should construct");
+        let decoded = decoder.decode_window(&audio).unwrap_or_default();
+
+        // 5. Did our intended message survive? Match on the decoded TEXT
+        //    (case-insensitive, trimmed) — a decode of *some other* phantom is
+        //    not "our" signal getting through.
+        let want = text.trim().to_uppercase();
+        let hit = decoded
+            .iter()
+            .find(|d| d.text.trim().to_uppercase() == want);
+
+        let outcome = match hit {
+            Some(d) => {
+                // Feed the decoder's ACTUAL recovered text/freq/SNR into the
+                // engine, exactly like inject_decode would for a perfect copy.
+                self.pending_injects.push(Reception {
+                    slot,
+                    text: d.text.clone(),
+                    freq_hz: d.frequency_offset,
+                    snr_db: d.snr_db,
+                    dt: d.time_offset as f32,
+                    slot_parity: parity,
+                });
+                SignalOutcome {
+                    slot,
+                    sent_text: text.to_string(),
+                    sent_freq_hz: freq_hz,
+                    requested_snr_db: snr_db,
+                    fading,
+                    decoded: true,
+                    decoded_text: Some(d.text.clone()),
+                    measured_snr_db: Some(d.snr_db),
+                    measured_freq_hz: Some(d.frequency_offset),
+                }
+            }
+            None => {
+                // A real MISS: the slot simply has no reception of our signal.
+                // The engine sees nothing this slot; keep-call re-arm / watchdog
+                // still run on tick, so a QSO can recover over later slots.
+                SignalOutcome {
+                    slot,
+                    sent_text: text.to_string(),
+                    sent_freq_hz: freq_hz,
+                    requested_snr_db: snr_db,
+                    fading,
+                    decoded: false,
+                    decoded_text: None,
+                    measured_snr_db: None,
+                    measured_freq_hz: None,
+                }
+            }
+        };
+        self.timeline.signals.push(outcome.clone());
+        outcome
+    }
+}
+
+// ============================================================================
+// High-fidelity sim: fading profiles, signal outcomes, calibrated noise.
+//
+// These plain-data / pure-math items are always compiled (no pancetta-ft8
+// dependency); only [`Sim::inject_signal`], which drives the real codec, is
+// gated behind the `sim-hifi` feature.
+// ============================================================================
+
+/// A time-varying channel impairment applied to a transmitted signal before
+/// AWGN is added, in [`Sim::inject_signal`].
+///
+/// Fading is modeled as a per-sample real-valued amplitude envelope across the
+/// 12.64 s FT8 frame. It is applied to the *signal* before the noise floor is
+/// added, so faded portions genuinely sink toward (or below) the noise — the
+/// realistic mechanism by which a weak-but-fading station drops in and out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FadingProfile {
+    /// No fading: the signal passes through at full modeled amplitude.
+    None,
+    /// Flat (frequency-flat, time-flat) attenuation by `attenuation_db` over
+    /// the whole frame. Positive values attenuate; the signal RMS drops, so at
+    /// a fixed requested SNR this mostly just shifts where the calibration
+    /// lands — useful for stacking a deterministic loss on top of an SNR sweep.
+    Flat {
+        /// Attenuation in dB (positive = quieter).
+        attenuation_db: f32,
+    },
+    /// Dropout: the signal is fully present for the first `(1 - fraction)` of
+    /// the frame, then absent (amplitude 0) for the trailing `fraction`.
+    /// Models a station that fades out partway through the slot. With `fraction`
+    /// large enough the decoder loses sync and the slot MISSES.
+    Dropout {
+        /// Fraction of the frame, at the end, during which the signal is gone
+        /// (clamped to `[0.0, 1.0]`).
+        fraction: f32,
+    },
+}
+
+impl FadingProfile {
+    /// Apply this profile in-place to `samples`, a `sample_rate`-Hz audio
+    /// buffer spanning one FT8 frame. (`sample_rate` is threaded in so this
+    /// stays independent of the optional pancetta-ft8 dependency.)
+    pub fn apply(&self, samples: &mut [f32], _sample_rate: u32) {
+        match *self {
+            FadingProfile::None => {}
+            FadingProfile::Flat { attenuation_db } => {
+                let gain = 10f32.powf(-attenuation_db / 20.0);
+                for s in samples.iter_mut() {
+                    *s *= gain;
+                }
+            }
+            FadingProfile::Dropout { fraction } => {
+                let frac = fraction.clamp(0.0, 1.0);
+                let n = samples.len();
+                let keep = ((1.0 - frac) * n as f32) as usize;
+                for s in samples.iter_mut().skip(keep) {
+                    *s = 0.0;
+                }
+            }
+        }
+    }
+}
+
+/// The outcome of one high-fidelity signal injection ([`Sim::inject_signal`]):
+/// what we transmitted, and whether the real decoder recovered it.
+#[derive(Debug, Clone)]
+pub struct SignalOutcome {
+    /// Slot index in which the signal was injected.
+    pub slot: u64,
+    /// The text we encoded and transmitted.
+    pub sent_text: String,
+    /// The audio offset we modulated at, in Hz.
+    pub sent_freq_hz: f64,
+    /// The requested (wideband-RMS) SNR, in dB.
+    pub requested_snr_db: f32,
+    /// The fading profile applied.
+    pub fading: FadingProfile,
+    /// `true` if the decoder recovered our message; `false` if it was MISSED.
+    pub decoded: bool,
+    /// The decoder's recovered text (when `decoded`).
+    pub decoded_text: Option<String>,
+    /// The decoder's *measured* SNR (WSJT-X 2500 Hz reference), when `decoded`.
+    /// This — not `requested_snr_db` — is what the QSO engine is fed.
+    pub measured_snr_db: Option<f32>,
+    /// The decoder's measured audio offset, when `decoded`.
+    pub measured_freq_hz: Option<f64>,
+}
+
+/// Add additive white Gaussian noise to `samples` at the requested wideband
+/// RMS SNR, matching the research `gen_synth` convention: the noise RMS is set
+/// so `20·log10(signal_rms / noise_rms) == snr_db` over the whole buffer.
+///
+/// Uses a deterministic seeded Box–Muller generator (no external RNG crate) so
+/// a given seed replays byte-identically.
+#[cfg(feature = "sim-hifi")]
+fn add_calibrated_awgn(samples: &mut [f32], snr_db: f32, seed: u64) {
+    if samples.is_empty() {
+        return;
+    }
+    let signal_rms =
+        (samples.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / samples.len() as f64).sqrt();
+    if signal_rms <= 0.0 {
+        return;
+    }
+    let noise_rms = signal_rms / 10f64.powf(snr_db as f64 / 20.0);
+    let mut rng = DeterministicGaussian::new(seed);
+    for s in samples.iter_mut() {
+        *s += (rng.next_standard() * noise_rms) as f32;
+    }
+}
+
+/// Derive a per-injection noise seed from the base seed and the call's
+/// distinguishing parameters, so distinct signals in distinct slots get
+/// distinct (but reproducible) noise realizations.
+#[cfg(feature = "sim-hifi")]
+fn hifi_noise_seed(base: u64, slot: u64, freq_hz: f64, snr_db: f32) -> u64 {
+    let mut h = base ^ 0x9E37_79B9_7F4A_7C15;
+    h = h.wrapping_mul(0x100_0000_01B3).wrapping_add(slot);
+    h = h
+        .wrapping_mul(0x100_0000_01B3)
+        .wrapping_add((freq_hz as u64).wrapping_mul(1_000));
+    h = h
+        .wrapping_mul(0x100_0000_01B3)
+        .wrapping_add(((snr_db * 100.0) as i64) as u64);
+    h
+}
+
+/// A tiny deterministic standard-normal generator: SplitMix64 uniform draws fed
+/// through Box–Muller. Self-contained so the harness needs no `rand` dependency
+/// and replays identically given a seed.
+#[cfg(feature = "sim-hifi")]
+struct DeterministicGaussian {
+    state: u64,
+    spare: Option<f64>,
+}
+
+#[cfg(feature = "sim-hifi")]
+impl DeterministicGaussian {
+    fn new(seed: u64) -> Self {
+        Self {
+            // Avoid the all-zero state degeneracy of SplitMix64.
+            state: seed ^ 0xDEAD_BEEF_CAFE_F00D,
+            spare: None,
+        }
+    }
+
+    /// Next uniform in (0, 1), via SplitMix64.
+    fn next_uniform(&mut self) -> f64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        // 53-bit mantissa -> (0,1); nudge off exact 0 so log is finite.
+        let u = (z >> 11) as f64 / (1u64 << 53) as f64;
+        u.max(f64::MIN_POSITIVE)
+    }
+
+    /// Next draw from the standard normal N(0,1).
+    fn next_standard(&mut self) -> f64 {
+        if let Some(v) = self.spare.take() {
+            return v;
+        }
+        let u1 = self.next_uniform();
+        let u2 = self.next_uniform();
+        let mag = (-2.0 * u1.ln()).sqrt();
+        let z0 = mag * (2.0 * std::f64::consts::PI * u2).cos();
+        let z1 = mag * (2.0 * std::f64::consts::PI * u2).sin();
+        self.spare = Some(z1);
+        z0
+    }
 }
 
 /// Assert a chosen TX offset stays at least `min_clear_hz` away from `occupied_hz`.
@@ -1148,5 +1543,198 @@ mod tests {
     #[should_panic(expected = "clear of occupied")]
     fn assert_tx_offset_clear_of_panics_when_too_close() {
         assert_tx_offset_clear_of(1520.0, 1500.0, 100.0);
+    }
+}
+
+/// High-fidelity sim tests: real encode -> noise/fading -> decode -> engine.
+///
+/// Marginal-SNR decode is inherently probabilistic, so the weak-signal tests
+/// assert *handling* (no panic, miss recorded, keep-call continues) and ranges,
+/// not exact bit outcomes. All noise is seeded, so each test replays
+/// identically; the strong-signal completion test is the deterministic anchor.
+#[cfg(all(test, feature = "sim-hifi"))]
+mod hifi_tests {
+    use super::*;
+
+    /// Flat attenuation scales every sample by the expected linear gain.
+    #[test]
+    fn fading_flat_attenuates_by_db() {
+        let mut buf = vec![1.0f32; 100];
+        FadingProfile::Flat {
+            attenuation_db: 6.0,
+        }
+        .apply(&mut buf, pancetta_ft8::SAMPLE_RATE);
+        // -6 dB ~= 0.501x amplitude.
+        assert!((buf[0] - 0.5012).abs() < 0.01, "got {}", buf[0]);
+        assert!(buf.iter().all(|&s| (s - buf[0]).abs() < 1e-6));
+    }
+
+    /// Dropout zeroes the trailing `fraction` of the buffer and leaves the rest.
+    #[test]
+    fn fading_dropout_zeroes_tail() {
+        let mut buf = vec![1.0f32; 1000];
+        FadingProfile::Dropout { fraction: 0.3 }.apply(&mut buf, pancetta_ft8::SAMPLE_RATE);
+        assert_eq!(buf[0], 1.0);
+        assert_eq!(buf[699], 1.0); // last kept sample (700 kept)
+        assert_eq!(buf[700], 0.0); // first dropped sample
+        assert_eq!(buf[999], 0.0);
+    }
+
+    /// Calibrated AWGN hits the requested wideband RMS SNR (within tolerance)
+    /// and is deterministic for a fixed seed.
+    #[test]
+    fn awgn_calibration_and_determinism() {
+        // A flat-amplitude "signal" so RMS is well defined.
+        let make = || vec![0.1f32; 12_000];
+        let mut a = make();
+        add_calibrated_awgn(&mut a, -10.0, 42);
+        let mut b = make();
+        add_calibrated_awgn(&mut b, -10.0, 42);
+        // Byte-identical replay for the same seed.
+        assert_eq!(a, b, "same seed must produce identical noise");
+
+        // Measured SNR ~= requested. signal_rms = 0.1; recover noise RMS from
+        // the residual after subtracting the constant signal.
+        let noise: Vec<f64> = a.iter().map(|&s| s as f64 - 0.1).collect();
+        let noise_rms = (noise.iter().map(|n| n * n).sum::<f64>() / noise.len() as f64).sqrt();
+        let measured_snr = 20.0 * (0.1 / noise_rms).log10();
+        assert!(
+            (measured_snr - (-10.0)).abs() < 0.5,
+            "measured wideband SNR {measured_snr:.2} dB should be ~ -10 dB"
+        );
+
+        // A different seed gives a different realization.
+        let mut c = make();
+        add_calibrated_awgn(&mut c, -10.0, 43);
+        assert_ne!(a, c, "different seeds should differ");
+    }
+
+    /// A strong, clean signal reliably decodes and drives a manual-call QSO to
+    /// completion. This is the deterministic anchor (seeded noise, +6 dB).
+    #[tokio::test]
+    async fn strong_signal_completes_qso() {
+        let mut sim = Sim::new("K5ARH", Some("EM10")).await.with_hifi_seed(11);
+        let dx = "VB7F";
+        let freq = 1200.0;
+        sim.call_station(dx, freq).await;
+
+        let g = sim.inject_signal(&format!("K5ARH {dx} EM73"), freq, 6.0, FadingProfile::None);
+        assert!(g.decoded, "strong grid reply must decode");
+        sim.tick().await;
+
+        let r = sim.inject_signal(&format!("K5ARH {dx} -12"), freq, 6.0, FadingProfile::None);
+        assert!(r.decoded, "strong report must decode");
+        sim.tick().await;
+
+        let rr = sim.inject_signal(&format!("K5ARH {dx} RR73"), freq, 6.0, FadingProfile::None);
+        assert!(rr.decoded, "strong RR73 must decode");
+        sim.tick().await;
+        sim.tick_n(2).await;
+
+        let tl = sim.into_timeline();
+        assert_eq!(
+            tl.signals_missed(),
+            0,
+            "strong signals should never miss\n{tl}"
+        );
+        tl.assert_completed_with(dx);
+        tl.assert_no_duplicate_qsos();
+    }
+
+    /// The decoder reports its own (spectrogram, 2500 Hz reference) SNR, which
+    /// is higher than the requested wideband SNR — and that measured value is
+    /// what reaches the engine.
+    #[tokio::test]
+    async fn measured_snr_drives_engine_not_requested() {
+        let mut sim = Sim::new("K5ARH", Some("EM10")).await.with_hifi_seed(5);
+        let dx = "VB7F";
+        let freq = 1500.0;
+        sim.call_station(dx, freq).await;
+        let out = sim.inject_signal(
+            &format!("K5ARH {dx} EM73"),
+            freq,
+            -10.0,
+            FadingProfile::None,
+        );
+        assert!(out.decoded);
+        let measured = out.measured_snr_db.unwrap();
+        // In-band SNR exceeds the wideband requested SNR by the BW correction.
+        assert!(
+            measured > out.requested_snr_db,
+            "measured {measured} should exceed requested {}",
+            out.requested_snr_db
+        );
+        // The reception fed to the engine carries the measured SNR (receptions
+        // are committed to the timeline on tick).
+        sim.tick().await;
+        let tl = sim.timeline();
+        assert!(tl
+            .receptions
+            .iter()
+            .any(|r| (r.snr_db - measured).abs() < 1e-3));
+    }
+
+    /// A deep dropout fade causes a MISS, and the harness handles it without
+    /// panicking: the slot has no reception, the miss is recorded, and the
+    /// manual keep-call keeps re-arming (so the QSO is not stranded).
+    #[tokio::test]
+    async fn deep_dropout_misses_and_keep_call_continues() {
+        let mut sim = Sim::new("K5ARH", Some("EM10")).await.with_hifi_seed(2);
+        let dx = "VB7F";
+        let freq = 1000.0;
+        sim.call_station(dx, freq).await;
+
+        // Heavy dropout (90% of the frame gone) — the DX's answer is lost.
+        let out = sim.inject_signal(
+            &format!("K5ARH {dx} EM73"),
+            freq,
+            6.0,
+            FadingProfile::Dropout { fraction: 0.9 },
+        );
+        assert!(!out.decoded, "a 90% dropout must MISS");
+        sim.tick().await;
+        // A couple more silent slots: keep-call must keep firing.
+        sim.tick_n(2).await;
+
+        let tl = sim.into_timeline();
+        assert_eq!(tl.signals_missed(), 1);
+        assert_eq!(tl.signals_decoded(), 0);
+        // The miss left no reception this run.
+        assert!(
+            tl.receptions.is_empty(),
+            "a missed signal yields no reception\n{tl}"
+        );
+        // Manual keep-call re-armed our CQ-response across the silent slots.
+        assert!(
+            tl.count_transmitted_containing(dx) >= 2,
+            "expected keep-call to re-send to {dx} across slots\n{tl}"
+        );
+        // And nothing completed (the DX never got through).
+        tl.assert_not_completed_with(dx);
+    }
+
+    /// Same seed + same scenario => identical decoded/missed outcomes.
+    #[tokio::test]
+    async fn marginal_run_is_reproducible() {
+        async fn run(seed: u64) -> Vec<bool> {
+            let mut sim = Sim::new("K5ARH", Some("EM10")).await.with_hifi_seed(seed);
+            let dx = "VB7F";
+            let freq = 1500.0;
+            sim.call_station(dx, freq).await;
+            let mut outcomes = Vec::new();
+            for snr in [-20.0f32, -24.0, -22.0, -23.0] {
+                let o =
+                    sim.inject_signal(&format!("K5ARH {dx} EM73"), freq, snr, FadingProfile::None);
+                outcomes.push(o.decoded);
+                sim.tick().await;
+            }
+            outcomes
+        }
+        let a = run(99).await;
+        let b = run(99).await;
+        assert_eq!(
+            a, b,
+            "same seed must replay identical decoded/missed pattern"
+        );
     }
 }

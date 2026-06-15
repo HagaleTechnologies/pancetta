@@ -3029,6 +3029,7 @@ dependencies = [
  "dirs",
  "lazy_static",
  "pancetta-core",
+ "pancetta-ft8",
  "proptest",
  "regex",
  "serde",
