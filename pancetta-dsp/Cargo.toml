@@ -19,7 +19,7 @@ tracing = "0.1"
 rustfft = "6.4"
 realfft = "3.3"
 rubato = "0.15"  # High-quality resampling
-biquad = "0.4"   # IIR filters
+biquad = "0.6"   # IIR filters
 
 # Numerical computing
 ndarray = "0.15"
