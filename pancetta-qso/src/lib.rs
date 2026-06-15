@@ -195,6 +195,8 @@ pub use cross_sequence::{
 pub mod fdr;
 pub use fdr::{should_reject as fdr_should_reject, FdrFeatures, FdrLevel, MessageCategory};
 
+pub mod sim;
+
 // Common error type for the entire library
 use crate::async_database::AsyncDatabaseError;
 use crate::async_logger::AsyncLoggerError;
