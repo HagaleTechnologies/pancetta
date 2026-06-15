@@ -645,6 +645,14 @@ impl super::ApplicationCoordinator {
                                     );
                                     if let Err(e) = message_bus.send_message(ptt_msg).await {
                                         warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
+                                    } else {
+                                        info!(
+                                            target: "tx.ptt",
+                                            "PTT ON (scheduled TX) sent to rig: '{}' @{:.0}Hz qso={}",
+                                            message_text,
+                                            frequency_offset,
+                                            qso_id.as_deref().unwrap_or("-")
+                                        );
                                     }
 
                                     // --- Step 6: Sleep precisely until target slot start ---
@@ -1074,6 +1082,11 @@ impl super::ApplicationCoordinator {
                                     );
                                     if let Err(e) = message_bus.send_message(ptt_msg).await {
                                         warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
+                                    } else {
+                                        info!(
+                                            target: "tx.ptt",
+                                            "PTT ON (scheduled multi-TX) sent to rig"
+                                        );
                                     }
 
                                     // --- Step 6: Sleep precisely until target slot ---

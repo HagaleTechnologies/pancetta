@@ -469,11 +469,16 @@ impl super::ApplicationCoordinator {
                                         } else {
                                             pancetta_hamlib::PttState::Off
                                         };
-                                        if let Err(e) = rig_poll
+                                        match rig_poll
                                             .set_ptt(pancetta_hamlib::Vfo::Current, ptt)
                                             .await
                                         {
-                                            error!("Failed to set PTT: {}", e);
+                                            Ok(()) => info!(
+                                                target: "tx.ptt",
+                                                "rig set_ptt {} OK",
+                                                if *state { "ON" } else { "OFF" }
+                                            ),
+                                            Err(e) => error!("Failed to set PTT: {}", e),
                                         }
                                     }
                                     _ => {}
