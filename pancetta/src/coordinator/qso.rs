@@ -15,11 +15,56 @@
 //!  - report completed QSOs to cqdx.io via the bridge.
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
+
+/// item-2-auto-73 tuning. When a station we JUST completed a *manual* QSO
+/// with keeps re-sending us RR73/RRR (they did not copy our 73), we
+/// auto-re-send our 73 — bounded so a stuck DX can never make us TX
+/// forever:
+///   - only for **manual** completions (never autonomous),
+///   - only while within [`AUTO_73_WINDOW`] of completion,
+///   - at most [`AUTO_73_MAX_RESENDS`] extra 73s per completed QSO,
+///   - at most once per ~15 s FT8 slot (so two decodes of the same RR73 in
+///     one slot fire only once),
+///   - never when a live QSO with that station is already active.
+const AUTO_73_WINDOW: chrono::Duration = chrono::Duration::minutes(3);
+/// Maximum number of auto re-sends of our 73 per completed manual QSO.
+const AUTO_73_MAX_RESENDS: u8 = 3;
+/// Minimum spacing between auto re-sends (one FT8 slot is 15 s; we use a
+/// slightly-under-slot guard so we fire at most once per slot even if the
+/// DX's RR73 is decoded a hair early/late).
+const AUTO_73_MIN_SPACING: chrono::Duration = chrono::Duration::seconds(14);
+
+/// One recently-completed **manual** QSO, tracked so we can auto-re-send our
+/// 73 if the DX keeps sending RR73/RRR. Keyed (in the map) by uppercased
+/// callsign.
+#[derive(Debug, Clone)]
+struct RecentManualCompletion {
+    /// When the QSO completed (window + pruning are measured from here).
+    completed_at: chrono::DateTime<chrono::Utc>,
+    /// Audio frequency (Hz) we last heard them on — where we send the 73.
+    frequency_hz: f64,
+    /// DX slot parity (so our 73 lands on the slot they expect). `None`
+    /// lets the TX scheduler fall back to its default.
+    dx_parity: Option<pancetta_core::slot::SlotParity>,
+    /// How many auto re-sends we have already done (bounded by
+    /// [`AUTO_73_MAX_RESENDS`]).
+    resends: u8,
+    /// When we last auto-re-sent (one-per-slot guard). `None` = never yet.
+    last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Shared map of recently-completed manual QSOs. Populated by the QSO-event
+/// task on `QsoCompleted` and consumed by the decode-processing loop when a
+/// directed RR73/RRR arrives. Both live inside the same QSO component task.
+type RecentManualCompletions = Arc<Mutex<HashMap<String, RecentManualCompletion>>>;
 
 /// Send a free-form status string to the TUI status bar via the message bus.
 /// Used to surface QSO/TX state changes that the operator should see, even
@@ -33,6 +78,157 @@ async fn emit_status(message_bus: &MessageBus, text: impl Into<String>) {
         Instant::now(),
     );
     let _ = message_bus.send_message(msg).await;
+}
+
+/// item-2-auto-73 trigger. When `msg_type` is a directed-at-us RR73/RRR
+/// (`FinalConfirmation { to_station == our call }`) from a station we just
+/// MANUALLY completed a QSO with, auto-re-send our 73 — bounded so it can
+/// never run away:
+///   - the sender must be in `completions` (a MANUAL completion stashed by
+///     the QsoCompleted handler) and within [`AUTO_73_WINDOW`],
+///   - `resends < AUTO_73_MAX_RESENDS`,
+///   - at most once per [`AUTO_73_MIN_SPACING`] (≈ one FT8 slot, so two
+///     decodes of the same RR73 in one slot fire only once),
+///   - the global [`pancetta_core::TxPolicy`] must `allows_any_tx()`
+///     (RESPOND-ONLY allows — it's a response; DISABLED blocks),
+///   - there must be NO currently-active QSO with the sender (don't fight a
+///     live exchange).
+///
+/// On success it sends our 73 via the same `respond_to_caller(SeventyThree)`
+/// path the Callers/Space close uses; the resulting Completed QSO is handled
+/// by the drop-stale-TX grace window (the 73 frame goes out, then drops), so
+/// there is no runaway. After the cap/window the entry is dropped.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_auto_resend_73(
+    msg_type: &pancetta_qso::states::MessageType,
+    our_callsign: &str,
+    frequency_hz: f64,
+    dx_parity: Option<pancetta_core::slot::SlotParity>,
+    qso_manager: &pancetta_qso::QsoManager,
+    completions: &RecentManualCompletions,
+    tx_policy: &std::sync::atomic::AtomicU8,
+    message_bus: &MessageBus,
+) {
+    use pancetta_qso::states::MessageType as Mt;
+
+    // Only directed RR73/RRR (both parse to FinalConfirmation) addressed to us.
+    let from_station = match msg_type {
+        Mt::FinalConfirmation {
+            to_station,
+            from_station,
+        } if to_station.eq_ignore_ascii_case(our_callsign) => from_station.clone(),
+        _ => return,
+    };
+    let key = from_station.to_uppercase();
+
+    // TX policy gate (DISABLED blocks; RESPOND-ONLY/FULL allow). Cheap check
+    // first, before touching the map.
+    let policy =
+        pancetta_core::TxPolicy::from_u8(tx_policy.load(std::sync::atomic::Ordering::Relaxed));
+    if !policy.allows_any_tx() {
+        return;
+    }
+
+    let now = chrono::Utc::now();
+
+    // Decide under the map lock: is this a stashed manual completion still in
+    // window and under the cap, with the per-slot guard satisfied? We mutate
+    // the entry (resends/last_resend_at) here so the bound holds even if RR73
+    // arrives every slot. We do NOT call into the QSO manager while holding
+    // the lock.
+    {
+        let mut map = completions.lock().await;
+        // Prune expired entries every time we look.
+        map.retain(|_, e| now.signed_duration_since(e.completed_at) < AUTO_73_WINDOW);
+
+        let Some(entry) = map.get_mut(&key) else {
+            return;
+        };
+        if entry.resends >= AUTO_73_MAX_RESENDS {
+            // Cap reached — stop and drop the entry so we never reconsider it.
+            map.remove(&key);
+            return;
+        }
+        if let Some(last) = entry.last_resend_at {
+            if now.signed_duration_since(last) < AUTO_73_MIN_SPACING {
+                // Already re-sent this slot — ignore the duplicate decode.
+                return;
+            }
+        }
+        // Commit the send: increment + stamp BEFORE we drop the lock so two
+        // decodes racing in the same slot can't both pass the per-slot guard.
+        entry.resends += 1;
+        entry.last_resend_at = Some(now);
+        // Prefer the freq/parity we just heard them on (fresher); fall back to
+        // the stashed completion values if the decode lacked parity.
+        entry.frequency_hz = frequency_hz;
+        if dx_parity.is_some() {
+            entry.dx_parity = dx_parity;
+        }
+    }
+
+    // Don't fight a live QSO with this station: if one is active, skip the
+    // auto-73 (the QSO state machine is handling it). The counter was already
+    // incremented above, which is fine — it only tightens the bound.
+    let active = qso_manager.get_active_qsos().await;
+    let has_active = active.iter().any(|(_, p)| {
+        p.state
+            .their_callsign()
+            .map(|c| c.eq_ignore_ascii_case(&from_station))
+            .unwrap_or(false)
+            || p.metadata
+                .their_callsign
+                .as_deref()
+                .map(|c| c.eq_ignore_ascii_case(&from_station))
+                .unwrap_or(false)
+    });
+    if has_active {
+        return;
+    }
+
+    // Read back the resend count for logging (lock is released between the
+    // commit and the send; the value can only have grown, never shrunk).
+    let resend_n = completions
+        .lock()
+        .await
+        .get(&key)
+        .map(|e| e.resends)
+        .unwrap_or(AUTO_73_MAX_RESENDS);
+
+    info!(
+        target: "qso",
+        "auto-resending 73 to {} ({}/{}) — repeated RR73 after manual QSO completion",
+        from_station, resend_n, AUTO_73_MAX_RESENDS
+    );
+
+    match qso_manager
+        .respond_to_caller(
+            from_station.clone(),
+            frequency_hz,
+            dx_parity,
+            pancetta_core::ResponseStep::SeventyThree,
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(_) => {
+            emit_status(
+                message_bus,
+                format!(
+                    "Re-sending 73 to {} ({}/{}) — they repeated RR73",
+                    from_station, resend_n, AUTO_73_MAX_RESENDS
+                ),
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!(
+                target: "qso",
+                "auto-73 re-send to {} failed: {}", from_station, e
+            );
+        }
+    }
 }
 
 /// Short, operator-facing description of why a QSO failed, for the TUI
@@ -93,6 +289,9 @@ impl super::ApplicationCoordinator {
         // gate. The QSO component keeps it in sync from the QsoEvent stream
         // below.
         let active_tx_qsos = self.active_tx_qsos.clone();
+        // Global TX policy — the auto-73 re-send respects it (RESPOND-ONLY
+        // allows, DISABLED blocks), exactly like every other response path.
+        let tx_policy = self.tx_policy.clone();
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
 
@@ -318,6 +517,14 @@ impl super::ApplicationCoordinator {
                     our_callsign, our_grid
                 );
 
+                // item-2-auto-73: map of recently-completed MANUAL QSOs, shared
+                // between the QsoCompleted handler (in the event-forwarding task
+                // below, which populates it) and the decode-processing loop
+                // (which consumes it when a directed RR73/RRR arrives). See the
+                // type alias / constants at the top of this module.
+                let recent_manual_completions: RecentManualCompletions =
+                    Arc::new(Mutex::new(HashMap::new()));
+
                 // Spawn a task to forward QSO auto-sequence TX requests to the transmitter
                 // and update AP decoding state for the FT8 decoder thread.
                 let mut qso_events = qso_manager.subscribe();
@@ -329,6 +536,7 @@ impl super::ApplicationCoordinator {
                 let active_tx_qsos = active_tx_qsos.clone();
                 let snapshot_qso_manager = qso_manager.clone();
                 let snapshot_bus = tx_bus.clone();
+                let completions_for_events = recent_manual_completions.clone();
                 tokio::spawn(async move {
                     while !tx_shutdown.load(Ordering::Acquire) {
                         match qso_events.recv().await {
@@ -604,23 +812,32 @@ impl super::ApplicationCoordinator {
                                         pancetta_qso::utils::frequency_to_band(metadata.frequency);
                                     qso_lookup.record_worked(their_call, &band);
 
-                                    // TODO(item-2-auto-73): auto re-send our 73 when a
-                                    // station we JUST completed a *manual* QSO with keeps
-                                    // sending us RR73/RRR (they didn't copy our 73). The
-                                    // primary fix already lets the operator press Space
-                                    // again to re-send 73 (context-aware Space →
-                                    // RespondToCaller{SeventyThree}); this would automate
-                                    // that bounded re-send. Sketch: on a manual QsoCompleted
-                                    // (metadata.initiated_by == Manual) stash
-                                    // (their_call, completed_at) here in a small per-callsign
-                                    // map; in the decode-processing path, when a directed-
-                                    // at-us RR73/RRR arrives from a stashed callsign within
-                                    // ~3 min, synthesize a RespondToCaller{SeventyThree}
-                                    // (max 3 extra sends, then drop the entry). Deferred:
-                                    // it spans the completion handler AND the decode path,
-                                    // and must interact cleanly with the manual watchdog and
-                                    // the dx-busy / self-duplicate gates — out of scope for
-                                    // this batch.
+                                    // item-2-auto-73: stash MANUAL completions so
+                                    // that if this DX keeps re-sending RR73/RRR (they
+                                    // didn't copy our 73) we can auto-re-send our 73,
+                                    // bounded, from the decode-processing loop below.
+                                    // Autonomous completions are deliberately NOT
+                                    // stashed — that path has its own dx-busy /
+                                    // duplicate gates and shouldn't keep TXing 73s.
+                                    if metadata.initiated_by == pancetta_qso::CallInitiation::Manual
+                                    {
+                                        let now = chrono::Utc::now();
+                                        let entry = RecentManualCompletion {
+                                            completed_at: now,
+                                            frequency_hz: metadata.frequency,
+                                            dx_parity: metadata.tx_parity.map(|p| p.opposite()),
+                                            resends: 0,
+                                            last_resend_at: None,
+                                        };
+                                        let mut map = completions_for_events.lock().await;
+                                        // Prune stale entries while we hold the lock so
+                                        // the map never grows unbounded.
+                                        map.retain(|_, e| {
+                                            now.signed_duration_since(e.completed_at)
+                                                < AUTO_73_WINDOW
+                                        });
+                                        map.insert(their_call.to_uppercase(), entry);
+                                    }
 
                                     // Report QSO to cqdx.io
                                     if let Some(ref bridge) = cqdx_bridge {
@@ -704,6 +921,24 @@ impl super::ApplicationCoordinator {
                                         &our_callsign,
                                     ) {
                                         Ok(msg_type) => {
+                                            // item-2-auto-73: a directed RR73/RRR from
+                                            // a station we just MANUALLY completed with
+                                            // means they didn't copy our 73 — bounded
+                                            // auto-re-send. Detect before process_message
+                                            // moves the parsed type. The map/window/cap
+                                            // gating lives in the helper.
+                                            maybe_auto_resend_73(
+                                                &msg_type,
+                                                &our_callsign,
+                                                frequency,
+                                                decoded_msg.slot_parity,
+                                                &qso_manager,
+                                                &recent_manual_completions,
+                                                &tx_policy,
+                                                &message_bus,
+                                            )
+                                            .await;
+
                                             if let Err(e) = qso_manager
                                                 .process_message(
                                                     msg_type,
@@ -1339,6 +1574,351 @@ mod snapshot_tests {
             super::failure_reason_text(&R::ProtocolError("boom".to_string())),
             "protocol error: boom"
         );
+    }
+}
+
+#[cfg(test)]
+mod auto_73_tests {
+    use super::{
+        maybe_auto_resend_73, RecentManualCompletion, RecentManualCompletions, AUTO_73_MAX_RESENDS,
+        AUTO_73_WINDOW,
+    };
+    use crate::message_bus::MessageBus;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_core::TxPolicy;
+    use pancetta_qso::states::MessageType as Mt;
+    use pancetta_qso::{QsoManager, QsoManagerConfig};
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU8;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    const OUR: &str = "K5ARH";
+    const DX: &str = "JA1ABC";
+
+    async fn manager() -> QsoManager {
+        let mut m = QsoManager::new(QsoManagerConfig {
+            our_callsign: OUR.to_string(),
+            our_grid: Some("EM10".to_string()),
+            ..Default::default()
+        });
+        m.start().await.expect("manager start");
+        m
+    }
+
+    fn bus() -> MessageBus {
+        MessageBus::new(1000).expect("bus")
+    }
+
+    /// A completions map containing a single fresh manual completion for `DX`.
+    fn map_with_dx() -> RecentManualCompletions {
+        let mut map = HashMap::new();
+        map.insert(
+            DX.to_string(),
+            RecentManualCompletion {
+                completed_at: chrono::Utc::now(),
+                frequency_hz: 1500.0,
+                dx_parity: Some(SlotParity::Even),
+                resends: 0,
+                last_resend_at: None,
+            },
+        );
+        Arc::new(Mutex::new(map))
+    }
+
+    fn rr73_to_us() -> Mt {
+        Mt::FinalConfirmation {
+            to_station: OUR.to_string(),
+            from_station: DX.to_string(),
+        }
+    }
+
+    /// Count `MessageToSend` events the manager has emitted by draining a
+    /// subscriber that was attached before the action under test.
+    fn drain_sends(rx: &mut tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>) -> usize {
+        let mut n = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, pancetta_qso::QsoEvent::MessageToSend { .. }) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// A directed RR73 from a stashed manual completion triggers exactly one
+    /// auto-73 per slot, and never more than `AUTO_73_MAX_RESENDS` total even
+    /// if RR73 arrives every slot.
+    #[tokio::test]
+    async fn bound_holds_under_repeated_rr73_every_slot() {
+        let mgr = manager().await;
+        let map = map_with_dx();
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        // Simulate the DX hammering RR73 across many slots. We bypass the
+        // per-slot guard by zeroing last_resend_at between calls — that proves
+        // the HARD cap (resends) holds independently of the time guard.
+        for _ in 0..10 {
+            maybe_auto_resend_73(
+                &rr73_to_us(),
+                OUR,
+                1500.0,
+                Some(SlotParity::Even),
+                &mgr,
+                &map,
+                &policy,
+                &bus,
+            )
+            .await;
+            if let Some(e) = map.lock().await.get_mut(DX) {
+                e.last_resend_at = None; // defeat the per-slot guard for this test
+            }
+        }
+
+        let sends = drain_sends(&mut rx);
+        assert_eq!(
+            sends as u8, AUTO_73_MAX_RESENDS,
+            "auto-73 must be capped at {AUTO_73_MAX_RESENDS}, got {sends}"
+        );
+        // After the cap the entry is dropped so it can never fire again.
+        assert!(map.lock().await.get(DX).is_none());
+    }
+
+    /// Within one slot, two decodes of the same RR73 fire only ONE auto-73.
+    #[tokio::test]
+    async fn one_per_slot_dedup() {
+        let mgr = manager().await;
+        let map = map_with_dx();
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        for _ in 0..3 {
+            maybe_auto_resend_73(
+                &rr73_to_us(),
+                OUR,
+                1500.0,
+                Some(SlotParity::Even),
+                &mgr,
+                &map,
+                &policy,
+                &bus,
+            )
+            .await;
+            // Do NOT reset last_resend_at — same slot.
+        }
+
+        assert_eq!(drain_sends(&mut rx), 1, "only one 73 per slot");
+        assert_eq!(map.lock().await.get(DX).map(|e| e.resends), Some(1));
+    }
+
+    /// An RR73 outside the 3-minute window never triggers an auto-73 (the
+    /// entry is pruned on lookup).
+    #[tokio::test]
+    async fn outside_window_no_resend() {
+        let mgr = manager().await;
+        let map = {
+            let mut m = HashMap::new();
+            m.insert(
+                DX.to_string(),
+                RecentManualCompletion {
+                    completed_at: chrono::Utc::now()
+                        - AUTO_73_WINDOW
+                        - chrono::Duration::seconds(1),
+                    frequency_hz: 1500.0,
+                    dx_parity: Some(SlotParity::Even),
+                    resends: 0,
+                    last_resend_at: None,
+                },
+            );
+            Arc::new(Mutex::new(m))
+        };
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        maybe_auto_resend_73(
+            &rr73_to_us(),
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+        )
+        .await;
+
+        assert_eq!(drain_sends(&mut rx), 0);
+        assert!(map.lock().await.get(DX).is_none(), "stale entry pruned");
+    }
+
+    /// While a QSO with the DX is active, no auto-73 (don't fight a live QSO).
+    #[tokio::test]
+    async fn active_qso_no_resend() {
+        let mgr = manager().await;
+        // Open a live QSO with DX (RespondingToCq via manual call).
+        mgr.respond_to_cq_manual(DX.to_string(), 1500.0, Some(SlotParity::Even))
+            .await
+            .expect("start qso");
+        let map = map_with_dx();
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        // Subscribe AFTER the manual call so its MessageToSend is not counted;
+        // we only want to observe whether the auto-73 fires.
+        let mut rx = mgr.subscribe();
+
+        maybe_auto_resend_73(
+            &rr73_to_us(),
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+        )
+        .await;
+
+        assert_eq!(drain_sends(&mut rx), 0, "no auto-73 while QSO active");
+    }
+
+    /// A station NOT in the map (e.g. an AUTONOMOUS-completed QSO, which the
+    /// QsoCompleted handler never stashes) gets no auto-73.
+    #[tokio::test]
+    async fn not_in_map_no_resend() {
+        let mgr = manager().await;
+        let map: RecentManualCompletions = Arc::new(Mutex::new(HashMap::new()));
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        maybe_auto_resend_73(
+            &rr73_to_us(),
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+        )
+        .await;
+
+        assert_eq!(drain_sends(&mut rx), 0);
+    }
+
+    /// TX policy DISABLED blocks the auto-73 entirely (and does not consume
+    /// the resend budget).
+    #[tokio::test]
+    async fn disabled_policy_no_resend() {
+        let mgr = manager().await;
+        let map = map_with_dx();
+        let policy = AtomicU8::new(TxPolicy::Disabled.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        maybe_auto_resend_73(
+            &rr73_to_us(),
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+        )
+        .await;
+
+        assert_eq!(drain_sends(&mut rx), 0, "DISABLED blocks auto-73");
+        assert_eq!(
+            map.lock().await.get(DX).map(|e| e.resends),
+            Some(0),
+            "budget untouched under DISABLED"
+        );
+    }
+
+    /// RESPOND-ONLY allows the auto-73 (it's a response, not an initiation).
+    #[tokio::test]
+    async fn respond_only_allows_resend() {
+        let mgr = manager().await;
+        let map = map_with_dx();
+        let policy = AtomicU8::new(TxPolicy::RespondOnly.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        maybe_auto_resend_73(
+            &rr73_to_us(),
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+        )
+        .await;
+
+        assert_eq!(drain_sends(&mut rx), 1, "RESPOND-ONLY permits the 73");
+    }
+
+    /// A non-close message (e.g. a signal report) directed at us never
+    /// triggers an auto-73, even from a stashed callsign.
+    #[tokio::test]
+    async fn non_close_message_ignored() {
+        let mgr = manager().await;
+        let map = map_with_dx();
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        let report = Mt::SignalReport {
+            to_station: OUR.to_string(),
+            from_station: DX.to_string(),
+            report: -12,
+        };
+        maybe_auto_resend_73(
+            &report,
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+        )
+        .await;
+
+        assert_eq!(drain_sends(&mut rx), 0);
+    }
+
+    /// An RR73 NOT directed at us (to a third party) is ignored.
+    #[tokio::test]
+    async fn rr73_to_third_party_ignored() {
+        let mgr = manager().await;
+        let map = map_with_dx();
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        let rr73 = Mt::FinalConfirmation {
+            to_station: "W1XYZ".to_string(),
+            from_station: DX.to_string(),
+        };
+        maybe_auto_resend_73(
+            &rr73,
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+        )
+        .await;
+
+        assert_eq!(drain_sends(&mut rx), 0);
     }
 }
 
