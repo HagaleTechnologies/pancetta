@@ -462,15 +462,9 @@ impl super::ApplicationCoordinator {
         let cmd_message_bus = self.message_bus.clone();
         let cmd_operating_freq = operating_freq.clone();
         let cmd_operating_freq_hz = self.operating_frequency_hz.clone();
-        // Read station config for CQ generation
-        let cmd_station_call = {
-            let cfg = self.config.read().await;
-            cfg.station.callsign.clone()
-        };
-        let cmd_station_grid = {
-            let cfg = self.config.read().await;
-            cfg.station.grid_square.clone()
-        };
+        // (CQ text is no longer generated in this task — the CallingCq QSO in
+        // the QSO component owns it, rendered from the operator's configured
+        // callsign/grid there.)
         let cmd_ptt_state = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_cq_active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cmd_abort_current_tx = self.abort_current_tx.clone();
@@ -507,12 +501,6 @@ impl super::ApplicationCoordinator {
         const TUNE_DURATION_SECS: u32 = 12;
         const TUNE_TONE_HZ: f64 = 1500.0;
         let cmd_handle = tokio::spawn(async move {
-            let mut next_cq_time: Option<tokio::time::Instant> = None;
-            // Operator's TX audio offset (Hz) for repeating CQ, set from the
-            // waterfall cursor on StartCq. Default 1500 until the operator
-            // moves the cursor (was previously hard-coded, ignoring the cursor).
-            let mut cq_frequency_offset: f64 = 1500.0;
-
             // Push the available audio devices to the TUI once at startup so
             // the `d` device-selection picker can list them. The coordinator
             // owns the pancetta-audio host; the TUI is a passive renderer.
@@ -563,44 +551,39 @@ impl super::ApplicationCoordinator {
             }
 
             while !cmd_shutdown.load(Ordering::Acquire) {
-                // Send repeating CQ every 15 seconds when active. CQ is an
-                // initiation: if the operator cycled the TX policy away from
-                // Full while a CQ loop was running, stop emitting (and clear
-                // the active flag so it doesn't silently resume on return to
-                // Full — the operator must re-press `c`).
+                // CQ is now TRANSMITTED by a real CallingCq QSO owned by the
+                // QSO component (StartCq → QsoManager::start_cq_manual, which
+                // keep-calls every slot and auto-sequences the exchange to
+                // completion when a station answers). This task no longer
+                // transmits CQ text itself — that would be a SECOND CQ TX
+                // source on the same slot/freq (double-TX). `cmd_cq_active` is
+                // kept purely as bookkeeping (Shift+Q / F8 / the policy-stop
+                // below read it).
+                //
+                // CQ is an initiation: if the operator cycled the TX policy
+                // away from Full while a CQ was running, stop it — clear the
+                // active flag (so it doesn't silently resume on return to
+                // Full; the operator must re-press `c`) AND cancel the
+                // CallingCq QSO in the QSO component so it stops keep-calling.
                 if cmd_cq_active.load(Ordering::Relaxed) {
                     let policy =
                         pancetta_core::TxPolicy::from_u8(cmd_tx_policy.load(Ordering::Acquire));
                     if !policy.allows_initiation() {
                         info!(
                             target: "tx.policy",
-                            "Stopping repeating CQ: TX policy is now {}",
+                            "Stopping manual CQ: TX policy is now {}",
                             policy.label()
                         );
                         cmd_cq_active.store(false, Ordering::Relaxed);
-                        next_cq_time = None;
-                    }
-                }
-                if cmd_cq_active.load(Ordering::Relaxed) {
-                    let now = tokio::time::Instant::now();
-                    if next_cq_time.map_or(true, |t| now >= t) {
-                        let cq_text = format!("CQ {} {}", cmd_station_call, cmd_station_grid);
-                        info!("CQ repeat: '{}'", cq_text);
                         let msg = ComponentMessage::new(
                             ComponentId::Tui,
-                            ComponentId::Ft8Transmitter,
-                            MessageType::TransmitRequest {
-                                message_text: cq_text,
-                                frequency_offset: cq_frequency_offset,
-                                qso_id: None,
-                                tx_parity: None, // TUI CQ repeat: no DX context
-                            },
+                            ComponentId::Qso,
+                            MessageType::QsoMessage(crate::message_bus::QsoMessage::StopCq),
                             Instant::now(),
                         );
                         if let Err(e) = cmd_message_bus.send_message(msg).await {
-                            warn!("Failed to send repeating CQ: {}", e);
+                            warn!("Failed to cancel CQ QSO on policy change: {}", e);
                         }
-                        next_cq_time = Some(now + Duration::from_secs(15));
                     }
                 }
 
@@ -782,18 +765,50 @@ impl super::ApplicationCoordinator {
                                 continue;
                             }
                             info!(
-                                "TUI StartCq: enabling repeating CQ at {:.0} Hz (waterfall cursor)",
+                                "TUI StartCq: starting manual CQ QSO at {:.0} Hz (waterfall \
+                                 cursor)",
                                 frequency_offset
                             );
-                            cq_frequency_offset = frequency_offset;
+                            // Bookkeeping only — the CQ is TRANSMITTED by a real
+                            // CallingCq QSO owned by the QSO component (below),
+                            // NOT the old text-only loop in this task, so there
+                            // is exactly one CQ TX source per slot (no
+                            // double-TX). The QSO keep-calls every slot and,
+                            // when a station answers, auto-sequences the
+                            // exchange to Completed + ADIF log.
                             cmd_cq_active.store(true, Ordering::Relaxed);
-                            // Send first CQ immediately by resetting the timer
-                            next_cq_time = None;
+                            // tx_parity = None: calling CQ we choose our own slot
+                            // parity; let the TX scheduler resolve it via the
+                            // configured self-parity fallback (consistent with
+                            // QsoManager::start_cq's default).
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Qso,
+                                MessageType::QsoMessage(crate::message_bus::QsoMessage::StartCq {
+                                    frequency: frequency_offset.round().max(0.0) as u64,
+                                    tx_parity: None,
+                                }),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to forward StartCq command: {}", e);
+                            }
                         }
                         pancetta_tui::tui_runner::TuiCommand::StopCq => {
-                            info!("TUI StopCq: stopping repeating CQ");
+                            info!("TUI StopCq: stopping manual CQ QSO");
                             cmd_cq_active.store(false, Ordering::Relaxed);
-                            next_cq_time = None;
+                            // Cancel the un-answered CallingCq QSO in the QSO
+                            // component (an already-answered exchange is left to
+                            // finish).
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Qso,
+                                MessageType::QsoMessage(crate::message_bus::QsoMessage::StopCq),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to forward StopCq command: {}", e);
+                            }
                         }
                         pancetta_tui::tui_runner::TuiCommand::OperatorEmergencyStop => {
                             // hb-161: Phase 5 emergency stop. Operator
@@ -821,7 +836,6 @@ impl super::ApplicationCoordinator {
                             cmd_autonomous_enabled.store(false, Ordering::Release);
                             cmd_cq_active.store(false, Ordering::Relaxed);
                             *cmd_tune_until.write().await = None;
-                            next_cq_time = None;
                             // Emergency stop also hard-mutes all TX: set the
                             // global policy to Disabled (RX-only) and echo it
                             // to the TUI banner. The operator restores TX with
@@ -874,12 +888,22 @@ impl super::ApplicationCoordinator {
                             // same abort flag Shift+Q uses so the in-flight TX
                             // (up to 12.64s of FT8, or an active tune) stops
                             // within ~50ms via the worker's interruptible_sleep.
-                            // Also stop the repeating-CQ loop so we don't re-arm.
+                            // Also cancel the manual CQ QSO so it stops
+                            // keep-calling (clearing the bookkeeping flag alone
+                            // no longer stops TX — the QSO owns it now).
                             if next == pancetta_core::TxPolicy::Disabled {
                                 cmd_abort_current_tx.store(true, Ordering::Release);
                                 cmd_cq_active.store(false, Ordering::Relaxed);
                                 *cmd_tune_until.write().await = None;
-                                next_cq_time = None;
+                                let msg = ComponentMessage::new(
+                                    ComponentId::Tui,
+                                    ComponentId::Qso,
+                                    MessageType::QsoMessage(crate::message_bus::QsoMessage::StopCq),
+                                    Instant::now(),
+                                );
+                                if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                    warn!("Failed to cancel CQ QSO on TX disable: {}", e);
+                                }
                             }
                             let _ = cmd_tui_msg_tx.send(
                                 pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate {
@@ -902,15 +926,23 @@ impl super::ApplicationCoordinator {
                             // try_recv cycle so a stale F8 doesn't kill
                             // the next legitimate TX.
                             //
-                            // Also stop the repeating-CQ loop so we don't
-                            // immediately re-arm a new TX in the next cycle.
+                            // Also cancel the manual CQ QSO so we don't
+                            // immediately re-arm a new CQ TX next slot.
                             // Clear the tune-until tracker so the F4 toggle
                             // re-arms cleanly next press.
                             info!("TUI StopTx: halting current TX (F8)");
                             cmd_abort_current_tx.store(true, Ordering::Release);
                             cmd_cq_active.store(false, Ordering::Relaxed);
                             *cmd_tune_until.write().await = None;
-                            next_cq_time = None;
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Qso,
+                                MessageType::QsoMessage(crate::message_bus::QsoMessage::StopCq),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to cancel CQ QSO on StopTx: {}", e);
+                            }
                         }
                         pancetta_tui::tui_runner::TuiCommand::ToggleTune => {
                             // F4 toggle. If a tune is already in flight,

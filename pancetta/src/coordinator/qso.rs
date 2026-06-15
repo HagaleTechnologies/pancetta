@@ -1184,6 +1184,79 @@ impl super::ApplicationCoordinator {
                                                 n
                                             );
                                         }
+                                        // Operator pressed `c`: start a manual
+                                        // CQ as a tracked CallingCq QSO. The QSO
+                                        // owns the CQ transmission (emits the
+                                        // first CQ + keeps calling every slot
+                                        // via rearm_manual_calls_at); the old
+                                        // tui_relay text-only CQ loop no longer
+                                        // transmits, so there is exactly one CQ
+                                        // TX source per slot (no double-TX).
+                                        // When a station answers, the
+                                        // CallingCq → WaitingForReport arm fires
+                                        // and the Manual-gated auto-reply emitter
+                                        // sequences the exchange to Completed +
+                                        // QsoCompleted (ADIF log).
+                                        crate::message_bus::QsoMessage::StartCq {
+                                            frequency,
+                                            tx_parity,
+                                        } => {
+                                            match qso_manager
+                                                .start_cq_manual(frequency as f64, tx_parity)
+                                                .await
+                                            {
+                                                Ok(qso_id) => {
+                                                    info!(
+                                                        "Manual CQ started: {} ({} Hz, \
+                                                         keep-calling under watchdog)",
+                                                        qso_id, frequency
+                                                    );
+                                                    emit_status(
+                                                        &message_bus,
+                                                        format!(
+                                                            "Calling CQ — TX queued ({} Hz)",
+                                                            frequency
+                                                        ),
+                                                    )
+                                                    .await;
+                                                }
+                                                Err(e) => {
+                                                    warn!("Failed to start manual CQ: {}", e);
+                                                    emit_status(
+                                                        &message_bus,
+                                                        format!("Start CQ failed: {}", e),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                        }
+                                        // Operator pressed `s`: stop calling CQ.
+                                        // Cancel any active QSO still in
+                                        // CallingCq (un-answered). A CallingCq
+                                        // QSO that already advanced past CallingCq
+                                        // (a caller answered) is left running so
+                                        // the in-progress exchange completes.
+                                        crate::message_bus::QsoMessage::StopCq => {
+                                            let active = qso_manager.get_active_qsos().await;
+                                            let mut cancelled = 0usize;
+                                            for (id, progress) in active {
+                                                if matches!(
+                                                    progress.state,
+                                                    pancetta_qso::QsoState::CallingCq { .. }
+                                                ) {
+                                                    if let Err(e) = qso_manager.cancel_qso(id).await
+                                                    {
+                                                        warn!("StopCq: {} failed: {}", id, e);
+                                                    } else {
+                                                        cancelled += 1;
+                                                    }
+                                                }
+                                            }
+                                            info!(
+                                                "StopCq: cancelled {} un-answered CQ QSO(s)",
+                                                cancelled
+                                            );
+                                        }
                                     }
                                 }
 

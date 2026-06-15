@@ -386,6 +386,24 @@ pub enum QsoMessage {
         /// Our measured SNR of the caller, used to derive the report we send.
         snr: Option<f32>,
     },
+    /// Start a **manual** CQ call as a real `CallingCq` QSO (operator `c`).
+    ///
+    /// Unlike the autonomous CQ, this creates a tracked QSO that keeps
+    /// calling CQ every slot (under the manual watchdog) and — when a station
+    /// answers — auto-sequences the exchange through to Completed + ADIF log.
+    /// Stopped by [`QsoMessage::StopCq`] (operator `s`).
+    StartCq {
+        /// Audio offset (Hz, within the FT8 passband) to transmit our CQ on.
+        frequency: u64,
+        /// The slot parity we want our CQ to land on (we choose our own when
+        /// calling CQ). `None` lets the TX scheduler pick via the configured
+        /// self-parity fallback.
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+    },
+    /// Stop the manual CQ: cancel any active `CallingCq` QSO that has not yet
+    /// been answered (operator `s`). A `CallingCq` QSO that already advanced
+    /// (a caller answered) is left alone so the in-progress exchange finishes.
+    StopCq,
     /// End QSO
     EndQso { qso_id: String },
     /// Log QSO

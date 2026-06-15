@@ -422,6 +422,129 @@ impl QsoManager {
         Ok(qso_id)
     }
 
+    /// Start a **manual** (operator-initiated) CQ call as a real QSO.
+    ///
+    /// This is the engine half of the TUI `c` (StartCq) key. Unlike
+    /// [`Self::start_cq`] (which marks the QSO [`CallInitiation::Auto`] for
+    /// autonomous CQ), this marks it [`CallInitiation::Manual`] so that:
+    ///
+    /// 1. **We keep calling CQ every slot** until a station answers or the
+    ///    CQ watchdog fires — [`Self::rearm_manual_calls_at`] re-emits a
+    ///    `Cq` `MessageToSend` for a manual `CallingCq` QSO once per FT8
+    ///    slot, bounded by `manual_call_max_calls` /
+    ///    `manual_call_watchdog_minutes` (see [`Self::check_timeouts_at`]).
+    /// 2. **When a caller answers, the exchange auto-sequences to
+    ///    Completed + logs** — the auto-reply emitter in
+    ///    [`Self::process_message`] is gated on `CallInitiation::Manual`, so
+    ///    a manual CQer (us) automatically replies with our report → RR73 as
+    ///    the caller's CqResponse → ReportAck arrive, exactly like the
+    ///    operator-driven Callers path.
+    ///
+    /// We emit a `StateChanged` (Idle → CallingCq) so the coordinator's
+    /// drop-stale-TX gate keys this QSO into `active_tx_qsos` (otherwise the
+    /// TX worker would refuse to key PTT for it), and emit the first `Cq`
+    /// `MessageToSend` immediately. `last_call_at` is stamped `now` so the
+    /// per-slot rearm does not double-send the first CQ within the opening
+    /// slot.
+    ///
+    /// `tx_parity` is the parity we want our CQ to land on; `None` lets the
+    /// TX scheduler pick using the configured self-parity fallback. (Calling
+    /// CQ, we choose our own slot parity — there is no DX parity to oppose.)
+    pub async fn start_cq_manual(
+        &self,
+        frequency: f64,
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+    ) -> Result<QsoId, QsoManagerError> {
+        if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
+            return Err(QsoManagerError::Configuration {
+                message: format!(
+                    "Cannot transmit with placeholder callsign '{}'. Configure your callsign first.",
+                    self.config.our_callsign
+                ),
+            });
+        }
+        let qso_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let state = QsoState::CallingCq {
+            frequency,
+            started_at: now,
+            call_count: 1,
+        };
+
+        let message = MessageType::Cq {
+            callsign: self.config.our_callsign.clone(),
+            grid: self.config.our_grid.clone(),
+        };
+
+        let raw_text = self.render_sent_text(&message);
+        let metadata = QsoMetadata {
+            qso_id,
+            our_callsign: self.config.our_callsign.clone(),
+            their_callsign: None,
+            frequency,
+            mode: "FT8".to_string(),
+            start_time: now,
+            end_time: None,
+            reports: SignalReports::default(),
+            grids: GridSquares {
+                ours: self.config.our_grid.clone(),
+                theirs: None,
+            },
+            contest_info: None,
+            tags: HashMap::new(),
+            notes: None,
+            tx_parity,
+            // Operator pressed `c`: this is a MANUAL CQ. The manual
+            // keep-calling watchdog re-arms our CQ every slot, and the
+            // CallInitiation::Manual gate turns on the auto-reply emitter so
+            // an answering station drives the exchange to completion.
+            initiated_by: CallInitiation::Manual,
+            // We called CQ → CQer role (drives the role-aware display ladder).
+            role: QsoRole::Cqer,
+            call_count: 1,
+            first_call_at: Some(now),
+            last_call_at: Some(now),
+        };
+
+        let progress = QsoProgress {
+            state: state.clone(),
+            state_history: vec![],
+            // Record the opening CQ as a Sent message so the TUI last-TX line
+            // and `resend_last_tx` see it.
+            messages: vec![QsoMessage {
+                timestamp: now,
+                direction: MessageDirection::Sent,
+                message_type: message.clone(),
+                raw_text,
+                signal_strength: None,
+                frequency,
+            }],
+            metadata,
+        };
+
+        self.qsos.write().await.insert(qso_id, progress);
+
+        // Emit a state change (Idle → CallingCq) so the coordinator's
+        // drop-stale-TX gate keys this QSO into `active_tx_qsos`; without it
+        // the TX worker would drop our CQ as "stale TX for an ended QSO".
+        self.emit_state_change(qso_id, QsoState::Idle, state).await;
+
+        // Emit the first CQ. Subsequent slots are owned by the per-slot
+        // manual keep-call rearm (`rearm_manual_calls_at`).
+        self.emit_event(QsoEvent::MessageToSend {
+            qso_id,
+            message,
+            frequency,
+            tx_parity,
+        })
+        .await;
+
+        info!("Started manual CQ on {:.1} Hz: {}", frequency, qso_id);
+
+        Ok(qso_id)
+    }
+
     /// Respond to a CQ call (autonomous/internal path).
     ///
     /// `dx_parity` is the slot parity of the DX station's CQ, used to
@@ -2253,6 +2376,13 @@ impl QsoManager {
                     continue;
                 }
                 let message = match &progress.state {
+                    // Manual CQ (operator `c`): keep calling CQ every slot
+                    // until a station answers (→ WaitingForReport, handled by
+                    // the normal sequence) or the watchdog retires us.
+                    QsoState::CallingCq { .. } => MessageType::Cq {
+                        callsign: self.config.our_callsign.clone(),
+                        grid: self.config.our_grid.clone(),
+                    },
                     QsoState::RespondingToCq {
                         target_callsign, ..
                     } => MessageType::CqResponse {
@@ -2380,18 +2510,21 @@ impl QsoManager {
         let mut timeouts = Vec::new();
 
         for (&qso_id, progress) in qsos.iter() {
-            // Manual keep-calling watchdog. Covers both RespondingToCq
+            // Manual keep-calling watchdog. Covers CallingCq (operator `c`:
+            // re-calling CQ until someone answers), RespondingToCq
             // (re-calling the DX) and SendingReport (FIX 4: re-sending our
-            // R-report when the DX repeats their report). In both phases the
+            // R-report when the DX repeats their report). In all phases the
             // operator is actively keep-calling, and `call_count` /
             // `first_call_at` span the whole QSO, so the 10-calls / 5-min
             // bound applies to the QSO as a whole. Once the DX advances past
-            // these states (ReportAck/RR73 received), the normal state
-            // timeouts take over.
+            // these states (a caller answers / ReportAck / RR73 received),
+            // the normal state timeouts take over.
             if progress.metadata.initiated_by == CallInitiation::Manual
                 && matches!(
                     progress.state,
-                    QsoState::RespondingToCq { .. } | QsoState::SendingReport { .. }
+                    QsoState::CallingCq { .. }
+                        | QsoState::RespondingToCq { .. }
+                        | QsoState::SendingReport { .. }
                 )
             {
                 let max_calls = self.config.timeouts.manual_call_max_calls;
@@ -3164,6 +3297,239 @@ mod tests {
             saw_rr73,
             "manual CQer should emit a FinalConfirmation (RR73)"
         );
+    }
+
+    // --- Manual `c` (CQ) → CallingCq QSO ---------------------------------
+
+    /// Pressing `c` (`start_cq_manual`) creates an ACTIVE, manual CallingCq
+    /// QSO that emits a StateChanged (so the coordinator keys it into
+    /// `active_tx_qsos`) and an opening Cq MessageToSend.
+    #[tokio::test]
+    async fn start_cq_manual_creates_active_calling_cq_qso() {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        let mut events = manager.subscribe();
+
+        let qso_id = manager.start_cq_manual(freq, None).await.unwrap();
+
+        let p = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(p.state, QsoState::CallingCq { .. }),
+            "expected CallingCq, got {:?}",
+            p.state
+        );
+        assert_eq!(p.metadata.initiated_by, CallInitiation::Manual);
+        assert_eq!(p.metadata.role, QsoRole::Cqer);
+        // It is an active QSO (so it shows in the active set).
+        assert_eq!(manager.get_active_qsos().await.len(), 1);
+
+        // It emitted a StateChanged into CallingCq (keys active_tx_qsos in the
+        // coordinator) and an opening Cq MessageToSend.
+        let mut saw_state_change = false;
+        let mut saw_cq = false;
+        loop {
+            match events.try_recv() {
+                Ok(QsoEvent::StateChanged { new_state, .. }) => {
+                    if matches!(new_state, QsoState::CallingCq { .. }) {
+                        saw_state_change = true;
+                    }
+                }
+                Ok(QsoEvent::MessageToSend { message, .. }) => {
+                    if matches!(message, MessageType::Cq { .. }) {
+                        saw_cq = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                Err(TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        assert!(
+            saw_state_change,
+            "start_cq_manual should emit a StateChanged into CallingCq"
+        );
+        assert!(saw_cq, "start_cq_manual should emit an opening Cq message");
+    }
+
+    /// The full operator-CQ exchange: a caller answers our manual CQ and the
+    /// exchange auto-sequences (Manual-gated auto-reply) all the way to
+    /// Completed + QsoCompleted (ADIF log), latching the caller's grid.
+    #[tokio::test]
+    async fn start_cq_manual_caller_answer_completes_and_logs() {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let manager = QsoManager::new(test_config()); // our call = W1ABC
+        let freq = 14074000.0;
+        let qso_id = manager.start_cq_manual(freq, None).await.unwrap();
+        let mut events = manager.subscribe();
+
+        // Caller answers our CQ with their grid: "W1ABC K1DEF FN31".
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                freq,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                manager.get_qso(qso_id).await.unwrap().state,
+                QsoState::WaitingForReport { .. }
+            ),
+            "CallingCq + CqResponse → WaitingForReport"
+        );
+
+        // Caller rogers our report: "W1ABC K1DEF R-12".
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -12,
+                },
+                "W1ABC K1DEF R-12".to_string(),
+                freq,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+
+        // Caller closes with 73 → Completed.
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                },
+                "W1ABC K1DEF 73".to_string(),
+                freq,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+
+        let p = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(p.state, QsoState::Completed { .. }),
+            "expected Completed, got {:?}",
+            p.state
+        );
+        assert_eq!(p.metadata.their_callsign.as_deref(), Some("K1DEF"));
+        assert_eq!(p.metadata.grids.theirs.as_deref(), Some("FN31"));
+        assert!(p.metadata.end_time.is_some());
+
+        // A QsoCompleted event fired (ADIF logger subscribes to this).
+        let mut saw_completed = false;
+        loop {
+            match events.try_recv() {
+                Ok(QsoEvent::QsoCompleted { qso_id: id, .. }) if id == qso_id => {
+                    saw_completed = true;
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                Err(TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        assert!(saw_completed, "completed CQ QSO should emit QsoCompleted");
+    }
+
+    /// While calling CQ (un-answered), the per-slot rearm keeps re-emitting our
+    /// CQ — exactly ONE keep-call per slot (no double-TX), bounded by the
+    /// manual watchdog.
+    #[tokio::test]
+    async fn manual_cq_rearm_re_emits_one_cq_per_slot() {
+        use tokio::sync::broadcast::error::TryRecvError;
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        let qso_id = manager.start_cq_manual(freq, None).await.unwrap();
+        let mut events = manager.subscribe();
+
+        let start = Utc::now();
+        // Same slot as creation (< 15s elapsed): rearm must NOT re-emit (the
+        // opening CQ already went out — re-emitting now would double-TX).
+        manager
+            .rearm_manual_calls_at(start + Duration::seconds(5))
+            .await;
+        // One slot later: rearm re-emits exactly one Cq.
+        manager
+            .rearm_manual_calls_at(start + Duration::seconds(16))
+            .await;
+
+        let mut cq_count = 0;
+        loop {
+            match events.try_recv() {
+                Ok(QsoEvent::MessageToSend { message, .. }) => {
+                    if matches!(message, MessageType::Cq { .. }) {
+                        cq_count += 1;
+                    }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                Err(TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        assert_eq!(
+            cq_count, 1,
+            "rearm should emit exactly one CQ keep-call across one elapsed slot"
+        );
+
+        // Sanity: the QSO is still CallingCq and call_count advanced.
+        let p = manager.get_qso(qso_id).await.unwrap();
+        assert!(matches!(p.state, QsoState::CallingCq { .. }));
+        assert_eq!(p.metadata.call_count, 2, "1 opening + 1 rearm");
+    }
+
+    /// The manual CQ watchdog retires an un-answered CallingCq QSO once it
+    /// hits the max-calls bound (so we never CQ forever).
+    #[tokio::test]
+    async fn manual_cq_watchdog_retires_after_max_calls() {
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        let qso_id = manager.start_cq_manual(freq, None).await.unwrap();
+
+        // Drive enough slots to exceed manual_call_max_calls (default 10).
+        let mut t = Utc::now();
+        for _ in 0..15 {
+            t += Duration::seconds(16);
+            manager.rearm_manual_calls_at(t).await;
+        }
+        manager.check_timeouts_at(t).await;
+
+        // QSO retired (Failed / mapping cleared → not found via get_qso after
+        // cleanup, or in a terminal state).
+        match manager.get_qso(qso_id).await {
+            Ok(p) => assert!(
+                p.state.is_terminal(),
+                "watchdog should retire the CQ QSO, got {:?}",
+                p.state
+            ),
+            Err(QsoManagerError::QsoNotFound { .. }) => {}
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    /// `cancel_qso` (StopCq path) cancels an un-answered CallingCq QSO.
+    #[tokio::test]
+    async fn manual_cq_cancel_stops_calling() {
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        let qso_id = manager.start_cq_manual(freq, None).await.unwrap();
+        assert_eq!(manager.get_active_qsos().await.len(), 1);
+
+        manager.cancel_qso(qso_id).await.unwrap();
+
+        // No longer active; a subsequent rearm emits nothing for it.
+        assert!(manager
+            .get_active_qsos()
+            .await
+            .iter()
+            .all(|(_, p)| !matches!(p.state, QsoState::CallingCq { .. })));
     }
 
     // --- Batch 2 #7 / FIX 1: case-insensitive continue --------------------
