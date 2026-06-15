@@ -257,6 +257,282 @@ fn tx_qso_is_live(
     }
 }
 
+/// Upper bound on the number of distinct TX streams the worker will retain
+/// when coalescing a backlog. Mirrors the "max simultaneous TX in one slot"
+/// ceiling: a single FT8 slot can only carry a handful of summed signals
+/// cleanly, so retaining more than this serves no purpose and only risks
+/// over-summing the waveform. There is no shared multi-TX cap constant in the
+/// TX-worker scope (the QSO engine's `max_concurrent_qsos` lives in config and
+/// is out of bounds here), so we pick a small, safe constant.
+const MAX_RETAINED_TX_STREAMS: usize = 8;
+
+/// One drained `TransmitRequest`, reduced to the fields coalescing needs.
+/// Pulled out of `MessageType::TransmitRequest` so the coalesce logic is a
+/// pure function testable without the message bus.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoalesceEntry {
+    pub message_text: String,
+    pub frequency_offset: f64,
+    pub qso_id: Option<String>,
+    pub tx_parity: Option<pancetta_core::slot::SlotParity>,
+}
+
+/// Result of draining + coalescing a backlog of `TransmitRequest`s.
+#[derive(Debug, Default, PartialEq)]
+pub struct CoalesceOutcome {
+    /// The requests to actually transmit, after coalescing per `qso_id`
+    /// (newest wins), dropping terminal-QSO requests, and capping the
+    /// distinct-stream count. Order is the order each retained key was first
+    /// seen, so the head entry is the oldest-surviving stream.
+    pub retained: Vec<CoalesceEntry>,
+    /// How many requests were superseded by a newer request for the SAME
+    /// `qso_id` (i.e. older keep-call frames dropped in favor of the latest).
+    pub coalesced: usize,
+    /// How many requests were dropped because their `qso_id` is no longer in
+    /// the active set (terminal / cancelled / completed-past-grace QSO).
+    pub dropped_terminal: usize,
+    /// How many distinct streams were dropped because the retained set hit
+    /// the [`MAX_RETAINED_TX_STREAMS`] cap (silent truncation made visible).
+    pub truncated: usize,
+}
+
+impl CoalesceOutcome {
+    /// `true` when nothing was reduced — a single request (or a backlog that
+    /// happened to be one fresh frame per distinct live QSO with no overflow).
+    /// Used only for the log-suppression decision in the worker.
+    fn is_noop(&self) -> bool {
+        self.coalesced == 0 && self.dropped_terminal == 0 && self.truncated == 0
+    }
+}
+
+/// Pure backlog coalescer for the single-threaded TX worker.
+///
+/// Given the requests drained from the channel (oldest first — the channel is
+/// FIFO) and a predicate for whether a `qso_id` is still live, collapse the
+/// backlog to "current intent":
+///
+/// 1. **Coalesce per `qso_id`, newest wins.** Two requests sharing a non-`None`
+///    `qso_id` are the same stream's keep-call cadence; only the latest matters
+///    (a newer keep-call frame supersedes the older). The older one is counted
+///    in `coalesced` and discarded.
+/// 2. **Never coalesce manual / free-text / tune sends.** A request with
+///    `qso_id == None` is its own non-coalescable stream — every such entry is
+///    retained verbatim, so a flood of keep-calls can never swallow an
+///    operator's manual send.
+/// 3. **Drop terminal QSOs.** A request whose `qso_id` is no longer live (same
+///    predicate Step 4b uses) is dropped during the drain and counted in
+///    `dropped_terminal`. `None`-keyed requests are never gated.
+/// 4. **Bound the retained set.** At most [`MAX_RETAINED_TX_STREAMS`] distinct
+///    streams survive; the rest are counted in `truncated` and dropped. The
+///    earliest-seen streams are kept (FIFO fairness).
+///
+/// The single-request, no-backlog case returns `retained == [that request]`
+/// with all counters zero, so the worker's normal path is unchanged.
+pub fn coalesce_transmit_requests(
+    drained: Vec<CoalesceEntry>,
+    mut qso_is_live: impl FnMut(Option<&str>) -> bool,
+) -> CoalesceOutcome {
+    use std::collections::HashMap;
+
+    let mut outcome = CoalesceOutcome::default();
+    // Insertion-ordered map keyed by qso_id (uppercased to match the
+    // active-set canonicalization). `None`-keyed entries bypass the map and go
+    // straight to `manual` so they're never coalesced.
+    let mut order: Vec<String> = Vec::new();
+    let mut by_qso: HashMap<String, CoalesceEntry> = HashMap::new();
+    // Retained manual/None entries, kept in drain order.
+    let mut manual: Vec<CoalesceEntry> = Vec::new();
+
+    for entry in drained {
+        // Drop terminal-QSO requests (None is never gated).
+        if !qso_is_live(entry.qso_id.as_deref()) {
+            outcome.dropped_terminal += 1;
+            continue;
+        }
+        match entry.qso_id.as_deref() {
+            None => manual.push(entry),
+            Some(id) => {
+                let key = super::active_tx_qso_key(id);
+                if by_qso.insert(key.clone(), entry).is_some() {
+                    // Superseded an older frame for the same QSO.
+                    outcome.coalesced += 1;
+                } else {
+                    order.push(key);
+                }
+            }
+        }
+    }
+
+    // Assemble retained in a stable order: coalesced QSO streams (first-seen
+    // order) followed by manual sends (drain order). Manual sends go last so a
+    // single-stream QSO backlog keeps the QSO as the headline item.
+    let mut retained: Vec<CoalesceEntry> = Vec::with_capacity(order.len() + manual.len());
+    for key in order {
+        if let Some(e) = by_qso.remove(&key) {
+            retained.push(e);
+        }
+    }
+    retained.append(&mut manual);
+
+    // Enforce the distinct-stream cap.
+    if retained.len() > MAX_RETAINED_TX_STREAMS {
+        outcome.truncated = retained.len() - MAX_RETAINED_TX_STREAMS;
+        retained.truncate(MAX_RETAINED_TX_STREAMS);
+    }
+
+    outcome.retained = retained;
+    outcome
+}
+
+/// Drain the queued backlog behind a head `TransmitRequest` and collapse it to
+/// current intent, returning the `MessageType` the worker should actually
+/// process this cycle.
+///
+/// `head` MUST be a `MessageType::TransmitRequest` (the caller checks). The
+/// channel is drained non-blockingly: every additional `TransmitRequest` is
+/// folded into the coalesce buffer; the FIRST non-`TransmitRequest`
+/// (`MultiTransmitRequest` / `TuneRequest` / anything else) stops the drain and
+/// is re-enqueued to the transmitter's own channel so it is never reordered
+/// relative to other non-TX messages, coalesced, or dropped.
+///
+/// Returns:
+/// - the original single `TransmitRequest` when nothing was queued (normal,
+///   no-backlog path — byte-for-byte unchanged),
+/// - a single `TransmitRequest` carrying the freshest retained frame when the
+///   backlog collapsed to one distinct live stream,
+/// - a `MultiTransmitRequest` folding the freshest frame of each distinct live
+///   stream when several survived (reuses the existing multi-TX path).
+///
+/// A `tx.policy` warning is logged whenever anything was coalesced, dropped, or
+/// truncated, so silent backlog reduction is always operator-visible.
+async fn coalesce_backlog_into(
+    head: MessageType,
+    tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
+    message_bus: &MessageBus,
+    active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+) -> MessageType {
+    // Decompose the head into a CoalesceEntry. (Caller guarantees the variant.)
+    let head_entry = match head {
+        MessageType::TransmitRequest {
+            message_text,
+            frequency_offset,
+            qso_id,
+            tx_parity,
+        } => CoalesceEntry {
+            message_text,
+            frequency_offset,
+            qso_id,
+            tx_parity,
+        },
+        // Defensive: not a TransmitRequest — hand it back unchanged.
+        other => return other,
+    };
+
+    // Drain queued TransmitRequests behind the head; stop at the first
+    // non-TransmitRequest and re-enqueue it so it is processed next cycle.
+    let mut drained = vec![head_entry];
+    while let Ok(msg) = tx_rx.try_recv() {
+        match msg.message_type {
+            MessageType::TransmitRequest {
+                message_text,
+                frequency_offset,
+                qso_id,
+                tx_parity,
+            } => {
+                drained.push(CoalesceEntry {
+                    message_text,
+                    frequency_offset,
+                    qso_id,
+                    tx_parity,
+                });
+            }
+            _ => {
+                // Non-TX message: re-enqueue verbatim and stop draining so we
+                // never reorder Tune/Multi ahead of, or behind, TX intent.
+                if let Err(e) = message_bus.send_message(msg).await {
+                    warn!(
+                        target: "tx.policy",
+                        "failed to re-enqueue non-TX message during coalesce drain: {}",
+                        e
+                    );
+                }
+                break;
+            }
+        }
+    }
+
+    // Fast path: only the head was present — nothing to coalesce.
+    if drained.len() == 1 {
+        let e = drained.into_iter().next().expect("len == 1");
+        return MessageType::TransmitRequest {
+            message_text: e.message_text,
+            frequency_offset: e.frequency_offset,
+            qso_id: e.qso_id,
+            tx_parity: e.tx_parity,
+        };
+    }
+
+    let backlog_total = drained.len();
+    let outcome = coalesce_transmit_requests(drained, |id| tx_qso_is_live(id, active_tx_qsos));
+
+    if !outcome.is_noop() {
+        warn!(
+            target: "tx.policy",
+            "TX backlog coalesced: drained {} request(s) → {} retained; \
+             coalesced {} stale (newest-per-QSO wins), dropped {} for ended QSOs, \
+             truncated {} over the {}-stream cap",
+            backlog_total,
+            outcome.retained.len(),
+            outcome.coalesced,
+            outcome.dropped_terminal,
+            outcome.truncated,
+            MAX_RETAINED_TX_STREAMS,
+        );
+    }
+
+    // Every drained request belonged to an ended QSO (rare: needs ≥2 queued
+    // requests, all terminal). Hand back an empty MultiTransmitRequest; the
+    // multi-TX arm's "empty after dropping stale items" branch consumes and
+    // skips it without keying PTT. These QSOs already transitioned terminal, so
+    // there is no live state machine awaiting a TransmitComplete.
+    if outcome.retained.is_empty() {
+        return MessageType::MultiTransmitRequest {
+            items: Vec::new(),
+            tx_parity: None,
+        };
+    }
+
+    // Single retained distinct stream → single TransmitRequest (unchanged arm).
+    if outcome.retained.len() == 1 {
+        let e = outcome.retained.into_iter().next().expect("len == 1");
+        return MessageType::TransmitRequest {
+            message_text: e.message_text,
+            frequency_offset: e.frequency_offset,
+            qso_id: e.qso_id,
+            tx_parity: e.tx_parity,
+        };
+    }
+
+    // Several distinct live streams survived → fold into the existing multi-TX
+    // path. All bundle items share one slot, so the bundle parity is the
+    // freshest stream's parity (first retained entry, which the existing arm
+    // resolves via resolve_required_parity).
+    let bundle_parity = outcome.retained[0].tx_parity;
+    let items = outcome
+        .retained
+        .into_iter()
+        .map(|e| crate::message_bus::TransmitRequestItem {
+            message_text: e.message_text,
+            frequency_offset: e.frequency_offset,
+            qso_id: e.qso_id,
+        })
+        .collect();
+    MessageType::MultiTransmitRequest {
+        items,
+        tx_parity: bundle_parity,
+    }
+}
+
 impl Drop for PttGuard {
     fn drop(&mut self) {
         if self.armed {
@@ -339,7 +615,34 @@ impl super::ApplicationCoordinator {
                     // TX was in flight) from killing the next legitimate TX.
                     abort_current_tx.store(false, Ordering::Release);
                     match tx_rx.try_recv() {
-                        Ok(message) => {
+                        Ok(mut message) => {
+                            // --- Backpressure / staleness coalescing ---
+                            // The worker processes one request at a time and a
+                            // single transmit spans ~13-28s, while keep-call +
+                            // repeated operator actions enqueue a new request
+                            // every ~5-15s. Under load the channel backs up
+                            // unboundedly and we'd replay STALE frames slot
+                            // after slot. So when the head is a TransmitRequest,
+                            // drain the rest of the queued TransmitRequests now
+                            // and coalesce to current intent: newest-per-qso_id
+                            // wins, terminal-QSO requests are dropped, manual
+                            // (qso_id == None) sends are preserved, and the
+                            // distinct-stream count is bounded. The drain stops
+                            // at the first non-TransmitRequest (Tune / Multi),
+                            // which is re-enqueued so it's never reordered or
+                            // dropped. Single-request (no-backlog) case rewrites
+                            // back to exactly that one request — normal path
+                            // unchanged.
+                            if matches!(message.message_type, MessageType::TransmitRequest { .. }) {
+                                message.message_type = coalesce_backlog_into(
+                                    message.message_type,
+                                    &tx_rx,
+                                    &message_bus,
+                                    &active_tx_qsos,
+                                )
+                                .await;
+                            }
+
                             match message.message_type {
                                 MessageType::TransmitRequest {
                                     message_text,
@@ -1628,5 +1931,189 @@ mod schedule_tx_tests {
         assert!(set.is_poisoned());
         // Even for a qso_id that would otherwise be "ended", fail-open → true.
         assert!(super::tx_qso_is_live(Some("qso-ended"), &set));
+    }
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn entry(text: &str, qso_id: Option<&str>) -> CoalesceEntry {
+        CoalesceEntry {
+            message_text: text.to_string(),
+            frequency_offset: 1000.0,
+            qso_id: qso_id.map(|s| s.to_string()),
+            tx_parity: None,
+        }
+    }
+
+    /// Predicate over a fixed live-set (uppercased+trimmed to match the
+    /// production canonicalization). `None` is always live.
+    fn live_in(set: &HashSet<String>) -> impl FnMut(Option<&str>) -> bool + '_ {
+        move |id: Option<&str>| match id {
+            None => true,
+            Some(id) => set.contains(&super::super::active_tx_qso_key(id)),
+        }
+    }
+
+    fn liveset(ids: &[&str]) -> HashSet<String> {
+        ids.iter()
+            .map(|s| super::super::active_tx_qso_key(s))
+            .collect()
+    }
+
+    #[test]
+    fn single_request_passthrough_unchanged() {
+        // The no-backlog case: one request in, one retained out, zero reduced.
+        let live = liveset(&["qso-a"]);
+        let out = coalesce_transmit_requests(vec![entry("CQ", Some("qso-a"))], live_in(&live));
+        assert_eq!(out.retained, vec![entry("CQ", Some("qso-a"))]);
+        assert_eq!(out.coalesced, 0);
+        assert_eq!(out.dropped_terminal, 0);
+        assert_eq!(out.truncated, 0);
+        assert!(out.is_noop());
+    }
+
+    #[test]
+    fn newest_per_qso_id_wins() {
+        // Three keep-calls for the SAME live QSO collapse to the LAST one.
+        let live = liveset(&["qso-a"]);
+        let out = coalesce_transmit_requests(
+            vec![
+                entry("OLD-1", Some("qso-a")),
+                entry("OLD-2", Some("qso-a")),
+                entry("NEWEST", Some("qso-a")),
+            ],
+            live_in(&live),
+        );
+        assert_eq!(out.retained, vec![entry("NEWEST", Some("qso-a"))]);
+        assert_eq!(out.coalesced, 2);
+        assert_eq!(out.dropped_terminal, 0);
+        assert_eq!(out.truncated, 0);
+    }
+
+    #[test]
+    fn newest_per_qso_id_is_case_insensitive() {
+        // Mixed-case ids for the same QSO coalesce together (canonical key).
+        let live = liveset(&["qso-a"]);
+        let out = coalesce_transmit_requests(
+            vec![entry("OLD", Some("QSO-A")), entry("NEWEST", Some("qso-a"))],
+            live_in(&live),
+        );
+        assert_eq!(out.retained.len(), 1);
+        assert_eq!(out.retained[0].message_text, "NEWEST");
+        assert_eq!(out.coalesced, 1);
+    }
+
+    #[test]
+    fn terminal_qso_requests_dropped() {
+        // qso-dead is not in the live set → its requests are dropped; the live
+        // QSO survives.
+        let live = liveset(&["qso-a"]);
+        let out = coalesce_transmit_requests(
+            vec![
+                entry("DEAD-1", Some("qso-dead")),
+                entry("LIVE", Some("qso-a")),
+                entry("DEAD-2", Some("qso-dead")),
+            ],
+            live_in(&live),
+        );
+        assert_eq!(out.retained, vec![entry("LIVE", Some("qso-a"))]);
+        assert_eq!(out.dropped_terminal, 2);
+        assert_eq!(out.coalesced, 0);
+    }
+
+    #[test]
+    fn manual_none_entries_preserved_and_never_coalesced() {
+        // Two distinct manual sends (qso_id == None) must BOTH survive — they
+        // are never coalesced into each other, and never gated by liveness.
+        let live = liveset(&[]); // empty: no QSO is "live"
+        let out = coalesce_transmit_requests(
+            vec![entry("MANUAL-1", None), entry("MANUAL-2", None)],
+            live_in(&live),
+        );
+        assert_eq!(out.retained.len(), 2);
+        assert_eq!(out.retained[0].message_text, "MANUAL-1");
+        assert_eq!(out.retained[1].message_text, "MANUAL-2");
+        assert_eq!(out.coalesced, 0);
+        assert_eq!(out.dropped_terminal, 0);
+    }
+
+    #[test]
+    fn manual_send_survives_keepcall_flood() {
+        // A flood of keep-calls for one QSO plus an operator manual send: the
+        // QSO collapses to its newest frame, and the manual send is retained.
+        let live = liveset(&["qso-a"]);
+        let out = coalesce_transmit_requests(
+            vec![
+                entry("KC-1", Some("qso-a")),
+                entry("KC-2", Some("qso-a")),
+                entry("MANUAL", None),
+                entry("KC-3", Some("qso-a")),
+            ],
+            live_in(&live),
+        );
+        // QSO stream first (first-seen), manual last.
+        assert_eq!(out.retained.len(), 2);
+        assert_eq!(out.retained[0].message_text, "KC-3"); // newest for qso-a
+        assert_eq!(out.retained[1].message_text, "MANUAL");
+        assert_eq!(out.coalesced, 2);
+    }
+
+    #[test]
+    fn cap_enforced_with_truncation_count() {
+        // More distinct live streams than the cap → truncated to the cap,
+        // first-seen streams kept, overflow counted.
+        let ids: Vec<String> = (0..MAX_RETAINED_TX_STREAMS + 3)
+            .map(|i| format!("qso-{i}"))
+            .collect();
+        let live: HashSet<String> = ids
+            .iter()
+            .map(|s| super::super::active_tx_qso_key(s))
+            .collect();
+        let drained: Vec<CoalesceEntry> = ids.iter().map(|id| entry(id, Some(id))).collect();
+        let out = coalesce_transmit_requests(drained, live_in(&live));
+        assert_eq!(out.retained.len(), MAX_RETAINED_TX_STREAMS);
+        assert_eq!(out.truncated, 3);
+        // First-seen streams kept (FIFO fairness): qso-0..qso-7.
+        assert_eq!(out.retained[0].message_text, "qso-0");
+        assert_eq!(
+            out.retained[MAX_RETAINED_TX_STREAMS - 1].message_text,
+            format!("qso-{}", MAX_RETAINED_TX_STREAMS - 1)
+        );
+    }
+
+    #[test]
+    fn distinct_live_qsos_all_retained_under_cap() {
+        // Two distinct live QSOs, one frame each, under cap → both retained,
+        // nothing reduced (is_noop).
+        let live = liveset(&["qso-a", "qso-b"]);
+        let out = coalesce_transmit_requests(
+            vec![entry("A", Some("qso-a")), entry("B", Some("qso-b"))],
+            live_in(&live),
+        );
+        assert_eq!(out.retained.len(), 2);
+        assert!(out.is_noop());
+    }
+
+    #[test]
+    fn empty_input_yields_empty_retained() {
+        let live = liveset(&[]);
+        let out = coalesce_transmit_requests(Vec::new(), live_in(&live));
+        assert!(out.retained.is_empty());
+        assert!(out.is_noop());
+    }
+
+    #[test]
+    fn all_terminal_yields_empty_retained_with_drop_count() {
+        let live = liveset(&[]); // nothing live
+        let out = coalesce_transmit_requests(
+            vec![entry("D1", Some("qso-x")), entry("D2", Some("qso-y"))],
+            live_in(&live),
+        );
+        assert!(out.retained.is_empty());
+        assert_eq!(out.dropped_terminal, 2);
+        assert!(!out.is_noop());
     }
 }
