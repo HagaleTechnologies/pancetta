@@ -230,11 +230,16 @@ mod tests {
         let elapsed_ns = timer.elapsed_ns();
         let elapsed_ms = timer.elapsed_ms();
 
-        // Should be approximately 1ms
-        assert!(elapsed_ns > 500_000); // At least 0.5ms
-        assert!(elapsed_ns < 2_000_000); // At most 2ms
+        // The 1ms sleep guarantees the timer advanced past ~0.5ms. We do NOT
+        // assert a tight UPPER bound: `thread::sleep` only guarantees a MINIMUM
+        // and on a loaded host (e.g. the pre-push hook running the whole suite
+        // in parallel) a 1ms sleep routinely overruns several ms — a tight
+        // ceiling here made this test flaky and blocked pushes. Assert the
+        // lower bound (the timer ran forward) and that the ns/ms views agree.
+        assert!(elapsed_ns > 500_000); // At least 0.5ms — the sleep happened
         assert!(elapsed_ms > 0.5);
-        assert!(elapsed_ms < 2.0);
+        // ns and ms must be consistent views of the same elapsed time.
+        assert!((elapsed_ms - elapsed_ns as f64 / 1_000_000.0).abs() < 0.5);
     }
 
     #[test]
