@@ -23,7 +23,7 @@ anyhow = "1.0"
 tokio = { version = "1.50", features = ["full"] }
 
 # File system watching for hot-reload
-notify = "6.1"
+notify = "8.2"
 
 # Path and environment utilities
 dirs = "5.0"
