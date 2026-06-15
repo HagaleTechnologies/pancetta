@@ -3698,6 +3698,59 @@ mod reply_emitter_tests {
         assert!(matches!(progress.state, QsoState::Completed { .. }));
     }
 
+    /// Item 2 (primary): a station keeps sending us RR73 (never copied our 73).
+    /// The operator presses Space again — a repeat
+    /// `respond_to_caller(SeventyThree)` for the SAME callsign must re-emit
+    /// another 73 rather than getting deduped into a no-op. Because the first
+    /// 73 leaves the QSO `Completed` (terminal, not active), `supersede_*` skips
+    /// it and we build a fresh completed QSO that emits its own SeventyThree.
+    #[tokio::test]
+    async fn repeat_respond_to_caller_seventy_three_resends_73() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+
+        // First 73.
+        let first = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::SeventyThree,
+                Some(-8.0),
+                Some(-4),
+            )
+            .await
+            .unwrap();
+        let sends = messages_to_send(&drain(&mut rx));
+        assert_eq!(sends.len(), 1);
+        assert!(matches!(sends[0], MessageType::SeventyThree { .. }));
+
+        // They send us RR73 again; operator presses Space again → second 73.
+        let second = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::SeventyThree,
+                Some(-8.0),
+                Some(-4),
+            )
+            .await
+            .unwrap();
+        assert_ne!(first, second, "repeat press should build a fresh QSO");
+        let sends2 = messages_to_send(&drain(&mut rx));
+        assert_eq!(
+            sends2.len(),
+            1,
+            "repeat Space must re-send a 73, not no-op: {sends2:?}"
+        );
+        assert!(
+            matches!(sends2[0], MessageType::SeventyThree { .. }),
+            "expected a second SeventyThree, got {:?}",
+            sends2[0]
+        );
+    }
+
     /// `our_snr_of_them = None` falls back to a sane default report (-15).
     #[tokio::test]
     async fn respond_to_caller_defaults_report_when_no_snr() {

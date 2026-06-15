@@ -400,6 +400,13 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     let help_line = Line::from(vec![
         Span::styled(
+            "Space",
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(":Call/Reply | "),
+        Span::styled(
             "Arrows",
             Style::default()
                 .fg(app.theme.accent_color())

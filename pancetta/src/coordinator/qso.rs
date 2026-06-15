@@ -604,6 +604,24 @@ impl super::ApplicationCoordinator {
                                         pancetta_qso::utils::frequency_to_band(metadata.frequency);
                                     qso_lookup.record_worked(their_call, &band);
 
+                                    // TODO(item-2-auto-73): auto re-send our 73 when a
+                                    // station we JUST completed a *manual* QSO with keeps
+                                    // sending us RR73/RRR (they didn't copy our 73). The
+                                    // primary fix already lets the operator press Space
+                                    // again to re-send 73 (context-aware Space →
+                                    // RespondToCaller{SeventyThree}); this would automate
+                                    // that bounded re-send. Sketch: on a manual QsoCompleted
+                                    // (metadata.initiated_by == Manual) stash
+                                    // (their_call, completed_at) here in a small per-callsign
+                                    // map; in the decode-processing path, when a directed-
+                                    // at-us RR73/RRR arrives from a stashed callsign within
+                                    // ~3 min, synthesize a RespondToCaller{SeventyThree}
+                                    // (max 3 extra sends, then drop the entry). Deferred:
+                                    // it spans the completion handler AND the decode path,
+                                    // and must interact cleanly with the manual watchdog and
+                                    // the dx-busy / self-duplicate gates — out of scope for
+                                    // this batch.
+
                                     // Report QSO to cqdx.io
                                     if let Some(ref bridge) = cqdx_bridge {
                                         bridge.report_qso(pancetta_cqdx::QsoRecord {

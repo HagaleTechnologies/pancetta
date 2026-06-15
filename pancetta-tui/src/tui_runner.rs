@@ -967,17 +967,51 @@ impl TuiRunner {
                 self.message_tx.send(TuiCommand::ClearMessages)?;
             }
 
-            // Space - Select/activate (click-to-call)
-            KeyCode::Char(' ') => {
-                if let Some((callsign, frequency, dx_parity)) = app.get_selected_station() {
+            // Space - context-aware action on the selected station ("do the
+            // right next thing"). If the selected callsign most-recently sent
+            // us something directed at us (grid/report/R/RR73/73), reply at the
+            // correct exchange step (same smart-default the Callers panel uses);
+            // otherwise answer their CQ with our grid. This unifies Space with
+            // Callers-Enter and fixes "I clicked to send 73 but it sent my
+            // grid" — pressing Space on a station still sending us RR73 sends
+            // another 73.
+            KeyCode::Char(' ') => match app.resolve_space_action() {
+                Some(crate::app::SpaceAction::Reply {
+                    callsign,
+                    frequency,
+                    dx_parity,
+                    step,
+                    snr,
+                }) => {
+                    self.message_tx.send(TuiCommand::RespondToCaller {
+                        callsign: callsign.clone(),
+                        frequency,
+                        dx_parity,
+                        step,
+                        snr,
+                    })?;
+                    app.status_message = format!(
+                        "Replying {} to {}",
+                        crate::app::reply_step_label(step),
+                        callsign
+                    );
+                }
+                Some(crate::app::SpaceAction::Call {
+                    callsign,
+                    frequency,
+                    dx_parity,
+                }) => {
                     self.message_tx.send(TuiCommand::CallStation {
-                        callsign,
+                        callsign: callsign.clone(),
                         frequency,
                         dx_parity,
                     })?;
+                    app.status_message = format!("Calling {}...", callsign);
                 }
-                app.activate_selected();
-            }
+                None => {
+                    app.status_message = "No station selected".to_string();
+                }
+            },
 
             // Enter - confirm the selected caller reply. When the Callers panel
             // is focused and a caller is selected, this commits the reply at the

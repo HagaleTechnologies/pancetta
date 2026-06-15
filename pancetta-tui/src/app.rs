@@ -419,6 +419,49 @@ impl ActivePanel {
     }
 }
 
+/// What the Space key should DO for the currently-selected station — resolved
+/// by [`App::resolve_space_action`]. Space means "do the right next thing":
+///
+/// - [`SpaceAction::Reply`] when the selected callsign most-recently sent us a
+///   message directed at us (a grid/report/R-report/RR73/73). We reply at the
+///   smart-default sequence step (same `classify_caller_reply` logic the
+///   Callers panel uses), e.g. their `K5ARH VB7F RR73` → we send `VB7F K5ARH
+///   73`. This is what fixes "I clicked to send 73 but it sent my grid".
+/// - [`SpaceAction::Call`] when nothing directed-at-us is on record for the
+///   callsign (a pure CQer, or a DX-cluster spot we've never heard call us).
+///   This is the historical Space behavior — answer their CQ with our grid.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpaceAction {
+    /// Answer a CQ / start a fresh contact at the grid step. Carries the
+    /// fields the coordinator's `CallStation` command needs.
+    Call {
+        callsign: String,
+        frequency: u64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+    },
+    /// Reply to a station that last sent us something directed at us, at the
+    /// smart-default sequence step. Carries the fields the coordinator's
+    /// `RespondToCaller` command needs.
+    Reply {
+        callsign: String,
+        frequency: u64,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+        step: pancetta_core::ResponseStep,
+        snr: Option<f32>,
+    },
+}
+
+/// A per-band snapshot stashed on band switch and restored when the operator
+/// returns to that band within the cache TTL. Holds the decoded-message list
+/// (the source of both the Band Activity and Callers panels) and the DX-Hunter
+/// station map, plus when it was captured.
+#[derive(Debug, Clone)]
+struct BandSnapshot {
+    decoded_messages: VecDeque<DecodedMessageView>,
+    dx_stations: HashMap<String, DxStation>,
+    captured_at: DateTime<Utc>,
+}
+
 /// A compact, display-oriented TX item for the NOW-SENDING / QUEUED view.
 /// Mirrors the coordinator's `message_bus::TxItem` but lives in the TUI so
 /// the TUI doesn't depend on the main `pancetta` crate.
@@ -586,6 +629,15 @@ pub struct App {
     pub current_band_index: usize,
     /// Frequency reported by the radio (via hamlib), if known. In MHz.
     pub radio_frequency: Option<f64>,
+    /// Per-band snapshot cache. On every band switch we stash the band we are
+    /// leaving (its decoded messages — the source of BOTH the Band Activity and
+    /// Callers lists — and its DX-Hunter stations) keyed by band name with a
+    /// timestamp, then clear the live lists. Switching BACK to a band within
+    /// [`Self::BAND_CACHE_TTL_SECS`] restores that snapshot so the operator does
+    /// not lose who was calling them; an older snapshot is dropped (start
+    /// fresh). Bounded to [`Self::BAND_CACHE_MAX`] bands and pruned of stale
+    /// entries on each switch so it can't grow without bound.
+    band_cache: HashMap<String, BandSnapshot>,
 
     // Communication channels
     pub message_rx: Option<mpsc::UnboundedReceiver<DecodedMessageView>>,
@@ -683,6 +735,7 @@ impl App {
             tx_output_default: false,
             current_band_index: default_band_index,
             radio_frequency: None,
+            band_cache: HashMap::new(),
             message_rx: None,
             audio_rx: None,
         };
@@ -1148,14 +1201,25 @@ impl App {
         self.radio_frequency = Some(freq_mhz);
     }
 
+    /// How long a cached per-band snapshot stays restorable. Return to a band
+    /// within this window and its Callers / DX lists come back; older than this
+    /// and the operator starts fresh (the stale snapshot is dropped).
+    const BAND_CACHE_TTL_SECS: i64 = 600; // 10 minutes
+    /// Cap on the number of bands kept in the snapshot cache so memory stays
+    /// bounded regardless of how much the operator band-hops.
+    const BAND_CACHE_MAX: usize = 4;
+
     /// Switch to the next band (higher frequency). Returns the new FT8 dial frequency in Hz.
     pub fn band_up(&mut self) -> u64 {
         let num_bands = self.config.bands.bands.len();
         if num_bands == 0 {
             return (self.station_info.operating_frequency * 1_000_000.0) as u64;
         }
+        let old_band = self.config.bands.bands[self.current_band_index]
+            .name
+            .clone();
         self.current_band_index = (self.current_band_index + 1) % num_bands;
-        self.apply_band_selection()
+        self.apply_band_selection(Some(old_band))
     }
 
     /// Switch to the previous band (lower frequency). Returns the new FT8 dial frequency in Hz.
@@ -1164,20 +1228,106 @@ impl App {
         if num_bands == 0 {
             return (self.station_info.operating_frequency * 1_000_000.0) as u64;
         }
+        let old_band = self.config.bands.bands[self.current_band_index]
+            .name
+            .clone();
         self.current_band_index = (self.current_band_index + num_bands - 1) % num_bands;
-        self.apply_band_selection()
+        self.apply_band_selection(Some(old_band))
     }
 
     /// Apply the current band selection, updating operating frequency.
     /// Returns the FT8 dial frequency in Hz.
-    fn apply_band_selection(&mut self) -> u64 {
+    ///
+    /// `leaving_band` is the name of the band we are switching AWAY from (the
+    /// one whose live lists are about to be cleared), or `None` on the initial
+    /// selection where there is nothing to stash. The leaving band's decoded
+    /// messages and DX stations are snapshotted into `band_cache` (so a return
+    /// within [`Self::BAND_CACHE_TTL_SECS`] can restore who was calling us),
+    /// then ALL live lists (Band Activity, Callers — both derive from
+    /// `decoded_messages` — and the DX Hunter) are cleared and their cursors /
+    /// pins reset. If the band we are switching TO has a fresh cached snapshot,
+    /// it is restored and the stale-cache entry is consumed.
+    fn apply_band_selection(&mut self, leaving_band: Option<String>) -> u64 {
+        // 1. Stash the band we're leaving so a return within the TTL restores it.
+        if let Some(old) = leaving_band {
+            if !self.decoded_messages.is_empty() || !self.dx_stations.is_empty() {
+                self.band_cache.insert(
+                    old,
+                    BandSnapshot {
+                        decoded_messages: self.decoded_messages.clone(),
+                        dx_stations: self.dx_stations.clone(),
+                        captured_at: Utc::now(),
+                    },
+                );
+            }
+        }
+
+        // 2. Prune stale / overflow cache entries to keep memory bounded.
+        self.prune_band_cache();
+
         let band = &self.config.bands.bands[self.current_band_index];
+        let band_name = band.name.clone();
         self.station_info.operating_frequency = band.ft8_frequency;
-        self.status_message = format!("Band: {} — {:.3} MHz", band.name, band.ft8_frequency);
-        // Clear band activity when switching bands
+        let dial = (band.ft8_frequency * 1_000_000.0) as u64;
+        let base_status = format!("Band: {} — {:.3} MHz", band_name, band.ft8_frequency);
+
+        // 3. Clear every live list and reset cursors/pins.
         self.decoded_messages.clear();
+        self.dx_stations.clear();
         self.band_activity_scroll = 0;
-        (band.ft8_frequency * 1_000_000.0) as u64
+        self.dx_hunter_scroll = 0;
+        self.dx_hunter_pinned_call = None;
+        self.callers_scroll = 0;
+        self.callers_pinned_call = None;
+        self.caller_reply_override = None;
+        self.caller_override_for = None;
+
+        // 4. Restore a fresh snapshot for the band we're switching TO, if any.
+        if let Some(snap) = self.band_cache.remove(&band_name) {
+            let age_secs = (Utc::now() - snap.captured_at).num_seconds();
+            if age_secs <= Self::BAND_CACHE_TTL_SECS {
+                let caller_count = directed_caller_count(&snap.decoded_messages);
+                self.decoded_messages = snap.decoded_messages;
+                self.dx_stations = snap.dx_stations;
+                let mins = (age_secs / 60).max(0);
+                self.status_message = if caller_count > 0 {
+                    format!(
+                        "{} — restored {} caller{} from {}m ago",
+                        base_status,
+                        caller_count,
+                        if caller_count == 1 { "" } else { "s" },
+                        mins
+                    )
+                } else {
+                    format!("{} — restored from {}m ago", base_status, mins)
+                };
+                return dial;
+            }
+            // else: too old — already removed; fall through to a fresh start.
+        }
+
+        self.status_message = base_status;
+        dial
+    }
+
+    /// Drop band-cache entries older than the TTL, then evict the oldest until
+    /// the cache is within [`Self::BAND_CACHE_MAX`].
+    fn prune_band_cache(&mut self) {
+        let now = Utc::now();
+        self.band_cache
+            .retain(|_, snap| (now - snap.captured_at).num_seconds() <= Self::BAND_CACHE_TTL_SECS);
+        while self.band_cache.len() > Self::BAND_CACHE_MAX {
+            if let Some(oldest) = self
+                .band_cache
+                .iter()
+                .min_by_key(|(_, s)| s.captured_at)
+                .map(|(k, _)| k.clone())
+            {
+                self.band_cache.remove(&oldest);
+            } else {
+                break;
+            }
+        }
     }
 
     /// Returns the frequency delta between our expected frequency and the radio, if known.
@@ -1558,6 +1708,62 @@ impl App {
         } else {
             self.status_message = "No station selected".to_string();
         }
+    }
+
+    /// The most-recent decode **directed at us** from `callsign`, if any.
+    /// This is the same notion of "directed at us" the Callers panel uses
+    /// (`is_directed_at_us`), filtered to a single callsign. `decoded_messages`
+    /// is push-back (oldest→newest) so we walk it in reverse and take the first
+    /// match. Used by [`Self::resolve_space_action`] to decide whether Space
+    /// should answer a CQ (grid) or reply at the correct exchange step.
+    pub fn last_directed_at_us_from(&self, callsign: &str) -> Option<&DecodedMessageView> {
+        self.decoded_messages.iter().rev().find(|m| {
+            m.is_directed_at_us
+                && m.call_sign
+                    .as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(callsign))
+        })
+    }
+
+    /// Resolve what the Space key should do for the currently-selected station,
+    /// unifying the Space and Callers-Enter paths into "do the right next
+    /// thing". Returns `None` when no station is selected.
+    ///
+    /// - If the selected callsign has a most-recent decode directed at us (a
+    ///   grid/report/R-report/RR73/73), classify it with the SAME
+    ///   [`classify_caller_reply`] logic the Callers panel uses and return
+    ///   [`SpaceAction::Reply`] at that smart-default step (their `RR73` → we
+    ///   send `73`, their grid → we send our report, etc.).
+    /// - Otherwise (a pure CQer, or a DX-cluster spot we've never heard call
+    ///   us) return [`SpaceAction::Call`] — the historical Space behavior of
+    ///   answering their CQ at the grid step.
+    ///
+    /// The reply target's frequency/parity come from the directed decode itself
+    /// (where we actually heard them) rather than the selected-row frequency,
+    /// so a reply always lands on the right passband even if the operator
+    /// selected the station from the DX Hunter (network-spot) row.
+    pub fn resolve_space_action(&self) -> Option<SpaceAction> {
+        let (callsign, frequency, dx_parity) = self.get_selected_station()?;
+
+        if let Some(msg) = self.last_directed_at_us_from(&callsign) {
+            let step = classify_caller_reply(&msg.message, &self.station_info.call_sign);
+            // Reply on the passband where we actually heard them, on their slot
+            // parity if we know it — mirrors the Callers-Enter reply target.
+            let reply_freq = (msg.delta_freq.round() as u64).clamp(200, 2500);
+            return Some(SpaceAction::Reply {
+                callsign,
+                frequency: reply_freq,
+                dx_parity: msg.slot_parity,
+                step,
+                snr: Some(msg.snr as f32),
+            });
+        }
+
+        Some(SpaceAction::Call {
+            callsign,
+            frequency,
+            dx_parity,
+        })
     }
 
     // === Callers panel ====================================================
@@ -2067,6 +2273,21 @@ impl App {
     }
 }
 
+/// A short human label for a reply step, for operator status messages
+/// ("Replying 73 to VB7F"). Matches the vocabulary the Callers panel uses
+/// (`ui::callers::reply_label`) but without a filled-in report value, since the
+/// Space-feedback line names the action rather than the exact frame.
+pub fn reply_step_label(step: pancetta_core::ResponseStep) -> &'static str {
+    use pancetta_core::ResponseStep;
+    match step {
+        ResponseStep::Grid => "grid",
+        ResponseStep::Report => "report",
+        ResponseStep::ReportAck => "R-report",
+        ResponseStep::Rr73 => "RR73",
+        ResponseStep::SeventyThree => "73",
+    }
+}
+
 /// Classify a station's directed-at-us message and pick the sequence step our
 /// reply should open at. This is the Callers panel's smart default.
 ///
@@ -2128,6 +2349,25 @@ pub fn classify_caller_reply(msg_text: &str, _our_call: &str) -> pancetta_core::
         }
         _ => ResponseStep::Grid,
     }
+}
+
+/// Count the unique callsigns that are calling US (directed-at-us decodes) in a
+/// decoded-message snapshot — i.e. the number of rows the Callers panel would
+/// show. Used to phrase the "restored N callers from Nm ago" status on a
+/// band-return. Mirrors the de-dup in [`App::displayed_callers`].
+fn directed_caller_count(messages: &VecDeque<DecodedMessageView>) -> usize {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for msg in messages.iter() {
+        if !msg.is_directed_at_us {
+            continue;
+        }
+        if let Some(call) = msg.call_sign.as_ref() {
+            if !call.is_empty() {
+                seen.insert(call.to_uppercase());
+            }
+        }
+    }
+    seen.len()
 }
 
 /// `true` if `tok` looks like a 4- or 6-character Maidenhead grid.
@@ -3190,6 +3430,217 @@ mod tests {
         assert!(
             app.caller_reply_override.is_none(),
             "override resets when pinned callsign changes"
+        );
+    }
+
+    // === Item 1: context-aware Space ======================================
+
+    /// A directed-at-us decode from `call` carrying `payload` as the 3rd token
+    /// (`<us> <them> <payload>`).
+    fn fixture_view_directed_payload(call: &str, payload: &str, snr: i32) -> DecodedMessageView {
+        let mut v = fixture_view(call, snr);
+        v.is_directed_at_us = true;
+        v.message = format!("K5ARH {} {}", call, payload);
+        v
+    }
+
+    /// Space on a station that last sent us RR73 must REPLY at the 73 step
+    /// (`SpaceAction::Reply { step: SeventyThree }`) — the core on-air bug fix
+    /// (operator pressed Space to send 73, got their grid instead).
+    #[tokio::test]
+    async fn space_replies_seventy_three_to_rr73_sender() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        // VB7F repeatedly sending us RR73 (never copied our 73).
+        app.add_decoded_message(fixture_view_directed_payload("VB7F", "RR73", -8))
+            .await
+            .unwrap();
+        app.band_activity_scroll = 0;
+
+        let action = app.resolve_space_action().expect("station selectable");
+        match action {
+            SpaceAction::Reply { callsign, step, .. } => {
+                assert_eq!(callsign, "VB7F");
+                assert_eq!(step, pancetta_core::ResponseStep::SeventyThree);
+            }
+            other => panic!("expected Reply(SeventyThree), got {:?}", other),
+        }
+    }
+
+    /// Space on a pure CQer (nothing directed at us) keeps the historical
+    /// behavior: `SpaceAction::Call` (answer their CQ with our grid).
+    #[tokio::test]
+    async fn space_calls_pure_cqer() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        // Only a CQ from this station — never directed at us.
+        app.add_decoded_message(fixture_view("DL5XYZ", -3))
+            .await
+            .unwrap();
+        app.band_activity_scroll = 0;
+
+        let action = app.resolve_space_action().expect("station selectable");
+        match action {
+            SpaceAction::Call { callsign, .. } => assert_eq!(callsign, "DL5XYZ"),
+            other => panic!("expected Call, got {:?}", other),
+        }
+    }
+
+    /// Space classifies each directed payload at the right rung: their grid →
+    /// Report, their report → ReportAck, their R-report → Rr73, their RR73 → 73.
+    #[tokio::test]
+    async fn space_reply_step_tracks_their_last_message() {
+        for (payload, expect) in [
+            ("FN42", pancetta_core::ResponseStep::Report),
+            ("-12", pancetta_core::ResponseStep::ReportAck),
+            ("R-05", pancetta_core::ResponseStep::Rr73),
+            ("73", pancetta_core::ResponseStep::SeventyThree),
+        ] {
+            let mut app = fixture_app().await;
+            app.active_panel = ActivePanel::BandActivity;
+            app.add_decoded_message(fixture_view_directed_payload("K9XYZ", payload, -10))
+                .await
+                .unwrap();
+            app.band_activity_scroll = 0;
+            match app.resolve_space_action().expect("selectable") {
+                SpaceAction::Reply { step, .. } => assert_eq!(
+                    step, expect,
+                    "payload {payload:?} should classify to {expect:?}"
+                ),
+                other => panic!("payload {payload:?} expected Reply, got {other:?}"),
+            }
+        }
+    }
+
+    /// Space uses the MOST-RECENT directed message: an earlier report followed
+    /// by a later RR73 from the same station resolves to the 73 step.
+    #[tokio::test]
+    async fn space_uses_most_recent_directed_message() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        app.add_decoded_message(fixture_view_directed_payload("VB7F", "-10", -8))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view_directed_payload("VB7F", "RR73", -8))
+            .await
+            .unwrap();
+        app.band_activity_scroll = 0;
+        match app.resolve_space_action().expect("selectable") {
+            SpaceAction::Reply { step, .. } => {
+                assert_eq!(step, pancetta_core::ResponseStep::SeventyThree)
+            }
+            other => panic!("expected Reply(SeventyThree), got {other:?}"),
+        }
+    }
+
+    // === Item 3: band-switch clear + 10-min restore =======================
+
+    /// A band switch clears the Band Activity, Callers (both derive from
+    /// `decoded_messages`) and DX Hunter lists, and resets their cursors.
+    #[tokio::test]
+    async fn band_switch_clears_all_lists() {
+        let mut app = fixture_app().await;
+        app.add_decoded_message(fixture_view_directed("AA1AA", -5))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("BB2BB", -3))
+            .await
+            .unwrap();
+        app.dx_hunter_scroll = 1;
+        app.callers_scroll = 0;
+        assert!(!app.decoded_messages.is_empty());
+        assert!(!app.dx_stations.is_empty());
+
+        app.band_up();
+
+        assert!(app.decoded_messages.is_empty(), "decodes cleared");
+        assert!(app.dx_stations.is_empty(), "DX list cleared");
+        assert!(app.displayed_callers().is_empty(), "Callers cleared");
+        assert_eq!(app.band_activity_scroll, 0);
+        assert_eq!(app.dx_hunter_scroll, 0);
+        assert_eq!(app.callers_scroll, 0);
+    }
+
+    /// Returning to a band within the 10-minute TTL restores its Callers (and
+    /// DX) list and surfaces a "restored N callers" status.
+    #[tokio::test]
+    async fn band_return_within_ttl_restores_callers() {
+        let mut app = fixture_app().await;
+        app.add_decoded_message(fixture_view_directed("AA1AA", -5))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view_directed("CC3CC", -7))
+            .await
+            .unwrap();
+        assert_eq!(app.displayed_callers().len(), 2);
+
+        app.band_up(); // leave 20M (snapshot stashed), lists cleared
+        assert!(app.displayed_callers().is_empty());
+
+        app.band_down(); // back to 20M within TTL → restore
+
+        assert_eq!(
+            app.displayed_callers().len(),
+            2,
+            "callers restored on return within TTL"
+        );
+        assert!(
+            app.status_message.contains("restored") && app.status_message.contains("2 caller"),
+            "restore should be visible in status: {:?}",
+            app.status_message
+        );
+    }
+
+    /// A snapshot older than the 10-minute TTL is dropped — returning to that
+    /// band starts fresh (no restore).
+    #[tokio::test]
+    async fn band_return_after_ttl_starts_fresh() {
+        let mut app = fixture_app().await;
+        app.add_decoded_message(fixture_view_directed("AA1AA", -5))
+            .await
+            .unwrap();
+
+        app.band_up(); // stash 20M snapshot
+
+        // Age the stashed snapshot past the TTL.
+        let twenty_m = app.config.bands.bands[5].name.clone();
+        assert_eq!(twenty_m, "20M");
+        if let Some(snap) = app.band_cache.get_mut(&twenty_m) {
+            snap.captured_at =
+                Utc::now() - chrono::Duration::seconds(App::BAND_CACHE_TTL_SECS + 60);
+        } else {
+            panic!("20M snapshot should have been cached");
+        }
+
+        app.band_down(); // back to 20M, but snapshot is stale
+
+        assert!(
+            app.displayed_callers().is_empty(),
+            "stale snapshot must not restore"
+        );
+        assert!(
+            !app.status_message.contains("restored"),
+            "no restore status for stale snapshot: {:?}",
+            app.status_message
+        );
+    }
+
+    /// The band cache is bounded: hopping across more than `BAND_CACHE_MAX`
+    /// bands never grows the cache past the cap.
+    #[tokio::test]
+    async fn band_cache_is_bounded() {
+        let mut app = fixture_app().await;
+        for _ in 0..(App::BAND_CACHE_MAX + 4) {
+            // Each band gets a decode so a snapshot is actually stashed.
+            app.add_decoded_message(fixture_view_directed("AA1AA", -5))
+                .await
+                .unwrap();
+            app.band_up();
+        }
+        assert!(
+            app.band_cache.len() <= App::BAND_CACHE_MAX,
+            "band cache exceeded cap: {}",
+            app.band_cache.len()
         );
     }
 }
