@@ -495,14 +495,42 @@ impl QsoManager {
             });
         }
 
+        // FIX 1: re-calling a station we are ALREADY actively working CONTINUES
+        // that QSO instead of superseding it / spawning a duplicate. The
+        // on-air failure mode this guards against: an operator mashing Space on
+        // one DX previously created a brand-new QSO each press (each
+        // superseding the last from the grid step), flooding the single TX
+        // worker with stale frames and surfacing the intentional supersede as a
+        // scary "QSO … failed: superseded". Now a re-call of an active manual
+        // QSO on the same band is an idempotent keep-call: re-send the existing
+        // QSO's CURRENT outbound message and return its id. State is untouched
+        // (we do NOT reset to RespondingToCq/grid). Only when there is NO active
+        // QSO do we fall through to create one (and the genuine
+        // re-call-after-terminal case still supersedes any leftover).
+        if initiated_by == CallInitiation::Manual {
+            if let Some(existing_id) = self
+                .find_active_manual_qso_for(&target_callsign, frequency)
+                .await
+            {
+                info!(
+                    "Re-call of {} on {:.1} Hz — continuing existing QSO {} (idempotent keep-call, no new QSO)",
+                    target_callsign, frequency, existing_id
+                );
+                // Re-emit the QSO's most-recent outbound as a keep-call. This
+                // is a benign no-op if it somehow has no prior Sent message.
+                let _ = self.resend_last_tx(existing_id).await;
+                return Ok(existing_id);
+            }
+        }
+
         // FIX 3: supersede any existing active QSO with this callsign on the
-        // same band before creating the new one. Operator policy: "if there
-        // are two exchanges on the same band from the same callsign, use the
-        // state of whichever is more recent." Re-calling a station already in
-        // an active QSO previously spawned a SECOND concurrent QSO; both
-        // transmitted to the same DX on the same freq. We retire the older
-        // one (→ Failed{Superseded}, mapping removed) so exactly one QSO per
-        // (callsign, band) remains active.
+        // same band before creating the new one. With FIX 1 above this should
+        // now only ever fire for the genuine case (the older QSO already went
+        // terminal but its mapping/record lingered before cleanup). Operator
+        // policy: "if there are two exchanges on the same band from the same
+        // callsign, use the state of whichever is more recent." We retire the
+        // older one (→ Failed{Superseded}, mapping removed) so exactly one QSO
+        // per (callsign, band) remains active.
         self.supersede_active_qsos_for(&target_callsign, frequency)
             .await;
 
@@ -645,14 +673,6 @@ impl QsoManager {
             });
         }
 
-        // Manual: supersede any same-call QSO on this band, then build the new
-        // one (no duplicate gate — the operator explicitly chose this caller).
-        self.supersede_active_qsos_for(&target, frequency).await;
-
-        let qso_id = Uuid::new_v4();
-        let now = Utc::now();
-        let tx_parity = dx_parity.map(|p| p.opposite());
-
         // Our report of their signal (the report WE send), same formula the
         // auto-sequencer uses in `MessageExchange::generate_response`, but
         // defaulting to -15 when we have no measurement.
@@ -661,6 +681,64 @@ impl QsoManager {
             .unwrap_or(-15);
         // Their report of us (only meaningful for ReportAck/Rr73 opens).
         let their_report_val: SignalReport = their_report.unwrap_or(-15);
+
+        // FIX 1: if we already have an ACTIVE manual QSO with this caller on
+        // this band, CONTINUE it instead of superseding/duplicating. Mashing a
+        // context reply on a station already in progress must keep ONE QSO per
+        // (callsign, band).
+        //   - If the requested step is AHEAD of the existing QSO's current
+        //     ladder stage (e.g. the DX now sent RR73 → SeventyThree while we
+        //     were in SendingReport), advance the EXISTING QSO to emit that
+        //     step.
+        //   - If it matches (or is behind) the current stage, just re-send the
+        //     existing QSO's current outbound (idempotent keep-call).
+        // Either way we return the existing id and never create a second QSO.
+        if let Some(existing_id) = self.find_active_manual_qso_for(&target, frequency).await {
+            let existing_rank = {
+                let qsos = self.qsos.read().await;
+                qsos.get(&existing_id)
+                    .and_then(|p| Self::ladder_rank(&p.state))
+            };
+            let requested_rank = Self::step_ladder_rank(step);
+            match (existing_rank, requested_rank) {
+                (Some(cur), Some(req)) if req > cur => {
+                    info!(
+                        "Context reply to {} at step {:?} — advancing existing QSO {} \
+                         (ahead of its current stage)",
+                        target, step, existing_id
+                    );
+                    self.advance_existing_qso_to_step(
+                        existing_id,
+                        &target,
+                        frequency,
+                        step,
+                        our_report,
+                        their_report_val,
+                    )
+                    .await?;
+                    return Ok(existing_id);
+                }
+                _ => {
+                    info!(
+                        "Context reply to {} at step {:?} — re-sending existing QSO {} \
+                         current outbound (idempotent keep-call)",
+                        target, step, existing_id
+                    );
+                    let _ = self.resend_last_tx(existing_id).await;
+                    return Ok(existing_id);
+                }
+            }
+        }
+
+        // Manual: supersede any same-call QSO on this band, then build the new
+        // one (no duplicate gate — the operator explicitly chose this caller).
+        // With FIX 1 above this only fires when no ACTIVE QSO remains (e.g. a
+        // lingering terminal record), so it should rarely trigger now.
+        self.supersede_active_qsos_for(&target, frequency).await;
+
+        let qso_id = Uuid::new_v4();
+        let now = Utc::now();
+        let tx_parity = dx_parity.map(|p| p.opposite());
 
         // Build (initial_state, first_message) for the chosen step.
         let (state, message): (QsoState, MessageType) = match step {
@@ -1787,6 +1865,199 @@ impl QsoManager {
             .push(qso_id);
     }
 
+    /// FIX 1: return the id of an ACTIVE (non-terminal), MANUAL-initiated QSO
+    /// with `callsign` on the same band as `frequency`, if one exists. Used by
+    /// the operator re-call paths so mashing Call/Space on a station already in
+    /// progress CONTINUES the one QSO rather than superseding it / spawning a
+    /// duplicate. Case-insensitive callsign match (matching the callsign-map
+    /// keying); "same band" derived via [`crate::utils::frequency_to_band`]
+    /// exactly like [`Self::supersede_active_qsos_for`]. When several match
+    /// (shouldn't happen post-FIX-1, but be robust), the most-recently-started
+    /// one wins.
+    async fn find_active_manual_qso_for(&self, callsign: &str, frequency: f64) -> Option<QsoId> {
+        let want_band = crate::utils::frequency_to_band(frequency);
+        let key = callsign.to_uppercase();
+        let ids = self.qsos_by_callsign.read().await.get(&key).cloned()?;
+        let qsos = self.qsos.read().await;
+        ids.into_iter()
+            .filter_map(|id| {
+                qsos.get(&id).and_then(|p| {
+                    let matches = p.state.is_active()
+                        && p.metadata.initiated_by == CallInitiation::Manual
+                        && crate::utils::frequency_to_band(p.metadata.frequency) == want_band;
+                    matches.then_some((id, p.metadata.start_time))
+                })
+            })
+            .max_by_key(|(_, started)| *started)
+            .map(|(id, _)| id)
+    }
+
+    /// FIX 1: forward position of a [`ResponseStep`] on the responder's FT8 QSO
+    /// ladder, aligned with [`Self::ladder_rank`] so the two are directly
+    /// comparable. `Grid` → 0 (RespondingToCq), `Report`/`ReportAck` → 1
+    /// (SendingReport), `Rr73` → 2 (WaitingForConfirmation), `SeventyThree` → 3
+    /// (Completed). Used to decide whether a context reply is AHEAD of an
+    /// existing QSO's current stage (→ advance) or at/behind it (→ re-send).
+    fn step_ladder_rank(step: pancetta_core::ResponseStep) -> Option<u8> {
+        use pancetta_core::ResponseStep;
+        Some(match step {
+            ResponseStep::Grid => 0,
+            ResponseStep::Report | ResponseStep::ReportAck => 1,
+            ResponseStep::Rr73 => 2,
+            ResponseStep::SeventyThree => 3,
+        })
+    }
+
+    /// FIX 1: advance an EXISTING manual QSO to the state/outbound implied by
+    /// `step`, instead of creating a new QSO. Mirrors the (state, message)
+    /// mapping in [`Self::respond_to_caller`] but mutates the existing QSO in
+    /// place: sets its state, records the outbound as a `Sent` message, emits
+    /// the `MessageToSend`, and — when advancing to `SeventyThree` — stamps the
+    /// completion metadata and emits `QsoCompleted` so the contact is logged.
+    /// The QSO's latched `tx_parity` and `initiated_by` are preserved (we reuse
+    /// what was latched at QSO start). Used when an operator context-replies at
+    /// a step ahead of where the QSO currently is.
+    async fn advance_existing_qso_to_step(
+        &self,
+        qso_id: QsoId,
+        target: &str,
+        frequency: f64,
+        step: pancetta_core::ResponseStep,
+        our_report: SignalReport,
+        their_report_val: SignalReport,
+    ) -> Result<(), QsoManagerError> {
+        use pancetta_core::ResponseStep;
+        let now = Utc::now();
+
+        let (new_state, message): (QsoState, MessageType) = match step {
+            ResponseStep::Grid => {
+                // Grid never ranks ahead of an active QSO, so the caller never
+                // routes here; re-send current as a safe fallback.
+                return self.resend_last_tx(qso_id).await;
+            }
+            ResponseStep::Report => (
+                QsoState::SendingReport {
+                    their_callsign: target.to_string(),
+                    their_report: None,
+                    our_report,
+                    frequency,
+                    started_at: now,
+                },
+                MessageType::SignalReport {
+                    to_station: target.to_string(),
+                    from_station: self.config.our_callsign.clone(),
+                    report: our_report,
+                },
+            ),
+            ResponseStep::ReportAck => (
+                QsoState::SendingReport {
+                    their_callsign: target.to_string(),
+                    their_report: Some(their_report_val),
+                    our_report,
+                    frequency,
+                    started_at: now,
+                },
+                MessageType::ReportAck {
+                    to_station: target.to_string(),
+                    from_station: self.config.our_callsign.clone(),
+                    report: our_report,
+                },
+            ),
+            ResponseStep::Rr73 => (
+                QsoState::WaitingForConfirmation {
+                    their_callsign: target.to_string(),
+                    their_report: their_report_val,
+                    our_report,
+                    frequency,
+                    grid_square: None,
+                    started_at: now,
+                },
+                MessageType::FinalConfirmation {
+                    to_station: target.to_string(),
+                    from_station: self.config.our_callsign.clone(),
+                },
+            ),
+            ResponseStep::SeventyThree => (
+                QsoState::Completed {
+                    their_callsign: target.to_string(),
+                    their_report: their_report_val,
+                    our_report,
+                    frequency,
+                    grid_square: None,
+                    completed_at: now,
+                    duration_seconds: 0,
+                },
+                MessageType::SeventyThree {
+                    to_station: target.to_string(),
+                    from_station: self.config.our_callsign.clone(),
+                },
+            ),
+        };
+
+        let is_completed = matches!(new_state, QsoState::Completed { .. });
+        let raw_text = self.render_sent_text(&message);
+
+        // Mutate the existing QSO under the write lock, capturing what we need
+        // for the emits after the lock is released.
+        let emit = {
+            let mut qsos = self.qsos.write().await;
+            let Some(progress) = qsos.get_mut(&qso_id) else {
+                return Err(QsoManagerError::QsoNotFound { qso_id });
+            };
+            let old_state = progress.state.clone();
+            progress.state = new_state.clone();
+            progress.state_history.push(StateTransition {
+                from_state: old_state.clone(),
+                to_state: new_state.clone(),
+                timestamp: now,
+                reason: TransitionReason::UserAction,
+            });
+            progress.messages.push(QsoMessage {
+                timestamp: now,
+                direction: MessageDirection::Sent,
+                message_type: message.clone(),
+                raw_text,
+                signal_strength: None,
+                frequency,
+            });
+            let tx_parity = progress.metadata.tx_parity;
+
+            // On completion, stamp reports/end-time and prepare the completed
+            // metadata (with the real RF frequency = dial + offset) to log.
+            let completed_metadata = if is_completed {
+                progress.metadata.reports = SignalReports {
+                    sent: Some(our_report),
+                    received: Some(their_report_val),
+                };
+                progress.metadata.end_time = Some(now);
+                let mut m = progress.metadata.clone();
+                let dial = self.dial_frequency_hz.load(Ordering::Relaxed);
+                if dial > 0 {
+                    m.frequency += dial as f64;
+                }
+                Some(m)
+            } else {
+                None
+            };
+            (old_state, tx_parity, completed_metadata)
+        };
+        let (old_state, tx_parity, completed_metadata) = emit;
+
+        self.emit_state_change(qso_id, old_state, new_state).await;
+        self.emit_event(QsoEvent::MessageToSend {
+            qso_id,
+            message,
+            frequency,
+            tx_parity,
+        })
+        .await;
+        if let Some(metadata) = completed_metadata {
+            self.emit_event(QsoEvent::QsoCompleted { qso_id, metadata })
+                .await;
+        }
+        Ok(())
+    }
+
     /// FIX 3: retire every active (non-terminal) QSO with `callsign` on the
     /// same band as `frequency`, marking each `Failed{Superseded}` and
     /// clearing its callsign mapping. Emits a `StateChanged` per superseded
@@ -2269,11 +2540,12 @@ mod tests {
         assert!(a.is_ok() && b.is_ok(), "both manual calls allowed");
     }
 
-    /// FIX 3: two manual calls to the same callsign on the same band leave
-    /// exactly ONE active QSO (the newer); the older is superseded and
-    /// removed from the active set and its callsign mapping.
+    /// FIX 1: re-calling a station with an ACTIVE manual QSO CONTINUES that QSO
+    /// — it returns the SAME qso_id, does NOT create a second QSO, and does NOT
+    /// supersede (the old QSO is NOT marked Failed{Superseded}). This is the
+    /// core of the "mashing Space spawns duplicate/superseding QSOs" fix.
     #[tokio::test]
-    async fn manual_recall_supersedes_older_active_qso() {
+    async fn manual_recall_of_active_qso_continues_same_qso() {
         let manager = QsoManager::new(test_config());
         let first = manager
             .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
@@ -2283,9 +2555,12 @@ mod tests {
             .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
             .await
             .unwrap();
-        assert_ne!(first, second);
+        assert_eq!(
+            first, second,
+            "re-call of an active QSO must continue it (same id), not spawn a new one"
+        );
 
-        // Exactly one active QSO for this callsign, and it is the newer one.
+        // Exactly one active QSO for this callsign — the original.
         let active = manager.get_active_qsos().await;
         let active_for_dx: Vec<_> = active
             .iter()
@@ -2294,32 +2569,105 @@ mod tests {
             .collect();
         assert_eq!(
             active_for_dx,
-            vec![second],
-            "only the newer QSO should remain active"
+            vec![first],
+            "exactly one active QSO (the original) should remain"
         );
 
-        // The older QSO is Failed{Superseded} (still retrievable until cleanup).
-        let old = manager.get_qso(first).await.unwrap();
+        // It is NOT superseded — still in its original RespondingToCq state.
+        let progress = manager.get_qso(first).await.unwrap();
         assert!(
-            matches!(
-                old.state,
-                QsoState::Failed {
-                    reason: QsoFailureReason::Superseded,
-                    ..
-                }
-            ),
-            "older QSO must be Superseded, got {:?}",
-            old.state
+            matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "continued QSO must keep its state, got {:?}",
+            progress.state
         );
 
-        // The callsign mapping points only to the newer QSO so subsequent
-        // routing / re-arm operates on exactly one QSO.
+        // The callsign mapping holds only the one QSO.
         let mapping = manager.qsos_by_callsign.read().await;
         assert_eq!(
             mapping.get("K1DEF").map(|v| v.as_slice()),
-            Some([second].as_slice()),
-            "mapping must point only to the newer QSO"
+            Some([first].as_slice()),
+            "mapping must point only to the single continued QSO"
         );
+    }
+
+    /// FIX 1 / FIX 3 boundary: a re-call AFTER the prior QSO already went
+    /// terminal still works — it creates a FRESH QSO (and supersedes any
+    /// lingering terminal record). This is the genuine "work them again" case.
+    #[tokio::test]
+    async fn manual_recall_after_terminal_creates_fresh_qso() {
+        let manager = QsoManager::new(test_config());
+        let first = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        // Drive the first QSO terminal (operator cancel).
+        manager.cancel_qso(first).await.unwrap();
+
+        let second = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        assert_ne!(
+            first, second,
+            "re-call after the prior QSO went terminal must create a fresh QSO"
+        );
+
+        let active = manager.get_active_qsos().await;
+        let active_for_dx: Vec<_> = active
+            .iter()
+            .filter(|(_, p)| p.metadata.their_callsign.as_deref() == Some("K1DEF"))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(active_for_dx, vec![second], "only the fresh QSO is active");
+    }
+
+    /// FIX 1: a context-Space reply at a step AHEAD of the existing active
+    /// QSO's stage ADVANCES the SAME QSO (no new QSO, no supersede). We open a
+    /// manual QSO (RespondingToCq → step rank 0), then context-reply at Rr73
+    /// (rank 2): the existing QSO must advance to WaitingForConfirmation and
+    /// keep its id.
+    #[tokio::test]
+    async fn context_reply_ahead_advances_existing_qso() {
+        use pancetta_core::ResponseStep;
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        let first = manager
+            .respond_to_cq_manual("K1DEF".to_string(), freq, None)
+            .await
+            .unwrap();
+
+        // DX is now ahead (they sent us an R-report); operator context-replies
+        // at Rr73. Must advance THIS QSO, not create a new one.
+        let advanced = manager
+            .respond_to_caller(
+                "K1DEF".to_string(),
+                freq,
+                None,
+                ResponseStep::Rr73,
+                Some(-10.0),
+                Some(-12),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first, advanced,
+            "ahead context reply must continue same QSO"
+        );
+
+        let progress = manager.get_qso(first).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::WaitingForConfirmation { .. }),
+            "QSO should have advanced to WaitingForConfirmation, got {:?}",
+            progress.state
+        );
+
+        // Exactly one active QSO for this callsign.
+        let active = manager.get_active_qsos().await;
+        let n = active
+            .iter()
+            .filter(|(_, p)| p.metadata.their_callsign.as_deref() == Some("K1DEF"))
+            .count();
+        assert_eq!(n, 1, "exactly one active QSO after the advance");
     }
 
     /// The manual watchdog retires a RespondingToCq QSO once the call count
@@ -2794,35 +3142,35 @@ mod tests {
         );
     }
 
-    // --- Batch 2 #7: case-insensitive supersede ---------------------------
+    // --- Batch 2 #7 / FIX 1: case-insensitive continue --------------------
 
-    /// A manual call to "k1def" must supersede an existing active QSO with
-    /// "K1DEF" (case-insensitive), not spawn a duplicate.
+    /// A manual call to "k1def" must CONTINUE the existing active QSO with
+    /// "K1DEF" (case-insensitive match), not spawn a duplicate and not
+    /// supersede. The case-insensitive callsign keying is what makes the
+    /// FIX-1 active-QSO lookup robust to case/format mismatches between a
+    /// DX-Hunter call and a Callers reply for the same station.
     #[tokio::test]
-    async fn supersede_is_case_insensitive() {
+    async fn recall_continue_is_case_insensitive() {
         let manager = QsoManager::new(test_config());
         let freq = 14074000.0;
         let first = manager
             .respond_to_cq_manual("K1DEF".to_string(), freq, None)
             .await
             .unwrap();
-        // Re-call with different case — should supersede `first`.
+        // Re-call with different case — should CONTINUE `first` (same id).
         let second = manager
             .respond_to_cq_manual("k1def".to_string(), freq, None)
             .await
             .unwrap();
-        assert_ne!(first, second);
-        // The first QSO is retired (Failed{Superseded}); only `second` active.
+        assert_eq!(
+            first, second,
+            "case-different re-call must continue the same QSO"
+        );
+        // `first` is NOT superseded — still active.
         let first_state = manager.get_qso(first).await.unwrap().state;
         assert!(
-            matches!(
-                first_state,
-                QsoState::Failed {
-                    reason: QsoFailureReason::Superseded,
-                    ..
-                }
-            ),
-            "first QSO should be superseded, got {:?}",
+            matches!(first_state, QsoState::RespondingToCq { .. }),
+            "first QSO must remain active (not superseded), got {:?}",
             first_state
         );
         let active = manager.get_active_qsos().await;
@@ -2831,7 +3179,7 @@ mod tests {
             1,
             "exactly one active QSO after case-different re-call"
         );
-        assert_eq!(active[0].0, second);
+        assert_eq!(active[0].0, first);
     }
 
     // --- Batch 2 #8: grid latched into Completed (Caller path) ------------

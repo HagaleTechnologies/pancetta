@@ -670,10 +670,22 @@ impl super::ApplicationCoordinator {
                                 // Batch 2 #3: a QSO that just went terminal-Failed
                                 // is otherwise silently dropped from the snapshot.
                                 // Surface a one-line status so the operator learns
-                                // WHY (watchdog timeout, superseded, cancelled,
-                                // …) instead of the QSO just vanishing. We only
-                                // fire on the transition INTO Failed (old_state
-                                // was not already terminal).
+                                // WHY (watchdog timeout, cancelled, …) instead of
+                                // the QSO just vanishing. We only fire on the
+                                // transition INTO Failed (old_state was not already
+                                // terminal).
+                                //
+                                // FIX 2: a `Superseded` end is an INTENTIONAL
+                                // replace, not a failure — the operator (or the
+                                // engine on a genuine re-call after the old QSO
+                                // went terminal) deliberately swapped one QSO for
+                                // another. Surfacing it as "QSO … failed:
+                                // superseded" alarmed the operator into thinking
+                                // the rig was broken. So we phrase Superseded
+                                // neutrally ("replaced earlier call to X") and keep
+                                // the scary "failed" wording only for REAL failures
+                                // (Timeout / SignalLost / StationQrt / …). With FIX
+                                // 1, supersede is rare anyway.
                                 if let pancetta_qso::QsoState::Failed { reason, .. } = &new_state {
                                     if !old_state.is_terminal() {
                                         let who = new_state
@@ -681,15 +693,19 @@ impl super::ApplicationCoordinator {
                                             .or_else(|| old_state.their_callsign())
                                             .unwrap_or("?")
                                             .to_string();
-                                        emit_status(
-                                            &snapshot_bus,
+                                        let text = if matches!(
+                                            reason,
+                                            pancetta_qso::QsoFailureReason::Superseded
+                                        ) {
+                                            format!("Replaced earlier call to {who}")
+                                        } else {
                                             format!(
                                                 "QSO with {} failed: {}",
                                                 who,
                                                 failure_reason_text(reason)
-                                            ),
-                                        )
-                                        .await;
+                                            )
+                                        };
+                                        emit_status(&snapshot_bus, text).await;
                                     }
                                 }
                             }
