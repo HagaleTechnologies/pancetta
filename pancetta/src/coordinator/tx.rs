@@ -241,6 +241,22 @@ fn current_tx_policy(
     pancetta_core::TxPolicy::from_u8(tx_policy.load(Ordering::Acquire))
 }
 
+/// Whether a TX item belonging to `qso_id` is still allowed on the air, given
+/// the shared active-QSO set. Thin wrapper over [`super::tx_qso_is_live`] that
+/// takes the read lock. A poisoned lock fails *open* (returns `true`) — a stuck
+/// lock should never silently mute legitimate TX; the worst case reverts to the
+/// pre-fix behavior for one cycle, which the operator-facing emergency stop
+/// (Shift+Q → cancel-all + Disabled) still covers.
+fn tx_qso_is_live(
+    qso_id: Option<&str>,
+    active: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+) -> bool {
+    match active.read() {
+        Ok(set) => super::tx_qso_is_live(qso_id, &set),
+        Err(_) => true,
+    }
+}
+
 impl Drop for PttGuard {
     fn drop(&mut self) {
         if self.armed {
@@ -300,6 +316,10 @@ impl super::ApplicationCoordinator {
             // block to the TUI. RespondOnly is gated upstream (at the
             // initiation sources) so in-progress QSOs keep flowing here.
             let tx_policy = self.tx_policy.clone();
+            // Drop-stale-TX gate: the QSO component keeps this set in sync;
+            // the worker refuses to key PTT for a request whose `qso_id` is no
+            // longer present (superseded / cancelled / completed-past-grace).
+            let active_tx_qsos = self.active_tx_qsos.clone();
 
             tokio::spawn(async move {
                 info!("FT8 transmitter component ready");
@@ -467,6 +487,33 @@ impl super::ApplicationCoordinator {
                                     // the deferred flag so it shows "deferred 30s"
                                     // instead of looking dead during the long wait.
                                     if schedule.deferred {
+                                        // Re-check active-status at defer time: a
+                                        // terminal QSO's request must not be re-
+                                        // deferred 30s into the future (that is
+                                        // exactly the "stale frames every cycle"
+                                        // loop the operator hit).
+                                        if !tx_qso_is_live(qso_id.as_deref(), &active_tx_qsos) {
+                                            info!(
+                                                target: "tx.policy",
+                                                "dropping stale TX for ended QSO {} at defer time: '{}'",
+                                                qso_id.as_deref().unwrap_or("?"),
+                                                message_text
+                                            );
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text,
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                            continue;
+                                        }
                                         send_tx_queue_status(
                                             &message_bus,
                                             None,
@@ -533,6 +580,38 @@ impl super::ApplicationCoordinator {
                                         // Clear the strip explicitly so the QUEUED row
                                         // doesn't sit stale until the next status push.
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        continue;
+                                    }
+
+                                    // --- Step 4b: Drop-stale-TX gate ---
+                                    // The slot wait above can span the moment a QSO
+                                    // ends (superseded by a newer call, cancelled,
+                                    // or completed-past-grace). Re-check active
+                                    // status at the last instant before keying:
+                                    // if this request's QSO is no longer live, do
+                                    // NOT key PTT / build+send audio — clear the
+                                    // strip, report a failed TransmitComplete, and
+                                    // skip. Requests with no qso_id (manual / tune)
+                                    // are never gated.
+                                    if !tx_qso_is_live(qso_id.as_deref(), &active_tx_qsos) {
+                                        info!(
+                                            target: "tx.policy",
+                                            "dropping stale TX for ended QSO {}: '{}'",
+                                            qso_id.as_deref().unwrap_or("?"),
+                                            message_text
+                                        );
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        let complete_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Autonomous,
+                                            MessageType::TransmitComplete {
+                                                success: false,
+                                                message_text,
+                                                duration_ms: 0,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus.send_message(complete_msg).await;
                                         continue;
                                     }
 
@@ -666,7 +745,10 @@ impl super::ApplicationCoordinator {
                                     }
                                 }
 
-                                MessageType::MultiTransmitRequest { items, tx_parity } => {
+                                MessageType::MultiTransmitRequest {
+                                    mut items,
+                                    tx_parity,
+                                } => {
                                     info!("Multi-TX request: {} messages", items.len());
 
                                     // --- Step 0: TX-policy hard mute ---
@@ -697,6 +779,54 @@ impl super::ApplicationCoordinator {
                                             let _ = message_bus.send_message(complete_msg).await;
                                         }
                                         continue;
+                                    }
+
+                                    // --- Step 0b: Drop-stale-TX gate ---
+                                    // Drop bundle items whose QSO has ended (the
+                                    // waveform is summed up front, so we must filter
+                                    // before encoding). Items with no qso_id are
+                                    // never gated. Each dropped item gets a failed
+                                    // TransmitComplete; if the whole bundle drops,
+                                    // skip it.
+                                    {
+                                        let mut kept = Vec::with_capacity(items.len());
+                                        for item in items.into_iter() {
+                                            if tx_qso_is_live(
+                                                item.qso_id.as_deref(),
+                                                &active_tx_qsos,
+                                            ) {
+                                                kept.push(item);
+                                            } else {
+                                                info!(
+                                                    target: "tx.policy",
+                                                    "dropping stale multi-TX item for ended QSO {}: '{}'",
+                                                    item.qso_id.as_deref().unwrap_or("?"),
+                                                    item.message_text
+                                                );
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: item.message_text.clone(),
+                                                        duration_ms: 0,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                let _ =
+                                                    message_bus.send_message(complete_msg).await;
+                                            }
+                                        }
+                                        items = kept;
+                                        if items.is_empty() {
+                                            info!(
+                                                target: "tx.policy",
+                                                "multi-TX bundle empty after dropping stale items — skipping"
+                                            );
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            continue;
+                                        }
                                     }
 
                                     // Report the bundle items as QUEUED.
@@ -870,6 +1000,37 @@ impl super::ApplicationCoordinator {
                                             break;
                                         }
                                         info!("Multi-TX aborted before PTT by operator (F8)");
+                                        continue;
+                                    }
+
+                                    // --- Step 4b: Drop-stale-TX gate (key-time) ---
+                                    // The slot wait can span the moment a QSO ends.
+                                    // The summed waveform can't be re-filtered now,
+                                    // but if EVERY item's QSO went terminal during
+                                    // the wait, skip the whole bundle rather than key
+                                    // PTT for a dead exchange.
+                                    if !items.iter().any(|it| {
+                                        tx_qso_is_live(it.qso_id.as_deref(), &active_tx_qsos)
+                                    }) {
+                                        info!(
+                                            target: "tx.policy",
+                                            "dropping stale multi-TX bundle: all {} item(s) belong to ended QSOs",
+                                            items.len()
+                                        );
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: item.message_text.clone(),
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
                                         continue;
                                     }
 
@@ -1416,5 +1577,43 @@ mod schedule_tx_tests {
             Ordering::Release,
         );
         assert_eq!(current_tx_policy(&p), pancetta_core::TxPolicy::RespondOnly);
+    }
+
+    /// The worker's drop-decision helper reads the shared active-QSO set
+    /// through its RwLock and matches `super::tx_qso_is_live`'s semantics:
+    /// live id → transmit, absent id → drop, `None` → always transmit.
+    #[test]
+    fn worker_tx_qso_is_live_reads_shared_set() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let set: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        set.write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-live"));
+
+        // Manual / tune (no qso_id) always transmits.
+        assert!(super::tx_qso_is_live(None, &set));
+        // Live QSO transmits (case-insensitive).
+        assert!(super::tx_qso_is_live(Some("QSO-LIVE"), &set));
+        // Ended QSO (not in set) is dropped.
+        assert!(!super::tx_qso_is_live(Some("qso-ended"), &set));
+    }
+
+    /// A poisoned lock fails OPEN — a stuck lock must never silently mute a
+    /// legitimate TX. (The operator emergency stop covers the rare worst case.)
+    #[test]
+    fn worker_tx_qso_is_live_fails_open_on_poison() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let set: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        // Poison the lock.
+        let s2 = set.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = s2.write().unwrap();
+            panic!("poison");
+        }));
+        assert!(set.is_poisoned());
+        // Even for a qso_id that would otherwise be "ended", fail-open → true.
+        assert!(super::tx_qso_is_live(Some("qso-ended"), &set));
     }
 }

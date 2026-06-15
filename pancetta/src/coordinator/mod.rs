@@ -36,6 +36,33 @@ mod wav_playback;
 
 pub use tx::{schedule_tx, TxSchedule};
 
+/// Canonical key for the `active_tx_qsos` set: QSO ids are compared
+/// case-insensitively (and trimmed) so the producer (QSO component) and
+/// consumer (TX worker) never disagree on casing. Centralized here so the
+/// insert / remove / membership-test sites can't drift.
+pub(crate) fn active_tx_qso_key(qso_id: &str) -> String {
+    qso_id.trim().to_uppercase()
+}
+
+/// Decide whether a `TransmitRequest`/`MultiTransmitRequest` item may be
+/// keyed, given its `qso_id` and the current active-QSO set.
+///
+/// Returns `true` (transmit) when:
+///   - the item has no `qso_id` (manual free-text / tune / test-TX — never
+///     gated), or
+///   - the item's `qso_id` is present in `active` (the QSO is still live, or
+///     within its post-completion grace window).
+///
+/// Returns `false` (drop) only when the item belongs to a QSO that is no
+/// longer in the active set — i.e. it was superseded / cancelled / failed /
+/// timed out, or its completion grace already elapsed.
+pub(crate) fn tx_qso_is_live(qso_id: Option<&str>, active: &HashSet<String>) -> bool {
+    match qso_id {
+        None => true,
+        Some(id) => active.contains(&active_tx_qso_key(id)),
+    }
+}
+
 /// Lead-in (seconds) before the UTC slot boundary at which the live decode
 /// window starts. The DSP pipeline slices the emitted window so that sample 0
 /// corresponds to `slot_boundary − WINDOW_LEAD_SECS`, and the FT8 pipeline
@@ -50,7 +77,7 @@ pub(crate) const WINDOW_LEAD_SECS: f64 = 0.5;
 use anyhow::Result;
 use pancetta_config::Config;
 use pancetta_ft8::{Ft8Config, Ft8Decoder};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -227,6 +254,21 @@ pub struct ApplicationCoordinator {
     /// TUI as an error banner at startup so the operator is never left guessing
     /// why their callsign/audio came up as defaults. Empty on a clean load.
     pub(crate) config_warnings: Vec<String>,
+
+    /// Set of QSO ids (uppercased strings) whose TX is currently *live* —
+    /// i.e. the QSO is in a non-terminal active state (or within the brief
+    /// post-completion grace window during which its final 73 is still
+    /// allowed out). Maintained by the QSO component from the QsoEvent
+    /// stream; read by the TX worker, which refuses to key PTT for a
+    /// `TransmitRequest` whose `qso_id` is no longer present.
+    ///
+    /// This is the core defense against the "stale TX keeps transmitting
+    /// after a QSO ends" bug: superseding / cancelling / completing a QSO
+    /// changes its state but does NOT purge requests already sitting in the
+    /// TX path. The TX worker dropping inactive-QSO requests at key-time
+    /// closes that gap. Requests with `qso_id == None` (manual free-text,
+    /// tune, test-TX) are never gated by this set.
+    pub(crate) active_tx_qsos: Arc<std::sync::RwLock<HashSet<String>>>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -450,6 +492,7 @@ impl ApplicationCoordinator {
             scoped_fast_path,
             ft8_config,
             config_warnings,
+            active_tx_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
         };
 
         info!("Application Coordinator initialized with ID: {}", id);
@@ -721,6 +764,78 @@ impl ApplicationCoordinator {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tx_active_set_tests {
+    use super::{active_tx_qso_key, tx_qso_is_live};
+    use std::collections::HashSet;
+
+    /// Keys are normalized (trimmed + uppercased) so producer/consumer agree.
+    #[test]
+    fn key_normalizes_case_and_whitespace() {
+        assert_eq!(active_tx_qso_key("abc-123"), "ABC-123");
+        assert_eq!(active_tx_qso_key("  AbC-123 "), "ABC-123");
+    }
+
+    /// A request with no qso_id (manual free-text / tune / test-TX) is never
+    /// gated — always live.
+    #[test]
+    fn no_qso_id_is_always_live() {
+        let empty = HashSet::new();
+        assert!(tx_qso_is_live(None, &empty));
+    }
+
+    /// A request whose QSO is in the active set is allowed; one whose QSO is
+    /// absent (superseded / cancelled / completed-past-grace) is dropped.
+    #[test]
+    fn membership_decides_live_vs_drop() {
+        let mut active = HashSet::new();
+        active.insert(active_tx_qso_key("qso-live"));
+
+        // Live QSO → transmit (case-insensitive match).
+        assert!(tx_qso_is_live(Some("qso-live"), &active));
+        assert!(tx_qso_is_live(Some("QSO-LIVE"), &active));
+
+        // Ended QSO not in the set → drop.
+        assert!(!tx_qso_is_live(Some("qso-ended"), &active));
+    }
+
+    /// Simulate the superseded/cancelled case: the QSO id is removed from the
+    /// set (as the QSO component does on terminal-Failed), and its queued TX
+    /// is then dropped at key-time.
+    #[test]
+    fn superseded_qso_removed_then_dropped() {
+        let mut active = HashSet::new();
+        let a = active_tx_qso_key("qso-a");
+        let b = active_tx_qso_key("qso-b");
+        active.insert(a.clone());
+        active.insert(b.clone());
+
+        // qso-a is superseded → removed immediately.
+        active.remove(&a);
+
+        // qso-a's still-queued frame is now dropped; qso-b keeps transmitting.
+        assert!(!tx_qso_is_live(Some("qso-a"), &active));
+        assert!(tx_qso_is_live(Some("qso-b"), &active));
+    }
+
+    /// Completion grace: while the id is still present (within the ~16s grace),
+    /// the final 73 is allowed; after the grace removes it, leftover backlog is
+    /// dropped.
+    #[test]
+    fn completed_qso_grace_then_drop() {
+        let mut active = HashSet::new();
+        let c = active_tx_qso_key("qso-c");
+        active.insert(c.clone());
+
+        // During grace: final 73 still goes out.
+        assert!(tx_qso_is_live(Some("qso-c"), &active));
+
+        // Grace elapsed (delayed task removed it): backlog dropped.
+        active.remove(&c);
+        assert!(!tx_qso_is_live(Some("qso-c"), &active));
     }
 }
 

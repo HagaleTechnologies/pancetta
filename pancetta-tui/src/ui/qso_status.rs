@@ -270,6 +270,20 @@ fn watchdog_line(
     Some(s)
 }
 
+/// Pick the live-TX item to surface on the QSO Status panel's "Now:" line.
+///
+/// Returns the keyed item when it belongs to this QSO (matched by `qso_id`)
+/// OR when it has no `qso_id` (a manual free-text send — the operator is
+/// watching this single-detail panel for the only active QSO). Returns `None`
+/// when nothing is keyed, or when the keyed frame belongs to a *different*
+/// QSO. Pure so it can be unit-tested without a render backend.
+fn live_tx_for_qso<'a>(
+    now_sending: Option<&'a crate::app::TxQueueItem>,
+    qso_id: Option<&str>,
+) -> Option<&'a crate::app::TxQueueItem> {
+    now_sending.filter(|item| item.qso_id.is_none() || item.qso_id.as_deref() == qso_id)
+}
+
 /// Render the role-aware sequence ladder plus the Now/Next lines for the
 /// selected (single-detail) QSO. The ladder shows the canonical exchange
 /// as a row of rungs joined by " ── "; rungs we transmit are prefixed with
@@ -320,26 +334,54 @@ fn render_ladder(f: &mut Frame<'_>, area: Rect, app: &App) {
         spans.push(Span::styled(text, style));
     }
 
-    let now = if qso.now_line.is_empty() {
-        "---".to_string()
-    } else {
-        qso.now_line.clone()
-    };
     let next = if qso.next_line.is_empty() {
         "---".to_string()
     } else {
         qso.next_line.clone()
     };
 
-    let lines = vec![
-        Line::from(spans),
-        Line::from(vec![
+    // When a frame is actively keyed for THIS QSO, the "Now:" line shows what
+    // is on the air RIGHT NOW (bold red), so the operator watching this panel
+    // sees the live transmission, not just the planned next step. Falls back
+    // to the planned now_line when nothing is transmitting (or the live frame
+    // belongs to a different QSO / a manual send). The match is by qso_id; a
+    // live send with no qso_id (manual free-text) is shown too, since the
+    // operator is watching the single-detail panel for the only active QSO.
+    let live_tx = live_tx_for_qso(app.tx_now_sending.as_ref(), qso.qso_id.as_deref());
+
+    let now_line = match live_tx {
+        Some(item) => Line::from(vec![
             Span::styled("Now : ", Style::default().fg(app.theme.muted_color())),
-            Span::styled(now, Style::default().fg(app.theme.foreground_color())),
-            Span::styled("   Next: ", Style::default().fg(app.theme.muted_color())),
-            Span::styled(next, Style::default().fg(app.theme.muted_color())),
+            Span::styled(
+                " 🔴 TX ",
+                Style::default()
+                    .fg(ratatui::style::Color::White)
+                    .bg(ratatui::style::Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {} @{:.0}Hz", item.text, item.freq_hz),
+                Style::default()
+                    .fg(ratatui::style::Color::Red)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]),
-    ];
+        None => {
+            let now = if qso.now_line.is_empty() {
+                "---".to_string()
+            } else {
+                qso.now_line.clone()
+            };
+            Line::from(vec![
+                Span::styled("Now : ", Style::default().fg(app.theme.muted_color())),
+                Span::styled(now, Style::default().fg(app.theme.foreground_color())),
+                Span::styled("   Next: ", Style::default().fg(app.theme.muted_color())),
+                Span::styled(next, Style::default().fg(app.theme.muted_color())),
+            ])
+        }
+    };
+
+    let lines = vec![Line::from(spans), now_line];
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);
@@ -576,5 +618,40 @@ mod tests {
         let only_time = format_direction_line("TX", None, Some(at));
         assert!(only_time.starts_with("TX: "));
         assert_ne!(only_time, "TX: Never");
+    }
+
+    /// The QSO Status "Now:" line surfaces the live TX frame when it belongs
+    /// to the selected QSO (matched by qso_id) or has no qso_id (manual send),
+    /// and stays quiet when the keyed frame is for a different QSO.
+    #[test]
+    fn test_live_tx_for_qso_selection() {
+        use super::live_tx_for_qso;
+        use crate::app::TxQueueItem;
+
+        let item_a = TxQueueItem {
+            text: "W5XO K5ARH R-02".to_string(),
+            freq_hz: 1234.0,
+            qso_id: Some("qso-a".to_string()),
+            deferred: false,
+        };
+        let item_manual = TxQueueItem {
+            text: "CQ K5ARH EM10".to_string(),
+            freq_hz: 1500.0,
+            qso_id: None,
+            deferred: false,
+        };
+
+        // Nothing keyed → None.
+        assert!(live_tx_for_qso(None, Some("qso-a")).is_none());
+
+        // Keyed frame belongs to this QSO → surfaced.
+        assert!(live_tx_for_qso(Some(&item_a), Some("qso-a")).is_some());
+
+        // Keyed frame belongs to a DIFFERENT QSO → not surfaced here.
+        assert!(live_tx_for_qso(Some(&item_a), Some("qso-b")).is_none());
+
+        // Manual send (no qso_id) → surfaced for the single-detail panel.
+        assert!(live_tx_for_qso(Some(&item_manual), Some("qso-a")).is_some());
+        assert!(live_tx_for_qso(Some(&item_manual), None).is_some());
     }
 }

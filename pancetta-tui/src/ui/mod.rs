@@ -223,17 +223,21 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     match &app.tx_now_sending {
         Some(item) => {
-            // Concurrent count = headline + companions all on the air at once.
+            // LIVE TX — make it unmistakable. A bold red chip + bold frame
+            // text dominate the strip for the full ~12.64s the message is
+            // keyed (set at PTT-assert, cleared at PTT-release). The operator
+            // repeatedly reported "I can't see what we're actually
+            // transmitting WHILE we're transmitting it" — this is the fix.
             let now_count = 1 + concurrent.len();
             let label = if now_count > 1 {
-                format!("▶ NOW ×{}: ", now_count)
+                format!(" 🔴 TX NOW ×{} ", now_count)
             } else {
-                "▶ NOW: ".to_string()
+                " 🔴 TX NOW ".to_string()
             };
             spans.push(Span::styled(
                 label,
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(Color::White)
                     .bg(Color::Red)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -243,10 +247,14 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
                     .iter()
                     .map(|it| format!("{} @{:.0}Hz", it.text, it.freq_hz)),
             );
+            // The frame text itself, also white-on-red and bold so it reads as
+            // a single dominant TX banner rather than a thin easily-missed
+            // strip.
             spans.push(Span::styled(
-                format!(" {} ", on_air.join(" | ")),
+                format!(" {} ", on_air.join("  |  ")),
                 Style::default()
-                    .fg(app.theme.foreground_color())
+                    .fg(Color::White)
+                    .bg(Color::Red)
                     .add_modifier(Modifier::BOLD),
             ));
         }

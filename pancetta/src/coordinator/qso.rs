@@ -89,6 +89,10 @@ impl super::ApplicationCoordinator {
         let active_qso_ap = self.active_qso_ap.clone();
         let active_qso_freq_hz = self.active_qso_freq_hz.clone();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
+        // Shared with the TX worker — drives the "drop TX for ended QSOs"
+        // gate. The QSO component keeps it in sync from the QsoEvent stream
+        // below.
+        let active_tx_qsos = self.active_tx_qsos.clone();
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
 
@@ -322,16 +326,48 @@ impl super::ApplicationCoordinator {
                 let tx_callsign = our_callsign.clone();
                 let ap_state = active_qso_ap;
                 let qso_freq_state = active_qso_freq_hz;
+                let active_tx_qsos = active_tx_qsos.clone();
                 let snapshot_qso_manager = qso_manager.clone();
                 let snapshot_bus = tx_bus.clone();
                 tokio::spawn(async move {
                     while !tx_shutdown.load(Ordering::Acquire) {
                         match qso_events.recv().await {
                             Ok(pancetta_qso::QsoEvent::StateChanged {
+                                qso_id,
                                 old_state,
                                 new_state,
                                 ..
                             }) => {
+                                // Keep the TX-active set in sync (drop-stale-TX
+                                // gate). A QSO entering a non-terminal active
+                                // state is now allowed to TX; a QSO entering a
+                                // terminal Failed state (covers Superseded /
+                                // UserCancelled / Timeout / SignalLost / …) must
+                                // STOP transmitting at once, so we remove it
+                                // immediately. (Completion is handled in the
+                                // QsoCompleted arm with a grace window so the
+                                // final 73 still goes out.)
+                                {
+                                    let key = super::active_tx_qso_key(&qso_id.to_string());
+                                    if new_state.is_active() {
+                                        if let Ok(mut set) = active_tx_qsos.write() {
+                                            set.insert(key);
+                                        }
+                                    } else if matches!(
+                                        new_state,
+                                        pancetta_qso::QsoState::Failed { .. }
+                                    ) {
+                                        if let Ok(mut set) = active_tx_qsos.write() {
+                                            set.remove(&key);
+                                        }
+                                        info!(
+                                            target: "tx.policy",
+                                            "QSO {} went terminal-Failed — purging its TX from the active set",
+                                            qso_id
+                                        );
+                                    }
+                                }
+
                                 // Map QSO state to AP context for AP3/AP4 decoding.
                                 //
                                 // WSJT-X Improved-style a8 wiring: also enumerate
@@ -492,7 +528,37 @@ impl super::ApplicationCoordinator {
                                     }
                                 }
                             }
-                            Ok(pancetta_qso::QsoEvent::QsoCompleted { metadata, .. }) => {
+                            Ok(pancetta_qso::QsoEvent::QsoCompleted {
+                                qso_id, metadata, ..
+                            }) => {
+                                // Drop-stale-TX grace window. A normally
+                                // completing QSO emits its FINAL 73 right at
+                                // completion, so we must NOT purge it from the
+                                // active set immediately — that would race the
+                                // 73 out of existence. Instead we keep it live
+                                // for one slot (~16s) via a spawned delayed
+                                // task: the final 73 keys this slot, and any
+                                // leftover backlog for this QSO is dropped on
+                                // the next slot. 16s comfortably covers the
+                                // worst-case schedule (≤16s slot wait selects
+                                // THIS or the next same-parity slot for the 73)
+                                // plus the 12.64s on-air burst.
+                                {
+                                    let key = super::active_tx_qso_key(&qso_id.to_string());
+                                    let set = active_tx_qsos.clone();
+                                    let qid = qso_id;
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(Duration::from_secs(16)).await;
+                                        if let Ok(mut s) = set.write() {
+                                            s.remove(&key);
+                                        }
+                                        info!(
+                                            target: "tx.policy",
+                                            "QSO {} completed — grace elapsed, purging its TX from the active set",
+                                            qid
+                                        );
+                                    });
+                                }
                                 // Clear AP state on QSO completion
                                 if let Ok(mut guard) = ap_state.write() {
                                     *guard = None;
@@ -559,7 +625,20 @@ impl super::ApplicationCoordinator {
                                     }
                                 }
                             }
-                            Ok(pancetta_qso::QsoEvent::QsoFailed { metadata, .. }) => {
+                            Ok(pancetta_qso::QsoEvent::QsoFailed {
+                                qso_id, metadata, ..
+                            }) => {
+                                // Drop-stale-TX gate: a failed QSO must stop
+                                // transmitting immediately. (StateChanged-into-
+                                // Failed already purges, but a QsoFailed not
+                                // preceded by such a transition would otherwise
+                                // be missed — purge here too, idempotently.)
+                                {
+                                    let key = super::active_tx_qso_key(&qso_id.to_string());
+                                    if let Ok(mut set) = active_tx_qsos.write() {
+                                        set.remove(&key);
+                                    }
+                                }
                                 // Clear AP state on QSO failure
                                 if let Ok(mut guard) = ap_state.write() {
                                     *guard = None;
