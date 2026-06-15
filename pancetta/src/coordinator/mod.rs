@@ -34,13 +34,16 @@ mod tx;
 mod util;
 mod wav_playback;
 
-pub use tx::{schedule_tx, TxSchedule};
+pub use tx::{
+    coalesce_transmit_requests, resolve_required_parity, schedule_tx, CoalesceEntry,
+    CoalesceOutcome, TxSchedule,
+};
 
 /// Canonical key for the `active_tx_qsos` set: QSO ids are compared
 /// case-insensitively (and trimmed) so the producer (QSO component) and
 /// consumer (TX worker) never disagree on casing. Centralized here so the
 /// insert / remove / membership-test sites can't drift.
-pub(crate) fn active_tx_qso_key(qso_id: &str) -> String {
+pub fn active_tx_qso_key(qso_id: &str) -> String {
     qso_id.trim().to_uppercase()
 }
 
@@ -56,7 +59,7 @@ pub(crate) fn active_tx_qso_key(qso_id: &str) -> String {
 /// Returns `false` (drop) only when the item belongs to a QSO that is no
 /// longer in the active set — i.e. it was superseded / cancelled / failed /
 /// timed out, or its completion grace already elapsed.
-pub(crate) fn tx_qso_is_live(qso_id: Option<&str>, active: &HashSet<String>) -> bool {
+pub fn tx_qso_is_live(qso_id: Option<&str>, active: &HashSet<String>) -> bool {
     match qso_id {
         None => true,
         Some(id) => active.contains(&active_tx_qso_key(id)),
