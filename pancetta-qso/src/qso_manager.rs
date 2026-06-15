@@ -600,6 +600,19 @@ impl QsoManager {
         self.qsos.write().await.insert(qso_id, progress);
         self.add_callsign_mapping(&target_callsign, qso_id).await;
 
+        // Announce the QSO's birth into its initial active state BEFORE the
+        // first MessageToSend. The coordinator's `active_tx_qsos` populater
+        // inserts a qso_id only on `StateChanged` into an active state; the TX
+        // worker's drop-stale-TX gate (Step 4b) then drops any TransmitRequest
+        // whose qso_id is absent. Both the StateChanged and the MessageToSend
+        // are consumed by the SAME serial event loop in the coordinator, so
+        // emitting StateChanged first guarantees the insert is ordered ahead of
+        // the TransmitRequest the MessageToSend produces — otherwise the very
+        // first scheduled call is silently dropped and PTT never keys (the
+        // operator-reported "scheduled QSO never keys PTT, but manual/tune
+        // do" bug).
+        self.emit_state_change(qso_id, QsoState::Idle, state).await;
+
         self.emit_event(QsoEvent::MessageToSend {
             qso_id,
             message,
@@ -855,6 +868,17 @@ impl QsoManager {
 
         self.qsos.write().await.insert(qso_id, progress);
         self.add_callsign_mapping(&target, qso_id).await;
+
+        // See the matching comment in `respond_to_cq_with`: emit the initial
+        // StateChanged BEFORE the first MessageToSend so the coordinator's
+        // `active_tx_qsos` set has this qso_id inserted before the first
+        // scheduled TransmitRequest reaches the Step 4b PTT gate. A
+        // `Completed` open (SeventyThree) is not an active state, but emitting
+        // the StateChanged is still correct/harmless — the gate's post-
+        // completion grace window keeps the final-73 TransmitRequest live (and
+        // the QsoCompleted event below drives the grace insert+removal anyway).
+        self.emit_state_change(qso_id, QsoState::Idle, state.clone())
+            .await;
 
         self.emit_event(QsoEvent::MessageToSend {
             qso_id,

@@ -769,6 +769,19 @@ impl super::ApplicationCoordinator {
                                 // plus the 12.64s on-air burst.
                                 {
                                     let key = super::active_tx_qso_key(&qso_id.to_string());
+                                    // Ensure the key is present for the grace
+                                    // window's duration. Normally a prior
+                                    // active StateChanged already inserted it
+                                    // (idempotent here), but a QSO that OPENS
+                                    // directly at the close (respond_to_caller
+                                    // SeventyThree → Completed) never passed
+                                    // through an active state, so without this
+                                    // insert its single final-73 TransmitRequest
+                                    // would be dropped by the Step 4b gate and
+                                    // never key PTT.
+                                    if let Ok(mut s) = active_tx_qsos.write() {
+                                        s.insert(key.clone());
+                                    }
                                     let set = active_tx_qsos.clone();
                                     let qid = qso_id;
                                     tokio::spawn(async move {
