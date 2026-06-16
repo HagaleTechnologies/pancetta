@@ -946,6 +946,7 @@ mod tests {
                 call_count: 0,
                 first_call_at: None,
                 last_call_at: None,
+                progressed_this_cycle: false,
             },
         };
 
@@ -985,6 +986,7 @@ mod tests {
                 call_count: 0,
                 first_call_at: None,
                 last_call_at: None,
+                progressed_this_cycle: false,
             },
         };
 

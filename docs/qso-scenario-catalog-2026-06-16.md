@@ -22,8 +22,8 @@ timeouts, 13 supersedes — most stalls trace to this + tail-end re-call churn.
 - A1 stuck-at-grid: DX answers with bare `DX K5ARH` → we must send a report, not loop grid. **[BUG?]**
 - A2 stuck-at-grid-2: DX answers `DX K5ARH <grid>` → we must send a report. **[BUG?]**
 - A3 they 73 us while we're at report (skip R-report) → accept + log, stop sending report.
-- A4 DX skips grid (answers CQ with `R-xx`) → accept, close, log (grid empty).
-- A5 out-of-order RR73 before we reported → accept completion, log, send 73.
+- A4 DX skips grid (answers CQ with `R-xx`) → accept, close, log (grid empty). **[FIXED]** — `(CallingCq, SignalReport→WaitingForReport)` arm + routing + report reply.
+- A5 out-of-order RR73 before we reported → accept completion, log, send 73. **[FIXED]** — `(WaitingForReport, RR73/73→Completed)` early-close arm (CQer mirror of FIX-2) + routing + 73 reply.
 - A6 wrong report value repeated (no RR73) → re-send our R, don't advance.
 - A7 DX corrects report (different value 2nd time) → latch newest received report, re-send R.
 - A8 stuck loop: neither copies R-frame → keep-call to watchdog, never auto-complete.
@@ -48,12 +48,12 @@ timeouts, 13 supersedes — most stalls trace to this + tail-end re-call churn.
 - B12 multi-stream: N parallel QSOs don't cross-contaminate partner/parity/report. [peer A9]
 - B13 foreign frame on our exact freq w/ DX call but wrong to → callsign+to+state, not freq alone.
 - B14 we QSY mid-QSO (freq occupied) → same QSO continues on new TX freq, identity preserved.
-- B15 DX drifts > tolerance mid-QSO → prefer callsign+state continuity for an active QSO. **[decide semantics]**
+- B15 DX drifts > tolerance mid-QSO → prefer callsign+state continuity for an active QSO. **[FIXED]** — `is_message_relevant` applies the freq gate AFTER the callsign/to/state match; an ESTABLISHED QSO (contra known) allows up to 100 Hz drift, tight 15 Hz kept for initial/ambiguous matching (gate widened, not re-latched).
 
 ## Batch C — timing / fading / lifecycle races + re-engagement + operator
 - C1 DX fades after our report, returns 3 slots later → keep-call across silence, resume. [peer C2]
 - C2 intermittent decodes (every other slot) → completes; watchdog counts calls not slots.
-- C3 watchdog expiry vs just-in-time answer SAME slot → process RX before timeout; don't retire. **[race, high bug-exposure]**
+- C3 watchdog expiry vs just-in-time answer SAME slot → process RX before timeout; don't retire. **[FIXED]** — a forward state advance sets `progressed_this_cycle`; the manual watchdog grants a one-pass reprieve (and clears the flag each pass) so a just-in-time answer at the call cap is not retired in the slot it advanced. NOT a `call_count` reset (per-QSO cap preserved, C12); a regression clears the flag so a stuck DX still retires.
 - C4 abandoned (watchdog-Failed) station starts answering within a window → re-engage fresh. **[decide window]**
 - C5 we abandoned them but they close with us → accept gift completion + log.
 - C6 late return after minutes (mapping cleared) → new QSO / dupe policy; no crash.

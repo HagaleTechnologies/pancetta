@@ -645,14 +645,12 @@ async fn b14_qsy_within_tolerance_preserves_identity() {
 //       ALREADY-ACTIVE QSO despite the larger drift. The engine does NOT do
 //       this today, so this is committed as a KNOWN BUG.
 // =====================================================================
-#[ignore = "KNOWN BUG: DX drift >15 Hz mid-QSO is rejected by the freq gate before \
-            the callsign/to/state check, so an actively-answering DX cannot advance \
-            an established QSO and we time out instead of completing. Catalog B15 \
-            asks for callsign+state continuity to win for an already-active QSO. \
-            Fix belongs in qso_manager::is_message_relevant (widen / waive the freq \
-            tolerance once a QSO is established and from+to+state all match). \
-            Semantic question to settle in the fix: how wide a drift to allow for an \
-            active QSO (e.g. 60-100 Hz), and whether to re-latch the QSO frequency."]
+// FIXED (B15): is_message_relevant now applies the freq gate AFTER the
+// callsign/to/state match. An ESTABLISHED QSO (contra callsign known, past
+// CallingCq/Idle) whose partner answers with from==DX && to==us && the
+// expected next message is allowed a wider drift bound (100 Hz) instead of
+// the tight 15 Hz used for initial/ambiguous matching. We widen the gate
+// rather than re-latch the stored frequency (the fn holds only a read lock).
 #[tokio::test]
 async fn b15_dx_drift_beyond_tolerance_continuity_should_win() {
     let mut sim = sim().await;

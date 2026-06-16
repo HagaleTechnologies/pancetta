@@ -192,9 +192,10 @@ async fn a3_they_73_us_early_we_accept_and_complete() {
 // keep re-CQing (see timeline: slots 2-3 still emit "CQ K5ARH EM10"). The
 // symmetric fix belongs with the CQer-flow gaps (A4/A5) in a follow-up; the
 // Caller-side stuck-at-grid fix in this batch does not touch the CQer ladder.
-#[ignore = "KNOWN BUG: CallingCq has no SignalReport arm — a CQ answered with a \
-            bare report (grid skipped) never advances; we keep re-CQing. \
-            CQer-flow gap, separate from the Caller-flow stuck-at-grid fix."]
+// FIXED (A4): `(CallingCq, SignalReport[to==us])` arm added to
+// determine_state_transition (→ WaitingForReport), routed in
+// is_message_relevant, and generate_response sends our report — so a CQ
+// answered with a bare report now advances and completes.
 #[tokio::test]
 async fn a4_dx_skips_grid_answers_cq_with_report() {
     let mut sim = sim().await;
@@ -233,10 +234,10 @@ async fn a4_dx_skips_grid_answers_cq_with_report() {
 // the QSO never completes (see timeline: slot 2 RR73 produces no transition).
 // The Caller flow already accepts an early close from `SendingReport` (the
 // FIX-2 arm); the symmetric CQer arm is the follow-up.
-#[ignore = "KNOWN BUG: WaitingForReport (CQer flow) has no FinalConfirmation/73 \
-            arm — a caller closing early with RR73 before sending their R-report \
-            is ignored and the QSO never completes. CQer-flow gap, separate from \
-            the Caller-flow stuck-at-grid fix."]
+// FIXED (A5): symmetric early-close arm added —
+// `(WaitingForReport, FinalConfirmation|SeventyThree[from==DX,to==us])` →
+// Completed in determine_state_transition, routed in is_message_relevant, and
+// generate_response answers our 73. The CQer now accepts a caller's early RR73.
 #[tokio::test]
 async fn a5_out_of_order_rr73_after_our_report_completes() {
     let mut sim = sim().await;

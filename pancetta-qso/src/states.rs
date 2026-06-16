@@ -377,6 +377,17 @@ pub struct QsoMetadata {
     /// Used to rate-limit re-arms to roughly one per FT8 slot.
     #[serde(default)]
     pub last_call_at: Option<DateTime<Utc>>,
+
+    /// C3 race guard: set `true` whenever this (manual) QSO makes a forward
+    /// state advance, and cleared by each manual-watchdog pass. It grants a
+    /// one-pass reprieve from `manual_call_max_calls` retirement to a QSO that
+    /// advanced in the same slot the cap trips (a just-in-time DX answer), so
+    /// the operator never loses a QSO the DX just came back on. It does NOT
+    /// reset `call_count`, so the per-QSO cap still bounds total calls across
+    /// the whole QSO (C12 per-QSO, not per-step semantics): a QSO that advances
+    /// once then goes silent still retires at the cap on the following pass.
+    #[serde(default)]
+    pub progressed_this_cycle: bool,
 }
 
 /// Signal reports exchanged

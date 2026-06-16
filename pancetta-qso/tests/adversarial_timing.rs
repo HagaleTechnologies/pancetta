@@ -191,10 +191,12 @@ async fn c2_intermittent_decodes_completes_watchdog_counts_calls() {
 // once a report is acked, or reset `call_count` on a real state advance, or
 // only time-out on staleness measured from the last *forward* transition).
 // Un-ignore once fixed.
+// FIXED (C3): a FORWARD state advance on a manual QSO now resets the
+// keep-calling stall (call_count → 0, first_call_at → message time) in
+// process_message_for_qso, so a just-in-time answer at the call cap is no
+// longer retired by check_timeouts in the same slot it advanced. A truly
+// silent partner (no advance) still climbs to the cap and times out (C4/C5).
 #[tokio::test]
-#[ignore = "KNOWN BUG: just-in-time answer at the manual call cap is retired by \
-            the watchdog in the same slot it advanced (check_timeouts fires after \
-            the advancing RX). See the test's KNOWN BUG note."]
 async fn c3_watchdog_vs_just_in_time_answer_same_slot() {
     // Cap = 3. Opening call = call_count 1 (slot 0). Re-arms on slots 1 and 2
     // bring call_count to 3, which is == max_calls. The watchdog check at the

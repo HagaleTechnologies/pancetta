@@ -300,6 +300,33 @@ impl MessageExchange {
                 report: computed_report,
             })),
 
+            // A4 (CQer flow — caller skipped the grid): a station answered our
+            // CQ with a bare signal report ("<us> <them> -NN"). They already
+            // have our copy; the state machine advances us CallingCq →
+            // WaitingForReport for the same pair, so we reply with OUR report to
+            // them (identical to the CqResponse arm above). Keyed on the report
+            // frame instead of a grid frame.
+            (QsoState::CallingCq { .. }, MessageType::SignalReport { from_station, .. }) => {
+                Ok(Some(MessageType::SignalReport {
+                    to_station: from_station.clone(),
+                    from_station: self.our_callsign.clone(),
+                    report: computed_report,
+                }))
+            }
+
+            // A5 (CQer flow — caller closed early): from WaitingForReport the
+            // caller fired RR73 / 73 instead of an R-report. The state machine
+            // completes the QSO; we answer the close with our 73 (the standard
+            // CQer sign-off). Mirrors the (WaitingForConfirmation, 73/RR73) and
+            // FIX-2 (SendingReport, RR73) close arms.
+            (
+                QsoState::WaitingForReport { their_callsign, .. },
+                MessageType::FinalConfirmation { .. } | MessageType::SeventyThree { .. },
+            ) => Ok(Some(MessageType::SeventyThree {
+                to_station: their_callsign.clone(),
+                from_station: self.our_callsign.clone(),
+            })),
+
             // Received signal report, send acknowledgment
             (
                 QsoState::RespondingToCq {

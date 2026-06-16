@@ -392,6 +392,7 @@ impl QsoManager {
             call_count: 1,
             first_call_at: Some(now),
             last_call_at: Some(now),
+            progressed_this_cycle: false,
         };
 
         let progress = QsoProgress {
@@ -505,6 +506,7 @@ impl QsoManager {
             call_count: 1,
             first_call_at: Some(now),
             last_call_at: Some(now),
+            progressed_this_cycle: false,
         };
 
         let progress = QsoProgress {
@@ -692,6 +694,7 @@ impl QsoManager {
             call_count: 1,
             first_call_at: Some(now),
             last_call_at: Some(now),
+            progressed_this_cycle: false,
         };
 
         // Send response message
@@ -961,6 +964,7 @@ impl QsoManager {
             call_count: 1,
             first_call_at: Some(now),
             last_call_at: Some(now),
+            progressed_this_cycle: false,
         };
 
         // If we are opening at the close (SeventyThree → Completed), stamp the
@@ -1317,6 +1321,25 @@ impl QsoManager {
                 None
             };
 
+            // C3 fix (watchdog-vs-just-in-time-answer race): mark that this QSO
+            // made a FORWARD state advance in the current watchdog cycle. The
+            // manual keep-calling watchdog (`check_timeouts_at`) grants a
+            // one-pass reprieve to any QSO that advanced since its previous
+            // pass, so a just-in-time DX answer arriving in the very slot the
+            // call cap trips is NOT thrown away as Failed{Timeout} in the same
+            // tick it advanced. This is deliberately NOT a `call_count` reset —
+            // the per-QSO cap still bounds total calls across the whole QSO
+            // (C12: per-QSO, not per-step), and a QSO that advances once then
+            // goes silent still retires at the cap on the NEXT pass (the flag
+            // is cleared every watchdog pass). We set it only on a genuine
+            // forward advance (not a manual regression — a DX repeating an
+            // earlier message must keep counting against the cap so a stuck DX
+            // cannot drive an unbounded ping-pong). Auto QSOs do not use the
+            // manual watchdog and are unaffected.
+            if qso_initiated_by == CallInitiation::Manual && !is_manual_regression {
+                progress.metadata.progressed_this_cycle = true;
+            }
+
             progress.state = new_state.clone();
             progress.state_history.push(StateTransition {
                 from_state: old_state.clone(),
@@ -1346,6 +1369,11 @@ impl QsoManager {
             if let Some(progress) = qsos.get_mut(&qso_id) {
                 progress.metadata.call_count += 1;
                 progress.metadata.last_call_at = Some(message.timestamp);
+                // A regression is the opposite of forward progress (the DX
+                // repeated an earlier message), so it cancels any pending C3
+                // reprieve from an earlier advance — a stuck DX repeating must
+                // still retire at the cap, never earn an extra watchdog pass.
+                progress.metadata.progressed_this_cycle = false;
             }
         }
 
@@ -1445,6 +1473,98 @@ impl QsoManager {
                     frequency: *frequency,
                     started_at: Utc::now(),
                     their_grid: grid.clone(),
+                })
+            }
+
+            // A4 (CQer flow — caller skips the grid): a station answers our CQ
+            // with a bare signal report ("<us> <them> -NN") instead of the
+            // usual grid frame. On-air this means "I copied you, here's your
+            // report" — the caller already has our copy. The protocol-correct
+            // next move for us (the CQer) is to send THEM our report, exactly
+            // as we would after a grid-bearing CqResponse — so we advance to
+            // WaitingForReport (same rung as the CqResponse path) and the reply
+            // emitter sends our SignalReport. Without this arm CallingCq had no
+            // SignalReport transition and we kept re-CQing forever.
+            //
+            // Sender-verified like every other arm: the report must be TO us
+            // (we don't yet know who will answer our CQ, so any from_station is
+            // accepted as the contra). We latch their callsign (from_station)
+            // so the QSO carries the right contra call; no grid is available.
+            (
+                QsoState::CallingCq { frequency, .. },
+                MessageType::SignalReport {
+                    from_station,
+                    to_station,
+                    ..
+                },
+            ) => {
+                if to_station != &self.config.our_callsign {
+                    warn!(
+                        target: "qso.security",
+                        got_to = %to_station,
+                        got_from = %from_station,
+                        "SignalReport not addressed to us ignored — no CQ advance (A4)"
+                    );
+                    return Ok(current_state.clone());
+                }
+                Ok(QsoState::WaitingForReport {
+                    their_callsign: from_station.clone(),
+                    frequency: *frequency,
+                    started_at: Utc::now(),
+                    their_grid: None,
+                })
+            }
+
+            // A5 (CQer flow — caller closes early): after we (the CQer) sent our
+            // report (now WaitingForReport) the caller fires RR73 / a plain 73
+            // instead of acking with their R-report. The caller is done — accept
+            // the early close, complete, and log. This is the CQer-side mirror
+            // of the FIX-2 early-close arm the Caller flow already has
+            // (SendingReport → Completed on RR73/73). Without it a
+            // WaitingForReport CQer ignored the close and the QSO never
+            // completed.
+            //
+            // Sender-verified (from == caller && to == us). We never received a
+            // numeric report-ack from them, so log with our computed report and
+            // a defaulted their_report.
+            (
+                QsoState::WaitingForReport {
+                    their_callsign,
+                    frequency,
+                    started_at,
+                    ..
+                },
+                MessageType::FinalConfirmation {
+                    from_station,
+                    to_station,
+                }
+                | MessageType::SeventyThree {
+                    from_station,
+                    to_station,
+                },
+            ) => {
+                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %their_callsign,
+                        got_from = %from_station,
+                        got_to = %to_station,
+                        "spurious RR73/73 in WaitingForReport ignored (CQer, A5)"
+                    );
+                    return Ok(current_state.clone());
+                }
+                let our_report = signal_strength
+                    .map(|snr| (snr.round() as i8).clamp(-30, 50))
+                    .unwrap_or(-15);
+                let duration = (Utc::now() - *started_at).num_seconds() as u32;
+                Ok(QsoState::Completed {
+                    their_callsign: their_callsign.clone(),
+                    their_report: -15,
+                    our_report,
+                    frequency: *frequency,
+                    grid_square: None,
+                    completed_at: Utc::now(),
+                    duration_seconds: duration,
                 })
             }
 
@@ -1898,13 +2018,23 @@ impl QsoManager {
         // covers normal operation while shrinking the window an attacker
         // can exploit. (Security review 2026-04-29 C-1.)
         const FREQ_TOLERANCE_HZ: f64 = 15.0;
-        if let Some(qso_freq) = state.frequency() {
-            if (qso_freq - frequency).abs() > FREQ_TOLERANCE_HZ {
-                return false;
-            }
-        }
+        // B15 fix: once a QSO is ESTABLISHED (we know the contra callsign and
+        // are past CallingCq/Idle), allow a wider drift so an actively-
+        // answering DX that has drifted beyond the tight window is NOT dropped.
+        // The match arms below already require from == DX && to == us && the
+        // state-appropriate message, which unambiguously identifies our partner
+        // — at that point callsign+state continuity wins over the freq window
+        // (catalog B15). We WIDEN the gate (to 100 Hz) rather than re-latch the
+        // QSO's stored frequency here: `is_message_relevant` takes `&self` and
+        // holds only a read lock, so it cannot mutate state; 100 Hz comfortably
+        // covers realistic transceiver drift / micro-QSY within a contact while
+        // still bounding how far a stray station can be from our partner's
+        // latched offset. The tight 15 Hz gate is kept for INITIAL / ambiguous
+        // matching (CallingCq, Idle, and any non-matching message) so two
+        // different stations are never merged into one QSO.
+        const ESTABLISHED_FREQ_TOLERANCE_HZ: f64 = 100.0;
 
-        match (state, message_type) {
+        let matched = match (state, message_type) {
             // We're calling CQ. The responder's callsign is whoever is in the
             // `responding_station` field; the message must be addressed to us.
             (
@@ -1913,6 +2043,15 @@ impl QsoManager {
                     calling_station, ..
                 },
             ) => calling_station == &self.config.our_callsign,
+
+            // A4 (routing half): a caller answered our CQ with a bare signal
+            // report (grid skipped) — "<us> <them> -NN". Route it to this
+            // CallingCq QSO so the transition arm can step CQ → report. Only
+            // addressed-to-us reports qualify (any from_station, since we don't
+            // yet know who will answer).
+            (QsoState::CallingCq { .. }, MessageType::SignalReport { to_station, .. }) => {
+                to_station == &self.config.our_callsign
+            }
 
             // CQer flow: we called CQ, the caller answered, and we sent our
             // report (now WaitingForReport). The caller's R-report (ReportAck)
@@ -1924,6 +2063,22 @@ impl QsoManager {
                     to_station,
                     from_station,
                     ..
+                },
+            ) => from_station == their_callsign && to_station == &self.config.our_callsign,
+
+            // A5 (routing half): the caller closed early with RR73 / 73 from
+            // WaitingForReport (before sending their R-report). Route the close
+            // to this QSO so the transition arm can complete it. Both directions
+            // verified: from THEM, to US.
+            (
+                QsoState::WaitingForReport { their_callsign, .. },
+                MessageType::FinalConfirmation {
+                    to_station,
+                    from_station,
+                }
+                | MessageType::SeventyThree {
+                    to_station,
+                    from_station,
                 },
             ) => from_station == their_callsign && to_station == &self.config.our_callsign,
 
@@ -2002,7 +2157,29 @@ impl QsoManager {
                 // Anything else: only relevant if addressed to us.
                 message_type.is_addressed_to(&self.config.our_callsign)
             }
+        };
+
+        if !matched {
+            return false;
         }
+
+        // Apply the frequency gate AFTER the callsign/to/state match (B15). A
+        // matched message from an ESTABLISHED QSO's partner is allowed the
+        // wider drift bound; everything else uses the tight default. An
+        // established QSO is one where we already know the contra callsign
+        // (i.e. not CallingCq/Idle) — `their_callsign()` is Some.
+        if let Some(qso_freq) = state.frequency() {
+            let tolerance = if state.their_callsign().is_some() {
+                ESTABLISHED_FREQ_TOLERANCE_HZ
+            } else {
+                FREQ_TOLERANCE_HZ
+            };
+            if (qso_freq - frequency).abs() > tolerance {
+                return false;
+            }
+        }
+
+        true
     }
 
     async fn check_duplicate(
@@ -2585,7 +2762,7 @@ impl QsoManager {
         let mut qsos = self.qsos.write().await;
         let mut timeouts = Vec::new();
 
-        for (&qso_id, progress) in qsos.iter() {
+        for (&qso_id, progress) in qsos.iter_mut() {
             // Manual keep-calling watchdog. Covers CallingCq (operator `c`:
             // re-calling CQ until someone answers), RespondingToCq
             // (re-calling the DX) and SendingReport (FIX 4: re-sending our
@@ -2612,7 +2789,17 @@ impl QsoManager {
                     .map(|t| now - t)
                     .unwrap_or_else(Duration::zero);
 
-                if progress.metadata.call_count >= max_calls || elapsed >= watchdog {
+                // C3 race guard: if this QSO made a forward state advance in the
+                // current watchdog cycle (the DX just answered), grant a
+                // one-pass reprieve — do NOT retire it in the same tick it
+                // advanced. The flag is consumed (cleared) here, so a QSO that
+                // advanced once then goes silent is retired on the NEXT pass
+                // once it re-hits the cap (per-QSO bound preserved; see C12).
+                let progressed = progress.metadata.progressed_this_cycle;
+                progress.metadata.progressed_this_cycle = false;
+
+                if !progressed && (progress.metadata.call_count >= max_calls || elapsed >= watchdog)
+                {
                     timeouts.push((qso_id, QsoFailureReason::Timeout));
                 }
                 // Manual calls do not use the (much shorter) per-state
@@ -3307,6 +3494,7 @@ mod tests {
                 call_count: 1,
                 first_call_at: Some(now),
                 last_call_at: Some(now),
+                progressed_this_cycle: false,
             },
         };
         manager.qsos.write().await.insert(qso_id, progress);
@@ -3816,28 +4004,39 @@ mod sender_verification_tests {
     }
 
     #[test]
-    fn is_message_relevant_rejects_offset_15hz_or_more() {
-        // Tightened from 50 Hz to 15 Hz.
+    fn is_message_relevant_tight_gate_for_initial_ambiguous_match() {
+        // The tight 15 Hz gate still governs INITIAL / ambiguous matching —
+        // a state with no known contra callsign (CallingCq). This preserves
+        // the security-review C-1 tightening for the case where we have not
+        // yet locked onto a partner. (B15 only widens the gate once a QSO is
+        // ESTABLISHED; see is_message_relevant_established_qso_allows_drift.)
         let manager = manager_with_call("K5ARH");
-        let state = QsoState::RespondingToCq {
-            target_callsign: "K9ZZ".into(),
+        let state = QsoState::CallingCq {
             frequency: 1500.0,
             started_at: Utc::now(),
+            call_count: 1,
         };
+        // A bare report answering our CQ (A4 routing shape), addressed to us.
         let legit = MessageType::SignalReport {
             to_station: "K5ARH".into(),
             from_station: "K9ZZ".into(),
             report: -12,
         };
-        // 16 Hz off → should be rejected.
+        // 16 Hz off, no partner latched yet → rejected (tight gate).
         assert!(!manager.is_message_relevant(&state, &legit, 1516.0));
-        // 14 Hz off → should be accepted.
+        // 14 Hz off → accepted.
         assert!(manager.is_message_relevant(&state, &legit, 1514.0));
     }
 
     #[test]
-    fn is_message_relevant_rejects_50hz_offset_now() {
-        // Regression guard: the old 50 Hz tolerance must be gone.
+    fn is_message_relevant_established_qso_allows_drift() {
+        // B15: once a QSO is ESTABLISHED (contra callsign known, here a
+        // RespondingToCq partner answering us with from+to+state all matching),
+        // callsign+state continuity wins over the tight 15 Hz window — a DX that
+        // drifted beyond 15 Hz is still routed (up to the 100 Hz established
+        // bound) instead of being dropped, so an actively-answering partner can
+        // complete the contact. The old 50 Hz tolerance is gone for the initial
+        // case, but the established case now intentionally accepts up to 100 Hz.
         let manager = manager_with_call("K5ARH");
         let state = QsoState::RespondingToCq {
             target_callsign: "K9ZZ".into(),
@@ -3849,7 +4048,12 @@ mod sender_verification_tests {
             from_station: "K9ZZ".into(),
             report: -12,
         };
-        assert!(!manager.is_message_relevant(&state, &legit, 1545.0));
+        // 16 Hz, 45 Hz, 100 Hz drift from an established partner → accepted.
+        assert!(manager.is_message_relevant(&state, &legit, 1516.0));
+        assert!(manager.is_message_relevant(&state, &legit, 1545.0));
+        assert!(manager.is_message_relevant(&state, &legit, 1600.0));
+        // Beyond the 100 Hz established bound → rejected (still bounded).
+        assert!(!manager.is_message_relevant(&state, &legit, 1601.0));
     }
 
     #[tokio::test]
