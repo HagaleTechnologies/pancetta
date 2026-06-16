@@ -1,0 +1,79 @@
+# QSO Adversarial Scenario Catalog — 2026-06-16
+
+Synthesized from three sources: (1) **log analysis** of all past runs (`~/.pancetta/logs/*`),
+(2) **peer/forum research** (WSJT-X/JTDX/MSHV/ft8mon/JS8Call + Hinson FT8 guide + wsjt-devel),
+(3) **operator-grounded ideation** (50 scenarios). Built against the sim harnesses
+(`pancetta-qso/src/sim.rs`, `pancetta/tests/coord_sim.rs` patterns, `Sim::inject_signal` hi-fi).
+
+Goal: a permanent adversarial regression library that PROVES proper QSO progression — and
+surfaces any case where a real on-air frustration would still happen.
+
+## ⚠️ KEY LOG FINDING — likely real bug ("stuck-at-grid", highest frequency in corpus)
+Across many real attempts (N8ME, F5NNN, N9FME, IQ0VT, KB5YNF, KA0NC, first-K9HJZ), we
+answered with our grid (`DX K5ARH EM10`) and **kept re-sending our grid 10× until the
+watchdog timed out**, even while the DX was responding (bare call or their grid). We only
+ever advance to a report on a specific message shape; when the DX's "answer" doesn't match
+that shape we never step grid→report. **Investigate via harness; if confirmed, fix the
+state machine to advance to a report when the DX returns our call (bare or with grid).**
+Log totals: 65 QSO ids, only 7 completions (5 stations; VB7F logged 3×), 16 full-10-call
+timeouts, 13 supersedes — most stalls trace to this + tail-end re-call churn.
+
+## Batch A — Completion / asymmetry / close-token semantics
+- A1 stuck-at-grid: DX answers with bare `DX K5ARH` → we must send a report, not loop grid. **[BUG?]**
+- A2 stuck-at-grid-2: DX answers `DX K5ARH <grid>` → we must send a report. **[BUG?]**
+- A3 they 73 us while we're at report (skip R-report) → accept + log, stop sending report.
+- A4 DX skips grid (answers CQ with `R-xx`) → accept, close, log (grid empty).
+- A5 out-of-order RR73 before we reported → accept completion, log, send 73.
+- A6 wrong report value repeated (no RR73) → re-send our R, don't advance.
+- A7 DX corrects report (different value 2nd time) → latch newest received report, re-send R.
+- A8 stuck loop: neither copies R-frame → keep-call to watchdog, never auto-complete.
+- A9 mutual deadlock: after we (CQer) receive their R, WE owe RR73 → must send it, not idle.
+- A10 premature self-completion: single sent grid, no replies → never log; watchdog→Failed.
+- A11 RR73 vs RRR vs 73 distinct close paths (RR73=no reply expected; RRR=expect 73). [peer D1]
+- A12 log on OUR state, not string-match "73"; partner goes silent/CQs after report → still log. [peer A6/D7]
+- A13 bounded auto-73 actually STOPS after the cap on repeated RR73 (verify the bound).
+
+## Batch B — 3rd/4th-party + sender/to-field discrimination + yield-to-busy
+- B1 DX working someone else: `Z DX -07` (to≠us) → recognize, yield, don't take their report. **[log pattern 6]**
+- B2 DX picks the other guy: we answered, DX sends `X DX -10` → yield + back off.
+- B3 third station calls mid-QSO (`K5ARH X ...`) → defer X, keep current DX QSO.
+- B4 tail-ender pounces as we finish → complete DX, then start fresh QSO with X.
+- B5 two answer our CQ same slot → deterministic pick-one (priority), handle/ignore other. [peer B1]
+- B6 directed-CQ off-target answerer → policy (no auto-resp / configurable). [peer B2]
+- B7 calling a station already in QSO (busy) → tail-end/queue, don't barge. [peer B3]
+- B8 third-party exchange (`X Y RR73`) → no auto-reply, no advance. [peer B5]
+- B9 impostor: same expected text from wrong from-call → no advance (sender verify). [peer B4]
+- B10 station calls us with partner's call by mistake (`K5ARH DX` from X) → discard.
+- B11 near-miss callsign answering our CQ (`K5ARG` vs `K5ARH`) → exact match, no false start.
+- B12 multi-stream: N parallel QSOs don't cross-contaminate partner/parity/report. [peer A9]
+- B13 foreign frame on our exact freq w/ DX call but wrong to → callsign+to+state, not freq alone.
+- B14 we QSY mid-QSO (freq occupied) → same QSO continues on new TX freq, identity preserved.
+- B15 DX drifts > tolerance mid-QSO → prefer callsign+state continuity for an active QSO. **[decide semantics]**
+
+## Batch C — timing / fading / lifecycle races + re-engagement + operator
+- C1 DX fades after our report, returns 3 slots later → keep-call across silence, resume. [peer C2]
+- C2 intermittent decodes (every other slot) → completes; watchdog counts calls not slots.
+- C3 watchdog expiry vs just-in-time answer SAME slot → process RX before timeout; don't retire. **[race, high bug-exposure]**
+- C4 abandoned (watchdog-Failed) station starts answering within a window → re-engage fresh. **[decide window]**
+- C5 we abandoned them but they close with us → accept gift completion + log.
+- C6 late return after minutes (mapping cleared) → new QSO / dupe policy; no crash.
+- C7 stale close after working another station → don't misroute into the new QSO; ignore/bounded.
+- C8 return after band change → ignore close that doesn't match current band/freq context.
+- C9 band change mid-QSO → tear down gracefully; no stale keep-call TXing on new band. **[high bug-exposure]**
+- C10 DX on our own parity → re-derive tx_parity from DX frame; never key DX's slot.
+- C11 late-in-slot decision → defer to next same-parity slot (don't TX truncated).
+- C12 per-step-stall vs per-QSO watchdog semantics — clarify + assert.
+- C13 operator re-click active station → continue, no duplicate. [covered — assert]
+- C14 operator abort then re-call → clean teardown + fresh manual QSO.
+- C15 operator manual frame out of sequence (force RR73) → honor override, log consistently.
+- C16 operator clicks NEW station mid-QSO → queue or multi-stream; never silently drop/collide.
+- C17 hashed/partial `<...>` callsign → no auto-reply, no advance, no log vs unresolved. [peer D2/D3]
+- C18 compound call /P /R /MM consistent across frames; compound↔base equivalence (no stall). [peer D4]
+- C19 config hot-reload mid-QSO must not clobber latched partner/parity. [peer A8]
+- C20 RF-present-but-zero-decodes health signal (mode/clock fault). [peer D8]
+
+## Conventions
+Each scenario → a named test with a slot-by-slot exchange + asserted outcome, citing source
+(LOG / PEER / IDEA) + the original incident where applicable. A scenario that reveals a real
+bug (frustration would still happen) is committed as `#[ignore]` with `// KNOWN BUG:` + a note,
+then fixed in a coordinated follow-up and un-ignored. Status tracked here.
