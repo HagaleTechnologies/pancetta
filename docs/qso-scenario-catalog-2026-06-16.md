@@ -72,6 +72,46 @@ timeouts, 13 supersedes — most stalls trace to this + tail-end re-call churn.
 - C19 config hot-reload mid-QSO must not clobber latched partner/parity. [peer A8] **[FIXED/GUARDED]** — no live reload path reaches QSO state today (holds by construction); added classify_config_reload() so any future apply-handler defers station.callsign/grid/parity while a QSO is active (ui/network/audio/rig safe-live).
 - C20 RF-present-but-zero-decodes health signal (mode/clock fault). [peer D8] **[FIXED]** — RfNoDecodeMonitor: ≥4 consecutive slots with RMS≥floor (RF present) but zero new decodes → TUI warning 'RF present but no decodes — check mode/clock?'; quiet band never warns; edge-triggered.
 
+## Phase 5 — autonomous QSO loop status (2026-06-16)
+
+**Engine: DONE and sim-proven.** The QSO engine now drives `CallInitiation::Auto`
+QSOs through the full reply ladder and retires unanswered pounces
+(`13d423dc`). The 4 Phase-5 scenarios in
+`pancetta-qso/tests/autonomous_scenarios.rs` (full exchange to completion,
+context-aware skip-rung reply, RR73/RRR close, unanswered-pounce retirement)
+pass driving the **real** `AutonomousOperator` through the sim's
+`run_autonomous_slot` → real `QsoManager`.
+
+**Production coordinator wiring: NOT YET (deliberate plan-sized follow-on).**
+Today no production path creates an `Auto` QSO in the `QsoManager` — the
+autonomous task (`coordinator/autonomous.rs`) only emits gated
+`TransmitRequest`s; the universal decode→`process_message` loop
+(`coordinator/qso.rs:966`) therefore never has an Auto QSO to advance. To
+enable autonomous completion on-air, the autonomous task must register each
+surviving opening (pounce → `respond_to_cq` Auto; CQ → `start_cq` Auto) in the
+`QsoManager` so the engine drives it. Open design points (resolve before
+touching the live TX path):
+  1. **Frequency-model split.** The autonomous operator smart-allocates a TX
+     offset that differs from the DX's decode frequency, but `QsoState` carries
+     ONE frequency (manual answers *on* the DX freq). The QSO needs an
+     RX-match-freq (DX, for `is_message_relevant`) distinct from the TX-freq
+     (our offset). Until split, an autonomous QSO would either mismatch the
+     DX's frames or TX on top of the DX. (In the sim today we sidestep this by
+     answering on the DX freq — fine for the tests, wrong for production.)
+  2. **Double-send avoidance.** The autonomous task already sends the gated
+     opening `TransmitRequest` (qso_id=None). If `respond_to_cq` also emits its
+     opening `MessageToSend` (→ forwarded at `qso.rs:718`), the opening goes
+     out twice. Need a register-only QSO-creation that emits `StateChanged`
+     (to populate `active_tx_qsos`) but NOT the opening `MessageToSend`.
+  3. **Gating order.** QSO creation must happen only for openings that survive
+     the Shift+Q runtime gate and the tri-state TX policy (both applied to
+     `tx_items` AFTER the action loop). Create QSOs from surviving items, not
+     inside the action loop.
+  4. **Coordinator integration test.** Add a `coord_sim`-pattern test that
+     drives an autonomous pounce end-to-end through the coordinator to a logged
+     completion, asserting exactly one opening TX and no double-send.
+  5. On-air A/B validation is operator-gated (needs antenna) — meatspace-pending.
+
 ## Conventions
 Each scenario → a named test with a slot-by-slot exchange + asserted outcome, citing source
 (LOG / PEER / IDEA) + the original incident where applicable. A scenario that reveals a real

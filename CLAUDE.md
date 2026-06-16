@@ -104,7 +104,9 @@ Design spec: `docs/superpowers/specs/2026-04-02-end-to-end-qso-design.md`
 - **Phase 2** (complete): Autonomous operator + priority engine — configurable weighted scoring, POTA/SOTA detection
 - **Phase 3** (complete): Multi-stream TX — SmartFrequencyAllocator, multi-slot decision logic, dual QSO loopback test
 - **Phase 4** (complete, 2026-04-26): Hardware integration — hamlib CAT control via rigctld short-form commands, real rig TX validated on FTdx10 (DT 0.2, ALC clean), tail-end message decoded on PSKReporter across NA + EU
-- **Phase 5** (next): Full autonomous QSO loop — enable autonomous operator with antenna, complete a CQ→grid→report→RR73 exchange end-to-end
+- **Phase 5** (in progress): Full autonomous QSO loop — complete a CQ→grid→report→RR73 exchange end-to-end autonomously.
+  - **Engine landed (2026-06-16, `13d423dc`)**: the QSO engine now drives `CallInitiation::Auto` QSOs through the full reply ladder (forward auto-reply emitter no longer Manual-gated; regression handling stays Manual-only) and retires unanswered Auto pounces via a `RespondingToCq | SendingReport` per-state timeout. Also: signed-seconds timeout comparison (a negative elapsed never times out) and a new `(RespondingToCq, ReportAck)` skip-rung transition (DX skips the plain-report rung → we close with RR73). Proven by the 4 Phase-5 scenarios in `pancetta-qso/tests/autonomous_scenarios.rs` driving the real `AutonomousOperator` → real `QsoManager` through the sim.
+  - **Remaining**: production coordinator wiring (register autonomous openings in the `QsoManager` so the live decode→`process_message` loop drives them) — a deliberate plan-sized follow-on; open design points (RX-match-freq vs TX-freq split, double-send avoidance, gating order, coord integration test) are catalogued in `docs/qso-scenario-catalog-2026-06-16.md` (Phase 5 status section). On-air A/B validation is operator-gated (needs antenna).
 
 ## Known Gaps and TODOs
 
