@@ -312,6 +312,23 @@ impl MessageExchange {
                 report: computed_report,
             })),
 
+            // STUCK-AT-GRID FIX: we answered the CQer with our grid and the DX
+            // returned our call (a bare "<us> <DX>" or "<us> <DX> <grid>"
+            // CqResponse to us, no report). They heard us — step forward and
+            // send THEM a signal report (the state machine advances us to
+            // SendingReport for the same pair). This is the reply that used to
+            // be missing: we re-looped our grid every slot instead of advancing.
+            (
+                QsoState::RespondingToCq {
+                    target_callsign, ..
+                },
+                MessageType::CqResponse { .. },
+            ) => Ok(Some(MessageType::SignalReport {
+                to_station: target_callsign.clone(),
+                from_station: self.our_callsign.clone(),
+                report: computed_report,
+            })),
+
             // Received report acknowledgment, send final confirmation
             (QsoState::SendingReport { their_callsign, .. }, MessageType::ReportAck { .. }) => {
                 Ok(Some(MessageType::FinalConfirmation {
@@ -484,9 +501,18 @@ impl MessageExchange {
         self.validate_callsign(&station1)?;
         self.validate_callsign(&station2)?;
 
-        // Determine message type based on pattern
-        if captures.len() == 3 {
-            // Could be response to CQ with no grid
+        // Determine message type based on pattern. NOTE: `captures.len()`
+        // counts capture GROUPS (+1 for group 0), not *matched* groups — for
+        // the "call call (grid)?" pattern it is always 4 because the grid is an
+        // optional group, present or not. A bare two-callsign answer
+        // ("<us> <DX>") therefore lands in the `== 4` branch with group(3)
+        // absent. That is the DX's grid-less acknowledgment of our grid — the
+        // STUCK-AT-GRID answer shape — so it must classify as a grid-less
+        // CqResponse, NOT error out (it previously fell through to a
+        // MissingCapture error → NonStandard → no routing → the QSO stalled at
+        // grid forever).
+        if captures.len() == 3 || (captures.len() == 4 && captures.get(3).is_none()) {
+            // Response to CQ / bare-call acknowledgment with no grid.
             Ok(MessageType::CqResponse {
                 calling_station: station1,
                 responding_station: station2,
@@ -826,6 +852,30 @@ mod tests {
             matches!(result, MessageType::SeventyThree { .. }),
             "Expected SeventyThree for bare 73, got {result:?}"
         );
+    }
+
+    #[test]
+    fn test_parse_bare_two_call_is_cqresponse_no_grid() {
+        // STUCK-AT-GRID regression: a bare two-callsign answer "<us> <DX>"
+        // (the DX acknowledging our grid with no grid of their own) must parse
+        // as a grid-less CqResponse, not error out to NonStandard. Previously
+        // `captures.len()` was always 4 for the optional-grid pattern, so the
+        // absent grid hit a MissingCapture error → NonStandard → the message
+        // never routed and the QSO stalled at grid forever.
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let result = exchange.parse_message("K5ARH N8ME").unwrap();
+        match result {
+            MessageType::CqResponse {
+                calling_station,
+                responding_station,
+                grid,
+            } => {
+                assert_eq!(calling_station, "K5ARH");
+                assert_eq!(responding_station, "N8ME");
+                assert_eq!(grid, None);
+            }
+            other => panic!("Expected grid-less CqResponse for bare two-call, got {other:?}"),
+        }
     }
 
     #[test]

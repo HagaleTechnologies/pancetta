@@ -1493,6 +1493,63 @@ impl QsoManager {
                 })
             }
 
+            // STUCK-AT-GRID FIX: we answered a CQer with our grid (now in
+            // RespondingToCq) and the DX returns OUR call — either a bare
+            // "<us> <DX>" or a "<us> <DX> <grid>" (a CqResponse directed at
+            // us, carrying no report). On-air this means "I copied you, here
+            // I am" — the DX heard our grid. The protocol-correct next move is
+            // for us (the answering station) to send the DX a signal report,
+            // advancing the contact. Without this arm we re-sent our grid every
+            // slot until the manual watchdog timed out — the single
+            // highest-frequency stall in the on-air log (N8ME, F5NNN, N9FME,
+            // IQ0VT, KB5YNF, KA0NC, first-K9HJZ).
+            //
+            // A bare-call or grid answer to us parses as a CqResponse with
+            // calling_station = us, responding_station = DX. Verify both
+            // directions (from DX, to us) before advancing, exactly as on every
+            // other arm. We carry no report from the DX yet (their_report:
+            // None) and compute OUR report from the SNR.
+            (
+                QsoState::RespondingToCq {
+                    target_callsign,
+                    frequency,
+                    ..
+                },
+                MessageType::CqResponse {
+                    calling_station,
+                    responding_station,
+                    ..
+                },
+            ) => {
+                if responding_station != target_callsign
+                    || calling_station != &self.config.our_callsign
+                {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %target_callsign,
+                        got_from = %responding_station,
+                        got_to = %calling_station,
+                        "spurious CqResponse in RespondingToCq ignored — sender/target mismatch"
+                    );
+                    return Ok(current_state.clone());
+                }
+                let our_report = signal_strength
+                    .map(|snr| (snr.round() as i8).clamp(-30, 50))
+                    .unwrap_or(-15);
+                info!(
+                    target: "qso.advance",
+                    their_callsign = %target_callsign,
+                    "DX returned our call without a report — advancing grid -> signal report"
+                );
+                Ok(QsoState::SendingReport {
+                    their_callsign: target_callsign.clone(),
+                    their_report: None,
+                    our_report,
+                    frequency: *frequency,
+                    started_at: Utc::now(),
+                })
+            }
+
             // Response to CQ, waiting for report
             (
                 QsoState::RespondingToCq {
@@ -1882,6 +1939,25 @@ impl QsoManager {
                     ..
                 },
             ) => from_station == target_callsign && to_station == &self.config.our_callsign,
+
+            // STUCK-AT-GRID FIX (routing half): the DX answered our grid by
+            // returning our call (bare "<us> <DX>" or "<us> <DX> <grid>") — a
+            // CqResponse directed at us. Route it to this QSO so the transition
+            // arm can step grid -> report. Verify both directions: from THEM
+            // (responding_station), to US (calling_station).
+            (
+                QsoState::RespondingToCq {
+                    target_callsign, ..
+                },
+                MessageType::CqResponse {
+                    calling_station,
+                    responding_station,
+                    ..
+                },
+            ) => {
+                responding_station == target_callsign
+                    && calling_station == &self.config.our_callsign
+            }
 
             // We sent the report and are waiting for the report-ack. Same check.
             (
