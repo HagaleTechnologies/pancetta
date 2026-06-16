@@ -1220,9 +1220,30 @@ impl Sim {
                     // action's tx_parity (= dx_parity.opposite()); we pass the
                     // current slot parity as the DX parity, matching the
                     // operator-driven `call_station` convention.
+                    //
+                    // CRITICAL: track the QSO at the DX's *decoded* frequency
+                    // (where we will hear the DX's subsequent frames), NOT our
+                    // chosen TX offset. `frequency_offset` here is the operator's
+                    // smart-allocated TX freq, which is generally different from
+                    // the DX's freq; if we tracked the QSO at the TX offset, the
+                    // DX's report/RR73 (arriving at the DX freq) would fail the
+                    // relevance frequency gate and never advance the QSO. Mirror
+                    // the manual `call_station(dx, dx_freq)` convention by finding
+                    // the DX's CQ in this slot's injects and using its frequency.
+                    let dx_freq = injects
+                        .iter()
+                        .find(|r| {
+                            self.exchange
+                                .parse_message(&r.text)
+                                .ok()
+                                .and_then(|m| m.sender_callsign().map(|s| s.to_string()))
+                                .is_some_and(|s| s.eq_ignore_ascii_case(&dx))
+                        })
+                        .map(|r| r.freq_hz)
+                        .unwrap_or(frequency_offset);
                     let _ = self
                         .manager
-                        .respond_to_cq(dx, frequency_offset, Some(dx_parity))
+                        .respond_to_cq(dx, dx_freq, Some(dx_parity))
                         .await;
                 }
             }

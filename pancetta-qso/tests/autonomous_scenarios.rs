@@ -11,27 +11,30 @@
 //!
 //! Run: `cargo test -p pancetta-qso --test autonomous_scenarios`.
 //!
-//! # Phase-5 gating (the to-enable list)
+//! # Phase-5 autonomous auto-completion (ENABLED)
 //!
-//! The QSO engine auto-sequences replies only for **manual** QSOs. An
-//! autonomous-opened QSO is [`CallInitiation::Auto`]
-//! (`QsoManager::respond_to_cq` / `start_cq`), so it emits its **opening** call
-//! but does NOT auto-advance through report → R-report → RR73 → completion, and
-//! an unanswered Auto pounce is neither kept-alive nor retired by the engine.
+//! The QSO engine now auto-sequences replies for **both** manual and autonomous
+//! (`CallInitiation::Auto`) QSOs. An autonomous-opened QSO
+//! (`QsoManager::respond_to_cq` / `start_cq`) emits its **opening** call AND
+//! auto-advances through report → R-report → RR73 → completion, and an unanswered
+//! Auto pounce is RETIRED by the per-state timeout (it is intentionally NOT
+//! kept-alive — an Auto call is one-shot, never a keep-call storm). Two engine
+//! changes drive this (both gated to Auto QSOs by construction):
+//!   1. the forward auto-reply emitter in `process_message_for_qso` fires on any
+//!      forward state advance regardless of `CallInitiation` (regression handling
+//!      stays Manual-only);
+//!   2. `check_timeouts_at`'s per-state timeout covers `RespondingToCq` /
+//!      `SendingReport` (Manual QSOs in those states use the keep-call watchdog).
 //!
-//! Consequently the scenarios split cleanly:
+//! The scenarios split into two groups:
 //!
-//! - **Guard scenarios PASS now** — they validate the *decision* gates that
-//!   live entirely inside [`AutonomousOperator::decide_at`]: yield-to-busy-DX,
-//!   duplicate suppression, pile-up pick-one, and the auto-call "no keep-call
-//!   storm" property. None of these require a QSO to complete.
+//! - **Guard scenarios (G*)** validate the *decision* gates inside
+//!   [`AutonomousOperator::decide_at`]: yield-to-busy-DX, duplicate suppression,
+//!   pile-up pick-one, and the auto-call "no keep-call storm" property.
 //!
-//! - **Completion / sequencing scenarios are `#[ignore]`d with a precise
-//!   `// PHASE-5 (not yet enabled): …` note** — they assert the DESIRED
-//!   end-to-end autonomous behavior and will start passing once the Phase-5
-//!   follow-up routes autonomous QSOs through the auto-reply emitter (or marks
-//!   them keep-callable). Each ignored test is the spec for one piece of that
-//!   work.
+//! - **Phase-5 scenarios (P*)** validate end-to-end autonomous *completion*:
+//!   full exchange to completion, context-aware reply to a skipped rung, RR73/RRR
+//!   closes, and retirement of an unanswered pounce. All pass now.
 
 use pancetta_qso::sim::Sim;
 use pancetta_qso::{
@@ -232,20 +235,19 @@ async fn auto_g5_unanswered_auto_call_does_not_keep_calling() {
 }
 
 // =====================================================================
-// PHASE-5 SCENARIOS — `#[ignore]`d until autonomous auto-sequencing is
-// enabled. Each is the spec for one piece of the Phase-5 follow-up.
+// PHASE-5 SCENARIOS — autonomous auto-sequencing is ENABLED; these assert
+// end-to-end autonomous completion. Each is one piece of the Phase-5 behavior.
 // =====================================================================
 
 // ---------------------------------------------------------------------
 // P1. Auto-answer a CQ → progress → complete + log.
 // ---------------------------------------------------------------------
 #[tokio::test]
-#[ignore]
-// PHASE-5 (not yet enabled): an autonomous (Auto) QSO opened by a pounce must
-// auto-sequence its reply ladder — on the DX's report send our R-report, on
-// RR73 send our 73 and emit QsoCompleted — exactly as a MANUAL QSO does today.
-// Currently the engine's auto-reply emitter is gated to CallInitiation::Manual,
-// so the Auto QSO stalls after the opening grid and never completes.
+// PHASE-5 (ENABLED): an autonomous (Auto) QSO opened by a pounce auto-sequences
+// its reply ladder — on the DX's report we send our R-report, on RR73 we send our
+// 73 and emit QsoCompleted — exactly as a MANUAL QSO does. The forward auto-reply
+// emitter in `process_message_for_qso` now fires for Auto QSOs on every forward
+// state advance (regression handling stays Manual-only).
 async fn auto_p1_full_exchange_to_completion() {
     let mut sim = auto_sim().await;
 
@@ -273,13 +275,11 @@ async fn auto_p1_full_exchange_to_completion() {
 // P2. Context-aware: respond at the correct step to whatever the DX sent.
 // ---------------------------------------------------------------------
 #[tokio::test]
-#[ignore]
-// PHASE-5 (not yet enabled): when an autonomous QSO is open and the DX skips a
-// rung (e.g. answers our grid directly with a report, or sends R-report), the
-// engine must auto-advance to the correct reply for what the DX actually sent
-// (report → R-report; R-report → RR73), not re-send the previous rung. This is
-// the auto-sequencer behavior, which is Manual-gated today, so an Auto QSO does
-// not advance context-aware.
+// PHASE-5 (ENABLED): when an autonomous QSO is open and the DX skips a rung
+// (e.g. answers our grid directly with a report, or sends R-report), the engine
+// auto-advances to the correct reply for what the DX actually sent (report →
+// R-report; R-report → RR73), not the previous rung. The forward auto-sequencer
+// now runs for Auto QSOs, so an Auto QSO advances context-aware.
 async fn auto_p2_context_aware_reply_to_dx_step() {
     let mut sim = auto_sim().await;
 
@@ -302,11 +302,10 @@ async fn auto_p2_context_aware_reply_to_dx_step() {
 // P3. RR73 / RRR / bare-73 closes handled in the autonomous role.
 // ---------------------------------------------------------------------
 #[tokio::test]
-#[ignore]
-// PHASE-5 (not yet enabled): in the autonomous (Auto) role, receiving the DX's
-// RR73 (or RRR, or a bare 73 directed at us) on an open QSO must close it —
-// emit our 73 and complete + log. Today only Manual QSOs auto-close; an Auto
-// QSO that reaches the confirmation step does not auto-finish.
+// PHASE-5 (ENABLED): in the autonomous (Auto) role, receiving the DX's RR73 (or
+// RRR, or a bare 73 directed at us) on an open QSO closes it — we emit our 73 and
+// complete + log. The forward auto-reply emitter now runs for Auto QSOs, so an
+// Auto QSO that reaches the confirmation step auto-finishes.
 async fn auto_p3_rr73_closes_the_autonomous_qso() {
     let mut sim = auto_sim().await;
 
@@ -329,14 +328,11 @@ async fn auto_p3_rr73_closes_the_autonomous_qso() {
 // P-watchdog. An unanswered auto-call eventually retires.
 // ---------------------------------------------------------------------
 #[tokio::test]
-#[ignore]
-// PHASE-5 (not yet enabled): an autonomous pounce that the DX never answers
-// must eventually be RETIRED (→ Failed{Timeout}) so it doesn't linger as a
-// zombie active QSO that blocks max_concurrent_qsos forever. Today the manual
-// keep-call watchdog (check_timeouts_at) is gated to CallInitiation::Manual,
-// and the per-state timeout match does not cover RespondingToCq, so an Auto
-// RespondingToCq QSO never times out. Phase-5 must give Auto pounces a
-// retirement path (keep-call-under-watchdog, or a RespondingToCq timeout).
+// PHASE-5 (ENABLED): an autonomous pounce that the DX never answers is RETIRED
+// (→ Failed{Timeout}) so it doesn't linger as a zombie active QSO blocking
+// max_concurrent_qsos. `check_timeouts_at`'s per-state timeout match now covers
+// RespondingToCq | SendingReport (report_timeout) for Auto QSOs — Manual QSOs in
+// those states are still governed by the keep-call watchdog above.
 async fn auto_pwatchdog_unanswered_auto_call_retires() {
     use pancetta_qso::QsoFailureReason;
 

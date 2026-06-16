@@ -493,6 +493,22 @@ impl MessageExchange {
                 report: computed_report,
             })),
 
+            // Phase-5 skip-rung: the DX skipped the plain-report rung and sent an
+            // R-report (ReportAck) directly while we are still at grid
+            // (RespondingToCq). Close with RR73 — the state machine advances us to
+            // WaitingForConfirmation and the (WaitingForConfirmation, 73/RR73)
+            // path completes + logs. Mirrors the (WaitingForReport, ReportAck)
+            // close arm below for the CQer role.
+            (
+                QsoState::RespondingToCq {
+                    target_callsign, ..
+                },
+                MessageType::ReportAck { .. },
+            ) => Ok(Some(MessageType::FinalConfirmation {
+                to_station: target_callsign.clone(),
+                from_station: self.our_callsign.clone(),
+            })),
+
             // Received report acknowledgment, send final confirmation
             (QsoState::SendingReport { their_callsign, .. }, MessageType::ReportAck { .. }) => {
                 Ok(Some(MessageType::FinalConfirmation {

@@ -1262,9 +1262,17 @@ impl QsoManager {
                     && matches!(message.message_type, MessageType::SignalReport { .. })));
 
         let mut reply_to_emit: Option<MessageType> = None;
-        if (new_state != old_state || is_manual_regression)
-            && qso_initiated_by == CallInitiation::Manual
-        {
+        // Phase 5 (autonomous auto-completion): forward auto-sequencing now fires
+        // for BOTH Manual and Auto QSOs — an autonomous-opened pounce / CQ-answer
+        // must advance its reply ladder (grid → R-report → RR73 → 73) exactly as a
+        // manual QSO does, otherwise the autonomous operator opens a QSO and then
+        // goes silent after the opening call. Regression handling stays Manual-only:
+        // `is_manual_regression` is always false for an Auto QSO, so an Auto QSO
+        // emits a reply ONLY on a genuine FORWARD advance (`new_state != old_state`).
+        // This activates only while the autonomous operator is running (Auto QSOs
+        // are created solely by `respond_to_cq` / `start_cq`), so it is gated behind
+        // the autonomous toggle by construction.
+        if new_state != old_state || is_manual_regression {
             let exchange = crate::exchange::MessageExchange::new(self.config.our_callsign.clone());
             match exchange.generate_response(
                 &old_state,
@@ -1747,6 +1755,48 @@ impl QsoManager {
                     their_report: Some(*report),
                     our_report,
                     frequency: *frequency,
+                    started_at: Utc::now(),
+                })
+            }
+
+            // Phase-5 skip-rung: the DX skipped the plain-report rung and sent an
+            // R-report (ReportAck) directly while we are still at grid
+            // (RespondingToCq). Treat it like the (WaitingForReport, ReportAck)
+            // close for the CQer role: advance to WaitingForConfirmation; the
+            // reply emitter sends our RR73, and the (WaitingForConfirmation,
+            // RR73/73) arm completes + logs on the DX's roger. Sender-verified
+            // exactly as the SignalReport arm above.
+            (
+                QsoState::RespondingToCq {
+                    target_callsign,
+                    frequency,
+                    ..
+                },
+                MessageType::ReportAck {
+                    from_station,
+                    to_station,
+                    report,
+                },
+            ) => {
+                if !Self::is_partner(from_station, target_callsign) || !self.is_us(to_station) {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %target_callsign,
+                        got_from = %from_station,
+                        got_to = %to_station,
+                        "spurious ReportAck in RespondingToCq ignored — sender does not match QSO target"
+                    );
+                    return Ok(current_state.clone());
+                }
+                let our_report = signal_strength
+                    .map(|snr| (snr.round() as i8).clamp(-30, 50))
+                    .unwrap_or(*report);
+                Ok(QsoState::WaitingForConfirmation {
+                    their_callsign: target_callsign.clone(),
+                    their_report: *report,
+                    our_report,
+                    frequency: *frequency,
+                    grid_square: None,
                     started_at: Utc::now(),
                 })
             }
@@ -2858,10 +2908,28 @@ impl QsoManager {
                     QsoState::WaitingForConfirmation { .. } => {
                         self.config.timeouts.confirmation_timeout
                     }
+                    // Phase 5: an AUTO pounce / CQ-answer that the DX never replies
+                    // to must retire so it does not pin `max_concurrent_qsos`
+                    // forever. Manual QSOs in these states are governed by the
+                    // keep-call watchdog above (which already `continue`d), so these
+                    // arms apply only to Auto QSOs. `report_timeout` is the natural
+                    // bound — it is how long we wait for the DX's next frame before
+                    // giving up on a one-shot autonomous call.
+                    QsoState::RespondingToCq { .. } | QsoState::SendingReport { .. } => {
+                        self.config.timeouts.report_timeout
+                    }
                     _ => continue,
                 };
 
-                if duration.num_seconds() as u64 > timeout_seconds {
+                // Compare as signed seconds: a NEGATIVE elapsed (the state's
+                // `started_at` is later than `now`) must never count as a
+                // timeout. In production `started_at` and `now` are both the real
+                // clock so elapsed is always ≥ 0, but the sim harness anchors its
+                // virtual `now` to a slot boundary that can sit slightly behind
+                // the real-clock `started_at` the engine stamps — casting a
+                // negative `num_seconds()` to `u64` would wrap to a huge value
+                // and spuriously retire a just-opened QSO.
+                if duration.num_seconds() > timeout_seconds as i64 {
                     timeouts.push((qso_id, QsoFailureReason::Timeout));
                 }
             }
@@ -4943,10 +5011,14 @@ mod reply_emitter_tests {
         );
     }
 
-    /// 4. AUTONOMOUS QSO in RespondingToCq + SignalReport → state advances
-    ///    but NO reply is emitted (manual-only gate).
+    /// 4. AUTONOMOUS QSO in RespondingToCq + SignalReport → state advances AND
+    ///    the forward reply (our R-report / ReportAck) is auto-emitted. This is
+    ///    the Phase-5 autonomous auto-completion behavior: forward auto-sequencing
+    ///    now fires for Auto QSOs exactly as for Manual (regression handling stays
+    ///    Manual-only). (Previously the emitter was Manual-gated and an Auto QSO
+    ///    advanced silently — that gate was removed when Phase 5 landed.)
     #[tokio::test]
-    async fn auto_qso_advances_but_emits_no_reply() {
+    async fn auto_qso_advances_and_auto_replies() {
         let manager = manager();
         let mut rx = manager.subscribe();
         let qso_id = manager
@@ -4971,16 +5043,19 @@ mod reply_emitter_tests {
 
         let events = drain(&mut rx);
         let sends = messages_to_send(&events);
+        // The forward reply IS emitted now (our R-report = ReportAck).
         assert!(
-            sends.is_empty(),
-            "autonomous QSO must NOT auto-reply, got {:?}",
+            sends
+                .iter()
+                .any(|m| matches!(m, MessageType::ReportAck { .. })),
+            "autonomous QSO must auto-reply with our R-report (ReportAck), got {:?}",
             sends
         );
-        // State still advanced (machine unchanged).
+        // And the state advanced.
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert!(
             matches!(progress.state, QsoState::SendingReport { .. }),
-            "auto QSO state must still advance, got {:?}",
+            "auto QSO state must advance to SendingReport, got {:?}",
             progress.state
         );
     }
