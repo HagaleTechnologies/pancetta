@@ -524,6 +524,11 @@ impl super::ApplicationCoordinator {
         // Shared config — the SelectDevice handler persists the operator's
         // chosen output device into it (and into ~/.pancetta/pancetta.toml).
         let cmd_config = self.config.clone();
+        // Live device-switch channel into the audio thread. `None` in
+        // stub/`--no-audio` modes — the SelectDevice handler then persists the
+        // choice (applies on next restart) and tells the operator it can't apply
+        // live in this mode.
+        let cmd_audio_reopen_tx = self.audio_reopen_tx.clone();
         // F4 toggle state: Some(t) when a tune is in flight and expected
         // to auto-stop at instant t. None when no tune is queued. The
         // coordinator owns this — TUI just emits ToggleTune events.
@@ -1170,12 +1175,9 @@ impl super::ApplicationCoordinator {
                             );
                             // Persist the operator's choice to the in-memory
                             // config and to ~/.pancetta/pancetta.toml so it
-                            // survives a restart. We do NOT reopen the live
-                            // cpal output stream here — that lives in
-                            // pancetta-audio's stream layer.
-                            // TODO(coordinator): live output-stream switch on
-                            // SelectDevice (reopen the cpal output stream
-                            // without a restart).
+                            // survives a restart, AND apply it live by asking the
+                            // audio thread to reopen the cpal stream(s) on the new
+                            // device(s) — no restart required.
                             {
                                 let mut cfg = cmd_config.write().await;
                                 if let Some(ref out) = output_device {
@@ -1197,30 +1199,98 @@ impl super::ApplicationCoordinator {
                                     output_device.as_deref(),
                                 )
                             };
-                            match persist_result {
-                                Ok(()) => {
-                                    info!(
-                                        "Persisted audio device selection to {}",
-                                        config_path.display()
-                                    );
-                                    if let Err(e) = cmd_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                            component: "audio".to_string(),
-                                            status: format!(
-                                                "Output device set to {} — restart to apply",
-                                                output_device.as_deref().unwrap_or("(unchanged)")
-                                            ),
-                                        },
-                                    ) {
-                                        debug!("Failed to send device-set status: {}", e);
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!("Failed to persist audio device selection: {}", e);
+                            if let Err(e) = persist_result {
+                                warn!("Failed to persist audio device selection: {}", e);
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "audio".to_string(),
+                                        status: format!("Failed to save device choice: {}", e),
+                                    },
+                                );
+                            } else {
+                                info!(
+                                    "Persisted audio device selection to {}",
+                                    config_path.display()
+                                );
+                            }
+
+                            // Apply LIVE: ask the audio thread to reopen the
+                            // cpal stream(s) on the new device(s) without a
+                            // restart, and relay the outcome to the operator.
+                            // Prefer the output name in the status text (the
+                            // common picker action); fall back to input.
+                            let picked = output_device
+                                .clone()
+                                .or_else(|| input_device.clone())
+                                .unwrap_or_else(|| "(unchanged)".to_string());
+                            match cmd_audio_reopen_tx {
+                                Some(ref reopen_tx) => {
+                                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                                    let req = crate::coordinator::audio::AudioReopenRequest {
+                                        input: input_device.clone(),
+                                        output: output_device.clone(),
+                                        respond: resp_tx,
+                                    };
+                                    let status = if reopen_tx.send(req).is_err() {
+                                        warn!(
+                                            "Audio reopen channel closed; device not switched live"
+                                        );
+                                        format!(
+                                            "Device {} saved — live switch unavailable (audio thread gone); restart to apply",
+                                            picked
+                                        )
+                                    } else {
+                                        // Bound the wait so a wedged audio thread
+                                        // can't hang the TUI command loop.
+                                        match tokio::time::timeout(Duration::from_secs(5), resp_rx)
+                                            .await
+                                        {
+                                            Ok(Ok(Ok(()))) => {
+                                                info!(
+                                                    "Live audio device switch succeeded: {}",
+                                                    picked
+                                                );
+                                                format!("Device → {} (live)", picked)
+                                            }
+                                            Ok(Ok(Err(err))) => {
+                                                warn!("Live audio device switch failed: {}", err);
+                                                format!(
+                                                    "Failed to switch to {} ({}) — kept previous device",
+                                                    picked, err
+                                                )
+                                            }
+                                            Ok(Err(_)) => {
+                                                warn!("Audio thread dropped reopen response");
+                                                format!(
+                                                    "Device {} saved — no response from audio thread; restart to apply",
+                                                    picked
+                                                )
+                                            }
+                                            Err(_) => {
+                                                warn!("Live audio device switch timed out");
+                                                format!(
+                                                    "Device {} saved — live switch timed out; restart to apply",
+                                                    picked
+                                                )
+                                            }
+                                        }
+                                    };
                                     let _ = cmd_tui_msg_tx.send(
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "audio".to_string(),
-                                            status: format!("Failed to save device choice: {}", e),
+                                            status,
+                                        },
+                                    );
+                                }
+                                None => {
+                                    // Stub / --no-audio: no live stream to reopen.
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "audio".to_string(),
+                                            status: format!(
+                                                "Device {} saved — restart to apply (no live audio in this mode)",
+                                                picked
+                                            ),
                                         },
                                     );
                                 }

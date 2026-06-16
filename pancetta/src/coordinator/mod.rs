@@ -282,6 +282,17 @@ pub struct ApplicationCoordinator {
     /// the TUI relay to drive a persistent station-panel badge.
     audio_output_default: Arc<AtomicBool>,
 
+    /// Command channel into the dedicated audio thread for **live device
+    /// switching**. The TUI `SelectDevice` handler sends an
+    /// [`AudioReopenRequest`](crate::coordinator::audio::AudioReopenRequest)
+    /// here; the audio thread tears down and rebuilds the cpal stream(s) on the
+    /// new device(s) without a restart and reports success/failure back over the
+    /// request's oneshot. `None` until the real (non-stub) audio thread has been
+    /// started; absent in stub/`--no-audio` modes (where live switching is a
+    /// no-op the handler reports to the operator).
+    audio_reopen_tx:
+        Option<crossbeam_channel::Sender<crate::coordinator::audio::AudioReopenRequest>>,
+
     /// Rig connection state for the TUI badge. Encodes
     /// [`crate::coordinator::hamlib::RigConnState`] via `as_u8`/`from_u8`.
     /// Written by the hamlib connect/poll loop, read by the TUI relay.
@@ -538,6 +549,7 @@ impl ApplicationCoordinator {
             last_audio_timestamp: Arc::new(RwLock::new(None)),
             last_decode_timestamp: Arc::new(RwLock::new(None)),
             audio_output_default: Arc::new(AtomicBool::new(false)),
+            audio_reopen_tx: None,
             rig_conn_state: Arc::new(std::sync::atomic::AtomicU8::new(
                 crate::coordinator::hamlib::RigConnState::default().as_u8(),
             )),

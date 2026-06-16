@@ -387,6 +387,134 @@ impl AudioManager {
             .collect()
     }
 
+    /// Reopen the audio stream(s) bound to new device name(s), live, without
+    /// recreating the [`AudioManager`].
+    ///
+    /// This is the engine behind the TUI device picker's "apply live" behavior.
+    /// The cpal streams cannot be moved across threads, so this method must be
+    /// called *on the thread that owns the `AudioManager`* (the dedicated audio
+    /// thread in the coordinator) — typically in response to a command sent over
+    /// a channel.
+    ///
+    /// `input` / `output` are device-name patterns; `None` leaves that side
+    /// unchanged. The same downstream ring buffers/channels are preserved across
+    /// the reopen: [`process_audio`](Self::process_audio) keeps draining the RX
+    /// consumer and [`queue_output`](Self::queue_output) keeps feeding the TX
+    /// producer, both of which are re-taken from the freshly-built streams here.
+    ///
+    /// # Failure / fallback
+    ///
+    /// If the new device(s) fail to open, the previous device configuration is
+    /// restored and the stream is restarted on it. The station is never left
+    /// with a dead audio path: on success the new device is live; on failure the
+    /// old device is live again (and an error is returned so the caller can tell
+    /// the operator). The only way this leaves audio down is if *both* the new
+    /// and the prior device fail to open — in which case the original open error
+    /// is returned and the audio path is genuinely gone (device unplugged).
+    pub fn reopen_devices(
+        &mut self,
+        input: Option<&str>,
+        output: Option<&str>,
+    ) -> Result<(), AudioError> {
+        // Snapshot the current config so we can roll back on failure.
+        let prev_input = self.config.input_device.clone();
+        let prev_output = self.config.output_device.clone();
+
+        // Resolve the actual targets; short-circuit if nothing would change so
+        // we don't needlessly tear down a healthy stream (e.g. operator re-picks
+        // the already-active device).
+        let (next_input, next_output) = match resolve_reopen_targets(
+            prev_input.as_deref(),
+            prev_output.as_deref(),
+            input,
+            output,
+        ) {
+            Some(targets) => targets,
+            None => {
+                info!("Audio reopen requested but selection is unchanged — no-op");
+                return Ok(());
+            }
+        };
+
+        // Apply the requested changes to our config.
+        self.config.input_device = next_input;
+        self.config.output_device = next_output;
+
+        match self.apply_devices_to_stream() {
+            Ok(()) => {
+                info!(
+                    "Audio devices reopened live: input={:?} output={:?}",
+                    self.config.input_device, self.config.output_device
+                );
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    "Reopen with input={:?} output={:?} failed: {} — rolling back to input={:?} output={:?}",
+                    input, output, e, prev_input, prev_output
+                );
+                // Roll back the config and attempt to restore the previous
+                // streams so the station keeps running on the old device.
+                self.config.input_device = prev_input;
+                self.config.output_device = prev_output;
+                if let Err(restore_err) = self.apply_devices_to_stream() {
+                    error!(
+                        "Failed to restore previous audio device after a failed reopen: {} \
+                         (audio path is now DOWN)",
+                        restore_err
+                    );
+                    // Return the original failure — that's what the operator
+                    // asked for and what went wrong first.
+                    return Err(e);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Rebuild the underlying stream(s) from the current [`AudioManagerConfig`].
+    ///
+    /// Stops the active stream (dropping the old cpal streams) and starts a
+    /// fresh [`AudioStreamManager`] bound to the device names in `self.config`,
+    /// then re-takes the RX consumer / shared state / TX output producer so the
+    /// thread loop keeps using the new streams. Errors propagate to the caller
+    /// (see [`reopen_devices`](Self::reopen_devices) for the fallback policy).
+    fn apply_devices_to_stream(&mut self) -> Result<(), AudioError> {
+        // Tear down the existing stream (if any). Stopping the old
+        // AudioStreamManager releases its cpal streams; dropping it below frees
+        // the underlying device handles before we open the new ones.
+        if let Some(mut old) = self.stream.take() {
+            let _ = old.stop();
+            drop(old);
+        }
+
+        // Build a fresh stream manager with the updated device names. A
+        // brand-new manager gives a clean ring-buffer/stream lifecycle,
+        // mirroring `with_config`.
+        let stream_config = StreamConfig {
+            sample_rate: self.config.sample_rate,
+            buffer_size: self.config.buffer_size as u32,
+            input_channels: self.config.channels,
+            output_channels: 2,
+            input_device_name: self.config.input_device.clone(),
+            output_device_name: self.config.output_device.clone(),
+            enable_monitoring: self.config.enable_monitoring,
+        };
+
+        let mut stream = AudioStreamManager::new(stream_config)?;
+        stream.start()?;
+
+        // Re-take the consumer / shared / output producer from the new stream
+        // so the thread loop's process_audio() and queue_output() keep working
+        // against the freshly-opened device.
+        self.consumer = stream.take_consumer();
+        self.shared = stream.get_shared();
+        self.output_producer = stream.take_output_producer();
+        self.stream = Some(stream);
+
+        Ok(())
+    }
+
     /// Select input device by name
     pub fn select_input_device(&mut self, name: &str) -> Result<(), AudioError> {
         let found = self
@@ -430,6 +558,38 @@ impl Drop for AudioManager {
             error!("Error stopping audio manager: {:?}", e);
         }
     }
+}
+
+/// Compute the input/output device names a live reopen should target, given
+/// the manager's current selection and the operator's request.
+///
+/// `None` on either side of the request means "leave that side unchanged" and
+/// the current value is carried forward. Returns `None` overall when nothing
+/// would change (both requests `None`, or both requests equal the current
+/// selection) — the caller can short-circuit without tearing down the stream.
+///
+/// Pure decision logic (no cpal I/O), separated so it is unit-testable without
+/// real audio hardware.
+fn resolve_reopen_targets(
+    current_input: Option<&str>,
+    current_output: Option<&str>,
+    req_input: Option<&str>,
+    req_output: Option<&str>,
+) -> Option<(Option<String>, Option<String>)> {
+    if req_input.is_none() && req_output.is_none() {
+        return None;
+    }
+
+    let next_input = req_input.or(current_input).map(str::to_string);
+    let next_output = req_output.or(current_output).map(str::to_string);
+
+    let input_changed = req_input.is_some() && req_input != current_input;
+    let output_changed = req_output.is_some() && req_output != current_output;
+    if !input_changed && !output_changed {
+        return None;
+    }
+
+    Some((next_input, next_output))
 }
 
 /// Calculate RMS (Root Mean Square) of audio samples
@@ -523,6 +683,71 @@ mod tests {
             let result = manager.queue_output(&samples, 12000);
             // Should succeed — producer is available even without a running stream
             assert!(result.is_ok() || result.is_err());
+        }
+    }
+
+    #[test]
+    fn test_resolve_reopen_targets_no_request_is_noop() {
+        assert_eq!(
+            resolve_reopen_targets(Some("Mic"), Some("Spk"), None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_reopen_targets_same_device_is_noop() {
+        // Re-picking the currently-active output should not trigger a reopen.
+        assert_eq!(
+            resolve_reopen_targets(Some("Mic"), Some("Spk"), None, Some("Spk")),
+            None
+        );
+        // And the same for input.
+        assert_eq!(
+            resolve_reopen_targets(Some("Mic"), Some("Spk"), Some("Mic"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn test_resolve_reopen_targets_output_change_carries_input() {
+        // Changing only output keeps the existing input, returns both targets.
+        assert_eq!(
+            resolve_reopen_targets(Some("Mic"), Some("Spk"), None, Some("USB CODEC")),
+            Some((Some("Mic".to_string()), Some("USB CODEC".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_resolve_reopen_targets_input_change_carries_output() {
+        assert_eq!(
+            resolve_reopen_targets(Some("Mic"), Some("Spk"), Some("USB CODEC"), None),
+            Some((Some("USB CODEC".to_string()), Some("Spk".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_resolve_reopen_targets_both_change() {
+        assert_eq!(
+            resolve_reopen_targets(Some("Mic"), Some("Spk"), Some("In2"), Some("Out2")),
+            Some((Some("In2".to_string()), Some("Out2".to_string())))
+        );
+    }
+
+    #[test]
+    fn test_resolve_reopen_targets_from_unset_current() {
+        // No current selection (None) + a request opens the requested device.
+        assert_eq!(
+            resolve_reopen_targets(None, None, Some("In"), None),
+            Some((Some("In".to_string()), None))
+        );
+    }
+
+    #[test]
+    fn test_reopen_devices_noop_returns_ok() {
+        // A reopen with no requested change must succeed without touching the
+        // stream — verifies the short-circuit plumbing end to end.
+        if let Ok(mut manager) = AudioManager::new() {
+            assert!(manager.reopen_devices(None, None).is_ok());
         }
     }
 

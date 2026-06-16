@@ -20,6 +20,26 @@ use tracing::{error, info, span, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
+/// A request to switch the live audio device(s) without restarting pancetta.
+///
+/// Sent by the TUI `SelectDevice` handler (`tui_relay.rs`) over the
+/// coordinator's `audio_reopen_tx` channel and consumed by the dedicated audio
+/// thread, which owns the (non-`Send`) cpal streams. The thread calls
+/// [`AudioManager::reopen_devices`](pancetta_audio::AudioManager::reopen_devices),
+/// then reports the outcome back over `respond` so the handler can surface a
+/// success/failure `StatusUpdate` to the operator. On failure the audio thread
+/// has already rolled back to the previous device (see `reopen_devices`), so the
+/// `Err` here means "stayed on the old device", not "audio is dead".
+pub struct AudioReopenRequest {
+    /// New input device name pattern, or `None` to leave input unchanged.
+    pub input: Option<String>,
+    /// New output device name pattern, or `None` to leave output unchanged.
+    pub output: Option<String>,
+    /// One-shot reply channel: `Ok(())` on a successful live switch, or
+    /// `Err(message)` describing why it failed (with the old device kept live).
+    pub respond: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
 impl super::ApplicationCoordinator {
     pub(crate) async fn start_audio_pipeline(
         &mut self,
@@ -117,6 +137,12 @@ impl super::ApplicationCoordinator {
             let shutdown = self.shutdown_signal.clone();
             let last_timestamp = self.last_audio_timestamp.clone();
 
+            // Live device-switch command channel into the audio thread. The TUI
+            // `SelectDevice` handler sends an `AudioReopenRequest` here; the
+            // thread reopens the cpal stream(s) on the new device(s) in place.
+            let (reopen_tx, reopen_rx) = crossbeam_channel::unbounded::<AudioReopenRequest>();
+            self.audio_reopen_tx = Some(reopen_tx);
+
             // Audio thread sends samples via a tokio mpsc to an async relay
             let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(100);
 
@@ -205,6 +231,42 @@ impl super::ApplicationCoordinator {
                 loop {
                     if shutdown.load(Ordering::Acquire) {
                         break;
+                    }
+
+                    // Live device switch: drain any reopen requests from the TUI
+                    // picker. Performed here (on the thread that owns the cpal
+                    // streams) so the non-Send streams never cross threads.
+                    while let Ok(req) = reopen_rx.try_recv() {
+                        let AudioReopenRequest {
+                            input,
+                            output,
+                            respond,
+                        } = req;
+                        let result = match audio_manager
+                            .reopen_devices(input.as_deref(), output.as_deref())
+                        {
+                            Ok(()) => {
+                                info!(
+                                    "Live audio device switch applied: in={:?} out={:?}",
+                                    input, output
+                                );
+                                // Re-evaluate the TX-output-misconfig flag for
+                                // the new output device so the TUI badge tracks
+                                // the live selection.
+                                audio_output_default.store(
+                                    audio_manager.output_is_system_default(),
+                                    Ordering::Relaxed,
+                                );
+                                Ok(())
+                            }
+                            Err(e) => {
+                                let s = e.to_string();
+                                error!("Live audio device switch failed: {}", s);
+                                Err(s)
+                            }
+                        };
+                        // The receiver may have dropped (e.g. TUI gone); ignore.
+                        let _ = respond.send(result);
                     }
 
                     // Check for TX audio to play out
