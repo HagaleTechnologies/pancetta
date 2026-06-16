@@ -122,6 +122,9 @@ impl super::ApplicationCoordinator {
             // first push by seeding sentinels that differ from any real value).
             let mut last_rig_state: Option<u8> = None;
             let mut last_audio_default: Option<bool> = None;
+            // C20 — RF-present / zero-decodes detector (mode/clock fault),
+            // fed from the cumulative DSP-window + decode telemetry below.
+            let mut rf_no_decode = super::health::RfNoDecodeMonitor::new();
             while !relay_shutdown.load(Ordering::Acquire) {
                 if !ft8_disconnected {
                     match ft8_to_tui_rx.try_recv() {
@@ -451,6 +454,38 @@ impl super::ApplicationCoordinator {
                             },
                         );
                     }
+
+                    // C20 — RF present but zero decodes over several slots →
+                    // likely wrong mode (FT8/FT4) or a bad system clock. Feed
+                    // the cumulative DSP-window + decode counters and the latest
+                    // RMS; emit an operator status only on a warn on/off edge.
+                    let rf_dsp_windows = health_dsp_windows_relay.load(Ordering::Relaxed);
+                    let rf_total_decodes =
+                        health_total_decodes_relay.load(Ordering::Relaxed);
+                    let rf_last_rms =
+                        f32::from_bits(health_last_rms_relay.load(Ordering::Relaxed));
+                    match rf_no_decode.observe(rf_dsp_windows, rf_total_decodes, rf_last_rms)
+                    {
+                        Some(true) => {
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                    component: "dsp".to_string(),
+                                    status: "⚠ RF present but no decodes — check mode/clock?"
+                                        .to_string(),
+                                },
+                            );
+                        }
+                        Some(false) => {
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                    component: "dsp".to_string(),
+                                    status: "Decodes resumed — RF/no-decode warning cleared"
+                                        .to_string(),
+                                },
+                            );
+                        }
+                        None => {}
+                    }
                 }
             }
             info!("TUI relay thread stopped");
@@ -717,9 +752,35 @@ impl super::ApplicationCoordinator {
                         }
                         pancetta_tui::tui_runner::TuiCommand::SetFrequency { vfo, frequency } => {
                             info!("TUI SetFrequency: VFO {} -> {} Hz", vfo, frequency);
+                            // C9 — band change mid-QSO: tear down active QSOs so no
+                            // stale keep-call keeps TXing on the new band. Capture the
+                            // *old* dial frequency BEFORE we overwrite the atomic, then
+                            // decide whether this dial move is a genuine band change.
+                            let old_freq_hz = cmd_operating_freq_hz.load(Ordering::Relaxed);
                             let freq_mhz = frequency as f64 / 1_000_000.0;
                             cmd_operating_freq.store(freq_mhz.to_bits(), Ordering::Relaxed);
                             cmd_operating_freq_hz.store(frequency, Ordering::Relaxed);
+                            if super::is_band_change(old_freq_hz, frequency) {
+                                info!(
+                                    target: "operator.override",
+                                    "Band change {} Hz -> {} Hz — tearing down active QSOs",
+                                    old_freq_hz, frequency
+                                );
+                                let teardown = ComponentMessage::new(
+                                    ComponentId::Tui,
+                                    ComponentId::Qso,
+                                    MessageType::QsoMessage(
+                                        crate::message_bus::QsoMessage::BandChanged {
+                                            previous_hz: old_freq_hz,
+                                            new_hz: frequency,
+                                        },
+                                    ),
+                                    Instant::now(),
+                                );
+                                if let Err(e) = cmd_message_bus.send_message(teardown).await {
+                                    warn!("Band change: failed to send teardown: {}", e);
+                                }
+                            }
                             // Forward to hamlib if available
                             let msg = ComponentMessage::new(
                                 ComponentId::Tui,

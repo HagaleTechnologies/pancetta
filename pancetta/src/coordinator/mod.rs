@@ -39,6 +39,11 @@ pub use tx::{
     CoalesceOutcome, TxSchedule,
 };
 
+// Re-export the C19 config-reload classifier (safe-live vs deferred) and the
+// C20 RF-present/no-decode detector so the coordinator-robustness integration
+// tests can exercise the real production decision logic.
+pub use health::{classify_config_reload, ConfigReloadApplicability, RfNoDecodeMonitor};
+
 /// Canonical key for the `active_tx_qsos` set: QSO ids are compared
 /// case-insensitively (and trimmed) so the producer (QSO component) and
 /// consumer (TX worker) never disagree on casing. Centralized here so the
@@ -63,6 +68,50 @@ pub fn tx_qso_is_live(qso_id: Option<&str>, active: &HashSet<String>) -> bool {
     match qso_id {
         None => true,
         Some(id) => active.contains(&active_tx_qso_key(id)),
+    }
+}
+
+/// Threshold (Hz) for treating a same-band (or out-of-band) dial move as a
+/// "band change" for the C9 active-QSO teardown. Sized to ride over normal
+/// fine-tuning / passband nudges within an FT8 sub-band (a few kHz) while
+/// still catching a deliberate jump that lands the rig somewhere a QSO can no
+/// longer complete. 100 kHz.
+pub const BAND_CHANGE_HZ_THRESHOLD: u64 = 100_000;
+
+/// Decide whether a dial-frequency change (`old_hz` → `new_hz`) is a genuine
+/// **band change** that should tear down active QSOs (C9), versus a tiny tune
+/// wobble that should not.
+///
+/// Returns `true` when:
+///   - the two frequencies map to **different ham bands**
+///     ([`pancetta_core::Band::from_frequency`]), or
+///   - one/both are outside any ham band but the dial moved more than
+///     [`BAND_CHANGE_HZ_THRESHOLD`].
+///
+/// Returns `false` when:
+///   - `old_hz == 0` (uninitialized / first frequency set at startup — there
+///     is nothing to tear down, and we must not fire on the initial dial read),
+///   - the frequencies are in the **same** ham band (intra-band fine-tuning),
+///     or
+///   - both are out-of-band and within the threshold (small wobble).
+pub fn is_band_change(old_hz: u64, new_hz: u64) -> bool {
+    // Nothing to compare against at startup / before the first real read.
+    if old_hz == 0 {
+        return false;
+    }
+    if old_hz == new_hz {
+        return false;
+    }
+    match (
+        pancetta_core::Band::from_frequency(old_hz),
+        pancetta_core::Band::from_frequency(new_hz),
+    ) {
+        // Both map to a known band: a change iff the band differs.
+        (Some(a), Some(b)) => a != b,
+        // One/both out-of-band: fall back to a magnitude threshold so a big
+        // jump still triggers teardown but a small nudge near a band edge does
+        // not.
+        _ => old_hz.abs_diff(new_hz) >= BAND_CHANGE_HZ_THRESHOLD,
     }
 }
 

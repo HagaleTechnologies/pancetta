@@ -416,6 +416,19 @@ pub enum QsoMessage {
     /// single Shift+Q clears every keep-calling source (including duplicate
     /// QSO objects), not just the one selected by `AbortQso`.
     CancelAllQsos,
+    /// The operator changed bands (rig dial frequency) mid-session (C9). The
+    /// QSO component tears down every active QSO — an active QSO cannot
+    /// complete on a different band, and its keep-call must NOT keep
+    /// transmitting on the new band. Carries the old/new dial frequency (Hz)
+    /// for an operator-facing status line ("Band change — N active QSO(s)
+    /// ended"). Distinct from [`QsoMessage::CancelAllQsos`] only so the status
+    /// text and log target can name the cause.
+    BandChanged {
+        /// Previous dial frequency in Hz.
+        previous_hz: u64,
+        /// New dial frequency in Hz.
+        new_hz: u64,
+    },
 }
 
 /// DX cluster messages

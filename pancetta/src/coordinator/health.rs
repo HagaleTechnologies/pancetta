@@ -11,6 +11,198 @@ use super::{
 };
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
+/// C19 — classification of a config hot-reload while QSO state may be latched.
+///
+/// A config reload must **never** clobber an in-progress QSO's latched partner
+/// callsign / `tx_parity`, and must never rebuild the QSO manager (or the
+/// autonomous operator) in a way that drops active QSOs. Some config sections
+/// are safe to apply on the fly (UI theme, most network toggles); others are
+/// snapshotted into the QSO/autonomous machinery at startup and, if re-applied
+/// mid-QSO, would invalidate the latched identity/parity.
+///
+/// This enum is the single decision point a hot-reload apply-handler must
+/// consult before touching anything. Today the wired hot-reload task is a
+/// no-op (config is loaded once at startup), so this is also a regression
+/// guard: it documents and pins down which fields are unsafe to apply live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigReloadApplicability {
+    /// Nothing changed that matters; ignore.
+    NoChange,
+    /// Only live-safe sections changed (UI, network) — safe to apply now.
+    SafeLive,
+    /// A QSO-latched field changed (`station.callsign`, `station.grid_square`,
+    /// or `autonomous.slot_parity`) and a QSO is currently active. The change
+    /// MUST be deferred (not applied to the running QSO/autonomous state)
+    /// until no QSO is active, so we never clobber the latched partner/parity
+    /// or drop the in-progress exchange.
+    DeferQsoLatched,
+    /// A QSO-latched field changed but no QSO is active — safe to apply (it
+    /// will be picked up the normal way, and there is nothing to clobber).
+    SafeQuiescent,
+}
+
+/// Decide how a hot-reloaded config (`new` vs `old`) may be applied, given
+/// whether any QSO is currently active (`qso_active`).
+///
+/// Live-safe sections (applied immediately, never deferred): `ui`, `network`,
+/// `audio` (device switches are already "restart to apply"), `rig`,
+/// `metadata`.
+///
+/// QSO-latched fields (deferred while a QSO is active): `station.callsign`,
+/// `station.grid_square`, `autonomous.slot_parity`. These are snapshotted into
+/// the task-local `QsoManager` / `AutonomousOperator` at startup; re-applying
+/// them mid-QSO would break sender verification (`from_station == expected DX`)
+/// and the QSO's latched `tx_parity`.
+pub fn classify_config_reload(
+    old: &pancetta_config::Config,
+    new: &pancetta_config::Config,
+    qso_active: bool,
+) -> ConfigReloadApplicability {
+    let latched_changed = old.station.callsign != new.station.callsign
+        || old.station.grid_square != new.station.grid_square
+        || old.autonomous.slot_parity != new.autonomous.slot_parity;
+
+    if latched_changed {
+        // The only fields that can clobber a latched QSO. Defer while a QSO is
+        // active; otherwise safe to pick up.
+        return if qso_active {
+            ConfigReloadApplicability::DeferQsoLatched
+        } else {
+            ConfigReloadApplicability::SafeQuiescent
+        };
+    }
+
+    // No QSO-latched field changed. Detect whether *anything* changed at all so
+    // a no-op reload (file touched, content identical) doesn't churn. We avoid
+    // requiring `PartialEq` on every config section by comparing serialized
+    // forms; a reload that changed only live-safe sections (UI / network /
+    // audio / rig) is safe to apply now and can never touch latched QSO state.
+    let unchanged = match (toml::to_string(old), toml::to_string(new)) {
+        (Ok(a), Ok(b)) => a == b,
+        // If we can't serialize for comparison, assume something changed and
+        // treat it as live-safe (latched fields already ruled out above).
+        _ => false,
+    };
+    if unchanged {
+        ConfigReloadApplicability::NoChange
+    } else {
+        ConfigReloadApplicability::SafeLive
+    }
+}
+
+/// C20 — RF-present-but-zero-decodes detector (mode / clock fault).
+///
+/// Per JTDX guidance: strong RF energy with zero decodes over several slots
+/// usually means the wrong mode (FT8 vs FT4) or a bad system clock (DT way
+/// off). This monitor watches the per-window DSP RMS and the running decode
+/// count and raises an operator warning when there is clear signal energy but
+/// no decodes for [`RfNoDecodeMonitor::WARN_AFTER_SLOTS`] consecutive slots.
+///
+/// Inputs are the **cumulative** health atomics the pipeline already maintains
+/// (`health_dsp_windows`, `health_total_decodes`) plus the latest per-window
+/// RMS (`health_last_rms`). The monitor is fed once per relay health tick and
+/// derives per-slot behavior from the deltas, so it lives entirely off the
+/// existing telemetry — no changes to the hot DSP/FT8 threads.
+#[derive(Debug, Clone)]
+pub struct RfNoDecodeMonitor {
+    last_windows: u64,
+    last_decodes: u64,
+    /// Consecutive slots seen with RF present but zero decodes.
+    consecutive: u32,
+    /// Whether the warning is currently latched (so we emit on edges only).
+    warning_active: bool,
+    initialized: bool,
+}
+
+impl Default for RfNoDecodeMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RfNoDecodeMonitor {
+    /// RMS floor (raw, un-normalized FT8 window RMS as computed in `dsp.rs`)
+    /// above which we consider RF to be present. A genuinely quiet band sits
+    /// well below this, so a quiet band never raises the warning. Calibrated
+    /// conservatively: only clear signal energy counts.
+    pub const RF_PRESENT_RMS_FLOOR: f32 = 0.02;
+
+    /// Number of consecutive RF-present / zero-decode slots before warning.
+    /// Several slots avoids false alarms on a single noisy/empty slot while
+    /// still catching a persistent mode/clock fault within ~1 minute.
+    pub const WARN_AFTER_SLOTS: u32 = 4;
+
+    /// Create a fresh monitor.
+    pub fn new() -> Self {
+        Self {
+            last_windows: 0,
+            last_decodes: 0,
+            consecutive: 0,
+            warning_active: false,
+            initialized: false,
+        }
+    }
+
+    /// Whether the warning is currently latched on.
+    pub fn warning_active(&self) -> bool {
+        self.warning_active
+    }
+
+    /// Current consecutive RF-present/no-decode slot count (for tests/inspection).
+    pub fn consecutive(&self) -> u32 {
+        self.consecutive
+    }
+
+    /// Feed the latest cumulative telemetry. Returns `Some(true)` when the
+    /// warning transitions **on**, `Some(false)` when it transitions **off**,
+    /// and `None` when there is no edge (so the caller emits only on change).
+    ///
+    /// - `dsp_windows`: cumulative count of FT8 windows the DSP has produced.
+    /// - `total_decodes`: cumulative count of decodes.
+    /// - `last_rms`: most recent per-window RMS.
+    pub fn observe(&mut self, dsp_windows: u64, total_decodes: u64, last_rms: f32) -> Option<bool> {
+        // First observation just seeds the baseline; we can't compute a delta.
+        if !self.initialized {
+            self.last_windows = dsp_windows;
+            self.last_decodes = total_decodes;
+            self.initialized = true;
+            return None;
+        }
+
+        let windows_delta = dsp_windows.saturating_sub(self.last_windows);
+        let decodes_delta = total_decodes.saturating_sub(self.last_decodes);
+        self.last_windows = dsp_windows;
+        self.last_decodes = total_decodes;
+
+        // No new window ran since last tick — nothing to judge this tick.
+        if windows_delta == 0 {
+            return None;
+        }
+
+        let rf_present = last_rms >= Self::RF_PRESENT_RMS_FLOOR;
+        let zero_decodes = decodes_delta == 0;
+
+        if rf_present && zero_decodes {
+            self.consecutive = self.consecutive.saturating_add(1);
+        } else {
+            // Either the band is quiet (no RF) or we decoded something — the
+            // pipeline is healthy; reset the streak.
+            self.consecutive = 0;
+        }
+
+        let should_warn = self.consecutive >= Self::WARN_AFTER_SLOTS;
+        if should_warn && !self.warning_active {
+            self.warning_active = true;
+            Some(true)
+        } else if !should_warn && self.warning_active {
+            self.warning_active = false;
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Start coordinator management tasks
     pub(crate) async fn start_coordinator_tasks(&mut self) -> Result<()> {
@@ -27,7 +219,18 @@ impl super::ApplicationCoordinator {
         // Health monitoring task -- checks task handles and message bus health
         let health_handle = self.start_health_monitor().await;
 
-        // Configuration hot-reload task
+        // Configuration hot-reload task.
+        //
+        // C19 — by design this task does NOT apply any reloaded config to the
+        // running QSO / autonomous state. Config is snapshotted once at startup
+        // into the task-local `QsoManager` (callsign/grid, owned by value with
+        // no setter) and `AutonomousOperator`; nothing here rebuilds them or
+        // mutates a latched partner/`tx_parity`. This is the C19 guarantee:
+        // a hot-reload can never clobber an in-progress QSO or drop active
+        // QSOs, because no reload path reaches QSO state. Should a real apply
+        // handler ever be wired here, it MUST gate every change through
+        // `classify_config_reload(...)` and refuse/defer `DeferQsoLatched`
+        // changes while a QSO is active (see `active_tx_qsos`).
         let config_handle = {
             let _config = self.config.clone();
             let shutdown = self.shutdown_signal.clone();

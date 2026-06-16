@@ -1184,6 +1184,46 @@ impl super::ApplicationCoordinator {
                                                 n
                                             );
                                         }
+                                        // C9 — operator changed bands mid-QSO.
+                                        // An active QSO cannot complete on a new
+                                        // band, and its manual keep-call must NOT
+                                        // keep transmitting there. Tear every
+                                        // active QSO down (drives each to
+                                        // Failed{UserCancelled}, which purges it
+                                        // from `active_tx_qsos` via the QsoEvent
+                                        // subscriber — so any already-queued TX is
+                                        // dropped by the stale-TX gate next slot)
+                                        // and surface a brief operator status.
+                                        crate::message_bus::QsoMessage::BandChanged {
+                                            previous_hz,
+                                            new_hz,
+                                        } => {
+                                            let active = qso_manager.get_active_qsos().await;
+                                            let n = active.len();
+                                            for (id, _) in active {
+                                                if let Err(e) = qso_manager.cancel_qso(id).await {
+                                                    warn!(
+                                                        "BandChanged: cancel {} failed: {}",
+                                                        id, e
+                                                    );
+                                                }
+                                            }
+                                            info!(
+                                                target: "operator.override",
+                                                "Band change {} Hz -> {} Hz: ended {} active QSO(s)",
+                                                previous_hz, new_hz, n
+                                            );
+                                            if n > 0 {
+                                                emit_status(
+                                                    &message_bus,
+                                                    format!(
+                                                        "Band change — {} active QSO(s) ended",
+                                                        n
+                                                    ),
+                                                )
+                                                .await;
+                                            }
+                                        }
                                         // Operator pressed `c`: start a manual
                                         // CQ as a tracked CallingCq QSO. The QSO
                                         // owns the CQ transmission (emits the
