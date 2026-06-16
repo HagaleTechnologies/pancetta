@@ -24,6 +24,7 @@
 //! committed `#[ignore]` with a `// KNOWN BUG:` note (assertion left intact), to
 //! become the fix list for a coordinated engine follow-up.
 
+use chrono::TimeZone;
 use pancetta_qso::sim::Sim;
 use pancetta_qso::{AutonomousConfig, AutonomousOperator, DecodedMessageInfo, DxEvaluator};
 
@@ -109,8 +110,11 @@ async fn b1_autonomous_yields_to_busy_dx() {
 
     // VB7F is mid-exchange with W9ZZZ (report not directed at us) AND CQs in the
     // same batch. The CQ alone would be worth answering (score 5.0 ≥ 0.3), but
-    // the busy gate must win.
-    op.feed_decoded_messages(
+    // the busy gate must win. Stamp the busy bookkeeping at a fixed virtual
+    // `now` (epoch) so the decide-loop below — which derives its own `now` from
+    // the slot timestamps `s * 15` — evaluates the busy window against the same
+    // clock. The scan stays within the 90 s busy window.
+    op.feed_decoded_messages_at(
         &[
             DecodedMessageInfo {
                 message_text: "W9ZZZ VB7F -07".to_string(),
@@ -134,17 +138,28 @@ async fn b1_autonomous_yields_to_busy_dx() {
             },
         ],
         &AlwaysWorthIt,
+        chrono::Utc
+            .timestamp_opt(0, 0)
+            .single()
+            .expect("epoch valid"),
     );
 
     assert!(
-        op.is_dx_busy("VB7F", std::time::Instant::now()),
+        op.is_dx_busy(
+            "VB7F",
+            chrono::Utc
+                .timestamp_opt(0, 0)
+                .single()
+                .expect("epoch valid")
+        ),
         "VB7F mid-exchange with a third party must read as busy"
     );
 
     // Find a transmit slot deterministically and confirm we do NOT key a
-    // response addressed to the busy VB7F.
+    // response addressed to the busy VB7F. Both parities are covered within the
+    // first few slots, all inside the 90 s busy window (s*15 ≤ 75 s).
     let mut responded = false;
-    for s in 0..8i64 {
+    for s in 0..6i64 {
         let actions = op.decide_at(s * 15);
         if auto_transmitted_to(&actions, "VB7F") {
             responded = true;

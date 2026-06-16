@@ -124,6 +124,9 @@ use pancetta_core::slot::SlotParity;
 use pancetta_core::ResponseStep;
 use tokio::sync::broadcast::error::TryRecvError;
 
+use crate::autonomous::{
+    AutonomousOperator, DecodedMessageInfo, DxEvaluator, NullDxEvaluator, OperatorAction,
+};
 use crate::exchange::MessageExchange;
 use crate::frequency::{
     DecodeHistory, DecodeRecord, FrequencyAllocatorConfig, SmartFrequencyAllocator,
@@ -206,6 +209,26 @@ impl SimClock {
             base: Self::slot_floor(base),
             slot: 0,
         }
+    }
+
+    /// Create a clock whose slot 0 is anchored to a wall-clock slot boundary
+    /// **of Even parity**: floor `Utc::now()` to its slot boundary, then bump
+    /// forward one slot if that boundary is Odd.
+    ///
+    /// This is the base the autonomous-drive harness uses. It keeps `base`
+    /// within ~one slot of real `now` (so the QSO engine's real-clock
+    /// `started_at` stamps land just after `base`, avoiding the negative-
+    /// elapsed wrap the [`SimClock`] type docs warn about) while making the
+    /// per-slot parity deterministic — slot 0 Even, slot 1 Odd, … — so the
+    /// autonomous operator's Even-parity TX gating is reproducible.
+    pub fn new_even() -> Self {
+        let floored = Self::slot_floor(Utc::now());
+        let base = if SlotParity::of(floored) == SlotParity::Even {
+            floored
+        } else {
+            floored + ChronoDuration::seconds(SLOT_SECONDS)
+        };
+        Self { base, slot: 0 }
     }
 
     /// The slot-0 base instant (a 15s slot boundary).
@@ -553,6 +576,40 @@ impl fmt::Display for Timeline {
     }
 }
 
+/// `true` if `text` is a CQ call (`"CQ ..."`, case-insensitive). Used by the
+/// autonomous drive to route a CQ-self action to [`QsoManager::start_cq`].
+fn is_cq_text(text: &str) -> bool {
+    text.trim_start().to_uppercase().starts_with("CQ ")
+}
+
+/// Extract the DX callsign an autonomous TX is directed at: for a CQ-response
+/// of the form `"<DX> <us> <grid>"` this is the first token; for a `"CQ ..."`
+/// there is no directed DX. A "callsign-shaped" token contains a digit and a
+/// letter and is at least 3 chars (filters `"CQ"`, `"DX"`, grids, reports).
+fn first_callsign_of(text: &str) -> Option<String> {
+    let mut tokens = text.split_whitespace();
+    let first = tokens.next()?;
+    if first.eq_ignore_ascii_case("CQ") {
+        // "CQ <us> <grid>" or "CQ DX <us> <grid>": skip the CQ (+ optional
+        // direction word) — these are our own CQs, not directed at a DX.
+        return None;
+    }
+    if looks_like_callsign(first) {
+        Some(first.to_uppercase())
+    } else {
+        None
+    }
+}
+
+/// A token is callsign-shaped if it is ≥3 chars and contains both a digit and
+/// a letter (so grids like `FN42`, reports like `-12`, and words like `DX`
+/// don't qualify). Compound calls (`EA8/G8BCG`) qualify.
+fn looks_like_callsign(tok: &str) -> bool {
+    tok.len() >= 3
+        && tok.chars().any(|c| c.is_ascii_digit())
+        && tok.chars().any(|c| c.is_ascii_alphabetic())
+}
+
 /// A compact one-word label for a [`QsoState`], for the timeline display.
 fn short_state(s: &QsoState) -> &'static str {
     match s {
@@ -735,6 +792,22 @@ pub struct Sim {
     allocator: SmartFrequencyAllocator,
     /// Base seed for the high-fidelity AWGN generator (deterministic replay).
     hifi_seed: u64,
+    /// Optional autonomous-drive: when installed (via
+    /// [`Sim::with_autonomous`]), [`Sim::tick`] also runs the *real*
+    /// [`AutonomousOperator`] each slot — feeding it the slot's decodes at
+    /// the virtual `now`, running [`AutonomousOperator::decide_at`], and
+    /// executing the operator's [`OperatorAction::Transmit`] decisions
+    /// against the same real [`QsoManager`]. `None` (default) leaves the
+    /// harness in its original operator-driven mode, unchanged.
+    autonomous: Option<AutonomousDrive>,
+}
+
+/// The autonomous-drive state bundled into a [`Sim`] when
+/// [`Sim::with_autonomous`] is used: the real decision engine plus the DX
+/// evaluator it scores CQs with.
+struct AutonomousDrive {
+    operator: AutonomousOperator,
+    evaluator: Box<dyn DxEvaluator>,
 }
 
 impl Sim {
@@ -770,6 +843,7 @@ impl Sim {
             band: BandModel::clear(),
             allocator: SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default()),
             hifi_seed: 0xF18_C0DE,
+            autonomous: None,
         }
     }
 
@@ -779,6 +853,75 @@ impl Sim {
     pub fn with_hifi_seed(mut self, seed: u64) -> Self {
         self.hifi_seed = seed;
         self
+    }
+
+    /// Install the **real** [`AutonomousOperator`] as the decision-maker for
+    /// this harness, with a [`NullDxEvaluator`] (every CQ scores 0.5).
+    ///
+    /// In autonomous-drive mode, each [`Sim::tick`] additionally:
+    ///
+    /// 1. feeds the slot's injected decodes to the operator at the virtual
+    ///    `now` ([`AutonomousOperator::feed_decoded_messages_at`]),
+    /// 2. tells it how many QSOs are currently active
+    ///    ([`AutonomousOperator::set_active_qso_count`]),
+    /// 3. runs one decision cycle at the slot's virtual time
+    ///    ([`AutonomousOperator::decide_at`]), and
+    /// 4. executes each emitted [`OperatorAction::Transmit`] against the
+    ///    **same** real [`QsoManager`]: a hunt/pounce CQ-response (a
+    ///    `"<DX> <us> <grid>"` message with `qso_id == None`) opens an
+    ///    **autonomous** ([`crate::states::CallInitiation::Auto`]) QSO via
+    ///    [`QsoManager::respond_to_cq`]; a `"CQ <us> <grid>"` opens an
+    ///    autonomous CQ via [`QsoManager::start_cq`].
+    ///
+    /// Everything the manager then transmits ([`QsoEvent::MessageToSend`])
+    /// lands in the [`Timeline`] exactly as in operator-driven mode. The
+    /// operator-driven API ([`Sim::call_station`] etc.) is unchanged and may
+    /// still be used; this only *adds* an autonomous decision step per tick.
+    ///
+    /// NOTE on Phase-5 gating: the QSO engine auto-sequences replies only for
+    /// **manual** QSOs. An autonomous-opened QSO is `Auto`, so it emits its
+    /// opening call but does **not** auto-advance through report → RR73 →
+    /// completion. Scenarios that need an autonomous QSO to *complete* will
+    /// therefore stall until Phase-5 flips that gate — see the
+    /// `autonomous_scenarios` test suite.
+    pub fn with_autonomous(self, operator: AutonomousOperator) -> Self {
+        self.with_autonomous_evaluator(operator, Box::new(NullDxEvaluator))
+    }
+
+    /// Like [`Sim::with_autonomous`] but with a custom [`DxEvaluator`] (e.g.
+    /// to score one DX higher than another for the pile-up "pick-one"
+    /// scenario, or to drop a CQ below `min_dx_score`).
+    pub fn with_autonomous_evaluator(
+        mut self,
+        operator: AutonomousOperator,
+        evaluator: Box<dyn DxEvaluator>,
+    ) -> Self {
+        // Anchor the virtual clock to a wall-clock Even-parity slot boundary so
+        // the operator's slot-parity TX gating (`SlotParity::from_unix_secs`)
+        // is deterministic — slot 0 Even, slot 1 Odd, … — while keeping `base`
+        // within ~one slot of real `now`. (The latter matters because the QSO
+        // engine stamps `started_at`/`first_call_at` with the REAL clock; an
+        // epoch-anchored base far in the past would make `virtual_now -
+        // started_at` negative and wrap the timeout math — see the SimClock
+        // type docs.) Without this, `Sim::new`'s base lands on a random parity,
+        // making autonomous-drive runs flaky.
+        self.clock = SimClock::new_even();
+        self.autonomous = Some(AutonomousDrive {
+            operator,
+            evaluator,
+        });
+        self
+    }
+
+    /// `true` if this harness is in autonomous-drive mode.
+    pub fn is_autonomous(&self) -> bool {
+        self.autonomous.is_some()
+    }
+
+    /// Read-only access to the installed [`AutonomousOperator`], if any (for
+    /// assertions on operator-internal state — e.g. `is_dx_busy`).
+    pub fn operator(&self) -> Option<&AutonomousOperator> {
+        self.autonomous.as_ref().map(|a| &a.operator)
     }
 
     /// Access the underlying real [`QsoManager`] (for advanced assertions on
@@ -973,6 +1116,12 @@ impl Sim {
             self.timeline.receptions.push(r.clone());
         }
 
+        // 1b. Autonomous-drive: run the real decision engine over this slot's
+        // decodes and execute its TX decisions against the same QsoManager.
+        if self.autonomous.is_some() {
+            self.run_autonomous_slot(&injects, now).await;
+        }
+
         // 2. Manual keep-call re-arm + timeout watchdog at the virtual `now`.
         self.manager.rearm_manual_calls_at(now).await;
         self.manager.check_timeouts_at(now).await;
@@ -983,6 +1132,101 @@ impl Sim {
         // 4. Advance the clock.
         self.timeline.last_slot = slot;
         self.clock.advance();
+    }
+
+    /// Run one autonomous decision cycle for the current slot: feed the
+    /// slot's decodes to the operator at the virtual `now`, ask it to decide,
+    /// and execute each [`OperatorAction::Transmit`] against the real
+    /// [`QsoManager`] using the production-equivalent entry points.
+    ///
+    /// Faithful to production wiring (`coordinator/autonomous.rs`): a
+    /// CQ-response / hunt-pounce (`qso_id == None`, message of the form
+    /// `"<DX> <us> ..."`) opens an [`crate::states::CallInitiation::Auto`]
+    /// QSO via [`QsoManager::respond_to_cq`]; a `"CQ ..."` opens an autonomous
+    /// CQ via [`QsoManager::start_cq`]. Both emit their opening
+    /// [`QsoEvent::MessageToSend`], which the normal event drain records into
+    /// the [`Timeline`]. The duplicate / DX-busy / recently-responded gates
+    /// all live inside [`AutonomousOperator::decide_at`], so a suppressed CQ
+    /// simply produces no `Transmit` here.
+    async fn run_autonomous_slot(&mut self, injects: &[Reception], now: DateTime<Utc>) {
+        // Build DecodedMessageInfo for the operator from this slot's decodes.
+        // The `callsign` field is the *sender* of the decode (production sets
+        // it from the decoder's `from_callsign`), parsed with the real
+        // exchange parser — so a CQ's sender is the CQer and a reply's sender
+        // is the replier. This is what `feed_decoded_messages` keys CQ
+        // extraction and DX-busy tracking on.
+        let infos: Vec<DecodedMessageInfo> = injects
+            .iter()
+            .map(|r| {
+                let sender = self
+                    .exchange
+                    .parse_message(&r.text)
+                    .ok()
+                    .and_then(|m| m.sender_callsign().map(|s| s.to_string()));
+                DecodedMessageInfo {
+                    callsign: sender,
+                    frequency_hz: r.freq_hz,
+                    snr: r.snr_db.round() as i32,
+                    message_text: r.text.clone(),
+                    slot_parity: Some(r.slot_parity),
+                    confidence: None,
+                    time_offset_s: None,
+                    decode_origin: None,
+                }
+            })
+            .collect();
+
+        // Keep the operator's active-QSO count in sync with the manager so its
+        // max-concurrent and multi-slot thresholds gate correctly.
+        let active = self.manager.get_active_qsos().await.len() as u32;
+
+        // Decide. The drive bundle is taken out across the awaits below to
+        // avoid holding a borrow on `self` while calling `&mut self` manager
+        // entry points.
+        let actions = {
+            let drive = self
+                .autonomous
+                .as_mut()
+                .expect("run_autonomous_slot only called when autonomous is Some");
+            drive
+                .operator
+                .feed_decoded_messages_at(&infos, drive.evaluator.as_ref(), now);
+            drive.operator.set_active_qso_count(active);
+            drive.operator.decide_at(now.timestamp())
+        };
+
+        let dx_parity = self.clock.parity();
+        for action in actions {
+            if let OperatorAction::Transmit {
+                message_text,
+                frequency_offset,
+                qso_id,
+                ..
+            } = action
+            {
+                // Only autonomous *initiations* (qso_id == None) are routed
+                // through the manager here — exactly the items the coordinator
+                // treats as initiations. (Mid-QSO sequencer items would carry
+                // a qso_id, but the Auto path never produces those.)
+                if qso_id.is_some() {
+                    continue;
+                }
+                if is_cq_text(&message_text) {
+                    // Calling CQ ourselves: open an autonomous CallingCq QSO.
+                    let _ = self.manager.start_cq(frequency_offset, None).await;
+                } else if let Some(dx) = first_callsign_of(&message_text) {
+                    // Hunt/pounce: answer the DX's CQ as an autonomous QSO.
+                    // The operator latched the DX's heard parity into the
+                    // action's tx_parity (= dx_parity.opposite()); we pass the
+                    // current slot parity as the DX parity, matching the
+                    // operator-driven `call_station` convention.
+                    let _ = self
+                        .manager
+                        .respond_to_cq(dx, frequency_offset, Some(dx_parity))
+                        .await;
+                }
+            }
+        }
     }
 
     /// Run `n` consecutive empty slots (each calls [`Sim::tick`]). Handy for

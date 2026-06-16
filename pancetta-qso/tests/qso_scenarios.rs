@@ -239,10 +239,11 @@ async fn scenario_07_recall_continues_same_qso() {
 // =====================================================================
 // 8. DX busy with third party — autonomous operator recognizes busy
 //    (no auto-pounce). AUTONOMOUS-ONLY: the busy set lives in
-//    AutonomousOperator and is keyed on std::time::Instant.
+//    AutonomousOperator and is keyed on the injectable DateTime<Utc> clock.
 // =====================================================================
 #[tokio::test]
 async fn scenario_08_dx_busy_with_third_party_autonomous() {
+    use chrono::Utc;
     use pancetta_qso::{AutonomousConfig, AutonomousOperator, DecodedMessageInfo, NullDxEvaluator};
 
     let mut op = AutonomousOperator::new(
@@ -252,9 +253,10 @@ async fn scenario_08_dx_busy_with_third_party_autonomous() {
     );
 
     // Feed a third-party exchange NOT directed at us: DX is mid-QSO with W9ZZZ.
-    // (report from VB7F to W9ZZZ → VB7F is "busy".)
-    let busy_now = std::time::Instant::now();
-    op.feed_decoded_messages(
+    // (report from VB7F to W9ZZZ → VB7F is "busy".) Stamp the bookkeeping at an
+    // explicit virtual `now` so the busy-window check below is deterministic.
+    let busy_now = Utc::now();
+    op.feed_decoded_messages_at(
         &[DecodedMessageInfo {
             message_text: "W9ZZZ VB7F -12".to_string(),
             callsign: Some("VB7F".to_string()),
@@ -266,6 +268,7 @@ async fn scenario_08_dx_busy_with_third_party_autonomous() {
             decode_origin: None,
         }],
         &NullDxEvaluator,
+        busy_now,
     );
 
     assert!(

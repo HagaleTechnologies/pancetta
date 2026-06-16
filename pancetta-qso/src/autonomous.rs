@@ -4,7 +4,7 @@
 //! decisions: hunt for interesting CQs, call CQ when idle, manage even/odd slots,
 //! and periodically listen on our TX slot to detect doubling.
 
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -725,11 +725,16 @@ impl FrequencyAllocator {
 // The autonomous operator itself
 // ---------------------------------------------------------------------------
 
-// Per-callsign rate-limit window. If we initiated a response to a
-// callsign within this duration we skip re-initiating. Defends against
-// an attacker spamming `CQ FAKECALL FN42` every cycle to flood
+// Per-callsign rate-limit window, in seconds. If we initiated a response
+// to a callsign within this duration we skip re-initiating. Defends
+// against an attacker spamming `CQ FAKECALL FN42` every cycle to flood
 // pancetta's QSO slots and log. (Security review 2026-04-29 I-1.)
-const RECENT_RESPONSE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+//
+// Stored as a plain `i64` of seconds so the windows can be evaluated
+// against the injectable [`DateTime<Utc>`] clock the sim harness drives
+// (mirrors `QsoManager`'s `check_timeouts_at(now)` pattern). The
+// time-dependent maps below key on `DateTime<Utc>` for the same reason.
+const RECENT_RESPONSE_WINDOW_SECS: i64 = 60;
 
 /// The per-cycle decision-making brain.
 ///
@@ -771,14 +776,20 @@ pub struct AutonomousOperator {
     /// RECENT_RESPONSE_WINDOW. Defends against an attacker spamming `CQ
     /// FAKECALL FN42` every cycle to flood pancetta's QSO slots and
     /// log. (Security review 2026-04-29 I-1.)
-    recently_responded_to: HashMap<String, std::time::Instant>,
+    ///
+    /// Keyed on `DateTime<Utc>` (not `Instant`) so the window can be
+    /// evaluated against the sim harness's injectable virtual clock.
+    recently_responded_to: HashMap<String, DateTime<Utc>>,
     /// DX-busy tracker: callsign → time it was last seen participating in
     /// a non-CQ exchange (report / RR73 / 73) that was NOT directed at us
     /// and was NOT a CQ. If a station appears here within
     /// `config.dx_busy_window_secs`, the autonomous operator presumes it is
     /// working a third party and suppresses any auto-response to its CQ.
     /// Populated from `feed_decoded_messages`.
-    recently_in_qso: HashMap<String, std::time::Instant>,
+    ///
+    /// Keyed on `DateTime<Utc>` (not `Instant`) so the busy window can be
+    /// evaluated against the sim harness's injectable virtual clock.
+    recently_in_qso: HashMap<String, DateTime<Utc>>,
     /// Phase-5 hardening #1: optional callsign-continuity FP filter
     /// consulted before responding to any CQ. Defends against OSD
     /// fabrications (`R44XYB`, `OR1QRD`, ...) reaching the TX path.
@@ -839,10 +850,27 @@ impl AutonomousOperator {
 
     /// Feed decoded messages from the most recent RX slot so the operator
     /// can score CQs and check for collisions.
+    ///
+    /// Uses the real wall clock for the DX-busy bookkeeping. The
+    /// deterministic sim harness calls [`Self::feed_decoded_messages_at`]
+    /// with the virtual slot `now` instead; this method just forwards to it
+    /// with `Utc::now()`, so production behavior is unchanged.
     pub fn feed_decoded_messages(
         &mut self,
         messages: &[DecodedMessageInfo],
         evaluator: &dyn DxEvaluator,
+    ) {
+        self.feed_decoded_messages_at(messages, evaluator, Utc::now());
+    }
+
+    /// Feed decoded messages, stamping DX-busy bookkeeping at an explicit
+    /// `now` (testable / sim-drivable). [`Self::feed_decoded_messages`]
+    /// forwards here with `Utc::now()` so production behavior is identical.
+    pub fn feed_decoded_messages_at(
+        &mut self,
+        messages: &[DecodedMessageInfo],
+        evaluator: &dyn DxEvaluator,
+        now: DateTime<Utc>,
     ) {
         // Auto-parity detection.
         let current_parity = SlotParity::current();
@@ -874,11 +902,10 @@ impl AutonomousOperator {
         // (report / RR73 / 73 not directed at us) so we can yield to a DX
         // that is mid-QSO with a third party. Prune entries older than the
         // configured busy window so the map stays bounded.
-        let busy_now = std::time::Instant::now();
-        let busy_window = std::time::Duration::from_secs(self.config.dx_busy_window_secs);
-        if let Some(cutoff) = busy_now.checked_sub(busy_window) {
-            self.recently_in_qso.retain(|_, t| *t > cutoff);
-        }
+        let busy_now = now;
+        let busy_window = ChronoDuration::seconds(self.config.dx_busy_window_secs as i64);
+        let cutoff = busy_now - busy_window;
+        self.recently_in_qso.retain(|_, t| *t > cutoff);
         for msg in messages {
             for call in third_party_exchange_callsigns(&msg.message_text, &self.our_callsign) {
                 self.recently_in_qso.insert(call, busy_now);
@@ -937,32 +964,36 @@ impl AutonomousOperator {
     // -- per-callsign rate limit (I-1) ----------------------------------------
 
     /// Returns `true` if we initiated a response to `callsign` within the
-    /// last [`RECENT_RESPONSE_WINDOW`] (60 s). Caller should skip the CQ.
-    pub fn is_recently_responded_to(&self, callsign: &str, now: std::time::Instant) -> bool {
+    /// last [`RECENT_RESPONSE_WINDOW_SECS`] (60 s). Caller should skip the
+    /// CQ. `now` is supplied explicitly so the sim harness can drive it
+    /// from the virtual clock; production passes `Utc::now()`.
+    pub fn is_recently_responded_to(&self, callsign: &str, now: DateTime<Utc>) -> bool {
+        let window = ChronoDuration::seconds(RECENT_RESPONSE_WINDOW_SECS);
         self.recently_responded_to
             .get(callsign)
-            .is_some_and(|t| now.duration_since(*t) < RECENT_RESPONSE_WINDOW)
+            .is_some_and(|t| now.signed_duration_since(*t) < window)
     }
 
     /// Returns `true` if `callsign` was seen working a third party (a
     /// non-CQ exchange not directed at us) within
     /// `config.dx_busy_window_secs`. The autonomous operator suppresses
     /// new auto-responses to such a station even if it briefly CQs again.
-    pub fn is_dx_busy(&self, callsign: &str, now: std::time::Instant) -> bool {
-        let window = std::time::Duration::from_secs(self.config.dx_busy_window_secs);
+    /// `now` is supplied explicitly so the sim harness can drive it from
+    /// the virtual clock; production passes `Utc::now()`.
+    pub fn is_dx_busy(&self, callsign: &str, now: DateTime<Utc>) -> bool {
+        let window = ChronoDuration::seconds(self.config.dx_busy_window_secs as i64);
         self.recently_in_qso
             .get(callsign)
-            .is_some_and(|t| now.duration_since(*t) < window)
+            .is_some_and(|t| now.signed_duration_since(*t) < window)
     }
 
     /// Record that we just initiated a response to `callsign`. Also
     /// opportunistically prunes entries older than 5 × the window so the
-    /// map doesn't grow unbounded.
-    fn mark_responded_to(&mut self, callsign: &str, now: std::time::Instant) {
-        let prune_cutoff = now.checked_sub(RECENT_RESPONSE_WINDOW * 5);
-        if let Some(cutoff) = prune_cutoff {
-            self.recently_responded_to.retain(|_, t| *t > cutoff);
-        }
+    /// map doesn't grow unbounded. `now` is supplied explicitly for the
+    /// sim harness; production passes `Utc::now()`.
+    fn mark_responded_to(&mut self, callsign: &str, now: DateTime<Utc>) {
+        let cutoff = now - ChronoDuration::seconds(RECENT_RESPONSE_WINDOW_SECS * 5);
+        self.recently_responded_to.retain(|_, t| *t > cutoff);
         self.recently_responded_to.insert(callsign.to_string(), now);
     }
 
@@ -1176,7 +1207,14 @@ impl AutonomousOperator {
                         self.config.min_multi_slot_score
                     };
 
-                    let now = std::time::Instant::now();
+                    // Time-dependent gates (recently-responded, DX-busy)
+                    // evaluate against the slot's virtual `now`, derived
+                    // from the `unix_secs` this cycle runs at, so the sim
+                    // harness drives them deterministically. Production
+                    // calls `decide()` which passes `Utc::now().timestamp()`,
+                    // so the derived `now` equals real now to the second.
+                    let now =
+                        DateTime::<Utc>::from_timestamp(unix_secs, 0).unwrap_or_else(Utc::now);
                     // Phase-5 hardening #1: TX-side FP gate. If a
                     // callsign-continuity filter is installed, reject
                     // any CQ whose sender doesn't appear in the trust
@@ -2360,7 +2398,7 @@ mod tests {
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
-    use std::time::Duration;
+    use chrono::Duration as ChronoDuration;
 
     fn build_test_operator(our_call: &str) -> AutonomousOperator {
         let config = AutonomousConfig {
@@ -2373,12 +2411,12 @@ mod rate_limit_tests {
     #[test]
     fn skips_recent_cq_from_same_callsign() {
         let mut op = build_test_operator("K5ARH");
-        let now = std::time::Instant::now();
+        let now = Utc::now();
 
         op.recently_responded_to.insert("AB1CD".to_string(), now);
 
         assert!(
-            op.is_recently_responded_to("AB1CD", now + Duration::from_secs(30)),
+            op.is_recently_responded_to("AB1CD", now + ChronoDuration::seconds(30)),
             "60s window not honored — should still be skipping"
         );
     }
@@ -2386,12 +2424,12 @@ mod rate_limit_tests {
     #[test]
     fn allows_cq_from_callsign_after_window() {
         let mut op = build_test_operator("K5ARH");
-        let now = std::time::Instant::now();
+        let now = Utc::now();
 
         op.recently_responded_to.insert("AB1CD".to_string(), now);
 
         assert!(
-            !op.is_recently_responded_to("AB1CD", now + Duration::from_secs(70)),
+            !op.is_recently_responded_to("AB1CD", now + ChronoDuration::seconds(70)),
             "after 60s, should accept again"
         );
     }
@@ -2399,9 +2437,9 @@ mod rate_limit_tests {
     #[test]
     fn mark_responded_to_prunes_stale() {
         let mut op = build_test_operator("K5ARH");
-        let stale = std::time::Instant::now() - Duration::from_secs(60 * 60); // 1 hour ago
+        let stale = Utc::now() - ChronoDuration::seconds(60 * 60); // 1 hour ago
         op.recently_responded_to.insert("STALE".to_string(), stale);
-        let now = std::time::Instant::now();
+        let now = Utc::now();
         op.mark_responded_to("FRESH", now);
         // Stale should be pruned (older than 5 × 60s = 300s).
         assert!(!op.recently_responded_to.contains_key("STALE"));
@@ -2412,6 +2450,7 @@ mod rate_limit_tests {
 #[cfg(test)]
 mod dx_busy_tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn op_even(our: &str) -> AutonomousOperator {
         let config = AutonomousConfig {
@@ -2465,12 +2504,16 @@ mod dx_busy_tests {
         let mut op = op_even("K5ARH");
         let evaluator = NullDxEvaluator; // 0.5 ≥ 0.3 threshold
 
+        // A fixed even-parity virtual slot time. Unix epoch (slot 0) is
+        // Even; `decide_at(0)` derives the same instant for its gates.
+        let now = Utc.timestamp_opt(0, 0).single().expect("epoch is valid");
+
         // Slot A: JA1ABC is working W1XYZ (a third party).
-        op.feed_decoded_messages(
+        op.feed_decoded_messages_at(
             &[dmi("JA1ABC W1XYZ -12", Some("W1XYZ"), 1500.0)],
             &evaluator,
+            now,
         );
-        let now = std::time::Instant::now();
         assert!(
             op.is_dx_busy("JA1ABC", now),
             "JA1ABC should be flagged busy after a third-party exchange"
@@ -2478,8 +2521,12 @@ mod dx_busy_tests {
 
         // Slot B: JA1ABC briefly CQs again. Because it was just busy, the
         // autonomous operator must NOT respond.
-        op.feed_decoded_messages(&[dmi("CQ JA1ABC PM95", Some("JA1ABC"), 1500.0)], &evaluator);
-        let actions = op.decide_at(0); // even slot → our TX slot
+        op.feed_decoded_messages_at(
+            &[dmi("CQ JA1ABC PM95", Some("JA1ABC"), 1500.0)],
+            &evaluator,
+            now,
+        );
+        let actions = op.decide_at(0); // even slot → our TX slot, now=epoch
         let responded = actions.iter().any(|a| {
             matches!(a, OperatorAction::Transmit { message_text, .. } if message_text.contains("JA1ABC"))
         });
@@ -2490,10 +2537,15 @@ mod dx_busy_tests {
     fn non_busy_dx_cq_is_answered() {
         let mut op = op_even("K5ARH");
         let evaluator = NullDxEvaluator;
+        let now = Utc.timestamp_opt(0, 0).single().expect("epoch is valid");
 
         // JA1ABC simply CQs; never seen in an exchange → answerable.
-        op.feed_decoded_messages(&[dmi("CQ JA1ABC PM95", Some("JA1ABC"), 1500.0)], &evaluator);
-        assert!(!op.is_dx_busy("JA1ABC", std::time::Instant::now()));
+        op.feed_decoded_messages_at(
+            &[dmi("CQ JA1ABC PM95", Some("JA1ABC"), 1500.0)],
+            &evaluator,
+            now,
+        );
+        assert!(!op.is_dx_busy("JA1ABC", now));
         let actions = op.decide_at(0);
         let responded = actions.iter().any(|a| {
             matches!(a, OperatorAction::Transmit { message_text, .. } if message_text.contains("JA1ABC"))
@@ -2504,11 +2556,12 @@ mod dx_busy_tests {
     #[test]
     fn busy_flag_expires_after_window() {
         let mut op = op_even("K5ARH");
+        let now = Utc::now();
         // Manually seed an old busy timestamp beyond the 90s window.
-        let stale = std::time::Instant::now() - std::time::Duration::from_secs(120);
+        let stale = now - ChronoDuration::seconds(120);
         op.recently_in_qso.insert("JA1ABC".to_string(), stale);
         assert!(
-            !op.is_dx_busy("JA1ABC", std::time::Instant::now()),
+            !op.is_dx_busy("JA1ABC", now),
             "busy flag older than dx_busy_window_secs (90s) must expire"
         );
     }
