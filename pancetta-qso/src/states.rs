@@ -701,6 +701,28 @@ impl MessageType {
         }
     }
 
+    /// The sender's displayed callsign, if this message type carries one.
+    ///
+    /// Used by the compound-callsign equivalence logic (catalog C18): when the
+    /// DX's displayed call changes compound↔base mid-QSO, we keep the
+    /// most-complete form (the compound carries DX/portable info) for logging
+    /// while still matching the partner via `callsigns_match`. Returns `None`
+    /// for message types with no single sender field (e.g. `NonStandard`).
+    pub fn sender_callsign(&self) -> Option<&str> {
+        match self {
+            MessageType::Cq { callsign, .. } => Some(callsign),
+            MessageType::CqResponse {
+                responding_station, ..
+            } => Some(responding_station),
+            MessageType::SignalReport { from_station, .. }
+            | MessageType::ReportAck { from_station, .. }
+            | MessageType::FinalConfirmation { from_station, .. }
+            | MessageType::SeventyThree { from_station, .. }
+            | MessageType::ContestExchange { from_station, .. } => Some(from_station),
+            MessageType::NonStandard { .. } => None,
+        }
+    }
+
     /// Check if this message type is from a specific station
     pub fn is_from(&self, callsign: &str) -> bool {
         match self {

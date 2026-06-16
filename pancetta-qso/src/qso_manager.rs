@@ -1202,6 +1202,31 @@ impl QsoManager {
         let qso_initiated_by = progress.metadata.initiated_by;
         progress.messages.push(message.clone());
 
+        // Compound-callsign equivalence (catalog C18 / peer D4): if this frame
+        // came from our latched partner under a MORE-COMPLETE displayed call
+        // (same station per `callsigns_match`, but a longer compound form — e.g.
+        // we latched bare `G8BCG` and the DX now signs `EA8/G8BCG`), upgrade the
+        // logged `their_callsign` to the fuller form. The compound carries DX /
+        // portable info worth preserving in the ADIF. We only upgrade to a
+        // STRICTLY LONGER matching form, so a later bare-call frame never
+        // downgrades an already-latched compound, and a genuinely different
+        // station (which would fail `callsigns_match`) never overwrites it.
+        if let (Some(sender), Some(latched)) = (
+            message.message_type.sender_callsign(),
+            progress.metadata.their_callsign.as_deref(),
+        ) {
+            if crate::exchange::callsigns_match(sender, latched) && sender.len() > latched.len() {
+                let upgraded = sender.to_string();
+                info!(
+                    target: "qso.compound",
+                    from = %latched,
+                    to = %upgraded,
+                    "upgrading logged partner callsign to more-complete compound form (C18)"
+                );
+                progress.metadata.their_callsign = Some(upgraded);
+            }
+        }
+
         // Determine state transition based on current state and message.
         // `initiated_by` is threaded through so the manual-only state-regression
         // arms ("back up to where the DX thinks we are") never fire for
@@ -1425,6 +1450,26 @@ impl QsoManager {
     /// state *regression* (a transition whose rank decreased). States off this
     /// ladder (CallingCq, Idle, Failed, Contest, …) return `None` so they never
     /// register as a regression.
+    /// Does `call` refer to *our* station, allowing a compound form of our own
+    /// callsign (e.g. we operate as `K5ARH/P`)? Thin wrapper over
+    /// [`crate::exchange::callsigns_match`] against `our_callsign`. Used in the
+    /// `to == us` / `calling_station == us` halves of sender verification so a
+    /// message directed at our compound call is not rejected as "not for us".
+    fn is_us(&self, call: &str) -> bool {
+        crate::exchange::callsigns_match(call, &self.config.our_callsign)
+    }
+
+    /// Is `from` the same station as our latched QSO partner `partner`, allowing
+    /// a compound↔base change mid-QSO (catalog C18 / peer D4)? Thin wrapper over
+    /// [`crate::exchange::callsigns_match`]. Used in the `from == DX` half of
+    /// sender verification so an established QSO does not stall when the DX's
+    /// displayed call gains or loses a portable prefix/suffix between frames.
+    /// Deliberately conservative: genuinely different calls (`K5ARH`/`K5ARG`)
+    /// still mismatch — see `callsigns_match` docs.
+    fn is_partner(from: &str, partner: &str) -> bool {
+        crate::exchange::callsigns_match(from, partner)
+    }
+
     fn ladder_rank(state: &QsoState) -> Option<u8> {
         match state {
             QsoState::RespondingToCq { .. } => Some(0),
@@ -1459,7 +1504,7 @@ impl QsoManager {
                     grid,
                 },
             ) => {
-                if calling_station != &self.config.our_callsign {
+                if !self.is_us(calling_station) {
                     warn!(
                         target: "qso.security",
                         got_to = %calling_station,
@@ -1498,7 +1543,7 @@ impl QsoManager {
                     ..
                 },
             ) => {
-                if to_station != &self.config.our_callsign {
+                if !self.is_us(to_station) {
                     warn!(
                         target: "qso.security",
                         got_to = %to_station,
@@ -1543,7 +1588,7 @@ impl QsoManager {
                     to_station,
                 },
             ) => {
-                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -1587,7 +1632,7 @@ impl QsoManager {
                     report,
                 },
             ) => {
-                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -1641,8 +1686,8 @@ impl QsoManager {
                     ..
                 },
             ) => {
-                if responding_station != target_callsign
-                    || calling_station != &self.config.our_callsign
+                if !Self::is_partner(responding_station, target_callsign)
+                    || !self.is_us(calling_station)
                 {
                     warn!(
                         target: "qso.security",
@@ -1683,7 +1728,7 @@ impl QsoManager {
                     report,
                 },
             ) => {
-                if from_station != target_callsign || to_station != &self.config.our_callsign {
+                if !Self::is_partner(from_station, target_callsign) || !self.is_us(to_station) {
                     warn!(
                         target: "qso.security",
                         expected_from = %target_callsign,
@@ -1721,7 +1766,7 @@ impl QsoManager {
                     ..
                 },
             ) => {
-                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -1765,7 +1810,7 @@ impl QsoManager {
                     to_station,
                 },
             ) => {
-                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -1806,7 +1851,7 @@ impl QsoManager {
                     to_station,
                 },
             ) => {
-                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -1855,7 +1900,7 @@ impl QsoManager {
                     report,
                 },
             ) if initiated_by == CallInitiation::Manual => {
-                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -1909,7 +1954,7 @@ impl QsoManager {
                     report,
                 },
             ) if initiated_by == CallInitiation::Manual => {
-                if from_station != their_callsign || to_station != &self.config.our_callsign {
+                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -1954,8 +1999,8 @@ impl QsoManager {
                 // A "DX K5ARH GRID" repeat parses with calling_station = us,
                 // responding_station = DX. Verify both directions before
                 // regressing so a spurious station cannot reset our QSO.
-                if responding_station != their_callsign
-                    || calling_station != &self.config.our_callsign
+                if !Self::is_partner(responding_station, their_callsign)
+                    || !self.is_us(calling_station)
                 {
                     warn!(
                         target: "qso.security",
@@ -2042,7 +2087,7 @@ impl QsoManager {
                 MessageType::CqResponse {
                     calling_station, ..
                 },
-            ) => calling_station == &self.config.our_callsign,
+            ) => self.is_us(calling_station),
 
             // A4 (routing half): a caller answered our CQ with a bare signal
             // report (grid skipped) — "<us> <them> -NN". Route it to this
@@ -2050,7 +2095,7 @@ impl QsoManager {
             // addressed-to-us reports qualify (any from_station, since we don't
             // yet know who will answer).
             (QsoState::CallingCq { .. }, MessageType::SignalReport { to_station, .. }) => {
-                to_station == &self.config.our_callsign
+                self.is_us(to_station)
             }
 
             // CQer flow: we called CQ, the caller answered, and we sent our
@@ -2064,7 +2109,7 @@ impl QsoManager {
                     from_station,
                     ..
                 },
-            ) => from_station == their_callsign && to_station == &self.config.our_callsign,
+            ) => Self::is_partner(from_station, their_callsign) && self.is_us(to_station),
 
             // A5 (routing half): the caller closed early with RR73 / 73 from
             // WaitingForReport (before sending their R-report). Route the close
@@ -2080,7 +2125,7 @@ impl QsoManager {
                     to_station,
                     from_station,
                 },
-            ) => from_station == their_callsign && to_station == &self.config.our_callsign,
+            ) => Self::is_partner(from_station, their_callsign) && self.is_us(to_station),
 
             // We responded to a CQ from `target_callsign` and are waiting for
             // their report. Verify both directions: from THEM, to US.
@@ -2093,7 +2138,7 @@ impl QsoManager {
                     from_station,
                     ..
                 },
-            ) => from_station == target_callsign && to_station == &self.config.our_callsign,
+            ) => Self::is_partner(from_station, target_callsign) && self.is_us(to_station),
 
             // STUCK-AT-GRID FIX (routing half): the DX answered our grid by
             // returning our call (bare "<us> <DX>" or "<us> <DX> <grid>") — a
@@ -2110,8 +2155,7 @@ impl QsoManager {
                     ..
                 },
             ) => {
-                responding_station == target_callsign
-                    && calling_station == &self.config.our_callsign
+                Self::is_partner(responding_station, target_callsign) && self.is_us(calling_station)
             }
 
             // We sent the report and are waiting for the report-ack. Same check.
@@ -2122,7 +2166,7 @@ impl QsoManager {
                     from_station,
                     ..
                 },
-            ) => from_station == their_callsign && to_station == &self.config.our_callsign,
+            ) => Self::is_partner(from_station, their_callsign) && self.is_us(to_station),
 
             // FIX 2: the DX may close directly from our R-report with RR73
             // (or a plain 73) instead of acking first — accept it here so it
@@ -2137,7 +2181,7 @@ impl QsoManager {
                     to_station,
                     from_station,
                 },
-            ) => from_station == their_callsign && to_station == &self.config.our_callsign,
+            ) => Self::is_partner(from_station, their_callsign) && self.is_us(to_station),
 
             // Awaiting RR73 — verify both directions. Accept a plain 73 too
             // (DX skipped RR73).
@@ -2151,7 +2195,7 @@ impl QsoManager {
                     to_station,
                     from_station,
                 },
-            ) => from_station == their_callsign && to_station == &self.config.our_callsign,
+            ) => Self::is_partner(from_station, their_callsign) && self.is_us(to_station),
 
             _ => {
                 // Anything else: only relevant if addressed to us.
