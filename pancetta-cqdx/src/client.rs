@@ -165,9 +165,33 @@ impl CqdxClient {
         Ok(())
     }
 
+    /// Report a completed QSO to cqdx.io, discarding the success/duplicate
+    /// distinction. Retained for the fire-and-forget spot-poller bridge path;
+    /// new logbook-upload callers should prefer [`CqdxClient::log_qso`], which
+    /// surfaces the duplicate-vs-inserted outcome.
     pub async fn report_qso(&self, qso: QsoRecord) -> Result<()> {
+        self.log_qso(qso).await.map(|_| ())
+    }
+
+    /// Upload a completed QSO to the operator's cqdx.io logbook
+    /// (`POST /api/v1/qsos`, the clublog-style logging endpoint documented in
+    /// `docs/cqdx-api-requirements.md`).
+    ///
+    /// Response handling is defensive so the caller can treat a duplicate as a
+    /// benign no-op rather than a failure:
+    ///   - `201 Created` / any other `2xx` → [`QsoUploadOutcome::Logged`]
+    ///   - `200 OK` whose JSON body marks the record as a duplicate, **or**
+    ///     `409 Conflict` → [`QsoUploadOutcome::Duplicate`]
+    ///   - `401` → [`CqdxError::Unauthorized`]
+    ///   - any other non-2xx → [`CqdxError::Server`]
+    ///
+    /// The body is parsed leniently: the endpoint contract only promises a
+    /// status code, so a missing / non-JSON body on a 2xx is still treated as a
+    /// successful log. The PAT token is sent via `Authorization: Bearer` and is
+    /// never logged.
+    pub async fn log_qso(&self, qso: QsoRecord) -> Result<QsoUploadOutcome> {
         let url = format!("{}/api/v1/qsos", self.base_url);
-        debug!("Reporting QSO with {} to {}", qso.callsign, url);
+        debug!("Logging QSO with {} to {}", qso.callsign, url);
         let req = QsoReportRequest { version: 1, qso };
         let resp = self
             .http
@@ -176,8 +200,39 @@ impl CqdxClient {
             .json(&req)
             .send()
             .await?;
-        self.check_status(resp).await?;
-        Ok(())
+
+        let status = resp.status();
+
+        // 401 is always an auth failure regardless of body.
+        if status.as_u16() == 401 {
+            return Err(CqdxError::Unauthorized);
+        }
+        // 409 Conflict is the conventional "already logged" signal — treat as
+        // a non-fatal duplicate.
+        if status.as_u16() == 409 {
+            return Ok(QsoUploadOutcome::Duplicate);
+        }
+        if !status.is_success() {
+            let message = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
+            return Err(CqdxError::Server {
+                status: status.as_u16(),
+                message,
+            });
+        }
+
+        // 2xx: a duplicate may still be reported in-band with a 200 body
+        // (`{"status":"duplicate"}` / `{"duplicate":true}` — the exact shape is
+        // not pinned by the API doc, so we sniff leniently). Read the body
+        // best-effort; a missing / non-JSON body just means "logged".
+        let body = resp.text().await.unwrap_or_default();
+        if !body.is_empty() {
+            if let Ok(parsed) = serde_json::from_str::<QsoUploadBody>(&body) {
+                if parsed.is_duplicate() {
+                    return Ok(QsoUploadOutcome::Duplicate);
+                }
+            }
+        }
+        Ok(QsoUploadOutcome::Logged)
     }
 
     async fn check_status(&self, resp: reqwest::Response) -> Result<reqwest::Response> {
@@ -218,7 +273,7 @@ impl CqdxClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::matchers::{body_partial_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_client(base_url: &str) -> CqdxClient {
@@ -344,6 +399,21 @@ mod tests {
         client.report_spots(spots).await.unwrap();
     }
 
+    /// Build a representative completed-QSO record for the logbook tests.
+    fn sample_qso() -> QsoRecord {
+        QsoRecord {
+            callsign: "JA1ABC".to_string(),
+            remote_grid: Some("PM95".to_string()),
+            local_grid: Some("FN31".to_string()),
+            frequency: 14074000,
+            mode: "FT8".to_string(),
+            rst_sent: Some("-10".to_string()),
+            rst_received: Some("-14".to_string()),
+            start_time: chrono::Utc::now(),
+            end_time: chrono::Utc::now(),
+        }
+    }
+
     #[tokio::test]
     async fn test_report_qso() {
         let server = MockServer::start().await;
@@ -355,18 +425,93 @@ mod tests {
             .await;
 
         let client = test_client(&server.uri());
-        let qso = QsoRecord {
-            callsign: "JA1ABC".to_string(),
-            remote_grid: Some("PM95".to_string()),
-            local_grid: Some("FN31".to_string()),
-            frequency: 14074000,
-            mode: "FT8".to_string(),
-            rst_sent: Some("-10".to_string()),
-            rst_received: Some("-14".to_string()),
-            start_time: chrono::Utc::now(),
-            end_time: chrono::Utc::now(),
-        };
-        client.report_qso(qso).await.unwrap();
+        client.report_qso(sample_qso()).await.unwrap();
+    }
+
+    /// `log_qso` posts the documented `{version, qso}` envelope and reports a
+    /// bare 201 as `Logged`.
+    #[tokio::test]
+    async fn test_log_qso_logged_201() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/qsos"))
+            .and(header("Authorization", "Bearer pat_test_token"))
+            .and(body_partial_json(serde_json::json!({
+                "version": 1,
+                "qso": { "callsign": "JA1ABC", "mode": "FT8", "frequency": 14074000_u64 }
+            })))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let outcome = client.log_qso(sample_qso()).await.unwrap();
+        assert_eq!(outcome, QsoUploadOutcome::Logged);
+    }
+
+    /// A 409 Conflict is a non-fatal duplicate, not an error.
+    #[tokio::test]
+    async fn test_log_qso_duplicate_409() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/qsos"))
+            .respond_with(ResponseTemplate::new(409))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let outcome = client.log_qso(sample_qso()).await.unwrap();
+        assert_eq!(outcome, QsoUploadOutcome::Duplicate);
+    }
+
+    /// A 200 whose body marks the record as a duplicate is also non-fatal.
+    #[tokio::test]
+    async fn test_log_qso_duplicate_in_band_200() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/qsos"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "status": "duplicate" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let outcome = client.log_qso(sample_qso()).await.unwrap();
+        assert_eq!(outcome, QsoUploadOutcome::Duplicate);
+    }
+
+    /// A 401 is surfaced as `Unauthorized` so the caller can stop retrying.
+    #[tokio::test]
+    async fn test_log_qso_unauthorized_401() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/qsos"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": { "code": "UNAUTHORIZED", "message": "Invalid token" }
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let result = client.log_qso(sample_qso()).await;
+        assert!(matches!(result, Err(CqdxError::Unauthorized)));
+    }
+
+    /// A 500 is a hard server error.
+    #[tokio::test]
+    async fn test_log_qso_server_error_500() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/qsos"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let result = client.log_qso(sample_qso()).await;
+        assert!(matches!(result, Err(CqdxError::Server { status: 500, .. })));
     }
 
     #[tokio::test]

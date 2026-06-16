@@ -239,6 +239,12 @@ api_key  = ""        # ClubLog application API key
 [network.qrz_logbook]
 enabled = false
 api_key = ""         # per-logbook API access key, plaintext on disk
+
+[network.cqdx]
+enabled = false      # also gates the spot-discovery integration; when true with a
+                     # token set, each completed QSO is ALSO logged to your cqdx.io logbook
+token   = ""         # cqdx.io Personal Access Token (pat_…), plaintext on disk
+# base_url = "https://cqdx.io"   # optional; defaults to https://cqdx.io
 ```
 
 | Key | Service | Notes |
@@ -250,6 +256,8 @@ api_key = ""         # per-logbook API access key, plaintext on disk
 | `clublog.api_key` | ClubLog | Application API key. |
 | `qrz_logbook.enabled` | QRZ | Master switch. When `true`, `api_key` is required. |
 | `qrz_logbook.api_key` | QRZ | Per-logbook API access key. |
+| `cqdx.enabled` | cqdx.io | Master switch for the cqdx.io integration. When `true` **and** `cqdx.token` is non-empty, each completed QSO is uploaded to your cqdx.io logbook (in addition to the spot-discovery features the same flag enables). |
+| `cqdx.token` | cqdx.io | Personal Access Token (`pat_…`). Plaintext on disk; never logged. |
 
 **Getting the keys:**
 
@@ -264,6 +272,13 @@ api_key = ""         # per-logbook API access key, plaintext on disk
   per-logbook key, distinct from your QRZ XML subscription). Uploads POST
   to `https://logbook.qrz.com/api` with `ACTION=INSERT`. A QSO that QRZ
   already has is reported as a duplicate and skipped (non-fatal).
+- **cqdx.io:** cqdx.io is the operator's own first-party logbook service.
+  Create a Personal Access Token (`pat_…`) and set `cqdx.token`. Each
+  completed QSO is POSTed as structured JSON to `POST /api/v1/qsos`
+  (documented in `docs/cqdx-api-requirements.md`) with the dial+offset RF
+  frequency and both grids. A QSO cqdx already has is reported as a
+  duplicate and skipped (non-fatal). The same `[network.cqdx]` block also
+  drives live spot discovery; enabling it turns on both.
 
 ---
 

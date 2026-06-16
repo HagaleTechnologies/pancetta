@@ -156,6 +156,43 @@ pub struct QsoReportRequest {
     pub qso: QsoRecord,
 }
 
+/// Outcome of a [`crate::CqdxClient::log_qso`] upload. A duplicate is a
+/// successful, non-fatal result (the QSO is already in the logbook) — the
+/// caller should treat it like `Logged`, not an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QsoUploadOutcome {
+    /// The QSO was accepted and recorded in the cqdx.io logbook.
+    Logged,
+    /// cqdx.io already had this QSO; nothing to do.
+    Duplicate,
+}
+
+/// Lenient view of an optional `POST /api/v1/qsos` 2xx response body, used only
+/// to recognise an in-band duplicate signal. The endpoint contract does not
+/// pin the body shape, so every field is optional and unknown fields are
+/// ignored; a missing / non-JSON body simply means "logged".
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct QsoUploadBody {
+    /// e.g. `"duplicate"`, `"logged"`, `"created"`.
+    #[serde(default)]
+    status: Option<String>,
+    /// e.g. `{"duplicate": true}`.
+    #[serde(default)]
+    duplicate: Option<bool>,
+}
+
+impl QsoUploadBody {
+    /// True when the body indicates the QSO was already on file.
+    pub(crate) fn is_duplicate(&self) -> bool {
+        self.duplicate.unwrap_or(false)
+            || self
+                .status
+                .as_deref()
+                .map(|s| s.eq_ignore_ascii_case("duplicate"))
+                .unwrap_or(false)
+    }
+}
+
 // --- Utilities ---
 
 /// Convert a CQDX rarityRank (1=rarest, ~340=most common) to a 0.0–1.0 float

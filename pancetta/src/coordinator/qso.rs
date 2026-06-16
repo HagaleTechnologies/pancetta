@@ -275,12 +275,17 @@ impl super::ApplicationCoordinator {
         // enabled do we build clients + spawn the upload subscriber.
         let clublog_cfg = config.network.clublog.clone();
         let qrz_cfg = config.network.qrz_logbook.clone();
+        let cqdx_cfg = config.network.cqdx.clone();
         drop(config);
 
-        let upload_enabled = clublog_cfg.enabled || qrz_cfg.enabled;
+        // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
+        // the integration enabled AND a non-empty PAT token. (The same
+        // `[network.cqdx]` token gates the spot-poller bridge; here it drives
+        // the per-QSO logbook POST to `POST /api/v1/qsos`.)
+        let cqdx_upload_enabled = cqdx_logbook_upload_enabled(&cqdx_cfg);
+        let upload_enabled = clublog_cfg.enabled || qrz_cfg.enabled || cqdx_upload_enabled;
 
         let qso_lookup = self.cached_lookup.clone();
-        let cqdx_bridge = self.cqdx_bridge.clone();
         let upload_our_callsign = our_callsign.clone();
         let active_qso_ap = self.active_qso_ap.clone();
         let active_qso_freq_hz = self.active_qso_freq_hz.clone();
@@ -382,7 +387,7 @@ impl super::ApplicationCoordinator {
                     }
                 };
 
-                // Per-QSO log-upload subscriber (ClubLog + QRZ Logbook).
+                // Per-QSO log-upload subscriber (ClubLog + QRZ Logbook + cqdx.io).
                 // Opt-in: only spawned when at least one is enabled. Best-effort
                 // and fully decoupled from the QSO pipeline — each upload runs in
                 // its own task so a slow/failing service never blocks logging.
@@ -390,6 +395,7 @@ impl super::ApplicationCoordinator {
                     start_qso_upload_subscriber(
                         clublog_cfg.clone(),
                         qrz_cfg.clone(),
+                        cqdx_cfg.clone(),
                         upload_our_callsign.clone(),
                         qso_manager.subscribe(),
                         shutdown.clone(),
@@ -868,25 +874,14 @@ impl super::ApplicationCoordinator {
                                         map.insert(their_call.to_uppercase(), entry);
                                     }
 
-                                    // Report QSO to cqdx.io
-                                    if let Some(ref bridge) = cqdx_bridge {
-                                        bridge.report_qso(pancetta_cqdx::QsoRecord {
-                                            callsign: their_call.clone(),
-                                            remote_grid: metadata.grids.theirs.clone(),
-                                            local_grid: metadata.grids.ours.clone(),
-                                            frequency: metadata.frequency as u64,
-                                            mode: metadata.mode.clone(),
-                                            rst_sent: metadata.reports.sent.map(|r| r.to_string()),
-                                            rst_received: metadata
-                                                .reports
-                                                .received
-                                                .map(|r| r.to_string()),
-                                            start_time: metadata.start_time,
-                                            end_time: metadata
-                                                .end_time
-                                                .unwrap_or_else(chrono::Utc::now),
-                                        });
-                                    }
+                                    // QSO upload to cqdx.io's logbook is handled
+                                    // by the opt-in `start_qso_upload_subscriber`
+                                    // (alongside ClubLog / QRZ), which has its
+                                    // own `QsoEvent::QsoCompleted` subscription
+                                    // and defensively parses the
+                                    // success/duplicate/auth-fail response. We do
+                                    // NOT also fire `cqdx_bridge.report_qso` here
+                                    // — that would double-upload the same QSO.
                                 }
                             }
                             Ok(pancetta_qso::QsoEvent::QsoFailed {
@@ -2073,19 +2068,55 @@ mod auto_73_tests {
 /// should investigate. The task handles receiver lag and channel closure
 /// gracefully so it never blocks or panics.
 /// Spawn a background task that uploads each completed QSO to the operator's
-/// online logbooks (ClubLog and/or QRZ Logbook), one ADIF record per QSO.
+/// online logbooks (ClubLog and/or QRZ Logbook and/or cqdx.io), one record per
+/// QSO.
 ///
-/// The single ADIF record is rendered exactly as the source-of-truth ADIF
-/// writer renders it (`AdifProcessor::qso_to_adif` → `generate_record`), so the
-/// uploaded record matches `~/.pancetta/qsos.adi`.
+/// ClubLog/QRZ receive a single ADIF record rendered exactly as the
+/// source-of-truth ADIF writer renders it (`AdifProcessor::qso_to_adif` →
+/// `generate_record`), so the uploaded record matches `~/.pancetta/qsos.adi`.
+/// cqdx.io is the operator's own first-party logbook service and takes the
+/// structured `QsoRecord` JSON its `POST /api/v1/qsos` endpoint expects (see
+/// `docs/cqdx-api-requirements.md`) — built from the same `QsoMetadata`, using
+/// the dial+offset RF frequency already stamped on the completed metadata.
 ///
 /// Best-effort by design: uploads are decoupled from the QSO pipeline and never
 /// block it. Each per-service upload is spawned in its own task. Successes log
-/// at `info!`, duplicates at `info!`, failures at `warn!` (target
-/// `"qso.upload"`). Credentials are never logged.
+/// at `info!`, duplicates at `info!` (non-fatal), failures at `warn!` (target
+/// `"qso.upload"`). Credentials / tokens are never logged.
+/// Whether the opt-in cqdx.io per-QSO logbook upload should run: the
+/// `[network.cqdx]` integration must be enabled AND carry a non-empty PAT
+/// token. Default config (disabled, no token) returns `false`, so the upload
+/// subscriber never fires unless the operator opts in.
+fn cqdx_logbook_upload_enabled(cfg: &pancetta_config::network::CqdxConfig) -> bool {
+    cfg.enabled && cfg.token.as_ref().is_some_and(|t| !t.is_empty())
+}
+
+/// Build the structured cqdx.io `QsoRecord` for the `POST /api/v1/qsos`
+/// logbook endpoint from a completed `QsoMetadata`. Returns `None` when the
+/// contra-callsign is unknown (nothing to log). The frequency is the dial+offset
+/// RF value already stamped on the metadata; reports are stringified SNRs
+/// ("-10" etc.) as the API expects.
+fn cqdx_record_from_metadata(
+    metadata: &pancetta_qso::QsoMetadata,
+) -> Option<pancetta_cqdx::QsoRecord> {
+    let callsign = metadata.their_callsign.clone()?;
+    Some(pancetta_cqdx::QsoRecord {
+        callsign,
+        remote_grid: metadata.grids.theirs.clone(),
+        local_grid: metadata.grids.ours.clone(),
+        frequency: metadata.frequency as u64,
+        mode: metadata.mode.clone(),
+        rst_sent: metadata.reports.sent.map(|r| r.to_string()),
+        rst_received: metadata.reports.received.map(|r| r.to_string()),
+        start_time: metadata.start_time,
+        end_time: metadata.end_time.unwrap_or_else(chrono::Utc::now),
+    })
+}
+
 fn start_qso_upload_subscriber(
     clublog_cfg: pancetta_config::network::ClubLogConfig,
     qrz_cfg: pancetta_config::network::QrzLogbookConfig,
+    cqdx_cfg: pancetta_config::network::CqdxConfig,
     our_callsign: String,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2118,11 +2149,38 @@ fn start_qso_upload_subscriber(
         None
     };
 
+    // cqdx.io logbook client. Opt-in: enabled + a non-empty PAT token. A
+    // malformed token (CqdxClient::new validation) is logged once at WARN and
+    // simply disables the cqdx upload — it never takes down the subscriber.
+    let cqdx_client = if cqdx_cfg.enabled {
+        match cqdx_cfg.token.as_ref().filter(|t| !t.is_empty()) {
+            Some(token) => {
+                match pancetta_cqdx::CqdxClient::new(cqdx_cfg.base_url.clone(), token.clone()) {
+                    Ok(c) => Some(Arc::new(c)),
+                    Err(e) => {
+                        // Token value is wrapped/redacted; the error never prints it.
+                        warn!(
+                            target: "qso.upload",
+                            "cqdx.io upload disabled — client init failed: {}", e
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     if clublog_client.is_some() {
         info!(target: "qso.upload", "ClubLog per-QSO upload enabled");
     }
     if qrz_client.is_some() {
         info!(target: "qso.upload", "QRZ Logbook per-QSO upload enabled");
+    }
+    if cqdx_client.is_some() {
+        info!(target: "qso.upload", "cqdx.io per-QSO logbook upload enabled");
     }
 
     tokio::spawn(async move {
@@ -2191,6 +2249,34 @@ fn start_qso_upload_subscriber(
                             }
                         });
                     }
+
+                    // cqdx.io takes the structured QsoRecord its
+                    // `POST /api/v1/qsos` endpoint expects (not ADIF). We only
+                    // have something to upload once the contra-callsign is
+                    // known; skip otherwise. Frequency is the dial+offset RF
+                    // value already stamped on the completed metadata.
+                    if let Some(client) = cqdx_client.clone() {
+                        if let Some(qso) = cqdx_record_from_metadata(&metadata) {
+                            let their = their.clone();
+                            tokio::spawn(async move {
+                                match client.log_qso(qso).await {
+                                    Ok(pancetta_cqdx::QsoUploadOutcome::Logged) => info!(
+                                        target: "qso.upload",
+                                        "cqdx.io: uploaded QSO with {}", their
+                                    ),
+                                    Ok(pancetta_cqdx::QsoUploadOutcome::Duplicate) => info!(
+                                        target: "qso.upload",
+                                        "cqdx.io: QSO with {} already logged (duplicate, skipped)",
+                                        their
+                                    ),
+                                    Err(e) => warn!(
+                                        target: "qso.upload",
+                                        "cqdx.io: upload failed for {}: {}", their, e
+                                    ),
+                                }
+                            });
+                        }
+                    }
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -2230,4 +2316,113 @@ fn start_adif_subscriber(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod cqdx_upload_tests {
+    use super::{cqdx_logbook_upload_enabled, cqdx_record_from_metadata};
+    use chrono::Utc;
+    use pancetta_config::network::CqdxConfig;
+    use pancetta_qso::{GridSquares, QsoMetadata, SignalReports};
+
+    /// Default cqdx config (disabled, no token) must NOT enable the upload —
+    /// the subscriber stays dormant unless the operator opts in.
+    #[test]
+    fn upload_disabled_by_default() {
+        let cfg = CqdxConfig::default();
+        assert!(!cfg.enabled);
+        assert!(!cqdx_logbook_upload_enabled(&cfg));
+    }
+
+    /// Enabled but with no token (or an empty token) must NOT enable the upload
+    /// — we never POST without auth.
+    #[test]
+    fn upload_requires_token() {
+        let mut cfg = CqdxConfig {
+            enabled: true,
+            token: None,
+            ..Default::default()
+        };
+        assert!(!cqdx_logbook_upload_enabled(&cfg));
+
+        cfg.token = Some(String::new());
+        assert!(!cqdx_logbook_upload_enabled(&cfg));
+    }
+
+    /// Enabled + a non-empty token opts in.
+    #[test]
+    fn upload_enabled_with_token() {
+        let cfg = CqdxConfig {
+            enabled: true,
+            token: Some("pat_abc123def456".to_string()),
+            ..Default::default()
+        };
+        assert!(cqdx_logbook_upload_enabled(&cfg));
+    }
+
+    /// A token without `enabled` is still off (belt-and-suspenders).
+    #[test]
+    fn upload_off_when_disabled_even_with_token() {
+        let cfg = CqdxConfig {
+            enabled: false,
+            token: Some("pat_abc123def456".to_string()),
+            ..Default::default()
+        };
+        assert!(!cqdx_logbook_upload_enabled(&cfg));
+    }
+
+    fn metadata_with_call(call: Option<&str>) -> QsoMetadata {
+        let now = Utc::now();
+        QsoMetadata {
+            qso_id: pancetta_qso::QsoId::new_v4(),
+            our_callsign: "K5ARH".to_string(),
+            their_callsign: call.map(str::to_string),
+            frequency: 14_074_000.0,
+            mode: "FT8".to_string(),
+            start_time: now,
+            end_time: Some(now + chrono::Duration::seconds(90)),
+            reports: SignalReports {
+                sent: Some(-8),
+                received: Some(-12),
+            },
+            grids: GridSquares {
+                ours: Some("EM10".to_string()),
+                theirs: Some("PM95".to_string()),
+            },
+            contest_info: None,
+            tags: std::collections::HashMap::new(),
+            notes: None,
+            tx_parity: None,
+            initiated_by: Default::default(),
+            role: Default::default(),
+            call_count: 0,
+            first_call_at: None,
+            last_call_at: None,
+            progressed_this_cycle: false,
+        }
+    }
+
+    /// The structured cqdx record carries the dial+offset RF frequency,
+    /// both grids, and stringified SNR reports the API expects.
+    #[test]
+    fn record_maps_metadata_fields() {
+        let md = metadata_with_call(Some("JA1ABC"));
+        let rec = cqdx_record_from_metadata(&md).expect("record");
+        assert_eq!(rec.callsign, "JA1ABC");
+        assert_eq!(rec.frequency, 14_074_000);
+        assert_eq!(rec.mode, "FT8");
+        assert_eq!(rec.remote_grid.as_deref(), Some("PM95"));
+        assert_eq!(rec.local_grid.as_deref(), Some("EM10"));
+        assert_eq!(rec.rst_sent.as_deref(), Some("-8"));
+        assert_eq!(rec.rst_received.as_deref(), Some("-12"));
+        assert_eq!(rec.start_time, md.start_time);
+        assert_eq!(rec.end_time, md.end_time.unwrap());
+    }
+
+    /// No contra-callsign → nothing to upload.
+    #[test]
+    fn record_none_without_callsign() {
+        let md = metadata_with_call(None);
+        assert!(cqdx_record_from_metadata(&md).is_none());
+    }
 }
