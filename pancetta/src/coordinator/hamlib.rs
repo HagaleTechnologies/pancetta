@@ -208,6 +208,11 @@ impl super::ApplicationCoordinator {
 
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         let rig_conn_state = self.rig_conn_state.clone();
+        // C9 dedup anchor (most recent pancetta-initiated SetFrequency) — the
+        // poll loop reads it to tell an operator dial move (tear down) from a
+        // pancetta-commanded change (already torn down by the TUI / autonomous
+        // site; must NOT double-fire).
+        let last_freq_command = self.last_freq_command.clone();
 
         let hamlib_handle = {
             let shutdown = self.shutdown_signal.clone();
@@ -266,12 +271,22 @@ impl super::ApplicationCoordinator {
                 let shutdown_for_polling = shutdown.clone();
                 let op_freq_for_polling = operating_frequency_hz.clone();
                 let rig_conn_state_poll = rig_conn_state.clone();
+                // C9 dial-poll teardown plumbing.
+                let last_freq_command_poll = last_freq_command.clone();
+                let bus_for_polling = message_bus.clone();
                 let mut spawned_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
                 spawned_handles.push(tokio::spawn(async move {
                     let mut poll_interval = interval(Duration::from_millis(500));
                     let mut consecutive_failures: u32 = 0;
                     const CRASH_WARN_THRESHOLD: u32 = 10; // 5 seconds of failures
+                    // C9 dial-poll band-change detection: the frequency this
+                    // poll loop last *accepted* as the current dial. Seeded to
+                    // the rig's already-read startup frequency so the first poll
+                    // doesn't false-fire (`is_band_change(0, _)` is also false,
+                    // belt and braces). Updated only when the loop accepts a new
+                    // reading, so a teardown fires at most once per dial move.
+                    let mut last_seen_freq: u64 = op_freq_for_polling.load(Ordering::Relaxed);
                     // S-meter poll: every 4th frequency tick (one
                     // STRENGTH read per 2s). Modest on purpose — each
                     // read is a rigctld round-trip on the same serial
@@ -306,6 +321,67 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     let _ = message_bus.send_message(message).await;
+
+                                    // C9 — operator turned the rig's dial. We
+                                    // learn of the new dial freq by polling (not
+                                    // via the TUI), so this is a band change
+                                    // pancetta did not initiate. If it's a real
+                                    // band change (not a tiny fine-tune wobble)
+                                    // AND not attributable to a freq pancetta
+                                    // itself just commanded (the TUI / autonomous
+                                    // site already fired the teardown, and the
+                                    // rig may still be settling), fire the same
+                                    // BandChanged teardown. `last_seen_freq` is
+                                    // only advanced once we've decided, so a
+                                    // single dial move tears down at most once.
+                                    if super::is_band_change(last_seen_freq, freq) {
+                                        let cmd = last_freq_command_poll
+                                            .lock()
+                                            .ok()
+                                            .and_then(|g| *g);
+                                        let attributable =
+                                            super::band_change_attributable_to_command(
+                                                freq,
+                                                cmd,
+                                                Instant::now(),
+                                            );
+                                        if attributable {
+                                            // pancetta commanded this (or the rig
+                                            // is still slewing to it) — accept the
+                                            // reading without a second teardown.
+                                            last_seen_freq = freq;
+                                        } else {
+                                            info!(
+                                                target: "operator.override",
+                                                "Rig dial band change {} Hz -> {} Hz (operator) — tearing down active QSOs",
+                                                last_seen_freq, freq
+                                            );
+                                            let teardown = ComponentMessage::new(
+                                                ComponentId::Hamlib,
+                                                ComponentId::Qso,
+                                                MessageType::QsoMessage(
+                                                    crate::message_bus::QsoMessage::BandChanged {
+                                                        previous_hz: last_seen_freq,
+                                                        new_hz: freq,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                bus_for_polling.send_message(teardown).await
+                                            {
+                                                warn!(
+                                                    "Rig dial band change: failed to send teardown: {}",
+                                                    e
+                                                );
+                                            }
+                                            last_seen_freq = freq;
+                                        }
+                                    } else if freq != last_seen_freq {
+                                        // Same-band fine-tune / wobble: track the
+                                        // new reading but don't tear anything down.
+                                        last_seen_freq = freq;
+                                    }
 
                                     // Batch 95: real rig S-meter for the
                                     // TUI. Best-effort — a failed read

@@ -115,6 +115,59 @@ pub fn is_band_change(old_hz: u64, new_hz: u64) -> bool {
     }
 }
 
+/// Settle window (ms) after a pancetta-initiated frequency command during which
+/// the hamlib dial-poll loop suppresses its own C9 teardown.
+///
+/// When the TUI / autonomous operator commands a band change it updates the
+/// shared dial frequency and fires the `BandChanged` teardown *itself*. The
+/// rig then takes a moment to slew; until it reaches the commanded frequency
+/// the poll loop may read the **old** frequency once or twice. Without this
+/// window the poll would mistake that stale reading for an operator dial move
+/// *back* to the old band and fire a second (spurious) teardown. Sized to
+/// comfortably cover a rigctld round-trip plus VFO slew at the 500 ms poll
+/// cadence.
+pub const FREQ_COMMAND_SETTLE_MS: u64 = 3_000;
+
+/// Decide whether a band change the **dial-poll loop** just observed
+/// (`last_seen_hz` → `polled_hz`) is attributable to a frequency change
+/// **pancetta itself commanded**, and therefore must NOT be torn down again by
+/// the poll loop (the TUI / autonomous site already fired the `BandChanged`
+/// teardown).
+///
+/// `last_command` is the coordinator's `last_freq_command` anchor: the
+/// `(target_hz, issued_at)` of the most recent pancetta-initiated
+/// `SetFrequency`, or `None` if pancetta has never commanded a change.
+///
+/// Returns `true` (suppress the poll teardown) when EITHER:
+///   - the polled frequency has reached the commanded frequency's band — the
+///     rig settled onto what pancetta asked for (the common, post-settle case);
+///     or
+///   - the command was issued within [`FREQ_COMMAND_SETTLE_MS`] — the rig is
+///     still slewing and the poll may be reading a transient old frequency.
+///
+/// Returns `false` (the poll loop should treat it as a real operator dial move
+/// and fire the teardown) when there is no recent command that can explain the
+/// observed band — i.e. the operator turned the rig's dial directly.
+pub fn band_change_attributable_to_command(
+    polled_hz: u64,
+    last_command: Option<(u64, Instant)>,
+    now: Instant,
+) -> bool {
+    let Some((commanded_hz, issued_at)) = last_command else {
+        // pancetta never commanded a change → this can only be the operator.
+        return false;
+    };
+    // Still within the post-command settle window: the rig may be slewing and
+    // the poll may read a transient stale frequency — suppress.
+    if now.duration_since(issued_at) < Duration::from_millis(FREQ_COMMAND_SETTLE_MS) {
+        return true;
+    }
+    // Settled: suppress only if the rig actually reached the commanded band
+    // (so the poll reading the commanded frequency back doesn't double-fire).
+    // A genuine later operator move to a *different* band is NOT suppressed.
+    !is_band_change(commanded_hz, polled_hz)
+}
+
 /// Lead-in (seconds) before the UTC slot boundary at which the live decode
 /// window starts. The DSP pipeline slices the emitted window so that sample 0
 /// corresponds to `slot_boundary − WINDOW_LEAD_SECS`, and the FT8 pipeline
@@ -270,6 +323,21 @@ pub struct ApplicationCoordinator {
     /// Updated by the hamlib polling task; read by cqdx.io and PSKReporter
     /// to compute absolute RF frequency from audio offsets.
     operating_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
+
+    /// C9 dedup anchor: the most recent dial frequency **pancetta itself
+    /// commanded** (TUI `SetFrequency`, autonomous `ChangeBand`) and when.
+    /// `None` until the first pancetta-initiated frequency change.
+    ///
+    /// The hamlib dial-poll loop uses this to distinguish an *operator dial
+    /// move* (which it must tear active QSOs down for) from a frequency
+    /// change **pancetta initiated** (where the TUI / autonomous site has
+    /// already fired the `BandChanged` teardown — the poll must NOT
+    /// double-fire when it later reads the commanded frequency back off the
+    /// rig, nor on a transient old-frequency reading while the rig is still
+    /// settling to the commanded value). See
+    /// [`band_change_attributable_to_command`] and the poll loop in
+    /// `coordinator/hamlib.rs`.
+    last_freq_command: Arc<std::sync::Mutex<Option<(u64, Instant)>>>,
 
     /// Performance metrics
     message_count: Arc<std::sync::atomic::AtomicU64>,
@@ -543,6 +611,8 @@ impl ApplicationCoordinator {
             // Initialize to 0 — hamlib will read the actual rig frequency on startup.
             // If hamlib isn't available, the TUI default (14.074) takes over.
             operating_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // C9 dedup anchor — no pancetta-initiated frequency command yet.
+            last_freq_command: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "pancetta-hamlib")]
             rigctld_process: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),

@@ -195,6 +195,10 @@ impl super::ApplicationCoordinator {
 
         let cqdx_bridge_for_auto = self.cqdx_bridge.clone();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
+        // C9 dedup anchor: record that *pancetta* (the autonomous operator)
+        // commanded a band change, so the hamlib poll loop doesn't double-fire
+        // the teardown when it reads the new freq back off the rig.
+        let last_freq_command = self.last_freq_command.clone();
         let autonomous_runtime_gate = self.autonomous_enabled_runtime.clone();
         // Global tri-state TX policy. Orthogonal to the autonomous runtime
         // gate: autonomous *initiation* (calling CQ ourselves, or
@@ -313,6 +317,49 @@ impl super::ApplicationCoordinator {
                                         ));
                                     }
                                     pancetta_qso::OperatorAction::ChangeBand { dial_frequency } => {
+                                        // C9 — the autonomous operator is changing
+                                        // band. An active QSO can't complete on the
+                                        // new band, so tear active QSOs down (same
+                                        // mechanism as the TUI SetFrequency path)
+                                        // before/at the band switch. Capture the
+                                        // *old* dial freq, update the shared atomic,
+                                        // and stamp the dedup anchor so the hamlib
+                                        // poll loop doesn't double-fire when it reads
+                                        // the new freq back off the rig.
+                                        let old_freq_hz =
+                                            operating_frequency_hz.load(Ordering::Relaxed);
+                                        operating_frequency_hz
+                                            .store(dial_frequency, Ordering::Relaxed);
+                                        if let Ok(mut anchor) = last_freq_command.lock() {
+                                            *anchor = Some((dial_frequency, Instant::now()));
+                                        }
+                                        if crate::coordinator::is_band_change(
+                                            old_freq_hz,
+                                            dial_frequency,
+                                        ) {
+                                            info!(
+                                                target: "operator.override",
+                                                "Autonomous band change {} Hz -> {} Hz — tearing down active QSOs",
+                                                old_freq_hz, dial_frequency
+                                            );
+                                            let teardown = ComponentMessage::new(
+                                                ComponentId::Autonomous,
+                                                ComponentId::Qso,
+                                                MessageType::QsoMessage(
+                                                    crate::message_bus::QsoMessage::BandChanged {
+                                                        previous_hz: old_freq_hz,
+                                                        new_hz: dial_frequency,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) = message_bus.send_message(teardown).await {
+                                                warn!(
+                                                    "Autonomous band change: failed to send teardown: {}",
+                                                    e
+                                                );
+                                            }
+                                        }
                                         let msg = ComponentMessage::new(
                                             ComponentId::Autonomous,
                                             ComponentId::Hamlib,

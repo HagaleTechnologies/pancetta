@@ -29,8 +29,8 @@ use std::sync::{Arc, RwLock};
 use pancetta_config::Config;
 use pancetta_core::slot::SlotParity;
 use pancetta_lib::coordinator::{
-    active_tx_qso_key, classify_config_reload, is_band_change, tx_qso_is_live,
-    ConfigReloadApplicability, RfNoDecodeMonitor,
+    active_tx_qso_key, band_change_attributable_to_command, classify_config_reload, is_band_change,
+    tx_qso_is_live, ConfigReloadApplicability, RfNoDecodeMonitor, FREQ_COMMAND_SETTLE_MS,
 };
 use pancetta_qso::{CallInitiation, QsoEvent, QsoManager, QsoManagerConfig};
 
@@ -181,6 +181,197 @@ fn c9_is_band_change_predicate_matrix() {
     assert!(!is_band_change(5_000_000, 5_010_000));
     // Out-of-band large jump (>= 100 kHz threshold): a change.
     assert!(is_band_change(5_000_000, 5_200_000));
+}
+
+// 15m FT8 dial.
+const FREQ_15M: u64 = 21_074_000;
+
+/// The exact decision the **hamlib dial-poll loop** makes (mirror of the
+/// `coordinator/hamlib.rs` poll arm): a poll-observed band change
+/// (`last_seen` → `polled`) fires a teardown iff it is a real band change AND
+/// it is NOT attributable to a frequency pancetta itself commanded (already
+/// torn down by the TUI / autonomous site, or the rig is still settling).
+fn poll_should_tear_down(
+    last_seen: u64,
+    polled: u64,
+    last_command: Option<(u64, std::time::Instant)>,
+    now: std::time::Instant,
+) -> bool {
+    is_band_change(last_seen, polled)
+        && !band_change_attributable_to_command(polled, last_command, now)
+}
+
+/// The dedup predicate, exhaustively. This is the C9 follow-on's core: how the
+/// dial-poll site tells an operator dial move (tear down) from a
+/// pancetta-initiated change (don't double-fire).
+#[test]
+fn c9_band_change_attributable_to_command_matrix() {
+    let now = std::time::Instant::now();
+
+    // No command ever issued → any observed band change is the operator's.
+    assert!(!band_change_attributable_to_command(FREQ_40M, None, now));
+
+    // pancetta commanded 40m long ago and the rig settled onto 40m → the poll
+    // reading 40m back is attributable (don't double-fire).
+    let old = now - std::time::Duration::from_millis(FREQ_COMMAND_SETTLE_MS + 1_000);
+    assert!(band_change_attributable_to_command(
+        FREQ_40M,
+        Some((FREQ_40M, old)),
+        now
+    ));
+
+    // pancetta commanded 40m long ago, but the operator has since dialed to 15m
+    // → NOT attributable; the poll must treat this as an operator move.
+    assert!(!band_change_attributable_to_command(
+        FREQ_15M,
+        Some((FREQ_40M, old)),
+        now
+    ));
+
+    // pancetta JUST commanded 40m (within the settle window): even a transient
+    // OLD-frequency reading (rig still slewing) is attributable → suppress.
+    let recent = now - std::time::Duration::from_millis(500);
+    assert!(band_change_attributable_to_command(
+        FREQ_20M, // stale read while slewing 20m -> 40m
+        Some((FREQ_40M, recent)),
+        now
+    ));
+}
+
+/// Dial-poll site: the operator turns the rig's dial across bands (pancetta did
+/// NOT command it) → the poll loop tears the active QSO down exactly once; its
+/// queued keep-call TX is then dropped. A same-band wobble does not.
+#[tokio::test]
+async fn c9_dial_poll_band_change_tears_down_once() {
+    let manager = QsoManager::new(QsoManagerConfig {
+        our_callsign: "K5ARH".to_string(),
+        our_grid: Some("EM10".to_string()),
+        ..Default::default()
+    });
+    let mut rx = manager.subscribe();
+    let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+
+    let qso_id = manager
+        .respond_to_cq_with(
+            "DL1ABC".to_string(),
+            1200.0,
+            Some(SlotParity::Odd),
+            CallInitiation::Auto,
+        )
+        .await
+        .expect("respond_to_cq_with");
+    let qso_key = qso_id.to_string();
+    drain_into_active_set(&mut rx, &active);
+    assert!(tx_qso_is_live(Some(&qso_key), &active.read().unwrap()));
+
+    let now = std::time::Instant::now();
+    // No pancetta command on record → the poll attributes this to the operator.
+    let last_command: Option<(u64, std::time::Instant)> = None;
+
+    // The poll loop started life knowing the rig was on 20m. It now reads 40m.
+    let mut last_seen = FREQ_20M;
+    assert!(
+        poll_should_tear_down(last_seen, FREQ_40M, last_command, now),
+        "operator dial 20m -> 40m must tear down"
+    );
+    last_seen = FREQ_40M; // the loop advances its anchor
+
+    // The teardown ran (same loop the production BandChanged arm runs).
+    for (id, _) in manager.get_active_qsos().await {
+        manager.cancel_qso(id).await.expect("cancel_qso");
+    }
+    drain_into_active_set(&mut rx, &active);
+    assert!(
+        !tx_qso_is_live(Some(&qso_key), &active.read().unwrap()),
+        "torn-down QSO must NOT be live — its keep-call TX is dropped"
+    );
+
+    // Re-reading the SAME (now-current) 40m freq next poll must NOT re-fire.
+    assert!(
+        !poll_should_tear_down(last_seen, FREQ_40M, last_command, now),
+        "re-reading the just-accepted freq must not re-fire the teardown"
+    );
+    // And a small fine-tune wobble within 40m must NOT fire either.
+    assert!(
+        !poll_should_tear_down(last_seen, FREQ_40M + 1_500, last_command, now),
+        "same-band fine-tune wobble must not tear down"
+    );
+}
+
+/// Dial-poll dedup vs the TUI/autonomous path: pancetta commanded the change
+/// (so the TUI / autonomous site already fired the teardown). When the poll
+/// then reads the new freq back — or reads a transient old freq while the rig
+/// is still slewing — it must NOT fire a second teardown.
+#[test]
+fn c9_dial_poll_does_not_double_fire_pancetta_initiated_change() {
+    let now = std::time::Instant::now();
+
+    // Settled case: pancetta commanded 40m a while ago; rig now on 40m. The
+    // poll loop's anchor was still 20m (it hadn't observed the move yet), so it
+    // sees a band change 20m -> 40m — but it's attributable → no teardown.
+    let settled = now - std::time::Duration::from_millis(FREQ_COMMAND_SETTLE_MS + 500);
+    assert!(
+        !poll_should_tear_down(FREQ_20M, FREQ_40M, Some((FREQ_40M, settled)), now),
+        "poll reading back the pancetta-commanded freq must not double-fire"
+    );
+
+    // Slewing case: pancetta JUST commanded 40m; the poll transiently reads the
+    // old 20m (rig not there yet). Within the settle window → suppressed.
+    let recent = now - std::time::Duration::from_millis(300);
+    assert!(
+        !poll_should_tear_down(FREQ_40M, FREQ_20M, Some((FREQ_40M, recent)), now),
+        "transient old-freq reading during rig slew must not fire a spurious teardown"
+    );
+}
+
+/// Autonomous `ChangeBand`: when the autonomous operator changes band, the
+/// teardown fires (same BandChanged mechanism). The predicate the autonomous
+/// arm uses is the plain `is_band_change(old, target)`.
+#[tokio::test]
+async fn c9_autonomous_change_band_tears_down() {
+    let manager = QsoManager::new(QsoManagerConfig {
+        our_callsign: "K5ARH".to_string(),
+        our_grid: Some("EM10".to_string()),
+        ..Default::default()
+    });
+    let mut rx = manager.subscribe();
+    let active: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+
+    let qso_id = manager
+        .respond_to_cq_with(
+            "JA1XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Auto,
+        )
+        .await
+        .expect("respond_to_cq_with");
+    let qso_key = qso_id.to_string();
+    drain_into_active_set(&mut rx, &active);
+    assert!(tx_qso_is_live(Some(&qso_key), &active.read().unwrap()));
+
+    // The autonomous operator decides to QSY 20m -> 15m. Its ChangeBand arm
+    // asks `is_band_change(old, target)` before firing the teardown.
+    assert!(
+        is_band_change(FREQ_20M, FREQ_15M),
+        "autonomous 20m -> 15m QSY must register as a band change"
+    );
+    for (id, _) in manager.get_active_qsos().await {
+        manager.cancel_qso(id).await.expect("cancel_qso");
+    }
+    drain_into_active_set(&mut rx, &active);
+    assert!(
+        !tx_qso_is_live(Some(&qso_key), &active.read().unwrap()),
+        "autonomous band change must tear the active QSO down"
+    );
+
+    // The autonomous arm stamped the command anchor — a subsequent dial-poll
+    // reading the new 15m freq back must NOT double-fire the teardown.
+    let now = std::time::Instant::now();
+    assert!(
+        !poll_should_tear_down(FREQ_20M, FREQ_15M, Some((FREQ_15M, now)), now),
+        "poll after an autonomous QSY must not double-tear-down"
+    );
 }
 
 // ---------------------------------------------------------------------------

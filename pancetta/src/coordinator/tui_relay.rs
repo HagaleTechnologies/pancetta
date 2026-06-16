@@ -497,6 +497,10 @@ impl super::ApplicationCoordinator {
         let cmd_message_bus = self.message_bus.clone();
         let cmd_operating_freq = operating_freq.clone();
         let cmd_operating_freq_hz = self.operating_frequency_hz.clone();
+        // C9 dedup anchor: record that *pancetta* (via the operator's TUI
+        // SetFrequency) commanded this dial change, so the hamlib poll loop
+        // doesn't double-fire the teardown when it reads the new freq back.
+        let cmd_last_freq_command = self.last_freq_command.clone();
         // (CQ text is no longer generated in this task — the CallingCq QSO in
         // the QSO component owns it, rendered from the operator's configured
         // callsign/grid there.)
@@ -765,6 +769,12 @@ impl super::ApplicationCoordinator {
                             let freq_mhz = frequency as f64 / 1_000_000.0;
                             cmd_operating_freq.store(freq_mhz.to_bits(), Ordering::Relaxed);
                             cmd_operating_freq_hz.store(frequency, Ordering::Relaxed);
+                            // Stamp the C9 dedup anchor: pancetta commanded this
+                            // freq, so the hamlib poll loop suppresses its own
+                            // teardown (here and during the rig settle window).
+                            if let Ok(mut anchor) = cmd_last_freq_command.lock() {
+                                *anchor = Some((frequency, Instant::now()));
+                            }
                             if super::is_band_change(old_freq_hz, frequency) {
                                 info!(
                                     target: "operator.override",
