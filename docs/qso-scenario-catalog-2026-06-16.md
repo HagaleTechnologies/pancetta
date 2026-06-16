@@ -59,7 +59,7 @@ timeouts, 13 supersedes — most stalls trace to this + tail-end re-call churn.
 - C6 late return after minutes (mapping cleared) → new QSO / dupe policy; no crash.
 - C7 stale close after working another station → don't misroute into the new QSO; ignore/bounded.
 - C8 return after band change → ignore close that doesn't match current band/freq context.
-- C9 band change mid-QSO → tear down gracefully; no stale keep-call TXing on new band. **[high bug-exposure]**
+- C9 band change mid-QSO → tear down gracefully; no stale keep-call TXing on new band. **[FIXED]** — TUI SetFrequency detects a real band change (different ham band, or ≥100kHz out-of-band move) → BandChanged → cancels active QSOs (purged from active_tx_qsos → stale TX dropped) + operator status. (Other band-change trigger sites — hamlib poll loop, autonomous ChangeBand — noted as follow-on.)
 - C10 DX on our own parity → re-derive tx_parity from DX frame; never key DX's slot.
 - C11 late-in-slot decision → defer to next same-parity slot (don't TX truncated).
 - C12 per-step-stall vs per-QSO watchdog semantics — clarify + assert.
@@ -68,9 +68,9 @@ timeouts, 13 supersedes — most stalls trace to this + tail-end re-call churn.
 - C15 operator manual frame out of sequence (force RR73) → honor override, log consistently.
 - C16 operator clicks NEW station mid-QSO → queue or multi-stream; never silently drop/collide.
 - C17 hashed/partial `<...>` callsign → no auto-reply, no advance, no log vs unresolved. [peer D2/D3]
-- C18 compound call /P /R /MM consistent across frames; compound↔base equivalence (no stall). [peer D4]
-- C19 config hot-reload mid-QSO must not clobber latched partner/parity. [peer A8]
-- C20 RF-present-but-zero-decodes health signal (mode/clock fault). [peer D8]
+- C18 compound call /P /R /MM consistent across frames; compound↔base equivalence (no stall). [peer D4] **[FIXED]** — base_callsign()/callsigns_match() (strip one prefix/suffix, compare base) used in all sender-verify + relevance arms; validate_callsign widened to accept compound; near-miss calls still rejected; logged under most-complete form.
+- C19 config hot-reload mid-QSO must not clobber latched partner/parity. [peer A8] **[FIXED/GUARDED]** — no live reload path reaches QSO state today (holds by construction); added classify_config_reload() so any future apply-handler defers station.callsign/grid/parity while a QSO is active (ui/network/audio/rig safe-live).
+- C20 RF-present-but-zero-decodes health signal (mode/clock fault). [peer D8] **[FIXED]** — RfNoDecodeMonitor: ≥4 consecutive slots with RMS≥floor (RF present) but zero new decodes → TUI warning 'RF present but no decodes — check mode/clock?'; quiet band never warns; edge-triggered.
 
 ## Conventions
 Each scenario → a named test with a slot-by-slot exchange + asserted outcome, citing source
