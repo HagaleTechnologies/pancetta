@@ -59,6 +59,102 @@ pub(crate) fn classify_autonomous_opening(
     (dx, frequency, parity)
 }
 
+/// Parameters for opening one autonomous QSO (a resolved
+/// [`crate::message_bus::QsoMessage::StartAutonomousQso`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AutonomousQsoStart {
+    pub callsign: Option<String>,
+    pub frequency: f64,
+    pub parity: Option<SlotParity>,
+}
+
+/// The fully-gated, routed result of one autonomous decision slot: which QSOs
+/// to open in the `QsoManager` and which raw `TransmitRequest`s to bundle.
+#[derive(Debug, Default)]
+pub(crate) struct SlotPlan {
+    /// Openings to create as Auto QSOs (the `QsoManager` emits their TX).
+    pub qso_starts: Vec<AutonomousQsoStart>,
+    /// Items to transmit raw (QSO-in-progress sequencer items, qso_id=Some).
+    pub tx_items: Vec<(crate::message_bus::TransmitRequestItem, Option<SlotParity>)>,
+    /// Message texts of openings that were *not* opened because `dry_run` is on
+    /// (for operator-facing logging only).
+    pub dry_run_openings: Vec<String>,
+    /// How many items the Shift+Q runtime gate dropped.
+    pub runtime_gate_dropped: usize,
+    /// How many initiation items the TX policy suppressed.
+    pub policy_dropped: usize,
+}
+
+/// Pure decision: turn one slot's collected TX items into a [`SlotPlan`],
+/// applying — in order — (1) the Shift+Q runtime gate (drops everything when
+/// closed), (2) the tri-state TX-policy initiation suppression (drops
+/// `qso_id == None` items unless the policy allows initiation), and (3) the
+/// opening→QSO-start split (each surviving `qso_id == None` opening becomes an
+/// `AutonomousQsoStart` — routed through the `QsoManager` instead of a raw TX,
+/// so no double-send — while `qso_id == Some` items stay on the raw TX path).
+/// `dry_run` records openings without opening them.
+///
+/// Extracted as a pure function so the full gating/routing matrix is unit
+/// testable without the wall-clock slot loop. The spawned task only does I/O
+/// (logging + `send_message`) around this.
+pub(crate) fn plan_slot_transmissions(
+    mut tx_items: Vec<(crate::message_bus::TransmitRequestItem, Option<SlotParity>)>,
+    runtime_gate_open: bool,
+    policy: pancetta_core::TxPolicy,
+    dry_run: bool,
+    listen_messages: &[pancetta_qso::DecodedMessageInfo],
+) -> SlotPlan {
+    // (1) Shift+Q runtime gate: closed → drop everything this cycle.
+    let mut runtime_gate_dropped = 0;
+    if !runtime_gate_open && !tx_items.is_empty() {
+        runtime_gate_dropped = tx_items.len();
+        tx_items.clear();
+    }
+
+    // (2) TX policy: suppress autonomous *initiations* (qso_id == None) unless
+    // the policy allows initiation. QSO-in-progress items (qso_id == Some) flow.
+    let mut policy_dropped = 0;
+    if !policy.allows_initiation() {
+        let before = tx_items.len();
+        tx_items.retain(|(item, _)| item.qso_id.is_some());
+        policy_dropped = before - tx_items.len();
+    }
+
+    // (3) Opening → QSO-start split.
+    let mut qso_starts = Vec::new();
+    let mut dry_run_openings = Vec::new();
+    let mut remaining = Vec::with_capacity(tx_items.len());
+    for (item, tx_parity) in tx_items.into_iter() {
+        if item.qso_id.is_some() {
+            remaining.push((item, tx_parity));
+            continue;
+        }
+        if dry_run {
+            dry_run_openings.push(item.message_text.clone());
+            continue;
+        }
+        let (callsign, frequency, parity) = classify_autonomous_opening(
+            &item.message_text,
+            item.frequency_offset,
+            tx_parity,
+            listen_messages,
+        );
+        qso_starts.push(AutonomousQsoStart {
+            callsign,
+            frequency,
+            parity,
+        });
+    }
+
+    SlotPlan {
+        qso_starts,
+        tx_items: remaining,
+        dry_run_openings,
+        runtime_gate_dropped,
+        policy_dropped,
+    }
+}
+
 impl super::ApplicationCoordinator {
     pub(crate) async fn start_autonomous_component(&mut self) -> Result<()> {
         let span = span!(Level::INFO, "start_autonomous");
@@ -483,109 +579,73 @@ impl super::ApplicationCoordinator {
                                 }
                             }
 
-                            // hb-161: gate TX dispatch on the runtime
-                            // operator-override flag. If the operator
-                            // pressed Shift+Q, drop any TX items the
-                            // decision engine produced this cycle and
-                            // log once at WARN so the disengagement is
-                            // visible in journals. Listen/Status/Band
-                            // actions are still forwarded — only
-                            // outgoing TX is suppressed. The autonomous
-                            // operator retains its internal state so
-                            // re-enabling later picks up cleanly.
-                            if !autonomous_runtime_gate.load(Ordering::Acquire)
-                                && !tx_items.is_empty()
-                            {
+                            // Gate + route this slot's TX items (Shift+Q runtime
+                            // gate → tri-state TX policy → opening→QSO-start
+                            // split). All the decision logic is the pure
+                            // `plan_slot_transmissions`; here we only do I/O.
+                            let runtime_gate_open =
+                                autonomous_runtime_gate.load(Ordering::Acquire);
+                            let policy = pancetta_core::TxPolicy::from_u8(
+                                tx_policy.load(Ordering::Acquire),
+                            );
+                            let plan = plan_slot_transmissions(
+                                tx_items,
+                                runtime_gate_open,
+                                policy,
+                                dry_run,
+                                &listen_messages,
+                            );
+
+                            // hb-161: the operator pressed Shift+Q — log the
+                            // disengagement once so it is visible in journals.
+                            if plan.runtime_gate_dropped > 0 {
                                 warn!(
                                     target: "operator.override",
-                                    "Autonomous runtime gate is OFF; dropping {} TX items \
+                                    "Autonomous runtime gate is OFF; dropping {} TX item(s) \
                                      produced this cycle (operator pressed Shift+Q)",
-                                    tx_items.len()
+                                    plan.runtime_gate_dropped
                                 );
-                                tx_items.clear();
+                            }
+                            if plan.policy_dropped > 0 {
+                                info!(
+                                    target: "tx.policy",
+                                    "TX policy {}: suppressing {} autonomous initiation \
+                                     item(s) this cycle (QSO-in-progress items kept)",
+                                    policy.label(),
+                                    plan.policy_dropped
+                                );
+                            }
+                            for text in &plan.dry_run_openings {
+                                info!(
+                                    target: "autonomous.dry_run",
+                                    "DRY RUN: would have opened autonomous QSO from '{}'",
+                                    text
+                                );
                             }
 
-                            // Tri-state TX policy: when the policy disallows
-                            // initiation (RespondOnly or Disabled), drop the
-                            // autonomous *initiation* items — calling CQ
-                            // ourselves and hunting/pouncing on a CQer, both
-                            // identified by `qso_id == None`. Items belonging
-                            // to a QSO already in progress (`qso_id == Some`)
-                            // are kept so RespondOnly continues those exchanges;
-                            // Disabled additionally hard-mutes them at the TX
-                            // worker. The decision engine's internal state is
-                            // untouched, so returning to Full resumes cleanly.
-                            {
-                                let policy = pancetta_core::TxPolicy::from_u8(
-                                    tx_policy.load(Ordering::Acquire),
+                            // Phase 5: open each surviving autonomous QSO via the
+                            // QSO component (the QsoManager owns the exchange and
+                            // emits the opening TX + StateChanged). Sent INSTEAD
+                            // OF a raw TransmitRequest — no double-send.
+                            for start in plan.qso_starts {
+                                let msg = ComponentMessage::new(
+                                    ComponentId::Autonomous,
+                                    ComponentId::Qso,
+                                    MessageType::QsoMessage(
+                                        crate::message_bus::QsoMessage::StartAutonomousQso {
+                                            callsign: start.callsign,
+                                            frequency: start.frequency,
+                                            parity: start.parity,
+                                        },
+                                    ),
+                                    Instant::now(),
                                 );
-                                if !policy.allows_initiation() {
-                                    let before = tx_items.len();
-                                    tx_items.retain(|(item, _)| item.qso_id.is_some());
-                                    let dropped = before - tx_items.len();
-                                    if dropped > 0 {
-                                        info!(
-                                            target: "tx.policy",
-                                            "TX policy {}: suppressing {} autonomous initiation \
-                                             item(s) this cycle (QSO-in-progress items kept)",
-                                            policy.label(),
-                                            dropped
-                                        );
-                                    }
+                                if let Err(e) = message_bus.send_message(msg).await {
+                                    warn!("Failed to send StartAutonomousQso: {}", e);
                                 }
                             }
 
-                            // Phase 5: route surviving autonomous *openings*
-                            // (qso_id == None) through the QSO component so the
-                            // QsoManager owns the exchange and auto-sequences it
-                            // to completion. This runs AFTER the runtime gate and
-                            // TX-policy initiation suppression above, so a
-                            // suppressed cycle never creates a QSO. The opening is
-                            // sent via StartAutonomousQso INSTEAD OF a raw
-                            // TransmitRequest (the QsoManager emits the opening
-                            // itself, on the DX's frequency); we drop it from
-                            // tx_items to avoid a double-send. QSO-in-progress
-                            // items (qso_id == Some) stay on the raw TX path.
-                            {
-                                let mut remaining: Vec<_> = Vec::with_capacity(tx_items.len());
-                                for (item, tx_parity) in tx_items.drain(..) {
-                                    if item.qso_id.is_some() {
-                                        remaining.push((item, tx_parity));
-                                        continue;
-                                    }
-                                    if dry_run {
-                                        info!(
-                                            target: "autonomous.dry_run",
-                                            "DRY RUN: would have opened autonomous QSO from '{}'",
-                                            item.message_text
-                                        );
-                                        continue;
-                                    }
-                                    let (callsign, frequency, parity) =
-                                        classify_autonomous_opening(
-                                            &item.message_text,
-                                            item.frequency_offset,
-                                            tx_parity,
-                                            &listen_messages,
-                                        );
-                                    let msg = ComponentMessage::new(
-                                        ComponentId::Autonomous,
-                                        ComponentId::Qso,
-                                        MessageType::QsoMessage(
-                                            crate::message_bus::QsoMessage::StartAutonomousQso {
-                                                callsign,
-                                                frequency,
-                                                parity,
-                                            },
-                                        ),
-                                        Instant::now(),
-                                    );
-                                    if let Err(e) = message_bus.send_message(msg).await {
-                                        warn!("Failed to send StartAutonomousQso: {}", e);
-                                    }
-                                }
-                                tx_items = remaining;
-                            }
+                            let mut tx_items = plan.tx_items;
 
                             // Bundle collected TX items into a single message.
                             if tx_items.len() == 1 {
@@ -778,6 +838,207 @@ mod classify_autonomous_opening_tests {
         assert_eq!(
             freq, 1500.0,
             "case-insensitive sender match still resolves DX freq"
+        );
+    }
+}
+
+#[cfg(test)]
+mod plan_slot_transmissions_tests {
+    use super::*;
+    use crate::message_bus::TransmitRequestItem;
+    use pancetta_core::TxPolicy;
+    use pancetta_qso::DecodedMessageInfo;
+
+    fn decode(callsign: &str, freq: f64, parity: SlotParity) -> DecodedMessageInfo {
+        DecodedMessageInfo {
+            callsign: Some(callsign.to_string()),
+            frequency_hz: freq,
+            snr: -10,
+            message_text: format!("CQ {callsign} EM10"),
+            slot_parity: Some(parity),
+            confidence: None,
+            time_offset_s: None,
+            decode_origin: None,
+        }
+    }
+
+    fn opening(text: &str, offset: f64) -> (TransmitRequestItem, Option<SlotParity>) {
+        (
+            TransmitRequestItem {
+                message_text: text.to_string(),
+                frequency_offset: offset,
+                qso_id: None,
+            },
+            Some(SlotParity::Even),
+        )
+    }
+
+    fn in_progress(text: &str, qso_id: &str) -> (TransmitRequestItem, Option<SlotParity>) {
+        (
+            TransmitRequestItem {
+                message_text: text.to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some(qso_id.to_string()),
+            },
+            Some(SlotParity::Odd),
+        )
+    }
+
+    // --- Runtime gate (Shift+Q) -------------------------------------------
+
+    #[test]
+    fn runtime_gate_closed_drops_everything() {
+        let items = vec![
+            opening("VB7F K5ARH EM10", 600.0),
+            in_progress("VB7F K5ARH R-09", "q1"),
+        ];
+        let plan = plan_slot_transmissions(items, false, TxPolicy::Full, false, &[]);
+        assert!(plan.qso_starts.is_empty(), "Shift+Q drops openings");
+        assert!(plan.tx_items.is_empty(), "Shift+Q drops in-progress TX too");
+        assert_eq!(plan.runtime_gate_dropped, 2);
+        assert_eq!(plan.policy_dropped, 0);
+    }
+
+    // --- TX policy --------------------------------------------------------
+
+    #[test]
+    fn policy_respondonly_drops_openings_keeps_in_progress() {
+        let items = vec![
+            opening("VB7F K5ARH EM10", 600.0),
+            in_progress("VB7F K5ARH R-09", "q1"),
+        ];
+        let plan = plan_slot_transmissions(items, true, TxPolicy::RespondOnly, false, &[]);
+        assert!(
+            plan.qso_starts.is_empty(),
+            "RespondOnly suppresses autonomous initiations (no new QSO opened)"
+        );
+        assert_eq!(
+            plan.policy_dropped, 1,
+            "the one opening was the suppressed initiation"
+        );
+        assert_eq!(
+            plan.tx_items.len(),
+            1,
+            "in-progress (qso_id=Some) item still flows under RespondOnly"
+        );
+        assert_eq!(plan.tx_items[0].0.qso_id.as_deref(), Some("q1"));
+    }
+
+    #[test]
+    fn policy_disabled_drops_openings_keeps_in_progress() {
+        // Disabled suppresses initiation here too; the hard-mute of in-progress
+        // items happens later at the TX worker, not in this planner.
+        let items = vec![
+            opening("VB7F K5ARH EM10", 600.0),
+            in_progress("VB7F K5ARH R-09", "q1"),
+        ];
+        let plan = plan_slot_transmissions(items, true, TxPolicy::Disabled, false, &[]);
+        assert!(plan.qso_starts.is_empty());
+        assert_eq!(plan.policy_dropped, 1);
+        assert_eq!(plan.tx_items.len(), 1);
+    }
+
+    // --- Full policy: opening → QSO-start split ---------------------------
+
+    #[test]
+    fn full_policy_pounce_becomes_qso_start_on_dx_freq() {
+        let decodes = [decode("VB7F", 1500.0, SlotParity::Odd)];
+        let items = vec![opening("VB7F K5ARH EM10", 600.0)];
+        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, false, &decodes);
+        assert_eq!(plan.qso_starts.len(), 1, "the pounce became a QSO start");
+        assert_eq!(plan.qso_starts[0].callsign.as_deref(), Some("VB7F"));
+        assert_eq!(
+            plan.qso_starts[0].frequency, 1500.0,
+            "Tx=Rx on the DX's decoded freq, not the 600 Hz TX offset"
+        );
+        assert!(
+            plan.tx_items.is_empty(),
+            "the opening is routed via QSO start, NOT also sent raw (no double-send)"
+        );
+        assert_eq!(plan.policy_dropped, 0);
+        assert_eq!(plan.runtime_gate_dropped, 0);
+    }
+
+    #[test]
+    fn full_policy_cq_becomes_qso_start_with_no_callsign() {
+        let items = vec![opening("CQ K5ARH EM10", 1200.0)];
+        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, false, &[]);
+        assert_eq!(plan.qso_starts.len(), 1);
+        assert_eq!(
+            plan.qso_starts[0].callsign, None,
+            "calling CQ → no DX callsign"
+        );
+        assert_eq!(
+            plan.qso_starts[0].frequency, 1200.0,
+            "CQ uses our chosen offset"
+        );
+        assert!(plan.tx_items.is_empty());
+    }
+
+    #[test]
+    fn full_policy_in_progress_item_stays_on_raw_tx_path() {
+        let items = vec![in_progress("VB7F K5ARH R-09", "q1")];
+        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, false, &[]);
+        assert!(
+            plan.qso_starts.is_empty(),
+            "a qso_id=Some sequencer item is never a QSO start"
+        );
+        assert_eq!(
+            plan.tx_items.len(),
+            1,
+            "it stays on the raw TransmitRequest path"
+        );
+    }
+
+    #[test]
+    fn mixed_opening_and_in_progress_split_correctly() {
+        let decodes = [decode("VB7F", 1500.0, SlotParity::Odd)];
+        let items = vec![
+            opening("VB7F K5ARH EM10", 600.0),
+            in_progress("W1AW K5ARH R-12", "q7"),
+        ];
+        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, false, &decodes);
+        assert_eq!(plan.qso_starts.len(), 1, "the opening → start");
+        assert_eq!(plan.tx_items.len(), 1, "the in-progress item → raw TX");
+        assert_eq!(plan.tx_items[0].0.qso_id.as_deref(), Some("q7"));
+    }
+
+    // --- dry_run ----------------------------------------------------------
+
+    #[test]
+    fn dry_run_records_openings_without_creating_qsos() {
+        let items = vec![
+            opening("VB7F K5ARH EM10", 600.0),
+            in_progress("W1AW K5ARH R-12", "q7"),
+        ];
+        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, true, &[]);
+        assert!(plan.qso_starts.is_empty(), "dry_run opens no QSOs");
+        assert_eq!(
+            plan.dry_run_openings,
+            vec!["VB7F K5ARH EM10".to_string()],
+            "dry_run records the opening text for logging"
+        );
+        assert_eq!(
+            plan.tx_items.len(),
+            1,
+            "in-progress items remain for the bundler (which dry-run-logs them)"
+        );
+    }
+
+    // --- gate ordering: runtime gate wins over policy --------------------
+
+    #[test]
+    fn runtime_gate_takes_precedence_over_policy() {
+        // Even under Full policy, a closed runtime gate drops everything and
+        // nothing is attributed to the policy.
+        let items = vec![opening("VB7F K5ARH EM10", 600.0)];
+        let plan = plan_slot_transmissions(items, false, TxPolicy::Full, false, &[]);
+        assert!(plan.qso_starts.is_empty());
+        assert!(plan.tx_items.is_empty());
+        assert_eq!(plan.runtime_gate_dropped, 1);
+        assert_eq!(
+            plan.policy_dropped, 0,
+            "runtime gate already cleared the list"
         );
     }
 }

@@ -597,6 +597,35 @@ impl CoordSim {
         (keyed, released)
     }
 
+    /// Open an **autonomous** (Auto) QSO exactly as the coordinator's
+    /// `QsoMessage::StartAutonomousQso` handler does for a pounce: a plain
+    /// `respond_to_cq` (= `CallInitiation::Auto`) at the DX's decoded frequency.
+    /// Returns the new QSO id.
+    pub async fn autonomous_pounce(
+        &self,
+        dx: &str,
+        dx_freq_hz: f64,
+        dx_parity: Option<SlotParity>,
+    ) -> String {
+        self.manager
+            .respond_to_cq(dx.to_string(), dx_freq_hz, dx_parity)
+            .await
+            .expect("autonomous respond_to_cq")
+            .to_string()
+    }
+
+    /// Feed a decoded DX frame into the QSO engine exactly as the coordinator's
+    /// decode loop does (`parse_ft8_message` → `process_message`). The resulting
+    /// auto-sequenced reply (if any) surfaces on the next `pump_qso_events`.
+    pub async fn inject_decode(&self, text: &str, freq_hz: f64) {
+        let msg = pancetta_qso::utils::parse_ft8_message(text, &self.our_callsign)
+            .unwrap_or_else(|e| panic!("parse_ft8_message('{text}'): {e}"));
+        self.manager
+            .process_message(msg, text.to_string(), freq_hz, Some(-12.0))
+            .await
+            .expect("process_message");
+    }
+
     /// Tear down the consumer and take ownership of the accumulated timeline.
     /// Optional — scenarios may also read `sim.timeline` directly; the
     /// fixture's `Drop` flips the shutdown flag regardless.
@@ -1078,4 +1107,114 @@ async fn manual_send_never_gated_keys_with_empty_active_set() {
         sim.timeline
     );
     sim.timeline.assert_all_released();
+}
+
+// ===========================================================================
+// Phase 5 — autonomous QSO completion through the coordinator TX path.
+// These exercise the SAME path the production wiring uses: the
+// StartAutonomousQso handler opens an Auto QSO (respond_to_cq), the universal
+// decode loop (process_message) auto-sequences it, and each reply keys PTT at
+// the rig. They are the coordinator-level counterpart to the engine-level
+// pancetta-qso/tests/autonomous_scenarios.rs.
+// ===========================================================================
+
+/// An autonomous pounce runs the full ladder — grid → R-report → 73 — and PTT
+/// keys at the rig for each, all on the DX's frequency (Tx=Rx). This is the
+/// end-to-end Phase-5 acceptance at the coordinator level.
+#[tokio::test]
+async fn autonomous_pounce_completes_end_to_end_with_ptt() {
+    let mut sim = CoordSim::new("K5ARH").await;
+
+    // Slot 0: the StartAutonomousQso handler opens the Auto QSO; opening keys.
+    let qso_id = sim
+        .autonomous_pounce("VB7F", 1500.0, Some(SlotParity::Odd))
+        .await;
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+    sim.timeline.assert_keyed_for_qso(&qso_id);
+
+    // Slot 1: DX sends us a report → engine auto-sends our R-report; it keys.
+    sim.inject_decode("K5ARH VB7F -12", 1500.0).await;
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+
+    // Slot 2: DX rogers with RR73 → engine completes + auto-sends our 73; keys.
+    sim.inject_decode("K5ARH VB7F RR73", 1500.0).await;
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+
+    // The full responder ladder was keyed, in order, all at the DX's freq
+    // (Tx=Rx), all released. (The harness records the MessageType variant as the
+    // keyed `text`: CqResponse = our grid, ReportAck = our R-report,
+    // SeventyThree = our 73 close.)
+    let keyed: Vec<_> = sim.timeline.keyed_for_qso(&qso_id);
+    let ladder: Vec<&str> = keyed.iter().map(|k| k.text.as_str()).collect();
+    assert_eq!(
+        ladder,
+        vec!["CqResponse", "ReportAck", "SeventyThree"],
+        "expected the full grid → R-report → 73 ladder keyed in order.\n{}",
+        sim.timeline
+    );
+    assert!(
+        keyed
+            .iter()
+            .all(|k| k.ptt_keyed && (k.freq_hz - 1500.0).abs() < 0.5),
+        "all autonomous-QSO transmits must key PTT on the DX's 1500 Hz freq.\n{}",
+        sim.timeline
+    );
+    sim.timeline.assert_all_released();
+}
+
+/// No double-send: the opening goes out exactly ONCE. (In production the
+/// autonomous task sends StartAutonomousQso INSTEAD OF a raw TransmitRequest;
+/// here we confirm the QsoManager-emitted opening is the only keyed TX in the
+/// opening slot.)
+#[tokio::test]
+async fn autonomous_pounce_opening_keys_exactly_once() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    let qso_id = sim
+        .autonomous_pounce("VB7F", 1500.0, Some(SlotParity::Odd))
+        .await;
+
+    let pending = sim.pump_qso_events();
+    let slot = sim.drive_slot(pending).await;
+
+    let keyed_this_slot: Vec<_> = sim
+        .timeline
+        .keyed
+        .iter()
+        .filter(|k| k.slot == slot && k.ptt_keyed)
+        .collect();
+    assert_eq!(
+        keyed_this_slot.len(),
+        1,
+        "the autonomous opening must key exactly once (no double-send).\n{}",
+        sim.timeline
+    );
+    assert_eq!(keyed_this_slot[0].qso_id.as_deref(), Some(qso_id.as_str()));
+}
+
+/// Under TX policy Disabled, an autonomous QSO's transmit is hard-muted at the
+/// TX worker — PTT never keys, even though the QSO exists. (Initiation is also
+/// suppressed earlier by the planner; this asserts the worker-level backstop.)
+#[tokio::test]
+async fn autonomous_qso_tx_hard_muted_when_policy_disabled() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    let qso_id = sim
+        .autonomous_pounce("VB7F", 1500.0, Some(SlotParity::Odd))
+        .await;
+    sim.set_policy(TxPolicy::Disabled);
+
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+
+    sim.timeline.assert_not_keyed_for_qso(&qso_id);
+    assert!(
+        sim.timeline
+            .dropped
+            .iter()
+            .any(|d| d.reason == DropReason::PolicyDisabled),
+        "expected a PolicyDisabled drop for the autonomous QSO.\n{}",
+        sim.timeline
+    );
 }
