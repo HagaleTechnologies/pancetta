@@ -68,3 +68,8 @@ path = "examples/qso_logging.rs"
 name = "qso_sim_hifi"
 path = "examples/qso_sim_hifi.rs"
 required-features = ["sim-hifi"]
+
+[[example]]
+name = "decode_rate_sweep"
+path = "examples/decode_rate_sweep.rs"
+required-features = ["sim-hifi"]
