@@ -429,6 +429,32 @@ pub enum QsoMessage {
         /// New dial frequency in Hz.
         new_hz: u64,
     },
+    /// Open an **autonomous** QSO (`CallInitiation::Auto`) from the autonomous
+    /// operator's decision (Phase 5). Routed to the QSO component so the
+    /// `QsoManager` owns the exchange and auto-sequences it to completion,
+    /// exactly as the manual `StartQso` path does for manual calls.
+    ///
+    /// The `QsoManager` emits the **opening** `MessageToSend` (forwarded to the
+    /// transmitter by the QSO event loop) and a `StateChanged` (which populates
+    /// the coordinator's `active_tx_qsos` set). The autonomous task therefore
+    /// must **not** also transmit the opening itself — it sends this message
+    /// *instead of* its raw opening `TransmitRequest` (no double-send). All of
+    /// the autonomous task's gating (Shift+Q runtime gate, tri-state TX policy
+    /// initiation suppression, dry-run) is applied *before* this message is
+    /// sent, so a suppressed cycle never creates a QSO.
+    StartAutonomousQso {
+        /// `Some(dx)` = a hunt/pounce on a station calling CQ (→
+        /// `QsoManager::respond_to_cq`). `None` = we are calling CQ ourselves
+        /// (→ `QsoManager::start_cq`).
+        callsign: Option<String>,
+        /// For a pounce: the DX's **decoded** audio frequency (we answer
+        /// Tx=Rx so the DX's subsequent frames pass the QSO relevance gate).
+        /// For a CQ: our chosen audio offset.
+        frequency: f64,
+        /// For a pounce: the DX's slot parity (we reply on the opposite). For
+        /// a CQ: our chosen TX parity (`None` → self-parity fallback).
+        parity: Option<pancetta_core::slot::SlotParity>,
+    },
 }
 
 /// DX cluster messages

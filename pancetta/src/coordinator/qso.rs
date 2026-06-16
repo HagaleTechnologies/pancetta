@@ -1048,6 +1048,57 @@ impl super::ApplicationCoordinator {
                                                 }
                                             }
                                         }
+                                        crate::message_bus::QsoMessage::StartAutonomousQso {
+                                            callsign,
+                                            frequency,
+                                            parity,
+                                        } => {
+                                            // Phase 5: the autonomous operator decided to open
+                                            // a QSO. Create it in the QsoManager as an Auto QSO
+                                            // so the engine auto-sequences it to completion; the
+                                            // QsoManager emits the opening MessageToSend (→ TX)
+                                            // and StateChanged (→ active_tx_qsos). The autonomous
+                                            // task already applied its gating and is NOT sending
+                                            // the opening itself, so there is no double-send.
+                                            let result = match &callsign {
+                                                Some(dx) => {
+                                                    qso_manager
+                                                        .respond_to_cq(
+                                                            dx.clone(),
+                                                            frequency,
+                                                            parity,
+                                                        )
+                                                        .await
+                                                }
+                                                None => {
+                                                    // Calling CQ ourselves: `parity` is our TX
+                                                    // parity (not a DX parity).
+                                                    qso_manager.start_cq(frequency, parity).await
+                                                }
+                                            };
+                                            match result {
+                                                Ok(qso_id) => match &callsign {
+                                                    Some(dx) => info!(
+                                                        target: "qso.autonomous",
+                                                        "Autonomous QSO opened with {} on {:.0} Hz: {} \
+                                                         (auto-sequencing to completion)",
+                                                        dx, frequency, qso_id
+                                                    ),
+                                                    None => info!(
+                                                        target: "qso.autonomous",
+                                                        "Autonomous CQ QSO opened on {:.0} Hz: {}",
+                                                        frequency, qso_id
+                                                    ),
+                                                },
+                                                Err(e) => {
+                                                    warn!(
+                                                        target: "qso.autonomous",
+                                                        "Failed to open autonomous QSO ({:?}): {}",
+                                                        callsign, e
+                                                    );
+                                                }
+                                            }
+                                        }
                                         crate::message_bus::QsoMessage::RespondToCaller {
                                             callsign,
                                             frequency,

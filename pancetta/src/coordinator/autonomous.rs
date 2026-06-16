@@ -13,6 +13,51 @@ use tokio::time::interval;
 use tracing::{debug, error, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+use pancetta_core::slot::SlotParity;
+
+/// Classify a surviving autonomous *opening* TX item into the parameters for a
+/// [`crate::message_bus::QsoMessage::StartAutonomousQso`]. Kept pure (no I/O,
+/// no task state) so the freq/parity-resolution logic can be unit-tested
+/// without standing up the slot loop.
+///
+/// - A `"CQ …"` opening → `(None, our chosen offset, our tx_parity)` — we are
+///   calling CQ, so we pick our own offset and parity.
+/// - A pounce (`"<DX> <us> …"`) → `(Some(DX), DX's decoded freq, DX's parity)`,
+///   i.e. answer Tx=Rx on the DX's frequency so its subsequent frames pass the
+///   QSO relevance gate. Falls back to the item's offset and
+///   `tx_parity.opposite()` (the DX parity the operator derived our TX parity
+///   from) when the DX's decode for this slot can't be located.
+///
+/// `decodes` is this slot's decoded traffic; the DX is matched by *sender*
+/// callsign (the first token of the pounce text).
+pub(crate) fn classify_autonomous_opening(
+    message_text: &str,
+    frequency_offset: f64,
+    tx_parity: Option<SlotParity>,
+    decodes: &[pancetta_qso::DecodedMessageInfo],
+) -> (Option<String>, f64, Option<SlotParity>) {
+    let first = message_text.split_whitespace().next();
+    let is_cq = first.map(|t| t.eq_ignore_ascii_case("CQ")).unwrap_or(false);
+    if is_cq {
+        // Calling CQ ourselves: our chosen offset + our TX parity.
+        return (None, frequency_offset, tx_parity);
+    }
+    // Pounce: the DX is the first token. Answer on its decoded frequency.
+    let dx = first.map(|s| s.to_string());
+    let decoded = dx.as_ref().and_then(|d| {
+        decodes.iter().find(|m| {
+            m.callsign
+                .as_deref()
+                .map(|c| c.eq_ignore_ascii_case(d))
+                .unwrap_or(false)
+        })
+    });
+    let frequency = decoded.map(|m| m.frequency_hz).unwrap_or(frequency_offset);
+    let parity = decoded
+        .and_then(|m| m.slot_parity)
+        .or_else(|| tx_parity.map(|p| p.opposite()));
+    (dx, frequency, parity)
+}
 
 impl super::ApplicationCoordinator {
     pub(crate) async fn start_autonomous_component(&mut self) -> Result<()> {
@@ -208,6 +253,12 @@ impl super::ApplicationCoordinator {
         // responses (`qso_id == Some`) flowing; Disabled is additionally
         // hard-muted at the TX worker.
         let tx_policy = self.tx_policy.clone();
+        // Phase 5: the active-QSO set the QSO component maintains. Its length is
+        // fed to the operator each slot as `active_qso_count` so the decision
+        // engine's `max_concurrent_qsos` gate sees QSOs the engine itself is
+        // now driving (autonomous Auto QSOs land here once created), and so we
+        // don't open a second pounce while one is already in progress.
+        let active_tx_qsos = self.active_tx_qsos.clone();
         let auto_handle = {
             let shutdown = self.shutdown_signal.clone();
             let operator = operator.clone();
@@ -284,6 +335,16 @@ impl super::ApplicationCoordinator {
                             }
 
                             op.feed_decoded_messages(&slot_messages, evaluator.as_ref());
+                            // Phase 5: sync the operator's active-QSO count from
+                            // the shared active-QSO set so `max_concurrent_qsos`
+                            // gating is honored (fail-open to 0 on a poisoned
+                            // lock — the engine's own dedup/in-progress gates
+                            // still apply).
+                            let active_now = active_tx_qsos
+                                .read()
+                                .map(|s| s.len() as u32)
+                                .unwrap_or(0);
+                            op.set_active_qso_count(active_now);
                             let listen_messages = slot_messages.clone();
                             slot_messages.clear();
                             let actions = op.decide();
@@ -474,6 +535,58 @@ impl super::ApplicationCoordinator {
                                 }
                             }
 
+                            // Phase 5: route surviving autonomous *openings*
+                            // (qso_id == None) through the QSO component so the
+                            // QsoManager owns the exchange and auto-sequences it
+                            // to completion. This runs AFTER the runtime gate and
+                            // TX-policy initiation suppression above, so a
+                            // suppressed cycle never creates a QSO. The opening is
+                            // sent via StartAutonomousQso INSTEAD OF a raw
+                            // TransmitRequest (the QsoManager emits the opening
+                            // itself, on the DX's frequency); we drop it from
+                            // tx_items to avoid a double-send. QSO-in-progress
+                            // items (qso_id == Some) stay on the raw TX path.
+                            {
+                                let mut remaining: Vec<_> = Vec::with_capacity(tx_items.len());
+                                for (item, tx_parity) in tx_items.drain(..) {
+                                    if item.qso_id.is_some() {
+                                        remaining.push((item, tx_parity));
+                                        continue;
+                                    }
+                                    if dry_run {
+                                        info!(
+                                            target: "autonomous.dry_run",
+                                            "DRY RUN: would have opened autonomous QSO from '{}'",
+                                            item.message_text
+                                        );
+                                        continue;
+                                    }
+                                    let (callsign, frequency, parity) =
+                                        classify_autonomous_opening(
+                                            &item.message_text,
+                                            item.frequency_offset,
+                                            tx_parity,
+                                            &listen_messages,
+                                        );
+                                    let msg = ComponentMessage::new(
+                                        ComponentId::Autonomous,
+                                        ComponentId::Qso,
+                                        MessageType::QsoMessage(
+                                            crate::message_bus::QsoMessage::StartAutonomousQso {
+                                                callsign,
+                                                frequency,
+                                                parity,
+                                            },
+                                        ),
+                                        Instant::now(),
+                                    );
+                                    if let Err(e) = message_bus.send_message(msg).await {
+                                        warn!("Failed to send StartAutonomousQso: {}", e);
+                                    }
+                                }
+                                tx_items = remaining;
+                            }
+
                             // Bundle collected TX items into a single message.
                             if tx_items.len() == 1 {
                                 let (item, tx_parity) = tx_items.remove(0);
@@ -595,5 +708,76 @@ impl super::ApplicationCoordinator {
             .push((ComponentId::Autonomous, auto_handle));
         info!("Autonomous operator component started");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod classify_autonomous_opening_tests {
+    use super::*;
+    use pancetta_qso::DecodedMessageInfo;
+
+    fn decode(callsign: &str, freq: f64, parity: SlotParity) -> DecodedMessageInfo {
+        DecodedMessageInfo {
+            callsign: Some(callsign.to_string()),
+            frequency_hz: freq,
+            snr: -10,
+            message_text: format!("CQ {callsign} EM10"),
+            slot_parity: Some(parity),
+            confidence: None,
+            time_offset_s: None,
+            decode_origin: None,
+        }
+    }
+
+    #[test]
+    fn cq_opening_uses_our_offset_and_parity() {
+        let (callsign, freq, parity) =
+            classify_autonomous_opening("CQ K5ARH EM10", 1234.0, Some(SlotParity::Even), &[]);
+        assert_eq!(callsign, None, "calling CQ → no DX callsign");
+        assert_eq!(freq, 1234.0, "CQ uses our chosen offset");
+        assert_eq!(parity, Some(SlotParity::Even), "CQ uses our TX parity");
+    }
+
+    #[test]
+    fn pounce_answers_on_dx_decoded_frequency_and_parity() {
+        // DX VB7F was decoded at 1500 Hz, Odd slot. The operator chose a TX
+        // offset of 600 Hz (which we must NOT use to track the QSO).
+        let decodes = [decode("VB7F", 1500.0, SlotParity::Odd)];
+        let (callsign, freq, parity) =
+            classify_autonomous_opening("VB7F K5ARH EM10", 600.0, Some(SlotParity::Even), &decodes);
+        assert_eq!(callsign.as_deref(), Some("VB7F"));
+        assert_eq!(freq, 1500.0, "answer Tx=Rx on the DX's decoded frequency");
+        assert_eq!(
+            parity,
+            Some(SlotParity::Odd),
+            "respond_to_cq wants the DX's slot parity (it latches our tx = opposite)"
+        );
+    }
+
+    #[test]
+    fn pounce_falls_back_when_dx_decode_missing() {
+        // No matching decode this slot → use the item's offset, and recover the
+        // DX parity from the operator's computed tx_parity (= dx.opposite()).
+        let (callsign, freq, parity) =
+            classify_autonomous_opening("VB7F K5ARH EM10", 600.0, Some(SlotParity::Even), &[]);
+        assert_eq!(callsign.as_deref(), Some("VB7F"));
+        assert_eq!(freq, 600.0, "fallback to the operator's chosen offset");
+        assert_eq!(
+            parity,
+            Some(SlotParity::Odd),
+            "fallback DX parity = opposite of our computed tx_parity"
+        );
+    }
+
+    #[test]
+    fn pounce_matches_dx_callsign_case_insensitively() {
+        let decodes = [decode("vb7f", 1500.0, SlotParity::Odd)];
+        let (callsign, freq, _) =
+            classify_autonomous_opening("VB7F K5ARH EM10", 600.0, Some(SlotParity::Even), &decodes);
+        assert_eq!(callsign.as_deref(), Some("VB7F"));
+        assert_eq!(
+            freq, 1500.0,
+            "case-insensitive sender match still resolves DX freq"
+        );
     }
 }

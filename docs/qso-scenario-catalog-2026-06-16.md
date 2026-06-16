@@ -82,35 +82,41 @@ context-aware skip-rung reply, RR73/RRR close, unanswered-pounce retirement)
 pass driving the **real** `AutonomousOperator` through the sim's
 `run_autonomous_slot` → real `QsoManager`.
 
-**Production coordinator wiring: NOT YET (deliberate plan-sized follow-on).**
-Today no production path creates an `Auto` QSO in the `QsoManager` — the
-autonomous task (`coordinator/autonomous.rs`) only emits gated
-`TransmitRequest`s; the universal decode→`process_message` loop
-(`coordinator/qso.rs:966`) therefore never has an Auto QSO to advance. To
-enable autonomous completion on-air, the autonomous task must register each
-surviving opening (pounce → `respond_to_cq` Auto; CQ → `start_cq` Auto) in the
-`QsoManager` so the engine drives it. Open design points (resolve before
-touching the live TX path):
-  1. **Frequency-model split.** The autonomous operator smart-allocates a TX
-     offset that differs from the DX's decode frequency, but `QsoState` carries
-     ONE frequency (manual answers *on* the DX freq). The QSO needs an
-     RX-match-freq (DX, for `is_message_relevant`) distinct from the TX-freq
-     (our offset). Until split, an autonomous QSO would either mismatch the
-     DX's frames or TX on top of the DX. (In the sim today we sidestep this by
-     answering on the DX freq — fine for the tests, wrong for production.)
-  2. **Double-send avoidance.** The autonomous task already sends the gated
-     opening `TransmitRequest` (qso_id=None). If `respond_to_cq` also emits its
-     opening `MessageToSend` (→ forwarded at `qso.rs:718`), the opening goes
-     out twice. Need a register-only QSO-creation that emits `StateChanged`
-     (to populate `active_tx_qsos`) but NOT the opening `MessageToSend`.
-  3. **Gating order.** QSO creation must happen only for openings that survive
-     the Shift+Q runtime gate and the tri-state TX policy (both applied to
-     `tx_items` AFTER the action loop). Create QSOs from surviving items, not
-     inside the action loop.
-  4. **Coordinator integration test.** Add a `coord_sim`-pattern test that
-     drives an autonomous pounce end-to-end through the coordinator to a logged
-     completion, asserting exactly one opening TX and no double-send.
-  5. On-air A/B validation is operator-gated (needs antenna) — meatspace-pending.
+**Production coordinator wiring: DONE (2026-06-16, second commit).** The
+autonomous task now creates each surviving opening as a real `Auto` QSO in the
+`QsoManager`, so the universal decode→`process_message` loop drives it to
+completion. Design decisions as built:
+  1. **Bus message, not a manager handle.** The `QsoManager` lives inside the
+     QSO component's task, so the autonomous task can't call it directly. A new
+     `QsoMessage::StartAutonomousQso { callsign, frequency, parity }` is sent on
+     the bus (mirroring the manual `StartQso` path); `coordinator/qso.rs` handles
+     it with `respond_to_cq`(Auto) for a pounce / `start_cq`(Auto) for a CQ.
+  2. **Frequency model (v1 = answer Tx=Rx).** The opening + all replies go out
+     on the DX's *decoded* frequency (so the DX's frames pass the relevance
+     gate), matching the manual path and the sim exactly. The operator's
+     smart-allocated TX offset is NOT used to track the QSO. **Follow-on:** an
+     RX-match-freq vs TX-freq split in `QsoState` would let autonomous QSOs keep
+     the smart offset; deferred (would need the split in sim + engine + tests).
+  3. **No double-send.** The opening is sent via `StartAutonomousQso` *instead
+     of* the raw `TransmitRequest`; the created QSO's `respond_to_cq`/`start_cq`
+     emits the opening `MessageToSend` (→ `qso.rs:718` → TX) and a
+     `StateChanged` (→ `active_tx_qsos`). The opening item is dropped from the
+     autonomous task's TX bundle.
+  4. **Gating preserved.** QSO creation happens AFTER the Shift+Q runtime gate
+     and the tri-state TX-policy initiation suppression (both filter `tx_items`),
+     and honors `dry_run`. A suppressed cycle never creates a QSO.
+  5. **Concurrency.** The operator's `active_qso_count` is now fed each slot
+     from `active_tx_qsos.len()` (previously never fed in production), so
+     `max_concurrent_qsos` is honored and we don't open a second pounce while
+     one QSO is in progress.
+  Tested: the opening-classification logic (`classify_autonomous_opening`) has 4
+  unit tests (CQ, pounce w/ decode, fallback, case-insensitive); engine
+  completion is the 4 Phase-5 `autonomous_scenarios` tests; the qso.rs handler
+  calls already-tested manager methods. **Remaining: a full live-coordinator
+  integration test** (stand up the real qso + autonomous components, inject a CQ
+  decode, assert one opening TX + logged completion) — heavier than the existing
+  mirror-style harnesses; **on-air A/B is the real Phase-5 acceptance test and
+  is operator-gated (needs antenna) — meatspace-pending.**
 
 ## Conventions
 Each scenario → a named test with a slot-by-slot exchange + asserted outcome, citing source
