@@ -707,3 +707,152 @@ fn test_decode_silence_no_panic_or_inf() {
         waterfall.max_power
     );
 }
+
+// =============================================================
+// SNR calibration regression (WSJT-X 2500 Hz reference)
+// =============================================================
+
+/// Deterministic Box-Muller Gaussian PRNG (xorshift64) for calibrated noise.
+struct CalRng(u64);
+impl CalRng {
+    fn new(seed: u64) -> Self {
+        CalRng(seed | 1)
+    }
+    fn unit(&mut self) -> f64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        ((x >> 11) as f64 + 1.0) / ((1u64 << 53) as f64 + 1.0)
+    }
+    fn gaussian(&mut self) -> f64 {
+        let u1 = self.unit();
+        let u2 = self.unit();
+        (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+    }
+}
+
+/// Add white Gaussian noise so the WSJT-X 2500 Hz-reference SNR equals
+/// `target_snr_db`. For real white noise of variance sigma^2 sampled at
+/// `SAMPLE_RATE`, the one-sided spectrum spans 0..fs/2, so the power in a
+/// 2500 Hz reference bandwidth is `sigma^2 * 2500/(fs/2)`. We solve for sigma
+/// from `P_noise_2500 = P_sig / 10^(snr/10)`.
+fn add_noise_2500ref(audio: &mut [f32], p_sig: f64, target_snr_db: f64, seed: u64) {
+    let p_noise_2500 = p_sig / 10f64.powf(target_snr_db / 10.0);
+    let half_band = SAMPLE_RATE as f64 / 2.0;
+    let sigma = (p_noise_2500 * half_band / 2500.0).sqrt();
+    let mut rng = CalRng::new(seed);
+    for s in audio.iter_mut() {
+        *s += (sigma * rng.gaussian()) as f32;
+    }
+}
+
+/// Mean power over the active (modulated) span of the slot.
+fn active_signal_power(audio: &[f32]) -> f64 {
+    let active = audio
+        .iter()
+        .rposition(|&x| x != 0.0)
+        .map(|i| i + 1)
+        .unwrap_or(audio.len());
+    audio[..active]
+        .iter()
+        .map(|&x| (x as f64) * (x as f64))
+        .sum::<f64>()
+        / active as f64
+}
+
+/// Both decode paths must report an SNR close to the *true* WSJT-X 2500 Hz
+/// SNR across the operational band. This pins the linearity calibration in
+/// `decoder::snr_from_tone_mags_db` and `ft8_lib_ffi::estimate_snr_from_waterfall`
+/// (derived in `examples/snr_calibration.rs`); a regression there would shift
+/// reported SNR off the WSJT-X convention.
+#[test]
+fn test_snr_calibration_wsjtx_2500ref() {
+    let symbols = encode_message("CQ K5ARH EM12");
+    let clean = modulate_symbols(&symbols, 0.0);
+    let p_sig = active_signal_power(&clean);
+
+    // Operational band where SNR reports drive QSO decisions. Tolerance is
+    // generous (±3 dB) — the calibration targets ~±1 dB but a single noise
+    // realization per point wobbles, and the goal is "unbiased & WSJT-X-aligned",
+    // not bit-exact.
+    let cases = [(-17.0, 4.0), (-13.0, 3.0), (-9.0, 3.0), (-5.0, 3.5)];
+
+    for (true_snr, tol) in cases {
+        let mut audio = clean.clone();
+        add_noise_2500ref(
+            &mut audio,
+            p_sig,
+            true_snr,
+            0xC0FFEE ^ (true_snr as i64 as u64),
+        );
+
+        // Native path.
+        let native = decode_audio(&audio);
+        let nat = native
+            .iter()
+            .find(|m| m.text.contains("K5ARH"))
+            .unwrap_or_else(|| panic!("native decode failed at true SNR {true_snr} dB"));
+        assert!(
+            (nat.snr_db as f64 - true_snr).abs() <= tol,
+            "native reported SNR {} too far from true {} dB (tol {})",
+            nat.snr_db,
+            true_snr,
+            tol
+        );
+
+        // ft8_lib FFI path.
+        let ffi = ft8lib_decode_audio(&audio);
+        let (_t, _f, _ti, _l, ffi_snr) = ffi
+            .iter()
+            .find(|(t, ..)| t.contains("K5ARH"))
+            .unwrap_or_else(|| panic!("ffi decode failed at true SNR {true_snr} dB"));
+        assert!(
+            (*ffi_snr as f64 - true_snr).abs() <= tol,
+            "ffi reported SNR {} too far from true {} dB (tol {})",
+            ffi_snr,
+            true_snr,
+            tol
+        );
+
+        // The two paths must also agree with each other.
+        assert!(
+            (nat.snr_db - ffi_snr).abs() <= 3.0,
+            "native ({}) and ffi ({}) SNR disagree at true {} dB",
+            nat.snr_db,
+            ffi_snr,
+            true_snr
+        );
+    }
+}
+
+/// Reported SNR must never fall outside WSJT-X's conventional range
+/// (-24..+24 dB), even on pure noise or a very strong signal.
+#[test]
+fn test_snr_reported_range_clamped() {
+    // Pure noise: no signal tone; estimator must clamp, not produce -inf/NaN.
+    let mut noise = vec![0.0f32; WINDOW_SAMPLES];
+    let mut rng = CalRng::new(0xDEAD_BEEF);
+    for s in noise.iter_mut() {
+        *s = (0.05 * rng.gaussian()) as f32;
+    }
+    for m in decode_audio(&noise) {
+        assert!(
+            (-24.0..=24.0).contains(&m.snr_db) && m.snr_db.is_finite(),
+            "SNR out of range on noise: {}",
+            m.snr_db
+        );
+    }
+
+    // Very strong clean signal: reported SNR is clamped at the top of the range.
+    let symbols = encode_message("CQ K5ARH EM12");
+    let strong = modulate_symbols(&symbols, 0.0);
+    for m in decode_audio(&strong) {
+        assert!(
+            (-24.0..=24.0).contains(&m.snr_db) && m.snr_db.is_finite(),
+            "SNR out of range on strong signal: {}",
+            m.snr_db
+        );
+    }
+}

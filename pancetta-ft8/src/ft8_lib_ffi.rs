@@ -317,8 +317,11 @@ fn estimate_snr_from_waterfall(wf: &ftx_waterfall_t, cand: &ftx_candidate_t) -> 
         * num_bins
         + cand.freq_offset as i64;
 
-    let mut signal_sum = 0.0f64;
-    let mut noise_sum = 0.0f64;
+    // Accumulate per-bin signal/noise *power* (linear), mirroring the native
+    // `snr_from_tone_mags_db`: for each symbol, peak tone = signal+noise, mean
+    // of the other 7 = per-bin noise floor.
+    let mut signal_power = 0.0f64;
+    let mut noise_power = 0.0f64;
     let mut count = 0usize;
 
     for k in 0..FT8_ND {
@@ -333,32 +336,57 @@ fn estimate_snr_from_waterfall(wf: &ftx_waterfall_t, cand: &ftx_candidate_t) -> 
         if sym_off < 0 || cand.freq_offset as i64 + (FT8_NUM_TONES as i64) > num_bins {
             continue;
         }
-        let mut best = f64::NEG_INFINITY;
-        let mut worst = f64::INFINITY;
-        for t in 0..FT8_NUM_TONES {
-            let v = unsafe { wf_mag_db(wf.mag, (sym_off as usize) + t) };
-            if v > best {
-                best = v;
-            }
-            if v < worst {
-                worst = v;
+        // Read the 8 tone bins as linear power and find the peak (signal) tone.
+        let mut lin = [0.0f64; FT8_NUM_TONES];
+        let mut peak = 0.0f64;
+        let mut peak_idx = 0usize;
+        for (t, slot) in lin.iter_mut().enumerate() {
+            let db = unsafe { wf_mag_db(wf.mag, (sym_off as usize) + t) };
+            let p = 10.0f64.powf(db / 10.0);
+            *slot = p;
+            if p > peak {
+                peak = p;
+                peak_idx = t;
             }
         }
-        signal_sum += best;
-        noise_sum += worst;
+        // Noise floor: mean of the non-peak tone bins.
+        let mut floor_sum = 0.0f64;
+        for (t, &p) in lin.iter().enumerate() {
+            if t != peak_idx {
+                floor_sum += p;
+            }
+        }
+        let floor = floor_sum / (FT8_NUM_TONES as f64 - 1.0);
+        signal_power += (peak - floor).max(0.0);
+        noise_power += floor;
         count += 1;
     }
 
-    if count == 0 {
+    if count == 0 || noise_power <= 0.0 {
         return None;
     }
-    let avg_signal_db = signal_sum / count as f64;
-    let avg_noise_db = noise_sum / count as f64;
-    let snr_bin_db = avg_signal_db - avg_noise_db;
-    // Match estimate_snr_spectrogram: reference the 6.25 Hz bin ratio to a
-    // 2500 Hz noise bandwidth (WSJT-X convention).
+    let snr_bin_linear = signal_power / noise_power;
+    if snr_bin_linear <= 0.0 {
+        return Some(-24.0);
+    }
+    let snr_bin_db = 10.0 * snr_bin_linear.log10();
+    // Reference the 6.25 Hz bin ratio to a 2500 Hz noise bandwidth (WSJT-X
+    // convention).
     let bw_correction = 10.0 * (2500.0f64 / 6.25).log10();
-    Some(snr_bin_db - bw_correction)
+    let raw = snr_bin_db - bw_correction;
+    // Linearity correction, mirroring the native `snr_from_tone_mags_db`. The
+    // ft8_lib waterfall is a uint8 dB grid with its own dynamic range, so its
+    // raw estimate has a *different* compression than the native spectrogram: a
+    // least-squares fit over the operational band (true SNR -19..-3 dB,
+    // calibrated white noise referenced to 2500 Hz; see
+    // `examples/snr_calibration.rs`) gives raw ≈ 0.756*true - 3.73. Inverting
+    // (true ≈ (raw - b)/slope) maps it onto the true WSJT-X 2500 Hz SNR and
+    // makes this path report the same number as the native path for the same
+    // signal. Level- and message-independent (SNR is a ratio).
+    const SLOPE: f64 = 0.756;
+    const INTERCEPT: f64 = -3.73;
+    let snr = (raw - INTERCEPT) / SLOPE;
+    Some(snr.clamp(-24.0, 24.0))
 }
 
 /// Decode audio samples to FT8 messages using ft8_lib's full pipeline.

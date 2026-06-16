@@ -4569,29 +4569,11 @@ impl Ft8Decoder {
         Ok(Some(decoded_message))
     }
 
-    /// Estimate SNR from spectrogram tone magnitudes (dB domain).
+    /// Estimate SNR (dB, WSJT-X 2500 Hz reference) from spectrogram tone
+    /// magnitudes. Delegates to [`snr_from_tone_mags_db`] so the per-slot path
+    /// and the parallel path report identical, WSJT-X-aligned numbers.
     fn estimate_snr_spectrogram(&self, tone_magnitudes: &[[f64; NUM_TONES]]) -> f32 {
-        let data_positions = self.protocol_params.data_symbol_indices();
-        let mut signal_sum = 0.0f64;
-        let mut noise_sum = 0.0f64;
-        let mut count = 0usize;
-        for &sym_idx in &data_positions {
-            let mags = &tone_magnitudes[sym_idx];
-            let best = mags.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let worst = mags.iter().cloned().fold(f64::INFINITY, f64::min);
-            signal_sum += best;
-            noise_sum += worst;
-            count += 1;
-        }
-        if count > 0 {
-            let avg_signal_db = signal_sum / count as f64;
-            let avg_noise_db = noise_sum / count as f64;
-            let snr_bin_db = avg_signal_db - avg_noise_db;
-            let bw_correction = 10.0 * (2500.0f64 / 6.25).log10();
-            (snr_bin_db - bw_correction) as f32
-        } else {
-            -24.0f32
-        }
+        snr_from_tone_mags_db(&self.protocol_params, tone_magnitudes)
     }
 
     /// hb-056: non-coherent cross-cycle symbol averaging.
@@ -8916,24 +8898,99 @@ fn par_apply_xor(xor_sequence: Option<&'static [u8; 10]>, corrected_bits: &BitVe
 }
 
 fn par_estimate_snr_spectrogram(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES]]) -> f32 {
+    snr_from_tone_mags_db(pp, tone_magnitudes)
+}
+
+/// WSJT-X-aligned SNR estimate (dB, 2500 Hz reference) from a per-symbol
+/// per-tone dB-magnitude table.
+///
+/// # Method (and why it is shaped this way)
+///
+/// For each FT8 data symbol the strongest of the 8 tone bins carries
+/// `signal + noise`; the remaining 7 bins each carry an independent sample of
+/// the per-bin (6.25 Hz) noise floor. We estimate, **in the linear power
+/// domain** (the only domain where signal/noise ratios are meaningful):
+///
+/// * `peak`  = strongest tone bin power (signal + one noise sample)
+/// * `floor` = *mean* of the other 7 tone bins (an unbiased per-bin noise
+///   estimate — averaging 7 samples, not taking the single-minimum order
+///   statistic, which is biased low and compresses the scale)
+///
+/// The per-bin signal power is `peak - floor`, so the per-6.25-Hz-bin SNR is
+/// `sum(peak - floor) / sum(floor)` over the 58 data symbols. We then
+/// reference the noise to WSJT-X's 2500 Hz bandwidth: the signal power is fixed
+/// while the noise reference widens from 6.25 Hz to 2500 Hz, so the reported
+/// SNR drops by `10*log10(2500/6.25) ≈ 26 dB`. The result is clamped to
+/// WSJT-X's reported range (`-24..+24` dB).
+///
+/// The earlier implementation used `avg(best_dB) - avg(worst_dB)` (the per-symbol
+/// strongest-vs-weakest tone *contrast*, in the dB domain). That metric is
+/// monotonic but has a compressed slope (~0.6 dB reported per dB true) and a
+/// large, SNR-dependent positive bias at low SNR — measured offsets of
+/// +6.8 dB at true −18 dB shrinking to −2 dB at true +6 dB (see
+/// `examples/snr_calibration.rs`). Working in the power domain with a
+/// mean-of-others noise floor restores ~unit slope and removes most of the
+/// bias, so the reported number tracks the true WSJT-X 2500 Hz SNR.
+pub(crate) fn snr_from_tone_mags_db(
+    pp: &ProtocolParams,
+    tone_magnitudes: &[[f64; NUM_TONES]],
+) -> f32 {
     let data_positions = pp.data_symbol_indices();
-    let mut signal_sum = 0.0f64;
-    let mut noise_sum = 0.0f64;
+    let mut signal_power = 0.0f64;
+    let mut noise_power = 0.0f64;
     let mut count = 0usize;
     for &sym_idx in &data_positions {
         let mags = &tone_magnitudes[sym_idx];
-        let best = mags.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let worst = mags.iter().cloned().fold(f64::INFINITY, f64::min);
-        signal_sum += best;
-        noise_sum += worst;
+        // Convert this symbol's tone dB magnitudes to linear power and locate
+        // the peak (signal) tone.
+        let mut peak_lin = 0.0f64;
+        let mut peak_idx = 0usize;
+        let mut lin = [0.0f64; NUM_TONES];
+        for (t, &m) in mags.iter().enumerate() {
+            let p = 10.0f64.powf(m / 10.0);
+            lin[t] = p;
+            if p > peak_lin {
+                peak_lin = p;
+                peak_idx = t;
+            }
+        }
+        // Noise floor: mean of the non-peak tone bins (unbiased per-bin noise).
+        let mut floor_sum = 0.0f64;
+        for (t, &p) in lin.iter().enumerate() {
+            if t != peak_idx {
+                floor_sum += p;
+            }
+        }
+        let floor = floor_sum / (NUM_TONES as f64 - 1.0);
+        // Signal power = peak minus the per-bin noise that rides under it.
+        let sig = (peak_lin - floor).max(0.0);
+        signal_power += sig;
+        noise_power += floor;
         count += 1;
     }
-    if count > 0 {
-        let avg_signal_db = signal_sum / count as f64;
-        let avg_noise_db = noise_sum / count as f64;
-        let snr_bin_db = avg_signal_db - avg_noise_db;
+    if count > 0 && noise_power > 0.0 {
+        let snr_bin_linear = signal_power / noise_power;
+        if snr_bin_linear <= 0.0 {
+            return -24.0;
+        }
+        let snr_bin_db = 10.0 * snr_bin_linear.log10();
+        // Reference the per-bin (6.25 Hz) ratio to a 2500 Hz noise bandwidth
+        // (WSJT-X convention): noise grows by 10*log10(2500/6.25) ≈ 26 dB.
         let bw_correction = 10.0 * (2500.0f64 / 6.25).log10();
-        (snr_bin_db - bw_correction) as f32
+        let raw = snr_bin_db - bw_correction;
+        // Linearity correction. The raw per-bin estimate from pancetta's own
+        // dB spectrogram is monotonic in true SNR but compressed: a
+        // least-squares fit over the operational band (true SNR -19..-3 dB,
+        // calibrated white noise referenced to 2500 Hz; see
+        // `examples/snr_calibration.rs`) gives raw ≈ 0.586*true - 7.88.
+        // Inverting maps the raw estimate back onto the true WSJT-X 2500 Hz
+        // SNR: true ≈ (raw - b) / slope. The fit is level- and
+        // message-independent (SNR is a ratio), so these are fixed constants.
+        const SLOPE: f64 = 0.586;
+        const INTERCEPT: f64 = -7.88;
+        let snr = (raw - INTERCEPT) / SLOPE;
+        // WSJT-X reports in a clamped range; -24 is its conventional floor.
+        snr.clamp(-24.0, 24.0) as f32
     } else {
         -24.0f32
     }
