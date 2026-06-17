@@ -281,6 +281,57 @@ impl RigctldClient {
         }
     }
 
+    /// First token of every rigctld command this client is permitted to send.
+    ///
+    /// SECURITY (I-12): `send_raw_command` is a public escape hatch, so an
+    /// untrusted/buggy caller could otherwise reach *any* rigctld verb,
+    /// including dangerous configuration ones (`\set_conf`, `q`/quit, reset,
+    /// memory-clear, etc.). We constrain it to an allow-list keyed on the
+    /// first whitespace-separated token. The set covers:
+    ///   - every verb this client already issues internally (so nothing
+    ///     that works today breaks):
+    ///       short form: `f` (get_freq), `F` (set_freq), `m` (get_mode),
+    ///                   `T` (set_ptt), `V` (set_vfo)
+    ///       long form:  `\set_mode`, `\get_ptt`, `\get_level`, `\set_vfo`,
+    ///                   `\get_vfo`, `\set_level`, `\set_mem`, `\get_mem`,
+    ///                   `\set_func`, `\get_info`
+    ///   - the standard short/long forms that pair with the above (so the
+    ///     escape hatch can read what it can already set and vice versa):
+    ///       `M` (set_mode), `t` (get_ptt), `v` (get_vfo)
+    ///   - the antenna verbs the escape hatch was documented for:
+    ///       `y` (get_ant), `Y` (set_ant), `\get_ant`, `\set_ant`
+    /// Anything else (notably `\set_conf`, `q`, `Q`, `reset`, `\reset`,
+    /// `\send_morse`, free text) is rejected without being sent.
+    const ALLOWED_COMMAND_VERBS: &'static [&'static str] = &[
+        // short-form verbs (internal + their read/write pair + antenna)
+        "f",
+        "F",
+        "m",
+        "M",
+        "t",
+        "T",
+        "v",
+        "V",
+        "y",
+        "Y",
+        // long-form `\verb` commands (internal + antenna pair)
+        "\\set_mode",
+        "\\get_mode",
+        "\\set_ptt",
+        "\\get_ptt",
+        "\\set_level",
+        "\\get_level",
+        "\\set_vfo",
+        "\\get_vfo",
+        "\\set_func",
+        "\\get_func",
+        "\\set_mem",
+        "\\get_mem",
+        "\\get_info",
+        "\\set_ant",
+        "\\get_ant",
+    ];
+
     /// Send a raw command to rigctld and return the response string.
     ///
     /// This is a public escape hatch for commands that don't have a
@@ -288,7 +339,10 @@ impl RigctldClient {
     ///
     /// The command must contain only printable ASCII characters (0x20..=0x7E).
     /// Embedded newlines (`\n`, `\r`) and non-printable bytes are rejected
-    /// to prevent protocol injection.
+    /// to prevent protocol injection. Additionally (I-12), the first token
+    /// must be one of [`Self::ALLOWED_COMMAND_VERBS`]; any other verb
+    /// (e.g. `\set_conf`, `q`, arbitrary text) is rejected without being
+    /// sent to the rig.
     pub async fn send_raw_command(&self, cmd: &str) -> Result<String> {
         // Reject embedded newlines and non-printable ASCII to prevent injection
         if cmd.bytes().any(|b| b == b'\n' || b == b'\r') {
@@ -299,7 +353,23 @@ impl RigctldClient {
                 "raw command must contain only printable ASCII characters (0x20-0x7E)"
             ));
         }
+        // SECURITY (I-12): grammar allow-list keyed on the first token.
+        if !Self::raw_command_allowed(cmd) {
+            let verb = cmd.split_whitespace().next().unwrap_or("");
+            return Err(anyhow!(
+                "raw command verb '{}' is not in the rigctld allow-list",
+                verb
+            ));
+        }
         self.send_command_with_retry(cmd).await
+    }
+
+    /// Returns `true` iff the first whitespace-separated token of `cmd` is in
+    /// [`Self::ALLOWED_COMMAND_VERBS`]. Pure, side-effect-free helper so the
+    /// I-12 allow-list can be unit-tested without a live rigctld connection.
+    fn raw_command_allowed(cmd: &str) -> bool {
+        let verb = cmd.split_whitespace().next().unwrap_or("");
+        Self::ALLOWED_COMMAND_VERBS.contains(&verb)
     }
 
     /// Convert VFO enum to rigctld string
@@ -657,5 +727,97 @@ impl RigControl for RigctldClient {
         // just the rig model/info string.
         let response = self.send_command_with_retry("\\get_info").await?;
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod allow_list_tests {
+    use super::*;
+
+    /// Every command the client currently issues internally (plus the
+    /// documented antenna escape-hatch verbs) must pass the I-12 allow-list,
+    /// so tightening it breaks nothing that works today.
+    #[test]
+    fn accepts_all_internal_and_documented_commands() {
+        let accepted = [
+            // short-form internal callers
+            "f",
+            "F 14074000",
+            "m",
+            "T 1",
+            "T 0",
+            "V VFOA",
+            // their read/write pairs
+            "M PKTUSB 0",
+            "t",
+            "v",
+            // long-form internal callers
+            "\\set_mode PKTUSB 0",
+            "\\get_ptt VFOA",
+            "\\get_level STRENGTH",
+            "\\get_level RFPOWER",
+            "\\get_level SWR",
+            "\\set_level RFPOWER 0.5",
+            "\\set_vfo VFOA",
+            "\\get_vfo",
+            "\\set_func VFOA SCAN 1",
+            "\\get_mem VFOA",
+            "\\set_mem VFOA 3",
+            "\\get_info",
+            // documented antenna escape hatch
+            "y",
+            "Y 1",
+            "\\get_ant",
+            "\\set_ant 1",
+        ];
+        for cmd in accepted {
+            assert!(
+                RigctldClient::raw_command_allowed(cmd),
+                "expected allow-list to accept {cmd:?}"
+            );
+        }
+    }
+
+    /// Unknown / dangerous verbs must be rejected without being sent.
+    #[test]
+    fn rejects_unknown_and_dangerous_commands() {
+        let rejected = [
+            "\\set_conf serial_speed 115200",
+            "\\reset",
+            "q",
+            "Q",
+            "reset",
+            "\\send_morse hi",
+            "\\dump_state",
+            "rm -rf /",
+            "arbitrary text",
+            "",
+            "   ",
+            // an allowed verb only matches as the *first* token, not as an arg
+            "echo f",
+        ];
+        for cmd in rejected {
+            assert!(
+                !RigctldClient::raw_command_allowed(cmd),
+                "expected allow-list to reject {cmd:?}"
+            );
+        }
+    }
+
+    /// The async wrapper surfaces the rejection as an `Err` (and therefore
+    /// never reaches `send_command_with_retry`). We use a client that is not
+    /// connected; an allow-listed command would fail at the connection step,
+    /// but a rejected command fails earlier with the allow-list message.
+    #[tokio::test]
+    async fn send_raw_command_rejects_disallowed_verb() {
+        let client = RigctldClient::new(RigctldConfig::default());
+        let err = client
+            .send_raw_command("\\set_conf foo bar")
+            .await
+            .expect_err("disallowed verb must be rejected");
+        assert!(
+            err.to_string().contains("allow-list"),
+            "unexpected error: {err}"
+        );
     }
 }

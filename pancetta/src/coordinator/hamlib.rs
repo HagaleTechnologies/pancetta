@@ -70,6 +70,53 @@ impl super::ApplicationCoordinator {
         }
     }
 
+    /// SECURITY (I-10 / I-11): validate the `station.interface.port` device
+    /// spec before handing it to rigctld's `-r` argument. Accepts only shapes
+    /// that look like a real serial device or a `host:port` network rig:
+    ///   - Linux serial:   `/dev/ttyUSB<N>`, `/dev/ttyACM<N>`, `/dev/ttyS<N>`
+    ///   - macOS serial:   `/dev/cu.*`, `/dev/tty.*` (dev machine uses
+    ///                      `/dev/cu.usbserial-*`)
+    ///   - Windows serial: `COM<N>`
+    ///   - network rig:    `host:port`, where `port` parses as a `u16` in
+    ///                      `1..=65535` (I-11 port-range check)
+    /// Everything else (bare `/dev/tty`, `/dev/null`, malformed/out-of-range
+    /// network ports, arbitrary paths) is rejected.
+    pub(crate) fn device_path_looks_safe(port_field: &str) -> bool {
+        // Linux serial: /dev/ttyUSB<N>, /dev/ttyACM<N>, /dev/ttyS<N> with a
+        // trailing all-digit index.
+        let linux_serial = |prefix: &str| {
+            port_field
+                .strip_prefix(prefix)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        };
+        if linux_serial("/dev/ttyUSB") || linux_serial("/dev/ttyACM") || linux_serial("/dev/ttyS") {
+            return true;
+        }
+        // macOS callout/tty devices: /dev/cu.* and /dev/tty.* (require a
+        // non-empty suffix after the dot so a bare "/dev/tty" is rejected).
+        if let Some(suffix) = port_field
+            .strip_prefix("/dev/cu.")
+            .or_else(|| port_field.strip_prefix("/dev/tty."))
+        {
+            return !suffix.is_empty();
+        }
+        // Windows serial: COM<N>.
+        if let Some(n) = port_field.strip_prefix("COM") {
+            return !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit());
+        }
+        // Network rig: host:port. Port must be a valid u16 (1..=65535).
+        // rsplit so IPv6-ish hosts still parse on the final ':' segment;
+        // host non-emptiness is required, but host *content* stays a warn
+        // (see RIGCTLD_HOST handling) for remote-rig operability.
+        if let Some((host, port)) = port_field.rsplit_once(':') {
+            if host.is_empty() {
+                return false;
+            }
+            return matches!(port.parse::<u16>(), Ok(p) if p >= 1);
+        }
+        false
+    }
+
     #[cfg(feature = "pancetta-hamlib")]
     pub(crate) async fn start_hamlib_component(&mut self) -> Result<()> {
         let span = span!(Level::INFO, "start_hamlib");
@@ -101,13 +148,14 @@ impl super::ApplicationCoordinator {
         let rigctld_host =
             std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
 
-        // SECURITY: rigctld talks to the radio over an unauthenticated TCP
-        // socket. The default 127.0.0.1 keeps it loopback-only; if the user
-        // explicitly sets RIGCTLD_HOST to a non-loopback address, anyone who
-        // can reach that port can drive the rig (key TX, change frequency,
-        // etc.). We don't outright block it because some operators have a
-        // legitimate reason to expose rigctld on a private network, but we
-        // do log a prominent warning so it's not silent.
+        // SECURITY (I-11): rigctld talks to the radio over an unauthenticated
+        // TCP socket. The default 127.0.0.1 keeps it loopback-only; if the
+        // user explicitly sets RIGCTLD_HOST to a non-loopback address, anyone
+        // who can reach that port can drive the rig (key TX, change frequency,
+        // etc.). We deliberately keep this a *warning*, not a hard reject:
+        // some operators legitimately run rigctld on a separate machine
+        // (remote rig) and a hard block would break them. (Port-range
+        // validation for any `host:port` device spec is enforced below.)
         if rigctld_host != "127.0.0.1" && rigctld_host != "localhost" && rigctld_host != "::1" {
             warn!(
                 "RIGCTLD_HOST is set to a non-loopback address ({}). The \
@@ -119,26 +167,24 @@ impl super::ApplicationCoordinator {
         }
 
         if rig_enabled {
-            // SECURITY: rig_config.interface.port is interpolated into the
-            // rigctld -r argument and identifies the serial device the
+            // SECURITY (I-10): rig_config.interface.port is interpolated into
+            // the rigctld -r argument and identifies the serial device the
             // daemon will open. Args are passed as a vec (no shell), so
-            // command-injection isn't a risk, but a hostile config could
-            // still ask rigctld to open an unrelated path. Restrict to the
-            // shapes that look like a real serial / network rig spec:
-            //   - /dev/tty*          (Linux/macOS USB-serial)
-            //   - /dev/cu.*          (macOS callout devices)
-            //   - COM<N>             (Windows)
-            //   - host:port          (rigctld's network rig syntax)
+            // command-injection isn't a risk, but a hostile/typo'd config
+            // could still ask rigctld to open an unrelated path. Restrict to
+            // the shapes that look like a real serial / network rig spec
+            // (see `device_path_looks_safe`):
+            //   - /dev/ttyUSB<N> / ttyACM<N> / ttyS<N>   (Linux USB-serial)
+            //   - /dev/cu.* and /dev/tty.*               (macOS — dev machine)
+            //   - COM<N>                                 (Windows)
+            //   - host:port                              (rigctld network rig)
             let port_field = &rig_config.interface.port;
-            let looks_safe = port_field.starts_with("/dev/tty")
-                || port_field.starts_with("/dev/cu.")
-                || port_field.starts_with("COM")
-                || port_field.contains(':');
-            if !looks_safe && !port_field.is_empty() {
+            if !port_field.is_empty() && !Self::device_path_looks_safe(port_field) {
                 warn!(
                     "Refusing to spawn rigctld with suspicious port path \
-                     '{}'. Expected /dev/tty*, /dev/cu.*, COM<N>, or \
-                     host:port — adjust station.interface.port in config.",
+                     '{}'. Expected /dev/ttyUSB<N>|ttyACM<N>|ttyS<N>, \
+                     /dev/cu.*, /dev/tty.*, COM<N>, or host:port (valid \
+                     1-65535 port) — adjust station.interface.port in config.",
                     port_field
                 );
                 return Ok(());
@@ -582,5 +628,68 @@ impl super::ApplicationCoordinator {
             .push((ComponentId::Hamlib, hamlib_handle));
         info!("Hamlib component started");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod device_path_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_real_serial_and_network_shapes() {
+        let ok = [
+            // Linux serial
+            "/dev/ttyUSB0",
+            "/dev/ttyUSB10",
+            "/dev/ttyACM0",
+            "/dev/ttyS0",
+            // macOS (dev machine: /dev/cu.usbserial-*)
+            "/dev/cu.usbserial-1410",
+            "/dev/tty.usbserial-1410",
+            // Windows
+            "COM3",
+            "COM12",
+            // network rig
+            "127.0.0.1:4532",
+            "192.168.1.50:4532",
+            "myrig.local:65535",
+            "myrig.local:1",
+        ];
+        for p in ok {
+            assert!(
+                super::super::ApplicationCoordinator::device_path_looks_safe(p),
+                "expected {p:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_bogus_paths_and_bad_ports() {
+        let bad = [
+            // bare/loose serial roots that the old starts_with("/dev/tty") let through
+            "/dev/tty",
+            "/dev/ttyZZZ",
+            "/dev/null",
+            "/dev/cu.",
+            "/dev/tty.",
+            "/etc/passwd",
+            "COM",
+            "COMx",
+            // network: bad / out-of-range / missing ports
+            "myrig.local:0",
+            "myrig.local:70000",
+            "myrig.local:abc",
+            "myrig.local:",
+            ":4532",
+            // arbitrary
+            "rm -rf /",
+            "hello",
+        ];
+        for p in bad {
+            assert!(
+                !super::super::ApplicationCoordinator::device_path_looks_safe(p),
+                "expected {p:?} to be rejected"
+            );
+        }
     }
 }
