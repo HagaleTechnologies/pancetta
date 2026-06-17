@@ -6,8 +6,24 @@
 #![allow(non_camel_case_types)]
 
 #[cfg(not(ft8lib_stub))]
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::raw::c_char;
+
+/// Safely build a `&str` from a fixed C output buffer, requiring an in-bounds
+/// NUL terminator.
+///
+/// `ft8_lib` is trusted to NUL-terminate its decode-text output within the
+/// caller-provided fixed buffer, but a deliberately-crafted hostile frame must
+/// never be able to make us read past the buffer. Unlike `CStr::from_ptr`
+/// (which scans for a NUL with no length bound and would over-read on a
+/// non-terminated buffer), this scans only `buf` and returns `None` if no NUL
+/// is present — letting the caller discard that decode instead of triggering
+/// undefined behavior. A leading NUL yields `Some("")`.
+#[cfg(not(ft8lib_stub))]
+fn cstr_from_fixed_buf(buf: &[u8]) -> Option<&str> {
+    let nul = buf.iter().position(|&b| b == 0)?; // in-bounds NUL required
+    std::str::from_utf8(&buf[..nul]).ok()
+}
 
 // Compile-time struct size assertions to match C layout
 const _: () = assert!(std::mem::size_of::<ftx_waterfall_t>() == 40);
@@ -252,8 +268,16 @@ pub fn ft8lib_decode_payload(payload: &[u8; 10]) -> Option<String> {
         return None;
     }
 
-    let c_str = unsafe { CStr::from_ptr(text_buf.as_ptr() as *const c_char) };
-    Some(c_str.to_string_lossy().trim().to_string())
+    match cstr_from_fixed_buf(&text_buf) {
+        Some(s) => Some(s.trim().to_string()),
+        None => {
+            tracing::warn!(
+                target: "ft8.ffi",
+                "ft8_lib decode buffer not NUL-terminated within bounds; discarding decode"
+            );
+            None
+        }
+    }
 }
 
 /// Number of FSK tones in an FT8 symbol.
@@ -462,8 +486,16 @@ pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32, f32)>
             };
 
             if rc == ftx_message_rc_t::FTX_MESSAGE_RC_OK {
-                let c_str = unsafe { CStr::from_ptr(text_buf.as_ptr() as *const c_char) };
-                let text = c_str.to_string_lossy().trim().to_string();
+                let text = match cstr_from_fixed_buf(&text_buf) {
+                    Some(s) => s.trim().to_string(),
+                    None => {
+                        tracing::warn!(
+                            target: "ft8.ffi",
+                            "ft8_lib decode buffer not NUL-terminated within bounds; skipping candidate"
+                        );
+                        continue;
+                    }
+                };
 
                 // ft8_lib's ftx_decode_candidate never populates
                 // status.freq / status.time (upstream behavior — only
@@ -537,4 +569,30 @@ pub fn ft8lib_decode_audio(_samples: &[f32]) -> Vec<(String, f32, f32, i32, f32)
 /// `false` when using the pure-Rust stub fallback.
 pub fn ft8lib_is_available() -> bool {
     cfg!(not(ft8lib_stub))
+}
+
+#[cfg(all(test, not(ft8lib_stub)))]
+mod tests {
+    use super::cstr_from_fixed_buf;
+
+    #[test]
+    fn fixed_buf_with_in_bounds_nul_returns_prefix() {
+        // 35-byte buffer mirroring the FFI text_buf; NUL after "CQ K5ARH".
+        let mut buf = [0u8; 35];
+        buf[..8].copy_from_slice(b"CQ K5ARH");
+        assert_eq!(cstr_from_fixed_buf(&buf), Some("CQ K5ARH"));
+    }
+
+    #[test]
+    fn fixed_buf_without_nul_returns_none() {
+        // No NUL anywhere in bounds: must not over-read, must not panic.
+        let buf = [b'A'; 35];
+        assert_eq!(cstr_from_fixed_buf(&buf), None);
+    }
+
+    #[test]
+    fn fixed_buf_leading_nul_returns_empty() {
+        let buf = [0u8; 35];
+        assert_eq!(cstr_from_fixed_buf(&buf), Some(""));
+    }
 }
