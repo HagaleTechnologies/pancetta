@@ -23,6 +23,48 @@ use tracing::{debug, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
+/// Maximum length (in chars) for any human-facing decoded string field.
+/// FT8 message payloads are short (callsigns ≤ ~11 chars, grids 4-6, the
+/// full text well under 64); anything longer is malformed/hostile.
+const MAX_DECODED_FIELD_LEN: usize = 64;
+
+/// I-16: sanitize a human-facing decoded string before it crosses the
+/// message-bus boundary into the TUI / QSO state machine / ADIF log.
+///
+/// A decoded FT8 callsign / grid / text that carries an embedded control
+/// character or ANSI escape sequence could corrupt TUI rendering or
+/// log/ADIF output. The decoder's `is_plausible` / `looks_like_callsign`
+/// checks cover most malformed input, but this is a defensive
+/// belt-and-suspenders strip applied once, at the boundary:
+///   - drops control chars (`< 0x20`), DEL (`0x7f`), and ESC (`0x1b`),
+///   - caps length to [`MAX_DECODED_FIELD_LEN`] chars.
+fn sanitize_decoded_field(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c != '\u{1b}' && c != '\u{7f}' && c >= '\u{20}')
+        .take(MAX_DECODED_FIELD_LEN)
+        .collect()
+}
+
+/// I-16: sanitize every human-facing string field on a [`pancetta_ft8::DecodedMessage`]
+/// in place — applied once at the bus boundary before the message is broadcast.
+/// Covers the top-level `text` plus the inner `message`'s `from_callsign`,
+/// `to_callsign`, `grid_square`, and `text` (all the operator-/log-visible strings).
+fn sanitize_decoded_message(decoded_msg: &mut pancetta_ft8::DecodedMessage) {
+    decoded_msg.text = sanitize_decoded_field(&decoded_msg.text);
+    if let Some(ref call) = decoded_msg.message.from_callsign {
+        decoded_msg.message.from_callsign = Some(sanitize_decoded_field(call));
+    }
+    if let Some(ref call) = decoded_msg.message.to_callsign {
+        decoded_msg.message.to_callsign = Some(sanitize_decoded_field(call));
+    }
+    if let Some(ref grid) = decoded_msg.message.grid_square {
+        decoded_msg.message.grid_square = Some(sanitize_decoded_field(grid));
+    }
+    if let Some(ref text) = decoded_msg.message.text {
+        decoded_msg.message.text = Some(sanitize_decoded_field(text));
+    }
+}
+
 /// hb-237 Session 3 — pure helper: translate the pancetta-qso
 /// [`pancetta_qso::A7SeedEntry`] cache entries into the decoder's ABI-
 /// stable [`pancetta_ft8::CrossSequenceSeed`] inputs.
@@ -385,6 +427,9 @@ impl super::ApplicationCoordinator {
                                 pancetta_core::slot::SlotParity::of(scoped_slot_start);
                             for mut decoded_msg in scoped_decodes {
                                 decoded_msg.slot_parity = Some(scoped_parity);
+                                // I-16: sanitize at the bus boundary (scoped
+                                // fast-path also broadcasts to TUI/QSO).
+                                sanitize_decoded_message(&mut decoded_msg);
                                 // Boundary-relative DT: the DSP window's sample 0
                                 // sits at slot_boundary − WINDOW_LEAD_SECS, so the
                                 // decoder's slice-relative time_offset overstates DT
@@ -553,6 +598,11 @@ impl super::ApplicationCoordinator {
 
                         for decoded_msg in decoded_messages.iter_mut() {
                             decoded_msg.slot_parity = Some(window_parity);
+                            // I-16: strip control/ANSI chars and cap length on
+                            // the human-facing string fields, once, at the bus
+                            // boundary before any consumer (cross-slot state,
+                            // TUI, QSO, PSKReporter, ADIF) sees them.
+                            sanitize_decoded_message(decoded_msg);
                             // Boundary-relative DT correction (live path only). The
                             // DSP window is anchored so sample 0 = slot_boundary −
                             // WINDOW_LEAD_SECS; the decoder reports time_offset
@@ -707,8 +757,20 @@ impl super::ApplicationCoordinator {
                             });
                         }
 
-                        // Update AP recent_pool with newly decoded callsigns
+                        // Update AP recent_pool with newly decoded callsigns.
+                        // I-6: cap the number of *new* unique calls we construct
+                        // per slot. An air-attacker spamming many unique novel
+                        // callsigns in one slot would otherwise force a
+                        // `RecentCallAp::new()` construction per call (CPU
+                        // pressure on the decoder thread) before the final
+                        // `truncate(20)` runs. Short-circuit once enough new
+                        // calls have been collected this slot; truncate(20) still
+                        // applies below to keep the strongest entries.
+                        const MAX_NEW_CALLS_PER_SLOT: usize = 50;
                         for msg in &decoded_messages {
+                            if recent_pool.len() >= MAX_NEW_CALLS_PER_SLOT {
+                                break;
+                            }
                             if let Some(ref call) = msg.message.from_callsign {
                                 if !recent_pool.iter().any(|r| r.callsign == *call) {
                                     if let Some(ap) =
@@ -961,5 +1023,85 @@ mod cross_sequence_invocation_tests {
                 .map(|m| m.text.as_str())
                 .collect::<Vec<_>>()
         );
+    }
+}
+
+// =============================================================================
+// I-16 — decoded-field sanitization at the message-bus boundary
+// =============================================================================
+#[cfg(test)]
+mod sanitize_decoded_field_tests {
+    use super::{sanitize_decoded_field, sanitize_decoded_message, MAX_DECODED_FIELD_LEN};
+    use pancetta_ft8::{DecodedMessage, Ft8Message};
+
+    #[test]
+    fn strips_ansi_escape_sequence() {
+        // A SGR color escape: ESC [ 3 1 m … ESC [ 0 m
+        let hostile = "\u{1b}[31mK1ABC\u{1b}[0m";
+        assert_eq!(sanitize_decoded_field(hostile), "[31mK1ABC[0m");
+        // The raw ESC (0x1b) bytes are gone (the literal '[' / digits remain,
+        // but they are inert text — the control byte that drives the terminal
+        // is what we strip).
+        assert!(!sanitize_decoded_field(hostile).contains('\u{1b}'));
+    }
+
+    #[test]
+    fn strips_control_chars_and_del() {
+        let hostile = "K1\u{0}A\u{7}B\nC\r\u{7f}";
+        // NUL, BEL, LF, CR, DEL all dropped; printable chars survive.
+        assert_eq!(sanitize_decoded_field(hostile), "K1ABC");
+    }
+
+    #[test]
+    fn caps_over_long_string() {
+        let long: String = "A".repeat(MAX_DECODED_FIELD_LEN + 50);
+        let out = sanitize_decoded_field(&long);
+        assert_eq!(out.chars().count(), MAX_DECODED_FIELD_LEN);
+    }
+
+    #[test]
+    fn leaves_normal_callsign_unchanged() {
+        assert_eq!(sanitize_decoded_field("K5ARH"), "K5ARH");
+        assert_eq!(sanitize_decoded_field("EA8/G8BCG"), "EA8/G8BCG");
+    }
+
+    #[test]
+    fn leaves_normal_grid_and_text_unchanged() {
+        assert_eq!(sanitize_decoded_field("FN31"), "FN31");
+        assert_eq!(sanitize_decoded_field("CQ K1ABC FN42"), "CQ K1ABC FN42");
+    }
+
+    #[test]
+    fn sanitize_message_covers_all_string_fields() {
+        let msg = Ft8Message {
+            from_callsign: Some("K1\u{1b}ABC".to_string()),
+            to_callsign: Some("W2\u{7}XYZ".to_string()),
+            grid_square: Some("FN\u{0}31".to_string()),
+            text: Some("hello\u{1b}[mworld".to_string()),
+            ..Ft8Message::default()
+        };
+
+        let mut decoded = DecodedMessage::new(msg, -10.0, 1.0, 1200.0, 0.0);
+        decoded.text = "CQ \u{1b}[31mK1ABC\u{7f}".to_string();
+
+        sanitize_decoded_message(&mut decoded);
+
+        assert_eq!(decoded.text, "CQ [31mK1ABC");
+        assert_eq!(decoded.message.from_callsign.as_deref(), Some("K1ABC"));
+        assert_eq!(decoded.message.to_callsign.as_deref(), Some("W2XYZ"));
+        assert_eq!(decoded.message.grid_square.as_deref(), Some("FN31"));
+        assert_eq!(decoded.message.text.as_deref(), Some("hello[mworld"));
+        // No control / ESC / DEL bytes survive anywhere.
+        for field in [
+            decoded.text.as_str(),
+            decoded.message.from_callsign.as_deref().unwrap_or(""),
+            decoded.message.to_callsign.as_deref().unwrap_or(""),
+            decoded.message.grid_square.as_deref().unwrap_or(""),
+            decoded.message.text.as_deref().unwrap_or(""),
+        ] {
+            assert!(field
+                .chars()
+                .all(|c| c != '\u{1b}' && c != '\u{7f}' && c >= '\u{20}'));
+        }
     }
 }
