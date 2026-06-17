@@ -1161,14 +1161,6 @@ impl App {
         }
     }
 
-    fn toggle_theme(&mut self) {
-        self.theme = match self.theme {
-            Theme::Dark => Theme::Light,
-            Theme::Light => Theme::Dark,
-        };
-        self.status_message = format!("Switched to {:?} theme", self.theme);
-        info!("Theme switched to: {:?}", self.theme);
-    }
 
     pub fn clear_messages(&mut self) {
         self.decoded_messages.clear();
