@@ -236,6 +236,31 @@ pub enum AsyncDatabaseError {
     Replay(String),
 }
 
+/// Maximum number of rows any dynamic query is allowed to request.
+///
+/// `QueryOptions::limit` is a `u32` interpolated directly into a `LIMIT`
+/// clause. While that interpolation is injection-safe (it is a number), an
+/// unbounded value such as `u32::MAX` would ask SQLite to materialize every
+/// row and could exhaust memory. We clamp to a sane ceiling.
+const MAX_QUERY_LIMIT: u32 = 10_000;
+
+/// Clamp a caller-supplied row limit to [`MAX_QUERY_LIMIT`] so a hostile or
+/// buggy `limit = u32::MAX` cannot force SQLite to return the whole table
+/// (potential OOM). Normal small limits pass through unchanged.
+fn clamp_query_limit(limit: u32) -> u32 {
+    limit.min(MAX_QUERY_LIMIT)
+}
+
+/// Escape a string for safe interpolation inside a single-quoted SQLite
+/// string literal by doubling embedded single quotes (`'` → `''`).
+///
+/// This is needed for `VACUUM INTO '<path>'`, which has no bind-parameter
+/// form — without escaping, a path containing `'` would terminate the literal
+/// early and allow SQL injection via the operator-config backup path.
+fn escape_sqlite_string_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 /// Async QSO database using sqlx
 #[derive(Clone)]
 pub struct QsoDatabase {
@@ -467,9 +492,9 @@ impl QsoDatabase {
         // Add ordering
         query.push_str(" ORDER BY created_at DESC");
 
-        // Add limit
+        // Add limit (clamped so a hostile u32::MAX can't force a full-table OOM)
         if let Some(limit) = options.limit {
-            query.push_str(&format!(" LIMIT {}", limit));
+            query.push_str(&format!(" LIMIT {}", clamp_query_limit(limit)));
         }
 
         // Execute query
@@ -521,8 +546,23 @@ impl QsoDatabase {
     pub async fn backup<P: AsRef<Path>>(&self, backup_path: P) -> Result<(), AsyncDatabaseError> {
         let backup_path_str = backup_path.as_ref().to_string_lossy().to_string();
 
+        // Defensive: a NUL byte can't appear in a valid filesystem path and a
+        // newline has no legitimate place in a backup target — refuse rather
+        // than risk a malformed statement.
+        if backup_path_str.contains('\0') || backup_path_str.contains('\n') {
+            return Err(AsyncDatabaseError::InvalidQuery {
+                message: "backup path contains a NUL byte or newline".to_string(),
+            });
+        }
+
+        // VACUUM INTO has no bind-parameter form for its target, so the path is
+        // interpolated into a single-quoted SQL string literal. Escape embedded
+        // single quotes (`'` → `''`) so a path containing `'` cannot break out
+        // of the literal and inject SQL.
+        let escaped_path = escape_sqlite_string_literal(&backup_path_str);
+
         // Use VACUUM INTO which atomically creates a complete copy of the database.
-        sqlx::query(&format!("VACUUM INTO '{}'", backup_path_str))
+        sqlx::query(&format!("VACUUM INTO '{}'", escaped_path))
             .execute(&self.pool)
             .await
             .map_err(AsyncDatabaseError::Sqlx)?;
@@ -655,9 +695,9 @@ impl QsoDatabase {
         // Add ordering
         query.push_str(" ORDER BY created_at DESC");
 
-        // Add limit
+        // Add limit (clamped so a hostile u32::MAX can't force a full-table OOM)
         if let Some(limit) = options.limit {
-            query.push_str(&format!(" LIMIT {}", limit));
+            query.push_str(&format!(" LIMIT {}", clamp_query_limit(limit)));
         }
 
         // Execute query
@@ -912,6 +952,55 @@ impl QsoDatabase {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Security: I-8 (VACUUM INTO path escaping) -------------------------
+
+    #[test]
+    fn test_escape_sqlite_string_literal_doubles_single_quotes() {
+        // A path containing a single quote must have it doubled so it cannot
+        // terminate the surrounding string literal in `VACUUM INTO '<path>'`.
+        assert_eq!(
+            escape_sqlite_string_literal("/tmp/back'up.db"),
+            "/tmp/back''up.db"
+        );
+        // An injection attempt: the closing quote is doubled, neutralizing it.
+        assert_eq!(
+            escape_sqlite_string_literal("x'; DROP TABLE qsos; --"),
+            "x''; DROP TABLE qsos; --"
+        );
+    }
+
+    #[test]
+    fn test_escape_sqlite_string_literal_passthrough() {
+        // Normal paths are returned unchanged.
+        let p = "/home/op/.pancetta/backups/qso-2026.db";
+        assert_eq!(escape_sqlite_string_literal(p), p);
+    }
+
+    #[tokio::test]
+    async fn test_backup_rejects_nul_and_newline_paths() {
+        let db = AsyncQsoDatabase::new_in_memory().await.unwrap();
+        assert!(matches!(
+            db.backup("/tmp/ev\0il.db").await,
+            Err(AsyncDatabaseError::InvalidQuery { .. })
+        ));
+        assert!(matches!(
+            db.backup("/tmp/ev\nil.db").await,
+            Err(AsyncDatabaseError::InvalidQuery { .. })
+        ));
+    }
+
+    // --- Security: I-9 (LIMIT clamping) -----------------------------------
+
+    #[test]
+    fn test_clamp_query_limit() {
+        assert_eq!(clamp_query_limit(0), 0);
+        assert_eq!(clamp_query_limit(10), 10);
+        assert_eq!(clamp_query_limit(MAX_QUERY_LIMIT), MAX_QUERY_LIMIT);
+        // Above the cap is clamped down.
+        assert_eq!(clamp_query_limit(MAX_QUERY_LIMIT + 1), MAX_QUERY_LIMIT);
+        assert_eq!(clamp_query_limit(u32::MAX), MAX_QUERY_LIMIT);
+    }
 
     #[tokio::test]
     async fn test_async_database_creation() {
