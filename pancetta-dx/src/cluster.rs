@@ -537,6 +537,21 @@ impl DxClusterClient {
         })
     }
 
+    /// Sanitize text taken raw from the plaintext (non-TLS) telnet cluster feed
+    /// before it is stored/forwarded to the TUI, logs, or ADIF.
+    ///
+    /// [sec I-15] A compromised or MITM'd cluster could inject ANSI escape
+    /// sequences, control characters, or oversized strings. This strips every
+    /// control character below `0x20` (including the `0x1b` ESC that begins ANSI
+    /// sequences and `\t`/`\r`/`\n`) and the `0x7f` DEL, keeps the normal space
+    /// and all printable characters, and caps the result at 200 characters.
+    fn sanitize_spot_text(s: &str) -> String {
+        s.chars()
+            .filter(|&c| c == ' ' || (!c.is_control() && c != '\u{7f}'))
+            .take(200)
+            .collect()
+    }
+
     /// Parse DX spot line
     fn parse_dx_spot(line: &str) -> Option<ClusterSpot> {
         // Expected format: DX de W1ABC:     14074.0  JA1XYZ       FT8 from Tokyo     1234Z
@@ -568,12 +583,14 @@ impl DxClusterClient {
             Utc::now()
         };
 
+        // [sec I-15] Sanitize every field sourced from the untrusted telnet line
+        // (strip control/ANSI chars, cap length) before it is stored/forwarded.
         Some(ClusterSpot {
-            callsign: callsign.to_uppercase(),
+            callsign: Self::sanitize_spot_text(&callsign.to_uppercase()),
             frequency_khz,
-            spotter: spotter.to_uppercase(),
+            spotter: Self::sanitize_spot_text(&spotter.to_uppercase()),
             time,
-            comment: comment.to_string(),
+            comment: Self::sanitize_spot_text(comment),
             raw_line: line.to_string(),
         })
     }
@@ -724,6 +741,41 @@ mod tests {
         assert_eq!(spot.spotter, "W1ABC");
         assert_eq!(spot.frequency_khz, 14074.0);
         assert_eq!(spot.callsign, "JA1XYZ");
+        assert!(spot.comment.contains("FT8"));
+        assert!(spot.comment.contains("Tokyo"));
+    }
+
+    #[test]
+    fn test_sanitize_spot_text_strips_ansi_and_control() {
+        // [sec I-15] ANSI escape + NUL/control chars are removed; printable text kept.
+        let dirty = "\x1b[31mhi\x00\x07 there\x7f";
+        let clean = DxClusterClient::sanitize_spot_text(dirty);
+        assert_eq!(clean, "[31mhi there");
+        assert!(!clean.contains('\x1b'));
+        assert!(!clean.contains('\x00'));
+        assert!(!clean.contains('\x7f'));
+    }
+
+    #[test]
+    fn test_sanitize_spot_text_truncates_to_200() {
+        let long = "A".repeat(500);
+        let clean = DxClusterClient::sanitize_spot_text(&long);
+        assert_eq!(clean.chars().count(), 200);
+    }
+
+    #[test]
+    fn test_sanitize_spot_text_passes_normal_through() {
+        let normal = "FT8 from Tokyo -15 dB";
+        assert_eq!(DxClusterClient::sanitize_spot_text(normal), normal);
+    }
+
+    #[test]
+    fn test_dx_spot_parsing_sanitizes_comment() {
+        // A MITM'd cluster injects an ANSI escape + control char into the comment.
+        let line = "DX de W1ABC:     14074.0  JA1XYZ       \x1b[31mFT8\x00 Tokyo     1234Z";
+        let spot = DxClusterClient::parse_dx_spot(line).unwrap();
+        assert!(!spot.comment.contains('\x1b'));
+        assert!(!spot.comment.contains('\x00'));
         assert!(spot.comment.contains("FT8"));
         assert!(spot.comment.contains("Tokyo"));
     }

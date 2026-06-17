@@ -805,11 +805,21 @@ impl PskReporterUploader {
         );
 
         let addr = format!("{}:{}", self.config.server, self.config.port);
+        // Bind to 0.0.0.0:0 so the kernel can route the outbound packet to the
+        // public PSKReporter server (a 127.0.0.1 source can't reach the internet).
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(DxError::Io)?;
 
-        socket.send_to(&packet, &addr).await.map_err(DxError::Io)?;
+        // [sec I-14] Restrict the socket to its single peer. `connect` on a UDP
+        // socket sets the default destination AND makes the kernel drop any
+        // inbound datagram that does not originate from that peer, closing the
+        // ephemeral-port exposure of the all-interfaces bind. This path is
+        // send-only (we `send` then drop the socket; we never `recv`), so the
+        // connect is purely a hardening measure with no behavioral cost.
+        socket.connect(&addr).await.map_err(DxError::Io)?;
+
+        socket.send(&packet).await.map_err(DxError::Io)?;
 
         info!("Successfully uploaded {} reports to PSKReporter", count);
         self.pending_reports.clear();
