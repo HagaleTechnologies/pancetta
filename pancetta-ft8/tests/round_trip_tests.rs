@@ -3,6 +3,9 @@
 //! These tests validate the complete FT8 pipeline by encoding a message,
 //! generating audio, and decoding it back to verify the message matches.
 
+// rationale: test/bench loops index buffers by position; the index is
+// load-bearing and an iterator rewrite would obscure intent.
+#![allow(clippy::needless_range_loop)]
 #![cfg(feature = "transmit")]
 
 mod test_signal_generator;

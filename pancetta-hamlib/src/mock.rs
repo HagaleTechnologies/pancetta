@@ -202,6 +202,9 @@ impl MockRig {
     }
 
     /// Create mock rig with default configuration
+    // rationale: inherent `default()` is kept (callers use `Type::default()`);
+    // switching to a `Default` impl would change the public API shape.
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> Self {
         Self::new(MockRigConfig::default())
     }
@@ -257,7 +260,7 @@ impl MockRig {
             - self.config.s_meter_noise;
 
         // Occasional strong signals
-        let strong_signal = if (count % 100) == 0 { 30 } else { 0 };
+        let strong_signal = if count.is_multiple_of(100) { 30 } else { 0 };
 
         base_level + noise + strong_signal
     }
@@ -276,9 +279,7 @@ impl MockRig {
         // Add some random variation
         let random_variation = ((count % 100) as f32 / 1000.0) - 0.05;
 
-        (self.config.base_swr + freq_variation + random_variation)
-            .max(1.0)
-            .min(3.0)
+        (self.config.base_swr + freq_variation + random_variation).clamp(1.0, 3.0)
     }
 
     /// Update last operation time and increment operation counter
@@ -844,6 +845,9 @@ impl RigControl for MockRig {
 }
 
 #[cfg(test)]
+// rationale: test-only builder structs assigned field-by-field after
+// default(); sequential assignment reads clearer than a struct-update splat.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use tokio::time::Duration;

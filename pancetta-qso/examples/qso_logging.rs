@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("  Export directory: {:?}", export_dir);
 
     // Sample QSOs to log (callsign, grid, frequency Hz, our SNR, their SNR)
-    let sample_qsos = vec![
+    let sample_qsos = [
         ("K1DEF", "FN31", 14074000.0f64, -12i32, -15i32),
         ("VE3XYZ", "FN03", 14074000.0, -18, -21),
         ("G0ABC", "IO91", 21074000.0, -15, -12),

@@ -936,8 +936,8 @@ impl super::ApplicationCoordinator {
                                 // Decoded FT8 messages forwarded from the decoder
                                 MessageType::DecodedMessage(ref decoded_msg) => {
                                     let raw_text = decoded_msg.text.clone();
-                                    let frequency = decoded_msg.frequency_offset as f64;
-                                    let snr = decoded_msg.snr_db as f32;
+                                    let frequency = decoded_msg.frequency_offset;
+                                    let snr = decoded_msg.snr_db;
 
                                     // Parse the FT8 message to determine its type
                                     match pancetta_qso::utils::parse_ft8_message(
@@ -1786,7 +1786,7 @@ mod auto_73_tests {
     const DX: &str = "JA1ABC";
 
     async fn manager() -> QsoManager {
-        let mut m = QsoManager::new(QsoManagerConfig {
+        let m = QsoManager::new(QsoManagerConfig {
             our_callsign: OUR.to_string(),
             our_grid: Some("EM10".to_string()),
             ..Default::default()

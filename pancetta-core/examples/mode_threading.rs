@@ -89,7 +89,7 @@ fn main() {
     let original = ModeValue::custom("TEST-MODE");
     let mut clones = vec![];
 
-    for i in 0..1000 {
+    for _ in 0..1000 {
         clones.push(original.clone());
     }
 

@@ -1440,6 +1440,21 @@ impl TuiRunner {
     }
 }
 
+/// Create and run TUI with message bus integration
+pub async fn run_tui_with_message_bus(
+    config: Config,
+    message_rx: Receiver<TuiMessage>,
+    message_tx: Sender<TuiCommand>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    // Create app state
+    let app = Arc::new(RwLock::new(App::new(config.clone(), None).await?));
+
+    // Create and run TUI runner
+    let runner = TuiRunner::new(app, config, message_rx, message_tx, shutdown)?;
+    runner.run().await
+}
+
 #[cfg(test)]
 mod key_tests {
     use super::*;
@@ -2172,19 +2187,4 @@ mod key_tests {
         assert!(!a.compose_mode);
         assert!(a.tx_input_buffer.is_empty());
     }
-}
-
-/// Create and run TUI with message bus integration
-pub async fn run_tui_with_message_bus(
-    config: Config,
-    message_rx: Receiver<TuiMessage>,
-    message_tx: Sender<TuiCommand>,
-    shutdown: Arc<AtomicBool>,
-) -> Result<()> {
-    // Create app state
-    let app = Arc::new(RwLock::new(App::new(config.clone(), None).await?));
-
-    // Create and run TUI runner
-    let runner = TuiRunner::new(app, config, message_rx, message_tx, shutdown)?;
-    runner.run().await
 }

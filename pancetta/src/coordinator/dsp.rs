@@ -153,7 +153,7 @@ impl WavRecorder {
             .into_iter()
             .flatten()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "wav"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "wav"))
             .collect();
 
         entries.sort_by_key(|e| e.file_name());

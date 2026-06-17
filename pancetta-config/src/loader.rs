@@ -30,6 +30,9 @@ pub struct ConfigLoader {
     sources: Vec<ConfigSource>,
 
     /// Hot-reload callback
+    // rationale: a boxed `Fn` behind Arc<Mutex<Option<..>>> is the natural shape for
+    // a shared, optional, hot-swappable callback; a type alias adds indirection.
+    #[allow(clippy::type_complexity)]
     reload_callback: Arc<Mutex<Option<Box<dyn Fn(&Config) + Send + Sync>>>>,
 
     /// Cache for parsed configurations
@@ -295,7 +298,7 @@ impl ConfigLoader {
         }
 
         // Load and parse file
-        let content = fs::read_to_string(path).map_err(|e| ConfigError::Io(e))?;
+        let content = fs::read_to_string(path).map_err(ConfigError::Io)?;
 
         let config = match path.extension().and_then(|ext| ext.to_str()) {
             Some("toml") => self.parse_toml(&content)?,
@@ -552,7 +555,7 @@ impl ConfigLoader {
         let expanded_content = shellexpand::full(content)
             .map_err(|e| ConfigError::Validation(format!("Shell expansion failed: {}", e)))?;
 
-        toml::from_str(&expanded_content).map_err(|e| ConfigError::Toml(e))
+        toml::from_str(&expanded_content).map_err(ConfigError::Toml)
     }
 
     /// Parse JSON configuration
@@ -560,7 +563,7 @@ impl ConfigLoader {
         let expanded_content = shellexpand::full(content)
             .map_err(|e| ConfigError::Validation(format!("Shell expansion failed: {}", e)))?;
 
-        serde_json::from_str(&expanded_content).map_err(|e| ConfigError::Json(e))
+        serde_json::from_str(&expanded_content).map_err(ConfigError::Json)
     }
 
     /// Get cached configuration for a file
@@ -597,12 +600,12 @@ impl ConfigLoader {
 
         // Watch all configuration files
         for source in &self.sources {
-            if matches!(source.source_type, SourceType::Toml | SourceType::Json) {
-                if source.path.exists() {
-                    if let Some(parent) = source.path.parent() {
-                        watcher.watch(parent, RecursiveMode::NonRecursive)?;
-                        debug!("Watching directory: {}", parent.display());
-                    }
+            if matches!(source.source_type, SourceType::Toml | SourceType::Json)
+                && source.path.exists()
+            {
+                if let Some(parent) = source.path.parent() {
+                    watcher.watch(parent, RecursiveMode::NonRecursive)?;
+                    debug!("Watching directory: {}", parent.display());
                 }
             }
         }
@@ -685,7 +688,7 @@ impl ConfigLoader {
                             if let Ok(callback_guard) = reload_callback.lock() {
                                 if let Some(ref callback) = *callback_guard {
                                     if let Ok(config_guard) = current_config.read() {
-                                        callback(&*config_guard);
+                                        callback(&config_guard);
                                     }
                                 }
                             }

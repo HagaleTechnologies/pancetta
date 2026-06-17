@@ -181,8 +181,8 @@ impl FrequencyTracker {
         let initial_angle = -pi2 * self.current_offset_hz * chunk_start_n as f64 / self.sample_rate;
         let mut rotator = Complex::new(initial_angle.cos(), initial_angle.sin());
         for s in samples.iter_mut() {
-            *s = *s * rotator;
-            rotator = rotator * phase_step;
+            *s *= rotator;
+            rotator *= phase_step;
         }
     }
 }

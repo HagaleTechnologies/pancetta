@@ -5,6 +5,10 @@
 //! probabilities replace |LLR|-based ordering in OSD, reducing trials from
 //! ~125K to ~200.
 
+// rationale: CNN forward-pass loops index conv/linear weight and activation
+// tensors by position; the index is load-bearing for the tensor layout.
+#![allow(clippy::needless_range_loop)]
+
 use crate::neural_osd_weights::{
     conv1_bias, conv1_weight, conv2_bias, conv2_weight, conv3_bias, conv3_weight, linear_bias,
     linear_weight,
@@ -94,6 +98,9 @@ pub fn predict_error_bits(trajectory: &[[f32; N_CODEWORD]; BP_ITERS]) -> [f32; K
 }
 
 #[cfg(test)]
+// rationale: test-only builder structs assigned field-by-field after
+// default(); sequential assignment reads clearer than a struct-update splat.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -109,7 +116,7 @@ mod tests {
 
         assert_eq!(probs.len(), K_INFO);
         for &p in &probs {
-            assert!(p >= 0.0 && p <= 1.0, "Probability {} out of range", p);
+            assert!((0.0..=1.0).contains(&p), "Probability {} out of range", p);
         }
     }
 

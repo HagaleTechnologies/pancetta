@@ -7,6 +7,10 @@
 //! - Power spectral density estimation
 //! - Symbol synchronization and timing recovery
 
+// rationale: DSP loops index FFT/window/sample buffers by position; the index is
+// load-bearing for the signal-processing math.
+#![allow(clippy::needless_range_loop)]
+
 use crate::{
     Ft8Error, Ft8Result, BASE_FREQUENCY, NUM_TONES, SAMPLE_RATE, SYMBOL_DURATION, TONE_SPACING,
 };
@@ -158,7 +162,7 @@ impl FftProcessor {
         }
 
         // Nyquist frequency
-        if fft_size % 2 == 0 {
+        if fft_size.is_multiple_of(2) {
             psd.push(fft_result[fft_size / 2].norm_sqr());
         }
 
@@ -300,7 +304,7 @@ impl BandpassFilter {
 
 /// Design a simple bandpass filter using windowed sinc method
 fn design_bandpass_filter(center_freq: f64, bandwidth: f64, order: usize) -> Ft8Result<Vec<f64>> {
-    if order % 2 == 0 {
+    if order.is_multiple_of(2) {
         return Err(Ft8Error::SignalProcessingError(
             "Filter order must be odd".to_string(),
         ));

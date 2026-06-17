@@ -49,6 +49,9 @@
 //! arithmetic on LLR slices and does not require `transmit`.
 
 #![allow(dead_code)]
+// rationale: template cross-correlation loops index LLR/symbol slices by
+// position; the index is load-bearing.
+#![allow(clippy::needless_range_loop)]
 
 use std::time::Instant;
 
@@ -188,6 +191,9 @@ pub enum A7TemplateKind {
 impl A7Template {
     /// Number of bits in this template's PINNED mask. Always
     /// [`A7_CODEWORD_BITS`].
+    // rationale: not a collection — `len` is the fixed codeword bit-width and is
+    // never zero, so an `is_empty` companion would be meaningless.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         A7_CODEWORD_BITS
     }
@@ -589,11 +595,11 @@ mod tests {
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            let u1 = ((x as u64) as f64) / (u64::MAX as f64);
+            let u1 = (x as f64) / (u64::MAX as f64);
             x ^= x << 13;
             x ^= x >> 7;
             x ^= x << 17;
-            let u2 = ((x as u64) as f64) / (u64::MAX as f64);
+            let u2 = (x as f64) / (u64::MAX as f64);
             // Box-Muller
             let r = (-2.0 * u1.max(1e-10).ln()).sqrt();
             let theta = 2.0 * std::f64::consts::PI * u2;

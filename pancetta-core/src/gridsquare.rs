@@ -593,7 +593,7 @@ mod tests {
     #[test]
     fn test_bearing_calculation() {
         let bearing = grid_bearing("FN31pr", "EN90cv").unwrap();
-        assert!(bearing >= 0.0 && bearing < 360.0);
+        assert!((0.0..360.0).contains(&bearing));
 
         let grid1 = GridSquare::new("FN31pr").unwrap();
         let grid2 = GridSquare::new("EN90cv").unwrap();

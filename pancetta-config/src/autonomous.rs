@@ -133,7 +133,7 @@ impl PriorityWeightsConfig {
             ("duplicate_penalty", self.duplicate_penalty),
             ("recent_failure_penalty", self.recent_failure_penalty),
         ] {
-            if val < -1.0 || val > 1.0 {
+            if !(-1.0..=1.0).contains(&val) {
                 return Err(ConfigError::InvalidValue {
                     field: format!("autonomous.priorities.{}", name),
                     value: val.to_string(),
@@ -288,6 +288,9 @@ impl ConfigSection for AutonomousConfig {
 }
 
 #[cfg(test)]
+// rationale: test-only builder structs assigned field-by-field after
+// default(); sequential assignment reads clearer than a struct-update splat.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 

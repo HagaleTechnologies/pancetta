@@ -58,6 +58,10 @@
 //! O(small) — a key hash + linear walk of a small bucket + one 174-f32
 //! copy — so the critical section is short.
 
+// rationale: soft-combine loops index parallel 174-element LLR arrays by position;
+// the index is load-bearing.
+#![allow(clippy::needless_range_loop)]
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -517,7 +521,7 @@ mod tests {
         let key = CombinerKey::new(Mode::Ft8, 50, 1);
 
         // First reception: 32 sign bits all zero.
-        let llrs_a = llrs_from_bits(&vec![0u8; 32]);
+        let llrs_a = llrs_from_bits(&[0u8; 32]);
         combiner.combine(key, &llrs_a);
 
         // Second reception: flip 3 sign bits → Hamming distance 3,
@@ -537,7 +541,7 @@ mod tests {
         let mut combiner = SoftCombiner::with_defaults();
         let key = CombinerKey::new(Mode::Ft8, 50, 1);
 
-        let llrs_a = llrs_from_bits(&vec![0u8; 32]);
+        let llrs_a = llrs_from_bits(&[0u8; 32]);
         combiner.combine(key, &llrs_a);
 
         // Flip 5 sign bits → Hamming distance 5, above default
@@ -688,7 +692,7 @@ mod tests {
         // Receptions 2 & 3: bit 0 truly positive (= no negative sign),
         // bit 1 still negative. After accumulation, the sign at bit 0
         // should flip from negative to positive.
-        let mut bits_clean = vec![0u8; 32];
+        let mut bits_clean = [0u8; 32];
         bits_clean[1] = 1;
         // Use a larger LLR magnitude so the sum dominates the noisy
         // first reception at bit 0.

@@ -1,5 +1,9 @@
 //! Tests for decoder frequency/time refinement improvements
 
+// rationale: plain-data config structs built field-by-field in test/bench
+// setup; sequential assignment reads clearer than a struct-update splat.
+#![allow(clippy::field_reassign_with_default)]
+
 use pancetta_ft8::{Ft8Config, Ft8Decoder, SAMPLE_RATE, WINDOW_SAMPLES};
 
 #[cfg(feature = "transmit")]

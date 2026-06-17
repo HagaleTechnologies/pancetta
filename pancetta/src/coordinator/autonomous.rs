@@ -565,11 +565,8 @@ impl super::ApplicationCoordinator {
                                         drop(op);
                                         // Re-inject any resulting actions (e.g., FrequencyShift)
                                         for ca in collision_actions {
-                                            match ca {
-                                                pancetta_qso::OperatorAction::FrequencyShift { new_offset_hz } => {
-                                                    info!("Collision listen: TX offset shifted to {:.0} Hz", new_offset_hz);
-                                                }
-                                                _ => {}
+                                            if let pancetta_qso::OperatorAction::FrequencyShift { new_offset_hz } = ca {
+                                                info!("Collision listen: TX offset shifted to {:.0} Hz", new_offset_hz);
                                             }
                                         }
                                     }

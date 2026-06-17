@@ -10,6 +10,10 @@
 //! 4. LDPC encode → 174-bit codeword
 //! 5. Map to 79 symbols via Gray code + Costas sync arrays
 
+// rationale: encode loops index the 77-bit payload / 174-bit codeword / 79-symbol
+// arrays by position; the index is load-bearing for the protocol layout.
+#![allow(clippy::needless_range_loop)]
+
 use crate::ldpc::{binary_to_gray, binary_to_gray_4fsk, LdpcEncoder};
 use crate::message::{calculate_crc14, CRC_BITS, PAYLOAD_BITS};
 use crate::protocol::ProtocolParams;
@@ -409,7 +413,7 @@ impl Ft8Encoder {
     }
 
     /// Parse standard message text into (call_to, call_de, extra) fields
-    fn parse_standard_message<'a>(&self, parts: &[&'a str]) -> Ft8Result<(String, String, String)> {
+    fn parse_standard_message(&self, parts: &[&str]) -> Ft8Result<(String, String, String)> {
         if parts.is_empty() {
             return Err(Ft8Error::MessageDecodingError("Empty message".to_string()));
         }
@@ -884,14 +888,14 @@ pub fn packgrid(extra: &str) -> u16 {
     if bytes[0] == b'R' && bytes.len() >= 2 {
         // R prefix → ir=1
         if let Some(dd) = parse_report(&extra[1..]) {
-            if dd < -35 || dd > 30 {
+            if !(-35..=30).contains(&dd) {
                 return MAXGRID4 + 1; // out of range
             }
             let irpt = (35 + dd) as u16;
             return (MAXGRID4 + irpt) | 0x8000; // ir=1
         }
     } else if let Some(dd) = parse_report(extra) {
-        if dd < -35 || dd > 30 {
+        if !(-35..=30).contains(&dd) {
             return MAXGRID4 + 1; // out of range
         }
         let irpt = (35 + dd) as u16;
@@ -1602,7 +1606,7 @@ mod tests {
         use crate::message::{calculate_crc14, CRC_BITS, PAYLOAD_BITS};
         use crate::protocol::{ProtocolParams, FT4_XOR_SEQUENCE};
 
-        let mut encoder = Ft8Encoder::new(); // FT8 encoder to get raw payloads
+        let encoder = Ft8Encoder::new(); // FT8 encoder to get raw payloads
 
         let messages = [
             "CQ W1ABC FN42",
@@ -1633,7 +1637,7 @@ mod tests {
             }
 
             // Compute CRC on scrambled payload
-            let crc = calculate_crc14(&scrambled_bits);
+            let _crc = calculate_crc14(&scrambled_bits);
 
             // Simulate decoder un-XOR: apply XOR to the scrambled bits
             let mut unscrambled_bits = scrambled_bits.clone();

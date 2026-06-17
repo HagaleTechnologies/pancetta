@@ -378,6 +378,9 @@ pub struct PipelineStats {
 
 impl DspPipeline {
     /// Create a new DSP pipeline
+    // rationale: the (pipeline, sender, receiver) tuple is the intended public API
+    // shape; a type alias would not improve clarity.
+    #[allow(clippy::type_complexity)]
     pub fn new(config: PipelineConfig) -> Result<(Self, Sender<Vec<f32>>, Receiver<Vec<f32>>)> {
         config.validate()?;
 
@@ -559,7 +562,7 @@ impl DspPipeline {
             }
         });
 
-        if self.frame_counter % 10000 == 0 {
+        if self.frame_counter.is_multiple_of(10000) {
             info!(
                 "DSP pipeline: {} frames processed, window extractor at {}/{}",
                 self.frame_counter,
@@ -669,6 +672,9 @@ impl PipelineBuilder {
         self
     }
 
+    // rationale: the (pipeline, sender, receiver) tuple is the intended public API
+    // shape; a type alias would not improve clarity.
+    #[allow(clippy::type_complexity)]
     pub fn build(self) -> Result<(DspPipeline, Sender<Vec<f32>>, Receiver<Vec<f32>>)> {
         DspPipeline::new(self.config)
     }

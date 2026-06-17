@@ -24,6 +24,10 @@
 //!   outcome, not an error. See
 //!   <https://www.qrz.com/docs/logbook/QRZLogbookAPI.html>.
 
+// rationale: the crate-wide `DxError` is intentionally a flat (non-boxed) enum for
+// ergonomic `?`; boxing it crate-wide to satisfy this lint is out of scope here.
+#![allow(clippy::result_large_err)]
+
 use crate::{DxError, Result};
 use reqwest::Client;
 use std::time::Duration;

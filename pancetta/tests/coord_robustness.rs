@@ -23,6 +23,10 @@
 //! end-to-end "cancelled QSO → its TX is dropped" contract is asserted, not
 //! just the trigger predicate.
 
+// rationale: test config structs assigned field-by-field after default();
+// sequential assignment reads clearer than a struct-update splat.
+#![allow(clippy::field_reassign_with_default)]
+
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 

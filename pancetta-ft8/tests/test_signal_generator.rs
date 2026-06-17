@@ -115,7 +115,7 @@ fn generate_test_tone_sequence() -> Vec<u8> {
     for i in 0..79 {
         if i < 7 {
             tones.push(costas[i]);
-        } else if i >= 36 && i < 43 {
+        } else if (36..43).contains(&i) {
             tones.push(costas[i - 36]);
         } else if i >= 72 {
             tones.push(costas[i - 72]);

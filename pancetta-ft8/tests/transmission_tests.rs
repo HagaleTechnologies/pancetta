@@ -6,12 +6,11 @@
 #[cfg(feature = "transmit")]
 mod transmission_tests {
     use pancetta_ft8::{
-        AudioConfig, AudioFormat, BandLimits, FrequencyConfig, Ft8Encoder, Ft8EncodingConfig,
-        Ft8Modulator, Ft8Transmitter, ModulatorConfig, PowerConfig, PttConfig, PttMethod,
-        SafetyConfig, SampleType, TransmissionConfig, TransmissionState, MESSAGE_DURATION,
-        NUM_SYMBOLS, SAMPLE_RATE,
+        AudioFormat, BandLimits, FrequencyConfig, Ft8Encoder, Ft8EncodingConfig, Ft8Modulator,
+        Ft8Transmitter, ModulatorConfig, PowerConfig, PttConfig, PttMethod, SafetyConfig,
+        SampleType, TransmissionConfig, TransmissionState, MESSAGE_DURATION, NUM_SYMBOLS,
+        SAMPLE_RATE,
     };
-    use std::time::{Duration, SystemTime};
 
     #[test]
     fn test_encoder_basic_messages() {
@@ -268,7 +267,7 @@ mod transmission_tests {
         // Emergency stop should be reflected in state
         // Note: transmission_allowed might still be true from safety monitor perspective
         // but emergency_stop flag would prevent actual transmission
-        let stats = transmitter.get_statistics();
+        let _stats = transmitter.get_statistics();
         // The emergency stop doesn't necessarily change transmission_allowed from safety monitor,
         // but the state check would prevent transmission
 

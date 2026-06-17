@@ -128,9 +128,7 @@ impl RealtimeAudioProcessor {
                 let _ = latency_producer.push_latency(latency_ns);
 
                 // Check for shutdown signal
-                if shared_clone.should_stop() {
-                    return;
-                }
+                if shared_clone.should_stop() {}
             },
             |err| {
                 eprintln!("Audio stream error: {}", err);
@@ -234,7 +232,9 @@ pub fn run_latency_stress_test(
         }
 
         // Print periodic updates
-        if test_start.elapsed().as_secs() % 5 == 0 && latency_measurer.measurement_count() > 0 {
+        if test_start.elapsed().as_secs().is_multiple_of(5)
+            && latency_measurer.measurement_count() > 0
+        {
             let stats = latency_measurer.get_stats();
             println!(
                 "Progress: {}s - Avg: {:.3}ms, Max: {:.3}ms, Excessive: {:.1}%",

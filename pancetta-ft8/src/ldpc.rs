@@ -6,6 +6,10 @@
 //! All constant data is taken directly from the WSJT-X / ft8_lib reference
 //! implementation (kgoba/ft8_lib, constants.c).
 
+// rationale: LDPC encode/decode loops index parity-check matrix rows/columns and
+// the 174-bit codeword by position; the index is load-bearing.
+#![allow(clippy::needless_range_loop)]
+
 use crate::{Ft8Error, Ft8Result};
 use bitvec::prelude::*;
 
@@ -701,6 +705,12 @@ pub struct LdpcEncoder {
     parity_check_matrix: ParityCheckMatrix,
 }
 
+impl Default for LdpcEncoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LdpcEncoder {
     pub fn new() -> Self {
         Self {
@@ -937,7 +947,7 @@ mod tests {
         for pattern in 0..10u8 {
             let mut message = bitvec![0; LDPC_INFO_BITS];
             for i in 0..LDPC_INFO_BITS {
-                message.set(i, (i as u8 + pattern) % 3 == 0);
+                message.set(i, (i as u8 + pattern).is_multiple_of(3));
             }
 
             let codeword = encoder.encode(&message).unwrap();

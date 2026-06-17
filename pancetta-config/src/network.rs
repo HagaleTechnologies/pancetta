@@ -1122,29 +1122,24 @@ impl ConfigSection for NetworkConfig {
         }
 
         // Validate web API settings
-        if self.web_api.enabled {
-            if self.web_api.port == 0 {
-                return Err(ConfigError::InvalidValue {
-                    field: "web_api.port".to_string(),
-                    value: self.web_api.port.to_string(),
-                });
-            }
+        if self.web_api.enabled && self.web_api.port == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "web_api.port".to_string(),
+                value: self.web_api.port.to_string(),
+            });
         }
 
         // Validate rate limiting
-        if self.rate_limiting.enabled {
-            if self.rate_limiting.global.requests_per_minute == 0 {
-                return Err(ConfigError::InvalidValue {
-                    field: "rate_limiting.global.requests_per_minute".to_string(),
-                    value: self.rate_limiting.global.requests_per_minute.to_string(),
-                });
-            }
+        if self.rate_limiting.enabled && self.rate_limiting.global.requests_per_minute == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "rate_limiting.global.requests_per_minute".to_string(),
+                value: self.rate_limiting.global.requests_per_minute.to_string(),
+            });
         }
 
         // cqdx.io validation
         if self.cqdx.enabled {
-            if self.cqdx.token.is_none() || self.cqdx.token.as_ref().map_or(true, |t| t.is_empty())
-            {
+            if self.cqdx.token.is_none() || self.cqdx.token.as_ref().is_none_or(|t| t.is_empty()) {
                 return Err(ConfigError::Validation(
                     "cqdx.io integration enabled but no PAT token configured".to_string(),
                 ));

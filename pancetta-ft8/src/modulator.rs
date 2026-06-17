@@ -6,6 +6,10 @@
 //! - Configurable frequency offset and power levels
 //! - Real-time audio generation with precise timing
 
+// rationale: waveform/symbol synthesis loops index sample and tone buffers by
+// position; the index is load-bearing for phase continuity.
+#![allow(clippy::needless_range_loop)]
+
 use crate::{
     protocol::ProtocolParams, Ft8Error, Ft8Result, BASE_FREQUENCY, MESSAGE_DURATION, NUM_SYMBOLS,
     NUM_TONES, SAMPLE_RATE, SYMBOL_DURATION, TONE_SPACING,
@@ -762,13 +766,13 @@ pub fn convert_samples(samples: &[f32], format: AudioFormat) -> Vec<u8> {
         }
         SampleType::I16 => {
             for &sample in samples {
-                let scaled = (sample * 32767.0).round().max(-32768.0).min(32767.0) as i16;
+                let scaled = (sample * 32767.0).round().clamp(-32768.0, 32767.0) as i16;
                 output.extend_from_slice(&scaled.to_le_bytes());
             }
         }
         SampleType::I24 => {
             for &sample in samples {
-                let scaled = (sample * 8388607.0).round().max(-8388608.0).min(8388607.0) as i32;
+                let scaled = (sample * 8388607.0).round().clamp(-8388608.0, 8388607.0) as i32;
                 let bytes = scaled.to_le_bytes();
                 output.extend_from_slice(&bytes[0..3]); // 24-bit = 3 bytes
             }
@@ -777,8 +781,7 @@ pub fn convert_samples(samples: &[f32], format: AudioFormat) -> Vec<u8> {
             for &sample in samples {
                 let scaled = (sample * 2147483647.0)
                     .round()
-                    .max(-2147483648.0)
-                    .min(2147483647.0) as i32;
+                    .clamp(-2147483648.0, 2147483647.0) as i32;
                 output.extend_from_slice(&scaled.to_le_bytes());
             }
         }

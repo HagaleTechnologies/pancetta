@@ -270,7 +270,7 @@ fn test_our_audio_decoded_by_ft8lib() {
 
         // Modulate with our modulator
         let mut modulator = Ft8Modulator::new(SAMPLE_RATE, *freq_offset, 1.0).unwrap();
-        let tones_arr: [u8; NUM_SYMBOLS] = tones.try_into().unwrap();
+        let tones_arr: [u8; NUM_SYMBOLS] = tones;
         let audio = modulator.modulate_symbols(&tones_arr, 0.0).unwrap();
 
         // Pad to 15 seconds (180000 samples at 12kHz) — same as WAV files

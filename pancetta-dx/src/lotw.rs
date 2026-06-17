@@ -3,6 +3,10 @@
 //! This module provides integration with ARRL's Logbook of the World
 //! for QSL confirmation and award tracking.
 
+// rationale: the crate-wide `DxError` is intentionally a flat (non-boxed) enum for
+// ergonomic `?`; boxing it crate-wide to satisfy this lint is out of scope here.
+#![allow(clippy::result_large_err)]
+
 use crate::{ConfirmationStatus, DxError, DxQso, Result};
 use chrono::{NaiveDate, Utc};
 use reqwest::{multipart::Form, Client};
@@ -227,10 +231,10 @@ impl LotwClient {
             .form(&params)
             .send()
             .await
-            .map_err(|e| DxError::Network(e))?;
+            .map_err(DxError::Network)?;
 
         if response.status().is_success() {
-            let text = response.text().await.map_err(|e| DxError::Network(e))?;
+            let text = response.text().await.map_err(DxError::Network)?;
 
             if text.contains("Invalid username") || text.contains("Invalid password") {
                 return Err(DxError::ExternalService(
@@ -266,9 +270,9 @@ impl LotwClient {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| DxError::Network(e))?;
+            .map_err(DxError::Network)?;
 
-        let text = response.text().await.map_err(|e| DxError::Network(e))?;
+        let text = response.text().await.map_err(DxError::Network)?;
 
         // Parse the response (LoTW returns HTML, so we need to parse it)
         self.parse_upload_response(&text)
@@ -330,7 +334,7 @@ impl LotwClient {
             .query(&query_params)
             .send()
             .await
-            .map_err(|e| DxError::Network(e))?;
+            .map_err(DxError::Network)?;
 
         if !response.status().is_success() {
             return Err(DxError::ExternalService(format!(
@@ -339,7 +343,7 @@ impl LotwClient {
             )));
         }
 
-        let adif_data = response.text().await.map_err(|e| DxError::Network(e))?;
+        let adif_data = response.text().await.map_err(DxError::Network)?;
 
         if adif_data.contains("No records found") {
             tracing::warn!("No QSL records found in LoTW");
@@ -562,7 +566,7 @@ impl LotwClient {
                 let mut field_def = String::new();
 
                 // Read until '>'
-                while let Some(ch) = chars.next() {
+                for ch in chars.by_ref() {
                     if ch == '>' {
                         break;
                     }

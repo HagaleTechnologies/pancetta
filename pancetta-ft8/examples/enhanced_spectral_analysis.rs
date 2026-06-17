@@ -8,6 +8,10 @@
 //! - Waterfall display generation
 //! - Automatic gain control
 
+// rationale: test/bench loops index buffers by position; the index is
+// load-bearing and an iterator rewrite would obscure intent.
+#![allow(clippy::needless_range_loop)]
+
 use pancetta_ft8::{Ft8Config, Ft8Decoder};
 use std::f64::consts::PI;
 

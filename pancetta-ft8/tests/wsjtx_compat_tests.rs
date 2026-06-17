@@ -5,6 +5,9 @@
 //!
 //! Reference vectors were generated using kgoba/ft8_lib compiled from source.
 
+// rationale: test/bench loops index buffers by position; the index is
+// load-bearing and an iterator rewrite would obscure intent.
+#![allow(clippy::needless_range_loop)]
 #![cfg(feature = "transmit")]
 
 use bitvec::prelude::*;

@@ -11,6 +11,9 @@
 //! - Bits 56-76: report/grid/message content (21 bits)
 
 #![allow(dead_code)]
+// rationale: AP LLR-injection loops index the 77-bit payload positions; the
+// index is load-bearing for the protocol bit layout.
+#![allow(clippy::needless_range_loop)]
 
 /// High-confidence LLR magnitude for known AP bits.
 const AP_LLR_MAGNITUDE: f32 = 15.0;

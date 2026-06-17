@@ -9,6 +9,21 @@
 //! 6. CRC-14 verification
 //! 7. Message parsing
 
+// rationale: DSP hot loops index spectrogram/LLR/symbol buffers by position
+// (often multiple parallel arrays at the same i); the index is load-bearing and
+// rewriting to iterators would obscure the signal-processing intent.
+#![allow(clippy::needless_range_loop)]
+// rationale: plain-data config/result structs built field-by-field in tests and
+// builders; sequential assignment reads clearer than a struct-update splat.
+#![allow(clippy::field_reassign_with_default)]
+// rationale: `!(a < b)` / `!(x > 0.0)` guards are written this way deliberately so
+// NaN inputs take the early-return branch (NaN comparisons are false); rewriting to
+// `>=` / `<=` would silently change the NaN handling.
+#![allow(clippy::neg_cmp_op_on_partial_ord)]
+// rationale: wrapped prose lines starting with `-Σ` / `(` are misparsed as
+// markdown list items; the doc renders correctly and reflowing would add noise.
+#![allow(clippy::doc_lazy_continuation)]
+
 use crate::{
     message::{calculate_crc14, DecodedMessage, MessageParser, CRC_BITS, PAYLOAD_BITS},
     osd::{OsdConfig, OsdDecoder},
@@ -3218,7 +3233,7 @@ impl Ft8Decoder {
         let total_len = NUM_SYMBOLS * sps;
         let base_freq = msg.frequency_offset;
         let nominal_time = (msg.time_offset * SAMPLE_RATE as f64) as isize;
-        let tone_spacing = TONE_SPACING as f64;
+        let tone_spacing = TONE_SPACING;
         let sidelobe_scale = 0.15 * 0.9; // 15% sidelobe × 0.9 conservative factor
 
         // For each sidelobe offset (+1 and -1 tone spacing)
@@ -3338,7 +3353,7 @@ impl Ft8Decoder {
         let min_steps = msg_span + search_margin;
 
         // Pad audio if needed to get enough blocks
-        let min_blocks = (min_steps + time_osr - 1) / time_osr;
+        let min_blocks = min_steps.div_ceil(time_osr);
         let padded;
         let audio_ref = if num_blocks < min_blocks {
             let min_len = min_blocks * block_size;
@@ -3925,7 +3940,7 @@ impl Ft8Decoder {
                         let (refined_score, time_refinement) =
                             if self.config.sync_time_interpolation
                                 && t0 > 0
-                                && t0 + 1 <= max_time_step
+                                && t0 < max_time_step
                                 && score > self.config.sync_time_interp_score_gate
                             {
                                 // hb-245: parabolic peak interpolation
@@ -4421,6 +4436,10 @@ impl Ft8Decoder {
     ///
     /// Clones the base LLRs, injects AP bits, normalizes, runs LDPC + CRC,
     /// and returns a DecodedMessage on success.
+    // rationale: decode hot-path fn threads many independent context values
+    // (LLRs, AP state, candidate coords, trackers); a params struct would add a
+    // layer without simplifying the call sites.
+    #[allow(clippy::too_many_arguments)]
     fn try_ldpc_with_ap(
         &self,
         base_llrs: &[f32],
@@ -4899,6 +4918,10 @@ impl Ft8Decoder {
         // Spec: docs/superpowers/specs/2026-05-31-hb-057-median-dt-design.md.
         // Prior art: JTDX commit "use median filter in average DT
         // calculation" (Feb 2022).
+        // rationale: the guard is a compound `enabled && is_some()`; the
+        // `as_ref().expect("checked above")` keeps the short-circuit explicit and is
+        // clearer than threading an `if let` through the flag and the large branch.
+        #[allow(clippy::unnecessary_unwrap)]
         let new_candidates: Vec<CostasCandidate> =
             if self.config.dt_history_enabled && self.dt_priors.is_some() {
                 let lookup = self.dt_priors.as_ref().expect("checked above");
@@ -6141,7 +6164,7 @@ impl Ft8Decoder {
                     symbol_audio[i] * w * rotator.re,
                     symbol_audio[i] * w * rotator.im,
                 );
-                rotator = rotator * phase_step;
+                rotator *= phase_step;
             }
 
             // Compute FFT — tone k is now at bin k
@@ -6887,7 +6910,7 @@ fn par_decode_candidate(
     ctx: &DecodeContext,
     candidate: &CostasCandidate,
     ldpc: &LdpcDecoder,
-    fft_buffer: &mut Vec<Complex<f64>>,
+    fft_buffer: &mut [Complex<f64>],
 ) -> Option<DecodedMessage> {
     let sps = ctx.protocol_params.samples_per_symbol(SAMPLE_RATE);
     let tone_spacing = ctx.protocol_params.tone_spacing;
@@ -7435,6 +7458,9 @@ fn par_try_ap_decode(
 }
 
 /// Try LDPC decode with AP injection at a specific level (parallel-safe).
+// rationale: parallel-safe decode fn threads many independent context values; a
+// params struct would add a layer without simplifying the rayon call sites.
+#[allow(clippy::too_many_arguments)]
 fn par_try_ldpc_with_ap(
     ctx: &DecodeContext,
     ldpc: &LdpcDecoder,
@@ -7558,6 +7584,9 @@ enum RecentInjectPos {
 /// hb-043: LDPC decode with a single recent callsign injected at one position,
 /// without the my_call-coupled AP1 injection that AP2 normally prepends.
 /// Mirrors `par_try_ldpc_with_ap` but for the my_call-less use case.
+// rationale: parallel-safe decode fn threads many independent context values; a
+// params struct would add a layer without simplifying the rayon call sites.
+#[allow(clippy::too_many_arguments)]
 fn par_try_ldpc_with_recent_only(
     ctx: &DecodeContext,
     ldpc: &LdpcDecoder,
@@ -8724,6 +8753,9 @@ fn bessel_llrs_from_metrics(metrics: &[[f64; 8]]) -> Vec<f32> {
 /// When `None`, the function is byte-identical to the legacy fine-FFT
 /// path. Inspired by spec ref
 /// `research/specs/spec-js8call-per-candidate-frequency-tracker.md`.
+// rationale: parallel symbol-extraction fn threads many independent DSP context
+// values; a params struct would add a layer without simplifying the call sites.
+#[allow(clippy::too_many_arguments)]
 fn par_extract_symbols_complex(
     pp: &ProtocolParams,
     audio: &[f64],
@@ -8731,7 +8763,7 @@ fn par_extract_symbols_complex(
     base_frequency: f64,
     symbol_fft: &std::sync::Arc<dyn rustfft::Fft<f64>>,
     symbol_window: &[f64],
-    fft_buffer: &mut Vec<Complex<f64>>,
+    fft_buffer: &mut [Complex<f64>],
     freq_tracker: Option<&mut crate::freq_tracker::FrequencyTracker>,
 ) -> Ft8Result<(Vec<u8>, Vec<[f64; NUM_TONES]>)> {
     let sps = pp.samples_per_symbol(SAMPLE_RATE);
@@ -8786,7 +8818,7 @@ fn par_extract_symbols_complex(
                 symbol_audio[i] * w * rotator.re,
                 symbol_audio[i] * w * rotator.im,
             );
-            rotator = rotator * phase_step;
+            rotator *= phase_step;
         }
 
         // Step 2 (optional): apply tracker's running offset as an
@@ -9996,7 +10028,7 @@ impl LdpcDecoder {
                 #[cfg(feature = "neural_osd")]
                 let neural_ordering = trajectory
                     .as_ref()
-                    .map(|traj| crate::neural_osd::predict_error_bits(traj));
+                    .map(crate::neural_osd::predict_error_bits);
                 #[cfg(not(feature = "neural_osd"))]
                 let neural_ordering: Option<[f32; 91]> = {
                     let _ = trajectory.as_ref();
@@ -10214,6 +10246,9 @@ impl LdpcDecoder {
     /// Belief propagation with per-iteration LLR trajectory collection.
     /// Returns (final_llrs, Some(trajectory)) when BP fails to converge.
     /// Returns (final_llrs, None) when BP converges (no trajectory needed).
+    // rationale: the (llrs, trajectory) tuple mirrors the BP telemetry contract; a
+    // type alias would obscure the dimensions documented above.
+    #[allow(clippy::type_complexity)]
     fn belief_propagation_with_trajectory(
         &self,
         channel_llrs: &[f32],
@@ -10230,6 +10265,9 @@ impl LdpcDecoder {
     /// trajectory contract is unchanged: `Some(traj)` when BP fails to
     /// converge, `None` when it succeeds. Inspired by spec ref
     /// `spec-wsjtx-improved-fdr.md` §"Inputs".
+    // rationale: the (llrs, trajectory, telemetry) tuple is the BP telemetry
+    // contract documented above; a type alias would obscure the dimensions.
+    #[allow(clippy::type_complexity)]
     fn belief_propagation_with_features(
         &self,
         channel_llrs: &[f32],
@@ -11614,7 +11652,7 @@ mod tests {
             .collect();
 
         // Generate the signal
-        let total_len = NUM_SYMBOLS * sps;
+        let _total_len = NUM_SYMBOLS * sps;
         let time_offset_samples = 960usize; // 1 half-symbol offset
         let mut audio = vec![0.0f32; WINDOW_SAMPLES];
 

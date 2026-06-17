@@ -3,6 +3,13 @@
 //! These benchmarks measure the decoder performance under various conditions
 //! to ensure it meets real-time requirements.
 
+// rationale: test/bench loops index buffers by position; the index is
+// load-bearing and an iterator rewrite would obscure intent.
+#![allow(clippy::needless_range_loop)]
+// rationale: plain-data config structs built field-by-field in test/bench
+// setup; sequential assignment reads clearer than a struct-update splat.
+#![allow(clippy::field_reassign_with_default)]
+
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use pancetta_ft8::{
     Ft8Config, Ft8Decoder, NUM_SYMBOLS, SAMPLE_RATE, SYMBOL_DURATION, WINDOW_SAMPLES,
@@ -194,11 +201,10 @@ fn benchmark_signal_processing(c: &mut Criterion) {
 
     group.bench_function("bandpass_filter", |b| {
         b.iter(|| {
-            black_box(
-                filter
-                    .filter_batch(black_box(&filter_test_data), black_box(&mut output))
-                    .unwrap(),
-            );
+            filter
+                .filter_batch(black_box(&filter_test_data), black_box(&mut output))
+                .unwrap();
+            black_box(());
         });
     });
 
@@ -339,7 +345,6 @@ fn benchmark_throughput(c: &mut Criterion) {
 
 /// Custom measurement for real-time factor
 fn benchmark_realtime_factor(c: &mut Criterion) {
-    use criterion::measurement::WallTime;
     use std::time::{Duration, Instant};
 
     let mut group = c.benchmark_group("realtime_factor");

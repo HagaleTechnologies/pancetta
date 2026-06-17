@@ -2820,8 +2820,8 @@ mod tests {
 
         // Latest waterfall row is mostly quiet except 1400-1600.
         let mut row = vec![0.0f32; 100];
-        for i in 47..54 {
-            row[i] = 1.0;
+        for cell in &mut row[47..54] {
+            *cell = 1.0;
         }
         app.waterfall_data.push(row);
 
@@ -2832,12 +2832,12 @@ mod tests {
         );
         // Should land outside 1400-1600 ± 75 Hz separation.
         assert!(
-            pick < 1325.0 || pick > 1675.0,
+            !(1325.0..=1675.0).contains(&pick),
             "picked {} which is too close to busy band",
             pick
         );
         // Should be in the allowed range (200..2800).
-        assert!(pick >= 200.0 && pick <= 2800.0);
+        assert!((200.0..=2800.0).contains(&pick));
     }
 
     #[tokio::test]
@@ -2865,7 +2865,7 @@ mod tests {
             .find_clear_offset()
             .expect("must still return a best-effort offset on a busy band");
         assert!(!is_clear, "saturated band cannot yield a truly clear slot");
-        assert!(pick >= 200.0 && pick <= 2800.0);
+        assert!((200.0..=2800.0).contains(&pick));
     }
 
     #[tokio::test]

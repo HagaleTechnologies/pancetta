@@ -164,8 +164,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// High-level API for common use cases
 pub mod prelude {
-    //! Convenient re-exports for common use cases
-
     pub use crate::{
         AgcConfig, AgcMode, AudioFrame, AudioResampler, AudioRingBuffer, AutomaticGainControl,
         DspPipeline, PipelineBuilder, PipelineConfig,
@@ -177,8 +175,6 @@ pub mod prelude {
 
 /// Factory functions for creating common configurations
 pub mod factory {
-    //! Factory functions for creating pre-configured components
-
     use crate::*;
 
     /// Create an FT8-optimized DSP pipeline
@@ -189,6 +185,9 @@ pub mod factory {
     /// - AGC optimized for digital modes
     /// - Noise reduction enabled
     /// - 12.64-second window extraction
+    // rationale: the (pipeline, sender, receiver) tuple is the intended public API
+    // shape; a type alias would not improve clarity.
+    #[allow(clippy::type_complexity)]
     pub fn create_ft8_pipeline() -> pipeline::Result<(
         DspPipeline,
         crossbeam_channel::Sender<Vec<f32>>,
@@ -212,6 +211,9 @@ pub mod factory {
     /// - Wide bandwidth (no bandpass filtering)
     /// - Medium AGC settings
     /// - Noise reduction enabled
+    // rationale: the (pipeline, sender, receiver) tuple is the intended public API
+    // shape; a type alias would not improve clarity.
+    #[allow(clippy::type_complexity)]
     pub fn create_amateur_radio_pipeline() -> pipeline::Result<(
         DspPipeline,
         crossbeam_channel::Sender<Vec<f32>>,
@@ -265,8 +267,6 @@ pub mod factory {
 
 /// Utility functions for signal processing
 pub mod utils {
-    //! Utility functions for common signal processing tasks
-
     /// Convert dB to linear scale
     pub fn db_to_linear(db: f32) -> f32 {
         10.0_f32.powf(db / 20.0)

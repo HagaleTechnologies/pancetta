@@ -291,6 +291,9 @@ impl SmartFrequencyAllocator {
 }
 
 #[cfg(test)]
+// rationale: test-only builder structs assigned field-by-field after
+// default(); sequential assignment reads clearer than a struct-update splat.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
@@ -388,7 +391,7 @@ mod tests {
         let best = &candidates[0];
         let dist = (best.offset_hz - dx_target).abs();
         assert!(
-            dist >= 50.0 && dist <= 200.0,
+            (50.0..=200.0).contains(&dist),
             "Expected best candidate 50–200 Hz from DX at {} Hz, got {} Hz (dist {})",
             dx_target,
             best.offset_hz,

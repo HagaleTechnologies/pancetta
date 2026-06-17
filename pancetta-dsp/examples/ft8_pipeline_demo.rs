@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sample_rate = 48000.0;
     let duration_seconds = 1.0;
     let samples_per_buffer = 1024;
-    let total_samples = (sample_rate * duration_seconds) as usize;
+    let _total_samples = (sample_rate * duration_seconds) as usize;
 
     // Create a synthetic FT8-like signal (simplified)
     let test_signal = generate_test_signal(sample_rate, duration_seconds);
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Start the pipeline in a background task
     println!("\n⚡ Starting DSP pipeline...");
-    let pipeline_handle = tokio::spawn(async move {
+    let _pipeline_handle = tokio::spawn(async move {
         match pipeline.start().await {
             Ok(_) => println!("Pipeline completed successfully"),
             Err(e) => eprintln!("Pipeline error: {}", e),
@@ -145,6 +145,8 @@ fn generate_test_signal(sample_rate: f32, duration: f32) -> Vec<f32> {
 }
 
 /// Example showing custom pipeline configuration
+// rationale: demonstration helper retained for reference; not wired into `main`.
+#[allow(dead_code)]
 async fn custom_pipeline_example() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n🔧 Custom Pipeline Configuration Example");
 

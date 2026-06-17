@@ -447,6 +447,9 @@ impl Coordinates {
 }
 
 #[cfg(test)]
+// rationale: test-only builder structs assigned field-by-field after
+// default(); sequential assignment reads clearer than a struct-update splat.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 

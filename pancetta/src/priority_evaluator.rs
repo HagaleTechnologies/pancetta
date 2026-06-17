@@ -124,6 +124,12 @@ pub struct CachedStationLookup {
     excluded_dxcc_prefixes: Arc<RwLock<HashSet<String>>>,
 }
 
+impl Default for CachedStationLookup {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CachedStationLookup {
     pub fn new() -> Self {
         Self {
@@ -228,7 +234,7 @@ impl WorkedStationLookup for CachedStationLookup {
         let worked = self.worked_on_band.read();
         worked
             .get(&band)
-            .map_or(false, |set| set.contains(&callsign.to_uppercase()))
+            .is_some_and(|set| set.contains(&callsign.to_uppercase()))
     }
 
     fn is_recent_failure(&self, callsign: &str) -> bool {

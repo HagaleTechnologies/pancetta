@@ -200,7 +200,7 @@ impl PeakDetector {
             self.peak = input_abs;
         } else {
             // Decay: slow fall
-            self.peak = self.peak * self.decay_alpha;
+            self.peak *= self.decay_alpha;
         }
 
         self.peak
@@ -468,8 +468,10 @@ mod tests {
 
     #[test]
     fn test_config_validation() {
-        let mut config = AgcConfig::default();
-        config.target_level = 1.5; // Invalid: > 1.0
+        let config = AgcConfig {
+            target_level: 1.5, // Invalid: > 1.0
+            ..AgcConfig::default()
+        };
 
         assert!(config.validate().is_err());
     }

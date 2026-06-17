@@ -4,6 +4,10 @@
 //! No audio hardware, no coordinator, no async runtime for the core loop.
 //! Tests the pure FT8 + QSO pipeline.
 
+// rationale: test config structs assigned field-by-field after default();
+// sequential assignment reads clearer than a struct-update splat.
+#![allow(clippy::field_reassign_with_default)]
+
 use pancetta_ft8::{
     DecodedMessage, Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES,
 };

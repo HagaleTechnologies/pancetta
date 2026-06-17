@@ -12,6 +12,10 @@
 //! This module provides the GF(2) matrix primitives and Gaussian elimination
 //! needed for OSD. The LDPC code is (174, 91): 91 information bits and 83 parity bits.
 
+// rationale: OSD Gaussian-elimination / matrix loops index parallel rows and
+// columns by position; the index is load-bearing.
+#![allow(clippy::needless_range_loop)]
+
 use std::collections::HashMap;
 
 use bitvec::prelude::*;
@@ -1114,13 +1118,11 @@ mod tests {
                 let osd1_result = decoder1.decode(&llrs, None);
                 let osd2_result = decoder2.decode(&llrs, None);
 
-                if osd1_result.is_none() && osd2_result.is_some() {
+                if let (None, Some(cw2)) = (&osd1_result, &osd2_result) {
                     assert_eq!(
-                        osd2_result.unwrap(),
-                        codeword,
+                        cw2, &codeword,
                         "OSD-2 decoded wrong codeword for pair ({}, {})",
-                        a,
-                        b
+                        a, b
                     );
                     found_good_pair = true;
                     break;
@@ -1181,14 +1183,11 @@ mod tests {
                 let osd2_result = decoder2.decode(&llrs, None);
                 let osd3_result = decoder3.decode(&llrs, None);
 
-                if osd2_result.is_none() && osd3_result.is_some() {
+                if let (None, Some(cw3)) = (&osd2_result, &osd3_result) {
                     assert_eq!(
-                        osd3_result.unwrap(),
-                        codeword,
+                        cw3, &codeword,
                         "OSD-3 decoded wrong codeword for triple ({}, {}, {})",
-                        a,
-                        b,
-                        c
+                        a, b, c
                     );
                     found_good_triple = true;
                     break;

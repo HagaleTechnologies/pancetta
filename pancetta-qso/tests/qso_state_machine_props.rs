@@ -125,7 +125,7 @@ proptest! {
 
                 // State before this frame.
                 let before = manager
-                    .get_qso(qso_id.clone())
+                    .get_qso(qso_id)
                     .await
                     .ok()
                     .map(|p| state_tag(&p.state));
@@ -137,7 +137,7 @@ proptest! {
                     .expect("process_message must not error on a valid frame");
 
                 let after = manager
-                    .get_qso(qso_id.clone())
+                    .get_qso(qso_id)
                     .await
                     .ok()
                     .map(|p| state_tag(&p.state));
@@ -157,7 +157,7 @@ proptest! {
             }
 
             // INVARIANT 3: completion implies the partner actually closed.
-            if let Ok(progress) = manager.get_qso(qso_id.clone()).await {
+            if let Ok(progress) = manager.get_qso(qso_id).await {
                 if matches!(progress.state, QsoState::Completed { .. }) {
                     prop_assert!(
                         partner_sent_close,

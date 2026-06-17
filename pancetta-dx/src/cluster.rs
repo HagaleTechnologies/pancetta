@@ -370,16 +370,16 @@ impl DxClusterClient {
                     Ok(Message::Text(text)) => {
                         debug!("WebSocket: {}", text);
 
-                        if let Some(cluster_message) = Self::parse_cluster_line(&text) {
-                            if let ClusterMessage::Spot(cluster_spot) = cluster_message {
-                                if let Ok(dx_spot) =
-                                    Self::convert_cluster_spot(cluster_spot, &filter, &recent_spots)
-                                        .await
-                                {
-                                    if spot_tx.send(dx_spot).is_err() {
-                                        warn!("Spot receiver dropped");
-                                        break;
-                                    }
+                        if let Some(ClusterMessage::Spot(cluster_spot)) =
+                            Self::parse_cluster_line(&text)
+                        {
+                            if let Ok(dx_spot) =
+                                Self::convert_cluster_spot(cluster_spot, &filter, &recent_spots)
+                                    .await
+                            {
+                                if spot_tx.send(dx_spot).is_err() {
+                                    warn!("Spot receiver dropped");
+                                    break;
                                 }
                             }
                         }
@@ -668,6 +668,10 @@ impl DxClusterClient {
     }
 
     /// Extract mode from spot comment
+    // rationale: the JT65/JT9/MSK144 arms each return `None` with a comment
+    // explaining the mode is intentionally unmapped; keeping them distinct
+    // documents the recognized-but-unmapped modes rather than collapsing.
+    #[allow(clippy::if_same_then_else)]
     fn extract_mode_from_comment(comment: &str) -> Option<Mode> {
         let comment_upper = comment.to_uppercase();
 
@@ -704,7 +708,6 @@ impl Default for DxClusterClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Timelike;
 
     #[test]
     fn test_client_creation() {

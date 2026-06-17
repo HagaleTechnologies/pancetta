@@ -128,7 +128,7 @@ impl AudioRingBuffer {
         }
 
         // Read samples from buffer
-        for (_i, sample) in output.iter_mut().enumerate() {
+        for sample in output.iter_mut() {
             if let Some(s) = buffer.pop_front() {
                 *sample = s;
             } else {
@@ -149,6 +149,9 @@ impl AudioRingBuffer {
     }
 
     /// Try to read samples without blocking
+    // rationale: the index `i` pairs each `pop_front` with its output slot and the
+    // early `break` is load-bearing; an iterator rewrite would obscure that.
+    #[allow(clippy::needless_range_loop)]
     pub fn try_read(&self, output: &mut [f32]) -> usize {
         let mut buffer = self.buffer.lock();
         let available = buffer.len().min(output.len());

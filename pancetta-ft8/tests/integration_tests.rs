@@ -3,6 +3,9 @@
 //! These tests validate the complete FT8 decoding pipeline using real
 //! encoder → modulator → decoder round-trip signals.
 
+// rationale: plain-data config structs built field-by-field in test/bench
+// setup; sequential assignment reads clearer than a struct-update splat.
+#![allow(clippy::field_reassign_with_default)]
 #![cfg(feature = "transmit")]
 
 use pancetta_ft8::{

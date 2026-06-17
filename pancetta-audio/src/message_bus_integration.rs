@@ -64,6 +64,9 @@ pub struct AudioMessageBusIntegration {
 
 impl AudioMessageBusIntegration {
     /// Create new audio message bus integration
+    // rationale: the audio processor wraps platform handles that aren't Send+Sync;
+    // the `Arc<RwLock<..>>` is the intentional shared-owner shape for this task.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn new(
         audio_processor: AudioProcessor,
         health_check_interval: Duration,

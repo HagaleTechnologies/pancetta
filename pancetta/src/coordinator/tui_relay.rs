@@ -33,6 +33,9 @@ use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
 impl super::ApplicationCoordinator {
     /// Start TUI component with point-to-point decoded message channel
+    // rationale: wires many independent channel endpoints and shared handles into
+    // the TUI task; a params struct would just relocate the same fields.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start_tui_pipeline(
         &mut self,
         ft8_to_tui_rx: crossbeam_channel::Receiver<pancetta_ft8::DecodedMessage>,
@@ -221,190 +224,181 @@ impl super::ApplicationCoordinator {
                 }
 
                 // Also drain control messages from the message bus
-                match tui_bus_rx.try_recv() {
-                    Ok(bus_msg) => {
-                        match bus_msg.message_type {
-                            MessageType::AutonomousStatus(ref status) => {
-                                // Batch 93: forward the STRUCTURED status so the
-                                // live `[AUTO]` panel renders (previously this was
-                                // flattened to a transient status-bar string and
-                                // `app.autonomous_status` stayed None forever).
-                                let mapped = map_autonomous_status(
-                                    status,
-                                    relay_autonomous_gate.load(Ordering::Acquire),
-                                );
-                                let _ = tui_msg_tx_relay.send(
-                                    pancetta_tui::tui_runner::TuiMessage::AutonomousStatusUpdate(
-                                        mapped,
-                                    ),
-                                );
-                                // Keep the status-bar text line too (additive).
-                                let _ = tui_msg_tx_relay.send(
-                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                        component: "Autonomous".to_string(),
-                                        status: status.state.clone(),
-                                    },
-                                );
-                            }
-                            MessageType::TxStatus { active } => {
-                                // Batch 93: TX worker brackets every transmission
-                                // (PTT-on → PTT-off, including aborts) with these.
-                                // Drives the title-bar " TX " badge.
-                                let _ = tui_msg_tx_relay.send(
-                                    pancetta_tui::tui_runner::TuiMessage::TxStatus { active },
-                                );
-                            }
-                            MessageType::TxQueueStatus {
-                                ref sending,
-                                ref queued,
-                            } => {
-                                // Richer NOW-SENDING / QUEUED view. Re-shape the
-                                // coordinator's TxItem into the TUI's local
-                                // TxQueueItem (decoupled so the TUI doesn't link
-                                // the main crate).
-                                let map = |it: &crate::message_bus::TxItem| {
-                                    pancetta_tui::app::TxQueueItem {
-                                        text: it.text.clone(),
-                                        freq_hz: it.freq_hz,
-                                        qso_id: it.qso_id.clone(),
-                                        deferred: it.deferred,
-                                    }
-                                };
-                                let _ = tui_msg_tx_relay.send(
-                                    pancetta_tui::tui_runner::TuiMessage::TxQueueUpdate {
-                                        sending: sending.as_ref().map(map),
-                                        queued: queued.iter().map(map).collect(),
-                                    },
-                                );
-                            }
-                            MessageType::TxPolicyStatus { policy } => {
-                                // Echo the global TX policy to the bold banner.
-                                let _ = tui_msg_tx_relay.send(
-                                    pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy },
-                                );
-                            }
-                            MessageType::ActiveQsosSnapshot { ref qsos } => {
-                                // Re-shape into the TUI's ActiveQsoBanner
-                                // (decoupled struct so the TUI doesn't link
-                                // pancetta_qso). Push as a TuiMessage; the
-                                // TUI replaces its previous list with this.
-                                // Batch 94: carries the QSO-detail panel
-                                // fields too (last TX/RX message, SNR,
-                                // reports, exchange count).
-                                let banner_qsos: Vec<pancetta_tui::app::ActiveQsoBanner> =
-                                    qsos.iter().map(map_qso_snapshot_item).collect();
-                                let _ = tui_msg_tx_relay.send(
-                                    pancetta_tui::tui_runner::TuiMessage::ActiveQsosUpdate {
-                                        qsos: banner_qsos,
-                                    },
-                                );
-                            }
-                            MessageType::RigControl(
-                                crate::message_bus::RigControlMessage::FrequencyResponse {
+                if let Ok(bus_msg) = tui_bus_rx.try_recv() {
+                    match bus_msg.message_type {
+                        MessageType::AutonomousStatus(ref status) => {
+                            // Batch 93: forward the STRUCTURED status so the
+                            // live `[AUTO]` panel renders (previously this was
+                            // flattened to a transient status-bar string and
+                            // `app.autonomous_status` stayed None forever).
+                            let mapped = map_autonomous_status(
+                                status,
+                                relay_autonomous_gate.load(Ordering::Acquire),
+                            );
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::AutonomousStatusUpdate(
+                                    mapped,
+                                ),
+                            );
+                            // Keep the status-bar text line too (additive).
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                    component: "Autonomous".to_string(),
+                                    status: status.state.clone(),
+                                },
+                            );
+                        }
+                        MessageType::TxStatus { active } => {
+                            // Batch 93: TX worker brackets every transmission
+                            // (PTT-on → PTT-off, including aborts) with these.
+                            // Drives the title-bar " TX " badge.
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxStatus { active },
+                            );
+                        }
+                        MessageType::TxQueueStatus {
+                            ref sending,
+                            ref queued,
+                        } => {
+                            // Richer NOW-SENDING / QUEUED view. Re-shape the
+                            // coordinator's TxItem into the TUI's local
+                            // TxQueueItem (decoupled so the TUI doesn't link
+                            // the main crate).
+                            let map = |it: &crate::message_bus::TxItem| {
+                                pancetta_tui::app::TxQueueItem {
+                                    text: it.text.clone(),
+                                    freq_hz: it.freq_hz,
+                                    qso_id: it.qso_id.clone(),
+                                    deferred: it.deferred,
+                                }
+                            };
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxQueueUpdate {
+                                    sending: sending.as_ref().map(map),
+                                    queued: queued.iter().map(map).collect(),
+                                },
+                            );
+                        }
+                        MessageType::TxPolicyStatus { policy } => {
+                            // Echo the global TX policy to the bold banner.
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy },
+                            );
+                        }
+                        MessageType::ActiveQsosSnapshot { ref qsos } => {
+                            // Re-shape into the TUI's ActiveQsoBanner
+                            // (decoupled struct so the TUI doesn't link
+                            // pancetta_qso). Push as a TuiMessage; the
+                            // TUI replaces its previous list with this.
+                            // Batch 94: carries the QSO-detail panel
+                            // fields too (last TX/RX message, SNR,
+                            // reports, exchange count).
+                            let banner_qsos: Vec<pancetta_tui::app::ActiveQsoBanner> =
+                                qsos.iter().map(map_qso_snapshot_item).collect();
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::ActiveQsosUpdate {
+                                    qsos: banner_qsos,
+                                },
+                            );
+                        }
+                        MessageType::RigControl(
+                            crate::message_bus::RigControlMessage::FrequencyResponse {
+                                vfo,
+                                frequency,
+                            },
+                        ) => {
+                            // Update operating frequency for decoded message enrichment
+                            let freq_mhz = frequency as f64 / 1_000_000.0;
+                            // Relaxed ordering is fine -- this is a best-effort display value for the TUI
+                            operating_freq_relay.store(freq_mhz.to_bits(), Ordering::Relaxed);
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::FrequencyUpdate {
                                     vfo,
                                     frequency,
                                 },
-                            ) => {
-                                // Update operating frequency for decoded message enrichment
-                                let freq_mhz = frequency as f64 / 1_000_000.0;
-                                // Relaxed ordering is fine -- this is a best-effort display value for the TUI
-                                operating_freq_relay.store(freq_mhz.to_bits(), Ordering::Relaxed);
-                                let _ = tui_msg_tx_relay.send(
-                                    pancetta_tui::tui_runner::TuiMessage::FrequencyUpdate {
-                                        vfo,
-                                        frequency,
-                                    },
-                                );
-                            }
-                            MessageType::RigControl(
-                                crate::message_bus::RigControlMessage::SignalStrengthResponse {
+                            );
+                        }
+                        MessageType::RigControl(
+                            crate::message_bus::RigControlMessage::SignalStrengthResponse {
+                                db_over_s9,
+                            },
+                        ) => {
+                            // Batch 95: real rig S-meter read (hamlib
+                            // STRENGTH, dB relative to S9) from the
+                            // polling loop — forward verbatim.
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::SignalStrengthUpdate {
                                     db_over_s9,
                                 },
-                            ) => {
-                                // Batch 95: real rig S-meter read (hamlib
-                                // STRENGTH, dB relative to S9) from the
-                                // polling loop — forward verbatim.
-                                let _ = tui_msg_tx_relay.send(
-                                    pancetta_tui::tui_runner::TuiMessage::SignalStrengthUpdate {
-                                        db_over_s9,
-                                    },
-                                );
-                            }
-                            MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
-                                callsign,
-                                frequency,
-                                spotter,
-                                ..
-                            }) => {
-                                // Worked-before keyed on the SPOT's frequency
-                                // (cluster spots carry their own), same
-                                // lookup/semantics as the decode path above.
-                                let worked_before = worked_before_for(
-                                    &relay_station_lookup,
-                                    Some(callsign.as_str()),
-                                    frequency as f64,
-                                );
-                                let _ = tui_msg_tx_relay.send(
-                                    pancetta_tui::tui_runner::TuiMessage::DxSpot {
-                                        callsign,
-                                        frequency,
-                                        spotter,
-                                        worked_before,
-                                    },
-                                );
-                            }
-                            MessageType::StatusUpdate(text) => {
-                                // Free-form status emitted by other components (e.g. QSO
-                                // component reports respond_to_cq success/failure here so
-                                // Space-to-call surfaces "Calling X — TX queued" or the
-                                // actual rejection reason instead of just an optimistic
-                                // "Calling X..." that hides silent failures.
-                                let _ = tui_msg_tx_relay.send(
-                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                        component: format!("{}", bus_msg.source),
-                                        status: text,
-                                    },
-                                );
-                            }
-                            MessageType::Error {
-                                component_id,
-                                ref error_message,
-                                ..
-                            } => {
-                                // Component-level errors (audio init failure, audio
-                                // device stalls, etc.) get surfaced to the TUI's error
-                                // log instead of dying silently in the log file. Without
-                                // this hop the audio thread can fail to start and the
-                                // user sees only an inert pipeline with no decodes.
-                                let _ = tui_msg_tx_relay.send(
-                                    pancetta_tui::tui_runner::TuiMessage::Error {
-                                        component: format!("{}", component_id),
-                                        message: error_message.clone(),
-                                    },
-                                );
-                            }
-                            _ => {}
+                            );
                         }
+                        MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
+                            callsign,
+                            frequency,
+                            spotter,
+                            ..
+                        }) => {
+                            // Worked-before keyed on the SPOT's frequency
+                            // (cluster spots carry their own), same
+                            // lookup/semantics as the decode path above.
+                            let worked_before = worked_before_for(
+                                &relay_station_lookup,
+                                Some(callsign.as_str()),
+                                frequency as f64,
+                            );
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::DxSpot {
+                                    callsign,
+                                    frequency,
+                                    spotter,
+                                    worked_before,
+                                },
+                            );
+                        }
+                        MessageType::StatusUpdate(text) => {
+                            // Free-form status emitted by other components (e.g. QSO
+                            // component reports respond_to_cq success/failure here so
+                            // Space-to-call surfaces "Calling X — TX queued" or the
+                            // actual rejection reason instead of just an optimistic
+                            // "Calling X..." that hides silent failures.
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                    component: format!("{}", bus_msg.source),
+                                    status: text,
+                                },
+                            );
+                        }
+                        MessageType::Error {
+                            component_id,
+                            ref error_message,
+                            ..
+                        } => {
+                            // Component-level errors (audio init failure, audio
+                            // device stalls, etc.) get surfaced to the TUI's error
+                            // log instead of dying silently in the log file. Without
+                            // this hop the audio thread can fail to start and the
+                            // user sees only an inert pipeline with no decodes.
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::Error {
+                                    component: format!("{}", component_id),
+                                    message: error_message.clone(),
+                                },
+                            );
+                        }
+                        _ => {}
                     }
-                    Err(_) => {}
                 }
 
                 // Relay waterfall data from FT8 decoder to TUI
-                match waterfall_rx.try_recv() {
-                    Ok(rows) => {
-                        let _ = tui_msg_tx_relay
-                            .send(pancetta_tui::tui_runner::TuiMessage::WaterfallUpdate { rows });
-                    }
-                    Err(_) => {}
+                if let Ok(rows) = waterfall_rx.try_recv() {
+                    let _ = tui_msg_tx_relay
+                        .send(pancetta_tui::tui_runner::TuiMessage::WaterfallUpdate { rows });
                 }
 
                 // Relay audio level from DSP to TUI
-                match audio_level_rx.try_recv() {
-                    Ok(level) => {
-                        let _ = tui_msg_tx_relay
-                            .send(pancetta_tui::tui_runner::TuiMessage::AudioLevel { level });
-                    }
-                    Err(_) => {}
+                if let Ok(level) = audio_level_rx.try_recv() {
+                    let _ = tui_msg_tx_relay
+                        .send(pancetta_tui::tui_runner::TuiMessage::AudioLevel { level });
                 }
 
                 // Sleep to prevent busy-spinning

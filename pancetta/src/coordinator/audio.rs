@@ -362,7 +362,7 @@ impl super::ApplicationCoordinator {
                     relay_count += 1;
                     if relay_count == 1 {
                         info!("Audio relay: first batch sent ({} samples)", len);
-                    } else if relay_count % 1000 == 0 {
+                    } else if relay_count.is_multiple_of(1000) {
                         info!("Audio relay: {} batches sent so far", relay_count);
                     }
                 }

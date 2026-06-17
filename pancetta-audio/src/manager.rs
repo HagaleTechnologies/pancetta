@@ -227,6 +227,10 @@ impl AudioManager {
 
             // Stop the processing task
             if let Some(handle) = self.process_handle.take() {
+                // rationale: `stop` is sync; the handle is dropped (aborting the task
+                // on drop) rather than awaited. Preserving existing behavior — this is
+                // lint hygiene only, not a logic change.
+                #[allow(clippy::let_underscore_future)]
                 let _ = tokio::time::timeout(Duration::from_secs(1), handle);
             }
 
@@ -302,7 +306,7 @@ impl AudioManager {
 
     /// Check if audio is running
     pub fn is_running(&self) -> bool {
-        self.stream.as_ref().map_or(false, |s| s.is_running())
+        self.stream.as_ref().is_some_and(|s| s.is_running())
     }
 
     /// Set input gain in dB

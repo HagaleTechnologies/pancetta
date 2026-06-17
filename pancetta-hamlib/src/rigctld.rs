@@ -93,6 +93,9 @@ impl RigctldClient {
     }
 
     /// Create with default configuration
+    // rationale: inherent `default()` is kept (callers use `Type::default()`);
+    // switching to a `Default` impl would change the public API shape.
+    #[allow(clippy::should_implement_trait)]
     pub fn default() -> Self {
         Self::new(RigctldConfig::default())
     }
@@ -581,7 +584,7 @@ impl RigControl for RigctldClient {
     async fn set_power_level(&self, watts: f32) -> Result<()> {
         // Convert watts to percentage (0.0 - 1.0)
         // Assuming 100W max for now (should be configurable)
-        let level = (watts / 100.0).min(1.0).max(0.0);
+        let level = (watts / 100.0).clamp(0.0, 1.0);
         let cmd = format!("\\set_level RFPOWER {}", level);
         self.send_command_with_retry(&cmd).await?;
         Ok(())

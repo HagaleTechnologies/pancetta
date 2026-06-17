@@ -1347,7 +1347,7 @@ impl QsoManager {
                 // recorded BAND 0MHZ / FREQ ~0.001 from the bare offset.
                 let dial = self.dial_frequency_hz.load(Ordering::Relaxed);
                 if dial > 0 {
-                    m.frequency = dial as f64 + m.frequency;
+                    m.frequency += dial as f64;
                 }
                 Some(m)
             } else {

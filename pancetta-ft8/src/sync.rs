@@ -377,7 +377,7 @@ impl TimeSync {
 
     /// Check if currently synchronized
     pub fn is_synchronized(&self) -> bool {
-        self.current_sync.as_ref().map_or(false, |s| s.synchronized)
+        self.current_sync.as_ref().is_some_and(|s| s.synchronized)
     }
 
     /// Get time until next expected sync window

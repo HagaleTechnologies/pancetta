@@ -173,6 +173,9 @@ impl TxStatusGuard {
 impl Drop for TxStatusGuard {
     fn drop(&mut self) {
         let bus = self.message_bus.clone();
+        // rationale: intentional fire-and-forget detach — `spawn` runs the task
+        // independently; the dropped JoinHandle is the canonical detach idiom.
+        #[allow(clippy::let_underscore_future)]
         let _ = tokio::task::spawn(async move {
             let msg = ComponentMessage::new(
                 ComponentId::Ft8Transmitter,
@@ -539,6 +542,9 @@ impl Drop for PttGuard {
             let bus = self.message_bus.clone();
             // Spawn a fire-and-forget task to send PTT-off.
             // This runs even if the parent task was cancelled.
+            // rationale: intentional detach — `spawn` runs the task independently;
+            // the dropped JoinHandle is the canonical fire-and-forget idiom.
+            #[allow(clippy::let_underscore_future)]
             let _ = tokio::task::spawn(async move {
                 let ptt_off_msg = ComponentMessage::new(
                     ComponentId::Ft8Transmitter,

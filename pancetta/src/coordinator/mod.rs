@@ -530,6 +530,9 @@ fn degradation_message(id: ComponentId) -> &'static str {
 
 impl ApplicationCoordinator {
     /// Create a new application coordinator
+    // rationale: the coordinator constructor takes many independent dependencies;
+    // a builder/params struct would relocate the same fields without simplifying.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: Config,
         audio_device: Option<String>,

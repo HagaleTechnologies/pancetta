@@ -760,23 +760,21 @@ impl ConfigSection for AudioConfig {
         }
 
         // Validate compression settings
-        if self.processing.compression.enabled {
-            if self.processing.compression.ratio < 1.0 || self.processing.compression.ratio > 20.0 {
-                return Err(ConfigError::InvalidValue {
-                    field: "compression.ratio".to_string(),
-                    value: self.processing.compression.ratio.to_string(),
-                });
-            }
+        if self.processing.compression.enabled
+            && (self.processing.compression.ratio < 1.0 || self.processing.compression.ratio > 20.0)
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "compression.ratio".to_string(),
+                value: self.processing.compression.ratio.to_string(),
+            });
         }
 
         // Validate AGC settings
-        if self.agc.enabled {
-            if self.agc.max_gain_db < 0.0 || self.agc.max_gain_db > 60.0 {
-                return Err(ConfigError::InvalidValue {
-                    field: "agc.max_gain_db".to_string(),
-                    value: self.agc.max_gain_db.to_string(),
-                });
-            }
+        if self.agc.enabled && (self.agc.max_gain_db < 0.0 || self.agc.max_gain_db > 60.0) {
+            return Err(ConfigError::InvalidValue {
+                field: "agc.max_gain_db".to_string(),
+                value: self.agc.max_gain_db.to_string(),
+            });
         }
 
         Ok(())
@@ -861,6 +859,9 @@ impl AudioLevelsConfig {
 }
 
 #[cfg(test)]
+// rationale: test-only builder structs assigned field-by-field after
+// default(); sequential assignment reads clearer than a struct-update splat.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 

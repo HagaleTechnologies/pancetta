@@ -7,6 +7,13 @@
 //! - Message type detection and parsing
 //! - Callsign and grid square validation
 
+// rationale: bit-packing loops index the 77-bit payload / codeword arrays by
+// position; the index is load-bearing for the protocol bit layout.
+#![allow(clippy::needless_range_loop)]
+// rationale: plain-data message structs built field-by-field in tests; sequential
+// assignment reads clearer than a struct-update splat.
+#![allow(clippy::field_reassign_with_default)]
+
 use crate::{Ft8Error, Ft8Result};
 use bitvec::prelude::*;
 use std::collections::HashMap;
@@ -684,7 +691,7 @@ impl Ft8Message {
             //    HF=Poland, HH=Haiti, HI=Dominican Republic, HJ-HK=Colombia,
             //    HL=South Korea, HM=North Korea, HP=Panama, HQ=Honduras,
             //    HR=Honduras, HS=Thailand, HT=Nicaragua, HU=El Salvador, HV=Vatican, HZ=Saudi Arabia
-            b'H' => matches!(second, b'A'..=b'Z'),
+            b'H' => second.is_ascii_uppercase(),
             // I: IA-IZ=Italy
             b'I' => true,
             // J: JA-JS=Japan, JT-JV=Mongolia, JW-JX=Norway, JY=Jordan, JZ=Indonesia
@@ -717,7 +724,7 @@ impl Ft8Message {
             //    TS=Tunisia, TT=Chad, TU=Ivory Coast, TY=Benin, TZ=Mali
             b'T' => matches!(second, b'A'..=b'U' | b'Y' | b'Z'),
             // U: UA-UI=Russia, UJ-UM=Uzbekistan, UN-UQ=Kazakhstan, UR-UZ=Ukraine
-            b'U' => matches!(second, b'A'..=b'Z'),
+            b'U' => second.is_ascii_uppercase(),
             // V: VA-VG=Canada, VH-VN=Australia, VO=Canada, VP-VQ=UK overseas,
             //    VR=Hong Kong, VS=UK overseas, VU=India, VV-VW=unassigned?, VX-VY=Canada, VZ=Australia
             b'V' => {
@@ -735,7 +742,7 @@ impl Ft8Message {
             //    YK=Syria, YL=Latvia, YM=Turkey, YN=Nicaragua, YO=Romania,
             //    YS=El Salvador, YT-YU=Serbia, YV-YY=Venezuela, YZ=Serbia
             // NOT: YP, YQ, YR are Romania
-            b'Y' => matches!(second, b'A'..=b'Z'),
+            b'Y' => second.is_ascii_uppercase(),
             // Z: ZA=Albania, ZB-ZJ=UK overseas, ZK-ZM=New Zealand, ZN-ZO=UK overseas,
             //    ZP=Paraguay, ZR-ZU=South Africa, ZV-ZZ=Brazil
             b'Z' => matches!(second, b'A'..=b'U' | b'V'..=b'Z'),
@@ -903,7 +910,7 @@ impl Ft8Message {
         let len = chars.len();
         // Packed callsigns are always 6 chars (space-padded), but after
         // trimming they're 3-6 chars.
-        if len < 3 || len > 6 {
+        if !(3..=6).contains(&len) {
             return false;
         }
         if !chars.iter().all(|c| c.is_ascii_alphanumeric()) {
@@ -1426,17 +1433,17 @@ impl MessageParser {
             1 | 2 => {
                 // Standard message: n29a(29) + n29b(29) + ir(1) + igrid4(15) + i3(3)
                 message.message_type = MessageType::Standard;
-                self.parse_type1_standard(&payload, &mut message)?;
+                self.parse_type1_standard(payload, &mut message)?;
             }
             3 => {
                 // ARRL RTTY Roundup: TU(1) + n29a(29) + n29b(29) + R(1) + nexch(3) + nrpt(13) + i3(3)
                 message.message_type = MessageType::RTTYRoundup;
-                self.parse_rtty_roundup(&payload, &mut message)?;
+                self.parse_rtty_roundup(payload, &mut message)?;
             }
             4 => {
                 // Nonstandard callsign: n12(12) + n58(58) + iflip(1) + nrpt(2) + icq(1) + i3(3)
                 message.message_type = MessageType::NonStdCall;
-                self.parse_nonstd_call(&payload, &mut message)?;
+                self.parse_nonstd_call(payload, &mut message)?;
             }
             _ => {
                 message.message_type = MessageType::Unknown;
@@ -1520,10 +1527,8 @@ impl MessageParser {
 
         if is_cq {
             message.standard_type = Some(StandardMessageType::Cq);
-            if let CallsignField::Cq(modifier) = &call_a {
-                if let Some(m) = modifier {
-                    message.special_operation = Some(m.clone());
-                }
+            if let CallsignField::Cq(Some(m)) = &call_a {
+                message.special_operation = Some(m.clone());
             }
             message.from_callsign = call_b_str;
             message.grid_square = filtered_grid;
@@ -2219,7 +2224,7 @@ impl MessageParser {
         if (code as usize) < STATES.len() {
             Ok(STATES[code as usize].to_string())
         } else {
-            Ok(format!("DX"))
+            Ok("DX".to_string())
         }
     }
 
@@ -2276,7 +2281,7 @@ pub fn calculate_crc14(payload: &BitSlice) -> u16 {
     const NUM_BITS: usize = 82; // 77 payload + 5 zero padding
 
     // Pack payload bits into bytes (MSB first), zero-extending to 82 bits
-    let _num_bytes = (NUM_BITS + 7) / 8; // 11 bytes
+    let _num_bytes = NUM_BITS.div_ceil(8); // 11 bytes
     let mut bytes = [0u8; 11];
     for (i, bit) in payload.iter().enumerate() {
         if *bit {
@@ -2556,8 +2561,7 @@ mod tests {
             let i3: u32 = 1; // A in " ABCDEFGHIJKLMNOPQRSTUVWXYZ"
             let i4: u32 = 2; // B
             let i5: u32 = 3; // C
-            let n = ((((i0 * 36 + i1) * 10 + i2) * 27 + i3) * 27 + i4) * 27 + i5;
-            n
+            ((((i0 * 36 + i1) * 10 + i2) * 27 + i3) * 27 + i4) * 27 + i5
         };
         const NTOKENS: u32 = 2_063_592;
         const MAX22: u32 = 4_194_304;
@@ -2710,7 +2714,7 @@ mod tests {
         assert!(
             msg.to_string().ends_with(" RR73"),
             "rendered message must end in RR73 — got: {}",
-            msg.to_string()
+            msg
         );
         assert!(
             msg.grid_square.is_none(),

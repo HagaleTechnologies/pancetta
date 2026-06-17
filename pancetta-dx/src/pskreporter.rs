@@ -3,6 +3,10 @@
 //! This module provides integration with PSKReporter for real-time
 //! digital mode activity monitoring and spot collection.
 
+// rationale: the crate-wide `DxError` is intentionally a flat (non-boxed) enum for
+// ergonomic `?`; boxing it crate-wide to satisfy this lint is out of scope here.
+#![allow(clippy::result_large_err)]
+
 use crate::{Band, DxError, DxSpot, Mode, Result};
 use chrono::{DateTime, Duration, Utc};
 use reqwest::{Client, Url};
@@ -208,7 +212,7 @@ impl PskReporterClient {
             .get(url)
             .send()
             .await
-            .map_err(|e| DxError::Network(e))?;
+            .map_err(DxError::Network)?;
 
         if !response.status().is_success() {
             return Err(DxError::ExternalService(format!(
@@ -803,12 +807,9 @@ impl PskReporterUploader {
         let addr = format!("{}:{}", self.config.server, self.config.port);
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0")
             .await
-            .map_err(|e| DxError::Io(e))?;
+            .map_err(DxError::Io)?;
 
-        socket
-            .send_to(&packet, &addr)
-            .await
-            .map_err(|e| DxError::Io(e))?;
+        socket.send_to(&packet, &addr).await.map_err(DxError::Io)?;
 
         info!("Successfully uploaded {} reports to PSKReporter", count);
         self.pending_reports.clear();
@@ -1008,7 +1009,7 @@ mod tests {
             uploader.add_report(ReceptionReport {
                 tx_callsign: format!("K{}DEF", i),
                 frequency: 14_074_000 + i as u64 * 100,
-                snr: Some(-10 + i as i32),
+                snr: Some(-10 + i),
                 mode: "FT8".to_string(),
                 tx_grid: None,
                 timestamp: 1600000000 + i as i64 * 15,

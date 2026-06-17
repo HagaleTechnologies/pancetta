@@ -562,8 +562,10 @@ impl ComponentMessage {
         message_type: MessageType,
         timestamp: Instant,
     ) -> Self {
-        let mut latency_tracking = LatencyTracking::default();
-        latency_tracking.queued_at = Some(Instant::now());
+        let latency_tracking = LatencyTracking {
+            queued_at: Some(Instant::now()),
+            ..LatencyTracking::default()
+        };
 
         Self {
             id: generate_message_id(),
@@ -584,8 +586,10 @@ impl ComponentMessage {
         message_type: MessageType,
         timestamp: Instant,
     ) -> Self {
-        let mut latency_tracking = LatencyTracking::default();
-        latency_tracking.queued_at = Some(Instant::now());
+        let latency_tracking = LatencyTracking {
+            queued_at: Some(Instant::now()),
+            ..LatencyTracking::default()
+        };
 
         Self {
             id: generate_message_id(),
@@ -949,6 +953,9 @@ fn generate_message_id() -> u64 {
 }
 
 #[cfg(test)]
+// rationale: test-only builder structs assigned field-by-field after
+// default(); sequential assignment reads clearer than a struct-update splat.
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use tokio::time::sleep;
@@ -974,8 +981,8 @@ mod tests {
     #[tokio::test]
     async fn test_message_sending() {
         let bus = MessageBus::new(1000).unwrap();
-        let (tx, rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
-        let (dsp_tx, dsp_rx) = bus.create_channel(ComponentId::Dsp).await.unwrap();
+        let (_tx, _rx) = bus.create_channel(ComponentId::Audio).await.unwrap();
+        let (_dsp_tx, dsp_rx) = bus.create_channel(ComponentId::Dsp).await.unwrap();
 
         let message = ComponentMessage::new(
             ComponentId::Audio,
@@ -997,7 +1004,7 @@ mod tests {
         config.message_timeout_us = 1; // 1 microsecond timeout
 
         let bus = MessageBus::with_config(config).unwrap();
-        let (tx, rx) = bus.create_channel(ComponentId::Dsp).await.unwrap();
+        let (_tx, _rx) = bus.create_channel(ComponentId::Dsp).await.unwrap();
 
         let old_message = ComponentMessage::new(
             ComponentId::Audio,

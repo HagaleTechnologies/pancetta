@@ -60,7 +60,7 @@ impl LinearResampler {
 
     /// Process a batch of audio samples
     pub fn process(&mut self, input: &[f32]) -> AudioResult<Vec<f32>> {
-        if input.len() % self.channels as usize != 0 {
+        if !input.len().is_multiple_of(self.channels as usize) {
             return Err(AudioError::sample_rate(
                 "Input length must be multiple of channel count",
             ));
@@ -241,7 +241,7 @@ impl SincResampler {
 
     /// Process audio samples with sinc interpolation
     pub fn process(&mut self, input: &[f32]) -> AudioResult<Vec<f32>> {
-        if input.len() % self.channels as usize != 0 {
+        if !input.len().is_multiple_of(self.channels as usize) {
             return Err(AudioError::sample_rate(
                 "Input length must be multiple of channel count",
             ));

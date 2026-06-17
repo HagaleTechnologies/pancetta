@@ -28,8 +28,9 @@
 //!
 //! The Fast preset trades wall-clock for sensitivity:
 //! - Batch 36 B1: `max_decode_passes=2` (+32 TPs / hard-200, 2.0× WC)
-//! - Batch 41:    `ldpc_iterations=200` (+16 TPs / hard-200; early-
-//!                termination means avg iter count rises modestly)
+//! - Batch 41: `ldpc_iterations=200` (+16 TPs / hard-200; early-termination
+//!   means avg iter count rises modestly)
+//!
 //! Hosts with the compute budget pay it; Moderate/Slow stay at the default.
 //!
 //! See `docs/superpowers/specs/2026-06-04-hb-216-s2-tier-wiring-design.md`.

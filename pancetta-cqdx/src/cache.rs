@@ -21,6 +21,12 @@ pub struct CqdxCache {
     spot_groups: Vec<SpotGroup>,
 }
 
+impl Default for CqdxCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CqdxCache {
     pub fn new() -> Self {
         Self {

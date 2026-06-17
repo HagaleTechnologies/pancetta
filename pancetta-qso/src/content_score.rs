@@ -301,6 +301,9 @@ mod tests {
         assert!(early > late);
     }
 
+    // rationale: the asserted relations are over named constants by design — this
+    // test pins the documented ordering of the SHIP thresholds.
+    #[allow(clippy::assertions_on_constants)]
     #[test]
     fn ship_thresholds_are_ordered() {
         assert!(MessageContentScore::SHIP_CONSERVATIVE < MessageContentScore::SHIP_PRECISE);

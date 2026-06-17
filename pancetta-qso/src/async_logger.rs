@@ -868,7 +868,7 @@ mod tests {
 
     fn test_logger_config() -> LoggerConfig {
         let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
-        let db_path = tmp_dir.into_path().join("test_qso.db");
+        let db_path = tmp_dir.keep().join("test_qso.db");
         LoggerConfig {
             database_path: db_path,
             ..LoggerConfig::default()

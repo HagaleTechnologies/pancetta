@@ -8,8 +8,8 @@
 //! Run with: cargo run --example transmission_demo --features transmit
 
 use pancetta_ft8::{
-    convert_samples, AudioFormat, Ft8Encoder, Ft8Modulator, Ft8Transmitter, ModulatorConfig,
-    TransmissionConfig, MESSAGE_DURATION, NUM_SYMBOLS, SAMPLE_RATE,
+    convert_samples, AudioFormat, Ft8Encoder, Ft8Modulator, Ft8Transmitter, TransmissionConfig,
+    MESSAGE_DURATION, SAMPLE_RATE,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -181,6 +181,8 @@ fn demo_transmission_system() -> Result<(), Box<dyn std::error::Error>> {
 // Additional demo functions for async features
 #[cfg(feature = "transmit")]
 #[tokio::main]
+// rationale: demonstration helper retained for reference; not wired into `main`.
+#[allow(dead_code)]
 async fn async_demo() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔄 Async Transmission Demo");
     println!("---------------------------");
@@ -231,6 +233,8 @@ async fn async_demo() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // Helper function to demonstrate various encoding scenarios
+// rationale: demonstration helper retained for reference; not wired into `main`.
+#[allow(dead_code)]
 fn demo_advanced_encoding() -> Result<(), Box<dyn std::error::Error>> {
     println!("🔬 Advanced Encoding Demo");
     println!("-------------------------");
@@ -250,12 +254,12 @@ fn demo_advanced_encoding() -> Result<(), Box<dyn std::error::Error>> {
 
     // Signal report with extreme values
     let weak_report = encoder.encode_signal_report("K1DEF", "W1ABC", -30)?;
-    let strong_report = encoder.encode_signal_report("K1DEF", "W1ABC", 20)?;
+    let _strong_report = encoder.encode_signal_report("K1DEF", "W1ABC", 20)?;
     println!("  Signal reports: {} symbols each", weak_report.len());
 
     // Free text variations
     let short_text = encoder.encode_freetext("73")?;
-    let long_text = encoder.encode_freetext("HELLO WORLD")?;
+    let _long_text = encoder.encode_freetext("HELLO WORLD")?;
     println!("  Free text: {} symbols each", short_text.len());
 
     println!();

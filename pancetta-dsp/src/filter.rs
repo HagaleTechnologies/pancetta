@@ -1,3 +1,7 @@
+// rationale: filter loops index FFT bins / sample buffers by position; the index
+// is load-bearing for the DSP math.
+#![allow(clippy::needless_range_loop)]
+
 use biquad::{Biquad, Coefficients, DirectForm1, ToHertz, Type, Q_BUTTERWORTH_F32};
 use num_complex::Complex;
 use realfft::RealFftPlanner;
@@ -170,7 +174,7 @@ impl FilterConfig {
             }
         }
 
-        if self.order == 0 || self.order % 2 != 0 {
+        if self.order == 0 || !self.order.is_multiple_of(2) {
             return Err(FilterError::InvalidParameter {
                 parameter: "order".to_string(),
                 value: self.order as f32,
