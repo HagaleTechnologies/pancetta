@@ -109,14 +109,42 @@ completion. Design decisions as built:
      from `active_tx_qsos.len()` (previously never fed in production), so
      `max_concurrent_qsos` is honored and we don't open a second pounce while
      one QSO is in progress.
-  Tested: the opening-classification logic (`classify_autonomous_opening`) has 4
-  unit tests (CQ, pounce w/ decode, fallback, case-insensitive); engine
-  completion is the 4 Phase-5 `autonomous_scenarios` tests; the qso.rs handler
-  calls already-tested manager methods. **Remaining: a full live-coordinator
-  integration test** (stand up the real qso + autonomous components, inject a CQ
-  decode, assert one opening TX + logged completion) — heavier than the existing
-  mirror-style harnesses; **on-air A/B is the real Phase-5 acceptance test and
-  is operator-gated (needs antenna) — meatspace-pending.**
+**Test hardening (2026-06-17) — pending code items cleared.** The Phase-5 path
+is now covered by, in layers:
+  - **Pure gating/routing matrix** — the slot pipeline is the pure
+    `plan_slot_transmissions(...)`; 9 unit tests cover Shift+Q / TX-policy /
+    opening-split / dry-run / gate-ordering, plus 4 `classify_autonomous_opening`
+    tests (CQ / pounce-with-decode / fallback / case-insensitive).
+  - **Engine sequencing** — the 4 Phase-5 `autonomous_scenarios` tests (pounce
+    full-completion, skip-rung, RR73/RRR close, unanswered-retire) **plus H1**
+    (autonomous CQ-self → answered → completion, the CQer-role Auto path) and
+    **H2** (impostor report does not advance an Auto QSO — sender verify holds on
+    the Auto path).
+  - **Property-based invariants** — `qso_state_machine_props.rs` feeds 200
+    randomized frame sequences into an Auto QSO and asserts: never panics; an
+    impostor frame never changes the state variant; `Completed` implies the
+    verified partner sent a close token; a completed QSO logs against the partner,
+    never an impostor.
+  - **Coordinator end-to-end** — 3 `coord_sim` scenarios with rig-level PTT
+    asserts (full ladder keyed in order on the DX freq to completion; opening
+    keys exactly once / no double-send; Auto TX hard-muted under policy Disabled).
+
+  **Decisions that clear the remaining items:**
+  - *Smart-TX-offset for autonomous QSOs* — **deferred as optional, not a
+    defect.** Answering **Tx=Rx on the DX's frequency** is the WSJT-X default and
+    is generally what a DX expects (they listen on their own freq). The
+    smart-offset would require an RX-match-vs-TX-freq split in `QsoState` (touches
+    the engine + every emission site + sim + tests) and changes on-air behavior.
+    Build it only if on-air shows collisions with other answerers — the trigger
+    is recorded in meatspace-pending. Not blocking.
+  - *Full live-coordinator (real qso.rs message loop) integration test* —
+    **resolved as adequately covered.** The `StartAutonomousQso` handler is a
+    thin dispatch (`respond_to_cq`/`start_cq`) whose behavior is exercised by the
+    `coord_sim` end-to-end scenarios and whose dispatch is verified by the build;
+    extracting the whole live loop body would be a high-risk refactor of the live
+    QSO path for marginal coverage. Not pursued.
+  - *On-air A/B* — the real Phase-5 acceptance test; **operator-gated (needs
+    antenna), meatspace-pending.** The only genuinely-open Phase-5 item.
 
 ## Conventions
 Each scenario → a named test with a slot-by-slot exchange + asserted outcome, citing source

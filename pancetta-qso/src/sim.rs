@@ -981,6 +981,21 @@ impl Sim {
         id.to_string()
     }
 
+    /// Open an **autonomous** (`CallInitiation::Auto`) CQ — what the production
+    /// `StartAutonomousQso { callsign: None }` handler does (`start_cq`). Used to
+    /// exercise the autonomous CQer-role auto-sequencing path (Phase 5): once a
+    /// caller answers, the engine must auto-sequence report → RR73 → completion
+    /// exactly as the manual CQ does.
+    pub async fn cq_auto(&mut self, freq_hz: f64) -> String {
+        let parity = self.clock.parity();
+        let id = self
+            .manager
+            .start_cq(freq_hz, Some(parity))
+            .await
+            .expect("start_cq");
+        id.to_string()
+    }
+
     /// Operator replies to a station calling **us**, opening at `step`.
     pub async fn respond_to_caller(
         &mut self,

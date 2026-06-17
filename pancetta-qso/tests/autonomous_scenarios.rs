@@ -355,3 +355,79 @@ async fn auto_pwatchdog_unanswered_auto_call_retires() {
         "a never-answered auto pounce must not linger as an active QSO\n{tl}"
     );
 }
+
+// =====================================================================
+// AUTO-ENGINE HARDENING — the Auto *initiation* paths exercised directly
+// (no operator decision), validating that the engine auto-sequences and
+// sender-verifies Auto QSOs exactly like manual ones.
+// =====================================================================
+
+// ---------------------------------------------------------------------
+// H1. Autonomous CQ-self (CallInitiation::Auto `start_cq`): a caller answers
+//     our CQ → the engine auto-sequences report → RR73 → completion + log.
+//     (The pounce path is covered by P1/P3; this is the CQer-role Auto path,
+//     what the production `StartAutonomousQso { callsign: None }` handler opens.)
+// ---------------------------------------------------------------------
+#[tokio::test]
+async fn auto_h1_cq_self_completes_when_answered() {
+    let mut sim = Sim::new(US, Some(GRID)).await;
+
+    // Slot 0: we call CQ (Auto). Opening "CQ K5ARH EM10".
+    sim.cq_auto(FREQ).await;
+    sim.tick().await;
+
+    // Slot 1: a caller answers with their grid → we auto-send a report.
+    sim.inject_decode("K5ARH VB7F DO33", FREQ, -8.0, 0.1);
+    sim.tick().await;
+
+    // Slot 2: caller R-reports → we auto-send RR73.
+    sim.inject_decode("K5ARH VB7F R-12", FREQ, -8.0, 0.1);
+    sim.tick().await;
+
+    // Slot 3: caller signs 73 → we complete + log.
+    sim.inject_decode("K5ARH VB7F 73", FREQ, -8.0, 0.1);
+    sim.tick().await;
+    sim.tick_n(2).await;
+
+    let tl = sim.into_timeline();
+    // We sent a report and an RR73 to the caller, and the QSO completed.
+    tl.assert_transmitted_contains("VB7F K5ARH RR73");
+    tl.assert_completed_with("VB7F");
+    tl.assert_no_duplicate_qsos();
+}
+
+// ---------------------------------------------------------------------
+// H2. Sender verification on an AUTO QSO: a report from the WRONG callsign
+//     (an impostor, or a third party) must NOT advance our Auto pounce. The
+//     same `from == DX && to == us` gate that protects manual QSOs must apply
+//     to Auto QSOs the engine now auto-sequences.
+// ---------------------------------------------------------------------
+#[tokio::test]
+async fn auto_h2_impostor_report_does_not_advance_auto_qso() {
+    let mut sim = Sim::new(US, Some(GRID)).await;
+
+    // Open an Auto pounce on VB7F (what the production pounce handler does).
+    sim.manager()
+        .respond_to_cq("VB7F".to_string(), FREQ, None)
+        .await
+        .expect("respond_to_cq (Auto)");
+
+    // An impostor on our frequency sends us a report, but it is FROM W9XYZ,
+    // not our DX VB7F. The engine must reject it (sender mismatch) — no R-report.
+    sim.inject_decode("K5ARH W9XYZ -12", FREQ, -8.0, 0.1);
+    sim.tick().await;
+    sim.tick_n(1).await;
+
+    // The QSO is still the opening pounce — we never sent an R-report, and the
+    // impostor never completed a QSO with us.
+    let active = sim.manager().get_active_qsos().await;
+    assert_eq!(
+        active.len(),
+        1,
+        "the Auto QSO must still be active (not advanced/closed)"
+    );
+    let tl = sim.into_timeline();
+    tl.assert_not_transmitted_contains("W9XYZ");
+    tl.assert_not_completed_with("W9XYZ");
+    tl.assert_not_completed_with("VB7F");
+}
