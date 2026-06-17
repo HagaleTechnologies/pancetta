@@ -1,5 +1,26 @@
 # Pancetta Security Review — 2026-04-29
 
+> **Remediation status (updated 2026-06-17).** Phase 1 (C-1 sender verification,
+> I-1 per-callsign rate limit) landed 2026-04-29. Phase 2 + most of Phase 3 landed
+> 2026-06-17: **I-5** (FFI in-bounds NUL check, `fa1c42b9`), **I-6** (per-slot
+> new-call cap, `48e2d03a`), **I-7** (shellexpand tilde-only, `b67a345d`),
+> **I-8/I-9** (VACUUM-INTO escape + LIMIT cap, `da088e6f`), **I-10/I-11/I-12**
+> (rigctld command allow-list + device-path/port validation; host stays a *warn*
+> for remote-rig operability, `f6d52d59`), **I-13** (cqdx error-body token
+> redaction, `ff5a0b3f`), **I-14** (PSKReporter `connect()`-to-peer rather than
+> the originally-suggested `bind 127.0.0.1`, which would have broken outbound
+> routing; `05547a3c`), **I-15** (DX-cluster spot-text sanitization, `05547a3c`),
+> **I-16** (decoded-field sanitization at the bus boundary, `48e2d03a`). Each has
+> regression tests; full suite green; workspace clippy zero.
+>
+> **Still open (deliberate):** **I-2/I-3** (POTA/SOTA + DXCC-prefix validation) —
+> lookup-dependent, blocked on cqdx endpoint additions; **I-4** (AP-gate boundary
+> instrumentation) — log-only telemetry, needs field data to tune; and the Minor
+> items. A deeper follow-on audit (RF/FFI memory-safety focus) is tracked
+> separately in `docs/security-deep-analysis-2026-06-17.md`.
+
+
+
 **Author:** Claude Opus 4.7 (under K5ARH supervision)
 **Scope:** Full architectural security review with focus on hostile FT8
 transmissions over the air.
