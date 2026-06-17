@@ -203,6 +203,88 @@ pub fn callsigns_match(a: &str, b: &str) -> bool {
     base_callsign(&au) == base_callsign(&bu)
 }
 
+/// Split a (possibly compound) callsign into its base and the *extra*
+/// (non-base) `/`-separated tokens, uppercased.
+///
+/// Returns `(base, extras)` where `base` is [`base_callsign`] and `extras`
+/// is every other non-empty component in original order. A bare call yields
+/// an empty `extras` vector.
+fn split_compound(callsign: &str) -> (String, Vec<String>) {
+    let upper = callsign.trim().to_uppercase();
+    let base = base_callsign(&upper);
+    let extras: Vec<String> = upper
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != base)
+        .map(|c| c.to_string())
+        .collect();
+    (base, extras)
+}
+
+/// Is `token` a recognized compound prefix/suffix token?
+///
+/// Reuses the SAME rule [`MessageExchange::validate_callsign`] applies to the
+/// non-base components of a compound call: a short (1–4 char) purely
+/// alphanumeric token. This covers country prefixes (`EA8`, `VK9`), portable
+/// suffixes (`P`, `M`, `MM`, `R`, `QRP`), and a single reassignment digit
+/// (`4`). Anything longer or containing punctuation (the kind of arbitrary
+/// junk an RF attacker would wrap around a known base, e.g. `BOGUS9`) is
+/// rejected.
+fn is_recognized_affix_token(token: &str) -> bool {
+    !token.is_empty() && token.len() <= 4 && token.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Decide whether `candidate` may safely *upgrade* the latched logged
+/// callsign `latched` to a more-complete compound form.
+///
+/// This guards the ADIF-logged `their_callsign` against an RF attacker who,
+/// knowing a partner's on-air base call, signs a state-appropriate frame with
+/// an ARBITRARY prefix/suffix wrapped around that base (e.g.
+/// `BOGUS9/G8BCG/MM`) to rewrite the logged callsign to a call of their
+/// choosing. We accept the upgrade ONLY when ALL of:
+///   - `candidate` is strictly longer than `latched` (the upgrade is a
+///     lengthening, never a downgrade), AND
+///   - both share the same [`base_callsign`] (same station per
+///     [`callsigns_match`]), AND
+///   - every extra (non-base) token in `candidate` is a recognized
+///     prefix/suffix token ([`is_recognized_affix_token`]) — no junk, AND
+///   - the upgrade only ADDS affix tokens: every extra token already present
+///     on `latched` is still present on `candidate` (so a *different*
+///     prefix/suffix never silently replaces the latched one — that is a
+///     suspicious substitution, not a completion).
+///
+/// The motivating legitimate case — latched bare base `G8BCG`, later seen as
+/// the single standard compound `EA8/G8BCG` — is accepted (latched has no
+/// extras, candidate adds one recognized prefix). An attacker's
+/// `BOGUS9/G8BCG` is rejected (`BOGUS9` is not a recognized token), and a
+/// prefix swap on an already-compound latched call (`EA8/G8BCG` → `FR/G8BCG`)
+/// is rejected (the latched `EA8` token is missing from the candidate).
+pub fn is_safe_compound_upgrade(latched: &str, candidate: &str) -> bool {
+    let lu = latched.trim().to_uppercase();
+    let cu = candidate.trim().to_uppercase();
+
+    // Must be a strict lengthening of the same station.
+    if cu.len() <= lu.len() || !callsigns_match(&lu, &cu) {
+        return false;
+    }
+
+    let (_l_base, l_extras) = split_compound(&lu);
+    let (_c_base, c_extras) = split_compound(&cu);
+
+    // Every extra token on the candidate must be a recognized affix token —
+    // reject arbitrary junk wrapped around the known base.
+    if !c_extras.iter().all(|t| is_recognized_affix_token(t)) {
+        return false;
+    }
+
+    // The upgrade may only ADD affix tokens, never replace a latched one with
+    // a different value. Every token already latched must survive.
+    if !l_extras.iter().all(|t| c_extras.contains(t)) {
+        return false;
+    }
+
+    true
+}
+
 impl MessageExchange {
     /// Create a new message exchange handler.
     ///
@@ -952,6 +1034,45 @@ enum QsoSequenceState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Fix 1 (security): safe compound-callsign upgrade gate ----------
+
+    #[test]
+    fn safe_upgrade_bare_base_to_standard_compound() {
+        // Legitimate C18 case: bare base later seen as a single standard
+        // compound (recognized country prefix / portable suffix).
+        assert!(is_safe_compound_upgrade("G8BCG", "EA8/G8BCG"));
+        assert!(is_safe_compound_upgrade("G8BCG", "G8BCG/P"));
+        assert!(is_safe_compound_upgrade("K1ABC", "K1ABC/4"));
+        assert!(is_safe_compound_upgrade("W1XYZ", "W1XYZ/MM"));
+    }
+
+    #[test]
+    fn safe_upgrade_rejects_bogus_affix_token() {
+        // Attacker wraps an arbitrary (>4 char) junk token around a known base.
+        assert!(!is_safe_compound_upgrade("G8BCG", "BOGUS9/G8BCG"));
+        assert!(!is_safe_compound_upgrade("G8BCG", "BOGUS9/G8BCG/MM"));
+        // Punctuation in the affix is also rejected.
+        assert!(!is_safe_compound_upgrade("G8BCG", "E-8/G8BCG"));
+    }
+
+    #[test]
+    fn safe_upgrade_rejects_different_prefix_substitution() {
+        // Already-compound latched call; a frame swaps the prefix to a
+        // different recognized token (substitution, not completion).
+        assert!(!is_safe_compound_upgrade("EA8/G8BCG", "FR/G8BCG/P"));
+        // Adding a suffix while keeping the latched prefix IS a completion.
+        assert!(is_safe_compound_upgrade("EA8/G8BCG", "EA8/G8BCG/P"));
+    }
+
+    #[test]
+    fn safe_upgrade_requires_strict_lengthening_same_base() {
+        // Same length / shorter never upgrades.
+        assert!(!is_safe_compound_upgrade("G8BCG/P", "G8BCG"));
+        assert!(!is_safe_compound_upgrade("G8BCG", "G8BCG"));
+        // Different base never matches → never upgrades.
+        assert!(!is_safe_compound_upgrade("G8BCG", "EA8/G8BCH"));
+    }
 
     #[test]
     fn test_parse_cq_message() {

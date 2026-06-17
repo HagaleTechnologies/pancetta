@@ -1207,15 +1207,25 @@ impl QsoManager {
         // (same station per `callsigns_match`, but a longer compound form — e.g.
         // we latched bare `G8BCG` and the DX now signs `EA8/G8BCG`), upgrade the
         // logged `their_callsign` to the fuller form. The compound carries DX /
-        // portable info worth preserving in the ADIF. We only upgrade to a
-        // STRICTLY LONGER matching form, so a later bare-call frame never
-        // downgrades an already-latched compound, and a genuinely different
-        // station (which would fail `callsigns_match`) never overwrites it.
+        // portable info worth preserving in the ADIF.
+        //
+        // SECURITY (deep audit, Fix 1): the upgrade is gated by
+        // `is_safe_compound_upgrade`, NOT a bare `callsigns_match` + length
+        // check. `callsigns_match` treats two calls as the same station when
+        // they share a base, so an RF attacker who knows the partner's on-air
+        // base call could otherwise rewrite the LOGGED callsign by signing a
+        // state-appropriate frame with arbitrary junk wrapped around that base
+        // (e.g. `BOGUS9/G8BCG/MM`). The safe check additionally requires every
+        // extra token to be a recognized prefix/suffix (per the same rules
+        // `validate_callsign` uses) and forbids replacing a latched affix with
+        // a different one — so only a genuine compound completion of the same
+        // base is accepted. A rejected-but-matching upgrade is logged at
+        // `warn!(target: "qso.security")`.
         if let (Some(sender), Some(latched)) = (
             message.message_type.sender_callsign(),
             progress.metadata.their_callsign.as_deref(),
         ) {
-            if crate::exchange::callsigns_match(sender, latched) && sender.len() > latched.len() {
+            if crate::exchange::is_safe_compound_upgrade(latched, sender) {
                 let upgraded = sender.to_string();
                 info!(
                     target: "qso.compound",
@@ -1224,6 +1234,18 @@ impl QsoManager {
                     "upgrading logged partner callsign to more-complete compound form (C18)"
                 );
                 progress.metadata.their_callsign = Some(upgraded);
+            } else if sender.len() > latched.len()
+                && crate::exchange::callsigns_match(sender, latched)
+            {
+                // Same base + strictly longer, but NOT a safe compound
+                // completion (junk affix token, or a different prefix/suffix
+                // than already latched). Do not overwrite the logged call.
+                warn!(
+                    target: "qso.security",
+                    latched = %latched,
+                    rejected = %sender,
+                    "rejected unsafe compound-callsign upgrade (unrecognized or substituted affix); keeping latched logged callsign"
+                );
             }
         }
 
@@ -1609,7 +1631,7 @@ impl QsoManager {
                 let our_report = signal_strength
                     .map(|snr| (snr.round() as i8).clamp(-30, 50))
                     .unwrap_or(-15);
-                let duration = (Utc::now() - *started_at).num_seconds() as u32;
+                let duration = (Utc::now() - *started_at).num_seconds().max(0) as u32;
                 Ok(QsoState::Completed {
                     their_callsign: their_callsign.clone(),
                     their_report: -15,
@@ -1870,7 +1892,7 @@ impl QsoManager {
                     );
                     return Ok(current_state.clone());
                 }
-                let duration = (Utc::now() - *started_at).num_seconds() as u32;
+                let duration = (Utc::now() - *started_at).num_seconds().max(0) as u32;
                 Ok(QsoState::Completed {
                     their_callsign: their_callsign.clone(),
                     their_report: their_report.unwrap_or(-15),
@@ -1911,7 +1933,7 @@ impl QsoManager {
                     );
                     return Ok(current_state.clone());
                 }
-                let duration = (Utc::now() - *started_at).num_seconds() as u32;
+                let duration = (Utc::now() - *started_at).num_seconds().max(0) as u32;
                 Ok(QsoState::Completed {
                     their_callsign: their_callsign.clone(),
                     their_report: *their_report,
@@ -3013,6 +3035,152 @@ mod tests {
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert!(matches!(progress.state, QsoState::RespondingToCq { .. }));
         assert_eq!(progress.metadata.their_callsign, Some("K1DEF".to_string()));
+    }
+
+    // --- Fix 1 (security): compound-callsign logged-callsign upgrade ------
+
+    /// (a) A bare base latched as the partner, later seen under a SINGLE
+    /// standard compound form (recognized country prefix), upgrades the logged
+    /// callsign — the legitimate C18 case this feature exists for.
+    #[tokio::test]
+    async fn compound_upgrade_bare_base_to_standard_compound() {
+        let manager = QsoManager::new(test_config()); // our call = W1ABC
+        let freq = 14074000.0;
+        // We answer a CQ from bare base G8BCG → latched their_callsign=G8BCG.
+        let qso_id = manager
+            .respond_to_cq("G8BCG".to_string(), freq, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .their_callsign
+                .as_deref(),
+            Some("G8BCG")
+        );
+
+        // The DX now signs the standard compound EA8/G8BCG in a frame to us.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "EA8/G8BCG".to_string(),
+                    report: -12,
+                },
+                "W1ABC EA8/G8BCG -12".to_string(),
+                freq,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .their_callsign
+                .as_deref(),
+            Some("EA8/G8BCG"),
+            "bare base should upgrade to the standard compound form"
+        );
+    }
+
+    /// (b) An attacker who knows the partner's on-air base call wraps an
+    /// ARBITRARY (unrecognized) prefix token around it. Same base → matches,
+    /// strictly longer → but the bogus token must NOT be allowed to overwrite
+    /// the logged callsign.
+    #[tokio::test]
+    async fn compound_upgrade_rejects_bogus_affix_token() {
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        let qso_id = manager
+            .respond_to_cq("G8BCG".to_string(), freq, None)
+            .await
+            .unwrap();
+
+        // BOGUS9 is 6 chars → not a recognized prefix/suffix token.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "BOGUS9/G8BCG/MM".to_string(),
+                    report: -12,
+                },
+                "W1ABC BOGUS9/G8BCG/MM -12".to_string(),
+                freq,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .their_callsign
+                .as_deref(),
+            Some("G8BCG"),
+            "attacker compound with a bogus token must not overwrite the logged callsign"
+        );
+    }
+
+    /// (c) Already-compound latched call; a frame arrives with the SAME base
+    /// but a DIFFERENT recognized prefix (a substitution, not a completion).
+    /// It must not silently overwrite the latched call.
+    #[tokio::test]
+    async fn compound_upgrade_rejects_different_prefix_substitution() {
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        // Latch the compound EA8/G8BCG directly.
+        let qso_id = manager
+            .respond_to_cq("EA8/G8BCG".to_string(), freq, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .their_callsign
+                .as_deref(),
+            Some("EA8/G8BCG")
+        );
+
+        // A frame swaps the prefix to FR (same base, strictly longer string,
+        // recognized token — but a substitution of the latched EA8).
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "FR/G8BCG/P".to_string(),
+                    report: -12,
+                },
+                "W1ABC FR/G8BCG/P -12".to_string(),
+                freq,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .their_callsign
+                .as_deref(),
+            Some("EA8/G8BCG"),
+            "a different-prefix compound must not replace the latched compound"
+        );
     }
 
     // --- Manual-vs-auto calling semantics (operator policy) --------------
