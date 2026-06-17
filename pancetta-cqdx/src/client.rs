@@ -213,10 +213,10 @@ impl CqdxClient {
             return Ok(QsoUploadOutcome::Duplicate);
         }
         if !status.is_success() {
-            let message = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
+            let body = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
             return Err(CqdxError::Server {
                 status: status.as_u16(),
-                message,
+                message: sanitize_error_body(&body),
             });
         }
 
@@ -243,10 +243,10 @@ impl CqdxClient {
         if status.as_u16() == 401 {
             return Err(CqdxError::Unauthorized);
         }
-        let message = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
+        let body = resp.text().await.unwrap_or_else(|_| "unknown".to_string());
         Err(CqdxError::Server {
             status: status.as_u16(),
-            message,
+            message: sanitize_error_body(&body),
         })
     }
 
@@ -270,6 +270,63 @@ impl CqdxClient {
     }
 }
 
+/// Maximum length (in chars) of a sanitized error body embedded in
+/// [`CqdxError::Server`].
+const MAX_ERROR_BODY_CHARS: usize = 200;
+
+/// Sanitize a server error-response body before embedding it in an error that
+/// may be logged.
+///
+/// Belt-and-suspenders defense: if the cqdx server ever (bug) echoed the bearer
+/// token back in an error body, embedding the raw body in `CqdxError::Server`
+/// would surface it in pancetta logs. This redacts any `pat_<...>` token-shaped
+/// substrings to `pat_***REDACTED***` and truncates the result to
+/// [`MAX_ERROR_BODY_CHARS`] chars (appending `…` if truncated).
+///
+/// The `pat_` redaction is done with a manual scan (no regex dependency).
+fn sanitize_error_body(body: &str) -> String {
+    // Redact `pat_` followed by one-or-more token chars ([A-Za-z0-9_]).
+    let mut redacted = String::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if body[i..].starts_with("pat_") {
+            // Consume the trailing token characters.
+            let mut j = i + 4;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if c.is_ascii_alphanumeric() || c == b'_' {
+                    j += 1;
+                } else {
+                    break;
+                }
+            }
+            // Only redact if there was at least one token char after `pat_`.
+            if j > i + 4 {
+                redacted.push_str("pat_***REDACTED***");
+                i = j;
+                continue;
+            }
+        }
+        // Push this single character (handle multi-byte UTF-8 correctly).
+        let ch_len = match body[i..].chars().next() {
+            Some(c) => c.len_utf8(),
+            None => 1,
+        };
+        redacted.push_str(&body[i..i + ch_len]);
+        i += ch_len;
+    }
+
+    // Truncate to MAX_ERROR_BODY_CHARS chars, appending an ellipsis if cut.
+    if redacted.chars().count() > MAX_ERROR_BODY_CHARS {
+        let mut out: String = redacted.chars().take(MAX_ERROR_BODY_CHARS).collect();
+        out.push('…');
+        out
+    } else {
+        redacted
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +335,55 @@ mod tests {
 
     fn test_client(base_url: &str) -> CqdxClient {
         CqdxClient::new(base_url.to_string(), "pat_test_token".to_string()).unwrap()
+    }
+
+    #[test]
+    fn test_sanitize_error_body_redacts_pat_token() {
+        let body = "auth failed for token pat_abc123DEF_456 sorry";
+        let out = sanitize_error_body(body);
+        assert!(
+            !out.contains("pat_abc123DEF_456"),
+            "raw token leaked: {out}"
+        );
+        assert!(
+            out.contains("pat_***REDACTED***"),
+            "no redaction marker: {out}"
+        );
+        assert_eq!(out, "auth failed for token pat_***REDACTED*** sorry");
+    }
+
+    #[test]
+    fn test_sanitize_error_body_redacts_multiple_and_at_edges() {
+        let body = "pat_first middle pat_SECOND_99";
+        let out = sanitize_error_body(body);
+        assert_eq!(out, "pat_***REDACTED*** middle pat_***REDACTED***");
+    }
+
+    #[test]
+    fn test_sanitize_error_body_truncates_long_body() {
+        let body = "x".repeat(500);
+        let out = sanitize_error_body(&body);
+        assert_eq!(out.chars().count(), MAX_ERROR_BODY_CHARS + 1); // +1 for ellipsis
+        assert!(out.ends_with('…'));
+        assert_eq!(
+            out.chars().take(MAX_ERROR_BODY_CHARS).collect::<String>(),
+            "x".repeat(MAX_ERROR_BODY_CHARS)
+        );
+    }
+
+    #[test]
+    fn test_sanitize_error_body_clean_passthrough() {
+        let body = "internal server error: database unavailable";
+        let out = sanitize_error_body(body);
+        assert_eq!(out, body);
+    }
+
+    #[test]
+    fn test_sanitize_error_body_bare_pat_prefix_untouched() {
+        // "pat_" with no following token char is not a token shape; leave as-is.
+        let body = "pat_ alone";
+        let out = sanitize_error_body(body);
+        assert_eq!(out, "pat_ alone");
     }
 
     #[tokio::test]
