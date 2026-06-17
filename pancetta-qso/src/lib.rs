@@ -3,7 +3,7 @@
 //! QSO management: autonomous operator, priority scorer, frequency allocator, state machine, ADIF logging.
 //!
 //! A comprehensive QSO (contact) management and logging library for FT8 amateur radio communications.
-//! This library provides state machine-based QSO tracking, automatic sequencing, ADIF import/export,
+//! This library provides state machine-based QSO tracking, ADIF import/export,
 //! SQLite-based storage, and comprehensive statistics and analytics.
 //!
 //! ## Data Flow
@@ -23,7 +23,6 @@
 //! ## Features
 //!
 //! - **QSO State Machine**: Complete FT8 QSO flow management with automatic state transitions
-//! - **Auto Sequencing**: Intelligent automatic QSO progression with configurable behavior
 //! - **ADIF 3.0 Support**: Full ADIF import/export with validation and conversion
 //! - **SQLite Database**: Efficient storage with advanced querying and indexing
 //! - **Comprehensive Logging**: Automatic logging with duplicate detection and validation
@@ -68,7 +67,6 @@
 //! - [`states`]: Core QSO state definitions and transitions
 //! - [`qso_manager`]: QSO lifecycle management and state machine
 //! - [`exchange`]: FT8 message parsing and generation
-//! - [`auto_sequencer`]: Automatic QSO progression logic
 //! - [`adif`]: ADIF 3.0 format support for import/export
 //! - [`async_database`]: SQLite-based persistent storage
 //! - [`async_logger`]: QSO logging with automatic features
@@ -101,27 +99,6 @@
 //! ).await?;
 //! ```
 //!
-//! ### Automatic Sequencing
-//!
-//! ```rust,ignore
-//! use pancetta_qso::*;
-//!
-//! // Configure auto sequencer
-//! let auto_config = AutoSequencerConfig {
-//!     enabled: true,
-//!     response_behavior: ResponseBehaviorConfig {
-//!         auto_respond: true,
-//!         auto_send_reports: true,
-//!         auto_send_confirmations: true,
-//!         ..Default::default()
-//!     },
-//!     ..Default::default()
-//! };
-//!
-//! let sequencer = AutoSequencer::new(auto_config, manager, "W1ABC".to_string());
-//! sequencer.start().await?;
-//! ```
-//!
 //! ### ADIF Import/Export
 //!
 //! Use [`AsyncQsoLogger`] to export logged QSOs to ADIF or import from an existing log file.
@@ -147,7 +124,6 @@ pub use crate::async_logger::{
     AsyncQsoLogger, AutoLoggingConfig, BackupConfig, ExportFormat, ExportImportConfig,
     ExportResult, ImportResult, IntegrationConfig, LoggerConfig, ValidationConfig,
 };
-pub use crate::auto_sequencer::*;
 pub use crate::autonomous::*;
 pub use crate::exchange::*;
 pub use crate::frequency::*;
@@ -161,7 +137,6 @@ pub mod adif;
 pub mod adif_log_writer;
 pub mod async_database;
 pub mod async_logger;
-pub mod auto_sequencer;
 pub mod autonomous;
 pub mod exchange;
 pub mod frequency;
@@ -200,7 +175,6 @@ pub mod sim;
 // Common error type for the entire library
 use crate::async_database::AsyncDatabaseError;
 use crate::async_logger::AsyncLoggerError;
-use std::sync::Arc;
 use thiserror::Error;
 
 /// Common error types for the QSO library
@@ -218,13 +192,6 @@ pub enum QsoError {
     Exchange {
         #[from]
         source: ExchangeError,
-    },
-
-    /// Auto sequencer error
-    #[error("Auto sequencer error: {source}")]
-    AutoSequencer {
-        #[from]
-        source: AutoSequencerError,
     },
 
     /// ADIF processing error
@@ -278,9 +245,7 @@ pub const DESCRIPTION: &str = env!("CARGO_PKG_DESCRIPTION");
 /// High-level QSO system builder for easy setup
 pub struct QsoSystemBuilder {
     qso_config: Option<QsoManagerConfig>,
-    auto_config: Option<AutoSequencerConfig>,
     logger_config: Option<LoggerConfig>,
-    enable_auto_sequencer: bool,
     enable_logger: bool,
 }
 
@@ -289,9 +254,7 @@ impl QsoSystemBuilder {
     pub fn new() -> Self {
         Self {
             qso_config: None,
-            auto_config: None,
             logger_config: None,
-            enable_auto_sequencer: false,
             enable_logger: false,
         }
     }
@@ -302,23 +265,10 @@ impl QsoSystemBuilder {
         self
     }
 
-    /// Set auto sequencer configuration and enable it
-    pub fn with_auto_sequencer(mut self, config: AutoSequencerConfig) -> Self {
-        self.auto_config = Some(config);
-        self.enable_auto_sequencer = true;
-        self
-    }
-
     /// Set logger configuration and enable it
     pub fn with_logger(mut self, config: LoggerConfig) -> Self {
         self.logger_config = Some(config);
         self.enable_logger = true;
-        self
-    }
-
-    /// Enable auto sequencer with default configuration
-    pub fn enable_auto_sequencer(mut self) -> Self {
-        self.enable_auto_sequencer = true;
         self
     }
 
@@ -331,24 +281,8 @@ impl QsoSystemBuilder {
     /// Build the complete QSO system
     pub async fn build(self) -> QsoResult<QsoSystem> {
         let qso_config = self.qso_config.unwrap_or_default();
-        let our_callsign = qso_config.our_callsign.clone();
         let qso_manager = QsoManager::new(qso_config);
         qso_manager.start().await?;
-
-        let auto_sequencer = if self.enable_auto_sequencer {
-            let mut auto_config = self.auto_config.unwrap_or_default();
-            auto_config.enabled = true;
-            let our_callsign = our_callsign.clone();
-            let sequencer = Arc::new(AutoSequencer::new(
-                auto_config,
-                qso_manager.clone(),
-                our_callsign,
-            ));
-            sequencer.start().await?;
-            Some(sequencer)
-        } else {
-            None
-        };
 
         let logger = if self.enable_logger {
             let logger_config = self.logger_config.unwrap_or_default();
@@ -362,7 +296,6 @@ impl QsoSystemBuilder {
 
         Ok(QsoSystem {
             qso_manager,
-            auto_sequencer,
             logger,
         })
     }
@@ -379,9 +312,6 @@ pub struct QsoSystem {
     /// QSO manager instance
     pub qso_manager: QsoManager,
 
-    /// Auto sequencer instance (if enabled)
-    pub auto_sequencer: Option<Arc<AutoSequencer>>,
-
     /// Logger instance (if enabled)
     pub logger: Option<std::sync::Arc<AsyncQsoLogger>>,
 }
@@ -397,24 +327,6 @@ impl QsoSystem {
 
         QsoSystemBuilder::new()
             .with_qso_config(qso_config)
-            .build()
-            .await
-    }
-
-    /// Create a new QSO system with auto sequencing enabled
-    pub async fn with_auto_sequencing(
-        our_callsign: String,
-        our_grid: Option<String>,
-    ) -> QsoResult<Self> {
-        let qso_config = QsoManagerConfig {
-            our_callsign: our_callsign.clone(),
-            our_grid,
-            ..Default::default()
-        };
-
-        QsoSystemBuilder::new()
-            .with_qso_config(qso_config)
-            .enable_auto_sequencer()
             .build()
             .await
     }
@@ -463,7 +375,6 @@ impl QsoSystem {
         QsoSystemBuilder::new()
             .with_qso_config(qso_config)
             .with_logger(logger_config)
-            .enable_auto_sequencer()
             .build()
             .await
     }
@@ -637,17 +548,6 @@ mod tests {
             system.qso_manager.config().our_grid,
             Some("FN42".to_string())
         );
-        assert!(system.auto_sequencer.is_none());
-        assert!(system.logger.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_qso_system_with_auto_sequencing() {
-        let system = QsoSystem::with_auto_sequencing("W1ABC".to_string(), Some("FN42".to_string()))
-            .await
-            .unwrap();
-
-        assert!(system.auto_sequencer.is_some());
         assert!(system.logger.is_none());
     }
 
@@ -661,13 +561,12 @@ mod tests {
 
         let system = QsoSystemBuilder::new()
             .with_qso_config(qso_config)
-            .enable_auto_sequencer()
             .build()
             .await
             .unwrap();
 
         assert_eq!(system.qso_manager.config().our_callsign, "W1ABC");
-        assert!(system.auto_sequencer.is_some());
+        assert!(system.logger.is_none());
     }
 
     #[tokio::test]
