@@ -979,7 +979,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_backup_rejects_nul_and_newline_paths() {
-        let db = AsyncQsoDatabase::new_in_memory().await.unwrap();
+        let db = QsoDatabase::new_in_memory().await.unwrap();
         assert!(matches!(
             db.backup("/tmp/ev\0il.db").await,
             Err(AsyncDatabaseError::InvalidQuery { .. })

@@ -72,15 +72,13 @@ impl super::ApplicationCoordinator {
 
     /// SECURITY (I-10 / I-11): validate the `station.interface.port` device
     /// spec before handing it to rigctld's `-r` argument. Accepts only shapes
-    /// that look like a real serial device or a `host:port` network rig:
-    ///   - Linux serial:   `/dev/ttyUSB<N>`, `/dev/ttyACM<N>`, `/dev/ttyS<N>`
-    ///   - macOS serial:   `/dev/cu.*`, `/dev/tty.*` (dev machine uses
-    ///                      `/dev/cu.usbserial-*`)
-    ///   - Windows serial: `COM<N>`
-    ///   - network rig:    `host:port`, where `port` parses as a `u16` in
-    ///                      `1..=65535` (I-11 port-range check)
-    /// Everything else (bare `/dev/tty`, `/dev/null`, malformed/out-of-range
-    /// network ports, arbitrary paths) is rejected.
+    /// that look like a real serial device or a `host:port` network rig.
+    /// Linux serial: `/dev/ttyUSB<N>`, `/dev/ttyACM<N>`, `/dev/ttyS<N>`.
+    /// macOS serial: `/dev/cu.*`, `/dev/tty.*` (dev machine uses
+    /// `/dev/cu.usbserial-*`). Windows serial: `COM<N>`. Network rig:
+    /// `host:port`, where `port` parses as a `u16` in `1..=65535` (I-11
+    /// port-range check). Everything else (bare `/dev/tty`, `/dev/null`,
+    /// malformed/out-of-range network ports, arbitrary paths) is rejected.
     pub(crate) fn device_path_looks_safe(port_field: &str) -> bool {
         // Linux serial: /dev/ttyUSB<N>, /dev/ttyACM<N>, /dev/ttyS<N> with a
         // trailing all-digit index.

@@ -287,19 +287,21 @@ impl RigctldClient {
     /// untrusted/buggy caller could otherwise reach *any* rigctld verb,
     /// including dangerous configuration ones (`\set_conf`, `q`/quit, reset,
     /// memory-clear, etc.). We constrain it to an allow-list keyed on the
-    /// first whitespace-separated token. The set covers:
-    ///   - every verb this client already issues internally (so nothing
-    ///     that works today breaks):
-    ///       short form: `f` (get_freq), `F` (set_freq), `m` (get_mode),
-    ///                   `T` (set_ptt), `V` (set_vfo)
-    ///       long form:  `\set_mode`, `\get_ptt`, `\get_level`, `\set_vfo`,
-    ///                   `\get_vfo`, `\set_level`, `\set_mem`, `\get_mem`,
-    ///                   `\set_func`, `\get_info`
-    ///   - the standard short/long forms that pair with the above (so the
-    ///     escape hatch can read what it can already set and vice versa):
-    ///       `M` (set_mode), `t` (get_ptt), `v` (get_vfo)
-    ///   - the antenna verbs the escape hatch was documented for:
-    ///       `y` (get_ant), `Y` (set_ant), `\get_ant`, `\set_ant`
+    /// first whitespace-separated token. The set covers three groups.
+    ///
+    /// Verbs this client already issues internally (so nothing that works
+    /// today breaks) — short form `f` (get_freq), `F` (set_freq), `m`
+    /// (get_mode), `T` (set_ptt), `V` (set_vfo); long form `\set_mode`,
+    /// `\get_ptt`, `\get_level`, `\set_vfo`, `\get_vfo`, `\set_level`,
+    /// `\set_mem`, `\get_mem`, `\set_func`, `\get_info`.
+    ///
+    /// The standard read/write pairs of the above (so the escape hatch can
+    /// read what it can already set and vice versa) — `M` (set_mode), `t`
+    /// (get_ptt), `v` (get_vfo).
+    ///
+    /// The antenna verbs the escape hatch was documented for — `y` (get_ant),
+    /// `Y` (set_ant), `\get_ant`, `\set_ant`.
+    ///
     /// Anything else (notably `\set_conf`, `q`, `Q`, `reset`, `\reset`,
     /// `\send_morse`, free text) is rejected without being sent.
     const ALLOWED_COMMAND_VERBS: &'static [&'static str] = &[
