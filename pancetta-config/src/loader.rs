@@ -552,16 +552,19 @@ impl ConfigLoader {
 
     /// Parse TOML configuration
     fn parse_toml(&self, content: &str) -> ConfigResult<Config> {
-        let expanded_content = shellexpand::full(content)
-            .map_err(|e| ConfigError::Validation(format!("Shell expansion failed: {}", e)))?;
+        // Tilde-only (`~`) expansion — deliberately NOT `shellexpand::full`,
+        // which would also expand `$VAR` env references in the raw config text
+        // and risk leaking secrets (e.g. tokens) into the parsed config and
+        // downstream logs/errors. See security fix I-7.
+        let expanded_content = shellexpand::tilde(content);
 
         toml::from_str(&expanded_content).map_err(ConfigError::Toml)
     }
 
     /// Parse JSON configuration
     fn parse_json(&self, content: &str) -> ConfigResult<Config> {
-        let expanded_content = shellexpand::full(content)
-            .map_err(|e| ConfigError::Validation(format!("Shell expansion failed: {}", e)))?;
+        // Tilde-only (`~`) expansion — see `parse_toml` and security fix I-7.
+        let expanded_content = shellexpand::tilde(content);
 
         serde_json::from_str(&expanded_content).map_err(ConfigError::Json)
     }
@@ -1012,10 +1015,12 @@ mod tests {
         let loader = ConfigLoader::new().unwrap();
 
         // Start with a valid default config and verify that parse_toml
-        // successfully processes shell expansion on the TOML content.
-        // Note: shellexpand::full operates on the raw TOML text, so `~`
-        // inside quoted string values is not expanded (it only expands
-        // `~` at the start of the input or `$VAR` references).
+        // successfully processes path expansion on the TOML content.
+        // Note: parse_toml uses tilde-only (`~`) expansion via
+        // `shellexpand::tilde`, which operates on the raw TOML text. It
+        // expands ONLY a `~` at the very start of the input (never `$VAR`
+        // env references — see security fix I-7), so `~` inside quoted
+        // string values is left untouched.
         let mut config = Config::default();
         config.audio.recording.directory = "~/Documents/Recordings".to_string();
         let toml_content = toml::to_string_pretty(&config).unwrap();
@@ -1023,10 +1028,76 @@ mod tests {
         let parsed = loader.parse_toml(&toml_content);
         assert!(parsed.is_ok(), "parse_toml failed: {:?}", parsed.err());
 
-        // Verify parse_toml ran shell expansion without errors and
+        // Verify parse_toml ran path expansion without errors and
         // produced a valid config.
         let parsed = parsed.unwrap();
         assert_eq!(parsed.station.callsign, config.station.callsign);
+    }
+
+    #[test]
+    fn test_no_env_var_expansion_in_config_values() {
+        // Security fix I-7: `$VAR` env references in config values must be
+        // passed through LITERALLY and never expanded (the old
+        // `shellexpand::full` would have substituted the env value,
+        // leaking secrets into the parsed config and downstream logs).
+        let loader = ConfigLoader::new().unwrap();
+
+        // Set a distinctive env var that, if expanded, would corrupt the
+        // value (and in the real leak, would inject a secret).
+        let var_name = "PANCETTA_I7_TEST_SECRET";
+        std::env::set_var(var_name, "leaked-secret-value");
+
+        let mut config = Config::default();
+        // A config value that textually references the env var.
+        config.audio.recording.directory = format!("/recordings/${}", var_name);
+        let toml_content = toml::to_string_pretty(&config).unwrap();
+
+        let parsed = loader
+            .parse_toml(&toml_content)
+            .expect("parse_toml should succeed");
+
+        // The `$VAR` reference must survive verbatim — NOT be expanded to
+        // the env value.
+        assert_eq!(
+            parsed.audio.recording.directory,
+            format!("/recordings/${}", var_name),
+            "$VAR in config value must be passed through literally (no env-var expansion)"
+        );
+        assert!(
+            !parsed
+                .audio
+                .recording
+                .directory
+                .contains("leaked-secret-value"),
+            "env-var value leaked into parsed config — secret-leak regression"
+        );
+
+        std::env::remove_var(var_name);
+    }
+
+    #[test]
+    fn test_leading_tilde_still_expands() {
+        // The legitimate use case (the original intent of the call) — a
+        // leading `~` in the raw input expands to the home directory.
+        let loader = ConfigLoader::new().unwrap();
+        let home = dirs::home_dir().expect("home dir available in test env");
+
+        // `shellexpand::tilde` only expands a `~` at the very start of the
+        // input, so build a raw document that begins with `~`.
+        let raw = format!(
+            "~/.pancetta\n{}",
+            toml::to_string_pretty(&Config::default()).unwrap()
+        );
+        let expanded = shellexpand::tilde(&raw);
+        assert!(
+            expanded.starts_with(&home.to_string_lossy().to_string()),
+            "leading ~ should expand to home dir, got: {}",
+            &expanded[..expanded.len().min(80)]
+        );
+
+        // Sanity: parse_toml on a normal default config still succeeds.
+        let toml_content = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(loader.parse_toml(&toml_content).is_ok());
     }
 
     #[test]
