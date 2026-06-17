@@ -1,9 +1,9 @@
 //! QSO logging example
 //!
-//! This example demonstrates async QSO logging with `AsyncQsoLogger` including:
+//! This example demonstrates async QSO logging with `QsoLogger` including:
 //! - System configuration and initialisation via `QsoSystemBuilder`
 //! - Logging multiple QSOs through the async logger
-//! - ADIF export using `AsyncQsoLogger::export_adif`
+//! - ADIF export using `QsoLogger::export_adif`
 //! - Querying basic statistics
 
 use pancetta_qso::*;

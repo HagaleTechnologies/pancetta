@@ -378,7 +378,7 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
 
 async fn export_command(args: ExportArgs) -> Result<()> {
     use pancetta_qso::adif::AdifProcessor;
-    use pancetta_qso::async_database::{AsyncQsoDatabase, QsoFilter, QueryOptions};
+    use pancetta_qso::async_database::{QsoDatabase, QsoFilter, QueryOptions};
 
     let db_path = args.database.unwrap_or_else(|| {
         dirs::home_dir()
@@ -394,7 +394,7 @@ async fn export_command(args: ExportArgs) -> Result<()> {
     }
 
     println!("Opening database: {}", db_path.display());
-    let db = AsyncQsoDatabase::open(&db_path)
+    let db = QsoDatabase::open(&db_path)
         .await
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
 

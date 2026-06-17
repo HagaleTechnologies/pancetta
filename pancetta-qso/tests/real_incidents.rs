@@ -103,7 +103,7 @@ async fn t46fcr_full_exchange_sends_73_completes_and_logs() {
     let tl = sim.into_timeline();
     tl.assert_transmitted_contains("T46FCR K5ARH 73");
     tl.assert_completed_with("T46FCR");
-    // A QsoCompleted (what AsyncQsoLogger persists) was emitted for T46FCR.
+    // A QsoCompleted (what QsoLogger persists) was emitted for T46FCR.
     assert!(
         tl.completions
             .iter()

@@ -101,12 +101,12 @@
 //!
 //! ### ADIF Import/Export
 //!
-//! Use [`AsyncQsoLogger`] to export logged QSOs to ADIF or import from an existing log file.
+//! Use [`QsoLogger`] to export logged QSOs to ADIF or import from an existing log file.
 //! See [`async_logger`] for the full API, including `export_adif` and `import_adif`.
 //!
 //! ### Statistics and Analytics
 //!
-//! Use [`AsyncQsoDatabase`] to query the SQLite log and [`StatisticsCalculator`] to derive
+//! Use [`QsoDatabase`] to query the SQLite log and [`StatisticsCalculator`] to derive
 //! per-band, per-DXCC, and time-series metrics. See [`statistics`] for details.
 
 #![allow(missing_docs)] // TODO: documentation pass pending — see CONTRIBUTING.md
@@ -117,12 +117,12 @@
 pub use crate::adif::*;
 pub use crate::adif_log_writer::{AdifLogError, AdifLogResult, AdifLogWriter};
 pub use crate::async_database::{
-    AsyncQsoDatabase, DatabaseStats, DateRange, FrequencyRange, QslStatus, QsoDatabaseRecord,
-    QsoFilter, QueryOptions, SortField, SortOrder,
+    DatabaseStats, DateRange, FrequencyRange, QslStatus, QsoDatabase, QsoDatabaseRecord, QsoFilter,
+    QueryOptions, SortField, SortOrder,
 };
 pub use crate::async_logger::{
-    AsyncQsoLogger, AutoLoggingConfig, BackupConfig, ExportFormat, ExportImportConfig,
-    ExportResult, ImportResult, IntegrationConfig, LoggerConfig, ValidationConfig,
+    AutoLoggingConfig, BackupConfig, ExportFormat, ExportImportConfig, ExportResult, ImportResult,
+    IntegrationConfig, LoggerConfig, QsoLogger, ValidationConfig,
 };
 pub use crate::autonomous::*;
 pub use crate::exchange::*;
@@ -287,7 +287,7 @@ impl QsoSystemBuilder {
         let logger = if self.enable_logger {
             let logger_config = self.logger_config.unwrap_or_default();
             let qso_logger =
-                std::sync::Arc::new(AsyncQsoLogger::new(logger_config, qso_manager.clone()).await?);
+                std::sync::Arc::new(QsoLogger::new(logger_config, qso_manager.clone()).await?);
             qso_logger.start().await?;
             Some(qso_logger)
         } else {
@@ -313,7 +313,7 @@ pub struct QsoSystem {
     pub qso_manager: QsoManager,
 
     /// Logger instance (if enabled)
-    pub logger: Option<std::sync::Arc<AsyncQsoLogger>>,
+    pub logger: Option<std::sync::Arc<QsoLogger>>,
 }
 
 impl QsoSystem {

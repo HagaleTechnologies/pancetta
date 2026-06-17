@@ -361,7 +361,7 @@ impl super::ApplicationCoordinator {
                     ..Default::default()
                 };
 
-                let _async_logger = match pancetta_qso::async_logger::AsyncQsoLogger::new(
+                let _async_logger = match pancetta_qso::async_logger::QsoLogger::new(
                     logger_config,
                     qso_manager.clone(),
                 )
@@ -412,7 +412,7 @@ impl super::ApplicationCoordinator {
                 //      detection sees every prior contact.
                 //   3. Open as-is: normal startup; index is current.
                 {
-                    use pancetta_qso::async_database::AsyncQsoDatabase;
+                    use pancetta_qso::async_database::QsoDatabase;
 
                     // Determine the current band from the rig's operating frequency,
                     // falling back to "20m".  This is a best-effort seed — the
@@ -433,7 +433,7 @@ impl super::ApplicationCoordinator {
                             db_path.display(),
                             adif_path.display(),
                         );
-                        match AsyncQsoDatabase::open(&db_path).await {
+                        match QsoDatabase::open(&db_path).await {
                             Ok(db) => {
                                 if let Err(e) = db.export_to_adif(&adif_path).await {
                                     warn!(
@@ -482,7 +482,7 @@ impl super::ApplicationCoordinator {
                     };
 
                     let db_for_seed = if needs_replay {
-                        match AsyncQsoDatabase::replay_from_adif(&db_path, &adif_path).await {
+                        match QsoDatabase::replay_from_adif(&db_path, &adif_path).await {
                             Ok(db) => Some(db),
                             Err(e) => {
                                 warn!(
@@ -490,12 +490,12 @@ impl super::ApplicationCoordinator {
                                      (may be stale)",
                                     e,
                                 );
-                                AsyncQsoDatabase::open(&db_path).await.ok()
+                                QsoDatabase::open(&db_path).await.ok()
                             }
                         }
                     } else {
                         // Case 3: open as-is.
-                        AsyncQsoDatabase::open(&db_path).await.ok()
+                        QsoDatabase::open(&db_path).await.ok()
                     };
 
                     if let Some(db) = db_for_seed {

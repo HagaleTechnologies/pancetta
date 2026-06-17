@@ -4,7 +4,7 @@
 //! including achievements, trends, contest analysis, and performance metrics.
 
 use crate::async_database::{
-    AsyncDatabaseError, AsyncQsoDatabase, DateRange, QsoDatabaseRecord, QsoFilter, QueryOptions,
+    AsyncDatabaseError, DateRange, QsoDatabase, QsoDatabaseRecord, QsoFilter, QueryOptions,
 };
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -941,12 +941,12 @@ pub struct PerformancePrediction {
 
 /// Statistics calculator
 pub struct StatisticsCalculator {
-    database: AsyncQsoDatabase,
+    database: QsoDatabase,
 }
 
 impl StatisticsCalculator {
     /// Create a new statistics calculator
-    pub fn new(database: AsyncQsoDatabase) -> Self {
+    pub fn new(database: QsoDatabase) -> Self {
         Self { database }
     }
 
@@ -2260,7 +2260,7 @@ pub struct StatisticsDifferences {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::async_database::AsyncQsoDatabase;
+    use crate::async_database::QsoDatabase;
     use crate::states::*;
     use std::collections::HashMap;
     use uuid::Uuid;
@@ -2362,7 +2362,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_basic_statistics() {
-        let dummy_db = AsyncQsoDatabase::new_in_memory().await.unwrap();
+        let dummy_db = QsoDatabase::new_in_memory().await.unwrap();
         let calculator = StatisticsCalculator::new(dummy_db);
         let records = create_test_records().await;
 
@@ -2382,7 +2382,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_temporal_statistics() {
-        let dummy_db = AsyncQsoDatabase::new_in_memory().await.unwrap();
+        let dummy_db = QsoDatabase::new_in_memory().await.unwrap();
         let calculator = StatisticsCalculator::new(dummy_db);
         let records = create_test_records().await;
 
@@ -2400,7 +2400,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_technical_statistics() {
-        let dummy_db = AsyncQsoDatabase::new_in_memory().await.unwrap();
+        let dummy_db = QsoDatabase::new_in_memory().await.unwrap();
         let calculator = StatisticsCalculator::new(dummy_db);
         let records = create_test_records().await;
 

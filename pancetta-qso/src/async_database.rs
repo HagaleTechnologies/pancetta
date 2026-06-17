@@ -238,7 +238,7 @@ pub enum AsyncDatabaseError {
 
 /// Async QSO database using sqlx
 #[derive(Clone)]
-pub struct AsyncQsoDatabase {
+pub struct QsoDatabase {
     /// Database connection pool
     pool: SqlitePool,
 
@@ -249,7 +249,7 @@ pub struct AsyncQsoDatabase {
     schema_version: u32,
 }
 
-impl AsyncQsoDatabase {
+impl QsoDatabase {
     /// Open or create a database at the specified path
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self, AsyncDatabaseError> {
         let database_url = if path.as_ref() == Path::new(":memory:") {
@@ -907,7 +907,7 @@ impl AsyncQsoDatabase {
     }
 }
 
-// AsyncQsoDatabase is automatically Send + Sync thanks to SqlitePool
+// QsoDatabase is automatically Send + Sync thanks to SqlitePool
 
 #[cfg(test)]
 mod tests {
@@ -915,13 +915,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_async_database_creation() {
-        let db = AsyncQsoDatabase::new_in_memory().await;
+        let db = QsoDatabase::new_in_memory().await;
         assert!(db.is_ok());
     }
 
     #[tokio::test]
     async fn test_insert_and_get_qso() {
-        let db = AsyncQsoDatabase::new_in_memory().await.unwrap();
+        let db = QsoDatabase::new_in_memory().await.unwrap();
 
         let progress = QsoProgress {
             state: QsoState::Idle,
@@ -961,7 +961,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_qso() {
-        let db = AsyncQsoDatabase::new_in_memory().await.unwrap();
+        let db = QsoDatabase::new_in_memory().await.unwrap();
 
         let mut progress = QsoProgress {
             state: QsoState::Idle,
@@ -1031,7 +1031,7 @@ mod tests {
             <EOR>\n";
         tokio::fs::write(&adif_path, adif_contents).await.unwrap();
 
-        let db = AsyncQsoDatabase::replay_from_adif(&db_path, &adif_path)
+        let db = QsoDatabase::replay_from_adif(&db_path, &adif_path)
             .await
             .unwrap();
         let count = db.count_qsos().await.unwrap();

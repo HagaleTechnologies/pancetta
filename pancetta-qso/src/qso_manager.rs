@@ -3,7 +3,7 @@
 //! This module provides the core QSO management functionality including
 //! state transitions, timeout handling, and QSO lifecycle management.
 
-use crate::async_database::AsyncQsoDatabase;
+use crate::async_database::QsoDatabase;
 use crate::states::*;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -258,7 +258,7 @@ pub struct QsoManager {
     cleanup_interval: Arc<RwLock<Option<Interval>>>,
 
     /// Optional database for persistent duplicate checking
-    database: Option<Arc<AsyncQsoDatabase>>,
+    database: Option<Arc<QsoDatabase>>,
 
     /// Rig dial frequency in Hz, shared from the coordinator's hamlib poll
     /// (0 if unknown / no rig). `metadata.frequency` holds the *audio offset*;
@@ -299,7 +299,7 @@ impl QsoManager {
     }
 
     /// Create a new QSO manager with a database for persistent duplicate checking
-    pub fn with_database(config: QsoManagerConfig, database: Arc<AsyncQsoDatabase>) -> Self {
+    pub fn with_database(config: QsoManagerConfig, database: Arc<QsoDatabase>) -> Self {
         let mut manager = Self::new(config);
         manager.database = Some(database);
         manager

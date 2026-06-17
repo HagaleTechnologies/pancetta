@@ -4,9 +4,7 @@
 //! for tokio spawns, using the sqlx-based async database.
 
 use crate::adif::{AdifFile, AdifProcessor};
-use crate::async_database::{
-    AsyncDatabaseError, AsyncQsoDatabase, QsoFilter, QueryOptions, SortOrder,
-};
+use crate::async_database::{AsyncDatabaseError, QsoDatabase, QsoFilter, QueryOptions, SortOrder};
 use crate::qso_manager::{QsoEvent, QsoManager};
 use crate::states::*;
 use chrono::{DateTime, Utc};
@@ -392,12 +390,12 @@ pub enum AsyncLoggerError {
 
 /// Async QSO logger with Send/Sync support
 #[derive(Clone)]
-pub struct AsyncQsoLogger {
+pub struct QsoLogger {
     /// Configuration
     config: Arc<LoggerConfig>,
 
     /// Async database connection
-    database: Arc<AsyncQsoDatabase>,
+    database: Arc<QsoDatabase>,
 
     /// ADIF processor
     adif_processor: Arc<AdifProcessor>,
@@ -415,13 +413,13 @@ pub struct AsyncQsoLogger {
     import_history: Arc<RwLock<Vec<ImportResult>>>,
 }
 
-impl AsyncQsoLogger {
+impl QsoLogger {
     /// Create a new async QSO logger
     pub async fn new(
         config: LoggerConfig,
         qso_manager: QsoManager,
     ) -> Result<Self, AsyncLoggerError> {
-        let database = AsyncQsoDatabase::open(&config.database_path).await?;
+        let database = QsoDatabase::open(&config.database_path).await?;
 
         Ok(Self {
             config: Arc::new(config),
@@ -882,15 +880,15 @@ mod tests {
         let config = test_logger_config();
         let qso_manager = QsoManager::new(QsoManagerConfig::default());
 
-        let logger = AsyncQsoLogger::new(config, qso_manager).await;
+        let logger = QsoLogger::new(config, qso_manager).await;
         assert!(logger.is_ok());
     }
 
     #[tokio::test]
     async fn test_async_logger_is_send_sync() {
-        // This test verifies that AsyncQsoLogger implements Send + Sync
+        // This test verifies that QsoLogger implements Send + Sync
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<AsyncQsoLogger>();
+        assert_send_sync::<QsoLogger>();
     }
 
     #[tokio::test]
@@ -898,7 +896,7 @@ mod tests {
         let config = test_logger_config();
         let qso_manager = QsoManager::new(QsoManagerConfig::default());
 
-        let logger = AsyncQsoLogger::new(config, qso_manager).await.unwrap();
+        let logger = QsoLogger::new(config, qso_manager).await.unwrap();
 
         // This should now compile without Send/Sync errors!
         let logger_clone = logger.clone();
