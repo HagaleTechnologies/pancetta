@@ -181,8 +181,8 @@ fn main() -> anyhow::Result<()> {
                     .seed
                     .wrapping_add(msg_idx as u64)
                     .wrapping_mul(1_000_003)
-                    .wrapping_add((snr_db.to_bits() as u64).wrapping_mul(7))
-                    .wrapping_add((drift.to_bits() as u64).wrapping_mul(13));
+                    .wrapping_add(snr_db.to_bits().wrapping_mul(7))
+                    .wrapping_add(drift.to_bits().wrapping_mul(13));
                 let mut samples = base_samples.clone();
                 apply_linear_drift_crude(&mut samples, *drift);
                 add_awgn(&mut samples, *snr_db, seed_for_this_wav);

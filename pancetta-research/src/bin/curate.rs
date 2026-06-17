@@ -86,7 +86,7 @@ fn discover_wavs(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "wav") {
+        if path.extension().is_some_and(|ext| ext == "wav") {
             out.push(path);
         }
     }

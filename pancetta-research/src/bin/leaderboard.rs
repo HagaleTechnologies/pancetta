@@ -5,7 +5,7 @@
 
 use anyhow::Context;
 use pancetta_research::scorecard::Scorecard;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn workspace_root() -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -14,14 +14,14 @@ fn workspace_root() -> anyhow::Result<PathBuf> {
         .to_path_buf())
 }
 
-fn load_all_scorecards(workspace: &PathBuf) -> anyhow::Result<Vec<(PathBuf, Scorecard)>> {
+fn load_all_scorecards(workspace: &Path) -> anyhow::Result<Vec<(PathBuf, Scorecard)>> {
     let mut out = Vec::new();
     let history = workspace.join("research/scorecards/history");
     if history.exists() {
         for entry in std::fs::read_dir(&history)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |ext| ext == "json") {
+            if path.extension().is_some_and(|ext| ext == "json") {
                 match Scorecard::load(&path) {
                     Ok(c) => out.push((path, c)),
                     Err(e) => eprintln!("warn: skipping {}: {e}", path.display()),

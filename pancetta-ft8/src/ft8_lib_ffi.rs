@@ -438,6 +438,10 @@ pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32, f32)>
     // Decode each candidate
     let mut messages = Vec::new();
     let mut hash_if = make_hash_interface();
+    // rationale: `i` indexes the C-returned `candidates` buffer up to `n_found`
+    // and is used to take `&candidates[i]` for the FFI decode call; the index
+    // form mirrors the ft8_lib C API and keeps this hot FFI loop unambiguous.
+    #[allow(clippy::needless_range_loop)]
     for i in 0..n_found as usize {
         let mut msg: ftx_message_t = unsafe { std::mem::zeroed() };
         let mut status: ftx_decode_status_t = unsafe { std::mem::zeroed() };

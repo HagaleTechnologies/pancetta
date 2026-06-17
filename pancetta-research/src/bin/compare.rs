@@ -160,6 +160,9 @@ fn value_to_string(v: &serde_json::Value) -> String {
 /// where the aligned vectors are `(recovered, truth)` and `(novel, _)`
 /// pairs in the same WAV order — suitable inputs for
 /// `bootstrap_recall_delta` / `bootstrap_novel_delta`.
+// rationale: the 6-tuple return is documented field-by-field inline below; a
+// type alias would hoist the names away from these comments and read worse.
+#[allow(clippy::type_complexity)]
 fn align_per_wav(
     a: &[PerWavRecord],
     b: &[PerWavRecord],

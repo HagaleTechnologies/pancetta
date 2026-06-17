@@ -150,9 +150,9 @@ fn per_wav_seed(
     base_seed
         .wrapping_add(pair_idx as u64)
         .wrapping_mul(1_000_003)
-        .wrapping_add((delta_snr_db.to_bits() as u64).wrapping_mul(7))
-        .wrapping_add((delta_freq_hz.to_bits() as u64).wrapping_mul(13))
-        .wrapping_add((delta_time_s.to_bits() as u64).wrapping_mul(19))
+        .wrapping_add(delta_snr_db.to_bits().wrapping_mul(7))
+        .wrapping_add(delta_freq_hz.to_bits().wrapping_mul(13))
+        .wrapping_add(delta_time_s.to_bits().wrapping_mul(19))
 }
 
 fn slugify(s: &str) -> String {
