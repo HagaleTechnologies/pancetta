@@ -622,6 +622,20 @@ impl DxClusterClient {
         }
     }
 
+    /// Drop dedup entries whose timestamp is older than `duplicate_timeout`
+    /// seconds relative to `now`. Pure/synchronous so it can be unit-tested and
+    /// reused; keeps `recent_spots` bounded by the dedup window rather than by
+    /// the (unbounded) number of distinct spots ever seen.
+    fn prune_recent_spots(
+        recent: &mut HashMap<String, DateTime<Utc>>,
+        now: DateTime<Utc>,
+        duplicate_timeout: u64,
+    ) {
+        recent.retain(|_, &mut t| {
+            now.signed_duration_since(t).num_seconds() < duplicate_timeout as i64
+        });
+    }
+
     /// Convert cluster spot to DxSpot
     async fn convert_cluster_spot(
         cluster_spot: ClusterSpot,
@@ -634,9 +648,10 @@ impl DxClusterClient {
             cluster_spot.callsign, cluster_spot.frequency_khz as u64
         );
         {
+            let now = Utc::now();
             let mut recent = recent_spots.lock().await;
             if let Some(last_time) = recent.get(&spot_key) {
-                let elapsed = Utc::now().signed_duration_since(*last_time);
+                let elapsed = now.signed_duration_since(*last_time);
                 if elapsed.num_seconds() < filter.duplicate_timeout as i64 {
                     return Err(DxError::Configuration(
                         "Duplicate spot filtered".to_string(),
@@ -644,6 +659,11 @@ impl DxClusterClient {
                 }
             }
             recent.insert(spot_key, cluster_spot.time);
+            // Prune entries older than the dedup window. Without this the map
+            // grows unboundedly when a (compromised/MITM) cluster streams
+            // unique spot lines forever; it also clears stale keys that have
+            // aged past the window so they can't linger and mis-dedup.
+            Self::prune_recent_spots(&mut recent, now, filter.duplicate_timeout);
         }
 
         // Convert frequency to Hz
@@ -731,6 +751,35 @@ mod tests {
         let client = DxClusterClient::new();
         assert_eq!(client.config.hostname, "dxc.nc7j.com");
         assert_eq!(client.config.port, 23);
+    }
+
+    #[test]
+    fn test_prune_recent_spots_evicts_old_keeps_fresh() {
+        let now = Utc::now();
+        let timeout: u64 = 300; // 5 minutes
+        let mut recent: HashMap<String, DateTime<Utc>> = HashMap::new();
+        // Older than the window -> should be evicted.
+        recent.insert(
+            "OLD:14074".to_string(),
+            now - chrono::Duration::seconds(timeout as i64 + 1),
+        );
+        // Inside the window -> should be kept.
+        recent.insert(
+            "FRESH:14074".to_string(),
+            now - chrono::Duration::seconds(10),
+        );
+
+        DxClusterClient::prune_recent_spots(&mut recent, now, timeout);
+
+        assert!(
+            !recent.contains_key("OLD:14074"),
+            "stale entry should be pruned"
+        );
+        assert!(
+            recent.contains_key("FRESH:14074"),
+            "fresh entry should be kept"
+        );
+        assert_eq!(recent.len(), 1);
     }
 
     #[test]

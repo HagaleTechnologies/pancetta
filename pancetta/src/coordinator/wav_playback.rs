@@ -5,6 +5,25 @@ use tracing::{debug, info};
 
 use super::util::resample_linear;
 
+/// Compute the integer-PCM normalization scale (`2^(bits-1)`) for a WAV's
+/// `bits_per_sample`, validating it first.
+///
+/// `bits_per_sample` comes straight out of an attacker-controlled WAV header.
+/// Rejecting out-of-range values up front avoids the `bits - 1` u16 underflow
+/// (panic in debug / wrap in release) and the subsequent oversized
+/// `1i64 << (bits - 1)` shift that the naive expression would hit on a
+/// malformed `0` or absurdly large field. Valid PCM widths (8/16/24/32) are
+/// unaffected.
+fn int_sample_max_val(bits_per_sample: u16) -> Result<f32> {
+    if !(1..=32).contains(&bits_per_sample) {
+        anyhow::bail!(
+            "Unsupported WAV bits_per_sample: {} (expected 1..=32)",
+            bits_per_sample
+        );
+    }
+    Ok((1i64 << (bits_per_sample - 1)) as f32)
+}
+
 impl super::ApplicationCoordinator {
     /// Run WAV playback mode: read file, decode, print results, exit.
     pub(crate) async fn run_wav_playback(&self, wav_path: PathBuf) -> Result<()> {
@@ -24,7 +43,7 @@ impl super::ApplicationCoordinator {
         // Read all samples as f32
         let raw_samples: Vec<f32> = match spec.sample_format {
             hound::SampleFormat::Int => {
-                let max_val = (1i64 << (spec.bits_per_sample - 1)) as f32;
+                let max_val = int_sample_max_val(spec.bits_per_sample)?;
                 reader
                     .into_samples::<i32>()
                     .filter_map(|s| s.ok())
@@ -125,5 +144,33 @@ impl super::ApplicationCoordinator {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::int_sample_max_val;
+
+    #[test]
+    fn valid_pcm_widths_match_naive_scale() {
+        for bits in [8u16, 16, 24, 32] {
+            let expected = (1i64 << (bits - 1)) as f32;
+            assert_eq!(int_sample_max_val(bits).unwrap(), expected, "bits={bits}");
+        }
+        // Spot-check boundary value 1.
+        assert_eq!(int_sample_max_val(1).unwrap(), 1.0);
+    }
+
+    #[test]
+    fn zero_bits_is_rejected_not_underflowed() {
+        // Naive `1i64 << (0u16 - 1)` would underflow the u16 subtraction.
+        assert!(int_sample_max_val(0).is_err());
+    }
+
+    #[test]
+    fn oversized_bits_are_rejected_not_overflowed() {
+        // Naive `1i64 << (65535 - 1)` would be an oversized shift.
+        assert!(int_sample_max_val(33).is_err());
+        assert!(int_sample_max_val(u16::MAX).is_err());
     }
 }

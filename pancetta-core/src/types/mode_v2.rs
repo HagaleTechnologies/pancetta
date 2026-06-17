@@ -395,9 +395,11 @@ impl From<super::mode::Mode> for ModeValue {
     }
 }
 
-// Safety: ModeValue is safe to send between threads
-unsafe impl Send for ModeValue {}
-unsafe impl Sync for ModeValue {}
+// ModeValue is Send + Sync automatically: it wraps `Arc<ModeKind>`, and
+// `ModeKind`'s fields (`StandardMode: Copy`, `String`) are all Send + Sync.
+// The previous manual `unsafe impl Send/Sync` was redundant and future-fragile
+// (it would have masked a real unsoundness if a non-thread-safe field were
+// ever added), so it has been removed in favor of the auto-derived bounds.
 
 #[cfg(test)]
 mod tests {
