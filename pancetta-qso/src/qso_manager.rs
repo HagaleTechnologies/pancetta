@@ -3153,6 +3153,176 @@ mod tests {
         assert_eq!(active_for_dx, vec![second], "only the fresh QSO is active");
     }
 
+    // --- Manual re-call dedup regression locks (K9HJZ duplicate-QSO incident)
+    //
+    // Audit (2026-06-17): the manual re-call entry (`respond_to_cq_with`,
+    // Manual) is dedup-safe by construction. (1) FIX 1
+    // (`find_active_manual_qso_for`) continues an ACTIVE manual QSO instead of
+    // spawning a second one. (2) Every terminal transition clears the
+    // `qsos_by_callsign` mapping for that QSO — `cancel_qso` and
+    // `check_timeouts_at` `qsos.remove` it outright, `supersede_active_qsos_for`
+    // marks it `Failed{Superseded}` and removes its mapping — and
+    // `find_active_manual_qso_for` / `supersede_active_qsos_for` both filter on
+    // `state.is_active()`, so a lingering `Failed` record can neither be
+    // "continued" nor block a fresh call. The tests below pin both guarantees
+    // against regression. No production change was required.
+
+    /// REGRESSION LOCK (scenario a): a manual re-call to a callsign that already
+    /// has an ACTIVE QSO must leave EXACTLY ONE active QSO for that callsign —
+    /// never two concurrent ones. Here the prior active QSO is an AUTO QSO (FIX
+    /// 1's "continue" only matches a prior *manual* QSO), so the manual re-call
+    /// takes the supersede path: the older QSO is retired to
+    /// `Failed{Superseded}` and a single fresh manual QSO remains active.
+    #[tokio::test]
+    async fn manual_recall_supersedes_active_qso_leaving_exactly_one() {
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+
+        // Prior ACTIVE (auto) QSO with the DX.
+        let prior = manager
+            .respond_to_cq("K9HJZ".to_string(), freq, None)
+            .await
+            .unwrap();
+        assert!(manager.get_qso(prior).await.unwrap().state.is_active());
+
+        // Operator manually re-calls the same DX on the same band.
+        let recall = manager
+            .respond_to_cq_manual("K9HJZ".to_string(), freq, None)
+            .await
+            .unwrap();
+        assert_ne!(
+            prior, recall,
+            "a non-manual prior QSO is superseded, not continued — fresh id"
+        );
+
+        // The prior QSO is retired (superseded), not still active.
+        let prior_state = manager.get_qso(prior).await.unwrap().state;
+        assert!(
+            matches!(
+                prior_state,
+                QsoState::Failed {
+                    reason: QsoFailureReason::Superseded,
+                    ..
+                }
+            ),
+            "prior active QSO must be superseded → Failed, got {:?}",
+            prior_state
+        );
+
+        // EXACTLY ONE active QSO for the callsign — the new manual one.
+        let active = manager.get_active_qsos().await;
+        let active_for_dx: Vec<_> = active
+            .iter()
+            .filter(|(_, p)| p.metadata.their_callsign.as_deref() == Some("K9HJZ"))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            active_for_dx,
+            vec![recall],
+            "exactly one active QSO (the fresh manual re-call) must remain"
+        );
+
+        // The callsign mapping points only to the surviving QSO — the
+        // superseded one was unmapped, so no stale entry lingers.
+        let mapping = manager.qsos_by_callsign.read().await;
+        assert_eq!(
+            mapping.get("K9HJZ").map(|v| v.as_slice()),
+            Some([recall].as_slice()),
+            "mapping must hold only the surviving QSO, no stale superseded id"
+        );
+    }
+
+    /// REGRESSION LOCK (scenario b): a manual re-call AFTER the prior QSO with
+    /// that callsign was retired by the keep-call WATCHDOG (timed out) must
+    /// start a fresh QSO cleanly — no panic, no stale mapping that misroutes or
+    /// blocks the new call. This exercises the `check_timeouts_at` terminal
+    /// path (distinct from the `cancel_qso` path covered above), which is the
+    /// real "frustrated operator re-call" trigger from the K9HJZ incident.
+    #[tokio::test]
+    async fn manual_recall_after_watchdog_timeout_starts_fresh_cleanly() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 2;
+        config.timeouts.manual_call_watchdog_minutes = 60; // call-count is the binding bound
+        let manager = QsoManager::new(config);
+        let freq = 14074000.0;
+
+        let first = manager
+            .respond_to_cq_manual("K9HJZ".to_string(), freq, None)
+            .await
+            .unwrap();
+
+        // Keep-call until the watchdog cap is reached, then let it retire.
+        let mut t = Utc::now();
+        for _ in 0..4 {
+            t += Duration::seconds(15);
+            manager.rearm_manual_calls_at(t).await;
+        }
+        manager.check_timeouts_at(t).await;
+
+        // The timed-out QSO is gone from the live map AND its callsign mapping
+        // is cleared (no stale entry left behind).
+        assert!(
+            matches!(
+                manager.get_qso(first).await,
+                Err(QsoManagerError::QsoNotFound { .. })
+            ),
+            "watchdog must have removed the timed-out QSO"
+        );
+        assert!(
+            manager.qsos_by_callsign.read().await.get("K9HJZ").is_none(),
+            "timed-out QSO must leave no stale callsign mapping"
+        );
+
+        // The operator re-calls the same DX. It must start a fresh, correctly
+        // routed QSO — not panic, not be blocked, not be misrouted to the dead id.
+        let second = manager
+            .respond_to_cq_manual("K9HJZ".to_string(), freq, None)
+            .await
+            .expect("re-call after watchdog timeout must succeed cleanly");
+        assert_ne!(first, second, "must be a brand-new QSO id");
+
+        let progress = manager.get_qso(second).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "fresh QSO must open in RespondingToCq, got {:?}",
+            progress.state
+        );
+        assert_eq!(
+            progress.metadata.their_callsign.as_deref(),
+            Some("K9HJZ"),
+            "fresh QSO must be routed to the re-called DX"
+        );
+        assert_eq!(
+            progress.metadata.call_count, 1,
+            "fresh QSO must start its own keep-call count, not inherit the old one"
+        );
+
+        // EXACTLY ONE active QSO for the callsign — the fresh one.
+        let active = manager.get_active_qsos().await;
+        let active_for_dx: Vec<_> = active
+            .iter()
+            .filter(|(_, p)| p.metadata.their_callsign.as_deref() == Some("K9HJZ"))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            active_for_dx,
+            vec![second],
+            "exactly one active QSO (the fresh re-call) after a watchdog timeout"
+        );
+
+        // And the mapping points only to it.
+        assert_eq!(
+            manager
+                .qsos_by_callsign
+                .read()
+                .await
+                .get("K9HJZ")
+                .map(|v| v.as_slice()),
+            Some([second].as_slice()),
+            "mapping must point only at the fresh QSO"
+        );
+    }
+
     /// FIX 1: a context-Space reply at a step AHEAD of the existing active
     /// QSO's stage ADVANCES the SAME QSO (no new QSO, no supersede). We open a
     /// manual QSO (RespondingToCq → step rank 0), then context-reply at Rr73
