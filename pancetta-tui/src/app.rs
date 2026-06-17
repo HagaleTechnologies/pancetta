@@ -3364,6 +3364,66 @@ mod tests {
         assert_eq!(sel, chosen, "DX-Hunter cursor must stay on pinned callsign");
     }
 
+    /// Direct DX-Hunter analog of the Band Activity scroll-bump-on-push fix:
+    /// with the operator scrolled DOWN (`dx_hunter_scroll > 0`), a new decode
+    /// that sorts ABOVE the selection (shifting existing rows down by one)
+    /// must not slide the highlight onto the freshly-arrived station. The
+    /// callsign-pin mechanism re-derives `dx_hunter_scroll` from the pinned
+    /// callsign after the list mutation, so the underlying scroll index
+    /// advances in lock-step (the equivalent of Band Activity's `+= 1` bump),
+    /// keeping the operator on the same logical row.
+    #[tokio::test]
+    async fn dx_hunter_scroll_index_tracks_pinned_row_on_new_top_arrival() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+
+        // Three decodes, ascending SNR so display order (snr desc) is
+        // CC3CC, BB2BB, AA1AA top-to-bottom.
+        app.add_decoded_message(fixture_view("AA1AA", -15))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("BB2BB", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("CC3CC", -5))
+            .await
+            .unwrap();
+
+        // Operator scrolls down to row 1 (BB2BB) and pins it.
+        let displayed = app.displayed_dx_stations();
+        assert_eq!(
+            displayed
+                .iter()
+                .map(|s| s.call_sign.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CC3CC", "BB2BB", "AA1AA"]
+        );
+        let chosen = displayed[1].call_sign.clone();
+        assert_eq!(chosen, "BB2BB");
+        app.dx_hunter_scroll = 1;
+        app.repin_dx_hunter();
+
+        // A NEW highest-SNR station arrives and sorts to the very top, pushing
+        // every existing row (including the selection) down by one.
+        app.add_decoded_message(fixture_view("ZZ9ZZ", 20))
+            .await
+            .unwrap();
+
+        // The scroll index must have advanced 1 → 2 so it still points at the
+        // pinned callsign — never at the freshly-arrived ZZ9ZZ at row 0.
+        let displayed = app.displayed_dx_stations();
+        assert_eq!(displayed[0].call_sign, "ZZ9ZZ", "new spot sorts to top");
+        assert_eq!(
+            app.dx_hunter_scroll, 2,
+            "scroll index must bump to keep the highlight on the pinned row"
+        );
+        let (sel, _, _) = app.get_selected_station().expect("a station selected");
+        assert_eq!(
+            sel, chosen,
+            "highlight stays on the operator's chosen station"
+        );
+    }
+
     /// A new caller arriving at row 0 must not shift the operator's selection
     /// off the caller they had pinned.
     #[tokio::test]
