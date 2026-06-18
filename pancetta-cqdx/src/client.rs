@@ -122,6 +122,37 @@ impl CqdxClient {
         Ok(body.needed)
     }
 
+    /// Fetch the operator's needed Maidenhead grid squares from cqdx.io.
+    ///
+    /// GET `/api/v1/entities/needed-grids` → `{"grids": ["JD15", "FN42", ...]}`.
+    /// Returns the grid fields as-is (caller normalizes to the 4-char field).
+    ///
+    /// Graceful degradation: this endpoint is a roadmap item and may not be
+    /// live on the cqdx.io server yet. A `404 Not Found` (endpoint absent) is
+    /// treated as "no needed-grids data" and returns an empty Vec rather than
+    /// an error — mirroring the "empty set = inert" contract of the
+    /// `needed_grids` priority set, so the rest of startup is unaffected.
+    /// Other failures (auth, 5xx, transport) still propagate as errors so the
+    /// caller can log them; the caller leaves the set empty on any error.
+    pub async fn fetch_needed_grids(&self) -> Result<Vec<String>> {
+        let url = format!("{}/api/v1/entities/needed-grids", self.base_url);
+        debug!("Fetching needed grids from {}", url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(self.token.expose_secret())
+            .send()
+            .await?;
+        // Endpoint may not exist yet — treat 404 as "no data" rather than an error.
+        if resp.status().as_u16() == 404 {
+            debug!("needed-grids endpoint not available (404); leaving grid set empty");
+            return Ok(Vec::new());
+        }
+        let resp = self.check_status(resp).await?;
+        let body: NeededGridsResponse = self.checked_json(resp).await?;
+        Ok(body.grids)
+    }
+
     /// Fetch live spot groups from the cqdx.io Durable Object snapshot.
     /// Edge-cached with 10s TTL — safe to poll every 30s.
     pub async fn fetch_live_spots(
@@ -438,6 +469,41 @@ mod tests {
         let needed = client.fetch_needed().await.unwrap();
         assert_eq!(needed.len(), 1);
         assert_eq!(needed[0].entity_id, 327);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_needed_grids() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/entities/needed-grids"))
+            .and(header("Authorization", "Bearer pat_test_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "grids": ["JD15", "FN42", "PM95"]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let grids = client.fetch_needed_grids().await.unwrap();
+        assert_eq!(grids.len(), 3);
+        assert_eq!(grids[0], "JD15");
+        assert!(grids.contains(&"PM95".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_needed_grids_404_graceful() {
+        // The needed-grids endpoint is a roadmap item; a server that hasn't
+        // shipped it yet returns 404. We degrade to an empty Vec, not an error.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/entities/needed-grids"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let grids = client.fetch_needed_grids().await.unwrap();
+        assert!(grids.is_empty());
     }
 
     #[tokio::test]

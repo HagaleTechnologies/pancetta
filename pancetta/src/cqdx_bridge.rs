@@ -13,6 +13,19 @@ use tokio::sync::RwLock;
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
 
+/// Normalize a Maidenhead locator to its 4-character field, uppercased.
+///
+/// cqdx.io may return needed grids as 4-char (`JD15`) or 6-char (`JD15kl`)
+/// locators; the autonomous scorer keys on the 4-char field. Anything shorter
+/// than 4 characters yields an empty string (caller filters these out).
+fn normalize_grid_field(grid: &str) -> String {
+    let trimmed = grid.trim();
+    if trimmed.len() < 4 {
+        return String::new();
+    }
+    trimmed[..4].to_uppercase()
+}
+
 /// Manages the cqdx.io integration lifecycle.
 pub struct CqdxBridge {
     client: CqdxClient,
@@ -74,10 +87,28 @@ impl CqdxBridge {
             needed.iter().map(|n| n.prefix.to_uppercase()).collect();
         self.cached_lookup.update_needed_dxcc(needed_prefixes);
 
-        // TODO: Populate needed_grids when cqdx.io adds a grid-needed endpoint.
-        // Until then, is_needed_grid returns false when the set is empty —
-        // "unknown" means "no bonus" rather than inflating all priority scores.
-        // See: docs/cqdx-api-requirements.md
+        // Populate needed_grids from the (roadmap) grid-needed endpoint.
+        // Graceful-degrade: if the cqdx.io server hasn't shipped
+        // /api/v1/entities/needed-grids yet, fetch_needed_grids returns an
+        // empty Vec on 404, and any other error is swallowed here — the set is
+        // left empty so is_needed_grid returns false ("unknown" = "no bonus"
+        // rather than inflating all priority scores). Once the endpoint is
+        // live, the needed_grid priority weight starts contributing with no
+        // further code change. See: docs/cqdx-api-requirements.md
+        match self.client.fetch_needed_grids().await {
+            Ok(grids) => {
+                let needed_grids: std::collections::HashSet<String> = grids
+                    .iter()
+                    .map(|g| normalize_grid_field(g))
+                    .filter(|g| !g.is_empty())
+                    .collect();
+                info!("Loaded {} needed grids from cqdx.io", needed_grids.len());
+                self.cached_lookup.update_needed_grids(needed_grids);
+            }
+            Err(e) => {
+                debug!("needed-grids fetch failed ({e}); leaving grid set empty (inert)");
+            }
+        }
 
         Ok(())
     }

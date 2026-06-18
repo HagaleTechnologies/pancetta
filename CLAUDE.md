@@ -112,7 +112,7 @@ Design spec: `docs/superpowers/specs/2026-04-02-end-to-end-qso-design.md`
 
 ## Known Gaps and TODOs
 
-- Grid "needed" set never populated (cqdx.io has no grid-needed endpoint yet); `is_needed_grid` returns `false` when empty to avoid inflating scores
+- Grid "needed" set: client + wiring shipped (`CqdxClient::fetch_needed_grids` → `GET /api/v1/entities/needed-grids` → `CachedStationLookup::update_needed_grids`, called in `CqdxBridge::startup` alongside the needed-DXCC refresh). Graceful-degrades to an empty (inert) set on 404/error, so `is_needed_grid` still returns `false` (no score inflation) until the cqdx.io server ships the `/entities/needed-grids` endpoint — at which point the `needed_grid` weight starts contributing with no further code change.
 - cqdx.io `GET /api/v1/spots?live=true` response envelope key (`groups`) unverified against live API — a gated live test exists: `CQDX_TOKEN=pat_xxx cargo test -p pancetta-cqdx test_live_spots_envelope -- --ignored --nocapture`
 - ~~`auto_sequencer::evaluate_cq_call` slot_parity gap~~ — RESOLVED-AS-STALE (2026-06-11 audit): the autonomous CQ-response path threads `tx_parity = cq.slot_parity.opposite()` (`autonomous.rs` RespondToCq build), and live mid-QSO TX flows through `QsoManager::send_message` → `QsoEvent::MessageToSend`, which carries the parity latched at QSO start. The only `tx_parity: None` site (`autonomous.rs` pending_sequencer_messages drain) has no production caller; documented in-code.
 

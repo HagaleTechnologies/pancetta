@@ -280,7 +280,14 @@ impl WorkedStationLookup for CachedStationLookup {
         if needed.is_empty() {
             return false;
         }
-        needed.contains(&grid.to_uppercase())
+        // Compare on the 4-char Maidenhead field, uppercased. The DX's
+        // decoded grid may be 4 or 6 chars; the cqdx-populated set is stored
+        // as 4-char fields (see CqdxBridge::startup normalization).
+        let trimmed = grid.trim();
+        if trimmed.len() < 4 {
+            return false;
+        }
+        needed.contains(&trimmed[..4].to_uppercase())
     }
 
     fn rarity(&self, callsign: &str) -> f64 {
@@ -419,6 +426,37 @@ mod tests {
         assert!(!lookup.is_needed_dxcc("JA1ABC"));
         // 3Y/B1234 — is in cqdx-needed
         assert!(lookup.is_needed_dxcc("3Y/B1234"));
+    }
+
+    #[test]
+    fn test_needed_grids_empty_set_is_inert() {
+        // No cqdx grid data loaded: nothing is "needed" — preserves the
+        // historical behavior so the needed_grid weight doesn't inflate
+        // every score.
+        let lookup = CachedStationLookup::new();
+        assert!(!lookup.is_needed_grid("FN42"));
+        assert!(!lookup.is_needed_grid("JD15"));
+    }
+
+    #[test]
+    fn test_update_needed_grids_marks_needed() {
+        let lookup = CachedStationLookup::new();
+        let mut needed = HashSet::new();
+        needed.insert("JD15".to_string());
+        needed.insert("FN42".to_string());
+        lookup.update_needed_grids(needed);
+
+        // In the set — needed.
+        assert!(lookup.is_needed_grid("JD15"));
+        assert!(lookup.is_needed_grid("FN42"));
+        // Case-insensitive match.
+        assert!(lookup.is_needed_grid("jd15"));
+        // 6-char locator normalizes to its 4-char field before comparison.
+        assert!(lookup.is_needed_grid("JD15kl"));
+        // Not in the set — not needed.
+        assert!(!lookup.is_needed_grid("PM95"));
+        // Too short to be a valid field — not needed.
+        assert!(!lookup.is_needed_grid("JD"));
     }
 
     #[test]

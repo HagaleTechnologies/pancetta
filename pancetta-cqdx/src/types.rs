@@ -45,6 +45,18 @@ pub struct NeededResponse {
     pub needed: Vec<NeededEntity>,
 }
 
+/// Response envelope for `GET /api/v1/entities/needed-grids`.
+///
+/// The needed-grids endpoint returns the Maidenhead grid squares the operator
+/// still needs as a flat list of grid-field strings (e.g. `["JD15", "FN42"]`).
+/// Mirrors the `needed` envelope of [`NeededResponse`]. The endpoint may not
+/// exist on the cqdx.io server yet — see `CqdxClient::fetch_needed_grids`,
+/// which degrades gracefully (empty list) when it is absent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NeededGridsResponse {
+    pub grids: Vec<String>,
+}
+
 // --- Live Spot Groups ---
 
 /// A spot group from the cqdx.io live feed, aggregated by (dxCall, band, mode).
