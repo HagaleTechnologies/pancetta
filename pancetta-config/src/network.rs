@@ -48,6 +48,14 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub qrz_logbook: QrzLogbookConfig,
 
+    /// LoTW (TQSL-signed) QSO upload configuration (opt-in; default disabled)
+    #[serde(default)]
+    pub lotw: LotwUploadConfig,
+
+    /// eQSL.cc QSO upload configuration (opt-in; default disabled)
+    #[serde(default)]
+    pub eqsl: EqslConfig,
+
     /// Custom service integrations
     #[serde(default)]
     pub custom_services: HashMap<String, CustomServiceConfig>,
@@ -98,6 +106,56 @@ pub struct QrzLogbookConfig {
     /// Per-logbook API access key (from the QRZ logbook Settings page).
     #[serde(default)]
     pub api_key: String,
+}
+
+/// LoTW (Logbook of the World) per-QSO upload configuration.
+///
+/// LoTW requires every record to be digitally signed with the operator's TQSL
+/// certificate, so pancetta shells out to the operator's installed `tqsl` CLI
+/// rather than raw-POSTing ADIF. When [`enabled`](Self::enabled) is `true`,
+/// each completed QSO is signed + uploaded via `tqsl`. No credential value is
+/// ever logged; the certificate lives in the operator's TQSL install.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct LotwUploadConfig {
+    /// Enable per-QSO signed uploads to LoTW.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Path to the operator's `tqsl` binary (e.g. `/usr/bin/tqsl`,
+    /// `C:\\Program Files (x86)\\TrustedQSL\\tqsl.exe`).
+    #[serde(default)]
+    pub tqsl_path: String,
+
+    /// The TQSL "Station Location" name the operator configured in TQSL. TQSL
+    /// uses this to select the certificate + station details for signing.
+    #[serde(default)]
+    pub station_location: String,
+}
+
+/// eQSL.cc per-QSO upload configuration.
+///
+/// When [`enabled`](Self::enabled) is `true`, each completed QSO is POSTed as
+/// a single ADIF record to eQSL.cc's `importADIF.cfm` endpoint. The account
+/// credentials stay on the operator's machine (keep the config file
+/// `chmod 600`) and are never logged.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct EqslConfig {
+    /// Enable per-QSO uploads to eQSL.cc.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// eQSL.cc account username.
+    #[serde(default)]
+    pub username: String,
+
+    /// eQSL.cc account password.
+    #[serde(default)]
+    pub password: String,
+
+    /// Optional QTH nickname (eQSL "Profile" name) when the account has more
+    /// than one location configured. Left empty for single-location accounts.
+    #[serde(default)]
+    pub qth_nickname: String,
 }
 
 /// PSKReporter service configuration
@@ -1179,6 +1237,35 @@ impl ConfigSection for NetworkConfig {
             ));
         }
 
+        // LoTW upload validation — signing requires the tqsl binary path AND
+        // the TQSL Station Location name.
+        if self.lotw.enabled {
+            if self.lotw.tqsl_path.is_empty() {
+                return Err(ConfigError::Validation(
+                    "LoTW upload enabled but no tqsl_path configured".to_string(),
+                ));
+            }
+            if self.lotw.station_location.is_empty() {
+                return Err(ConfigError::Validation(
+                    "LoTW upload enabled but no station_location configured".to_string(),
+                ));
+            }
+        }
+
+        // eQSL upload validation — enabling requires the account credentials.
+        if self.eqsl.enabled {
+            if self.eqsl.username.is_empty() {
+                return Err(ConfigError::Validation(
+                    "eQSL upload enabled but no username configured".to_string(),
+                ));
+            }
+            if self.eqsl.password.is_empty() {
+                return Err(ConfigError::Validation(
+                    "eQSL upload enabled but no password configured".to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -1365,6 +1452,57 @@ mod tests {
         assert!(config.validate_section().is_err());
 
         config.qrz_logbook.api_key = "qrzkey123".to_string();
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_lotw_defaults_disabled() {
+        let config = NetworkConfig::default();
+        assert!(!config.lotw.enabled);
+        assert!(config.lotw.tqsl_path.is_empty());
+        assert!(config.lotw.station_location.is_empty());
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_lotw_validation_enabled_without_creds_fails() {
+        let mut config = NetworkConfig::default();
+        config.lotw.enabled = true;
+        // No tqsl_path / station_location.
+        assert!(config.validate_section().is_err());
+
+        // tqsl_path only — still missing station_location.
+        config.lotw.tqsl_path = "/usr/bin/tqsl".to_string();
+        assert!(config.validate_section().is_err());
+
+        // Both present.
+        config.lotw.station_location = "Home Station".to_string();
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_eqsl_defaults_disabled() {
+        let config = NetworkConfig::default();
+        assert!(!config.eqsl.enabled);
+        assert!(config.eqsl.username.is_empty());
+        assert!(config.eqsl.password.is_empty());
+        assert!(config.eqsl.qth_nickname.is_empty());
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_eqsl_validation_enabled_without_creds_fails() {
+        let mut config = NetworkConfig::default();
+        config.eqsl.enabled = true;
+        // No creds.
+        assert!(config.validate_section().is_err());
+
+        // Username only — still missing password.
+        config.eqsl.username = "K5ARH".to_string();
+        assert!(config.validate_section().is_err());
+
+        // Both present (qth_nickname may stay empty).
+        config.eqsl.password = "secret".to_string();
         assert!(config.validate_section().is_ok());
     }
 }

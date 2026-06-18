@@ -275,6 +275,8 @@ impl super::ApplicationCoordinator {
         // enabled do we build clients + spawn the upload subscriber.
         let clublog_cfg = config.network.clublog.clone();
         let qrz_cfg = config.network.qrz_logbook.clone();
+        let lotw_cfg = config.network.lotw.clone();
+        let eqsl_cfg = config.network.eqsl.clone();
         let cqdx_cfg = config.network.cqdx.clone();
         drop(config);
 
@@ -283,7 +285,11 @@ impl super::ApplicationCoordinator {
         // `[network.cqdx]` token gates the spot-poller bridge; here it drives
         // the per-QSO logbook POST to `POST /api/v1/qsos`.)
         let cqdx_upload_enabled = cqdx_logbook_upload_enabled(&cqdx_cfg);
-        let upload_enabled = clublog_cfg.enabled || qrz_cfg.enabled || cqdx_upload_enabled;
+        let upload_enabled = clublog_cfg.enabled
+            || qrz_cfg.enabled
+            || lotw_cfg.enabled
+            || eqsl_cfg.enabled
+            || cqdx_upload_enabled;
 
         let qso_lookup = self.cached_lookup.clone();
         let upload_our_callsign = our_callsign.clone();
@@ -395,6 +401,8 @@ impl super::ApplicationCoordinator {
                     start_qso_upload_subscriber(
                         clublog_cfg.clone(),
                         qrz_cfg.clone(),
+                        lotw_cfg.clone(),
+                        eqsl_cfg.clone(),
                         cqdx_cfg.clone(),
                         upload_our_callsign.clone(),
                         qso_manager.subscribe(),
@@ -2167,6 +2175,8 @@ fn cqdx_record_from_metadata(
 fn start_qso_upload_subscriber(
     clublog_cfg: pancetta_config::network::ClubLogConfig,
     qrz_cfg: pancetta_config::network::QrzLogbookConfig,
+    lotw_cfg: pancetta_config::network::LotwUploadConfig,
+    eqsl_cfg: pancetta_config::network::EqslConfig,
     cqdx_cfg: pancetta_config::network::CqdxConfig,
     our_callsign: String,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
@@ -2195,6 +2205,36 @@ fn start_qso_upload_subscriber(
     let qrz_client = if qrz_cfg.enabled {
         Some(Arc::new(pancetta_dx::QrzLogbookClient::new(
             qrz_cfg.api_key.clone(),
+        )))
+    } else {
+        None
+    };
+
+    // eQSL.cc client. Opt-in: enabled + username/password (config validation
+    // already rejects enabled-without-creds). QTH nickname is optional.
+    let eqsl_client = if eqsl_cfg.enabled {
+        let nick = if eqsl_cfg.qth_nickname.is_empty() {
+            None
+        } else {
+            Some(eqsl_cfg.qth_nickname.clone())
+        };
+        Some(Arc::new(pancetta_dx::EqslClient::new(
+            eqsl_cfg.username.clone(),
+            eqsl_cfg.password.clone(),
+            nick,
+        )))
+    } else {
+        None
+    };
+
+    // LoTW client. Opt-in: enabled + tqsl_path + station_location (config
+    // validation already rejects enabled-without-creds). Signs + uploads each
+    // QSO by shelling out to the operator's tqsl CLI; a missing/erroring tqsl
+    // is logged best-effort and never takes down the subscriber.
+    let lotw_client = if lotw_cfg.enabled {
+        Some(Arc::new(pancetta_dx::LotwUploadClient::new(
+            lotw_cfg.tqsl_path.clone(),
+            lotw_cfg.station_location.clone(),
         )))
     } else {
         None
@@ -2229,6 +2269,12 @@ fn start_qso_upload_subscriber(
     }
     if qrz_client.is_some() {
         info!(target: "qso.upload", "QRZ Logbook per-QSO upload enabled");
+    }
+    if eqsl_client.is_some() {
+        info!(target: "qso.upload", "eQSL.cc per-QSO upload enabled");
+    }
+    if lotw_client.is_some() {
+        info!(target: "qso.upload", "LoTW per-QSO (TQSL-signed) upload enabled");
     }
     if cqdx_client.is_some() {
         info!(target: "qso.upload", "cqdx.io per-QSO logbook upload enabled");
@@ -2296,6 +2342,55 @@ fn start_qso_upload_subscriber(
                                 Err(e) => warn!(
                                     target: "qso.upload",
                                     "QRZ: upload failed for {}: {}", their, e
+                                ),
+                            }
+                        });
+                    }
+
+                    // eQSL.cc takes the same rendered ADIF record (the client
+                    // prepends an ADIF header carrying the account credentials).
+                    if let Some(client) = eqsl_client.clone() {
+                        let record = record.clone();
+                        let their = their.clone();
+                        tokio::spawn(async move {
+                            match client.upload_adif(&record).await {
+                                Ok(pancetta_dx::QsoUploadOutcome::Logged) => info!(
+                                    target: "qso.upload",
+                                    "eQSL: uploaded QSO with {}", their
+                                ),
+                                Ok(pancetta_dx::QsoUploadOutcome::Duplicate) => info!(
+                                    target: "qso.upload",
+                                    "eQSL: QSO with {} already logged (duplicate, skipped)",
+                                    their
+                                ),
+                                Err(e) => warn!(
+                                    target: "qso.upload",
+                                    "eQSL: upload failed for {}: {}", their, e
+                                ),
+                            }
+                        });
+                    }
+
+                    // LoTW signs + uploads the same rendered ADIF record by
+                    // shelling out to the operator's tqsl CLI. Best-effort: a
+                    // missing/erroring tqsl never blocks or fails the pipeline.
+                    if let Some(client) = lotw_client.clone() {
+                        let record = record.clone();
+                        let their = their.clone();
+                        tokio::spawn(async move {
+                            match client.upload_adif(&record).await {
+                                Ok(pancetta_dx::QsoUploadOutcome::Logged) => info!(
+                                    target: "qso.upload",
+                                    "LoTW: signed + uploaded QSO with {}", their
+                                ),
+                                Ok(pancetta_dx::QsoUploadOutcome::Duplicate) => info!(
+                                    target: "qso.upload",
+                                    "LoTW: QSO with {} already logged (duplicate, skipped)",
+                                    their
+                                ),
+                                Err(e) => warn!(
+                                    target: "qso.upload",
+                                    "LoTW: upload failed for {}: {}", their, e
                                 ),
                             }
                         });

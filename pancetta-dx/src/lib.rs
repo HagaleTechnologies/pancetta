@@ -14,13 +14,23 @@
 //! - [`pskreporter`] — uploads locally-decoded FT8 messages to the
 //!   global PSKReporter database for reciprocal spot visibility.
 //!
+//! ## Per-QSO log upload (opt-in)
+//!
+//! - [`qso_upload`] — per-QSO upload clients wired into the coordinator's
+//!   `start_qso_upload_subscriber`, all opt-in (default disabled):
+//!   [`ClubLogClient`] / [`QrzLogbookClient`] (raw ADIF POST), [`EqslClient`]
+//!   (ADIF POST to eQSL.cc's `importADIF.cfm`), and [`LotwUploadClient`]
+//!   (shells out to the operator's `tqsl` CLI to sign + upload, since LoTW
+//!   requires a TQSL digital signature). Credentials stay local and are never
+//!   logged.
+//!
 //! ## Scaffolding
 //!
-//! - [`lotw`] — ARRL LoTW client with login + ADIF upload + QSL download
-//!   wired but no caller yet. The credentialed-integration build-out is
-//!   tracked under `docs/superpowers/specs/`. Until then the module is
-//!   covered by the HTTPS scheme guard tests but isn't run from the
-//!   coordinator.
+//! - [`lotw`] — ARRL LoTW *web-scrape* client (login + bulk ADIF upload + QSL
+//!   download) wired but with no coordinator caller. The per-QSO signed-upload
+//!   path lives in [`qso_upload`] instead (it shells out to `tqsl`). This
+//!   module remains for future bulk-confirmation download and is covered by the
+//!   HTTPS scheme guard tests.
 //!
 //! ## What used to live here
 //!
@@ -44,7 +54,10 @@ pub mod lotw;
 pub mod pskreporter;
 pub mod qso_upload;
 
-pub use qso_upload::{ClubLogClient, QrzInsertOutcome, QrzLogbookClient};
+pub use qso_upload::{
+    ClubLogClient, EqslClient, LotwClient as LotwUploadClient, QrzInsertOutcome, QrzLogbookClient,
+    QsoUploadOutcome,
+};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
