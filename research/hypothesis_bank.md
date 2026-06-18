@@ -6242,9 +6242,9 @@ search to in-repo sources.
 
     Journal: research/experiments/2026-06-07-batch-43.md
 
-### hb-228 — JTDX 3-method spectral sweep (sqrt/power/L1 magnitudes)  [PRIORITY: 0.60, spawned 2026-06-07 Batch 43, HIGHEST-PRIORITY NEW]
+### hb-228 — JTDX 3-method spectral sweep (sqrt/power/L1 magnitudes)  [SHELVED-NULL 2026-06-18 — +0 TP / +0 FP at N=50 AND N=200 on raw_530_full; byte-identical decodes, +2s/+5s wall confirms the extra passes ran. Mechanism: pancetta's Costas peak LOCATIONS are compression-invariant (sqrt/linear/power peak at the same (t,f); compression only rescales scores → union dedups back to the same candidate set → extra candidates are decode-dead). Same shape as hb-117 (scale-invariance) / hb-090 (energy-not-there). Gated flag `three_method_spectral_sweep_enabled` + probe `examples/hb228_three_method_sweep.rs` kept dormant (default-OFF) for cheap re-test on Doppler/storm corpora. Note: `research/notes/2026-06-18-hb228-three-method-sweep.md`.]
   mode: ft8
-  status: PROPOSED-FROM-RESEARCH — JTDX runs Costas sync on 3 different magnitude maps from the SAME FFT (sqrt(re²+im²), re²+im², |re|+|im|), each with different syncmin threshold. Different signals pop under different metrics. Truly orthogonal to pancetta's residual-subtract mp=2.
+  status: SHELVED-NULL (was PROPOSED-FROM-RESEARCH) — JTDX runs Costas sync on 3 different magnitude maps from the SAME FFT (sqrt(re²+im²), re²+im², |re|+|im|), each with different syncmin threshold. Premise (different signals pop under different metrics) does NOT hold in pancetta's sync formulation: the metrics rescale scores but the peak (t,f) locations are identical, so the union adds no new candidate LOCATIONS. Contrast hb-225 (sub-bin grid) which genuinely MOVES peak locations and is corroborated +33 TP.
   priority_score: 0.60
   estimated_effort: ~1 day (~150 LOC); FFT cost amortized across 3 magnitude maps
   expected_delta: largest expected recall lift among new findings per agent assessment; not numerically published but JTDX users report sensitivity gain (the ">i7/>3GHz" CPU req is mostly this)

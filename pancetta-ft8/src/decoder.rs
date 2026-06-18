@@ -933,6 +933,16 @@ pub struct Ft8Config {
     /// `try_decode` with `do_third = 2`). Peer GPL-3.0 source was not
     /// consulted.
     pub three_stage_sync_cascade_enabled: bool,
+
+    /// hb-228 (JTDX 3-method spectral sweep): on the initial decode pass, also
+    /// run the Costas sync search over `Sqrt`- and `Linear`-compressed
+    /// spectrograms built from the same audio, and UNION the candidates with the
+    /// default `Power`-map candidates (dedup by (time,freq), best score kept,
+    /// capped at `max_sync_candidates`). Each compression surfaces a slightly
+    /// different candidate population; the union widens recall before the
+    /// unchanged downstream CRC/LDPC gating. Costs ~2 extra FFT+sync passes on
+    /// pass 0 only. Default **false** (research opt-in).
+    pub three_method_spectral_sweep_enabled: bool,
     /// WSJT-X Improved-style a8 sequenced-QSO-state AP. When `true`
     /// AND the supplied `ApContext.active_qso` carries a non-empty
     /// `expected_next_message_texts` list AND `ApContext.my_call` is
@@ -1342,6 +1352,7 @@ impl Default for Ft8Config {
             // is byte-identical to the legacy path. Inspired by spec
             // ref `spec-ft8mon-three-stage-sync-cascade.md`.
             three_stage_sync_cascade_enabled: false,
+            three_method_spectral_sweep_enabled: false,
             // WSJT-X Improved-style a8 sequenced-QSO-state AP. Default
             // OFF — preserves byte-identical legacy AP3/AP4 confidence
             // gating. Flip on to relax the AP floor for decodes that
@@ -1437,6 +1448,22 @@ struct CostasCandidate {
     /// 0.0 = integer-bin alignment (unrefined). Currently unused in
     /// symbol extraction — that wiring is hb-044 part 2.
     time_refinement: f64,
+}
+
+/// hb-228: per-bin magnitude compression used when building the sync
+/// spectrogram. The JTDX "3-method spectral sweep" runs the Costas sync search
+/// over three compressions of the SAME FFT and unions the candidates — each
+/// compression surfaces a slightly different candidate population (power
+/// emphasizes strong peaks; sqrt flattens the dynamic range, helping weak /
+/// co-channel peaks clear the neighbor-difference sync threshold).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MagnitudeTransform {
+    /// `|X|^2` — the historical default (reproduces prior behavior exactly).
+    Power,
+    /// `|X|` — linear amplitude (L1).
+    Linear,
+    /// `|X|^0.5` — sqrt-compressed.
+    Sqrt,
 }
 
 /// hb-250 premise probe (Batch 91): one record per sync candidate that
@@ -2061,6 +2088,46 @@ impl Ft8Decoder {
             };
             let mut sync_candidates =
                 self.costas_sync_search_partner(&spectrogram, effective_scope, partner_freq_hz)?;
+
+            // hb-228: 3-method spectral sweep. On the initial pass, also run the
+            // Costas sync search over sqrt- and linear-compressed spectrograms
+            // built from the SAME audio and UNION the candidates (dedup by
+            // (time,freq) keeping the best sync score, then restore the cap).
+            // Each compression surfaces a slightly different candidate
+            // population; the union widens recall before the (unchanged)
+            // downstream decode/CRC/LDPC gating. Pass-0-only — multipass already
+            // re-searches the subtracted residual.
+            if self.config.three_method_spectral_sweep_enabled && pass == 0 {
+                for transform in [MagnitudeTransform::Sqrt, MagnitudeTransform::Linear] {
+                    if let Ok(alt_spec) = self.compute_spectrogram_with(&audio, transform) {
+                        if let Ok(extra) = self.costas_sync_search_partner(
+                            &alt_spec,
+                            effective_scope,
+                            partner_freq_hz,
+                        ) {
+                            sync_candidates.extend(extra);
+                        }
+                    }
+                }
+                // Dedup exact (time,freq) collisions, keeping the highest sync
+                // score, then re-sort best-first and restore the configured cap.
+                sync_candidates.sort_by(|a, b| {
+                    (a.time_step, a.freq_bin, a.freq_sub)
+                        .cmp(&(b.time_step, b.freq_bin, b.freq_sub))
+                        .then(
+                            b.sync_score
+                                .partial_cmp(&a.sync_score)
+                                .unwrap_or(std::cmp::Ordering::Equal),
+                        )
+                });
+                sync_candidates.dedup_by_key(|c| (c.time_step, c.freq_bin, c.freq_sub));
+                sync_candidates.sort_by(|a, b| {
+                    b.sync_score
+                        .partial_cmp(&a.sync_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                sync_candidates.truncate(self.config.max_sync_candidates);
+            }
 
             // On passes 2+, reduce candidate count — strong signals are already
             // decoded and subtracted, so fewer candidates need evaluation.
@@ -3325,6 +3392,18 @@ impl Ft8Decoder {
     /// - Window includes 2.0/nfft normalization (baked in at init)
     /// - Frequency oversampling via freq_osr sub-bins
     fn compute_spectrogram(&self, audio: &[f64]) -> Ft8Result<Spectrogram> {
+        self.compute_spectrogram_with(audio, MagnitudeTransform::Power)
+    }
+
+    /// hb-228: spectrogram builder parameterized by per-bin magnitude
+    /// compression (see [`MagnitudeTransform`]). `Power` reproduces the
+    /// historical behavior byte-for-byte; `Linear`/`Sqrt` feed the 3-method
+    /// spectral sweep's extra Costas sync passes.
+    fn compute_spectrogram_with(
+        &self,
+        audio: &[f64],
+        transform: MagnitudeTransform,
+    ) -> Ft8Result<Spectrogram> {
         let pp = &self.protocol_params;
         let block_size = pp.samples_per_symbol(SAMPLE_RATE); // 1920
         let freq_osr = FREQ_OSR; // 2
@@ -3426,8 +3505,14 @@ impl Ft8Decoder {
                         let src_bin = bin * freq_osr + fs;
                         if src_bin < nfft / 2 + 1 {
                             let cval = fft_buffer[src_bin];
-                            let mag2 = cval.norm_sqr();
-                            let db = 10.0 * (1e-12f64 + mag2).log10();
+                            // hb-228: per-bin magnitude compression. `Power`
+                            // (|X|^2) is the historical default.
+                            let m = match transform {
+                                MagnitudeTransform::Power => cval.norm_sqr(),
+                                MagnitudeTransform::Linear => cval.norm(),
+                                MagnitudeTransform::Sqrt => cval.norm().sqrt(),
+                            };
+                            let db = 10.0 * (1e-12f64 + m).log10();
                             row.push(db);
                             if let Some(c) = crow.as_mut() {
                                 c.push(cval);
@@ -13984,6 +14069,17 @@ mod three_stage_sync_tests {
             "Ft8Config::default().three_stage_sync_cascade_enabled must \
              be false; flipping the default-ON requires a hard-200 \
              measurement (spec §'do_third == 1 vs 2')"
+        );
+    }
+
+    #[test]
+    fn default_config_keeps_three_method_spectral_sweep_off() {
+        let cfg = Ft8Config::default();
+        assert!(
+            !cfg.three_method_spectral_sweep_enabled,
+            "Ft8Config::default().three_method_spectral_sweep_enabled must be \
+             false (hb-228 is research opt-in; flipping default-ON requires a \
+             corpus measurement showing ΔTPs>0 at ΔFPs≤2·ΔTPs)"
         );
     }
 
