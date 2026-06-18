@@ -1161,7 +1161,6 @@ impl App {
         }
     }
 
-
     pub fn clear_messages(&mut self) {
         self.decoded_messages.clear();
         self.band_activity_scroll = 0;
