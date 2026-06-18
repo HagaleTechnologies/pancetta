@@ -2172,6 +2172,10 @@ fn cqdx_record_from_metadata(
     })
 }
 
+// rationale: one explicit config arg per upload destination (ClubLog, QRZ,
+// cqdx, LoTW, eQSL) plus the event source + shared handles — bundling them into
+// a struct would just move the same fields without improving clarity.
+#[allow(clippy::too_many_arguments)]
 fn start_qso_upload_subscriber(
     clublog_cfg: pancetta_config::network::ClubLogConfig,
     qrz_cfg: pancetta_config::network::QrzLogbookConfig,
