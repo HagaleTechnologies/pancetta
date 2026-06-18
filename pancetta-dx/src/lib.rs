@@ -52,8 +52,10 @@
 pub mod cluster;
 pub mod lotw;
 pub mod pskreporter;
+pub mod qrz_xml;
 pub mod qso_upload;
 
+pub use qrz_xml::{QrzLookup, QrzXmlClient};
 pub use qso_upload::{
     ClubLogClient, EqslClient, LotwClient as LotwUploadClient, QrzInsertOutcome, QrzLogbookClient,
     QsoUploadOutcome,

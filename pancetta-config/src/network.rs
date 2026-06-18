@@ -56,6 +56,10 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub eqsl: EqslConfig,
 
+    /// QRZ.com paid XML callsign-lookup configuration (opt-in; default disabled)
+    #[serde(default)]
+    pub qrz_xml: QrzXmlConfig,
+
     /// Custom service integrations
     #[serde(default)]
     pub custom_services: HashMap<String, CustomServiceConfig>,
@@ -156,6 +160,33 @@ pub struct EqslConfig {
     /// than one location configured. Left empty for single-location accounts.
     #[serde(default)]
     pub qth_nickname: String,
+}
+
+/// QRZ.com paid XML callsign-lookup configuration.
+///
+/// When [`enabled`](Self::enabled) is `true`, pancetta may use the operator's
+/// paid QRZ XML subscription to look up callsign metadata (name, grid, DXCC,
+/// country, state) for read-side enrichment. This is a **credentialed,
+/// per-operator paid subscription** that cannot be proxied through cqdx.io, so
+/// the credentials stay on the operator's machine (keep the config file
+/// `chmod 600`) and are never logged.
+///
+/// The client ([`QrzXmlClient`](../../pancetta_dx/struct.QrzXmlClient.html)) is
+/// a scaffold: it is not yet wired into the decode/priority hot path (a later
+/// operator decision).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct QrzXmlConfig {
+    /// Enable QRZ XML callsign lookups.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// QRZ.com account username (callsign or login).
+    #[serde(default)]
+    pub username: String,
+
+    /// QRZ.com account password.
+    #[serde(default)]
+    pub password: String,
 }
 
 /// PSKReporter service configuration
@@ -1266,6 +1297,21 @@ impl ConfigSection for NetworkConfig {
             }
         }
 
+        // QRZ XML lookup validation — enabling requires the paid subscription
+        // username + password.
+        if self.qrz_xml.enabled {
+            if self.qrz_xml.username.is_empty() {
+                return Err(ConfigError::Validation(
+                    "QRZ XML lookup enabled but no username configured".to_string(),
+                ));
+            }
+            if self.qrz_xml.password.is_empty() {
+                return Err(ConfigError::Validation(
+                    "QRZ XML lookup enabled but no password configured".to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -1465,6 +1511,15 @@ mod tests {
     }
 
     #[test]
+    fn test_qrz_xml_defaults_disabled() {
+        let config = NetworkConfig::default();
+        assert!(!config.qrz_xml.enabled);
+        assert!(config.qrz_xml.username.is_empty());
+        assert!(config.qrz_xml.password.is_empty());
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
     fn test_lotw_validation_enabled_without_creds_fails() {
         let mut config = NetworkConfig::default();
         config.lotw.enabled = true;
@@ -1503,6 +1558,22 @@ mod tests {
 
         // Both present (qth_nickname may stay empty).
         config.eqsl.password = "secret".to_string();
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_qrz_xml_validation_enabled_without_creds_fails() {
+        let mut config = NetworkConfig::default();
+        config.qrz_xml.enabled = true;
+        // No creds at all.
+        assert!(config.validate_section().is_err());
+
+        // Username only — still missing password.
+        config.qrz_xml.username = "K5ARH".to_string();
+        assert!(config.validate_section().is_err());
+
+        // Both present — valid.
+        config.qrz_xml.password = "secret".to_string();
         assert!(config.validate_section().is_ok());
     }
 }
