@@ -278,6 +278,11 @@ impl super::ApplicationCoordinator {
         let lotw_cfg = config.network.lotw.clone();
         let eqsl_cfg = config.network.eqsl.clone();
         let cqdx_cfg = config.network.cqdx.clone();
+        // QRZ paid-XML callsign lookup — a gated, best-effort enrichment that
+        // fills a MISSING their-grid (and name/dxcc for logging) on a completed
+        // QSO's metadata before the ADIF record is rendered for upload.
+        // Default-off; only the upload subscriber consumes it.
+        let qrz_xml_cfg = config.network.qrz_xml.clone();
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -285,11 +290,19 @@ impl super::ApplicationCoordinator {
         // `[network.cqdx]` token gates the spot-poller bridge; here it drives
         // the per-QSO logbook POST to `POST /api/v1/qsos`.)
         let cqdx_upload_enabled = cqdx_logbook_upload_enabled(&cqdx_cfg);
+        // QRZ XML enrichment is gated on `enabled` + creds (config validation
+        // already rejects enabled-without-creds). When it (and only it) is on,
+        // we still want the subscriber so completed QSOs get grid enrichment —
+        // even with no upload target the enriched record costs nothing.
+        let qrz_xml_enabled = qrz_xml_cfg.enabled
+            && !qrz_xml_cfg.username.is_empty()
+            && !qrz_xml_cfg.password.is_empty();
         let upload_enabled = clublog_cfg.enabled
             || qrz_cfg.enabled
             || lotw_cfg.enabled
             || eqsl_cfg.enabled
-            || cqdx_upload_enabled;
+            || cqdx_upload_enabled
+            || qrz_xml_enabled;
 
         let qso_lookup = self.cached_lookup.clone();
         let upload_our_callsign = our_callsign.clone();
@@ -393,10 +406,12 @@ impl super::ApplicationCoordinator {
                     }
                 };
 
-                // Per-QSO log-upload subscriber (ClubLog + QRZ Logbook + cqdx.io).
-                // Opt-in: only spawned when at least one is enabled. Best-effort
-                // and fully decoupled from the QSO pipeline — each upload runs in
-                // its own task so a slow/failing service never blocks logging.
+                // Per-QSO log-upload subscriber (ClubLog + QRZ Logbook + cqdx.io
+                // + eQSL + LoTW), with optional QRZ-XML grid enrichment applied
+                // first. Opt-in: only spawned when at least one upload target OR
+                // QRZ XML enrichment is enabled. Best-effort and fully decoupled
+                // from the QSO pipeline — each upload runs in its own task so a
+                // slow/failing service never blocks logging.
                 if upload_enabled {
                     start_qso_upload_subscriber(
                         clublog_cfg.clone(),
@@ -404,6 +419,7 @@ impl super::ApplicationCoordinator {
                         lotw_cfg.clone(),
                         eqsl_cfg.clone(),
                         cqdx_cfg.clone(),
+                        qrz_xml_cfg.clone(),
                         upload_our_callsign.clone(),
                         qso_manager.subscribe(),
                         shutdown.clone(),
@@ -2172,6 +2188,155 @@ fn cqdx_record_from_metadata(
     })
 }
 
+/// Result of merging a QRZ lookup into a completed QSO's metadata. Returned by
+/// the pure [`merge_qrz_lookup`] so the merge policy can be unit-tested without
+/// any network or `QrzXmlClient`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct QrzMergeResult {
+    /// `true` if a missing grid was filled from the QRZ lookup.
+    grid_filled: bool,
+    /// `true` if a name was appended to notes (for logging/display only).
+    name_added: bool,
+}
+
+/// Merge a QRZ lookup into the QSO metadata, **only filling MISSING fields**.
+///
+/// Policy (additive, never overrides decoded/cqdx data):
+///   - `grids.theirs`: filled iff currently empty AND the QRZ grid is a valid
+///     Maidenhead locator (validated via [`pancetta_core::GridSquare`]).
+///   - operator `name` / `dxcc`: stashed into `metadata.notes` (display/log
+///     only) iff not already present in notes. Never overrides an existing note.
+///
+/// Pure + synchronous so the policy is unit-testable. Returns what it changed.
+fn merge_qrz_lookup(
+    metadata: &mut pancetta_qso::QsoMetadata,
+    lookup: &pancetta_dx::QrzLookup,
+) -> QrzMergeResult {
+    let mut result = QrzMergeResult::default();
+
+    // Grid: only fill when genuinely missing, and only with a grid that parses
+    // as a valid Maidenhead locator (QRZ records vary; reject garbage).
+    let grid_missing = metadata
+        .grids
+        .theirs
+        .as_ref()
+        .map(|g| g.trim().is_empty())
+        .unwrap_or(true);
+    if grid_missing {
+        if let Some(grid) = lookup
+            .grid
+            .as_ref()
+            .map(|g| g.trim())
+            .filter(|g| !g.is_empty())
+        {
+            if pancetta_core::gridsquare::GridSquare::new(grid).is_ok() {
+                metadata.grids.theirs = Some(grid.to_string());
+                result.grid_filled = true;
+            }
+        }
+    }
+
+    // Name (and DXCC) are enrichment for logging/display only — appended to the
+    // notes field so they ride into the ADIF COMMENT without clobbering the
+    // structured fields. Only append a name once.
+    if let Some(name) = lookup
+        .name
+        .as_ref()
+        .map(|n| n.trim())
+        .filter(|n| !n.is_empty())
+    {
+        let already = metadata
+            .notes
+            .as_deref()
+            .map(|n| n.contains(name))
+            .unwrap_or(false);
+        if !already {
+            let note = match metadata.notes.take() {
+                Some(existing) if !existing.trim().is_empty() => {
+                    format!("{existing}; QRZ: {name}")
+                }
+                _ => format!("QRZ: {name}"),
+            };
+            metadata.notes = Some(note);
+            result.name_added = true;
+        }
+    }
+
+    result
+}
+
+/// Best-effort QRZ-XML grid enrichment for a completed QSO.
+///
+/// Looks up the contra-callsign via [`QrzXmlClient`](pancetta_dx::QrzXmlClient)
+/// **only when the their-grid is missing**, caches the result (hit or miss) for
+/// the session, and merges it into `metadata` via [`merge_qrz_lookup`]. Never
+/// blocks or fails the pipeline: any error/timeout is logged at debug (target
+/// `dx.qrz`) and the metadata is left unchanged.
+async fn maybe_enrich_grid_from_qrz(
+    metadata: &mut pancetta_qso::QsoMetadata,
+    client: &pancetta_dx::QrzXmlClient,
+    cache: &Mutex<HashMap<String, Option<pancetta_dx::QrzLookup>>>,
+) {
+    // Only spend a lookup when the grid is actually missing.
+    let grid_missing = metadata
+        .grids
+        .theirs
+        .as_ref()
+        .map(|g| g.trim().is_empty())
+        .unwrap_or(true);
+    if !grid_missing {
+        return;
+    }
+
+    let callsign = match metadata.their_callsign.as_ref() {
+        Some(c) if !c.trim().is_empty() => c.trim().to_string(),
+        _ => return,
+    };
+    let key = callsign.to_ascii_uppercase();
+
+    // Session cache: reuse a prior hit OR miss for this callsign.
+    if let Some(cached) = cache.lock().await.get(&key).cloned() {
+        match cached {
+            Some(lookup) => {
+                let merged = merge_qrz_lookup(metadata, &lookup);
+                if merged.grid_filled {
+                    debug!(
+                        target: "dx.qrz",
+                        "QRZ (cached): filled grid for {} = {:?}",
+                        callsign, metadata.grids.theirs
+                    );
+                }
+            }
+            None => {
+                debug!(target: "dx.qrz", "QRZ (cached): no data for {}", callsign);
+            }
+        }
+        return;
+    }
+
+    // Cache miss — query QRZ. Best-effort: on any error, cache the miss so we
+    // don't retry this callsign every QSO, and leave metadata untouched.
+    match client.lookup(&callsign).await {
+        Ok(lookup) => {
+            let merged = merge_qrz_lookup(metadata, &lookup);
+            if merged.grid_filled {
+                debug!(
+                    target: "dx.qrz",
+                    "QRZ: filled grid for {} = {:?}", callsign, metadata.grids.theirs
+                );
+            } else {
+                debug!(target: "dx.qrz", "QRZ: no usable grid for {}", callsign);
+            }
+            cache.lock().await.insert(key, Some(lookup));
+        }
+        Err(e) => {
+            // Never log credentials; QrzXmlClient errors never carry them.
+            debug!(target: "dx.qrz", "QRZ lookup failed for {} (skipping): {}", callsign, e);
+            cache.lock().await.insert(key, None);
+        }
+    }
+}
+
 // rationale: one explicit config arg per upload destination (ClubLog, QRZ,
 // cqdx, LoTW, eQSL) plus the event source + shared handles — bundling them into
 // a struct would just move the same fields without improving clarity.
@@ -2182,6 +2347,7 @@ fn start_qso_upload_subscriber(
     lotw_cfg: pancetta_config::network::LotwUploadConfig,
     eqsl_cfg: pancetta_config::network::EqslConfig,
     cqdx_cfg: pancetta_config::network::CqdxConfig,
+    qrz_xml_cfg: pancetta_config::network::QrzXmlConfig,
     our_callsign: String,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -2268,6 +2434,32 @@ fn start_qso_upload_subscriber(
         None
     };
 
+    // QRZ paid-XML lookup client (read-side enrichment). Opt-in: enabled +
+    // creds (config validation already rejects enabled-without-creds). When
+    // present, a completed QSO with a MISSING their-grid gets a best-effort
+    // lookup that fills the grid (and name/dxcc for logging) before the ADIF
+    // record is rendered. Never blocks or fails the pipeline. Credentials are
+    // held inside the client and never logged (target `dx.qrz`).
+    let qrz_xml_client = if qrz_xml_cfg.enabled
+        && !qrz_xml_cfg.username.is_empty()
+        && !qrz_xml_cfg.password.is_empty()
+    {
+        let agent = format!("pancetta-{}", env!("CARGO_PKG_VERSION"));
+        Some(Arc::new(pancetta_dx::QrzXmlClient::new(
+            qrz_xml_cfg.username.clone(),
+            qrz_xml_cfg.password.clone(),
+            agent,
+        )))
+    } else {
+        None
+    };
+    // Session-scoped lookup cache (uppercased callsign → result). Avoids
+    // re-querying QRZ for the same station repeatedly in one session; the
+    // `None` value caches a miss/failure too, so a station QRZ has no data for
+    // is not retried every QSO. Only allocated when the client is built.
+    let qrz_xml_cache: Arc<Mutex<HashMap<String, Option<pancetta_dx::QrzLookup>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
     if clublog_client.is_some() {
         info!(target: "qso.upload", "ClubLog per-QSO upload enabled");
     }
@@ -2283,13 +2475,25 @@ fn start_qso_upload_subscriber(
     if cqdx_client.is_some() {
         info!(target: "qso.upload", "cqdx.io per-QSO logbook upload enabled");
     }
+    if qrz_xml_client.is_some() {
+        info!(target: "dx.qrz", "QRZ XML grid enrichment enabled (fills missing grid before upload)");
+    }
 
     tokio::spawn(async move {
         let processor = pancetta_qso::AdifProcessor::new();
 
         while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
             match events.recv().await {
-                Ok(pancetta_qso::QsoEvent::QsoCompleted { metadata, .. }) => {
+                Ok(pancetta_qso::QsoEvent::QsoCompleted { mut metadata, .. }) => {
+                    // Best-effort QRZ XML enrichment: fill a MISSING their-grid
+                    // (and name/dxcc in notes for logging) before rendering the
+                    // ADIF record. No-op when the client is disabled or the grid
+                    // is already known from decode/cqdx; never blocks or fails
+                    // the upload pipeline.
+                    if let Some(client) = qrz_xml_client.clone() {
+                        maybe_enrich_grid_from_qrz(&mut metadata, &client, &qrz_xml_cache).await;
+                    }
+
                     // Render the single ADIF record the same way the
                     // source-of-truth writer does.
                     let adif_qso = processor.qso_to_adif(&metadata, metadata.contest_info.as_ref());
@@ -2574,5 +2778,131 @@ mod cqdx_upload_tests {
     fn record_none_without_callsign() {
         let md = metadata_with_call(None);
         assert!(cqdx_record_from_metadata(&md).is_none());
+    }
+}
+
+#[cfg(test)]
+mod qrz_enrichment_tests {
+    use super::merge_qrz_lookup;
+    use chrono::Utc;
+    use pancetta_dx::QrzLookup;
+    use pancetta_qso::{GridSquares, QsoMetadata, SignalReports};
+
+    /// Build a completed QSO metadata with the given their-grid / notes so the
+    /// "only fill when missing" merge policy can be exercised in isolation.
+    fn metadata(their_grid: Option<&str>, notes: Option<&str>) -> QsoMetadata {
+        let now = Utc::now();
+        QsoMetadata {
+            qso_id: pancetta_qso::QsoId::new_v4(),
+            our_callsign: "K5ARH".to_string(),
+            their_callsign: Some("JA1ABC".to_string()),
+            frequency: 14_074_000.0,
+            mode: "FT8".to_string(),
+            start_time: now,
+            end_time: Some(now + chrono::Duration::seconds(90)),
+            reports: SignalReports {
+                sent: Some(-8),
+                received: Some(-12),
+            },
+            grids: GridSquares {
+                ours: Some("EM10".to_string()),
+                theirs: their_grid.map(str::to_string),
+            },
+            contest_info: None,
+            tags: std::collections::HashMap::new(),
+            notes: notes.map(str::to_string),
+            tx_parity: None,
+            initiated_by: Default::default(),
+            role: Default::default(),
+            call_count: 0,
+            first_call_at: None,
+            last_call_at: None,
+            progressed_this_cycle: false,
+        }
+    }
+
+    fn lookup(grid: Option<&str>, name: Option<&str>) -> QrzLookup {
+        QrzLookup {
+            call: Some("JA1ABC".to_string()),
+            name: name.map(str::to_string),
+            grid: grid.map(str::to_string),
+            country: Some("Japan".to_string()),
+            dxcc: Some("339".to_string()),
+            state: None,
+        }
+    }
+
+    /// A MISSING grid is filled from a valid QRZ grid.
+    #[test]
+    fn fills_missing_grid() {
+        let mut md = metadata(None, None);
+        let res = merge_qrz_lookup(&mut md, &lookup(Some("PM95"), None));
+        assert!(res.grid_filled);
+        assert_eq!(md.grids.theirs.as_deref(), Some("PM95"));
+    }
+
+    /// An empty-string grid counts as missing and is filled.
+    #[test]
+    fn fills_blank_grid() {
+        let mut md = metadata(Some("  "), None);
+        let res = merge_qrz_lookup(&mut md, &lookup(Some("PM95"), None));
+        assert!(res.grid_filled);
+        assert_eq!(md.grids.theirs.as_deref(), Some("PM95"));
+    }
+
+    /// An EXISTING (decoded/cqdx) grid is NEVER overridden by QRZ.
+    #[test]
+    fn never_overrides_existing_grid() {
+        let mut md = metadata(Some("FN20"), None);
+        let res = merge_qrz_lookup(&mut md, &lookup(Some("PM95"), None));
+        assert!(!res.grid_filled);
+        assert_eq!(md.grids.theirs.as_deref(), Some("FN20"));
+    }
+
+    /// An invalid QRZ grid is rejected (metadata left missing, not poisoned).
+    #[test]
+    fn rejects_invalid_grid() {
+        let mut md = metadata(None, None);
+        let res = merge_qrz_lookup(&mut md, &lookup(Some("not-a-grid!!"), None));
+        assert!(!res.grid_filled);
+        assert!(md.grids.theirs.is_none());
+    }
+
+    /// A name is appended to notes for logging/display.
+    #[test]
+    fn appends_name_to_empty_notes() {
+        let mut md = metadata(None, None);
+        let res = merge_qrz_lookup(&mut md, &lookup(Some("PM95"), Some("Taro")));
+        assert!(res.name_added);
+        assert_eq!(md.notes.as_deref(), Some("QRZ: Taro"));
+    }
+
+    /// A name is appended to (not clobbering) existing notes.
+    #[test]
+    fn appends_name_to_existing_notes() {
+        let mut md = metadata(None, Some("contest exchange"));
+        let res = merge_qrz_lookup(&mut md, &lookup(Some("PM95"), Some("Taro")));
+        assert!(res.name_added);
+        assert_eq!(md.notes.as_deref(), Some("contest exchange; QRZ: Taro"));
+    }
+
+    /// A name already present in notes is not appended twice (idempotent).
+    #[test]
+    fn does_not_duplicate_name() {
+        let mut md = metadata(None, Some("QRZ: Taro"));
+        let res = merge_qrz_lookup(&mut md, &lookup(Some("PM95"), Some("Taro")));
+        assert!(!res.name_added);
+        assert_eq!(md.notes.as_deref(), Some("QRZ: Taro"));
+    }
+
+    /// A lookup with nothing usable is a complete no-op.
+    #[test]
+    fn empty_lookup_is_noop() {
+        let mut md = metadata(None, None);
+        let before = md.clone();
+        let res = merge_qrz_lookup(&mut md, &lookup(None, None));
+        assert!(!res.grid_filled && !res.name_added);
+        assert_eq!(md.grids.theirs, before.grids.theirs);
+        assert_eq!(md.notes, before.notes);
     }
 }
