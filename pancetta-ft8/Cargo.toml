@@ -58,7 +58,7 @@ approx = "0.5"
 # Property-based testing
 proptest = "1.11"
 # Random number generation for tests
-rand = "0.8"
+rand = "0.9"
 # Async testing runtime
 tokio-test = "0.4"
 # WAV file reading for integration tests
