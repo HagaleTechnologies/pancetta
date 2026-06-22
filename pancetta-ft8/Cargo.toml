@@ -21,7 +21,7 @@ bitvec = "1.0"
 # Time handling
 time = "0.3"
 # High-precision mathematics
-nalgebra = "0.32"
+nalgebra = "0.35"
 # Concurrency primitives
 rayon = "1.12"
 # Error handling
