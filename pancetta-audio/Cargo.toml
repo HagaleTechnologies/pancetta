@@ -1,0 +1,25 @@
+[package]
+name = "pancetta-audio"
+description = "Real-time audio processing for Pancetta"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Use workspace dependencies for consistency
+cpal = { workspace = true }
+ringbuf = { workspace = true }
+instant = { workspace = true }
+atomic = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[features]
+default = []
+# Feature for even more aggressive real-time optimizations
+rt-optimized = []

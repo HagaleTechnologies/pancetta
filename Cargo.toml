@@ -1,0 +1,156 @@
+[workspace]
+members = [
+    "pancetta",
+    "pancetta-audio",
+    "pancetta-config",
+    "pancetta-core",
+    "pancetta-cqdx",
+    "pancetta-dsp",
+    "pancetta-dx",
+    "pancetta-ft8",
+    "pancetta-hamlib",
+    "pancetta-qso",
+    "pancetta-research",
+    "pancetta-tui",
+]
+default-members = [
+    "pancetta",
+    "pancetta-audio",
+    "pancetta-config",
+    "pancetta-core",
+    "pancetta-cqdx",
+    "pancetta-dsp",
+    "pancetta-dx",
+    "pancetta-ft8",
+    "pancetta-hamlib",
+    "pancetta-qso",
+    "pancetta-tui",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Hagale Technologies, LLC"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/HagaleTechnologies/pancetta"
+# Pre-1.0: crates aren't published to crates.io. Flip to `true` and add
+# `version = "..."` to each path dep when ready to publish.
+publish = false
+
+[workspace.dependencies]
+# Real-time audio processing
+cpal = "0.15"
+# Lock-free data structures for real-time communication
+ringbuf = "0.4"
+# High-precision timing
+instant = "0.1"
+# Atomic operations for real-time coordination
+atomic = "0.6"
+
+# Async runtime and coordination
+tokio = { version = "1.50", features = ["full", "rt-multi-thread"] }
+tokio-util = "0.7"
+futures = "0.3"
+futures-util = "0.3"
+
+# Inter-process communication
+crossbeam-channel = "0.5"
+flume = "0.11"
+async-channel = "2.0"
+parking_lot = "0.12"
+
+# CLI and configuration
+clap = { version = "4.6", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Logging and telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# System utilities
+uuid = { version = "1.23", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+num_cpus = "1.0"
+
+# Signal handling
+signal-hook = "0.3"
+signal-hook-tokio = { version = "0.4", features = ["futures-v0_3"] }
+
+# Performance monitoring
+metrics = "0.24"
+
+# HTTP client and networking
+reqwest = { version = "0.12", features = ["json", "stream", "multipart", "cookies"] }
+
+# Geographic calculations
+geo = "0.28"
+geographiclib-rs = "0.2"
+
+# Database support
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+
+# XML and CSV parsing
+quick-xml = "0.36"
+csv = "1.4"
+
+# Regular expressions
+regex = "1.12"
+
+# URL parsing
+url = "2.5"
+
+# Encoding support
+base64 = "0.22"
+
+# TLS and WebSocket support
+native-tls = "0.2"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+
+# Statistical calculations
+statrs = "0.17"
+
+# Testing utilities
+approx = "0.5"
+
+[profile.release]
+# Optimize for real-time performance
+opt-level = 3
+lto = true
+codegen-units = 1
+# `unwind` (not `abort`) so the FT8 decode loop can `catch_unwind` a panic in a
+# single window — that window is logged + skipped and the station keeps running,
+# instead of one bad decode aborting the whole process. The OS supervisor
+# (packaging/systemd, packaging/launchd; see docs/RUNBOOK.md) remains the
+# backstop for everything unwinding can't catch (notably a native ft8_lib C
+# abort). The tiny unwinding-table size cost is worth unattended resilience.
+panic = "unwind"
+strip = true
+overflow-checks = false
+debug-assertions = false
+
+[profile.dev]
+# Fast compilation for development
+opt-level = 1
+debug = true
+# panic = "unwind" so backtraces and panic catching work during testing —
+# release keeps "abort" for binary size and predictable failure semantics.
+panic = "unwind"
+
+[profile.dev.package.pancetta-ft8]
+opt-level = 3
+
+[profile.bench]
+# Optimized for benchmarking
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = true

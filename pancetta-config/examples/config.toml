@@ -1,0 +1,706 @@
+# Pancetta Example Configuration
+# This file demonstrates a complete configuration setup for Pancetta amateur radio software.
+# Copy this file to your configuration directory and customize it for your station.
+
+[metadata]
+version = "1.0"
+
+# Station Configuration
+[station]
+callsign = "K1ABC"                     # YOUR CALLSIGN HERE
+grid_square = "FN42aa"                 # YOUR GRID SQUARE HERE
+power_watts = 100                      # Your transmitter power
+qth = "Anytown, USA"                   # Your location
+dxcc_entity = 291                      # 291 = United States
+itu_zone = 8                           # ITU Zone 8 (US East Coast)
+cq_zone = 5                            # CQ Zone 5 (US East Coast)
+operator_name = "John Doe"             # Your name
+contest_category = "SINGLE-OP-LOW"     # Contest category
+
+# Station coordinates for accurate calculations
+[station.coordinates]
+latitude = 42.3601                     # Your latitude in decimal degrees
+longitude = -71.0589                   # Your longitude in decimal degrees
+elevation_meters = 100.0               # Elevation above sea level
+
+# Antenna definitions
+[[station.antennas]]
+id = "40m_dipole"
+name = "40m Dipole"
+antenna_type = "dipole"
+bands = ["40m", "80m"]
+gain_dbi = 2.15
+pattern = "bidirectional"
+height_meters = 12.0
+active = true
+
+[[station.antennas]]
+id = "tribander"
+name = "3-Element Yagi"
+antenna_type = "yagi"
+bands = ["20m", "15m", "10m"]
+gain_dbi = 8.0
+pattern = "directional"
+height_meters = 15.0
+azimuth_degrees = 45
+active = true
+
+[[station.antennas]]
+id = "6m_vertical"
+name = "6m Vertical"
+antenna_type = "vertical"
+bands = ["6m"]
+gain_dbi = 3.0
+pattern = "omnidirectional"
+height_meters = 8.0
+active = false
+
+# Audio Configuration
+[audio]
+input_device = "Sound Blaster Z"       # Your audio input device
+output_device = "Sound Blaster Z"      # Your audio output device
+sample_rate = 48000                    # 48 kHz for digital modes
+buffer_size = 512                      # Low latency buffer
+input_channels = 2
+output_channels = 2
+bit_depth = "float32"
+
+# Enable audio processing
+[audio.processing]
+enabled = true
+lowpass_cutoff = 2700.0               # SSB upper limit
+highpass_cutoff = 300.0               # SSB lower limit
+
+# Bandwidth filter for voice
+[audio.processing.bandwidth]
+enabled = true
+filter_type = "butterworth"
+order = 8
+center_frequency = 1500.0
+bandwidth_hz = 2400.0                 # Typical SSB bandwidth
+
+# Light compression for voice
+[audio.processing.compression]
+enabled = true
+ratio = 3.0
+threshold_db = -15.0
+attack_ms = 2.0
+release_ms = 150.0
+knee_width_db = 3.0
+makeup_gain_db = 3.0
+
+# 3-band equalizer
+[audio.processing.equalizer]
+enabled = true
+global_gain_db = 0.0
+
+[[audio.processing.equalizer.bands]]
+frequency = 300.0
+gain_db = 2.0
+q_factor = 0.7
+band_type = "highpass"
+
+[[audio.processing.equalizer.bands]]
+frequency = 1000.0
+gain_db = 1.0
+q_factor = 1.0
+band_type = "peak"
+
+[[audio.processing.equalizer.bands]]
+frequency = 2700.0
+gain_db = 0.0
+q_factor = 0.7
+band_type = "lowpass"
+
+# AGC for consistent levels
+[audio.agc]
+enabled = true
+mode = "fast"
+target_level_db = -18.0
+max_gain_db = 25.0
+attack_time_ms = 0.5
+decay_time_ms = 300.0
+hang_time_ms = 100.0
+threshold_db = -50.0
+
+# Noise reduction for weak signals
+[audio.noise_reduction]
+enabled = true
+algorithm = "spectral_subtraction"
+strength = 0.7
+noise_gate_threshold_db = -45.0
+
+[audio.noise_reduction.spectral_subtraction]
+alpha = 2.5
+beta = 0.02
+frame_size = 2048
+overlap = 0.75
+
+# Audio routing for monitoring
+[audio.routing.monitor_routing]
+enabled = true
+level = 0.4
+source = "processed"
+destination = "Sound Blaster Z"
+
+# Sidetone for CW
+[audio.routing.sidetone]
+enabled = true
+frequency = 700.0
+level = 0.4
+shape = "sine"
+
+# Recording configuration
+[audio.recording]
+auto_record = true
+format = "wav"
+bit_depth = "int16"
+sample_rate = 44100
+max_length_minutes = 120
+directory = "~/Documents/Pancetta/Recordings"
+filename_pattern = "QSO_%Y%m%d_%H%M%S"
+compression_level = 0
+
+# Rig Control Configuration
+[rig]
+model = "Yaesu FT-991A"               # Your rig model
+
+# CAT interface via USB
+[rig.interface]
+port = "/dev/ttyUSB0"                 # Linux: /dev/ttyUSB0, Windows: COM3
+baud_rate = 38400                     # FT-991A uses 38400 baud
+data_bits = 8
+stop_bits = "one"
+parity = "none"
+flow_control = "none"
+timeout_ms = 2000
+enabled = true
+protocol = "yaesu"
+termination = ";"
+response_timeout_ms = 1000
+retry_count = 3
+
+# PTT via CAT
+[rig.ptt]
+method = "cat"
+polarity = "positive"
+tx_delay_ms = 150                     # Allow time for rig to switch
+tx_tail_ms = 150
+timeout_seconds = 300
+
+# Frequency control
+[rig.frequency]
+control_enabled = true
+follow_rig = true
+polling_interval_ms = 500             # Poll every 500ms
+
+# Memory channels
+[rig.frequency.memory_channels]
+enabled = true
+auto_save = false
+
+[[rig.frequency.memory_channels.quick_memories]]
+channel = 1
+frequency = 14205000                  # 20m PSK31
+mode = "USB"
+name = "20m PSK"
+bandwidth = 2400
+power = 50
+
+[[rig.frequency.memory_channels.quick_memories]]
+channel = 2
+frequency = 7035000                   # 40m PSK31
+mode = "USB"
+name = "40m PSK"
+bandwidth = 2400
+power = 100
+
+[[rig.frequency.memory_channels.quick_memories]]
+channel = 3
+frequency = 14074000                  # 20m FT8
+mode = "USB"
+name = "20m FT8"
+bandwidth = 2400
+power = 50
+
+# Frequency limits for safety
+[rig.frequency.limits]
+min_frequency = 1800000               # 160m band start
+max_frequency = 54000000              # 6m band end
+
+# Band plan for Region 2
+[rig.frequency.band_plan]
+region = 2
+edge_warnings = true
+
+# Custom band definitions
+[rig.frequency.band_plan.custom_bands.psk31]
+name = "PSK31"
+default_mode = "USB"
+band_type = "hf"
+
+[[rig.frequency.band_plan.custom_bands.psk31.ranges]]
+start = 14070000
+end = 14075000
+modes = ["USB"]
+
+[[rig.frequency.band_plan.custom_bands.psk31.ranges]]
+start = 7035000
+end = 7040000
+modes = ["USB"]
+
+# Power control
+[rig.power_control]
+enabled = true
+method = "cat"
+default_level = 50
+
+# Per-band power settings
+[rig.power_control.band_power]
+"40m" = 100
+"30m" = 50
+"20m" = 50
+"17m" = 50
+"15m" = 50
+"12m" = 30
+"10m" = 30
+"6m" = 25
+
+# Power ramping for tube amplifiers
+[rig.power_control.ramping]
+enabled = false
+ramp_up_ms = 2000
+ramp_down_ms = 1000
+curve = "exponential"
+
+# Operating modes
+[rig.modes]
+supported_modes = ["LSB", "USB", "CW", "CWR", "FM", "AM", "RTTY", "PSK31", "FT8", "FT4"]
+default_mode = "USB"
+
+# Mode-specific settings
+[rig.modes.mode_settings.CW]
+bandwidth = 500
+power_level = 25
+agc_mode = "fast"
+noise_blanker = false
+
+[rig.modes.mode_settings.USB]
+bandwidth = 2400
+power_level = 50
+agc_mode = "medium"
+noise_blanker = true
+
+[rig.modes.mode_settings.PSK31]
+bandwidth = 1000
+power_level = 25
+agc_mode = "slow"
+noise_blanker = true
+
+# Timing optimized for FT-991A
+[rig.timing]
+command_interval_ms = 50
+status_polling_ms = 500
+retry_interval_ms = 500
+keepalive_interval_ms = 30000
+response_timeout_ms = 1000
+
+# User Interface Configuration
+[ui]
+theme = "dark"                        # Dark theme for night operation
+layout = "contester"                  # Contest-oriented layout
+
+# Window settings for dual monitor setup
+[ui.window]
+width = 1920
+height = 1200
+state = "maximized"
+decorations = true
+resizable = true
+transparency = 0.95
+always_on_top = false
+
+[ui.window.multi_monitor]
+preferred_monitor = 1                 # Secondary monitor
+span_monitors = false
+remember_placement = true
+
+# Typography optimized for readability
+[ui.typography]
+font_family = "Ubuntu"
+font_size = 14.0
+monospace_font = "Ubuntu Mono"
+monospace_size = 13.0
+
+[ui.typography.rendering]
+antialiasing = "subpixel"
+subpixel_rendering = true
+hinting = "full"
+line_height = 1.3
+
+# Dark theme colors
+[ui.colors.primary]
+base = "#0ea5e9"
+light = "#38bdf8"
+dark = "#0284c7"
+contrast = "#ffffff"
+
+[ui.colors.background]
+primary = "#1e293b"
+secondary = "#334155"
+panel = "#475569"
+input = "#1e293b"
+selected = "#0f172a"
+hover = "#334155"
+
+[ui.colors.text]
+primary = "#f1f5f9"
+secondary = "#cbd5e1"
+disabled = "#64748b"
+link = "#38bdf8"
+selected = "#f8fafc"
+placeholder = "#94a3b8"
+
+[ui.colors.status]
+connected = "#22c55e"
+disconnected = "#ef4444"
+transmitting = "#f59e0b"
+receiving = "#22c55e"
+
+# Spectrum display colors for dark theme
+[ui.colors.spectrum]
+spectrum_line = "#0ea5e9"
+waterfall_gradient = ["#1e1b4b", "#3730a3", "#0ea5e9", "#06b6d4", "#10b981", "#84cc16", "#eab308", "#f59e0b", "#ef4444"]
+grid_lines = "#374151"
+frequency_markers = "#6b7280"
+signal_detection = "#f59e0b"
+background_noise = "#1f2937"
+
+# Panel layout for contesting
+[[ui.panels.available_panels]]
+id = "spectrum"
+name = "Spectrum & Waterfall"
+panel_type = "spectrum"
+default_position = "center"
+closeable = false
+moveable = true
+resizable = true
+
+[ui.panels.available_panels.default_size]
+width = { Percentage = 60.0 }
+height = { Percentage = 70.0 }
+min_width = 600
+min_height = 400
+
+[[ui.panels.available_panels]]
+id = "rig_control"
+name = "Rig Control"
+panel_type = "rig_control"
+default_position = "right"
+closeable = false
+moveable = true
+resizable = true
+
+[ui.panels.available_panels.default_size]
+width = { Percentage = 25.0 }
+height = { Percentage = 100.0 }
+min_width = 200
+min_height = 300
+
+[[ui.panels.available_panels]]
+id = "logging"
+name = "QSO Logging"
+panel_type = "logging"
+default_position = "bottom"
+closeable = false
+moveable = true
+resizable = true
+
+[ui.panels.available_panels.default_size]
+width = { Percentage = 100.0 }
+height = { Percentage = 30.0 }
+min_width = 400
+min_height = 150
+
+[[ui.panels.available_panels]]
+id = "macros"
+name = "Function Keys"
+panel_type = "macros"
+default_position = "left"
+closeable = true
+moveable = true
+resizable = true
+
+[ui.panels.available_panels.default_size]
+width = { Percentage = 15.0 }
+height = { Percentage = 100.0 }
+min_width = 150
+min_height = 200
+
+[ui.panels.visibility]
+initial_panels = ["spectrum", "rig_control", "logging", "macros"]
+auto_hide = false
+show_titles = true
+show_close_buttons = true
+
+# Accessibility for contest operation
+[ui.accessibility]
+high_contrast = true
+large_fonts = false
+screen_reader = false
+
+[ui.accessibility.keyboard_navigation]
+enabled = true
+show_focus = true
+focus_ring_width = 3
+focus_ring_color = "#0ea5e9"
+
+[ui.accessibility.sound_feedback]
+enabled = true
+button_clicks = false
+alerts = true
+status_changes = true
+volume = 0.3
+
+# Fast animations for quick operation
+[ui.animations]
+enabled = true
+duration_scale = 0.7
+
+[ui.animations.transitions]
+fade_duration_ms = 100
+slide_duration_ms = 150
+scale_duration_ms = 100
+
+# Keyboard shortcuts for contest operation
+[ui.keyboard.shortcuts.qsy_up]
+keys = "Ctrl+Up"
+action = "rig.frequency_up"
+description = "QSY frequency up"
+context = "main_window"
+enabled = true
+
+[ui.keyboard.shortcuts.qsy_down]
+keys = "Ctrl+Down"
+action = "rig.frequency_down"
+description = "QSY frequency down"
+context = "main_window"
+enabled = true
+
+[ui.keyboard.shortcuts.toggle_tx]
+keys = "Ctrl+T"
+action = "rig.toggle_tx"
+description = "Toggle transmit"
+context = "main_window"
+enabled = true
+
+[ui.keyboard.shortcuts.quick_qsy_40m]
+keys = "F1"
+action = "rig.band_40m"
+description = "QSY to 40m"
+context = "main_window"
+enabled = true
+
+[ui.keyboard.shortcuts.quick_qsy_20m]
+keys = "F2"
+action = "rig.band_20m"
+description = "QSY to 20m"
+context = "main_window"
+enabled = true
+
+[ui.keyboard.shortcuts.quick_qsy_15m]
+keys = "F3"
+action = "rig.band_15m"
+description = "QSY to 15m"
+context = "main_window"
+enabled = true
+
+[ui.keyboard.shortcuts.quick_qsy_10m]
+keys = "F4"
+action = "rig.band_10m"
+description = "QSY to 10m"
+context = "main_window"
+enabled = true
+
+# Logging display for contest
+[ui.logging]
+max_entries = 2000
+entry_format = "{timestamp} [{level}] {message}"
+show_timestamps = true
+timestamp_format = "%H:%M:%S"
+color_by_level = true
+auto_scroll = true
+
+[ui.logging.filtering]
+min_level = "info"
+recent_only = true
+recent_window_minutes = 30
+
+# Spectrum display optimized for weak signal work
+[ui.spectrum]
+mode = "combined"
+fft_size = 4096                       # Higher resolution
+averaging = 0.9                       # Heavy averaging for stability
+update_rate = 20.0                    # 20 FPS update rate
+
+[ui.spectrum.waterfall]
+height = 300
+scroll_speed = 30.0
+color_mapping = "plasma"
+contrast = 1.2
+brightness = 0.1
+
+[ui.spectrum.frequency_axis]
+visible = true
+units = "khz"
+major_ticks = 1.0
+minor_ticks = 0.1
+label_format = "{:.1f}"
+
+[ui.spectrum.amplitude_axis]
+visible = true
+units = "dbm"
+scale = "logarithmic"
+reference_level = -40.0
+dynamic_range = 100.0
+
+[ui.spectrum.markers]
+visible = true
+color = "#f59e0b"
+width = 2.0
+style = "line"
+show_labels = true
+
+# Network Services Configuration
+[network]
+
+# PSKReporter for propagation reporting
+[network.psk_reporter]
+enabled = true
+server_url = "https://pskreporter.info/cgi-bin/pskdata.pl"
+upload_interval_seconds = 120
+batch_size = 25
+include_receives = true
+include_transmits = true
+min_snr_db = -15.0
+max_age_hours = 6
+frequency_accuracy_hz = 1
+
+[network.psk_reporter.reporter_info]
+software_name = "Pancetta"
+software_version = "0.1.0"
+antenna_info = "3-El Yagi @ 15m"
+comments = "Contest station"
+
+[network.psk_reporter.filters]
+enabled_modes = ["PSK31", "PSK63", "FT8", "FT4", "JS8", "RTTY"]
+enabled_bands = ["80m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m"]
+
+# DX Cluster for DX spots
+[network.dx_cluster]
+enabled = true
+
+[[network.dx_cluster.servers]]
+name = "DX Summit"
+hostname = "dxc.dxlabsuite.com"
+port = 7300
+server_type = "dx_spider"
+auth_required = false
+priority = 1
+
+[[network.dx_cluster.servers]]
+name = "VE7CC"
+hostname = "ve7cc.net"
+port = 23
+server_type = "cc"
+auth_required = true
+username = "K1ABC"
+priority = 2
+
+[network.dx_cluster.connection]
+auto_connect = true
+reconnect_attempts = 5
+reconnect_delay_seconds = 30
+keepalive_interval_seconds = 300
+timeout_seconds = 30
+
+[network.dx_cluster.filtering]
+bands = ["40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m"]
+modes = ["CW", "SSB", "RTTY", "PSK", "FT8", "FT4"]
+duplicate_window_minutes = 30
+
+[network.dx_cluster.alerts]
+visual_alerts = true
+audio_alerts = true
+
+[[network.dx_cluster.alerts.conditions]]
+name = "New DXCC"
+expression = "new_dxcc == true"
+priority = "high"
+enabled = true
+
+[[network.dx_cluster.alerts.conditions]]
+name = "Needed Band"
+expression = "needed_band == true"
+priority = "medium"
+enabled = true
+
+[network.dx_cluster.alerts.sounds]
+high_priority_sound = "~/Documents/Pancetta/Sounds/dx_alert.wav"
+medium_priority_sound = "~/Documents/Pancetta/Sounds/band_needed.wav"
+volume = 0.7
+
+# Web API for remote control
+[network.web_api]
+enabled = true
+bind_address = "127.0.0.1"
+port = 8080
+
+[network.web_api.authentication]
+required = true
+method = "api_key"
+
+[[network.web_api.authentication.api_keys]]
+name = "contest_logger"
+key_encrypted = "encrypted_api_key_here"
+permissions = ["rig.control", "logging.read", "logging.write"]
+enabled = true
+
+[network.web_api.rate_limiting]
+enabled = true
+requests_per_minute = 120
+burst_allowance = 20
+by_ip = true
+
+# Rate limiting optimized for contest operation
+[network.rate_limiting]
+enabled = true
+
+[network.rate_limiting.global]
+requests_per_minute = 600
+requests_per_hour = 7200
+requests_per_day = 172800
+
+# Service-specific rate limits
+[network.rate_limiting.services.psk_reporter]
+requests_per_minute = 30
+burst_allowance = 5
+cooldown_seconds = 2
+
+# Reliability settings for contest operation
+[network.reliability]
+connection_timeout_seconds = 10
+request_timeout_seconds = 15
+
+[network.reliability.retry]
+max_attempts = 2
+base_delay_ms = 500
+max_delay_ms = 2000
+backoff_multiplier = 1.5
+jitter_factor = 0.2
+
+[network.reliability.circuit_breaker]
+enabled = true
+failure_threshold = 3
+success_threshold = 2
+timeout_ms = 30000

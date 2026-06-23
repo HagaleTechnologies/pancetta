@@ -1,0 +1,39 @@
+[package]
+name = "pancetta-dsp"
+description = "High-performance digital signal processing pipeline for amateur radio applications"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Core dependencies
+tokio = { version = "1.50", features = ["full"] }
+async-trait = "0.1"
+thiserror = "2.0"
+tracing = "0.1"
+
+# Signal processing
+rustfft = "6.4"
+realfft = "3.3"
+rubato = "0.15"  # High-quality resampling
+biquad = "0.4"   # IIR filters
+
+# Numerical computing
+ndarray = "0.15"
+num-complex = "0.4"
+num-traits = "0.2"
+
+# Synchronization
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+[dev-dependencies]
+tracing-subscriber = "0.3"
+rand = "0.9"
+
+[[example]]
+name = "ft8_pipeline_demo"
+required-features = []

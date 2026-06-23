@@ -1,0 +1,71 @@
+[package]
+name = "pancetta-research"
+description = "Local-only decoder iteration harness (never published)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false                          # never published; local-only research crate
+
+[features]
+# All eval-time corpus-touching tests gate on this feature so default test passes
+# do not require corpus files to exist.
+research-eval = []
+
+[dependencies]
+pancetta-ft8 = { path = "../pancetta-ft8", features = ["serde", "transmit"] }
+# hb-058 follow-on (Batch 30): batch30_slash_r_full_audit example reuses
+# the production has_high_risk_fp_pattern helper.
+pancetta-qso = { path = "../pancetta-qso" }
+# hb-103 (Batch 32): for payload-bit entropy in feature extraction.
+bitvec = "1.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+hound = "3.5"                            # WAV reader (already used in pancetta-ft8; not in workspace.dependencies)
+# Used by gen-synth binary for AWGN noise (Box-Muller via rand_distr).
+rand = "0.8"
+rand_distr = "0.4"
+# hb-088 OSD-without-Costas scoping diagnostic replicates pancetta-ft8's
+# spectrogram + Costas score + LLR pipeline inline.
+rustfft = "6.4"
+num-complex = "0.4"
+sha2 = "0.10"                            # SHA-256 for WAV cache keying in baseline binary
+tempfile = "3"                           # slot-cutting helper for Jt9Decoder; not in workspace.dependencies
+# Raw flock(2) for cross-process tier-slot semaphore (see tier_slots.rs).
+# Already transitively present in the workspace via other crates; we pin
+# it directly here so the call sites compile cleanly.
+libc = "0.2"
+
+[[bin]]
+name = "gen-synth"
+path = "src/bin/gen_synth.rs"
+
+[[bin]]
+name = "gen-synth-pair"
+path = "src/bin/gen_synth_pair.rs"
+
+[[bin]]
+name = "baseline"
+path = "src/bin/baseline.rs"
+
+[[bin]]
+name = "compare"
+path = "src/bin/compare.rs"
+
+[[bin]]
+name = "curate"
+path = "src/bin/curate.rs"
+
+[[bin]]
+name = "curate-jt9-rich"
+path = "src/bin/curate_jt9_rich.rs"
+
+[[bin]]
+name = "leaderboard"
+path = "src/bin/leaderboard.rs"
+
+[dev-dependencies]
+# (tempfile moved to [dependencies] for slot-cutting helper)

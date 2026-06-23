@@ -1,0 +1,67 @@
+{
+  "n_samples": 28619,
+  "n_osd_recovered": 545,
+  "n_osd_failed": 28074,
+  "feature_separability": [
+    {
+      "name": "final_mean_abs_llr",
+      "mean_recovered": 7.370159406399508,
+      "mean_failed": 5.1547528568,
+      "stddev_recovered": 7.066815188568297,
+      "stddev_failed": 2.618234713473013,
+      "d_prime": 0.29396678924084285
+    },
+    {
+      "name": "final_stddev_abs_llr",
+      "mean_recovered": 4.200089716692584,
+      "mean_failed": 3.864775762205035,
+      "stddev_recovered": 1.1881745168870952,
+      "stddev_failed": 0.5887850724301946,
+      "d_prime": 0.2528654604605579
+    },
+    {
+      "name": "early_mean_abs_llr",
+      "mean_recovered": 5.1640031035886995,
+      "mean_failed": 5.129203654196711,
+      "stddev_recovered": 0.6501631832333972,
+      "stddev_failed": 0.6920722247935527,
+      "d_prime": 0.03664773060112503
+    },
+    {
+      "name": "growth_ratio",
+      "mean_recovered": 1.4071917388417305,
+      "mean_failed": 1.0052635619177848,
+      "stddev_recovered": 1.201273711249205,
+      "stddev_failed": 0.47350046119023337,
+      "d_prime": 0.31127671125382755
+    },
+    {
+      "name": "max_consecutive_sign_flips",
+      "mean_recovered": 19.124770642201835,
+      "mean_failed": 16.954263731566574,
+      "stddev_recovered": 9.325360306508033,
+      "stddev_failed": 5.985708512378677,
+      "d_prime": 0.19587446090067054
+    },
+    {
+      "name": "total_sign_flips",
+      "mean_recovered": 148.81100917431192,
+      "mean_failed": 122.07715323787134,
+      "stddev_recovered": 85.81818089829754,
+      "stddev_failed": 92.94788886652317,
+      "d_prime": 0.21132281114817045
+    },
+    {
+      "name": "parity_errors_final",
+      "mean_recovered": 4.7853211009174315,
+      "mean_failed": 13.033518558096459,
+      "stddev_recovered": 1.3705694453128836,
+      "stddev_failed": 4.795706957624596,
+      "d_prime": 1.653703805225952
+    }
+  ],
+  "distinguishable_fraction": 0.8342010552430204,
+  "distinguishable_gate": 0.2,
+  "decision": "PROCEED — trajectory signature distinguishes >=20% of OSD-eligible BP failures; Session 2 should train the trajectory-aware model",
+  "notes": ""
+}

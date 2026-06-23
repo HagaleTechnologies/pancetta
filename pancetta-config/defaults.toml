@@ -1,0 +1,790 @@
+# Pancetta Default Configuration
+# This file contains sensible default settings for Pancetta amateur radio software.
+# These values serve as the base configuration that can be overridden by user settings.
+
+[metadata]
+version = "1.0"
+instance_id = "00000000-0000-0000-0000-000000000000"
+
+# Station Configuration
+[station]
+callsign = "N0CALL"                    # Replace with your callsign
+grid_square = "AA00aa"                 # Replace with your grid square
+power_watts = 100                      # Transmitter power in watts
+qth = "Unknown"                        # Your location/QTH
+dxcc_entity = 291                      # DXCC entity (291 = United States)
+itu_zone = 8                           # ITU zone
+cq_zone = 5                            # CQ zone
+operator_name = ""                     # Operator name (optional)
+contest_category = ""                  # Contest category (optional)
+
+# Default antenna configuration
+[[station.antennas]]
+id = "default"
+name = "Default Antenna"
+antenna_type = "dipole"
+bands = ["40m", "20m"]
+gain_dbi = 2.15
+pattern = "bidirectional"
+height_meters = 10.0
+active = true
+
+# Audio Configuration
+[audio]
+input_device = "default"               # Audio input device
+output_device = "default"              # Audio output device
+sample_rate = 48000                    # Sample rate in Hz
+buffer_size = 512                      # Buffer size in samples
+input_channels = 2                     # Number of input channels
+output_channels = 2                    # Number of output channels
+bit_depth = "float32"                  # Audio bit depth
+
+# Audio processing settings
+[audio.processing]
+enabled = true
+lowpass_cutoff = 3000.0               # Low-pass filter cutoff (Hz)
+highpass_cutoff = 300.0               # High-pass filter cutoff (Hz)
+
+[audio.processing.bandwidth]
+enabled = true
+filter_type = "butterworth"
+order = 6
+center_frequency = 1500.0
+bandwidth_hz = 2700.0
+
+[audio.processing.compression]
+enabled = false
+ratio = 3.0
+threshold_db = -20.0
+attack_ms = 1.0
+release_ms = 100.0
+knee_width_db = 2.0
+makeup_gain_db = 0.0
+
+[audio.processing.equalizer]
+enabled = false
+global_gain_db = 0.0
+
+[[audio.processing.equalizer.bands]]
+frequency = 300.0
+gain_db = 0.0
+q_factor = 1.0
+band_type = "highpass"
+
+[[audio.processing.equalizer.bands]]
+frequency = 3000.0
+gain_db = 0.0
+q_factor = 1.0
+band_type = "lowpass"
+
+[audio.processing.emphasis]
+pre_emphasis_enabled = false
+de_emphasis_enabled = false
+time_constant_us = 75.0
+
+# AGC settings
+[audio.agc]
+enabled = true
+mode = "medium"
+target_level_db = -20.0
+max_gain_db = 30.0
+attack_time_ms = 1.0
+decay_time_ms = 500.0
+hang_time_ms = 200.0
+threshold_db = -60.0
+
+# Noise reduction settings
+[audio.noise_reduction]
+enabled = false
+algorithm = "noise_gate"
+strength = 0.5
+noise_gate_threshold_db = -50.0
+
+[audio.noise_reduction.spectral_subtraction]
+alpha = 2.0
+beta = 0.01
+frame_size = 1024
+overlap = 0.5
+
+[audio.noise_reduction.wiener_filter]
+estimation_window_ms = 500.0
+smoothing_factor = 0.98
+min_gain = 0.1
+
+# Audio routing
+[audio.routing]
+input_routing = []
+output_routing = []
+
+[audio.routing.monitor_routing]
+enabled = false
+level = 0.5
+source = "processed"
+destination = "default"
+
+[audio.routing.sidetone]
+enabled = true
+frequency = 600.0
+level = 0.3
+shape = "sine"
+
+# Recording settings
+[audio.recording]
+auto_record = false
+format = "wav"
+bit_depth = "int16"
+sample_rate = 44100
+max_length_minutes = 60
+directory = "~/Documents/Pancetta/Recordings"
+filename_pattern = "pancetta_%Y%m%d_%H%M%S"
+compression_level = 5
+
+# Audio levels
+[audio.levels]
+input_gain_db = 0.0
+output_gain_db = 0.0
+peak_warning_db = -6.0
+peak_clip_db = -1.0
+rms_target_db = -20.0
+
+[audio.levels.meter_ballistics]
+peak_attack_ms = 0.0
+peak_decay_ms = 1600.0
+rms_averaging_ms = 300.0
+hold_time_ms = 2000.0
+
+# Rig Control Configuration
+[rig]
+model = "Generic"                      # Rig model/manufacturer
+
+# CAT interface settings
+[rig.interface]
+port = "/dev/ttyUSB0"                 # Serial port (Linux/macOS) or "COM3" (Windows)
+baud_rate = 9600                      # Baud rate
+data_bits = 8                         # Data bits
+stop_bits = "one"                     # Stop bits
+parity = "none"                       # Parity
+flow_control = "none"                 # Flow control
+timeout_ms = 1000                     # Connection timeout
+enabled = false                       # Enable CAT control
+protocol = "hamlib"                   # CAT protocol
+termination = "\n"                    # Command termination
+response_timeout_ms = 500             # Response timeout
+retry_count = 3                       # Retry count
+
+# PTT control settings
+[rig.ptt]
+method = "none"                       # PTT method
+polarity = "positive"                 # PTT polarity
+tx_delay_ms = 100                     # TX delay
+tx_tail_ms = 100                      # TX tail delay
+timeout_seconds = 300                 # Safety timeout (5 minutes)
+
+[rig.ptt.vox]
+enabled = false
+gain = 0.5
+delay_ms = 500
+anti_vox = true
+threshold_db = -30.0
+
+# Frequency management
+[rig.frequency]
+control_enabled = false
+follow_rig = true
+polling_interval_ms = 1000
+
+[rig.frequency.memory_channels]
+enabled = false
+auto_save = false
+quick_memories = []
+
+[rig.frequency.limits]
+min_frequency = 1800000               # 1.8 MHz
+max_frequency = 440000000             # 440 MHz
+
+[rig.frequency.band_plan]
+region = 2                            # ITU Region 2 (Americas)
+edge_warnings = true
+
+# Band switching
+[rig.band_switching]
+auto_switching = false
+method = "none"
+switching_delay_ms = 100
+
+# Antenna switching
+[rig.antenna_switching]
+enabled = false
+method = "none"
+switching_delay_ms = 100
+antennas = []
+auto_rules = []
+
+# Power control
+[rig.power_control]
+enabled = false
+method = "none"
+default_level = 50
+
+[rig.power_control.ramping]
+enabled = false
+ramp_up_ms = 1000
+ramp_down_ms = 500
+curve = "linear"
+
+[rig.power_control.protection]
+max_power_watts = 100
+swr_protection = true
+max_swr = 3.0
+temperature_protection = true
+max_temperature_c = 80.0
+
+# Operating modes
+[rig.modes]
+supported_modes = ["LSB", "USB", "CW", "FM", "AM", "RTTY", "PSK31"]
+default_mode = "USB"
+
+[rig.modes.filters]
+available_widths = [500, 1000, 1500, 2400, 3000]
+
+# Timing settings
+[rig.timing]
+command_interval_ms = 100
+status_polling_ms = 1000
+retry_interval_ms = 1000
+keepalive_interval_ms = 30000
+response_timeout_ms = 500
+
+# Rig parameters
+[rig.rig_parameters]
+extended_features = []
+
+[rig.rig_parameters.calibration]
+frequency_offset = 0
+power_calibration = []
+s_meter_calibration = []
+swr_calibration = []
+
+[rig.rig_parameters.quirks]
+workarounds = []
+
+# User Interface Configuration
+[ui]
+theme = "default"                     # UI theme
+layout = "standard"                   # UI layout
+
+# Window settings
+[ui.window]
+width = 1200
+height = 800
+state = "normal"
+decorations = true
+resizable = true
+transparency = 1.0
+always_on_top = false
+
+[ui.window.multi_monitor]
+preferred_monitor = 0
+span_monitors = false
+remember_placement = true
+
+[ui.window.session]
+restore_positions = true
+restore_layouts = true
+auto_save_interval_minutes = 5
+
+# Typography settings
+[ui.typography]
+font_family = "Inter"
+font_size = 12.0
+monospace_font = "Fira Code"
+monospace_size = 11.0
+
+[ui.typography.font_weights]
+normal = 400
+bold = 600
+light = 300
+heavy = 700
+
+[ui.typography.rendering]
+antialiasing = "subpixel"
+subpixel_rendering = true
+hinting = "medium"
+line_height = 1.4
+letter_spacing = 0.0
+
+[ui.typography.scaling]
+ui_scale = 1.0
+log_scale = 0.9
+button_scale = 1.0
+menu_scale = 1.0
+tooltip_scale = 0.9
+
+# Color scheme
+[ui.colors.primary]
+base = "#3b82f6"
+light = "#60a5fa"
+dark = "#1d4ed8"
+contrast = "#ffffff"
+
+[ui.colors.secondary]
+base = "#6b7280"
+light = "#9ca3af"
+dark = "#374151"
+contrast = "#ffffff"
+
+[ui.colors.background]
+primary = "#ffffff"
+secondary = "#f9fafb"
+panel = "#f3f4f6"
+input = "#ffffff"
+selected = "#dbeafe"
+hover = "#f0f9ff"
+
+[ui.colors.text]
+primary = "#111827"
+secondary = "#6b7280"
+disabled = "#d1d5db"
+link = "#3b82f6"
+selected = "#1e40af"
+placeholder = "#9ca3af"
+
+[ui.colors.borders]
+normal = "#d1d5db"
+focus = "#3b82f6"
+error = "#ef4444"
+success = "#10b981"
+warning = "#f59e0b"
+
+[ui.colors.status]
+success = "#10b981"
+warning = "#f59e0b"
+error = "#ef4444"
+info = "#3b82f6"
+connected = "#10b981"
+disconnected = "#6b7280"
+transmitting = "#ef4444"
+receiving = "#10b981"
+
+[ui.colors.spectrum]
+spectrum_line = "#3b82f6"
+waterfall_gradient = ["#000080", "#0000ff", "#00ffff", "#ffff00", "#ff0000"]
+grid_lines = "#e5e7eb"
+frequency_markers = "#6b7280"
+signal_detection = "#ef4444"
+background_noise = "#374151"
+
+# Panel configuration
+[ui.panels]
+default_layout = "standard"
+
+[[ui.panels.available_panels]]
+id = "spectrum"
+name = "Spectrum"
+panel_type = "spectrum"
+default_position = "center"
+closeable = false
+moveable = true
+resizable = true
+
+[ui.panels.available_panels.default_size]
+width = { Percentage = 70.0 }
+height = { Percentage = 60.0 }
+min_width = 400
+min_height = 300
+
+[[ui.panels.available_panels]]
+id = "logging"
+name = "Logging"
+panel_type = "logging"
+default_position = "bottom"
+closeable = true
+moveable = true
+resizable = true
+
+[ui.panels.available_panels.default_size]
+width = { Percentage = 100.0 }
+height = { Percentage = 30.0 }
+min_width = 200
+min_height = 100
+
+[ui.panels.docking]
+enabled = true
+sensitivity = 20
+show_guides = true
+snap_to_edges = true
+zones = []
+
+[ui.panels.sizing]
+spacing = 4
+border_width = 1
+title_bar_height = 24
+splitter_width = 4
+tab_height = 28
+
+[ui.panels.visibility]
+initial_panels = ["spectrum", "logging"]
+auto_hide = false
+auto_hide_delay_ms = 2000
+show_titles = true
+show_close_buttons = true
+
+# Accessibility settings
+[ui.accessibility]
+high_contrast = false
+large_fonts = false
+screen_reader = false
+
+[ui.accessibility.keyboard_navigation]
+enabled = true
+show_focus = true
+focus_ring_width = 2
+focus_ring_color = "#3b82f6"
+tab_order = "standard"
+
+[ui.accessibility.visual_indicators]
+show_status = true
+color_coding = true
+show_progress = true
+change_animation = true
+highlight_active = true
+
+[ui.accessibility.sound_feedback]
+enabled = false
+button_clicks = false
+alerts = true
+status_changes = true
+volume = 0.5
+
+[ui.accessibility.motion_sensitivity]
+reduce_animations = false
+disable_auto_scroll = false
+disable_parallax = false
+static_backgrounds = false
+
+# Animation settings
+[ui.animations]
+enabled = true
+duration_scale = 1.0
+
+[ui.animations.easing]
+default = "ease_in_out"
+button_hover = "ease_out"
+panel_transition = "ease_in_out"
+fade = "linear"
+
+[ui.animations.transitions]
+fade_duration_ms = 200
+slide_duration_ms = 300
+scale_duration_ms = 200
+rotation_duration_ms = 300
+color_duration_ms = 150
+
+[ui.animations.performance]
+hardware_acceleration = true
+max_fps = 60
+adaptive_quality = true
+performance_monitoring = false
+
+# Toolbar configuration
+[ui.toolbars]
+toolbars = []
+
+[ui.toolbars.visibility]
+main_toolbar = true
+status_toolbar = true
+formatting_toolbar = false
+auto_hide = false
+lock_positions = false
+
+[ui.toolbars.customization]
+enabled = true
+allow_add_remove = true
+allow_reorder = true
+allow_new_toolbars = false
+save_customizations = true
+
+# Status bar
+[ui.status_bar]
+visible = true
+position = "bottom"
+update_interval_ms = 500
+show_progress = true
+
+[[ui.status_bar.items]]
+id = "frequency"
+item_type = "frequency"
+format = "{:.3} MHz"
+width = 100
+alignment = "left"
+priority = 10
+visible = true
+
+[[ui.status_bar.items]]
+id = "mode"
+item_type = "mode"
+width = 60
+alignment = "left"
+priority = 9
+visible = true
+
+[[ui.status_bar.items]]
+id = "connection"
+item_type = "connection"
+width = 80
+alignment = "right"
+priority = 8
+visible = true
+
+# Keyboard shortcuts
+[ui.keyboard]
+global_shortcuts = false
+conflict_resolution = "warn_user"
+show_hints = true
+
+[ui.keyboard.shortcuts.quit]
+keys = "Ctrl+Q"
+action = "application.quit"
+description = "Quit application"
+context = "global"
+enabled = true
+
+[ui.keyboard.shortcuts.connect]
+keys = "Ctrl+Shift+C"
+action = "rig.connect"
+description = "Connect to rig"
+context = "main_window"
+enabled = true
+
+# Logging display
+[ui.logging]
+max_entries = 1000
+entry_format = "[{timestamp}] {level}: {message}"
+show_timestamps = true
+timestamp_format = "%H:%M:%S"
+color_by_level = true
+auto_scroll = true
+
+[ui.logging.filtering]
+min_level = "info"
+category_filters = []
+recent_only = false
+recent_window_minutes = 60
+
+# Spectrum display
+[ui.spectrum]
+mode = "combined"
+fft_size = 2048
+averaging = 0.8
+update_rate = 30.0
+
+[ui.spectrum.waterfall]
+height = 200
+scroll_speed = 50.0
+color_mapping = "heat"
+contrast = 1.0
+brightness = 0.0
+
+[ui.spectrum.frequency_axis]
+visible = true
+units = "mhz"
+major_ticks = 1.0
+minor_ticks = 0.1
+label_format = "{:.1}"
+
+[ui.spectrum.amplitude_axis]
+visible = true
+units = "dbm"
+scale = "logarithmic"
+reference_level = -30.0
+dynamic_range = 80.0
+
+[ui.spectrum.grid]
+visible = true
+major_color = "#e5e7eb"
+minor_color = "#f3f4f6"
+line_width = 1.0
+line_style = "solid"
+
+[ui.spectrum.markers]
+visible = true
+color = "#ef4444"
+width = 2.0
+style = "line"
+show_labels = true
+
+# Network Services Configuration
+[network]
+
+# PSKReporter integration
+[network.psk_reporter]
+enabled = false
+server_url = "https://pskreporter.info/cgi-bin/pskdata.pl"
+upload_interval_seconds = 300
+batch_size = 50
+include_receives = true
+include_transmits = true
+min_snr_db = -20.0
+max_age_hours = 24
+frequency_accuracy_hz = 1
+
+[network.psk_reporter.reporter_info]
+software_name = "Pancetta"
+software_version = "0.1.0"
+
+[network.psk_reporter.filters]
+enabled_modes = ["PSK31", "PSK63", "FT8", "FT4", "JS8"]
+enabled_bands = ["40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m"]
+
+[network.psk_reporter.filters.geographic]
+include_dxcc = []
+exclude_dxcc = []
+include_itu_zones = []
+exclude_itu_zones = []
+include_cq_zones = []
+exclude_cq_zones = []
+
+[network.psk_reporter.filters.geographic.distance]
+great_circle = true
+
+# WSPR integration
+[network.wspr]
+enabled = false
+database_url = "http://wsprnet.org/drupal/wsprnet/spotquery"
+upload_spots = false
+download_spots = false
+
+[network.wspr.filtering]
+min_snr = -30.0
+max_drift_hz = 3.0
+bands = ["40m", "30m", "20m"]
+time_window_hours = 24
+
+[network.wspr.filtering.geographic]
+include_dxcc = []
+exclude_dxcc = []
+include_itu_zones = []
+exclude_itu_zones = []
+include_cq_zones = []
+exclude_cq_zones = []
+
+[network.wspr.filtering.geographic.distance]
+great_circle = true
+
+[network.wspr.analysis]
+propagation_analysis = false
+band_comparison = false
+antenna_analysis = false
+export_analysis = false
+
+# DX Cluster integration
+[network.dx_cluster]
+enabled = false
+servers = []
+
+[network.dx_cluster.connection]
+auto_connect = false
+reconnect_attempts = 3
+reconnect_delay_seconds = 30
+keepalive_interval_seconds = 300
+timeout_seconds = 30
+
+[network.dx_cluster.filtering]
+bands = []
+modes = []
+dxcc_filters = []
+duplicate_window_minutes = 10
+
+[network.dx_cluster.alerts]
+visual_alerts = true
+audio_alerts = false
+conditions = []
+
+[network.dx_cluster.alerts.sounds]
+volume = 0.5
+
+# Web API server
+[network.web_api]
+enabled = false
+bind_address = "127.0.0.1"
+port = 8080
+
+[network.web_api.authentication]
+required = true
+method = "api_key"
+api_keys = []
+
+[network.web_api.authentication.jwt]
+secret_encrypted = ""
+expiration_hours = 24
+issuer = "pancetta"
+audience = "pancetta-api"
+
+[network.web_api.cors]
+enabled = true
+allowed_origins = ["*"]
+allowed_methods = ["GET", "POST"]
+allowed_headers = ["Content-Type", "Authorization"]
+allow_credentials = false
+max_age_seconds = 3600
+
+[network.web_api.rate_limiting]
+enabled = true
+requests_per_minute = 60
+burst_allowance = 10
+by_ip = true
+by_api_key = false
+
+[network.web_api.documentation]
+enabled = true
+path = "/docs"
+title = "Pancetta API"
+description = "Amateur Radio Software API"
+version = "1.0.0"
+
+# Proxy settings
+[network.proxy]
+enabled = false
+proxy_type = "http"
+server = ""
+port = 8080
+exclusions = []
+
+# TLS/SSL settings
+[network.tls]
+verify_certificates = true
+min_version = "tls12"
+cipher_suites = []
+
+# Rate limiting
+[network.rate_limiting]
+enabled = true
+
+[network.rate_limiting.global]
+requests_per_minute = 300
+requests_per_hour = 3600
+requests_per_day = 86400
+
+# Reliability settings
+[network.reliability]
+connection_timeout_seconds = 30
+request_timeout_seconds = 60
+
+[network.reliability.retry]
+max_attempts = 3
+base_delay_ms = 1000
+max_delay_ms = 10000
+backoff_multiplier = 2.0
+jitter_factor = 0.1
+
+[network.reliability.circuit_breaker]
+enabled = true
+failure_threshold = 5
+success_threshold = 3
+timeout_ms = 60000
+
+[network.reliability.health_check]
+enabled = true
+interval_seconds = 300
+timeout_seconds = 10
+unhealthy_threshold = 3

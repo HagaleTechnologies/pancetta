@@ -1,0 +1,98 @@
+[package]
+name = "pancetta"
+description = "Autonomous FT8 ham radio station"
+keywords = ["amateur-radio", "ft8", "dsp", "real-time", "ham-radio"]
+categories = ["science", "multimedia::audio", "network-programming"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pancetta_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pancetta"
+path = "src/main.rs"
+
+[dependencies]
+# Local workspace dependencies
+pancetta-core = { path = "../pancetta-core" }
+pancetta-audio = { path = "../pancetta-audio" }
+pancetta-dsp = { path = "../pancetta-dsp" }
+pancetta-ft8 = { path = "../pancetta-ft8", features = ["transmit", "benchmark"] }
+pancetta-tui = { path = "../pancetta-tui" }
+pancetta-config = { path = "../pancetta-config" }
+pancetta-hamlib = { path = "../pancetta-hamlib", optional = true }
+pancetta-qso = { path = "../pancetta-qso" }
+pancetta-dx = { path = "../pancetta-dx" }
+pancetta-cqdx = { path = "../pancetta-cqdx" }
+geographiclib-rs = { workspace = true }
+
+# Async runtime and coordination
+tokio = { version = "1.50", features = ["full", "rt-multi-thread"] }
+
+# Inter-process communication
+crossbeam-channel = "0.5"
+
+# Real-time coordination
+parking_lot = "0.12"
+atomic = "0.6"
+
+# CLI and configuration
+clap = { version = "4.6", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Logging and telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# System utilities
+serialport = "4.9"
+libc = "0.2"
+signal-hook = { workspace = true }
+uuid = { version = "1.23", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+num_cpus = "1.0"
+
+# Performance monitoring
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", optional = true }
+
+# Audio output for examples
+cpal = { workspace = true }
+
+# WAV file reading for playback mode
+hound = "3.5"
+
+# FFT for live waterfall
+rustfft = "6.4"
+
+[dev-dependencies]
+tempfile = "3.27"
+criterion = { version = "0.5", features = ["html_reports"] }
+assert_cmd = "2.2"
+predicates = "3.1"
+tracing-test = "0.2"
+
+[features]
+default = ["metrics", "pancetta-hamlib"]
+metrics = []
+pancetta-hamlib = ["dep:pancetta-hamlib"]
+prometheus = ["metrics-exporter-prometheus"]
+tracing-json = []
+
+[[bench]]
+name = "pipeline_bench"
+harness = false

@@ -1,0 +1,52 @@
+[package]
+name = "pancetta-tui"
+description = "Terminal User Interface for Pancetta"
+# This crate is a library only — the production TUI runs inside the `pancetta`
+# binary via `TuiRunner` (the single source of truth for the keymap). The old
+# standalone `src/main.rs` monitor (a divergent keymap that never had a
+# coordinator/message-bus) was removed in the 2026-06-14 UX audit. Disable
+# bin auto-discovery so a stray `src/main.rs` can't resurrect that fork.
+autobins = false
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# TUI Framework
+ratatui = "0.30"
+crossterm = "0.28"
+
+# Async runtime and channels
+tokio = { version = "1.50", features = ["full"] }
+tokio-util = "0.7"
+crossbeam-channel = "0.5"
+
+# Serialization and configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Date and time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Logging
+tracing = "0.1"
+
+# Additional utility crates
+dirs = "5.0"
+
+# Ham radio specific
+# ft8-lib = { path = "../ft8-lib" }
+pancetta-core = { path = "../pancetta-core" }
+pancetta-config = { path = "../pancetta-config" }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.27"

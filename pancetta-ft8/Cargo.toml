@@ -1,0 +1,100 @@
+[package]
+name = "pancetta-ft8"
+description = "High-performance FT8 digital mode decoder for Pancetta"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Shared types (SlotParity, etc.)
+pancetta-core = { path = "../pancetta-core" }
+# DSP and FFT operations
+rustfft = "6.4"
+# Numeric operations with SIMD optimization
+num-complex = "0.4"
+num-traits = "0.2"
+# Bit manipulation for FT8 protocol
+bitvec = "1.0"
+# Time handling
+time = "0.3"
+# Concurrency primitives
+rayon = "1.12"
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+# Logging/tracing
+tracing = "0.1"
+# Serial port communication for PTT/CAT control
+serialport = { version = "4.9", optional = true }
+# GPIO control for Raspberry Pi
+rppal = { version = "0.17", optional = true }
+# Audio output and control
+cpal = { version = "0.15", optional = true }
+# Date/time handling for transmission scheduling
+chrono = { version = "0.4", features = ["serde"], optional = true }
+# Atomic operations for thread-safe state
+parking_lot = { version = "0.12", optional = true }
+# Configuration handling (optional: required by benchmark and transmit features)
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+# Async runtime for transmission control
+tokio = { version = "1.50", features = ["full"], optional = true }
+# WAV file reading for benchmark (optional)
+hound = { version = "3.5", optional = true }
+
+[build-dependencies]
+# C compiler for ft8_lib FFI
+cc = "1.2"
+
+[dev-dependencies]
+# Testing framework
+criterion = { version = "0.5", features = ["html_reports"] }
+approx = "0.5"
+# Property-based testing
+proptest = "1.11"
+# Random number generation for tests
+rand = "0.9"
+# Async testing runtime
+tokio-test = "0.4"
+# WAV file reading for integration tests
+hound = "3.5"
+
+[[example]]
+name = "transmission_demo"
+required-features = ["transmit"]
+
+[[test]]
+name = "benchmark_tests"
+required-features = ["benchmark"]
+
+[[bench]]
+name = "decoder_benchmark"
+harness = false
+
+[features]
+default = ["std", "neural_osd"]
+std = []
+# Enable SIMD optimizations
+simd = []
+# Use external ft8_lib via FFI (fallback)
+ffi = []
+# Enable GPIO support for Raspberry Pi
+gpio = ["rppal"]
+# Enable transmission capabilities
+transmit = ["serialport", "cpal", "chrono", "parking_lot", "tokio", "dep:serde", "dep:serde_json"]
+# Enable benchmark harness for decoder comparison
+benchmark = ["dep:hound", "dep:serde", "dep:serde_json"]
+# Enable serde Serialize/Deserialize for config types (used by research harness)
+serde = ["dep:serde"]
+# Enable decoder debug output (temporary)
+debug-decode = []
+# Enable experimental FT2 protocol support
+ft2 = []
+# Neural-OSD model: bundles ~80KB of weight blob and the CNN inference
+# pass that biases OSD bit-flip ordering. ON by default — yields a 600x
+# reduction in OSD trials for failed-BP frames. Disable for minimal
+# builds where the weight blob and inference cost aren't acceptable.
+neural_osd = []

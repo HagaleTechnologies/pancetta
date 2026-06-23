@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for running pancetta as an unattended FT8 station on macOS.
+  KeepAlive restarts pancetta automatically if it exits or crashes (including a
+  native ft8_lib C abort that no Rust panic handler can catch).
+
+  Install (per-user LaunchAgent):
+    cp packaging/launchd/net.hagale.pancetta.plist ~/Library/LaunchAgents/
+    # edit the ProgramArguments path to your built binary
+    launchctl load -w ~/Library/LaunchAgents/net.hagale.pancetta.plist
+    # logs: tail -f ~/.pancetta/launchd.{out,err}.log
+    # stop: launchctl unload ~/Library/LaunchAgents/net.hagale.pancetta.plist
+
+  Pancetta runs headless under a supervisor (no TUI).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>net.hagale.pancetta</string>
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Adjust to your installed binary path. -->
+        <string>/usr/local/bin/pancetta</string>
+        <string>--headless</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Restart on any exit, throttled so a crash-loop can't spin. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/pancetta.launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/pancetta.launchd.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,217 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/ci.yml'
+  schedule:
+    # Weekly drift check (Mondays 12:00 UTC). Catches toolchain bumps,
+    # advisory drops, and platform regressions even when no human pushes
+    # land. The full lane runs on schedule so the catch-up isn't gated
+    # behind a PR.
+    - cron: '0 12 * * 1'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Job gating policy:
+#
+#   - clippy + fmt: run on every event (push, PR, schedule). Cheap and fast.
+#   - heavy lanes (ft8-tests, workspace-check, deny): run on PR (so
+#     dependabot is fully gated), schedule (weekly drift), or
+#     workflow_dispatch — but NOT on direct human pushes to main. The
+#     pre-push hook (scripts/check.sh) is the safety net for direct
+#     pushes; CI minutes are reserved for what only CI can catch.
+#   - cross-platform-check: PR-only and on schedule (slowest lane,
+#     macos+windows runners are 10x and 2x cost).
+#
+# `if: github.event_name != 'push' || github.actor == 'dependabot[bot]'`
+# means "skip on a human direct push to main; run everywhere else." The
+# dependabot carve-out is moot in practice (dependabot never pushes
+# directly, only via PR) but kept explicit for safety.
+
+jobs:
+  # Fast checks — run on every push and PR (~2 min)
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+
+      - name: Clippy (workspace)
+        # pancetta-research is a local-only iteration harness (CLAUDE.md): never
+        # built in CI. Excluded explicitly so its research internals never gate
+        # or ship through the public CI lane.
+        run: cargo clippy --workspace --exclude pancetta-research --features transmit
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # Full test suite — runs on PR (dependabot included), weekly schedule,
+  # and manual dispatch. Skipped on direct human pushes to main; the
+  # pre-push hook covers that case locally.
+  ft8-tests:
+    name: FT8 Tests
+    if: github.event_name != 'push' || github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ft8-tests
+
+      - name: Check (no features)
+        run: cargo check -p pancetta-ft8
+
+      - name: Check (transmit feature)
+        run: cargo check --features transmit -p pancetta-ft8
+
+      - name: Run FT8 tests (all features)
+        run: cargo test --features transmit -p pancetta-ft8
+
+  workspace-check:
+    name: Workspace Check
+    if: github.event_name != 'push' || github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    env:
+      # This lane links the whole workspace THREE times (check, examples,
+      # tests). Each test/example binary statically links a large dep tree,
+      # and the workspace ships dozens of example binaries. With full
+      # debuginfo the accumulated target/ exhausted the runner's disk during
+      # linking on a cold cache — `ld` died with SIGBUS (ENOSPC on its
+      # mmap'd output) on 2026-06-13. line-tables-only keeps file:line in
+      # backtraces while dropping ~70-80% of debuginfo size, for both the
+      # dev profile (examples) and the test profile (integration tests).
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # Reclaim ~25-30 GB of preinstalled tooling the runner ships but this
+      # lane never uses. Pairs with the reduced debuginfo above to keep the
+      # cold-cache full-workspace build comfortably under the disk ceiling.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          df -h /
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: workspace-check
+
+      - name: Check workspace
+        # Exclude the local-only research harness (CLAUDE.md): its sources and
+        # examples are never built in CI.
+        run: cargo check --workspace --exclude pancetta-research
+
+      - name: Build examples
+        run: cargo build --workspace --exclude pancetta-research --examples
+
+      - name: Test workspace
+        run: cargo test --workspace --exclude pancetta-research --features transmit
+
+  # Cross-platform compile check. Pancetta targets Linux/macOS/Windows
+  # (development on Mac, production on Windows MiniPC), so a Linux-only
+  # CI lane silently lets platform regressions land. Check-only (not test)
+  # to keep wall-clock manageable. PR + weekly cron + manual dispatch
+  # (skipped on direct human push to main; macos minutes are 10x cost).
+  cross-platform-check:
+    name: Cross-Platform Check (${{ matrix.os }})
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        # windows-latest dropped 2026-05-23: MSVC can't compile the
+        # variable-length arrays in vendor/ft8_lib/ft8/decode.c
+        # (error C2057). The pancetta-ft8 build script invokes cc on
+        # the C sources, and MSVC is stricter than gcc/clang about
+        # VLA support (only allowed with /experimental:c11atomics, and
+        # even then not reliably). Patching upstream ft8_lib is out of
+        # scope; on-rig builds use the MinGW toolchain on the Windows
+        # MiniPC, not MSVC. Re-add windows-latest if the upstream
+        # ft8_lib drops VLAs.
+        os: [macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-${{ matrix.os }}
+
+      # default-members excludes pancetta-hamlib; the rigctld TCP path is
+      # exercised on Linux and the bundled FFI bindings are dead code. The
+      # other crates must compile on all three platforms.
+      - name: Check workspace (default members)
+        run: cargo check
+
+  # cargo-deny enforces license whitelist, banned-crate-source policy,
+  # multi-version warnings, AND RustSec advisories — the latter subsumes
+  # what cargo-audit would do separately. Single source of truth in
+  # deny.toml, including any documented advisory ignores. Skipped on
+  # direct human push to main; the pre-push hook covers it locally.
+  deny:
+    name: Cargo Deny
+    if: github.event_name != 'push' || github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources advisories

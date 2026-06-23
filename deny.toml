@@ -1,0 +1,81 @@
+# cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/
+# for the full schema.
+
+[graph]
+# Workspace targets that we ship to. Linux is the primary deployment target;
+# the Mac and Windows entries match the cross-platform-check CI matrix.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = false
+
+[advisories]
+# Fail on any RustSec advisory in dependencies. Yanked crates also fail.
+yanked = "deny"
+# Each ignore MUST come with a rationale comment so future-us can re-evaluate.
+# Re-check this list when bumping the affected crate's parent.
+ignore = [
+    # `instant` 0.1 is unmaintained. Replacement is `web-time`. We pull
+    # instant transitively via tokio/cpal; both are working on migration.
+    # Nothing actionable at our layer.
+    { id = "RUSTSEC-2024-0384", reason = "transitive via tokio/cpal; upstream migration to web-time pending" },
+
+    # `paste` is unmaintained but is a proc-macro crate that runs only at
+    # compile time. No runtime code, no security surface from being
+    # unmaintained.
+    { id = "RUSTSEC-2024-0436", reason = "proc-macro only — runs at build time, no runtime exposure" },
+
+    # `proc-macro-error2` was a maintained fork of proc-macro-error; both
+    # the original and the fork are now unmaintained. Proc-macro only
+    # (compile time), no runtime surface.
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro only — runs at build time, no runtime exposure (also tracked as RUSTSEC-2024-0370)" },
+]
+
+[licenses]
+# Permissive licenses we accept for transitive deps. The workspace itself
+# is dual MIT/Apache. We allow the standard Rust ecosystem set; anything
+# outside this list requires an explicit decision.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+    # CDLA-Permissive-2.0 is the Linux Foundation Community Data License
+    # Agreement, used by webpki-roots to publish the Mozilla CA bundle
+    # (it's data, not code). Permissive use, equivalent in effect to
+    # MIT for our purposes.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+# Block a crate from showing up under multiple major versions in the graph
+# unless we explicitly allow it. Multiple-version skews are a common source
+# of bloat and behaviour drift.
+multiple-versions = "warn"
+# Wildcard external deps are a footgun (silent major-version bumps), but
+# our internal `path = "../pancetta-foo"` workspace edges resolve as
+# wildcards and that's normal Rust workspace shape. allow-wildcard-paths
+# permits the path case while still denying `version = "*"` on a
+# crates.io dep.
+wildcards = "deny"
+allow-wildcard-paths = true
+# Add explicit `deny = [...]` entries here if a banned crate ever creeps
+# in (e.g. unmaintained or compromised packages).
+
+[sources]
+# Only crates.io and the workspace itself. No git dependencies for now.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

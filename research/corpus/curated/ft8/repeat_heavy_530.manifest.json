@@ -1,0 +1,3009 @@
+{
+  "schema_version": 1,
+  "label": "repeat_heavy_530",
+  "generated_at_utc": "batch66",
+  "source": "research/corpus/scans/raw_20260530_scan.jsonl",
+  "criterion": "repeat_heavy (min_repeats=3, window=2700s)",
+  "entries": [
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_152356.wav",
+      "wav_sha256": "80f5b76dc72e02de6296948c6128b3eb25110d02ca33dca2f761e8271843838f",
+      "slot_index": 0,
+      "wav_timestamp": 1778945036
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_152443.wav",
+      "wav_sha256": "74e64b38e91fa4872dcd77d1e562dcdd7d358b82ad4e9eae841483621938d15c",
+      "slot_index": 1,
+      "wav_timestamp": 1778945083
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_152543.wav",
+      "wav_sha256": "ce652a8ead4cbd112bf3087443d0b7f51ff8429b02dc9f85571a9ba43d8d960d",
+      "slot_index": 2,
+      "wav_timestamp": 1778945143
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_152643.wav",
+      "wav_sha256": "a21d50a6f2315178f7351801a9602a41008765dec368f8ba9891de7c7e88107d",
+      "slot_index": 3,
+      "wav_timestamp": 1778945203
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_152743.wav",
+      "wav_sha256": "3d43d1bd9647abbb68b1ad894de834fbec402dbca3ff67a00b102c9f8c62569d",
+      "slot_index": 4,
+      "wav_timestamp": 1778945263
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_152843.wav",
+      "wav_sha256": "7fc0c623d95096c72969fa8b2927a84b5fcb01d3a5c8b4f34bcaf7678098b833",
+      "slot_index": 5,
+      "wav_timestamp": 1778945323
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_152943.wav",
+      "wav_sha256": "2bb2f150d3b8915a578239f53f32a0731cd0ea8d696f2fc46c9bf6ddcd7d1978",
+      "slot_index": 6,
+      "wav_timestamp": 1778945383
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_153043.wav",
+      "wav_sha256": "2b54f071f788d415a2d832b1a603988cfd074d672b4372d6de4609311c5907c1",
+      "slot_index": 7,
+      "wav_timestamp": 1778945443
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_153158.wav",
+      "wav_sha256": "5d00c34137b690c3cb96f9ce6bd0c48c486b0bf71b6658840b9fef91e9ca5f4f",
+      "slot_index": 8,
+      "wav_timestamp": 1778945518
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_153258.wav",
+      "wav_sha256": "bd36a60fe537053d9a7ad9121d38f944d7511746eb22b7d9a8b05f21146124cf",
+      "slot_index": 9,
+      "wav_timestamp": 1778945578
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_153358.wav",
+      "wav_sha256": "af671609e0c54e417aa495cda439e7599f85565edab8c1abf25f463941126080",
+      "slot_index": 10,
+      "wav_timestamp": 1778945638
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_153458.wav",
+      "wav_sha256": "1cb3096e5c65458b0f5becf49b2886ea018344bb329a23e6c97071bd392de5d5",
+      "slot_index": 11,
+      "wav_timestamp": 1778945698
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_153558.wav",
+      "wav_sha256": "666685f0cc395931e5125c75b085cc4539b5469c05d842b1d67ea6ff4bf44c6c",
+      "slot_index": 12,
+      "wav_timestamp": 1778945758
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_153658.wav",
+      "wav_sha256": "e9beea3fc4ea7986b857fe49a3a999d5de766b1a1a28ee09e5042a733cdfe704",
+      "slot_index": 13,
+      "wav_timestamp": 1778945818
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_153758.wav",
+      "wav_sha256": "dce7943c7173116dac6aab5b883bce838ef36858c55beb02a656022559463401",
+      "slot_index": 14,
+      "wav_timestamp": 1778945878
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_153858.wav",
+      "wav_sha256": "f1dff3078a27c9b6dba88a883558a5fe111afdc819665108a0d6a30470af330a",
+      "slot_index": 15,
+      "wav_timestamp": 1778945938
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_154013.wav",
+      "wav_sha256": "ae21404bf1c29c62350379d0dde75308fce12c949ed7677afffab60b24bee06e",
+      "slot_index": 16,
+      "wav_timestamp": 1778946013
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_154113.wav",
+      "wav_sha256": "e3019898af757557bd0cd1848fd5bfddcf32d44315d24ed3701d588bb0957019",
+      "slot_index": 17,
+      "wav_timestamp": 1778946073
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_154213.wav",
+      "wav_sha256": "632a0f8f02f88d3b47e70db0aa10a57dc26f9c3526a674aef28825cdce42004a",
+      "slot_index": 18,
+      "wav_timestamp": 1778946133
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_154313.wav",
+      "wav_sha256": "5bfe7fa33b03b63457c840c335da3e9eca0d262ebeda95ee6ab46615eecd885c",
+      "slot_index": 19,
+      "wav_timestamp": 1778946193
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_154413.wav",
+      "wav_sha256": "49fb6b5929c6a46793d5c4d72484915c426b562adcbaad4aa6399899891064e4",
+      "slot_index": 20,
+      "wav_timestamp": 1778946253
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_154513.wav",
+      "wav_sha256": "66fd7592749fdf39ba2c0eaf3f62557c8c0bd8feddee238d9e8a24268817b090",
+      "slot_index": 21,
+      "wav_timestamp": 1778946313
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_154613.wav",
+      "wav_sha256": "d6f6298f0fdbb905f276197abeee2a52e4339d8df397d75131f9812c89c03ee7",
+      "slot_index": 22,
+      "wav_timestamp": 1778946373
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_154728.wav",
+      "wav_sha256": "faada358e9489d4ac8b64dbc7cd3016b0619667a146920665727bdc6a9af1229",
+      "slot_index": 23,
+      "wav_timestamp": 1778946448
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_154828.wav",
+      "wav_sha256": "85a9b40ca3ccca60e921ac57ba0a8eadc5f535d780bf4344ec78b5312ef54350",
+      "slot_index": 24,
+      "wav_timestamp": 1778946508
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_154928.wav",
+      "wav_sha256": "78c0d2dcde7b69551df139990d1d5f618a64915cb428d33b1bdcbc004476541b",
+      "slot_index": 25,
+      "wav_timestamp": 1778946568
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_155028.wav",
+      "wav_sha256": "07cc8fb72fd5d3d06bdc45693751deb08b1a25f1476d25cd195675e7fdfe98a0",
+      "slot_index": 26,
+      "wav_timestamp": 1778946628
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_155128.wav",
+      "wav_sha256": "d58830487871b5cb50a76442a1b3092b74baf7e6efa72f7086d7047b980b1f62",
+      "slot_index": 27,
+      "wav_timestamp": 1778946688
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_155228.wav",
+      "wav_sha256": "60070eb862ab70c6bf3df7b2432fef81f97d4b0532e773ea55f655e51365336e",
+      "slot_index": 28,
+      "wav_timestamp": 1778946748
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_155328.wav",
+      "wav_sha256": "d7e786378c8e133bbc5e696bea635bfbaad4b6b62350fec15ba0b9d43de082e5",
+      "slot_index": 29,
+      "wav_timestamp": 1778946808
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_155428.wav",
+      "wav_sha256": "f8a4b7187ff17256c76d7226f2a2bcbfb6e5e3daee11f9aca6e3aabca01b4568",
+      "slot_index": 30,
+      "wav_timestamp": 1778946868
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_155543.wav",
+      "wav_sha256": "469eb60c5367bfdac5694867f37d1a18a12afbd0ef7d9fa48f96c378b6fb691f",
+      "slot_index": 31,
+      "wav_timestamp": 1778946943
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_155643.wav",
+      "wav_sha256": "03c1223bccceff78a6a6ddb501412393325650836e165103af4af409e746f6fd",
+      "slot_index": 32,
+      "wav_timestamp": 1778947003
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_155743.wav",
+      "wav_sha256": "32404955368dfb0d18a60e2b4b83919fc73e070f21493669f51ec4b61f8b47d5",
+      "slot_index": 33,
+      "wav_timestamp": 1778947063
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_155843.wav",
+      "wav_sha256": "acc5d69f34686b9fe4e8e29992a7e8929384dbe68f9187c0963cc79ffeb40ac8",
+      "slot_index": 34,
+      "wav_timestamp": 1778947123
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_155943.wav",
+      "wav_sha256": "0338a79c39c8a9d82f93dacdbad2e53b44df8c470636781d1c386a619209570c",
+      "slot_index": 35,
+      "wav_timestamp": 1778947183
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_160043.wav",
+      "wav_sha256": "3c1490f892f8f3a67164b7c5ab0eaf3cbf88f6cf6b7a23761f1a7da90a7774a1",
+      "slot_index": 36,
+      "wav_timestamp": 1778947243
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_160143.wav",
+      "wav_sha256": "82b140b932cacd6a2b0e403865df137843287edb00f0f81bd83c70e96f2b25db",
+      "slot_index": 37,
+      "wav_timestamp": 1778947303
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_160258.wav",
+      "wav_sha256": "3d28a4ea1ce8bef7648a9227df82f9b89e0a94e629dabb2305a7a40dc1f47ba3",
+      "slot_index": 38,
+      "wav_timestamp": 1778947378
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_160358.wav",
+      "wav_sha256": "61321ae1069771c8cb0aa5eb4a61c1b76cbaaae1534eb8d1ca734549a58bd0f2",
+      "slot_index": 39,
+      "wav_timestamp": 1778947438
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_160458.wav",
+      "wav_sha256": "b20156c9c1f8581d9ccd68fc8245269bdf0c003316c3e8a26b75038235905dc7",
+      "slot_index": 40,
+      "wav_timestamp": 1778947498
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_160558.wav",
+      "wav_sha256": "de8ca59ed696f8836f7be9a9610cb11a44428bc64b63c77675c2eef762e1476e",
+      "slot_index": 41,
+      "wav_timestamp": 1778947558
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_160658.wav",
+      "wav_sha256": "45673483078160261a90b210fbe4c5f8ff762f46223d4e5d57dd23a47ca4e616",
+      "slot_index": 42,
+      "wav_timestamp": 1778947618
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_160758.wav",
+      "wav_sha256": "8d48ae9253ac28a8a2cd9d50af4811dd45d4606109bde420d99ac19af2a71e78",
+      "slot_index": 43,
+      "wav_timestamp": 1778947678
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_160858.wav",
+      "wav_sha256": "293e11875ef6e9b4e989afba48846a564034c1ab4fe7c3780ff0d596e7e5f31b",
+      "slot_index": 44,
+      "wav_timestamp": 1778947738
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_160958.wav",
+      "wav_sha256": "e3dc3630a325639beba99c102c61f75a545c7d0e867b433ee99991567be80ac5",
+      "slot_index": 45,
+      "wav_timestamp": 1778947798
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_161113.wav",
+      "wav_sha256": "ecda52633fca5bba8a3ae9b3a62ace81115e2a066205ac8d62b3170b9e978e46",
+      "slot_index": 46,
+      "wav_timestamp": 1778947873
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_161213.wav",
+      "wav_sha256": "6ba6b07156e1c8da4845b5fdbce6ab9161b53c39f4e1a8a29bac4c7abe6e6482",
+      "slot_index": 47,
+      "wav_timestamp": 1778947933
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_161313.wav",
+      "wav_sha256": "1049041a2ce066733a05908c8af2a423c3ee4f07ffeb1068bc63ae76d141b4f2",
+      "slot_index": 48,
+      "wav_timestamp": 1778947993
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_161413.wav",
+      "wav_sha256": "594b1c9951e086fae02e662500310f83a29df166e9390483fc35671fd94964b1",
+      "slot_index": 49,
+      "wav_timestamp": 1778948053
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_161513.wav",
+      "wav_sha256": "0a75c56123647e285010959cb03e636f93dc103af822531fba22edd7738efe01",
+      "slot_index": 50,
+      "wav_timestamp": 1778948113
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_161613.wav",
+      "wav_sha256": "9446521f8b602c8ec5041ee49b3536d9f893c8087287a6a116c618259f0ba73e",
+      "slot_index": 51,
+      "wav_timestamp": 1778948173
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_161713.wav",
+      "wav_sha256": "5cd2c5eeb7206c85978e0e08d4a39904222071b25bc413094c6b95da021c5a5f",
+      "slot_index": 52,
+      "wav_timestamp": 1778948233
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_161813.wav",
+      "wav_sha256": "6cb3ac101193b9c37d8f63bf47232f2a5952cba13248328899ae1f56b2b7d8a8",
+      "slot_index": 53,
+      "wav_timestamp": 1778948293
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_161928.wav",
+      "wav_sha256": "78f4a05c385327b86c8120854c55d20e978510ad98cdb76e32ad8f0ebcfa0c02",
+      "slot_index": 54,
+      "wav_timestamp": 1778948368
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_162028.wav",
+      "wav_sha256": "88fdbe1a74fe8373a173b7dbedcefebc37fbb6607c9ed6848f302d3c2d7bea32",
+      "slot_index": 55,
+      "wav_timestamp": 1778948428
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_162128.wav",
+      "wav_sha256": "69fa7b44bb7fa3ce04b6761aef26119dd4e77fc4cc49d7ff6c9fad79d210f773",
+      "slot_index": 56,
+      "wav_timestamp": 1778948488
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_162228.wav",
+      "wav_sha256": "1de23592735cbcf8e327fa08008f04260b63d5b50b62b0794c3488c7b892380a",
+      "slot_index": 57,
+      "wav_timestamp": 1778948548
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_162328.wav",
+      "wav_sha256": "37d6b3eb53234e4264648269cf08aeff86e0d30a58facc56f27295e54d1529b1",
+      "slot_index": 58,
+      "wav_timestamp": 1778948608
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_162428.wav",
+      "wav_sha256": "301ffce1dcc65ccb9ee22faefca497fa8915898fe09b266c7a57ada3f5094655",
+      "slot_index": 59,
+      "wav_timestamp": 1778948668
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_162528.wav",
+      "wav_sha256": "ecdceedefd2453a2f8a7fad361339971ed84285427bbf8944fd5a448200fd77d",
+      "slot_index": 60,
+      "wav_timestamp": 1778948728
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_162643.wav",
+      "wav_sha256": "ee5c09568cbc05b749e88e39b3490afb7731a14444e47fb618e7f35dda1fa659",
+      "slot_index": 61,
+      "wav_timestamp": 1778948803
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_162743.wav",
+      "wav_sha256": "f2c9c4d7f82950015f16a8796c4be88ce50fccb8bacbdbd58fe7566a6c411b85",
+      "slot_index": 62,
+      "wav_timestamp": 1778948863
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_162843.wav",
+      "wav_sha256": "f17a1829fc3cb965d52870f271103da85e55537d2eb8d23e67b324d70ec4b627",
+      "slot_index": 63,
+      "wav_timestamp": 1778948923
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_162943.wav",
+      "wav_sha256": "72a8541ea0576ce696bfcf33e6846755b283ff30882494e918d820fc1c466d34",
+      "slot_index": 64,
+      "wav_timestamp": 1778948983
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_163043.wav",
+      "wav_sha256": "12fd3a6c6eb4a78b4427705f36f9bf776a768577690202a4bdb07583621ac26d",
+      "slot_index": 65,
+      "wav_timestamp": 1778949043
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_163143.wav",
+      "wav_sha256": "cd01e84195b8e513534415b439faafdfb182c7db665ab6309427abbea1185a60",
+      "slot_index": 66,
+      "wav_timestamp": 1778949103
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_163243.wav",
+      "wav_sha256": "6cf48f955d8ec92ddb4ad6abdd213085767f19dfc998192f7a5832cc8a67d74d",
+      "slot_index": 67,
+      "wav_timestamp": 1778949163
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_163343.wav",
+      "wav_sha256": "bcf7b61f7ac8e8f2f29a08afc489d3791afa71431f2e96d116c7ac5ad052856f",
+      "slot_index": 68,
+      "wav_timestamp": 1778949223
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_163458.wav",
+      "wav_sha256": "24baad116ed5c7d2e735b8efa90165508bb28041243e24024b182b103751119b",
+      "slot_index": 69,
+      "wav_timestamp": 1778949298
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_163558.wav",
+      "wav_sha256": "ec218c2754654ec006d2fee2180fdb53e306844421cc776b7eb337fefbce4b60",
+      "slot_index": 70,
+      "wav_timestamp": 1778949358
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_163658.wav",
+      "wav_sha256": "b12156328309639bdc2623257a1f1bd1007ee1b7bf24a60387ee553af2633ac4",
+      "slot_index": 71,
+      "wav_timestamp": 1778949418
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_163758.wav",
+      "wav_sha256": "732b3396b6279e1324a50b33d64423400e43ff4c6794ab9257f0b12d5b46c4fc",
+      "slot_index": 72,
+      "wav_timestamp": 1778949478
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_163858.wav",
+      "wav_sha256": "b4ea7e3687ba0b3d7fb3c97b7c88d998d96d6d79eccd4b25addc58406a707011",
+      "slot_index": 73,
+      "wav_timestamp": 1778949538
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_163958.wav",
+      "wav_sha256": "8ae05155344af41d2d2e834aebced5f112508f44a3e4d1162601488f116e5a94",
+      "slot_index": 74,
+      "wav_timestamp": 1778949598
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_164058.wav",
+      "wav_sha256": "63642ef7473926de9b69c6e963c4c734383c965abcdda701f3bf2f2912bcca71",
+      "slot_index": 75,
+      "wav_timestamp": 1778949658
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_164213.wav",
+      "wav_sha256": "5899cbb1cae2ea6d7a997665c21282ef66bdd26f5cb2832fae89df19659d08a8",
+      "slot_index": 76,
+      "wav_timestamp": 1778949733
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_164313.wav",
+      "wav_sha256": "fa3d6cea787b6d2db07e7a66df853eefb9b1ac21eba4ff874ecef2cf3fa9dca2",
+      "slot_index": 77,
+      "wav_timestamp": 1778949793
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_164413.wav",
+      "wav_sha256": "43e7e7db1d7359052cf25241d400a6add37bb692533016ef9d6180ba0d279727",
+      "slot_index": 78,
+      "wav_timestamp": 1778949853
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_164513.wav",
+      "wav_sha256": "4b159d7d1ed95e744a72a34c4737b92697825125f1ca5e95cfc6b30bb806d609",
+      "slot_index": 79,
+      "wav_timestamp": 1778949913
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_164613.wav",
+      "wav_sha256": "df00786791544d85fbf95c7f433240ce7affab2aafeac69fa219637b7024b65d",
+      "slot_index": 80,
+      "wav_timestamp": 1778949973
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_164713.wav",
+      "wav_sha256": "1fda087c7490a21d57c4f6403d58000cab26a4fab47bbf200f768386620d453f",
+      "slot_index": 81,
+      "wav_timestamp": 1778950033
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_164813.wav",
+      "wav_sha256": "ff3c18a196995f61b106a157e372e94bc99377eaaaf9e50633a8a6648276f09a",
+      "slot_index": 82,
+      "wav_timestamp": 1778950093
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_164913.wav",
+      "wav_sha256": "e4122a18e1fc6d2ab5adcff8776e63492b99f56fd5104eda9df26a943a7253b7",
+      "slot_index": 83,
+      "wav_timestamp": 1778950153
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_165028.wav",
+      "wav_sha256": "c0f740855325cb7a3c6ff0e38751d1c2fb0da56207c53e476844290a3ff6a45b",
+      "slot_index": 84,
+      "wav_timestamp": 1778950228
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_165128.wav",
+      "wav_sha256": "bb8e2cdfb93532fb386f386102ad5291e056721905fb3292f8d1fbcda8380f87",
+      "slot_index": 85,
+      "wav_timestamp": 1778950288
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_165228.wav",
+      "wav_sha256": "255543798352694006ff01516cfdb39fc2991c5748fcaf5d98d934902655dbd1",
+      "slot_index": 86,
+      "wav_timestamp": 1778950348
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_165328.wav",
+      "wav_sha256": "9dbf4d18150dcffbc94fb6f0d43b621482514dafa875efa63a16d7952c2fc412",
+      "slot_index": 87,
+      "wav_timestamp": 1778950408
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_165428.wav",
+      "wav_sha256": "93bb7f9e37f479c616ef5a18a713c7888e3816781c0ee44e70d00f5af9d0fb2e",
+      "slot_index": 88,
+      "wav_timestamp": 1778950468
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_165528.wav",
+      "wav_sha256": "9b4701ca2d1de43846f2535b218cd29096d068e608583e5ecd1055faeb9c9315",
+      "slot_index": 89,
+      "wav_timestamp": 1778950528
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_165628.wav",
+      "wav_sha256": "deaf05717f437d335c4a3bdf5d1d10246e74513580c37e4cb8a3216390106218",
+      "slot_index": 90,
+      "wav_timestamp": 1778950588
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_165743.wav",
+      "wav_sha256": "2eb6476b9546daffc165e79ab88e902e2f9d2665aab84e91cfd39de1f53d534d",
+      "slot_index": 91,
+      "wav_timestamp": 1778950663
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_165843.wav",
+      "wav_sha256": "0c230b5660916d1d37992369bee9e57cf1b89b69c0d5481ae9171cbec078a596",
+      "slot_index": 92,
+      "wav_timestamp": 1778950723
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_165943.wav",
+      "wav_sha256": "f1e530535b03f86128cc835da60d4a42200039731d5ad601fc2aa5a7e8e9d09c",
+      "slot_index": 93,
+      "wav_timestamp": 1778950783
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_170043.wav",
+      "wav_sha256": "cf9ebe70b02ca63a3e4cc03157d3307efab6c6e8298182ffeadac09ec616294e",
+      "slot_index": 94,
+      "wav_timestamp": 1778950843
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_170143.wav",
+      "wav_sha256": "b6f1cb1f0f03d81ca7f726228bc20cbcd49e81af263d5dc9b207782db061812d",
+      "slot_index": 95,
+      "wav_timestamp": 1778950903
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_170243.wav",
+      "wav_sha256": "04c5299f028ff303ff92ea0deb49554224933b0d841620a40f948c98d1b338dd",
+      "slot_index": 96,
+      "wav_timestamp": 1778950963
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_170343.wav",
+      "wav_sha256": "3f36c59943c7e5bcd1e5ded6958e56df493980366ec44f433bb2ce9d9e189c7b",
+      "slot_index": 97,
+      "wav_timestamp": 1778951023
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_170443.wav",
+      "wav_sha256": "93a525108cd7cb2d3ffc299685a093e78748577e1ddc1be2b003a3fcaa2475d9",
+      "slot_index": 98,
+      "wav_timestamp": 1778951083
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_170558.wav",
+      "wav_sha256": "9ce14397702ec3873c077e36d38ac8bd8d60ec543e648f6bde213e328df36666",
+      "slot_index": 99,
+      "wav_timestamp": 1778951158
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_170658.wav",
+      "wav_sha256": "4dc92e7e1d9a68f6137551286a516b5ff5c078fd5b5078a3da8332dcdc182c1f",
+      "slot_index": 100,
+      "wav_timestamp": 1778951218
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_170758.wav",
+      "wav_sha256": "9db0decb82d202d7cc1d626fc723843b1c1f6468b950163e4302c997d22850ab",
+      "slot_index": 101,
+      "wav_timestamp": 1778951278
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_170858.wav",
+      "wav_sha256": "2e4294c559ead732a96cd1fdb810767e19973c2159ffd7dfb28cc1c006b51db0",
+      "slot_index": 102,
+      "wav_timestamp": 1778951338
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_170958.wav",
+      "wav_sha256": "99191c6681f9b3649e089afa88c070f4dd13b5398bd5e0ded1a8d781005dce44",
+      "slot_index": 103,
+      "wav_timestamp": 1778951398
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_171058.wav",
+      "wav_sha256": "8301dc05d7a03784d5ac061bf0d8b10cd7b854f4008294776b9bc28b02be98a2",
+      "slot_index": 104,
+      "wav_timestamp": 1778951458
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_171158.wav",
+      "wav_sha256": "8e65844ab17b0c3f74b7e9d257d5ab7cfe9c4f216b3c9b58c96ca67580cbd7f8",
+      "slot_index": 105,
+      "wav_timestamp": 1778951518
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_171258.wav",
+      "wav_sha256": "16fe7ed1f0a07464ca67aa8c2151d3db03552ffb39830d56fc7353595752eee6",
+      "slot_index": 106,
+      "wav_timestamp": 1778951578
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_171413.wav",
+      "wav_sha256": "e74efe5fce51e9725183f638a28762f89d94d44b6632f7fb342e5516ea1652cd",
+      "slot_index": 107,
+      "wav_timestamp": 1778951653
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_171513.wav",
+      "wav_sha256": "55e18bbf6b66150c4927272328a46f65d8bf5183ad44563f3d76988e5ab8ff69",
+      "slot_index": 108,
+      "wav_timestamp": 1778951713
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_171613.wav",
+      "wav_sha256": "dec0ea4d4dd65a238dbace30fefdae9d9a93c92abcf809dcae4ddc093c26ae18",
+      "slot_index": 109,
+      "wav_timestamp": 1778951773
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_171713.wav",
+      "wav_sha256": "b539046c3353499f9e5fb577e749376c8b64b0ae4d2d1a2ee47b361a13cd3212",
+      "slot_index": 110,
+      "wav_timestamp": 1778951833
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_171813.wav",
+      "wav_sha256": "b42463597f3c403cf33c5d21c977eea9101d45fc67a122130f90300946a92dcb",
+      "slot_index": 111,
+      "wav_timestamp": 1778951893
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_171913.wav",
+      "wav_sha256": "5492269ac9366d1d8846a9bddff7e5915bbfc4ebdcf53314b49ba060a02ac915",
+      "slot_index": 112,
+      "wav_timestamp": 1778951953
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_172013.wav",
+      "wav_sha256": "9ddbeb957c81d7fb8161f38ae892c26708f198ffe273d2db2425dd1279b3411f",
+      "slot_index": 113,
+      "wav_timestamp": 1778952013
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_172128.wav",
+      "wav_sha256": "34fe08e77a502bd44cb579b956c635427cae562f4578feb11faa15df4ccb48a4",
+      "slot_index": 114,
+      "wav_timestamp": 1778952088
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_172228.wav",
+      "wav_sha256": "ad1397ad2d6e3d896195c65cd0b8b8740c04e1a769b0662ea72cd4270220ec38",
+      "slot_index": 115,
+      "wav_timestamp": 1778952148
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_172328.wav",
+      "wav_sha256": "7becf9e2a8d56c320b3560798b0a026178b586729f17b3996c4ef22ec2481d3b",
+      "slot_index": 116,
+      "wav_timestamp": 1778952208
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_172428.wav",
+      "wav_sha256": "007816a439b13eefc1ae7e2d55e2f9a1c00f005cdd51146803b3b3a8099ed191",
+      "slot_index": 117,
+      "wav_timestamp": 1778952268
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_172528.wav",
+      "wav_sha256": "d810eb40a04eb69ceaa4085daf0315a3674d1b75c12aa9009b4c9d81b5017732",
+      "slot_index": 118,
+      "wav_timestamp": 1778952328
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_172628.wav",
+      "wav_sha256": "c900b014055a5ffbcd57f77752a6d015ea3cc9ec93e5009f6a012a61227f61da",
+      "slot_index": 119,
+      "wav_timestamp": 1778952388
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_172728.wav",
+      "wav_sha256": "b05351613ef8b37588cbabe06aafe95e23894b1334fe9b5c3ecde34b1ed28028",
+      "slot_index": 120,
+      "wav_timestamp": 1778952448
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_172828.wav",
+      "wav_sha256": "ff5dc769562c3e332a119d4278740b6bc7b473e92dda2b1d04fb5c281306f0d9",
+      "slot_index": 121,
+      "wav_timestamp": 1778952508
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_172943.wav",
+      "wav_sha256": "18265c368b86bbaccb93b7ca669651c15e64eae8bb60c07ac2382ab232f2bc77",
+      "slot_index": 122,
+      "wav_timestamp": 1778952583
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_173043.wav",
+      "wav_sha256": "36751b38af90f055b3e489d6ac06f5b0e3ff26a939d0e705fc021e999d16dd31",
+      "slot_index": 123,
+      "wav_timestamp": 1778952643
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_173143.wav",
+      "wav_sha256": "94b217d5ce53531bec5f7a22642c1d051ebb0e008af3e421797b9097d3325b6c",
+      "slot_index": 124,
+      "wav_timestamp": 1778952703
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_173243.wav",
+      "wav_sha256": "43c7452a4382cf3b0675284c17496d62b57e3e4e0c3a1b6b6eb1610b44932260",
+      "slot_index": 125,
+      "wav_timestamp": 1778952763
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_173343.wav",
+      "wav_sha256": "564999bf7d07fb8743877bce268c5acca442ccbbc22f6066699dab273eb22377",
+      "slot_index": 126,
+      "wav_timestamp": 1778952823
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_173443.wav",
+      "wav_sha256": "cd9602563757f2b07ceb858b7cac1aff832e3b1c54e02e425a58c7cb53eafe8a",
+      "slot_index": 127,
+      "wav_timestamp": 1778952883
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_173543.wav",
+      "wav_sha256": "884dcc479ce7d76b9586e22bbe9140d93252849e461e3676f6e7867b1fe71f06",
+      "slot_index": 128,
+      "wav_timestamp": 1778952943
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_173658.wav",
+      "wav_sha256": "5011c01483b2db444045afe837c383529683641c1259b077b2a44501a53ba35e",
+      "slot_index": 129,
+      "wav_timestamp": 1778953018
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_173758.wav",
+      "wav_sha256": "3012e17c531be82cc5ff4e889abac37548001605eced8f54878bec3320f0d8c8",
+      "slot_index": 130,
+      "wav_timestamp": 1778953078
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_173858.wav",
+      "wav_sha256": "81241b34bbd57645ed9419cb96f32d18d752c2acccd7bf9d1aaefa4296855466",
+      "slot_index": 131,
+      "wav_timestamp": 1778953138
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_173958.wav",
+      "wav_sha256": "8f080103da5d9e2c968ca929b580cf0663280ffcea0989372e243cc69664255a",
+      "slot_index": 132,
+      "wav_timestamp": 1778953198
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_174058.wav",
+      "wav_sha256": "9350937c59f16649fdd99cf105d7c2fb279c82f40923cf7f899eb8d42ed4471f",
+      "slot_index": 133,
+      "wav_timestamp": 1778953258
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_174158.wav",
+      "wav_sha256": "8b2ea36cb5125623b1cff3a1e98ab258a6d12a47a3cdc35303606ab608ab5d54",
+      "slot_index": 134,
+      "wav_timestamp": 1778953318
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_174258.wav",
+      "wav_sha256": "4a6d6556a87f98230fc638aec9f63127fa1ac474f677a30d884b6d9d7b13bb3e",
+      "slot_index": 135,
+      "wav_timestamp": 1778953378
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_174358.wav",
+      "wav_sha256": "c2aa50d5a195dc76df07ce69fb2ce2e8c1c74e28c26501d6a48741ebdc55d955",
+      "slot_index": 136,
+      "wav_timestamp": 1778953438
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_174513.wav",
+      "wav_sha256": "c844c289f4e0876039fa8dad672f446942cfbbc441b719f22e3d4f91e318089d",
+      "slot_index": 137,
+      "wav_timestamp": 1778953513
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_174613.wav",
+      "wav_sha256": "1f9cd28e63c636a02714c14be2704453701873e598ac674905ce04ab973bb125",
+      "slot_index": 138,
+      "wav_timestamp": 1778953573
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_174713.wav",
+      "wav_sha256": "5a17542b6e098ab9da7bca20b14b1bf57e7f0ea98be345b2b825d18eb01f83b0",
+      "slot_index": 139,
+      "wav_timestamp": 1778953633
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_174813.wav",
+      "wav_sha256": "7ab0db4406cad14e95b30cf8e468c77aeefa5a0940a08923c30bc608839f1c12",
+      "slot_index": 140,
+      "wav_timestamp": 1778953693
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_174913.wav",
+      "wav_sha256": "4c04ff7d6f70ae85337c38ea245d83060dc3cc1957d4b6ce3502295505a44360",
+      "slot_index": 141,
+      "wav_timestamp": 1778953753
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_175013.wav",
+      "wav_sha256": "5a73051c25a4f2999a2504728af3d985a92de3365d958ed28ef9244b09c35f12",
+      "slot_index": 142,
+      "wav_timestamp": 1778953813
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_175113.wav",
+      "wav_sha256": "a1f2667ae3564afbace607870d37814860beec956247dcacbbc2899011897a1d",
+      "slot_index": 143,
+      "wav_timestamp": 1778953873
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_175228.wav",
+      "wav_sha256": "66e7b9c7723cc880adcb890228999282c18e38788266bc145e142624c53c923a",
+      "slot_index": 144,
+      "wav_timestamp": 1778953948
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_175328.wav",
+      "wav_sha256": "fca53ecef02609532e9efdb749b7710adeda973bb992e5d8b2fee05500f3710a",
+      "slot_index": 145,
+      "wav_timestamp": 1778954008
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_175428.wav",
+      "wav_sha256": "3fbb277d575d9fc005639e295f8222729d766e6e983ebf4efaf1dcc061844f1c",
+      "slot_index": 146,
+      "wav_timestamp": 1778954068
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_175528.wav",
+      "wav_sha256": "39cf5781fbf41373efd6235a7eb3ac18ad0c11849085c7ac2431b39db3b6cfd1",
+      "slot_index": 147,
+      "wav_timestamp": 1778954128
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_175628.wav",
+      "wav_sha256": "bf024b0b6abab68b15d27df26ab252480e971b0568c02632c6d84b96e9b08f8b",
+      "slot_index": 148,
+      "wav_timestamp": 1778954188
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_175728.wav",
+      "wav_sha256": "4010ae73ffe09ab5fb6dd9f51f5824187f6e94cd173ff3c1d974ba02c20a7ba7",
+      "slot_index": 149,
+      "wav_timestamp": 1778954248
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_175828.wav",
+      "wav_sha256": "87e5ec6a50f2c190f03decc5e7eabbc6cd32aaab64d9f7ab7985422a151de802",
+      "slot_index": 150,
+      "wav_timestamp": 1778954308
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_175928.wav",
+      "wav_sha256": "14707f602569f21536173a553d8e920e40bf8151c97f5c863f2d16f829b24ed0",
+      "slot_index": 151,
+      "wav_timestamp": 1778954368
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_180043.wav",
+      "wav_sha256": "ec25afc23551c60e7acdbff70201b2d3ee690eeb9035e244d0eb29a07d71f3a7",
+      "slot_index": 152,
+      "wav_timestamp": 1778954443
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_180143.wav",
+      "wav_sha256": "f8f5e7a6a1f1b064d6d40fbc2486386e5b8d98b4dfff8e1c466c86aac4635d97",
+      "slot_index": 153,
+      "wav_timestamp": 1778954503
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_180243.wav",
+      "wav_sha256": "03ea6a45784ab6b9a2402effd6566552ef2d8132c63e2c6a3075e211531b562b",
+      "slot_index": 154,
+      "wav_timestamp": 1778954563
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_180343.wav",
+      "wav_sha256": "cf4b6fa875f37cff60bbca4bb998efe5a5a4a401443fa9394185dc5a5109aaf3",
+      "slot_index": 155,
+      "wav_timestamp": 1778954623
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_180443.wav",
+      "wav_sha256": "44b5ef99cd55e4463ee6aef59f3168c43ee178975963d1f0c45d014db12cf768",
+      "slot_index": 156,
+      "wav_timestamp": 1778954683
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_180543.wav",
+      "wav_sha256": "7b240f8719fada9f0fa7b4a6fc645987bad9ba635b0a33a2bf356ddf89188e85",
+      "slot_index": 157,
+      "wav_timestamp": 1778954743
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_180643.wav",
+      "wav_sha256": "8c75f82a47761a87eb760271267663e993eb70e7bf3729489f54d16c37b6a2e7",
+      "slot_index": 158,
+      "wav_timestamp": 1778954803
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_180743.wav",
+      "wav_sha256": "c7e609e648e81413e63291add0b1c8f6910fcd0e7e52f19adb3e0d6153660945",
+      "slot_index": 159,
+      "wav_timestamp": 1778954863
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_180858.wav",
+      "wav_sha256": "cd5b2bff188a3f1538ec3dfb707ed7f435d5c40ef957da3ae7e11598bdf40d34",
+      "slot_index": 160,
+      "wav_timestamp": 1778954938
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_180958.wav",
+      "wav_sha256": "b445a976533024f530f54aae1f46736a6dc6aa3185ac6c14eaf9503765dc76be",
+      "slot_index": 161,
+      "wav_timestamp": 1778954998
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_181058.wav",
+      "wav_sha256": "510ceaeacde94ab4184b451104e134a4403aad5cc2ac3206b46615b15fe25f55",
+      "slot_index": 162,
+      "wav_timestamp": 1778955058
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_181158.wav",
+      "wav_sha256": "ecb4419da8d1fd142afac0c85f58eeddc5f04109927163c793a98837fbdb6773",
+      "slot_index": 163,
+      "wav_timestamp": 1778955118
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_181258.wav",
+      "wav_sha256": "05e5400120bd427f54c4538bc8f71ce3cd9293653fac36b90b5c28f0e9deb30f",
+      "slot_index": 164,
+      "wav_timestamp": 1778955178
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_181358.wav",
+      "wav_sha256": "60ee85957b4d8a8093497515fbb12b59e518283fc8277a86fd705322c9f9ed5b",
+      "slot_index": 165,
+      "wav_timestamp": 1778955238
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_181458.wav",
+      "wav_sha256": "87f95d8e4f068023459465515358c4559af601ab9f42d7ea1c97ae5dd224b568",
+      "slot_index": 166,
+      "wav_timestamp": 1778955298
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_181613.wav",
+      "wav_sha256": "745f39d9bca9fcc1f5b5675df428e4978477cc607dec7b528558181f82af1a64",
+      "slot_index": 167,
+      "wav_timestamp": 1778955373
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_181713.wav",
+      "wav_sha256": "e2201f984088ba16864a9162411b4fb7afc257bb77fe6a4635ddc2687cf84592",
+      "slot_index": 168,
+      "wav_timestamp": 1778955433
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_181813.wav",
+      "wav_sha256": "675cbaaccb061e2dc2f5122914237934595e4b868e2d3ce4b7bb211019ec741f",
+      "slot_index": 169,
+      "wav_timestamp": 1778955493
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_181913.wav",
+      "wav_sha256": "19b6c2a55f5fc45c576a91d0b8368cd3b3ec279cfd951399aec5c93216e4118b",
+      "slot_index": 170,
+      "wav_timestamp": 1778955553
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_182013.wav",
+      "wav_sha256": "d0878f0f310923823234bb16f786ef099511e9803b50ec87850f0aac0b0e4e15",
+      "slot_index": 171,
+      "wav_timestamp": 1778955613
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_182113.wav",
+      "wav_sha256": "cd7c68f14dcdd14fbbe06b7164daa7631de02f457ad4e8a0fbe726113de010de",
+      "slot_index": 172,
+      "wav_timestamp": 1778955673
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_182213.wav",
+      "wav_sha256": "3d92b1ec07deb977bed859861e650cd9a6c7b8f64aa80711ec1d2f2340cd1767",
+      "slot_index": 173,
+      "wav_timestamp": 1778955733
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_182313.wav",
+      "wav_sha256": "12a8f24398444337677eb2d8d53464345b5acab884bc8734deb0a14ca19caec0",
+      "slot_index": 174,
+      "wav_timestamp": 1778955793
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_182428.wav",
+      "wav_sha256": "c79dbe3727de4fe5555e427979fd5ac658e189440318b1f3a7386026c3aa3b85",
+      "slot_index": 175,
+      "wav_timestamp": 1778955868
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_182528.wav",
+      "wav_sha256": "4f01d2a587a466257d219d838f96b4b8aa5fa97a35acaee7d618c92bfa207283",
+      "slot_index": 176,
+      "wav_timestamp": 1778955928
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_182628.wav",
+      "wav_sha256": "e865e1762eabf9220a827b8cc38e35098e2d1e6b63d04921ab4c91f7357b7e3a",
+      "slot_index": 177,
+      "wav_timestamp": 1778955988
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_182728.wav",
+      "wav_sha256": "954e4286e72eabbaddb005090ac4701cdbfb3b4f88a8b26b4a1d62bcd611278b",
+      "slot_index": 178,
+      "wav_timestamp": 1778956048
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_182828.wav",
+      "wav_sha256": "cbe6407a442326c476f75f234d97f91847cd2307502d7cb65c371b52b1f2965d",
+      "slot_index": 179,
+      "wav_timestamp": 1778956108
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_182928.wav",
+      "wav_sha256": "20b2e46e9d2ce199581dd89b185f1e2525dc2b9c09b227220f6bfc566d1bd0bc",
+      "slot_index": 180,
+      "wav_timestamp": 1778956168
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_183028.wav",
+      "wav_sha256": "b1395fd6a6fb0f801a39ddf4253f415376b0a3ccfeef966242020efb1f0cae84",
+      "slot_index": 181,
+      "wav_timestamp": 1778956228
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_183143.wav",
+      "wav_sha256": "adde9de3413251a9c7c50a2c82766c23da30680dbc732e424f189180279dfae7",
+      "slot_index": 182,
+      "wav_timestamp": 1778956303
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_183243.wav",
+      "wav_sha256": "b0d4bd885c0f6c3ed07a5c63c0166651d41fac0bb2b09a94c1540e906d053aff",
+      "slot_index": 183,
+      "wav_timestamp": 1778956363
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_183343.wav",
+      "wav_sha256": "78c3889e2c4cbdd21dbc1fd1c1e1c00ad770b85858bb863da30ab6ecd80e758d",
+      "slot_index": 184,
+      "wav_timestamp": 1778956423
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_183443.wav",
+      "wav_sha256": "a08930c4374bf3e50d58299e9f88d1a3db9979e15bd5801dce764d748c2497c3",
+      "slot_index": 185,
+      "wav_timestamp": 1778956483
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_183543.wav",
+      "wav_sha256": "d69e965ea3fc38a9750edcbfdd917ee237a5584f27aea9262ea328731945ffac",
+      "slot_index": 186,
+      "wav_timestamp": 1778956543
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_183643.wav",
+      "wav_sha256": "13edf1f8f52421c45173f648515b8bc74c72c189a9adcdadeeb6ccda406e9aca",
+      "slot_index": 187,
+      "wav_timestamp": 1778956603
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_183743.wav",
+      "wav_sha256": "cccdd278e035d9dedf0b5fddab6d9974dcdba8f3bb7cc0e12b0a38ddb9a70354",
+      "slot_index": 188,
+      "wav_timestamp": 1778956663
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_183843.wav",
+      "wav_sha256": "86a53cb689abcb2250c52140acd6513b01ecafa444a7c9b67f0567243580c4b1",
+      "slot_index": 189,
+      "wav_timestamp": 1778956723
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_183958.wav",
+      "wav_sha256": "455ce9cb839333653ffd4b3d88313ccee8849c5732325f78552619346db08557",
+      "slot_index": 190,
+      "wav_timestamp": 1778956798
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_184058.wav",
+      "wav_sha256": "2df568e97c9150120bd63f2c8cb7e21447500497f972a134a10ddc8f89b9c6b2",
+      "slot_index": 191,
+      "wav_timestamp": 1778956858
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_184158.wav",
+      "wav_sha256": "7455b946b87a3ae495a5004cc96d955e331422ebf62bed926a858671461b7f45",
+      "slot_index": 192,
+      "wav_timestamp": 1778956918
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_184258.wav",
+      "wav_sha256": "15d3b29e60a879b89bdbfe830d1cd444d257efa0d9ac94658cb0bc47a2b862e4",
+      "slot_index": 193,
+      "wav_timestamp": 1778956978
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_184358.wav",
+      "wav_sha256": "8b60a4cf55ebc5914bbd0704169cdd9b23eca86dd383c1ac7771d7692d3b2fdd",
+      "slot_index": 194,
+      "wav_timestamp": 1778957038
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_184458.wav",
+      "wav_sha256": "317dd75a15d32db3598c0d1bfa5ef8a67693b908ca9199d98511323a379522d3",
+      "slot_index": 195,
+      "wav_timestamp": 1778957098
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_184558.wav",
+      "wav_sha256": "4bedada8a822c64fb02f1f9f043b227f99d9db35954b6053e6cb9ea68c6865c5",
+      "slot_index": 196,
+      "wav_timestamp": 1778957158
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_184713.wav",
+      "wav_sha256": "62ebb58ec2e8f00aab9cfdf26e66393730a1b842d4186cbf641c5b5dd8dc2087",
+      "slot_index": 197,
+      "wav_timestamp": 1778957233
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_184813.wav",
+      "wav_sha256": "46faf3affd93c12df5468f95d199b608818966ecc33f251e68283b7b70cddc1f",
+      "slot_index": 198,
+      "wav_timestamp": 1778957293
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_184913.wav",
+      "wav_sha256": "9e2d875e6094d7dd4f3f6158b9bdcafeeb0af8c45447aef51a37f5973a13386c",
+      "slot_index": 199,
+      "wav_timestamp": 1778957353
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_185013.wav",
+      "wav_sha256": "129fce7dd887476481cee83b045d0ea30e3cd35721d0251eaf195faddfa6da0e",
+      "slot_index": 200,
+      "wav_timestamp": 1778957413
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_185113.wav",
+      "wav_sha256": "83091ddd0c3e8f7d9aa908b9a79ad9ba64074bc3ea974f4a3144e93f4a667974",
+      "slot_index": 201,
+      "wav_timestamp": 1778957473
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_185213.wav",
+      "wav_sha256": "850031f143ed2dec02493768e5ea7c4c21722e4d875e34bdf9604f917c892206",
+      "slot_index": 202,
+      "wav_timestamp": 1778957533
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_185313.wav",
+      "wav_sha256": "a4430dbaa5be13f378cae3235bf5562862f4d0474b6367a52aee66c755688379",
+      "slot_index": 203,
+      "wav_timestamp": 1778957593
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_185413.wav",
+      "wav_sha256": "18ff165e8add5978da0e3093570dd4e53e1106ad031c5e0b50473bf96a2370e7",
+      "slot_index": 204,
+      "wav_timestamp": 1778957653
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_185528.wav",
+      "wav_sha256": "5051c46a2d4640e7164ae864231ce1a12e69d15fce060ec59d75dfe4b3c42a12",
+      "slot_index": 205,
+      "wav_timestamp": 1778957728
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_185628.wav",
+      "wav_sha256": "67ca5416bc0443549649674d273cddfc54d41439c51c401353c96dc91ff283a9",
+      "slot_index": 206,
+      "wav_timestamp": 1778957788
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_185728.wav",
+      "wav_sha256": "87ee2ac2d798807fb07883df94d17a7744480a2cff3cf268771b570961ca7e51",
+      "slot_index": 207,
+      "wav_timestamp": 1778957848
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_185828.wav",
+      "wav_sha256": "5dd2aae78b305fee570f17aaeddcc75f3ae3731b1b02811c42d57ce11801e31c",
+      "slot_index": 208,
+      "wav_timestamp": 1778957908
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_185928.wav",
+      "wav_sha256": "80fe37c51e50927812b9a5cfd055ccb6db9c305b086c6b139e445818f544b6e6",
+      "slot_index": 209,
+      "wav_timestamp": 1778957968
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_190028.wav",
+      "wav_sha256": "58e05628ac0596fb52c9363efafe21db508a4934a84e2094762ac1583f21cfb2",
+      "slot_index": 210,
+      "wav_timestamp": 1778958028
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_190128.wav",
+      "wav_sha256": "11a50b8a3a334cbdc2ab9d6ce8dcc08d76b84ca6a81b80f0d863c69551e49790",
+      "slot_index": 211,
+      "wav_timestamp": 1778958088
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_190228.wav",
+      "wav_sha256": "832ebfa1216f3ee004b2eeeab686f36dbce18ed440579616fce03efad0eb874c",
+      "slot_index": 212,
+      "wav_timestamp": 1778958148
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_190343.wav",
+      "wav_sha256": "d92859bd85accc8139dba94278e787d2fae89a84a967a9494f5464bfa6a5bb16",
+      "slot_index": 213,
+      "wav_timestamp": 1778958223
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_190443.wav",
+      "wav_sha256": "fff4214c5bbc69aea7b7b773f0fc8d278b005dc0a5c4b95e6cde835af31a3242",
+      "slot_index": 214,
+      "wav_timestamp": 1778958283
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_190543.wav",
+      "wav_sha256": "6aa4f2dcbcdfe936a6f75bc88df406826553e1c004eeceaddc257783e73bc856",
+      "slot_index": 215,
+      "wav_timestamp": 1778958343
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_190643.wav",
+      "wav_sha256": "7f4d52cede3d9bb112d4cfcdab1b9f150e3018004de552676cdda5933ef102fa",
+      "slot_index": 216,
+      "wav_timestamp": 1778958403
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_190743.wav",
+      "wav_sha256": "61d5094e4d630a04cd3740b6050f25fcec20dca61ca6e49918357f6bd561b288",
+      "slot_index": 217,
+      "wav_timestamp": 1778958463
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_190843.wav",
+      "wav_sha256": "3ba76769f64a5967d30dd8f34cb6f34a8d2ee6facb300e6e3e0733254dc5e7b7",
+      "slot_index": 218,
+      "wav_timestamp": 1778958523
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_190943.wav",
+      "wav_sha256": "088a5f031f9c844440cd69d2912bf176f174f9268192115e4818543e20a86912",
+      "slot_index": 219,
+      "wav_timestamp": 1778958583
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_191058.wav",
+      "wav_sha256": "a65abcf502a7e5582d6e224170256b7760bfdf227eab35c5337ff4cb1b0e0597",
+      "slot_index": 220,
+      "wav_timestamp": 1778958658
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_191158.wav",
+      "wav_sha256": "61a577f38b2aff9049177394303387e7572e1731c91a45ddcc94362c4539b9a2",
+      "slot_index": 221,
+      "wav_timestamp": 1778958718
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_191258.wav",
+      "wav_sha256": "185e7f3c6d010f4f0364a378dcf4d0e0082846c10a3c4c026146ac81431f0282",
+      "slot_index": 222,
+      "wav_timestamp": 1778958778
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_191358.wav",
+      "wav_sha256": "d7c83edffd82be221142705051d80465c455ebe4906b2a0fbf452daaaa27a261",
+      "slot_index": 223,
+      "wav_timestamp": 1778958838
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_191458.wav",
+      "wav_sha256": "d461b49c537bda49f32bfef1c46384a3b039f5fc840cb76018f3ed55c221ae1f",
+      "slot_index": 224,
+      "wav_timestamp": 1778958898
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_191558.wav",
+      "wav_sha256": "0b9746a0c4a808bba1f74ee00a83fdc8d21ccb1c5793de0dfc634a5a47788942",
+      "slot_index": 225,
+      "wav_timestamp": 1778958958
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_191658.wav",
+      "wav_sha256": "d326c96faa09ce9cbfa7c69a6ffc8398803c29d3234c6854db68858e9634adcb",
+      "slot_index": 226,
+      "wav_timestamp": 1778959018
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_191758.wav",
+      "wav_sha256": "93af5a7b1ab08fae019dd8af4f6e431f4067fac261daae656096150eec66419a",
+      "slot_index": 227,
+      "wav_timestamp": 1778959078
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_191913.wav",
+      "wav_sha256": "ea58e9f4d34d326ab5f889ce39424a27688eff817672b60f2139f21b9239df9b",
+      "slot_index": 228,
+      "wav_timestamp": 1778959153
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_192013.wav",
+      "wav_sha256": "e2980c4420edd823534801ae9988addf38ac597724a9b97fa73633553db96cce",
+      "slot_index": 229,
+      "wav_timestamp": 1778959213
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_192113.wav",
+      "wav_sha256": "eae7891232bc45e3e95e3b04604b23bcfe062309d1991695d97bba761073d689",
+      "slot_index": 230,
+      "wav_timestamp": 1778959273
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_192213.wav",
+      "wav_sha256": "385b60dcf63bebba8be826a7c9020cea36d12a9c69bd74d9bd161c60edd0329c",
+      "slot_index": 231,
+      "wav_timestamp": 1778959333
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_192313.wav",
+      "wav_sha256": "ded0dccdff9dab8881d664eb4d3824ec65d0e701ddea7d282c4e46e37d8a52dd",
+      "slot_index": 232,
+      "wav_timestamp": 1778959393
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_192413.wav",
+      "wav_sha256": "e87c5c68cb925c97ad73723ffac126cade9acee67d2fe686374ac7d68abfaae4",
+      "slot_index": 233,
+      "wav_timestamp": 1778959453
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_192513.wav",
+      "wav_sha256": "974b160b1f9447f22c01cb9a9be22338d4cd19e20632d4b1aa4f184abcd2e3cb",
+      "slot_index": 234,
+      "wav_timestamp": 1778959513
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_192628.wav",
+      "wav_sha256": "fe906de0738080aef774962dc556b2f05f2c53c12eec0e19b5ae9707e9277cd5",
+      "slot_index": 235,
+      "wav_timestamp": 1778959588
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_192728.wav",
+      "wav_sha256": "ce8a646114b87560bb3061c03d5e7901413b022da35077451db8002c6546fd05",
+      "slot_index": 236,
+      "wav_timestamp": 1778959648
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_192828.wav",
+      "wav_sha256": "9a40d399d6e11a9c81b73427569ed35ebc1730ab9705a1f7d7c70d1d0be57e3f",
+      "slot_index": 237,
+      "wav_timestamp": 1778959708
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_192928.wav",
+      "wav_sha256": "3955681514a8a1fb036fe0f699c5c771218e387108475551da408b2eb7618a4b",
+      "slot_index": 238,
+      "wav_timestamp": 1778959768
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_193028.wav",
+      "wav_sha256": "9d27e6ef5bdd72daf10d5bd7038aa80e3426d81ab068058fa5491593df3bc08f",
+      "slot_index": 239,
+      "wav_timestamp": 1778959828
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_193128.wav",
+      "wav_sha256": "9b1888d6bdcca21e4508c08bd8dab8640f28ca1637da1e2ec907af73b9ef1113",
+      "slot_index": 240,
+      "wav_timestamp": 1778959888
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_193228.wav",
+      "wav_sha256": "1a9d7476075b334903c5e2385a21e1c4059f2649f627fa88e2e7a1828f353b22",
+      "slot_index": 241,
+      "wav_timestamp": 1778959948
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_193328.wav",
+      "wav_sha256": "85048e4f8da2ae8266e9dfe9dec87b085b01a9691ba56fc950491daf369f1365",
+      "slot_index": 242,
+      "wav_timestamp": 1778960008
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_193443.wav",
+      "wav_sha256": "902716c18f416c309551763c6c39cd0578ecbe00639d6f6ecd3ff8ef7d916813",
+      "slot_index": 243,
+      "wav_timestamp": 1778960083
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_193543.wav",
+      "wav_sha256": "ed6ee5b179af61b305ceb59262f20655f9b8ddfc292abc0f43e16e6958bab994",
+      "slot_index": 244,
+      "wav_timestamp": 1778960143
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_193643.wav",
+      "wav_sha256": "6e86578731d778ff06f96fce345b2fa3eed3c427e5d0eb9a5a70fdb359eb3756",
+      "slot_index": 245,
+      "wav_timestamp": 1778960203
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_193743.wav",
+      "wav_sha256": "9e3e233221b6e7923945e53e5dcd1ab7c45340c6eb348c21be246045b40af39e",
+      "slot_index": 246,
+      "wav_timestamp": 1778960263
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_193843.wav",
+      "wav_sha256": "7385eace1b2b99abf05c072e173de8a9ddc9323b57e752e4b6117a9eb1146d5e",
+      "slot_index": 247,
+      "wav_timestamp": 1778960323
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_193943.wav",
+      "wav_sha256": "cf8f98a83e578b5748b9029bb2464d32225907ec9218f54c88cc91c924a2b00a",
+      "slot_index": 248,
+      "wav_timestamp": 1778960383
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_194043.wav",
+      "wav_sha256": "626a06a45a5593949beba42301ab463bdd2ebb282475c308a3ac2a63918522f2",
+      "slot_index": 249,
+      "wav_timestamp": 1778960443
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_194158.wav",
+      "wav_sha256": "62229e11e8032ba271c40defa19ae64395ebff23b15746b338a3b950a30ac941",
+      "slot_index": 250,
+      "wav_timestamp": 1778960518
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_194258.wav",
+      "wav_sha256": "1c5a340d8d604699653eb009eaecb27d4a6d964e6cabd0088df31b12999963c3",
+      "slot_index": 251,
+      "wav_timestamp": 1778960578
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_194358.wav",
+      "wav_sha256": "0f5d5eb99a8b371237e75a3b09042f040e07cad81eb1a90646d0c7d2721a282f",
+      "slot_index": 252,
+      "wav_timestamp": 1778960638
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_194458.wav",
+      "wav_sha256": "6549a1e93617d0cd506bad7e6947ea046b2d146d4bd5a90dbdbd0c5c7d2f4222",
+      "slot_index": 253,
+      "wav_timestamp": 1778960698
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_194558.wav",
+      "wav_sha256": "ba58b2a9adf77cc3666e7e8c9cc5f791925f31e280855e525fc9b9322768cb3f",
+      "slot_index": 254,
+      "wav_timestamp": 1778960758
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_194658.wav",
+      "wav_sha256": "2864e56248edd03e92c8839eea0aa7b0157cb8ff579e5e70296e314d5f0c3f04",
+      "slot_index": 255,
+      "wav_timestamp": 1778960818
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_194758.wav",
+      "wav_sha256": "9540b4d7f82a2d6a33a3b00e546e28a77d019ca559b8d081673c393896d3b730",
+      "slot_index": 256,
+      "wav_timestamp": 1778960878
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_194858.wav",
+      "wav_sha256": "e951d625361beb354d00ea5b30798dd436d17405d0c37cc09acfcd7d4d168c4f",
+      "slot_index": 257,
+      "wav_timestamp": 1778960938
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_195013.wav",
+      "wav_sha256": "0788720d465c7f0ee7c06549755e403580235ea6df224e96feebed133898c3c4",
+      "slot_index": 258,
+      "wav_timestamp": 1778961013
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_195113.wav",
+      "wav_sha256": "e2ef2dd31c4770e9618a3ad08f0255e0887aca57f0f859e7bf295907c4976144",
+      "slot_index": 259,
+      "wav_timestamp": 1778961073
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_195213.wav",
+      "wav_sha256": "4841df3bc78d70470a2a2211ef2f9d6255e4168bf18651f3004d8ce64cecf2c7",
+      "slot_index": 260,
+      "wav_timestamp": 1778961133
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_195313.wav",
+      "wav_sha256": "d67be4969cc24972089c9bc4e9904916d943f187dc6612791c7748a0d21fcf0d",
+      "slot_index": 261,
+      "wav_timestamp": 1778961193
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_195413.wav",
+      "wav_sha256": "a49ad41c81d521d66eaa05cce2c654740069916d6eb9d946546d44e0517d8c10",
+      "slot_index": 262,
+      "wav_timestamp": 1778961253
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_195513.wav",
+      "wav_sha256": "335fcee2fa94d586eacd586c97a5a92722d57a21d84e6f022ceeb94cf63b46ef",
+      "slot_index": 263,
+      "wav_timestamp": 1778961313
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_195613.wav",
+      "wav_sha256": "cd0fe9988021007086b550e79a1236014fc2cb1a1617571e08c487381e183ac2",
+      "slot_index": 264,
+      "wav_timestamp": 1778961373
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_195713.wav",
+      "wav_sha256": "4722eef5f7b7191e5109445caefc6558cbd5d5625bd600d43ada81ef3bd2e29f",
+      "slot_index": 265,
+      "wav_timestamp": 1778961433
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_195828.wav",
+      "wav_sha256": "05cb2cd9f7f1c59da5ad0d65cb6107639a1ac7c1b14bf1030b8142b157a246c6",
+      "slot_index": 266,
+      "wav_timestamp": 1778961508
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_195928.wav",
+      "wav_sha256": "43928d68987e0444e8ae081c2682bc5b9a9243d741ded75efae7d6b8ed8073d8",
+      "slot_index": 267,
+      "wav_timestamp": 1778961568
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_200028.wav",
+      "wav_sha256": "4a1d5299c96718b92ba9dcec75c54c3b2d87b121a0c17477e626508eae84af22",
+      "slot_index": 268,
+      "wav_timestamp": 1778961628
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_200128.wav",
+      "wav_sha256": "4e9d3c209a30ea2294b0298a1b9d30634eb3c4adc2fb8ecae53a6fecd26c1d71",
+      "slot_index": 269,
+      "wav_timestamp": 1778961688
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_200228.wav",
+      "wav_sha256": "d2a4283b8bf0f0a34e62345b7482554120471cd0bf2eeeda44895569fa0db35a",
+      "slot_index": 270,
+      "wav_timestamp": 1778961748
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_200328.wav",
+      "wav_sha256": "42ed30c330b05053a83f5b2c2c1c3834a8a824991adffcaae3dd81c4308929f5",
+      "slot_index": 271,
+      "wav_timestamp": 1778961808
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_200428.wav",
+      "wav_sha256": "43247a982f2f0a95b26ab30769e652d6bbca8e6c8ef7c4f1353123a69ba7f1ff",
+      "slot_index": 272,
+      "wav_timestamp": 1778961868
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_200543.wav",
+      "wav_sha256": "0908b1a9e811a6a8c4d72d68fb544454eba97441f19534492426be6e9b2f2fff",
+      "slot_index": 273,
+      "wav_timestamp": 1778961943
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_200643.wav",
+      "wav_sha256": "725d31acdfc109f74f52a542915b58218686bca5f212c6e55d1b7e3acb96b8de",
+      "slot_index": 274,
+      "wav_timestamp": 1778962003
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_200743.wav",
+      "wav_sha256": "1b4c0d36548fdaccb31a0f95de8b383949008b26e6dd58e7b6dd5789d693bb42",
+      "slot_index": 275,
+      "wav_timestamp": 1778962063
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_200843.wav",
+      "wav_sha256": "d9050a0fccb56b7145f54f5312490bce9047a4f93819fee83fd7a2d804b8a7ee",
+      "slot_index": 276,
+      "wav_timestamp": 1778962123
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_200943.wav",
+      "wav_sha256": "c123714ad240c0d2080071cd0709a1d74ae010557e90aaf0f8d4a327f96e8792",
+      "slot_index": 277,
+      "wav_timestamp": 1778962183
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_201043.wav",
+      "wav_sha256": "bd8759909ca5700bbbedbf936fc9e083f4dddbeaa8aaea736930b904c23322c1",
+      "slot_index": 278,
+      "wav_timestamp": 1778962243
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_201143.wav",
+      "wav_sha256": "42d2ef32d95298d7ae1ed4b5bafa63aef2e7ced847273cfd81e7880c1be98ea4",
+      "slot_index": 279,
+      "wav_timestamp": 1778962303
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_201243.wav",
+      "wav_sha256": "b085c74bf9692b2d64735cccfa7eefe433f306576fca5d07ad9a21437a5302e8",
+      "slot_index": 280,
+      "wav_timestamp": 1778962363
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_201358.wav",
+      "wav_sha256": "d385931156f76e3f27819097b865128ff48e7d6e41b9dd68f877996042365bb9",
+      "slot_index": 281,
+      "wav_timestamp": 1778962438
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_201458.wav",
+      "wav_sha256": "cae5601d4abfc76f42f0c056f93c78732451163792493657d2e931480caeb6c1",
+      "slot_index": 282,
+      "wav_timestamp": 1778962498
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_201558.wav",
+      "wav_sha256": "5e83718a3847f8bd30e982b2926e22540b3faac3324ad9070bddbe528a166655",
+      "slot_index": 283,
+      "wav_timestamp": 1778962558
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_201658.wav",
+      "wav_sha256": "624bd382f7ede06ebece41f1bef237d275ca09069b3cf5967244ec56195b2e6f",
+      "slot_index": 284,
+      "wav_timestamp": 1778962618
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_201758.wav",
+      "wav_sha256": "d067f0dc8a7da4dbb44d0ddcb9ef6e40a78927de966a06479c26c09ff63af83b",
+      "slot_index": 285,
+      "wav_timestamp": 1778962678
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_201858.wav",
+      "wav_sha256": "8ba3e933eb550fd5c00dae2868134253eeaf035114f018b21545eba443cf20cc",
+      "slot_index": 286,
+      "wav_timestamp": 1778962738
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_201958.wav",
+      "wav_sha256": "7e6dbd5fa7d28f7b56bd95ddb28af7cef6fad0958a28fc0bc5ca5a65bf23c458",
+      "slot_index": 287,
+      "wav_timestamp": 1778962798
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_202113.wav",
+      "wav_sha256": "fdb54b7da779ae2a6a82821550805b931f1f4a9e61703dee68b2d690e274963a",
+      "slot_index": 288,
+      "wav_timestamp": 1778962873
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_202213.wav",
+      "wav_sha256": "7594ad93a82355cea9beedb462bb4352b14c9ed50c83c1db8ba0b6d97755555a",
+      "slot_index": 289,
+      "wav_timestamp": 1778962933
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_202313.wav",
+      "wav_sha256": "63c6e5b3b03e2a0560e42a5285425fea411fde64cb95c4006d83ff0b3e303253",
+      "slot_index": 290,
+      "wav_timestamp": 1778962993
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_202413.wav",
+      "wav_sha256": "929206dc2a5a8917dca3b9e3c5bf6dbf4f485c2540a1a49393f1ba077c7b57c4",
+      "slot_index": 291,
+      "wav_timestamp": 1778963053
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_202513.wav",
+      "wav_sha256": "ff6b10c59b19944538f172c6313dbbe00d5da241f97493de82e7a36172ca62f9",
+      "slot_index": 292,
+      "wav_timestamp": 1778963113
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_202613.wav",
+      "wav_sha256": "54e29ed3e49ea042a4e97c218d85878fa2b491882ccf106743c8225183122fe0",
+      "slot_index": 293,
+      "wav_timestamp": 1778963173
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_202713.wav",
+      "wav_sha256": "d7c77e8ec87f6609676c2cd41c737022b6ac72048651fd08e97f075871c7a68d",
+      "slot_index": 294,
+      "wav_timestamp": 1778963233
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_202813.wav",
+      "wav_sha256": "85ec5de040ae94ce25574a6ed7418da3a836a4f764ee52e42dabd690c2cafcdc",
+      "slot_index": 295,
+      "wav_timestamp": 1778963293
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_202928.wav",
+      "wav_sha256": "24fcc21bcffbf7c99517b68f8a3d8b2619c58382dfed255aeddc76e4a5317a10",
+      "slot_index": 296,
+      "wav_timestamp": 1778963368
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_203028.wav",
+      "wav_sha256": "46fc64bd8a2a944d4be3ff5493c6d2590fd7f9095d38d4ac2615a6988bb12e5f",
+      "slot_index": 297,
+      "wav_timestamp": 1778963428
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_203128.wav",
+      "wav_sha256": "95d47060a83ccd6b0ab41ab6932a42246e2d17a00e42fa5cea62d7b54152dd4a",
+      "slot_index": 298,
+      "wav_timestamp": 1778963488
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_203228.wav",
+      "wav_sha256": "7f287cda6eaf3e20a476154769d892e39e044de2f9b06aa8ee7c5e247e58549e",
+      "slot_index": 299,
+      "wav_timestamp": 1778963548
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_203328.wav",
+      "wav_sha256": "cd972ee1b108f0aabf0628aab069481864f155e2db02e8083a2583896fa9225d",
+      "slot_index": 300,
+      "wav_timestamp": 1778963608
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_203428.wav",
+      "wav_sha256": "d016e5ec2de8798c5a21ac59ada801088e553d248a57b9895e252a1682822c94",
+      "slot_index": 301,
+      "wav_timestamp": 1778963668
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_203528.wav",
+      "wav_sha256": "e4a534ca73b2e7ef4ffc82cc0e917cb75415364055e51f43ae85d5f5bc029e4f",
+      "slot_index": 302,
+      "wav_timestamp": 1778963728
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_203628.wav",
+      "wav_sha256": "dd6d1b960f24acf39610191d1a3da6305b43f530e0d7d6e3af7286498651de02",
+      "slot_index": 303,
+      "wav_timestamp": 1778963788
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_203743.wav",
+      "wav_sha256": "903eeaf950670cc3399c6d54886184b281440d5dcba40673be6cec08336b6eba",
+      "slot_index": 304,
+      "wav_timestamp": 1778963863
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_203843.wav",
+      "wav_sha256": "d572fe733122c30a933b72181b807a9047b41f5e83fc9f8a9f84aac6b2597e2b",
+      "slot_index": 305,
+      "wav_timestamp": 1778963923
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_203943.wav",
+      "wav_sha256": "6d9c667bc20f7a3e4c3a2763421eba797016928e90d287a61e070c4ed4060618",
+      "slot_index": 306,
+      "wav_timestamp": 1778963983
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_204043.wav",
+      "wav_sha256": "6b902251e945dd7b995a75c87ba6f0fd57eb198f62a967ec2a13b1b1c88860b6",
+      "slot_index": 307,
+      "wav_timestamp": 1778964043
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_204143.wav",
+      "wav_sha256": "f41ccc74f383ad4504f27898d9c69e33088fecfeed834e49bead91302c4f0583",
+      "slot_index": 308,
+      "wav_timestamp": 1778964103
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_204243.wav",
+      "wav_sha256": "af71a71eccc1a9bb08683726af84bfc1216090e29a7b143fa8bf88ed77f2ca00",
+      "slot_index": 309,
+      "wav_timestamp": 1778964163
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_204343.wav",
+      "wav_sha256": "b1d21d02e6b3da0907cd8ed8aeeb924c581807c41fd15b29cd42d6d6bf18fbcd",
+      "slot_index": 310,
+      "wav_timestamp": 1778964223
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_204458.wav",
+      "wav_sha256": "2ffc1b42df4d402127f170a7ca23fcc8cf0e9ac36fe4383e9c1313aa70d0c2ce",
+      "slot_index": 311,
+      "wav_timestamp": 1778964298
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_204558.wav",
+      "wav_sha256": "dbda3c6569746eb72722779f0972ad3e52883ee20a9c16e67b2d9db10dd980bf",
+      "slot_index": 312,
+      "wav_timestamp": 1778964358
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_204658.wav",
+      "wav_sha256": "909a5e4454b0acd8aae931f1635c8caeb886424baca890a25a42577c003d3c12",
+      "slot_index": 313,
+      "wav_timestamp": 1778964418
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_204758.wav",
+      "wav_sha256": "ac003e4d8b3044f5003deba69cfe45e46c270b54166e3c298cab0d7bd0a277a2",
+      "slot_index": 314,
+      "wav_timestamp": 1778964478
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_204858.wav",
+      "wav_sha256": "d78377eadc7a3dbbc23b175f0a8cb24417d2525f02499cc43545244debf9cd2a",
+      "slot_index": 315,
+      "wav_timestamp": 1778964538
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_204958.wav",
+      "wav_sha256": "c2d208fa6ace9102fb4ad9785c8243d2bf8c2d945e91ac17731cd431459aa657",
+      "slot_index": 316,
+      "wav_timestamp": 1778964598
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_205058.wav",
+      "wav_sha256": "eee2de83923ce4eb8e70ef956bcd7a3e5b469d2bbe4756d628ca974a976e8a20",
+      "slot_index": 317,
+      "wav_timestamp": 1778964658
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_205158.wav",
+      "wav_sha256": "60b936c82199106b21e1532c6df04787a34a5fd0868eb4f0225b40aa2a2a5861",
+      "slot_index": 318,
+      "wav_timestamp": 1778964718
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_205313.wav",
+      "wav_sha256": "c4ab07b16fc75a97a842e8c46463fc82ce9beafb85763472febd6e98b0630637",
+      "slot_index": 319,
+      "wav_timestamp": 1778964793
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_205413.wav",
+      "wav_sha256": "1fc135fbe74fbc0e97ded679c355cea5fedd955d58096889ae1de3facd6928da",
+      "slot_index": 320,
+      "wav_timestamp": 1778964853
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_205513.wav",
+      "wav_sha256": "4bcddf1a476bedc02356daf9bc3cc3c956eb2f8323f24eee80d86e8fab8949b3",
+      "slot_index": 321,
+      "wav_timestamp": 1778964913
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_205613.wav",
+      "wav_sha256": "cb10e174b0a87a5434f42daa2a45a1664bef1a92263d77a27d910ce3bc923904",
+      "slot_index": 322,
+      "wav_timestamp": 1778964973
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_205713.wav",
+      "wav_sha256": "896a1dc3d1df0ec1ce63daf303cf7809346199dbeb15f11712063bd448353efe",
+      "slot_index": 323,
+      "wav_timestamp": 1778965033
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_205813.wav",
+      "wav_sha256": "9c9694aa52c2c887a24ff3b7012347441a63afcc51212be5868f998f80ffea73",
+      "slot_index": 324,
+      "wav_timestamp": 1778965093
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_205913.wav",
+      "wav_sha256": "bcd1419f0cce01f7114979730215279e5461610d3664fb7dda9550a1c05d291f",
+      "slot_index": 325,
+      "wav_timestamp": 1778965153
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_210028.wav",
+      "wav_sha256": "75d40c098f4107676cb6b05f6c41b6806d29eabd7afabc22a0cd90388e2c9772",
+      "slot_index": 326,
+      "wav_timestamp": 1778965228
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_210128.wav",
+      "wav_sha256": "7bb54d7497db9720b348beb2f29a4b0de93d85380cd4695f23d115b89ac58fb5",
+      "slot_index": 327,
+      "wav_timestamp": 1778965288
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_210228.wav",
+      "wav_sha256": "fc80393f7cd476cbdc259ecac4b9b7fbe0341a26c8f8a0f3cf270747c318dd34",
+      "slot_index": 328,
+      "wav_timestamp": 1778965348
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_210328.wav",
+      "wav_sha256": "d041600b10a5fb4818da7bfefb63c2b3a89f918e655a08ebfd98f31046d62c9b",
+      "slot_index": 329,
+      "wav_timestamp": 1778965408
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_210428.wav",
+      "wav_sha256": "bb6d53dc9424bbc56f42d6fc5e518c408edfd2beb2aecf6178a9ccbe07f28cf9",
+      "slot_index": 330,
+      "wav_timestamp": 1778965468
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_210528.wav",
+      "wav_sha256": "e77986c76ae1ede85f7dd1b9778a1f62f3074eb3bc3105982e9ae45c0091cbfa",
+      "slot_index": 331,
+      "wav_timestamp": 1778965528
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_210628.wav",
+      "wav_sha256": "58bb12b8af1cb7ffb2cdf7fc9dcc04fc5a76074aa89b12a80803d43cedd91fe8",
+      "slot_index": 332,
+      "wav_timestamp": 1778965588
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_210728.wav",
+      "wav_sha256": "7770c1fe98be8840513b12aa44078ed60ab5ff15b3d8ca0b03c1430bfb49fcb1",
+      "slot_index": 333,
+      "wav_timestamp": 1778965648
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_210843.wav",
+      "wav_sha256": "8cdda0c3c681292e603cb7603f91ba21f3f3a2aa68d14dc2419a0d287f13876c",
+      "slot_index": 334,
+      "wav_timestamp": 1778965723
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_210943.wav",
+      "wav_sha256": "3c89314cdfc57d05ec7cc14578bd2a5b37591597adb389875a9fd7425b58856e",
+      "slot_index": 335,
+      "wav_timestamp": 1778965783
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_211043.wav",
+      "wav_sha256": "723eeebcd004106567ade693470f5dee2088c9fc5244182268832b6501f33d76",
+      "slot_index": 336,
+      "wav_timestamp": 1778965843
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_211143.wav",
+      "wav_sha256": "b6ed4fc5dd2c7c87a08e8ca1b5d8b9cbce253fe3c2158a1efca85441fdf7cf9e",
+      "slot_index": 337,
+      "wav_timestamp": 1778965903
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_211243.wav",
+      "wav_sha256": "787f888c7f57ed37300875ad12eaf01c3dc4910def7fa45e6db65d9c1ff3e6e6",
+      "slot_index": 338,
+      "wav_timestamp": 1778965963
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_211343.wav",
+      "wav_sha256": "282c8faa3bf654c92674105c58e001f6a393cb1b5edac920b4afc440fa123523",
+      "slot_index": 339,
+      "wav_timestamp": 1778966023
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_211443.wav",
+      "wav_sha256": "f01b8573fac46aa0a218bd061809da5d3a039bb4be77e8a53138a905a77f0e2f",
+      "slot_index": 340,
+      "wav_timestamp": 1778966083
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_211558.wav",
+      "wav_sha256": "77edae37799470f59d2110c3376d8cccc364e2dd40535a3eb6c63bdb1eaa6e57",
+      "slot_index": 341,
+      "wav_timestamp": 1778966158
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_211658.wav",
+      "wav_sha256": "46c9658c4d0cd37b9112cc62887e2718570a0579560886324141cc71b73d0f8e",
+      "slot_index": 342,
+      "wav_timestamp": 1778966218
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_211758.wav",
+      "wav_sha256": "8eb9991695ca7030a9677c3e413cc27ed6607fb3d4b4dbf0a96deecd47086805",
+      "slot_index": 343,
+      "wav_timestamp": 1778966278
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_211858.wav",
+      "wav_sha256": "849a571bd1deb7103e151f882969358c4e96c7e46abf4df0236d07fdf934be08",
+      "slot_index": 344,
+      "wav_timestamp": 1778966338
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_211958.wav",
+      "wav_sha256": "ec31d9fecc4d4a19129cfcde2182ecb8b98cd9878d8dde820fc2246a35a62f0e",
+      "slot_index": 345,
+      "wav_timestamp": 1778966398
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_212058.wav",
+      "wav_sha256": "0adddbd9158a4c4b6a96baa118516048baaca3d713c9f4aeab25ea22b445a8a2",
+      "slot_index": 346,
+      "wav_timestamp": 1778966458
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_212158.wav",
+      "wav_sha256": "cfa1b9baa652a10d517017fd22a015a038ea16c320ac4ae310af6538c6c3f514",
+      "slot_index": 347,
+      "wav_timestamp": 1778966518
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_212258.wav",
+      "wav_sha256": "7e9bfdb0c5e5a4aaa6f0f72377c9877dc97e6102e80514cf387801d8989d1742",
+      "slot_index": 348,
+      "wav_timestamp": 1778966578
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_212413.wav",
+      "wav_sha256": "03a8417c8414d480699df70ff224e402be4140149c98c103048be1f6d0e76b86",
+      "slot_index": 349,
+      "wav_timestamp": 1778966653
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_212513.wav",
+      "wav_sha256": "f4ab9c013f1da63e76eb81f6064e2687081fbc7ac370180ad00310b18eedf36f",
+      "slot_index": 350,
+      "wav_timestamp": 1778966713
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_212613.wav",
+      "wav_sha256": "f145a2f71d87edf52f3d8c9c3bdad977e3f753aecb8957e5820bd89d677d3476",
+      "slot_index": 351,
+      "wav_timestamp": 1778966773
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_212713.wav",
+      "wav_sha256": "f5045c8046e34d3fde42b94015dc68913b2b3965dd979aa0ad9dbbe9f8a5e18f",
+      "slot_index": 352,
+      "wav_timestamp": 1778966833
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_212813.wav",
+      "wav_sha256": "63f97b8cb5567a7562c1f6f0a2c32605bd2927b5923f0bacc0aeb4a39a857600",
+      "slot_index": 353,
+      "wav_timestamp": 1778966893
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_212913.wav",
+      "wav_sha256": "87cfda9937bf7dbbbd1c3a73bacb0140321aa50c9d8a901b9b8c13c680c2d599",
+      "slot_index": 354,
+      "wav_timestamp": 1778966953
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_213013.wav",
+      "wav_sha256": "e2d92d5c70f454dd5fa5502384be26822805940b106fe111c0d86a229b2998bb",
+      "slot_index": 355,
+      "wav_timestamp": 1778967013
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_213113.wav",
+      "wav_sha256": "5cf33eda290cf7a7f1c2de3f1cf6703503c60fe37877fefabbfc56fe2a94b81c",
+      "slot_index": 356,
+      "wav_timestamp": 1778967073
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_213228.wav",
+      "wav_sha256": "0d725b339fa66ac12774edfe8f24d5227e5a57f8d73fafa03a158fa2a59003ac",
+      "slot_index": 357,
+      "wav_timestamp": 1778967148
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_213328.wav",
+      "wav_sha256": "01a5470cd74b5a81f41594293ad2f2d59a829dc0c4f5ada69ee75702f8d556e7",
+      "slot_index": 358,
+      "wav_timestamp": 1778967208
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_213428.wav",
+      "wav_sha256": "0286761a0e57f1fe2466869c3e233f8fe81a02e670e940a9679a5b9adf1caa0d",
+      "slot_index": 359,
+      "wav_timestamp": 1778967268
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_213528.wav",
+      "wav_sha256": "b14a3394dbc40beea7884198977e78eb197846533ade76ab9e3a318ea649fd07",
+      "slot_index": 360,
+      "wav_timestamp": 1778967328
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_213628.wav",
+      "wav_sha256": "b3f1bb2e083378fe15f11b4da4135f660db15191d3a112fb2d72c46a8f4e4828",
+      "slot_index": 361,
+      "wav_timestamp": 1778967388
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_213728.wav",
+      "wav_sha256": "b66c50c71a54081945f9ab0726b9849598206c365cc28bbf0ec6c71d15155c9c",
+      "slot_index": 362,
+      "wav_timestamp": 1778967448
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_213828.wav",
+      "wav_sha256": "3d8e25e5cf9d3c3f2a2603013ddff27a640040dc82bc480f255ec6eec13950e7",
+      "slot_index": 363,
+      "wav_timestamp": 1778967508
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_213943.wav",
+      "wav_sha256": "806f25ce91afd4ff0e39e449a392b7c643dbf41486cfdbd6066818a352e4be83",
+      "slot_index": 364,
+      "wav_timestamp": 1778967583
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_214043.wav",
+      "wav_sha256": "0ce90b27bbd04feeea74631b66016fced8ac476180c1497718b249b74bd6854f",
+      "slot_index": 365,
+      "wav_timestamp": 1778967643
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_214143.wav",
+      "wav_sha256": "45c163fa800921c10ec12a3cf7362da957a327fac7ae78bddd3b0af39e60b637",
+      "slot_index": 366,
+      "wav_timestamp": 1778967703
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_214243.wav",
+      "wav_sha256": "b58d7e2b9c8747162bff4ea9d6c15ce21b197d02e7fa1bb9bb68acaf381edd6a",
+      "slot_index": 367,
+      "wav_timestamp": 1778967763
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_214343.wav",
+      "wav_sha256": "5a0ce0d126c75192f9a36ddf3bdc2a22bd73af523b8e935215785867c5121b1c",
+      "slot_index": 368,
+      "wav_timestamp": 1778967823
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_214443.wav",
+      "wav_sha256": "a968afcaa36cb6010deeef6d84a82b15f869687faea4df0e399e6434c52a3f75",
+      "slot_index": 369,
+      "wav_timestamp": 1778967883
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_214543.wav",
+      "wav_sha256": "a4586469ae7467ab549c64236020ba4451e50e6bb102eab54634408aca7ee6f7",
+      "slot_index": 370,
+      "wav_timestamp": 1778967943
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_214643.wav",
+      "wav_sha256": "664a4b2b704b2ea6808f412389d2f005fb745b14faae8b36bf02cc250680a91f",
+      "slot_index": 371,
+      "wav_timestamp": 1778968003
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_214758.wav",
+      "wav_sha256": "6ad28565ddc76496b37831aab8525684b953102bd7c213eb9383ee248a5bad8e",
+      "slot_index": 372,
+      "wav_timestamp": 1778968078
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_214858.wav",
+      "wav_sha256": "106c85212dcb05d990b37dd1197ce5e06dba0ad8b24ac3b796665a1e03503cb0",
+      "slot_index": 373,
+      "wav_timestamp": 1778968138
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_214958.wav",
+      "wav_sha256": "c416f237c507306034a5f1754014995124fb12811b49db5fb02ac9622e940b04",
+      "slot_index": 374,
+      "wav_timestamp": 1778968198
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_215058.wav",
+      "wav_sha256": "ad32a7c445aec22685d60059b0a3b16e4087a01b0e4dc8598938fd00d4b7674b",
+      "slot_index": 375,
+      "wav_timestamp": 1778968258
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_215158.wav",
+      "wav_sha256": "9f2968eb4ca24c0b9cc6782eb13d1455dee587d8f2a490f325082ad51bad5397",
+      "slot_index": 376,
+      "wav_timestamp": 1778968318
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_215258.wav",
+      "wav_sha256": "0a733f3756d4b73110c8e90133f5ae66a069f87efce60853e0e9b6adbc75c031",
+      "slot_index": 377,
+      "wav_timestamp": 1778968378
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_215358.wav",
+      "wav_sha256": "aea58b16e81fd9150b0616ee68ce3b4ec46612aa5ca422f584b1da2ee7e99396",
+      "slot_index": 378,
+      "wav_timestamp": 1778968438
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_215513.wav",
+      "wav_sha256": "130d6275a19ccf8c764bfcd5acc805e15452f9bffbc1555777f4cbf0572f38ca",
+      "slot_index": 379,
+      "wav_timestamp": 1778968513
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_215613.wav",
+      "wav_sha256": "00f790299f4d7e14e16bc09ddf963b850a10e72be417b08c40c78e79481f3605",
+      "slot_index": 380,
+      "wav_timestamp": 1778968573
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_215713.wav",
+      "wav_sha256": "651839d9d4509b96745884dc4441c4ed156ce317d86587d8f0ea0fbb1a92a3b9",
+      "slot_index": 381,
+      "wav_timestamp": 1778968633
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_215813.wav",
+      "wav_sha256": "5ae74cb70d33d1394ceb3f4866ac2c89a1fd39c01d19269177a1ede57a4367bc",
+      "slot_index": 382,
+      "wav_timestamp": 1778968693
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_215913.wav",
+      "wav_sha256": "ede62564584f87414c8d235f6ef114c4ea54260fa37f68467834a0ebcf8aad0b",
+      "slot_index": 383,
+      "wav_timestamp": 1778968753
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_220013.wav",
+      "wav_sha256": "d8f261991a3942e207c5d7991abea5ea1af8fc545e27b17217ddc0876c828563",
+      "slot_index": 384,
+      "wav_timestamp": 1778968813
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_220113.wav",
+      "wav_sha256": "45a75bf47a522065f93deb323e517cc2e87294c873b595be33369faeb411f6c5",
+      "slot_index": 385,
+      "wav_timestamp": 1778968873
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_220213.wav",
+      "wav_sha256": "5a757c71446796b06fe842e96599a21b4408b116572e2e2f38124e09c11dc058",
+      "slot_index": 386,
+      "wav_timestamp": 1778968933
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_220328.wav",
+      "wav_sha256": "cb1535c9417d4690cf90a86da96a6cad31ea4e9666bf011fb8bd7a2378353867",
+      "slot_index": 387,
+      "wav_timestamp": 1778969008
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_220428.wav",
+      "wav_sha256": "20bbb1e4297b52e75a7c3feee9dc6973cf9e5f2ab29e8fd829b86bc3885cb434",
+      "slot_index": 388,
+      "wav_timestamp": 1778969068
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_220528.wav",
+      "wav_sha256": "f17ef5edb897b7f43c352c8ba823d4a3a1ba2c89aa47b962867d3e04f8777e6c",
+      "slot_index": 389,
+      "wav_timestamp": 1778969128
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_220628.wav",
+      "wav_sha256": "115e3d558bffc9258606a7556e0c6e45ae70fe259ee9d0f43d998b25db425fc4",
+      "slot_index": 390,
+      "wav_timestamp": 1778969188
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_220728.wav",
+      "wav_sha256": "199c54c40d2221ed2ba37244de0968a6e93ab05720d779fd4ceafffe3bfd4354",
+      "slot_index": 391,
+      "wav_timestamp": 1778969248
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_220828.wav",
+      "wav_sha256": "00b1718197966a6055248cca0b2254a65883d581b845827b16d00ddbf6c59581",
+      "slot_index": 392,
+      "wav_timestamp": 1778969308
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_220928.wav",
+      "wav_sha256": "6d692aaf136f4dc263bdb30708ccd64de4217e3dfdfae835b0c13d805d393636",
+      "slot_index": 393,
+      "wav_timestamp": 1778969368
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_221043.wav",
+      "wav_sha256": "3d93a98e92abee4108da9b4cdb01762da736c5b8ee862220bcd90fa2533a0af4",
+      "slot_index": 394,
+      "wav_timestamp": 1778969443
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_221143.wav",
+      "wav_sha256": "283646e79a8a37e999522ed91d48cb833824cb2a0449864443239969ead8c0ab",
+      "slot_index": 395,
+      "wav_timestamp": 1778969503
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_221243.wav",
+      "wav_sha256": "0d609d36202c5d51a2faaf30caa66170bb2a5c2c59e2149ceff3af0b8b14043b",
+      "slot_index": 396,
+      "wav_timestamp": 1778969563
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_221343.wav",
+      "wav_sha256": "f8e3ab8fa734355f4170bf5f9e5180ae4859459cc0db053b7f41f7d4631210b0",
+      "slot_index": 397,
+      "wav_timestamp": 1778969623
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_221443.wav",
+      "wav_sha256": "9a59be6fc76733be2958adfbe70a5ec96e60f86f237fed79752cdc818a5ce2f3",
+      "slot_index": 398,
+      "wav_timestamp": 1778969683
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_221543.wav",
+      "wav_sha256": "70ffda638966d46efd8cd17993c9639ba7a2fd247d917acddec5269a428ac119",
+      "slot_index": 399,
+      "wav_timestamp": 1778969743
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_221643.wav",
+      "wav_sha256": "beeb81444c7065f5e201ac462a68dec503ecd580e10fafb3b01788ef455e341b",
+      "slot_index": 400,
+      "wav_timestamp": 1778969803
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_221743.wav",
+      "wav_sha256": "2217a2242941296c6bceeedd4233c0688c3515ebcc27ed5bcea641b53e67a157",
+      "slot_index": 401,
+      "wav_timestamp": 1778969863
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_221858.wav",
+      "wav_sha256": "c4c5e21994df9544827d9531a7911634267201b406bf9c5f50e643cd6a6ec08f",
+      "slot_index": 402,
+      "wav_timestamp": 1778969938
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_221958.wav",
+      "wav_sha256": "f448c698cdb0607b73f1e9aa88b48cd86b4c119aac8533134c132eb2d242a21e",
+      "slot_index": 403,
+      "wav_timestamp": 1778969998
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_222058.wav",
+      "wav_sha256": "c8d8eb87805fb280ee04ab00f042b46bd533d79da65621f5f31ce5fee5e3afa6",
+      "slot_index": 404,
+      "wav_timestamp": 1778970058
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_222158.wav",
+      "wav_sha256": "e97954c8a1d075919a422aae665ed7dab87dff6af91ea160e4eb67a9bfaa8bef",
+      "slot_index": 405,
+      "wav_timestamp": 1778970118
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_222258.wav",
+      "wav_sha256": "a2a0430023b91d9a9aaaf7d69491feb8905bd4644cad636602abf701669e8e43",
+      "slot_index": 406,
+      "wav_timestamp": 1778970178
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_222358.wav",
+      "wav_sha256": "531300eabc2999e82aa4070925ca100b492a5f05431516d81f1c64767a2c6640",
+      "slot_index": 407,
+      "wav_timestamp": 1778970238
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_222458.wav",
+      "wav_sha256": "d8204fde5cef693996ffbb5f517eb630f11ff5bc327ce5d132511463aae49356",
+      "slot_index": 408,
+      "wav_timestamp": 1778970298
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_222558.wav",
+      "wav_sha256": "f8a5926c2a5be69fbfc8bb9f517d25ed24d66b29b6a5bfd36e966b299e530716",
+      "slot_index": 409,
+      "wav_timestamp": 1778970358
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_222713.wav",
+      "wav_sha256": "9c36a14d9a6e630c413c184898437f82918c86ee0a73deb3cd14d0048fa72475",
+      "slot_index": 410,
+      "wav_timestamp": 1778970433
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_222813.wav",
+      "wav_sha256": "aeca916b0bfc68cb80eb964ff038c073f68902e5758118b46a7df8ee516ca2ad",
+      "slot_index": 411,
+      "wav_timestamp": 1778970493
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_222913.wav",
+      "wav_sha256": "b4c9dd3298d4e6bf76a81615da8ee636b6e6d859b841485fecf277d0292ac06f",
+      "slot_index": 412,
+      "wav_timestamp": 1778970553
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_223013.wav",
+      "wav_sha256": "5ccfd9d39df7cea5fd6c4cff691fe4eee83e7b5e85cf5b3472d1c716a2793726",
+      "slot_index": 413,
+      "wav_timestamp": 1778970613
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_223113.wav",
+      "wav_sha256": "6ad6598f373a5f0b8eb4136371abc2a7ccd233e855177175e20088af332592cc",
+      "slot_index": 414,
+      "wav_timestamp": 1778970673
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_223213.wav",
+      "wav_sha256": "a33b27207125a81d47f56a3971d02ebee45ceddeb6817909b90b305e996e6372",
+      "slot_index": 415,
+      "wav_timestamp": 1778970733
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_223313.wav",
+      "wav_sha256": "9982f86219ef3f40eae692eab98f74a497b3a72206c47ba16e4d8ad5aaf6f277",
+      "slot_index": 416,
+      "wav_timestamp": 1778970793
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_223428.wav",
+      "wav_sha256": "9e357e67e28c481fab386c8c059487a972294f2eb9d30c44434787c1b32d35a0",
+      "slot_index": 417,
+      "wav_timestamp": 1778970868
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_223528.wav",
+      "wav_sha256": "20f3c1a2db5ba30dbc1456631571da52fa1e632423951d546a13fb4a3cf0e15d",
+      "slot_index": 418,
+      "wav_timestamp": 1778970928
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_223628.wav",
+      "wav_sha256": "68574183bd82a48247ffea0ae2370dac45958d2888b70865e1bb56e65eb0f8ac",
+      "slot_index": 419,
+      "wav_timestamp": 1778970988
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_223728.wav",
+      "wav_sha256": "b9726e2659799fa44faeb30ab7ce8d3e45a74da32162d2e514929fbc31e7fed4",
+      "slot_index": 420,
+      "wav_timestamp": 1778971048
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_223828.wav",
+      "wav_sha256": "d299b5967684335f2273d329c99e838ac2e575194b017ee92cb4d7fcefde417f",
+      "slot_index": 421,
+      "wav_timestamp": 1778971108
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_223928.wav",
+      "wav_sha256": "4409cef7aeae26d1e365ae1f1ceb0a9ab3ebd636b88d7b86a7bf60ad5fe8e617",
+      "slot_index": 422,
+      "wav_timestamp": 1778971168
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_224028.wav",
+      "wav_sha256": "194f303360c9fd15ec1022a6c57b4c1a667d0b817045452459ed539721a612dc",
+      "slot_index": 423,
+      "wav_timestamp": 1778971228
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_224128.wav",
+      "wav_sha256": "837078c9abede09a2feab9b55029f74a97a99e36ecb6250d71b6ebc47652c8b1",
+      "slot_index": 424,
+      "wav_timestamp": 1778971288
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_224243.wav",
+      "wav_sha256": "61ad2d55db1e67c065cadc7c8dda60733aa73a0c1f6651a8814de933cf40bf9d",
+      "slot_index": 425,
+      "wav_timestamp": 1778971363
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_224343.wav",
+      "wav_sha256": "2077d3b53003d543e50719c8993b4883f4e4de571696eec3731579ca09fc65da",
+      "slot_index": 426,
+      "wav_timestamp": 1778971423
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_224443.wav",
+      "wav_sha256": "07f96d94a5cc321239af6185d2f1f4bce8d72163567b60e200967f2ba7e2d893",
+      "slot_index": 427,
+      "wav_timestamp": 1778971483
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_224543.wav",
+      "wav_sha256": "74a772ba53d87da071ec231bd0f258853112e64aedc30af07801e90d59664d67",
+      "slot_index": 428,
+      "wav_timestamp": 1778971543
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_224643.wav",
+      "wav_sha256": "2d84144a3d7df61a5ae1e0a64fc4e5301a0fa040acf0aa88e214f5f2e46f74f4",
+      "slot_index": 429,
+      "wav_timestamp": 1778971603
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_224743.wav",
+      "wav_sha256": "6af58df90b6bf9dcada1914f37006fbdbd4e3641efe709ffbcf9d2853cd0d887",
+      "slot_index": 430,
+      "wav_timestamp": 1778971663
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_224843.wav",
+      "wav_sha256": "4cbda973fa7eb933dbffc9b35bb8de5db455eca9f6561115ab4de63fc96acd45",
+      "slot_index": 431,
+      "wav_timestamp": 1778971723
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_224958.wav",
+      "wav_sha256": "5f8e229cac844bd374038a43ed93c79fbc674052c4d061d02703d77e47bf5832",
+      "slot_index": 432,
+      "wav_timestamp": 1778971798
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_225058.wav",
+      "wav_sha256": "f0af8287f75570d17fe45ba0e87877f0aa2065663ceeda184f3ed149d40991b4",
+      "slot_index": 433,
+      "wav_timestamp": 1778971858
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_225158.wav",
+      "wav_sha256": "40e55ce6f68f1095d6787f9182d32eef34fa9c0b507f3e73047d31781eb5bdfc",
+      "slot_index": 434,
+      "wav_timestamp": 1778971918
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_225258.wav",
+      "wav_sha256": "260c64d4ee2dd400574166b227b6b88fedcb47d2f4dffe033182047e581a7396",
+      "slot_index": 435,
+      "wav_timestamp": 1778971978
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_225358.wav",
+      "wav_sha256": "b25bade2f823d72cec726e9a7a818c10192b006b40ce923767ce6f19c5a8c23f",
+      "slot_index": 436,
+      "wav_timestamp": 1778972038
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_225458.wav",
+      "wav_sha256": "8ec5e5e4cf0e5344e9da513f0874cc2607402d727793ead86fd5310a8663f9bb",
+      "slot_index": 437,
+      "wav_timestamp": 1778972098
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_225558.wav",
+      "wav_sha256": "9b91348c6fb231dc6560ecf2ba091e9edcd270e2e4e4b5c80faea4a421c0db00",
+      "slot_index": 438,
+      "wav_timestamp": 1778972158
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_225658.wav",
+      "wav_sha256": "fb8c9213c963dd06dea9aa6cc2043157ce659a693f44e07c0e931c4981e5431c",
+      "slot_index": 439,
+      "wav_timestamp": 1778972218
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_225813.wav",
+      "wav_sha256": "50b2bc95cae7e100601b2e82144241218248699eec79ff117565a3691639251f",
+      "slot_index": 440,
+      "wav_timestamp": 1778972293
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_225913.wav",
+      "wav_sha256": "03bb255464f9233eb83b83849a6c4bbe25c20c5437c9e42286d4c58caf208503",
+      "slot_index": 441,
+      "wav_timestamp": 1778972353
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_230013.wav",
+      "wav_sha256": "2cad755c56a4a5df25402d99d6412bda7c96648f3f2f5adcd02044e781dae07e",
+      "slot_index": 442,
+      "wav_timestamp": 1778972413
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_230113.wav",
+      "wav_sha256": "3ffc9b296d06e480ac0a965543d8db0e83c410663b578d61cb53cf676660d932",
+      "slot_index": 443,
+      "wav_timestamp": 1778972473
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_230213.wav",
+      "wav_sha256": "1d41e3ceb72a4223882ea901b6efe7f9abaf6e36c12a61901a5f0ec8e37afc21",
+      "slot_index": 444,
+      "wav_timestamp": 1778972533
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_230313.wav",
+      "wav_sha256": "2de5df39c2380cff76a98d3cb2d99d6c9112f81a84dd9d9dc125790a6cca1690",
+      "slot_index": 445,
+      "wav_timestamp": 1778972593
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_230413.wav",
+      "wav_sha256": "d55529c30694e2f484c273747389bf206ab2b7b518c850f6155041e1cbd1e56e",
+      "slot_index": 446,
+      "wav_timestamp": 1778972653
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_230528.wav",
+      "wav_sha256": "a057045b4d48a56a01eea5e7a3936c19d8b78072e87413f111a83bb12826d8d2",
+      "slot_index": 447,
+      "wav_timestamp": 1778972728
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_230628.wav",
+      "wav_sha256": "03daf494a92644e0e450da2295c7a231a8d59da7f297604ef17a940194db8d40",
+      "slot_index": 448,
+      "wav_timestamp": 1778972788
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_230728.wav",
+      "wav_sha256": "06f24f7d073e100cc2c5114fb61aee90171be0bd1ddc039042769f2e5299c3a1",
+      "slot_index": 449,
+      "wav_timestamp": 1778972848
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_230828.wav",
+      "wav_sha256": "818eeed4ac38c3ba14586372e9369be9a8b476b1c98290c3867c98e4eec20714",
+      "slot_index": 450,
+      "wav_timestamp": 1778972908
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_230928.wav",
+      "wav_sha256": "6279f9d86005d7e07c6555fac56307edff59cc3e69a05b569e44e363793a32b9",
+      "slot_index": 451,
+      "wav_timestamp": 1778972968
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_231028.wav",
+      "wav_sha256": "beec4a3decadbecf43cbb089f01728644cff3a4c32b9eaad028499d56aea8af0",
+      "slot_index": 452,
+      "wav_timestamp": 1778973028
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_231128.wav",
+      "wav_sha256": "6c13c2a09424ea680037a9b2e4c64a9a695078ee9382dc5a071c59e3bf8e4e62",
+      "slot_index": 453,
+      "wav_timestamp": 1778973088
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_231228.wav",
+      "wav_sha256": "b8447599c8a553e188a0ca994708451d5176461e4fee7a443e6b3676b0347d49",
+      "slot_index": 454,
+      "wav_timestamp": 1778973148
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_231343.wav",
+      "wav_sha256": "c6ec7e989f67b3938eeb20228907ff0eaae22c96d89cfe1c0636dcb71325b26c",
+      "slot_index": 455,
+      "wav_timestamp": 1778973223
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_231443.wav",
+      "wav_sha256": "3af7d5b0b15a6a8f301d91c5e8732313bf73dbcc604b75b7ad030a8e7a3a72cc",
+      "slot_index": 456,
+      "wav_timestamp": 1778973283
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_231543.wav",
+      "wav_sha256": "e09b094000e0e79214f34ec454a749c7a83bfd444afea458c20cd2934f6046d4",
+      "slot_index": 457,
+      "wav_timestamp": 1778973343
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_231643.wav",
+      "wav_sha256": "96145fdd42a2773746c2f7467888ec3c5b0465b40f00f57d95948f4b46485bad",
+      "slot_index": 458,
+      "wav_timestamp": 1778973403
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_231743.wav",
+      "wav_sha256": "5a39cb43a897c2299a47dea34012a92ddfc32d325772c1d73f9b3f8cd0c23520",
+      "slot_index": 459,
+      "wav_timestamp": 1778973463
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_231843.wav",
+      "wav_sha256": "b95209a9ccc5b043327a27c5a1e78fb31f708e3470746ab2c46bdd717bfe4dc3",
+      "slot_index": 460,
+      "wav_timestamp": 1778973523
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_231943.wav",
+      "wav_sha256": "86e350081f85d96e8b5bbc45328053ff0be8da30aaa62ff4415dba7500165014",
+      "slot_index": 461,
+      "wav_timestamp": 1778973583
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_232043.wav",
+      "wav_sha256": "9fc20e654fd90f831d0a5cbf71cbb23c0c7eababa12d590ee1d012090037ba38",
+      "slot_index": 462,
+      "wav_timestamp": 1778973643
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_232158.wav",
+      "wav_sha256": "a3b458c889e6cbe6cbbae9a970a8da07146122af03bebef482e4233aae6fa988",
+      "slot_index": 463,
+      "wav_timestamp": 1778973718
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_232258.wav",
+      "wav_sha256": "d4a19479c4222d4e72348c257fc7f4e6598b19b2c199b3ca561ed19ade1e289c",
+      "slot_index": 464,
+      "wav_timestamp": 1778973778
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_232358.wav",
+      "wav_sha256": "93cd6ae2c31846105cf14516cbed7a289af0b9930bb6ed772c87fb56f2cc7a40",
+      "slot_index": 465,
+      "wav_timestamp": 1778973838
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_232458.wav",
+      "wav_sha256": "0fc2607dce26c3dcbc28814d553588e9c5ddfa1849f790be83ed789b116803ba",
+      "slot_index": 466,
+      "wav_timestamp": 1778973898
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_232558.wav",
+      "wav_sha256": "6ed711b61aee107ab9f8111354cbf765dfde63d5f0929f09bf9a41ed5df3228e",
+      "slot_index": 467,
+      "wav_timestamp": 1778973958
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_232658.wav",
+      "wav_sha256": "12a9cdeebe40d96f65d2ab3c8f606b4b6b084cad6bd1431f0e1372cdfafffa42",
+      "slot_index": 468,
+      "wav_timestamp": 1778974018
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_232758.wav",
+      "wav_sha256": "ae4a8e20374f6e2f217d0822166a6d1bae7212ae319377b075ee22ec44a27db0",
+      "slot_index": 469,
+      "wav_timestamp": 1778974078
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_232913.wav",
+      "wav_sha256": "fabde03fcb936883529d5f9d63e005289d5e6c3c6e49edf9b34432abc780ac82",
+      "slot_index": 470,
+      "wav_timestamp": 1778974153
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_233013.wav",
+      "wav_sha256": "2b3af48e12de733d55af761a7ed8df75def981b5381608e772e1ea4633f1c0e6",
+      "slot_index": 471,
+      "wav_timestamp": 1778974213
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_233113.wav",
+      "wav_sha256": "273654517dc9ba49ba6d54e5f1a7e861efc4b1269332254d43b200bfd1e460ec",
+      "slot_index": 472,
+      "wav_timestamp": 1778974273
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_233213.wav",
+      "wav_sha256": "3ebef66f3b1acc80baa8980b0c8d585f82800e0d542548369237c454d1a40c73",
+      "slot_index": 473,
+      "wav_timestamp": 1778974333
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_233313.wav",
+      "wav_sha256": "ff803d7d9e13b088d943088145ffe0909333364d4e622dc6aa3f33874adf9167",
+      "slot_index": 474,
+      "wav_timestamp": 1778974393
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_233413.wav",
+      "wav_sha256": "8127b16085d82d6618078dc835a66dd064daabd76419a5a9690d3efa05456eea",
+      "slot_index": 475,
+      "wav_timestamp": 1778974453
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_233513.wav",
+      "wav_sha256": "0c526c69706e814d614202eb421de785bdcba15db6749848b322a9b4e5dbf46f",
+      "slot_index": 476,
+      "wav_timestamp": 1778974513
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_233613.wav",
+      "wav_sha256": "badb4e6d049e03a7e144a66564d3331730b71f21ccfc7bee223d85dd293f66b8",
+      "slot_index": 477,
+      "wav_timestamp": 1778974573
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_233728.wav",
+      "wav_sha256": "f8acab7ba936719d995ce15212b6cd823cacaac363eb49d885b708bb55e205a8",
+      "slot_index": 478,
+      "wav_timestamp": 1778974648
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_233828.wav",
+      "wav_sha256": "fd9ee29abd10309bc1389da9649bee4c624a0b61ec2b6093a40d46049c923f8e",
+      "slot_index": 479,
+      "wav_timestamp": 1778974708
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_233928.wav",
+      "wav_sha256": "8281ee4086a8cb317b19b5d24f4b29aeb6469355aee0d4146b5ac26360acd29f",
+      "slot_index": 480,
+      "wav_timestamp": 1778974768
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_234028.wav",
+      "wav_sha256": "47864b6d2c58ee05e9ce68ee1ce1631b1ef406593201cacda9812948905b7d2e",
+      "slot_index": 481,
+      "wav_timestamp": 1778974828
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_234128.wav",
+      "wav_sha256": "8fbfe4f8e6889403efa36930b4024d5cb44884e5bc832b6d533dde61933d371a",
+      "slot_index": 482,
+      "wav_timestamp": 1778974888
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_234228.wav",
+      "wav_sha256": "bb742aaef078efb4b692fbdf6b3eb6e00a1ff8305a900a4cf933e3790c30be95",
+      "slot_index": 483,
+      "wav_timestamp": 1778974948
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_234328.wav",
+      "wav_sha256": "d3a64a7a2267da0b00d9bc911ffc042934910a00d15805e241b48fd1b1aefc21",
+      "slot_index": 484,
+      "wav_timestamp": 1778975008
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_234443.wav",
+      "wav_sha256": "0d15bb412a9fb1f1b05b54ec1a6bf724f0c2ee5a513f7a688279df10eb92ba44",
+      "slot_index": 485,
+      "wav_timestamp": 1778975083
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_234543.wav",
+      "wav_sha256": "9f6edf9189734583d54b31dbd2fc4e88bdafc9252f94124b8918ab66a1580399",
+      "slot_index": 486,
+      "wav_timestamp": 1778975143
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_234643.wav",
+      "wav_sha256": "a1fa1d55f6070434e2a14435b5af2a06a04a7d38aeb72adb1baf286eb6d814a5",
+      "slot_index": 487,
+      "wav_timestamp": 1778975203
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_234743.wav",
+      "wav_sha256": "40b29457c1d98b977452f5735cc179623760aa646afa27ff92989dc7d410a5eb",
+      "slot_index": 488,
+      "wav_timestamp": 1778975263
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_234843.wav",
+      "wav_sha256": "7be420b7338ee7f99ee91360de395b1e0ed99179a0d55296a7739874b284abaf",
+      "slot_index": 489,
+      "wav_timestamp": 1778975323
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_234943.wav",
+      "wav_sha256": "b0ab452d37aa037dcd8116c35ff5ea43c80ffdc469bf71959eca99ab26db726b",
+      "slot_index": 490,
+      "wav_timestamp": 1778975383
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_235043.wav",
+      "wav_sha256": "958244e63f0b34ce826660f517b459006ccdbfb2dac60915590665a9b3857e02",
+      "slot_index": 491,
+      "wav_timestamp": 1778975443
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_235143.wav",
+      "wav_sha256": "5f03eb519abef9bc82f95260d515d87c0c26168184b59fec60a8114e97989b38",
+      "slot_index": 492,
+      "wav_timestamp": 1778975503
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_235258.wav",
+      "wav_sha256": "aa1d6c82e2ae1f6ddf8e80813cb80cd1c07aa1bf330107340d32bdcc0434a48c",
+      "slot_index": 493,
+      "wav_timestamp": 1778975578
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_235358.wav",
+      "wav_sha256": "11326da26b1023ca58b0ab36000949f08389f4265922803f208198d5fe60bf52",
+      "slot_index": 494,
+      "wav_timestamp": 1778975638
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_235458.wav",
+      "wav_sha256": "2a5f56ac4065c08f99ccdc913141c7ba4bd2159ec773d4ebd44a6d63373322d6",
+      "slot_index": 495,
+      "wav_timestamp": 1778975698
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_235558.wav",
+      "wav_sha256": "5e33ec17d6ab80db4c8578e9377e1a0809e9ede0dbbb2faad11e3c8f1998e0d3",
+      "slot_index": 496,
+      "wav_timestamp": 1778975758
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_235658.wav",
+      "wav_sha256": "e799e33c14192523ec56ea5f701a5c9a6ec883a61f44c8f4284d3f7884921151",
+      "slot_index": 497,
+      "wav_timestamp": 1778975818
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_235758.wav",
+      "wav_sha256": "0c7975b23eb0887ec725d72cf9fbf3816cf81ef788f23bca4d87bcd637f5f9a4",
+      "slot_index": 498,
+      "wav_timestamp": 1778975878
+    },
+    {
+      "wav_path": "~/.pancetta/recordings/ft8_20260530_235858.wav",
+      "wav_sha256": "43c420769d0800f6f24c0f43ad3ff90c9d4b33fa17fa8661d594ec8e34bc8f42",
+      "slot_index": 499,
+      "wav_timestamp": 1778975938
+    }
+  ]
+}

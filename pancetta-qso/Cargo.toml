@@ -1,0 +1,75 @@
+[package]
+name = "pancetta-qso"
+description = "QSO management and logging system for FT8 communications"
+keywords = ["ham-radio", "ft8", "qso", "adif", "logging"]
+categories = ["simulation", "science", "database"]
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Internal dependencies
+pancetta-core = { path = "../pancetta-core" }
+# FT8 encoder/modulator/decoder — only pulled in for the high-fidelity sim
+# path (encode -> noise/fading -> real decode). Optional + the `transmit`
+# feature (the encoder/modulator are feature-gated there). The base harness
+# (direct text inject) builds without this.
+pancetta-ft8 = { path = "../pancetta-ft8", features = ["transmit"], optional = true }
+
+# Core dependencies
+tokio = { version = "1.50", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Database dependencies
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "chrono", "uuid"] }
+
+# Logging and tracing
+tracing = "0.1"
+
+# Utilities
+regex = "1.12"
+lazy_static = "1.4"
+dirs = "5.0"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3.27"
+proptest = "1.11"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = ["sqlite"]
+sqlite = []
+contest-mode = []
+dx-cluster = []
+# High-fidelity QSO sim: encode text -> modulate -> add calibrated AWGN +
+# fading -> decode through the REAL pancetta-ft8 pipeline, feeding the actual
+# decode (which may be MISSED at low SNR) into the QSO engine. Requires the
+# pancetta-ft8 encoder/modulator/decoder (the `transmit` feature there).
+sim-hifi = ["dep:pancetta-ft8"]
+
+[[example]]
+name = "basic_qso"
+path = "examples/basic_qso.rs"
+
+[[example]]
+name = "qso_logging"
+path = "examples/qso_logging.rs"
+
+[[example]]
+name = "qso_sim_hifi"
+path = "examples/qso_sim_hifi.rs"
+required-features = ["sim-hifi"]
+
+[[example]]
+name = "decode_rate_sweep"
+path = "examples/decode_rate_sweep.rs"
+required-features = ["sim-hifi"]

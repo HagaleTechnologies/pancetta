@@ -1,0 +1,24 @@
+[package]
+name = "pancetta-cqdx"
+description = "cqdx.io API client and cache for Pancetta"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+pancetta-core = { path = "../pancetta-core" }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+wiremock = "0.6"

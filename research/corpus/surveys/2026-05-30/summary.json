@@ -1,0 +1,20 @@
+{
+  "sampled_wav_count": 20,
+  "total_wavs_today": 2066,
+  "total_size_bytes_today": 743785240,
+  "pancetta_decode_count_total": 527,
+  "jt9_decode_count_total": 566,
+  "intersection_total": 392,
+  "agreement_pct": 69.25795053003533,
+  "pancetta_p10": 20.0,
+  "pancetta_p50": 27.0,
+  "pancetta_p90": 30.0,
+  "pancetta_mean": 26.35,
+  "jt9_p10": 23.0,
+  "jt9_p50": 29.0,
+  "jt9_p90": 35.0,
+  "jt9_mean": 28.3,
+  "jt9_max": 38.0,
+  "unique_callsigns_total": 1488,
+  "elapsed_total_s": 59.2964475
+}

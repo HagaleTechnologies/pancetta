@@ -1,0 +1,10 @@
+{
+  "n_samples_total": 113340,
+  "n_osd_recovered": 2029,
+  "recovered_per_tier": {
+    "fixtures-basicft8": 85,
+    "fixtures-wsjt": 34,
+    "hard-200": 1910
+  },
+  "note": "Generator terminated at 113,340 captured trajectories (was: gen-run wall-clock budget). Full pool was 708 WAVs across 5 tiers (fixtures-basicft8, fixtures-wsjt, synth-clean, hard-200, hard-jt9-rich-200, chrono-replay); the captured sample comes mostly from fixtures + synth + the first ~100 hard-200 entries."
+}

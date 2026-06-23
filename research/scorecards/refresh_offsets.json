@@ -1,0 +1,12 @@
+{
+  "_doc": "Corpus-refresh offset registry — hb-133 (saturation-aware composite). Each entry records a one-time corpus rotation event and the composite-delta attributable to corpus shift alone (NOT decoder change). Subtract the cumulative sum of `offset_to_subtract` from any raw composite score computed against the post-refresh corpus to keep it comparable to the pre-refresh baseline. New entries are appended at corpus-refresh time; never edit historical entries. Anchored by `applies_from_sha` (the main HEAD just AFTER the refresh landed). See research/ideation/2026-06-01-metric.md (M5) and pancetta-research/src/metrics.rs::saturation_aware_composite.",
+  "schema_version": 1,
+  "offsets": [
+    {
+      "refresh_date": "2026-05-30",
+      "applies_from_sha": "e6a1594e158e1db5d201b980d211cf18efa0fa37",
+      "offset_to_subtract": 0.009699,
+      "note": "hard-200 mix update (2026-05-30 corpus refresh). Computed as score(post-refresh main.json) - score(pre-refresh main.json) = 0.579114 - 0.569415 = +0.009699; same production decoder code (post-hb-068) on both sides, so the delta is purely corpus shift. Pre-refresh card archived at research/scorecards/history/main.2026-05-30-pre-refresh.json."
+    }
+  ]
+}
