@@ -720,7 +720,9 @@ impl ApplicationCoordinator {
             if let Some(bridge) = crate::cqdx_bridge::CqdxBridge::from_config(
                 &config.network.cqdx,
                 self.cached_lookup.clone(),
-            ) {
+            )
+            .map(|b| b.with_operating_frequency(self.operating_frequency_hz.clone()))
+            {
                 drop(config);
                 match bridge.startup().await {
                     Ok(()) => {

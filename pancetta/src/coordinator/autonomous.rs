@@ -309,6 +309,7 @@ impl super::ApplicationCoordinator {
             signal_strength: config.autonomous.priorities.signal_strength,
             duplicate_penalty: config.autonomous.priorities.duplicate_penalty,
             recent_failure_penalty: config.autonomous.priorities.recent_failure_penalty,
+            atno_bonus: config.autonomous.priorities.atno_bonus,
         };
         drop(config);
 

@@ -105,6 +105,19 @@ pub struct PriorityWeightsConfig {
     pub duplicate_penalty: f64,
     /// Penalty for stations recently called but QSO didn't complete (should be negative).
     pub recent_failure_penalty: f64,
+    /// Extra bonus for an ATNO ("all-time new one" — a DXCC entity never
+    /// worked on any band), added on top of `needed_dxcc`. ATNO is a
+    /// stronger signal than a per-band fill, so it earns a small premium.
+    /// Populated from cqdx.io's `atno` flag on needed entities; inert
+    /// (no ATNO ever flagged) when cqdx is unconfigured or the server
+    /// doesn't supply the flag. Defaults to 0.15 for forward-compat with
+    /// configs written before this field existed.
+    #[serde(default = "default_atno_bonus")]
+    pub atno_bonus: f64,
+}
+
+fn default_atno_bonus() -> f64 {
+    0.15
 }
 
 impl Default for PriorityWeightsConfig {
@@ -117,6 +130,7 @@ impl Default for PriorityWeightsConfig {
             signal_strength: 0.05,
             duplicate_penalty: -0.40,
             recent_failure_penalty: -0.15,
+            atno_bonus: default_atno_bonus(),
         }
     }
 }
@@ -132,6 +146,7 @@ impl PriorityWeightsConfig {
             ("signal_strength", self.signal_strength),
             ("duplicate_penalty", self.duplicate_penalty),
             ("recent_failure_penalty", self.recent_failure_penalty),
+            ("atno_bonus", self.atno_bonus),
         ] {
             if !(-1.0..=1.0).contains(&val) {
                 return Err(ConfigError::InvalidValue {

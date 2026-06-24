@@ -98,6 +98,10 @@ pub struct CachedStationLookup {
     recent_failures: Arc<RwLock<HashSet<String>>>,
     /// DXCC entities still needed.
     needed_dxcc: Arc<RwLock<HashSet<String>>>,
+    /// DXCC entity prefixes that are ATNO (all-time new ones — never worked
+    /// on any band). A strict subset of `needed_dxcc`; populated from
+    /// cqdx.io's `atno` flag. Empty/inert when cqdx is unconfigured.
+    needed_atno: Arc<RwLock<HashSet<String>>>,
     /// Grid squares still needed for award tracking.
     needed_grids: Arc<RwLock<HashSet<String>>>,
     /// Rarity scores from cqdx.io, keyed by uppercase callsign.
@@ -136,6 +140,7 @@ impl CachedStationLookup {
             worked_on_band: Arc::new(RwLock::new(HashMap::new())),
             recent_failures: Arc::new(RwLock::new(HashSet::new())),
             needed_dxcc: Arc::new(RwLock::new(HashSet::new())),
+            needed_atno: Arc::new(RwLock::new(HashSet::new())),
             needed_grids: Arc::new(RwLock::new(HashSet::new())),
             rarity_scores: Arc::new(RwLock::new(HashMap::new())),
             notable_callsigns: Arc::new(RwLock::new(HashSet::new())),
@@ -185,6 +190,14 @@ impl CachedStationLookup {
 
     pub fn update_needed_dxcc(&self, patterns: HashSet<String>) {
         *self.needed_dxcc.write() = patterns;
+    }
+
+    /// Install the set of ATNO ("all-time new one") DXCC prefixes. Should
+    /// be a subset of the `needed_dxcc` set. Uppercase enforced. Replaces
+    /// the prior set on each call.
+    pub fn update_needed_atno(&self, prefixes: HashSet<String>) {
+        let upper: HashSet<String> = prefixes.into_iter().map(|p| p.to_uppercase()).collect();
+        *self.needed_atno.write() = upper;
     }
 
     pub fn update_needed_grids(&self, grids: HashSet<String>) {
@@ -270,6 +283,15 @@ impl WorkedStationLookup for CachedStationLookup {
         needed
             .iter()
             .any(|prefix| upper.starts_with(prefix.as_str()))
+    }
+
+    fn is_atno(&self, callsign: &str) -> bool {
+        let atno = self.needed_atno.read();
+        if atno.is_empty() {
+            return false;
+        }
+        let upper = callsign.to_uppercase();
+        atno.iter().any(|prefix| upper.starts_with(prefix.as_str()))
     }
 
     fn is_needed_grid(&self, grid: &str) -> bool {
@@ -426,6 +448,58 @@ mod tests {
         assert!(!lookup.is_needed_dxcc("JA1ABC"));
         // 3Y/B1234 — is in cqdx-needed
         assert!(lookup.is_needed_dxcc("3Y/B1234"));
+    }
+
+    #[test]
+    fn test_atno_empty_set_is_inert() {
+        // No ATNO data loaded: is_atno is false for everything.
+        let lookup = CachedStationLookup::new();
+        assert!(!lookup.is_atno("3Y/B1234"));
+        assert!(!lookup.is_atno("K5ARH"));
+    }
+
+    #[test]
+    fn test_atno_prefix_match() {
+        let lookup = CachedStationLookup::new();
+        let mut atno = HashSet::new();
+        atno.insert("3Y/B".to_string());
+        atno.insert("ja".to_string()); // lower-case is normalized on update
+        lookup.update_needed_atno(atno);
+
+        assert!(lookup.is_atno("3Y/B1234"));
+        assert!(lookup.is_atno("JA1ABC")); // case-insensitive prefix
+        assert!(!lookup.is_atno("DL5XYZ")); // not in ATNO set
+    }
+
+    #[test]
+    fn test_atno_bonus_lifts_score_over_plain_needed() {
+        // An ATNO entity should score strictly higher than the same entity
+        // when only band-needed (not ATNO), via the atno_bonus weight.
+        use pancetta_qso::priority::{PriorityScorer, PriorityWeights};
+        use pancetta_qso::DxEvaluator;
+
+        let mut needed = HashSet::new();
+        needed.insert("3Y/B".to_string());
+
+        // Lookup A: needed but NOT atno.
+        let plain = CachedStationLookup::new();
+        plain.update_needed_dxcc(needed.clone());
+        let plain_scorer =
+            PriorityScorer::new(PriorityWeights::default(), Box::new(plain));
+        let plain_score = plain_scorer.evaluate_cq("3Y/B1234", None, -10, 14_074_000.0);
+
+        // Lookup B: needed AND atno.
+        let atno_lookup = CachedStationLookup::new();
+        atno_lookup.update_needed_dxcc(needed.clone());
+        atno_lookup.update_needed_atno(needed);
+        let atno_scorer =
+            PriorityScorer::new(PriorityWeights::default(), Box::new(atno_lookup));
+        let atno_score = atno_scorer.evaluate_cq("3Y/B1234", None, -10, 14_074_000.0);
+
+        assert!(
+            atno_score > plain_score,
+            "ATNO ({atno_score}) should outscore plain-needed ({plain_score})"
+        );
     }
 
     #[test]

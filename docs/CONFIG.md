@@ -150,11 +150,16 @@ hunting vs. contesting.
 ```toml
 [priority_weights]
 needed_dxcc = 0.35
+atno_bonus  = 0.15   # extra premium for an all-time-new-one (never worked on any band)
 needed_grid = 0.20
 pota_sota   = 0.15
 rarity      = 0.10
 snr         = 0.05
 ```
+
+`atno_bonus` is added on top of `needed_dxcc` only when cqdx.io flags the
+entity as an ATNO. It's inert (no entity is ever ATNO) when cqdx is
+unconfigured.
 
 Weights need not sum to 1.0; they're combined linearly with the
 duplicate-and-failure penalty applied on top. Set any weight to `0.0`

@@ -17,6 +17,10 @@ pub struct PriorityWeights {
     pub signal_strength: f64,
     pub duplicate_penalty: f64,
     pub recent_failure_penalty: f64,
+    /// Extra bonus added on top of `needed_dxcc` when the entity is an
+    /// ATNO ("all-time new one" — never worked on any band). 0.0 disables.
+    #[serde(default)]
+    pub atno_bonus: f64,
 }
 
 impl Default for PriorityWeights {
@@ -29,6 +33,7 @@ impl Default for PriorityWeights {
             signal_strength: 0.05,
             duplicate_penalty: -0.40,
             recent_failure_penalty: -0.15,
+            atno_bonus: 0.15,
         }
     }
 }
@@ -38,6 +43,8 @@ impl Default for PriorityWeights {
 pub struct ScoreBreakdown {
     pub callsign: String,
     pub needed_dxcc: f64,
+    /// ATNO bonus contribution applied to the total (0.0 when not ATNO).
+    pub atno: f64,
     pub needed_grid: f64,
     pub pota_sota: f64,
     pub rarity: f64,
@@ -60,6 +67,12 @@ pub trait WorkedStationLookup: Send + Sync {
 
     /// Is this DXCC entity needed (not yet confirmed)?
     fn is_needed_dxcc(&self, callsign: &str) -> bool;
+
+    /// Is this DXCC entity an ATNO (all-time new one — never worked on any
+    /// band)? Defaults to `false` for lookups that don't track ATNO.
+    fn is_atno(&self, _callsign: &str) -> bool {
+        false
+    }
 
     /// Is this grid square needed for award tracking?
     fn is_needed_grid(&self, grid: &str) -> bool;
@@ -167,6 +180,12 @@ impl PriorityScorer {
         } else {
             0.0
         };
+        // ATNO premium: only meaningful when the entity is also needed.
+        let atno = if needed_dxcc > 0.0 && self.lookup.is_atno(callsign) {
+            self.weights.atno_bonus
+        } else {
+            0.0
+        };
         let needed_grid = match grid {
             Some(g) if self.lookup.is_needed_grid(g) => 1.0,
             _ => 0.0,
@@ -231,6 +250,7 @@ impl PriorityScorer {
             + signal_strength * self.weights.signal_strength
             + duplicate_penalty * self.weights.duplicate_penalty
             + recent_failure_penalty * self.weights.recent_failure_penalty
+            + atno
             + notable_bonus
             + snr_bonus)
             * staleness;
@@ -240,6 +260,7 @@ impl PriorityScorer {
         ScoreBreakdown {
             callsign: callsign.to_string(),
             needed_dxcc,
+            atno,
             needed_grid,
             pota_sota,
             rarity,
@@ -468,6 +489,7 @@ mod tests {
             signal_strength: 0.0,
             duplicate_penalty: 0.0,
             recent_failure_penalty: 0.0,
+            atno_bonus: 0.0,
         };
         let scorer = PriorityScorer::new(weights, Box::new(NullLookup));
         let score_regular = scorer.evaluate_cq("W1ABC", None, -10, 14074000.0);
@@ -492,6 +514,7 @@ mod tests {
             signal_strength: 1.0,
             duplicate_penalty: 0.0,
             recent_failure_penalty: 0.0,
+            atno_bonus: 0.0,
         };
         let mut lookup = TestLookup::new();
         lookup.needed_dxcc.insert("W1ABC".to_string());
@@ -556,6 +579,7 @@ mod tests {
             signal_strength: 0.0,
             duplicate_penalty: 0.0,
             recent_failure_penalty: 0.0,
+            atno_bonus: 0.0,
         };
 
         let scorer_rare = PriorityScorer::new(

@@ -4,9 +4,11 @@
 //! and fire-and-forget spot/QSO reporting.
 
 use crate::priority_evaluator::CachedStationLookup;
-use pancetta_cqdx::{rank_to_rarity, CqdxCache, CqdxClient, QsoRecord, SpotReport};
+use pancetta_cqdx::{
+    frequency_to_band, rank_to_rarity, CqdxCache, CqdxClient, NeededEntity, QsoRecord, SpotReport,
+};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -26,6 +28,23 @@ fn normalize_grid_field(grid: &str) -> String {
     trimmed[..4].to_uppercase()
 }
 
+/// Push a `needed` entity list into the [`CachedStationLookup`], splitting
+/// out the ATNO subset. `needed_dxcc` gets every prefix; `needed_atno` gets
+/// only those flagged `atno` by cqdx.io. Returns `(total, atno)` counts.
+fn apply_needed(cached_lookup: &CachedStationLookup, needed: &[NeededEntity]) -> (usize, usize) {
+    let prefixes: std::collections::HashSet<String> =
+        needed.iter().map(|n| n.prefix.to_uppercase()).collect();
+    let atno: std::collections::HashSet<String> = needed
+        .iter()
+        .filter(|n| n.atno)
+        .map(|n| n.prefix.to_uppercase())
+        .collect();
+    let (total, atno_count) = (prefixes.len(), atno.len());
+    cached_lookup.update_needed_dxcc(prefixes);
+    cached_lookup.update_needed_atno(atno);
+    (total, atno_count)
+}
+
 /// Manages the cqdx.io integration lifecycle.
 pub struct CqdxBridge {
     client: CqdxClient,
@@ -34,6 +53,13 @@ pub struct CqdxBridge {
     poll_interval: Duration,
     /// Current band, updated by coordinator when radio frequency changes.
     current_band: Arc<RwLock<Option<String>>>,
+    /// The rig's current dial frequency (Hz), shared with the coordinator.
+    /// When present, the spot poller derives the operating band from it and
+    /// re-fetches per-band needed entities whenever the band changes — so
+    /// `needed_dxcc` reflects band-fills for the band actually in use, while
+    /// the all-time ATNO set stays global. `None` keeps the all-time
+    /// (band-agnostic) needed set fetched at startup.
+    operating_frequency_hz: Option<Arc<AtomicU64>>,
 }
 
 impl CqdxBridge {
@@ -64,7 +90,15 @@ impl CqdxBridge {
             cached_lookup,
             poll_interval: Duration::from_secs(config.poll_interval_secs),
             current_band: Arc::new(RwLock::new(None)),
+            operating_frequency_hz: None,
         })
+    }
+
+    /// Attach the coordinator's shared dial-frequency atomic so the spot
+    /// poller can track the operating band and re-fetch per-band needs.
+    pub fn with_operating_frequency(mut self, freq: Arc<AtomicU64>) -> Self {
+        self.operating_frequency_hz = Some(freq);
+        self
     }
 
     /// Fetch entities and needed data on startup. Populates cache and CachedStationLookup.
@@ -73,7 +107,9 @@ impl CqdxBridge {
         let entities = self.client.fetch_entities().await?;
         info!("Loaded {} DXCC entities from cqdx.io", entities.len());
 
-        // Fetch needed (all-time / ATNO; pass a band for per-band fills)
+        // Fetch needed. At startup we may not know the operating band yet,
+        // so fetch the all-time/ATNO set (band=None). The spot poller
+        // re-fetches per-band fills once the dial frequency is known.
         let needed = self.client.fetch_needed(None).await?;
         info!("Loaded {} needed entities from cqdx.io", needed.len());
 
@@ -82,10 +118,12 @@ impl CqdxBridge {
         cache.load_entities(entities);
         cache.load_needed(needed.clone());
 
-        // Update CachedStationLookup needed_dxcc with prefix strings
-        let needed_prefixes: std::collections::HashSet<String> =
-            needed.iter().map(|n| n.prefix.to_uppercase()).collect();
-        self.cached_lookup.update_needed_dxcc(needed_prefixes);
+        // Update CachedStationLookup needed_dxcc + ATNO subset.
+        let (total, atno) = apply_needed(&self.cached_lookup, &needed);
+        info!(
+            "cqdx.io needed: {} DXCC prefix(es), {} flagged ATNO",
+            total, atno
+        );
 
         // Populate needed_grids from the (roadmap) grid-needed endpoint.
         // Graceful-degrade: if the cqdx.io server hasn't shipped
@@ -132,6 +170,8 @@ impl CqdxBridge {
         let cached_lookup = self.cached_lookup.clone();
         let interval = self.poll_interval;
         let current_band_ref = self.current_band.clone();
+        let operating_frequency_hz = self.operating_frequency_hz.clone();
+        let needed_lookup = self.cached_lookup.clone();
         let watchdog_timeout = std::time::Duration::from_secs(2 * 60 * 60); // 2 hours
 
         tokio::spawn(async move {
@@ -140,12 +180,46 @@ impl CqdxBridge {
             let mut polling_paused = false;
             let backoff_interval = Duration::from_secs(5 * 60); // 5 min retry after failures
             let mut last_backoff_attempt = std::time::Instant::now();
+            // Last band we re-fetched per-band needs for. `None` until the
+            // dial frequency is first observed.
+            let mut last_needed_band: Option<String> = None;
 
             loop {
                 timer.tick().await;
 
                 if shutdown.load(Ordering::Acquire) {
                     break;
+                }
+
+                // Per-band needs: when the dial moves to a new band, re-fetch
+                // the needed set for that band. cqdx returns the band's fills
+                // plus the all-time ATNO set, so this replaces both lookups.
+                // Graceful-degrade: on error keep the prior set unchanged.
+                if let Some(ref freq) = operating_frequency_hz {
+                    let dial_hz = freq.load(Ordering::Relaxed);
+                    if dial_hz > 0 {
+                        if let Some(band) = frequency_to_band(dial_hz).map(|b| b.to_uppercase()) {
+                            if last_needed_band.as_deref() != Some(band.as_str()) {
+                                match client.fetch_needed(Some(&band)).await {
+                                    Ok(needed) => {
+                                        let (total, atno) = apply_needed(&needed_lookup, &needed);
+                                        info!(
+                                            "cqdx.io per-band needs for {}: {} prefix(es), {} ATNO",
+                                            band, total, atno
+                                        );
+                                        *current_band_ref.write().await = Some(band.clone());
+                                        last_needed_band = Some(band);
+                                    }
+                                    Err(e) => {
+                                        debug!(
+                                            "per-band needed fetch for {} failed ({e}); keeping prior set",
+                                            band
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Watchdog: check last decode activity
@@ -302,5 +376,53 @@ impl CqdxBridge {
     /// Get a clone of the cache for read access.
     pub fn cache(&self) -> Arc<RwLock<CqdxCache>> {
         self.cache.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pancetta_qso::priority::WorkedStationLookup;
+
+    fn ne(prefix: &str, atno: bool) -> NeededEntity {
+        NeededEntity {
+            entity_id: 1,
+            name: prefix.to_string(),
+            prefix: prefix.to_string(),
+            atno,
+        }
+    }
+
+    #[test]
+    fn apply_needed_splits_atno_subset() {
+        let lookup = CachedStationLookup::new();
+        let needed = vec![ne("3Y/B", true), ne("JA", false), ne("VK0", true)];
+        let (total, atno) = apply_needed(&lookup, &needed);
+        assert_eq!(total, 3);
+        assert_eq!(atno, 2);
+
+        // All three are "needed".
+        assert!(lookup.is_needed_dxcc("3Y/B1234"));
+        assert!(lookup.is_needed_dxcc("JA1ABC"));
+        assert!(lookup.is_needed_dxcc("VK0XYZ"));
+
+        // Only the ATNO-flagged two report is_atno.
+        assert!(lookup.is_atno("3Y/B1234"));
+        assert!(lookup.is_atno("VK0XYZ"));
+        assert!(!lookup.is_atno("JA1ABC")); // band-fill, not ATNO
+    }
+
+    #[test]
+    fn apply_needed_replaces_prior_set() {
+        let lookup = CachedStationLookup::new();
+        apply_needed(&lookup, &[ne("JA", true)]);
+        assert!(lookup.is_atno("JA1ABC"));
+
+        // A subsequent (per-band) fetch fully replaces both sets.
+        apply_needed(&lookup, &[ne("DL", false)]);
+        assert!(!lookup.is_needed_dxcc("JA1ABC"));
+        assert!(!lookup.is_atno("JA1ABC"));
+        assert!(lookup.is_needed_dxcc("DL5XYZ"));
+        assert!(!lookup.is_atno("DL5XYZ"));
     }
 }
