@@ -579,29 +579,6 @@ impl ComponentMessage {
         }
     }
 
-    /// Create a high-priority message (for real-time audio)
-    pub fn new_high_priority(
-        source: ComponentId,
-        destination: ComponentId,
-        message_type: MessageType,
-        timestamp: Instant,
-    ) -> Self {
-        let latency_tracking = LatencyTracking {
-            queued_at: Some(Instant::now()),
-            ..LatencyTracking::default()
-        };
-
-        Self {
-            id: generate_message_id(),
-            source,
-            destination,
-            message_type,
-            timestamp,
-            priority: 0, // Highest priority
-            hop_count: 0,
-            latency_tracking,
-        }
-    }
 
     /// Get message age in microseconds
     pub fn age_us(&self) -> u64 {
@@ -845,27 +822,6 @@ impl MessageBus {
         Ok(())
     }
 
-    /// Broadcast a message to all components except the sender
-    pub async fn broadcast_message(&self, message: ComponentMessage) -> Result<()> {
-        let channels = self.channels.read().await;
-
-        for (&component_id, channel) in channels.iter() {
-            if component_id != message.source {
-                let mut broadcast_message = message.clone();
-                broadcast_message.destination = component_id;
-                broadcast_message.hop_count += 1;
-
-                if let Err(e) = channel.sender.try_send(broadcast_message) {
-                    warn!("Failed to broadcast to {}: {}", component_id, e);
-                    channel.error_count.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-
-        self.total_messages.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
     /// Get health status for all components
     pub async fn get_component_health(&self) -> Vec<ComponentHealth> {
         let channels = self.channels.read().await;
@@ -922,18 +878,6 @@ impl MessageBus {
         Ok(())
     }
 
-    /// Remove a component channel (cleanup)
-    pub async fn remove_channel(&self, component_id: ComponentId) -> Result<()> {
-        let mut channels = self.channels.write().await;
-
-        if channels.remove(&component_id).is_some() {
-            debug!("Removed channel for component: {}", component_id);
-        } else {
-            warn!("Attempted to remove non-existent channel: {}", component_id);
-        }
-
-        Ok(())
-    }
 }
 
 /// Message bus performance statistics
@@ -1050,15 +994,4 @@ mod tests {
         assert_eq!(message.hop_count, 0);
     }
 
-    #[test]
-    fn test_high_priority_message() {
-        let message = ComponentMessage::new_high_priority(
-            ComponentId::Audio,
-            ComponentId::Dsp,
-            MessageType::AudioData(vec![0.1]),
-            Instant::now(),
-        );
-
-        assert_eq!(message.priority, 0);
-    }
 }
