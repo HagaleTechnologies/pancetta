@@ -2818,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2865,7 +2865,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-audio"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "atomic",
  "cpal",
@@ -2879,7 +2879,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-config"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2900,7 +2900,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-core"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "approx",
  "chrono",
@@ -2911,7 +2911,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-cqdx"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "chrono",
  "pancetta-core",
@@ -2927,7 +2927,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-dsp"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "async-trait",
  "biquad",
@@ -2948,7 +2948,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-dx"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "approx",
  "chrono",
@@ -2971,7 +2971,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-ft8"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "anyhow",
  "approx",
@@ -3002,7 +3002,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-hamlib"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3029,7 +3029,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-qso"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3053,7 +3053,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-research"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -3074,7 +3074,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-tui"
-version = "0.1.0"
+version = "0.9.5"
 dependencies = [
  "anyhow",
  "chrono",
