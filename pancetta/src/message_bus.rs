@@ -772,42 +772,40 @@ impl MessageBus {
         let channels = self.channels.read().await;
 
         if let Some(channel) = channels.get(&message.destination) {
-            match channel.sender.try_send(message.clone()) {
+            // Perf (Pass 1 / A8): capture the small Copy fields needed for
+            // metrics/tracing/error logs up front so the message can be MOVED
+            // into try_send instead of deep-cloned on EVERY point-to-point send.
+            // The old `try_send(message.clone())` cloned the whole
+            // ComponentMessage — including potentially large MessageType
+            // payloads (audio buffers, snapshots) — on the hot bus path.
+            let src = message.source;
+            let dst = message.destination;
+            let msg_id = message.id;
+            let transit = message.transit_latency_us();
+            match channel.sender.try_send(message) {
                 Ok(_) => {
                     channel.message_count.fetch_add(1, Ordering::Relaxed);
                     self.total_messages.fetch_add(1, Ordering::Relaxed);
 
-                    // Update latency metrics if available
-                    if let Some(transit_us) = message.transit_latency_us() {
-                        // Store average latency (simplified - in production would use rolling average)
-                        let _avg_latency = transit_us as f64;
-                    }
-
                     if self.config.enable_tracing {
                         trace!(
                             "Message sent from {} to {}: {:?} (transit: {:?}μs)",
-                            message.source,
-                            message.destination,
-                            message.id,
-                            message.transit_latency_us()
+                            src,
+                            dst,
+                            msg_id,
+                            transit
                         );
                     }
                 }
                 Err(crossbeam_channel::TrySendError::Full(_)) => {
                     channel.error_count.fetch_add(1, Ordering::Relaxed);
                     self.dropped_messages.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        "Channel full, dropping message from {} to {}",
-                        message.source, message.destination
-                    );
+                    warn!("Channel full, dropping message from {} to {}", src, dst);
                 }
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                     channel.error_count.fetch_add(1, Ordering::Relaxed);
                     self.dropped_messages.fetch_add(1, Ordering::Relaxed);
-                    error!(
-                        "Channel disconnected for component: {}",
-                        message.destination
-                    );
+                    error!("Channel disconnected for component: {}", dst);
                 }
             }
         } else {

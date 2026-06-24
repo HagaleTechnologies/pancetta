@@ -504,10 +504,13 @@ pub mod utils {
         exchange.validate_grid(grid).is_ok()
     }
 
-    /// Convert frequency in Hz to band designation
+    /// Convert frequency in Hz to band designation.
+    ///
+    /// Perf (Pass 1 / A13): calls the free `freq_hz_to_band` directly instead
+    /// of building a throwaway `AdifProcessor` (~54 String allocs) on every
+    /// call — this is hit per duplicate-check / per QSO-scan, many times/slot.
     pub fn frequency_to_band(frequency_hz: f64) -> String {
-        let processor = AdifProcessor::new();
-        processor.frequency_to_band(frequency_hz)
+        crate::adif::freq_hz_to_band(frequency_hz)
     }
 
     /// Get library version information

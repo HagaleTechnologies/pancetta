@@ -389,6 +389,14 @@ impl TuiRunner {
                 break;
             }
 
+            // Perf (Pass 1 / infra-A6): snapshot the cumulative message count
+            // so the adaptive timeout below can test RECENT activity (this
+            // iteration) rather than lifetime total. The old test
+            // `messages_processed > 0` is monotonic — true forever after the
+            // first message — which pinned the poll timeout at 10ms for the
+            // whole session and defeated the intended 50ms idle cadence.
+            let msgs_before = self.metrics.messages_processed;
+
             // Process incoming messages (non-blocking)
             self.process_messages().await?;
 
@@ -451,8 +459,10 @@ impl TuiRunner {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
 
-            // Adaptive timeout based on activity
-            event_timeout = if self.metrics.messages_processed > 0 {
+            // Adaptive timeout based on RECENT activity (messages processed this
+            // iteration), not lifetime total — so an idle TUI actually falls
+            // back to the 50ms cadence instead of spinning at 10ms forever.
+            event_timeout = if self.metrics.messages_processed > msgs_before {
                 Duration::from_millis(10) // More responsive when active
             } else {
                 Duration::from_millis(50) // Less CPU when idle

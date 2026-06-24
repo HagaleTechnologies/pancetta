@@ -218,7 +218,10 @@ impl super::ApplicationCoordinator {
                             match tui_msg_tx_relay.send(
                                 pancetta_tui::tui_runner::TuiMessage::DecodedMessage(tui_decoded),
                             ) {
-                                Ok(()) => info!("TUI relay: forwarded decoded message to TUI channel"),
+                                // Perf (Pass 1): one decode forwards dozens of
+                                // these per slot — demote to debug so steady-state
+                                // info logging isn't dominated by per-decode spam.
+                                Ok(()) => debug!("TUI relay: forwarded decoded message to TUI channel"),
                                 Err(e) => warn!("TUI relay: failed to send to TUI: {}", e),
                             }
                         }

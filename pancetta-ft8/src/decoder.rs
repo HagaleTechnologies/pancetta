@@ -10189,11 +10189,26 @@ impl LdpcDecoder {
 
                 match self.algorithm {
                     LdpcAlgorithm::SumProduct => {
+                        // Perf (Pass 1 / A1+A5): the original computed
+                        // `fast_tanh(v2c[pos] / 2.0)` inside the target loop, so
+                        // each edge's tanh was recomputed `degree` times
+                        // (O(degree²) tanh per check node). Hoist it: compute
+                        // `tanh(v2c[pos] * 0.5)` once per edge into a stack
+                        // scratch (degree ≤ 7, so no heap), then form each
+                        // target's product from the cached values. Bit-identical:
+                        // `x / 2.0 == x * 0.5` exactly for f32 (2.0 is a power of
+                        // two), and each product still multiplies the same
+                        // operands in the same order — only the redundant tanh
+                        // evaluations are removed.
+                        let mut tanh_half = [0.0f32; 7];
+                        for (pos, slot) in tanh_half.iter_mut().enumerate().take(degree) {
+                            *slot = fast_tanh(v2c[check_idx][pos] * 0.5);
+                        }
                         for target_pos in 0..degree {
                             let mut product = 1.0f32;
-                            for pos in 0..degree {
+                            for (pos, &th) in tanh_half.iter().enumerate().take(degree) {
                                 if pos != target_pos {
-                                    product *= fast_tanh(v2c[check_idx][pos] / 2.0);
+                                    product *= th;
                                 }
                             }
                             c2v[check_idx][target_pos] = 2.0 * fast_atanh(product);
@@ -10412,11 +10427,26 @@ impl LdpcDecoder {
 
                 match self.algorithm {
                     LdpcAlgorithm::SumProduct => {
+                        // Perf (Pass 1 / A1+A5): the original computed
+                        // `fast_tanh(v2c[pos] / 2.0)` inside the target loop, so
+                        // each edge's tanh was recomputed `degree` times
+                        // (O(degree²) tanh per check node). Hoist it: compute
+                        // `tanh(v2c[pos] * 0.5)` once per edge into a stack
+                        // scratch (degree ≤ 7, so no heap), then form each
+                        // target's product from the cached values. Bit-identical:
+                        // `x / 2.0 == x * 0.5` exactly for f32 (2.0 is a power of
+                        // two), and each product still multiplies the same
+                        // operands in the same order — only the redundant tanh
+                        // evaluations are removed.
+                        let mut tanh_half = [0.0f32; 7];
+                        for (pos, slot) in tanh_half.iter_mut().enumerate().take(degree) {
+                            *slot = fast_tanh(v2c[check_idx][pos] * 0.5);
+                        }
                         for target_pos in 0..degree {
                             let mut product = 1.0f32;
-                            for pos in 0..degree {
+                            for (pos, &th) in tanh_half.iter().enumerate().take(degree) {
                                 if pos != target_pos {
-                                    product *= fast_tanh(v2c[check_idx][pos] / 2.0);
+                                    product *= th;
                                 }
                             }
                             c2v[check_idx][target_pos] = 2.0 * fast_atanh(product);

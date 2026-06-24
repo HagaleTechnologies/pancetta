@@ -54,6 +54,16 @@ pub fn active_tx_qso_key(qso_id: &str) -> String {
     qso_id.trim().to_uppercase()
 }
 
+/// Current Unix time in whole milliseconds (0 if the clock is before the
+/// epoch, which never happens in practice). Used for the lock-free
+/// `last_audio_timestamp` atomic (Pass 1 / A10).
+pub(crate) fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Decide whether a `TransmitRequest`/`MultiTransmitRequest` item may be
 /// keyed, given its `qso_id` and the current active-QSO set.
 ///
@@ -416,7 +426,13 @@ pub struct ApplicationCoordinator {
 
     /// Performance metrics
     message_count: Arc<std::sync::atomic::AtomicU64>,
-    last_audio_timestamp: Arc<RwLock<Option<Instant>>>,
+    /// Last-audio-sample wall-clock timestamp as Unix epoch milliseconds
+    /// (0 = no audio yet). Perf (Pass 1 / A10): was `Arc<RwLock<Option<Instant>>>`
+    /// written under an async write lock on EVERY audio relay batch (the most
+    /// frequent lock in the pipeline) and read only by the 30s stats log — now
+    /// a lock-free atomic. Wall-clock ms is fine here: the sole reader formats a
+    /// "last audio Xs ago" status string.
+    last_audio_timestamp: Arc<std::sync::atomic::AtomicU64>,
     last_decode_timestamp: Arc<RwLock<Option<Instant>>>,
 
     /// `true` when the resolved TX OUTPUT device fell back to the system
@@ -707,7 +723,7 @@ impl ApplicationCoordinator {
             #[cfg(feature = "pancetta-hamlib")]
             rigctld_process: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            last_audio_timestamp: Arc::new(RwLock::new(None)),
+            last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_decode_timestamp: Arc::new(RwLock::new(None)),
             audio_output_default: Arc::new(AtomicBool::new(false)),
             audio_reopen_tx: None,

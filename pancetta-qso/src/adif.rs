@@ -222,6 +222,34 @@ pub struct AdifQso {
     pub additional_fields: HashMap<String, String>,
 }
 
+/// Map an RF frequency (Hz) to its ADIF band string (e.g. "20M").
+///
+/// Free function so callers don't have to construct an [`AdifProcessor`] just
+/// to classify a frequency. Perf (Pass 1 / A13): `utils::frequency_to_band`
+/// was building a whole `AdifProcessor` (~54 String allocations in `new()`) on
+/// every call — and it's called per duplicate-check / per QSO-scan, i.e.
+/// thousands of times per slot on a busy band. The classification uses no
+/// instance state, so it now lives here and the `&self` method delegates.
+pub fn freq_hz_to_band(frequency_hz: f64) -> String {
+    let freq_mhz = frequency_hz / 1_000_000.0;
+    match freq_mhz {
+        f if (1.8..=2.0).contains(&f) => "160M".to_string(),
+        f if (3.5..=4.0).contains(&f) => "80M".to_string(),
+        f if (5.3..=5.4).contains(&f) => "60M".to_string(),
+        f if (7.0..=7.3).contains(&f) => "40M".to_string(),
+        f if (10.1..=10.15).contains(&f) => "30M".to_string(),
+        f if (14.0..=14.35).contains(&f) => "20M".to_string(),
+        f if (18.068..=18.168).contains(&f) => "17M".to_string(),
+        f if (21.0..=21.45).contains(&f) => "15M".to_string(),
+        f if (24.89..=24.99).contains(&f) => "12M".to_string(),
+        f if (28.0..=29.7).contains(&f) => "10M".to_string(),
+        f if (50.0..=54.0).contains(&f) => "6M".to_string(),
+        f if (144.0..=148.0).contains(&f) => "2M".to_string(),
+        f if (420.0..=450.0).contains(&f) => "70CM".to_string(),
+        _ => format!("{:.0}MHZ", freq_mhz),
+    }
+}
+
 /// ADIF parser and generator
 #[derive(Clone)]
 pub struct AdifProcessor {
@@ -907,24 +935,9 @@ impl AdifProcessor {
     }
 
     pub fn frequency_to_band(&self, frequency_hz: f64) -> String {
-        let freq_mhz = frequency_hz / 1_000_000.0;
-
-        match freq_mhz {
-            f if (1.8..=2.0).contains(&f) => "160M".to_string(),
-            f if (3.5..=4.0).contains(&f) => "80M".to_string(),
-            f if (5.3..=5.4).contains(&f) => "60M".to_string(),
-            f if (7.0..=7.3).contains(&f) => "40M".to_string(),
-            f if (10.1..=10.15).contains(&f) => "30M".to_string(),
-            f if (14.0..=14.35).contains(&f) => "20M".to_string(),
-            f if (18.068..=18.168).contains(&f) => "17M".to_string(),
-            f if (21.0..=21.45).contains(&f) => "15M".to_string(),
-            f if (24.89..=24.99).contains(&f) => "12M".to_string(),
-            f if (28.0..=29.7).contains(&f) => "10M".to_string(),
-            f if (50.0..=54.0).contains(&f) => "6M".to_string(),
-            f if (144.0..=148.0).contains(&f) => "2M".to_string(),
-            f if (420.0..=450.0).contains(&f) => "70CM".to_string(),
-            _ => format!("{:.0}MHZ", freq_mhz),
-        }
+        // Delegates to the free function — see `freq_hz_to_band`. The method is
+        // kept for the existing `&self` call sites; it uses no instance state.
+        freq_hz_to_band(frequency_hz)
     }
 
     fn signal_report_to_rst(&self, signal_report: SignalReport) -> String {

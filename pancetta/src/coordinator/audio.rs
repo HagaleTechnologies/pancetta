@@ -96,10 +96,9 @@ impl super::ApplicationCoordinator {
                         }
                     }
 
-                    {
-                        let mut timestamp = last_timestamp.write().await;
-                        *timestamp = Some(Instant::now());
-                    }
+                    // Perf (Pass 1 / A10): lock-free atomic store (was an async
+                    // RwLock write on every audio batch — the hottest lock).
+                    last_timestamp.store(super::now_epoch_ms(), Ordering::Relaxed);
 
                     if audio_to_dsp_tx.send(samples).is_err() {
                         break;
@@ -331,10 +330,9 @@ impl super::ApplicationCoordinator {
                 let mut raw_recorder: Option<Vec<f32>> =
                     Some(Vec::with_capacity(raw_capture_samples));
                 while let Some(samples) = result_rx.recv().await {
-                    {
-                        let mut timestamp = last_timestamp.write().await;
-                        *timestamp = Some(Instant::now());
-                    }
+                    // Perf (Pass 1 / A10): lock-free atomic store (was an async
+                    // RwLock write on every audio batch — the hottest lock).
+                    last_timestamp.store(super::now_epoch_ms(), Ordering::Relaxed);
 
                     // Capture raw 48kHz for diagnostic comparison
                     if let Some(ref mut buf) = raw_recorder {

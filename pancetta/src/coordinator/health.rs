@@ -295,22 +295,15 @@ impl super::ApplicationCoordinator {
         // handler ever be wired here, it MUST gate every change through
         // `classify_config_reload(...)` and refuse/defer `DeferQsoLatched`
         // changes while a QSO is active (see `active_tx_qsos`).
-        let config_handle = {
-            let _config = self.config.clone();
-            let shutdown = self.shutdown_signal.clone();
-
-            tokio::spawn(async move {
-                while !shutdown.load(Ordering::Acquire) {
-                    sleep(Duration::from_secs(1)).await;
-                }
-                Ok(())
-            })
-        };
+        // Perf (Pass 1 / infra-A5): the former `config_handle` here was a
+        // do-nothing placeholder task (`while !shutdown { sleep(1s) }`) with no
+        // config-apply logic wired — a pure 1 Hz wakeup forever. Removed. If a
+        // real hot-reload apply handler is ever added, it MUST gate every
+        // change through `classify_config_reload(...)` and refuse/defer
+        // `DeferQsoLatched` changes while a QSO is active (see `active_tx_qsos`).
 
         self.named_task_handles
             .push((ComponentId::Coordinator, health_handle));
-        self.named_task_handles
-            .push((ComponentId::Coordinator, config_handle));
 
         Ok(())
     }
@@ -392,8 +385,13 @@ impl super::ApplicationCoordinator {
                 _ = health_check_interval.tick() => {
                     self.check_task_handles().await;
                 }
-                _ = sleep(Duration::from_millis(100)) => {
-                    // Main loop iteration
+                _ = sleep(Duration::from_secs(1)) => {
+                    // Perf (Pass 1 / infra-A4): this arm only bounds how quickly
+                    // the `while !shutdown` guard is re-checked — it does no work.
+                    // It was firing 10×/s (100ms); 1s cuts that to 1/s with no
+                    // behavior change beyond at-most-1s extra shutdown latency on
+                    // this top-level housekeeping loop. (Not removed outright:
+                    // that would defer the shutdown check to the 5s health tick.)
                 }
             }
         }
@@ -491,10 +489,13 @@ impl super::ApplicationCoordinator {
         let uptime = self.startup_time.elapsed();
 
         let audio_status = {
-            let timestamp = self.last_audio_timestamp.read().await;
-            match *timestamp {
-                Some(ts) => format!("active (last: {:.2}s ago)", ts.elapsed().as_secs_f64()),
-                None => "inactive".to_string(),
+            // Perf (Pass 1 / A10): lock-free read of the epoch-ms atomic.
+            let ms = self.last_audio_timestamp.load(Ordering::Relaxed);
+            if ms == 0 {
+                "inactive".to_string()
+            } else {
+                let ago_s = super::now_epoch_ms().saturating_sub(ms) as f64 / 1000.0;
+                format!("active (last: {:.2}s ago)", ago_s)
             }
         };
 
