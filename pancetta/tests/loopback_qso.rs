@@ -790,6 +790,7 @@ fn test_priority_scorer_prefers_pota() {
         signal_strength: 0.0,
         duplicate_penalty: 0.0,
         recent_failure_penalty: 0.0,
+        atno_bonus: 0.0,
     };
     let scorer = PriorityScorer::new(weights, Box::new(NullLookup));
 
