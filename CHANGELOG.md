@@ -7,8 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-06-24
+
 ### Added
 
+- Per-band cqdx needs: the cqdx bridge now re-fetches the needed-DXCC set
+  for the operating band whenever the dial moves to a new band, and
+  tracks an ATNO ("all-time new one") subset. The priority scorer applies
+  a configurable `atno_bonus` (default 0.15) on top of `needed_dxcc` for
+  ATNO entities. All inert when cqdx is unconfigured.
+- DX Hunter need markers: a callsign-prefix `!` (ATNO) / `+` (needed
+  DXCC) marker, sourced from the same `CachedStationLookup` the scorer
+  uses, rendered alongside the existing `★` notable marker.
 - `LICENSE-APACHE` (project is now dual-licensed MIT OR Apache-2.0; the
   former `LICENSE` file is now `LICENSE-MIT`).
 - `SECURITY.md` describing the vulnerability-reporting process and known
@@ -25,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Bumped all crate versions to `0.9.5`.
+- PSKReporter reports the real build version instead of a hard-coded
+  `0.1.0`.
+- Removed three unused `MessageBus` methods (`broadcast_message`,
+  `remove_channel`, `ComponentMessage::new_high_priority`) ahead of the
+  public release.
+- Hardened credential redaction, SSRF host-parsing (cqdx base-URL via
+  `reqwest::Url`), LoTW temp-file creation (`O_EXCL`, mode 0600), and log
+  retention (cap 14 files).
 - Crate metadata centralized in `[workspace.package]`. All eleven crates
   now inherit `version`, `edition`, `authors`, `license`, and
   `repository`. Repository URL standardized to
@@ -42,6 +61,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Bus error on launch**: the audio device-selection modal underflowed
+  its height arithmetic (`area.height - 2`) when the terminal reported a
+  tiny or 0×0 size (common over a remote/Jump Desktop session at launch).
+  In release this wrapped to a huge `usize` → out-of-bounds render →
+  SIGBUS. Now uses saturating arithmetic, skips the overlay when the area
+  is too small, and `overflow-checks` is enabled for the (non-hot-path)
+  TUI crate so any future underflow is a catchable unwind rather than a
+  hard crash.
 - TUI Space-to-call previously passed the dial frequency (e.g.
   14,074,000 Hz) where the modulator expected an audio offset (200–2500
   Hz), causing the modulator to silently reject the request. The TUI now

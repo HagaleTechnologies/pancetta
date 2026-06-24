@@ -904,7 +904,7 @@ impl Default for PskReporterConfig {
             max_age_hours: 24,
             reporter_info: ReporterInfo {
                 software_name: "Pancetta".to_string(),
-                software_version: "0.1.0".to_string(),
+                software_version: env!("CARGO_PKG_VERSION").to_string(),
                 antenna_info: None,
                 comments: None,
             },
