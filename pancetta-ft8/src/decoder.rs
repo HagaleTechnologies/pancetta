@@ -4480,6 +4480,34 @@ impl Ft8Decoder {
         base_frequency: f64,
         time_offset_s: f64,
     ) -> Ft8Result<Option<DecodedMessage>> {
+        // Perf (Pass 1b / A6): `confidence` is loop-invariant — the caller
+        // derives it from the candidate's sync_score, so it is fixed before any
+        // of the expensive per-attempt work (LLR clone + AP inject + normalize +
+        // BP/OSD). The post-decode floor below rejects (returns None) whenever
+        // `confidence < floor`, and `floor` is at most the value picked here for
+        // this ap_level — the a8 branch can only LOWER the Ap3/Ap4 floor to
+        // MIN_DECODE_CONFIDENCE. So if confidence is under the lowest floor that
+        // could possibly apply, the decode is rejected on EVERY path; skip it up
+        // front. Output-neutral by construction (the only `Some` return is gated
+        // by the same floor) and the skipped decode is side-effect-free.
+        const MIN_DECODE_CONFIDENCE: f32 = 0.41;
+        const MIN_AP_DECODE_CONFIDENCE: f32 = 0.55;
+        const SCRUTINY_THRESHOLD: f32 = 0.65;
+        let lowest_possible_floor = match ap_level {
+            crate::ap::ApLevel::Ap0 => MIN_DECODE_CONFIDENCE,
+            crate::ap::ApLevel::Ap1 | crate::ap::ApLevel::Ap2 => MIN_AP_DECODE_CONFIDENCE,
+            crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
+                if self.config.a8_qso_state_ap_enabled {
+                    MIN_DECODE_CONFIDENCE
+                } else {
+                    MIN_AP_DECODE_CONFIDENCE
+                }
+            }
+        };
+        if confidence < lowest_possible_floor {
+            return Ok(None);
+        }
+
         let mut llrs = base_llrs.to_vec();
         let xor_sequence = self.protocol_params.xor_sequence;
 
@@ -4571,9 +4599,8 @@ impl Ft8Decoder {
         // structurally valid messages at low sync, especially under AP
         // injection where the prior steers the codeword toward a
         // pre-chosen callsign pattern.
-        const MIN_DECODE_CONFIDENCE: f32 = 0.41;
-        const MIN_AP_DECODE_CONFIDENCE: f32 = 0.55;
-        const SCRUTINY_THRESHOLD: f32 = 0.65;
+        // (MIN_DECODE_CONFIDENCE / MIN_AP_DECODE_CONFIDENCE / SCRUTINY_THRESHOLD
+        // are declared at the top of this fn — see the A6 early-return.)
 
         // WSJT-X Improved-style a8: when enabled AND this is an AP3/AP4
         // attempt AND the decoded text matches one of the coordinator-
@@ -5905,7 +5932,7 @@ impl Ft8Decoder {
                         let mut signal_sum = 0.0f64;
                         let mut noise_sum = 0.0f64;
                         let mut count = 0usize;
-                        for &sym_idx in &data_positions {
+                        for &sym_idx in data_positions {
                             let mags = &tone_magnitudes[sym_idx];
                             let best = mags.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                             let worst = mags.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -6086,7 +6113,7 @@ impl Ft8Decoder {
                     let mut signal_power = 0.0f64;
                     let mut noise_power = 0.0f64;
                     let mut count = 0usize;
-                    for &sym_idx in &data_positions {
+                    for &sym_idx in data_positions {
                         let mags = &tone_magnitudes[sym_idx];
                         let best = mags.iter().cloned().fold(0.0f64, f64::max);
                         let worst = mags.iter().cloned().fold(f64::MAX, f64::min);
@@ -6292,7 +6319,7 @@ impl Ft8Decoder {
         let mut llrs = Vec::with_capacity(174);
         let data_positions = pp.data_symbol_indices();
 
-        for &sym_idx in &data_positions {
+        for &sym_idx in data_positions {
             let mags = &tone_magnitudes[sym_idx];
 
             match pp.bits_per_symbol {
@@ -6354,7 +6381,7 @@ impl Ft8Decoder {
         let mut llrs = Vec::with_capacity(174);
         let data_positions = pp.data_symbol_indices();
 
-        for &sym_idx in &data_positions {
+        for &sym_idx in data_positions {
             let mags = &tone_magnitudes[sym_idx];
 
             match pp.bits_per_symbol {
@@ -8326,7 +8353,7 @@ fn par_compute_soft_llrs_db(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TO
     let mut llrs = Vec::with_capacity(174);
     let data_positions = pp.data_symbol_indices();
 
-    for &sym_idx in &data_positions {
+    for &sym_idx in data_positions {
         let mags = &tone_magnitudes[sym_idx];
 
         match pp.bits_per_symbol {
@@ -8374,7 +8401,7 @@ fn par_compute_soft_llrs(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES
     let mut llrs = Vec::with_capacity(174);
     let data_positions = pp.data_symbol_indices();
 
-    for &sym_idx in &data_positions {
+    for &sym_idx in data_positions {
         let mags = &tone_magnitudes[sym_idx];
 
         match pp.bits_per_symbol {
@@ -8991,7 +9018,7 @@ pub(crate) fn snr_from_tone_mags_db(
     let mut signal_power = 0.0f64;
     let mut noise_power = 0.0f64;
     let mut count = 0usize;
-    for &sym_idx in &data_positions {
+    for &sym_idx in data_positions {
         let mags = &tone_magnitudes[sym_idx];
         // Convert this symbol's tone dB magnitudes to linear power and locate
         // the peak (signal) tone.
@@ -9053,7 +9080,7 @@ fn par_estimate_snr_fft(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES]
     let mut signal_power = 0.0f64;
     let mut noise_power = 0.0f64;
     let mut count = 0usize;
-    for &sym_idx in &data_positions {
+    for &sym_idx in data_positions {
         let mags = &tone_magnitudes[sym_idx];
         let best = mags.iter().cloned().fold(0.0f64, f64::max);
         let worst = mags.iter().cloned().fold(f64::MAX, f64::min);
@@ -9152,7 +9179,7 @@ fn whiten_llrs(llrs: &mut [f32], tone_magnitudes: &[[f64; NUM_TONES]], pp: &Prot
     // whitening step operates on the magnitude matrix BEFORE the
     // Gray-coded LLR formula and only needs "which tone was loudest".
     let mut winners: Vec<usize> = Vec::with_capacity(nd);
-    for &sym_idx in &data_positions {
+    for &sym_idx in data_positions {
         let mags = &tone_magnitudes[sym_idx];
         let mut best_tone = 0usize;
         let mut best_mag = f64::NEG_INFINITY;
@@ -9181,7 +9208,7 @@ fn whiten_llrs(llrs: &mut [f32], tone_magnitudes: &[[f64; NUM_TONES]], pp: &Prot
             // symbol position (would require all 58 data symbols to
             // peak at the same tone). Fall back to the all-positions
             // median to keep the divisor well-defined.
-            for &sym_idx in &data_positions {
+            for &sym_idx in data_positions {
                 scratch.push(tone_magnitudes[sym_idx][tone]);
             }
             median_inplace(&mut scratch).max(NOISE_FLOOR)

@@ -286,12 +286,34 @@ impl ProtocolParams {
         self.data_symbol_ranges.iter().any(|r| r.contains(&idx))
     }
 
-    /// Iterator over all data symbol indices
-    pub fn data_symbol_indices(&self) -> Vec<usize> {
-        self.data_symbol_ranges
-            .iter()
-            .flat_map(|r| r.clone())
-            .collect()
+    /// All data symbol indices, flattened from `data_symbol_ranges`.
+    ///
+    /// Perf (Pass 1b / A2): read once per candidate in several hot decode
+    /// loops; it used to allocate + collect a fresh `Vec` on every call
+    /// (thousands of allocations per window on a busy band). The indices are a
+    /// pure function of the protocol's `&'static` ranges, so they are computed
+    /// once per protocol into a `OnceLock` and returned as a `&'static` slice.
+    /// Bit-identical to the previous flatten — only the allocation is removed.
+    pub fn data_symbol_indices(&self) -> &'static [usize] {
+        use std::sync::OnceLock;
+        fn compute(ranges: &[Range<usize>]) -> Vec<usize> {
+            ranges.iter().flat_map(|r| r.clone()).collect()
+        }
+        match self.protocol {
+            Protocol::Ft8 => {
+                static C: OnceLock<Vec<usize>> = OnceLock::new();
+                C.get_or_init(|| compute(&FT8_DATA_RANGES)).as_slice()
+            }
+            Protocol::Ft4 => {
+                static C: OnceLock<Vec<usize>> = OnceLock::new();
+                C.get_or_init(|| compute(&FT4_DATA_RANGES)).as_slice()
+            }
+            #[cfg(feature = "ft2")]
+            Protocol::Ft2 => {
+                static C: OnceLock<Vec<usize>> = OnceLock::new();
+                C.get_or_init(|| compute(&FT2_DATA_RANGES)).as_slice()
+            }
+        }
     }
 }
 

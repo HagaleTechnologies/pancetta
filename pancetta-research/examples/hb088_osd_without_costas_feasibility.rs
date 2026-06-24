@@ -280,7 +280,7 @@ fn extract_symbols(spec: &Spec, t0: usize, f0: usize, fs: usize) -> Vec<[f64; NU
 /// Convention (matches pancetta-ft8 OSD): llr < 0 => bit=1, llr > 0 => bit=0.
 fn compute_llrs_db(tone_mags: &[[f64; NUM_TONES]], pp: &ProtocolParams) -> Vec<f32> {
     let mut llrs = Vec::with_capacity(NUM_CODEWORD_BITS);
-    for sym_idx in pp.data_symbol_indices() {
+    for &sym_idx in pp.data_symbol_indices() {
         let mags = &tone_mags[sym_idx];
         let mut s2 = [0.0f64; 8];
         for j in 0..8 {
@@ -323,7 +323,7 @@ fn tone_symbols_to_codeword(
 ) -> [u8; NUM_CODEWORD_BITS] {
     let mut out = [0u8; NUM_CODEWORD_BITS];
     let mut bit_idx = 0usize;
-    for sym_idx in pp.data_symbol_indices() {
+    for &sym_idx in pp.data_symbol_indices() {
         let gray = symbols[sym_idx];
         let bits3 = gray_to_binary(gray);
         // 3 bits MSB-first per the encoder's generate_symbols_protocol path.
