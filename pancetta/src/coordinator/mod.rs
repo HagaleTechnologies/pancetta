@@ -73,6 +73,39 @@ pub fn tx_qso_is_live(qso_id: Option<&str>, active: &HashSet<String>) -> bool {
     }
 }
 
+/// The most recent transmit intent the QSO component has produced for a
+/// given QSO, keyed by [`active_tx_qso_key`]. Written by the QSO component
+/// each time it forwards a `QsoEvent::MessageToSend` as a `TransmitRequest`;
+/// read by the TX worker at key-time so it can "pivot" to the freshest
+/// message for the QSO if a newer decode advanced the exchange during the
+/// worker's (up to ~30 s) pre-PTT wait. See `latest_tx_intent`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LatestTxIntent {
+    pub message_text: String,
+    pub frequency_offset: f64,
+    pub tx_parity: Option<pancetta_core::slot::SlotParity>,
+}
+
+/// Decide whether the TX worker should swap the message it is about to key
+/// for a fresher one from [`LatestTxIntent`]. Returns `Some(intent)` only
+/// when there is a live intent for this `qso_id` whose `message_text`
+/// differs from what the worker currently holds (a genuine ladder advance
+/// or content change) — never for an identical keep-call re-send, and never
+/// for `qso_id == None` (manual / tune / test-TX are never pivoted).
+pub fn tx_pivot_target(
+    qso_id: Option<&str>,
+    current_text: &str,
+    latest: &HashMap<String, LatestTxIntent>,
+) -> Option<LatestTxIntent> {
+    let id = qso_id?;
+    let intent = latest.get(&active_tx_qso_key(id))?;
+    if intent.message_text == current_text {
+        None
+    } else {
+        Some(intent.clone())
+    }
+}
+
 /// Threshold (Hz) for treating a same-band (or out-of-band) dial move as a
 /// "band change" for the C9 active-QSO teardown. Sized to ride over normal
 /// fine-tuning / passband nudges within an FT8 sub-band (a few kHz) while
@@ -442,6 +475,10 @@ pub struct ApplicationCoordinator {
     /// closes that gap. Requests with `qso_id == None` (manual free-text,
     /// tune, test-TX) are never gated by this set.
     pub(crate) active_tx_qsos: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Newest transmit intent per QSO (see [`LatestTxIntent`]). Written by
+    /// the QSO component as it forwards each `MessageToSend`; read by the TX
+    /// worker at key-time to pivot to the freshest message for the QSO.
+    pub(crate) latest_tx_intent: Arc<std::sync::RwLock<HashMap<String, LatestTxIntent>>>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -681,6 +718,7 @@ impl ApplicationCoordinator {
             ft8_config,
             config_warnings,
             active_tx_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            latest_tx_intent: Arc::new(std::sync::RwLock::new(HashMap::new())),
         };
 
         info!("Application Coordinator initialized with ID: {}", id);

@@ -34,7 +34,8 @@ use pancetta_config::Config;
 use pancetta_core::slot::SlotParity;
 use pancetta_lib::coordinator::{
     active_tx_qso_key, band_change_attributable_to_command, classify_config_reload, is_band_change,
-    tx_qso_is_live, ConfigReloadApplicability, RfNoDecodeMonitor, FREQ_COMMAND_SETTLE_MS,
+    tx_pivot_target, tx_qso_is_live, ConfigReloadApplicability, LatestTxIntent, RfNoDecodeMonitor,
+    FREQ_COMMAND_SETTLE_MS,
 };
 use pancetta_qso::{CallInitiation, QsoEvent, QsoManager, QsoManagerConfig};
 
@@ -564,6 +565,41 @@ fn c20_no_new_window_is_ignored() {
                                                         // Same window count (no new slot ran): no judgement, streak unchanged.
     assert_eq!(m.observe(5, 0, RF).rf_no_decode, None);
     assert_eq!(m.consecutive(), 0);
+}
+
+#[test]
+fn tx_pivot_target_swaps_only_on_a_fresher_message() {
+    use std::collections::HashMap;
+    let qid = "abc-123";
+    let mut latest: HashMap<String, LatestTxIntent> = HashMap::new();
+
+    // No intent recorded yet → no pivot.
+    assert!(tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", &latest).is_none());
+
+    // Record a fresher intent (DX advanced → we should now send 73).
+    latest.insert(
+        active_tx_qso_key(qid),
+        LatestTxIntent {
+            message_text: "KF9UG K5ARH 73".to_string(),
+            frequency_offset: 1353.0,
+            tx_parity: Some(SlotParity::Even),
+        },
+    );
+
+    // Worker still holds RR73 → pivot to the fresher 73.
+    let got = tx_pivot_target(Some(qid), "KF9UG K5ARH RR73", &latest)
+        .expect("should pivot to fresher message");
+    assert_eq!(got.message_text, "KF9UG K5ARH 73");
+    assert_eq!(got.frequency_offset, 1353.0);
+
+    // Identical text (keep-call re-send) → no pivot.
+    assert!(tx_pivot_target(Some(qid), "KF9UG K5ARH 73", &latest).is_none());
+
+    // Manual / tune (qso_id == None) is never pivoted.
+    assert!(tx_pivot_target(None, "CQ K5ARH EM10", &latest).is_none());
+
+    // Unknown qso_id → no pivot.
+    assert!(tx_pivot_target(Some("other"), "X Y RR73", &latest).is_none());
 }
 
 #[test]

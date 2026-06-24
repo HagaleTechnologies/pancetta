@@ -314,6 +314,9 @@ impl super::ApplicationCoordinator {
         // gate. The QSO component keeps it in sync from the QsoEvent stream
         // below.
         let active_tx_qsos = self.active_tx_qsos.clone();
+        // Newest-TX-intent map — written as we forward each MessageToSend so
+        // the TX worker can pivot to the freshest message at key-time.
+        let latest_tx_intent = self.latest_tx_intent.clone();
         // Global TX policy — the auto-73 re-send respects it (RESPOND-ONLY
         // allows, DISABLED blocks), exactly like every other response path.
         let tx_policy = self.tx_policy.clone();
@@ -568,6 +571,7 @@ impl super::ApplicationCoordinator {
                 let ap_state = active_qso_ap;
                 let qso_freq_state = active_qso_freq_hz;
                 let active_tx_qsos = active_tx_qsos.clone();
+                let latest_tx_intent = latest_tx_intent.clone();
                 let snapshot_qso_manager = qso_manager.clone();
                 let snapshot_bus = tx_bus.clone();
                 let completions_for_events = recent_manual_completions.clone();
@@ -601,6 +605,9 @@ impl super::ApplicationCoordinator {
                                     ) {
                                         if let Ok(mut set) = active_tx_qsos.write() {
                                             set.remove(&key);
+                                        }
+                                        if let Ok(mut m) = latest_tx_intent.write() {
+                                            m.remove(&key);
                                         }
                                         info!(
                                             target: "tx.policy",
@@ -758,6 +765,20 @@ impl super::ApplicationCoordinator {
                                             "QSO auto-sequence sending: '{}' on {:.1} Hz (qso={}, tx_parity={:?})",
                                             text, frequency, qso_id, tx_parity
                                         );
+                                        // Record this as the newest intent for the QSO so the
+                                        // TX worker can pivot to it at key-time if it arrives
+                                        // while an earlier frame for the same QSO is still in
+                                        // the worker's pre-PTT wait.
+                                        if let Ok(mut m) = latest_tx_intent.write() {
+                                            m.insert(
+                                                super::active_tx_qso_key(&qso_id.to_string()),
+                                                super::LatestTxIntent {
+                                                    message_text: text.clone(),
+                                                    frequency_offset: frequency,
+                                                    tx_parity,
+                                                },
+                                            );
+                                        }
                                         let tx_msg = ComponentMessage::new(
                                             ComponentId::Qso,
                                             ComponentId::Ft8Transmitter,
@@ -832,11 +853,15 @@ impl super::ApplicationCoordinator {
                                         s.insert(key.clone());
                                     }
                                     let set = active_tx_qsos.clone();
+                                    let intent_map = latest_tx_intent.clone();
                                     let qid = qso_id;
                                     tokio::spawn(async move {
                                         tokio::time::sleep(COMPLETED_TX_GRACE).await;
                                         if let Ok(mut s) = set.write() {
                                             s.remove(&key);
+                                        }
+                                        if let Ok(mut m) = intent_map.write() {
+                                            m.remove(&key);
                                         }
                                         info!(
                                             target: "tx.policy",
@@ -939,6 +964,9 @@ impl super::ApplicationCoordinator {
                                     let key = super::active_tx_qso_key(&qso_id.to_string());
                                     if let Ok(mut set) = active_tx_qsos.write() {
                                         set.remove(&key);
+                                    }
+                                    if let Ok(mut m) = latest_tx_intent.write() {
+                                        m.remove(&key);
                                     }
                                 }
                                 // Clear AP state on QSO failure

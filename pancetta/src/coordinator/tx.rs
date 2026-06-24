@@ -602,6 +602,10 @@ impl super::ApplicationCoordinator {
             // the worker refuses to key PTT for a request whose `qso_id` is no
             // longer present (superseded / cancelled / completed-past-grace).
             let active_tx_qsos = self.active_tx_qsos.clone();
+            // Newest-TX-intent map: at key-time the worker pivots to the
+            // freshest message for this QSO if a later decode advanced the
+            // exchange while this frame waited out the pre-PTT sleep.
+            let latest_tx_intent = self.latest_tx_intent.clone();
 
             tokio::spawn(async move {
                 info!("FT8 transmitter component ready");
@@ -651,8 +655,8 @@ impl super::ApplicationCoordinator {
 
                             match message.message_type {
                                 MessageType::TransmitRequest {
-                                    message_text,
-                                    frequency_offset,
+                                    mut message_text,
+                                    mut frequency_offset,
                                     qso_id,
                                     tx_parity,
                                 } => {
@@ -922,6 +926,70 @@ impl super::ApplicationCoordinator {
                                         );
                                         let _ = message_bus.send_message(complete_msg).await;
                                         continue;
+                                    }
+
+                                    // --- Step 4c: late pivot to the freshest message ---
+                                    // Our decoder finishes ~1.8s BEFORE the slot
+                                    // boundary, but a fresher decode for THIS QSO can
+                                    // still land while this frame waited out the (up to
+                                    // ~30s) pre-PTT sleep. If the QSO component has since
+                                    // produced a newer message for this qso_id, swap to
+                                    // it now and re-modulate. We're at the slot boundary
+                                    // — comfortably inside the ~1.5s switch budget — and
+                                    // re-modulation is <100ms. tx_parity is unchanged (a
+                                    // QSO holds one parity for its whole exchange), so the
+                                    // schedule (pad/cursor) stays valid, and every FT8
+                                    // frame is the same 79-symbol length so audio_out's
+                                    // length (and audio_duration_ms) are unchanged.
+                                    if let Some(intent) =
+                                        latest_tx_intent.read().ok().and_then(|m| {
+                                            super::tx_pivot_target(
+                                                qso_id.as_deref(),
+                                                &message_text,
+                                                &m,
+                                            )
+                                        })
+                                    {
+                                        let new_text = intent.message_text;
+                                        let new_freq = intent.frequency_offset;
+                                        let remod = match modulator.set_base_frequency(new_freq) {
+                                            Ok(()) => encoder
+                                                .encode_message(&new_text, None)
+                                                .and_then(|s| modulator.modulate_symbols(&s, 0.0))
+                                                .ok(),
+                                            Err(_) => None,
+                                        };
+                                        match remod {
+                                            Some(new_samples)
+                                                if schedule.cursor_offset_samples
+                                                    < new_samples.len() =>
+                                            {
+                                                let mut rebuilt = Vec::with_capacity(
+                                                    schedule.silent_pad_samples + new_samples.len(),
+                                                );
+                                                rebuilt.resize(schedule.silent_pad_samples, 0.0f32);
+                                                rebuilt.extend_from_slice(
+                                                    &new_samples[schedule.cursor_offset_samples..],
+                                                );
+                                                info!(
+                                                    target: "tx.pivot",
+                                                    "TX pivot: '{}' -> '{}' @{:.0}Hz for qso {} (fresher message arrived during pre-PTT wait)",
+                                                    message_text,
+                                                    new_text,
+                                                    new_freq,
+                                                    qso_id.as_deref().unwrap_or("-")
+                                                );
+                                                message_text = new_text;
+                                                frequency_offset = new_freq;
+                                                audio_out = rebuilt;
+                                            }
+                                            _ => {
+                                                warn!(
+                                                    "TX pivot re-modulate failed for '{}' — keeping original '{}'",
+                                                    new_text, message_text
+                                                );
+                                            }
+                                        }
                                     }
 
                                     // --- Step 5: Assert PTT ---
