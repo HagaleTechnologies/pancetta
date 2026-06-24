@@ -111,7 +111,26 @@ pub struct RfNoDecodeMonitor {
     consecutive: u32,
     /// Whether the warning is currently latched (so we emit on edges only).
     warning_active: bool,
+    /// Consecutive slots seen with the input at digital silence (RMS≈0).
+    consecutive_silent: u32,
+    /// Whether the silent-input warning is currently latched.
+    silent_active: bool,
     initialized: bool,
+}
+
+/// Warning-state edges returned by [`RfNoDecodeMonitor::observe`]. Each field
+/// is `Some(true)` when that warning turns **on**, `Some(false)` when it turns
+/// **off**, and `None` when there's no change (so the caller emits only on
+/// edges). The two warnings are independent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HealthEdges {
+    /// "RF present but no decodes" (likely wrong mode / bad clock).
+    pub rf_no_decode: Option<bool>,
+    /// "Input audio is silent" — RMS≈0 for several slots while the stream is
+    /// running. Distinct from a quiet-but-live band (which has a noise floor
+    /// above the silence threshold). Points at a device/permission/routing
+    /// problem rather than band conditions.
+    pub silent_input: Option<bool>,
 }
 
 impl Default for RfNoDecodeMonitor {
@@ -132,6 +151,15 @@ impl RfNoDecodeMonitor {
     /// still catching a persistent mode/clock fault within ~1 minute.
     pub const WARN_AFTER_SLOTS: u32 = 4;
 
+    /// RMS ceiling below which the input is treated as **digital silence**
+    /// (not merely a quiet band). A live soundcard/CODEC always carries some
+    /// self-noise above this; an RMS this close to zero means the stream is
+    /// running but carrying all-zero samples — the classic signature of a
+    /// muted/missing device, denied microphone permission, or a remote-desktop
+    /// client (e.g. Jump Desktop) having grabbed the CODEC. Well below
+    /// `RF_PRESENT_RMS_FLOOR`, so the two states never overlap.
+    pub const SILENT_RMS_CEILING: f32 = 0.0005;
+
     /// Create a fresh monitor.
     pub fn new() -> Self {
         Self {
@@ -139,13 +167,20 @@ impl RfNoDecodeMonitor {
             last_decodes: 0,
             consecutive: 0,
             warning_active: false,
+            consecutive_silent: 0,
+            silent_active: false,
             initialized: false,
         }
     }
 
-    /// Whether the warning is currently latched on.
+    /// Whether the RF-present/no-decode warning is currently latched on.
     pub fn warning_active(&self) -> bool {
         self.warning_active
+    }
+
+    /// Whether the silent-input warning is currently latched on.
+    pub fn silent_input_active(&self) -> bool {
+        self.silent_active
     }
 
     /// Current consecutive RF-present/no-decode slot count (for tests/inspection).
@@ -160,13 +195,18 @@ impl RfNoDecodeMonitor {
     /// - `dsp_windows`: cumulative count of FT8 windows the DSP has produced.
     /// - `total_decodes`: cumulative count of decodes.
     /// - `last_rms`: most recent per-window RMS.
-    pub fn observe(&mut self, dsp_windows: u64, total_decodes: u64, last_rms: f32) -> Option<bool> {
+    pub fn observe(
+        &mut self,
+        dsp_windows: u64,
+        total_decodes: u64,
+        last_rms: f32,
+    ) -> HealthEdges {
         // First observation just seeds the baseline; we can't compute a delta.
         if !self.initialized {
             self.last_windows = dsp_windows;
             self.last_decodes = total_decodes;
             self.initialized = true;
-            return None;
+            return HealthEdges::default();
         }
 
         let windows_delta = dsp_windows.saturating_sub(self.last_windows);
@@ -176,12 +216,14 @@ impl RfNoDecodeMonitor {
 
         // No new window ran since last tick — nothing to judge this tick.
         if windows_delta == 0 {
-            return None;
+            return HealthEdges::default();
         }
 
         let rf_present = last_rms >= Self::RF_PRESENT_RMS_FLOOR;
+        let silent = last_rms < Self::SILENT_RMS_CEILING;
         let zero_decodes = decodes_delta == 0;
 
+        // RF-present / no-decode streak (wrong mode / bad clock).
         if rf_present && zero_decodes {
             self.consecutive = self.consecutive.saturating_add(1);
         } else {
@@ -190,15 +232,42 @@ impl RfNoDecodeMonitor {
             self.consecutive = 0;
         }
 
-        let should_warn = self.consecutive >= Self::WARN_AFTER_SLOTS;
-        if should_warn && !self.warning_active {
-            self.warning_active = true;
-            Some(true)
-        } else if !should_warn && self.warning_active {
-            self.warning_active = false;
-            Some(false)
+        // Silent-input streak (RMS≈0 = device/permission/routing problem).
+        if silent {
+            self.consecutive_silent = self.consecutive_silent.saturating_add(1);
         } else {
-            None
+            self.consecutive_silent = 0;
+        }
+
+        let rf_no_decode = {
+            let should_warn = self.consecutive >= Self::WARN_AFTER_SLOTS;
+            if should_warn && !self.warning_active {
+                self.warning_active = true;
+                Some(true)
+            } else if !should_warn && self.warning_active {
+                self.warning_active = false;
+                Some(false)
+            } else {
+                None
+            }
+        };
+
+        let silent_input = {
+            let should_warn = self.consecutive_silent >= Self::WARN_AFTER_SLOTS;
+            if should_warn && !self.silent_active {
+                self.silent_active = true;
+                Some(true)
+            } else if !should_warn && self.silent_active {
+                self.silent_active = false;
+                Some(false)
+            } else {
+                None
+            }
+        };
+
+        HealthEdges {
+            rf_no_decode,
+            silent_input,
         }
     }
 }

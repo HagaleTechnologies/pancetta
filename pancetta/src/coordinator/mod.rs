@@ -42,7 +42,7 @@ pub use tx::{
 // Re-export the C19 config-reload classifier (safe-live vs deferred) and the
 // C20 RF-present/no-decode detector so the coordinator-robustness integration
 // tests can exercise the real production decision logic.
-pub use health::{classify_config_reload, ConfigReloadApplicability, RfNoDecodeMonitor};
+pub use health::{classify_config_reload, ConfigReloadApplicability, HealthEdges, RfNoDecodeMonitor};
 
 /// Canonical key for the `active_tx_qsos` set: QSO ids are compared
 /// case-insensitively (and trimmed) so the producer (QSO component) and

@@ -469,16 +469,21 @@ fn c19_no_change_is_noop() {
 const RF: f32 = RfNoDecodeMonitor::RF_PRESENT_RMS_FLOOR + 0.05; // clearly RF present
 const QUIET: f32 = RfNoDecodeMonitor::RF_PRESENT_RMS_FLOOR / 4.0; // genuinely quiet band
 
+// Truly-silent input (RMS≈0) and a value safely above the silence ceiling
+// but still below the RF-present floor (a genuine quiet band).
+const SILENT: f32 = 0.0; // digital silence
+const _: () = assert!(QUIET > RfNoDecodeMonitor::SILENT_RMS_CEILING);
+
 #[test]
 fn c20_rf_present_no_decodes_raises_warning() {
     let mut m = RfNoDecodeMonitor::new();
     // First observation seeds the baseline (no edge).
-    assert_eq!(m.observe(0, 0, RF), None);
+    assert_eq!(m.observe(0, 0, RF).rf_no_decode, None);
 
     let mut warned = false;
     // Each tick advances one DSP window, RF present, decodes flat at 0.
     for slot in 1..=RfNoDecodeMonitor::WARN_AFTER_SLOTS {
-        let edge = m.observe(slot as u64, 0, RF);
+        let edge = m.observe(slot as u64, 0, RF).rf_no_decode;
         if slot < RfNoDecodeMonitor::WARN_AFTER_SLOTS {
             assert_eq!(edge, None, "must not warn before the slot threshold");
         } else {
@@ -488,35 +493,42 @@ fn c20_rf_present_no_decodes_raises_warning() {
     }
     assert!(warned);
     assert!(m.warning_active());
+    // RF clearly present → never the silent-input warning.
+    assert!(!m.silent_input_active());
 }
 
 #[test]
 fn c20_quiet_band_never_warns() {
     let mut m = RfNoDecodeMonitor::new();
-    assert_eq!(m.observe(0, 0, QUIET), None);
+    assert_eq!(m.observe(0, 0, QUIET).rf_no_decode, None);
     // Many slots of a quiet band (RMS below the floor) and zero decodes: this
-    // is normal, must never warn.
+    // is normal, must never warn — and a quiet band is NOT digital silence.
     for slot in 1..=(RfNoDecodeMonitor::WARN_AFTER_SLOTS * 3) {
+        let edges = m.observe(slot as u64, 0, QUIET);
         assert_eq!(
-            m.observe(slot as u64, 0, QUIET),
-            None,
+            edges.rf_no_decode, None,
             "a quiet band must never raise the RF/no-decode warning"
+        );
+        assert_eq!(
+            edges.silent_input, None,
+            "a quiet band (above the silence ceiling) is not silent input"
         );
     }
     assert!(!m.warning_active());
+    assert!(!m.silent_input_active());
     assert_eq!(m.consecutive(), 0);
 }
 
 #[test]
 fn c20_a_decode_resets_the_streak() {
     let mut m = RfNoDecodeMonitor::new();
-    assert_eq!(m.observe(0, 0, RF), None);
+    assert_eq!(m.observe(0, 0, RF).rf_no_decode, None);
     // A couple of RF-present/no-decode slots build the streak...
-    assert_eq!(m.observe(1, 0, RF), None);
-    assert_eq!(m.observe(2, 0, RF), None);
+    assert_eq!(m.observe(1, 0, RF).rf_no_decode, None);
+    assert_eq!(m.observe(2, 0, RF).rf_no_decode, None);
     assert!(m.consecutive() >= 2);
     // ...then we decode something: the streak resets, no warning.
-    assert_eq!(m.observe(3, 5, RF), None);
+    assert_eq!(m.observe(3, 5, RF).rf_no_decode, None);
     assert_eq!(m.consecutive(), 0);
     assert!(!m.warning_active());
 }
@@ -524,7 +536,7 @@ fn c20_a_decode_resets_the_streak() {
 #[test]
 fn c20_warning_clears_when_decodes_resume() {
     let mut m = RfNoDecodeMonitor::new();
-    assert_eq!(m.observe(0, 0, RF), None);
+    assert_eq!(m.observe(0, 0, RF).rf_no_decode, None);
     // Drive into the warning state.
     let mut decodes = 0u64;
     for slot in 1..=RfNoDecodeMonitor::WARN_AFTER_SLOTS {
@@ -534,11 +546,9 @@ fn c20_warning_clears_when_decodes_resume() {
 
     // Decodes resume → warning clears on the falling edge.
     decodes += 3;
-    let edge = m.observe(
-        (RfNoDecodeMonitor::WARN_AFTER_SLOTS + 1) as u64,
-        decodes,
-        RF,
-    );
+    let edge = m
+        .observe((RfNoDecodeMonitor::WARN_AFTER_SLOTS + 1) as u64, decodes, RF)
+        .rf_no_decode;
     assert_eq!(edge, Some(false), "warning must clear when decodes resume");
     assert!(!m.warning_active());
 }
@@ -546,8 +556,38 @@ fn c20_warning_clears_when_decodes_resume() {
 #[test]
 fn c20_no_new_window_is_ignored() {
     let mut m = RfNoDecodeMonitor::new();
-    assert_eq!(m.observe(5, 0, RF), None); // seed
-                                           // Same window count (no new slot ran): no judgement, streak unchanged.
-    assert_eq!(m.observe(5, 0, RF), None);
+    assert_eq!(m.observe(5, 0, RF).rf_no_decode, None); // seed
+                                                        // Same window count (no new slot ran): no judgement, streak unchanged.
+    assert_eq!(m.observe(5, 0, RF).rf_no_decode, None);
     assert_eq!(m.consecutive(), 0);
+}
+
+#[test]
+fn silent_input_raises_and_clears_warning() {
+    let mut m = RfNoDecodeMonitor::new();
+    // Seed.
+    assert_eq!(m.observe(0, 0, SILENT).silent_input, None);
+    // Several consecutive silent windows latch the warning at the threshold.
+    let mut warned = false;
+    for slot in 1..=RfNoDecodeMonitor::WARN_AFTER_SLOTS {
+        let edge = m.observe(slot as u64, 0, SILENT).silent_input;
+        if slot < RfNoDecodeMonitor::WARN_AFTER_SLOTS {
+            assert_eq!(edge, None);
+        } else {
+            assert_eq!(edge, Some(true), "must warn after sustained silence");
+            warned = true;
+        }
+    }
+    assert!(warned);
+    assert!(m.silent_input_active());
+    // Audio returns (RF present) → silent warning clears on the falling edge.
+    let edge = m
+        .observe(
+            (RfNoDecodeMonitor::WARN_AFTER_SLOTS + 1) as u64,
+            0,
+            RF,
+        )
+        .silent_input;
+    assert_eq!(edge, Some(false), "silent warning clears when audio returns");
+    assert!(!m.silent_input_active());
 }

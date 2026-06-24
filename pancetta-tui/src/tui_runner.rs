@@ -1351,12 +1351,20 @@ impl TuiRunner {
             ("Esc", "Dismiss overlay / cancel modal / clear stop banner"),
         ];
 
-        // Modal sizing: wide enough for content, tall enough for all lines
-        let modal_width: u16 = 52;
+        // Modal sizing: size to the widest "  <key:24><desc>" line so nothing
+        // wraps, then cap to the available width. The old fixed 52-col width
+        // forced long descriptions (and the 21-char "Home / End (or < / >)"
+        // key) to wrap, making the overlay hard to read.
+        const KEY_COL: usize = 24; // ≥ longest key (21) + gap
+        let widest_line = lines
+            .iter()
+            .map(|(_, desc)| 2 + KEY_COL + desc.chars().count())
+            .max()
+            .unwrap_or(50);
+        // +2 for the left/right borders.
+        let modal_width = ((widest_line + 2) as u16).min(area.width.saturating_sub(2));
         let modal_height = lines.len() as u16 + 5; // lines + title + 2 blank + footer + borders
-
-        let modal_width = modal_width.min(area.width.saturating_sub(4));
-        let modal_height = modal_height.min(area.height.saturating_sub(4));
+        let modal_height = modal_height.min(area.height.saturating_sub(2));
 
         let modal_area = Rect {
             x: (area.width.saturating_sub(modal_width)) / 2,
@@ -1385,7 +1393,7 @@ impl TuiRunner {
 
         for (key, desc) in lines {
             let key_span = Span::styled(
-                format!("  {:<20}", key),
+                format!("  {:<width$}", key, width = KEY_COL),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),

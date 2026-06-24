@@ -469,8 +469,9 @@ impl super::ApplicationCoordinator {
                         health_total_decodes_relay.load(Ordering::Relaxed);
                     let rf_last_rms =
                         f32::from_bits(health_last_rms_relay.load(Ordering::Relaxed));
-                    match rf_no_decode.observe(rf_dsp_windows, rf_total_decodes, rf_last_rms)
-                    {
+                    let edges =
+                        rf_no_decode.observe(rf_dsp_windows, rf_total_decodes, rf_last_rms);
+                    match edges.rf_no_decode {
                         Some(true) => {
                             let _ = tui_msg_tx_relay.send(
                                 pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
@@ -485,6 +486,32 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                     component: "dsp".to_string(),
                                     status: "Decodes resumed — RF/no-decode warning cleared"
+                                        .to_string(),
+                                },
+                            );
+                        }
+                        None => {}
+                    }
+                    // Silent-input warning: the stream is running but the
+                    // samples are ~0 (muted/missing device, denied mic
+                    // permission, or a remote-desktop client holding the
+                    // CODEC). Distinct from a quiet-but-live band.
+                    match edges.silent_input {
+                        Some(true) => {
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                    component: "audio".to_string(),
+                                    status: "⚠ INPUT SILENT (RMS≈0) — check Sound input device, \
+                                             mic permission, and that nothing else grabbed the CODEC"
+                                        .to_string(),
+                                },
+                            );
+                        }
+                        Some(false) => {
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                    component: "audio".to_string(),
+                                    status: "Audio input restored — silence warning cleared"
                                         .to_string(),
                                 },
                             );
