@@ -53,18 +53,11 @@ const MAX_DECODE_CANDIDATES: usize = 100;
 
 /// LDPC decoder iterations
 /// LDPC belief-propagation iteration cap before falling back to OSD.
-/// Raised from 25 to 50 on 2026-05-22 (hb-005 sweep): +0.0008 composite
-/// on the curated tiers with no regressions on fixtures or synth.
-/// Notably, hard-1000 saw +64 recovered AND -54 novel — more BP
-/// convergence pulled fuzzy "novel" decodes into confirmed truth-matches.
-/// Wall-clock got slightly FASTER overall (-3%) because BP converging
-/// successfully is cheaper than falling through to OSD.
-///
-/// 2026-05-25 (hb-053 / batch 9): raised 50 → 100. Per batch-3 hb-035
-/// sweep on hard-200: iters=100 gains +12 real decodes (+0.27%) at +21
-/// novel (-32% net) when filter applied (batch 6 iter 5: rec 4364→4376,
-/// novel 811→818 — Δrec +12, Δnov +7 vs OSD-2 + filter). Production
-/// now ships with FP filter (hb-062), making the extra recall safe.
+/// Successive increases (25 → 50 → 100) each bought a small recall gain
+/// with no regressions: more BP convergence pulls marginal decodes into
+/// confirmed matches, and converging successfully is actually cheaper
+/// than falling through to OSD, so wall-clock stayed flat-to-faster. The
+/// extra recall is kept safe by the production false-positive filter.
 const LDPC_MAX_ITERATIONS: usize = 100;
 
 /// FT8 Costas synchronization array
@@ -80,7 +73,7 @@ const FREQ_OSR: usize = 2;
 /// Each symbol occupies TIME_OSR time steps in the spectrogram.
 const TIME_OSR: usize = 2;
 
-/// hb-249 (Batch 88): sliding-frame look-back of the spectrogram, in time
+/// Sliding-frame look-back of the spectrogram, in time
 /// steps. `compute_spectrogram` fills its persistent analysis frame the
 /// way ft8_lib's monitor.c does: at time step `t` the nfft-sample frame
 /// holds the samples *ending* at `(t + 1) * subblock_size`, so the
@@ -110,33 +103,24 @@ fn candidate_offset_samples(time_step: usize, time_padding: usize, spec_step: us
 }
 
 /// Target LLR variance for normalization (matches ft8_lib's ftx_normalize_logl)
-/// LLR normalization target variance. Default raised from 24.0 (ft8_lib's
-/// `ftx_normalize_logl` value) to 32.0 on 2026-05-22 (hb-006 sweep): tiny
-/// but monotonic gain on the curated tiers (+5 recovered on hard-200,
-/// +11 on hard-1000, composite +0.0003) with no regressions on fixtures
-/// or synth. Diverges from ft8_lib's reference value but pancetta's
-/// decoder is not bit-exact with ft8_lib anyway (neural OSD, different
-/// candidate ranking, etc.) — operational sensitivity wins.
+/// LLR normalization target variance. Raised from 24.0 (ft8_lib's
+/// `ftx_normalize_logl` value) to 32.0 for a small but consistent recall
+/// gain with no regressions. Diverges from ft8_lib's reference value, but
+/// pancetta's decoder is not bit-exact with ft8_lib anyway (neural OSD,
+/// different candidate ranking, etc.) — operational sensitivity wins.
 const LLR_TARGET_VARIANCE: f32 = 32.0;
 
 /// Minimum Costas sync score to consider a candidate (dB difference, neighbor comparison)
 const MIN_SYNC_SCORE: f64 = 3.0;
 
-/// Maximum candidates from sync search before NMS. Raised from 100 to
-/// 200 on 2026-05-21 (hb-003), then to 300 on 2026-05-23 (hb-038)
-/// after nms-off (hb-019) shifted the elbow. hb-038 5-tier delta vs
-/// 200: composite +0.0023, hard-200 +40 rec, hard-1000 +96 rec, no
-/// regressions; wall-clock +92% per 5-tier (still well within the
-/// 3000 ms per-WAV budget).
-///
-/// Lowered back to 200 on 2026-06-11 (Batch 78): under ft8_lib truth
-/// and the post-Batch-72 `osd_depth=Some(0)` baseline, the 200→300
-/// step measures +3..+5 TPs for +260..+653 FPs across raw_530_full and
-/// hard_1000 — the hb-038-era gains do not reproduce on neutral truth
-/// (same pattern as the osd_depth and Batch 77 corrections). 200 keeps
-/// recall within 0.03% at −7% FPs and ~1.5× decode speed. The Slow
-/// hardware tier further lowers this to 150 (−0.06..−0.15% recall,
-/// −16% FPs, 2.3× speed; coordinator/tier.rs).
+/// Maximum candidates from sync search before NMS. An earlier 200→300
+/// bump looked like a recall win on one corpus, but under neutral
+/// ft8_lib truth (and the `osd_depth=Some(0)` baseline) the step buys
+/// only a handful of true positives for hundreds of false positives, so
+/// it was reverted to 200. 200 keeps recall within ~0.03% at fewer false
+/// positives and ~1.5× decode speed. The Slow hardware tier lowers this
+/// further to 150 (small recall cost, fewer false positives, faster;
+/// coordinator/tier.rs).
 const MAX_SYNC_CANDIDATES: usize = 200;
 
 /// Minimum frequency bin for FT8 search (0 = full passband coverage)
@@ -153,8 +137,8 @@ const NMS_FREQ_RADIUS: usize = 2;
 // ============================================================================
 
 /// Decoder configuration for FT8/FT4/FT2 protocols
-/// hb-253 (Batch 99): demapper metric used for per-symbol bit-LLR
-/// extraction from the tone metrics.
+/// Demapper metric used for per-symbol bit-LLR extraction from the tone
+/// metrics.
 ///
 /// Pancetta's historical extraction — max-vs-max over dB tone powers —
 /// is exactly the "parameter free dual-max" metric of Guillén i
@@ -200,13 +184,11 @@ pub struct Ft8Config {
     pub time_range: f64,
 
     /// Maximum number of successive decoding passes. Default 1 (no
-    /// subtract-and-redecode). Lowered from 3 to 1 on 2026-05-23
-    /// (hb-031): per hb-030's controlled probe and hb-031's 5-tier
-    /// confirmation, `subtract_with_sidelobes` masks adjacent weak
-    /// signals more than it surfaces new decodes, so passes 2+
-    /// contribute essentially nothing (−0.0007 composite) at huge
-    /// wall-clock cost (~2× decode time). Raise to ≥2 if a future
-    /// fix (hb-037) makes multi-pass productive again.
+    /// subtract-and-redecode). The dB-domain `subtract_with_sidelobes`
+    /// path masks adjacent weak signals more than it surfaces new
+    /// decodes, so passes 2+ contribute essentially nothing at roughly
+    /// double the decode time. Raise to ≥2 if a future subtract
+    /// improvement makes multi-pass productive again.
     pub max_decode_passes: usize,
 
     /// OSD depth (0, 1, or 2). Set to None to disable OSD. Default: Some(1).
@@ -218,9 +200,8 @@ pub struct Ft8Config {
     /// complementary-bit-pair warm start ahead of the OSD-3 trial loop.
     /// Active only when `osd_depth >= 3`; preserves byte-identical OSD
     /// behavior at shallower depths. Inspired by `osd174_91.f90`'s
-    /// `boxit91`/`fetchit91` rule (spec:
-    /// `research/specs/spec-wsjtx-mainline-osd174.md`). Default `false`
-    /// — pending hard-200 measurement validation.
+    /// `boxit91`/`fetchit91` rule. Default `false` — pending measurement
+    /// validation.
     pub osd_npre2_preprocessing_enabled: bool,
 
     /// Maximum candidates retained from Costas sync search before NMS.
@@ -240,27 +221,26 @@ pub struct Ft8Config {
     /// Enable non-maximum suppression of nearby Costas sync candidates.
     /// When true, candidates within `nms_time_radius` time steps and
     /// `nms_freq_radius` frequency bins of a stronger candidate are
-    /// dropped before LDPC. Default disabled as of 2026-05-22 (hb-019
-    /// audit): the historical NMS radii (time=8, freq=2) were merging
-    /// real adjacent signals on busy bands at the cost of +1706 decodes
-    /// per hard-1000 corpus (+13.7%). Disabling raises wall-clock per
-    /// WAV by ~58% (still well within the 3000 ms budget).
+    /// dropped before LDPC. Default disabled: the historical NMS radii
+    /// (time=8, freq=2) were merging real adjacent signals on busy bands,
+    /// suppressing a meaningful fraction of valid decodes. Disabling
+    /// raises wall-clock per WAV by roughly 60% (well within the decode
+    /// budget).
     pub nms_enabled: bool,
 
     /// Time radius (in spectrogram time steps) for NMS suppression. Only
     /// used when `nms_enabled = true`. Default value reflects the
-    /// historical `NMS_TIME_RADIUS = 4 * TIME_OSR = 8`. hb-008 sweep
-    /// (TBD) may tune this to recover the hb-019 wall-clock cost.
+    /// historical `NMS_TIME_RADIUS = 4 * TIME_OSR = 8`.
     pub nms_time_radius: usize,
 
     /// Frequency radius (in spectrogram bins) for NMS suppression. Only
     /// used when `nms_enabled = true`. Default value reflects the
-    /// historical `NMS_FREQ_RADIUS = 2`. Per hb-019 finding, freq=2
-    /// (= 25 Hz at 12.5 Hz/bin) is too coarse for busy FT8 bands —
-    /// merges distinct signals 25 Hz apart. hb-008 sweep candidate.
+    /// historical `NMS_FREQ_RADIUS = 2`. At freq=2 (= 25 Hz at
+    /// 12.5 Hz/bin) the radius is too coarse for busy FT8 bands — it
+    /// merges distinct signals 25 Hz apart.
     pub nms_freq_radius: usize,
 
-    /// hb-036: score-relative NMS suppression delta. When `> 0.0` and
+    /// Score-relative NMS suppression delta. When `> 0.0` and
     /// `nms_enabled = true`, a weaker candidate `j` is suppressed only
     /// if it lies within the TF radius AND its `sync_score` is within
     /// `nms_score_delta_db` of the stronger candidate `i`'s sync_score
@@ -278,11 +258,11 @@ pub struct Ft8Config {
     /// kept for LDPC decoding. Default 3.0 matches the historical
     /// `MIN_SYNC_SCORE` constant. Lowering surfaces more candidates
     /// (potential weak-signal recovery) at the cost of CPU and a
-    /// higher LDPC failure rate. hb-007 sweep candidate.
+    /// higher LDPC failure rate.
     pub min_sync_score: f64,
 
-    /// Enable per-candidate adaptive LDPC iteration scheduling
-    /// (hb-022). When true, candidates are bucketed by sync_score:
+    /// Enable per-candidate adaptive LDPC iteration scheduling.
+    /// When true, candidates are bucketed by sync_score:
     /// high (>8) → fewer iters, medium (4..8) → default
     /// `ldpc_iterations`, low (<4) → more iters. Default false —
     /// uniform `ldpc_iterations` for all candidates.
@@ -290,63 +270,59 @@ pub struct Ft8Config {
 
     /// Re-rank candidates by `block_score` after sync search +
     /// truncation, before LDPC. Default true (historical behavior).
-    /// hb-009 A/B-tests this — with parallel decoding, candidate
-    /// order shouldn't change which decodes succeed, only the order
-    /// they finish; if A/B is bit-identical, this knob can be
-    /// retired.
+    /// With parallel decoding, candidate order shouldn't change which
+    /// decodes succeed, only the order they finish; if A/B testing is
+    /// bit-identical, this knob can be retired.
     pub block_score_rerank: bool,
 
     /// Maximum unsatisfied parity-check count for a BP-non-converged
-    /// candidate to be eligible for OSD fallback. Default 6 — hb-014
-    /// (2026-05-23) swept {0..6}: recall is flat from 0 through 4, novels
-    /// grow monotonically with gate. hb-014 initially graduated 4 → 2
-    /// (-21% novels, no recall cost) when no FP filter was available.
-    /// hb-053 + batch 9 raised 2 → 6 because production now ships the
-    /// FP filter (hb-062): gate=6 + filter has same recall as gate=2
-    /// without filter, with -132 fewer novels.
+    /// candidate to be eligible for OSD fallback. Default 6: recall is
+    /// flat across the low end of the range while spurious decodes grow
+    /// monotonically with the gate. A wider gate is safe here because the
+    /// production pipeline ships a downstream false-positive filter —
+    /// gate=6 with the filter has the same recall as a tighter gate
+    /// without it, at fewer spurious decodes.
     pub max_parity_errors_for_osd: usize,
 
-    /// hb-044: enable parabolic interpolation of the Costas sync peak in
+    /// Enable parabolic interpolation of the Costas sync peak in
     /// the time axis. When true, after finding a candidate at integer
     /// time-step t0, fit a parabola to scores at t0-1/t0/t0+1 and store
     /// a fractional time offset (in [-0.5, +0.5]) on the candidate.
     /// Part 1 (this flag) only computes and stores the refinement;
     /// part 2 applies it in symbol extraction.
-    /// **Default `true`** as of hb-068 graduation (2026-05-30), paired
-    /// with `sync_time_interp_delta_scale = 0.3` — see that field's docs
-    /// for the recall/sensitivity trade-off measurements.
+    /// **Default `true`**, paired with
+    /// `sync_time_interp_delta_scale = 0.3` — see that field's docs
+    /// for the recall/sensitivity trade-off.
     pub sync_time_interpolation: bool,
 
-    /// hb-068 variant (a) — score gate: when `sync_time_interpolation` is
+    /// Score gate: when `sync_time_interpolation` is
     /// on, only apply the parabolic refinement if the integer-bin sync
     /// score exceeds this threshold. Candidates with score ≤ gate keep
     /// the original (un-inflated) integer-bin score and `time_refinement=0`.
     /// Default 0.0 (no gate — refine all qualifying candidates).
     pub sync_time_interp_score_gate: f64,
 
-    /// hb-068 variant (b) — delta scale: when `sync_time_interpolation` is
+    /// Delta scale: when `sync_time_interpolation` is
     /// on, multiply the parabolic delta by this factor before applying it
     /// to symbol extraction. The refined score is also recomputed from
     /// the scaled delta (parabola is `y_center + b·δ + a·δ²`), so the
     /// score consistently reflects the position used downstream.
-    /// **Default 0.3** as of hb-068 graduation (2026-05-30). The
-    /// unscaled (1.0) parabolic delta over-corrects on noisy real-corpus
-    /// audio and regresses hard-200 by -116 recall. Scaling to 0.3
-    /// captures the +2 dB synth-clean SNR@90% gain (clean single-peak
-    /// fits) while only mildly perturbing correctly-aligned hard-corpus
-    /// candidates (net +5 hard-200 recall, -7 novels).
+    /// **Default 0.3**. The unscaled (1.0) parabolic delta over-corrects
+    /// on noisy real-world audio and regresses recall. Scaling to 0.3
+    /// captures the synth-clean sensitivity gain (clean single-peak fits)
+    /// while only mildly perturbing correctly-aligned real-corpus
+    /// candidates (net recall gain).
     pub sync_time_interp_delta_scale: f64,
 
-    /// hb-068 variant (c) — reject large deltas: when
-    /// `sync_time_interpolation` is on AND `|delta| > threshold`, treat
-    /// the refinement as unreliable and fall back to integer-bin
-    /// behavior (delta=0, original score). Applied AFTER the
-    /// parabolic clamp to [-0.5, 0.5]. `None` disables (no rejection
-    /// — original hb-044 behavior).
+    /// Reject large deltas: when `sync_time_interpolation` is on AND
+    /// `|delta| > threshold`, treat the refinement as unreliable and
+    /// fall back to integer-bin behavior (delta=0, original score).
+    /// Applied AFTER the parabolic clamp to [-0.5, 0.5]. `None` disables
+    /// (no rejection — unconditional interpolation).
     /// Default `None`.
     pub sync_time_interp_max_delta_abs: Option<f64>,
 
-    /// hb-069: interpolate spectrogram lookups in linear power instead
+    /// Interpolate spectrogram lookups in linear power instead
     /// of dB. When true and the candidate has a non-zero
     /// `time_refinement`, `lookup_time_interp` converts each endpoint
     /// dB→linear (10^(db/10)), linearly interpolates in power, and
@@ -357,14 +333,14 @@ pub struct Ft8Config {
     /// Default `false` until A/B confirms a net gain.
     pub sync_time_interp_linear_power: bool,
 
-    /// hb-067 (arXiv:2306.00443): mBP offset — subtract this magnitude
+    /// mBP offset (arXiv:2306.00443) — subtract this magnitude
     /// from each LLR before invoking OSD. Reduces BP's confidence so
     /// OSD considers more flip patterns. Default 0.0 (no behavior change).
-    /// Sweep candidate range: 0.5 to 4.0.
+    /// Useful range: 0.5 to 4.0.
     pub bp_offset_subtract: f32,
 
-    /// JS8Call-Improved-style LDPC feedback refinement (clean-room port from
-    /// `spec-js8call-ldpc-feedback-refinement.md`). When true, a failed first
+    /// JS8Call-Improved-style LDPC feedback refinement (clean-room port
+    /// from a prose spec). When true, a failed first
     /// BP pass triggers a meta-loop:
     /// 1. Capture the iter-1 hard-decision codeword (output_llrs sign bits).
     /// 2. For each bit, compare hard-decision to original LLR sign.
@@ -374,7 +350,7 @@ pub struct Ft8Config {
     /// 3. Re-run BP on the refined LLRs; if converged, return.
     /// 4. Otherwise fall through to OSD as before.
     ///
-    /// Default `false` — pending hard-200 measurement validation. Inspired
+    /// Default `false` — pending measurement validation. Inspired
     /// by JS8Call-Improved `ldpc_feedback.h` (GPL-3.0 source code NOT read;
     /// clean-room implementation from prose spec only).
     pub ldpc_feedback_refinement_enabled: bool,
@@ -398,7 +374,7 @@ pub struct Ft8Config {
     /// fraction of pancetta's typical LLR scale (±10 after normalization).
     pub ldpc_feedback_erase_threshold: f32,
 
-    /// hb-056 cross-cycle non-coherent averaging: when true, after the
+    /// Cross-cycle non-coherent averaging: when true, after the
     /// regular per-candidate decode loop, group repeating-station
     /// candidates (same `freq_sub`+`freq_bin`±1, `t0` apart by a multiple
     /// of one FT8 slot ±2 steps, sync-score within band) and decode an
@@ -407,13 +383,11 @@ pub struct Ft8Config {
     /// per-slot decode; new decodes are unioned + deduped by message
     /// text. Power-only (pancetta's spectrogram discards phase, so this
     /// is the non-coherent variant of JTDX's `s2(i) = |cs|² + |csold|²`).
-    /// Default **true** as of 2026-05-25: hard-200 A/B gives +14
-    /// recovered / +8 novel (with FP filter); single-slot tiers
-    /// (fixtures, synth-clean) form no groups and are no-ops.
-    /// See docs/superpowers/specs/2026-05-25-cross-cycle-averaging-design.md.
+    /// Default **true**: A/B testing shows a net recall gain (with the FP
+    /// filter); single-slot inputs form no groups and are no-ops.
     pub cross_cycle_averaging: bool,
 
-    /// hb-074: when both `cross_cycle_averaging` AND this flag are true,
+    /// When both `cross_cycle_averaging` AND this flag are true,
     /// the pass becomes coherent — the spectrogram retains complex FFT
     /// bins, each candidate's phase rotor is estimated from the 21 known
     /// Costas symbols, the complex symbol amplitudes are rotated to a
@@ -424,77 +398,72 @@ pub struct Ft8Config {
     /// costs ~2× memory in the spectrogram pass.
     pub cross_cycle_coherent: bool,
 
-    /// hb-075: when `cross_cycle_coherent` AND this flag are both true,
+    /// When `cross_cycle_coherent` AND this flag are both true,
     /// weight each member's contribution by the magnitude of its
     /// un-normalised Costas accumulator. Equivalent to multiplying each
     /// member's complex symbols by `conj(acc_i)` instead of `conj(rotor_i)`
-    /// — does alignment AND MRC-style weighting in one op. Addresses
-    /// hb-074's failure mode where noisy rotors on marginal members
-    /// inflated sum variance. Default false.
+    /// — does alignment AND MRC-style weighting in one op. Addresses the
+    /// unweighted-coherent failure mode where noisy rotors on marginal
+    /// members inflated sum variance. Default false.
     pub cross_cycle_coherent_mrc: bool,
 
-    /// hb-086 V1: after the multipass loop, force-retry every original
+    /// After the multipass loop, force-retry every original
     /// sync candidate (not at an already-subtracted position) against the
     /// residual spectrogram. Catches pairs where pass-1 LDPC failed at B's
     /// position because of A's interference but B's residual sync score
-    /// (post-A-subtract) is below threshold — so hb-079's residual
-    /// sync_search wouldn't re-surface B. Diagnostic on top-20 hard-200
-    /// WAVs (`joint_decoding_pair_density.rs`) found 78% of missed truths
-    /// are within 50 Hz of a recovered decode — the structural fit.
+    /// (post-A-subtract) is below threshold — so the residual sync_search
+    /// wouldn't re-surface B. Most missed truths sit within ~50 Hz of a
+    /// recovered decode, which is the structural case this targets.
     pub joint_pair_retry: bool,
 
-    /// hb-082: optional sync_score floor applied to the *residual*
+    /// Optional sync_score floor applied to the *residual*
     /// Costas search inside the multipass loop (independent of the
     /// production `min_sync_score` that gates the original pass). After
     /// subtraction the noise floor drops, so a lower threshold can
     /// surface more masked candidates. `None` reuses `min_sync_score`.
     pub residual_min_sync_score: Option<f64>,
 
-    /// hb-086 V3 (SHELVED 2026-05-31): dB relaxation applied to
-    /// `min_sync_score` for a post-V1 localized sync_search pass on
-    /// the residual spectrogram. The pass scans ONLY frequency bins
-    /// within `joint_residual_sync_window_bins` of a subtracted-
-    /// eligible decode. 0.0 disables (production default); negative
-    /// values would lower the threshold.
+    /// dB relaxation applied to `min_sync_score` for a localized
+    /// sync_search pass on the residual spectrogram. The pass scans ONLY
+    /// frequency bins within `joint_residual_sync_window_bins` of a
+    /// subtracted-eligible decode. 0.0 disables (default); negative values
+    /// would lower the threshold.
     ///
-    /// SHELVED: production sweep at {-0.5, -1.0, -1.5, -2.0} on
-    /// hard-200 produced 0 additional decoded messages at every
-    /// threshold. Mechanism surfaces ~100+ truly-new candidates per
-    /// WAV in the targeted window, but they are noise — CRC catches
-    /// ~98% as FPs, plausibility rejects the rest. The residual at
-    /// sub-3.0 sync_score in the targeted window is not decodable
+    /// Disabled by default: relaxing the threshold here surfaces ~100+
+    /// truly-new candidates per WAV in the targeted window, but they are
+    /// noise — CRC catches ~98% as false positives and plausibility
+    /// rejects the rest, with zero additional real decodes. The residual
+    /// at sub-3.0 sync_score in the targeted window is not decodable
     /// signal. Plumbing kept at default-off for future revisit.
-    /// See `research/experiments/2026-05-31-hb-086-v3-subtract-aware-sync.md`.
     pub joint_residual_sync_relax_db: f64,
 
-    /// hb-086 V3 (SHELVED 2026-05-31): half-width (in freq_bins) of
-    /// the bin-targeting window around each subtracted-eligible
-    /// decode for the V3 localized sync_search pass. Ignored when
-    /// `joint_residual_sync_relax_db == 0.0`. Default 8 (≈ ±50 Hz at
-    /// 6.25 Hz/bin) per the V3 subtract-window-potential diagnostic.
+    /// Half-width (in freq_bins) of the bin-targeting window around each
+    /// subtracted-eligible decode for the localized sync_search pass.
+    /// Ignored when `joint_residual_sync_relax_db == 0.0`. Default 8
+    /// (≈ ±50 Hz at 6.25 Hz/bin).
     pub joint_residual_sync_window_bins: usize,
 
-    /// hb-081: MRC-weighted coherent subtract. When > 0.0, the
+    /// MRC-weighted coherent subtract. When > 0.0, the
     /// subtract amplitude is scaled by `min(1, |acc|/threshold)` where
     /// |acc| is the un-normalised Costas accumulator magnitude (rotor's
     /// confidence). Weak-rotor decodes subtract less (avoiding
     /// over-subtraction of adjacent bins when the rotor estimate is
     /// noisy), strong-rotor decodes subtract fully. 0.0 = unweighted
-    /// hb-079 behavior.
+    /// (full) subtract.
     pub coherent_subtract_mrc_threshold: f64,
 
-    /// hb-079 + hb-080: coherent iterative-subtract multi-pass. After
+    /// Coherent iterative-subtract multi-pass. After
     /// pass 1 (regular + cross-cycle), each decoded message's signal is
     /// subtracted from the complex spectrogram via ML projection
     /// (`Re(bin·conj(rotor))·rotor` — removes signal while preserving
     /// orthogonal noise); the residual is re-synced and any newly-
     /// revealed masked candidates are decoded. This field counts how
-    /// many such subtract+repass *rounds* to run. 0 disables; 1 = the
-    /// original hb-079 production (one round). hb-080 sweeps {2,3,4,5}.
-    /// Replaces the dead dB-domain `subtract_with_sidelobes` (hb-030).
+    /// many such subtract+repass *rounds* to run. 0 disables; 1 = one
+    /// round (the production default). Replaces the dead dB-domain
+    /// `subtract_with_sidelobes` path.
     pub coherent_multipass_iterations: u8,
 
-    /// hb-016: residual energy early-stop for the coherent multipass
+    /// Residual energy early-stop for the coherent multipass
     /// loop. After step 1 (subtract) of each `coherent_subtract_and_repass`
     /// round, compute the mean per-bin "excess above noise" of the
     /// residual spectrogram — `mean(max(0, db - noise_floor_db))` where
@@ -508,7 +477,7 @@ pub struct Ft8Config {
     /// recall).
     pub residual_energy_stop_db: Option<f64>,
 
-    /// hb-093: per-position residual SNR pre-decode gate. When `Some(db)`,
+    /// Per-position residual SNR pre-decode gate. When `Some(db)`,
     /// both `joint_pair_retry_pass` AND `coherent_subtract_and_repass`'s
     /// step-4 post-sync decode loop compute a per-position residual SNR
     /// estimate (same primitive as `par_estimate_snr_spectrogram`) BEFORE
@@ -519,17 +488,17 @@ pub struct Ft8Config {
     ///
     /// The threshold is the WAV-relative SNR (dB, after the 2500/6.25
     /// bandwidth correction) — typical FT8 decodable signals sit in
-    /// the −20..+10 dB range; the diagnostic recommended ~−5 dB as the
-    /// sweet spot (filters ~37% of pair-retry candidates with 0% decode
-    /// loss on top-5 hard-200). hb-093 step-4 extension (2026-06-01)
-    /// applies the same gate to the much larger `coherent_subtract_and_repass`
-    /// step-4 candidate set (~200/round vs ~130 for joint_pair_retry).
+    /// the −20..+10 dB range; ~−5 dB is a reasonable starting point
+    /// (filters roughly a third of pair-retry candidates with no decode
+    /// loss). The same gate also applies to the much larger
+    /// `coherent_subtract_and_repass` step-4 candidate set
+    /// (~200/round vs ~130 for joint_pair_retry).
     ///
     /// `None` disables the gate (production default until a sweep
     /// confirms ≥10% elapsed reduction with zero recall loss).
     pub residual_snr_gate_db: Option<f64>,
 
-    /// hb-093 diagnostic: when true, the decoder records per-position
+    /// Diagnostic: when true, the decoder records per-position
     /// SNR + decode-success for every candidate the gate would evaluate
     /// (both `joint_pair_retry_pass` AND `coherent_subtract_and_repass`
     /// step-4 paths). The data is reset per `decode_window` call and
@@ -538,21 +507,20 @@ pub struct Ft8Config {
     /// Default false.
     pub residual_snr_diagnostic: bool,
 
-    /// hb-063 (arXiv:2410.13131, Hocevar 2004): use a layered (row-
-    /// sequential) belief-propagation schedule instead of the flooding
+    /// Use a layered (row-sequential) belief-propagation schedule
+    /// (arXiv:2410.13131, Hocevar 2004) instead of the flooding
     /// schedule. Layered BP updates check nodes one at a time and folds
     /// each new check-to-variable message into the variable posteriors
     /// immediately, so later checks in the same sweep see fresher
     /// information — converging in ~half the iterations at the same
-    /// frame-error rate. Default **true** as of batch 10 (2026-05-25):
-    /// hard-200 +18 recovered (composite +0.00105) with -16% decode
-    /// wall-clock and zero regression on fixtures/synth/doppler. The
-    /// extra novel decodes it surfaces are caught downstream by the
-    /// production FP filter (hb-062). Set false for the flooding schedule.
+    /// frame-error rate. Default **true**: A/B testing shows a recall
+    /// gain at lower decode wall-clock and zero regression, with the
+    /// extra spurious decodes caught downstream by the production FP
+    /// filter. Set false for the flooding schedule.
     pub layered_bp: bool,
 
-    /// hb-048 (Session 3): enable the a7 template cross-correlation pass.
-    /// After multipass + V1 joint-pair-retry, for each successfully-decoded
+    /// Enable the a7 template cross-correlation pass.
+    /// After multipass + joint-pair-retry, for each successfully-decoded
     /// callsign C in this window, generate ~32 next-utterance templates
     /// rooted at C and cross-correlate each template's expected codeword
     /// bits against the residual LLRs at sync_candidate positions within
@@ -561,21 +529,21 @@ pub struct Ft8Config {
     /// `snr7b ≥ a7_snr7b_threshold`. Prior art: WSJT-X mainline commit
     /// `f13e31820470291fdd49627287a2dc08f3fa674c` (`lib/ft8_a7.f90`,
     /// Joe Taylor 2021); canonical thresholds 6.0 / 1.8 came from there.
-    /// Default `false` until Session 3 sweep confirms graduation criteria.
+    /// Default `false` until measurement confirms it pays off.
     pub a7_enabled: bool,
 
-    /// hb-048: a7 snr7 acceptance threshold (best-template matched-filter
+    /// a7 snr7 acceptance threshold (best-template matched-filter
     /// SNR in the LLR domain). WSJT-X reference value 6.0. Lowering admits
     /// more decodes at higher FP cost; raising tightens precision.
     pub a7_snr7_threshold: f64,
 
-    /// hb-048: a7 snr7b acceptance threshold (best/second-best correlation
+    /// a7 snr7b acceptance threshold (best/second-best correlation
     /// ratio — the AP-FP filter). WSJT-X reference value 1.8. The structural
     /// ceiling for snr7b given 32 templates of mostly-disjoint codewords is
-    /// in the 1.8-2.0 range per Session 2's synthetic-injection micro-test.
+    /// in the 1.8-2.0 range per a synthetic-injection micro-test.
     pub a7_snr7b_threshold: f64,
 
-    /// hb-048: half-width (Hz) of the freq window around each expected
+    /// Half-width (Hz) of the freq window around each expected
     /// call's audio frequency used to select sync_candidates for
     /// cross-correlation. Default 6.25 Hz (one freq_bin). WSJT-X uses 2 Hz
     /// — pancetta's bin step is 3.125 Hz so 6.25 captures ±1 bin.
@@ -597,13 +565,11 @@ pub struct Ft8Config {
     /// pipeline deterministic per the upstream design.
     ///
     /// Default **false** — when off the decoder takes the byte-identical
-    /// legacy path. Inspired by spec ref
-    /// `research/specs/spec-wsjtx-improved-4th-pass-after-a7.md`
-    /// (WSJT-X Improved v3.1.0, DG2YCB). Pancetta's implementation is
-    /// independent and license-clean.
+    /// legacy path. Inspired by WSJT-X Improved v3.1.0 (DG2YCB).
+    /// Pancetta's implementation is independent and license-clean.
     pub fourth_pass_after_a7_enabled: bool,
 
-    /// hb-057 V1 (Session 2): master switch for per-callsign median-DT
+    /// Master switch for per-callsign median-DT
     /// prior narrowing of the residual Costas sync search. When `false`
     /// (default), the prior lookup is never consulted and the residual
     /// sync sweep is unrestricted. When `true` AND a prior is registered
@@ -614,34 +580,33 @@ pub struct Ft8Config {
     /// around `prior.median_dt`). Candidates outside every prior window
     /// AND callsigns with no prior remain searchable via the AP/joint
     /// retry path — the filter NEVER rejects candidates when no prior
-    /// is available (cold-start safe). Diagnostic: 38.6% of missed
-    /// truths on top-20 hard-200 WAVs sit in the prior-recoverable
-    /// population (kill switch cleared 3.86×). See
-    /// `docs/superpowers/specs/2026-05-31-hb-057-median-dt-design.md`.
+    /// is available (cold-start safe). A meaningful fraction of missed
+    /// truths sit in the prior-recoverable population.
     pub dt_history_enabled: bool,
 
-    /// hb-057 V1: minimum prior-gate radius (seconds). The gate width is
-    /// `max(this, prior.iqr * dt_history_window_iqr_scale)`. Default 0.2
-    /// matches the diagnostic's ±0.2s window. Floor prevents IQR=0
-    /// callsigns (stable bucket) from collapsing to a sub-step window.
+    /// Minimum prior-gate radius (seconds). The gate width is
+    /// `max(this, prior.iqr * dt_history_window_iqr_scale)`. Default 0.2.
+    /// Floor prevents IQR=0 callsigns (stable bucket) from collapsing to
+    /// a sub-step window.
     pub dt_history_window_floor_s: f64,
 
-    /// hb-057 V1: IQR scaling factor for the prior gate. Default 3.0 —
+    /// IQR scaling factor for the prior gate. Default 3.0 —
     /// for the moderate-variance bucket (IQR ≤ 0.3s) this gives a
-    /// ±0.9s window, well within the diagnostic's recoverable bound.
+    /// ±0.9s window.
     pub dt_history_window_iqr_scale: f64,
 
-    /// hb-057 V2 (Session 3): frequency window (Hz) for per-candidate
+    /// Frequency window (Hz) for per-candidate
     /// callsign-keyed sync narrowing. For each residual candidate at
     /// `cand_freq`, the union of DT priors from callsigns whose recent
     /// sightings were within ±`dt_history_freq_window_hz` of `cand_freq`
     /// forms the t0 gate. Set to 25.0 (≈ 4 freq_bins at 6.25 Hz/bin) to
     /// match the typical operator-frequency stability window across a
-    /// chrono-replay session. 0.0 disables V2 (falls back to V1 union-of-
-    /// prior-pass behavior, kept for back-compat).
+    /// chrono-replay session. 0.0 disables this per-candidate narrowing
+    /// (falls back to the union-of-prior-pass behavior, kept for
+    /// back-compat).
     pub dt_history_freq_window_hz: f64,
 
-    /// hb-242: sync_bc partial-Costas metric. When enabled, the Costas
+    /// sync_bc partial-Costas metric. When enabled, the Costas
     /// search computes a parallel score using ONLY the second and third
     /// Costas blocks (symbols 36–42 and 72–78), skipping block A (0–6),
     /// and takes `max(full_abc, partial_bc)` as the candidate's sync
@@ -650,13 +615,12 @@ pub struct Ft8Config {
     /// (block A is noise/garbage) while the partial metric is still
     /// meaningful. Non-destructive: when block A contains real signal,
     /// the full metric dominates and nothing changes. Inspired by
-    /// wsjtr `sync_bc` / WSJT-X mainline `sync8`. Targets the documented
-    /// slot-edge bucket at 48.3% recall in pancetta's hard-200 corpus
-    /// (1376 truths). Default **true** as a non-destructive backstop;
-    /// flip to false to A/B-test the mechanism.
+    /// wsjtr `sync_bc` / WSJT-X mainline `sync8`. Targets slot-edge
+    /// signals, an under-recovered bucket. Default **true** as a
+    /// non-destructive backstop; flip to false to A/B-test the mechanism.
     pub costas_partial_metric_enabled: bool,
 
-    /// hb-242 + wide-lag baseline (red2): two-pathway sync candidate
+    /// Wide-lag baseline (red2): two-pathway sync candidate
     /// emission. When enabled, candidates are filtered through two
     /// parallel 40th-percentile-normalized rankings — a "tight" window
     /// near the nominal slot start (t0 ≤ `costas_two_baseline_tight_steps`)
@@ -673,7 +637,7 @@ pub struct Ft8Config {
     /// until corpus measurement confirms the FP profile.
     pub costas_two_baseline_enabled: bool,
 
-    /// hb-242 wide-lag baseline: half-width (in spectrogram time-steps)
+    /// Wide-lag baseline: half-width (in spectrogram time-steps)
     /// of the tight-lag window centred on the nominal slot start. Only
     /// consulted when `costas_two_baseline_enabled = true`. Default 20
     /// (≈ ±0.8 s at TIME_OSR=2 → 40 ms/step). The WSJT-X mainline
@@ -682,44 +646,41 @@ pub struct Ft8Config {
     /// steps in absolute time.
     pub costas_two_baseline_tight_steps: usize,
 
-    /// hb-242 wide-lag baseline: percentile used as the per-bin
+    /// Wide-lag baseline: percentile used as the per-bin
     /// normalization base. Default 0.40 matches WSJT-X mainline
     /// `npctile = nint(0.40 * iz)`. Only consulted when
     /// `costas_two_baseline_enabled = true`.
     pub costas_two_baseline_percentile: f64,
 
-    /// hb-242 wide-lag baseline: minimum normalized sync score for a
+    /// Wide-lag baseline: minimum normalized sync score for a
     /// candidate to be kept. Default 1.2 matches the wsjtr / WSJT-X
     /// mainline `syncmin` constant. Only consulted when
     /// `costas_two_baseline_enabled = true`.
     pub costas_two_baseline_norm_threshold: f64,
 
-    /// Batch 92 (Batch 88 residual #1): disable the half-symbol inner
-    /// loop in `compute_costas_score_groups`. The kernel historically
+    /// Disable the half-symbol inner loop in
+    /// `compute_costas_score_groups`. The kernel historically
     /// takes `max` over `half ∈ {0, 1}` — a holdover from TIME_OSR=1
     /// code. With `TIME_OSR = 2` the outer t0 sweep already visits
     /// half-symbol offsets, and the kernel at `(t0, half=1)` reads
     /// exactly the same spectrogram cells as `(t0+1, half=0)`, so the
     /// max produces a two-step score plateau: `score(t0) =
     /// max(g(t0), g(t0+1))`. Tie-breaking on the plateau emits ~8% of
-    /// candidates one sync step (960 samples ≈ 80 ms) early — the
-    /// −960 bucket in the Batch 88 dt audit. When `true`, only
-    /// `half = 0` is evaluated. Guarded: the flag is ignored (full half
-    /// loop runs) if `TIME_OSR < 2`, where the half loop is NOT
+    /// candidates one sync step (960 samples ≈ 80 ms) early. When `true`,
+    /// only `half = 0` is evaluated. Guarded: the flag is ignored (full
+    /// half loop runs) if `TIME_OSR < 2`, where the half loop is NOT
     /// redundant.
     ///
-    /// MEASURED (Batch 92, hb-251): keep this **false**. The plateau is
-    /// redundant for scoring but load-bearing for recall — with NMS off
-    /// it emits two candidates 960 samples apart per strong signal, and
-    /// the time-domain fine search (±720 samples) only jointly covers
-    /// the true alignment through the pair. Flag-ON on raw_530_full
-    /// (ft8_lib truth, hash-normalized): TP −64/FP −11 at 200 slots,
-    /// TP −635/FP −256 at 2066 slots (wall −27%), and the Batch 88
-    /// Part A dt distribution is byte-identical (no localization
-    /// benefit). See research/notes/2026-06-12-batch92-costas-half-loop.md.
+    /// Keep this **false**. The plateau is redundant for scoring but
+    /// load-bearing for recall — with NMS off it emits two candidates
+    /// 960 samples apart per strong signal, and the time-domain fine
+    /// search (±720 samples) only jointly covers the true alignment
+    /// through the pair. Disabling it measurably reduces recall (and
+    /// false positives) at a wall-clock saving, with no localization
+    /// benefit.
     pub costas_half_loop_disabled: bool,
 
-    /// hb-230: half-width (Hz) of the relaxed-sync window centred on the
+    /// Half-width (Hz) of the relaxed-sync window centred on the
     /// QSO partner's audio frequency. When `Some(r)` AND the per-call
     /// `partner_freq_hz` is supplied to
     /// `decode_window_with_ap_scoped_partner`, any Costas sync candidate
@@ -728,13 +689,13 @@ pub struct Ft8Config {
     /// (`max(0, min_sync_score + relaxed_sync_near_partner_score_delta)`).
     /// `None` (default) disables the mechanism. Inspired by JTDX's
     /// `lib/sync8.f90` candidate-acceptance loop, which uses a constant
-    /// 3.0 Hz around `nfqso`. Pairs with the hb-229 partner band-collapse
+    /// 3.0 Hz around `nfqso`. Pairs with the partner band-collapse
     /// — the band-collapse already narrows the sweep; this further
     /// relaxes acceptance inside the narrow window for weak partner
     /// messages (RR73 / 73 at low SNR).
     pub relaxed_sync_near_partner_hz_radius: Option<f64>,
 
-    /// hb-230: signed delta added to `min_sync_score` to form the
+    /// Signed delta added to `min_sync_score` to form the
     /// relaxed threshold inside the near-partner window. Default 0.0 (no
     /// actual relaxation — the mechanism is structurally wired but does
     /// nothing until the operator tunes this knob).
@@ -744,10 +705,10 @@ pub struct Ft8Config {
     /// `min_sync_score` is a raw dB-difference metric, so the JTDX
     /// constant does NOT transfer numerically. **Empirical recalibration
     /// is required**: collect normalised-vs-raw sync scores on a known
-    /// partner signal at marginal SNR on hard-200, find the
-    /// dB-difference level corresponding to JTDX's 1.1, and use the
-    /// negative of (raw_threshold - that_level) as this knob.
-    /// TODO: hard-200 recalibration sweep before flipping default ON.
+    /// partner signal at marginal SNR, find the dB-difference level
+    /// corresponding to JTDX's 1.1, and use the negative of
+    /// (raw_threshold - that_level) as this knob. Recalibration is
+    /// recommended before flipping the default ON.
     pub relaxed_sync_near_partner_score_delta: f64,
 
     /// JTDX cycle audio smoothing: when `true` AND `max_decode_passes > 1`,
@@ -757,11 +718,11 @@ pub struct Ft8Config {
     /// 300 Hz) that perturbs the noise distribution just enough for
     /// pass 2's Costas sync to find candidates pass 1 missed by a small
     /// margin. Inspired by JTDX's `lib/ft8_decode.f90` `ipass == 4`
-    /// branch. Default `false` until hard-200 measurement confirms the
+    /// branch. Default `false` until measurement confirms the
     /// recall lift on pancetta's pipeline.
     pub cycle_audio_smoothing_enabled: bool,
 
-    /// hb-244: enable the JS8Call-Improved-inspired soft combiner across
+    /// Enable the JS8Call-Improved-inspired soft combiner across
     /// repeated receptions. When `true`, the AP0 spectrogram path calls
     /// `SoftCombiner::combine` between LLR normalization and LDPC BP for
     /// every candidate, and `mark_decoded` after a successful CRC pass.
@@ -771,31 +732,30 @@ pub struct Ft8Config {
     ///
     /// Default `false`. The wiring is in place but disabled until a
     /// repeat-heavy corpus measurement validates a net recall gain;
-    /// pancetta's hard-200 corpus is largely single-reception per signal
-    /// and may not exercise the mechanism. The hot-path overhead when
-    /// off is a single `Option::is_some()` branch.
+    /// single-reception-per-signal inputs do not exercise the mechanism.
+    /// The hot-path overhead when off is a single `Option::is_some()`
+    /// branch.
     pub soft_combiner_enabled: bool,
 
-    /// hb-244: cache capacity for the soft combiner (total entries across
+    /// Cache capacity for the soft combiner (total entries across
     /// all coarse-key buckets). Excess entries evicted oldest-first.
     /// Default 256 matches `soft_combiner::DEFAULT_CAPACITY`. Only
     /// consulted when `soft_combiner_enabled = true`.
     pub soft_combiner_capacity: usize,
 
-    /// hb-244: time-to-live (seconds) for soft combiner cache entries.
+    /// Time-to-live (seconds) for soft combiner cache entries.
     /// Entries older than this are evicted on the next cleanup pass.
     /// Default 180 matches `soft_combiner::DEFAULT_TTL_SECONDS`. Only
     /// consulted when `soft_combiner_enabled = true`.
     pub soft_combiner_ttl_seconds: u64,
 
-    /// Batch 63: per-axis bin tolerance for the soft combiner's coarse-
+    /// Per-axis bin tolerance for the soft combiner's coarse-
     /// key lookup. When `> 0`, `SoftCombiner::combine()` consults
     /// neighbor buckets within ±tolerance in (freq_bin, time_bin)
     /// addition to the exact key, finding the best Hamming match
-    /// across all candidate buckets. Default 0 = exact-match (byte-
-    /// identical to pre-Batch-63 behavior). Set to 1-2 to catch
-    /// natural sync jitter on noise-jittered repeats (Batch 62
-    /// finding). Only consulted when `soft_combiner_enabled = true`.
+    /// across all candidate buckets. Default 0 = exact-match. Set to
+    /// 1-2 to catch natural sync jitter on noise-jittered repeats.
+    /// Only consulted when `soft_combiner_enabled = true`.
     pub soft_combiner_key_tolerance: u32,
 
     /// JS8Call-Improved-inspired LLR whitening (per-tone × per-symbol
@@ -813,24 +773,23 @@ pub struct Ft8Config {
     /// subsequent `normalize_llrs` pass then re-standardises the
     /// vector's variance to `llr_target_variance`.
     ///
-    /// Inspired by spec ref `research/specs/spec-js8call-llr-whitening.md`.
+    /// Inspired by JS8Call-Improved LLR whitening.
     /// Default `false` — the whitening pass is byte-identical to the
-    /// legacy path when off (no math executes). Flip on for hard-200
-    /// A/B; expected lift on band-edge / non-uniform-noise signals.
+    /// legacy path when off (no math executes). Flip on to A/B test;
+    /// expected lift on band-edge / non-uniform-noise signals.
     pub llr_whitening_enabled: bool,
 
-    /// hb-226: when true, the time-domain subtract path
+    /// When true, the time-domain subtract path
     /// (`subtract_signal`) applies a Gaussian-style cosine ramp at
     /// each inter-symbol boundary instead of a hard rectangular
     /// envelope. Smooths the reconstructed waveform's spectral splatter
     /// so the residual buffer doesn't expose splatter-driven false
-    /// candidates to subsequent decode passes. Inspired by spec ref
-    /// `research/specs/spec-ft8mon-gaussian-ramp-subtract.md`
-    /// (ft8mon `subtract()` `subtract_ramp = 0.11`). Default **false**
+    /// candidates to subsequent decode passes. Inspired by ft8mon's
+    /// `subtract()` (`subtract_ramp = 0.11`). Default **false**
     /// until corpus measurement confirms recall/FP profile.
     pub gaussian_ramp_subtract_enabled: bool,
 
-    /// hb-226: fractional ramp half-width at each symbol boundary, as a
+    /// Fractional ramp half-width at each symbol boundary, as a
     /// fraction of one symbol period. The total inter-symbol transition
     /// window is `2 × ramp` samples wide (off-ramp tail of the current
     /// symbol + on-ramp head of the next). Default **0.11** matches
@@ -840,16 +799,14 @@ pub struct Ft8Config {
     /// `gaussian_ramp_subtract_enabled = true`.
     pub gaussian_ramp_subtract_fraction: f64,
 
-    /// hb-237: cross-sequence A7 master switch. When `true`, the
+    /// Cross-sequence A7 master switch. When `true`, the
     /// coordinator's FT8 decode loop populates the
     /// `CrossSequenceCallCache` after each successful decode and
     /// retrieves the prior slot's opposite-parity seeds at the start
     /// of the next slot. Default `false` — the cache and any wired
     /// query points are inert until a corpus measurement confirms
-    /// the recall lift. Inspired by spec ref
-    /// `research/specs/spec-wsjtr-cross-sequence-a7.md` (WSJT-X
-    /// `ft8_a7.f90` `iaptype=7`, shipped since v2.6.0). The state
-    /// container itself lives in
+    /// the recall lift. Inspired by WSJT-X `ft8_a7.f90` (`iaptype=7`,
+    /// shipped since v2.6.0). The state container itself lives in
     /// `pancetta_qso::CrossSequenceCallCache`; this flag gates the
     /// coordinator-side wiring.
     pub cross_sequence_a7_enabled: bool,
@@ -869,8 +826,8 @@ pub struct Ft8Config {
     /// drift-heavy corpus measurement confirms a net recall gain. When
     /// off the hot path is byte-identical to the legacy fine-FFT path
     /// (no tracker is constructed, no rotation is applied). Inspired by
-    /// spec ref `research/specs/spec-js8call-per-candidate-frequency-tracker.md`;
-    /// peer source GPL-3.0 was NOT consulted.
+    /// JS8Call-Improved's per-candidate frequency tracker; peer source
+    /// GPL-3.0 was NOT consulted.
     pub per_candidate_freq_tracker_enabled: bool,
 
     /// Damping factor for the adaptive frequency tracker's running
@@ -900,9 +857,8 @@ pub struct Ft8Config {
     /// 79-symbol sequence as a known reference, sweep a small
     /// `(freq_sub, time_step)` neighborhood around
     /// `reverse_derive_candidate`'s estimate and pick the alignment that
-    /// MAXIMIZES the phase-aware known-coherence metric described in
-    /// `spec-ft8mon-three-stage-sync-cascade.md` §"Stage 3"
-    /// (`known_strength_how = 7`).
+    /// MAXIMIZES the phase-aware known-coherence metric of ft8mon's
+    /// Stage 3 (`known_strength_how = 7`).
     ///
     /// The metric is `-Σ |c[i] - c[i-1]|` over symbol-to-symbol phase
     /// differences at the known tones; minimizing the symbol-to-symbol
@@ -914,9 +870,9 @@ pub struct Ft8Config {
     /// **The third stage does NOT surface new decodes by itself** — it
     /// improves SUBTRACTION QUALITY, so multipass round N+1 sees a
     /// cleaner residual and can find weak signals that the coarser
-    /// alignment masked. Targets the hb-217 capture-effect line
-    /// (0/1/2/3 neighbors → 76/43/27/15% recall) where subtraction
-    /// quality is the bottleneck.
+    /// alignment masked. Targets the capture-effect regime (recall falls
+    /// sharply as the number of nearby competing signals grows) where
+    /// subtraction quality is the bottleneck.
     ///
     /// Default **false** — the legacy `reverse_derive_candidate` path
     /// produces byte-identical residuals to historical multipass
@@ -925,16 +881,14 @@ pub struct Ft8Config {
     /// `freq_bin` is preserved (a freq_bin shift would change the tone
     /// indexing relative to `f_idx = f0 + tone` in
     /// `subtract_decode_coherent`, which is structurally tied to the
-    /// decoded `tone_symbols[sym_idx]` — see spec §"Edge cases").
+    /// decoded `tone_symbols[sym_idx]`).
     ///
-    /// Inspired by spec ref
-    /// `research/specs/spec-ft8mon-three-stage-sync-cascade.md`
-    /// (ft8mon `search_both_known()` + `one_strength_known()` driven by
-    /// `try_decode` with `do_third = 2`). Peer GPL-3.0 source was not
-    /// consulted.
+    /// Inspired by ft8mon's `search_both_known()` + `one_strength_known()`
+    /// (driven by `try_decode` with `do_third = 2`). Peer GPL-3.0 source
+    /// was not consulted.
     pub three_stage_sync_cascade_enabled: bool,
 
-    /// hb-228 (JTDX 3-method spectral sweep): on the initial decode pass, also
+    /// JTDX 3-method spectral sweep: on the initial decode pass, also
     /// run the Costas sync search over `Sqrt`- and `Linear`-compressed
     /// spectrograms built from the same audio, and UNION the candidates with the
     /// default `Power`-map candidates (dedup by (time,freq), best score kept,
@@ -965,13 +919,12 @@ pub struct Ft8Config {
     ///
     /// Default **false** — when off the decoder path is
     /// byte-identical to the legacy AP3/AP4 confidence-gate. Inspired
-    /// by spec ref `research/specs/spec-wsjtx-improved-a8-decoding.md`
-    /// (WSJT-X Improved v3.0.0, DG2YCB). Pancetta's implementation
+    /// by WSJT-X Improved v3.0.0 (DG2YCB). Pancetta's implementation
     /// is independent of upstream GPL source.
     pub a8_qso_state_ap_enabled: bool,
 
-    /// hb-252 (Batch 97): BICM-ID global demodulation↔decoding
-    /// iterations. When `> 0`, a candidate whose standard BP(/OSD)
+    /// BICM-ID global demodulation↔decoding iterations.
+    /// When `> 0`, a candidate whose standard BP(/OSD)
     /// attempt fails CRC gets up to this many SOMAP feedback
     /// iterations: the LDPC extrinsic LLRs (BP posterior − channel
     /// input) for the other two bits of each 8-FSK symbol label are
@@ -986,28 +939,24 @@ pub struct Ft8Config {
     /// **0** — byte-identical to the legacy path.
     pub bicm_id_iterations: usize,
 
-    /// hb-252 (Batch 98): near-converged gate for the BICM-ID rescue.
+    /// Near-converged gate for the BICM-ID rescue.
     /// Before the SOMAP feedback loop runs on a CRC-failed candidate,
     /// the unsatisfied-parity-check count of the final BP hard
     /// decision is computed (the LDPC code has 83 checks); candidates
     /// with more than this many unsatisfied checks are skipped. The
-    /// Batch 97 spot check showed the ungated rescue is too
-    /// promiscuous: every noise candidate that fails BP gets extra
-    /// CRC-14 lottery tickets (ΔTP +3 / ΔFP +21 on hard_200/50). The
-    /// Batch 98 instrumentation run measured the unsatisfied-check
-    /// distribution of true rescues vs wrong-CRC rescues vs failures
-    /// and picked the default as the smallest threshold keeping ≥80%
-    /// of true rescues. Measured caveat: the wrong-CRC distribution
-    /// tracks the true-rescue distribution closely, so this gate
-    /// mainly prunes futile rescue work; FP control comes from the
-    /// unconditional suspicion gate and the origin-7 content pricing
-    /// (see `research/notes/2026-06-12-batch98-bicm-id-gated.md`).
+    /// ungated rescue is too promiscuous: every noise candidate that
+    /// fails BP gets extra CRC-14 lottery tickets, inflating false
+    /// positives. The default is the smallest threshold keeping the
+    /// large majority of true rescues. Note: the wrong-CRC distribution
+    /// tracks the true-rescue distribution closely, so this gate mainly
+    /// prunes futile rescue work; false-positive control comes from the
+    /// unconditional suspicion gate and the origin-7 content pricing.
     /// Inert when `bicm_id_iterations == 0` (the default).
     pub bicm_id_max_unsatisfied_checks: usize,
 
-    /// hb-253 (Batch 99): demapper metric for bit-LLR extraction on
+    /// Demapper metric for bit-LLR extraction on
     /// the primary parallel decode paths (`par_decode_candidate`,
-    /// spectrogram + fine-FFT) and inside the hb-252 BICM-ID rescue.
+    /// spectrogram + fine-FFT) and inside the BICM-ID rescue.
     /// `DualMax` (default) is byte-identical to the historical
     /// max-vs-max-over-dB extraction. `Bessel` switches to the exact
     /// noncoherent metric `ln I0(2·√Es·|y_b|/N0)` with per-candidate
@@ -1018,8 +967,8 @@ pub struct Ft8Config {
     /// **`DualMax`** — byte-identical to the legacy path.
     pub llr_metric: LlrMetric,
 
-    /// hb-259 (Batch 100): per-iteration EM re-estimation of the
-    /// block-constant (Es, N0) channel parameters inside the hb-252
+    /// Per-iteration EM re-estimation of the
+    /// block-constant (Es, N0) channel parameters inside the
     /// BICM-ID rescue loop (Cheng, Valenti & Torrieri, "Turbo-NFSK:
     /// Iterative Estimation, Noncoherent Demodulation, and Decoding
     /// for Fast Fading Channels", MILCOM 2005; Cheng dissertation
@@ -1033,14 +982,14 @@ pub struct Ft8Config {
     /// power-domain moment-matching simplification of the paper's
     /// implicit amplitude update (6.16) (which needs a recursive
     /// F = I1/I0 solve; the paper itself ships reduced-complexity
-    /// variants at ≤0.15 dB extra loss). Batch 99's static
+    /// variants at ≤0.15 dB extra loss). The static
     /// median/max estimator seeds iteration 0. Only meaningful with
     /// `llr_metric = Bessel` (where Es/N0 enter the metric) and
     /// `bicm_id_iterations ≥ 1`; inert otherwise. Default **false**
     /// — byte-identical to the legacy path.
     pub bicm_id_em_reestimation: bool,
 
-    /// hb-256 (Batch 101): impulse-robust per-symbol LLR weighting for
+    /// Impulse-robust per-symbol LLR weighting for
     /// impulsive (lightning-static / alpha-stable) HF noise.
     ///
     /// Translated from the robust LLR approximation
@@ -1075,8 +1024,7 @@ pub struct Ft8Config {
     /// rig-passband edges from the smoothed spectrum's rolloff shape,
     /// and narrows the Costas sync sweep to that interval.
     ///
-    /// The closed-form algorithm (per spec ref
-    /// `research/specs/spec-wsjtx-improved-auto-passband.md`):
+    /// The closed-form algorithm:
     ///   1. Average the spectrogram across time for each freq bin
     ///      (skipping bins below ~50 Hz to reject DC).
     ///   2. Smooth with a wide moving-average (≈300 Hz window) along
@@ -1095,12 +1043,10 @@ pub struct Ft8Config {
     ///
     /// Default **false** — when off the decoder path is byte-identical
     /// to the legacy fixed-range sweep. When the caller supplies an
-    /// explicit `freq_bin_range` (e.g. the coordinator's hb-091 scoped
-    /// fast path), auto-passband is skipped — the caller's narrower
-    /// scope always wins. Inspired by spec ref
-    /// `research/specs/spec-wsjtx-improved-auto-passband.md` (WSJT-X
-    /// Improved v3.1.0, DG2YCB). Pancetta's implementation is
-    /// independent of upstream GPL source.
+    /// explicit `freq_bin_range` (e.g. the coordinator's scoped fast
+    /// path), auto-passband is skipped — the caller's narrower scope
+    /// always wins. Inspired by WSJT-X Improved v3.1.0 (DG2YCB).
+    /// Pancetta's implementation is independent of upstream GPL source.
     pub auto_passband_enabled: bool,
 }
 
@@ -1412,7 +1358,7 @@ struct Spectrogram {
     /// Power values [time_step][freq_sub][freq_bin]
     /// With freq_osr=2: freq_sub 0 = even bins (0, 2, 4, ...), freq_sub 1 = odd bins (1, 3, 5, ...)
     power: Vec<Vec<Vec<f64>>>,
-    /// hb-074: optional complex FFT bins, same shape as `power`. Populated
+    /// Optional complex FFT bins, same shape as `power`. Populated
     /// only when `Ft8Config::cross_cycle_coherent` is true; required for
     /// coherent cross-cycle averaging (phase recovery from Costas, then
     /// complex sum across cycles). When `None`, the cross-cycle pass falls
@@ -1443,14 +1389,13 @@ struct CostasCandidate {
     /// Costas sync correlation score (refined value when
     /// `sync_time_interpolation` is enabled).
     sync_score: f64,
-    /// hb-044: fractional time-bin refinement from parabolic interpolation
+    /// Fractional time-bin refinement from parabolic interpolation
     /// of `compute_costas_score` at t0-1 / t0 / t0+1. In [-0.5, +0.5].
-    /// 0.0 = integer-bin alignment (unrefined). Currently unused in
-    /// symbol extraction — that wiring is hb-044 part 2.
+    /// 0.0 = integer-bin alignment (unrefined).
     time_refinement: f64,
 }
 
-/// hb-228: per-bin magnitude compression used when building the sync
+/// Per-bin magnitude compression used when building the sync
 /// spectrogram. The JTDX "3-method spectral sweep" runs the Costas sync search
 /// over three compressions of the SAME FFT and unions the candidates — each
 /// compression surfaces a slightly different candidate population (power
@@ -1466,7 +1411,7 @@ enum MagnitudeTransform {
     Sqrt,
 }
 
-/// hb-250 premise probe (Batch 91): one record per sync candidate that
+/// Premise probe: one record per sync candidate that
 /// entered the per-pass AP0/AP candidate loop, with whether THAT loop
 /// produced a CRC-valid decode for it. Research-side diagnostic only —
 /// populated exclusively via [`Ft8Decoder::decode_window_with_candidate_dump`];
@@ -1511,22 +1456,22 @@ pub struct WaterfallData {
 }
 
 // ============================================================================
-// Cross-sequence A7 seed (hb-237 Session 2)
+// Cross-sequence A7 seed
 // ============================================================================
 
-/// hb-237 Session 2: seed entry for the cross-sequence A7 consumer.
+/// Seed entry for the cross-sequence A7 consumer.
 ///
 /// One entry per callsign decoded in the previous slot of the opposite
 /// parity. The decoder uses the seed's `freq_hz` to gate which sync
 /// candidates in the current window are evaluated against the seed's
-/// templates (spec §5 baseband-extract is centered on `prev_freq`).
+/// templates (baseband-extract is centered on `prev_freq`).
 ///
 /// The seed type is deliberately decoupled from
 /// `pancetta_qso::A7SeedEntry` — the decoder lives below pancetta-qso in
 /// the dep graph. The coordinator translates between the two at the
 /// invocation boundary.
 ///
-/// Inspired by spec ref `research/specs/spec-wsjtr-cross-sequence-a7.md`.
+/// Inspired by WSJT-X cross-sequence a7.
 #[derive(Debug, Clone)]
 pub struct CrossSequenceSeed {
     /// Callsign (uppercase, no portable suffix). Templates are generated
@@ -1539,8 +1484,8 @@ pub struct CrossSequenceSeed {
     pub partner_callsign: Option<String>,
     /// Audio frequency (Hz from dial) at which `callsign` was decoded in
     /// the previous slot. Sync candidates outside ±freq_window of this
-    /// value are skipped per spec §5 (the QSO partner replies on the
-    /// same audio freq within a small drift band).
+    /// value are skipped (the QSO partner replies on the same audio freq
+    /// within a small drift band).
     pub freq_hz: f64,
 }
 
@@ -1586,20 +1531,20 @@ pub struct Ft8Decoder {
     /// Performance metrics
     last_metrics: DecodingMetrics,
 
-    /// hb-093 diagnostic accumulator. Populated only when
+    /// Residual-SNR diagnostic accumulator. Populated only when
     /// `config.residual_snr_diagnostic` is true. Per joint_pair_retry
     /// candidate position: (sync_score, residual_snr_db, decoded_ok).
     /// Read out (and reset) by `take_residual_snr_diagnostic`.
     residual_snr_records: Vec<(f64, f32, bool)>,
 
-    /// hb-057 V1 (Session 2): optional per-callsign DT prior lookup. When
+    /// Optional per-callsign DT prior lookup. When
     /// `Some(...)` AND `config.dt_history_enabled` is true, the residual
     /// `coherent_subtract_and_repass` step narrows its candidate set by
     /// the union of prior-windows for callsigns decoded in the prior
     /// pass. `None` (default) restores the historical full-axis sweep.
     dt_priors: Option<std::sync::Arc<dyn crate::dt_history::DtPriorLookup>>,
 
-    /// hb-244: optional soft combiner for cross-reception LLR
+    /// Optional soft combiner for cross-reception LLR
     /// accumulation. Constructed eagerly when
     /// `config.soft_combiner_enabled = true`. `None` when disabled —
     /// the hot path takes a single branch test in that case. Wrapped
@@ -1607,13 +1552,13 @@ pub struct Ft8Decoder {
     /// AP0 candidate loop runs across rayon workers.
     soft_combiner: Option<std::sync::Arc<std::sync::Mutex<SoftCombiner>>>,
 
-    /// hb-250 premise probe: when true, the per-pass candidate loop
+    /// Premise probe: when true, the per-pass candidate loop
     /// additionally records a [`SyncCandidateRecord`] per sync candidate.
     /// Default false — the disabled hot path is the exact pre-existing
     /// `flatten().collect()` pipeline (no per-candidate buffering).
     candidate_dump_enabled: bool,
 
-    /// hb-250 premise probe accumulator. Populated only when
+    /// Premise probe accumulator. Populated only when
     /// `candidate_dump_enabled` is true; drained by
     /// `take_candidate_dump`.
     candidate_dump: Vec<SyncCandidateRecord>,
@@ -1727,7 +1672,7 @@ impl Ft8Decoder {
         })
     }
 
-    /// hb-057 V1: attach a per-callsign DT prior lookup. Combined with
+    /// Attach a per-callsign DT prior lookup. Combined with
     /// `Ft8Config::dt_history_enabled = true`, the residual
     /// `coherent_subtract_and_repass` narrows its candidate t0 axis by
     /// the union of per-callsign prior windows.
@@ -1739,7 +1684,7 @@ impl Ft8Decoder {
         self
     }
 
-    /// hb-093: drain the diagnostic accumulator. Returns the per-candidate
+    /// Drain the diagnostic accumulator. Returns the per-candidate
     /// `(sync_score, residual_snr_db, decoded_ok)` records captured during
     /// the most recent `decode_window` call (joint_pair_retry path). Resets
     /// the internal buffer. Only populated when
@@ -1748,7 +1693,7 @@ impl Ft8Decoder {
         std::mem::take(&mut self.residual_snr_records)
     }
 
-    /// hb-250 premise probe (Batch 91): decode a window AND return one
+    /// Decode a window AND return one
     /// [`SyncCandidateRecord`] per sync candidate that entered the
     /// per-pass candidate loop, tagged with whether that loop produced
     /// a CRC-valid decode for it. Diagnostic-only wrapper around
@@ -1824,7 +1769,7 @@ impl Ft8Decoder {
 
     /// Decode with default AP context but restrict the Costas sync search to
     /// `freq_bin_range`. Used by the coordinator's t=13s partial-buffer path
-    /// (hb-091 Session 2) to scope decoding to the in-QSO partner's known
+    /// to scope decoding to the in-QSO partner's known
     /// frequency.
     pub fn decode_window_scoped(
         &mut self,
@@ -1852,7 +1797,7 @@ impl Ft8Decoder {
         self.decode_window_with_ap_scoped_partner(samples, ap_context, freq_bin_range, None)
     }
 
-    /// hb-230: same as `decode_window_with_ap_scoped` but additionally accepts
+    /// Same as `decode_window_with_ap_scoped` but additionally accepts
     /// `partner_freq_hz` — the QSO partner's audio frequency in Hz. When
     /// `Some(p)` AND `Ft8Config::relaxed_sync_near_partner_hz_radius` is
     /// `Some(r)`, the Costas sync acceptance threshold is relaxed by
@@ -2695,7 +2640,7 @@ impl Ft8Decoder {
         Ok(all_decoded_messages)
     }
 
-    /// hb-237 Session 2: cross-sequence A7 decoder consumer.
+    /// Cross-sequence A7 decoder consumer.
     ///
     /// Given a slice of `seeds` (callsigns decoded in the previous
     /// opposite-parity slot, supplied by the coordinator from the
@@ -2715,19 +2660,19 @@ impl Ft8Decoder {
     /// The coordinator gates the call on the same flag; this internal
     /// guard is a defense-in-depth.
     ///
-    /// # Scope (Session 2)
+    /// # Scope
     ///
     /// - Reuses the existing `a7::generate_templates` enumeration. The
-    ///   spec's full 206-candidate set (§8) — 100 SNR + 100 R-SNR per
-    ///   ordering — is deferred to a follow-on session along with the
-    ///   `dmin`/`dmin2` gate. Session 2 ships the basic + status + grid
+    ///   full 206-candidate set — 100 SNR + 100 R-SNR per
+    ///   ordering — is deferred along with the
+    ///   `dmin`/`dmin2` gate. This ships the basic + status + grid
     ///   shapes, which cover the common reply messages (RR73 / 73 /
     ///   grid) and exercise the wiring end-to-end.
     /// - Acceptance uses the existing `a7_snr7_threshold` /
     ///   `a7_snr7b_threshold` gates that have been calibrated for
-    ///   pancetta's LLR scale (see Session 1 spec note).
+    ///   pancetta's LLR scale.
     /// - Sync candidates are gated by `a7_freq_window_hz` of each seed
-    ///   (per spec §5: "downsample … centered on `prev_freq`").
+    ///   ("downsample … centered on `prev_freq`").
     ///
     /// # Errors
     ///
@@ -2735,7 +2680,7 @@ impl Ft8Decoder {
     /// for one FT8 frame. All other errors fall through into an empty
     /// result for that seed; one bad seed does not block the rest.
     ///
-    /// Inspired by spec ref `research/specs/spec-wsjtr-cross-sequence-a7.md`.
+    /// Inspired by wsjtr's cross-sequence A7 design.
     pub fn try_cross_sequence_decodes(
         &mut self,
         samples: &[f32],
@@ -2950,7 +2895,7 @@ impl Ft8Decoder {
         (recon_i, recon_q)
     }
 
-    /// hb-226: Gaussian-style ramped CPFSK I/Q.
+    /// Gaussian-style ramped CPFSK I/Q.
     ///
     /// Same continuous-phase FSK as `generate_cpfsk_iq` for the steady
     /// body of each symbol, but inside a `2 * ramp`-sample inter-symbol
@@ -2967,8 +2912,7 @@ impl Ft8Decoder {
     /// and matches the simple amplitude fade described by the source
     /// spec).
     ///
-    /// Inspired by spec ref
-    /// `research/specs/spec-ft8mon-gaussian-ramp-subtract.md`.
+    /// Inspired by ft8mon's Gaussian-ramp subtraction design.
     /// `ramp_samples = round(sps × subtract_ramp_fraction)` and is
     /// clamped to `>= 1`.
     #[inline]
@@ -3101,8 +3045,8 @@ impl Ft8Decoder {
         (recon_i, recon_q)
     }
 
-    /// hb-226: compute the ramp half-width in samples from the
-    /// fractional-symbol parameter. Clamps to `>= 1` per spec.
+    /// Compute the ramp half-width in samples from the
+    /// fractional-symbol parameter. Clamps to `>= 1`.
     #[inline]
     fn ramp_samples_from_fraction(sps: usize, fraction: f64) -> usize {
         let r = (sps as f64 * fraction).round() as i64;
@@ -3395,7 +3339,7 @@ impl Ft8Decoder {
         self.compute_spectrogram_with(audio, MagnitudeTransform::Power)
     }
 
-    /// hb-228: spectrogram builder parameterized by per-bin magnitude
+    /// Spectrogram builder parameterized by per-bin magnitude
     /// compression (see [`MagnitudeTransform`]). `Power` reproduces the
     /// historical behavior byte-for-byte; `Linear`/`Sqrt` feed the 3-method
     /// spectral sweep's extra Costas sync passes.
@@ -3805,7 +3749,7 @@ impl Ft8Decoder {
         )
     }
 
-    /// hb-230: like `costas_sync_search` but forwards a `partner_freq_hz`
+    /// Like `costas_sync_search` but forwards a `partner_freq_hz`
     /// to the threshold helper. Used by the top-level scoped-with-partner
     /// decode entry point so the near-partner relaxed-threshold branch
     /// fires on pass 1 (as well as the residual pass via
@@ -3824,12 +3768,12 @@ impl Ft8Decoder {
         )
     }
 
-    /// hb-082: same sync search as `costas_sync_search` but with an explicit
+    /// Same sync search as `costas_sync_search` but with an explicit
     /// minimum-score threshold. The residual multipass uses this with
     /// `residual_min_sync_score` so the residual's lower noise floor can
     /// surface candidates the production threshold would reject.
     ///
-    /// hb-091 Session 2: when `freq_bin_scope` is `Some`, the Costas sweep
+    /// When `freq_bin_scope` is `Some`, the Costas sweep
     /// is clamped to the intersection of the supplied range and the natural
     /// `MIN_FREQ_BIN..max_freq_bin` envelope. `None` preserves the full sweep.
     fn costas_sync_search_with_threshold(
@@ -3846,7 +3790,7 @@ impl Ft8Decoder {
         )
     }
 
-    /// hb-230: same as `costas_sync_search_with_threshold` but with optional
+    /// Same as `costas_sync_search_with_threshold` but with optional
     /// QSO-partner-aware relaxed acceptance.
     ///
     /// When `partner_freq_hz` is `Some(p)` AND
@@ -4183,13 +4127,13 @@ impl Ft8Decoder {
         self.compute_costas_score_groups(spec, t0, f0, freq_sub, |_| true)
     }
 
-    /// hb-242: Partial-Costas metric (`sync_bc`). Computes the sync score
+    /// Partial-Costas metric (`sync_bc`). Computes the sync score
     /// using ONLY the second and third Costas blocks (symbols 36–42 and
     /// 72–78), skipping block A. This is the slot-edge rescue metric:
     /// when the leading edge of the audio is missing or corrupted and
     /// block A contains noise/garbage, the full metric collapses while
-    /// the partial metric remains meaningful. Per spec-wsjtr-sync-bc.md
-    /// and spec-wsjtx-mainline-sync8.md, this is intended to be
+    /// the partial metric remains meaningful. Inspired by wsjtr's
+    /// `sync_bc` and WSJT-X mainline `sync8.f90`, this is intended to be
     /// combined with the full metric via `max(full, partial)` at the
     /// candidate-emission site — never as a replacement for the full
     /// metric on healthy signals.
@@ -4207,7 +4151,7 @@ impl Ft8Decoder {
     /// Inner Costas-score kernel parameterised by which sync groups to
     /// include. `keep_group(m)` is consulted once per group; pass
     /// `|_| true` for the full ABC metric or `|m| m != 0` for the
-    /// hb-242 partial BC metric.
+    /// partial BC metric.
     ///
     /// Because the score is an *average* (sum of per-comparison
     /// differences divided by the comparison count, not a sum), the
@@ -4321,7 +4265,7 @@ impl Ft8Decoder {
 
     /// Non-maximum suppression: remove weaker candidates near stronger ones.
     ///
-    /// hb-036: when `nms_score_delta_db > 0.0`, a weaker candidate `j` is
+    /// When `nms_score_delta_db > 0.0`, a weaker candidate `j` is
     /// suppressed only if it lies within the TF radius AND its sync_score
     /// is within `nms_score_delta_db` of the stronger candidate `i`'s
     /// sync_score. Meaningfully-weaker candidates are treated as distinct
@@ -4680,7 +4624,7 @@ impl Ft8Decoder {
         snr_from_tone_mags_db(&self.protocol_params, tone_magnitudes)
     }
 
-    /// hb-056: non-coherent cross-cycle symbol averaging.
+    /// Non-coherent cross-cycle symbol averaging.
     ///
     /// Groups sync candidates that look like the same repeating station in
     /// different slots (same `freq_sub`+`freq_bin`±1, `t0` apart by a
@@ -4693,8 +4637,7 @@ impl Ft8Decoder {
     ///
     /// Power-only: pancetta's spectrogram discards phase, so this is the
     /// non-coherent variant of JTDX's `s2(i) = |cs|² + |csold|²` rule.
-    /// Bounds the expected gain below JTDX's coherent edge — see
-    /// docs/superpowers/specs/2026-05-25-cross-cycle-averaging-design.md.
+    /// Bounds the expected gain below JTDX's coherent edge.
     fn cross_cycle_averaging_pass(
         &self,
         spectrogram: &Spectrogram,
@@ -4827,7 +4770,7 @@ impl Ft8Decoder {
         decoded
     }
 
-    /// hb-079: coherent iterative-subtract multi-pass.
+    /// Coherent iterative-subtract multi-pass.
     ///
     /// For each decoded message that has its tone_symbols preserved, reverse-
     /// derive the candidate position, estimate its phase rotor from Costas,
@@ -4851,7 +4794,7 @@ impl Ft8Decoder {
     /// Detection". Pancetta's variant differs from WSJT-X in implementation
     /// domain (spectrogram bins vs time-domain waveform) and rotor
     /// reference set (21 Costas symbols vs all 79), not in algorithm.
-    /// hb-079 closed a gap vs our underlying ft8_lib dependency (which has
+    /// This closed a gap vs our underlying ft8_lib dependency (which has
     /// no multi-pass), not vs WSJT-X. See
     /// `docs/engineering/2026-06-02-sic-novelty-verification.md` for the
     /// full novelty review.
@@ -5181,7 +5124,7 @@ impl Ft8Decoder {
         decoded_new
     }
 
-    /// hb-086 V1: after the multipass subtract+repass loop saturates, take
+    /// After the multipass subtract+repass loop saturates, take
     /// every ORIGINAL sync candidate that didn't already become a decoded
     /// (and therefore subtracted) signal, and try decoding it against the
     /// residual spectrogram. Catches signal pairs where pass-1 failed at
@@ -5192,10 +5135,8 @@ impl Ft8Decoder {
     /// candidate positions (which had a real Costas signature in the raw
     /// data) and just retrying the LDPC against the cleaner LLRs.
     ///
-    /// The kill-switch diagnostic
-    /// (`examples/joint_decoding_pair_density.rs`) found 78% of missed
-    /// truths on top-20 hard-200 WAVs are within 50 Hz of a recovered
-    /// decode — a strong "pair structure exists" signal.
+    /// Diagnostics found most missed truths are within 50 Hz of a
+    /// recovered decode — a strong "pair structure exists" signal.
     fn joint_pair_retry_pass(
         &mut self,
         spectrogram: &Spectrogram,
@@ -5326,7 +5267,7 @@ impl Ft8Decoder {
         decoded_new
     }
 
-    /// hb-048 Session 3: a7 template cross-correlation pass.
+    /// A7 template cross-correlation pass.
     ///
     /// For each callsign already decoded in this window's `pass_decoded`,
     /// generate ~32 next-utterance templates via `a7::generate_templates`,
@@ -5354,7 +5295,7 @@ impl Ft8Decoder {
     /// have no known audio frequency, so they probe ALL sync_candidates
     /// (the within-WAV `±a7_freq_window_hz` gate only applies to in-WAV
     /// expected calls). Without cross-slot context the function still
-    /// runs the within-WAV path — the design preserves the Session 3
+    /// runs the within-WAV path — the design preserves the within-WAV
     /// behavior at default config.
     ///
     /// Prior art: WSJT-X mainline commit
@@ -5619,8 +5560,8 @@ impl Ft8Decoder {
         }
     }
 
-    /// hb-086 V3 (SHELVED 2026-05-31): subtract-aware localized sync
-    /// threshold relaxation. After multipass subtract+V1 saturate, run
+    /// Subtract-aware localized sync threshold relaxation (SHELVED).
+    /// After multipass subtract+V1 saturate, run
     /// one more Costas sync_search on the residual at threshold
     /// `min_sync_score + joint_residual_sync_relax_db` (relax_db is
     /// negative), confined to freq_bins within
@@ -5631,31 +5572,28 @@ impl Ft8Decoder {
     /// **Status: SHELVED.** The structural hypothesis (subtraction
     /// localizes its noise-floor drop to specific bins, so a bin-
     /// targeted relaxation surfaces decodable weak signals at those
-    /// bins) is **wrong on this corpus**. Production hard-200 sweep
-    /// (relax_db ∈ {-0.5, -1.0, -1.5, -2.0}) at the diagnostic-default
+    /// bins) did not hold up in testing. A relaxation sweep
+    /// (relax_db ∈ {-0.5, -1.0, -1.5, -2.0}) at the default
     /// window of 8 bins produced 0 additional decoded messages at
-    /// every threshold. Mechanism trace
-    /// (`examples/hb086_v3_trace.rs`) on top-3 worst hard-200 WAVs
-    /// shows V3 surfaces ~100-131 truly-new (non-collision) candidates
-    /// per WAV at all thresholds — but LDPC "decodes" all of them
-    /// (random noise → BP converges on garbage), CRC catches ~98% as
-    /// false positives, and plausibility rejects the remaining 1-4
-    /// per WAV (all are CRC FPs that happen to form structured-but-
+    /// every threshold. Tracing shows the pass surfaces many
+    /// truly-new (non-collision) candidates per window at all
+    /// thresholds — but LDPC "decodes" all of them
+    /// (random noise → BP converges on garbage), CRC catches nearly
+    /// all as false positives, and plausibility rejects the few
+    /// that remain (all are CRC FPs that happen to form structured-but-
     /// invalid FT8 messages). The residual at sub-3.0 sync_score in
     /// the targeted window is *noise*, not weak signal.
     ///
-    /// Why this differs from hb-082 (SHELVED — global residual
-    /// relaxation, no-op): hb-082 found ZERO localized candidates
-    /// because the global noise floor in the residual is unchanged.
-    /// V3 *does* find candidates in the bin-targeted window (the
-    /// noise floor IS lower at subtracted bins, enough to cross the
-    /// relaxed score threshold), but they don't decode. The
-    /// pre-graduation diagnostic
-    /// (`examples/hb086_v3_subtract_window_potential.rs`) found 56.8%
-    /// of V1-uncoverable truths sit within ±8 bins of a subtracted
-    /// decode — geometric PROCEED — but the geometric proximity
-    /// doesn't imply decodability. Plumbing kept at default-off for
-    /// future revisit if the corpus or pipeline changes.
+    /// Why this differs from the global residual relaxation variant
+    /// (also shelved, a no-op): that variant found ZERO localized
+    /// candidates because the global noise floor in the residual is
+    /// unchanged. This pass *does* find candidates in the bin-targeted
+    /// window (the noise floor IS lower at subtracted bins, enough to
+    /// cross the relaxed score threshold), but they don't decode.
+    /// A pre-graduation diagnostic found that most V1-uncoverable
+    /// truths sit within ±8 bins of a subtracted decode — geometric
+    /// proximity — but proximity doesn't imply decodability. Plumbing
+    /// kept at default-off for future revisit.
     fn joint_residual_localized_sync_pass(
         &self,
         spectrogram: &Spectrogram,
@@ -5778,7 +5716,7 @@ impl Ft8Decoder {
         decoded_new
     }
 
-    /// hb-086 V3 helper: like `costas_sync_search_with_threshold` but
+    /// Helper: like `costas_sync_search_with_threshold` but
     /// restricts the f0 sweep to bins within ±`n_bins` of any
     /// `target_position.freq_bin` (matching `freq_sub`). NMS+truncate
     /// still apply.
@@ -6620,13 +6558,13 @@ struct DecodeContext<'a> {
     llr_target_variance: f32,
     /// When true, per-thread LDPC decoders are created in 3 buckets
     /// (low/mid/high iter counts) and dispatched per candidate by
-    /// sync_score. hb-022 wild-card config flag.
+    /// sync_score. Wild-card config flag.
     adaptive_ldpc_iters: bool,
-    /// Max parity errors tolerated before invoking OSD fallback. hb-014.
+    /// Max parity errors tolerated before invoking OSD fallback.
     max_parity_errors_for_osd: usize,
-    /// hb-067 mBP offset (subtract from |LLR| before OSD).
+    /// mBP offset (subtract from |LLR| before OSD).
     bp_offset_subtract: f32,
-    /// hb-063 layered (row-sequential) BP schedule.
+    /// Layered (row-sequential) BP schedule.
     layered_bp: bool,
     /// JS8Call-Improved-style LDPC feedback refinement: master switch.
     ldpc_feedback_refinement_enabled: bool,
@@ -6637,12 +6575,12 @@ struct DecodeContext<'a> {
     ldpc_feedback_attenuate_factor: f32,
     /// JS8Call-Improved-style LDPC feedback refinement: erase threshold.
     ldpc_feedback_erase_threshold: f32,
-    /// hb-069 linear-power spectrogram interpolation gate.
+    /// Linear-power spectrogram interpolation gate.
     sync_time_interp_linear_power: bool,
-    /// hb-129: window-start instant. Used to stamp each successful decode
+    /// Window-start instant. Used to stamp each successful decode
     /// with its presentation-time-into-window for the TTFD metric.
     window_start: Instant,
-    /// hb-244: optional soft combiner shared across rayon workers.
+    /// Optional soft combiner shared across rayon workers.
     /// `None` when `config.soft_combiner_enabled = false`. The combiner
     /// is wrapped in a `Mutex` and only locked when present, so the
     /// disabled hot path is a single `Option::as_ref()` branch test.
@@ -6654,8 +6592,8 @@ struct DecodeContext<'a> {
     /// JS8Call-Improved-style per-candidate frequency tracker: master
     /// switch. When false, `par_extract_symbols_complex` skips the
     /// tracker entirely and produces byte-identical output to the
-    /// legacy path. Inspired by spec ref
-    /// `spec-js8call-per-candidate-frequency-tracker.md`.
+    /// legacy path. Inspired by JS8Call-Improved's per-candidate
+    /// frequency tracker.
     per_candidate_freq_tracker_enabled: bool,
     /// Tracker damping factor (`FreqTrackerConfig::alpha`).
     per_candidate_freq_tracker_alpha: f64,
@@ -6667,22 +6605,22 @@ struct DecodeContext<'a> {
     /// When false the parallel AP path is byte-identical to the
     /// legacy AP3/AP4 confidence gate.
     a8_qso_state_ap_enabled: bool,
-    /// hb-252 BICM-ID global iterations (0 = disabled, byte-identical
+    /// BICM-ID global iterations (0 = disabled, byte-identical
     /// legacy path). See `Ft8Config::bicm_id_iterations`.
     bicm_id_iterations: usize,
-    /// hb-252 (Batch 98) near-converged gate: maximum unsatisfied
+    /// Near-converged gate: maximum unsatisfied
     /// parity checks (of 83) in the final BP hard decision for the
     /// rescue to run. See `Ft8Config::bicm_id_max_unsatisfied_checks`.
     bicm_id_max_unsatisfied_checks: usize,
-    /// hb-253 (Batch 99): demapper metric for bit-LLR extraction.
+    /// Demapper metric for bit-LLR extraction.
     /// `DualMax` (default) is byte-identical to the legacy path. See
     /// `Ft8Config::llr_metric`.
     llr_metric: LlrMetric,
-    /// hb-259 (Batch 100): per-iteration EM (Es, N0) re-estimation
+    /// Per-iteration EM (Es, N0) re-estimation
     /// inside the BICM-ID rescue (Bessel metric path only). See
     /// `Ft8Config::bicm_id_em_reestimation`.
     bicm_id_em_reestimation: bool,
-    /// hb-256 (Batch 101): impulse-robust per-symbol LLR weighting
+    /// Impulse-robust per-symbol LLR weighting
     /// knee. `None` (default) = the weighting helper is never invoked,
     /// byte-identical legacy path. See `Ft8Config::impulse_robust_llr`.
     impulse_robust_llr: Option<f64>,
@@ -6693,7 +6631,7 @@ struct ParDecodedCandidate {
     msg: DecodedMessage,
 }
 
-/// hb-252 (Batch 97): one SOMAP refresh of the 174 channel LLRs with
+/// One SOMAP refresh of the 174 channel LLRs with
 /// per-bit a-priori feedback (Valenti & Cheng, IEEE JSAC 2005, eq. 8,
 /// max-log form).
 ///
@@ -6712,7 +6650,7 @@ struct ParDecodedCandidate {
 /// a-priori zero this reduces exactly to the legacy max-log extraction
 /// scaled by whatever scale `metrics` carries.
 ///
-/// hb-253 (Batch 99): when `use_lse` is true the two `max` operators
+/// When `use_lse` is true the two `max` operators
 /// are replaced by exact log-sum-exp accumulation — this is the full
 /// eq. (6) of Guillén i Fàbregas & Grant (sum over labels weighted by
 /// the extrinsic priors `q_{k,i}(b)`; the label-independent
@@ -6755,7 +6693,7 @@ fn bicm_id_somap_refresh(metrics: &[[f64; 8]], apriori: &[f32], use_lse: bool) -
     out
 }
 
-/// hb-252 (Batch 97): BICM-ID rescue loop — iterative SOMAP
+/// BICM-ID rescue loop — iterative SOMAP
 /// demodulation ↔ LDPC BP decoding for a candidate whose standard
 /// attempt failed CRC.
 ///
@@ -6787,16 +6725,15 @@ fn bicm_id_somap_refresh(metrics: &[[f64; 8]], apriori: &[f32], use_lse: bool) -
 /// FT8 (3 bits/symbol) only; other protocols return `None`. Returns
 /// CRC-verified codeword bits on success, paired with the
 /// unsatisfied-parity-check count of the seed BP hard decision (the
-/// Batch 98 near-converged gate input; also feeds the research
-/// instrumentation).
+/// near-converged gate input; also feeds diagnostic instrumentation).
 ///
-/// **Near-converged gate (Batch 98)**: after the seed BP re-run, the
+/// **Near-converged gate**: after the seed BP re-run, the
 /// unsatisfied-check count of its hard decision is computed
 /// (`count_parity_errors`, 0..=83). If it exceeds `max_unsatisfied`
-/// the rescue is skipped — Batch 97 measured that running the loop on
+/// the rescue is skipped — testing showed that running the loop on
 /// far-from-convergence (noise) candidates buys mostly CRC-14 lottery
-/// tickets (ΔFP 7× ΔTP on hard_200/50), while true rescues come from
-/// the near-converged population.
+/// tickets (far more false positives than true positives), while true
+/// rescues come from the near-converged population.
 #[allow(clippy::too_many_arguments)] // research-flag plumbing; mirrors the Ft8Config knobs 1:1
 fn par_bicm_id_rescue(
     pp: &ProtocolParams,
@@ -6854,7 +6791,7 @@ fn par_bicm_id_rescue(
     // powers and the static-seed (Es, N0) are retained so the EM
     // loop can re-estimate the channel each global iteration.
     let use_lse = llr_metric == LlrMetric::Bessel;
-    /// hb-259 EM state: (linear tone powers, Es, N0). `Some` only when
+    /// EM state: (linear tone powers, Es, N0). `Some` only when
     /// EM re-estimation is active on the Bessel path.
     type BesselEmState = Option<(Vec<[f64; NUM_TONES]>, f64, f64)>;
     let (raw, unscaled_metrics, mut bessel_state): (Vec<f32>, Vec<[f64; 8]>, BesselEmState) =
@@ -6948,7 +6885,7 @@ fn par_bicm_id_rescue(
     None
 }
 
-/// Batch 98 research instrumentation for the BICM-ID rescue. When the
+/// Diagnostic instrumentation for the BICM-ID rescue. When the
 /// `PANCETTA_BICM_ID_INSTRUMENT_FILE` env var names a writable path
 /// (checked once per process), appends one line per rescue event:
 ///
@@ -7657,7 +7594,7 @@ fn par_try_ldpc_with_ap(
     Some(decoded_message)
 }
 
-/// Position to inject a recent callsign in the LLR vector. hb-043 my_call-less AP.
+/// Position to inject a recent callsign in the LLR vector. my_call-less AP.
 #[derive(Debug, Clone, Copy)]
 enum RecentInjectPos {
     /// Inject at bits 0-27 (caller / from-callsign position).
@@ -7666,7 +7603,7 @@ enum RecentInjectPos {
     Called,
 }
 
-/// hb-043: LDPC decode with a single recent callsign injected at one position,
+/// LDPC decode with a single recent callsign injected at one position,
 /// without the my_call-coupled AP1 injection that AP2 normally prepends.
 /// Mirrors `par_try_ldpc_with_ap` but for the my_call-less use case.
 // rationale: parallel-safe decode fn threads many independent context values; a
@@ -7842,7 +7779,7 @@ const CROSS_CYCLE_T_TOL: usize = 2;
 const CROSS_CYCLE_F_TOL: usize = 1;
 const CROSS_CYCLE_SCORE_BAND: f64 = 3.0;
 
-/// hb-056: group candidates that look like the same repeating station in
+/// Group candidates that look like the same repeating station in
 /// different slots. Two candidates match when they share `freq_sub`, their
 /// `freq_bin`s are within `F_TOL`, their `t0`s differ by a non-zero
 /// integer multiple of `SLOT_TIME_STEPS_FT8` within `T_TOL`, and their
@@ -7894,7 +7831,7 @@ fn group_for_cross_cycle(candidates: &[CostasCandidate]) -> Vec<Vec<usize>> {
     groups
 }
 
-/// hb-074: coherent complement of `sum_tone_magnitudes_linear`. Members
+/// Coherent complement of `sum_tone_magnitudes_linear`. Members
 /// are already phase-aligned (each multiplied by `conj(rotor)`), so a
 /// straight complex sum integrates signal amplitudes coherently while
 /// noise (uncorrelated phase) averages down. Returns the resulting
@@ -7923,7 +7860,7 @@ fn coherent_sum_complex_to_db(
     result
 }
 
-/// hb-056: sum tone magnitudes in LINEAR power (10^(dB/10)) across the
+/// Sum tone magnitudes in LINEAR power (10^(dB/10)) across the
 /// group's members, then convert back to dB. This is the non-coherent
 /// analogue of JTDX's `s2(i) = |cs|² + |csold|²`. Linear-domain
 /// summation is required — averaging in dB is the wrong operation
@@ -7950,7 +7887,7 @@ fn sum_tone_magnitudes_linear(
     result
 }
 
-/// hb-079: reverse-derive a candidate from a DecodedMessage's
+/// Reverse-derive a candidate from a DecodedMessage's
 /// `frequency_offset` and `time_offset`. We don't keep `(message,
 /// candidate)` pairs through the rayon decode path, so we reconstruct
 /// the candidate for coherent subtraction. `time_refinement` defaults
@@ -7980,7 +7917,7 @@ fn reverse_derive_candidate(
     }
 }
 
-/// hb-079: coherent maximum-likelihood subtraction of a decoded signal
+/// Coherent maximum-likelihood subtraction of a decoded signal
 /// from the complex spectrogram. At each of the 79 symbol positions, at
 /// the *true* (decoded) tone, project the complex bin onto the
 /// candidate's phase rotor — `proj = Re(bin·conj(rotor))·rotor` — and
@@ -8056,9 +7993,8 @@ fn subtract_decode_coherent(
 /// `(freq_sub, time_step)` using the LDPC-decoded `tone_symbols` as
 /// ground truth. Returns the score; HIGHER is better.
 ///
-/// Per spec
-/// (`research/specs/spec-ft8mon-three-stage-sync-cascade.md` §"Stage 3"
-/// + §"Implementation notes" — `known_strength_how = 7`), the metric is
+/// Per ft8mon's three-stage sync cascade (Stage 3 /
+/// `known_strength_how = 7`), the metric is
 /// `-Σ |c[i] - c[i-1]|` summed over symbol-to-symbol phase deltas at the
 /// KNOWN tones (all 79 symbols, not just the 21 Costas symbols). Lower
 /// jitter between consecutive on-tone samples ⇒ tighter alignment ⇒
@@ -8248,7 +8184,7 @@ fn par_extract_symbols_from_spectrogram(
     tone_magnitudes
 }
 
-/// hb-074: complex-valued sibling of `par_extract_symbols_from_spectrogram`.
+/// Complex-valued sibling of `par_extract_symbols_from_spectrogram`.
 /// Returns the complex FFT bin for each (symbol, tone) at the candidate's
 /// time/freq alignment. Returns `None` when the spectrogram wasn't built
 /// with `cross_cycle_coherent` (no `.complex` payload). Uses the FIRST of
@@ -8285,13 +8221,13 @@ fn par_extract_complex_symbols_from_spectrogram(
     Some(out)
 }
 
-/// hb-074: sum the candidate's complex FFT bins at all 21 Costas positions
+/// Sum the candidate's complex FFT bins at all 21 Costas positions
 /// (each at its expected tone). `Σ cs[costas_sym][expected_tone] =
 /// N·A·exp(jφ_cand)` (signal coherent, noise uncorrelated). The result's
 /// phase is the candidate's reference phase; the result's magnitude is
 /// proportional to the candidate's signal strength × √N_costas — the MRC
-/// weight for hb-075. Returned un-normalised so callers can pick
-/// rotor-only (hb-074) or rotor+magnitude (hb-075).
+/// weight. Returned un-normalised so callers can pick
+/// rotor-only or rotor+magnitude.
 fn compute_costas_complex_accumulator(
     pp: &ProtocolParams,
     complex_symbols: &[[Complex<f64>; NUM_TONES]],
@@ -8310,7 +8246,7 @@ fn compute_costas_complex_accumulator(
     acc
 }
 
-/// hb-074: estimate a candidate's per-cycle phase rotor — the
+/// Estimate a candidate's per-cycle phase rotor — the
 /// unit-magnitude `exp(jφ_cand)` to divide each symbol by to align the
 /// candidate's phase to a common reference. Returns `None` if the
 /// accumulator magnitude is too small to give a stable estimate
@@ -8329,9 +8265,9 @@ fn estimate_candidate_phase_rotor(
 
 /// Linear-interpolation lookup into a spectrogram with fractional time
 /// offset. dt=0 returns spectrogram.power[t_base][fs][freq_bin] exactly.
-/// Out-of-range cells contribute -120.0 dB. hb-044 helper.
+/// Out-of-range cells contribute -120.0 dB.
 ///
-/// hb-069: when `linear_power` is true and `dt != 0`, the two endpoint
+/// When `linear_power` is true and `dt != 0`, the two endpoint
 /// dB values are converted to linear power (10^(db/10)), interpolated
 /// linearly, then converted back to dB. dB-space interpolation is
 /// non-linear in real power; linear-power interpolation preserves
@@ -8532,7 +8468,7 @@ fn lse2(a: f64, b: f64) -> f64 {
     hi + (lo - hi).exp().ln_1p()
 }
 
-/// hb-253: linear tone powers from dB tone magnitudes (the spectrogram
+/// Linear tone powers from dB tone magnitudes (the spectrogram
 /// path stores `10·log10(mag²)` per bin; `-120 dB` sentinel → 1e-12).
 fn tone_powers_from_db(tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<[f64; NUM_TONES]> {
     tone_magnitudes
@@ -8547,7 +8483,7 @@ fn tone_powers_from_db(tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<[f64; NUM_TO
         .collect()
 }
 
-/// hb-253: linear tone powers from linear tone magnitudes (the fine-FFT
+/// Linear tone powers from linear tone magnitudes (the fine-FFT
 /// path stores `|y|` per bin; power = `|y|²`).
 fn tone_powers_from_mag(tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<[f64; NUM_TONES]> {
     tone_magnitudes
@@ -8562,7 +8498,7 @@ fn tone_powers_from_mag(tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<[f64; NUM_T
         .collect()
 }
 
-/// hb-253: simplest defensible block-constant (Es, N0) estimator from
+/// Simplest defensible block-constant (Es, N0) estimator from
 /// per-symbol linear tone powers at the candidate's bins.
 ///
 /// * **N0**: median of the 7 non-max tone powers across all symbols
@@ -8583,7 +8519,7 @@ fn tone_powers_from_mag(tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<[f64; NUM_T
 ///
 /// Both estimates are scale-invariant in the Bessel argument
 /// `2·√(Es·p)/N0` (Es, p, N0 all carry the spectrogram's arbitrary
-/// power scale), preserving the decoder's gain invariance (hb-117).
+/// power scale), preserving the decoder's gain invariance.
 fn estimate_es_n0(tone_powers: &[[f64; NUM_TONES]], num_tones: usize) -> (f64, f64) {
     let mut noise: Vec<f64> = Vec::with_capacity(tone_powers.len() * num_tones.saturating_sub(1));
     let mut max_sum = 0.0f64;
@@ -8615,7 +8551,7 @@ fn estimate_es_n0(tone_powers: &[[f64; NUM_TONES]], num_tones: usize) -> (f64, f
     (es, n0)
 }
 
-/// hb-253: per-data-symbol Bessel label metrics
+/// Per-data-symbol Bessel label metrics
 /// `m[j] = ln I0(2·√(Es·p_{gray(j)})/N0)` for binary label `j`
 /// (Gray-demapped, same mapping as `par_compute_soft_llrs_db`), plus
 /// the (Es, N0) estimates used. FT8 (3 bits/symbol) only.
@@ -8629,10 +8565,10 @@ fn bessel_label_metrics(
     (metrics, es, n0)
 }
 
-/// hb-259 (Batch 100): `bessel_label_metrics` core with caller-supplied
+/// `bessel_label_metrics` core with caller-supplied
 /// (Es, N0) — the EM re-estimation path rebuilds the per-label metrics
 /// from refreshed channel estimates without re-running the static
-/// estimator. Identical float operations to the Batch 99 inline loop.
+/// estimator. Identical float operations to the original inline loop.
 fn bessel_label_metrics_with(
     pp: &ProtocolParams,
     tone_powers: &[[f64; NUM_TONES]],
@@ -8654,7 +8590,7 @@ fn bessel_label_metrics_with(
         .collect()
 }
 
-/// hb-259 (Batch 100): per-iteration EM re-estimation of the
+/// Per-iteration EM re-estimation of the
 /// block-constant (Es, N0) inside the BICM-ID rescue (Cheng, Valenti &
 /// Torrieri, "Turbo-NFSK", MILCOM 2005; Cheng dissertation ch. 6).
 ///
@@ -8676,7 +8612,7 @@ fn bessel_label_metrics_with(
 ///   believed-noise tone power has mean `N0`, so
 ///   `N0 ← Σ_i Σ_j q_{i,j} · (noise-tone power sum) / (N·(M−1))` and
 ///   `Es ← Σ_i Σ_j q_{i,j} · (signal-tone power) / N − N0` (floored at
-///   `0.05·N0`, the Batch 99 floor). This is the same family of
+///   `0.05·N0`, the same floor used elsewhere). This is the same family of
 ///   reduced-complexity simplification the paper itself ships
 ///   (≤0.15 dB extra loss measured there); for the exponential noise
 ///   tones the mean IS the ML estimate.
@@ -8785,7 +8721,7 @@ fn bicm_id_em_reestimate(
     }
 }
 
-/// hb-253 (Batch 99): exact noncoherent Bessel-metric bit-LLR
+/// Exact noncoherent Bessel-metric bit-LLR
 /// extraction (Guillén i Fàbregas & Grant, IEEE TWC, eqs. (1)/(6),
 /// zero a-priori).
 ///
@@ -8805,7 +8741,7 @@ fn par_compute_soft_llrs_bessel(pp: &ProtocolParams, tone_powers: &[[f64; NUM_TO
     bessel_llrs_from_metrics(&metrics)
 }
 
-/// hb-259 (Batch 100): zero-a-priori exact-LSE bit-LLR marginalization
+/// Zero-a-priori exact-LSE bit-LLR marginalization
 /// from per-label Bessel metrics — factored out of
 /// `par_compute_soft_llrs_bessel` (identical float operations) so the
 /// EM path can rebuild raw LLRs from re-estimated metrics.
@@ -8836,8 +8772,7 @@ fn bessel_llrs_from_metrics(metrics: &[[f64; 8]]) -> Vec<f32> {
 /// running offset before the FFT, and consumes a residual measurement
 /// from the dominant-tone parabolic-peak offset of each Costas block.
 /// When `None`, the function is byte-identical to the legacy fine-FFT
-/// path. Inspired by spec ref
-/// `research/specs/spec-js8call-per-candidate-frequency-tracker.md`.
+/// path. Inspired by JS8Call-Improved's per-candidate frequency tracker.
 // rationale: parallel symbol-extraction fn threads many independent DSP context
 // values; a params struct would add a layer without simplifying the call sites.
 #[allow(clippy::too_many_arguments)]
@@ -9145,7 +9080,7 @@ fn par_estimate_snr_fft(pp: &ProtocolParams, tone_magnitudes: &[[f64; NUM_TONES]
 /// LDPC belief propagation is tuned for a specific LLR scale. This function
 /// computes the variance of the 174 LLR values and scales them so the variance
 /// equals `target_variance`. Default is `LLR_TARGET_VARIANCE` (24.0). This is
-/// critical for decoding weak signals; hb-006 swept this value as a possible
+/// critical for decoding weak signals; this value was swept as a possible
 /// sensitivity knob.
 fn normalize_llrs(llrs: &mut [f32], target_variance: f32) {
     debug_assert_eq!(llrs.len(), 174);
@@ -9166,8 +9101,6 @@ fn normalize_llrs(llrs: &mut [f32], target_variance: f32) {
 }
 
 /// JS8Call-Improved-inspired per-tone × per-symbol LLR whitening.
-///
-/// Inspired by spec ref `research/specs/spec-js8call-llr-whitening.md`.
 ///
 /// Estimates a non-uniform noise floor over the symbol-magnitude matrix
 /// and divides each LLR triplet at symbol position `sym` by the
@@ -9316,7 +9249,7 @@ fn maybe_whiten_llrs(
     }
 }
 
-/// hb-256: units of the per-symbol tone matrix handed to the
+/// Units of the per-symbol tone matrix handed to the
 /// impulse-robust LLR weighting. The two demapper families store
 /// different things: the spectrogram paths extract dB log-power, the
 /// fine-FFT paths extract linear magnitude `|y|`.
@@ -9328,7 +9261,7 @@ enum ToneUnits {
     LinearMag,
 }
 
-/// hb-256 (Batch 101): impulse-robust per-symbol LLR weighting —
+/// Impulse-robust per-symbol LLR weighting —
 /// translated form of the robust LLR `sign(y)·min(a|y|, b/|y|)`
 /// (Clavier et al., EURASIP JWCN 2021, eq. (15)). See
 /// `Ft8Config::impulse_robust_llr` for the translation rationale.
@@ -9391,7 +9324,7 @@ fn impulse_robust_weight_llrs(
     }
 }
 
-/// hb-256: gated wrapper around `impulse_robust_weight_llrs` that
+/// Gated wrapper around `impulse_robust_weight_llrs` that
 /// no-ops when the knee is `None`. Centralises the default-OFF
 /// byte-identical contract: when disabled, ZERO impulse-weighting code
 /// runs (one branch test only) and no power-conversion allocation is
@@ -9442,7 +9375,7 @@ fn bits_to_u16(bits: &BitSlice) -> u16 {
     value
 }
 
-/// hb-242 wide-lag baseline: compute the nth-percentile reference of
+/// Wide-lag baseline: compute the nth-percentile reference of
 /// a per-bin sync-peak array. Each entry is a `(score, time_step)`
 /// pair; only the score participates in the percentile. NaN / non-
 /// finite scores sort to the front (treated as zero). The percentile
@@ -9470,7 +9403,7 @@ fn percentile_baseline(peaks: &[(f64, usize)], pct: f64) -> f64 {
     sorted[idx]
 }
 
-/// hb-044 / hb-245: parabolic refinement of a discrete peak. Given
+/// Parabolic refinement of a discrete peak. Given
 /// three score samples at integer offsets (-1, 0, +1) around the
 /// candidate's peak, fit a parabola and return (refined_score,
 /// fractional_offset). The fractional offset is in (-0.5, +0.5)
@@ -9479,13 +9412,13 @@ fn percentile_baseline(peaks: &[(f64, usize)], pct: f64) -> f64 {
 /// If the three points don't form a concave-down parabola (i.e., the
 /// center isn't actually a local max), returns (y_center, 0.0).
 ///
-/// Per spec-wsjtx-improved-subsample-dt-refinement.md (hb-245), this
+/// Following WSJT-X Improved's subsample DT refinement, this
 /// is the textbook three-point parabolic peak interpolator (Smith,
 /// "Spectral Audio Signal Processing"). Pancetta's `a < 0` concave
-/// check is equivalent to the spec's "denominator strictly positive"
-/// check (the spec uses `c[-1] - 2*c[0] + c[+1] > 0`, which is the
+/// check is equivalent to the "denominator strictly positive"
+/// check (`c[-1] - 2*c[0] + c[+1] > 0`, which is the
 /// same condition as `-2*a > 0` ⇔ `a < 0`). The clamp to [-0.5,
-/// +0.5] matches the spec's edge-case handling.
+/// +0.5] matches the reference edge-case handling.
 fn parabolic_peak_refinement(y_left: f64, y_center: f64, y_right: f64) -> (f64, f64) {
     // Parabola: y(x) = a*x^2 + b*x + c
     //   y(-1) = a - b + c = y_left
@@ -9533,9 +9466,9 @@ mod parabolic_tests {
         assert_eq!(refined, 1.0);
     }
 
-    /// hb-245: recover a Gaussian peak centred at a sub-sample offset.
+    /// Recover a Gaussian peak centred at a sub-sample offset.
     /// Pancetta's `parabolic_peak_refinement` implements the same
-    /// closed-form formula as the hb-245 spec (Smith textbook).
+    /// closed-form formula as the subsample DT refinement (Smith textbook).
     #[test]
     fn hb245_synthetic_offset_peak_recovered() {
         let true_offset = 0.37_f64;
@@ -9548,7 +9481,7 @@ mod parabolic_tests {
         assert!(refined >= g(0.0) - 1e-9);
     }
 
-    /// hb-245 edge: flat three-point window (all values equal) is
+    /// Edge case: flat three-point window (all values equal) is
     /// not a peak — non-concave branch returns delta = 0.
     #[test]
     fn hb245_flat_window_returns_zero_delta() {
@@ -9557,14 +9490,14 @@ mod parabolic_tests {
         assert!((refined - 2.0).abs() < 1e-9);
     }
 
-    /// hb-245 edge: result always falls in [-0.5, +0.5].
+    /// Edge case: result always falls in [-0.5, +0.5].
     #[test]
     fn hb245_result_clamped_to_half_sample() {
         let (_refined, delta) = parabolic_peak_refinement(10.0, 11.0, 0.0);
         assert!((-0.5..=0.5).contains(&delta), "delta={delta} out of range");
     }
 
-    /// hb-242 percentile baseline: uniform distribution → the 40th-
+    /// Percentile baseline: uniform distribution → the 40th-
     /// percentile entry equals the 40th-percentile value.
     #[test]
     fn percentile_baseline_uniform_distribution() {
@@ -9574,14 +9507,14 @@ mod parabolic_tests {
         assert!((base - 0.39).abs() < 1e-9, "base={base}");
     }
 
-    /// hb-242 percentile baseline: empty input → 0.0 gracefully
+    /// Percentile baseline: empty input → 0.0 gracefully
     /// disables normalisation downstream.
     #[test]
     fn percentile_baseline_empty_input() {
         assert_eq!(percentile_baseline(&[], 0.40), 0.0);
     }
 
-    /// hb-242 percentile baseline: NaN scores are treated as zero
+    /// Percentile baseline: NaN scores are treated as zero
     /// and sort to the front. The result must remain finite.
     #[test]
     fn percentile_baseline_nan_safe() {
@@ -9601,7 +9534,7 @@ fn estimate_noise_floor(psd: &[f64]) -> f64 {
     sorted_psd[median_idx]
 }
 
-/// hb-016: average excess-above-noise (in dB) across a spectrogram's
+/// Average excess-above-noise (in dB) across a spectrogram's
 /// power tensor. For each bin, take `max(0, db - noise_floor_db)` and
 /// average. Result is monotone in signal energy: 0 when every bin sits
 /// at or below the noise-floor reference, grows as bright signal bins
@@ -9631,7 +9564,7 @@ fn mean_excess_above_noise_db(power: &[Vec<Vec<f64>>], noise_floor_db: f64) -> f
     sum / count as f64
 }
 
-/// hb-016: noise-floor proxy across a spectrogram — median dB of all
+/// Noise-floor proxy across a spectrogram — median dB of all
 /// bins. Most bins in an FT8 slot are noise (signals occupy a small
 /// fraction of (time, freq) cells), so the median of dB is a robust
 /// floor estimator. Computed once on the ORIGINAL spectrogram and
@@ -9691,7 +9624,7 @@ enum LdpcAlgorithm {
 /// Implements the LDPC decoder for FT8's (174,91) code:
 /// - 91 information bits (77 payload + 14 CRC)
 /// - 83 parity bits
-/// FDR Session 2 helpers — clamp the BP iteration count into the
+/// Feedback-decode-refinement helpers — clamp the BP iteration count into the
 /// `u8` confidence-feature representation, and compute the smallest
 /// magnitude across the 174-bit converged-codeword LLR vector.
 #[inline]
@@ -9734,19 +9667,20 @@ struct LdpcDecoder {
     /// Optional OSD fallback decoder
     osd: Option<OsdDecoder>,
     /// Max unsatisfied parity checks tolerated before invoking OSD.
-    /// 4 = production default; hb-014 sweep candidate.
+    /// 4 = production default; sweep candidate.
     max_parity_errors_for_osd: usize,
-    /// hb-067 mBP offset: subtract this magnitude from each LLR before
+    /// mBP offset: subtract this magnitude from each LLR before
     /// invoking OSD. Reduces BP's confidence → OSD considers more flip
     /// patterns. Default 0.0 = no offset (no behavior change).
     /// Per arXiv:2306.00443 — claim is order-(m-1) OSD reaches order-m
     /// performance with small offset.
     bp_offset_subtract: f32,
-    /// hb-063: when true, `belief_propagation_with_trajectory` uses a
+    /// When true, `belief_propagation_with_trajectory` uses a
     /// layered (row-sequential) schedule instead of flooding.
     layered: bool,
     /// JS8Call-Improved-style feedback refinement config (clean-room port
-    /// from `spec-js8call-ldpc-feedback-refinement.md`). When `enabled` is
+    /// from a prose spec of the JS8Call-Improved LDPC feedback
+    /// refinement). When `enabled` is
     /// false (default), `decode_soft` is byte-identical to its pre-feedback
     /// behavior. When true, a failed first BP pass triggers one meta-loop
     /// with refined LLRs before falling through to OSD.
@@ -9963,22 +9897,22 @@ impl LdpcDecoder {
         self.llrs_to_bits(&decoded_llrs)
     }
 
-    /// Decode with soft-decision input (LLRs). FDR Session 2 wrapper:
+    /// Decode with soft-decision input (LLRs). Wrapper that
     /// calls `decode_soft_with_features` and discards the features.
     /// Kept as the canonical decode entry point for all callers that
-    /// don't need confidence telemetry — the 11 existing call sites
-    /// stay byte-identical to their pre-Session-2 behavior.
+    /// don't need confidence telemetry — the existing call sites
+    /// stay byte-identical to their pre-feature behavior.
     pub fn decode_soft(&self, llrs: &[f32]) -> Ft8Result<BitVec> {
         let (bits, _features) = self.decode_soft_with_features(llrs)?;
         Ok(bits)
     }
 
-    /// FDR Session 2 — soft-decision decode that returns BP convergence
+    /// Soft-decision decode that returns BP convergence
     /// features alongside the decoded codeword. The features struct's
     /// `bp_iterations_used` and `min_llr_magnitude` are populated from
     /// the BP trajectory's convergence point. `osd_depth_used` and
-    /// `nharderrs` remain `None` until Session 3 plumbs the OSD path.
-    /// Inspired by spec ref `spec-wsjtx-improved-fdr.md` §"Inputs".
+    /// `nharderrs` remain `None` until a later pass plumbs the OSD path.
+    /// Inspired by WSJT-X Improved's feature-driven decode-refinement.
     pub fn decode_soft_with_features(
         &self,
         llrs: &[f32],
@@ -10342,14 +10276,14 @@ impl LdpcDecoder {
         Ok((out, traj))
     }
 
-    /// FDR Session 2: BP variant that captures convergence telemetry
+    /// BP variant that captures convergence telemetry
     /// alongside the trajectory. `iterations_used` is the 1-indexed
     /// iteration at which the syndrome cleared (or `max_iterations`
     /// when BP didn't converge). `min_llr_magnitude` is
     /// `min_i |output_llrs[i]|` over the 174-bit codeword. The
     /// trajectory contract is unchanged: `Some(traj)` when BP fails to
-    /// converge, `None` when it succeeds. Inspired by spec ref
-    /// `spec-wsjtx-improved-fdr.md` §"Inputs".
+    /// converge, `None` when it succeeds. Inspired by WSJT-X Improved's
+    /// feature-driven decode-refinement.
     // rationale: the (llrs, trajectory, telemetry) tuple is the BP telemetry
     // contract documented above; a type alias would obscure the dimensions.
     #[allow(clippy::type_complexity)]
@@ -10850,7 +10784,7 @@ mod tests {
         );
     }
 
-    /// Batch 92: `costas_half_loop_disabled` semantics.
+    /// `costas_half_loop_disabled` semantics.
     ///
     /// 1. Plateau identity (the redundancy claim as an executable
     ///    assertion): with the flag OFF, `score(t0) == max(g(t0),
@@ -11316,7 +11250,7 @@ mod tests {
         assert!(metrics.processing_time.as_millis() > 0);
     }
 
-    /// hb-129: every decode that survives CRC must carry a presentation-time
+    /// Every decode that survives CRC must carry a presentation-time
     /// `decode_time_into_window` stamp. Exercises the full pipeline with a
     /// synthetic FT8 transmission, then verifies every emitted message has a
     /// non-zero stamp that does not exceed the wall-clock processing time.
@@ -11914,7 +11848,7 @@ mod tests {
         }
     }
 
-    /// hb-242: on a fully-clean signal (all three Costas blocks
+    /// On a fully-clean signal (all three Costas blocks
     /// present), the full ABC metric and partial BC metric agree
     /// within a small tolerance.
     #[test]
@@ -11936,7 +11870,7 @@ mod tests {
         );
     }
 
-    /// hb-242 core: when block A is zeroed out (slot-edge negative-dt
+    /// When block A is zeroed out (slot-edge negative-dt
     /// scenario), the full ABC metric collapses while the partial BC
     /// metric stays meaningful.
     #[test]
@@ -11959,7 +11893,7 @@ mod tests {
         );
     }
 
-    /// hb-242: costas_sync_search_with_threshold recovers the (t0=0,
+    /// costas_sync_search_with_threshold recovers the (t0=0,
     /// f0) candidate when only blocks B+C are present.
     #[test]
     fn hb242_sync_search_recovers_block_a_missing_candidate() {
@@ -11987,12 +11921,12 @@ mod tests {
         );
     }
 
-    /// hb-242 negative control: turning the partial-Costas metric off
+    /// Negative control: turning the partial-Costas metric off
     /// should lower the (t0=0, f0) sync_score on the block-A-missing
     /// spec. The candidate may still survive the absolute gate on
     /// synthetic-clean noise (block A's per-symbol signal_dB -
     /// neighbor_dB ≈ 0 averages harmlessly into the ABC metric); the
-    /// production payoff is measured on hard-200 separately.
+    /// production payoff is measured on a real corpus separately.
     #[test]
     fn hb242_disabled_lowers_block_a_missing_score() {
         let f0 = 240usize;
@@ -12024,7 +11958,7 @@ mod tests {
         );
     }
 
-    /// hb-242 wide-lag baseline: when enabled, a clean signal still
+    /// Wide-lag baseline: when enabled, a clean signal still
     /// keeps its main candidate. The mechanism is additive.
     #[test]
     fn hb242_two_baseline_preserves_clean_candidate() {
@@ -12052,9 +11986,10 @@ mod tests {
         );
     }
 
-    /// hb-245 subsample DT refinement: an aligned synthetic signal
+    /// Subsample DT refinement: an aligned synthetic signal
     /// produces a `time_refinement` in [-0.5, +0.5]. Verifies
-    /// pancetta's hb-044 implementation satisfies the hb-245 spec.
+    /// pancetta's parabolic-refinement implementation satisfies the
+    /// subsample DT refinement spec.
     #[test]
     fn hb245_aligned_signal_has_bounded_time_refinement() {
         let mut config = Ft8Config::default();
@@ -13960,9 +13895,8 @@ mod llr_whitening_tests {
     }
 }
 
-/// ft8mon-style three-stage sync cascade tests. Inspired by spec ref
-/// `research/specs/spec-ft8mon-three-stage-sync-cascade.md`. The tests
-/// cover:
+/// ft8mon-style three-stage sync cascade tests. Inspired by ft8mon's
+/// three-stage sync cascade. The tests cover:
 ///
 /// 1. Default config keeps the cascade OFF (regression guard).
 /// 2. The known-coherence score is highest for a perfectly-aligned
@@ -14876,7 +14810,7 @@ mod auto_passband_tests {
     }
 
     /// Default config: `auto_passband_enabled = false`. The default-OFF
-    /// promise is a regression guard — flipping ON requires a hard-200
+    /// promise is a regression guard — flipping ON requires a corpus
     /// measurement, per the field doc-comment.
     #[test]
     fn default_config_keeps_auto_passband_off() {
@@ -15105,7 +15039,7 @@ mod auto_passband_tests {
     }
 }
 
-/// hb-247: end-to-end test for decode-origin stamping. Helper-level
+/// End-to-end test for decode-origin stamping. Helper-level
 /// behavior (set-when-absent, no-overwrite, feature preservation) is
 /// pinned in `message.rs::decode_origin_tests`; this module checks the
 /// pipeline actually stamps.
@@ -15163,10 +15097,9 @@ mod decode_origin_e2e_tests {
 mod bicm_id_tests {
     use super::*;
 
-    /// hb-252 default-OFF promise: BICM-ID must be opt-in. Regression
+    /// Default-OFF promise: BICM-ID must be opt-in. Regression
     /// guard against accidental flips — toggling default-ON requires a
-    /// graduation measurement per the verdict bars in
-    /// `research/notes/2026-06-12-batch97-bicm-id.md`.
+    /// graduation measurement.
     #[test]
     fn default_config_keeps_bicm_id_off() {
         let cfg = Ft8Config::default();
@@ -15197,7 +15130,7 @@ mod bicm_id_tests {
         .is_none());
     }
 
-    /// Batch 98 near-converged gate: `max_unsatisfied == 0` must block
+    /// Near-converged gate: `max_unsatisfied == 0` must block
     /// the rescue on any candidate whose seed BP hard decision has at
     /// least one unsatisfied parity check (i.e. every CRC-failed
     /// candidate, by construction).
@@ -15239,10 +15172,9 @@ mod bicm_id_tests {
         );
     }
 
-    /// Batch 98 default for the near-converged gate, pinned so a
+    /// Default for the near-converged gate, pinned so a
     /// re-tune is a deliberate, journaled act (the value was chosen
-    /// from the instrumentation distribution in
-    /// `research/notes/2026-06-12-batch98-bicm-id-gated.md`).
+    /// from the instrumentation distribution).
     #[test]
     fn default_config_gate_value_is_pinned() {
         assert_eq!(Ft8Config::default().bicm_id_max_unsatisfied_checks, 18);
@@ -15296,7 +15228,7 @@ mod bicm_id_tests {
         }
     }
 
-    /// Fairness check demanded by the hb-252 pre-registration: nonzero
+    /// Fairness check from the pre-registration: nonzero
     /// a-priori feedback must actually CHANGE the refreshed LLRs — a
     /// no-op bug must not masquerade as a SHELVE-grade null result.
     #[test]
@@ -15365,7 +15297,7 @@ mod bicm_id_tests {
         );
     }
 
-    /// hb-252 byte-identity promise: a decode with an explicit
+    /// Byte-identity promise: a decode with an explicit
     /// `bicm_id_iterations: 0` must produce exactly the same decode list
     /// as `Ft8Config::default()` (which is 0), on a synthetic
     /// signal-plus-deterministic-noise window. Guards the
@@ -15490,7 +15422,7 @@ mod llr_metric_tests {
         assert_eq!(lse2(3.0, f64::NEG_INFINITY), 3.0);
     }
 
-    /// hb-253 default promise: the metric must default to DualMax.
+    /// Default promise: the metric must default to DualMax.
     #[test]
     fn default_config_metric_is_dual_max() {
         assert_eq!(Ft8Config::default().llr_metric, LlrMetric::DualMax);
@@ -15559,7 +15491,7 @@ mod llr_metric_tests {
         }
     }
 
-    /// hb-253 byte-identity promise: an explicit `llr_metric: DualMax`
+    /// Byte-identity promise: an explicit `llr_metric: DualMax`
     /// must produce exactly the same decode list as
     /// `Ft8Config::default()` on a synthetic
     /// signal-plus-deterministic-noise window. Guards the metric
@@ -15652,7 +15584,7 @@ mod llr_metric_tests {
 mod em_reestimation_tests {
     use super::*;
 
-    /// hb-259 default-OFF promise: EM re-estimation must be opt-in.
+    /// Default-OFF promise: EM re-estimation must be opt-in.
     #[test]
     fn default_config_keeps_em_reestimation_off() {
         assert!(
@@ -15786,7 +15718,7 @@ mod em_reestimation_tests {
         );
     }
 
-    /// hb-259 byte-identity promise: an explicit
+    /// Byte-identity promise: an explicit
     /// `bicm_id_em_reestimation: true` with everything else default
     /// (BICM-ID off, DualMax metric — the rescue never runs) must
     /// produce exactly the same decode list as `Ft8Config::default()`.
