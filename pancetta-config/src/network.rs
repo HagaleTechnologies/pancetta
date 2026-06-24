@@ -71,7 +71,7 @@ pub struct NetworkConfig {
 /// a single ADIF record to ClubLog's `realtime.php` endpoint. All credentials
 /// stay on the operator's machine (keep the config file `chmod 600`) and are
 /// never logged.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct ClubLogConfig {
     /// Enable per-QSO uploads to ClubLog.
     #[serde(default)]
@@ -101,7 +101,7 @@ pub struct ClubLogConfig {
 /// a single ADIF record to the QRZ Logbook API (`logbook.qrz.com/api`). The
 /// API key is per-logbook (from the logbook's Settings page) and is never
 /// logged. Keep the config file `chmod 600`.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct QrzLogbookConfig {
     /// Enable per-QSO uploads to QRZ Logbook.
     #[serde(default)]
@@ -142,7 +142,7 @@ pub struct LotwUploadConfig {
 /// a single ADIF record to eQSL.cc's `importADIF.cfm` endpoint. The account
 /// credentials stay on the operator's machine (keep the config file
 /// `chmod 600`) and are never logged.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct EqslConfig {
     /// Enable per-QSO uploads to eQSL.cc.
     #[serde(default)]
@@ -174,7 +174,7 @@ pub struct EqslConfig {
 /// The client ([`QrzXmlClient`](../../pancetta_dx/struct.QrzXmlClient.html)) is
 /// a scaffold: it is not yet wired into the decode/priority hot path (a later
 /// operator decision).
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct QrzXmlConfig {
     /// Enable QRZ XML callsign lookups.
     #[serde(default)]
@@ -566,7 +566,7 @@ pub enum AuthMethod {
 }
 
 /// API key definition
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApiKey {
     /// Key name/identifier
     pub name: String,
@@ -585,7 +585,7 @@ pub struct ApiKey {
 }
 
 /// JWT configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct JwtConfig {
     /// JWT secret key (encrypted)
     pub secret_encrypted: String,
@@ -1329,9 +1329,107 @@ impl ConfigSection for NetworkConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Redacting Debug for credential-bearing configs (security review §3.1).
+// These structs hold plaintext secrets; `#[derive(Debug)]` was removed so a
+// stray `debug!("{:?}", cfg)` or a panic that formats one can never dump a
+// password / api_key / cert secret. Non-secret fields are still shown.
+// ---------------------------------------------------------------------------
+const REDACTED: &str = "<redacted>";
+
+impl std::fmt::Debug for ClubLogConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClubLogConfig")
+            .field("enabled", &self.enabled)
+            .field("email", &self.email)
+            .field("password", &REDACTED)
+            .field("callsign", &self.callsign)
+            .field("api_key", &REDACTED)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for QrzLogbookConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QrzLogbookConfig")
+            .field("enabled", &self.enabled)
+            .field("api_key", &REDACTED)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for EqslConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EqslConfig")
+            .field("enabled", &self.enabled)
+            .field("username", &self.username)
+            .field("password", &REDACTED)
+            .field("qth_nickname", &self.qth_nickname)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for QrzXmlConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QrzXmlConfig")
+            .field("enabled", &self.enabled)
+            .field("username", &self.username)
+            .field("password", &REDACTED)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKey")
+            .field("name", &self.name)
+            .field("key_encrypted", &REDACTED)
+            .field("permissions", &self.permissions)
+            .field("expires_at", &self.expires_at)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for JwtConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtConfig")
+            .field("secret_encrypted", &REDACTED)
+            .field("expiration_hours", &self.expiration_hours)
+            .field("issuer", &self.issuer)
+            .field("audience", &self.audience)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_debug_is_redacted() {
+        // A secret must never appear in Debug output (defense-in-depth: a stray
+        // debug!("{:?}", cfg) or a panic that formats config can't leak it).
+        let mut cl = ClubLogConfig::default();
+        cl.password = "hunter2SECRET".into();
+        cl.api_key = "clubKEY_abc".into();
+        let s = format!("{cl:?}");
+        assert!(!s.contains("hunter2SECRET"), "ClubLog password leaked: {s}");
+        assert!(!s.contains("clubKEY_abc"), "ClubLog api_key leaked: {s}");
+        assert!(s.contains("<redacted>"));
+
+        let mut eq = EqslConfig::default();
+        eq.password = "eqslPW_xyz".into();
+        assert!(!format!("{eq:?}").contains("eqslPW_xyz"));
+
+        let mut qx = QrzXmlConfig::default();
+        qx.password = "qrzPW_123".into();
+        assert!(!format!("{qx:?}").contains("qrzPW_123"));
+
+        let mut qb = QrzLogbookConfig::default();
+        qb.api_key = "qrzLogbookKEY".into();
+        assert!(!format!("{qb:?}").contains("qrzLogbookKEY"));
+    }
 
     #[test]
     fn test_default_network_config() {

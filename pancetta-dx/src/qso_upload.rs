@@ -572,9 +572,22 @@ impl LotwClient {
             file_body.push('\n');
         }
 
-        tokio::fs::write(&path, &file_body)
-            .await
-            .map_err(DxError::Io)?;
+        // Create the temp file EXCLUSIVELY (O_EXCL) so a co-tenant who
+        // pre-planted a symlink at this guessable /tmp path can't have our
+        // rendered ADIF written through it, and owner-only (0600) on Unix. It's
+        // a tiny, once-per-QSO write, so synchronous I/O here is fine.
+        {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts.open(&path).map_err(DxError::Io)?;
+            f.write_all(file_body.as_bytes()).map_err(DxError::Io)?;
+        }
 
         let path_str = path.to_string_lossy().to_string();
         let args = self.build_args(&path_str);

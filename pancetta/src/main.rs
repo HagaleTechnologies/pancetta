@@ -1248,7 +1248,15 @@ fn init_logging(cli: &Cli, headless: bool) -> Result<tracing_appender::non_block
     // Create log directory (ignore errors — file logging is best-effort)
     let _ = std::fs::create_dir_all(&log_dir);
 
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "pancetta.log");
+    // Daily rotation with a retention cap so an always-on appliance doesn't
+    // accumulate one log file per day forever (security review §5.4). Keep ~2
+    // weeks; fall back to the uncapped daily appender if the builder fails.
+    let file_appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("pancetta.log")
+        .max_log_files(14)
+        .build(&log_dir)
+        .unwrap_or_else(|_| tracing_appender::rolling::daily(&log_dir, "pancetta.log"));
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let file_layer = tracing_subscriber::fmt::layer()

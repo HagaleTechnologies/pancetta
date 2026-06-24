@@ -47,14 +47,22 @@ impl CqdxClient {
     /// The base URL must use `https://` or `http://localhost` (for development).
     /// Returns an error if the URL scheme is not allowed.
     pub fn new(base_url: String, token: String) -> Result<Self> {
-        // SSRF mitigation: only allow HTTPS or localhost HTTP
-        let url_lower = base_url.to_lowercase();
-        if !url_lower.starts_with("https://")
-            && !url_lower.starts_with("http://localhost")
-            && !url_lower.starts_with("http://127.0.0.1")
-        {
+        // SSRF / token-exfil mitigation: parse the URL properly (a prefix check
+        // like `starts_with("http://localhost")` is bypassable by
+        // `http://localhost.attacker.com/`). Require https, OR http only for a
+        // genuine loopback host. The bearer token rides every request, so this
+        // guards against the operator's base_url being pointed somewhere it
+        // would leak in cleartext.
+        let parsed = reqwest::Url::parse(&base_url).map_err(|e| {
+            CqdxError::InvalidBaseUrl(format!("base_url is not a valid URL: {e} ({base_url})"))
+        })?;
+        let host = parsed.host_str().unwrap_or("");
+        let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]");
+        let scheme_ok = parsed.scheme() == "https" || (parsed.scheme() == "http" && is_loopback);
+        if !scheme_ok {
             return Err(CqdxError::InvalidBaseUrl(format!(
-                "base_url must use https:// or http://localhost, got: {}",
+                "base_url must use https://, or http:// only for a loopback host \
+                 (localhost/127.0.0.1/::1), got: {}",
                 base_url
             )));
         }
@@ -85,6 +93,9 @@ impl CqdxClient {
         // takes the whole TUI down with no operator-visible reason.
         let http = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
+            // Never follow redirects: a 3xx could relocate the bearer token to
+            // another host. The cqdx API does not redirect.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(CqdxError::HttpInit)?;
         Ok(Self {
@@ -374,6 +385,23 @@ mod tests {
 
     fn test_client(base_url: &str) -> CqdxClient {
         CqdxClient::new(base_url.to_string(), "pat_test_token".to_string()).unwrap()
+    }
+
+    #[test]
+    fn base_url_guard_parses_host_not_prefix() {
+        let ok = |u: &str| CqdxClient::new(u.to_string(), "pat_test_token".to_string()).is_ok();
+        // Accepted: https anywhere, http only for genuine loopback.
+        assert!(ok("https://cqdx.io"));
+        assert!(ok("https://api.cqdx.io/v1"));
+        assert!(ok("http://localhost:8080"));
+        assert!(ok("http://127.0.0.1:3000"));
+        // Rejected: the prefix-bypass that `starts_with` would have allowed.
+        assert!(!ok("http://localhost.attacker.com/"));
+        assert!(!ok("http://127.0.0.1.evil.com/"));
+        // Rejected: plain http to a non-loopback host (cleartext token).
+        assert!(!ok("http://cqdx.io"));
+        // Rejected: not a URL at all.
+        assert!(!ok("cqdx.io"));
     }
 
     #[test]
