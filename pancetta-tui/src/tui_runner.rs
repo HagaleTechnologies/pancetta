@@ -1173,12 +1173,25 @@ impl TuiRunner {
 
     /// Render device selection modal as an overlay
     fn render_device_selection_modal(f: &mut Frame, area: Rect, state: &DeviceSelectionState) {
+        // Defensive: a zero/near-zero area (terminal not yet sized, or a
+        // remote session reporting 0×0 at launch) makes every dimension
+        // computation below underflow. In release builds an unchecked
+        // `area.height - 2` wraps to a huge u16 → out-of-bounds render →
+        // SIGBUS ("bus error") instead of a clean panic. Skip the overlay
+        // entirely until there's room for it; the base UI's min-size guard
+        // already shows the "terminal too small" notice.
+        if area.width < 10 || area.height < 4 {
+            return;
+        }
         // Modal dimensions: roughly 60% width, height to fit content
-        let modal_width = (area.width * 3 / 5).clamp(40, 70);
+        let modal_width = (area.width * 3 / 5).clamp(40, 70).min(area.width);
         let modal_height = {
             let max_devices = state.input_devices.len().max(state.output_devices.len());
             // title(1) + border(2) + header(1) + devices + footer(2) + border
-            (max_devices as u16 + 7).min(area.height - 2).max(10)
+            (max_devices as u16 + 7)
+                .min(area.height.saturating_sub(2))
+                .max(10)
+                .min(area.height)
         };
 
         let modal_area = Rect {
@@ -1696,6 +1709,31 @@ mod key_tests {
         let (mut r, _cmd_rx, app) = make_runner().await;
         r.handle_key_event(key_shift('D')).await.unwrap();
         assert!(!app.read().await.device_selection.visible);
+    }
+
+    /// Regression: the device-selection modal must not underflow its
+    /// dimension math at a tiny/zero terminal area. Pre-fix, `area.height
+    /// - 2` underflowed → debug panic / release SIGBUS ("bus error" on
+    /// launch over a remote session reporting 0×0). Render at a range of
+    /// degenerate sizes and assert no panic.
+    #[test]
+    fn device_modal_renders_without_underflow_at_tiny_sizes() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut state = DeviceSelectionState::new();
+        state.input_devices = vec![("USB CODEC".into(), true), ("Jump Audio".into(), false)];
+        state.output_devices = vec![("USB CODEC".into(), true)];
+        state.visible = true;
+
+        for (w, h) in [(1u16, 1u16), (0, 0), (3, 1), (10, 2), (40, 3), (80, 24)] {
+            let backend = TestBackend::new(w.max(1), h.max(1));
+            let mut terminal = Terminal::new(backend).unwrap();
+            // Must not panic (subtract-with-overflow) at any size.
+            terminal
+                .draw(|f| {
+                    TuiRunner::render_device_selection_modal(f, f.area(), &state);
+                })
+                .unwrap();
+        }
     }
 
     #[tokio::test]

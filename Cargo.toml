@@ -137,6 +137,17 @@ strip = true
 overflow-checks = false
 debug-assertions = false
 
+# The TUI does layout arithmetic on terminal dimensions that can hit zero
+# (terminal not yet sized, a remote/SSH session reporting 0×0 at launch).
+# An unchecked `area.height - 2` underflow wraps silently in release →
+# out-of-bounds render → SIGBUS ("bus error") instead of a catchable
+# panic. The TUI is not on the decode hot path, so turn overflow checks
+# back on for just this crate: a stray underflow becomes a clean unwind
+# (logged, recoverable) rather than a hard process crash. Cost is
+# negligible — the render loop is nowhere near CPU-bound.
+[profile.release.package.pancetta-tui]
+overflow-checks = true
+
 [profile.dev]
 # Fast compilation for development
 opt-level = 1
