@@ -195,12 +195,7 @@ impl RfNoDecodeMonitor {
     /// - `dsp_windows`: cumulative count of FT8 windows the DSP has produced.
     /// - `total_decodes`: cumulative count of decodes.
     /// - `last_rms`: most recent per-window RMS.
-    pub fn observe(
-        &mut self,
-        dsp_windows: u64,
-        total_decodes: u64,
-        last_rms: f32,
-    ) -> HealthEdges {
+    pub fn observe(&mut self, dsp_windows: u64, total_decodes: u64, last_rms: f32) -> HealthEdges {
         // First observation just seeds the baseline; we can't compute a delta.
         if !self.initialized {
             self.last_windows = dsp_windows;

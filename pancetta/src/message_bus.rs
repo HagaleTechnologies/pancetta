@@ -579,7 +579,6 @@ impl ComponentMessage {
         }
     }
 
-
     /// Get message age in microseconds
     pub fn age_us(&self) -> u64 {
         self.timestamp.elapsed().as_micros() as u64
@@ -877,7 +876,6 @@ impl MessageBus {
 
         Ok(())
     }
-
 }
 
 /// Message bus performance statistics
@@ -993,5 +991,4 @@ mod tests {
         assert_eq!(message.priority, 128);
         assert_eq!(message.hop_count, 0);
     }
-
 }

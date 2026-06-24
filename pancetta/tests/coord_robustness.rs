@@ -547,7 +547,11 @@ fn c20_warning_clears_when_decodes_resume() {
     // Decodes resume → warning clears on the falling edge.
     decodes += 3;
     let edge = m
-        .observe((RfNoDecodeMonitor::WARN_AFTER_SLOTS + 1) as u64, decodes, RF)
+        .observe(
+            (RfNoDecodeMonitor::WARN_AFTER_SLOTS + 1) as u64,
+            decodes,
+            RF,
+        )
         .rf_no_decode;
     assert_eq!(edge, Some(false), "warning must clear when decodes resume");
     assert!(!m.warning_active());
@@ -582,12 +586,12 @@ fn silent_input_raises_and_clears_warning() {
     assert!(m.silent_input_active());
     // Audio returns (RF present) → silent warning clears on the falling edge.
     let edge = m
-        .observe(
-            (RfNoDecodeMonitor::WARN_AFTER_SLOTS + 1) as u64,
-            0,
-            RF,
-        )
+        .observe((RfNoDecodeMonitor::WARN_AFTER_SLOTS + 1) as u64, 0, RF)
         .silent_input;
-    assert_eq!(edge, Some(false), "silent warning clears when audio returns");
+    assert_eq!(
+        edge,
+        Some(false),
+        "silent warning clears when audio returns"
+    );
     assert!(!m.silent_input_active());
 }

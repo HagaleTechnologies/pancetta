@@ -484,16 +484,14 @@ mod tests {
         // Lookup A: needed but NOT atno.
         let plain = CachedStationLookup::new();
         plain.update_needed_dxcc(needed.clone());
-        let plain_scorer =
-            PriorityScorer::new(PriorityWeights::default(), Box::new(plain));
+        let plain_scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(plain));
         let plain_score = plain_scorer.evaluate_cq("3Y/B1234", None, -10, 14_074_000.0);
 
         // Lookup B: needed AND atno.
         let atno_lookup = CachedStationLookup::new();
         atno_lookup.update_needed_dxcc(needed.clone());
         atno_lookup.update_needed_atno(needed);
-        let atno_scorer =
-            PriorityScorer::new(PriorityWeights::default(), Box::new(atno_lookup));
+        let atno_scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(atno_lookup));
         let atno_score = atno_scorer.evaluate_cq("3Y/B1234", None, -10, 14_074_000.0);
 
         assert!(
