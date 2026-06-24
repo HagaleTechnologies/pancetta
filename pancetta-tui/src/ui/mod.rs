@@ -28,6 +28,16 @@ use station_info::render_station_info;
 pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     let size = f.area();
 
+    // Paint an opaque full-frame background first so every cell carries an
+    // explicit bg. This guarantees the alternate screen fully covers the
+    // terminal's pre-launch scrollback even where a widget paints nothing
+    // (e.g. an empty waterfall when audio is silent) — those gaps would
+    // otherwise show through.
+    f.render_widget(
+        Block::default().style(Style::default().bg(app.theme.background_color())),
+        size,
+    );
+
     // Minimum-size guard. Below this the multi-panel layout degrades into
     // unreadable empty boxes (and panels silently drop content); show an
     // explicit resize prompt instead so a new operator isn't staring at a

@@ -322,7 +322,14 @@ impl TuiRunner {
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
         let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
+        let mut terminal = Terminal::new(backend)?;
+        // Force a full repaint on the first draw. Without this, ratatui's
+        // first frame diffs against its default-blank buffer and skips any
+        // cell that matches the default (e.g. regions a widget leaves
+        // unpainted), so the terminal's pre-launch scrollback bleeds through
+        // the alternate screen. clear() resets the back buffer so every cell
+        // is written on the next draw.
+        terminal.clear()?;
 
         Ok(Self {
             app,
