@@ -77,6 +77,15 @@ pub struct DecodedMessageView {
     /// Defaults to `false` in test fixtures and legacy paths.
     #[serde(default)]
     pub worked_before: bool,
+    /// `true` if this station's DXCC entity is still needed (from cqdx.io's
+    /// needed set, via the same `CachedStationLookup` the scorer uses).
+    /// Inert (always false) when cqdx is unconfigured. Test-default false.
+    #[serde(default)]
+    pub needed: bool,
+    /// `true` if the entity is an ATNO (all-time new one — never worked on
+    /// any band). A strict subset of `needed`. Test-default false.
+    #[serde(default)]
+    pub atno: bool,
 }
 
 /// One in-progress QSO surfaced to the operator. Coordinator-side QSO
@@ -249,6 +258,10 @@ pub struct DxStation {
     pub distance: Option<f64>,
     pub bearing: Option<f64>,
     pub worked_before: bool,
+    /// DXCC entity still needed (cqdx needed set). Inert when cqdx is off.
+    pub needed: bool,
+    /// Entity is an ATNO (all-time new one). Subset of `needed`.
+    pub atno: bool,
     pub priority_score: u32,
     // CQDX network metadata
     pub source: SpotSource,
@@ -898,6 +911,8 @@ impl App {
                     entry.distance = message.distance;
                     entry.bearing = message.bearing;
                     entry.worked_before = message.worked_before;
+                    entry.needed = message.needed;
+                    entry.atno = message.atno;
                     entry.audio_offset_hz = Some(audio_offset_hz);
                     entry.slot_parity = message.slot_parity;
                     // A station previously known only from the network is
@@ -930,6 +945,8 @@ impl App {
                             // duplicate penalty (band-scoped, uppercase-exact
                             // match).
                             worked_before: message.worked_before,
+                            needed: message.needed,
+                            atno: message.atno,
                             priority_score: local_score,
                             source: SpotSource::Local,
                             entity_name: None,
@@ -1470,6 +1487,7 @@ impl App {
             .map(|q| q.qso_id.clone());
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_dx_spot(
         &mut self,
         callsign: String,
@@ -1477,6 +1495,8 @@ impl App {
         mode: String,
         snr: i32,
         worked_before: bool,
+        needed: bool,
+        atno: bool,
     ) {
         let dx_station = DxStation {
             call_sign: callsign.clone(),
@@ -1491,6 +1511,8 @@ impl App {
             // CachedStationLookup (same source as the autonomous
             // scorer's duplicate penalty), keyed on the spot frequency.
             worked_before,
+            needed,
+            atno,
             priority_score: 0,
             source: SpotSource::Local,
             entity_name: None,
@@ -2074,6 +2096,8 @@ impl App {
                     distance: None,
                     bearing: None,
                     worked_before: false,
+                    needed: spot.needed,
+                    atno: spot.atno,
                     priority_score: 0,
                     source: SpotSource::Network,
                     entity_name: Some(spot.entity_name.clone()).filter(|s| !s.is_empty()),
@@ -2101,6 +2125,9 @@ impl App {
             entry.confidence = Some(spot.confidence);
             entry.best_snr_network = spot.best_snr;
             entry.last_seen_network = Some(spot.last_seen);
+            // cqdx is authoritative for needs; keep them current each tick.
+            entry.needed = spot.needed;
+            entry.atno = spot.atno;
             if !spot.entity_name.is_empty() {
                 entry.entity_name = Some(spot.entity_name.clone());
             }
@@ -2467,6 +2494,8 @@ mod tests {
             slot_parity: None,
             is_directed_at_us: false,
             worked_before: false,
+            needed: false,
+            atno: false,
         }
     }
 
@@ -3009,6 +3038,8 @@ mod tests {
             distance: None,
             bearing: None,
             worked_before,
+            needed: false,
+            atno: false,
             priority_score: priority,
             source: SpotSource::Local,
             entity_name: None,

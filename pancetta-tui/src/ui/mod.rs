@@ -57,7 +57,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
             x: size.x,
             y: size.y + y.saturating_sub(1).min(size.height.saturating_sub(1)),
             width: size.width,
-            height: size.height.saturating_sub(y).min(3).max(1),
+            height: size.height.saturating_sub(y).clamp(1, 3),
         };
         f.render_widget(p, area);
         return Ok(());

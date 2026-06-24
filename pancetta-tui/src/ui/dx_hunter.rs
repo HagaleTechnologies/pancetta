@@ -82,7 +82,7 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
 
     let widths = [
         Constraint::Length(4),  // Src
-        Constraint::Length(10), // Call (★ + up to ~8 chars)
+        Constraint::Length(12), // Call (!/+ need + ★ markers + up to ~8 chars)
         Constraint::Min(8),     // Entity (flexes into the freed Freq space)
         Constraint::Length(4),  // Grid
         Constraint::Length(4),  // SNR
@@ -150,12 +150,14 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
         SpotSource::Both => Style::default().fg(ratatui::style::Color::Cyan),
     };
 
-    // Callsign with notable prefix
-    let call_display = if station.is_notable {
-        format!("★{}", station.call_sign)
-    } else {
-        station.call_sign.clone()
-    };
+    // Callsign with need/notable markers. `!` = ATNO (all-time new one),
+    // `+` = needed DXCC (not ATNO), `★` = notable. Markers stack so an
+    // ATNO that's also notable reads "!★CALL".
+    let call_display = format!(
+        "{}{}",
+        need_marker(station.atno, station.needed, station.is_notable),
+        station.call_sign
+    );
 
     // Staleness check for network-only spots
     let is_stale = if station.source != SpotSource::Local {
@@ -172,12 +174,23 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
 
     let call_style = if is_stale {
         Style::default().fg(app.theme.muted_color())
+    } else if station.atno {
+        // ATNO — the highest-value catch. Bold magenta + underline so it
+        // stands apart from merely-notable (bold magenta) rows.
+        Style::default()
+            .fg(ratatui::style::Color::Magenta)
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
     } else if station.is_notable {
         Style::default()
             .fg(ratatui::style::Color::Magenta)
             .add_modifier(Modifier::BOLD)
     } else if station.worked_before {
         Style::default().fg(app.theme.muted_color())
+    } else if station.needed {
+        // Needed DXCC (band-fill, not ATNO): bold accent.
+        Style::default()
+            .fg(app.theme.error_color())
+            .add_modifier(Modifier::BOLD)
     } else if is_rare_dx_from_tier(station) {
         Style::default()
             .fg(app.theme.error_color())
@@ -254,6 +267,23 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
         Cell::from(last_str).style(dim),
         Cell::from(pri_str).style(priority_style),
     ])
+}
+
+/// Build the callsign-prefix marker string for the DX Hunter:
+/// `!` for ATNO, `+` for a needed (non-ATNO) DXCC, then `★` for notable.
+/// ATNO and needed are mutually exclusive (ATNO wins). Returns `""` for a
+/// plain station.
+fn need_marker(atno: bool, needed: bool, notable: bool) -> String {
+    let mut s = String::new();
+    if atno {
+        s.push('!');
+    } else if needed {
+        s.push('+');
+    }
+    if notable {
+        s.push('★');
+    }
+    s
 }
 
 fn get_snr_color(snr: i32, theme: &crate::config::Theme) -> ratatui::style::Color {
@@ -446,6 +476,8 @@ mod tests {
             distance: Some(8000.0),
             bearing: Some(45.0),
             worked_before: false,
+            needed: false,
+            atno: false,
             priority_score: 0,
             source: crate::app::SpotSource::Local,
             entity_name: None,
@@ -477,5 +509,20 @@ mod tests {
         // A local 0 dB decode is a real measurement -> "+0", never "---".
         assert_eq!(format_dx_snr(&SpotSource::Local, 0, None), "+0");
         assert_eq!(format_dx_snr(&SpotSource::Both, 12, Some(12)), "+12");
+    }
+
+    #[test]
+    fn need_marker_priority_and_stacking() {
+        // Plain station — no marker.
+        assert_eq!(need_marker(false, false, false), "");
+        // Needed (non-ATNO) → '+'.
+        assert_eq!(need_marker(false, true, false), "+");
+        // ATNO → '!' and beats the '+' even if needed is also set.
+        assert_eq!(need_marker(true, true, false), "!");
+        // Notable stacks after the need marker.
+        assert_eq!(need_marker(true, true, true), "!★");
+        assert_eq!(need_marker(false, true, true), "+★");
+        // Notable-only.
+        assert_eq!(need_marker(false, false, true), "★");
     }
 }

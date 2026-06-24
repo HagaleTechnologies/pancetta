@@ -308,6 +308,15 @@ impl CqdxBridge {
                                     is_notable: g.is_notable,
                                     notable_type: g.notable_type.clone(),
                                     entity_name: g.dx_entity_name.clone(),
+                                    // Same CachedStationLookup the scorer uses.
+                                    needed: {
+                                        use pancetta_qso::priority::WorkedStationLookup;
+                                        cached_lookup.is_needed_dxcc(&g.dx_call)
+                                    },
+                                    atno: {
+                                        use pancetta_qso::priority::WorkedStationLookup;
+                                        cached_lookup.is_atno(&g.dx_call)
+                                    },
                                 })
                                 .collect();
                             let _ =

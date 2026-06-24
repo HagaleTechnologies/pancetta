@@ -193,6 +193,8 @@ impl super::ApplicationCoordinator {
                                 call_sign.as_deref(),
                                 dial_mhz * 1_000_000.0,
                             );
+                            let (needed, atno) =
+                                needed_atno_for(&relay_station_lookup, call_sign.as_deref());
 
                             let tui_decoded = pancetta_tui::DecodedMessageView {
                                 timestamp: chrono::Utc::now(),
@@ -209,6 +211,8 @@ impl super::ApplicationCoordinator {
                                 slot_parity: decoded_msg.slot_parity,
                                 is_directed_at_us,
                                 worked_before,
+                                needed,
+                                atno,
                             };
 
                             match tui_msg_tx_relay.send(
@@ -349,12 +353,16 @@ impl super::ApplicationCoordinator {
                                 Some(callsign.as_str()),
                                 frequency as f64,
                             );
+                            let (needed, atno) =
+                                needed_atno_for(&relay_station_lookup, Some(callsign.as_str()));
                             let _ = tui_msg_tx_relay.send(
                                 pancetta_tui::tui_runner::TuiMessage::DxSpot {
                                     callsign,
                                     frequency,
                                     spotter,
                                     worked_before,
+                                    needed,
+                                    atno,
                                 },
                             );
                         }
@@ -1484,6 +1492,21 @@ fn worked_before_for(
     match callsign {
         Some(c) if !c.is_empty() => lookup.is_duplicate(c, freq_hz),
         _ => false,
+    }
+}
+
+/// Compute `(needed, atno)` for a callsign against the same
+/// `CachedStationLookup` the autonomous scorer consults. Both inert
+/// (false) when cqdx supplies no needed set, or the callsign is absent.
+/// `atno` implies `needed`.
+fn needed_atno_for(
+    lookup: &crate::priority_evaluator::CachedStationLookup,
+    callsign: Option<&str>,
+) -> (bool, bool) {
+    use pancetta_qso::priority::WorkedStationLookup;
+    match callsign {
+        Some(c) if !c.is_empty() => (lookup.is_needed_dxcc(c), lookup.is_atno(c)),
+        _ => (false, false),
     }
 }
 

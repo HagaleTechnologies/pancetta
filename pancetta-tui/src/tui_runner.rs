@@ -78,6 +78,12 @@ pub struct CqdxSpotInfo {
     pub is_notable: bool,
     pub notable_type: Option<String>,
     pub entity_name: String,
+    /// DXCC entity still needed (cqdx needed set), computed in the bridge
+    /// poller against the shared `CachedStationLookup`. Inert when cqdx
+    /// supplies no needed set.
+    pub needed: bool,
+    /// Entity is an ATNO (all-time new one). Subset of `needed`.
+    pub atno: bool,
 }
 
 /// Messages received by the TUI
@@ -101,6 +107,10 @@ pub enum TuiMessage {
         /// the same CachedStationLookup the autonomous scorer uses
         /// (band-scoped on the spot frequency, uppercase-exact match).
         worked_before: bool,
+        /// DXCC entity still needed (cqdx needed set). Inert when off.
+        needed: bool,
+        /// Entity is an ATNO (all-time new one). Subset of `needed`.
+        atno: bool,
     },
     /// Error message
     Error { component: String, message: String },
@@ -496,6 +506,8 @@ impl TuiRunner {
                 frequency,
                 spotter: _,
                 worked_before,
+                needed,
+                atno,
             } => {
                 // For now use FT8 as default mode
                 app.add_dx_spot(
@@ -504,6 +516,8 @@ impl TuiRunner {
                     "FT8".to_string(),
                     0,
                     worked_before,
+                    needed,
+                    atno,
                 );
             }
             TuiMessage::Error {
