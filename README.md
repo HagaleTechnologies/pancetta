@@ -1,22 +1,28 @@
 # Pancetta
 
-An autonomous FT8 ham radio station, written in Rust.
+A full-featured FT8 ham radio station, written in Rust — decode, log, and
+work QSOs, with optional hands-off operation.
 
-Pancetta listens on the FT8 sub-band, decodes everything it hears, scores
-each station against a configurable priority model (needed DXCC entity,
-needed grid, POTA/SOTA, rarity, recent activity), and runs full
-CQ → grid → report → RR73 exchanges on its own — including transmitting
-multiple simultaneous QSOs in a single 15-second slot when band conditions
-permit.
+Pancetta listens on the FT8 sub-band, decodes what it hears, and scores each
+station against a configurable priority model (needed DXCC entity, needed
+grid, POTA/SOTA, rarity, recent activity) so you can work the ones that matter
+— with a keystroke from the terminal UI, or hands-off when you choose to
+enable it. It can run a full CQ → grid → report → RR73 exchange, and transmit
+multiple simultaneous QSOs in a single 15-second slot when conditions allow.
 
-It is designed to run on a small headless host (e.g. a Windows MiniPC)
-attached to a transceiver via a USB CODEC, controlled remotely over SSH.
+It runs on a normal desktop or a small headless host (e.g. a Windows MiniPC)
+attached to a transceiver via a USB CODEC, and is comfortable driven remotely
+over SSH.
 
-> **Status: pre-1.0 / on-air ready.** The decoder is bit-exact with
-> ft8_lib and WSJT-X across ~295 tests. Hardware TX has been validated
-> end-to-end on a Yaesu FTdx10 with clean ALC and tail-end PSKReporter
-> spots across NA + EU. The autonomous QSO loop is the focus of the
-> current development phase.
+> **Status: pre-1.0, on-air ready.** Pancetta's FT8 engine pairs the
+> MIT-licensed [`ft8_lib`](https://github.com/kgoba/ft8_lib) C decoder (via
+> FFI) with a native Rust decoder that adds a-priori-aided recovery; on
+> real-world audio its decode rate is competitive with WSJT-X (the
+> `pancetta-research` harness has the measured comparisons). Hardware TX has
+> been validated end-to-end on a Yaesu FTdx10 (clean ALC, PSKReporter spots
+> across NA + EU). ~295 FT8 tests cover encode / decode / LDPC / CRC / OSD.
+> Hands-off (automatic) operation respects FCC §97.221 — see
+> [`docs/fcc-part97-compliance.md`](docs/fcc-part97-compliance.md).
 
 ---
 
@@ -62,15 +68,16 @@ cd pancetta
 cargo build --release
 ```
 
-The first build will take 5–10 minutes (workspace is 11 crates and
-compiles a vendored copy of `ft8_lib`, which Pancetta uses as its
-primary FT8 reference decoder via FFI — see [Acknowledgments](#acknowledgments)).
-After that, incremental builds are sub-30s.
+The first build will take 5–10 minutes (workspace is 12 crates and
+compiles a vendored copy of `ft8_lib`, which Pancetta uses as a decoder
+via FFI alongside its own native Rust decoder — see
+[Acknowledgments](#acknowledgments)). After that, incremental builds are
+sub-30s.
 
 ### 3. Bootstrap your config
 
 The first time you run `pancetta` it walks you through writing a
-`~/.pancetta/config.toml` containing your callsign, grid square, audio
+`~/.pancetta/pancetta.toml` containing your callsign, grid square, audio
 device names, and rig model. You can also write the file by hand —
 see [`docs/CONFIG.md`](docs/CONFIG.md) for every supported key.
 
@@ -79,7 +86,7 @@ see [`docs/CONFIG.md`](docs/CONFIG.md) for every supported key.
 pancetta
 
 # Or write the config directly, then run:
-$EDITOR ~/.pancetta/config.toml
+$EDITOR ~/.pancetta/pancetta.toml
 ```
 
 The minimum viable config:
@@ -90,7 +97,7 @@ callsign = "YOURCALL"
 grid_square = "FN42"   # 4-character Maidenhead grid
 
 [audio]
-input_device = "USB Audio CODEC"   # exact name from `pancetta --list-audio`
+input_device = "USB Audio CODEC"   # exact name from `pancetta test-audio --list`
 output_device = "USB Audio CODEC"
 
 [rig.interface]
@@ -115,7 +122,7 @@ model = "FTdx10"
 cargo run --release
 
 # Full pipeline (decode + manual / autonomous TX). Requires:
-#   [rig.interface] enabled = true   in ~/.pancetta/config.toml
+#   [rig.interface] enabled = true   in ~/.pancetta/pancetta.toml
 #   [autonomous]    enabled = true   for hands-off operation
 # and an actual antenna + license. See docs/RUNBOOK.md for the
 # Phase 5 (autonomous QSO loop) procedure.
@@ -130,6 +137,7 @@ cargo run --release
 |---|---|
 | `Tab` / `Shift+Tab` | Cycle active panel |
 | `↑` / `↓` | Move selection within active panel |
+| `Home` / `End` (or `<` / `>`) | Jump to newest (realtime) / oldest in the focused list |
 | `←` / `→` or `[` / `]` | TX offset −/+ 50 Hz |
 | `=` / `-` | Band up / down |
 | `Space` | Call selected station |
@@ -139,10 +147,12 @@ cargo run --release
 | `Shift+T` | **Tune** — 12 s single tone at TX offset (PTT engages). |
 | `h` | **Halt current TX** (drops PTT within ~150 ms) |
 | `p` | Toggle PTT manually |
+| `g` | Cycle TX policy: Full → Respond-only → Disabled |
+| `f` | TX-frequency mode: **Hold** (pin your offset) / **Auto** (Pancetta picks) |
 | `a` | Toggle autonomous mode |
 | `Shift+P` | Pause / resume autonomous |
 | `m` | Toggle audio monitoring |
-| `d` | Open audio device picker |
+| `d` | Open audio device picker (also reclaims a hijacked device) |
 | `x` | Clear decoded messages |
 | `?` | Toggle help overlay |
 | `q` | Quit (with `[y/N]` confirm) |
@@ -158,7 +168,7 @@ and any errors emitted by the audio / QSO components.
 ### "Audio init failed" appears in the TUI status
 
 Most often: cpal can't find the input device named in your config.
-Run `pancetta --list-audio` to see the names cpal sees and copy one
+Run `pancetta test-audio --list` to see the names cpal sees and copy one
 verbatim into `[audio].input_device`. Wireless USB CODECs sometimes
 present a transient name on first plug-in; unplug, replug, restart.
 
@@ -171,10 +181,10 @@ present a transient name on first plug-in; unplug, replug, restart.
    `:15` etc. If the host clock is more than ~1 second off, decodes will
    fail systematically. NTP fixes this; `chrony` is the recommended
    daemon on Linux.
-3. Confirm the band — set `[station].operating_frequency_hz` (or use
-   the rig CAT, which auto-syncs at startup). Listening on the wrong
-   band against a CW segment looks identical to "no signal" from the
-   decoder's point of view.
+3. Confirm the band — set the dial on your rig (CAT auto-syncs at
+   startup), or use the `=` / `-` band keys in the TUI. Listening on the
+   wrong band against a CW segment looks identical to "no signal" from
+   the decoder's point of view.
 
 ### `Call X failed: duplicate QSO`
 

@@ -1,7 +1,7 @@
 # Pancetta Configuration Reference
 
 Pancetta's configuration lives in a single TOML file at
-`~/.pancetta/config.toml`. The file is loaded at startup and watched for
+`~/.pancetta/pancetta.toml`. The file is loaded at startup and watched for
 changes; most keys hot-reload without a restart.
 
 This document covers the keys you'll actually touch. The full schema —
@@ -81,7 +81,7 @@ active        = true
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `input_device` | string | `"default"` | Exact cpal device name. Run `pancetta --list-audio` to enumerate. |
+| `input_device` | string | `"default"` | Exact cpal device name. Run `pancetta test-audio --list` to enumerate. |
 | `output_device` | string | `"default"` | Same. Most ham USB CODECs present input and output under the same name. |
 | `sample_rate` | integer | `48000` | Pancetta resamples internally to 12 kHz; 48 kHz is the recommended capture rate. |
 | `buffer_size` | integer | `512` | cpal frame size. 512 trades latency for stability. |
@@ -221,7 +221,7 @@ record) straight to your online logbooks. Both integrations are
 block or fail the QSO pipeline; results are logged under the
 `qso.upload` target. **Credentials stay local** — they are read from
 this file and never logged. Keep the file readable only by you:
-`chmod 600 ~/.pancetta/config.toml`.
+`chmod 600 ~/.pancetta/pancetta.toml`.
 
 > **LoTW auto-upload is deferred.** Unlike ClubLog/QRZ, LoTW requires
 > each record to be digitally signed with your TQSL certificate, not a
@@ -316,7 +316,7 @@ priority over both config and environment.
 
 ## Hot reload
 
-Pancetta watches `~/.pancetta/config.toml` for changes. Most keys take
+Pancetta watches `~/.pancetta/pancetta.toml` for changes. Most keys take
 effect within a second of save. Exceptions:
 
 - `[audio]` device names — require a TUI restart (cpal streams are bound
