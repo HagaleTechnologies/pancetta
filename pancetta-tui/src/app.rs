@@ -885,8 +885,16 @@ impl App {
             self.decoded_messages.pop_front();
         }
 
-        // Update DX stations list
-        if let Some(ref call_sign) = message.call_sign {
+        // Update DX stations list — but never list OURSELVES. Self-decodes of
+        // our own transmissions (and frames whose extracted callsign resolves to
+        // our station call) must not appear as a DX entry. The `.filter()` makes
+        // the `if let` simply not match for our own call, skipping the update. (#42)
+        let our_call = self.station_info.call_sign.clone();
+        if let Some(call_sign) = message
+            .call_sign
+            .as_ref()
+            .filter(|c| !c.eq_ignore_ascii_case(&our_call))
+        {
             // Preserve existing grid if new message doesn't have one
             // (e.g., RR73/73 messages don't carry grid info)
             let grid_square = message.grid_square.clone().or_else(|| {
@@ -2991,6 +2999,31 @@ mod tests {
         let fresh = fixture_view("DL5XYZ", -10);
         app.add_decoded_message(fresh).await.unwrap();
         assert!(!app.dx_stations.get("DL5XYZ").unwrap().worked_before);
+    }
+
+    /// #42: a self-decode of our own callsign must never appear as a DX entry.
+    #[tokio::test]
+    async fn self_decode_not_added_to_dx_hunter() {
+        let mut app = fixture_app().await;
+        app.station_info.call_sign = "K5ARH".to_string();
+
+        // Our own call (any case) — must be skipped.
+        app.add_decoded_message(fixture_view("K5ARH", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("k5arh", -10))
+            .await
+            .unwrap();
+        assert!(
+            !app.dx_stations.contains_key("K5ARH") && !app.dx_stations.contains_key("k5arh"),
+            "must never list our own station in the DX Hunter"
+        );
+
+        // A real DX still gets added.
+        app.add_decoded_message(fixture_view("JA1ABC", -10))
+            .await
+            .unwrap();
+        assert!(app.dx_stations.contains_key("JA1ABC"));
     }
 
     /// Batch 95 regression: an S-meter reading must NOT clobber the
