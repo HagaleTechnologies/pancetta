@@ -63,7 +63,7 @@
 #![allow(clippy::expect_used)]
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -74,7 +74,7 @@ use pancetta_lib::coordinator::{
 use pancetta_lib::message_bus::{
     ComponentId, ComponentMessage, MessageBus, MessageType, RigControlMessage,
 };
-use pancetta_qso::{CallInitiation, QsoEvent, QsoManager, QsoManagerConfig, QsoState};
+use pancetta_qso::{CallInitiation, QsoEvent, QsoManager, QsoManagerConfig, QsoMetadata, QsoState};
 
 use pancetta_core::slot::SlotParity;
 use pancetta_core::TxPolicy;
@@ -317,6 +317,13 @@ pub struct CoordSim {
     pub timeline: Timeline,
     /// Monotonic slot counter the scenario advances.
     slot: u64,
+    /// RX dial frequency shared into QsoManager (0 = unknown).
+    pub dial_frequency_hz: Arc<AtomicU64>,
+    /// Split TX dial frequency shared into QsoManager (0 = simplex).
+    pub split_tx_frequency_hz: Arc<AtomicU64>,
+    /// Completed-QSO metadata collected by `pump_qso_events` from
+    /// `QsoEvent::QsoCompleted`. Keyed by `qso_id.to_string()`.
+    pub completed: Vec<QsoMetadata>,
 }
 
 impl CoordSim {
@@ -329,8 +336,14 @@ impl CoordSim {
             our_grid: Some("EM10".to_string()),
             ..Default::default()
         };
-        let manager = QsoManager::new(config);
+        let mut manager = QsoManager::new(config);
         let qso_rx = manager.subscribe();
+
+        // Wire shared dial-frequency atomics so completed-QSO RF stamps work.
+        let dial_frequency_hz = Arc::new(AtomicU64::new(0));
+        let split_tx_frequency_hz = Arc::new(AtomicU64::new(0));
+        manager.set_dial_frequency_source(Arc::clone(&dial_frequency_hz));
+        manager.set_split_tx_frequency_source(Arc::clone(&split_tx_frequency_hz));
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let rig = spawn_hamlib_consumer(&bus, shutdown.clone()).await;
@@ -346,7 +359,23 @@ impl CoordSim {
             our_callsign: our_callsign.to_string(),
             timeline: Timeline::default(),
             slot: 0,
+            dial_frequency_hz,
+            split_tx_frequency_hz,
+            completed: Vec::new(),
         }
+    }
+
+    /// Set the RX dial frequency (Hz) — mirrors the hamlib poll loop updating
+    /// the coordinator's `operating_frequency_hz` atomic.
+    pub fn set_rx_dial(&self, hz: u64) {
+        self.dial_frequency_hz.store(hz, Ordering::Relaxed);
+    }
+
+    /// Set the split TX dial frequency (Hz). Zero = simplex (RX dial is used).
+    /// Mirrors the coordinator setting `split_tx_frequency_hz` on band change /
+    /// split toggle.
+    pub fn set_split_tx(&self, hz: u64) {
+        self.split_tx_frequency_hz.store(hz, Ordering::Relaxed);
     }
 
     /// Set the global TX policy (mirrors the operator's `g` cycle / Shift+Q).
@@ -395,12 +424,15 @@ impl CoordSim {
                     self.active_tx_qsos.write().unwrap().remove(&key);
                 }
             }
-            QsoEvent::QsoCompleted { qso_id, .. } => {
+            QsoEvent::QsoCompleted { qso_id, metadata } => {
                 // Grace window: keep the key live so the final 73 still keys.
                 // The scenario removes it explicitly via `expire_qso` when it
                 // wants to model grace elapsing.
                 let key = active_tx_qso_key(&qso_id.to_string());
                 self.active_tx_qsos.write().unwrap().insert(key);
+                // Capture the completed metadata so scenarios can assert on the
+                // stamped RF frequency (dial + audio offset).
+                self.completed.push(metadata);
             }
             QsoEvent::QsoFailed { qso_id, .. } => {
                 let key = active_tx_qso_key(&qso_id.to_string());
@@ -1215,6 +1247,79 @@ async fn autonomous_qso_tx_hard_muted_when_policy_disabled() {
             .iter()
             .any(|d| d.reason == DropReason::PolicyDisabled),
         "expected a PolicyDisabled drop for the autonomous QSO.\n{}",
+        sim.timeline
+    );
+}
+
+// ===========================================================================
+// Split-frequency RF stamping
+// ===========================================================================
+
+/// When rig split is active (split TX dial ≠ 0), a completed QSO must log the
+/// **split TX dial + audio offset** as its RF frequency — NOT the RX dial.
+///
+/// Setup: RX dial = 14.074 MHz, split TX dial = 14.090 MHz, audio offset ≈ 1500 Hz.
+/// Expected completed `metadata.frequency` ≈ 14_091_500 Hz (split dial + offset),
+/// cleanly distinguishable from the RX-based value (14_075_500).
+///
+/// This test drives a real autonomous QSO to completion through the real
+/// `QsoManager::process_message` path, with the split atomic actually injected
+/// via `set_split_tx_frequency_source`, so `effective_tx_dial` runs for real.
+#[tokio::test]
+async fn split_active_qso_logs_tx_dial() {
+    let mut sim = CoordSim::new("K5ARH").await;
+
+    // Set RX dial = 14.074 MHz, split TX dial = 14.090 MHz.
+    sim.set_rx_dial(14_074_000);
+    sim.set_split_tx(14_090_000);
+
+    // Audio offset ≈ 1500 Hz (the DX's decoded frequency in the passband).
+    let audio_offset = 1500.0_f64;
+
+    // Slot 0: open the auto QSO.
+    let qso_id = sim
+        .autonomous_pounce("VB7F", audio_offset, Some(SlotParity::Odd))
+        .await;
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+    sim.timeline.assert_keyed_for_qso(&qso_id);
+
+    // Slot 1: DX sends us a report → engine auto-sends our R-report.
+    sim.inject_decode("K5ARH VB7F -12", audio_offset).await;
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+
+    // Slot 2: DX rogers with RR73 → QSO completes; our 73 keys.
+    sim.inject_decode("K5ARH VB7F RR73", audio_offset).await;
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+
+    // The QsoCompleted event must have been captured in `sim.completed`.
+    assert!(
+        !sim.completed.is_empty(),
+        "expected at least one QsoCompleted, got none.\n{}",
+        sim.timeline
+    );
+
+    let meta = &sim.completed[0];
+    let logged_freq = meta.frequency;
+
+    // With split active the logged RF must be stamped against the split TX dial
+    // (14.090 MHz + ~1500 Hz ≈ 14_091_500), NOT the RX dial (14.074 MHz + ~1500 Hz ≈ 14_075_500).
+    let split_tx_base = 14_090_000.0_f64;
+    let rx_base = 14_074_000.0_f64;
+
+    assert!(
+        logged_freq >= split_tx_base && logged_freq < split_tx_base + 4_000.0,
+        "expected RF stamped against split TX dial (~{split_tx_base}..+4kHz), \
+         but got {logged_freq:.0} Hz (rx-based would be ~{rx_base:.0}+offset).\n{}",
+        sim.timeline
+    );
+    // And confirm it is NOT the RX-dial-based value.
+    assert!(
+        (logged_freq - rx_base).abs() > 5_000.0,
+        "RF frequency {logged_freq:.0} Hz is too close to the RX dial {rx_base:.0} Hz; \
+         split TX dial was not used.\n{}",
         sim.timeline
     );
 }
