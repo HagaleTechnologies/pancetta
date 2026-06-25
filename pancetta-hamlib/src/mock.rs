@@ -77,6 +77,10 @@ struct MockRigState {
     antenna: u32,
     /// Scanning state
     scanning: bool,
+    /// Split mode enabled.
+    split_enabled: bool,
+    /// Split TX-VFO frequency in Hz (meaningful only when `split_enabled`).
+    split_tx_freq: u64,
     /// Last operation time
     last_operation: Instant,
 }
@@ -109,6 +113,8 @@ impl Default for MockRigState {
             current_memory: HashMap::new(),
             antenna: 1,
             scanning: false,
+            split_enabled: false,
+            split_tx_freq: 0,
             last_operation: Instant::now(),
         }
     }
@@ -314,6 +320,16 @@ impl MockRig {
         self.operation_count.load(Ordering::Relaxed)
     }
 
+    /// Whether split is currently enabled (test accessor).
+    pub fn split_enabled(&self) -> bool {
+        self.state.read().split_enabled
+    }
+
+    /// Current split TX-VFO frequency in Hz (test accessor).
+    pub fn split_tx_freq(&self) -> u64 {
+        self.state.read().split_tx_freq
+    }
+
     /// Validate frequency range
     fn validate_frequency(&self, frequency: u64) -> Result<()> {
         let (min_freq, max_freq) = self.config.frequency_range;
@@ -433,6 +449,30 @@ impl RigControl for MockRig {
 
         self.update_operation_time();
         debug!("Mock rig set frequency to {} Hz on VFO {:?}", freq, vfo);
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn set_split(&self, enabled: bool, _tx_vfo: Vfo) -> Result<()> {
+        self.simulate_delay().await;
+        {
+            let mut state = self.state.write();
+            state.split_enabled = enabled;
+        }
+        self.update_operation_time();
+        debug!("Mock rig set split: {}", enabled);
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn set_split_freq(&self, tx_freq: u64) -> Result<()> {
+        self.simulate_delay().await;
+        {
+            let mut state = self.state.write();
+            state.split_tx_freq = tx_freq;
+        }
+        self.update_operation_time();
+        debug!("Mock rig set split TX freq: {} Hz", tx_freq);
         Ok(())
     }
 
@@ -1036,6 +1076,25 @@ mod tests {
         assert!(info.contains("Mock Transceiver"));
         assert!(info.contains("MHz"));
         assert!(info.contains("channels"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_mock_rig_split() {
+        let rig = MockRig::default();
+        rig.connect().await.unwrap();
+
+        // Default: split off.
+        assert!(!rig.split_enabled());
+
+        // Enable split with a TX freq.
+        rig.set_split_freq(14_090_000).await.unwrap();
+        rig.set_split(true, Vfo::B).await.unwrap();
+        assert!(rig.split_enabled());
+        assert_eq!(rig.split_tx_freq(), 14_090_000);
+
+        // Disable split.
+        rig.set_split(false, Vfo::A).await.unwrap();
+        assert!(!rig.split_enabled());
     }
 
     #[tokio::test(flavor = "current_thread")]
