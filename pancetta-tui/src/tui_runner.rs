@@ -1743,10 +1743,10 @@ mod key_tests {
     }
 
     /// Regression: the device-selection modal must not underflow its
-    /// dimension math at a tiny/zero terminal area. Pre-fix, `area.height
-    /// - 2` underflowed → debug panic / release SIGBUS ("bus error" on
-    /// launch over a remote session reporting 0×0). Render at a range of
-    /// degenerate sizes and assert no panic.
+    /// dimension math at a tiny/zero terminal area. Pre-fix, the
+    /// `area.height - 2` subtraction underflowed → debug panic / release
+    /// SIGBUS ("bus error" on launch over a remote session reporting 0×0).
+    /// Render at a range of degenerate sizes and assert no panic.
     #[test]
     fn device_modal_renders_without_underflow_at_tiny_sizes() {
         use ratatui::{backend::TestBackend, Terminal};

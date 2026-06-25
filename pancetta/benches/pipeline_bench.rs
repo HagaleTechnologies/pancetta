@@ -75,7 +75,7 @@ fn bench_dsp_pipeline(c: &mut Criterion) {
 
 /// Benchmark message bus throughput
 fn bench_message_bus(c: &mut Criterion) {
-    use pancetta::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
+    use pancetta_lib::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
     use std::time::Instant;
 
     let mut group = c.benchmark_group("message_bus");
@@ -142,10 +142,12 @@ fn bench_audio_buffer(c: &mut Criterion) {
         let samples = vec![0.1_f32; *size * 10];
         let _ = buffer.write(&samples);
 
+        // `read` fills a caller-provided slice (returns the count read).
+        let mut out = vec![0.0_f32; *size];
         group.throughput(Throughput::Elements(*size as u64));
         group.bench_function(BenchmarkId::new("read", size), |b| {
             b.iter(|| {
-                let _ = buffer.read(black_box(*size));
+                let _ = buffer.read(black_box(&mut out));
             });
         });
     }
