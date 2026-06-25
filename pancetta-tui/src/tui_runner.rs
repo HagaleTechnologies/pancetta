@@ -911,6 +911,7 @@ impl TuiRunner {
             // - / _ = band down
             KeyCode::Char('=') => {
                 let freq_hz = app.band_up();
+                app.split_tx_hz = 0; // band change reverts rig to simplex (coordinator clears atomic+rig)
                 self.message_tx.send(TuiCommand::SetFrequency {
                     vfo: 0,
                     frequency: freq_hz,
@@ -918,6 +919,7 @@ impl TuiRunner {
             }
             KeyCode::Char('-') | KeyCode::Char('_') => {
                 let freq_hz = app.band_down();
+                app.split_tx_hz = 0; // band change reverts rig to simplex (coordinator clears atomic+rig)
                 self.message_tx.send(TuiCommand::SetFrequency {
                     vfo: 0,
                     frequency: freq_hz,
