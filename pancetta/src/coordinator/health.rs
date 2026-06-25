@@ -500,10 +500,14 @@ impl super::ApplicationCoordinator {
         };
 
         let decode_status = {
-            let timestamp = self.last_decode_timestamp.read().await;
-            match *timestamp {
-                Some(ts) => format!("active (last: {:.2}s ago)", ts.elapsed().as_secs_f64()),
-                None => "inactive".to_string(),
+            let ms = self
+                .last_decode_timestamp
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if ms == 0 {
+                "inactive".to_string()
+            } else {
+                let ago_s = super::now_epoch_ms().saturating_sub(ms) as f64 / 1000.0;
+                format!("active (last: {:.2}s ago)", ago_s)
             }
         };
 

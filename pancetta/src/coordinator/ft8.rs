@@ -614,11 +614,10 @@ impl super::ApplicationCoordinator {
                         }
                         decoded_messages.extend(new_decodes);
 
-                        // Update decode timestamp
-                        rt.block_on(async {
-                            let mut timestamp = last_decode_timestamp.write().await;
-                            *timestamp = Some(Instant::now());
-                        });
+                        // Update decode timestamp (A9: lock-free atomic — no
+                        // more rt.block_on on the decoder thread per window).
+                        last_decode_timestamp
+                            .store(super::now_epoch_ms(), std::sync::atomic::Ordering::Relaxed);
 
                         health_total_decodes
                             .fetch_add(decoded_messages.len() as u64, Ordering::Relaxed);

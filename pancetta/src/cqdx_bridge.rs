@@ -161,7 +161,7 @@ impl CqdxBridge {
     pub fn spawn_spot_poller(
         &self,
         shutdown: Arc<AtomicBool>,
-        last_decode: Arc<RwLock<Option<Instant>>>,
+        last_decode: Arc<std::sync::atomic::AtomicU64>,
         mode: Option<String>,
         tui_tx: Option<crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>>,
     ) -> tokio::task::JoinHandle<()> {
@@ -222,10 +222,12 @@ impl CqdxBridge {
                     }
                 }
 
-                // Watchdog: check last decode activity
-                let last = last_decode.read().await;
-                if let Some(ts) = *last {
-                    if ts.elapsed() > watchdog_timeout {
+                // Watchdog: check last decode activity (A9: lock-free atomic
+                // epoch-ms; 0 = never decoded yet).
+                let last_ms = last_decode.load(std::sync::atomic::Ordering::Relaxed);
+                if last_ms != 0 {
+                    let elapsed_ms = crate::coordinator::now_epoch_ms().saturating_sub(last_ms);
+                    if elapsed_ms > watchdog_timeout.as_millis() as u64 {
                         if !polling_paused {
                             info!("cqdx.io watchdog: no decode activity for 2h, pausing polling");
                             polling_paused = true;
@@ -237,7 +239,6 @@ impl CqdxBridge {
                         consecutive_failures = 0;
                     }
                 }
-                drop(last);
 
                 // After 3 consecutive failures, retry every 5 minutes
                 if consecutive_failures >= 3 {

@@ -439,7 +439,12 @@ pub struct ApplicationCoordinator {
     /// a lock-free atomic. Wall-clock ms is fine here: the sole reader formats a
     /// "last audio Xs ago" status string.
     last_audio_timestamp: Arc<std::sync::atomic::AtomicU64>,
-    last_decode_timestamp: Arc<RwLock<Option<Instant>>>,
+    /// Wall-clock ms of the last decode-window completion (0 = never). Written
+    /// once per decode window from the decoder thread and read only by the 30s
+    /// stats log — a lock-free atomic (Pass-2 / A9), mirroring
+    /// `last_audio_timestamp`. Replaces an `RwLock<Option<Instant>>` that the
+    /// sync decoder thread had to touch via `rt.block_on` each window.
+    last_decode_timestamp: Arc<std::sync::atomic::AtomicU64>,
 
     /// `true` when the resolved TX OUTPUT device fell back to the system
     /// default rather than an explicit rig CODEC (the classic "PTT keys, audio
@@ -731,7 +736,7 @@ impl ApplicationCoordinator {
             rigctld_process: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            last_decode_timestamp: Arc::new(RwLock::new(None)),
+            last_decode_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             audio_output_default: Arc::new(AtomicBool::new(false)),
             audio_reopen_tx: None,
             rig_conn_state: Arc::new(std::sync::atomic::AtomicU8::new(
