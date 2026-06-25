@@ -66,6 +66,125 @@ struct RecentManualCompletion {
 /// directed RR73/RRR arrives. Both live inside the same QSO component task.
 type RecentManualCompletions = Arc<Mutex<HashMap<String, RecentManualCompletion>>>;
 
+/// A manual call the operator requested that could NOT start immediately
+/// because it would transmit in the *opposite* window from the one our active
+/// QSOs are committed to (half-duplex parity discipline, #40). It is held until
+/// the current side's QSOs complete and a clean window flip is possible, then
+/// promoted by [`promote_pending_manual_calls`]. Never preempts an in-flight
+/// QSO.
+#[derive(Debug, Clone)]
+struct PendingManualCall {
+    /// DX callsign the operator chose to work.
+    callsign: String,
+    /// Audio offset (Hz) to call them on.
+    frequency_hz: f64,
+    /// The DX's slot parity (we latch our TX = opposite at QSO start). `None`
+    /// would never have been queued (it rides any side), so in practice this
+    /// is always `Some`.
+    dx_parity: Option<pancetta_core::slot::SlotParity>,
+}
+
+impl PendingManualCall {
+    /// The parity we would transmit on for this call (opposite the DX's slot).
+    fn desired_tx_parity(&self) -> Option<pancetta_core::slot::SlotParity> {
+        self.dx_parity.map(|p| p.opposite())
+    }
+}
+
+/// Shared queue of operator-requested manual calls deferred by the half-duplex
+/// parity gate (#40). Pushed by the message-handler's `StartQso` arm when the
+/// call would cross the committed window; drained by the QSO-event task when
+/// the current side clears.
+type PendingManualCalls = Arc<Mutex<std::collections::VecDeque<PendingManualCall>>>;
+
+/// Maximum number of operator-deferred manual calls we hold. A generous bound
+/// purely to stop an unbounded queue if the operator mashes the call button on
+/// many opposite-window stations; older entries past this are dropped.
+const MAX_PENDING_MANUAL_CALLS: usize = 16;
+
+/// Pure partition step for [`promote_pending_manual_calls`] (#40): given the
+/// queued calls (oldest first) and the parity our still-active QSOs are
+/// committed to (`None` ⇒ idle), split into the calls to start now and the
+/// ones to keep queued.
+///
+/// When idle we adopt the oldest queued call's desired parity as the new side;
+/// otherwise we may only add to the side already in flight. Every call matching
+/// that side (and any parity-agnostic call) starts; cross-parity calls stay
+/// queued until that side, in turn, clears.
+fn partition_pending_calls(
+    queue: std::collections::VecDeque<PendingManualCall>,
+    current_side: Option<pancetta_core::slot::SlotParity>,
+) -> (
+    Vec<PendingManualCall>,
+    std::collections::VecDeque<PendingManualCall>,
+) {
+    let adopt =
+        current_side.or_else(|| queue.front().and_then(PendingManualCall::desired_tx_parity));
+    let mut start = Vec::new();
+    let mut keep = std::collections::VecDeque::new();
+    for p in queue {
+        match (p.desired_tx_parity(), adopt) {
+            // Rides any side, or matches the side we're committing to.
+            (None, _) => start.push(p),
+            (Some(want), Some(side)) if want == side => start.push(p),
+            // Cross-parity: hold until this side clears too.
+            _ => keep.push_back(p),
+        }
+    }
+    (start, keep)
+}
+
+/// Promote operator-deferred manual calls (#40) once the TX window is free to
+/// accept them.
+///
+/// Called from the QSO-event task after any QSO goes terminal. Determines the
+/// side we may now commit to — the side our remaining active QSOs hold, or (if
+/// idle) the parity the oldest pending call wants — and starts every pending
+/// call that matches it (concurrent, same window). Cross-parity calls stay
+/// queued until that side, in turn, clears. Never preempts a live QSO.
+async fn promote_pending_manual_calls(
+    qso_manager: &pancetta_qso::QsoManager,
+    pending: &PendingManualCalls,
+    message_bus: &MessageBus,
+) {
+    // The parity our still-active QSOs are committed to (None ⇒ idle).
+    let current_side = qso_manager.current_tx_side().await;
+
+    let to_start: Vec<PendingManualCall> = {
+        let mut q = pending.lock().await;
+        if q.is_empty() {
+            return;
+        }
+        let queue = std::mem::take(&mut *q);
+        let (start, keep) = partition_pending_calls(queue, current_side);
+        *q = keep;
+        start
+    };
+
+    for p in to_start {
+        info!(
+            target: "qso",
+            "Promoting deferred manual call to {} on {:.0} Hz — window is now free",
+            p.callsign, p.frequency_hz
+        );
+        match qso_manager
+            .respond_to_cq_manual(p.callsign.clone(), p.frequency_hz, p.dx_parity)
+            .await
+        {
+            Ok(_) => {
+                emit_status(
+                    message_bus,
+                    format!("Now calling {} (was queued)", p.callsign),
+                )
+                .await;
+            }
+            Err(e) => {
+                warn!(target: "qso", "Promoting queued call to {} failed: {}", p.callsign, e);
+            }
+        }
+    }
+}
+
 /// Send a free-form status string to the TUI status bar via the message bus.
 /// Used to surface QSO/TX state changes that the operator should see, even
 /// when nothing failed at the transport layer (e.g. duplicate suppression,
@@ -749,6 +868,12 @@ impl super::ApplicationCoordinator {
                 let recent_manual_completions: RecentManualCompletions =
                     Arc::new(Mutex::new(HashMap::new()));
 
+                // #40: operator-deferred manual calls (cross-parity, waiting for
+                // the window to free). Pushed by the StartQso handler below;
+                // drained by the QSO-event task when a QSO goes terminal.
+                let pending_manual_calls: PendingManualCalls =
+                    Arc::new(Mutex::new(std::collections::VecDeque::new()));
+
                 // Spawn a task to forward QSO auto-sequence TX requests to the transmitter
                 // and update AP decoding state for the FT8 decoder thread.
                 let mut qso_events = qso_manager.subscribe();
@@ -762,6 +887,7 @@ impl super::ApplicationCoordinator {
                 let snapshot_qso_manager = qso_manager.clone();
                 let snapshot_bus = tx_bus.clone();
                 let completions_for_events = recent_manual_completions.clone();
+                let pending_for_events = pending_manual_calls.clone();
                 tokio::spawn(async move {
                     while !tx_shutdown.load(Ordering::Acquire) {
                         match qso_events.recv().await {
@@ -801,6 +927,15 @@ impl super::ApplicationCoordinator {
                                             "QSO {} went terminal-Failed — purging its TX from the active set",
                                             qso_id
                                         );
+                                        // #40: a failed QSO frees its window
+                                        // immediately (no trailing TX) — promote
+                                        // any deferred cross-parity manual call.
+                                        promote_pending_manual_calls(
+                                            &snapshot_qso_manager,
+                                            &pending_for_events,
+                                            &snapshot_bus,
+                                        )
+                                        .await;
                                     }
                                 }
 
@@ -1042,6 +1177,15 @@ impl super::ApplicationCoordinator {
                                     let set = active_tx_qsos.clone();
                                     let intent_map = latest_tx_intent.clone();
                                     let qid = qso_id;
+                                    // #40: promote any operator-deferred
+                                    // cross-parity manual call once THIS QSO's
+                                    // trailing 73 has cleared (grace elapsed) —
+                                    // only then is the window truly free, so we
+                                    // never end up TXing the 73 and a new
+                                    // opposite-window call in sequential slots.
+                                    let promote_mgr = snapshot_qso_manager.clone();
+                                    let promote_pending = pending_for_events.clone();
+                                    let promote_bus = snapshot_bus.clone();
                                     tokio::spawn(async move {
                                         tokio::time::sleep(COMPLETED_TX_GRACE).await;
                                         if let Ok(mut s) = set.write() {
@@ -1055,6 +1199,12 @@ impl super::ApplicationCoordinator {
                                             "QSO {} completed — grace elapsed, purging its TX from the active set",
                                             qid
                                         );
+                                        promote_pending_manual_calls(
+                                            &promote_mgr,
+                                            &promote_pending,
+                                            &promote_bus,
+                                        )
+                                        .await;
                                     });
                                 }
                                 // Clear AP state on QSO completion
@@ -1156,6 +1306,13 @@ impl super::ApplicationCoordinator {
                                         m.remove(&key);
                                     }
                                 }
+                                // #40: window freed — promote a deferred call.
+                                promote_pending_manual_calls(
+                                    &snapshot_qso_manager,
+                                    &pending_for_events,
+                                    &snapshot_bus,
+                                )
+                                .await;
                                 // Clear AP state on QSO failure
                                 if let Ok(mut guard) = ap_state.write() {
                                     *guard = None;
@@ -1273,6 +1430,59 @@ impl super::ApplicationCoordinator {
                                                 "Starting QSO with {} on {} Hz (manual)",
                                                 callsign, frequency
                                             );
+                                            // #40 half-duplex parity gate: a manual call
+                                            // that would TX in the *opposite* window from
+                                            // the one our active QSOs hold is DEFERRED, not
+                                            // started — keeping the opposite window free to
+                                            // hear responses (no sequential-window TX).
+                                            // Same-window selections start immediately and
+                                            // run concurrently (the TX coalescer
+                                            // multi-streams them). The deferred call is
+                                            // promoted automatically once the current side's
+                                            // QSOs finish (promote_pending_manual_calls).
+                                            let desired_tx_parity = dx_parity.map(|p| p.opposite());
+                                            let current_side = qso_manager.current_tx_side().await;
+                                            if matches!(
+                                                pancetta_qso::qso_manager::admit_new_qso(
+                                                    current_side,
+                                                    desired_tx_parity,
+                                                ),
+                                                pancetta_qso::qso_manager::TxAdmission::Queue
+                                            ) {
+                                                let mut q = pending_manual_calls.lock().await;
+                                                // Dedup by callsign; bound the queue.
+                                                let dup = q.iter().any(|p| {
+                                                    p.callsign.eq_ignore_ascii_case(&callsign)
+                                                });
+                                                if !dup {
+                                                    if q.len() >= MAX_PENDING_MANUAL_CALLS {
+                                                        q.pop_front();
+                                                    }
+                                                    q.push_back(PendingManualCall {
+                                                        callsign: callsign.clone(),
+                                                        frequency_hz: frequency as f64,
+                                                        dx_parity,
+                                                    });
+                                                }
+                                                drop(q);
+                                                info!(
+                                                    target: "qso",
+                                                    "Queued manual call to {} — opposite window \
+                                                     (active side {:?}); will start when the \
+                                                     current QSO(s) finish",
+                                                    callsign, current_side
+                                                );
+                                                emit_status(
+                                                    &message_bus,
+                                                    format!(
+                                                        "Queued {} — waiting for current window \
+                                                         to clear",
+                                                        callsign
+                                                    ),
+                                                )
+                                                .await;
+                                                continue;
+                                            }
                                             // Operator-initiated MANUAL call:
                                             //  - bypasses the self-duplicate gate (operator
                                             //    explicitly chose to work/re-work this DX), and
@@ -1858,6 +2068,71 @@ fn snapshot_item_from_progress(
         max_calls: wd_max_calls,
         watchdog_deadline,
     })
+}
+
+#[cfg(test)]
+mod pending_manual_tests {
+    use super::{partition_pending_calls, PendingManualCall};
+    use pancetta_core::slot::SlotParity;
+    use std::collections::VecDeque;
+
+    // Build a pending call whose DX is on `dx`, so its desired TX parity is the
+    // opposite.
+    fn call(name: &str, dx: SlotParity) -> PendingManualCall {
+        PendingManualCall {
+            callsign: name.to_string(),
+            frequency_hz: 1500.0,
+            dx_parity: Some(dx),
+        }
+    }
+
+    fn names(v: &[PendingManualCall]) -> Vec<String> {
+        v.iter().map(|p| p.callsign.clone()).collect()
+    }
+
+    #[test]
+    fn idle_adopts_oldest_then_starts_all_same_side() {
+        // DX Even ⇒ we TX Odd; DX Odd ⇒ we TX Even.
+        let q: VecDeque<_> = [
+            call("A", SlotParity::Even), // want Odd
+            call("B", SlotParity::Odd),  // want Even
+            call("C", SlotParity::Even), // want Odd
+        ]
+        .into();
+        // Idle: adopt oldest (A wants Odd). A & C start, B stays.
+        let (start, keep) = partition_pending_calls(q, None);
+        assert_eq!(names(&start), vec!["A", "C"]);
+        assert_eq!(names(&keep.into_iter().collect::<Vec<_>>()), vec!["B"]);
+    }
+
+    #[test]
+    fn committed_side_only_adds_same_side() {
+        let q: VecDeque<_> = [
+            call("A", SlotParity::Even), // want Odd
+            call("B", SlotParity::Odd),  // want Even
+        ]
+        .into();
+        // We're committed to Odd already: only A (wants Odd) joins; B waits.
+        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Odd));
+        assert_eq!(names(&start), vec!["A"]);
+        assert_eq!(names(&keep.into_iter().collect::<Vec<_>>()), vec!["B"]);
+    }
+
+    #[test]
+    fn committed_side_with_no_match_keeps_all() {
+        let q: VecDeque<_> = [call("B", SlotParity::Odd)].into(); // wants Even
+                                                                  // Committed to Odd, only an Even-wanting call queued → nothing promotes.
+        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Odd));
+        assert!(start.is_empty());
+        assert_eq!(names(&keep.into_iter().collect::<Vec<_>>()), vec!["B"]);
+    }
+
+    #[test]
+    fn empty_queue_is_noop() {
+        let (start, keep) = partition_pending_calls(VecDeque::new(), None);
+        assert!(start.is_empty());
+        assert!(keep.is_empty());
+    }
 }
 
 #[cfg(test)]
