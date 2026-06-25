@@ -184,6 +184,16 @@ pub enum MessageType {
         policy: pancetta_core::TxPolicy,
     },
 
+    /// Split-TX state echo for the TUI title-bar chip. Sent by the
+    /// coordinator relay after every write to the split atomic: on
+    /// `TuiCommand::SetSplit` (operator modal), on manual band-change
+    /// (clears split), and on autonomous band-hop (clears split).
+    /// `tx_hz == 0` means simplex (chip hidden). Observation only.
+    SplitStatus {
+        /// Current split TX frequency in Hz, or 0 for simplex.
+        tx_hz: u64,
+    },
+
     /// Autonomous operator status update
     AutonomousStatus(AutonomousStatusData),
 

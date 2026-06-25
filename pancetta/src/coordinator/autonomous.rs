@@ -554,6 +554,15 @@ impl super::ApplicationCoordinator {
                                             }
                                             // A band change invalidates any split TX freq.
                                             if split_tx_hz.swap(0, Ordering::Relaxed) != 0 {
+                                                // Push authoritative split clear to the TUI chip
+                                                // via the message bus (Autonomous → Tui relay).
+                                                let split_clr_tui = ComponentMessage::new(
+                                                    ComponentId::Autonomous,
+                                                    ComponentId::Tui,
+                                                    MessageType::SplitStatus { tx_hz: 0 },
+                                                    Instant::now(),
+                                                );
+                                                let _ = message_bus.send_message(split_clr_tui).await;
                                                 let clr = ComponentMessage::new(
                                                     ComponentId::Autonomous,
                                                     ComponentId::Hamlib,

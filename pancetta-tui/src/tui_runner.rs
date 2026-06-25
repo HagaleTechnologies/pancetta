@@ -163,6 +163,14 @@ pub enum TuiMessage {
         /// New global TX policy.
         policy: pancetta_core::TxPolicy,
     },
+    /// Split-TX frequency echo. Sent by the coordinator relay after every
+    /// write to the split atomic: modal set, manual band-change clear,
+    /// and autonomous band-hop clear. `tx_hz == 0` means simplex (chip
+    /// hidden). Drives the "SPLIT TX" title-bar chip authoritatively.
+    SplitUpdate {
+        /// Current split TX frequency in Hz, or 0 for simplex.
+        tx_hz: u64,
+    },
     /// Available audio devices, enumerated by the coordinator (which owns
     /// the `pancetta-audio` host) and pushed to the TUI once at startup so
     /// the `d` device-selection picker can list them. Each entry is
@@ -582,6 +590,9 @@ impl TuiRunner {
             }
             TuiMessage::TxPolicyUpdate { policy } => {
                 app.tx_policy = policy;
+            }
+            TuiMessage::SplitUpdate { tx_hz } => {
+                app.split_tx_hz = tx_hz;
             }
             TuiMessage::DeviceListUpdate {
                 input,
@@ -2174,6 +2185,33 @@ mod key_tests {
         assert_eq!(
             app.read().await.tx_policy,
             pancetta_core::TxPolicy::Disabled
+        );
+    }
+
+    /// `SplitUpdate` (coordinator echo) drives the authoritative SPLIT TX chip.
+    /// A non-zero tx_hz sets the chip; zero clears it (simplex).
+    #[tokio::test]
+    async fn split_update_sets_chip() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        // Default is simplex (0).
+        assert_eq!(app.read().await.split_tx_hz, 0, "default is simplex");
+        // Coordinator pushes a split freq → chip lights.
+        r.handle_message(TuiMessage::SplitUpdate { tx_hz: 14_074_000 })
+            .await
+            .unwrap();
+        assert_eq!(
+            app.read().await.split_tx_hz,
+            14_074_000,
+            "SplitUpdate sets split_tx_hz"
+        );
+        // Coordinator pushes 0 (band-hop / manual clear) → chip clears.
+        r.handle_message(TuiMessage::SplitUpdate { tx_hz: 0 })
+            .await
+            .unwrap();
+        assert_eq!(
+            app.read().await.split_tx_hz,
+            0,
+            "SplitUpdate tx_hz=0 clears chip"
         );
     }
 

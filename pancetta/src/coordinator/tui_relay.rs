@@ -295,6 +295,15 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy },
                             );
                         }
+                        MessageType::SplitStatus { tx_hz } => {
+                            // Echo the authoritative split TX state to the
+                            // title-bar chip. Sent from all three split-atomic
+                            // write sites (SetSplit command, manual band-change,
+                            // autonomous band-hop).
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::SplitUpdate { tx_hz },
+                            );
+                        }
                         MessageType::ActiveQsosSnapshot { ref qsos } => {
                             // Re-shape into the TUI's ActiveQsoBanner
                             // (decoupled struct so the TUI doesn't link
@@ -848,6 +857,12 @@ impl super::ApplicationCoordinator {
                                 }
                                 // A band change invalidates any split TX freq.
                                 if cmd_split_tx_hz.swap(0, Ordering::Relaxed) != 0 {
+                                    // Push authoritative split clear to the TUI chip.
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::SplitUpdate {
+                                            tx_hz: 0,
+                                        },
+                                    );
                                     let clr = ComponentMessage::new(
                                         ComponentId::Tui,
                                         ComponentId::Hamlib,
@@ -885,6 +900,10 @@ impl super::ApplicationCoordinator {
                             let store = if enabled { tx_frequency } else { 0 };
                             cmd_split_tx_hz.store(store, Ordering::Relaxed);
                             info!(target: "rig.split", "TUI SetSplit enabled={} tx={} Hz", enabled, tx_frequency);
+                            // Push authoritative split state to the TUI chip.
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::SplitUpdate { tx_hz: store },
+                            );
                             let msg = ComponentMessage::new(
                                 ComponentId::Tui,
                                 ComponentId::Hamlib,
