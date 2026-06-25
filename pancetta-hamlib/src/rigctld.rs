@@ -308,8 +308,10 @@ impl RigctldClient {
         // short-form verbs (internal + their read/write pair + antenna)
         "f",
         "F",
+        "I",
         "m",
         "M",
+        "S",
         "t",
         "T",
         "v",
@@ -382,6 +384,20 @@ impl RigctldClient {
             Vfo::Current => "currVFO",
             _ => "currVFO",
         }
+    }
+
+    /// Format the rigctld short-form command to set split mode + TX VFO.
+    fn split_command(enabled: bool, tx_vfo: Vfo) -> String {
+        format!(
+            "S {} {}",
+            if enabled { 1 } else { 0 },
+            Self::vfo_to_string(tx_vfo)
+        )
+    }
+
+    /// Format the rigctld short-form command to set the split TX frequency.
+    fn split_freq_command(tx_freq: u64) -> String {
+        format!("I {}", tx_freq)
     }
 }
 
@@ -730,6 +746,22 @@ impl RigControl for RigctldClient {
         let response = self.send_command_with_retry("\\get_info").await?;
         Ok(response)
     }
+
+    #[instrument(skip(self))]
+    async fn set_split(&self, enabled: bool, tx_vfo: Vfo) -> Result<()> {
+        // OPERATOR-CONFIRM(split): exact short-form verified on-air (FTdx10).
+        self.send_command_with_retry(&Self::split_command(enabled, tx_vfo))
+            .await?;
+        Ok(())
+    }
+
+    #[instrument(skip(self))]
+    async fn set_split_freq(&self, tx_freq: u64) -> Result<()> {
+        // OPERATOR-CONFIRM(split): exact short-form verified on-air (FTdx10).
+        self.send_command_with_retry(&Self::split_freq_command(tx_freq))
+            .await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -745,7 +777,10 @@ mod allow_list_tests {
             // short-form internal callers
             "f",
             "F 14074000",
+            "I 14090000",
             "m",
+            "S 1 VFOB",
+            "S 0 VFOA",
             "T 1",
             "T 0",
             "V VFOA",
@@ -821,5 +856,18 @@ mod allow_list_tests {
             err.to_string().contains("allow-list"),
             "unexpected error: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+    use crate::models::Vfo;
+
+    #[test]
+    fn split_command_strings() {
+        assert_eq!(RigctldClient::split_command(true, Vfo::B), "S 1 VFOB");
+        assert_eq!(RigctldClient::split_command(false, Vfo::A), "S 0 VFOA");
+        assert_eq!(RigctldClient::split_freq_command(14_090_000), "I 14090000");
     }
 }
