@@ -398,6 +398,32 @@ impl QsoManager {
             .find_map(|p| p.metadata.tx_parity)
     }
 
+    /// Count of currently-active (non-terminal) QSOs.
+    pub async fn active_qso_count(&self) -> usize {
+        self.qsos
+            .read()
+            .await
+            .values()
+            .filter(|p| p.state.is_active())
+            .count()
+    }
+
+    /// Whether any *active* (non-terminal) QSO already exists with `callsign`
+    /// (compound-call-aware via [`crate::exchange::callsigns_match`], so
+    /// `EA8/G8BCG` and `G8BCG` count as the same station). Used by the
+    /// always-answer-callers path to avoid opening a duplicate QSO with a
+    /// station an exchange is already in progress with.
+    pub async fn has_active_qso_with(&self, callsign: &str) -> bool {
+        let qsos = self.qsos.read().await;
+        qsos.values().any(|p| {
+            p.state.is_active()
+                && p.metadata
+                    .their_callsign
+                    .as_deref()
+                    .is_some_and(|c| crate::exchange::callsigns_match(c, callsign))
+        })
+    }
+
     /// Create a new QSO manager
     pub fn new(config: QsoManagerConfig) -> Self {
         let (event_sender, _) = broadcast::channel(1000);

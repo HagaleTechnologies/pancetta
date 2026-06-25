@@ -231,6 +231,188 @@ async fn maybe_auto_resend_73(
     }
 }
 
+/// A decoded message that a station directed at *us* to work us, classified
+/// into the [`ResponseStep`](pancetta_core::ResponseStep) we'd open at and the
+/// report they gave us (if any). Produced by [`classify_caller_answer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CallerAnswer {
+    /// The station calling us (their callsign as decoded).
+    their_call: String,
+    /// The sequence rung we should open our reply at.
+    step: pancetta_core::ResponseStep,
+    /// The signal report they sent us, if this rung carried one.
+    their_report: Option<i8>,
+}
+
+/// Pure classifier for the always-answer-callers path (#39).
+///
+/// Maps a parsed FT8 message **directed at us** to the reply we owe, or `None`
+/// when the message isn't a station trying to work us. Compound-call aware
+/// (`callsigns_match`) so `EA8/G8BCG` calling `K5ARH` is recognized.
+///
+/// | They sent us            | We open at      |
+/// |-------------------------|-----------------|
+/// | `US THEM <grid>` (CqResponse) | `Report`   |
+/// | `US THEM -NN` (SignalReport)  | `ReportAck` |
+/// | `US THEM R-NN` (ReportAck)    | `Rr73`      |
+/// | `US THEM RR73` (FinalConfirmation) | `SeventyThree` |
+///
+/// CQ, 73, contest, and non-standard frames return `None` — a CQ is an
+/// initiation decision (autonomous/operator territory), not a direct call to
+/// us, and a 73 needs no reply. The caller still applies all the TX gates
+/// (policy, parity, dedup, capacity) before acting on a `Some`.
+fn classify_caller_answer(
+    msg: &pancetta_qso::states::MessageType,
+    our_call: &str,
+) -> Option<CallerAnswer> {
+    use pancetta_core::ResponseStep;
+    use pancetta_qso::exchange::callsigns_match;
+    use pancetta_qso::states::MessageType as Mt;
+
+    match msg {
+        Mt::CqResponse {
+            calling_station,
+            responding_station,
+            ..
+        } if callsigns_match(calling_station, our_call) => Some(CallerAnswer {
+            their_call: responding_station.clone(),
+            step: ResponseStep::Report,
+            their_report: None,
+        }),
+        Mt::SignalReport {
+            to_station,
+            from_station,
+            report,
+        } if callsigns_match(to_station, our_call) => Some(CallerAnswer {
+            their_call: from_station.clone(),
+            step: ResponseStep::ReportAck,
+            their_report: Some(*report),
+        }),
+        Mt::ReportAck {
+            to_station,
+            from_station,
+            report,
+        } if callsigns_match(to_station, our_call) => Some(CallerAnswer {
+            their_call: from_station.clone(),
+            step: ResponseStep::Rr73,
+            their_report: Some(*report),
+        }),
+        Mt::FinalConfirmation {
+            to_station,
+            from_station,
+        } if callsigns_match(to_station, our_call) => Some(CallerAnswer {
+            their_call: from_station.clone(),
+            step: ResponseStep::SeventyThree,
+            their_report: None,
+        }),
+        _ => None,
+    }
+}
+
+/// Always-answer-callers (#39 + #43 part 2): auto-open a reply to a station
+/// calling us, **independent of the autonomous-operator toggle**.
+///
+/// FT8 etiquette is to always come back to a station that calls you. This runs
+/// in the always-on decode loop, so it works whether or not autonomous mode is
+/// engaged. It is a *response*, not an unattended *initiation*, so the FCC
+/// §97.221 presence gate (which governs initiation) does not apply — but every
+/// other TX gate does:
+///
+/// 1. **TX policy** — `Disabled` blocks entirely; `RespondOnly`/`Full` allow.
+/// 2. **Already in QSO** — if `process_message` (run first) is already driving
+///    an exchange with this station, skip (no duplicate).
+/// 3. **Half-duplex parity** — we'd TX on `opposite(their_parity)`; if that
+///    crosses the window our active QSOs are committed to, defer (the operator
+///    can still pick them manually). Keeps us off sequential-window TX.
+/// 4. **Capacity** — at most `max_concurrent` concurrent caller-answers.
+///
+/// Because this path carries no failure-backoff state, it also satisfies #43
+/// part 2: after our initiation watchdog retires a QSO, if that DX then calls
+/// us we still answer.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_answer_caller(
+    msg_type: &pancetta_qso::states::MessageType,
+    our_callsign: &str,
+    frequency_hz: f64,
+    their_parity: Option<pancetta_core::slot::SlotParity>,
+    snr: f32,
+    qso_manager: &pancetta_qso::QsoManager,
+    tx_policy: &std::sync::atomic::AtomicU8,
+    max_concurrent: usize,
+    message_bus: &MessageBus,
+) {
+    // 1. TX policy: DISABLED blocks; RESPOND-ONLY / FULL allow responses.
+    let policy =
+        pancetta_core::TxPolicy::from_u8(tx_policy.load(std::sync::atomic::Ordering::Relaxed));
+    if !policy.allows_any_tx() {
+        return;
+    }
+
+    // Is this a station calling us, and at what rung?
+    let Some(answer) = classify_caller_answer(msg_type, our_callsign) else {
+        return;
+    };
+
+    // 2. Don't open a duplicate — process_message already drives any active QSO
+    //    with this station (it ran before us this cycle).
+    if qso_manager.has_active_qso_with(&answer.their_call).await {
+        return;
+    }
+
+    // 3. Half-duplex parity: our reply would TX on opposite(their_parity).
+    //    Defer if that crosses the window our active QSOs hold.
+    let desired_tx_parity = their_parity.map(|p| p.opposite());
+    let current_side = qso_manager.current_tx_side().await;
+    if matches!(
+        pancetta_qso::qso_manager::admit_new_qso(current_side, desired_tx_parity),
+        pancetta_qso::qso_manager::TxAdmission::Queue
+    ) {
+        debug!(
+            target: "qso",
+            "Not auto-answering {} — cross-parity (active side {:?}, would TX {:?})",
+            answer.their_call, current_side, desired_tx_parity
+        );
+        return;
+    }
+
+    // 4. Capacity bound.
+    if qso_manager.active_qso_count().await >= max_concurrent {
+        return;
+    }
+
+    info!(
+        target: "qso",
+        "Auto-answering {} at {:?} on {:.0} Hz (caller — autonomous-independent)",
+        answer.their_call, answer.step, frequency_hz
+    );
+
+    match qso_manager
+        .respond_to_caller(
+            answer.their_call.clone(),
+            frequency_hz,
+            their_parity,
+            answer.step,
+            Some(snr),
+            answer.their_report,
+        )
+        .await
+    {
+        Ok(_) => {
+            emit_status(
+                message_bus,
+                format!("Answering {} (caller)", answer.their_call),
+            )
+            .await;
+        }
+        Err(e) => {
+            warn!(
+                target: "qso",
+                "Auto-answer to {} failed: {}", answer.their_call, e
+            );
+        }
+    }
+}
+
 /// Short, operator-facing description of why a QSO failed, for the TUI
 /// status line (Batch 2 #3). Terminal QSOs are dropped from the active
 /// snapshot, so this is the only place the operator learns the reason.
@@ -283,6 +465,11 @@ impl super::ApplicationCoordinator {
         // QSO's metadata before the ADIF record is rendered for upload.
         // Default-off; only the upload subscriber consumes it.
         let qrz_xml_cfg = config.network.qrz_xml.clone();
+        // Always-answer-callers (#39): cap how many concurrent caller-answer
+        // QSOs we'll auto-open. Reuses the operator's `max_concurrent_qsos`
+        // (default 1) so the policy is consistent with autonomous concurrency;
+        // the parity gate additionally keeps all concurrent QSOs in one window.
+        let auto_answer_max_concurrent = config.autonomous.max_concurrent_qsos.max(1) as usize;
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -1036,7 +1223,7 @@ impl super::ApplicationCoordinator {
 
                                             if let Err(e) = qso_manager
                                                 .process_message(
-                                                    msg_type,
+                                                    msg_type.clone(),
                                                     raw_text.clone(),
                                                     frequency,
                                                     Some(snr),
@@ -1045,6 +1232,25 @@ impl super::ApplicationCoordinator {
                                             {
                                                 debug!("QSO process_message error: {}", e);
                                             }
+
+                                            // Always-answer-callers (#39): if a
+                                            // station is calling US and no QSO
+                                            // with them is already in progress,
+                                            // come back to them — independent of
+                                            // the autonomous toggle, gated by TX
+                                            // policy / parity / capacity.
+                                            maybe_answer_caller(
+                                                &msg_type,
+                                                &our_callsign,
+                                                frequency,
+                                                decoded_msg.slot_parity,
+                                                snr,
+                                                &qso_manager,
+                                                &tx_policy,
+                                                auto_answer_max_concurrent,
+                                                &message_bus,
+                                            )
+                                            .await;
                                         }
                                         Err(e) => {
                                             debug!(
@@ -1652,6 +1858,113 @@ fn snapshot_item_from_progress(
         max_calls: wd_max_calls,
         watchdog_deadline,
     })
+}
+
+#[cfg(test)]
+mod caller_answer_tests {
+    use super::{classify_caller_answer, CallerAnswer};
+    use pancetta_core::ResponseStep;
+    use pancetta_qso::states::MessageType as Mt;
+
+    const OUR: &str = "K5ARH";
+
+    #[test]
+    fn cqresponse_to_us_opens_at_report() {
+        let m = Mt::CqResponse {
+            calling_station: OUR.to_string(),
+            responding_station: "JA1ABC".to_string(),
+            grid: None,
+        };
+        assert_eq!(
+            classify_caller_answer(&m, OUR),
+            Some(CallerAnswer {
+                their_call: "JA1ABC".to_string(),
+                step: ResponseStep::Report,
+                their_report: None,
+            })
+        );
+    }
+
+    #[test]
+    fn signal_report_to_us_opens_at_reportack_with_report() {
+        let m = Mt::SignalReport {
+            to_station: OUR.to_string(),
+            from_station: "JA1ABC".to_string(),
+            report: -12,
+        };
+        assert_eq!(
+            classify_caller_answer(&m, OUR),
+            Some(CallerAnswer {
+                their_call: "JA1ABC".to_string(),
+                step: ResponseStep::ReportAck,
+                their_report: Some(-12),
+            })
+        );
+    }
+
+    #[test]
+    fn reportack_to_us_opens_at_rr73() {
+        let m = Mt::ReportAck {
+            to_station: OUR.to_string(),
+            from_station: "JA1ABC".to_string(),
+            report: -3,
+        };
+        let a = classify_caller_answer(&m, OUR).unwrap();
+        assert_eq!(a.step, ResponseStep::Rr73);
+        assert_eq!(a.their_report, Some(-3));
+    }
+
+    #[test]
+    fn final_confirmation_to_us_opens_at_73() {
+        let m = Mt::FinalConfirmation {
+            to_station: OUR.to_string(),
+            from_station: "JA1ABC".to_string(),
+        };
+        assert_eq!(
+            classify_caller_answer(&m, OUR).map(|a| a.step),
+            Some(ResponseStep::SeventyThree)
+        );
+    }
+
+    #[test]
+    fn compound_call_to_us_is_recognized() {
+        // Their frame addresses our base call from a compound call.
+        let m = Mt::SignalReport {
+            to_station: OUR.to_string(),
+            from_station: "EA8/G8BCG".to_string(),
+            report: -7,
+        };
+        assert_eq!(
+            classify_caller_answer(&m, OUR).map(|a| a.their_call),
+            Some("EA8/G8BCG".to_string())
+        );
+    }
+
+    #[test]
+    fn message_to_someone_else_is_ignored() {
+        let m = Mt::SignalReport {
+            to_station: "W1XYZ".to_string(),
+            from_station: "JA1ABC".to_string(),
+            report: -12,
+        };
+        assert_eq!(classify_caller_answer(&m, OUR), None);
+    }
+
+    #[test]
+    fn cq_and_seventythree_are_not_caller_answers() {
+        // A CQ is an initiation, not a direct call to us.
+        let cq = Mt::Cq {
+            callsign: "JA1ABC".to_string(),
+            grid: None,
+        };
+        assert_eq!(classify_caller_answer(&cq, OUR), None);
+        // A 73 to us needs no reply (the QSO is closing).
+        let seventythree = Mt::SeventyThree {
+            to_station: OUR.to_string(),
+            from_station: "JA1ABC".to_string(),
+        };
+        assert_eq!(classify_caller_answer(&seventythree, OUR), None);
+    }
 }
 
 #[cfg(test)]
