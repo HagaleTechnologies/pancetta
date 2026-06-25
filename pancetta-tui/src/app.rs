@@ -2503,6 +2503,28 @@ pub fn format_s_meter(db_over_s9: i32) -> String {
     }
 }
 
+/// Parse an operator-entered frequency in MHz (e.g. "14.085") to Hz. Returns
+/// `None` for empty or malformed input. Rounds to the nearest Hz.
+pub fn parse_mhz_to_hz(s: &str) -> Option<u64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let mhz: f64 = t.parse().ok()?;
+    if !mhz.is_finite() || mhz <= 0.0 {
+        return None;
+    }
+    Some((mhz * 1_000_000.0).round() as u64)
+}
+
+/// Interim US-band check: `true` when `tx_rf_hz` is outside the ham band ranges
+/// modeled by `pancetta_core::Band::from_frequency` (used here as the proxy for
+/// US bands). Region-aware band plans are a deferred TODO (see the split design
+/// spec at docs/superpowers/specs/2026-06-25-arbitrary-freq-split-design.md).
+pub fn tx_rf_out_of_us_band(tx_rf_hz: u64) -> bool {
+    pancetta_core::Band::from_frequency(tx_rf_hz).is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3810,5 +3832,25 @@ mod tests {
             "band cache exceeded cap: {}",
             app.band_cache.len()
         );
+    }
+
+    #[test]
+    fn parse_mhz_to_hz_accepts_and_rejects() {
+        assert_eq!(super::parse_mhz_to_hz("14.085"), Some(14_085_000));
+        assert_eq!(super::parse_mhz_to_hz("7.074"), Some(7_074_000));
+        assert_eq!(super::parse_mhz_to_hz("14"), Some(14_000_000));
+        assert_eq!(super::parse_mhz_to_hz("  14.085  "), Some(14_085_000));
+        assert_eq!(super::parse_mhz_to_hz(""), None);
+        assert_eq!(super::parse_mhz_to_hz("abc"), None);
+        assert_eq!(super::parse_mhz_to_hz("14.0.0"), None);
+        assert_eq!(super::parse_mhz_to_hz("-5"), None);
+    }
+
+    #[test]
+    fn tx_rf_out_of_us_band_flags_only_out_of_band() {
+        assert!(!super::tx_rf_out_of_us_band(14_074_000 + 1_500)); // 20m
+        assert!(!super::tx_rf_out_of_us_band(28_500_000)); // 10m
+        assert!(super::tx_rf_out_of_us_band(15_000_000)); // between 20m and 17m
+        assert!(super::tx_rf_out_of_us_band(100_000_000)); // nowhere near a ham band
     }
 }
