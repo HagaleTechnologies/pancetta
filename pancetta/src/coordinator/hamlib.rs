@@ -624,6 +624,32 @@ impl super::ApplicationCoordinator {
                                             Err(e) => error!("Failed to set PTT: {}", e),
                                         }
                                     }
+                                    crate::message_bus::RigControlMessage::SetSplit {
+                                        enabled,
+                                        tx_frequency,
+                                    } => {
+                                        if *enabled {
+                                            if let Err(e) =
+                                                rig_poll.set_split_freq(*tx_frequency).await
+                                            {
+                                                warn!(target: "rig.split", "set_split_freq failed: {}", e);
+                                            }
+                                            if let Err(e) = rig_poll
+                                                .set_split(true, pancetta_hamlib::Vfo::B)
+                                                .await
+                                            {
+                                                warn!(target: "rig.split", "set_split(on) failed: {}", e);
+                                            } else {
+                                                info!(target: "rig.split", "split ON, TX {} Hz", tx_frequency);
+                                            }
+                                        } else if let Err(e) =
+                                            rig_poll.set_split(false, pancetta_hamlib::Vfo::A).await
+                                        {
+                                            warn!(target: "rig.split", "set_split(off) failed: {}", e);
+                                        } else {
+                                            info!(target: "rig.split", "split OFF");
+                                        }
+                                    }
                                     _ => {}
                                 }
                             }
