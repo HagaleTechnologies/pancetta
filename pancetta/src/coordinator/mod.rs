@@ -409,6 +409,11 @@ pub struct ApplicationCoordinator {
     /// to compute absolute RF frequency from audio offsets.
     operating_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
 
+    /// Rig split-TX dial in Hz (0 = simplex). Written by the TUI SetSplit relay,
+    /// read by the QSO RF stamp (effective TX dial). RX dial stays
+    /// `operating_frequency_hz`.
+    split_tx_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
+
     /// `true` while the TX worker has PTT keyed. Set by the TX worker on
     /// key/unkey; read by the hamlib polling task so SWR is only sampled while
     /// transmitting (SWR is only meaningful under forward power) and by the TUI
@@ -729,6 +734,9 @@ impl ApplicationCoordinator {
             // Initialize to 0 — hamlib will read the actual rig frequency on startup.
             // If hamlib isn't available, the TUI default (14.074) takes over.
             operating_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // 0 = simplex; the TUI SetSplit relay writes the split TX dial when
+            // the operator enables split mode on the rig.
+            split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
@@ -1020,6 +1028,12 @@ impl ApplicationCoordinator {
         }
 
         Ok(())
+    }
+
+    /// Shared split-TX dial atomic (0 = simplex). Written by the TUI SetSplit
+    /// relay, read by the QSO RF stamp.
+    pub(crate) fn split_tx_frequency_hz(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.split_tx_frequency_hz.clone()
     }
 }
 

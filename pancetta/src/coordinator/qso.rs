@@ -753,6 +753,7 @@ impl super::ApplicationCoordinator {
         let active_qso_ap = self.active_qso_ap.clone();
         let active_qso_freq_hz = self.active_qso_freq_hz.clone();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
+        let split_tx_frequency_hz = self.split_tx_frequency_hz.clone();
         let tx_freq_mode = self.tx_freq_mode.clone();
         // Shared with the TX worker — drives the "drop TX for ended QSOs"
         // gate. The QSO component keeps it in sync from the QsoEvent stream
@@ -781,6 +782,10 @@ impl super::ApplicationCoordinator {
                 // real RF frequency (dial + audio offset), not the bare offset
                 // (was producing ADIF FREQ ~0.001 / BAND 0MHZ).
                 qso_manager.set_dial_frequency_source(operating_frequency_hz.clone());
+                // Share the split-TX dial source (0 = simplex). Written by the
+                // TUI SetSplit relay; the QSO RF stamp uses this for the
+                // effective TX dial frequency when split is active.
+                qso_manager.set_split_tx_frequency_source(split_tx_frequency_hz.clone());
                 // Share the operator's Hold/Auto TX-frequency mode so the
                 // stuck-DX hop only fires in Auto (Hold keeps the offset sticky).
                 qso_manager.set_tx_freq_mode_source(tx_freq_mode.clone());
