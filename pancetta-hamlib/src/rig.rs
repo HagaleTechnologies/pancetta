@@ -199,4 +199,16 @@ pub trait RigControl: Send + Sync {
 
     /// Get rig information
     async fn get_info(&self) -> Result<String>;
+
+    /// Enable or disable split operation, selecting which VFO transmits.
+    /// Default impl is a no-op for rigs/mocks that do not model split.
+    async fn set_split(&self, _enabled: bool, _tx_vfo: Vfo) -> Result<()> {
+        Ok(())
+    }
+
+    /// Set the transmit-VFO frequency (Hz) used while split is enabled.
+    /// Default impl is a no-op for rigs/mocks that do not model split.
+    async fn set_split_freq(&self, _tx_freq: u64) -> Result<()> {
+        Ok(())
+    }
 }
