@@ -1287,6 +1287,13 @@ impl TuiRunner {
             if app.quit_confirm_visible {
                 TuiRunner::render_quit_confirm_overlay(f, f.area());
             }
+
+            // Render freq/split modals (out-of-band ack has priority over freq entry)
+            if app.out_of_band_ack_visible {
+                crate::ui::render_out_of_band_modal(f, f.area(), app.out_of_band_rf_hz);
+            } else if app.freq_modal.visible {
+                crate::ui::render_freq_modal(f, f.area(), &app.freq_modal);
+            }
         })?;
 
         self.metrics.frames_rendered += 1;

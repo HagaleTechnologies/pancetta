@@ -238,6 +238,18 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     ));
 
+    // Split-TX chip: shown when the rig is operating split (TX ≠ RX dial).
+    if app.split_tx_hz != 0 {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            format!(" SPLIT TX {:.3} ", app.split_tx_hz as f64 / 1e6),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     // Health alarm chip — prominent, always-visible warning for the highest-
     // stakes silent failures so a new operator (or one whose audio device was
     // hijacked by a remote-desktop client) sees *why* nothing is decoding,
@@ -688,6 +700,60 @@ pub fn create_panel_block<'a>(title: &'a str, is_active: bool, app: &App) -> Blo
         .title(Span::styled(title, title_style))
         .borders(Borders::ALL)
         .border_style(border_style)
+}
+
+/// Render the Shift+F frequency-entry modal.
+pub fn render_freq_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::FreqModalState) {
+    if area.width < 10 || area.height < 4 {
+        return;
+    }
+    let modal_width: u16 = 52.min(area.width.saturating_sub(4));
+    let modal_height: u16 = 8.min(area.height.saturating_sub(4));
+    let modal_area = Rect {
+        x: (area.width.saturating_sub(modal_width)) / 2,
+        y: (area.height.saturating_sub(modal_height)) / 2,
+        width: modal_width,
+        height: modal_height,
+    };
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+    let rx_focus = matches!(m.field, crate::app::FreqModalField::RxDial);
+    let body = format!(
+        " RX dial (MHz): {}{}\n TX split (MHz): {}{}\n   (blank = simplex)\n\n [Enter] apply   [Tab] field   [Esc] cancel",
+        m.rx_buffer,
+        if rx_focus { "_" } else { "" },
+        m.tx_buffer,
+        if !rx_focus { "_" } else { "" },
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Set Frequency ")
+        .border_style(Style::default().fg(Color::Cyan));
+    f.render_widget(Paragraph::new(body).block(block), modal_area);
+}
+
+/// Render the required out-of-band acknowledgment modal.
+pub fn render_out_of_band_modal(f: &mut Frame<'_>, area: Rect, tx_rf_hz: u64) {
+    if area.width < 10 || area.height < 4 {
+        return;
+    }
+    let modal_width: u16 = 60.min(area.width.saturating_sub(4));
+    let modal_height: u16 = 7.min(area.height.saturating_sub(4));
+    let modal_area = Rect {
+        x: (area.width.saturating_sub(modal_width)) / 2,
+        y: (area.height.saturating_sub(modal_height)) / 2,
+        width: modal_width,
+        height: modal_height,
+    };
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+    let body = format!(
+        " TX {:.3} MHz is OUTSIDE the US ham bands.\n You are responsible for legal operation.\n\n [Enter] acknowledge",
+        tx_rf_hz as f64 / 1e6,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" \u{26a0} Out of band ")
+        .border_style(Style::default().fg(Color::Red));
+    f.render_widget(Paragraph::new(body).block(block), modal_area);
 }
 
 /// Helper function to get panel-specific colors
