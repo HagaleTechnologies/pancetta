@@ -16,12 +16,15 @@ over SSH.
 
 > **Status: pre-1.0, on-air ready.** Pancetta's FT8 engine pairs the
 > MIT-licensed [`ft8_lib`](https://github.com/kgoba/ft8_lib) C decoder (via
-> FFI) with a native Rust decoder that adds a-priori-aided recovery; on
-> real-world audio its decode rate is competitive with WSJT-X (the
-> `pancetta-research` harness has the measured comparisons). Hardware TX has
-> been validated end-to-end on a Yaesu FTdx10 (clean ALC, PSKReporter spots
-> across NA + EU). ~295 FT8 tests cover encode / decode / LDPC / CRC / OSD.
-> Hands-off (automatic) operation respects FCC §97.221 — see
+> FFI) with a native Rust decoder that adds parallel multi-candidate decoding
+> and a-priori-aided recovery. On a 1,201-file real off-air corpus the native
+> decoder produced **+11.6% more decodes than ft8_lib on the same audio**
+> (recovering 90.7% of ft8_lib's set, plus extras) — see
+> [`docs/decoder-comparison.md`](docs/decoder-comparison.md) for methodology,
+> the parallel-execution rationale, and honest caveats. Hardware TX has been
+> validated end-to-end on a Yaesu FTdx10 (clean ALC, PSKReporter spots across
+> NA + EU). ~295 FT8 tests cover encode / decode / LDPC / CRC / OSD. Hands-off
+> (automatic) operation respects FCC §97.221 — see
 > [`docs/fcc-part97-compliance.md`](docs/fcc-part97-compliance.md).
 
 ---
@@ -267,6 +270,7 @@ on every push to catch security advisories and license drift.
 
 - [`docs/CONFIG.md`](docs/CONFIG.md) — every config key, with examples and defaults.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — crate dependency graph, data flow, key abstractions.
+- [`docs/decoder-comparison.md`](docs/decoder-comparison.md) — native decoder vs. ft8_lib: measured decode yield on a 1,201-file corpus + the parallel-execution approach.
 - [`FEATURES.md`](FEATURES.md) — capabilities and feature status.
 - [`SECURITY.md`](SECURITY.md) — vulnerability reporting and known trade-offs.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — coding standards, contribution flow.
