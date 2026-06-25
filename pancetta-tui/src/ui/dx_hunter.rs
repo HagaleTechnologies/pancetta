@@ -366,24 +366,51 @@ fn extract_base_prefix(call_sign: &str) -> String {
 }
 
 /// Calculate DX priority score based on various factors
-pub fn calculate_dx_priority(
-    station: &DxStation,
-    _our_grid: &str,
-    worked_before: bool,
-    is_new_dxcc: bool,
-    is_new_band: bool,
+/// Unified DX-priority hierarchy used by BOTH the local-decode and network-spot
+/// scoring paths, so the DX Hunter ranks by the same cqdx-driven signals the
+/// autonomous operator's scorer uses. Order of dominance:
+///
+///   ATNO (all-time-new-one) > needed-DXCC > rarity-tier > distance > SNR
+///
+/// Previously the display score ignored ATNO/needed entirely (local decodes
+/// scored on SNR+distance only; network spots passed `is_new_dxcc/is_new_band`
+/// hardcoded `false`), so the `!`/`+` need markers were cosmetic and an ATNO
+/// never floated to the top. The need tiers use large gaps (1000 / 500) so they
+/// dominate rarity/distance/SNR, which only break ties within a need class.
+pub fn dx_priority_score(
+    atno: bool,
+    needed: bool,
+    rarity_tier: Option<&str>,
+    call_sign: &str,
+    distance: Option<f64>,
+    snr: i32,
 ) -> u32 {
     let mut score = 0u32;
 
-    // Base score from SNR (0-30 points)
-    if station.snr > 0 {
-        score += (station.snr as u32).min(30);
+    // cqdx need hierarchy — dominates the ranking.
+    if atno {
+        score += 1000;
+    } else if needed {
+        score += 500;
     }
 
-    // Distance bonus (0-50 points)
-    if let Some(distance) = station.distance {
+    // Rarity tier (cqdx) or hardcoded-prefix fallback.
+    match rarity_tier {
+        Some("legendary") => score += 400,
+        Some("very_rare") => score += 300,
+        Some("rare") => score += 150,
+        Some("uncommon") => score += 60,
+        _ => {
+            if is_rare_dx_fallback(call_sign) {
+                score += 200;
+            }
+        }
+    }
+
+    // Distance bonus.
+    if let Some(distance) = distance {
         if distance > 10000.0 {
-            score += 50; // Very long distance
+            score += 50;
         } else if distance > 5000.0 {
             score += 30;
         } else if distance > 1000.0 {
@@ -391,38 +418,45 @@ pub fn calculate_dx_priority(
         }
     }
 
-    // DXCC bonuses
-    if is_new_dxcc {
-        score += 200; // New country
+    // SNR tiebreak.
+    if snr > 0 {
+        score += (snr as u32).min(30);
     }
 
-    if is_new_band {
-        score += 100; // New band
-    }
+    score
+}
 
-    // Rarity-tier-based DX bonus
-    match station.rarity_tier.as_deref() {
-        Some("legendary") => score += 200,
-        Some("very_rare") => score += 150,
-        Some("rare") => score += 100,
-        Some("uncommon") => score += 50,
-        _ => {
-            if is_rare_dx_fallback(&station.call_sign) {
-                score += 150;
-            }
-        }
-    }
+pub fn calculate_dx_priority(
+    station: &DxStation,
+    _our_grid: &str,
+    worked_before: bool,
+    _is_new_dxcc: bool,
+    _is_new_band: bool,
+) -> u32 {
+    // Rank by the cqdx need hierarchy (ATNO/needed now actually drive the sort,
+    // not just the !/+ markers). The `is_new_dxcc`/`is_new_band` params are
+    // retained for call-site compatibility but superseded by the authoritative
+    // `station.atno` / `station.needed` flags carried from the coordinator's
+    // CachedStationLookup.
+    let mut score = dx_priority_score(
+        station.atno,
+        station.needed,
+        station.rarity_tier.as_deref(),
+        &station.call_sign,
+        station.distance,
+        station.snr,
+    );
 
-    // Penalty for already worked
+    // Penalty for already worked (the list comparator already sinks worked
+    // stations below unworked; this keeps the numeric score consistent).
     if worked_before {
         score = score.saturating_sub(50);
     }
 
-    // Recency bonus (more recent = higher priority)
+    // Recency bonus (more recent = higher priority).
     let age_minutes = chrono::Utc::now()
         .signed_duration_since(station.last_seen)
         .num_minutes();
-
     if age_minutes < 5 {
         score += 20;
     } else if age_minutes < 15 {
@@ -476,8 +510,8 @@ mod tests {
             distance: Some(8000.0),
             bearing: Some(45.0),
             worked_before: false,
-            needed: false,
-            atno: false,
+            needed: true,
+            atno: true,
             priority_score: 0,
             source: crate::app::SpotSource::Local,
             entity_name: None,
@@ -492,8 +526,26 @@ mod tests {
             slot_parity: None,
         };
 
-        let score = calculate_dx_priority(&station, "FN20", false, true, false);
-        assert!(score > 100); // Should have good score for new DXCC + good SNR + distance
+        let score = calculate_dx_priority(&station, "FN20", false, false, false);
+        // ATNO (+1000) dominates regardless of the legacy is_new_dxcc param.
+        assert!(
+            score > 1000,
+            "ATNO station should rank at the top; got {score}"
+        );
+    }
+
+    #[test]
+    fn dx_priority_hierarchy_atno_over_needed_over_rare_over_plain() {
+        // Same call/distance/SNR; only the need class differs. The ranking
+        // must be strict: ATNO > needed-DXCC > rare > plain — i.e. a strong
+        // common signal must never outrank a weak ATNO.
+        let atno = dx_priority_score(true, true, None, "JA1ABC", Some(500.0), -20);
+        let needed = dx_priority_score(false, true, None, "JA1ABC", Some(9000.0), 25);
+        let rare = dx_priority_score(false, false, Some("very_rare"), "JA1ABC", Some(9000.0), 25);
+        let plain = dx_priority_score(false, false, None, "JA1ABC", Some(9000.0), 25);
+        assert!(atno > needed, "ATNO {atno} must outrank needed {needed}");
+        assert!(needed > rare, "needed {needed} must outrank rare {rare}");
+        assert!(rare > plain, "rare {rare} must outrank plain {plain}");
     }
 
     #[test]

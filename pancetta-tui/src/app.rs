@@ -978,30 +978,19 @@ impl App {
     }
 
     fn calculate_dx_priority(&self, message: &DecodedMessageView) -> u32 {
-        let mut score = 0u32;
-
-        // Higher SNR gets more points
-        if message.snr > 0 {
-            score += message.snr as u32;
-        }
-
-        // Distance bonus
-        if let Some(distance) = message.distance {
-            if distance > 1000.0 {
-                score += 50;
-            }
-            if distance > 5000.0 {
-                score += 100;
-            }
-        }
-
-        // TODO: Add more sophisticated scoring based on:
-        // - DXCC entity
-        // - Band/mode combinations worked
-        // - Contest status
-        // - Propagation conditions
-
-        score
+        // Rank local decodes by the SAME cqdx need hierarchy as network spots
+        // (ATNO > needed-DXCC > rarity > distance > SNR). The `needed`/`atno`
+        // flags ride on the decode from the coordinator's CachedStationLookup;
+        // local decodes carry no rarity tier (that's network-spot metadata), so
+        // pass None there. Previously this was SNR+distance only.
+        crate::ui::dx_hunter::dx_priority_score(
+            message.atno,
+            message.needed,
+            None,
+            message.call_sign.as_deref().unwrap_or(""),
+            message.distance,
+            message.snr,
+        )
     }
 
     fn scroll_up(&mut self) {
