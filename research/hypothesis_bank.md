@@ -6166,10 +6166,10 @@ search to in-repo sources.
 
     Reference: ft8mon ft8.cc:2186-2225
 
-### hb-225 — ft8mon 2-D coarse sub-bin Costas search grid  [PRIORITY: 0.55, spawned 2026-06-07 Batch 42, RAISED by Batch 45 freq-dither corroboration]
+### hb-225 — ft8mon 2-D coarse sub-bin Costas search grid  [PRIORITY: 0.30, LOWERED 2026-06-25 Batch 102 — naive-oversampling knob path KILLED]
   mode: ft8
-  status: PROPOSED-FROM-RESEARCH (corroborated: Batch 45 sub-Hz freq dither measured +33 TPs on hard-200 N=200, demonstrating sub-bin offset surfaces sync candidates pancetta currently misses)
-  priority_score: 0.45
+  status: PROPOSED-FROM-RESEARCH, DOWNWEIGHTED. Batch 102 FREQ_OSR knob audit (2→4) on the CURRENT baseline (raw_530_full N=50, ft8_lib hash-normalized): FREQ_OSR=4 LOSES 151 TPs and pushes miss 2.42%→18.30% (precision rises 0.822→0.921 only because it rejects real signal). Mechanism: raising freq oversampling rescales the dB power map / 40th-pct noise floor / Costas scores that the OSR=2-tuned thresholds (sync-min, OSD gate=6, hb-062/103 FP filters) consume — same shape as hb-224 (can't lift the knob in isolation). This KILLS the naive "oversample finer" path. hb-225's ACTUAL proposal (fixed OSR=2 spectrogram + sub-bin offsets within the coarse Costas grid via cached-FFT bin-rotation) is NOT refuted but is now lower-confidence: the regression shows recall is very sensitive to anything perturbing the OSR=2 normalization, and Batch 45's +33 corroboration predates hash-norm scoring + the B88 dt fix. Re-open only with a band-middle-specific corpus + a fixed-resolution sub-bin probe (NOT a knob bump). Note: research/notes/2026-06-25-batch102-freq-osr-audit.md; probe: examples/batch102_freq_osr_audit.rs.
+  priority_score: 0.30
   estimated_effort: 1 session (~250 LOC including cached-FFT-with-bin-shift optimization)
   expected_delta: targets pancetta's band-middle 1000-2000 Hz recall hole (Batch 34 finding); potentially +30-50 TPs
   defensible_prior: PARTIAL — pancetta already has hb-044 parabolic time-axis refinement, but ft8mon's grid is finer (4×4 sub-bin per FFT bin via cached global FFT + bin-shift). Sub-bin frequency search not currently done.
