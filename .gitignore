@@ -165,3 +165,4 @@ research/experiments/**/trajectories.parquet
 # the baseline binary runs from the workspace root
 /decoded.txt
 /jt9_wisdom.dat
+.playwright-mcp/

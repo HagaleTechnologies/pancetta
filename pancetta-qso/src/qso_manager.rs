@@ -331,7 +331,73 @@ pub struct QsoManager {
     tx_freq_mode: Arc<std::sync::atomic::AtomicU8>,
 }
 
+/// Outcome of the half-duplex parity-admission check for a *new* QSO.
+///
+/// FT8 is half-duplex on a 15 s slot grid: while we transmit in one window we
+/// are deaf to the band. To keep the *opposite* window always free for hearing
+/// responses, **every concurrent active QSO must transmit on the same parity**
+/// (the "TX side"). A new QSO whose desired `tx_parity` matches the current
+/// side (or any QSO when we are idle) is [`TxAdmission::Admit`]ted and runs
+/// concurrently; a cross-parity request is [`TxAdmission::Queue`]d until all
+/// current-side QSOs finish and a clean window flip is possible. We never
+/// preempt an in-flight QSO to change sides. See [`admit_new_qso`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxAdmission {
+    /// Start the QSO now — either we are idle (it adopts its own side) or its
+    /// desired parity matches the current TX side (concurrent, same window).
+    Admit,
+    /// Defer the QSO — it wants the opposite window from the one we are
+    /// currently committed to. Hold it until the current-side QSOs complete.
+    Queue,
+}
+
+/// Pure half-duplex admission decision (see [`TxAdmission`]).
+///
+/// * `current_side` — the parity all currently-active QSOs transmit on, or
+///   `None` when we are idle (no committed side).
+/// * `desired` — the parity this new QSO wants to transmit on (`None` means the
+///   caller hasn't pinned a parity, e.g. a CQ that lets the scheduler choose —
+///   such a request never conflicts and is always admitted, adopting whatever
+///   side is live).
+///
+/// Rules: idle → admit (adopt the side); unpinned desire → admit (flexible);
+/// same side → admit (concurrent, same window); cross-side → queue.
+pub fn admit_new_qso(
+    current_side: Option<pancetta_core::slot::SlotParity>,
+    desired: Option<pancetta_core::slot::SlotParity>,
+) -> TxAdmission {
+    match (current_side, desired) {
+        // Idle: the new QSO defines the side.
+        (None, _) => TxAdmission::Admit,
+        // Caller didn't pin a parity: it can ride the live side.
+        (Some(_), None) => TxAdmission::Admit,
+        // Committed side and a pinned desire: admit iff they match.
+        (Some(side), Some(want)) => {
+            if side == want {
+                TxAdmission::Admit
+            } else {
+                TxAdmission::Queue
+            }
+        }
+    }
+}
+
 impl QsoManager {
+    /// The parity our currently-active QSOs are committed to transmitting on,
+    /// or `None` when idle.
+    ///
+    /// Half-duplex discipline (see [`admit_new_qso`]) guarantees every active
+    /// QSO shares one TX parity, so the first active QSO carrying a latched
+    /// `tx_parity` defines the side. QSOs with `tx_parity == None` (parity left
+    /// to the scheduler) don't pin a side and are skipped. Returns `None` when
+    /// no active QSO pins a parity (we are free to adopt either window).
+    pub async fn current_tx_side(&self) -> Option<pancetta_core::slot::SlotParity> {
+        let qsos = self.qsos.read().await;
+        qsos.values()
+            .filter(|p| p.state.is_active())
+            .find_map(|p| p.metadata.tx_parity)
+    }
+
     /// Create a new QSO manager
     pub fn new(config: QsoManagerConfig) -> Self {
         let (event_sender, _) = broadcast::channel(1000);
@@ -3199,6 +3265,49 @@ mod tests {
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
         }
+    }
+
+    #[test]
+    fn admit_idle_admits_any_desire() {
+        use pancetta_core::slot::SlotParity::*;
+        assert_eq!(admit_new_qso(None, Some(Even)), TxAdmission::Admit);
+        assert_eq!(admit_new_qso(None, Some(Odd)), TxAdmission::Admit);
+        assert_eq!(admit_new_qso(None, None), TxAdmission::Admit);
+    }
+
+    #[test]
+    fn admit_same_side_admits_cross_side_queues() {
+        use pancetta_core::slot::SlotParity::*;
+        // Same side → concurrent (same window) → admit.
+        assert_eq!(admit_new_qso(Some(Even), Some(Even)), TxAdmission::Admit);
+        assert_eq!(admit_new_qso(Some(Odd), Some(Odd)), TxAdmission::Admit);
+        // Cross side → would TX in the opposite window → queue.
+        assert_eq!(admit_new_qso(Some(Even), Some(Odd)), TxAdmission::Queue);
+        assert_eq!(admit_new_qso(Some(Odd), Some(Even)), TxAdmission::Queue);
+    }
+
+    #[test]
+    fn admit_unpinned_desire_rides_live_side() {
+        use pancetta_core::slot::SlotParity::*;
+        // A request that doesn't pin a parity (e.g. CQ, scheduler picks) never
+        // conflicts — it rides whatever side is already live.
+        assert_eq!(admit_new_qso(Some(Even), None), TxAdmission::Admit);
+        assert_eq!(admit_new_qso(Some(Odd), None), TxAdmission::Admit);
+    }
+
+    #[tokio::test]
+    async fn current_tx_side_none_when_idle_then_pins_after_admit() {
+        use pancetta_core::slot::SlotParity;
+        let manager = QsoManager::new(test_config());
+        assert_eq!(manager.current_tx_side().await, None);
+
+        // A responder latches tx_parity = opposite(dx_parity). DX on Even → we
+        // TX Odd, so the side becomes Odd.
+        manager
+            .respond_to_cq("K9XYZ".to_string(), 14074000.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+        assert_eq!(manager.current_tx_side().await, Some(SlotParity::Odd));
     }
 
     #[tokio::test]

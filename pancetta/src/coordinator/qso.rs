@@ -1131,6 +1131,37 @@ impl super::ApplicationCoordinator {
                                             // and StateChanged (→ active_tx_qsos). The autonomous
                                             // task already applied its gating and is NOT sending
                                             // the opening itself, so there is no double-send.
+                                            //
+                                            // Half-duplex parity discipline (#39): never open a
+                                            // QSO that would transmit in the *opposite* window
+                                            // from the one our active QSOs are committed to —
+                                            // doing so would leave us TXing in sequential windows
+                                            // and deaf to responses. The new QSO's desired TX
+                                            // parity is `opposite(dx_parity)` for a pounce, or
+                                            // `parity` itself for a self-CQ. If it crosses the
+                                            // live side, skip this slot; the DX will CQ again and
+                                            // we re-evaluate once the current side clears.
+                                            let desired_tx_parity = match &callsign {
+                                                Some(_) => parity.map(|p| p.opposite()),
+                                                None => parity,
+                                            };
+                                            let current_side = qso_manager.current_tx_side().await;
+                                            if matches!(
+                                                pancetta_qso::qso_manager::admit_new_qso(
+                                                    current_side,
+                                                    desired_tx_parity,
+                                                ),
+                                                pancetta_qso::qso_manager::TxAdmission::Queue
+                                            ) {
+                                                info!(
+                                                    target: "qso.autonomous",
+                                                    "Deferring autonomous QSO ({:?}) — cross-parity: \
+                                                     active side {:?}, wanted {:?}; \
+                                                     waiting for current window to clear",
+                                                    callsign, current_side, desired_tx_parity
+                                                );
+                                                continue;
+                                            }
                                             let result = match &callsign {
                                                 Some(dx) => {
                                                     qso_manager
