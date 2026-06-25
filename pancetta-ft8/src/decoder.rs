@@ -4211,18 +4211,25 @@ impl Ft8Decoder {
                         continue;
                     }
 
-                    let signal_mag = spec.power[time_idx][freq_sub][freq_idx];
+                    // Perf (Pass 2 / A3): hoist the `[time_idx][freq_sub]` row out
+                    // of this hot Costas-score loop. signal_mag and both frequency
+                    // neighbors index the same (time, freq_sub) plane, so resolving
+                    // the two outer `Vec` indirections once and reusing the row
+                    // slice is bit-identical — same f64 values, same order — and
+                    // removes two pointer-chases per access in the innermost loop.
+                    let row = &spec.power[time_idx][freq_sub];
+                    let signal_mag = row[freq_idx];
 
                     // Check frequency neighbor below
                     if sm > 0 && f0 + sm - 1 < spec.num_bins {
-                        let neighbor = spec.power[time_idx][freq_sub][f0 + sm - 1];
+                        let neighbor = row[f0 + sm - 1];
                         score += signal_mag - neighbor;
                         num_average += 1;
                     }
 
                     // Check frequency neighbor above
                     if sm + 1 < pp.num_tones && f0 + sm + 1 < spec.num_bins {
-                        let neighbor = spec.power[time_idx][freq_sub][f0 + sm + 1];
+                        let neighbor = row[f0 + sm + 1];
                         score += signal_mag - neighbor;
                         num_average += 1;
                     }

@@ -77,8 +77,6 @@ harness = false
 [features]
 default = ["std", "neural_osd"]
 std = []
-# Enable SIMD optimizations
-simd = []
 # Use external ft8_lib via FFI (fallback)
 ffi = []
 # Enable GPIO support for Raspberry Pi
