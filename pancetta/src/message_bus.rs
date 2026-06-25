@@ -367,6 +367,11 @@ pub enum RigControlMessage {
     /// Live SWR reading (e.g. 1.3 = 1.3:1), from the hamlib polling loop's
     /// `\get_level SWR` reads while PTT is keyed. Only meaningful during TX.
     SwrResponse { swr: f32 },
+    /// Enable/disable rig-level split (RX dial ≠ TX dial). When `enabled`,
+    /// the rig transmits on VFO B at `tx_frequency` (Hz) while receiving on
+    /// VFO A. When disabled, `tx_frequency` is ignored. Produced by the TUI
+    /// SetSplit relay; consumed by the hamlib command loop.
+    SetSplit { enabled: bool, tx_frequency: u64 },
 }
 
 /// QSO management messages
