@@ -1467,6 +1467,10 @@ impl TuiRunner {
                 "f",
                 "TX freq mode: HOLD (pin offset) / AUTO (pancetta picks)",
             ),
+            (
+                "Shift+F",
+                "Set dial / split freq (RX MHz + optional TX MHz)",
+            ),
             ("Shift+T", "Tune (12 s tone; blocked while TX DISABLED)"),
             ("h", "Halt current TX"),
             ("p", "Toggle PTT (blocked while TX DISABLED)"),
