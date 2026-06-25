@@ -52,6 +52,17 @@ fn stuck_hopped_offset(current: f64) -> f64 {
     .clamp(TX_OFFSET_MIN_HZ, TX_OFFSET_MAX_HZ)
 }
 
+/// The dial the station actually transmits on: the split TX dial when split is
+/// active (`split_tx_hz != 0`), otherwise the RX dial. Used to stamp the logged
+/// RF frequency of a completed QSO (dial + audio offset).
+pub fn effective_tx_dial(rx_dial_hz: u64, split_tx_hz: u64) -> u64 {
+    if split_tx_hz != 0 {
+        split_tx_hz
+    } else {
+        rx_dial_hz
+    }
+}
+
 /// QSO management errors
 #[derive(Debug, Error)]
 pub enum QsoManagerError {
@@ -322,6 +333,12 @@ pub struct QsoManager {
     /// records a real FREQ/BAND instead of the bare offset.
     dial_frequency_hz: Arc<AtomicU64>,
 
+    /// Rig split-TX dial in Hz (0 = simplex), shared from the coordinator.
+    /// When nonzero, completed-QSO RF is stamped against this TX dial instead
+    /// of `dial_frequency_hz` (the RX dial). Defaults to a private `0` atomic
+    /// so callers that never inject a source keep simplex (RX==TX) behavior.
+    split_tx_frequency_hz: Arc<AtomicU64>,
+
     /// Operator TX-frequency mode (`pancetta_core::TxFreqMode` as `u8`), shared
     /// from the coordinator. The stuck-DX TX-offset hop only fires in `Auto`
     /// mode; in the default `Hold` mode the operator's picked offset is sticky
@@ -442,6 +459,7 @@ impl QsoManager {
             cleanup_interval: Arc::new(RwLock::new(None)),
             database: None,
             dial_frequency_hz: Arc::new(AtomicU64::new(0)),
+            split_tx_frequency_hz: Arc::new(AtomicU64::new(0)),
             // Default Hold: the stuck-DX hop stays off unless the coordinator
             // injects a shared mode atomic and the operator switches to Auto.
             tx_freq_mode: Arc::new(std::sync::atomic::AtomicU8::new(
@@ -456,6 +474,14 @@ impl QsoManager {
     /// called, completed metadata keeps the offset value (e.g. unit tests).
     pub fn set_dial_frequency_source(&mut self, source: Arc<AtomicU64>) {
         self.dial_frequency_hz = source;
+    }
+
+    /// Share the coordinator's split-TX dial source so completed QSOs log the
+    /// real TX RF during split operation. Pass the same `Arc<AtomicU64>` the
+    /// TUI SetSplit relay updates (0 = simplex). If never called, the manager
+    /// keeps its private `0` (RX==TX).
+    pub fn set_split_tx_frequency_source(&mut self, source: Arc<AtomicU64>) {
+        self.split_tx_frequency_hz = source;
     }
 
     /// Share the coordinator's TX-frequency-mode atomic so the stuck-DX hop
@@ -1202,7 +1228,9 @@ impl QsoManager {
         // `process_message_for_qso`, including the dial-frequency stamp so the
         // ADIF carries the real on-air RF frequency, not the bare audio offset.
         if is_completed_open {
-            let dial = self.dial_frequency_hz.load(Ordering::Relaxed);
+            let rx_dial = self.dial_frequency_hz.load(Ordering::Relaxed);
+            let split = self.split_tx_frequency_hz.load(Ordering::Relaxed);
+            let dial = effective_tx_dial(rx_dial, split);
             if dial > 0 {
                 metadata.frequency += dial as f64;
             }
@@ -1552,7 +1580,9 @@ impl QsoManager {
                 // RF frequency is the rig dial plus that offset (WSJT-X logs the
                 // actual on-air frequency, not the dial). Without this the ADIF
                 // recorded BAND 0MHZ / FREQ ~0.001 from the bare offset.
-                let dial = self.dial_frequency_hz.load(Ordering::Relaxed);
+                let rx_dial = self.dial_frequency_hz.load(Ordering::Relaxed);
+                let split = self.split_tx_frequency_hz.load(Ordering::Relaxed);
+                let dial = effective_tx_dial(rx_dial, split);
                 if dial > 0 {
                     m.frequency += dial as f64;
                 }
@@ -2783,7 +2813,9 @@ impl QsoManager {
                 };
                 progress.metadata.end_time = Some(now);
                 let mut m = progress.metadata.clone();
-                let dial = self.dial_frequency_hz.load(Ordering::Relaxed);
+                let rx_dial = self.dial_frequency_hz.load(Ordering::Relaxed);
+                let split = self.split_tx_frequency_hz.load(Ordering::Relaxed);
+                let dial = effective_tx_dial(rx_dial, split);
                 if dial > 0 {
                     m.frequency += dial as f64;
                 }
@@ -3270,6 +3302,7 @@ impl Clone for QsoManager {
             cleanup_interval: Arc::clone(&self.cleanup_interval),
             database: self.database.clone(),
             dial_frequency_hz: Arc::clone(&self.dial_frequency_hz),
+            split_tx_frequency_hz: Arc::clone(&self.split_tx_frequency_hz),
             tx_freq_mode: Arc::clone(&self.tx_freq_mode),
         }
     }
@@ -6494,6 +6527,28 @@ mod stuck_dx_tests {
                 "Hold mode must never move the TX offset"
             );
         }
+    }
+
+    #[test]
+    fn effective_tx_dial_simplex_and_split() {
+        // Simplex: split == 0 → use RX dial.
+        assert_eq!(super::effective_tx_dial(14_074_000, 0), 14_074_000);
+        // Split: nonzero split → use split TX dial.
+        assert_eq!(super::effective_tx_dial(14_074_000, 14_090_000), 14_090_000);
+    }
+
+    #[test]
+    fn split_source_overrides_rx_dial_for_stamp() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let rx = std::sync::Arc::new(AtomicU64::new(14_074_000));
+        let split = std::sync::Arc::new(AtomicU64::new(14_090_000));
+        let dial =
+            super::effective_tx_dial(rx.load(Ordering::Relaxed), split.load(Ordering::Relaxed));
+        assert_eq!(dial, 14_090_000);
+        split.store(0, Ordering::Relaxed);
+        let dial =
+            super::effective_tx_dial(rx.load(Ordering::Relaxed), split.load(Ordering::Relaxed));
+        assert_eq!(dial, 14_074_000);
     }
 
     /// A *different* non-advancing frame resets the streak, so alternating
