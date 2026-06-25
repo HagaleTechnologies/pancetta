@@ -541,6 +541,9 @@ impl super::ApplicationCoordinator {
         let cmd_message_bus = self.message_bus.clone();
         let cmd_operating_freq = operating_freq.clone();
         let cmd_operating_freq_hz = self.operating_frequency_hz.clone();
+        // Split TX dial atomic (0 = simplex). Written by SetSplit relay, read
+        // by QSO RF-stamp and cleared here on any band change.
+        let cmd_split_tx_hz = self.split_tx_frequency_hz();
         // C9 dedup anchor: record that *pancetta* (via the operator's TUI
         // SetFrequency) commanded this dial change, so the hamlib poll loop
         // doesn't double-fire the teardown when it reads the new freq back.
@@ -843,6 +846,21 @@ impl super::ApplicationCoordinator {
                                 if let Err(e) = cmd_message_bus.send_message(teardown).await {
                                     warn!("Band change: failed to send teardown: {}", e);
                                 }
+                                // A band change invalidates any split TX freq.
+                                if cmd_split_tx_hz.swap(0, Ordering::Relaxed) != 0 {
+                                    let clr = ComponentMessage::new(
+                                        ComponentId::Tui,
+                                        ComponentId::Hamlib,
+                                        MessageType::RigControl(
+                                            crate::message_bus::RigControlMessage::SetSplit {
+                                                enabled: false,
+                                                tx_frequency: 0,
+                                            },
+                                        ),
+                                        Instant::now(),
+                                    );
+                                    let _ = cmd_message_bus.send_message(clr).await;
+                                }
                             }
                             // Forward to hamlib if available
                             let msg = ComponentMessage::new(
@@ -858,6 +876,28 @@ impl super::ApplicationCoordinator {
                             );
                             if let Err(e) = cmd_message_bus.send_message(msg).await {
                                 debug!("Failed to forward SetFrequency to hamlib: {}", e);
+                            }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::SetSplit {
+                            enabled,
+                            tx_frequency,
+                        } => {
+                            let store = if enabled { tx_frequency } else { 0 };
+                            cmd_split_tx_hz.store(store, Ordering::Relaxed);
+                            info!(target: "rig.split", "TUI SetSplit enabled={} tx={} Hz", enabled, tx_frequency);
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Hamlib,
+                                MessageType::RigControl(
+                                    crate::message_bus::RigControlMessage::SetSplit {
+                                        enabled,
+                                        tx_frequency,
+                                    },
+                                ),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to forward SetSplit to hamlib: {}", e);
                             }
                         }
                         pancetta_tui::tui_runner::TuiCommand::Quit => {

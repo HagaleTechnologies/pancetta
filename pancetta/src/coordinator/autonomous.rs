@@ -365,6 +365,9 @@ impl super::ApplicationCoordinator {
 
         let cqdx_bridge_for_auto = self.cqdx_bridge.clone();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
+        // Split TX dial atomic (0 = simplex). Cleared on autonomous band-hop
+        // (same as the manual TUI SetFrequency path).
+        let split_tx_hz = self.split_tx_frequency_hz();
         // C9 dedup anchor: record that *pancetta* (the autonomous operator)
         // commanded a band change, so the hamlib poll loop doesn't double-fire
         // the teardown when it reads the new freq back off the rig.
@@ -548,6 +551,21 @@ impl super::ApplicationCoordinator {
                                                     "Autonomous band change: failed to send teardown: {}",
                                                     e
                                                 );
+                                            }
+                                            // A band change invalidates any split TX freq.
+                                            if split_tx_hz.swap(0, Ordering::Relaxed) != 0 {
+                                                let clr = ComponentMessage::new(
+                                                    ComponentId::Autonomous,
+                                                    ComponentId::Hamlib,
+                                                    MessageType::RigControl(
+                                                        crate::message_bus::RigControlMessage::SetSplit {
+                                                            enabled: false,
+                                                            tx_frequency: 0,
+                                                        },
+                                                    ),
+                                                    Instant::now(),
+                                                );
+                                                let _ = message_bus.send_message(clr).await;
                                             }
                                         }
                                         let msg = ComponentMessage::new(
