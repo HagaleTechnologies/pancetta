@@ -193,6 +193,9 @@ pub enum TuiMessage {
 pub enum TuiCommand {
     /// Change frequency
     SetFrequency { vfo: u8, frequency: u64 },
+    /// Enable/disable rig split (RX dial ≠ TX dial). `tx_frequency` is the
+    /// split TX dial in Hz (ignored when `enabled == false`).
+    SetSplit { enabled: bool, tx_frequency: u64 },
     /// Start CQ
     StartCq {
         /// Operator's TX audio offset (Hz) from the waterfall cursor.

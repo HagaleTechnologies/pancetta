@@ -316,6 +316,29 @@ pub enum DevicePanel {
     Output,
 }
 
+/// Which field of the frequency-entry modal is focused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FreqModalField {
+    /// RX dial input field.
+    #[default]
+    RxDial,
+    /// TX split input field (blank = simplex).
+    TxSplit,
+}
+
+/// State for the Shift+F frequency-entry modal: two MHz text fields.
+#[derive(Debug, Clone, Default)]
+pub struct FreqModalState {
+    /// Modal visible.
+    pub visible: bool,
+    /// RX dial input buffer (MHz string).
+    pub rx_buffer: String,
+    /// TX split input buffer (MHz string); empty = simplex.
+    pub tx_buffer: String,
+    /// Focused field.
+    pub field: FreqModalField,
+}
+
 #[derive(Debug, Clone)]
 pub struct DeviceSelectionState {
     pub input_devices: Vec<(String, bool)>, // (name, is_default)
@@ -619,6 +642,20 @@ pub struct App {
     /// dismisses. Modal blocks all other keys while visible.
     pub quit_confirm_visible: bool,
 
+    /// Frequency-entry modal (Shift+F). See `FreqModalState`.
+    pub freq_modal: FreqModalState,
+    /// Active split TX dial in Hz for display (0 = simplex). Set optimistically
+    /// when the operator applies split; the authoritative atomic lives in the
+    /// coordinator.
+    pub split_tx_hz: u64,
+    /// True once this session has shown the out-of-band acknowledgment modal,
+    /// so it is shown at most once per session.
+    pub out_of_band_warned: bool,
+    /// True while the required out-of-band acknowledgment modal is visible.
+    pub out_of_band_ack_visible: bool,
+    /// The TX RF (Hz) that triggered the out-of-band modal (for its message).
+    pub out_of_band_rf_hz: u64,
+
     /// hb-161 — Phase 5 emergency-stop banner state. Flipped to `true`
     /// the moment the operator presses Shift+Q; the UI renders a red
     /// "STOPPED BY OPERATOR" banner over the main view. Cleared by Esc.
@@ -762,6 +799,11 @@ impl App {
             device_selection: DeviceSelectionState::new(),
             help_visible: false,
             quit_confirm_visible: false,
+            freq_modal: FreqModalState::default(),
+            split_tx_hz: 0,
+            out_of_band_warned: false,
+            out_of_band_ack_visible: false,
+            out_of_band_rf_hz: 0,
             stopped_by_operator: false,
             tx_input_buffer: String::new(),
             tx_input_cursor: 0,
@@ -2528,6 +2570,14 @@ pub fn tx_rf_out_of_us_band(tx_rf_hz: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn freq_modal_default_is_hidden_rxdial() {
+        let m = super::FreqModalState::default();
+        assert!(!m.visible);
+        assert_eq!(m.field, super::FreqModalField::RxDial);
+        assert!(m.rx_buffer.is_empty() && m.tx_buffer.is_empty());
+    }
 
     fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {
         DecodedMessageView {
