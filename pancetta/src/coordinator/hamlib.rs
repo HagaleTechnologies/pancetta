@@ -251,6 +251,7 @@ impl super::ApplicationCoordinator {
         }
 
         let operating_frequency_hz = self.operating_frequency_hz.clone();
+        let ptt_active = self.ptt_active.clone();
         let rig_conn_state = self.rig_conn_state.clone();
         // C9 dedup anchor (most recent pancetta-initiated SetFrequency) — the
         // poll loop reads it to tell an operator dial move (tear down) from a
@@ -314,6 +315,7 @@ impl super::ApplicationCoordinator {
                 let rig_for_polling = Arc::clone(&rig_poll);
                 let shutdown_for_polling = shutdown.clone();
                 let op_freq_for_polling = operating_frequency_hz.clone();
+                let ptt_active_poll = ptt_active.clone();
                 let rig_conn_state_poll = rig_conn_state.clone();
                 // C9 dial-poll teardown plumbing.
                 let last_freq_command_poll = last_freq_command.clone();
@@ -447,6 +449,27 @@ impl super::ApplicationCoordinator {
                                                 Instant::now(),
                                             );
                                             let _ = message_bus.send_message(s_msg).await;
+                                        }
+                                    }
+
+                                    // SWR — only meaningful while keyed (needs
+                                    // forward power). Poll every tick during TX so
+                                    // the status bar tracks across the ~12.6s
+                                    // burst; skipped entirely on RX. Best-effort,
+                                    // like the S-meter read.
+                                    if ptt_active_poll.load(Ordering::Acquire) {
+                                        if let Ok(swr) = rig_for_polling.get_swr().await {
+                                            let swr_msg = ComponentMessage::new(
+                                                ComponentId::Hamlib,
+                                                ComponentId::Tui,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::SwrResponse {
+                                                        swr,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(swr_msg).await;
                                         }
                                     }
                                     true

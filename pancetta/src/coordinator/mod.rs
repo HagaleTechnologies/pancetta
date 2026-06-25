@@ -409,6 +409,12 @@ pub struct ApplicationCoordinator {
     /// to compute absolute RF frequency from audio offsets.
     operating_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
 
+    /// `true` while the TX worker has PTT keyed. Set by the TX worker on
+    /// key/unkey; read by the hamlib polling task so SWR is only sampled while
+    /// transmitting (SWR is only meaningful under forward power) and by the TUI
+    /// status bar to show the live reading only during TX.
+    pub(crate) ptt_active: Arc<std::sync::atomic::AtomicBool>,
+
     /// C9 dedup anchor: the most recent dial frequency **pancetta itself
     /// commanded** (TUI `SetFrequency`, autonomous `ChangeBand`) and when.
     /// `None` until the first pancetta-initiated frequency change.
@@ -718,6 +724,7 @@ impl ApplicationCoordinator {
             // Initialize to 0 — hamlib will read the actual rig frequency on startup.
             // If hamlib isn't available, the TUI default (14.074) takes over.
             operating_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "pancetta-hamlib")]

@@ -583,6 +583,10 @@ pub struct App {
     /// relative to S9 (0 = S9, -54 ≈ S0, +20 = S9+20). `None` until the
     /// first reading arrives (no rig, or rig doesn't report STRENGTH).
     pub signal_strength_db: Option<i32>,
+    /// Last SWR reading (e.g. 1.3) from the rig while keyed, and when it
+    /// arrived. Shown in the status bar only during TX; goes stale after 5s.
+    pub swr: Option<f32>,
+    pub swr_at: Option<DateTime<Utc>>,
     /// When `signal_strength_db` was last updated. Used to render the
     /// S-meter as stale ("---") if the rig stops reporting.
     pub signal_strength_at: Option<DateTime<Utc>>,
@@ -742,6 +746,8 @@ impl App {
             audio_level: 0.0,
             signal_strength_db: None,
             signal_strength_at: None,
+            swr: None,
+            swr_at: None,
             pipeline_health: None,
             autonomous_init_paused: false,
             color_capability: ColorCapability::detect(),
@@ -1330,6 +1336,25 @@ impl App {
     pub fn update_signal_strength(&mut self, db_over_s9: i32) {
         self.signal_strength_db = Some(db_over_s9);
         self.signal_strength_at = Some(Utc::now());
+    }
+
+    /// Record a live SWR reading (e.g. 1.3 = 1.3:1) from the rig while keyed.
+    pub fn update_swr(&mut self, swr: f32) {
+        self.swr = Some(swr);
+        self.swr_at = Some(Utc::now());
+    }
+
+    /// SWR display ("SWR 1.3:1"), or `None` when there's no recent reading
+    /// (rig stopped reporting > 5s ago — TX ended). Only sampled during TX, so
+    /// this naturally clears shortly after unkey.
+    pub fn swr_display(&self) -> Option<String> {
+        const STALE_AFTER_SECS: i64 = 5;
+        let swr = self.swr?;
+        let at = self.swr_at?;
+        if (Utc::now() - at).num_seconds() > STALE_AFTER_SECS {
+            return None;
+        }
+        Some(format!("SWR {swr:.1}:1"))
     }
 
     /// S-meter display, or `None` when no reading exists or the last

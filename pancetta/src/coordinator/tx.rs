@@ -132,13 +132,21 @@ async fn interruptible_sleep(
 struct PttGuard {
     message_bus: MessageBus,
     armed: bool,
+    /// Mirrors the keyed state for the SWR poll / TUI. Set true on construct,
+    /// cleared on drop (RAII — clears on every exit path incl. abort/panic).
+    ptt_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PttGuard {
-    fn new(message_bus: MessageBus) -> Self {
+    fn new(
+        message_bus: MessageBus,
+        ptt_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        ptt_active.store(true, std::sync::atomic::Ordering::Release);
         Self {
             message_bus,
             armed: true,
+            ptt_active,
         }
     }
 
@@ -538,6 +546,9 @@ async fn coalesce_backlog_into(
 
 impl Drop for PttGuard {
     fn drop(&mut self) {
+        // Always clear keyed state, on every exit path (normal / abort / panic).
+        self.ptt_active
+            .store(false, std::sync::atomic::Ordering::Release);
         if self.armed {
             let bus = self.message_bus.clone();
             // Spawn a fire-and-forget task to send PTT-off.
@@ -606,6 +617,8 @@ impl super::ApplicationCoordinator {
             // freshest message for this QSO if a later decode advanced the
             // exchange while this frame waited out the pre-PTT sleep.
             let latest_tx_intent = self.latest_tx_intent.clone();
+            // Keyed-state flag for the SWR poll / TUI (set by PttGuard).
+            let ptt_active = self.ptt_active.clone();
 
             tokio::spawn(async move {
                 info!("FT8 transmitter component ready");
@@ -993,7 +1006,8 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 5: Assert PTT ---
-                                    let mut ptt_guard = PttGuard::new(message_bus.clone());
+                                    let mut ptt_guard =
+                                        PttGuard::new(message_bus.clone(), ptt_active.clone());
                                     // TX badge on; guard drop clears it on every
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
@@ -1420,7 +1434,8 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 5: Assert PTT ---
-                                    let mut ptt_guard = PttGuard::new(message_bus.clone());
+                                    let mut ptt_guard =
+                                        PttGuard::new(message_bus.clone(), ptt_active.clone());
                                     // TX badge on; guard drop clears it on every
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
@@ -1608,7 +1623,8 @@ impl super::ApplicationCoordinator {
 
                                     // Engage PTT immediately. No slot
                                     // scheduling: tune happens NOW.
-                                    let mut ptt_guard = PttGuard::new(message_bus.clone());
+                                    let mut ptt_guard =
+                                        PttGuard::new(message_bus.clone(), ptt_active.clone());
                                     // TX badge on; guard drop clears it on every
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());

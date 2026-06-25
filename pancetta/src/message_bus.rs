@@ -358,6 +358,9 @@ pub enum RigControlMessage {
     /// (Batch 95) from real `\get_level STRENGTH` reads — never
     /// synthesized.
     SignalStrengthResponse { db_over_s9: i32 },
+    /// Live SWR reading (e.g. 1.3 = 1.3:1), from the hamlib polling loop's
+    /// `\get_level SWR` reads while PTT is keyed. Only meaningful during TX.
+    SwrResponse { swr: f32 },
 }
 
 /// QSO management messages

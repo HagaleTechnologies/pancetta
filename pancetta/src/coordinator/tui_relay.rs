@@ -342,6 +342,15 @@ impl super::ApplicationCoordinator {
                                 },
                             );
                         }
+                        MessageType::RigControl(
+                            crate::message_bus::RigControlMessage::SwrResponse { swr },
+                        ) => {
+                            // Real rig SWR (hamlib SWR) sampled while keyed —
+                            // forward verbatim; the TUI shows it only during TX.
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::SwrUpdate { swr },
+                            );
+                        }
                         MessageType::DxMessage(crate::message_bus::DxMessage::Spot {
                             callsign,
                             frequency,

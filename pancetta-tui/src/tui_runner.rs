@@ -98,6 +98,9 @@ pub enum TuiMessage {
     /// Produced by the coordinator's rig polling loop (Batch 95); only
     /// real rig readings arrive here — never synthesized data.
     SignalStrengthUpdate { db_over_s9: i32 },
+    /// Live SWR reading (e.g. 1.3 = 1.3:1) from the rig while keyed. Shown in
+    /// the status bar only during TX. Real `\get_level SWR` reads.
+    SwrUpdate { swr: f32 },
     /// DX spot
     DxSpot {
         callsign: String,
@@ -517,6 +520,9 @@ impl TuiRunner {
             }
             TuiMessage::SignalStrengthUpdate { db_over_s9 } => {
                 app.update_signal_strength(db_over_s9);
+            }
+            TuiMessage::SwrUpdate { swr } => {
+                app.update_swr(swr);
             }
             TuiMessage::DxSpot {
                 callsign,

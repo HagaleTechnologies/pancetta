@@ -468,7 +468,7 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         ),
     };
 
-    let status_line = Line::from(vec![
+    let mut status_spans = vec![
         audio_indicator,
         Span::raw(" "),
         dsp_indicator,
@@ -505,7 +505,28 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
                 Style::default().fg(app.theme.accent_color()),
             ),
         },
-    ]);
+    ];
+
+    // SWR — shown only while transmitting (swr_display() returns Some only for
+    // a fresh reading, which is sampled solely during TX). Prepend it, bold and
+    // color-graded by match quality, so it's unmistakable when keyed.
+    if let Some(swr_text) = app.swr_display() {
+        let color = match app.swr {
+            Some(s) if s >= 3.0 => app.theme.error_color(),
+            Some(s) if s >= 2.0 => app.theme.warning_color(),
+            _ => app.theme.success_color(),
+        };
+        status_spans.insert(0, Span::raw(" | "));
+        status_spans.insert(
+            0,
+            Span::styled(
+                swr_text,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        );
+    }
+
+    let status_line = Line::from(status_spans);
 
     // Always-visible key hints. These MUST match the real bindings in
     // tui_runner.rs (the help-overlay is the only other on-screen keymap):
