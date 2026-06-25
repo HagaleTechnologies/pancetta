@@ -125,21 +125,26 @@ pub struct TimeoutConfig {
 
     /// Manual keep-calling watchdog: stop after transmitting this many
     /// calls to the DX. Whichever of this and `manual_call_watchdog_minutes`
-    /// fires first ends the manual call attempt. Default: 10 calls.
+    /// fires first ends the manual call attempt. Default: 25 — high enough that
+    /// the 5-minute time watchdog is the governing limit (operator wants ~5 min
+    /// of calling, not the old ~2.5 min the 10-call cap produced); it remains a
+    /// safety backstop. Applies only to the INITIAL call states.
     pub manual_call_max_calls: u32,
 
     /// Repetitive-TX watchdog (seconds). If a QSO sits in the SAME active TX
     /// state this long — i.e. we have been re-sending the same message without
     /// the DX advancing us — the QSO is retired as a timeout. Bounds "stuck
     /// sending the same thing" for BOTH manual and auto QSOs, independent of
-    /// (and tighter than) the manual keep-call watchdog. Default: 120 s.
+    /// (and tighter than) the manual keep-call watchdog. Default: 300 s.
+    /// (Raised from 120 s on operator request — we were giving up on calling a
+    /// non-answering DX too quickly. The 5-min keep-call watchdog now governs.)
     #[serde(default = "default_repetitive_tx_timeout_secs")]
     pub repetitive_tx_timeout_secs: u64,
 }
 
-/// Default for [`TimeoutConfig::repetitive_tx_timeout_secs`] (2 minutes).
+/// Default for [`TimeoutConfig::repetitive_tx_timeout_secs`] (5 minutes).
 fn default_repetitive_tx_timeout_secs() -> u64 {
-    120
+    300
 }
 
 /// Contest configuration
@@ -258,7 +263,7 @@ impl Default for TimeoutConfig {
             max_qso_duration: 300,
             cleanup_interval: 60,
             manual_call_watchdog_minutes: 5,
-            manual_call_max_calls: 10,
+            manual_call_max_calls: 25,
             repetitive_tx_timeout_secs: default_repetitive_tx_timeout_secs(),
         }
     }
@@ -4425,11 +4430,15 @@ mod tests {
     /// hits the max-calls bound (so we never CQ forever).
     #[tokio::test]
     async fn manual_cq_watchdog_retires_after_max_calls() {
-        let manager = QsoManager::new(test_config());
+        // Pin a small call cap so this exercises the cap mechanism
+        // deterministically, independent of the (now 25) default.
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 10;
+        let manager = QsoManager::new(config);
         let freq = 14074000.0;
         let qso_id = manager.start_cq_manual(freq, None).await.unwrap();
 
-        // Drive enough slots to exceed manual_call_max_calls (default 10).
+        // Drive enough slots to exceed manual_call_max_calls (10).
         let mut t = Utc::now();
         for _ in 0..15 {
             t += Duration::seconds(16);
