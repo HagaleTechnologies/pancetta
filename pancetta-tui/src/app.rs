@@ -3903,4 +3903,18 @@ mod tests {
         assert!(super::tx_rf_out_of_us_band(15_000_000)); // between 20m and 17m
         assert!(super::tx_rf_out_of_us_band(100_000_000)); // nowhere near a ham band
     }
+
+    #[test]
+    fn freq_modal_buffers_parse_simplex_and_split() {
+        let mut m = super::FreqModalState {
+            visible: true,
+            ..Default::default()
+        };
+        m.rx_buffer.push_str("14.085");
+        assert_eq!(super::parse_mhz_to_hz(&m.rx_buffer), Some(14_085_000));
+        // empty tx buffer = simplex
+        assert_eq!(super::parse_mhz_to_hz(&m.tx_buffer), None);
+        m.tx_buffer.push_str("14.090");
+        assert_eq!(super::parse_mhz_to_hz(&m.tx_buffer), Some(14_090_000));
+    }
 }

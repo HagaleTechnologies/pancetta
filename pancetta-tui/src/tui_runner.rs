@@ -616,6 +616,18 @@ impl TuiRunner {
 
         let mut app = self.app.write().await;
 
+        // Required out-of-band acknowledgment modal — must be dismissed first.
+        if app.out_of_band_ack_visible {
+            match key.code {
+                KeyCode::Enter | KeyCode::Esc => {
+                    app.out_of_band_ack_visible = false;
+                    app.status_message = "Out-of-band TX acknowledged".to_string();
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+
         // If quit-confirm modal is visible, route keys there
         if app.quit_confirm_visible {
             match key.code {
@@ -676,6 +688,82 @@ impl TuiRunner {
                         input_device: input,
                         output_device: output,
                     })?;
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+
+        // Frequency-entry modal (Shift+F): two MHz text fields.
+        if app.freq_modal.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    app.freq_modal.visible = false;
+                    app.status_message = "Frequency entry cancelled".to_string();
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    app.freq_modal.field = match app.freq_modal.field {
+                        crate::app::FreqModalField::RxDial => crate::app::FreqModalField::TxSplit,
+                        crate::app::FreqModalField::TxSplit => crate::app::FreqModalField::RxDial,
+                    };
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => match app.freq_modal.field {
+                    crate::app::FreqModalField::RxDial => app.freq_modal.rx_buffer.push(c),
+                    crate::app::FreqModalField::TxSplit => app.freq_modal.tx_buffer.push(c),
+                },
+                KeyCode::Backspace => match app.freq_modal.field {
+                    crate::app::FreqModalField::RxDial => {
+                        app.freq_modal.rx_buffer.pop();
+                    }
+                    crate::app::FreqModalField::TxSplit => {
+                        app.freq_modal.tx_buffer.pop();
+                    }
+                },
+                KeyCode::Enter => {
+                    let rx_hz = crate::app::parse_mhz_to_hz(&app.freq_modal.rx_buffer);
+                    let tx_hz = crate::app::parse_mhz_to_hz(&app.freq_modal.tx_buffer); // None = simplex
+                    match rx_hz {
+                        None => {
+                            app.status_message =
+                                "Invalid RX dial — enter MHz e.g. 14.085".to_string();
+                        }
+                        Some(rx) => {
+                            app.freq_modal.visible = false;
+                            self.message_tx.send(TuiCommand::SetFrequency {
+                                vfo: 0,
+                                frequency: rx,
+                            })?;
+                            let (split_enabled, split_freq) = match tx_hz {
+                                Some(tx) => (true, tx),
+                                None => (false, 0),
+                            };
+                            app.split_tx_hz = split_freq;
+                            self.message_tx.send(TuiCommand::SetSplit {
+                                enabled: split_enabled,
+                                tx_frequency: split_freq,
+                            })?;
+                            // Out-of-band check on the effective TX RF + current offset.
+                            let tx_dial = if split_enabled { split_freq } else { rx };
+                            let tx_rf = tx_dial + app.tx_frequency_offset as u64;
+                            if crate::app::tx_rf_out_of_us_band(tx_rf) && !app.out_of_band_warned {
+                                app.out_of_band_warned = true;
+                                app.out_of_band_ack_visible = true;
+                                app.out_of_band_rf_hz = tx_rf;
+                            }
+                            app.status_message = if split_enabled {
+                                format!(
+                                    "Dial {:.3} MHz, SPLIT TX {:.3} MHz",
+                                    rx as f64 / 1e6,
+                                    split_freq as f64 / 1e6
+                                )
+                            } else {
+                                format!("Dial {:.3} MHz (simplex)", rx as f64 / 1e6)
+                            };
+                            app.freq_modal.rx_buffer.clear();
+                            app.freq_modal.tx_buffer.clear();
+                            app.freq_modal.field = crate::app::FreqModalField::RxDial;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1050,6 +1138,14 @@ impl TuiRunner {
                 app.tx_freq_mode = next;
                 app.status_message = format!("TX freq: {}", next.label());
                 self.message_tx.send(TuiCommand::ToggleTxFreqMode)?;
+            }
+            // Shift+F — open the arbitrary-frequency / split entry modal.
+            KeyCode::Char('F') => {
+                app.freq_modal.visible = true;
+                app.freq_modal.field = crate::app::FreqModalField::RxDial;
+                app.freq_modal.rx_buffer.clear();
+                app.freq_modal.tx_buffer.clear();
+                app.status_message = "Freq entry: dial MHz, Tab→split, Enter, Esc".to_string();
             }
             KeyCode::Char('m') => {
                 app.toggle_monitoring().await?;
