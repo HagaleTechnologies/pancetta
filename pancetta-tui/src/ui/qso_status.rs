@@ -404,7 +404,7 @@ fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
     let tx_status = format_direction_line("TX", qso.last_tx_text.as_deref(), qso.last_tx);
     let rx_status = format_direction_line("RX", qso.last_rx_text.as_deref(), qso.last_rx);
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(Span::styled(
             tx_status,
             Style::default().fg(app.theme.warning_color()),
@@ -414,6 +414,16 @@ fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(app.theme.success_color()),
         )),
     ];
+
+    // #41: what the DX is doing on the band right now (their latest decoded
+    // frame, even before they answer us) — so the operator can tell whether
+    // they're working someone else, calling CQ, or coming back to us.
+    if let Some(activity) = qso.dx_last_activity.as_deref() {
+        lines.push(Line::from(Span::styled(
+            format!("DX: {}", activity),
+            Style::default().fg(app.theme.muted_color()),
+        )));
+    }
 
     let paragraph = Paragraph::new(lines);
     f.render_widget(paragraph, area);

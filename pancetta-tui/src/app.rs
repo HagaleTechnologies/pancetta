@@ -146,6 +146,9 @@ pub struct ActiveQsoBanner {
     /// Manual keep-calling watchdog: when keep-calling stops (elapsed-time
     /// bound). `None` when not keep-calling. Rendered as a live countdown.
     pub watchdog_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    /// #41: short summary of what the DX is doing on the band (their latest
+    /// decoded frame): "CQ", "→ W1XYZ R-12", "→ us -09". `None` when silent.
+    pub dx_last_activity: Option<String>,
 }
 
 /// Pipeline component health snapshot, forwarded from coordinator
@@ -214,6 +217,9 @@ pub struct QsoStatus {
     /// Manual keep-calling watchdog deadline (elapsed-time bound). `None`
     /// when not keep-calling.
     pub watchdog_deadline: Option<DateTime<Utc>>,
+    /// #41: short summary of what the DX is doing on the band (their latest
+    /// decoded frame): "CQ", "→ W1XYZ R-12", "→ us -09". `None` when silent.
+    pub dx_last_activity: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1434,6 +1440,7 @@ impl App {
                 call_count: q.call_count,
                 max_calls: q.max_calls,
                 watchdog_deadline: q.watchdog_deadline,
+                dx_last_activity: q.dx_last_activity.clone(),
             })
             .collect();
         self.active_qsos = qsos;
@@ -2688,6 +2695,7 @@ mod tests {
             call_count: 0,
             max_calls: 0,
             watchdog_deadline: None,
+            dx_last_activity: None,
         }
     }
 

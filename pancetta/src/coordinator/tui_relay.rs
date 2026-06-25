@@ -1510,6 +1510,7 @@ fn map_qso_snapshot_item(
         call_count: q.call_count,
         max_calls: q.max_calls,
         watchdog_deadline: q.watchdog_deadline,
+        dx_last_activity: q.dx_last_activity.clone(),
     }
 }
 
@@ -1602,6 +1603,7 @@ mod tui_relay_tests {
             call_count: 4,
             max_calls: 10,
             watchdog_deadline: Some(started + chrono::Duration::minutes(5)),
+            dx_last_activity: None,
         };
         let banner = map_qso_snapshot_item(&item);
         assert_eq!(banner.qso_id, "11111111-1111-1111-1111-111111111111");
@@ -1658,6 +1660,7 @@ mod tui_relay_tests {
             call_count: 0,
             max_calls: 0,
             watchdog_deadline: None,
+            dx_last_activity: None,
         };
         let banner = map_qso_snapshot_item(&item);
         assert!(banner.last_tx_text.is_none());

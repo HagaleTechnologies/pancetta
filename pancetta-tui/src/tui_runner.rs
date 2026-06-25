@@ -1988,6 +1988,7 @@ mod key_tests {
             call_count: 0,
             max_calls: 0,
             watchdog_deadline: None,
+            dx_last_activity: None,
         };
         r.handle_message(TuiMessage::ActiveQsosUpdate { qsos: vec![banner] })
             .await
@@ -2179,6 +2180,7 @@ mod key_tests {
             call_count: 0,
             max_calls: 0,
             watchdog_deadline: None,
+            dx_last_activity: None,
         }
     }
 

@@ -102,6 +102,144 @@ type PendingManualCalls = Arc<Mutex<std::collections::VecDeque<PendingManualCall
 /// many opposite-window stations; older entries past this are dropped.
 const MAX_PENDING_MANUAL_CALLS: usize = 16;
 
+/// The most-recent band activity decoded *from* a given station (#41), so the
+/// operator can see what the DX they're calling is actually doing — working
+/// someone else, calling CQ, or coming back to us — even before that DX has
+/// answered (i.e. before any QSO-internal RX exists).
+#[derive(Debug, Clone)]
+struct DxActivity {
+    /// Short human summary, e.g. "CQ", "→ W1XYZ R-12", "→ us -09".
+    summary: String,
+    /// When this frame was decoded (drives the staleness/"(silent)" display).
+    at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Shared map (uppercased callsign → latest [`DxActivity`]) updated by the
+/// decode loop for every decoded frame and read when building the active-QSO
+/// snapshot. Bounded by [`DX_ACTIVITY_MAX`] + age pruning.
+type DxActivityMap = Arc<std::sync::RwLock<HashMap<String, DxActivity>>>;
+
+/// Cap on tracked callsigns; oldest are pruned past this.
+const DX_ACTIVITY_MAX: usize = 256;
+
+/// Entries older than this are treated as stale (DX has gone quiet) and not
+/// surfaced; also the pruning horizon.
+const DX_ACTIVITY_TTL: chrono::Duration = chrono::Duration::seconds(150);
+
+/// Pure: summarize what a decoded frame tells us its sender is doing (#41).
+/// `our_call` lets us say "→ us" when the frame is directed at us. Returns
+/// `None` for frames with no useful "who are they working" signal.
+fn dx_activity_summary(
+    msg: &pancetta_qso::states::MessageType,
+    our_call: &str,
+) -> Option<(String, String)> {
+    use pancetta_qso::exchange::callsigns_match;
+    use pancetta_qso::states::MessageType as Mt;
+
+    // Render the target as "us" when it's our station, else the bare callsign.
+    let tgt = |to: &str| {
+        if callsigns_match(to, our_call) {
+            "us".to_string()
+        } else {
+            to.to_string()
+        }
+    };
+    // Returns (from_station, summary).
+    Some(match msg {
+        Mt::Cq { callsign, .. } => (callsign.clone(), "calling CQ".to_string()),
+        Mt::CqResponse {
+            calling_station,
+            responding_station,
+            ..
+        } => (
+            responding_station.clone(),
+            format!("→ {}", tgt(calling_station)),
+        ),
+        Mt::SignalReport {
+            to_station,
+            from_station,
+            report,
+        } => (
+            from_station.clone(),
+            format!("→ {} {:+}", tgt(to_station), report),
+        ),
+        Mt::ReportAck {
+            to_station,
+            from_station,
+            report,
+        } => (
+            from_station.clone(),
+            format!("→ {} R{:+}", tgt(to_station), report),
+        ),
+        Mt::FinalConfirmation {
+            to_station,
+            from_station,
+        } => (from_station.clone(), format!("→ {} RR73", tgt(to_station))),
+        Mt::SeventyThree {
+            to_station,
+            from_station,
+        } => (from_station.clone(), format!("→ {} 73", tgt(to_station))),
+        Mt::ContestExchange {
+            to_station,
+            from_station,
+            ..
+        } => (
+            from_station.clone(),
+            format!("→ {} (contest)", tgt(to_station)),
+        ),
+        Mt::NonStandard { .. } => return None,
+    })
+}
+
+/// Record one decoded frame into the DX-activity map (#41), pruning stale and
+/// excess entries. No-op for frames with no useful summary.
+fn record_dx_activity(
+    map: &DxActivityMap,
+    msg: &pancetta_qso::states::MessageType,
+    our_call: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    let Some((from, summary)) = dx_activity_summary(msg, our_call) else {
+        return;
+    };
+    if let Ok(mut m) = map.write() {
+        m.insert(from.to_uppercase(), DxActivity { summary, at: now });
+        // Cheap bound: prune by age, and if still over the cap drop the oldest.
+        if m.len() > DX_ACTIVITY_MAX {
+            m.retain(|_, a| now.signed_duration_since(a.at) < DX_ACTIVITY_TTL);
+            while m.len() > DX_ACTIVITY_MAX {
+                if let Some(oldest_key) = m.iter().min_by_key(|(_, a)| a.at).map(|(k, _)| k.clone())
+                {
+                    m.remove(&oldest_key);
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Look up the freshest non-stale activity summary for a callsign (#41),
+/// compound-call aware. Returns `None` if unknown or stale.
+fn lookup_dx_activity(
+    map: &DxActivityMap,
+    callsign: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let m = map.read().ok()?;
+    // Exact (uppercased) hit first; fall back to a compound-call match.
+    let entry = m.get(&callsign.to_uppercase()).or_else(|| {
+        m.iter()
+            .find(|(k, _)| pancetta_qso::exchange::callsigns_match(k, callsign))
+            .map(|(_, a)| a)
+    })?;
+    if now.signed_duration_since(entry.at) < DX_ACTIVITY_TTL {
+        Some(entry.summary.clone())
+    } else {
+        None
+    }
+}
+
 /// Pure partition step for [`promote_pending_manual_calls`] (#40): given the
 /// queued calls (oldest first) and the parity our still-active QSOs are
 /// committed to (`None` ⇒ idle), split into the calls to start now and the
@@ -874,6 +1012,12 @@ impl super::ApplicationCoordinator {
                 let pending_manual_calls: PendingManualCalls =
                     Arc::new(Mutex::new(std::collections::VecDeque::new()));
 
+                // #41: band-wide DX activity (callsign → latest decoded frame
+                // summary). Written by the decode loop for every frame; read
+                // when building the active-QSO snapshot so the QSO panel shows
+                // what the DX we're calling is doing.
+                let dx_activity: DxActivityMap = Arc::new(std::sync::RwLock::new(HashMap::new()));
+
                 // Spawn a task to forward QSO auto-sequence TX requests to the transmitter
                 // and update AP decoding state for the FT8 decoder thread.
                 let mut qso_events = qso_manager.subscribe();
@@ -888,6 +1032,7 @@ impl super::ApplicationCoordinator {
                 let snapshot_bus = tx_bus.clone();
                 let completions_for_events = recent_manual_completions.clone();
                 let pending_for_events = pending_manual_calls.clone();
+                let dx_activity_for_events = dx_activity.clone();
                 tokio::spawn(async move {
                     while !tx_shutdown.load(Ordering::Acquire) {
                         match qso_events.recv().await {
@@ -1018,8 +1163,11 @@ impl super::ApplicationCoordinator {
                                 // QSOs to the TUI banner. The QSO state
                                 // machine is the source of truth; the TUI
                                 // replaces its list each push.
-                                let snapshot =
-                                    build_active_qso_snapshot(&snapshot_qso_manager).await;
+                                let snapshot = build_active_qso_snapshot(
+                                    &snapshot_qso_manager,
+                                    &dx_activity_for_events,
+                                )
+                                .await;
                                 let snap_msg = ComponentMessage::new(
                                     ComponentId::Qso,
                                     ComponentId::Tui,
@@ -1217,8 +1365,11 @@ impl super::ApplicationCoordinator {
                                 }
                                 // Push fresh snapshot so the banner drops
                                 // the just-completed QSO from the active list.
-                                let snapshot =
-                                    build_active_qso_snapshot(&snapshot_qso_manager).await;
+                                let snapshot = build_active_qso_snapshot(
+                                    &snapshot_qso_manager,
+                                    &dx_activity_for_events,
+                                )
+                                .await;
                                 let snap_msg = ComponentMessage::new(
                                     ComponentId::Qso,
                                     ComponentId::Tui,
@@ -1319,8 +1470,11 @@ impl super::ApplicationCoordinator {
                                 }
                                 // Push fresh snapshot so the banner drops
                                 // the failed QSO.
-                                let snapshot =
-                                    build_active_qso_snapshot(&snapshot_qso_manager).await;
+                                let snapshot = build_active_qso_snapshot(
+                                    &snapshot_qso_manager,
+                                    &dx_activity_for_events,
+                                )
+                                .await;
                                 let snap_msg = ComponentMessage::new(
                                     ComponentId::Qso,
                                     ComponentId::Tui,
@@ -1408,6 +1562,17 @@ impl super::ApplicationCoordinator {
                                                 &message_bus,
                                             )
                                             .await;
+
+                                            // #41: record what this sender is
+                                            // doing on the band so the QSO panel
+                                            // can show whether the DX we're
+                                            // calling is busy / CQing / on us.
+                                            record_dx_activity(
+                                                &dx_activity,
+                                                &msg_type,
+                                                &our_callsign,
+                                                chrono::Utc::now(),
+                                            );
                                         }
                                         Err(e) => {
                                             debug!(
@@ -1890,8 +2055,10 @@ impl super::ApplicationCoordinator {
 /// QSO-detail panel both render from this.
 async fn build_active_qso_snapshot(
     qso_manager: &pancetta_qso::QsoManager,
+    dx_activity: &DxActivityMap,
 ) -> Vec<crate::message_bus::ActiveQsoSnapshotItem> {
     let active = qso_manager.get_active_qsos().await;
+    let now = chrono::Utc::now();
     // Watchdog config for the manual keep-calling countdown (Batch 2 #1).
     let timeouts = &qso_manager.config().timeouts;
     let max_calls = timeouts.manual_call_max_calls;
@@ -1942,7 +2109,15 @@ async fn build_active_qso_snapshot(
 
     progresses
         .iter()
-        .filter_map(|p| snapshot_item_from_progress(p, max_calls, watchdog_minutes))
+        .filter_map(|p| {
+            let item = snapshot_item_from_progress(p, max_calls, watchdog_minutes)?;
+            // #41: enrich with what the DX is doing band-wide.
+            let dx_last_activity = lookup_dx_activity(dx_activity, &item.their_callsign, now);
+            Some(crate::message_bus::ActiveQsoSnapshotItem {
+                dx_last_activity,
+                ..item
+            })
+        })
         .collect()
 }
 
@@ -2067,6 +2242,9 @@ fn snapshot_item_from_progress(
         call_count: wd_call_count,
         max_calls: wd_max_calls,
         watchdog_deadline,
+        // Enriched by build_active_qso_snapshot from the band-wide DX-activity
+        // map (#41); this pure per-progress builder has no band context.
+        dx_last_activity: None,
     })
 }
 
@@ -2132,6 +2310,57 @@ mod pending_manual_tests {
         let (start, keep) = partition_pending_calls(VecDeque::new(), None);
         assert!(start.is_empty());
         assert!(keep.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dx_activity_tests {
+    use super::dx_activity_summary;
+    use pancetta_qso::states::MessageType as Mt;
+
+    const OUR: &str = "K5ARH";
+
+    #[test]
+    fn cq_summarizes_as_calling_cq() {
+        let m = Mt::Cq {
+            callsign: "JA1ABC".to_string(),
+            grid: None,
+        };
+        let (from, s) = dx_activity_summary(&m, OUR).unwrap();
+        assert_eq!(from, "JA1ABC");
+        assert_eq!(s, "calling CQ");
+    }
+
+    #[test]
+    fn report_to_third_party_names_them() {
+        let m = Mt::SignalReport {
+            to_station: "W1XYZ".to_string(),
+            from_station: "JA1ABC".to_string(),
+            report: -12,
+        };
+        let (from, s) = dx_activity_summary(&m, OUR).unwrap();
+        assert_eq!(from, "JA1ABC");
+        assert_eq!(s, "→ W1XYZ -12");
+    }
+
+    #[test]
+    fn report_to_us_says_us() {
+        let m = Mt::ReportAck {
+            to_station: OUR.to_string(),
+            from_station: "JA1ABC".to_string(),
+            report: 3,
+        };
+        let (from, s) = dx_activity_summary(&m, OUR).unwrap();
+        assert_eq!(from, "JA1ABC");
+        assert_eq!(s, "→ us R+3");
+    }
+
+    #[test]
+    fn nonstandard_has_no_summary() {
+        let m = Mt::NonStandard {
+            text: "blah".to_string(),
+        };
+        assert!(dx_activity_summary(&m, OUR).is_none());
     }
 }
 

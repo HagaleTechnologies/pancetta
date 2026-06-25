@@ -317,6 +317,12 @@ pub struct ActiveQsoSnapshotItem {
     /// The TUI renders a live countdown ("stops 3:12"). `None` when this QSO
     /// is not in a manual keep-calling state.
     pub watchdog_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    /// #41: a short summary of what the DX is doing on the band right now,
+    /// from their latest decoded frame (e.g. "CQ", "→ W1XYZ R-12", "→ us -09").
+    /// Lets the operator see — even before the DX answers — whether they're
+    /// busy working someone else, calling CQ, or coming back to us. `None`
+    /// when we've heard nothing recent from them.
+    pub dx_last_activity: Option<String>,
 }
 
 /// Status data from the autonomous operator for TUI consumption.
