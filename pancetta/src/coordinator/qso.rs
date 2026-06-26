@@ -82,6 +82,9 @@ struct PendingManualCall {
     /// would never have been queued (it rides any side), so in practice this
     /// is always `Some`.
     dx_parity: Option<pancetta_core::slot::SlotParity>,
+    /// When the call was parked in the queue. Used by the TTL watchdog to
+    /// retire calls that have waited without a free window for too long.
+    queued_at: std::time::Instant,
 }
 
 impl PendingManualCall {
@@ -101,6 +104,11 @@ type PendingManualCalls = Arc<Mutex<std::collections::VecDeque<PendingManualCall
 /// purely to stop an unbounded queue if the operator mashes the call button on
 /// many opposite-window stations; older entries past this are dropped.
 const MAX_PENDING_MANUAL_CALLS: usize = 16;
+
+/// A manual call parked in the cross-parity queue is retired after this long
+/// if it never gets a window to start. Generous so it only catches genuinely
+/// stuck calls, not normal multi-QSO waits.
+const QUEUED_CALL_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 /// The most-recent band activity decoded *from* a given station (#41), so the
 /// operator can see what the DX they're calling is actually doing — working
@@ -355,6 +363,62 @@ async fn promote_pending_manual_calls(
         for p in failed.into_iter().rev() {
             q.push_front(p);
         }
+    }
+}
+
+/// Pure TTL partition: split the queue into entries that have NOT yet exceeded
+/// the TTL (retained) and entries that have expired (returned as a `Vec` of
+/// callsigns to report). `now` and `ttl` are injected so this is
+/// deterministically unit-testable without sleeping.
+fn partition_expired(
+    queue: std::collections::VecDeque<PendingManualCall>,
+    now: std::time::Instant,
+    ttl: std::time::Duration,
+) -> (std::collections::VecDeque<PendingManualCall>, Vec<String>) {
+    let mut kept = std::collections::VecDeque::new();
+    let mut expired = Vec::new();
+    for p in queue {
+        if now.duration_since(p.queued_at) >= ttl {
+            expired.push(p.callsign.clone());
+        } else {
+            kept.push_back(p);
+        }
+    }
+    (kept, expired)
+}
+
+/// TTL watchdog: remove entries from the cross-parity queue that have waited
+/// longer than [`QUEUED_CALL_TTL`] without getting a free window to start.
+/// Emits an operator status line + warn-level log for each retired call.
+/// Called from a dedicated interval task (every 15 s).
+async fn expire_stale_queued_calls(pending: &PendingManualCalls, message_bus: &MessageBus) {
+    let now = std::time::Instant::now();
+    let expired = {
+        let mut q = pending.lock().await;
+        if q.is_empty() {
+            return;
+        }
+        let queue = std::mem::take(&mut *q);
+        let (kept, expired) = partition_expired(queue, now, QUEUED_CALL_TTL);
+        *q = kept;
+        expired
+    };
+    for call in expired {
+        warn!(
+            target: "qso",
+            "Retiring queued call to {} — waited >{}s without a free TX window",
+            call,
+            QUEUED_CALL_TTL.as_secs()
+        );
+        emit_status(
+            message_bus,
+            format!(
+                "Queued call to {} expired — no free window in {}m",
+                call,
+                QUEUED_CALL_TTL.as_secs() / 60
+            ),
+        )
+        .await;
     }
 }
 
@@ -1058,6 +1122,29 @@ impl super::ApplicationCoordinator {
                 // what the DX we're calling is doing.
                 let dx_activity: DxActivityMap = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
+                // TTL watchdog: every 15 s, retire queued cross-parity calls
+                // that have waited longer than QUEUED_CALL_TTL without getting
+                // a free TX window. Runs in a dedicated lightweight task so it
+                // fires even when no QSO events are flowing (the main loop is
+                // event-driven and would never drain the queue on its own if
+                // the operator's active QSOs stay alive indefinitely).
+                {
+                    let ttl_pending = pending_manual_calls.clone();
+                    let ttl_bus = message_bus.clone();
+                    let ttl_shutdown = shutdown.clone();
+                    tokio::spawn(async move {
+                        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+                        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        loop {
+                            tick.tick().await;
+                            if ttl_shutdown.load(Ordering::Acquire) {
+                                break;
+                            }
+                            expire_stale_queued_calls(&ttl_pending, &ttl_bus).await;
+                        }
+                    });
+                }
+
                 // Spawn a task to forward QSO auto-sequence TX requests to the transmitter
                 // and update AP decoding state for the FT8 decoder thread.
                 let mut qso_events = qso_manager.subscribe();
@@ -1667,6 +1754,7 @@ impl super::ApplicationCoordinator {
                                                         callsign: callsign.clone(),
                                                         frequency_hz: frequency as f64,
                                                         dx_parity,
+                                                        queued_at: std::time::Instant::now(),
                                                     });
                                                 }
                                                 let queue_depth = q.len();
@@ -2301,6 +2389,7 @@ mod pending_manual_tests {
             callsign: name.to_string(),
             frequency_hz: 1500.0,
             dx_parity: Some(dx),
+            queued_at: std::time::Instant::now(),
         }
     }
 
@@ -2350,6 +2439,73 @@ mod pending_manual_tests {
         let (start, keep) = partition_pending_calls(VecDeque::new(), None);
         assert!(start.is_empty());
         assert!(keep.is_empty());
+    }
+
+    // ── TTL / partition_expired tests ────────────────────────────────────────
+
+    use super::partition_expired;
+
+    /// Build a call whose `queued_at` is `age` in the past.
+    fn aged_call(name: &str, dx: SlotParity, age: std::time::Duration) -> PendingManualCall {
+        PendingManualCall {
+            callsign: name.to_string(),
+            frequency_hz: 1500.0,
+            dx_parity: Some(dx),
+            queued_at: std::time::Instant::now()
+                .checked_sub(age)
+                .expect("Instant underflow in test"),
+        }
+    }
+
+    #[test]
+    fn fresh_calls_are_kept() {
+        let ttl = std::time::Duration::from_secs(600);
+        let q: VecDeque<_> = [call("A", SlotParity::Even), call("B", SlotParity::Odd)].into();
+        let now = std::time::Instant::now();
+        let (kept, expired) = partition_expired(q, now, ttl);
+        assert_eq!(kept.len(), 2);
+        assert!(expired.is_empty());
+    }
+
+    #[test]
+    fn expired_calls_are_removed_and_returned() {
+        let ttl = std::time::Duration::from_secs(600);
+        let q: VecDeque<_> = [
+            // A: 11 min old — expired
+            aged_call("A", SlotParity::Even, std::time::Duration::from_secs(660)),
+            // B: 5 min old — still fresh
+            aged_call("B", SlotParity::Odd, std::time::Duration::from_secs(300)),
+            // C: 12 min old — expired
+            aged_call("C", SlotParity::Even, std::time::Duration::from_secs(720)),
+        ]
+        .into();
+        let now = std::time::Instant::now();
+        let (kept, expired) = partition_expired(q, now, ttl);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].callsign, "B");
+        assert_eq!(expired, vec!["A", "C"]);
+    }
+
+    #[test]
+    fn exact_ttl_boundary_expires() {
+        // A call that is exactly TTL old should be retired (>=, not >).
+        let ttl = std::time::Duration::from_secs(600);
+        let q: VecDeque<_> = [aged_call("X", SlotParity::Even, ttl)].into();
+        let now = std::time::Instant::now();
+        let (kept, expired) = partition_expired(q, now, ttl);
+        assert!(kept.is_empty());
+        assert_eq!(expired, vec!["X"]);
+    }
+
+    #[test]
+    fn empty_queue_partition_expired_is_noop() {
+        let (kept, expired) = partition_expired(
+            VecDeque::new(),
+            std::time::Instant::now(),
+            std::time::Duration::from_secs(600),
+        );
+        assert!(kept.is_empty());
+        assert!(expired.is_empty());
     }
 }
 
