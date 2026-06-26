@@ -101,6 +101,30 @@ impl super::ApplicationCoordinator {
         // renders the precomputed bool.
         let relay_station_lookup = self.cached_lookup.clone();
 
+        // Display priority scorer: read the operator's configured weights
+        // once at relay startup (they don't hot-reload at runtime), then
+        // build a `PriorityScorer` inside the relay thread so every decode
+        // carries a nuanced f64 score from the REAL scorer rather than the
+        // coarse 0/500/1000 bucket function. The lookup clone shares the
+        // same Arc<RwLock> internals as relay_station_lookup, so it always
+        // sees the latest needed/rarity/worked data.
+        let relay_priority_weights = {
+            let cfg = self.config.read().await;
+            let p = &cfg.autonomous.priorities;
+            pancetta_qso::priority::PriorityWeights {
+                needed_dxcc: p.needed_dxcc,
+                needed_grid: p.needed_grid,
+                pota_sota: p.pota_sota,
+                rarity: p.rarity,
+                signal_strength: p.signal_strength,
+                duplicate_penalty: p.duplicate_penalty,
+                recent_failure_penalty: p.recent_failure_penalty,
+                atno_bonus: p.atno_bonus,
+            }
+        };
+        // Clone the lookup for the scorer (Arc-fields share the live data).
+        let relay_scorer_lookup = (*self.cached_lookup).clone();
+
         // Relay decoded messages from FT8 -> TUI on a dedicated thread
         // (tokio::spawn was causing starvation -- same pattern as DSP/FT8 fixes)
         let relay_shutdown = shutdown.clone();
@@ -127,6 +151,14 @@ impl super::ApplicationCoordinator {
             .spawn(move || {
             let mut ft8_disconnected = false;
             let mut last_health_send = std::time::Instant::now();
+            // Build the display priority scorer once per relay thread.
+            // Uses the same weights and lookup (via Arc-shared internals)
+            // as the autonomous scorer so the DX Hunter's "Pri" column
+            // reflects the real continuous score in [0,1] mapped to [0,1000].
+            let relay_scorer = pancetta_qso::PriorityScorer::new(
+                relay_priority_weights,
+                Box::new(relay_scorer_lookup),
+            );
             // Last-pushed badge state, so we only emit on change (and force the
             // first push by seeding sentinels that differ from any real value).
             let mut last_rig_state: Option<u8> = None;
@@ -199,6 +231,34 @@ impl super::ApplicationCoordinator {
                             let (needed, atno) =
                                 needed_atno_for(&relay_station_lookup, call_sign.as_deref());
 
+                            // Compute nuanced priority score via the real
+                            // PriorityScorer (continuous f64 in [0,1] mapped
+                            // to [0,1000]). This is the same scorer the
+                            // autonomous operator uses for call/no-call
+                            // decisions, so the DX Hunter's "Pri" column now
+                            // reflects the full weighted signal (rarity,
+                            // ATNO, needed-DXCC/grid, SNR, staleness, etc.)
+                            // rather than the coarse 0/500/1000 buckets.
+                            // Only meaningful for CQ frames that carry a
+                            // callsign; non-CQ decodes (RR73/73/reports) get
+                            // the same score but it won't influence the DX
+                            // Hunter because only CQ frames are listed there.
+                            let priority_score = call_sign.as_deref().map(|cs| {
+                                use pancetta_qso::DxEvaluator;
+                                let freq_hz = dial_mhz * 1_000_000.0;
+                                let snr_i8 = decoded_msg.snr_db.round().clamp(-128.0, 127.0) as i8;
+                                let score = relay_scorer.evaluate_cq(
+                                    cs,
+                                    grid_square.as_deref(),
+                                    snr_i8,
+                                    freq_hz,
+                                );
+                                // Map [0.0, 1.0] → [0, 1000] for the u32
+                                // display field. Values outside [0,1] are
+                                // clamped by PriorityScorer before we get here.
+                                (score * 1000.0).round() as u32
+                            });
+
                             let tui_decoded = pancetta_tui::DecodedMessageView {
                                 timestamp: chrono::Utc::now(),
                                 frequency: dial_mhz,
@@ -216,6 +276,7 @@ impl super::ApplicationCoordinator {
                                 worked_before,
                                 needed,
                                 atno,
+                                priority_score,
                             };
 
                             match tui_msg_tx_relay.send(
@@ -1906,5 +1967,58 @@ mod tui_relay_tests {
         assert!(!worked_before_for(&lookup, Some("VK2DEF"), 14_074_000.0));
         lookup.record_worked("VK2DEF", "20m");
         assert!(worked_before_for(&lookup, Some("VK2DEF"), 14_074_000.0));
+    }
+
+    /// Display priority scorer must produce DISTINCT scores for stations
+    /// with different rarity/SNR signals — verifying the relay thread's
+    /// PriorityScorer produces continuous f64 values that map to varied
+    /// [0,1000] display scores rather than the historic 0/500/1000 buckets.
+    #[test]
+    fn relay_display_scorer_produces_distinct_scores() {
+        use pancetta_qso::priority::{PriorityScorer, PriorityWeights};
+        use pancetta_qso::DxEvaluator;
+
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+
+        // Set up: rare station in needed-DXCC set.
+        let mut needed = std::collections::HashSet::new();
+        needed.insert("JA".to_string());
+        lookup.update_needed_dxcc(needed);
+        let mut rarity = std::collections::HashMap::new();
+        rarity.insert("JA1ABC".to_string(), 0.85); // high rarity
+        rarity.insert("W1XYZ".to_string(), 0.2); // low rarity
+        lookup.update_rarity_scores(rarity);
+
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+
+        let score_needed_rare = scorer.evaluate_cq("JA1ABC", Some("PM95"), -10, 14_074_000.0);
+        let score_plain_common = scorer.evaluate_cq("W1XYZ", Some("FN20"), -22, 14_074_000.0);
+        let score_plain_moderate = scorer.evaluate_cq("W1XYZ", Some("FN20"), -5, 14_074_000.0);
+
+        // Needed+rare must clearly outrank plain common.
+        assert!(
+            score_needed_rare > score_plain_common,
+            "needed+rare ({score_needed_rare:.3}) must outrank plain common ({score_plain_common:.3})"
+        );
+
+        // Two plain stations at different SNR must score differently (continuous).
+        assert!(
+            score_plain_moderate > score_plain_common,
+            "SNR -5 ({score_plain_moderate:.3}) must outrank SNR -22 ({score_plain_common:.3})"
+        );
+
+        // The scores must NOT be the same as the old coarse buckets (0.0/0.5/1.0).
+        assert!(
+            score_needed_rare > 0.0 && score_needed_rare < 1.0,
+            "score must be a continuous value in (0,1), got {score_needed_rare}"
+        );
+
+        // Map to display u32 — should produce distinct values, not all-zero.
+        let display_needed_rare = (score_needed_rare * 1000.0).round() as u32;
+        let display_plain_common = (score_plain_common * 1000.0).round() as u32;
+        assert_ne!(
+            display_needed_rare, display_plain_common,
+            "display scores must be distinct: {display_needed_rare} vs {display_plain_common}"
+        );
     }
 }

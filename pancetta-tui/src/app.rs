@@ -86,6 +86,14 @@ pub struct DecodedMessageView {
     /// any band). A strict subset of `needed`. Test-default false.
     #[serde(default)]
     pub atno: bool,
+    /// Pre-computed display priority score from the coordinator's real
+    /// `PriorityScorer` (continuous f64 mapped to [0, 1000]). Set by the
+    /// tui-relay thread which has access to `CachedStationLookup` and the
+    /// operator's configured `PriorityWeights`. When `Some`, the TUI uses
+    /// this directly instead of the coarse bucket function. `None` in test
+    /// fixtures and legacy paths.
+    #[serde(default)]
+    pub priority_score: Option<u32>,
 }
 
 /// One in-progress QSO surfaced to the operator. Coordinator-side QSO
@@ -1058,11 +1066,16 @@ impl App {
     }
 
     fn calculate_dx_priority(&self, message: &DecodedMessageView) -> u32 {
-        // Rank local decodes by the SAME cqdx need hierarchy as network spots
-        // (ATNO > needed-DXCC > rarity > distance > SNR). The `needed`/`atno`
-        // flags ride on the decode from the coordinator's CachedStationLookup;
-        // local decodes carry no rarity tier (that's network-spot metadata), so
-        // pass None there. Previously this was SNR+distance only.
+        // If the coordinator pre-computed a nuanced score from the real
+        // `PriorityScorer` (continuous f64 mapped to [0, 1000]), use it
+        // directly — it incorporates rarity, SNR, staleness, ATNO, and
+        // needed-DXCC/grid with configured weights, matching the autonomous
+        // scorer exactly. Fall back to the coarse bucket function only for
+        // legacy/test paths where no pre-computed score is available.
+        if let Some(pre_computed) = message.priority_score {
+            return pre_computed;
+        }
+        // Fallback: coarse bucket function (ATNO > needed-DXCC > rarity > distance > SNR).
         crate::ui::dx_hunter::dx_priority_score(
             message.atno,
             message.needed,
@@ -2677,6 +2690,7 @@ mod tests {
             worked_before: false,
             needed: false,
             atno: false,
+            priority_score: None,
         }
     }
 
@@ -3168,6 +3182,72 @@ mod tests {
         let fresh = fixture_view("DL5XYZ", -10);
         app.add_decoded_message(fresh).await.unwrap();
         assert!(!app.dx_stations.get("DL5XYZ").unwrap().worked_before);
+    }
+
+    /// Pre-computed priority_score from the coordinator's real PriorityScorer
+    /// must flow through `add_decoded_message` → `calculate_dx_priority` →
+    /// `DxStation.priority_score` and produce DISTINCT scores for stations
+    /// with different pre-computed values. When `priority_score: Some(v)`,
+    /// `calculate_dx_priority` returns `v` directly (no coarse bucket rounding).
+    /// Two stations with different scores must remain distinct in the DX Hunter.
+    #[tokio::test]
+    async fn pre_computed_priority_score_produces_nuanced_display() {
+        let mut app = fixture_app().await;
+
+        // Station A: pre-computed score 723 (e.g. needed DXCC + moderate SNR).
+        let mut msg_a = fixture_view("JA1ABC", -12);
+        msg_a.needed = true;
+        msg_a.priority_score = Some(723);
+        app.add_decoded_message(msg_a).await.unwrap();
+
+        // Station B: pre-computed score 412 (e.g. rare but not needed + good SNR).
+        let mut msg_b = fixture_view("W1XYZ", -5);
+        msg_b.priority_score = Some(412);
+        app.add_decoded_message(msg_b).await.unwrap();
+
+        let score_a = app.dx_stations.get("JA1ABC").unwrap().priority_score;
+        let score_b = app.dx_stations.get("W1XYZ").unwrap().priority_score;
+
+        // Scores must be distinct (not collapsed to coarse 0/500/1000).
+        assert_ne!(
+            score_a, score_b,
+            "pre-computed scores must produce distinct display values"
+        );
+        // And the values must exactly match what the coordinator set.
+        assert_eq!(
+            score_a, 723,
+            "JA1ABC score must be exactly 723 (from scorer)"
+        );
+        assert_eq!(
+            score_b, 412,
+            "W1XYZ score must be exactly 412 (from scorer)"
+        );
+    }
+
+    /// Fallback path (priority_score: None) still produces distinct scores via
+    /// the SNR tiebreak fix — the full FT8 SNR range now contributes nuance.
+    #[tokio::test]
+    async fn fallback_snr_nuance_produces_distinct_scores() {
+        let mut app = fixture_app().await;
+
+        // Same station at two different SNR levels with no pre-computed score.
+        let msg_weak = fixture_view("DL5XYZ", -20); // priority_score: None → fallback
+        let msg_strong = fixture_view("G8KHF", 5); // priority_score: None → fallback
+
+        app.add_decoded_message(msg_weak).await.unwrap();
+        app.add_decoded_message(msg_strong).await.unwrap();
+
+        let weak_score = app.dx_stations.get("DL5XYZ").unwrap().priority_score;
+        let strong_score = app.dx_stations.get("G8KHF").unwrap().priority_score;
+
+        assert!(
+            strong_score > weak_score,
+            "SNR +5 ({strong_score}) must rank above SNR -20 ({weak_score}) in fallback path"
+        );
+        assert_ne!(
+            weak_score, strong_score,
+            "fallback scores must not collapse to same value"
+        );
     }
 
     /// #42: a self-decode of our own callsign must never appear as a DX entry.

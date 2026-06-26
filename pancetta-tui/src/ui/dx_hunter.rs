@@ -418,10 +418,11 @@ pub fn dx_priority_score(
         }
     }
 
-    // SNR tiebreak.
-    if snr > 0 {
-        score += (snr as u32).min(30);
-    }
+    // SNR tiebreak: map the full FT8 range (-24..+10 dB) to 0..34 so
+    // weak-but-copyable signals (-20 dB) score differently from
+    // barely-detectable signals (-24 dB). Previously only snr > 0 earned
+    // anything, so the common negative-SNR case produced no tiebreak nuance.
+    score += ((snr + 24).clamp(0, 34)) as u32;
 
     score
 }
@@ -576,5 +577,28 @@ mod tests {
         assert_eq!(need_marker(false, true, true), "+★");
         // Notable-only.
         assert_eq!(need_marker(false, false, true), "★");
+    }
+
+    /// Distinct stations with different SNRs must produce distinct scores.
+    /// Previously `dx_priority_score` only added an SNR bonus for snr > 0,
+    /// so all negative-SNR local decodes (the common FT8 case) scored
+    /// identically — no nuance. After the SNR-range fix the full -24..+10 dB
+    /// band contributes 0..34 tiebreak points.
+    #[test]
+    fn snr_full_range_produces_distinct_scores() {
+        let weak = dx_priority_score(false, false, None, "W1ABC", Some(5000.0), -22);
+        let moderate = dx_priority_score(false, false, None, "W1ABC", Some(5000.0), -10);
+        let strong = dx_priority_score(false, false, None, "W1ABC", Some(5000.0), 5);
+        assert!(
+            strong > moderate,
+            "snr +5 ({strong}) must outrank snr -10 ({moderate})"
+        );
+        assert!(
+            moderate > weak,
+            "snr -10 ({moderate}) must outrank snr -22 ({weak})"
+        );
+        // All three must be DISTINCT — not the historical 0/0/0 cluster.
+        assert_ne!(weak, moderate, "weak and moderate must differ");
+        assert_ne!(moderate, strong, "moderate and strong must differ");
     }
 }
