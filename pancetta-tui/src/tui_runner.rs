@@ -133,8 +133,12 @@ pub enum TuiMessage {
     /// owns the truth, receiver is a passive renderer. Batch 94:
     /// also rebuilds the QSO-detail panel entries (`qso_statuses`)
     /// from the same snapshot via `App::apply_active_qsos`.
+    /// `pending_calls` carries the cross-parity manual-call queue
+    /// (#40) in the same push so the TUI sees a consistent
+    /// (active, queued) pair.
     ActiveQsosUpdate {
         qsos: Vec<crate::app::ActiveQsoBanner>,
+        pending_calls: Vec<crate::app::PendingCallBanner>,
     },
     /// Structured autonomous-operator status, forwarded by the
     /// coordinator's relay from the autonomous loop (one per 15s
@@ -575,8 +579,11 @@ impl TuiRunner {
             TuiMessage::PipelineHealth(health) => {
                 app.pipeline_health = Some(health);
             }
-            TuiMessage::ActiveQsosUpdate { qsos } => {
-                app.apply_active_qsos(qsos);
+            TuiMessage::ActiveQsosUpdate {
+                qsos,
+                pending_calls,
+            } => {
+                app.apply_active_qsos(qsos, pending_calls);
             }
             TuiMessage::AutonomousStatusUpdate(status) => {
                 app.update_autonomous_status(status);
@@ -2113,9 +2120,12 @@ mod key_tests {
             watchdog_deadline: None,
             dx_last_activity: None,
         };
-        r.handle_message(TuiMessage::ActiveQsosUpdate { qsos: vec![banner] })
-            .await
-            .unwrap();
+        r.handle_message(TuiMessage::ActiveQsosUpdate {
+            qsos: vec![banner],
+            pending_calls: Vec::new(),
+        })
+        .await
+        .unwrap();
         {
             let app = app.read().await;
             assert_eq!(app.active_qsos.len(), 1, "banner list populated");
@@ -2127,9 +2137,12 @@ mod key_tests {
         }
 
         // Completed/failed QSOs vanish from the next snapshot → panel clears.
-        r.handle_message(TuiMessage::ActiveQsosUpdate { qsos: Vec::new() })
-            .await
-            .unwrap();
+        r.handle_message(TuiMessage::ActiveQsosUpdate {
+            qsos: Vec::new(),
+            pending_calls: Vec::new(),
+        })
+        .await
+        .unwrap();
         let app = app.read().await;
         assert!(app.active_qsos.is_empty());
         assert!(app.qso_statuses.is_empty());
@@ -2378,7 +2391,7 @@ mod key_tests {
         let (mut r, cmd_rx, app) = make_runner().await;
         {
             let mut a = app.write().await;
-            a.apply_active_qsos(vec![banner("W1AW", "qso-1")]);
+            a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
             a.active_panel = crate::app::ActivePanel::BandActivity;
         }
         // Wrong panel: no abort, just a hint.
@@ -2404,7 +2417,7 @@ mod key_tests {
         let (mut r, cmd_rx, app) = make_runner().await;
         {
             let mut a = app.write().await;
-            a.apply_active_qsos(vec![banner("K5ARH", "qso-9")]);
+            a.apply_active_qsos(vec![banner("K5ARH", "qso-9")], Vec::new());
             a.active_panel = crate::app::ActivePanel::DxHunter;
         }
         r.handle_key_event(key('r')).await.unwrap();

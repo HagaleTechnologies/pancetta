@@ -1290,15 +1290,19 @@ impl super::ApplicationCoordinator {
                                 // QSOs to the TUI banner. The QSO state
                                 // machine is the source of truth; the TUI
                                 // replaces its list each push.
-                                let snapshot = build_active_qso_snapshot(
+                                let (snapshot, pending_snap) = build_active_qso_snapshot(
                                     &snapshot_qso_manager,
                                     &dx_activity_for_events,
+                                    &pending_for_events,
                                 )
                                 .await;
                                 let snap_msg = ComponentMessage::new(
                                     ComponentId::Qso,
                                     ComponentId::Tui,
-                                    MessageType::ActiveQsosSnapshot { qsos: snapshot },
+                                    MessageType::ActiveQsosSnapshot {
+                                        qsos: snapshot,
+                                        pending: pending_snap,
+                                    },
                                     Instant::now(),
                                 );
                                 if let Err(e) = snapshot_bus.send_message(snap_msg).await {
@@ -1492,15 +1496,19 @@ impl super::ApplicationCoordinator {
                                 }
                                 // Push fresh snapshot so the banner drops
                                 // the just-completed QSO from the active list.
-                                let snapshot = build_active_qso_snapshot(
+                                let (snapshot, pending_snap) = build_active_qso_snapshot(
                                     &snapshot_qso_manager,
                                     &dx_activity_for_events,
+                                    &pending_for_events,
                                 )
                                 .await;
                                 let snap_msg = ComponentMessage::new(
                                     ComponentId::Qso,
                                     ComponentId::Tui,
-                                    MessageType::ActiveQsosSnapshot { qsos: snapshot },
+                                    MessageType::ActiveQsosSnapshot {
+                                        qsos: snapshot,
+                                        pending: pending_snap,
+                                    },
                                     Instant::now(),
                                 );
                                 let _ = snapshot_bus.send_message(snap_msg).await;
@@ -1597,15 +1605,19 @@ impl super::ApplicationCoordinator {
                                 }
                                 // Push fresh snapshot so the banner drops
                                 // the failed QSO.
-                                let snapshot = build_active_qso_snapshot(
+                                let (snapshot, pending_snap) = build_active_qso_snapshot(
                                     &snapshot_qso_manager,
                                     &dx_activity_for_events,
+                                    &pending_for_events,
                                 )
                                 .await;
                                 let snap_msg = ComponentMessage::new(
                                     ComponentId::Qso,
                                     ComponentId::Tui,
-                                    MessageType::ActiveQsosSnapshot { qsos: snapshot },
+                                    MessageType::ActiveQsosSnapshot {
+                                        qsos: snapshot,
+                                        pending: pending_snap,
+                                    },
                                     Instant::now(),
                                 );
                                 let _ = snapshot_bus.send_message(snap_msg).await;
@@ -2180,11 +2192,17 @@ impl super::ApplicationCoordinator {
 
 /// Build a flat snapshot of in-progress QSOs from the QSO manager,
 /// suitable for `MessageType::ActiveQsosSnapshot`. The TUI banner and
-/// QSO-detail panel both render from this.
+/// QSO-detail panel both render from this. Also snapshots the cross-parity
+/// pending-call queue (#40) so the TUI can surface "Queued" calls without
+/// a separate message.
 async fn build_active_qso_snapshot(
     qso_manager: &pancetta_qso::QsoManager,
     dx_activity: &DxActivityMap,
-) -> Vec<crate::message_bus::ActiveQsoSnapshotItem> {
+    pending_manual_calls: &PendingManualCalls,
+) -> (
+    Vec<crate::message_bus::ActiveQsoSnapshotItem>,
+    Vec<crate::message_bus::PendingCallSnapshotItem>,
+) {
     let active = qso_manager.get_active_qsos().await;
     let now = chrono::Utc::now();
     // Watchdog config for the manual keep-calling countdown (Batch 2 #1).
@@ -2235,7 +2253,7 @@ async fn build_active_qso_snapshot(
             })
     });
 
-    progresses
+    let qsos: Vec<crate::message_bus::ActiveQsoSnapshotItem> = progresses
         .iter()
         .filter_map(|p| {
             let item = snapshot_item_from_progress(p, max_calls, watchdog_minutes)?;
@@ -2246,7 +2264,23 @@ async fn build_active_qso_snapshot(
                 ..item
             })
         })
-        .collect()
+        .collect();
+
+    // #40: snapshot the cross-parity pending queue. Lock briefly, copy out,
+    // release — never hold across await points.
+    let pending: Vec<crate::message_bus::PendingCallSnapshotItem> = {
+        let guard = pending_manual_calls.lock().await;
+        guard
+            .iter()
+            .map(|p| crate::message_bus::PendingCallSnapshotItem {
+                callsign: p.callsign.clone(),
+                dx_parity: p.dx_parity,
+                waited_secs: p.queued_at.elapsed().as_secs(),
+            })
+            .collect()
+    };
+
+    (qsos, pending)
 }
 
 /// Flatten one `QsoProgress` into the bus snapshot item. Pure read of

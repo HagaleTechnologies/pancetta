@@ -27,16 +27,20 @@ pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()>
         f.render_widget(block, area);
         render_multi_qso_table(f, inner, app);
     } else {
-        // Single QSO detail view (original layout)
+        // Single QSO detail view (original layout). When there are queued
+        // cross-parity calls (#40), allocate an extra row for them above
+        // the control hint so the operator knows those calls are waiting.
+        let queued_height = if app.pending_calls.is_empty() { 0 } else { 1 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // QSO info
-                Constraint::Length(3), // Sequence ladder + Now/Next
-                Constraint::Length(2), // TX/RX status
-                Constraint::Length(2), // SNR meters
-                Constraint::Min(1),    // Progress/timing
-                Constraint::Length(1), // Control hint
+                Constraint::Length(3),             // QSO info
+                Constraint::Length(3),             // Sequence ladder + Now/Next
+                Constraint::Length(2),             // TX/RX status
+                Constraint::Length(2),             // SNR meters
+                Constraint::Min(1),                // Progress/timing
+                Constraint::Length(queued_height), // Queued calls (0 when empty)
+                Constraint::Length(1),             // Control hint
             ])
             .split(block.inner(area));
 
@@ -47,7 +51,10 @@ pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()>
         render_tx_rx_status(f, chunks[2], app);
         render_snr_meters(f, chunks[3], app);
         render_timing_progress(f, chunks[4], app);
-        render_control_hint(f, chunks[5], app);
+        if !app.pending_calls.is_empty() {
+            render_queued_calls(f, chunks[5], app);
+        }
+        render_control_hint(f, chunks[6], app);
     }
 
     Ok(())
@@ -139,6 +146,24 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
             " No active QSOs",
             Style::default().fg(app.theme.muted_color()),
         )));
+    }
+
+    // Cross-parity queued calls (#40): show a compact "Queued: …" line when
+    // the pending queue is non-empty, so the operator knows calls are waiting
+    // for the active TX window to clear rather than being silently dropped.
+    if !app.pending_calls.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                " Queued: ",
+                Style::default()
+                    .fg(app.theme.warning_color())
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format_queued_line(&app.pending_calls),
+                Style::default().fg(app.theme.warning_color()),
+            ),
+        ]));
     }
 
     // Control hint for the multi-QSO view. r/k act only while this panel is
@@ -394,6 +419,51 @@ fn render_control_hint(f: &mut Frame<'_>, area: Rect, app: &App) {
         Style::default().fg(app.theme.muted_color()),
     )));
     f.render_widget(paragraph, area);
+}
+
+/// Render the cross-parity queued-call row (#40) in the single-detail view.
+/// Only called when `app.pending_calls` is non-empty.
+fn render_queued_calls(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let line = Line::from(vec![
+        Span::styled(
+            "Queued: ",
+            Style::default()
+                .fg(app.theme.warning_color())
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format_queued_line(&app.pending_calls),
+            Style::default().fg(app.theme.warning_color()),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
+}
+
+/// Build the compact text for the "Queued:" line from the pending-call list.
+/// Each entry is rendered as "CALLSIGN (waiting Even, 1:30)" separated by
+/// "  •  ". Pure function so it is directly unit-testable.
+pub(crate) fn format_queued_line(pending: &[crate::app::PendingCallBanner]) -> String {
+    use pancetta_core::slot::SlotParity;
+    pending
+        .iter()
+        .map(|p| {
+            // The DX's parity is the window we CANNOT use (we'd TX on the
+            // opposite). Describe what we're waiting for clearly.
+            let waiting_for = match p.dx_parity {
+                Some(SlotParity::Even) => "Odd window",
+                Some(SlotParity::Odd) => "Even window",
+                None => "a window",
+            };
+            let elapsed = format_elapsed(p.waited_secs);
+            format!("{} (waiting {}, {})", p.callsign, waiting_for, elapsed)
+        })
+        .collect::<Vec<_>>()
+        .join("  •  ")
+}
+
+/// Format elapsed seconds as "M:SS" (e.g. "0:45", "3:02").
+fn format_elapsed(secs: u64) -> String {
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -663,5 +733,60 @@ mod tests {
         // Manual send (no qso_id) → surfaced for the single-detail panel.
         assert!(live_tx_for_qso(Some(&item_manual), Some("qso-a")).is_some());
         assert!(live_tx_for_qso(Some(&item_manual), None).is_some());
+    }
+
+    /// #40: format_queued_line renders each pending call as
+    /// "CALL (waiting <parity> window, M:SS)" separated by "  •  ".
+    #[test]
+    fn test_format_queued_line_empty() {
+        assert_eq!(format_queued_line(&[]), "");
+    }
+
+    #[test]
+    fn test_format_queued_line_single() {
+        use crate::app::PendingCallBanner;
+        use pancetta_core::slot::SlotParity;
+        let pending = vec![PendingCallBanner {
+            callsign: "D2UY".to_string(),
+            dx_parity: Some(SlotParity::Even), // DX is Even → we want Odd
+            waited_secs: 45,
+        }];
+        let line = format_queued_line(&pending);
+        // DX is Even → we're waiting for the Odd window to free up
+        assert!(line.contains("D2UY"), "callsign: {line}");
+        assert!(line.contains("Odd window"), "parity label: {line}");
+        assert!(line.contains("0:45"), "elapsed: {line}");
+    }
+
+    #[test]
+    fn test_format_queued_line_multiple() {
+        use crate::app::PendingCallBanner;
+        use pancetta_core::slot::SlotParity;
+        let pending = vec![
+            PendingCallBanner {
+                callsign: "D2UY".to_string(),
+                dx_parity: Some(SlotParity::Even),
+                waited_secs: 45,
+            },
+            PendingCallBanner {
+                callsign: "VK9XX".to_string(),
+                dx_parity: Some(SlotParity::Odd), // DX is Odd → we want Even
+                waited_secs: 90,
+            },
+        ];
+        let line = format_queued_line(&pending);
+        assert!(line.contains("D2UY"), "first call: {line}");
+        assert!(line.contains("VK9XX"), "second call: {line}");
+        assert!(line.contains("Even window"), "second parity: {line}");
+        assert!(line.contains("1:30"), "second elapsed: {line}");
+        assert!(line.contains("  •  "), "separator: {line}");
+    }
+
+    #[test]
+    fn test_format_elapsed() {
+        assert_eq!(format_elapsed(0), "0:00");
+        assert_eq!(format_elapsed(45), "0:45");
+        assert_eq!(format_elapsed(90), "1:30");
+        assert_eq!(format_elapsed(3 * 60 + 5), "3:05");
     }
 }

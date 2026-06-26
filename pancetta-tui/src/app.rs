@@ -151,6 +151,21 @@ pub struct ActiveQsoBanner {
     pub dx_last_activity: Option<String>,
 }
 
+/// One entry in the cross-parity manual-call queue, pushed to the TUI as
+/// part of every `ActiveQsosUpdate` so the operator sees calls that are
+/// waiting — not silently dropped — while the active TX window is committed
+/// to the opposite parity (#40).
+#[derive(Debug, Clone)]
+pub struct PendingCallBanner {
+    /// DX callsign the operator chose to work.
+    pub callsign: String,
+    /// The DX's slot parity. We'd transmit on the opposite. `None` is
+    /// theoretically possible but in practice always `Some` for queued calls.
+    pub dx_parity: Option<pancetta_core::slot::SlotParity>,
+    /// Seconds since the call was parked in the queue.
+    pub waited_secs: u64,
+}
+
 /// Pipeline component health snapshot, forwarded from coordinator
 #[derive(Debug, Clone)]
 pub struct PipelineHealth {
@@ -560,6 +575,11 @@ pub struct App {
     /// QSO state change. Rendered in a 1-row banner above Band Activity
     /// so operators see who they're mid-conversation with at all times.
     pub active_qsos: Vec<ActiveQsoBanner>,
+    /// Cross-parity manual calls waiting in the queue (#40). Pushed alongside
+    /// `active_qsos` in every `ActiveQsosUpdate`. The QSO Status panel renders
+    /// these as a "Queued" section so the operator knows a call is waiting
+    /// rather than silently dropped.
+    pub pending_calls: Vec<PendingCallBanner>,
     /// Selection cursor into the active-QSO set (and the QSO Status panel),
     /// driving which QSO the abort/re-send management keys target. Clamped
     /// to the active set whenever it changes.
@@ -773,6 +793,7 @@ impl App {
             decoded_messages: VecDeque::with_capacity(1000),
             qso_statuses: Vec::new(),
             active_qsos: Vec::new(),
+            pending_calls: Vec::new(),
             qso_cursor: 0,
             qso_pinned_id: None,
             station_info,
@@ -1450,7 +1471,14 @@ impl App {
     /// appearing in the next snapshot, so they leave the detail panel
     /// the same way they leave the banner. An empty snapshot clears the
     /// panel back to STANDBY.
-    pub fn apply_active_qsos(&mut self, qsos: Vec<ActiveQsoBanner>) {
+    ///
+    /// `pending` carries the cross-parity manual-call queue (#40) and is
+    /// stored on `self.pending_calls` for the QSO Status panel renderer.
+    pub fn apply_active_qsos(
+        &mut self,
+        qsos: Vec<ActiveQsoBanner>,
+        pending: Vec<PendingCallBanner>,
+    ) {
         self.qso_statuses = qsos
             .iter()
             .map(|q| QsoStatus {
@@ -1486,6 +1514,7 @@ impl App {
             })
             .collect();
         self.active_qsos = qsos;
+        self.pending_calls = pending;
         // Batch 2 #5: re-derive the cursor from the pinned qso_id so the
         // selection tracks the SAME QSO across snapshots (the emit order is now
         // stable, but a QSO can still appear/disappear, shifting positions).
@@ -2778,7 +2807,7 @@ mod tests {
         let mut app = App::new(Config::default(), None).await.unwrap();
         assert!(app.qso_statuses.is_empty());
 
-        app.apply_active_qsos(vec![fixture_banner("JA1ABC", "wait rpt", None)]);
+        app.apply_active_qsos(vec![fixture_banner("JA1ABC", "wait rpt", None)], Vec::new());
 
         assert_eq!(app.active_qsos.len(), 1);
         assert_eq!(app.qso_statuses.len(), 1);
@@ -2802,10 +2831,10 @@ mod tests {
     #[tokio::test]
     async fn apply_active_qsos_empty_snapshot_clears_panel() {
         let mut app = App::new(Config::default(), None).await.unwrap();
-        app.apply_active_qsos(vec![fixture_banner("JA1ABC", "wait rpt", None)]);
+        app.apply_active_qsos(vec![fixture_banner("JA1ABC", "wait rpt", None)], Vec::new());
         assert_eq!(app.qso_statuses.len(), 1);
 
-        app.apply_active_qsos(Vec::new());
+        app.apply_active_qsos(Vec::new(), Vec::new());
         assert!(app.qso_statuses.is_empty());
         assert!(app.active_qsos.is_empty());
         assert!(!app.qso_status().active, "default entry is STANDBY");
@@ -2817,7 +2846,7 @@ mod tests {
         let mut app = App::new(Config::default(), None).await.unwrap();
         let mut banner = fixture_banner("JA1ABC", "wait rpt", None);
         banner.snr_rx = None;
-        app.apply_active_qsos(vec![banner]);
+        app.apply_active_qsos(vec![banner], Vec::new());
         assert_eq!(app.qso_statuses[0].snr_rx, Some(-8));
     }
 
@@ -2830,7 +2859,7 @@ mod tests {
         banner.max_calls = 10;
         let deadline = chrono::Utc::now() + chrono::Duration::minutes(5);
         banner.watchdog_deadline = Some(deadline);
-        app.apply_active_qsos(vec![banner]);
+        app.apply_active_qsos(vec![banner], Vec::new());
         let q = &app.qso_statuses[0];
         assert_eq!(q.call_count, 4);
         assert_eq!(q.max_calls, 10);
@@ -2844,20 +2873,26 @@ mod tests {
     #[tokio::test]
     async fn qso_cursor_pins_to_qso_id_across_snapshots() {
         let mut app = App::new(Config::default(), None).await.unwrap();
-        app.apply_active_qsos(vec![
-            fixture_banner_id("AAA", "aaa-id"),
-            fixture_banner_id("BBB", "bbb-id"),
-        ]);
+        app.apply_active_qsos(
+            vec![
+                fixture_banner_id("AAA", "aaa-id"),
+                fixture_banner_id("BBB", "bbb-id"),
+            ],
+            Vec::new(),
+        );
         // Select BBB (index 1) and pin it.
         app.qso_cursor_down();
         assert_eq!(app.selected_qso_id().as_deref(), Some("bbb-id"));
 
         // New snapshot inserts CCC at the front → BBB moves to index 2.
-        app.apply_active_qsos(vec![
-            fixture_banner_id("CCC", "ccc-id"),
-            fixture_banner_id("AAA", "aaa-id"),
-            fixture_banner_id("BBB", "bbb-id"),
-        ]);
+        app.apply_active_qsos(
+            vec![
+                fixture_banner_id("CCC", "ccc-id"),
+                fixture_banner_id("AAA", "aaa-id"),
+                fixture_banner_id("BBB", "bbb-id"),
+            ],
+            Vec::new(),
+        );
         assert_eq!(
             app.selected_qso_id().as_deref(),
             Some("bbb-id"),
@@ -2870,13 +2905,16 @@ mod tests {
     #[tokio::test]
     async fn qso_cursor_falls_back_when_pinned_qso_gone() {
         let mut app = App::new(Config::default(), None).await.unwrap();
-        app.apply_active_qsos(vec![
-            fixture_banner_id("AAA", "aaa-id"),
-            fixture_banner_id("BBB", "bbb-id"),
-        ]);
+        app.apply_active_qsos(
+            vec![
+                fixture_banner_id("AAA", "aaa-id"),
+                fixture_banner_id("BBB", "bbb-id"),
+            ],
+            Vec::new(),
+        );
         app.qso_cursor_down(); // pin bbb-id
                                // bbb-id gone; only aaa remains.
-        app.apply_active_qsos(vec![fixture_banner_id("AAA", "aaa-id")]);
+        app.apply_active_qsos(vec![fixture_banner_id("AAA", "aaa-id")], Vec::new());
         assert_eq!(app.selected_qso_id().as_deref(), Some("aaa-id"));
     }
 

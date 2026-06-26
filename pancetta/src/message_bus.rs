@@ -224,7 +224,14 @@ pub enum MessageType {
     /// on every state change. tui_relay forwards this to the TUI as
     /// `TuiMessage::ActiveQsosUpdate`; the TUI replaces its previous
     /// active-QSOs list with the new snapshot.
-    ActiveQsosSnapshot { qsos: Vec<ActiveQsoSnapshotItem> },
+    ActiveQsosSnapshot {
+        qsos: Vec<ActiveQsoSnapshotItem>,
+        /// Cross-parity manual calls parked in the queue (#40), waiting for
+        /// the active TX window to clear before they can start. Included in
+        /// the same push so the TUI always sees a consistent (active, queued)
+        /// pair without a separate message.
+        pending: Vec<PendingCallSnapshotItem>,
+    },
 
     /// Waterfall spectrogram data for TUI display
     WaterfallData {
@@ -333,6 +340,23 @@ pub struct ActiveQsoSnapshotItem {
     /// busy working someone else, calling CQ, or coming back to us. `None`
     /// when we've heard nothing recent from them.
     pub dx_last_activity: Option<String>,
+}
+
+/// One entry in the cross-parity manual-call queue (#40), included in
+/// `MessageType::ActiveQsosSnapshot::pending`. The TUI renders these as a
+/// compact "Queued" section so the operator knows a cross-window call is
+/// waiting rather than silently dropped.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCallSnapshotItem {
+    /// DX callsign the operator chose to work.
+    pub callsign: String,
+    /// The DX's slot parity (the window they transmit in; we would reply on
+    /// the opposite). `None` is theoretically possible but in practice this
+    /// is always `Some` for queued calls.
+    pub dx_parity: Option<pancetta_core::slot::SlotParity>,
+    /// How long this call has been waiting (wall-clock seconds since it was
+    /// parked in the queue).
+    pub waited_secs: u64,
 }
 
 /// Status data from the autonomous operator for TUI consumption.

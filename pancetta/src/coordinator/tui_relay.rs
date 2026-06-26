@@ -304,7 +304,10 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::SplitUpdate { tx_hz },
                             );
                         }
-                        MessageType::ActiveQsosSnapshot { ref qsos } => {
+                        MessageType::ActiveQsosSnapshot {
+                            ref qsos,
+                            ref pending,
+                        } => {
                             // Re-shape into the TUI's ActiveQsoBanner
                             // (decoupled struct so the TUI doesn't link
                             // pancetta_qso). Push as a TuiMessage; the
@@ -312,11 +315,17 @@ impl super::ApplicationCoordinator {
                             // Batch 94: carries the QSO-detail panel
                             // fields too (last TX/RX message, SNR,
                             // reports, exchange count).
+                            // #40: pending cross-parity calls are carried in
+                            // the same push as pending_calls so the TUI sees
+                            // a consistent (active, queued) pair.
                             let banner_qsos: Vec<pancetta_tui::app::ActiveQsoBanner> =
                                 qsos.iter().map(map_qso_snapshot_item).collect();
+                            let banner_pending: Vec<pancetta_tui::app::PendingCallBanner> =
+                                pending.iter().map(map_pending_call_item).collect();
                             let _ = tui_msg_tx_relay.send(
                                 pancetta_tui::tui_runner::TuiMessage::ActiveQsosUpdate {
                                     qsos: banner_qsos,
+                                    pending_calls: banner_pending,
                                 },
                             );
                         }
@@ -1542,6 +1551,17 @@ impl super::ApplicationCoordinator {
 /// (decoupled struct so pancetta-tui doesn't link pancetta-qso).
 /// Field-for-field copy — the QSO coordinator already derived everything
 /// from the state machine; the relay just re-shapes.
+/// Map a bus `PendingCallSnapshotItem` to the TUI's `PendingCallBanner`.
+fn map_pending_call_item(
+    p: &crate::message_bus::PendingCallSnapshotItem,
+) -> pancetta_tui::app::PendingCallBanner {
+    pancetta_tui::app::PendingCallBanner {
+        callsign: p.callsign.clone(),
+        dx_parity: p.dx_parity,
+        waited_secs: p.waited_secs,
+    }
+}
+
 fn map_qso_snapshot_item(
     q: &crate::message_bus::ActiveQsoSnapshotItem,
 ) -> pancetta_tui::app::ActiveQsoBanner {
