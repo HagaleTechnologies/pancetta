@@ -1403,6 +1403,10 @@ impl std::fmt::Debug for JwtConfig {
 }
 
 #[cfg(test)]
+// rationale: test builders assign credential fields after default() for
+// readability; sequential assignment reads clearer than a struct-update splat
+// (mirrors pancetta-hamlib mock.rs).
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
 
