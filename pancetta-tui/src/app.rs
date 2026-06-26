@@ -957,13 +957,10 @@ impl App {
         // Update DX stations list — but never list OURSELVES. Self-decodes of
         // our own transmissions (and frames whose extracted callsign resolves to
         // our station call) must not appear as a DX entry. The `.filter()` makes
-        // the `if let` simply not match for our own call, skipping the update. (#42)
-        let our_call = self.station_info.call_sign.clone();
-        if let Some(call_sign) = message
-            .call_sign
-            .as_ref()
-            .filter(|c| !c.eq_ignore_ascii_case(&our_call))
-        {
+        // the `if let` simply not match for our own call, skipping the update.
+        // (#42; unified via is_our_call which also catches compound forms like
+        // K5ARH/P or EA8/K5ARH)
+        if let Some(call_sign) = message.call_sign.as_ref().filter(|c| !self.is_our_call(c)) {
             // Preserve existing grid if new message doesn't have one
             // (e.g., RR73/73 messages don't carry grid info)
             let grid_square = message.grid_square.clone().or_else(|| {
@@ -1587,6 +1584,42 @@ impl App {
             .map(|q| q.qso_id.clone());
     }
 
+    /// Returns `true` when `call` resolves to our own station.
+    ///
+    /// Uses case-insensitive ASCII equality (matching the existing #42
+    /// self-filter) because `pancetta_qso` is not a dependency of
+    /// pancetta-tui. Guards against an empty/unconfigured callsign — if our
+    /// call is blank we cannot tell what "our" station is, so we return
+    /// `false` to avoid filtering every entry.
+    fn is_our_call(&self, call: &str) -> bool {
+        let ours = self.station_info.call_sign.trim();
+        if ours.is_empty() {
+            return false;
+        }
+        // Compound-callsign equivalence: K5ARH/P or EA8/K5ARH must also be
+        // treated as "us". Replicate the base-call extraction that
+        // pancetta_qso::exchange::callsigns_match uses without pulling in
+        // that crate — split on '/', pick the longest token that contains
+        // both a digit and an ASCII letter, compare case-insensitively.
+        fn base_call(s: &str) -> &str {
+            s.split('/')
+                .max_by(|a, b| {
+                    let shaped = |t: &str| {
+                        t.len() >= 3
+                            && t.bytes().any(|c| c.is_ascii_digit())
+                            && t.bytes().any(|c| c.is_ascii_alphabetic())
+                    };
+                    match (shaped(a), shaped(b)) {
+                        (true, false) => std::cmp::Ordering::Greater,
+                        (false, true) => std::cmp::Ordering::Less,
+                        _ => a.len().cmp(&b.len()),
+                    }
+                })
+                .unwrap_or(s)
+        }
+        call.eq_ignore_ascii_case(ours) || base_call(call).eq_ignore_ascii_case(base_call(ours))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn add_dx_spot(
         &mut self,
@@ -1598,6 +1631,10 @@ impl App {
         needed: bool,
         atno: bool,
     ) {
+        // Never insert our own station into the DX Hunter. (#42 extension)
+        if self.is_our_call(&callsign) {
+            return;
+        }
         let dx_station = DxStation {
             call_sign: callsign.clone(),
             grid_square: None,
@@ -1728,10 +1765,18 @@ impl App {
         // Drop spots not heard within the staleness window — a station last
         // heard minutes ago is no longer "current" DX to chase.
         let cutoff = Utc::now() - chrono::Duration::seconds(Self::DX_HUNTER_STALE_SECS);
+        // Belt-and-suspenders: even if our own callsign somehow slipped into
+        // dx_stations (e.g. a stale entry from before #42 was extended), never
+        // surface it to the operator at render time. (#42 extension)
+        let our_call = self.station_info.call_sign.clone();
         let mut list: Vec<&DxStation> = self
             .dx_stations
             .values()
             .filter(|s| s.last_seen > cutoff)
+            .filter(|s| {
+                let ours = our_call.trim();
+                ours.is_empty() || !s.call_sign.eq_ignore_ascii_case(ours)
+            })
             .collect();
         list.sort_by(|a, b| {
             a.worked_before
@@ -2183,6 +2228,12 @@ impl App {
     pub fn merge_spot_groups(&mut self, spots: &[crate::tui_runner::CqdxSpotInfo]) {
         let our_grid = self.station_info.grid_square.clone();
         for spot in spots {
+            // Never insert our own callsign into the DX Hunter via network
+            // spots (e.g. a PSKReporter/cqdx monitor reporting our own TX).
+            // (#42 extension)
+            if self.is_our_call(&spot.dx_call) {
+                continue;
+            }
             let entry = self
                 .dx_stations
                 .entry(spot.dx_call.clone())
@@ -3142,6 +3193,141 @@ mod tests {
             .await
             .unwrap();
         assert!(app.dx_stations.contains_key("JA1ABC"));
+    }
+
+    /// #42 extension: add_dx_spot (PSKReporter/local path) must not insert our
+    /// own callsign into dx_stations.
+    #[tokio::test]
+    async fn self_spot_not_added_via_add_dx_spot() {
+        let mut app = fixture_app().await;
+        app.station_info.call_sign = "K5ARH".to_string();
+
+        // Our own call — must be rejected.
+        app.add_dx_spot(
+            "K5ARH".to_string(),
+            14.074,
+            "FT8".to_string(),
+            -10,
+            false,
+            false,
+            false,
+        );
+        app.add_dx_spot(
+            "k5arh".to_string(),
+            14.074,
+            "FT8".to_string(),
+            -10,
+            false,
+            false,
+            false,
+        );
+        assert!(
+            !app.dx_stations.contains_key("K5ARH") && !app.dx_stations.contains_key("k5arh"),
+            "add_dx_spot must never insert our own callsign"
+        );
+
+        // A different station is still accepted.
+        app.add_dx_spot(
+            "JA1ABC".to_string(),
+            14.074,
+            "FT8".to_string(),
+            -5,
+            false,
+            false,
+            false,
+        );
+        assert!(app.dx_stations.contains_key("JA1ABC"));
+    }
+
+    /// #42 extension: merge_spot_groups (cqdx network path) must not insert our
+    /// own callsign into dx_stations.
+    #[test]
+    fn self_spot_not_added_via_merge_spot_groups() {
+        // merge_spot_groups is sync, so no async/await needed.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(fixture_app());
+        app.station_info.call_sign = "K5ARH".to_string();
+
+        let self_spot = crate::tui_runner::CqdxSpotInfo {
+            dx_call: "K5ARH".to_string(),
+            band: "20m".to_string(),
+            mode: "FT8".to_string(),
+            frequency_hz: 14_074_000,
+            grid: None,
+            rarity_tier: "common".to_string(),
+            reporter_count: 1,
+            best_snr: Some(-10),
+            confidence: 1.0,
+            first_seen: 0,
+            last_seen: chrono::Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "United States".to_string(),
+            needed: false,
+            atno: false,
+        };
+        let other_spot = crate::tui_runner::CqdxSpotInfo {
+            dx_call: "JA1ABC".to_string(),
+            ..self_spot.clone()
+        };
+
+        app.merge_spot_groups(&[self_spot, other_spot]);
+
+        assert!(
+            !app.dx_stations.contains_key("K5ARH"),
+            "merge_spot_groups must skip our own callsign"
+        );
+        assert!(
+            app.dx_stations.contains_key("JA1ABC"),
+            "merge_spot_groups must still insert other stations"
+        );
+    }
+
+    /// #42 extension: displayed_dx_stations (render-time backstop) must not
+    /// return our own callsign even if it somehow ended up in dx_stations.
+    #[test]
+    fn displayed_dx_stations_excludes_self() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(fixture_app());
+        app.station_info.call_sign = "K5ARH".to_string();
+
+        // Inject our own call directly (bypassing the population guards).
+        app.dx_stations.insert(
+            "K5ARH".to_string(),
+            DxStation {
+                call_sign: "K5ARH".to_string(),
+                grid_square: None,
+                frequency: 14.074,
+                mode: "FT8".to_string(),
+                last_seen: chrono::Utc::now(),
+                snr: -10,
+                distance: None,
+                bearing: None,
+                worked_before: false,
+                needed: false,
+                atno: false,
+                priority_score: 0,
+                source: SpotSource::Local,
+                entity_name: None,
+                rarity_tier: None,
+                reporter_count: None,
+                is_notable: false,
+                notable_type: None,
+                confidence: None,
+                best_snr_network: None,
+                last_seen_network: None,
+                audio_offset_hz: None,
+                slot_parity: None,
+            },
+        );
+
+        let displayed = app.displayed_dx_stations();
+        assert!(
+            displayed
+                .iter()
+                .all(|s| !s.call_sign.eq_ignore_ascii_case("K5ARH")),
+            "displayed_dx_stations must never surface our own callsign"
+        );
     }
 
     /// Batch 95 regression: an S-meter reading must NOT clobber the

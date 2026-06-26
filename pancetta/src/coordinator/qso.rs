@@ -1841,6 +1841,22 @@ impl super::ApplicationCoordinator {
                                             frequency,
                                             dx_parity,
                                         } => {
+                                            // Belt-and-suspenders: refuse to call our own
+                                            // station regardless of how the command arrived.
+                                            // The relay already blocks this via CallStation,
+                                            // but non-relay paths (tests, future commands)
+                                            // are covered here.
+                                            if pancetta_qso::exchange::callsigns_match(
+                                                &callsign,
+                                                &our_callsign,
+                                            ) {
+                                                warn!(
+                                                    target: "qso.security",
+                                                    "Refusing StartQso for our own callsign {}",
+                                                    callsign
+                                                );
+                                                continue;
+                                            }
                                             info!(
                                                 "Starting QSO with {} on {} Hz (manual)",
                                                 callsign, frequency

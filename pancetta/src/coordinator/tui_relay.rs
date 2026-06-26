@@ -119,6 +119,9 @@ impl super::ApplicationCoordinator {
         // tick; pushed only on change so the TUI render stays cheap).
         let rig_conn_state_relay = self.rig_conn_state.clone();
         let audio_output_default_relay = self.audio_output_default.clone();
+        // Clone our callsign before the tui-relay thread consumes the original
+        // via move. The async command-handler task below needs its own copy.
+        let cmd_our_callsign = our_callsign_for_relay.clone();
         let tui_relay_jh = std::thread::Builder::new()
             .name("tui-relay".to_string())
             .spawn(move || {
@@ -737,6 +740,26 @@ impl super::ApplicationCoordinator {
                             let policy = pancetta_core::TxPolicy::from_u8(
                                 cmd_tx_policy.load(Ordering::Acquire),
                             );
+                            // Refuse to call our own station — catches the case
+                            // where our callsign slipped into the DX Hunter and
+                            // the operator accidentally pressed Space on it.
+                            if pancetta_qso::exchange::callsigns_match(&callsign, &cmd_our_callsign)
+                            {
+                                warn!(
+                                    target: "qso.security",
+                                    "Refusing to call our own station {}", callsign
+                                );
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "TX".to_string(),
+                                        status: format!(
+                                            "Refusing to call our own station ({})",
+                                            callsign
+                                        ),
+                                    },
+                                );
+                                continue;
+                            }
                             if !policy.allows_initiation() {
                                 warn!(
                                     target: "tx.policy",
