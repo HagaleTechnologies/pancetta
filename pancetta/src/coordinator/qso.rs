@@ -288,16 +288,37 @@ async fn promote_pending_manual_calls(
     // The parity our still-active QSOs are committed to (None ⇒ idle).
     let current_side = qso_manager.current_tx_side().await;
 
-    let to_start: Vec<PendingManualCall> = {
+    let (to_start, keep_depth): (Vec<PendingManualCall>, usize) = {
         let mut q = pending.lock().await;
         if q.is_empty() {
             return;
         }
+        info!(
+            target: "qso",
+            "promote_pending_manual_calls: current_side={:?}, queue_depth={}",
+            current_side,
+            q.len()
+        );
         let queue = std::mem::take(&mut *q);
         let (start, keep) = partition_pending_calls(queue, current_side);
+        let keep_depth = keep.len();
         *q = keep;
-        start
+        (start, keep_depth)
     };
+
+    if keep_depth > 0 {
+        info!(
+            target: "qso",
+            "Promote: {} call(s) starting, {} still queued (cross-parity); current_side={:?}",
+            to_start.len(),
+            keep_depth,
+            current_side
+        );
+    }
+
+    // Collect calls that fail to start so we can re-queue them at the front
+    // rather than silently dropping them.
+    let mut failed: Vec<PendingManualCall> = Vec::new();
 
     for p in to_start {
         info!(
@@ -317,8 +338,22 @@ async fn promote_pending_manual_calls(
                 .await;
             }
             Err(e) => {
-                warn!(target: "qso", "Promoting queued call to {} failed: {}", p.callsign, e);
+                error!(
+                    target: "qso",
+                    "Promoting queued call to {} failed — re-queuing: {}",
+                    p.callsign, e
+                );
+                failed.push(p);
             }
+        }
+    }
+
+    // Re-queue any calls that failed to start at the FRONT of the queue so
+    // they get first priority on the next promote cycle.
+    if !failed.is_empty() {
+        let mut q = pending.lock().await;
+        for p in failed.into_iter().rev() {
+            q.push_front(p);
         }
     }
 }
@@ -624,10 +659,10 @@ async fn maybe_answer_caller(
         pancetta_qso::qso_manager::admit_new_qso(current_side, desired_tx_parity),
         pancetta_qso::qso_manager::TxAdmission::Queue
     ) {
-        debug!(
+        info!(
             target: "qso",
-            "Not auto-answering {} — cross-parity (active side {:?}, would TX {:?})",
-            answer.their_call, current_side, desired_tx_parity
+            "Skipping auto-answer to {} — cross-parity (active side {:?}); operator can queue manually",
+            answer.their_call, current_side
         );
         return;
     }
@@ -1634,13 +1669,13 @@ impl super::ApplicationCoordinator {
                                                         dx_parity,
                                                     });
                                                 }
+                                                let queue_depth = q.len();
                                                 drop(q);
                                                 info!(
                                                     target: "qso",
-                                                    "Queued manual call to {} — opposite window \
-                                                     (active side {:?}); will start when the \
-                                                     current QSO(s) finish",
-                                                    callsign, current_side
+                                                    "Queued {} ({:?}) — opposite window \
+                                                     (active side {:?}); queue now {} pending",
+                                                    callsign, dx_parity, current_side, queue_depth
                                                 );
                                                 emit_status(
                                                     &message_bus,
