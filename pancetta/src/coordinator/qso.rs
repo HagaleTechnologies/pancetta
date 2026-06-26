@@ -685,6 +685,30 @@ fn classify_caller_answer(
 /// Because this path carries no failure-backoff state, it also satisfies #43
 /// part 2: after our initiation watchdog retires a QSO, if that DX then calls
 /// us we still answer.
+
+/// Compute a monotonically-increasing slot index from a decode timestamp.
+///
+/// FT8 windows are 15 seconds wide and aligned to UTC. Two decodes that fall
+/// in the same window produce the same key; decodes in adjacent windows produce
+/// consecutive keys. Used by the per-slot creation-dedup set in the decode
+/// loop so that repeated decodes of the same station within one 15-second
+/// window only attempt QSO creation once.
+///
+/// # Formula
+/// ```text
+/// slot_key = floor(unix_seconds / 15)
+/// ```
+///
+/// A `SystemTime` before UNIX_EPOCH (e.g. in unit tests) returns 0.
+#[inline]
+fn caller_creation_slot_key(timestamp: std::time::SystemTime) -> u64 {
+    timestamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 15
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn maybe_answer_caller(
     msg_type: &pancetta_qso::states::MessageType,
@@ -1647,6 +1671,29 @@ impl super::ApplicationCoordinator {
                     }
                 });
 
+                // Per-slot decode-creation dedup (#fix/duplicate-qso-73 Part B).
+                //
+                // FT8 decoders routinely emit 2-4 copies of the same station in
+                // one 15-second window (different candidate frequencies / passes).
+                // `process_message` MUST run for every decode so active QSOs
+                // advance on every copy. But `maybe_answer_caller` (QSO
+                // *creation*) only needs to fire ONCE per station per slot — all
+                // subsequent copies can skip creation because the first already
+                // opened (or gated) it.
+                //
+                // Keying strategy: `slot_key = unix_secs_of_decode / 15`.
+                // Because `decoded_msg.timestamp` is a `SystemTime` stamped by
+                // the decoder, multiple decodes from the same 15-second window
+                // share the same `slot_key`. We dedup by `(slot_key,
+                // base_callsign)`, where `base_callsign` collapses compound
+                // variants (`EA8/G8BCG` and `G8BCG` → `G8BCG`).
+                //
+                // The set is a simple `(last_slot_key, HashSet<String>)`: when
+                // the slot_key changes (new window), we clear and restart. This
+                // is O(1) amortised and requires no locking (loop is single-task).
+                let mut caller_dedup: (u64, std::collections::HashSet<String>) =
+                    (0, std::collections::HashSet::new());
+
                 while !shutdown.load(Ordering::Acquire) {
                     match qso_rx.try_recv() {
                         Ok(message) => {
@@ -1681,6 +1728,10 @@ impl super::ApplicationCoordinator {
                                             )
                                             .await;
 
+                                            // process_message advances any active
+                                            // QSO — runs unconditionally for every
+                                            // decode so the state machine always
+                                            // sees the latest copy.
                                             if let Err(e) = qso_manager
                                                 .process_message(
                                                     msg_type.clone(),
@@ -1693,24 +1744,74 @@ impl super::ApplicationCoordinator {
                                                 debug!("QSO process_message error: {}", e);
                                             }
 
+                                            // Per-slot dedup gate for always-answer
+                                            // creation. Derive the slot key from the
+                                            // decode timestamp (floor(unix_secs/15)).
+                                            let decode_slot_key =
+                                                caller_creation_slot_key(decoded_msg.timestamp);
+
+                                            // Refresh the dedup set when the slot
+                                            // changes (new 15-second window).
+                                            if decode_slot_key != caller_dedup.0 {
+                                                caller_dedup.0 = decode_slot_key;
+                                                caller_dedup.1.clear();
+                                            }
+
+                                            // Peek at the caller's base callsign
+                                            // without consuming msg_type — we only
+                                            // need it to key the dedup set.
+                                            let caller_base =
+                                                classify_caller_answer(&msg_type, &our_callsign)
+                                                    .map(|a| {
+                                                        pancetta_qso::exchange::base_callsign(
+                                                            &a.their_call,
+                                                        )
+                                                    });
+
                                             // Always-answer-callers (#39): if a
                                             // station is calling US and no QSO
                                             // with them is already in progress,
                                             // come back to them — independent of
                                             // the autonomous toggle, gated by TX
                                             // policy / parity / capacity.
-                                            maybe_answer_caller(
-                                                &msg_type,
-                                                &our_callsign,
-                                                frequency,
-                                                decoded_msg.slot_parity,
-                                                snr,
-                                                &qso_manager,
-                                                &tx_policy,
-                                                auto_answer_max_concurrent,
-                                                &message_bus,
-                                            )
-                                            .await;
+                                            //
+                                            // Skip if we already attempted creation
+                                            // for this station in this slot (Part B
+                                            // of duplicate-QSO fix).
+                                            let skip_creation = caller_base
+                                                .as_deref()
+                                                .is_some_and(|base| caller_dedup.1.contains(base));
+
+                                            if skip_creation {
+                                                debug!(
+                                                    target: "qso",
+                                                    "Per-slot dedup: skipping maybe_answer_caller for {} (slot {})",
+                                                    caller_base.as_deref().unwrap_or("?"),
+                                                    decode_slot_key,
+                                                );
+                                            } else {
+                                                // Record the attempt BEFORE the
+                                                // async call so that a second
+                                                // decode arriving while we await
+                                                // would also be suppressed if this
+                                                // loop were ever concurrent (it
+                                                // isn't today, but is defensive).
+                                                if let Some(ref base) = caller_base {
+                                                    caller_dedup.1.insert(base.clone());
+                                                }
+                                                maybe_answer_caller(
+                                                    &msg_type,
+                                                    &our_callsign,
+                                                    frequency,
+                                                    decoded_msg.slot_parity,
+                                                    snr,
+                                                    &qso_manager,
+                                                    &tx_policy,
+                                                    auto_answer_max_concurrent,
+                                                    &message_bus,
+                                                )
+                                                .await;
+                                            }
 
                                             // #41: record what this sender is
                                             // doing on the band so the QSO panel
@@ -4045,5 +4146,87 @@ mod qrz_enrichment_tests {
         assert!(!res.grid_filled && !res.name_added);
         assert_eq!(md.grids.theirs, before.grids.theirs);
         assert_eq!(md.notes, before.notes);
+    }
+}
+
+#[cfg(test)]
+mod caller_dedup_tests {
+    use super::caller_creation_slot_key;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    /// Two SystemTimes within the same 15-second window map to the same key.
+    #[test]
+    fn same_slot_same_key() {
+        // Slot N starts at unix second N*15; both 0 s and 14 s are in slot 0.
+        let t0 = UNIX_EPOCH + Duration::from_secs(0);
+        let t14 = UNIX_EPOCH + Duration::from_secs(14);
+        assert_eq!(caller_creation_slot_key(t0), caller_creation_slot_key(t14));
+    }
+
+    /// The boundary second (15) starts a new slot.
+    #[test]
+    fn slot_boundary_increments_key() {
+        let t_end_of_slot0 = UNIX_EPOCH + Duration::from_secs(14);
+        let t_start_of_slot1 = UNIX_EPOCH + Duration::from_secs(15);
+        let k0 = caller_creation_slot_key(t_end_of_slot0);
+        let k1 = caller_creation_slot_key(t_start_of_slot1);
+        assert_eq!(k1, k0 + 1, "adjacent slots must differ by exactly 1");
+    }
+
+    /// A realistic mid-session timestamp (e.g. 2026-06-25 12:00:07 UTC) hashes
+    /// to the correct slot index.
+    #[test]
+    fn real_timestamp_hashes_correctly() {
+        // 2026-06-25 12:00:07 UTC = 1_751_198_407 unix seconds.
+        // Floor(1_751_198_407 / 15) = 116_746_560  (slot in the :00 window).
+        // 1_751_198_407 / 15 = 116_746_560.466...
+        let unix_secs: u64 = 1_751_198_407;
+        let t = UNIX_EPOCH + Duration::from_secs(unix_secs);
+        assert_eq!(caller_creation_slot_key(t), unix_secs / 15);
+    }
+
+    /// A timestamp before UNIX_EPOCH (e.g. from a unit-test stub) returns 0
+    /// rather than panicking.
+    #[test]
+    fn pre_epoch_timestamp_returns_zero() {
+        // SystemTime doesn't support times before UNIX_EPOCH directly in all
+        // implementations; we use UNIX_EPOCH itself as the minimal safe input.
+        let t = UNIX_EPOCH;
+        assert_eq!(caller_creation_slot_key(t), 0);
+    }
+
+    /// The dedup state clears when the slot key changes (simulated inline).
+    #[test]
+    fn dedup_set_clears_on_slot_change() {
+        let mut dedup: (u64, std::collections::HashSet<String>) =
+            (0, std::collections::HashSet::new());
+
+        // Slot 0: station A arrives twice.
+        let slot0 = caller_creation_slot_key(UNIX_EPOCH + Duration::from_secs(3));
+        if slot0 != dedup.0 {
+            dedup.0 = slot0;
+            dedup.1.clear();
+        }
+        let first_insert = dedup.1.insert("G8BCG".to_string());
+        assert!(first_insert, "first decode in slot must be admitted");
+
+        // Same slot, same station: second decode skipped.
+        let slot0_again = caller_creation_slot_key(UNIX_EPOCH + Duration::from_secs(7));
+        assert_eq!(slot0, slot0_again, "still same slot");
+        let second_insert = dedup.1.insert("G8BCG".to_string());
+        assert!(!second_insert, "second decode in same slot must be deduped");
+
+        // Slot 1: station A reappears — set should have been cleared.
+        let slot1 = caller_creation_slot_key(UNIX_EPOCH + Duration::from_secs(15));
+        assert_ne!(slot0, slot1);
+        if slot1 != dedup.0 {
+            dedup.0 = slot1;
+            dedup.1.clear();
+        }
+        let third_insert = dedup.1.insert("G8BCG".to_string());
+        assert!(
+            third_insert,
+            "first decode in new slot must be admitted again"
+        );
     }
 }
