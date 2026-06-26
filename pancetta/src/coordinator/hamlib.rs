@@ -6,6 +6,13 @@ use tokio::sync::RwLock;
 use tokio::time::interval;
 use tracing::{debug, error, info, span, warn, Level};
 
+/// Maximum time to wait for the rig's initial connect + frequency read before
+/// proceeding with startup.  A QSO takes ≥ 15 s (one FT8 slot) to complete,
+/// so anything under that is safe.  If the rig misses this window the poll
+/// loop (every 500 ms) will catch up; only the very first seconds of operation
+/// may stamp the wrong band.
+const RIG_INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(8);
+
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
 /// Rig connection state surfaced to the TUI as a station-panel badge.
@@ -259,6 +266,13 @@ impl super::ApplicationCoordinator {
         // site; must NOT double-fire).
         let last_freq_command = self.last_freq_command.clone();
 
+        // Oneshot used to gate startup: the spawned task signals here once the
+        // initial connect + get_frequency have completed (or failed).  We await
+        // this with a bounded timeout so the QSO pipeline doesn't go live while
+        // the dial atomic is still 0, which would cause the first-slot QSO
+        // completion to log the wrong band.
+        let (initial_read_tx, initial_read_rx) = tokio::sync::oneshot::channel::<()>();
+
         let hamlib_handle = {
             let shutdown = self.shutdown_signal.clone();
 
@@ -309,6 +323,12 @@ impl super::ApplicationCoordinator {
                         rig_conn_state.store(RigConnState::NotConnected.as_u8(), Ordering::Relaxed);
                     }
                 }
+
+                // Signal that the initial connect + read sequence is done (or
+                // gave up).  The receiver in start_hamlib_component is waiting
+                // with a bounded timeout; send errors are harmless (timeout
+                // already elapsed).
+                let _ = initial_read_tx.send(());
 
                 // Polling task
                 let rig_poll = Arc::new(rig);
@@ -673,6 +693,39 @@ impl super::ApplicationCoordinator {
 
         self.named_task_handles
             .push((ComponentId::Hamlib, hamlib_handle));
+
+        // On the rig-enabled path: block here (bounded) until the spawned task
+        // has completed its initial connect + get_frequency sequence.  This
+        // guarantees that `operating_frequency_hz` is non-zero before
+        // `start_qso_component` runs, so a QSO that completes in the first
+        // slot logs the correct band.
+        //
+        // On the mock / rig-disabled path: the receiver fires immediately after
+        // the spawned task calls `initial_read_tx.send(())`, so there's no
+        // meaningful delay.
+        //
+        // If the rig is slow or absent the timeout fires, we log a warning and
+        // carry on — the poll loop (every 500 ms) will catch up; only the first
+        // few seconds of operation could stamp band=0.
+        if rig_enabled {
+            match tokio::time::timeout(RIG_INITIAL_READ_TIMEOUT, initial_read_rx).await {
+                Ok(_) => {
+                    info!(
+                        target: "rig",
+                        "Rig initial frequency read complete before QSO pipeline start"
+                    );
+                }
+                Err(_) => {
+                    warn!(
+                        target: "rig",
+                        "Rig frequency not read within {}s at startup — band may be wrong \
+                         until the rig responds or you press a band key",
+                        RIG_INITIAL_READ_TIMEOUT.as_secs()
+                    );
+                }
+            }
+        }
+
         info!("Hamlib component started");
         Ok(())
     }
