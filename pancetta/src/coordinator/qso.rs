@@ -710,8 +710,18 @@ async fn maybe_answer_caller(
     };
 
     // 2. Don't open a duplicate — process_message already drives any active QSO
-    //    with this station (it ran before us this cycle).
-    if qso_manager.has_active_qso_with(&answer.their_call).await {
+    //    with this station (it ran before us this cycle). Also suppress for a
+    //    recently-completed QSO (120 s window): if the DX sends another RR73
+    //    right after we already exchanged 73s, the bounded auto-resend-73 path
+    //    (`maybe_auto_resend_73`) handles it — opening a brand-new QSO here
+    //    would produce spurious duplicate 73s. Explicit operator re-work via
+    //    StartQso / Space does NOT come through this function, so it is
+    //    unaffected by this gate.
+    if qso_manager
+        .has_active_or_recent_qso_with(&answer.their_call, std::time::Duration::from_secs(120))
+        .await
+    {
+        debug!(target: "qso", "Not auto-answering {} — active or recently-completed QSO exists", answer.their_call);
         return;
     }
 

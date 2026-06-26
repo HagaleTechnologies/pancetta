@@ -441,6 +441,42 @@ impl QsoManager {
         })
     }
 
+    /// True if we have an ACTIVE QSO with `callsign`, OR a recently-COMPLETED
+    /// one (within `within`). Used to suppress the always-answer-callers path
+    /// from opening a second QSO for a station we just finished working — the
+    /// bounded auto-resend-73 path already handles a DX that didn't copy our
+    /// 73. Explicit operator re-work bypasses this gate entirely (it uses the
+    /// `StartQso` → `respond_to_cq_manual` path, not `maybe_answer_caller`).
+    ///
+    /// Compound-call-aware: `EA8/G8BCG` and `G8BCG` are the same station.
+    pub async fn has_active_or_recent_qso_with(
+        &self,
+        callsign: &str,
+        within: std::time::Duration,
+    ) -> bool {
+        let qsos = self.qsos.read().await;
+        let now = chrono::Utc::now();
+        let window_secs = within.as_secs() as i64;
+        qsos.values().any(|p| {
+            let call_match = p
+                .metadata
+                .their_callsign
+                .as_deref()
+                .is_some_and(|c| crate::exchange::callsigns_match(c, callsign));
+            if !call_match {
+                return false;
+            }
+            if p.state.is_active() {
+                return true;
+            }
+            // Recently completed? (`completed_at` lives in QsoState::Completed { .. }.)
+            if let QsoState::Completed { completed_at, .. } = &p.state {
+                return now.signed_duration_since(*completed_at).num_seconds() <= window_secs;
+            }
+            false
+        })
+    }
+
     /// Create a new QSO manager
     pub fn new(config: QsoManagerConfig) -> Self {
         let (event_sender, _) = broadcast::channel(1000);
@@ -6573,5 +6609,196 @@ mod stuck_dx_tests {
                 "changing frames must never hop (iter {i})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod has_active_or_recent_qso_tests {
+    //! Tests for `has_active_or_recent_qso_with` — the completion-aware dedup
+    //! gate used by `maybe_answer_caller` to suppress post-completion duplicate
+    //! QSOs (fix for the ZL1UHD-style four-73 bug).
+    use super::*;
+    use chrono::Duration;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn manager() -> QsoManager {
+        QsoManager::new(QsoManagerConfig {
+            our_callsign: "W1ABC".into(),
+            our_grid: Some("FN42".into()),
+            timeouts: TimeoutConfig::default(),
+            contest_mode: None,
+            auto_sequence: AutoSequenceConfig::default(),
+            duplicate_checking: DuplicateCheckConfig::default(),
+        })
+    }
+
+    /// Minimal `QsoMetadata` for a QSO with `their_callsign`.
+    fn meta(their_callsign: &str) -> QsoMetadata {
+        let now = Utc::now();
+        QsoMetadata {
+            qso_id: Uuid::new_v4(),
+            our_callsign: "W1ABC".into(),
+            their_callsign: Some(their_callsign.into()),
+            frequency: 1500.0,
+            mode: "FT8".into(),
+            start_time: now,
+            end_time: None,
+            reports: SignalReports::default(),
+            grids: GridSquares::default(),
+            contest_info: None,
+            tags: HashMap::new(),
+            notes: None,
+            tx_parity: None,
+            initiated_by: CallInitiation::Auto,
+            role: QsoRole::Caller,
+            call_count: 1,
+            first_call_at: Some(now),
+            last_call_at: Some(now),
+            progressed_this_cycle: false,
+            last_rx_text: None,
+            dx_repeat_count: 0,
+        }
+    }
+
+    /// Insert a `QsoProgress` with the given state directly into the manager's
+    /// map (mirrors the pattern used by other test modules).
+    async fn insert(manager: &QsoManager, state: QsoState, their_call: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        let progress = QsoProgress {
+            state,
+            state_history: vec![],
+            messages: vec![],
+            metadata: meta(their_call),
+        };
+        manager.qsos.write().await.insert(id, progress);
+        id
+    }
+
+    // ── within-window: recently completed → true ─────────────────────────────
+
+    #[tokio::test]
+    async fn recently_completed_within_window_returns_true() {
+        let m = manager();
+        // Completed 5 seconds ago — well within the 120 s window.
+        let completed_state = QsoState::Completed {
+            their_callsign: "ZL1UHD".into(),
+            their_report: -12,
+            our_report: -7,
+            frequency: 1500.0,
+            grid_square: None,
+            completed_at: Utc::now() - Duration::seconds(5),
+            duration_seconds: 60,
+        };
+        insert(&m, completed_state, "ZL1UHD").await;
+
+        assert!(
+            m.has_active_or_recent_qso_with("ZL1UHD", std::time::Duration::from_secs(120))
+                .await,
+            "recently-completed QSO must block duplicate creation"
+        );
+    }
+
+    // ── outside window: stale completed → false ───────────────────────────────
+
+    #[tokio::test]
+    async fn completed_outside_window_returns_false() {
+        let m = manager();
+        // Completed 200 seconds ago — outside the 120 s window.
+        let completed_state = QsoState::Completed {
+            their_callsign: "ZL1UHD".into(),
+            their_report: -12,
+            our_report: -7,
+            frequency: 1500.0,
+            grid_square: None,
+            completed_at: Utc::now() - Duration::seconds(200),
+            duration_seconds: 60,
+        };
+        insert(&m, completed_state, "ZL1UHD").await;
+
+        assert!(
+            !m.has_active_or_recent_qso_with("ZL1UHD", std::time::Duration::from_secs(120))
+                .await,
+            "stale (>window) completed QSO must NOT block a new one"
+        );
+    }
+
+    // ── active QSO → true ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn active_qso_returns_true() {
+        let m = manager();
+        let active_state = QsoState::RespondingToCq {
+            target_callsign: "ZL1UHD".into(),
+            frequency: 1500.0,
+            started_at: Utc::now(),
+        };
+        insert(&m, active_state, "ZL1UHD").await;
+
+        assert!(
+            m.has_active_or_recent_qso_with("ZL1UHD", std::time::Duration::from_secs(120))
+                .await,
+            "active QSO must block duplicate"
+        );
+    }
+
+    // ── different callsign → false ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn different_callsign_returns_false() {
+        let m = manager();
+        let completed_state = QsoState::Completed {
+            their_callsign: "ZL1UHD".into(),
+            their_report: -12,
+            our_report: -7,
+            frequency: 1500.0,
+            grid_square: None,
+            completed_at: Utc::now() - Duration::seconds(5),
+            duration_seconds: 60,
+        };
+        insert(&m, completed_state, "ZL1UHD").await;
+
+        assert!(
+            !m.has_active_or_recent_qso_with("K9ZZ", std::time::Duration::from_secs(120))
+                .await,
+            "QSO with a different callsign must not match"
+        );
+    }
+
+    // ── no QSOs at all → false ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn empty_manager_returns_false() {
+        let m = manager();
+        assert!(
+            !m.has_active_or_recent_qso_with("ZL1UHD", std::time::Duration::from_secs(120))
+                .await,
+            "no QSOs → always false"
+        );
+    }
+
+    // ── compound-call equivalence ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn compound_call_matches_base() {
+        let m = manager();
+        // QSO was logged under the compound form EA8/G8BCG.
+        let completed_state = QsoState::Completed {
+            their_callsign: "EA8/G8BCG".into(),
+            their_report: -12,
+            our_report: -7,
+            frequency: 1500.0,
+            grid_square: None,
+            completed_at: Utc::now() - Duration::seconds(5),
+            duration_seconds: 60,
+        };
+        insert(&m, completed_state, "EA8/G8BCG").await;
+
+        // Query with the bare base call — must still match.
+        assert!(
+            m.has_active_or_recent_qso_with("G8BCG", std::time::Duration::from_secs(120))
+                .await,
+            "compound EA8/G8BCG QSO must match bare base G8BCG query"
+        );
     }
 }
