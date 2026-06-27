@@ -55,6 +55,8 @@ pub enum ComponentId {
     Autonomous,
     /// PSKReporter upload
     PskReporter,
+    /// Read-only remote view gateway (Panino client)
+    RemoteGateway,
 }
 
 impl std::fmt::Display for ComponentId {
@@ -72,6 +74,7 @@ impl std::fmt::Display for ComponentId {
             ComponentId::Ft8Transmitter => write!(f, "FT8Transmitter"),
             ComponentId::Autonomous => write!(f, "Autonomous"),
             ComponentId::PskReporter => write!(f, "PSKReporter"),
+            ComponentId::RemoteGateway => write!(f, "remote_gateway"),
         }
     }
 }
