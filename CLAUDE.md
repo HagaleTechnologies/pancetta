@@ -1,13 +1,14 @@
 # CLAUDE.md
 
-> 🔗 CROSS-REPO CONTRACTS — read before touching auth, pairing, relay, or rig-control code.
-> This repo is one of three — cqdx (web), pancetta (rig API/server), panino (RN client).
-> Cross-cutting architecture decisions and interface contracts live in the shared repo
-> dispensa (https://github.com/HagaleTechnologies/dispensa) — clone it as a sibling dir to
-> read locally. Before changing anything in the auth / pairing / relay / rig-control path:
-> read the relevant adr/ and contracts/ there, and propose cross-cutting changes in
-> dispensa first (then update consumers, or bump the contract version). The
-> remote-rig-control security model is dispensa/adr/0002 (Proposed).
+> 🔗 CROSS-REPO CONTRACTS + COORDINATION — read dispensa before any new work.
+> This repo is one of three — cqdx (web), pancetta (rig API/server), panino (RN client). Shared
+> decisions + interface contracts live in dispensa
+> (https://github.com/HagaleTechnologies/dispensa) — clone it as a sibling dir. Before ANY new
+> work: git pull dispensa and scan questions/ (anything for you / newly answered) + contracts/
+> (changes). Don't diverge from a shared contract — propose changes in dispensa first (ADR and/or
+> contract), then update consumers or bump the version. You may push questions/requirements to
+> other projects via dispensa/questions/. When committing to dispensa: git pull --rebase first
+> and use the next-free adr/question number. Security model: dispensa/adr/0002 (Proposed).
 
 Project instructions for Claude Code when working in this repository.
 
