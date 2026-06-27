@@ -1,226 +1,205 @@
-# Remote operation — client/server architecture design (DRAFT)
+# Remote operation — pancetta server + Panino client (DESIGN)
 
-**Date:** 2026-06-26
-**Status:** DRAFT for operator review — not yet approved; no implementation.
-**Author context:** drafted while the station was operating live; intentionally a
-design surface to react to, not a build plan.
+**Date:** 2026-06-26 (decisions converged with operator same day)
+**Status:** Design agreed at the architecture level; implementation not started.
+**Client name:** **Panino** (the handheld Italian sandwich that wraps/serves the
+pancetta core; "pan-" echoes pancetta).
 
 ## 1. Goal
 
-Let the operator run and watch their FT8 station **from anywhere network-
-connected**, while the rig-coupled core stays on the machine physically wired to
-the radio.
+Operate and watch the FT8 station **from anywhere network-connected**, while the
+rig-coupled core stays on the machine wired to the radio.
 
-- **Core ("server")** runs headless on the miniPC at the rig: audio I/O,
-  soundcard, DSP, FT8 decode, the QSO engine, hamlib/CAT control, logging.
-- **Client(s)** run elsewhere — phone, laptop, tablet, browser — and provide
-  display + control over the network.
+- **`pancetta` (server/core)** runs headless on the miniPC at the rig: audio I/O,
+  DSP, FT8 decode, QSO engine, hamlib/CAT, logging — **and now also exposes a
+  remote API**.
+- **Panino (client)** runs elsewhere — phone, tablet, laptop, browser — for
+  display + control over the network. Separate repository.
 
-## 2. Operator constraints (decisions already made)
+## 2. Firm decisions (operator, 2026-06-26)
 
-1. **No autonomous mode over remote, by default.** A remote client is *attended
-   manual* operation. The unattended/autonomous engine stays a local,
-   at-the-rig capability. (Also the cleanest posture for remote-TX legal
-   responsibility — see §7.)
-2. **Repo split.** `pancetta` stays the local/server (core). Client app(s) live
-   in a **separate repository (or repos)**.
-3. **Client app needs its own name.** TBD. Cured-meat lineage candidates
-   (pancetta ↔ ham): **Salumi** (a board of many cured meats ≈ many client
-   platforms), **Speck** (short, app-y; small/portable + "a tiny remote view"),
-   Prosciutto, Guanciale, Capicola, Porchetta. Decide before client repo
-   creation.
+1. **Augment, never replace the local TUI.** The remote work is **purely
+   additive** and runs in parallel; the existing TUI must keep working unchanged.
+   (See §3 invariant.)
+2. **No autonomous mode over remote.** Panino is *attended manual* operation.
+   The unattended/autonomous engine stays local at the rig (also the cleanest
+   remote-TX legal posture — §7).
+3. **Repo split.** `pancetta` (this repo) exposes the API/server. **Panino lives
+   in a separate repository**, built by a peer session against the documented
+   API.
+4. **Client name = Panino.**
+5. **Client tech = React Native (+ React Native Web)** delivered at a
+   **`cqdx.io` sub-path** — one codebase → iOS + Android + web; do NOT shoehorn
+   the control UI into the existing cqdx content app (§8).
+6. **Transport = WebSocket for all clients** (§5).
+7. **Tiered, station-paired auth** — view via cqdx login is fine; *control*
+   (anything that can TX) requires a station-paired credential independent of
+   cqdx, plus transmit-arm (§7).
+8. **v1 = a focused workflow, not TUI parity** (§10.1).
 
-## 3. Why this is feasible (the seam already exists)
+## 3. Why feasible + the additive invariant
 
-The hard architectural boundary is already present in the codebase:
+The seam already exists: the core runs headless (`--headless`), and the TUI is
+already a **client over a message boundary** — `TuiCommand` up, `TuiMessage` +
+snapshots down, centralized in `pancetta/src/coordinator/tui_relay.rs`. Today
+those ride **in-process channels**; remote = serializing the *same* messages
+over a network transport.
 
-- **The core already runs headless** (`--headless`); the rig-coupled components
-  are already server-side.
-- **The TUI is already a client over a message boundary**, not co-mingled with
-  the core:
-  - **Commands up:** `TuiCommand` (e.g. `SetFrequency`, `SetSplit`, `StartQso`,
-    `CallStation`, `RespondToCaller`, `StartCq`/`StopCq`, `TogglePtt`, `StopTx`,
-    `ToggleTune`, `ToggleTxFreqMode`, `SelectDevice`, `OperatorEmergencyStop`,
-    `Quit`).
-  - **Events/snapshots down:** `TuiMessage` + snapshot structs (decoded
-    messages, `ActiveQsosSnapshot` incl. the pending-call queue, DX-Hunter rows,
-    band activity, waterfall, S-meter/SWR, `TxPolicyUpdate`, `SplitUpdate`).
-  - Translation is centralized in `pancetta/src/coordinator/tui_relay.rs`
-    (`TuiCommand` → bus, bus → `TuiMessage`).
-- Today those messages ride **in-process channels**. Remote operation =
-  serialize the *same* messages over a network transport. The conceptual API
-  already exists; we're hardening and transporting it.
+**INVARIANT (must hold throughout):** the remote gateway is a NEW component
+beside `tui_relay` on the same bus. The local TUI keeps its in-process path
+untouched. Extracting the message types into `pancetta-protocol` must be a
+*move/derive* that the TUI keeps consuming exactly as today — zero behavior
+change to the existing TUI. If a protocol change would alter TUI behavior, it's
+wrong.
 
-### The key enabler: FT8 cadence makes latency a non-issue
-FT8 is **15-second-slot paced**. The control/display path tolerates hundreds of
-ms of latency with zero functional impact (works fine over cellular). Audio and
-decode stay **local** to the rig; only control + display *data* crosses the
-network. The waterfall is ~1 Hz of `f32` data — cheap to downsample/compress.
-Unlike remote CW/SSB, audio latency is irrelevant here. **Latency does not gate
-this design.**
+**Latency enabler:** FT8 is 15-second-slot paced. Control/display tolerates
+hundreds of ms latency with no functional impact; audio + decode stay local;
+only control + display data crosses the network. The waterfall is ~1 Hz `f32`
+data. Latency does not gate this design.
 
 ## 4. Architecture
 
 ```
-   ┌─────────────────────────── miniPC (at the rig) ───────────────────────────┐
-   │  audio I/O · DSP · FT8 decode · QSO engine · hamlib/CAT · logging          │
-   │                        ── coordinator / message bus ──                     │
-   │   tui_relay (in-proc)            remote_gateway (NEW)                       │
-   │        │                                  │                                 │
-   │   local TUI (optional)         WS/gRPC server + auth + TLS                  │
-   └────────────────────────────────────────┼──────────────────────────────────┘
-                                             │  network (LAN / VPN / internet)
-                ┌────────────────────────────┼────────────────────────────┐
-                │                │                │                │        │
-            web app          iOS app        Android app       macOS/Win   (Rust TUI
-          (via cqdx.io)     (native/RN)     (native/RN)        app          as a
-                                                                            client)
+   ┌──────────────────── miniPC (at the rig) — `pancetta` server ───────────────┐
+   │  audio · DSP · FT8 decode · QSO engine · hamlib/CAT · logging               │
+   │                       ── coordinator / message bus ──                       │
+   │   tui_relay (in-proc, UNCHANGED)          remote_gateway (NEW)              │
+   │        │                                        │                            │
+   │   local TUI (unchanged)            WS server + TLS + tiered auth + fan-out  │
+   └────────────────────────────────────────────────┼───────────────────────────┘
+                                                     │ network (LAN / VPN / internet)
+                                          ┌──────────┴──────────┐
+                                          │   Panino (RN + RN-Web)│  served at cqdx.io/<subpath>
+                                          │  iOS · Android · web  │
+                                          └───────────────────────┘
 ```
 
-- A new **remote gateway** component sits beside `tui_relay` on the bus: it
-  bridges the same command/event streams to/from remote clients over a network
-  transport, with auth + TLS + multi-client fan-out.
-- Clients are thin presentation layers: subscribe to the event/snapshot stream,
-  send commands. No DSP/decode/rig logic client-side.
+## 5. Protocol & transport
 
-## 5. Protocol design
+### 5.1 WebSocket for all
+- **Bidirectional, persistent, full-duplex** over one connection — matches our
+  model (event/snapshot stream down, commands up).
+- **Browser-native** — RN-Web/web speak WS with no extra runtime; gRPC would
+  need grpc-web + an Envoy-style proxy just to reach browsers. One transport for
+  web + RN + (potentially) the Rust TUI = one server + one path to secure/test.
+- **Type safety without gRPC:** define the protocol once in Rust
+  (`pancetta-protocol`) and generate TypeScript types for Panino (e.g. `ts-rs`).
+- **Encoding:** JSON for v1 (debuggable, web-native). If the waterfall stream
+  ever needs it, move *that one stream* to binary (CBOR) over the same WS.
 
-### 5.1 Foundation: serialize the existing UI boundary
+### 5.2 `pancetta-protocol` crate (new, in this repo)
 Promote `TuiCommand`, `TuiMessage`, and the snapshot structs to a **stable,
-versioned, `serde`-serializable** protocol. Many config types already derive
-serde; the UI/relay types largely do not yet. This is the bulk of the work — and
-doing it cleanly also tightens the current in-proc boundary (no shared-memory
-shortcuts leaking across it).
+versioned, serde-serializable** protocol crate — the single source of truth,
+shared by the server and any Rust client, and the basis for generated TS types.
 
-- **Wire format:** JSON for v1 (debuggable, web-native); consider a compact/
-  binary encoding (CBOR/msgpack) later for the waterfall stream if bandwidth
-  warrants.
-- **Transport:** WebSocket for v1 (browser-native, bidirectional, simplest path
-  to a web client). gRPC is an alternative for native clients but adds friction
-  for browsers; WebSocket keeps one transport for all clients.
-
-### 5.2 Message classes
-- **Commands (client → server):** the `TuiCommand` surface, each carrying the
-  authenticated session + (for TX-affecting commands) the control-operator
-  token (§7).
-- **Events/deltas (server → clients):** decoded messages, QSO state changes,
-  band activity, DX-Hunter updates, S-meter/SWR, TX policy/split status,
-  pending-call queue, waterfall frames.
-- **Snapshot-on-connect (server → one client):** a newly-connected client must
-  receive a **full current-state snapshot** (active QSOs, current band/dial +
-  split, config-relevant settings, recent decodes, TX policy) *then* the live
-  delta stream. Define a `StateSnapshot` aggregate for the handshake.
-
-### 5.3 Versioning
-Clients and server version independently → the protocol must be **versioned and
-backward-compatible** (a `protocol_version` in the handshake; additive fields;
-`#[serde(default)]` / non-exhaustive enums so an older client tolerates new
-event types it doesn't understand).
+- **Commands (client→server):** the relevant `TuiCommand` surface (frequency,
+  call/answer, CQ, etc. — v1 subset in §10.1).
+- **Events/deltas (server→clients):** decoded messages, QSO state changes,
+  DX-Hunter updates, band/dial+split, S-meter/SWR, TX-policy, pending-call
+  queue, (later) waterfall.
+- **Snapshot-on-connect:** a `StateSnapshot` aggregate (current band/dial+split,
+  active QSOs + ladder, recent decodes, DX-Hunter rows, TX policy) sent in full
+  on connect, then live deltas.
+- **Versioning:** `protocol_version` in the handshake; additive fields
+  (`#[serde(default)]`); non-exhaustive enums so an older client tolerates
+  unknown event types.
 
 ## 6. Multi-client & control arbitration
+- Many **read-only viewers** + **at most one control operator** at a time.
+- Explicit **take-control / release-control**; the server grants the control
+  token to one session; TX-affecting commands from non-control sessions are
+  rejected. The local TUI is the default privileged control surface.
 
-The bus is effectively single-UI today. Remote means N simultaneous clients:
+## 7. Auth & remote-TX safety (tiered, station-paired)
 
-- **Many read-only viewers** + **at most one control operator** at a time.
-- **Control handoff:** an explicit "take control" / "release control"
-  request; the server grants the control token to one session; others are
-  view-only. TX-affecting commands from non-control sessions are rejected.
-- The local at-the-rig TUI can be the default/privileged control surface.
+Keying a transmitter over the internet is the highest-risk capability. Auth is
+**tiered**, and the control tier is **independent of cqdx login** (a phished
+cqdx email must never be able to key the rig):
 
-## 7. Remote-TX safety (the hard part — design carefully)
+- **View tier (read-only):** cqdx login (email-proof) is acceptable — low risk.
+- **Control tier (anything that can TX):**
+  - **Station-side device pairing** — Panino pairs to the miniPC via a one-time
+    code generated *at the station* (like pairing a TV). The pairing secret
+    lives on the station, never in email/cqdx.
+  - **Strong, revocable per-device tokens**; **MFA** on the control role;
+    optional **mutual-TLS / device certs**.
+  - **Explicit transmit-arm** — a deliberate, revocable "armed" state; NOT armed
+    on connect.
+  - **Fail-safe PTT** — heartbeat timeout / disconnect drops PTT (reuse the
+    existing TX/PTT watchdog).
+  - **Audit log** of all remote control actions (extends `qso.security`).
+  - FCC §97.213 remote-control-operator model layered on the existing §97.221
+    presence logic.
+- **TLS everywhere.** No anonymous control. No autonomous over remote (§2.2).
 
-Keying a transmitter over the network is a different risk class than a local
-TUI. Non-negotiables:
+**Principle:** PTT requires (station-paired secret) + (explicit arm) + (control
+token) — never an email login alone.
 
-- **Authentication + TLS.** PTT is exposed to the network; all transport
-  encrypted; clients authenticated (token/cert). No anonymous control.
-- **Control-operator model (FCC §97.213 remote control)** layered on the
-  existing §97.221 presence logic. One authenticated control operator;
-  TX-affecting commands require the control token; everyone else read-only.
-- **Explicit transmit-enable.** A deliberate, revocable "transmit armed" state
-  for the remote control session — *not* armed by default on connect.
-- **Fail-safe PTT.** A network drop / heartbeat-timeout while transmitting must
-  **drop PTT** (reuse the existing TX/PTT watchdog). Default-to-safe.
-- **No autonomous over remote** (per §2.1) keeps remote operation strictly
-  attended, simplifying the control-operator story.
-- **Audit:** log remote control actions (who keyed what, when) — extends the
-  existing `qso.security` logging.
+## 8. Client strategy — DECIDED: React Native at a cqdx.io sub-path
+- **Chosen:** RN + **RN-Web** → one codebase targeting **iOS native, Android
+  native, and web**, delivered under **`cqdx.io/<subpath>`** (reuse cqdx's
+  domain/hosting/accounts for delivery) but as a **separate, purpose-built
+  control app** — NOT retrofitted into the existing cqdx content pages.
+- **Rejected:** shoehorning a real-time control surface into the existing cqdx
+  web app (fights its content-site architecture).
+- **Must verify during build:** RN-Web canvas/WebGL **waterfall** rendering perf
+  (deferred feature, §10.2); mobile-browser background/throttling + iOS PWA
+  limits for any background-watch use; RN build complexity.
 
-## 8. Client strategy — DECISION POINT (not yet decided)
+## 9. Repositories
+- **`pancetta` (this repo):** the server — adds `remote_gateway` + the
+  `pancetta-protocol` crate + the documented WS API. (Local TUI unchanged.)
+- **Panino (new, separate repo):** the RN/RN-Web client, built by a **peer
+  session** against the documented API. May live in/adjacent to the cqdx.io
+  codebase for the web deploy, but is its own app/repo.
+- **Handoff:** after the server API exists here, produce a **handoff context
+  doc** (protocol surface + generated TS types, v1 workflow, auth/pairing flow,
+  endpoint, the Panino name) so the peer session can build Panino standalone.
 
-cqdx.io (the operator's own first-party web service) reframes the client
-question: **the web app could *be* the client**, delivered through cqdx.io,
-instead of building 4–5 native binaries. Options:
+## 10. Phasing
 
-| Option | Pros | Cons |
-|---|---|---|
-| **Web-only via cqdx.io** | One codebase → every desktop + mobile browser; no app-store friction; leverages the operator's existing service | Mobile-browser background limits; PWA limits on iOS; perf of in-browser waterfall to verify |
-| **Native per-platform** | Best UX/perf/background behavior; push notifications | 4–5 codebases; app-store overhead |
-| **Hybrid (React Native / RN-Web)** | One codebase → native-ish apps; RN-Web can *also* target web via cqdx.io | RN complexity; still some per-platform polish |
+### 10.1 Phase 1 — server API + Panino v1 (focused workflow)
+**Server (this repo):** `pancetta-protocol` + `remote_gateway` (WS + TLS +
+tiered auth + station pairing + control arbitration + state-snapshot), exposing
+the v1 command/event subset. TUI untouched.
 
-**Leading low-cost candidate to evaluate first:** web client via cqdx.io.
+**Panino v1 (peer repo) — DEFINED SCOPE:**
+- **View:** **DX Hunter** list + **QSO progress** (the exchange ladder /
+  current QSO state).
+- **Control:**
+  1. **Select a station from the DX Hunter list** and call it.
+  2. **Answer a caller.**
+  3. **Call CQ.**
+  4. **Frequency select.**
+  - All control behind the control-tier auth + transmit-arm (§7).
+- **Out of v1:** full TUI parity, band activity panel, free-text, multi-stream
+  management UI, etc.
 
-### 8.1 Must-investigate before deciding
-1. **Is a web client fast enough?** FT8 cadence makes the *control/display* path
-   fine, but verify: in-browser waterfall rendering (canvas/WebGL) perf; mobile-
-   browser battery/throttling; **background-tab suspension** (iOS Safari throttles
-   backgrounded tabs/PWAs hard — matters if you want it watching while
-   backgrounded); iOS PWA limits (no real background, limited push).
-2. **Does web actually make our lives easier vs native?** Weigh one-codebase-via-
-   cqdx.io against native background operation, push notifications, and offline/
-   reconnect robustness. RN/RN-Web is the middle path.
+### 10.2 Later phases
+- **Waterfall** — a proper graphical waterfall (explicitly nicer than the ASCII
+  TUI's). Validate RN-Web rendering perf (the §8 open item) when built.
+- Broader TUI-feature parity as desired; native-app polish; push notifications.
 
-## 9. Repository structure
+## 11. Non-goals (v1)
+- Streaming rig *audio* to Panino (decode is server-side; not needed for FT8).
+- Autonomous over remote (§2.2).
+- Multi-rig / multi-station fan-in.
+- Replacing the local TUI (it stays first-class).
+- Waterfall in v1 (deferred to §10.2).
 
-- `pancetta` (this repo) — **stays the local/server core**, gains the remote
-  gateway component + the serialized protocol crate.
-- **`pancetta-protocol`** (new crate, possibly published) — the versioned,
-  serde wire types shared by server and any Rust client. The single source of
-  truth for the protocol; non-Rust clients (web/RN) mirror it (or generate from
-  it, e.g. via schema/`ts-rs`).
-- **Client repo(s)** — separate repository for the client app (name TBD, §2.3).
-  If web-via-cqdx.io wins, the client may live in/adjacent to the cqdx.io
-  codebase rather than a standalone app repo.
-
-## 10. Phasing / roadmap
-
-- **Phase 1 — prove the seam.** Extract `pancetta-protocol` (serialize
-  `TuiCommand`/`TuiMessage`/snapshots + handshake + versioning). Add the remote
-  gateway (WebSocket server) on the bus. Convert the existing Rust TUI into a
-  *network* client talking to the gateway (proves the whole path end-to-end on
-  LAN, no UI rewrite).
-- **Phase 2 — web client.** Build the browser client (via cqdx.io) consuming the
-  protocol; covers desktop + mobile browsers immediately. Resolve the §8.1
-  questions here with a real prototype (waterfall perf, mobile behavior).
-- **Phase 3 — production remote.** Full remote-TX security model (§7), multi-
-  client arbitration (§6), auth/TLS hardening, then native wrappers/apps (or
-  RN/RN-Web) if web alone proves insufficient.
-
-Each phase is independently useful and shippable; Phase 1 is the de-risking
-step (it converts an in-proc boundary into a network one with the existing TUI
-as the client, surfacing every serialization/handshake issue before any new UI
-exists).
-
-## 11. Non-goals / out of scope (v1)
-
-- Streaming rig *audio* to the client (the decode is server-side; not needed for
-  FT8 operation). Could be a later add for a remote "listen" feature.
-- Autonomous operation over remote (explicitly excluded, §2.1).
-- Multi-*rig* / multi-station fan-in (one core ↔ one rig for now).
-- Replacing the local TUI (it remains a first-class local client).
-
-## 12. Open questions for the operator
-
-1. **Client strategy (§8):** start with web-via-cqdx.io, or commit to a hybrid
-   (RN/RN-Web) from the outset?
-2. **Transport:** WebSocket-for-all (recommended) vs gRPC for native + WS for web?
-3. **Auth model:** reuse cqdx.io accounts/tokens for client auth, or a separate
-   station-local credential?
-4. **Client name (§2.3).**
-5. **Scope of Phase 1:** is "Rust TUI as a network client over LAN" the right
-   first milestone, or go straight to a minimal web read-only viewer?
+## 12. Status of open questions
+- Client strategy — **DECIDED** (RN/RN-Web at cqdx.io subpath).
+- Transport — **DECIDED** (WebSocket for all).
+- Auth — **DECIDED** (tiered, station-paired control tier; cqdx login for view).
+- Client name — **DECIDED** (Panino).
+- v1 workflow — **DECIDED** (§10.1).
+- Remaining to settle at plan time: exact `StateSnapshot`/event schema, the
+  station-pairing UX details, where Panino's repo lives relative to cqdx.io, and
+  the precise `pancetta-protocol` command/event list for v1.
 
 ---
 
-*This is a draft. Nothing here is built. Next step after operator review:
-converge §12, then a `writing-plans` implementation plan for Phase 1.*
+*Next step: a `writing-plans` implementation plan for the Phase-1 **server side**
+(in this repo): `pancetta-protocol` + `remote_gateway` + v1 API, preserving the
+TUI invariant. Then a handoff context doc for the peer session that builds the
+Panino repo.*
