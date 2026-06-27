@@ -30,7 +30,12 @@ pancetta-hamlib = { path = "../pancetta-hamlib", optional = true }
 pancetta-qso = { path = "../pancetta-qso" }
 pancetta-dx = { path = "../pancetta-dx" }
 pancetta-cqdx = { path = "../pancetta-cqdx" }
+pancetta-protocol = { path = "../pancetta-protocol" }
 geographiclib-rs = { workspace = true }
+
+# HTTP server and WebSocket upgrade (remote_gateway)
+axum = { workspace = true }
+tower-http = { workspace = true }
 
 # Async runtime and coordination
 tokio = { version = "1.50", features = ["full", "rt-multi-thread"] }

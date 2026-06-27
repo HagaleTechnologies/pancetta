@@ -117,6 +117,10 @@ base64 = "0.22"
 native-tls = "0.2"
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 
+# HTTP server and WebSocket upgrade (remote_gateway)
+axum = { version = "0.8", features = ["ws"] }
+tower-http = { version = "0.6", features = ["limit", "trace"] }
+
 # Statistical calculations
 statrs = "0.17"
 
