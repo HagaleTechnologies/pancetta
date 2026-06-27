@@ -5,9 +5,9 @@
 //! TLS (wss) + the control/relay path are deferred to a later sub-plan.
 pub(crate) mod translate;
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -22,10 +22,35 @@ use tracing::{debug, info, warn};
 use pancetta_core::TxPolicy;
 use pancetta_protocol::{ServerEvent, ServerFrame, StateSnapshot, Welcome, PROTOCOL_VERSION};
 
-use crate::message_bus::{ComponentId, MessageType};
+use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
 
 /// Maximum number of recent decodes to keep in the snapshot.
 const RECENT_DECODES_CAP: usize = 100;
+
+/// Additively relay a display event to the read-only gateway, **only** when the
+/// gateway is enabled. Centralizes the gate so each emit site (decode fan-out,
+/// QSO snapshot, frequency, s-meter, TX status, split) is a single additive
+/// call placed *after* the existing `→Tui`/`→Qso` send — those sends are never
+/// modified, preserving the TUI's behavior exactly (additive-only invariant).
+///
+/// Best-effort and fire-and-forget: a send error (no gateway reader yet, channel
+/// full) is logged at debug and never affects the caller's pipeline. When the
+/// gateway is disabled this is a single relaxed atomic load and immediate return
+/// — no clone, no send.
+pub(crate) async fn relay_to_gateway(
+    bus: &MessageBus,
+    gw_enabled: &AtomicBool,
+    source: ComponentId,
+    msg: MessageType,
+) {
+    if !gw_enabled.load(Ordering::Relaxed) {
+        return;
+    }
+    let m = ComponentMessage::new(source, ComponentId::RemoteGateway, msg, Instant::now());
+    if let Err(e) = bus.send_message(m).await {
+        debug!(target: "gateway", "relay to gateway failed: {e}");
+    }
+}
 
 /// Shared state threaded through each axum handler.
 #[derive(Clone)]
