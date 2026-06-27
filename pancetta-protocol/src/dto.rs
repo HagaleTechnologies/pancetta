@@ -1,10 +1,17 @@
 //! View payloads sent server→client.
+//!
+//! All structs use `#[serde(rename_all = "camelCase")]` so that field names
+//! in JSON match the dispensa rig-api.v1 schema (ADR-0003). Fields that hold
+//! pancetta-core enum types with PascalCase serialization use `wire_serde`
+//! helpers to re-map them to the schema's camelCase values.
+use crate::wire_serde;
 use chrono::{DateTime, Utc};
 use pancetta_core::slot::SlotParity;
 use serde::{Deserialize, Serialize};
 
 /// A DX-Hunter row (a spotted/decoded station).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DxRow {
     pub call_sign: String,
     pub grid_square: Option<String>,
@@ -20,6 +27,7 @@ pub struct DxRow {
     pub entity_name: Option<String>,
     pub rarity_tier: Option<String>,
     pub audio_offset_hz: Option<u64>,
+    #[serde(with = "wire_serde::slot_parity_opt")]
     pub slot_parity: Option<SlotParity>,
     pub last_seen: DateTime<Utc>,
     /// "local" | "network" | "both" (string for forward-compat).
@@ -28,11 +36,13 @@ pub struct DxRow {
 
 /// QSO progress (the exchange ladder + last messages).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct QsoProgress {
     pub qso_id: String,
     pub their_callsign: String,
     pub state: String,
     pub frequency_hz: f64,
+    #[serde(with = "wire_serde::slot_parity_opt")]
     pub tx_parity: Option<SlotParity>,
     pub ladder_labels: Vec<String>,
     pub ladder_ours: Vec<bool>,
@@ -49,14 +59,17 @@ pub struct QsoProgress {
 
 /// A manual call parked in the cross-parity queue.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingCall {
     pub callsign: String,
+    #[serde(with = "wire_serde::slot_parity_opt")]
     pub dx_parity: Option<SlotParity>,
     pub waited_secs: u64,
 }
 
 /// A single decoded FT8 frame (the live decode feed).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DecodedView {
     pub timestamp: DateTime<Utc>,
     pub frequency_hz: f64,
@@ -66,6 +79,7 @@ pub struct DecodedView {
     pub call_sign: Option<String>,
     pub grid_square: Option<String>,
     pub message: String,
+    #[serde(with = "wire_serde::slot_parity_opt")]
     pub slot_parity: Option<SlotParity>,
     pub is_directed_at_us: bool,
     pub worked_before: bool,
@@ -100,6 +114,21 @@ mod tests {
             source: "local".into(),
         };
         let j = serde_json::to_string(&r).unwrap();
+        // Verify camelCase field names appear in the output.
+        assert!(j.contains(r#""callSign""#), "expected callSign in: {j}");
+        assert!(
+            j.contains(r#""frequencyHz""#),
+            "expected frequencyHz in: {j}"
+        );
+        assert!(
+            j.contains(r#""workedBefore""#),
+            "expected workedBefore in: {j}"
+        );
+        assert!(
+            j.contains(r#""slotParity":"even""#),
+            "expected slotParity:even in: {j}"
+        );
+        assert!(j.contains(r#""lastSeen""#), "expected lastSeen in: {j}");
         assert_eq!(serde_json::from_str::<DxRow>(&j).unwrap(), r);
     }
 
@@ -124,6 +153,20 @@ mod tests {
             started_at: Utc::now(),
         };
         let j = serde_json::to_string(&q).unwrap();
+        assert!(j.contains(r#""qsoId""#), "expected qsoId in: {j}");
+        assert!(
+            j.contains(r#""theirCallsign""#),
+            "expected theirCallsign in: {j}"
+        );
+        assert!(
+            j.contains(r#""txParity":"odd""#),
+            "expected txParity:odd in: {j}"
+        );
+        assert!(
+            j.contains(r#""ladderLabels""#),
+            "expected ladderLabels in: {j}"
+        );
+        assert!(j.contains(r#""ladderOurs""#), "expected ladderOurs in: {j}");
         assert_eq!(serde_json::from_str::<QsoProgress>(&j).unwrap(), q);
 
         let p = PendingCall {
@@ -131,10 +174,16 @@ mod tests {
             dx_parity: Some(SlotParity::Even),
             waited_secs: 45,
         };
-        assert_eq!(
-            serde_json::from_str::<PendingCall>(&serde_json::to_string(&p).unwrap()).unwrap(),
-            p
+        let pj = serde_json::to_string(&p).unwrap();
+        assert!(
+            pj.contains(r#""dxParity":"even""#),
+            "expected dxParity:even in: {pj}"
         );
+        assert!(
+            pj.contains(r#""waitedSecs""#),
+            "expected waitedSecs in: {pj}"
+        );
+        assert_eq!(serde_json::from_str::<PendingCall>(&pj).unwrap(), p);
 
         let d = DecodedView {
             timestamp: Utc::now(),
@@ -152,9 +201,22 @@ mod tests {
             atno: true,
             priority_score: Some(720),
         };
-        assert_eq!(
-            serde_json::from_str::<DecodedView>(&serde_json::to_string(&d).unwrap()).unwrap(),
-            d
+        let dj = serde_json::to_string(&d).unwrap();
+        assert!(
+            dj.contains(r#""frequencyHz""#),
+            "expected frequencyHz in: {dj}"
         );
+        assert!(dj.contains(r#""deltaTime""#), "expected deltaTime in: {dj}");
+        assert!(dj.contains(r#""deltaFreq""#), "expected deltaFreq in: {dj}");
+        assert!(dj.contains(r#""callSign""#), "expected callSign in: {dj}");
+        assert!(
+            dj.contains(r#""isDirectedAtUs""#),
+            "expected isDirectedAtUs in: {dj}"
+        );
+        assert!(
+            dj.contains(r#""slotParity":"even""#),
+            "expected slotParity:even in: {dj}"
+        );
+        assert_eq!(serde_json::from_str::<DecodedView>(&dj).unwrap(), d);
     }
 }
