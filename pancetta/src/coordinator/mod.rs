@@ -27,6 +27,7 @@ mod pipeline;
 mod psk_reporter;
 mod qso;
 mod qso_filter;
+mod remote_gateway;
 mod shutdown;
 mod tier;
 mod tui_relay;
