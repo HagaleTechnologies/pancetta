@@ -987,6 +987,7 @@ impl ApplicationCoordinator {
         self.start_autonomous_component().await?;
         self.start_dx_cluster_component().await?;
         self.start_pskreporter_component().await?;
+        self.start_remote_gateway_component().await?;
 
         // Start coordinator tasks
         self.start_coordinator_tasks().await?;
