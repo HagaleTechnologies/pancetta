@@ -165,8 +165,14 @@ async fn handle_bus_msg(
                 }
                 _ => (false, false, false),
             };
-            let view =
-                translate::decoded_to_view(decoded, dial_hz, our_callsign, worked_before, needed, atno);
+            let view = translate::decoded_to_view(
+                decoded,
+                dial_hz,
+                our_callsign,
+                worked_before,
+                needed,
+                atno,
+            );
             {
                 let mut s = snapshot.write().await;
                 s.recent_decodes.push(view.clone());
@@ -223,8 +229,10 @@ impl super::ApplicationCoordinator {
             drop(config);
 
             // Drain the channel so the bus never floods.
-            let (_drain_tx, drain_rx) =
-                self.message_bus.create_channel(ComponentId::RemoteGateway).await?;
+            let (_drain_tx, drain_rx) = self
+                .message_bus
+                .create_channel(ComponentId::RemoteGateway)
+                .await?;
             let shutdown = self.shutdown_signal.clone();
             let drain_handle = tokio::spawn(async move {
                 while !shutdown.load(Ordering::Acquire) {
@@ -250,8 +258,10 @@ impl super::ApplicationCoordinator {
         let our_callsign = config.station.callsign.clone();
         drop(config);
 
-        let (_gw_tx, gw_rx) =
-            self.message_bus.create_channel(ComponentId::RemoteGateway).await?;
+        let (_gw_tx, gw_rx) = self
+            .message_bus
+            .create_channel(ComponentId::RemoteGateway)
+            .await?;
 
         // Broadcast channel: pump → all connected clients.
         let (evt_tx, _evt_rx0) = broadcast::channel::<ServerEvent>(1024);
@@ -330,8 +340,10 @@ impl super::ApplicationCoordinator {
             })
         };
 
-        self.named_task_handles.push((ComponentId::RemoteGateway, pump));
-        self.named_task_handles.push((ComponentId::RemoteGateway, server));
+        self.named_task_handles
+            .push((ComponentId::RemoteGateway, pump));
+        self.named_task_handles
+            .push((ComponentId::RemoteGateway, server));
         info!("remote_gateway component started");
         Ok(())
     }
@@ -377,10 +389,9 @@ mod server_tests {
         });
 
         // Connect via tokio-tungstenite.
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-                .await
-                .unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
 
         // Send a Hello frame (server v1 is read-only so it ignores it, but
         // this exercises the inbound-ignore path and matches the wire contract).
@@ -406,9 +417,7 @@ mod server_tests {
         // Broadcast an event from the pump side.  Because the handler
         // subscribes BEFORE sending the Welcome, this event is guaranteed to
         // be delivered even if it is produced very shortly after connection.
-        evt_tx
-            .send(ServerEvent::TxStatus { active: true })
-            .unwrap();
+        evt_tx.send(ServerEvent::TxStatus { active: true }).unwrap();
 
         // Second frame must be the Event wrapper around TxStatus.
         let msg2 = ws.next().await.unwrap().unwrap();
@@ -444,10 +453,9 @@ mod server_tests {
             axum::serve(listener, build_router(state)).await.unwrap();
         });
 
-        let (mut ws, _) =
-            tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
-                .await
-                .unwrap();
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/ws"))
+            .await
+            .unwrap();
 
         let msg = ws.next().await.unwrap().unwrap();
         let frame: ServerFrame = serde_json::from_str(msg.to_text().unwrap()).unwrap();
