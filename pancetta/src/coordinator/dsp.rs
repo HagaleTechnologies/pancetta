@@ -23,6 +23,19 @@ use crate::message_bus::ComponentId;
 /// Maximum total disk space for WAV recordings (bytes).
 const WAV_RECORDING_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 
+/// Peak absolute amplitude of an f32 audio window (0.0 if empty).
+fn window_peak(samples: &[f32]) -> f32 {
+    samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()))
+}
+
+/// A window is "dead air" (rig off/unplugged → digital silence) when its peak
+/// is below this threshold. Empirically: silence ≈ 0.0002, real FT8 ≥ 0.05.
+const DEAD_AIR_PEAK_THRESHOLD: f32 = 0.001;
+
+fn is_dead_air(samples: &[f32]) -> bool {
+    window_peak(samples) < DEAD_AIR_PEAK_THRESHOLD
+}
+
 /// Map a rig dial frequency (Hz) to a ham-band label for recording
 /// filenames. Returns `None` outside the standard HF/VHF amateur bands
 /// (or when the frequency is unknown, i.e. 0 — no rig / not yet polled),
@@ -126,6 +139,17 @@ impl WavRecorder {
         timestamp: &chrono::DateTime<chrono::Utc>,
         dial_freq_hz: u64,
     ) {
+        // Skip dead-air windows (rig off/unplugged → digital silence).
+        if is_dead_air(samples) {
+            debug!(
+                target: "dsp.record",
+                "skip dead-air window (peak {:.5} < {})",
+                window_peak(samples),
+                DEAD_AIR_PEAK_THRESHOLD
+            );
+            return;
+        }
+
         // Enforce cap by deleting oldest files
         while self.total_bytes >= WAV_RECORDING_MAX_BYTES {
             if !self.delete_oldest() {
@@ -893,5 +917,89 @@ mod median_tests {
         let xs = [1.0, f32::NAN, 3.0, 2.0];
         let m = rolling_median(&xs);
         assert!(m.is_finite());
+    }
+}
+
+#[cfg(test)]
+mod dead_air_tests {
+    use super::{is_dead_air, window_peak, DEAD_AIR_PEAK_THRESHOLD};
+
+    fn silent_buf(len: usize) -> Vec<f32> {
+        vec![0.0002_f32; len]
+    }
+
+    fn signal_buf(peak: f32, len: usize) -> Vec<f32> {
+        // Alternating +peak / -peak so we exercise the abs() path.
+        (0..len)
+            .map(|i| if i % 2 == 0 { peak } else { -peak })
+            .collect()
+    }
+
+    // --- window_peak ---
+
+    #[test]
+    fn peak_of_silent_buffer_is_approximately_silence_floor() {
+        let buf = silent_buf(1000);
+        let p = window_peak(&buf);
+        assert!((p - 0.0002).abs() < 1e-7, "expected peak ≈ 0.0002, got {p}");
+    }
+
+    #[test]
+    fn peak_of_signal_buffer_matches_amplitude() {
+        let buf = signal_buf(0.2, 1000);
+        let p = window_peak(&buf);
+        assert!((p - 0.2).abs() < 1e-7, "expected peak ≈ 0.2, got {p}");
+    }
+
+    #[test]
+    fn peak_of_empty_buffer_is_zero() {
+        assert_eq!(window_peak(&[]), 0.0);
+    }
+
+    // --- is_dead_air ---
+
+    #[test]
+    fn dead_air_true_for_silence_floor() {
+        // Peak ≈ 0.0002, which is below threshold 0.001.
+        assert!(
+            is_dead_air(&silent_buf(1000)),
+            "silence floor must be detected as dead air"
+        );
+    }
+
+    #[test]
+    fn dead_air_false_for_weak_ft8_signal() {
+        // Weakest real FT8 ≥ 0.05 — well above threshold.
+        assert!(
+            !is_dead_air(&signal_buf(0.05, 1000)),
+            "0.05 peak must NOT be detected as dead air"
+        );
+    }
+
+    #[test]
+    fn dead_air_false_for_strong_ft8_signal() {
+        assert!(
+            !is_dead_air(&signal_buf(0.2, 1000)),
+            "0.2 peak must NOT be detected as dead air"
+        );
+    }
+
+    #[test]
+    fn dead_air_true_for_empty_buffer() {
+        // Empty → peak = 0.0 < 0.001 → dead air.
+        assert!(is_dead_air(&[]), "empty buffer must be treated as dead air");
+    }
+
+    #[test]
+    fn threshold_boundary_just_below_is_dead_air() {
+        // A single sample at exactly (threshold − ε) is dead air.
+        let just_below = DEAD_AIR_PEAK_THRESHOLD - 1e-6;
+        assert!(is_dead_air(&[just_below]));
+    }
+
+    #[test]
+    fn threshold_boundary_at_threshold_is_not_dead_air() {
+        // A single sample at exactly threshold is NOT dead air (strict <).
+        assert!(!is_dead_air(&[DEAD_AIR_PEAK_THRESHOLD]));
     }
 }
