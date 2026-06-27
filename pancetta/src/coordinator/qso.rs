@@ -834,6 +834,7 @@ impl super::ApplicationCoordinator {
 
         let (_qso_tx, qso_rx) = self.message_bus.create_channel(ComponentId::Qso).await?;
         let message_bus = self.message_bus.clone();
+        let gateway_enabled = self.gateway_enabled.clone();
 
         // Read station config for callsign/grid
         let config = self.config.read().await;
@@ -1194,6 +1195,7 @@ impl super::ApplicationCoordinator {
                 let completions_for_events = recent_manual_completions.clone();
                 let pending_for_events = pending_manual_calls.clone();
                 let dx_activity_for_events = dx_activity.clone();
+                let gateway_enabled = gateway_enabled.clone();
                 tokio::spawn(async move {
                     while !tx_shutdown.load(Ordering::Acquire) {
                         match qso_events.recv().await {
@@ -1330,6 +1332,17 @@ impl super::ApplicationCoordinator {
                                     &pending_for_events,
                                 )
                                 .await;
+                                // Additive: clone the snapshot for the read-only
+                                // gateway BEFORE it is moved into the →Tui send
+                                // (only when the gateway is enabled).
+                                let gw_snap = if gateway_enabled.load(Ordering::Relaxed) {
+                                    Some(MessageType::ActiveQsosSnapshot {
+                                        qsos: snapshot.clone(),
+                                        pending: pending_snap.clone(),
+                                    })
+                                } else {
+                                    None
+                                };
                                 let snap_msg = ComponentMessage::new(
                                     ComponentId::Qso,
                                     ComponentId::Tui,
@@ -1341,6 +1354,15 @@ impl super::ApplicationCoordinator {
                                 );
                                 if let Err(e) = snapshot_bus.send_message(snap_msg).await {
                                     debug!("Failed to push active-QSOs snapshot: {}", e);
+                                }
+                                if let Some(m) = gw_snap {
+                                    super::remote_gateway::relay_to_gateway(
+                                        &snapshot_bus,
+                                        &gateway_enabled,
+                                        ComponentId::Qso,
+                                        m,
+                                    )
+                                    .await;
                                 }
 
                                 // Batch 2 #3: a QSO that just went terminal-Failed
@@ -1536,6 +1558,14 @@ impl super::ApplicationCoordinator {
                                     &pending_for_events,
                                 )
                                 .await;
+                                let gw_snap = if gateway_enabled.load(Ordering::Relaxed) {
+                                    Some(MessageType::ActiveQsosSnapshot {
+                                        qsos: snapshot.clone(),
+                                        pending: pending_snap.clone(),
+                                    })
+                                } else {
+                                    None
+                                };
                                 let snap_msg = ComponentMessage::new(
                                     ComponentId::Qso,
                                     ComponentId::Tui,
@@ -1546,6 +1576,15 @@ impl super::ApplicationCoordinator {
                                     Instant::now(),
                                 );
                                 let _ = snapshot_bus.send_message(snap_msg).await;
+                                if let Some(m) = gw_snap {
+                                    super::remote_gateway::relay_to_gateway(
+                                        &snapshot_bus,
+                                        &gateway_enabled,
+                                        ComponentId::Qso,
+                                        m,
+                                    )
+                                    .await;
+                                }
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO completed with {}, marking as worked", their_call);
 
@@ -1645,6 +1684,14 @@ impl super::ApplicationCoordinator {
                                     &pending_for_events,
                                 )
                                 .await;
+                                let gw_snap = if gateway_enabled.load(Ordering::Relaxed) {
+                                    Some(MessageType::ActiveQsosSnapshot {
+                                        qsos: snapshot.clone(),
+                                        pending: pending_snap.clone(),
+                                    })
+                                } else {
+                                    None
+                                };
                                 let snap_msg = ComponentMessage::new(
                                     ComponentId::Qso,
                                     ComponentId::Tui,
@@ -1655,6 +1702,15 @@ impl super::ApplicationCoordinator {
                                     Instant::now(),
                                 );
                                 let _ = snapshot_bus.send_message(snap_msg).await;
+                                if let Some(m) = gw_snap {
+                                    super::remote_gateway::relay_to_gateway(
+                                        &snapshot_bus,
+                                        &gateway_enabled,
+                                        ComponentId::Qso,
+                                        m,
+                                    )
+                                    .await;
+                                }
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO failed with {}, adding backoff", their_call);
                                     qso_lookup.record_failure(their_call);

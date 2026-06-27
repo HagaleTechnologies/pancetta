@@ -171,6 +171,7 @@ impl super::ApplicationCoordinator {
         let shutdown = self.shutdown_signal.clone();
         let last_decode_timestamp = self.last_decode_timestamp.clone();
         let message_bus = self.message_bus.clone();
+        let gateway_enabled = self.gateway_enabled.clone();
         let self_waterfall_to_auto_tx = self.waterfall_to_auto_tx.clone();
 
         // Read station callsign for AP decoding before moving into the thread
@@ -795,6 +796,28 @@ impl super::ApplicationCoordinator {
                                     );
                                 }
                             });
+
+                            // Additive: also forward to the read-only remote
+                            // gateway when enabled (gated — no clone/send when
+                            // off). The existing →Tui/→Qso/→PskReporter sends
+                            // above are untouched.
+                            if gateway_enabled.load(Ordering::Relaxed) {
+                                let gw_msg = ComponentMessage::new(
+                                    ComponentId::Ft8Decoder,
+                                    ComponentId::RemoteGateway,
+                                    MessageType::DecodedMessage(decoded_msg.clone()),
+                                    Instant::now(),
+                                );
+                                let bus4 = message_bus.clone();
+                                rt.spawn(async move {
+                                    if let Err(e) = bus4.send_message(gw_msg).await {
+                                        debug!(
+                                            "Failed to forward decoded message to RemoteGateway: {}",
+                                            e
+                                        );
+                                    }
+                                });
+                            }
                         }
 
                         // Update AP recent_pool with newly decoded callsigns.

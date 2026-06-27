@@ -131,6 +131,7 @@ impl super::ApplicationCoordinator {
 
         let (_hamlib_tx, hamlib_rx) = self.message_bus.create_channel(ComponentId::Hamlib).await?;
         let message_bus = self.message_bus.clone();
+        let gateway_enabled = self.gateway_enabled.clone();
 
         // Read rig config before spawning
         let rig_config = {
@@ -340,6 +341,7 @@ impl super::ApplicationCoordinator {
                 // C9 dial-poll teardown plumbing.
                 let last_freq_command_poll = last_freq_command.clone();
                 let bus_for_polling = message_bus.clone();
+                let gw_enabled_poll = gateway_enabled.clone();
                 let mut spawned_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
                 spawned_handles.push(tokio::spawn(async move {
@@ -387,6 +389,18 @@ impl super::ApplicationCoordinator {
                                         Instant::now(),
                                     );
                                     let _ = message_bus.send_message(message).await;
+                                    super::remote_gateway::relay_to_gateway(
+                                        &message_bus,
+                                        &gw_enabled_poll,
+                                        ComponentId::Hamlib,
+                                        MessageType::RigControl(
+                                            crate::message_bus::RigControlMessage::FrequencyResponse {
+                                                vfo: 0,
+                                                frequency: freq,
+                                            },
+                                        ),
+                                    )
+                                    .await;
 
                                     // C9 — operator turned the rig's dial. We
                                     // learn of the new dial freq by polling (not
@@ -469,6 +483,17 @@ impl super::ApplicationCoordinator {
                                                 Instant::now(),
                                             );
                                             let _ = message_bus.send_message(s_msg).await;
+                                            super::remote_gateway::relay_to_gateway(
+                                                &message_bus,
+                                                &gw_enabled_poll,
+                                                ComponentId::Hamlib,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::SignalStrengthResponse {
+                                                        db_over_s9: db,
+                                                    },
+                                                ),
+                                            )
+                                            .await;
                                         }
                                     }
 

@@ -415,6 +415,15 @@ pub struct ApplicationCoordinator {
     /// `operating_frequency_hz`.
     split_tx_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
 
+    /// `true` when the read-only `remote_gateway` component is enabled
+    /// (`[network.remote_gateway].enabled`). Cached from config at construction
+    /// so the display-event emit sites (decode fan-out, QSO snapshot, freq,
+    /// s-meter, TX status, split) can cheaply gate their **additive**
+    /// dual-destination send to `ComponentId::RemoteGateway` — when the gateway
+    /// is off, the emit sites skip the extra clone+send entirely (the existing
+    /// `→Tui`/`→Qso` sends are never touched). See `remote_gateway::relay_to_gateway`.
+    gateway_enabled: Arc<AtomicBool>,
+
     /// `true` while the TX worker has PTT keyed. Set by the TX worker on
     /// key/unkey; read by the hamlib polling task so SWR is only sampled while
     /// transmitting (SWR is only meaningful under forward power) and by the TUI
@@ -670,6 +679,11 @@ impl ApplicationCoordinator {
         let coordinator_config = CoordinatorConfig::default();
         let message_bus = MessageBus::new(coordinator_config.message_buffer_size)?;
 
+        // Cache the remote-gateway enabled flag before `config` is moved into
+        // the Arc<RwLock> — the additive dual-destination emit sites read this
+        // atomic to gate their (cheap, additive) sends to the gateway.
+        let gateway_enabled_init = config.network.remote_gateway.enabled;
+
         // Wrap config in Arc<RwLock> for hot-reloading
         let config = Arc::new(RwLock::new(config));
 
@@ -738,6 +752,7 @@ impl ApplicationCoordinator {
             // 0 = simplex; the TUI SetSplit relay writes the split TX dial when
             // the operator enables split mode on the rig.
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            gateway_enabled: Arc::new(AtomicBool::new(gateway_enabled_init)),
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
