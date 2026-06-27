@@ -60,6 +60,10 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub qrz_xml: QrzXmlConfig,
 
+    /// Read-only remote view gateway for the Panino client (opt-in; default disabled)
+    #[serde(default)]
+    pub remote_gateway: RemoteGatewayConfig,
+
     /// Custom service integrations
     #[serde(default)]
     pub custom_services: HashMap<String, CustomServiceConfig>,
@@ -187,6 +191,30 @@ pub struct QrzXmlConfig {
     /// QRZ.com account password.
     #[serde(default)]
     pub password: String,
+}
+
+/// Read-only remote view gateway (Panino client). Default OFF; localhost-bound.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteGatewayConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Bind address. Defaults to localhost only (no network exposure) until the
+    /// authenticated control path (Sub-plan C) exists.
+    #[serde(default = "default_gateway_bind")]
+    pub bind_addr: String,
+}
+
+fn default_gateway_bind() -> String {
+    "127.0.0.1:4080".to_string()
+}
+
+impl Default for RemoteGatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_addr: default_gateway_bind(),
+        }
+    }
 }
 
 /// PSKReporter service configuration
@@ -1677,5 +1705,21 @@ mod tests {
         // Both present — valid.
         config.qrz_xml.password = "secret".to_string();
         assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_remote_gateway_defaults_when_section_absent() {
+        // Deserializing a TOML string with NO [network.remote_gateway] section
+        // must yield the default: disabled + localhost bind.
+        let toml_str = "[network]\n";
+        let outer: toml::Value = toml::from_str(toml_str).expect("valid toml");
+        let net: NetworkConfig = outer
+            .get("network")
+            .cloned()
+            .unwrap_or(toml::Value::Table(Default::default()))
+            .try_into()
+            .expect("valid NetworkConfig");
+        assert!(!net.remote_gateway.enabled);
+        assert_eq!(net.remote_gateway.bind_addr, "127.0.0.1:4080");
     }
 }
