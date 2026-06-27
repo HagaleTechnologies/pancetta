@@ -3028,6 +3028,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pancetta-protocol"
+version = "0.9.5"
+dependencies = [
+ "chrono",
+ "pancetta-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "pancetta-qso"
 version = "0.9.5"
 dependencies = [

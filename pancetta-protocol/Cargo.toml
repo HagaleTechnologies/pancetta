@@ -1,0 +1,14 @@
+[package]
+name = "pancetta-protocol"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+pancetta-core = { path = "../pancetta-core" }
+
+[dev-dependencies]
+serde_json = { workspace = true }

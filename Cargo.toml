@@ -9,6 +9,7 @@ members = [
     "pancetta-dx",
     "pancetta-ft8",
     "pancetta-hamlib",
+    "pancetta-protocol",
     "pancetta-qso",
     "pancetta-research",
     "pancetta-tui",
@@ -23,6 +24,7 @@ default-members = [
     "pancetta-dx",
     "pancetta-ft8",
     "pancetta-hamlib",
+    "pancetta-protocol",
     "pancetta-qso",
     "pancetta-tui",
 ]
