@@ -184,16 +184,21 @@ pub enum QsoUploadOutcome {
     Duplicate,
 }
 
-/// Lenient view of an optional `POST /api/v1/qsos` 2xx response body, used only
-/// to recognise an in-band duplicate signal. The endpoint contract does not
-/// pin the body shape, so every field is optional and unknown fields are
-/// ignored; a missing / non-JSON body simply means "logged".
+/// View of the `POST /api/v1/qsos` 2xx response body, used to recognise a
+/// duplicate. Per the dispensa `cqdx-api.v1` contract (cqdx PR #126, Q-0007),
+/// the endpoint returns **HTTP 201 with `{ ok, entity, band, duplicate }`** —
+/// `duplicate: true` when the upload matched an existing contact on the
+/// `(userId, callsign, band, mode, startTime)` idempotency key, `false` when a
+/// new row was inserted. We read only `duplicate` (the contract field); `status`
+/// is retained as a lenient fallback for older/alternate shapes, and unknown
+/// fields (`ok`/`entity`/`band`) are ignored. A missing / non-JSON body means
+/// "logged".
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct QsoUploadBody {
-    /// e.g. `"duplicate"`, `"logged"`, `"created"`.
+    /// Lenient fallback: e.g. `"duplicate"`, `"logged"`, `"created"`.
     #[serde(default)]
     status: Option<String>,
-    /// e.g. `{"duplicate": true}`.
+    /// The contract duplicate signal: `{ …, "duplicate": true }`.
     #[serde(default)]
     duplicate: Option<bool>,
 }

@@ -733,6 +733,50 @@ mod tests {
         assert_eq!(outcome, QsoUploadOutcome::Duplicate);
     }
 
+    /// cqdx-api.v1 (cqdx PR #126, Q-0007): the upload always returns HTTP 201
+    /// with body `{ ok, entity, band, duplicate }`. `duplicate: true` (the
+    /// contact already existed under the `(userId, callsign, band, mode,
+    /// startTime)` idempotency key) maps to a non-fatal `Duplicate`.
+    #[tokio::test]
+    async fn test_log_qso_v1_duplicate_true_201() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/qsos"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "ok": true,
+                "entity": "Japan",
+                "band": "20m",
+                "duplicate": true
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let outcome = client.log_qso(sample_qso()).await.unwrap();
+        assert_eq!(outcome, QsoUploadOutcome::Duplicate);
+    }
+
+    /// cqdx-api.v1: a 201 with `duplicate: false` (a freshly-inserted contact)
+    /// maps to `Logged`. The extra `ok`/`entity`/`band` fields are ignored.
+    #[tokio::test]
+    async fn test_log_qso_v1_duplicate_false_201() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v1/qsos"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "ok": true,
+                "entity": "Japan",
+                "band": "20m",
+                "duplicate": false
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let outcome = client.log_qso(sample_qso()).await.unwrap();
+        assert_eq!(outcome, QsoUploadOutcome::Logged);
+    }
+
     /// A 401 is surfaced as `Unauthorized` so the caller can stop retrying.
     #[tokio::test]
     async fn test_log_qso_unauthorized_401() {
