@@ -743,6 +743,13 @@ pub struct App {
     /// command-forwarding loop is briefly stalled.
     pub stopped_by_operator: bool,
 
+    /// Fox (DXpedition operator) mode. Flipped optimistically on `Shift+X`
+    /// for immediate chip feedback; the coordinator's `SetFoxMode` handler
+    /// is the authoritative state machine (starts repeating CQ, raises the
+    /// concurrent caller-answer cap to `fox_max_streams`). Defaults to
+    /// `false` (Fox mode off).
+    pub fox_mode: bool,
+
     // TX input
     pub tx_input_buffer: String,
     pub tx_input_cursor: usize,
@@ -885,6 +892,7 @@ impl App {
             out_of_band_ack_visible: false,
             out_of_band_rf_hz: 0,
             stopped_by_operator: false,
+            fox_mode: false,
             tx_input_buffer: String::new(),
             tx_input_cursor: 0,
             compose_mode: false,
@@ -2281,6 +2289,25 @@ impl App {
             // coordinator; the runtime gate flips regardless.
             self.status_message = "Autonomous toggle sent (waiting for live status)".to_string();
         }
+    }
+
+    /// Toggle local Fox-mode mirror flag for optimistic TUI feedback.
+    ///
+    /// The coordinator's `SetFoxMode` handler is the authority; this method
+    /// only flips the local bool so the title-bar "FOX" chip appears
+    /// immediately without waiting for a round-trip. The coordinator echoes
+    /// the authoritative state via the standard `StatusUpdate` path.
+    pub fn toggle_fox_mode(&mut self) {
+        self.fox_mode = !self.fox_mode;
+        self.status_message = if self.fox_mode {
+            "Fox mode ON — calling CQ + answering callers (Shift+X to disengage)".to_string()
+        } else {
+            "Fox mode OFF".to_string()
+        };
+        info!(
+            "Fox mode: {}",
+            if self.fox_mode { "enabled" } else { "disabled" }
+        );
     }
 
     /// Merge live spot groups from cqdx.io into the DX station list.
