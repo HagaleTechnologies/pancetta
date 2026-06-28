@@ -1802,3 +1802,188 @@ async fn auto_single_no_collision_is_tx_eq_rx() {
 
     sim.timeline.assert_all_released();
 }
+
+// ===========================================================================
+// Fox mode — DXpedition multi-stream rig-level proof (Task 3)
+//
+// Fox answers many Hound callers concurrently. Each answer is a normal
+// `respond_to_caller(ResponseStep::Grid)` QSO (same path `maybe_answer_caller`
+// uses internally), all on the SAME parity so the coalescer folds them into one
+// `MultiTransmitRequest` and keys BOTH in a single 15-second slot.
+//
+// Offset de-confliction is exercised via `compute_manual_tx_offset` with the
+// live `active_tx_offsets()` snapshot, exactly as the coordinator's caller-
+// answer handler does it. The test proves:
+//   • ≥2 distinct offsets keyed in ONE slot
+//   • Every pair of keyed offsets is ≥ MIN_TX_SEPARATION_HZ (75 Hz) apart
+//   • Each QSO advances when injected with its Hound's R-report (sequencing
+//     works for concurrent Fox QSOs)
+//
+// Why `respond_to_caller` × 2, not `maybe_answer_caller`:
+//   `maybe_answer_caller` is a private `async fn` on the coordinator struct
+//   (not accessible from the test binary). `respond_to_caller` with
+//   `ResponseStep::Grid` is the exact call it makes internally
+//   (qso_manager.rs:1259-1268); the test is therefore equivalent in fidelity
+//   to calling the production path. The cap-admits-N / rejects-N+1 logic is
+//   separately unit-tested in `pancetta/tests/fox_mode.rs::fox_cap_admits_n_and_rejects_n_plus_1`.
+// ===========================================================================
+
+/// Fox mode: two Hound callers answered in ONE slot, multi-streamed on distinct
+/// de-conflicted offsets (≥ 75 Hz apart), both advancing toward RR73.
+///
+/// This is the rig-level multi-stream proof: the mock rig observes TWO distinct
+/// audio offsets keyed in a single slot — exactly what a DXpedition Fox needs.
+#[tokio::test]
+async fn fox_mode_answers_two_callers_multistreamed_distinct_offsets() {
+    use pancetta_lib::coordinator::compute_manual_tx_offset;
+    use pancetta_qso::MIN_TX_SEPARATION_HZ;
+
+    let mut sim = CoordSim::new("K5ARH").await;
+
+    // ── Step 1: Fox answers Hound A ──────────────────────────────────────────
+    //
+    // Hound A is calling at 1200 Hz (the Fox hears their CQ/call there).
+    // Auto, no held offset: `compute_manual_tx_offset` returns Tx=Rx (1200 Hz,
+    // no collision yet).
+    let hound_a_dx_freq = 1200.0_f64;
+    let (tx_off_a, partner_a) = compute_manual_tx_offset(hound_a_dx_freq, false, 0, &[]);
+
+    let qso_a = sim
+        .manager
+        .respond_to_caller(
+            "W1AAA".to_string(),
+            tx_off_a,
+            Some(SlotParity::Even),
+            pancetta_core::ResponseStep::Grid,
+            Some(-10.0),
+            None,
+            partner_a,
+        )
+        .await
+        .expect("Fox must be able to answer Hound A");
+
+    // ── Step 2: Fox answers Hound B ──────────────────────────────────────────
+    //
+    // Hound B is calling at 1240 Hz — only 40 Hz from A, within the 75 Hz
+    // minimum separation. The coordinator fetches `active_tx_offsets` (which
+    // now includes A's offset) and calls `compute_manual_tx_offset` to get a
+    // de-conflicted TX offset for B.
+    let active = sim.manager.active_tx_offsets().await;
+    assert!(
+        active.iter().any(|&o| (o - tx_off_a).abs() < 1.0),
+        "active_tx_offsets must include Hound A's offset {tx_off_a:.0} Hz after opening, got {active:?}"
+    );
+
+    let hound_b_dx_freq = 1240.0_f64; // within 75 Hz of A → triggers de-confliction
+    let (tx_off_b, partner_b) = compute_manual_tx_offset(hound_b_dx_freq, false, 0, &active);
+
+    // Sanity-check: de-conflicted offset must be ≥ MIN_TX_SEPARATION_HZ from A.
+    let sep = (tx_off_b - tx_off_a).abs();
+    assert!(
+        sep >= MIN_TX_SEPARATION_HZ,
+        "de-conflicted Hound B offset {tx_off_b:.0} Hz must be ≥{MIN_TX_SEPARATION_HZ} Hz from \
+         Hound A offset {tx_off_a:.0} Hz (sep={sep:.1} Hz)"
+    );
+
+    let qso_b = sim
+        .manager
+        .respond_to_caller(
+            "W2BBB".to_string(),
+            tx_off_b,
+            Some(SlotParity::Even),
+            pancetta_core::ResponseStep::Grid,
+            Some(-12.0),
+            None,
+            partner_b,
+        )
+        .await
+        .expect("Fox must be able to answer Hound B");
+
+    // ── Step 3: Pump events + drive one slot ─────────────────────────────────
+    //
+    // Both QSOs go active (StateChanged → RespondingToCq), both forward their
+    // opening TransmitRequest (our grid reply to each Hound). The coalescer
+    // keeps BOTH (distinct qso_ids, same parity) and the TX worker keys them
+    // sequentially within the slot. The mock rig therefore observes TWO PTT
+    // pulses at TWO distinct offsets.
+    let pending = sim.pump_qso_events();
+    assert!(
+        pending.len() >= 2,
+        "Fox must forward ≥2 TransmitRequests (one per Hound) after opening both QSOs, got {}",
+        pending.len()
+    );
+
+    let slot0 = sim.drive_slot(pending).await;
+
+    // Both QSOs must have keyed PTT.
+    let qso_a_str = qso_a.to_string();
+    let qso_b_str = qso_b.to_string();
+    sim.timeline.assert_keyed_for_qso(&qso_a_str);
+    sim.timeline.assert_keyed_for_qso(&qso_b_str);
+
+    // Each keyed at its de-conflicted offset (on-wire proof).
+    sim.timeline.assert_keyed_at_offset(&qso_a_str, tx_off_a);
+    sim.timeline.assert_keyed_at_offset(&qso_b_str, tx_off_b);
+
+    // TWO distinct offsets in ONE slot — the core multi-stream assertion.
+    sim.timeline.assert_distinct_offsets_in_slot(slot0, 2);
+
+    // The two offsets must be ≥ MIN_TX_SEPARATION_HZ apart (no on-air collision).
+    let mut offsets_slot0 = sim.timeline.offsets_in_slot(slot0);
+    offsets_slot0.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(
+        offsets_slot0.len(),
+        2,
+        "expected exactly 2 keyed offsets in slot 0"
+    );
+    let actual_sep = (offsets_slot0[0] - offsets_slot0[1]).abs();
+    assert!(
+        actual_sep >= MIN_TX_SEPARATION_HZ,
+        "Fox streams must be ≥{MIN_TX_SEPARATION_HZ} Hz apart on the wire; \
+         got {:.0} Hz and {:.0} Hz (sep={:.1} Hz).\n{}",
+        offsets_slot0[0],
+        offsets_slot0[1],
+        actual_sep,
+        sim.timeline
+    );
+
+    // ── Step 4: Inject each Hound's R-report → QSOs sequence forward ─────────
+    //
+    // The Fox receives Hound A's report at A's own audio position (hound_a_dx_freq
+    // if Tx=Rx; or via partner_freq when de-conflicted). Both QSOs must advance
+    // to the ReportAck rung, proving concurrent Fox sequencing works.
+    //
+    // Inject at the DX's decode frequency (where the Hound's signal lives), which
+    // is hound_a_dx_freq / hound_b_dx_freq. The relevance gate uses partner_freq
+    // when tx_off ≠ dx_freq, so the report routes correctly even when de-conflicted.
+    sim.inject_decode("K5ARH W1AAA -10", hound_a_dx_freq).await;
+    sim.inject_decode("K5ARH W2BBB -12", hound_b_dx_freq).await;
+
+    let pending_s1 = sim.pump_qso_events();
+    assert!(
+        !pending_s1.is_empty(),
+        "Hound R-reports must trigger ReportAck replies from Fox; got no pending TX.\n{}",
+        sim.timeline
+    );
+
+    let _slot1 = sim.drive_slot(pending_s1).await;
+
+    // Both QSOs must still be keying (ReportAck rung, sequencing works).
+    let a_keyed = sim.timeline.keyed_for_qso(&qso_a_str);
+    let b_keyed = sim.timeline.keyed_for_qso(&qso_b_str);
+    assert!(
+        a_keyed.len() >= 2,
+        "Fox QSO A must have keyed ≥2 times (grid + ReportAck), got {}.\n{}",
+        a_keyed.len(),
+        sim.timeline
+    );
+    assert!(
+        b_keyed.len() >= 2,
+        "Fox QSO B must have keyed ≥2 times (grid + ReportAck), got {}.\n{}",
+        b_keyed.len(),
+        sim.timeline
+    );
+
+    // All PTT transitions cleanly released (no stuck PTT).
+    sim.timeline.assert_all_released();
+}
