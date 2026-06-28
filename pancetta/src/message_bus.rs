@@ -506,6 +506,26 @@ pub enum QsoMessage {
         /// a CQ: our chosen TX parity (`None` → self-parity fallback).
         parity: Option<pancetta_core::slot::SlotParity>,
     },
+    /// Operator engaged Hound (DXpedition chaser) mode on a selected Fox.
+    ///
+    /// Opens a manual Hound QSO: calls the Fox low (300–900 Hz), QSYs up into
+    /// the Hound-response region (>1000 Hz) when the Fox sends us a report,
+    /// completes on the Fox's RR73, and flags the ADIF log record with
+    /// `HOUND`/`APP_PANCETTA_HOUND`. Uses the same half-duplex parity admit
+    /// gate and `PendingManualCalls` deferral as [`QsoMessage::StartQso`].
+    EngageHound {
+        /// The Fox's callsign.
+        callsign: String,
+        /// The Fox's RX audio offset (Hz) — where we hear the Fox. Used as
+        /// the `partner_freq` for the relevance gate and decoder bin-hint.
+        fox_freq: u64,
+        /// The Fox's slot parity (we TX on the opposite parity). `None` when
+        /// the Fox's parity is not yet known; the TX scheduler falls back to
+        /// the configured self-parity.
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+        /// The Fox's Maidenhead grid square, if known (for logging only).
+        fox_grid: Option<String>,
+    },
 }
 
 /// DX cluster messages

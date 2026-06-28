@@ -77,6 +77,11 @@ struct PendingManualCall {
     /// DX callsign the operator chose to work.
     callsign: String,
     /// Audio offset (Hz) to call them on.
+    ///
+    /// For normal manual calls this is the frequency used in
+    /// `respond_to_cq_manual`. For Hound calls (`hound = true`) this field
+    /// is unused on promotion (the low calling offset is re-derived from the
+    /// callsign via `engage_hound`); it is kept for logging/display only.
     frequency_hz: f64,
     /// The DX's slot parity (we latch our TX = opposite at QSO start). `None`
     /// would never have been queued (it rides any side), so in practice this
@@ -85,6 +90,17 @@ struct PendingManualCall {
     /// When the call was parked in the queue. Used by the TTL watchdog to
     /// retire calls that have waited without a free window for too long.
     queued_at: std::time::Instant,
+    /// Set when this entry was created by [`QsoMessage::EngageHound`].
+    /// On promotion, the call is routed to `engage_hound` instead of
+    /// `respond_to_cq_manual` so the Hound metadata (partner_freq, low
+    /// calling offset, QSY hook) is correctly installed.
+    hound: bool,
+    /// Fox RX audio offset (Hz), latched from the original `EngageHound`
+    /// message. Only meaningful when `hound == true`; `None` otherwise.
+    fox_freq_hz: Option<f64>,
+    /// Fox grid square, latched for ADIF logging. Only meaningful when
+    /// `hound == true`.
+    fox_grid: Option<String>,
 }
 
 impl PendingManualCall {
@@ -331,14 +347,30 @@ async fn promote_pending_manual_calls(
     for p in to_start {
         info!(
             target: "qso",
-            "Promoting deferred manual call to {} on {:.0} Hz — window is now free",
+            "Promoting deferred {} call to {} on {:.0} Hz — window is now free",
+            if p.hound { "Hound" } else { "manual" },
             p.callsign, p.frequency_hz
         );
-        match qso_manager
-            .respond_to_cq_manual(p.callsign.clone(), p.frequency_hz, p.dx_parity)
-            .await
-        {
-            Ok(_) => {
+        let result = if p.hound {
+            // Hound engage: re-derive the low calling offset + install Hound
+            // metadata (partner_freq, hound flag, QSY hook) via engage_hound.
+            qso_manager
+                .engage_hound(
+                    &p.callsign,
+                    p.fox_freq_hz.unwrap_or(p.frequency_hz),
+                    p.fox_grid.as_deref(),
+                    p.dx_parity,
+                )
+                .await
+                .map(|_| ())
+        } else {
+            qso_manager
+                .respond_to_cq_manual(p.callsign.clone(), p.frequency_hz, p.dx_parity)
+                .await
+                .map(|_| ())
+        };
+        match result {
+            Ok(()) => {
                 emit_status(
                     message_bus,
                     format!("Now calling {} (was queued)", p.callsign),
@@ -1314,12 +1346,45 @@ impl super::ApplicationCoordinator {
                                 // `QsoState::frequency()` returns Some for
                                 // the in-QSO states and None for Idle /
                                 // Failed / Completed.
-                                if let Ok(mut guard) = qso_freq_state.write() {
-                                    *guard = if new_state.is_active() {
-                                        new_state.frequency()
+                                //
+                                // Hound-mode bin-hint: for a Hound QSO the
+                                // decoder's narrow-band collapse window should
+                                // centre on the Fox's RX frequency (where we
+                                // HEAR the Fox), not our TX offset (where we
+                                // CALL the Fox). `metadata.partner_freq` holds
+                                // the Fox's RX offset when set; for every
+                                // non-Hound QSO it is `None` and we fall back
+                                // to `new_state.frequency()` (our TX offset),
+                                // preserving byte-identical behavior for all
+                                // existing QSOs.
+                                // Resolve the frequency value BEFORE acquiring
+                                // the std::sync::RwLock guard so we never hold
+                                // a non-Send guard across an await point.
+                                {
+                                    let decoder_hint_freq: Option<f64> = if new_state.is_active()
+                                    {
+                                        // Try to obtain `partner_freq` from the
+                                        // QSO metadata. This is a cheap read-lock
+                                        // on the already-updated QSO map; it fires
+                                        // once per state-change (not per decode
+                                        // window).  On error (QSO vanished between
+                                        // the event and the lookup — extremely
+                                        // rare) we fall back to the state's own
+                                        // TX frequency.
+                                        let partner = snapshot_qso_manager
+                                            .get_qso(qso_id)
+                                            .await
+                                            .ok()
+                                            .and_then(|p| p.metadata.partner_freq);
+                                        partner.or_else(|| new_state.frequency())
                                     } else {
                                         None
                                     };
+                                    // Acquire the guard synchronously (no await
+                                    // in this scope) and write.
+                                    if let Ok(mut guard) = qso_freq_state.write() {
+                                        *guard = decoder_hint_freq;
+                                    }
                                 }
 
                                 // Push an updated snapshot of in-progress
@@ -1950,6 +2015,9 @@ impl super::ApplicationCoordinator {
                                                         frequency_hz: frequency as f64,
                                                         dx_parity,
                                                         queued_at: std::time::Instant::now(),
+                                                        hound: false,
+                                                        fox_freq_hz: None,
+                                                        fox_grid: None,
                                                     });
                                                 }
                                                 let queue_depth = q.len();
@@ -2102,6 +2170,131 @@ impl super::ApplicationCoordinator {
                                                         "Failed to open autonomous QSO ({:?}): {}",
                                                         callsign, e
                                                     );
+                                                }
+                                            }
+                                        }
+                                        crate::message_bus::QsoMessage::EngageHound {
+                                            callsign,
+                                            fox_freq,
+                                            dx_parity,
+                                            fox_grid,
+                                        } => {
+                                            // Belt-and-suspenders: refuse to Hound our own call.
+                                            if pancetta_qso::exchange::callsigns_match(
+                                                &callsign,
+                                                &our_callsign,
+                                            ) {
+                                                warn!(
+                                                    target: "qso.security",
+                                                    "Refusing EngageHound for our own callsign {}",
+                                                    callsign
+                                                );
+                                                continue;
+                                            }
+                                            info!(
+                                                "Hound: engaging Fox {} at fox_freq={} Hz (manual)",
+                                                callsign, fox_freq
+                                            );
+                                            // #40 half-duplex parity gate — identical logic to
+                                            // StartQso. A cross-parity Hound engage is deferred
+                                            // into the pending queue (as a Hound entry) and
+                                            // promoted via engage_hound once the window flips.
+                                            let desired_tx_parity =
+                                                dx_parity.map(|p| p.opposite());
+                                            let current_side =
+                                                qso_manager.current_tx_side().await;
+                                            if matches!(
+                                                pancetta_qso::qso_manager::admit_new_qso(
+                                                    current_side,
+                                                    desired_tx_parity,
+                                                ),
+                                                pancetta_qso::qso_manager::TxAdmission::Queue
+                                            ) {
+                                                let mut q = pending_manual_calls.lock().await;
+                                                let dup = q.iter().any(|p| {
+                                                    p.callsign
+                                                        .eq_ignore_ascii_case(&callsign)
+                                                });
+                                                if !dup {
+                                                    if q.len() >= MAX_PENDING_MANUAL_CALLS {
+                                                        q.pop_front();
+                                                    }
+                                                    q.push_back(PendingManualCall {
+                                                        callsign: callsign.clone(),
+                                                        frequency_hz: fox_freq as f64,
+                                                        dx_parity,
+                                                        queued_at: std::time::Instant::now(),
+                                                        hound: true,
+                                                        fox_freq_hz: Some(fox_freq as f64),
+                                                        fox_grid: fox_grid.clone(),
+                                                    });
+                                                }
+                                                let queue_depth = q.len();
+                                                drop(q);
+                                                info!(
+                                                    target: "qso",
+                                                    "Hound: queued Fox {} ({:?}) — opposite \
+                                                     window (active side {:?}); queue now {} \
+                                                     pending",
+                                                    callsign, dx_parity, current_side,
+                                                    queue_depth
+                                                );
+                                                emit_status(
+                                                    &message_bus,
+                                                    format!(
+                                                        "Hound: queued {} — waiting for current \
+                                                         window to clear",
+                                                        callsign
+                                                    ),
+                                                )
+                                                .await;
+                                                continue;
+                                            }
+                                            // Same/idle parity: start the Hound QSO now.
+                                            // engage_hound sets hound=true, partner_freq,
+                                            // low calling offset, and emits the opening
+                                            // CqResponse — all via QsoEvent (StateChanged +
+                                            // MessageToSend), which the event-forwarding task
+                                            // above turns into active_tx_qsos insertion and
+                                            // a TransmitRequest. No double-send.
+                                            match qso_manager
+                                                .engage_hound(
+                                                    &callsign,
+                                                    fox_freq as f64,
+                                                    fox_grid.as_deref(),
+                                                    dx_parity,
+                                                )
+                                                .await
+                                            {
+                                                Ok(qso_id) => {
+                                                    info!(
+                                                        "Hound QSO started with Fox {}: {} \
+                                                         (calling low, keep-calling under watchdog)",
+                                                        callsign, qso_id
+                                                    );
+                                                    emit_status(
+                                                        &message_bus,
+                                                        format!(
+                                                            "Hound: calling Fox {} low — TX \
+                                                             queued ({} Hz RX)",
+                                                            callsign, fox_freq
+                                                        ),
+                                                    )
+                                                    .await;
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "Hound: failed to engage Fox {}: {}",
+                                                        callsign, e
+                                                    );
+                                                    emit_status(
+                                                        &message_bus,
+                                                        format!(
+                                                            "Hound: engage {} failed: {}",
+                                                            callsign, e
+                                                        ),
+                                                    )
+                                                    .await;
                                                 }
                                             }
                                         }
@@ -2607,6 +2800,9 @@ mod pending_manual_tests {
             frequency_hz: 1500.0,
             dx_parity: Some(dx),
             queued_at: std::time::Instant::now(),
+            hound: false,
+            fox_freq_hz: None,
+            fox_grid: None,
         }
     }
 
@@ -2671,6 +2867,9 @@ mod pending_manual_tests {
             queued_at: std::time::Instant::now()
                 .checked_sub(age)
                 .expect("Instant underflow in test"),
+            hound: false,
+            fox_freq_hz: None,
+            fox_grid: None,
         }
     }
 
