@@ -313,6 +313,15 @@ pub enum TuiCommand {
     /// the operator's picked offset sticky; Auto lets pancetta choose/adjust it
     /// (smart allocator, collision jitter, stuck-DX hop).
     ToggleTxFreqMode,
+    /// Operator used the `o` modal to set (or clear) the held TX audio offset.
+    /// `Some(hz)` → store `hz` into `tx_offset_hold_hz` AND flip
+    /// `tx_freq_mode` to `Hold` so the offset is actually used.
+    /// `None` → store `0` into `tx_offset_hold_hz` AND flip `tx_freq_mode` to
+    /// `Auto` (clear / release the offset).
+    SetTxOffset {
+        /// The desired held TX audio offset in Hz, or `None` to clear (→ Auto).
+        offset_hz: Option<u64>,
+    },
     /// Operator pressed `H` (Shift+H) on the DX Hunter panel to engage Hound
     /// mode on the selected Fox station. The coordinator opens a manual Hound
     /// QSO: calls the Fox low (300–900 Hz), QSYs up (>1000 Hz) when the Fox
@@ -807,6 +816,62 @@ impl TuiRunner {
             return Ok(true);
         }
 
+        // TX-audio-offset modal (`o`): single integer Hz field, range 200–2900.
+        // Blank Enter = clear → Auto; valid number → SetTxOffset{Some(hz)};
+        // out-of-range → reject with status message; Esc = cancel.
+        if app.offset_modal.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    app.offset_modal.visible = false;
+                    app.status_message = "TX offset entry cancelled".to_string();
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    app.offset_modal.buffer.push(c);
+                }
+                KeyCode::Backspace => {
+                    app.offset_modal.buffer.pop();
+                }
+                KeyCode::Enter => {
+                    let trimmed = app.offset_modal.buffer.trim().to_string();
+                    if trimmed.is_empty() {
+                        // Blank → clear held offset → Auto
+                        app.offset_modal.visible = false;
+                        app.offset_modal.buffer.clear();
+                        app.tx_offset_hold_hz = None;
+                        app.tx_freq_mode = pancetta_core::TxFreqMode::Auto;
+                        app.status_message = "TX offset auto (Tx=Rx)".to_string();
+                        self.message_tx
+                            .send(TuiCommand::SetTxOffset { offset_hz: None })?;
+                    } else {
+                        match crate::app::parse_hz(&trimmed) {
+                            Some(hz)
+                                if hz >= crate::app::TX_OFFSET_MIN_HZ
+                                    && hz <= crate::app::TX_OFFSET_MAX_HZ =>
+                            {
+                                app.offset_modal.visible = false;
+                                app.offset_modal.buffer.clear();
+                                app.tx_offset_hold_hz = Some(hz);
+                                app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
+                                app.status_message =
+                                    format!("TX offset held @ {} Hz", hz);
+                                self.message_tx
+                                    .send(TuiCommand::SetTxOffset { offset_hz: Some(hz) })?;
+                            }
+                            _ => {
+                                app.status_message = format!(
+                                    "Invalid offset — enter {} to {} Hz (blank = Auto)",
+                                    crate::app::TX_OFFSET_MIN_HZ,
+                                    crate::app::TX_OFFSET_MAX_HZ
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+
         // Compose (free-text TX) mode. While active, the keyboard is a text
         // editor — Char/Backspace edit the TX buffer, Enter sends + exits, Esc
         // cancels + exits. Command letters are intentionally inert here so the
@@ -1215,6 +1280,15 @@ impl TuiRunner {
                 app.freq_modal.tx_buffer.clear();
                 app.status_message = "Freq entry: dial MHz, Tab→split, Enter, Esc".to_string();
             }
+            // `o` — open the TX-audio-offset modal. Prompts for an integer Hz
+            // value in [200, 2900]; blank Enter = clear (→ Auto). Mirrors the
+            // Shift+F pattern but for audio offsets within the passband.
+            KeyCode::Char('o') => {
+                app.offset_modal.visible = true;
+                app.offset_modal.buffer.clear();
+                app.status_message =
+                    "TX offset: enter Hz (200–2900), blank=Auto, Enter, Esc".to_string();
+            }
             KeyCode::Char('m') => {
                 app.toggle_monitoring().await?;
             }
@@ -1356,11 +1430,14 @@ impl TuiRunner {
                 TuiRunner::render_quit_confirm_overlay(f, f.area());
             }
 
-            // Render freq/split modals (out-of-band ack has priority over freq entry)
+            // Render freq/split/offset modals (out-of-band ack has priority;
+            // then freq modal; then offset modal — only one visible at a time).
             if app.out_of_band_ack_visible {
                 crate::ui::render_out_of_band_modal(f, f.area(), app.out_of_band_rf_hz);
             } else if app.freq_modal.visible {
                 crate::ui::render_freq_modal(f, f.area(), &app.freq_modal);
+            } else if app.offset_modal.visible {
+                crate::ui::render_offset_modal(f, f.area(), &app.offset_modal);
             }
         })?;
 
@@ -1535,6 +1612,7 @@ impl TuiRunner {
                 "f",
                 "TX freq mode: HOLD (pin offset) / AUTO (pancetta picks)",
             ),
+            ("o", "Set TX audio offset Hz (blank=Auto) — implies Hold"),
             (
                 "Shift+F",
                 "Set dial / split freq (RX MHz + optional TX MHz)",
@@ -2659,5 +2737,145 @@ mod key_tests {
             app.read().await.status_message.contains("selected"),
             "shows a 'no station selected' hint"
         );
+    }
+
+    // === TX-offset modal (`o` key) =====================================
+
+    /// `o` opens the offset modal and clears the buffer.
+    #[tokio::test]
+    async fn key_o_opens_offset_modal() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        // Pre-populate buffer from a hypothetical previous open.
+        app.write().await.offset_modal.buffer = "1234".to_string();
+        r.handle_key_event(key('o')).await.unwrap();
+        let a = app.read().await;
+        assert!(a.offset_modal.visible, "modal must be visible after 'o'");
+        assert!(a.offset_modal.buffer.is_empty(), "buffer cleared on open");
+    }
+
+    /// Valid Hz entry on Enter emits `SetTxOffset{Some(hz)}`, sets Hold mode,
+    /// and closes the modal.
+    #[tokio::test]
+    async fn offset_modal_valid_entry_emits_set_tx_offset() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        // Open the modal.
+        r.handle_key_event(key('o')).await.unwrap();
+        assert!(app.read().await.offset_modal.visible);
+        // Type "1500".
+        for c in "1500".chars() {
+            r.handle_key_event(key(c)).await.unwrap();
+        }
+        // Enter → apply.
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let a = app.read().await;
+        assert!(!a.offset_modal.visible, "modal closes on valid Enter");
+        assert_eq!(
+            a.tx_offset_hold_hz,
+            Some(1500),
+            "local offset set to 1500"
+        );
+        assert_eq!(
+            a.tx_freq_mode,
+            pancetta_core::TxFreqMode::Hold,
+            "mode flipped to Hold"
+        );
+        drop(a);
+        assert!(
+            matches!(
+                cmd_rx.try_recv(),
+                Ok(TuiCommand::SetTxOffset {
+                    offset_hz: Some(1500)
+                })
+            ),
+            "SetTxOffset(Some(1500)) emitted"
+        );
+    }
+
+    /// Out-of-range entry is rejected; modal stays open with a status message.
+    #[tokio::test]
+    async fn offset_modal_out_of_range_rejected() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('o')).await.unwrap();
+        // Type "100" (below minimum 200).
+        for c in "100".chars() {
+            r.handle_key_event(key(c)).await.unwrap();
+        }
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let a = app.read().await;
+        assert!(a.offset_modal.visible, "modal stays open on bad input");
+        assert!(
+            a.status_message.contains("Invalid"),
+            "status message says invalid"
+        );
+        drop(a);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "no command emitted for out-of-range"
+        );
+    }
+
+    /// Blank entry on Enter emits `SetTxOffset{None}` (→ Auto) and closes.
+    #[tokio::test]
+    async fn offset_modal_blank_entry_clears_to_auto() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        // Set a held offset first.
+        app.write().await.tx_offset_hold_hz = Some(1500);
+        r.handle_key_event(key('o')).await.unwrap();
+        // Enter immediately (empty buffer).
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let a = app.read().await;
+        assert!(!a.offset_modal.visible, "modal closes on blank Enter");
+        assert_eq!(a.tx_offset_hold_hz, None, "offset cleared to None");
+        assert_eq!(
+            a.tx_freq_mode,
+            pancetta_core::TxFreqMode::Auto,
+            "mode flipped to Auto"
+        );
+        drop(a);
+        assert!(
+            matches!(
+                cmd_rx.try_recv(),
+                Ok(TuiCommand::SetTxOffset { offset_hz: None })
+            ),
+            "SetTxOffset(None) emitted"
+        );
+    }
+
+    /// Esc cancels without emitting a command.
+    #[tokio::test]
+    async fn offset_modal_esc_cancels() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('o')).await.unwrap();
+        for c in "1500".chars() {
+            r.handle_key_event(key(c)).await.unwrap();
+        }
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let a = app.read().await;
+        assert!(!a.offset_modal.visible, "modal closed on Esc");
+        drop(a);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "Esc must not emit a command"
+        );
+    }
+
+    /// `parse_hz` unit tests.
+    #[test]
+    fn parse_hz_accepts_and_rejects() {
+        assert_eq!(crate::app::parse_hz("1500"), Some(1500));
+        assert_eq!(crate::app::parse_hz("200"), Some(200));
+        assert_eq!(crate::app::parse_hz("2900"), Some(2900));
+        assert_eq!(crate::app::parse_hz("  1500  "), Some(1500));
+        assert_eq!(crate::app::parse_hz(""), None);
+        assert_eq!(crate::app::parse_hz("abc"), None);
+        assert_eq!(crate::app::parse_hz("-500"), None);
     }
 }

@@ -250,6 +250,19 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         ));
     }
 
+    // TX audio offset chip: shown when the operator has set a held offset.
+    // "TX off: NNNN (HOLD)" when set; hidden when Auto (no noise in the bar).
+    if let Some(offset_hz) = app.tx_offset_hold_hz {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            format!(" TX off: {} (HOLD) ", offset_hz),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     // Health alarm chip — prominent, always-visible warning for the highest-
     // stakes silent failures so a new operator (or one whose audio device was
     // hijacked by a remote-desktop client) sees *why* nothing is decoding,
@@ -727,6 +740,38 @@ pub fn render_freq_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::FreqModa
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Set Frequency ")
+        .border_style(Style::default().fg(Color::Cyan));
+    f.render_widget(Paragraph::new(body).block(block), modal_area);
+}
+
+/// Render the `o`-key TX-audio-offset modal.
+///
+/// One integer Hz field in [200, 2900]; blank Enter = Auto; Esc = cancel.
+/// Mirrors the `render_freq_modal` layout and sizing.
+pub fn render_offset_modal(
+    f: &mut Frame<'_>,
+    area: Rect,
+    m: &crate::app::OffsetModalState,
+) {
+    if area.width < 10 || area.height < 4 {
+        return;
+    }
+    let modal_width: u16 = 52.min(area.width.saturating_sub(4));
+    let modal_height: u16 = 6.min(area.height.saturating_sub(4));
+    let modal_area = Rect {
+        x: (area.width.saturating_sub(modal_width)) / 2,
+        y: (area.height.saturating_sub(modal_height)) / 2,
+        width: modal_width,
+        height: modal_height,
+    };
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+    let body = format!(
+        " TX audio offset (Hz, 200–2900): {}_\n   blank = Auto (Tx=Rx)\n\n [Enter] apply   [Esc] cancel",
+        m.buffer,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Set TX Offset ")
         .border_style(Style::default().fg(Color::Cyan));
     f.render_widget(Paragraph::new(body).block(block), modal_area);
 }

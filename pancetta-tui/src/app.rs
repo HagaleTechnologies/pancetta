@@ -369,6 +369,33 @@ pub struct FreqModalState {
     pub field: FreqModalField,
 }
 
+/// State for the `o`-key TX-audio-offset modal: a single integer Hz field.
+///
+/// Valid range: 200–2900 Hz. Blank entry on Enter clears the held offset
+/// (→ Auto). Out-of-range input is rejected with a status message.
+#[derive(Debug, Clone, Default)]
+pub struct OffsetModalState {
+    /// Modal visible.
+    pub visible: bool,
+    /// Hz input buffer (decimal digits only).
+    pub buffer: String,
+}
+
+/// Parse an integer Hz value from a decimal string. Returns `None` for empty,
+/// non-numeric, or negative input.
+pub fn parse_hz(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    s.parse::<u64>().ok()
+}
+
+/// Valid TX audio offset range (inclusive), in Hz.
+pub const TX_OFFSET_MIN_HZ: u64 = 200;
+/// Valid TX audio offset range (inclusive), in Hz.
+pub const TX_OFFSET_MAX_HZ: u64 = 2900;
+
 #[derive(Debug, Clone)]
 pub struct DeviceSelectionState {
     pub input_devices: Vec<(String, bool)>, // (name, is_default)
@@ -679,6 +706,12 @@ pub struct App {
 
     /// Frequency-entry modal (Shift+F). See `FreqModalState`.
     pub freq_modal: FreqModalState,
+    /// TX-audio-offset modal (`o` key). See `OffsetModalState`.
+    pub offset_modal: OffsetModalState,
+    /// Held TX audio offset in Hz, or `None` when in Auto mode. Set
+    /// optimistically on the TUI side when the operator applies the offset
+    /// modal; the coordinator echo is authoritative.
+    pub tx_offset_hold_hz: Option<u64>,
     /// Active split TX dial in Hz for display (0 = simplex). Set optimistically
     /// when the operator applies split; the authoritative atomic lives in the
     /// coordinator.
@@ -836,6 +869,8 @@ impl App {
             help_visible: false,
             quit_confirm_visible: false,
             freq_modal: FreqModalState::default(),
+            offset_modal: OffsetModalState::default(),
+            tx_offset_hold_hz: None,
             split_tx_hz: 0,
             out_of_band_warned: false,
             out_of_band_ack_visible: false,
