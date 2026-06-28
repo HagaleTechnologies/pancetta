@@ -857,6 +857,81 @@ impl QsoManager {
         .await
     }
 
+    /// Open a manual **Hound** QSO to work a Fox (DXpedition) station.
+    ///
+    /// Thin wrapper over [`respond_to_cq_with`](Self::respond_to_cq_with) that
+    /// additionally sets `metadata.hound = true` and
+    /// `metadata.partner_freq = Some(fox_freq)` on the created QSO.
+    ///
+    /// The Hound procedure (WSJT-X DXpedition mode) splits TX and RX offsets:
+    /// - **Our TX offset** (`metadata.frequency`) is placed in the **calling
+    ///   region** `[300, 900]` Hz, derived deterministically from `fox_call` so
+    ///   concurrent Hound QSOs spread across the pile-up (avoids
+    ///   `Math.random`-style non-determinism and keeps tests reproducible).
+    /// - **Fox's RX offset** (`metadata.partner_freq`) is `Some(fox_freq)` —
+    ///   where we *hear* the Fox. The relevance gate keys on this when set, so
+    ///   the Fox's reply on its own offset is correctly routed to this QSO.
+    ///
+    /// `fox_grid`, if provided, is the Fox's *own* grid square (for
+    /// display/logging metadata); it does **not** affect the TX message content
+    /// (our opening `<Fox> <us> <grid>` uses *our* grid from station config,
+    /// exactly as the normal Caller path does).
+    ///
+    /// Task 5 (QSY-on-report) mutates `metadata.frequency` upward when the Fox
+    /// answers; this constructor only covers the open-and-call-low phase.
+    ///
+    /// Existing callers of [`respond_to_cq_with`] are unchanged (their
+    /// `hound`/`partner_freq` defaults stay `false`/`None`).
+    pub async fn engage_hound(
+        &self,
+        fox_call: &str,
+        fox_freq: f64,
+        fox_grid: Option<&str>,
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+    ) -> Result<QsoId, QsoManagerError> {
+        // Compute our deterministic low calling offset for this Fox callsign.
+        let low_offset = hound_offset_for(fox_call, HOUND_CALL_MIN_HZ, HOUND_CALL_MAX_HZ);
+
+        // Store the Fox's grid on `their_callsign`'s QSO (for logging); the TX
+        // message itself uses *our* grid (station config), which respond_to_cq_with
+        // already handles via `self.config.our_grid`.
+        // fox_grid is accepted for future metadata use (Task 5 / ADIF tagging);
+        // we don't thread it into the opening message (same as how the normal path
+        // handles the partner's grid — it's not in the CqResponse frame).
+        let _ = fox_grid; // used in future tasks (ADIF tag, logging)
+
+        // Open the QSO as a manual Caller at our LOW calling offset. This
+        // bypasses the self-duplicate gate (operator explicitly chose this Fox),
+        // sets role=Caller, initiated_by=Manual, emits the opening CqResponse
+        // (`<Fox> <us> <our_grid>`), and latches tx_parity=dx_parity.opposite().
+        let qso_id = self
+            .respond_to_cq_with(
+                fox_call.to_string(),
+                low_offset,
+                dx_parity,
+                CallInitiation::Manual,
+            )
+            .await?;
+
+        // Stamp the Hound-specific fields on the freshly-inserted QSO.
+        // respond_to_cq_with initialised both to their defaults (false/None);
+        // we mutate them here so the relevance gate and QSY hook can see them.
+        {
+            let mut qsos = self.qsos.write().await;
+            if let Some(progress) = qsos.get_mut(&qso_id) {
+                progress.metadata.hound = true;
+                progress.metadata.partner_freq = Some(fox_freq);
+            }
+        }
+
+        info!(
+            "Hound: engaging Fox {} on partner_freq={:.1} Hz, calling low @ {:.1} Hz: {}",
+            fox_call, fox_freq, low_offset, qso_id
+        );
+
+        Ok(qso_id)
+    }
+
     /// Respond to a CQ call, explicitly choosing the initiation mode.
     ///
     /// [`CallInitiation::Auto`] preserves the historical behavior
@@ -6983,10 +7058,8 @@ mod has_active_or_recent_qso_tests {
 
 #[cfg(test)]
 mod hound_tests {
-    use super::{hound_offset_for, HOUND_CALL_MAX_HZ, HOUND_CALL_MIN_HZ};
-    use crate::states::{
-        CallInitiation, GridSquares, QsoMetadata, QsoRole, SignalReports,
-    };
+    use super::*;
+    use crate::states::{GridSquares, SignalReports};
     use chrono::Utc;
     use pancetta_core::slot::SlotParity;
     use std::collections::HashMap;
@@ -7087,5 +7160,203 @@ mod hound_tests {
     fn hound_offset_degenerate_lo_eq_hi() {
         let result = hound_offset_for("K5ARH", 500.0, 500.0);
         assert_eq!(result, 500.0, "lo == hi must return lo");
+    }
+
+    // ── engage_hound constructor ─────────────────────────────────────────────
+
+    fn hound_test_config() -> QsoManagerConfig {
+        QsoManagerConfig {
+            our_callsign: "K5ARH".to_string(),
+            our_grid: Some("EM20".to_string()),
+            timeouts: TimeoutConfig::default(),
+            contest_mode: None,
+            auto_sequence: AutoSequenceConfig::default(),
+            duplicate_checking: DuplicateCheckConfig::default(),
+        }
+    }
+
+    /// engage_hound creates a QSO in RespondingToCq with correct Hound metadata.
+    ///
+    /// Verifies:
+    /// - state == RespondingToCq
+    /// - metadata.hound == true
+    /// - metadata.partner_freq == Some(fox_freq)
+    /// - metadata.frequency in [300.0, 900.0]  (the low calling region)
+    /// - metadata.initiated_by == Manual
+    /// - metadata.role == Caller
+    /// - tx_parity == Some(SlotParity::Odd)  (opposite of Even DX parity)
+    #[tokio::test]
+    async fn engage_hound_creates_qso_with_correct_metadata() {
+        let manager = QsoManager::new(hound_test_config());
+
+        let qso_id = manager
+            .engage_hound("D2UY", 1800.0, Some("JI64"), Some(SlotParity::Even))
+            .await
+            .expect("engage_hound should succeed");
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+
+        // State
+        assert!(
+            matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "expected RespondingToCq, got {:?}",
+            progress.state
+        );
+
+        // Hound-specific fields
+        assert!(
+            progress.metadata.hound,
+            "metadata.hound must be true for a Hound QSO"
+        );
+        assert_eq!(
+            progress.metadata.partner_freq,
+            Some(1800.0),
+            "metadata.partner_freq must be Some(fox_freq)"
+        );
+
+        // Low calling offset in [300, 900]
+        let freq = progress.metadata.frequency;
+        assert!(
+            freq >= HOUND_CALL_MIN_HZ && freq <= HOUND_CALL_MAX_HZ,
+            "metadata.frequency {freq} must be in [{HOUND_CALL_MIN_HZ}, {HOUND_CALL_MAX_HZ}]"
+        );
+
+        // initiation / role
+        assert_eq!(
+            progress.metadata.initiated_by,
+            CallInitiation::Manual,
+            "Hound v1 QSO must be Manual"
+        );
+        assert_eq!(
+            progress.metadata.role,
+            QsoRole::Caller,
+            "Hound is the Caller (we chase the Fox)"
+        );
+
+        // tx_parity = opposite of dx_parity (Even → Odd)
+        assert_eq!(
+            progress.metadata.tx_parity,
+            Some(SlotParity::Odd),
+            "tx_parity must be opposite of Fox's Even parity"
+        );
+    }
+
+    /// engage_hound emits an opening MessageToSend on the LOW calling offset
+    /// whose text targets the Fox callsign and includes our station callsign.
+    #[tokio::test]
+    async fn engage_hound_emits_opening_message_on_low_offset() {
+        let manager = QsoManager::new(hound_test_config());
+        let mut events = manager.subscribe();
+
+        let qso_id = manager
+            .engage_hound("D2UY", 1800.0, Some("JI64"), Some(SlotParity::Even))
+            .await
+            .expect("engage_hound should succeed");
+
+        // Collect all events emitted during the call.
+        let mut msg_events: Vec<(f64, MessageType)> = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::MessageToSend {
+                qso_id: eid,
+                message,
+                frequency,
+                ..
+            } = ev
+            {
+                if eid == qso_id {
+                    msg_events.push((frequency, message));
+                }
+            }
+        }
+
+        assert!(
+            !msg_events.is_empty(),
+            "at least one MessageToSend must be emitted for the opening call"
+        );
+
+        // The first MessageToSend is our CqResponse call to the Fox.
+        let (event_freq, message) = &msg_events[0];
+
+        // Frequency must be in the low calling region.
+        assert!(
+            *event_freq >= HOUND_CALL_MIN_HZ && *event_freq <= HOUND_CALL_MAX_HZ,
+            "opening MessageToSend frequency {event_freq} must be in the low calling region [{HOUND_CALL_MIN_HZ}, {HOUND_CALL_MAX_HZ}]"
+        );
+
+        // Message must be CqResponse directed at the Fox with our callsign.
+        match message {
+            MessageType::CqResponse {
+                calling_station,
+                responding_station,
+                ..
+            } => {
+                assert_eq!(
+                    calling_station, "D2UY",
+                    "CqResponse calling_station must be the Fox"
+                );
+                assert_eq!(
+                    responding_station, "K5ARH",
+                    "CqResponse responding_station must be our callsign"
+                );
+            }
+            other => panic!("expected CqResponse, got {:?}", other),
+        }
+    }
+
+    /// engage_hound is deterministic: two calls for the same Fox callsign yield
+    /// the same low calling offset.
+    #[tokio::test]
+    async fn engage_hound_same_fox_same_low_offset() {
+        let manager = QsoManager::new(hound_test_config());
+
+        let a = manager
+            .engage_hound("D2UY", 1800.0, None, Some(SlotParity::Even))
+            .await
+            .expect("first engage_hound");
+        // The second call supersedes the first (same callsign, same band) —
+        // that's fine, we just need both to agree on the offset.
+        let b = manager
+            .engage_hound("D2UY", 1800.0, None, Some(SlotParity::Even))
+            .await
+            .expect("second engage_hound");
+
+        let freq_a = manager.get_qso(a).await.map(|p| p.metadata.frequency);
+        let freq_b = manager.get_qso(b).await.unwrap().metadata.frequency;
+
+        // If a was superseded its progress may be gone (Error); b always exists.
+        // Either way both were computed from the same seed so they're identical.
+        let expected_offset = hound_offset_for("D2UY", HOUND_CALL_MIN_HZ, HOUND_CALL_MAX_HZ);
+        assert_eq!(
+            freq_b, expected_offset,
+            "second QSO offset must equal hound_offset_for(D2UY)"
+        );
+        if let Ok(fa) = freq_a {
+            assert_eq!(
+                fa, expected_offset,
+                "first QSO offset must equal hound_offset_for(D2UY)"
+            );
+        }
+    }
+
+    /// engage_hound with dx_parity=None produces tx_parity=None (no preferred
+    /// slot when the Fox's parity is unknown).
+    #[tokio::test]
+    async fn engage_hound_no_parity_when_dx_parity_unknown() {
+        let manager = QsoManager::new(hound_test_config());
+
+        let qso_id = manager
+            .engage_hound("VK9M", 1500.0, None, None)
+            .await
+            .expect("engage_hound with no parity");
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.tx_parity, None,
+            "tx_parity should be None when dx_parity is None"
+        );
+        assert!(
+            progress.metadata.hound,
+            "hound flag must still be set even with no parity"
+        );
     }
 }
