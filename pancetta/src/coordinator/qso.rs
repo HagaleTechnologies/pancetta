@@ -940,9 +940,7 @@ impl super::ApplicationCoordinator {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                use pancetta_qso::{
-                    HoundRegions, LoggerConfig, QsoManager, QsoManagerConfig,
-                };
+                use pancetta_qso::{HoundRegions, LoggerConfig, QsoManager, QsoManagerConfig};
 
                 let qso_config = QsoManagerConfig {
                     our_callsign: our_callsign.clone(),
@@ -1374,8 +1372,7 @@ impl super::ApplicationCoordinator {
                                 // the std::sync::RwLock guard so we never hold
                                 // a non-Send guard across an await point.
                                 {
-                                    let decoder_hint_freq: Option<f64> = if new_state.is_active()
-                                    {
+                                    let decoder_hint_freq: Option<f64> = if new_state.is_active() {
                                         // Try to obtain `partner_freq` from the
                                         // QSO metadata. This is a cheap read-lock
                                         // on the already-updated QSO map; it fires
@@ -2212,10 +2209,8 @@ impl super::ApplicationCoordinator {
                                             // StartQso. A cross-parity Hound engage is deferred
                                             // into the pending queue (as a Hound entry) and
                                             // promoted via engage_hound once the window flips.
-                                            let desired_tx_parity =
-                                                dx_parity.map(|p| p.opposite());
-                                            let current_side =
-                                                qso_manager.current_tx_side().await;
+                                            let desired_tx_parity = dx_parity.map(|p| p.opposite());
+                                            let current_side = qso_manager.current_tx_side().await;
                                             if matches!(
                                                 pancetta_qso::qso_manager::admit_new_qso(
                                                     current_side,
@@ -2225,8 +2220,7 @@ impl super::ApplicationCoordinator {
                                             ) {
                                                 let mut q = pending_manual_calls.lock().await;
                                                 let dup = q.iter().any(|p| {
-                                                    p.callsign
-                                                        .eq_ignore_ascii_case(&callsign)
+                                                    p.callsign.eq_ignore_ascii_case(&callsign)
                                                 });
                                                 if !dup {
                                                     if q.len() >= MAX_PENDING_MANUAL_CALLS {

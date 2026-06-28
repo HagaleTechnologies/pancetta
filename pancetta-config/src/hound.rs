@@ -73,10 +73,7 @@ impl ConfigSection for HoundConfig {
         if self.call_min_hz >= self.call_max_hz {
             return Err(ConfigError::InvalidValue {
                 field: "hound.call_min_hz".into(),
-                value: format!(
-                    "{} >= call_max_hz ({})",
-                    self.call_min_hz, self.call_max_hz
-                ),
+                value: format!("{} >= call_max_hz ({})", self.call_min_hz, self.call_max_hz),
             });
         }
 
