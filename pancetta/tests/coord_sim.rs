@@ -1518,26 +1518,36 @@ async fn held_offset_honored_keys_at_held_not_dx_freq() {
         .manager
         .respond_to_cq_with(
             "VK4DX".to_string(),
-            tx_off,       // our TX offset (1500 Hz)
+            tx_off, // our TX offset (1500 Hz)
             Some(SlotParity::Even),
             CallInitiation::Manual,
-            partner,      // DX's decode freq (700 Hz)
+            partner, // DX's decode freq (700 Hz)
         )
         .await
         .expect("respond_to_cq_with with held offset");
 
     // --- Step 3: drive a slot → PTT must key at 1500 Hz, NOT at 700 Hz ---
     let pending = sim.pump_qso_events();
-    assert!(!pending.is_empty(), "QSO open must emit at least one TransmitRequest");
+    assert!(
+        !pending.is_empty(),
+        "QSO open must emit at least one TransmitRequest"
+    );
 
     // The forwarded request must carry the held offset, not the DX's freq.
     assert!(
-        pending.iter().any(|p| (p.frequency_offset - 1500.0).abs() < 1.0),
+        pending
+            .iter()
+            .any(|p| (p.frequency_offset - 1500.0).abs() < 1.0),
         "forwarded TransmitRequest must carry the held offset 1500 Hz, got {:?}",
-        pending.iter().map(|p| p.frequency_offset).collect::<Vec<_>>()
+        pending
+            .iter()
+            .map(|p| p.frequency_offset)
+            .collect::<Vec<_>>()
     );
     assert!(
-        !pending.iter().any(|p| (p.frequency_offset - 700.0).abs() < 1.0),
+        !pending
+            .iter()
+            .any(|p| (p.frequency_offset - 700.0).abs() < 1.0),
         "no TransmitRequest must carry the DX freq 700 Hz (we TX at the held spot)"
     );
 
@@ -1569,9 +1579,14 @@ async fn held_offset_honored_keys_at_held_not_dx_freq() {
 
     // The follow-on reply must still be at our held offset (1500 Hz), not 700.
     assert!(
-        pending.iter().any(|p| (p.frequency_offset - 1500.0).abs() < 1.0),
+        pending
+            .iter()
+            .any(|p| (p.frequency_offset - 1500.0).abs() < 1.0),
         "follow-on TransmitRequest after DX reply must still carry 1500 Hz, got {:?}",
-        pending.iter().map(|p| p.frequency_offset).collect::<Vec<_>>()
+        pending
+            .iter()
+            .map(|p| p.frequency_offset)
+            .collect::<Vec<_>>()
     );
 
     sim.timeline.assert_all_released();
@@ -1611,7 +1626,10 @@ async fn multi_tx_deconfliction_offsets_are_distinct() {
         .await
         .expect("qso A");
     let pending_a = sim.pump_qso_events();
-    assert!(!pending_a.is_empty(), "QSO A must forward at least one TransmitRequest");
+    assert!(
+        !pending_a.is_empty(),
+        "QSO A must forward at least one TransmitRequest"
+    );
     sim.drive_slot(pending_a).await;
     sim.timeline.assert_keyed_for_qso(&a.to_string());
     sim.timeline.assert_keyed_at_offset(&a.to_string(), 1500.0);
@@ -1649,12 +1667,16 @@ async fn multi_tx_deconfliction_offsets_are_distinct() {
         .expect("qso B");
 
     let pending_b = sim.pump_qso_events();
-    assert!(!pending_b.is_empty(), "QSO B must forward at least one TransmitRequest");
+    assert!(
+        !pending_b.is_empty(),
+        "QSO B must forward at least one TransmitRequest"
+    );
     let slot_b = sim.drive_slot(pending_b).await;
 
     // B must have keyed PTT at the de-conflicted offset.
     sim.timeline.assert_keyed_for_qso(&b.to_string());
-    sim.timeline.assert_keyed_at_offset(&b.to_string(), tx_off_b);
+    sim.timeline
+        .assert_keyed_at_offset(&b.to_string(), tx_off_b);
 
     // The de-conflicted offset must also appear in slot_b (B's opening slot).
     let b_offsets = sim.timeline.offsets_in_slot(slot_b);
@@ -1667,9 +1689,17 @@ async fn multi_tx_deconfliction_offsets_are_distinct() {
     // Over the full timeline: A keyed at 1500, B at a distinct de-conflicted offset ≥75 Hz away.
     let a_keyed = sim.timeline.keyed_for_qso(&a.to_string());
     let b_keyed = sim.timeline.keyed_for_qso(&b.to_string());
-    let a_off = a_keyed.iter().filter(|k| k.ptt_keyed).map(|k| k.freq_hz).next()
+    let a_off = a_keyed
+        .iter()
+        .filter(|k| k.ptt_keyed)
+        .map(|k| k.freq_hz)
+        .next()
         .expect("QSO A must have keyed PTT at least once");
-    let b_off = b_keyed.iter().filter(|k| k.ptt_keyed).map(|k| k.freq_hz).next()
+    let b_off = b_keyed
+        .iter()
+        .filter(|k| k.ptt_keyed)
+        .map(|k| k.freq_hz)
+        .next()
         .expect("QSO B must have keyed PTT at least once");
 
     assert!(
@@ -1707,8 +1737,7 @@ async fn auto_single_no_collision_is_tx_eq_rx() {
         "Auto + no-held + no-collision must yield tx_off == dx_freq, got {tx_off}"
     );
     assert_eq!(
-        partner,
-        None,
+        partner, None,
         "Auto + no-held + no-collision must yield partner_freq=None (Tx=Rx), got {partner:?}"
     );
 
@@ -1718,22 +1747,30 @@ async fn auto_single_no_collision_is_tx_eq_rx() {
         .manager
         .respond_to_cq_with(
             "JH1XYZ".to_string(),
-            tx_off,    // == dx_freq == 1500.0
+            tx_off, // == dx_freq == 1500.0
             Some(SlotParity::Odd),
             CallInitiation::Auto,
-            partner,   // None — Tx=Rx, no partner_freq split
+            partner, // None — Tx=Rx, no partner_freq split
         )
         .await
         .expect("respond_to_cq_with Tx=Rx");
 
     let pending = sim.pump_qso_events();
-    assert!(!pending.is_empty(), "Tx=Rx QSO open must emit a TransmitRequest");
+    assert!(
+        !pending.is_empty(),
+        "Tx=Rx QSO open must emit a TransmitRequest"
+    );
 
     // Forwarded request must carry 1500 Hz.
     assert!(
-        pending.iter().any(|p| (p.frequency_offset - 1500.0).abs() < 1.0),
+        pending
+            .iter()
+            .any(|p| (p.frequency_offset - 1500.0).abs() < 1.0),
         "forwarded request must carry 1500 Hz (Tx=Rx), got {:?}",
-        pending.iter().map(|p| p.frequency_offset).collect::<Vec<_>>()
+        pending
+            .iter()
+            .map(|p| p.frequency_offset)
+            .collect::<Vec<_>>()
     );
 
     sim.drive_slot(pending).await;
@@ -1753,9 +1790,14 @@ async fn auto_single_no_collision_is_tx_eq_rx() {
 
     // Follow-on reply must still be at 1500 Hz (TX offset unchanged).
     assert!(
-        pending.iter().any(|p| (p.frequency_offset - 1500.0).abs() < 1.0),
+        pending
+            .iter()
+            .any(|p| (p.frequency_offset - 1500.0).abs() < 1.0),
         "follow-on reply must be at 1500 Hz (Tx=Rx regression), got {:?}",
-        pending.iter().map(|p| p.frequency_offset).collect::<Vec<_>>()
+        pending
+            .iter()
+            .map(|p| p.frequency_offset)
+            .collect::<Vec<_>>()
     );
 
     sim.timeline.assert_all_released();
