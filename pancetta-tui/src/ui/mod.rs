@@ -748,11 +748,7 @@ pub fn render_freq_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::FreqModa
 ///
 /// One integer Hz field in [300, 2700]; blank Enter = Auto; Esc = cancel.
 /// Mirrors the `render_freq_modal` layout and sizing.
-pub fn render_offset_modal(
-    f: &mut Frame<'_>,
-    area: Rect,
-    m: &crate::app::OffsetModalState,
-) {
+pub fn render_offset_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::OffsetModalState) {
     if area.width < 10 || area.height < 4 {
         return;
     }

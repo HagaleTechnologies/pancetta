@@ -852,10 +852,10 @@ impl TuiRunner {
                                 app.offset_modal.buffer.clear();
                                 app.tx_offset_hold_hz = Some(hz);
                                 app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
-                                app.status_message =
-                                    format!("TX offset held @ {} Hz", hz);
-                                self.message_tx
-                                    .send(TuiCommand::SetTxOffset { offset_hz: Some(hz) })?;
+                                app.status_message = format!("TX offset held @ {} Hz", hz);
+                                self.message_tx.send(TuiCommand::SetTxOffset {
+                                    offset_hz: Some(hz),
+                                })?;
                             }
                             _ => {
                                 app.status_message = format!(
@@ -2771,11 +2771,7 @@ mod key_tests {
             .unwrap();
         let a = app.read().await;
         assert!(!a.offset_modal.visible, "modal closes on valid Enter");
-        assert_eq!(
-            a.tx_offset_hold_hz,
-            Some(1500),
-            "local offset set to 1500"
-        );
+        assert_eq!(a.tx_offset_hold_hz, Some(1500), "local offset set to 1500");
         assert_eq!(
             a.tx_freq_mode,
             pancetta_core::TxFreqMode::Hold,
@@ -2832,7 +2828,10 @@ mod key_tests {
             .await
             .unwrap();
         let a = app.read().await;
-        assert!(a.offset_modal.visible, "200 Hz is below new minimum 300 — modal stays open");
+        assert!(
+            a.offset_modal.visible,
+            "200 Hz is below new minimum 300 — modal stays open"
+        );
         assert!(a.status_message.contains("Invalid"), "status says invalid");
         drop(a);
         assert!(cmd_rx.try_recv().is_err(), "no command emitted");
@@ -2881,10 +2880,7 @@ mod key_tests {
         let a = app.read().await;
         assert!(!a.offset_modal.visible, "modal closed on Esc");
         drop(a);
-        assert!(
-            cmd_rx.try_recv().is_err(),
-            "Esc must not emit a command"
-        );
+        assert!(cmd_rx.try_recv().is_err(), "Esc must not emit a command");
     }
 
     /// `parse_hz` unit tests.

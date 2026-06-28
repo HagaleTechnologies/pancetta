@@ -2112,13 +2112,12 @@ impl super::ApplicationCoordinator {
                                                     // intent so promote_pending_manual_calls
                                                     // can rerun compute_manual_tx_offset with
                                                     // the current active set at promotion time.
-                                                    let queued_held = tx_offset_hold_hz
-                                                        .load(Ordering::Relaxed);
+                                                    let queued_held =
+                                                        tx_offset_hold_hz.load(Ordering::Relaxed);
                                                     let queued_hold_mode =
                                                         pancetta_core::TxFreqMode::from_u8(
                                                             tx_freq_mode.load(Ordering::Relaxed),
-                                                        )
-                                                        == pancetta_core::TxFreqMode::Hold;
+                                                        ) == pancetta_core::TxFreqMode::Hold;
                                                     q.push_back(PendingManualCall {
                                                         callsign: callsign.clone(),
                                                         frequency_hz: frequency as f64,
@@ -3114,7 +3113,8 @@ mod pending_manual_tests {
             hold_mode: true,
         };
         let active: Vec<f64> = vec![];
-        let (tx_off, partner) = compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
+        let (tx_off, partner) =
+            compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
         assert_eq!(tx_off, 1500.0, "held offset should be honoured");
         assert_eq!(
             partner,
@@ -3140,7 +3140,8 @@ mod pending_manual_tests {
         };
         // An active QSO is already on 1500 Hz at promotion time.
         let active: Vec<f64> = vec![1500.0];
-        let (tx_off, partner) = compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
+        let (tx_off, partner) =
+            compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
         // Should NOT be 1500 (too close to the occupied slot).
         assert_ne!(tx_off, 1500.0, "must not stack on the occupied offset");
         // tx_off should be within [300, 2700].
@@ -3172,7 +3173,8 @@ mod pending_manual_tests {
             hold_mode: false,
         };
         let active: Vec<f64> = vec![];
-        let (tx_off, partner) = compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
+        let (tx_off, partner) =
+            compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
         assert_eq!(tx_off, 1750.0, "Auto + no collision → Tx=Rx");
         assert_eq!(partner, None, "Tx=Rx → partner_freq is None");
     }

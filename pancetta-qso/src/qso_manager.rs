@@ -124,13 +124,7 @@ pub const MIN_TX_SEPARATION_HZ: f64 = 75.0;
 /// in-range offset that is `>= min_sep` from all `occupied`; if none exists in
 /// range, returns `candidate.clamp(lo, hi)`. Deterministic (no RNG) — for tests
 /// and reproducibility.
-pub fn deconflict_offset(
-    candidate: f64,
-    occupied: &[f64],
-    min_sep: f64,
-    lo: f64,
-    hi: f64,
-) -> f64 {
+pub fn deconflict_offset(candidate: f64, occupied: &[f64], min_sep: f64, lo: f64, hi: f64) -> f64 {
     let clear = |off: f64| occupied.iter().all(|o| (off - o).abs() >= min_sep);
     let c = candidate.clamp(lo, hi);
     if clear(c) {
@@ -5882,7 +5876,15 @@ mod reply_emitter_tests {
         let manager = manager();
         let mut rx = manager.subscribe();
         let qso_id = manager
-            .respond_to_caller(DX.into(), FREQ, None, ResponseStep::Grid, Some(-12.0), None, None)
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::Grid,
+                Some(-12.0),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let sends = messages_to_send(&drain(&mut rx));
@@ -6120,7 +6122,15 @@ mod reply_emitter_tests {
         let manager = manager();
         let mut rx = manager.subscribe();
         manager
-            .respond_to_caller(DX.into(), FREQ, None, ResponseStep::Report, None, None, None)
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::Report,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         let sends = messages_to_send(&drain(&mut rx));
@@ -8066,7 +8076,10 @@ mod deconflict_tests {
     fn deconflict_empty_occupied_clamps_candidate() {
         // No occupied offsets; candidate 2900 is above HI — must clamp to HI.
         let result = deconflict_offset(2900.0, &[], SEP, LO, HI);
-        assert_eq!(result, HI, "out-of-range candidate with no occupied must clamp to hi");
+        assert_eq!(
+            result, HI,
+            "out-of-range candidate with no occupied must clamp to hi"
+        );
     }
 
     #[test]
