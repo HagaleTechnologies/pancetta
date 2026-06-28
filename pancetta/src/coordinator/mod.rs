@@ -259,7 +259,7 @@ use pancetta_config::Config;
 use pancetta_ft8::{Ft8Config, Ft8Decoder};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -432,9 +432,14 @@ pub struct ApplicationCoordinator {
     gateway_enabled: Arc<AtomicBool>,
 
     /// `true` when the coordinator is running in Fox (DXpedition operator) mode.
-    /// Default `false` (standard Hound / normal operation). Task 2 will wire the
-    /// QSO component to read this flag and switch to Fox-mode QSO sequencing.
+    /// Default `false` (standard Hound / normal operation).
     fox_mode: Arc<AtomicBool>,
+
+    /// Maximum simultaneous caller-answer QSOs while Fox mode is engaged.
+    /// Seeded from `config.fox.max_streams` at construction. The QSO
+    /// component's `maybe_answer_caller` path uses this value instead of
+    /// `auto_answer_max_concurrent` when `fox_mode` is set.
+    fox_max_streams: Arc<AtomicUsize>,
 
     /// `true` while the TX worker has PTT keyed. Set by the TX worker on
     /// key/unkey; read by the hamlib polling task so SWR is only sampled while
@@ -695,6 +700,10 @@ impl ApplicationCoordinator {
         // the Arc<RwLock> — the additive dual-destination emit sites read this
         // atomic to gate their (cheap, additive) sends to the gateway.
         let gateway_enabled_init = config.network.remote_gateway.enabled;
+        // Snapshot fox.max_streams before config is moved into the Arc<RwLock>.
+        // The QSO component reads this to cap concurrent caller-answer QSOs
+        // while Fox mode is engaged.
+        let fox_max_streams_init = config.fox.max_streams;
 
         // Wrap config in Arc<RwLock> for hot-reloading
         let config = Arc::new(RwLock::new(config));
@@ -769,6 +778,7 @@ impl ApplicationCoordinator {
             tx_offset_hold_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gateway_enabled: Arc::new(AtomicBool::new(gateway_enabled_init)),
             fox_mode: Arc::new(AtomicBool::new(false)),
+            fox_max_streams: Arc::new(AtomicUsize::new(fox_max_streams_init)),
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
@@ -1078,10 +1088,18 @@ impl ApplicationCoordinator {
     }
 
     /// Fox-mode activation flag. `false` by default (normal Hound / station
-    /// operation). Task 2 will toggle this when the operator enables Fox mode;
-    /// the QSO component reads it to switch to Fox-mode QSO sequencing.
+    /// operation). Toggled by [`QsoMessage::SetFoxMode`]; the QSO component
+    /// reads it to switch to Fox-mode QSO sequencing and raise the answer cap.
     pub(crate) fn fox_mode(&self) -> Arc<AtomicBool> {
         self.fox_mode.clone()
+    }
+
+    /// Maximum simultaneous caller-answer QSOs while Fox mode is engaged.
+    /// Seeded from `config.fox.max_streams` at construction. Shared into the
+    /// QSO component task so the `maybe_answer_caller` cap can switch without
+    /// re-reading config.
+    pub(crate) fn fox_max_streams(&self) -> Arc<AtomicUsize> {
+        self.fox_max_streams.clone()
     }
 }
 

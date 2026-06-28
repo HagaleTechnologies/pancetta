@@ -510,6 +510,20 @@ pub enum QsoMessage {
         /// a CQ: our chosen TX parity (`None` → self-parity fallback).
         parity: Option<pancetta_core::slot::SlotParity>,
     },
+    /// Enable or disable Fox (DXpedition operator) mode.
+    ///
+    /// `on: true` — sets the `fox_mode` flag, starts a repeating CQ
+    /// (`CallingCq` QSO), and raises the concurrent caller-answer cap to
+    /// `fox_max_streams` so the Fox can work many Hound callers at once.
+    /// TX-policy gated (Fox originates CQ = initiation): refused under
+    /// `RespondOnly` / `Disabled`, matching `StartCq` / `CallStation`.
+    ///
+    /// `on: false` — clears the flag, cancels any active un-answered `CallingCq`
+    /// QSO (same as `StopCq`), and restores the normal caller-answer cap.
+    SetFoxMode {
+        /// `true` to engage Fox mode; `false` to disengage.
+        on: bool,
+    },
     /// Operator engaged Hound (DXpedition chaser) mode on a selected Fox.
     ///
     /// Opens a manual Hound QSO: calls the Fox low (300–900 Hz), QSYs up into
