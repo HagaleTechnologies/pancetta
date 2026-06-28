@@ -78,10 +78,11 @@ struct PendingManualCall {
     callsign: String,
     /// Audio offset (Hz) to call them on.
     ///
-    /// For normal manual calls this is the frequency used in
-    /// `respond_to_cq_manual`. For Hound calls (`hound = true`) this field
-    /// is unused on promotion (the low calling offset is re-derived from the
-    /// callsign via `engage_hound`); it is kept for logging/display only.
+    /// For normal manual calls this is the **DX's** decoded audio frequency
+    /// (used as the `dx_freq` argument to [`compute_manual_tx_offset`] on
+    /// promotion). For Hound calls (`hound = true`) this field is unused on
+    /// promotion (the low calling offset is re-derived from the callsign via
+    /// `engage_hound`); it is kept for logging/display only.
     frequency_hz: f64,
     /// The DX's slot parity (we latch our TX = opposite at QSO start). `None`
     /// would never have been queued (it rides any side), so in practice this
@@ -92,7 +93,7 @@ struct PendingManualCall {
     queued_at: std::time::Instant,
     /// Set when this entry was created by [`QsoMessage::EngageHound`].
     /// On promotion, the call is routed to `engage_hound` instead of
-    /// `respond_to_cq_manual` so the Hound metadata (partner_freq, low
+    /// `respond_to_cq_with` so the Hound metadata (partner_freq, low
     /// calling offset, QSY hook) is correctly installed.
     hound: bool,
     /// Fox RX audio offset (Hz), latched from the original `EngageHound`
@@ -101,6 +102,17 @@ struct PendingManualCall {
     /// Fox grid square, latched for ADIF logging. Only meaningful when
     /// `hound == true`.
     fox_grid: Option<String>,
+    /// Operator-held TX audio offset (Hz) at the time this call was queued.
+    /// `0` means no held offset was active. Only meaningful for non-Hound
+    /// calls; used by [`promote_pending_manual_calls`] to call
+    /// [`compute_manual_tx_offset`] with the same held state the live
+    /// `StartQso` handler would have used, so the offset logic is not lost
+    /// when promotion is deferred to a later window.
+    held_hz: u64,
+    /// Whether `TxFreqMode::Hold` was active when this call was queued.
+    /// Together with [`held_hz`](Self::held_hz), restores the held-offset
+    /// context at promotion time. Only meaningful for non-Hound calls.
+    hold_mode: bool,
 }
 
 impl PendingManualCall {
@@ -411,8 +423,31 @@ async fn promote_pending_manual_calls(
                 .await
                 .map(|_| ())
         } else {
+            // Normal manual call: re-run the held-offset + de-confliction
+            // logic at promotion time (not at queue time) so we use the
+            // CURRENT active offset set, not the stale snapshot from when
+            // the call was deferred. The held_hz/hold_mode fields carry the
+            // operator's intent from the original StartQso handler so the
+            // chosen offset is honoured even across the cross-parity deferral.
+            let active = qso_manager.active_tx_offsets().await;
+            let (tx_off, partner) =
+                compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
+            if tx_off != p.frequency_hz {
+                info!(
+                    target: "qso",
+                    "Promoting queued call to {} — held_hz={} hold_mode={} dx_freq={:.0} \
+                     → tx_off={:.0} Hz (de-conflicted from {} active)",
+                    p.callsign, p.held_hz, p.hold_mode, p.frequency_hz, tx_off, active.len()
+                );
+            }
             qso_manager
-                .respond_to_cq_manual(p.callsign.clone(), p.frequency_hz, p.dx_parity)
+                .respond_to_cq_with(
+                    p.callsign.clone(),
+                    tx_off,
+                    p.dx_parity,
+                    pancetta_qso::CallInitiation::Manual,
+                    partner,
+                )
                 .await
                 .map(|_| ())
         };
@@ -2073,6 +2108,17 @@ impl super::ApplicationCoordinator {
                                                     if q.len() >= MAX_PENDING_MANUAL_CALLS {
                                                         q.pop_front();
                                                     }
+                                                    // Capture the operator's held-offset
+                                                    // intent so promote_pending_manual_calls
+                                                    // can rerun compute_manual_tx_offset with
+                                                    // the current active set at promotion time.
+                                                    let queued_held = tx_offset_hold_hz
+                                                        .load(Ordering::Relaxed);
+                                                    let queued_hold_mode =
+                                                        pancetta_core::TxFreqMode::from_u8(
+                                                            tx_freq_mode.load(Ordering::Relaxed),
+                                                        )
+                                                        == pancetta_core::TxFreqMode::Hold;
                                                     q.push_back(PendingManualCall {
                                                         callsign: callsign.clone(),
                                                         frequency_hz: frequency as f64,
@@ -2081,6 +2127,8 @@ impl super::ApplicationCoordinator {
                                                         hound: false,
                                                         fox_freq_hz: None,
                                                         fox_grid: None,
+                                                        held_hz: queued_held,
+                                                        hold_mode: queued_hold_mode,
                                                     });
                                                 }
                                                 let queue_depth = q.len();
@@ -2313,6 +2361,11 @@ impl super::ApplicationCoordinator {
                                                         hound: true,
                                                         fox_freq_hz: Some(fox_freq as f64),
                                                         fox_grid: fox_grid.clone(),
+                                                        // Hound engage re-derives its own offset
+                                                        // via engage_hound — these fields are
+                                                        // ignored on promotion when hound==true.
+                                                        held_hz: 0,
+                                                        hold_mode: false,
                                                     });
                                                 }
                                                 let queue_depth = q.len();
@@ -2910,6 +2963,8 @@ mod pending_manual_tests {
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
+            held_hz: 0,
+            hold_mode: false,
         }
     }
 
@@ -2977,6 +3032,8 @@ mod pending_manual_tests {
             hound: false,
             fox_freq_hz: None,
             fox_grid: None,
+            held_hz: 0,
+            hold_mode: false,
         }
     }
 
@@ -3029,6 +3086,95 @@ mod pending_manual_tests {
         );
         assert!(kept.is_empty());
         assert!(expired.is_empty());
+    }
+
+    // ── Queued call offset fields + promote logic unit tests ─────────────────
+    //
+    // These tests verify that a PendingManualCall correctly carries the
+    // held_hz/hold_mode snapshot from queue time, and that
+    // compute_manual_tx_offset produces the expected offset when called with
+    // those values at promotion time (mirroring what promote_pending_manual_calls
+    // does in the non-Hound branch).
+
+    use super::compute_manual_tx_offset;
+
+    /// A queued call with held_hz=1500 / hold_mode=true opens at the held
+    /// offset (1500 Hz) when promoted with no active concurrent QSOs.
+    #[test]
+    fn queued_call_with_held_offset_opens_at_held_hz() {
+        let p = PendingManualCall {
+            callsign: "DX1ABC".to_string(),
+            frequency_hz: 900.0, // DX decoded at 900 Hz
+            dx_parity: Some(SlotParity::Even),
+            queued_at: std::time::Instant::now(),
+            hound: false,
+            fox_freq_hz: None,
+            fox_grid: None,
+            held_hz: 1500,
+            hold_mode: true,
+        };
+        let active: Vec<f64> = vec![];
+        let (tx_off, partner) = compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
+        assert_eq!(tx_off, 1500.0, "held offset should be honoured");
+        assert_eq!(
+            partner,
+            Some(900.0),
+            "partner_freq must be Some(dx_freq) when tx_off != dx_freq"
+        );
+    }
+
+    /// A queued call with held_hz=1500 / hold_mode=true de-conflicts against
+    /// an active QSO already at 1500 Hz.
+    #[test]
+    fn queued_call_deconflicts_held_offset_against_active_at_promotion() {
+        let p = PendingManualCall {
+            callsign: "DX2XYZ".to_string(),
+            frequency_hz: 1200.0, // DX decoded at 1200 Hz
+            dx_parity: Some(SlotParity::Odd),
+            queued_at: std::time::Instant::now(),
+            hound: false,
+            fox_freq_hz: None,
+            fox_grid: None,
+            held_hz: 1500,
+            hold_mode: true,
+        };
+        // An active QSO is already on 1500 Hz at promotion time.
+        let active: Vec<f64> = vec![1500.0];
+        let (tx_off, partner) = compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
+        // Should NOT be 1500 (too close to the occupied slot).
+        assert_ne!(tx_off, 1500.0, "must not stack on the occupied offset");
+        // tx_off should be within [300, 2700].
+        assert!(
+            tx_off >= 300.0 && tx_off <= 2700.0,
+            "tx_off={tx_off} is outside [300, 2700]"
+        );
+        // partner_freq must be Some so the DX's replies at 1200 Hz are routed.
+        assert_eq!(
+            partner,
+            Some(1200.0),
+            "partner_freq must be Some(dx_freq) when tx_off != dx_freq"
+        );
+    }
+
+    /// A queued call with hold_mode=false (Auto) and no active QSOs promotes
+    /// Tx=Rx (partner_freq=None) — regression invariant.
+    #[test]
+    fn queued_call_auto_mode_promotes_tx_eq_rx() {
+        let p = PendingManualCall {
+            callsign: "DX3WWW".to_string(),
+            frequency_hz: 1750.0,
+            dx_parity: Some(SlotParity::Even),
+            queued_at: std::time::Instant::now(),
+            hound: false,
+            fox_freq_hz: None,
+            fox_grid: None,
+            held_hz: 0,
+            hold_mode: false,
+        };
+        let active: Vec<f64> = vec![];
+        let (tx_off, partner) = compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
+        assert_eq!(tx_off, 1750.0, "Auto + no collision → Tx=Rx");
+        assert_eq!(partner, None, "Tx=Rx → partner_freq is None");
     }
 }
 

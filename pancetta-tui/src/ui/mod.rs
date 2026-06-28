@@ -746,7 +746,7 @@ pub fn render_freq_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::FreqModa
 
 /// Render the `o`-key TX-audio-offset modal.
 ///
-/// One integer Hz field in [200, 2900]; blank Enter = Auto; Esc = cancel.
+/// One integer Hz field in [300, 2700]; blank Enter = Auto; Esc = cancel.
 /// Mirrors the `render_freq_modal` layout and sizing.
 pub fn render_offset_modal(
     f: &mut Frame<'_>,
@@ -766,7 +766,7 @@ pub fn render_offset_modal(
     };
     f.render_widget(ratatui::widgets::Clear, modal_area);
     let body = format!(
-        " TX audio offset (Hz, 200–2900): {}_\n   blank = Auto (Tx=Rx)\n\n [Enter] apply   [Esc] cancel",
+        " TX audio offset (Hz, 300–2700): {}_\n   blank = Auto (Tx=Rx)\n\n [Enter] apply   [Esc] cancel",
         m.buffer,
     );
     let block = Block::default()
