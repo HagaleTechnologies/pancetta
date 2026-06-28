@@ -431,6 +431,11 @@ pub struct ApplicationCoordinator {
     /// `→Tui`/`→Qso` sends are never touched). See `remote_gateway::relay_to_gateway`.
     gateway_enabled: Arc<AtomicBool>,
 
+    /// `true` when the coordinator is running in Fox (DXpedition operator) mode.
+    /// Default `false` (standard Hound / normal operation). Task 2 will wire the
+    /// QSO component to read this flag and switch to Fox-mode QSO sequencing.
+    fox_mode: Arc<AtomicBool>,
+
     /// `true` while the TX worker has PTT keyed. Set by the TX worker on
     /// key/unkey; read by the hamlib polling task so SWR is only sampled while
     /// transmitting (SWR is only meaningful under forward power) and by the TUI
@@ -763,6 +768,7 @@ impl ApplicationCoordinator {
             // TX audio offset when the operator pins a specific frequency.
             tx_offset_hold_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gateway_enabled: Arc::new(AtomicBool::new(gateway_enabled_init)),
+            fox_mode: Arc::new(AtomicBool::new(false)),
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
@@ -1069,6 +1075,13 @@ impl ApplicationCoordinator {
     /// defaulting to the DX's audio frequency.
     pub(crate) fn tx_offset_hold_hz(&self) -> Arc<std::sync::atomic::AtomicU64> {
         self.tx_offset_hold_hz.clone()
+    }
+
+    /// Fox-mode activation flag. `false` by default (normal Hound / station
+    /// operation). Task 2 will toggle this when the operator enables Fox mode;
+    /// the QSO component reads it to switch to Fox-mode QSO sequencing.
+    pub(crate) fn fox_mode(&self) -> Arc<AtomicBool> {
+        self.fox_mode.clone()
     }
 }
 

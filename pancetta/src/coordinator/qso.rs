@@ -1024,11 +1024,18 @@ impl super::ApplicationCoordinator {
         // Global TX policy — the auto-73 re-send respects it (RESPOND-ONLY
         // allows, DISABLED blocks), exactly like every other response path.
         let tx_policy = self.tx_policy.clone();
+        // Fox-mode flag — Task 2 will read this inside the QSO task to switch
+        // to Fox-mode QSO sequencing. Captured here so it is in scope for the
+        // spawned task; unused this task (placeholder).
+        let fox_mode = self.fox_mode();
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
                 use pancetta_qso::{HoundRegions, LoggerConfig, QsoManager, QsoManagerConfig};
+
+                // Task 2 will read fox_mode to switch to Fox-mode QSO sequencing.
+                let _ = &fox_mode;
 
                 let qso_config = QsoManagerConfig {
                     our_callsign: our_callsign.clone(),
