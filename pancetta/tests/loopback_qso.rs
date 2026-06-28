@@ -210,6 +210,7 @@ async fn test_loopback_state_machine_driven_qso() {
             enabled: false,
             ..DuplicateCheckConfig::default()
         },
+        ..Default::default()
     };
     let config_b = QsoManagerConfig {
         our_callsign: "K2DEF".to_string(),
@@ -218,6 +219,7 @@ async fn test_loopback_state_machine_driven_qso() {
         contest_mode: None,
         auto_sequence: config_a.auto_sequence.clone(),
         duplicate_checking: config_a.duplicate_checking.clone(),
+        ..Default::default()
     };
 
     let manager_a = QsoManager::new(config_a);

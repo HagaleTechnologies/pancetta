@@ -112,13 +112,15 @@ run "research guard-ci" ./scripts/research-env.sh --guard-ci
 
 # --- Compile / drift lane (always; cheap with `check`) ----------------------
 #
-# `cargo check --workspace --examples` type-checks every crate's lib/bins AND
-# all example targets — including the CI-excluded pancetta-research examples —
-# so a decoder-API change that breaks an example call-site is caught here. We
-# `check` (not `build`): no codegen/linking of the dozens of example binaries
-# (that link step was the old ~40-min sink). CI does the full `build --examples`
-# + cross-platform on the PR/push.
-run "compile + examples (check)" cargo check --workspace --examples
+# `cargo check --workspace --all-targets` type-checks every crate's lib/bins AND
+# all example AND **test** targets — including the CI-excluded pancetta-research
+# examples — so a struct/API change that breaks an example OR an integration-test
+# call-site is caught here. (Was `--examples`, which compiled examples but NOT the
+# `tests/` dirs — a `QsoManagerConfig` field added 2026-06-28 broke an integration
+# test that the examples-only check missed and only CI caught; `--all-targets`
+# closes that gap.) We `check` (not `build`/`test`): no codegen/linking of the
+# dozens of example/test binaries and no test RUN (that's the FULL lane / CI).
+run "compile all-targets (check)" cargo check --workspace --all-targets
 
 # --- Test lane (FULL only; CI runs this on every PR + main push) ------------
 #
