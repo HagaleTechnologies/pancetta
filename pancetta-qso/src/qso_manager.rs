@@ -1927,11 +1927,7 @@ impl QsoManager {
                 && was_responding_to_cq
                 && advanced_to_sending_report
             {
-                let fox_call = progress
-                    .metadata
-                    .their_callsign
-                    .as_deref()
-                    .unwrap_or("");
+                let fox_call = progress.metadata.their_callsign.as_deref().unwrap_or("");
                 let (resp_min, resp_max) = (
                     self.config.hound.response_min_hz,
                     self.config.hound.response_max_hz,
@@ -2645,7 +2641,12 @@ impl QsoManager {
             }
 
             // Check if message is relevant to this QSO
-            if self.is_message_relevant(&progress.state, &progress.metadata, message_type, frequency) {
+            if self.is_message_relevant(
+                &progress.state,
+                &progress.metadata,
+                message_type,
+                frequency,
+            ) {
                 matching_qsos.push(qso_id);
             }
         }

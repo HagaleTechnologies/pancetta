@@ -419,9 +419,7 @@ impl AdifProcessor {
         // Appending rather than overwriting preserves any operator notes.
         let comment = if metadata.hound {
             match &metadata.notes {
-                Some(existing) if !existing.is_empty() => {
-                    Some(format!("{} HOUND", existing))
-                }
+                Some(existing) if !existing.is_empty() => Some(format!("{} HOUND", existing)),
                 _ => Some("HOUND".to_string()),
             }
         } else {
@@ -1136,9 +1134,7 @@ ADIF Export for Test Program
 
     /// Build a minimal QsoMetadata for ADIF rendering tests.
     fn hound_adif_metadata(hound: bool, notes: Option<&str>) -> crate::states::QsoMetadata {
-        use crate::states::{
-            CallInitiation, GridSquares, QsoRole, SignalReports,
-        };
+        use crate::states::{CallInitiation, GridSquares, QsoRole, SignalReports};
         use chrono::Utc;
         use uuid::Uuid;
 
