@@ -343,6 +343,10 @@ pub struct ActiveQsoSnapshotItem {
     /// busy working someone else, calling CQ, or coming back to us. `None`
     /// when we've heard nothing recent from them.
     pub dx_last_activity: Option<String>,
+    /// `true` when this QSO is using the FT8 DXpedition Hound procedure:
+    /// call low (300–900 Hz), QSY up (>1000 Hz) on the Fox's report,
+    /// complete on RR73. Additive — `false` for all normal QSOs.
+    pub hound: bool,
 }
 
 /// One entry in the cross-parity manual-call queue (#40), included in

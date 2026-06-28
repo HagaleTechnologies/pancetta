@@ -855,6 +855,87 @@ impl super::ApplicationCoordinator {
                                 warn!("Failed to forward CallStation command: {}", e);
                             }
                         }
+                        pancetta_tui::tui_runner::TuiCommand::EngageHound {
+                            callsign,
+                            fox_freq,
+                            dx_parity,
+                            fox_grid,
+                        } => {
+                            // EngageHound initiates a Hound QSO with the Fox.
+                            // Gated by the TX policy exactly like CallStation —
+                            // Hound engagement is an initiation (the Hound calls
+                            // the Fox first), so RespondOnly/Disabled both refuse.
+                            let policy = pancetta_core::TxPolicy::from_u8(
+                                cmd_tx_policy.load(Ordering::Acquire),
+                            );
+                            // Refuse to call our own station in Hound mode.
+                            if pancetta_qso::exchange::callsigns_match(&callsign, &cmd_our_callsign)
+                            {
+                                warn!(
+                                    target: "qso.security",
+                                    "Refusing EngageHound on our own callsign {}", callsign
+                                );
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "TX".to_string(),
+                                        status: format!(
+                                            "Refusing Hound on our own station ({})",
+                                            callsign
+                                        ),
+                                    },
+                                );
+                                continue;
+                            }
+                            if !policy.allows_initiation() {
+                                warn!(
+                                    target: "tx.policy",
+                                    "Refusing EngageHound {} ({} Hz): TX policy is {} \
+                                     (initiation disallowed)",
+                                    callsign, fox_freq, policy.label()
+                                );
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "TX".to_string(),
+                                        status: format!(
+                                            "Can't engage Hound on {} — TX policy is {} \
+                                             (press g for Full)",
+                                            callsign,
+                                            policy.label()
+                                        ),
+                                    },
+                                );
+                                continue;
+                            }
+                            info!(
+                                "TUI EngageHound: Fox={} at {} Hz parity={:?} grid={:?}",
+                                callsign, fox_freq, dx_parity, fox_grid
+                            );
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                    component: "TX".to_string(),
+                                    status: format!(
+                                        "Hound: calling {} low @ {} Hz",
+                                        callsign, fox_freq
+                                    ),
+                                },
+                            );
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Qso,
+                                MessageType::QsoMessage(
+                                    crate::message_bus::QsoMessage::EngageHound {
+                                        callsign,
+                                        fox_freq,
+                                        dx_parity,
+                                        fox_grid,
+                                    },
+                                ),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to forward EngageHound command: {}", e);
+                            }
+                        }
                         pancetta_tui::tui_runner::TuiCommand::RespondToCaller {
                             callsign,
                             frequency,
@@ -1674,6 +1755,7 @@ fn map_qso_snapshot_item(
         max_calls: q.max_calls,
         watchdog_deadline: q.watchdog_deadline,
         dx_last_activity: q.dx_last_activity.clone(),
+        hound: q.hound,
     }
 }
 
@@ -1767,6 +1849,7 @@ mod tui_relay_tests {
             max_calls: 10,
             watchdog_deadline: Some(started + chrono::Duration::minutes(5)),
             dx_last_activity: None,
+            hound: false,
         };
         let banner = map_qso_snapshot_item(&item);
         assert_eq!(banner.qso_id, "11111111-1111-1111-1111-111111111111");
@@ -1824,6 +1907,7 @@ mod tui_relay_tests {
             max_calls: 0,
             watchdog_deadline: None,
             dx_last_activity: None,
+            hound: false,
         };
         let banner = map_qso_snapshot_item(&item);
         assert!(banner.last_tx_text.is_none());

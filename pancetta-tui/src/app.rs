@@ -157,6 +157,10 @@ pub struct ActiveQsoBanner {
     /// #41: short summary of what the DX is doing on the band (their latest
     /// decoded frame): "CQ", "→ W1XYZ R-12", "→ us -09". `None` when silent.
     pub dx_last_activity: Option<String>,
+    /// `true` when this QSO is using the FT8 DXpedition Hound procedure.
+    /// Drives a "HOUND" badge in the QSO-status panel. `false` for all
+    /// non-Hound QSOs (additive, no change to existing rendering).
+    pub hound: bool,
 }
 
 /// One entry in the cross-parity manual-call queue, pushed to the TUI as
@@ -243,6 +247,9 @@ pub struct QsoStatus {
     /// #41: short summary of what the DX is doing on the band (their latest
     /// decoded frame): "CQ", "→ W1XYZ R-12", "→ us -09". `None` when silent.
     pub dx_last_activity: Option<String>,
+    /// `true` when this QSO is using the FT8 DXpedition Hound procedure.
+    /// Drives the "HOUND" badge in the QSO-status detail panel.
+    pub hound: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1521,6 +1528,7 @@ impl App {
                 max_calls: q.max_calls,
                 watchdog_deadline: q.watchdog_deadline,
                 dx_last_activity: q.dx_last_activity.clone(),
+                hound: q.hound,
             })
             .collect();
         self.active_qsos = qsos;
@@ -2862,6 +2870,7 @@ mod tests {
             max_calls: 0,
             watchdog_deadline: None,
             dx_last_activity: None,
+            hound: false,
         }
     }
 

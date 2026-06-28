@@ -1,7 +1,7 @@
 use anyhow::Result;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Gauge, Paragraph},
     Frame,
@@ -138,6 +138,16 @@ fn render_multi_qso_table(f: &mut Frame<'_>, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        // Hound-mode badge in the table row.
+        if qso.hound {
+            row.push(Span::styled(
+                " [HOUND]",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         lines.push(Line::from(row));
     }
 
@@ -203,22 +213,44 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
         .report_received
         .map_or("---".to_string(), |r| format!("{:+}", r));
 
+    // Hound-mode badge: shown only for Hound QSOs, styled distinctively so
+    // the operator instantly knows the DXpedition procedure is active.
+    let hound_badge: Option<Span<'_>> = if qso.hound {
+        Some(Span::styled(
+            " [HOUND]",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        None
+    };
+
+    let mut status_line = vec![
+        Span::styled(
+            "Status: ",
+            Style::default().fg(app.theme.foreground_color()),
+        ),
+        Span::styled(status_text, status_style),
+    ];
+    if let Some(badge) = hound_badge {
+        status_line.push(badge);
+    }
+    status_line.push(Span::raw("  "));
+    status_line.push(Span::styled(
+        "Call: ",
+        Style::default().fg(app.theme.foreground_color()),
+    ));
+    status_line.push(Span::styled(
+        call_text,
+        Style::default()
+            .fg(app.theme.accent_color())
+            .add_modifier(Modifier::BOLD),
+    ));
+
     let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "Status: ",
-                Style::default().fg(app.theme.foreground_color()),
-            ),
-            Span::styled(status_text, status_style),
-            Span::raw("  "),
-            Span::styled("Call: ", Style::default().fg(app.theme.foreground_color())),
-            Span::styled(
-                call_text,
-                Style::default()
-                    .fg(app.theme.accent_color())
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
+        Line::from(status_line),
         Line::from(vec![
             Span::styled("Freq: ", Style::default().fg(app.theme.foreground_color())),
             Span::styled(freq_text, Style::default().fg(app.theme.warning_color())),

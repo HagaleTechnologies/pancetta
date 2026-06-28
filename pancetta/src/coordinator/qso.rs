@@ -2783,6 +2783,7 @@ fn snapshot_item_from_progress(
         // Enriched by build_active_qso_snapshot from the band-wide DX-activity
         // map (#41); this pure per-progress builder has no band context.
         dx_last_activity: None,
+        hound: progress.metadata.hound,
     })
 }
 
