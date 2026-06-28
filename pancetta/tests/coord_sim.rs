@@ -1472,3 +1472,291 @@ async fn hound_engage_keys_low_then_qsys_high_on_report() {
     // All PTT transitions must be cleanly released.
     sim.timeline.assert_all_released();
 }
+
+// ===========================================================================
+// TX-offset control (Task 5) — held-offset honored, multi-TX de-confliction,
+// Tx=Rx regression. These prove that `compute_manual_tx_offset` (the pure
+// coordinator-side selection logic) produces the right TX audio offset and that
+// the chosen offset reaches the mock rig PTT wire.
+//
+// `compute_manual_tx_offset` is re-exported from `pancetta_lib::coordinator`
+// (the same path `coalesce_transmit_requests` / `tx_qso_is_live` use) so the
+// tests call the real function without duplicating the logic inline.
+// ===========================================================================
+
+/// **Held offset honored (single):** operator is in Hold mode with held=1500 Hz,
+/// DX decoded at 700 Hz. `compute_manual_tx_offset` must choose tx_off=1500 and
+/// partner_freq=Some(700) (we TX at the held spot; DX's replies are at 700).
+///
+/// The test:
+/// 1. Calls `compute_manual_tx_offset` directly and asserts the selection.
+/// 2. Opens the QSO with `respond_to_cq_with(dx=700, tx_off=1500, partner=Some(700))`.
+/// 3. Drives a slot → asserts PTT keyed at 1500 Hz, NOT 700.
+/// 4. Injects the DX reply at 700 Hz → asserts the QSO advances (relevance gate
+///    routes via `partner_freq`).
+#[tokio::test]
+async fn held_offset_honored_keys_at_held_not_dx_freq() {
+    use pancetta_lib::coordinator::compute_manual_tx_offset;
+
+    // --- Step 1: selection-level proof ---
+    let dx_freq = 700.0_f64;
+    let held_hz: u64 = 1500;
+    let (tx_off, partner) = compute_manual_tx_offset(dx_freq, true, held_hz, &[]);
+    assert!(
+        (tx_off - 1500.0).abs() < 1.0,
+        "hold mode + held=1500 + no collision must yield tx_off=1500, got {tx_off}"
+    );
+    assert_eq!(
+        partner,
+        Some(700.0),
+        "when tx_off ≠ dx_freq the partner_freq must be Some(dx_freq), got {partner:?}"
+    );
+
+    // --- Step 2: open the QSO with the computed offset + partner ---
+    let mut sim = CoordSim::new("K5ARH").await;
+    let qso_id = sim
+        .manager
+        .respond_to_cq_with(
+            "VK4DX".to_string(),
+            tx_off,       // our TX offset (1500 Hz)
+            Some(SlotParity::Even),
+            CallInitiation::Manual,
+            partner,      // DX's decode freq (700 Hz)
+        )
+        .await
+        .expect("respond_to_cq_with with held offset");
+
+    // --- Step 3: drive a slot → PTT must key at 1500 Hz, NOT at 700 Hz ---
+    let pending = sim.pump_qso_events();
+    assert!(!pending.is_empty(), "QSO open must emit at least one TransmitRequest");
+
+    // The forwarded request must carry the held offset, not the DX's freq.
+    assert!(
+        pending.iter().any(|p| (p.frequency_offset - 1500.0).abs() < 1.0),
+        "forwarded TransmitRequest must carry the held offset 1500 Hz, got {:?}",
+        pending.iter().map(|p| p.frequency_offset).collect::<Vec<_>>()
+    );
+    assert!(
+        !pending.iter().any(|p| (p.frequency_offset - 700.0).abs() < 1.0),
+        "no TransmitRequest must carry the DX freq 700 Hz (we TX at the held spot)"
+    );
+
+    sim.drive_slot(pending).await;
+
+    let qso_id_str = qso_id.to_string();
+    sim.timeline.assert_keyed_for_qso(&qso_id_str);
+    sim.timeline.assert_keyed_at_offset(&qso_id_str, 1500.0);
+
+    // Confirm we never accidentally keyed at the DX's decoded frequency.
+    let keyed = sim.timeline.keyed_for_qso(&qso_id_str);
+    assert!(
+        keyed.iter().all(|k| (k.freq_hz - 700.0).abs() > 1.0),
+        "PTT must NEVER key at the DX decoded freq 700 Hz (we are holding 1500 Hz).\n{}",
+        sim.timeline
+    );
+
+    // --- Step 4: DX replies at 700 Hz → relevance gate via partner_freq routes it ---
+    // The QSO is currently in RespondingToCq (we sent our grid); DX sends us a
+    // report at 700 Hz (the DX's own audio position). The relevance gate uses
+    // partner_freq=700 to match it to our QSO even though our TX is at 1500.
+    sim.inject_decode("K5ARH VK4DX -15", 700.0).await;
+    let pending = sim.pump_qso_events();
+    assert!(
+        !pending.is_empty(),
+        "DX report injected at 700 Hz (partner_freq) must advance QSO and emit a reply.\n{}",
+        sim.timeline
+    );
+
+    // The follow-on reply must still be at our held offset (1500 Hz), not 700.
+    assert!(
+        pending.iter().any(|p| (p.frequency_offset - 1500.0).abs() < 1.0),
+        "follow-on TransmitRequest after DX reply must still carry 1500 Hz, got {:?}",
+        pending.iter().map(|p| p.frequency_offset).collect::<Vec<_>>()
+    );
+
+    sim.timeline.assert_all_released();
+}
+
+/// **Multi-TX de-confliction:** opening a second QSO whose DX offset (1540 Hz)
+/// lands within `MIN_TX_SEPARATION_HZ` (75 Hz) of an already-active QSO's TX
+/// offset (1500 Hz) must produce a de-conflicted TX offset ≥ 75 Hz away, so
+/// the two streams do NOT collide in the audio passband.
+///
+/// The test:
+/// 1. Opens QSO A on 1500 Hz (Auto, no held), drives its opening slot → A keys
+///    at 1500 Hz.
+/// 2. Calls `compute_manual_tx_offset` with `active_tx_offsets()` = [1500] and
+///    candidate DX = 1540 Hz (within 75 Hz of A) → confirms de-confliction.
+/// 3. Opens QSO B at the de-conflicted offset (≥75 Hz from 1500).
+/// 4. Drives B's opening slot → B keys at the de-conflicted offset.
+/// 5. Asserts both QSOs keyed on distinct offsets ≥75 Hz apart (inspecting the
+///    full timeline across both slots).
+#[tokio::test]
+async fn multi_tx_deconfliction_offsets_are_distinct() {
+    use pancetta_lib::coordinator::compute_manual_tx_offset;
+    use pancetta_qso::MIN_TX_SEPARATION_HZ;
+
+    let mut sim = CoordSim::new("K5ARH").await;
+
+    // --- Slot 0: open QSO A at 1500 Hz, drive its opening ---
+    let a = sim
+        .manager
+        .respond_to_cq_with(
+            "EA8DX".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Auto,
+            None,
+        )
+        .await
+        .expect("qso A");
+    let pending_a = sim.pump_qso_events();
+    assert!(!pending_a.is_empty(), "QSO A must forward at least one TransmitRequest");
+    sim.drive_slot(pending_a).await;
+    sim.timeline.assert_keyed_for_qso(&a.to_string());
+    sim.timeline.assert_keyed_at_offset(&a.to_string(), 1500.0);
+
+    // --- Compute de-conflicted offset for QSO B ---
+    // QSO B's DX is at 1540 Hz (38 Hz from A — well within MIN_TX_SEPARATION_HZ).
+    // active_tx_offsets must include A's 1500 Hz so the de-confliction fires.
+    let active = sim.manager.active_tx_offsets().await;
+    assert!(
+        active.iter().any(|&o| (o - 1500.0).abs() < 1.0),
+        "active_tx_offsets must include QSO A's 1500 Hz offset, got {active:?}"
+    );
+
+    let dx_b = 1540.0_f64;
+    let (tx_off_b, _partner_b) = compute_manual_tx_offset(dx_b, false, 0, &active);
+
+    // The de-conflicted result must be ≥75 Hz from 1500 Hz.
+    let sep = (tx_off_b - 1500.0_f64).abs();
+    assert!(
+        sep >= MIN_TX_SEPARATION_HZ,
+        "de-conflicted offset {tx_off_b} Hz must be ≥{MIN_TX_SEPARATION_HZ} Hz from A's 1500 Hz (sep={sep:.1} Hz)"
+    );
+
+    // --- Slot 1: open QSO B at the de-conflicted offset, drive its opening ---
+    let b = sim
+        .manager
+        .respond_to_cq_with(
+            "UA9XYZ".to_string(),
+            tx_off_b,
+            Some(SlotParity::Even),
+            CallInitiation::Auto,
+            None,
+        )
+        .await
+        .expect("qso B");
+
+    let pending_b = sim.pump_qso_events();
+    assert!(!pending_b.is_empty(), "QSO B must forward at least one TransmitRequest");
+    let slot_b = sim.drive_slot(pending_b).await;
+
+    // B must have keyed PTT at the de-conflicted offset.
+    sim.timeline.assert_keyed_for_qso(&b.to_string());
+    sim.timeline.assert_keyed_at_offset(&b.to_string(), tx_off_b);
+
+    // The de-conflicted offset must also appear in slot_b (B's opening slot).
+    let b_offsets = sim.timeline.offsets_in_slot(slot_b);
+    assert!(
+        b_offsets.iter().any(|&o| (o - tx_off_b).abs() < 1.0),
+        "B's opening slot must show the de-conflicted offset {tx_off_b:.0} Hz, got {b_offsets:?}.\n{}",
+        sim.timeline
+    );
+
+    // Over the full timeline: A keyed at 1500, B at a distinct de-conflicted offset ≥75 Hz away.
+    let a_keyed = sim.timeline.keyed_for_qso(&a.to_string());
+    let b_keyed = sim.timeline.keyed_for_qso(&b.to_string());
+    let a_off = a_keyed.iter().filter(|k| k.ptt_keyed).map(|k| k.freq_hz).next()
+        .expect("QSO A must have keyed PTT at least once");
+    let b_off = b_keyed.iter().filter(|k| k.ptt_keyed).map(|k| k.freq_hz).next()
+        .expect("QSO B must have keyed PTT at least once");
+
+    assert!(
+        (a_off - 1500.0).abs() < 1.0,
+        "QSO A must key at 1500 Hz, got {a_off} Hz.\n{}",
+        sim.timeline
+    );
+    let actual_sep = (b_off - a_off).abs();
+    assert!(
+        actual_sep >= MIN_TX_SEPARATION_HZ,
+        "QSO A keyed at {a_off:.0} Hz and QSO B at {b_off:.0} Hz — separation {actual_sep:.1} Hz \
+         must be ≥{MIN_TX_SEPARATION_HZ} Hz.\n{}",
+        sim.timeline
+    );
+
+    // Both PTT transitions must be cleanly released.
+    sim.timeline.assert_all_released();
+}
+
+/// **Regression — Auto, single, no collision → Tx=Rx, partner_freq=None:**
+/// with `TxFreqMode::Auto` (hold_mode=false) and no already-active QSOs,
+/// `compute_manual_tx_offset` must return the DX's own freq with `partner_freq=None`
+/// — the byte-identical "Tx=Rx" behavior from before this feature was added.
+/// Opening the QSO must key at the DX's freq (no silent shift), and the DX's
+/// reply at that same freq must route without needing `partner_freq`.
+#[tokio::test]
+async fn auto_single_no_collision_is_tx_eq_rx() {
+    use pancetta_lib::coordinator::compute_manual_tx_offset;
+
+    // --- Selection-level regression: Auto, no held, no collision → Tx=Rx ---
+    let dx_freq = 1500.0_f64;
+    let (tx_off, partner) = compute_manual_tx_offset(dx_freq, false, 0, &[]);
+    assert!(
+        (tx_off - dx_freq).abs() < 1.0,
+        "Auto + no-held + no-collision must yield tx_off == dx_freq, got {tx_off}"
+    );
+    assert_eq!(
+        partner,
+        None,
+        "Auto + no-held + no-collision must yield partner_freq=None (Tx=Rx), got {partner:?}"
+    );
+
+    // --- Rig-level regression: open with the computed values, must key at dx_freq ---
+    let mut sim = CoordSim::new("K5ARH").await;
+    let qso_id = sim
+        .manager
+        .respond_to_cq_with(
+            "JH1XYZ".to_string(),
+            tx_off,    // == dx_freq == 1500.0
+            Some(SlotParity::Odd),
+            CallInitiation::Auto,
+            partner,   // None — Tx=Rx, no partner_freq split
+        )
+        .await
+        .expect("respond_to_cq_with Tx=Rx");
+
+    let pending = sim.pump_qso_events();
+    assert!(!pending.is_empty(), "Tx=Rx QSO open must emit a TransmitRequest");
+
+    // Forwarded request must carry 1500 Hz.
+    assert!(
+        pending.iter().any(|p| (p.frequency_offset - 1500.0).abs() < 1.0),
+        "forwarded request must carry 1500 Hz (Tx=Rx), got {:?}",
+        pending.iter().map(|p| p.frequency_offset).collect::<Vec<_>>()
+    );
+
+    sim.drive_slot(pending).await;
+
+    let qso_id_str = qso_id.to_string();
+    sim.timeline.assert_keyed_for_qso(&qso_id_str);
+    sim.timeline.assert_keyed_at_offset(&qso_id_str, 1500.0);
+
+    // DX replies at 1500 Hz (same freq, no partner split needed) → QSO advances.
+    sim.inject_decode("K5ARH JH1XYZ -09", 1500.0).await;
+    let pending = sim.pump_qso_events();
+    assert!(
+        !pending.is_empty(),
+        "DX reply at 1500 Hz must advance Tx=Rx QSO (no partner_freq needed).\n{}",
+        sim.timeline
+    );
+
+    // Follow-on reply must still be at 1500 Hz (TX offset unchanged).
+    assert!(
+        pending.iter().any(|p| (p.frequency_offset - 1500.0).abs() < 1.0),
+        "follow-on reply must be at 1500 Hz (Tx=Rx regression), got {:?}",
+        pending.iter().map(|p| p.frequency_offset).collect::<Vec<_>>()
+    );
+
+    sim.timeline.assert_all_released();
+}
