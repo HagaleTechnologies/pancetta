@@ -58,6 +58,7 @@ use tracing::{debug, info};
 pub mod audio;
 pub mod autonomous;
 pub mod hot_reload;
+pub mod hound;
 pub mod loader;
 pub mod network;
 pub mod rig;
@@ -66,6 +67,7 @@ pub mod ui;
 
 pub use audio::*;
 pub use autonomous::*;
+pub use hound::*;
 pub use loader::*;
 pub use network::*;
 pub use rig::*;
@@ -137,6 +139,10 @@ pub struct Config {
     #[serde(default)]
     pub autonomous: AutonomousConfig,
 
+    /// Hound (DXpedition chaser) audio-region configuration
+    #[serde(default)]
+    pub hound: hound::HoundConfig,
+
     /// Metadata about the configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ConfigMetadata>,
@@ -167,6 +173,7 @@ impl Default for Config {
             ui: UiConfig::default(),
             network: NetworkConfig::default(),
             autonomous: AutonomousConfig::default(),
+            hound: hound::HoundConfig::default(),
             metadata: Some(ConfigMetadata {
                 version: "1.0".to_string(),
                 last_modified: Some(chrono::Utc::now()),
@@ -214,6 +221,7 @@ impl Config {
         self.ui.validate_section()?;
         self.network.validate_section()?;
         self.autonomous.validate_section()?;
+        self.hound.validate_section()?;
 
         info!("Configuration validation successful");
         Ok(())
@@ -229,6 +237,7 @@ impl Config {
         self.ui.merge_with(other.ui);
         self.network.merge_with(other.network);
         self.autonomous.merge_with(other.autonomous);
+        self.hound.merge_with(other.hound);
 
         // Update metadata
         if let Some(ref mut metadata) = self.metadata {
