@@ -32,8 +32,9 @@ const STUCK_TX_HOP_HZ: f64 = 300.0;
 
 /// Usable FT8 audio passband for our TX offset (Hz). Matches the collision
 /// detector's clamp range in `autonomous.rs`.
-const TX_OFFSET_MIN_HZ: f64 = 300.0;
-const TX_OFFSET_MAX_HZ: f64 = 2700.0;
+pub const TX_OFFSET_MIN_HZ: f64 = 300.0;
+/// Upper bound of the usable FT8 audio passband for our TX offset (Hz).
+pub const TX_OFFSET_MAX_HZ: f64 = 2700.0;
 
 /// Hound calling region (low): Hounds call the Fox in 300–900 Hz.
 const HOUND_CALL_MIN_HZ: f64 = 300.0;
@@ -111,6 +112,11 @@ pub(crate) fn hound_offset_for(seed: &str, lo: f64, hi: f64) -> f64 {
     ((raw / 5.0).round() * 5.0).clamp(lo, hi)
 }
 
+/// Minimum TX audio separation (Hz) between concurrent QSOs to avoid
+/// self-interference. At ≥75 Hz two FT8 signals (each ~50 Hz wide) do not
+/// overlap; this matches criterion #7 in `SmartFrequencyAllocator`.
+pub const MIN_TX_SEPARATION_HZ: f64 = 75.0;
+
 /// Nudge a candidate TX audio offset away from already-occupied offsets so
 /// concurrent QSOs don't stack. Returns `candidate` unchanged if it is within
 /// `[lo, hi]` AND at least `min_sep` Hz from every offset in `occupied`.
@@ -118,7 +124,7 @@ pub(crate) fn hound_offset_for(seed: &str, lo: f64, hi: f64) -> f64 {
 /// in-range offset that is `>= min_sep` from all `occupied`; if none exists in
 /// range, returns `candidate.clamp(lo, hi)`. Deterministic (no RNG) — for tests
 /// and reproducibility.
-pub(crate) fn deconflict_offset(
+pub fn deconflict_offset(
     candidate: f64,
     occupied: &[f64],
     min_sep: f64,
@@ -907,8 +913,14 @@ impl QsoManager {
         frequency: f64,
         dx_parity: Option<pancetta_core::slot::SlotParity>,
     ) -> Result<QsoId, QsoManagerError> {
-        self.respond_to_cq_with(target_callsign, frequency, dx_parity, CallInitiation::Auto)
-            .await
+        self.respond_to_cq_with(
+            target_callsign,
+            frequency,
+            dx_parity,
+            CallInitiation::Auto,
+            None, // auto path always Tx=Rx; partner_freq not needed
+        )
+        .await
     }
 
     /// Respond to a CQ call as an operator-initiated **manual** call.
@@ -928,6 +940,7 @@ impl QsoManager {
             frequency,
             dx_parity,
             CallInitiation::Manual,
+            None, // partner_freq computed by coordinator (T3); None = Tx=Rx fallback
         )
         .await
     }
@@ -984,23 +997,23 @@ impl QsoManager {
         // bypasses the self-duplicate gate (operator explicitly chose this Fox),
         // sets role=Caller, initiated_by=Manual, emits the opening CqResponse
         // (`<Fox> <us> <our_grid>`), and latches tx_parity=dx_parity.opposite().
+        // Pass `partner_freq = Some(fox_freq)` directly so the relevance gate is
+        // set atomically at construction (no post-insertion mutation needed).
         let qso_id = self
             .respond_to_cq_with(
                 fox_call.to_string(),
                 low_offset,
                 dx_parity,
                 CallInitiation::Manual,
+                Some(fox_freq), // Fox's RX offset; routes the Fox's reply via partner_freq
             )
             .await?;
 
-        // Stamp the Hound-specific fields on the freshly-inserted QSO.
-        // respond_to_cq_with initialised both to their defaults (false/None);
-        // we mutate them here so the relevance gate and QSY hook can see them.
+        // Stamp the hound=true flag (partner_freq is now set via the ctor param).
         {
             let mut qsos = self.qsos.write().await;
             if let Some(progress) = qsos.get_mut(&qso_id) {
                 progress.metadata.hound = true;
-                progress.metadata.partner_freq = Some(fox_freq);
                 // NOTE: do NOT insert "HOUND" into metadata.tags — that would
                 // produce a bare `<HOUND:4>true` ADIF field, which is not a
                 // valid ADIF name (must be `APP_`-prefixed per the ADIF spec)
@@ -1023,12 +1036,19 @@ impl QsoManager {
     /// [`CallInitiation::Auto`] preserves the historical behavior
     /// (duplicate gate enforced, no keep-calling). [`CallInitiation::Manual`]
     /// bypasses the duplicate gate and enables manual keep-calling.
+    ///
+    /// `partner_freq` — when `Some(f)`, the DX's RX audio offset differs from
+    /// our TX offset (`frequency`). `metadata.partner_freq` is set to `f` so the
+    /// relevance gate routes the DX's replies (which arrive at *their* audio
+    /// offset) to this QSO. Pass `None` for the normal Tx=Rx case (no partner
+    /// routing needed). This is the same mechanism `engage_hound` uses.
     pub async fn respond_to_cq_with(
         &self,
         target_callsign: String,
         frequency: f64,
         dx_parity: Option<pancetta_core::slot::SlotParity>,
         initiated_by: CallInitiation,
+        partner_freq: Option<f64>,
     ) -> Result<QsoId, QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
@@ -1128,7 +1148,11 @@ impl QsoManager {
             last_rx_text: None,
             dx_repeat_count: 0,
             hound: false,
-            partner_freq: None,
+            // When our TX offset != the DX's RX offset (Hold mode / de-conflict),
+            // the caller supplies `partner_freq = Some(dx_freq)` so the relevance
+            // gate routes the DX's reply (which arrives at their own audio offset)
+            // to this QSO. `None` = Tx=Rx (legacy behavior, unchanged).
+            partner_freq,
             hound_qsyed: false,
         };
 
@@ -1216,6 +1240,11 @@ impl QsoManager {
     /// used to populate the `their_report` field of the `SendingReport` /
     /// `WaitingForConfirmation` state for `ReportAck`/`Rr73` opens.
     ///
+    /// `partner_freq` — when `Some(f)`, our TX offset (`frequency`) differs from
+    /// the DX's RX offset `f`. Set by the coordinator when the operator holds a
+    /// custom TX offset or when de-confliction nudges us away from the DX's freq.
+    /// `None` = Tx=Rx (legacy behavior, unchanged).
+    ///
     /// The `Grid` step is exactly equivalent to `respond_to_cq_manual`, so the
     /// DX-Hunter path (which still uses `StartQso` → `respond_to_cq_manual`) is
     /// unaffected.
@@ -1227,6 +1256,7 @@ impl QsoManager {
         step: pancetta_core::ResponseStep,
         our_snr_of_them: Option<f32>,
         their_report: Option<i8>,
+        partner_freq: Option<f64>,
     ) -> Result<QsoId, QsoManagerError> {
         use pancetta_core::ResponseStep;
 
@@ -1234,7 +1264,13 @@ impl QsoManager {
         // the existing path so there is a single source of truth for it.
         if step == ResponseStep::Grid {
             return self
-                .respond_to_cq_with(target, frequency, dx_parity, CallInitiation::Manual)
+                .respond_to_cq_with(
+                    target,
+                    frequency,
+                    dx_parity,
+                    CallInitiation::Manual,
+                    partner_freq,
+                )
                 .await;
         }
 
@@ -1403,7 +1439,11 @@ impl QsoManager {
             last_rx_text: None,
             dx_repeat_count: 0,
             hound: false,
-            partner_freq: None,
+            // When our TX offset != the DX's RX offset (Hold mode / de-conflict),
+            // the caller supplies `partner_freq = Some(dx_freq)` so the relevance
+            // gate routes the DX's reply (which arrives at their audio offset) to
+            // this QSO. `None` = Tx=Rx (legacy behavior, unchanged).
+            partner_freq,
             hound_qsyed: false,
         };
 
@@ -1521,6 +1561,18 @@ impl QsoManager {
         qsos.iter()
             .filter(|(_, progress)| progress.state.is_active())
             .map(|(id, progress)| (*id, progress.clone()))
+            .collect()
+    }
+
+    /// Return the TX audio offsets (Hz) of all currently-active (non-terminal)
+    /// QSOs. Used by the coordinator at QSO-open time to de-conflict a new QSO's
+    /// TX offset against live concurrent streams so no two QSOs transmit on the
+    /// same (or near) audio frequency.
+    pub async fn active_tx_offsets(&self) -> Vec<f64> {
+        let qsos = self.qsos.read().await;
+        qsos.values()
+            .filter(|p| p.state.is_active())
+            .map(|p| p.metadata.frequency)
             .collect()
     }
 
@@ -4181,6 +4233,7 @@ mod tests {
                 ResponseStep::Rr73,
                 Some(-10.0),
                 Some(-12),
+                None, // partner_freq
             )
             .await
             .unwrap();
@@ -5829,7 +5882,7 @@ mod reply_emitter_tests {
         let manager = manager();
         let mut rx = manager.subscribe();
         let qso_id = manager
-            .respond_to_caller(DX.into(), FREQ, None, ResponseStep::Grid, Some(-12.0), None)
+            .respond_to_caller(DX.into(), FREQ, None, ResponseStep::Grid, Some(-12.0), None, None)
             .await
             .unwrap();
         let sends = messages_to_send(&drain(&mut rx));
@@ -5865,6 +5918,7 @@ mod reply_emitter_tests {
                 ResponseStep::Report,
                 Some(-9.0),
                 None,
+                None, // partner_freq
             )
             .await
             .unwrap();
@@ -5910,6 +5964,7 @@ mod reply_emitter_tests {
                 ResponseStep::ReportAck,
                 Some(-10.0),
                 Some(-3),
+                None, // partner_freq
             )
             .await
             .unwrap();
@@ -5950,6 +6005,7 @@ mod reply_emitter_tests {
                 ResponseStep::Rr73,
                 Some(-5.0),
                 Some(-7),
+                None, // partner_freq
             )
             .await
             .unwrap();
@@ -5981,6 +6037,7 @@ mod reply_emitter_tests {
                 ResponseStep::SeventyThree,
                 Some(-8.0),
                 Some(-4),
+                None, // partner_freq
             )
             .await
             .unwrap();
@@ -6022,6 +6079,7 @@ mod reply_emitter_tests {
                 ResponseStep::SeventyThree,
                 Some(-8.0),
                 Some(-4),
+                None, // partner_freq
             )
             .await
             .unwrap();
@@ -6038,6 +6096,7 @@ mod reply_emitter_tests {
                 ResponseStep::SeventyThree,
                 Some(-8.0),
                 Some(-4),
+                None, // partner_freq
             )
             .await
             .unwrap();
@@ -6061,7 +6120,7 @@ mod reply_emitter_tests {
         let manager = manager();
         let mut rx = manager.subscribe();
         manager
-            .respond_to_caller(DX.into(), FREQ, None, ResponseStep::Report, None, None)
+            .respond_to_caller(DX.into(), FREQ, None, ResponseStep::Report, None, None, None)
             .await
             .unwrap();
         let sends = messages_to_send(&drain(&mut rx));
@@ -6085,6 +6144,7 @@ mod reply_emitter_tests {
                 ResponseStep::ReportAck,
                 Some(-10.0),
                 Some(-3),
+                None, // partner_freq
             )
             .await
             .unwrap();
@@ -6272,6 +6332,131 @@ mod reply_emitter_tests {
             matches!(progress.state, QsoState::RespondingToCq { .. }),
             "spurious report must not advance state, got {:?}",
             progress.state
+        );
+    }
+
+    // --- active_tx_offsets (T3) ----------------------------------------------
+
+    /// `active_tx_offsets()` returns the `metadata.frequency` of every
+    /// currently-active (non-terminal) QSO. Used by the coordinator to
+    /// de-conflict a new QSO's TX offset against live concurrent streams.
+    #[tokio::test]
+    async fn active_tx_offsets_returns_open_qso_offsets() {
+        let manager = manager();
+        // Initially empty — no QSOs.
+        assert!(
+            manager.active_tx_offsets().await.is_empty(),
+            "no QSOs → offsets must be empty"
+        );
+
+        // Open one QSO at 1234.0 Hz.
+        manager
+            .respond_to_cq("VK3XYZ".to_string(), 1234.0, None)
+            .await
+            .expect("open first QSO");
+
+        let offsets = manager.active_tx_offsets().await;
+        assert_eq!(offsets.len(), 1, "one active QSO");
+        assert!(
+            (offsets[0] - 1234.0).abs() < 0.1,
+            "offset must match the QSO's audio frequency"
+        );
+
+        // Open a second QSO at a different offset.
+        manager
+            .respond_to_cq("ZL2ABC".to_string(), 1800.0, None)
+            .await
+            .expect("open second QSO");
+
+        let offsets2 = manager.active_tx_offsets().await;
+        assert_eq!(offsets2.len(), 2, "two active QSOs");
+        let mut sorted = offsets2.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert!((sorted[0] - 1234.0).abs() < 0.1);
+        assert!((sorted[1] - 1800.0).abs() < 0.1);
+    }
+
+    // --- respond_to_cq_with partner_freq param (T3) --------------------------
+
+    /// When `partner_freq = Some(x)` is passed, the created QSO's
+    /// `metadata.partner_freq` is `Some(x)` and `metadata.frequency` stays at
+    /// the TX offset — so the two fields are independently settable.
+    #[tokio::test]
+    async fn respond_to_cq_with_partner_freq_some_sets_both_fields() {
+        let manager = manager();
+        let tx_off = 1234.0_f64;
+        let dx_rx = 1500.0_f64;
+        let qso_id = manager
+            .respond_to_cq_with(
+                DX.into(),
+                tx_off,
+                None,
+                CallInitiation::Manual,
+                Some(dx_rx), // partner_freq = DX's RX offset
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            (progress.metadata.frequency - tx_off).abs() < 0.1,
+            "metadata.frequency must be our TX offset ({tx_off}), got {}",
+            progress.metadata.frequency
+        );
+        assert_eq!(
+            progress.metadata.partner_freq,
+            Some(dx_rx),
+            "metadata.partner_freq must be the DX's RX offset ({dx_rx})"
+        );
+    }
+
+    /// Regression: `partner_freq = None` (Tx=Rx path) leaves `metadata.partner_freq`
+    /// as `None` — behavior identical to pre-T3. The coordinator passes `None`
+    /// when Auto mode and no collision.
+    #[tokio::test]
+    async fn respond_to_cq_with_partner_freq_none_is_txrx_regression() {
+        let manager = manager();
+        let qso_id = manager
+            .respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                None,
+                CallInitiation::Manual,
+                None, // Tx=Rx regression path — partner_freq must stay None
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.partner_freq, None,
+            "partner_freq=None must be preserved on the Tx=Rx (Auto+no-collision) path"
+        );
+        assert!(
+            (progress.metadata.frequency - FREQ).abs() < 0.1,
+            "metadata.frequency must equal the passed frequency"
+        );
+    }
+
+    /// Regression: `respond_to_caller` with `partner_freq = None` (Grid step
+    /// routes through `respond_to_cq_with`) — partner_freq must stay None.
+    #[tokio::test]
+    async fn respond_to_caller_partner_freq_none_is_txrx_regression() {
+        let manager = manager();
+        let qso_id = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::Grid,
+                None,
+                None,
+                None, // Tx=Rx — partner_freq must stay None
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.partner_freq, None,
+            "Grid/Tx=Rx path: partner_freq must be None (regression)"
         );
     }
 }

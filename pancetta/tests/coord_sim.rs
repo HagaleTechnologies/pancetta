@@ -788,6 +788,7 @@ async fn ptt_keys_for_scheduled_qso() {
             1500.0,
             Some(SlotParity::Even),
             CallInitiation::Auto,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -819,6 +820,7 @@ async fn stale_tx_dropped_after_supersede_no_ptt() {
             1200.0,
             Some(SlotParity::Odd),
             CallInitiation::Auto,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -859,6 +861,7 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
             1800.0,
             Some(SlotParity::Even),
             CallInitiation::Auto,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -928,6 +931,7 @@ async fn two_simultaneous_qsos_key_on_distinct_freqs() {
             1000.0,
             Some(SlotParity::Even),
             CallInitiation::Auto,
+            None,
         )
         .await
         .expect("qso a");
@@ -938,6 +942,7 @@ async fn two_simultaneous_qsos_key_on_distinct_freqs() {
             2400.0,
             Some(SlotParity::Even),
             CallInitiation::Auto,
+            None,
         )
         .await
         .expect("qso b");
@@ -974,6 +979,7 @@ async fn tx_policy_disabled_is_silent() {
             1500.0,
             Some(SlotParity::Even),
             CallInitiation::Auto,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -1014,6 +1020,7 @@ async fn tx_policy_respond_only_keeps_qso_drops_initiation() {
             1600.0,
             Some(SlotParity::Odd),
             pancetta_core::ResponseStep::Grid,
+            None,
             None,
             None,
         )
@@ -1060,6 +1067,7 @@ async fn tx_policy_full_keys_everything() {
             1700.0,
             Some(SlotParity::Even),
             CallInitiation::Auto,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
@@ -1101,6 +1109,7 @@ async fn requested_offset_is_used() {
             chosen_offset,
             Some(SlotParity::Odd),
             CallInitiation::Auto,
+            None,
         )
         .await
         .expect("respond_to_cq_with");
