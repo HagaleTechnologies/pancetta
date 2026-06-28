@@ -921,6 +921,13 @@ impl QsoManager {
             if let Some(progress) = qsos.get_mut(&qso_id) {
                 progress.metadata.hound = true;
                 progress.metadata.partner_freq = Some(fox_freq);
+                // Tag the QSO as a Hound contact for ADIF/logbook consumers.
+                // Idempotent: HashMap insert replaces any prior "HOUND" entry.
+                progress
+                    .metadata
+                    .tags
+                    .entry("HOUND".to_string())
+                    .or_insert_with(|| "true".to_string());
             }
         }
 
@@ -7627,6 +7634,37 @@ mod hound_tests {
             progress.metadata.hound_qsyed,
             "hound_qsyed must be true after QSY in Hold mode"
         );
+    }
+
+    /// Task 6: engage_hound must stamp a "HOUND" entry in metadata.tags so the
+    /// ADIF renderer can pick it up for the COMMENT field and APP_PANCETTA_HOUND.
+    /// The tag must be present exactly once (idempotent HashMap insert).
+    #[tokio::test]
+    async fn engage_hound_stamps_hound_tag_in_metadata() {
+        let manager = QsoManager::new(hound_test_config());
+
+        let qso_id = manager
+            .engage_hound("D2UY", 1800.0, Some("JI64"), Some(SlotParity::Even))
+            .await
+            .expect("engage_hound must succeed");
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+
+        assert_eq!(
+            progress.metadata.tags.get("HOUND"),
+            Some(&"true".to_string()),
+            "metadata.tags must contain HOUND=true after engage_hound"
+        );
+
+        // Count HOUND entries — HashMap can only have one key, but verify
+        // the value count is exactly 1 to confirm no accidental duplication.
+        let hound_count = progress
+            .metadata
+            .tags
+            .iter()
+            .filter(|(k, _)| *k == "HOUND")
+            .count();
+        assert_eq!(hound_count, 1, "tags must contain exactly one 'HOUND' entry");
     }
 
     /// T5-3: Non-Hound Caller QSO is completely unaffected by the QSY hook.
