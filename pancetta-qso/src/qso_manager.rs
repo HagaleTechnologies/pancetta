@@ -1626,6 +1626,13 @@ impl QsoManager {
         // never accumulates repeats regardless.
         let dx_frame_advanced = Self::ladder_rank(&new_state) > Self::ladder_rank(&old_state);
 
+        // Hound QSY gate: computed here while both `old_state` and `new_state`
+        // are still in scope (before `old_state` is consumed by `emit_state_change`
+        // below). The QSY fires after the state-update block where we can access
+        // `progress` again.
+        let was_responding_to_cq = matches!(old_state, QsoState::RespondingToCq { .. });
+        let advanced_to_sending_report = matches!(new_state, QsoState::SendingReport { .. });
+
         // Auto-sequence the outbound reply for MANUAL-initiated QSOs only.
         // The reply is generated from the SAME (pre-transition state,
         // received message) pair that drove the transition, so the two never
@@ -1844,6 +1851,60 @@ impl QsoManager {
                     dx = progress.metadata.their_callsign.as_deref().unwrap_or("?"),
                     "DX stuck (repeated frame x{}) — hopping our TX offset {:.0} Hz -> {:.0} Hz to clear a possible collision",
                     DX_STUCK_REPEAT_THRESHOLD, old_off, new_off
+                );
+            }
+
+            // Hound QSY: when the Fox answers with a signal report
+            // (RespondingToCq → SendingReport), the Hound must move its TX
+            // offset up into the response region (1000–2700 Hz) and send the
+            // R+report (`ReportAck`) there — the defining Hound procedure move.
+            //
+            // Fires exactly once per QSO (`hound_qsyed` gate). Executes
+            // INDEPENDENT of `TxFreqMode` (procedure-mandated, not an
+            // autonomous optimisation — unlike the Auto-gated stuck-hop above).
+            //
+            // Pattern mirrors the stuck-hop: mutate BOTH `metadata.frequency`
+            // (used as `qso_frequency` on the NEXT process_message call) AND
+            // `qso_frequency` (rides the ReportAck emitted this cycle). We also
+            // update the frequency field inside the already-set `SendingReport`
+            // state so the subsequent `Completed` state (built from
+            // `SendingReport.frequency` on the Fox RR73 arm) logs our actual
+            // QSY'd TX offset rather than the old low calling offset.
+            if progress.metadata.hound
+                && !progress.metadata.hound_qsyed
+                && was_responding_to_cq
+                && advanced_to_sending_report
+            {
+                let fox_call = progress
+                    .metadata
+                    .their_callsign
+                    .as_deref()
+                    .unwrap_or("");
+                let qsy = hound_offset_for(
+                    fox_call,
+                    HOUND_RESPONSE_MIN_HZ,
+                    HOUND_RESPONSE_MAX_HZ,
+                );
+                let old_off = progress.metadata.frequency;
+                progress.metadata.frequency = qsy;
+                progress.metadata.hound_qsyed = true;
+                // Keep the ReportAck emitted this cycle on the QSY'd offset.
+                qso_frequency = qsy;
+                // Update the SendingReport state's frequency so the Completed
+                // arm inherits the correct (QSY'd) TX offset.
+                if let QsoState::SendingReport {
+                    frequency: ref mut state_freq,
+                    ..
+                } = progress.state
+                {
+                    *state_freq = qsy;
+                }
+                info!(
+                    target: "hound",
+                    qso_id = %qso_id,
+                    fox = %fox_call,
+                    "Hound: Fox answered — QSY TX {:.0} Hz -> {:.0} Hz (response region {}–{} Hz), sending R+report on new offset",
+                    old_off, qsy, HOUND_RESPONSE_MIN_HZ, HOUND_RESPONSE_MAX_HZ
                 );
             }
         }
@@ -7357,6 +7418,272 @@ mod hound_tests {
         assert!(
             progress.metadata.hound,
             "hound flag must still be set even with no parity"
+        );
+    }
+
+    // ── Hound QSY-on-report (Task 5) ────────────────────────────────────────
+
+    /// Helper: drain all pending events from the broadcast receiver.
+    fn drain_events(rx: &mut tokio::sync::broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// Collect all `MessageToSend` events from a drained list.
+    fn message_to_sends(events: &[QsoEvent]) -> Vec<(f64, MessageType)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                QsoEvent::MessageToSend {
+                    message, frequency, ..
+                } => Some((*frequency, message.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// T5-1: Full Hound exchange end-to-end.
+    ///
+    /// `engage_hound("D2UY", 1800.0, Some("JI64"), Some(Even))`
+    /// → assert opening call is low (300–900 Hz).
+    /// Feed Fox `SignalReport` directed at us, arriving at Fox's freq 1800 Hz
+    /// → assert:
+    ///   - state == `SendingReport`,
+    ///   - `metadata.hound_qsyed == true`,
+    ///   - `metadata.frequency ∈ [1000, 2700]` (QSY'd up),
+    ///   - `metadata.partner_freq` still `Some(1800.0)` (unchanged),
+    ///   - emitted `ReportAck` (`<D2UY> <us> R-NN`) rides the QSY'd offset.
+    /// Then feed Fox `FinalConfirmation` at 1800 Hz
+    /// → assert the QSO reaches `Completed`.
+    #[tokio::test]
+    async fn hound_qsy_on_fox_report_full_exchange() {
+        let manager = QsoManager::new(hound_test_config());
+        let mut rx = manager.subscribe();
+
+        // Open Hound QSO targeting D2UY who is on 1800 Hz.
+        let qso_id = manager
+            .engage_hound("D2UY", 1800.0, Some("JI64"), Some(SlotParity::Even))
+            .await
+            .expect("engage_hound must succeed");
+
+        // Check the opening call is in the LOW region.
+        let opening_events = drain_events(&mut rx);
+        let opening_sends = message_to_sends(&opening_events);
+        assert!(
+            !opening_sends.is_empty(),
+            "opening MessageToSend must be emitted"
+        );
+        let (open_freq, _) = &opening_sends[0];
+        assert!(
+            *open_freq >= HOUND_CALL_MIN_HZ && *open_freq <= HOUND_CALL_MAX_HZ,
+            "opening call freq {open_freq} must be in [{HOUND_CALL_MIN_HZ}, {HOUND_CALL_MAX_HZ}]"
+        );
+
+        // ── Fox answers with a signal report directed at us, at Fox's freq ──
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "D2UY".into(),
+                    report: -12,
+                },
+                "K5ARH D2UY -12".into(),
+                1800.0, // Fox's decoded frequency (partner_freq)
+                Some(-12.0),
+            )
+            .await
+            .expect("process_message for Fox SignalReport must succeed");
+
+        // ── Assert QSY ──
+        let after_report_events = drain_events(&mut rx);
+        let progress = manager.get_qso(qso_id).await.unwrap();
+
+        // State must have advanced to SendingReport.
+        assert!(
+            matches!(progress.state, QsoState::SendingReport { .. }),
+            "state must be SendingReport after Fox report, got {:?}",
+            progress.state
+        );
+
+        // hound_qsyed must be set (fire-once gate).
+        assert!(
+            progress.metadata.hound_qsyed,
+            "hound_qsyed must be true after the first Fox report"
+        );
+
+        // TX offset must have QSY'd into the response region.
+        let qsy_freq = progress.metadata.frequency;
+        assert!(
+            qsy_freq >= HOUND_RESPONSE_MIN_HZ && qsy_freq <= HOUND_RESPONSE_MAX_HZ,
+            "metadata.frequency {qsy_freq} must be in response region [{HOUND_RESPONSE_MIN_HZ}, {HOUND_RESPONSE_MAX_HZ}] after QSY"
+        );
+
+        // partner_freq must be unchanged (Fox's RX offset is fixed).
+        assert_eq!(
+            progress.metadata.partner_freq,
+            Some(1800.0),
+            "partner_freq must remain Some(1800.0) after QSY"
+        );
+
+        // The emitted ReportAck must ride the QSY'd offset (not the old low one).
+        let sends = message_to_sends(&after_report_events);
+        let report_acks: Vec<_> = sends
+            .iter()
+            .filter(|(_, m)| matches!(m, MessageType::ReportAck { .. }))
+            .collect();
+        assert!(
+            !report_acks.is_empty(),
+            "a ReportAck must be emitted after the Fox's SignalReport"
+        );
+        let (ack_freq, ack_msg) = &report_acks[0];
+        assert!(
+            *ack_freq >= HOUND_RESPONSE_MIN_HZ && *ack_freq <= HOUND_RESPONSE_MAX_HZ,
+            "ReportAck must be emitted on the QSY'd offset {ack_freq} in [{HOUND_RESPONSE_MIN_HZ}, {HOUND_RESPONSE_MAX_HZ}]"
+        );
+        // ReportAck must be <D2UY> <us> R-NN.
+        match ack_msg {
+            MessageType::ReportAck {
+                to_station,
+                from_station,
+                ..
+            } => {
+                assert_eq!(to_station, "D2UY", "ReportAck must be addressed to Fox");
+                assert_eq!(from_station, "K5ARH", "ReportAck must be from us");
+            }
+            other => panic!("expected ReportAck, got {:?}", other),
+        }
+
+        // ── Fox sends RR73 (at Fox's freq) → QSO completes ──
+        manager
+            .process_message(
+                MessageType::FinalConfirmation {
+                    from_station: "D2UY".into(),
+                    to_station: "K5ARH".into(),
+                },
+                "K5ARH D2UY RR73".into(),
+                1800.0, // still at Fox's decoded frequency
+                Some(-10.0),
+            )
+            .await
+            .expect("process_message for Fox RR73 must succeed");
+
+        let final_progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(final_progress.state, QsoState::Completed { .. }),
+            "QSO must reach Completed after Fox RR73, got {:?}",
+            final_progress.state
+        );
+    }
+
+    /// T5-2: QSY fires even in `TxFreqMode::Hold`.
+    ///
+    /// The Hound QSY is procedure-mandated — independent of the autonomous
+    /// stuck-hop gate (`TxFreqMode::Auto`). In the default Hold mode the
+    /// operator's TX offset is "sticky" for the stuck-hop, but the Hound QSY
+    /// MUST still move to the response region on the Fox's first report.
+    #[tokio::test]
+    async fn hound_qsy_fires_in_hold_mode() {
+        // Default manager uses Hold (the tx_freq_mode default is Hold).
+        let manager = QsoManager::new(hound_test_config());
+        // Confirm it is in Hold mode (the stuck-hop would NOT fire in this mode).
+        // We do NOT set_tx_freq_mode_source to Auto — leave it as Hold.
+
+        let qso_id = manager
+            .engage_hound("D2UY", 1800.0, Some("JI64"), Some(SlotParity::Even))
+            .await
+            .expect("engage_hound must succeed");
+
+        let before_freq = manager.get_qso(qso_id).await.unwrap().metadata.frequency;
+        assert!(
+            before_freq >= HOUND_CALL_MIN_HZ && before_freq <= HOUND_CALL_MAX_HZ,
+            "before QSY, offset {before_freq} must be in the low calling region"
+        );
+
+        // Fox answers with a report — QSY must fire regardless of Hold mode.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "D2UY".into(),
+                    report: -12,
+                },
+                "K5ARH D2UY -12".into(),
+                1800.0,
+                Some(-12.0),
+            )
+            .await
+            .expect("process_message for Fox SignalReport in Hold mode must succeed");
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        let qsy_freq = progress.metadata.frequency;
+        assert!(
+            qsy_freq >= HOUND_RESPONSE_MIN_HZ && qsy_freq <= HOUND_RESPONSE_MAX_HZ,
+            "metadata.frequency {qsy_freq} must QSY into [{HOUND_RESPONSE_MIN_HZ}, {HOUND_RESPONSE_MAX_HZ}] even in Hold mode"
+        );
+        assert!(
+            progress.metadata.hound_qsyed,
+            "hound_qsyed must be true after QSY in Hold mode"
+        );
+    }
+
+    /// T5-3: Non-Hound Caller QSO is completely unaffected by the QSY hook.
+    ///
+    /// A normal `respond_to_cq_manual` QSO (hound=false) receiving a
+    /// `SignalReport` from the DX must NOT move its TX offset — `metadata.frequency`
+    /// stays at the latched value, and `hound_qsyed` stays false.
+    #[tokio::test]
+    async fn non_hound_caller_qso_not_affected_by_qsy_hook() {
+        let manager = QsoManager::new(hound_test_config());
+        // Normal (non-Hound) QSO at 1500 Hz.
+        let normal_freq = 1500.0;
+        let qso_id = manager
+            .respond_to_cq_manual("D2UY".into(), normal_freq, None)
+            .await
+            .expect("respond_to_cq_manual must succeed");
+
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            !before.metadata.hound,
+            "hound must be false for a non-Hound QSO"
+        );
+        assert_eq!(
+            before.metadata.frequency, normal_freq,
+            "frequency must be the latched value before any report"
+        );
+
+        // DX sends a signal report.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "D2UY".into(),
+                    report: -9,
+                },
+                "K5ARH D2UY -09".into(),
+                normal_freq,
+                Some(-9.0),
+            )
+            .await
+            .expect("process_message for SignalReport must succeed");
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(after.state, QsoState::SendingReport { .. }),
+            "state must advance to SendingReport"
+        );
+        // Frequency must NOT move.
+        assert_eq!(
+            after.metadata.frequency, normal_freq,
+            "non-Hound QSO: metadata.frequency must NOT change on report (got {})",
+            after.metadata.frequency
+        );
+        // hound_qsyed must stay false.
+        assert!(
+            !after.metadata.hound_qsyed,
+            "non-Hound QSO: hound_qsyed must stay false"
         );
     }
 }
