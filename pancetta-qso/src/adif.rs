@@ -414,6 +414,30 @@ impl AdifProcessor {
         let band = self.frequency_to_band(metadata.frequency);
         let freq_mhz = metadata.frequency / 1_000_000.0;
 
+        // Build the COMMENT field: start from existing notes, then append
+        // "HOUND" for Hound QSOs (the human-readable DXpedition marker).
+        // Appending rather than overwriting preserves any operator notes.
+        let comment = if metadata.hound {
+            match &metadata.notes {
+                Some(existing) if !existing.is_empty() => {
+                    Some(format!("{} HOUND", existing))
+                }
+                _ => Some("HOUND".to_string()),
+            }
+        } else {
+            metadata.notes.clone()
+        };
+
+        // Build additional_fields from metadata.tags; for Hound QSOs inject
+        // the machine-readable APP_PANCETTA_HOUND marker.  Non-Hound QSOs are
+        // unchanged (no extra field → byte-identical output).
+        let mut additional_fields = metadata.tags.clone();
+        if metadata.hound {
+            additional_fields
+                .entry("APP_PANCETTA_HOUND".to_string())
+                .or_insert_with(|| "true".to_string());
+        }
+
         AdifQso {
             qso_date: metadata.start_time,
             qso_date_off: metadata.end_time,
@@ -445,9 +469,9 @@ impl AdifProcessor {
             qsl_sent: Some("N".to_string()),
             qsl_rcvd: Some("N".to_string()),
             qslmsg: None,
-            comment: metadata.notes.clone(),
+            comment,
             notes: None,
-            additional_fields: metadata.tags.clone(),
+            additional_fields,
         }
     }
 
@@ -1106,5 +1130,163 @@ ADIF Export for Test Program
         // rst_to_signal_report should parse raw SNR values
         assert_eq!(processor.rst_to_signal_report("-15"), Some(-15));
         assert_eq!(processor.rst_to_signal_report("+03"), Some(3));
+    }
+
+    // ── Hound ADIF rendering ─────────────────────────────────────────────────
+
+    /// Build a minimal QsoMetadata for ADIF rendering tests.
+    fn hound_adif_metadata(hound: bool, notes: Option<&str>) -> crate::states::QsoMetadata {
+        use crate::states::{
+            CallInitiation, GridSquares, QsoRole, SignalReports,
+        };
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        crate::states::QsoMetadata {
+            qso_id: Uuid::new_v4(),
+            our_callsign: "K5ARH".into(),
+            their_callsign: Some("D2UY".into()),
+            frequency: 14_074_000.0,
+            mode: "FT8".into(),
+            start_time: Utc::now(),
+            end_time: None,
+            reports: SignalReports {
+                sent: Some(-12),
+                received: Some(-09),
+            },
+            grids: GridSquares {
+                ours: Some("EM20".into()),
+                theirs: Some("JI64".into()),
+            },
+            contest_info: None,
+            tags: HashMap::new(),
+            notes: notes.map(|s| s.to_string()),
+            tx_parity: None,
+            initiated_by: CallInitiation::Manual,
+            role: QsoRole::Caller,
+            call_count: 1,
+            first_call_at: None,
+            last_call_at: None,
+            progressed_this_cycle: false,
+            last_rx_text: None,
+            dx_repeat_count: 0,
+            hound,
+            partner_freq: if hound { Some(1500.0) } else { None },
+            hound_qsyed: false,
+        }
+    }
+
+    /// A completed Hound QSO must have MODE=FT8, COMMENT containing "HOUND",
+    /// and APP_PANCETTA_HOUND=true.  SUBMODE must NOT be set to anything other
+    /// than FT8/None (Hound is plain FT8, not a new mode).
+    #[test]
+    fn hound_qso_adif_mode_ft8_comment_hound_app_field() {
+        let processor = AdifProcessor::new();
+        let metadata = hound_adif_metadata(true, None);
+
+        let adif_qso = processor.qso_to_adif(&metadata, None);
+
+        // MODE stays "FT8", SUBMODE is None
+        assert_eq!(adif_qso.mode, "FT8", "MODE must remain FT8 for a Hound QSO");
+        assert!(
+            adif_qso.submode.is_none(),
+            "SUBMODE must not be set for a Hound QSO; got {:?}",
+            adif_qso.submode
+        );
+
+        // COMMENT contains "HOUND"
+        let comment = adif_qso.comment.as_deref().unwrap_or("");
+        assert!(
+            comment.contains("HOUND"),
+            "COMMENT must contain 'HOUND'; got {:?}",
+            adif_qso.comment
+        );
+
+        // APP_PANCETTA_HOUND is in additional_fields
+        assert_eq!(
+            adif_qso.additional_fields.get("APP_PANCETTA_HOUND"),
+            Some(&"true".to_string()),
+            "APP_PANCETTA_HOUND must be 'true' in additional_fields"
+        );
+
+        // Verify it appears in the rendered ADIF record string
+        let record_str = processor.generate_record(&adif_qso).unwrap();
+        assert!(
+            record_str.contains("APP_PANCETTA_HOUND"),
+            "rendered ADIF must contain APP_PANCETTA_HOUND; got:\n{record_str}"
+        );
+        assert!(
+            record_str.contains("HOUND"),
+            "rendered ADIF must contain HOUND in COMMENT; got:\n{record_str}"
+        );
+    }
+
+    /// A Hound QSO that already has operator notes must have COMMENT =
+    /// "<existing notes> HOUND" — the notes are preserved and HOUND is appended.
+    #[test]
+    fn hound_qso_adif_comment_appends_to_existing_notes() {
+        let processor = AdifProcessor::new();
+        let metadata = hound_adif_metadata(true, Some("Big pile-up!"));
+
+        let adif_qso = processor.qso_to_adif(&metadata, None);
+
+        let comment = adif_qso.comment.as_deref().unwrap_or("");
+        assert!(
+            comment.contains("Big pile-up!"),
+            "existing notes must be preserved in COMMENT; got {:?}",
+            adif_qso.comment
+        );
+        assert!(
+            comment.contains("HOUND"),
+            "COMMENT must contain 'HOUND'; got {:?}",
+            adif_qso.comment
+        );
+    }
+
+    /// A non-Hound QSO (hound=false) must NOT contain APP_PANCETTA_HOUND and
+    /// must NOT inject "HOUND" into the COMMENT from any internal path.
+    /// The output must be byte-identical to what existed before this feature.
+    #[test]
+    fn non_hound_qso_adif_no_app_field_no_hound_comment() {
+        let processor = AdifProcessor::new();
+        let metadata = hound_adif_metadata(false, None);
+
+        let adif_qso = processor.qso_to_adif(&metadata, None);
+
+        assert!(
+            !adif_qso
+                .additional_fields
+                .contains_key("APP_PANCETTA_HOUND"),
+            "non-Hound QSO must NOT have APP_PANCETTA_HOUND in additional_fields"
+        );
+
+        let comment = adif_qso.comment.as_deref().unwrap_or("");
+        assert!(
+            !comment.contains("HOUND"),
+            "non-Hound QSO COMMENT must not contain 'HOUND'; got {:?}",
+            adif_qso.comment
+        );
+
+        // Verify the raw record also has no HOUND traces
+        let record_str = processor.generate_record(&adif_qso).unwrap();
+        assert!(
+            !record_str.contains("APP_PANCETTA_HOUND"),
+            "non-Hound rendered ADIF must not contain APP_PANCETTA_HOUND; got:\n{record_str}"
+        );
+    }
+
+    /// A non-Hound QSO with existing notes must pass them through unchanged.
+    #[test]
+    fn non_hound_qso_adif_notes_unchanged() {
+        let processor = AdifProcessor::new();
+        let metadata = hound_adif_metadata(false, Some("Good contact"));
+
+        let adif_qso = processor.qso_to_adif(&metadata, None);
+
+        assert_eq!(
+            adif_qso.comment.as_deref(),
+            Some("Good contact"),
+            "non-Hound QSO notes must pass through to COMMENT unchanged"
+        );
     }
 }
