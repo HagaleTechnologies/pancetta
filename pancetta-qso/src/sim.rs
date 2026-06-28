@@ -1015,6 +1015,7 @@ impl Sim {
                 step,
                 our_snr_of_them,
                 their_report,
+                None, // sim always Tx=Rx; partner_freq not needed
             )
             .await
             .expect("respond_to_caller");

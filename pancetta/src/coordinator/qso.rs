@@ -150,6 +150,53 @@ const DX_ACTIVITY_MAX: usize = 256;
 /// surfaced; also the pruning horizon.
 const DX_ACTIVITY_TTL: chrono::Duration = chrono::Duration::seconds(150);
 
+/// Compute the TX audio offset for a new **manual** QSO (StartQso /
+/// RespondToCaller) from the operator's held-offset state and the live active
+/// QSO set.
+///
+/// Priority:
+///   1. **Hold mode + held offset set** → use the held offset as the candidate.
+///   2. Otherwise → candidate = `dx_freq` (Tx=Rx).
+///
+/// Then **de-conflict**: if the candidate is within `MIN_TX_SEPARATION_HZ` of
+/// any already-active QSO, nudge to the nearest clear slot in
+/// `[TX_OFFSET_MIN_HZ, TX_OFFSET_MAX_HZ]`.
+///
+/// Returns `(tx_off, partner_freq)` where:
+/// - `tx_off` is our chosen TX audio offset.
+/// - `partner_freq` is `Some(dx_freq)` **only when** `tx_off != dx_freq` —
+///   needed by the relevance gate so the DX's replies (at their own audio
+///   offset) are still routed to this QSO. `None` means Tx=Rx (unchanged
+///   from today's behavior).
+///
+/// **Regression invariant:** with `TxFreqMode::Auto` (or held=0) AND no
+/// occupied collision, `candidate = dx_freq`, `deconflict` returns it
+/// unchanged, `partner_freq = None` — byte-identical to today's Tx=Rx.
+fn compute_manual_tx_offset(
+    dx_freq: f64,
+    hold_mode: bool,
+    held_hz: u64,
+    active_offsets: &[f64],
+) -> (f64, Option<f64>) {
+    let candidate = if hold_mode && held_hz != 0 {
+        held_hz as f64
+    } else {
+        dx_freq
+    };
+    let tx_off = pancetta_qso::deconflict_offset(
+        candidate,
+        active_offsets,
+        pancetta_qso::MIN_TX_SEPARATION_HZ,
+        pancetta_qso::TX_OFFSET_MIN_HZ,
+        pancetta_qso::TX_OFFSET_MAX_HZ,
+    );
+    // Set partner_freq only when we actually diverge from the DX's RX freq.
+    // The 1.0 Hz tolerance guards against float-rounding noise on the exact
+    // Tx=Rx path.
+    let partner_freq = ((tx_off - dx_freq).abs() > 1.0).then_some(dx_freq);
+    (tx_off, partner_freq)
+}
+
 /// Pure: summarize what a decoded frame tells us its sender is doing (#41).
 /// `our_call` lets us say "→ us" when the frame is directed at us. Returns
 /// `None` for frames with no useful "who are they working" signal.
@@ -597,6 +644,7 @@ async fn maybe_auto_resend_73(
             pancetta_core::ResponseStep::SeventyThree,
             None,
             None,
+            None, // auto-73: always Tx=Rx, no partner offset
         )
         .await
     {
@@ -816,6 +864,7 @@ async fn maybe_answer_caller(
             answer.step,
             Some(snr),
             answer.their_report,
+            None, // classify_caller_answer: always Tx=Rx (answering a caller, no held-offset)
         )
         .await
     {
@@ -970,10 +1019,6 @@ impl super::ApplicationCoordinator {
                 // Share the operator's Hold/Auto TX-frequency mode so the
                 // stuck-DX hop only fires in Auto (Hold keeps the offset sticky).
                 qso_manager.set_tx_freq_mode_source(tx_freq_mode.clone());
-                // T3 will read `tx_offset_hold_hz` here to apply the held
-                // audio offset in Hold mode. Suppress the unused-variable
-                // warning until that task ships.
-                let _ = &tx_offset_hold_hz;
                 if let Err(e) = qso_manager.start().await {
                     error!("Failed to start QSO manager: {}", e);
                     return Err(anyhow::anyhow!("QSO manager startup failed"));
@@ -2063,7 +2108,31 @@ impl super::ApplicationCoordinator {
                                             //  - keep-calls every TX slot under the manual
                                             //    watchdog (5 min / 10 calls).
                                             //
-                                            // respond_to_cq_manual emits the first
+                                            // TX-offset selection (T3): honor the held offset
+                                            // (Hold mode) or de-conflict against live concurrent
+                                            // QSOs, then fall back to Tx=Rx. partner_freq is
+                                            // Some(dx_freq) only when tx_off != dx_freq so the
+                                            // relevance gate still routes the DX's replies to us.
+                                            // Regression: Auto + no collision → tx_off = dx_freq,
+                                            // partner_freq = None (Tx=Rx, identical to today).
+                                            let dx_freq = frequency as f64;
+                                            let held = tx_offset_hold_hz.load(Ordering::Relaxed);
+                                            let hold_mode = pancetta_core::TxFreqMode::from_u8(
+                                                tx_freq_mode.load(Ordering::Relaxed),
+                                            ) == pancetta_core::TxFreqMode::Hold;
+                                            let active = qso_manager.active_tx_offsets().await;
+                                            let (tx_off, partner) = compute_manual_tx_offset(
+                                                dx_freq, hold_mode, held, &active,
+                                            );
+                                            if tx_off != dx_freq {
+                                                info!(
+                                                    target: "qso",
+                                                    "TX offset: held={} hold_mode={} dx_freq={:.0} \
+                                                     → tx_off={:.0} Hz (de-conflicted from {} active)",
+                                                    held, hold_mode, dx_freq, tx_off, active.len()
+                                                );
+                                            }
+                                            // respond_to_cq_with (Manual) emits the first
                                             // CqResponse as a QsoEvent::MessageToSend,
                                             // which the event-forwarding task above turns
                                             // into a TransmitRequest with the latched
@@ -2074,24 +2143,26 @@ impl super::ApplicationCoordinator {
                                             // separate TransmitRequest here (that would
                                             // double-send the first call).
                                             match qso_manager
-                                                .respond_to_cq_manual(
+                                                .respond_to_cq_with(
                                                     callsign.clone(),
-                                                    frequency as f64,
+                                                    tx_off,
                                                     dx_parity,
+                                                    pancetta_qso::CallInitiation::Manual,
+                                                    partner,
                                                 )
                                                 .await
                                             {
                                                 Ok(qso_id) => {
                                                     info!(
                                                         "Manual QSO started with {}: {} \
-                                                         (keep-calling under watchdog)",
-                                                        callsign, qso_id
+                                                         (tx_off={:.0} Hz, keep-calling under watchdog)",
+                                                        callsign, qso_id, tx_off
                                                     );
                                                     emit_status(
                                                         &message_bus,
                                                         format!(
-                                                            "Calling {} — TX queued ({} Hz)",
-                                                            callsign, frequency
+                                                            "Calling {} — TX queued ({:.0} Hz)",
+                                                            callsign, tx_off
                                                         ),
                                                     )
                                                     .await;
@@ -2325,6 +2396,25 @@ impl super::ApplicationCoordinator {
                                                  (manual)",
                                                 callsign, frequency, step
                                             );
+                                            // TX-offset selection (T3): same priority as StartQso:
+                                            // held offset → de-conflict → Tx=Rx fallback.
+                                            let dx_freq = frequency as f64;
+                                            let held = tx_offset_hold_hz.load(Ordering::Relaxed);
+                                            let hold_mode = pancetta_core::TxFreqMode::from_u8(
+                                                tx_freq_mode.load(Ordering::Relaxed),
+                                            ) == pancetta_core::TxFreqMode::Hold;
+                                            let active = qso_manager.active_tx_offsets().await;
+                                            let (tx_off, partner) = compute_manual_tx_offset(
+                                                dx_freq, hold_mode, held, &active,
+                                            );
+                                            if tx_off != dx_freq {
+                                                info!(
+                                                    target: "qso",
+                                                    "RespondToCaller TX offset: held={} hold_mode={} \
+                                                     dx_freq={:.0} → tx_off={:.0} Hz",
+                                                    held, hold_mode, dx_freq, tx_off
+                                                );
+                                            }
                                             // Operator picked a station calling US from the
                                             // Callers panel and chose (or accepted the smart
                                             // default for) which sequence step to open at.
@@ -2337,25 +2427,26 @@ impl super::ApplicationCoordinator {
                                             match qso_manager
                                                 .respond_to_caller(
                                                     callsign.clone(),
-                                                    frequency as f64,
+                                                    tx_off,
                                                     dx_parity,
                                                     step,
                                                     snr,
                                                     None,
+                                                    partner,
                                                 )
                                                 .await
                                             {
                                                 Ok(qso_id) => {
                                                     info!(
                                                         "Caller-response QSO started with {}: \
-                                                         {} (step {:?})",
-                                                        callsign, qso_id, step
+                                                         {} (step {:?}, tx_off={:.0} Hz)",
+                                                        callsign, qso_id, step, tx_off
                                                     );
                                                     emit_status(
                                                         &message_bus,
                                                         format!(
-                                                            "Replying to {} — TX queued ({} Hz)",
-                                                            callsign, frequency
+                                                            "Replying to {} — TX queued ({:.0} Hz)",
+                                                            callsign, tx_off
                                                         ),
                                                     )
                                                     .await;
