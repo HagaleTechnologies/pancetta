@@ -313,6 +313,25 @@ pub enum TuiCommand {
     /// the operator's picked offset sticky; Auto lets pancetta choose/adjust it
     /// (smart allocator, collision jitter, stuck-DX hop).
     ToggleTxFreqMode,
+    /// Operator pressed `H` (Shift+H) on the DX Hunter panel to engage Hound
+    /// mode on the selected Fox station. The coordinator opens a manual Hound
+    /// QSO: calls the Fox low (300–900 Hz), QSYs up (>1000 Hz) when the Fox
+    /// answers, and completes on RR73. TX-policy gated (initiation, same as
+    /// `CallStation`).
+    ///
+    /// Note: lowercase `h` is already bound to `StopTx` (halt TX), so Hound
+    /// engage uses `Shift+H` as the spec's documented fallback.
+    EngageHound {
+        /// The Fox's callsign.
+        callsign: String,
+        /// The Fox's RX audio offset (Hz) — where we hear the Fox; becomes the
+        /// `partner_freq` for the relevance gate.
+        fox_freq: u64,
+        /// The Fox's slot parity (we TX on the opposite). `None` when unknown.
+        dx_parity: Option<pancetta_core::slot::SlotParity>,
+        /// The Fox's Maidenhead grid square, if known (logging only).
+        fox_grid: Option<String>,
+    },
 }
 
 /// TUI performance metrics
@@ -1029,6 +1048,35 @@ impl TuiRunner {
                 // h - Halt current TX. Releases PTT within ~150ms; pancetta
                 // keeps running and listening.
                 self.message_tx.send(TuiCommand::StopTx)?;
+            }
+            // Shift+H — Engage Hound mode on the selected DX-Hunter station.
+            // Lowercase `h` is taken by StopTx (halt TX), so Hound uses H.
+            // Only active when the DX Hunter panel is focused; a no-op hint
+            // is shown on other panels so the operator knows to switch.
+            KeyCode::Char('H') => {
+                if matches!(app.active_panel, crate::app::ActivePanel::DxHunter) {
+                    // Pull callsign + fox_freq + parity from the selected row,
+                    // and also the grid (one extra field beyond get_selected_station).
+                    let selected = app.displayed_dx_stations();
+                    if let Some(station) = selected.get(app.dx_hunter_scroll) {
+                        let callsign = station.call_sign.clone();
+                        let fox_freq = station.audio_offset_hz.unwrap_or(1500);
+                        let dx_parity = station.slot_parity;
+                        let fox_grid = station.grid_square.clone();
+                        self.message_tx.send(TuiCommand::EngageHound {
+                            callsign: callsign.clone(),
+                            fox_freq,
+                            dx_parity,
+                            fox_grid,
+                        })?;
+                        app.status_message = format!("Hound: engaging {} as Fox...", callsign);
+                    } else {
+                        app.status_message = "No DX station selected for Hound".to_string();
+                    }
+                } else {
+                    app.status_message =
+                        "Focus DX Hunter (H key) to engage Hound on selected station".to_string();
+                }
             }
             KeyCode::Char('p') => {
                 // TX-policy safety gate (mirror of the relay's authoritative
@@ -2119,6 +2167,7 @@ mod key_tests {
             max_calls: 0,
             watchdog_deadline: None,
             dx_last_activity: None,
+            hound: false,
         };
         r.handle_message(TuiMessage::ActiveQsosUpdate {
             qsos: vec![banner],
@@ -2344,6 +2393,7 @@ mod key_tests {
             max_calls: 0,
             watchdog_deadline: None,
             dx_last_activity: None,
+            hound: false,
         }
     }
 
@@ -2506,5 +2556,108 @@ mod key_tests {
         let a = app.read().await;
         assert!(!a.compose_mode);
         assert!(a.tx_input_buffer.is_empty());
+    }
+
+    // ── Hound mode key binding (Shift+H on DX Hunter) ────────────────────────
+
+    /// Pressing Shift+H on the DX Hunter panel with a station selected emits
+    /// `EngageHound` carrying the station's callsign, audio offset, parity,
+    /// and grid.
+    #[tokio::test]
+    async fn shift_h_on_dx_hunter_emits_engage_hound() {
+        use chrono::Utc;
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::DxHunter;
+            // Inject a DX station directly into dx_stations so
+            // displayed_dx_stations() returns it.
+            a.dx_stations.insert(
+                "VK9XX".to_string(),
+                crate::app::DxStation {
+                    call_sign: "VK9XX".to_string(),
+                    grid_square: Some("QH30".to_string()),
+                    frequency: 14.074,
+                    mode: "FT8".to_string(),
+                    last_seen: Utc::now(),
+                    snr: -10,
+                    distance: None,
+                    bearing: None,
+                    worked_before: false,
+                    needed: true,
+                    atno: false,
+                    priority_score: 800,
+                    source: crate::app::SpotSource::Local,
+                    entity_name: None,
+                    rarity_tier: None,
+                    reporter_count: None,
+                    is_notable: false,
+                    notable_type: None,
+                    confidence: None,
+                    best_snr_network: None,
+                    last_seen_network: None,
+                    audio_offset_hz: Some(750),
+                    slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+                },
+            );
+            a.dx_hunter_scroll = 0;
+        }
+        r.handle_key_event(key_shift('H')).await.unwrap();
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::EngageHound {
+                callsign,
+                fox_freq,
+                dx_parity,
+                fox_grid,
+            }) => {
+                assert_eq!(callsign, "VK9XX");
+                assert_eq!(fox_freq, 750);
+                assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Even));
+                assert_eq!(fox_grid, Some("QH30".to_string()));
+            }
+            other => panic!("Expected EngageHound, got {:?}", other),
+        }
+        assert!(
+            app.read().await.status_message.contains("VK9XX"),
+            "status message echoes the Fox callsign"
+        );
+    }
+
+    /// Pressing Shift+H when NOT on the DX Hunter panel emits nothing and
+    /// shows a panel-focus hint (no accidental Hound engage from other panels).
+    #[tokio::test]
+    async fn shift_h_outside_dx_hunter_emits_nothing() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.active_panel = crate::app::ActivePanel::BandActivity;
+        r.handle_key_event(key_shift('H')).await.unwrap();
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "Shift+H outside DX Hunter must not emit EngageHound"
+        );
+        assert!(
+            app.read().await.status_message.contains("DX Hunter"),
+            "shows a panel-focus hint"
+        );
+    }
+
+    /// Pressing Shift+H on the DX Hunter when no station is selected emits
+    /// nothing and shows an appropriate hint.
+    #[tokio::test]
+    async fn shift_h_on_empty_dx_hunter_emits_nothing() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::DxHunter;
+            // Leave dx_stations empty so displayed_dx_stations() is empty.
+        }
+        r.handle_key_event(key_shift('H')).await.unwrap();
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "Shift+H with no station selected must not emit EngageHound"
+        );
+        assert!(
+            app.read().await.status_message.contains("selected"),
+            "shows a 'no station selected' hint"
+        );
     }
 }
