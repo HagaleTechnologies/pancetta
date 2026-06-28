@@ -111,6 +111,40 @@ pub(crate) fn hound_offset_for(seed: &str, lo: f64, hi: f64) -> f64 {
     ((raw / 5.0).round() * 5.0).clamp(lo, hi)
 }
 
+/// Nudge a candidate TX audio offset away from already-occupied offsets so
+/// concurrent QSOs don't stack. Returns `candidate` unchanged if it is within
+/// `[lo, hi]` AND at least `min_sep` Hz from every offset in `occupied`.
+/// Otherwise searches outward from `candidate` in 25 Hz steps for the nearest
+/// in-range offset that is `>= min_sep` from all `occupied`; if none exists in
+/// range, returns `candidate.clamp(lo, hi)`. Deterministic (no RNG) — for tests
+/// and reproducibility.
+pub(crate) fn deconflict_offset(
+    candidate: f64,
+    occupied: &[f64],
+    min_sep: f64,
+    lo: f64,
+    hi: f64,
+) -> f64 {
+    let clear = |off: f64| occupied.iter().all(|o| (off - o).abs() >= min_sep);
+    let c = candidate.clamp(lo, hi);
+    if clear(c) {
+        return c;
+    }
+    // Search outward in 25 Hz steps: candidate±25, ±50, ... preferring the
+    // closer side; only accept in-range offsets that clear all occupied.
+    let step = 25.0;
+    let max_steps = (((hi - lo) / step).ceil() as i64).max(1);
+    for k in 1..=max_steps {
+        let d = k as f64 * step;
+        for cand in [c - d, c + d] {
+            if cand >= lo && cand <= hi && clear(cand) {
+                return cand;
+            }
+        }
+    }
+    c // no clear slot in range — fall back to the clamped candidate
+}
+
 /// The dial the station actually transmits on: the split TX dial when split is
 /// active (`split_tx_hz != 0`), otherwise the RX dial. Used to stamp the logged
 /// RF frequency of a completed QSO (dial + audio offset).
@@ -7777,5 +7811,85 @@ mod hound_tests {
             !after.metadata.hound_qsyed,
             "non-Hound QSO: hound_qsyed must stay false"
         );
+    }
+}
+
+#[cfg(test)]
+mod deconflict_tests {
+    use super::deconflict_offset;
+
+    const LO: f64 = 300.0;
+    const HI: f64 = 2700.0;
+    const SEP: f64 = 75.0;
+
+    #[test]
+    fn deconflict_clear_candidate_returned_unchanged() {
+        // 1500 Hz is well away from 800 Hz — must come back untouched.
+        let result = deconflict_offset(1500.0, &[800.0], SEP, LO, HI);
+        assert_eq!(result, 1500.0, "clear candidate must be returned unchanged");
+    }
+
+    #[test]
+    fn deconflict_collision_nudges_at_least_min_sep() {
+        // Candidate sits exactly on an occupied offset — must move by ≥ min_sep.
+        let result = deconflict_offset(1500.0, &[1500.0], SEP, LO, HI);
+        assert!(
+            result >= LO && result <= HI,
+            "result {result} must be within [{LO}, {HI}]"
+        );
+        assert!(
+            (result - 1500.0).abs() >= SEP,
+            "result {result} must be ≥ {SEP} Hz from the occupied offset 1500.0"
+        );
+    }
+
+    #[test]
+    fn deconflict_near_collision_within_min_sep() {
+        // Candidate 1520 Hz is only 20 Hz from occupied 1500 Hz (< 75 Hz sep) — must move.
+        let result = deconflict_offset(1520.0, &[1500.0], SEP, LO, HI);
+        assert!(
+            result >= LO && result <= HI,
+            "result {result} must be within [{LO}, {HI}]"
+        );
+        assert!(
+            (result - 1500.0).abs() >= SEP,
+            "result {result} must be ≥ {SEP} Hz from 1500.0 (was only 20 Hz away)"
+        );
+    }
+
+    #[test]
+    fn deconflict_bracketed_gap_finds_clear_slot() {
+        // Candidate 1500 Hz is bracketed by 1400 and 1600 Hz; the 100 Hz gap
+        // between them is narrower than 2 * min_sep so neither side clears
+        // within the bracket — the search must escape to a clear slot elsewhere.
+        let result = deconflict_offset(1500.0, &[1400.0, 1600.0], SEP, LO, HI);
+        assert!(
+            result >= LO && result <= HI,
+            "result {result} must be within [{LO}, {HI}]"
+        );
+        assert!(
+            (result - 1400.0).abs() >= SEP,
+            "result {result} must be ≥ {SEP} Hz from 1400.0"
+        );
+        assert!(
+            (result - 1600.0).abs() >= SEP,
+            "result {result} must be ≥ {SEP} Hz from 1600.0"
+        );
+    }
+
+    #[test]
+    fn deconflict_empty_occupied_clamps_candidate() {
+        // No occupied offsets; candidate 2900 is above HI — must clamp to HI.
+        let result = deconflict_offset(2900.0, &[], SEP, LO, HI);
+        assert_eq!(result, HI, "out-of-range candidate with no occupied must clamp to hi");
+    }
+
+    #[test]
+    fn deconflict_deterministic() {
+        // Same inputs twice must produce identical outputs.
+        let occupied = [800.0_f64, 1200.0, 1800.0];
+        let a = deconflict_offset(1500.0, &occupied, SEP, LO, HI);
+        let b = deconflict_offset(1500.0, &occupied, SEP, LO, HI);
+        assert_eq!(a, b, "deconflict_offset must be deterministic");
     }
 }
