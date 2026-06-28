@@ -926,6 +926,10 @@ impl super::ApplicationCoordinator {
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         let split_tx_frequency_hz = self.split_tx_frequency_hz.clone();
         let tx_freq_mode = self.tx_freq_mode.clone();
+        // T3 will read this to apply the operator's held TX audio offset when
+        // starting a manual QSO (Hold mode). Captured here so both atomics
+        // are in scope in the StartQso/RespondToCaller handlers below.
+        let tx_offset_hold_hz = self.tx_offset_hold_hz.clone();
         // Shared with the TX worker — drives the "drop TX for ended QSOs"
         // gate. The QSO component keeps it in sync from the QsoEvent stream
         // below.
@@ -966,6 +970,10 @@ impl super::ApplicationCoordinator {
                 // Share the operator's Hold/Auto TX-frequency mode so the
                 // stuck-DX hop only fires in Auto (Hold keeps the offset sticky).
                 qso_manager.set_tx_freq_mode_source(tx_freq_mode.clone());
+                // T3 will read `tx_offset_hold_hz` here to apply the held
+                // audio offset in Hold mode. Suppress the unused-variable
+                // warning until that task ships.
+                let _ = &tx_offset_hold_hz;
                 if let Err(e) = qso_manager.start().await {
                     error!("Failed to start QSO manager: {}", e);
                     return Err(anyhow::anyhow!("QSO manager startup failed"));
