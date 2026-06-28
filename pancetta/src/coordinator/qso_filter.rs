@@ -17,9 +17,19 @@
 //!
 //! Operator override: `PANCETTA_QSO_FILTER_OFF=1` disables the band
 //! collapse and the main decode runs at full bandwidth. Any other value
-//! (or the env var unset) leaves the filter on. The Hound-mode branch
-//! (±290 Hz) is not implemented — pancetta does not currently support
-//! Hound mode; the spec is explicit that this can be deferred.
+//! (or the env var unset) leaves the filter on.
+//!
+//! **Hound-mode band-collapse wiring** (Task 3 status): The *relevance gate*
+//! in `pancetta_qso::QsoManager::is_message_relevant` now keys on
+//! `QsoMetadata::partner_freq` when set — Fox frames are matched against
+//! the Fox's RX offset, not our TX offset. The band-collapse *here*, however,
+//! is a pure observer that receives `Option<f64>` from the coordinator's
+//! `active_qso_freq_hz` shared state; that shared state is currently
+//! populated with `new_state.frequency()` (our TX offset) in `coordinator/qso.rs`.
+//! For Hound, it should instead use `metadata.partner_freq` (the Fox's RX
+//! offset) so the ±60 Hz collapse window centres on the Fox's reply —
+//! the ±290 Hz Hound-mode window described in the spec is a future
+//! refinement of that wiring, not a change to this module itself.
 
 use std::ops::RangeInclusive;
 

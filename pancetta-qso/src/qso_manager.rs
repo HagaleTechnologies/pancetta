@@ -2457,7 +2457,7 @@ impl QsoManager {
             }
 
             // Check if message is relevant to this QSO
-            if self.is_message_relevant(&progress.state, message_type, frequency) {
+            if self.is_message_relevant(&progress.state, &progress.metadata, message_type, frequency) {
                 matching_qsos.push(qso_id);
             }
         }
@@ -2468,6 +2468,7 @@ impl QsoManager {
     fn is_message_relevant(
         &self,
         state: &QsoState,
+        metadata: &QsoMetadata,
         message_type: &MessageType,
         frequency: f64,
     ) -> bool {
@@ -2626,13 +2627,22 @@ impl QsoManager {
         // wider drift bound; everything else uses the tight default. An
         // established QSO is one where we already know the contra callsign
         // (i.e. not CallingCq/Idle) — `their_callsign()` is Some.
+        //
+        // Hound mode: when `metadata.partner_freq` is `Some`, the Fox transmits
+        // on a *different* frequency than we do (Hound calls low; Fox replies
+        // somewhere in [1000, 4000] Hz). We must match the incoming Fox frame
+        // against the Fox's RX offset (`partner_freq`), NOT our TX offset
+        // (`state.frequency()`). When `partner_freq` is `None` (every normal
+        // QSO) `unwrap_or(qso_freq)` falls back to the latched `qso_freq`,
+        // producing byte-identical behavior to before this change.
         if let Some(qso_freq) = state.frequency() {
+            let match_freq = metadata.partner_freq.unwrap_or(qso_freq);
             let tolerance = if state.their_callsign().is_some() {
                 ESTABLISHED_FREQ_TOLERANCE_HZ
             } else {
                 FREQ_TOLERANCE_HZ
             };
-            if (qso_freq - frequency).abs() > tolerance {
+            if (match_freq - frequency).abs() > tolerance {
                 return false;
             }
         }
@@ -4853,6 +4863,40 @@ mod sender_verification_tests {
         QsoManager::new(config)
     }
 
+    /// Minimal `QsoMetadata` for unit tests: `partner_freq = None` (normal QSO,
+    /// no Hound split). All tests that call `is_message_relevant` directly must
+    /// pass a metadata; this helper ensures the regression cases use the
+    /// canonical "no partner_freq" path, matching pre-Hound behavior.
+    fn normal_metadata(our: &str, their_freq: f64) -> QsoMetadata {
+        let now = Utc::now();
+        QsoMetadata {
+            qso_id: uuid::Uuid::new_v4(),
+            our_callsign: our.into(),
+            their_callsign: None,
+            frequency: their_freq,
+            mode: "FT8".into(),
+            start_time: now,
+            end_time: None,
+            reports: SignalReports::default(),
+            grids: GridSquares::default(),
+            contest_info: None,
+            tags: std::collections::HashMap::new(),
+            notes: None,
+            tx_parity: None,
+            initiated_by: CallInitiation::default(),
+            role: QsoRole::default(),
+            call_count: 0,
+            first_call_at: None,
+            last_call_at: None,
+            progressed_this_cycle: false,
+            last_rx_text: None,
+            dx_repeat_count: 0,
+            hound: false,
+            partner_freq: None,
+            hound_qsyed: false,
+        }
+    }
+
     #[tokio::test]
     async fn spoofed_signal_report_does_not_advance_state() {
         let manager = manager_with_call("K5ARH");
@@ -4912,7 +4956,9 @@ mod sender_verification_tests {
             from_station: "NF4KE".into(),
             report: -12,
         };
-        assert!(!manager.is_message_relevant(&state, &spoof, 1500.0));
+        // partner_freq = None → regression path (normal QSO behavior unchanged).
+        let md = normal_metadata("K5ARH", 1500.0);
+        assert!(!manager.is_message_relevant(&state, &md, &spoof, 1500.0));
     }
 
     #[test]
@@ -4928,7 +4974,9 @@ mod sender_verification_tests {
             from_station: "K9ZZ".into(),
             report: -12,
         };
-        assert!(manager.is_message_relevant(&state, &legit, 1500.0));
+        // partner_freq = None → regression path (normal QSO behavior unchanged).
+        let md = normal_metadata("K5ARH", 1500.0);
+        assert!(manager.is_message_relevant(&state, &md, &legit, 1500.0));
     }
 
     #[test]
@@ -4950,10 +4998,12 @@ mod sender_verification_tests {
             from_station: "K9ZZ".into(),
             report: -12,
         };
+        // partner_freq = None → regression path (normal QSO behavior unchanged).
+        let md = normal_metadata("K5ARH", 1500.0);
         // 16 Hz off, no partner latched yet → rejected (tight gate).
-        assert!(!manager.is_message_relevant(&state, &legit, 1516.0));
+        assert!(!manager.is_message_relevant(&state, &md, &legit, 1516.0));
         // 14 Hz off → accepted.
-        assert!(manager.is_message_relevant(&state, &legit, 1514.0));
+        assert!(manager.is_message_relevant(&state, &md, &legit, 1514.0));
     }
 
     #[test]
@@ -4976,12 +5026,94 @@ mod sender_verification_tests {
             from_station: "K9ZZ".into(),
             report: -12,
         };
+        // partner_freq = None → regression path (normal QSO behavior unchanged).
+        let md = normal_metadata("K5ARH", 1500.0);
         // 16 Hz, 45 Hz, 100 Hz drift from an established partner → accepted.
-        assert!(manager.is_message_relevant(&state, &legit, 1516.0));
-        assert!(manager.is_message_relevant(&state, &legit, 1545.0));
-        assert!(manager.is_message_relevant(&state, &legit, 1600.0));
+        assert!(manager.is_message_relevant(&state, &md, &legit, 1516.0));
+        assert!(manager.is_message_relevant(&state, &md, &legit, 1545.0));
+        assert!(manager.is_message_relevant(&state, &md, &legit, 1600.0));
         // Beyond the 100 Hz established bound → rejected (still bounded).
-        assert!(!manager.is_message_relevant(&state, &legit, 1601.0));
+        assert!(!manager.is_message_relevant(&state, &md, &legit, 1601.0));
+    }
+
+    // ── Hound partner_freq routing ───────────────────────────────────────────
+
+    /// Hound QSO: the QSO's TX offset (`frequency`) is low (600 Hz, where Hounds
+    /// call), but the Fox replies on a different, higher offset (`partner_freq =
+    /// Some(1800.0)`). A frame arriving at the Fox's frequency IS relevant; a
+    /// frame arriving at the Hound's TX offset but far from the Fox's RX offset
+    /// is NOT relevant.
+    #[test]
+    fn is_message_relevant_hound_keys_on_partner_freq() {
+        let manager = manager_with_call("K5ARH");
+        // Hound state: our TX offset is low (600 Hz); Fox's RX offset is 1800 Hz.
+        let state = QsoState::RespondingToCq {
+            target_callsign: "KH8B".into(),
+            frequency: 600.0, // our TX offset (Hound calls low)
+            started_at: Utc::now(),
+        };
+        let fox_report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "KH8B".into(),
+            report: -10,
+        };
+        // Hound metadata: partner_freq = Some(1800.0) (Fox's RX offset).
+        let mut md = normal_metadata("K5ARH", 600.0);
+        md.partner_freq = Some(1800.0);
+
+        // Frame at the Fox's offset (1800 Hz) — within ESTABLISHED tolerance.
+        // The gate must match against partner_freq (1800), NOT our TX freq (600).
+        assert!(
+            manager.is_message_relevant(&state, &md, &fox_report, 1800.0),
+            "Hound: frame at Fox's offset must be relevant"
+        );
+        // Frame at 1810 Hz — still within 100 Hz ESTABLISHED bound of 1800.
+        assert!(
+            manager.is_message_relevant(&state, &md, &fox_report, 1810.0),
+            "Hound: frame 10 Hz from Fox's offset must be relevant (within established tolerance)"
+        );
+        // Frame at OUR TX offset (600 Hz) but far from the Fox's RX offset —
+        // must be rejected because 600 Hz is not close to partner_freq 1800 Hz.
+        assert!(
+            !manager.is_message_relevant(&state, &md, &fox_report, 600.0),
+            "Hound: frame at our TX offset (far from Fox) must NOT be relevant"
+        );
+        // Frame beyond even the ESTABLISHED bound from partner_freq — rejected.
+        assert!(
+            !manager.is_message_relevant(&state, &md, &fox_report, 1901.0),
+            "Hound: frame >100 Hz from Fox's offset must NOT be relevant"
+        );
+    }
+
+    /// Regression: with `partner_freq = None` (every normal QSO), the gate
+    /// falls back to `state.frequency()` exactly as before — byte-identical
+    /// behavior. A frame at the QSO's latched frequency is relevant; one far
+    /// away is not.
+    #[test]
+    fn is_message_relevant_partner_freq_none_falls_back_to_state_freq() {
+        let manager = manager_with_call("K5ARH");
+        let state = QsoState::RespondingToCq {
+            target_callsign: "K9ZZ".into(),
+            frequency: 1500.0,
+            started_at: Utc::now(),
+        };
+        let legit = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "K9ZZ".into(),
+            report: -12,
+        };
+        // partner_freq = None — normal QSO regression path.
+        let md = normal_metadata("K5ARH", 1500.0);
+        // Frame at the QSO frequency → relevant (unchanged from pre-Hound).
+        assert!(
+            manager.is_message_relevant(&state, &md, &legit, 1500.0),
+            "regression: frame at state.frequency must be relevant when partner_freq=None"
+        );
+        // Frame far from QSO frequency → not relevant (unchanged).
+        assert!(
+            !manager.is_message_relevant(&state, &md, &legit, 2000.0),
+            "regression: frame far from state.frequency must NOT be relevant when partner_freq=None"
+        );
     }
 
     #[tokio::test]
