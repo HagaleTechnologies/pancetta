@@ -40,6 +40,8 @@ pub use tx::{
     CoalesceOutcome, TxSchedule,
 };
 
+pub use qso::compute_manual_tx_offset;
+
 // Re-export the C19 config-reload classifier (safe-live vs deferred) and the
 // C20 RF-present/no-decode detector so the coordinator-robustness integration
 // tests can exercise the real production decision logic.

@@ -172,7 +172,7 @@ const DX_ACTIVITY_TTL: chrono::Duration = chrono::Duration::seconds(150);
 /// **Regression invariant:** with `TxFreqMode::Auto` (or held=0) AND no
 /// occupied collision, `candidate = dx_freq`, `deconflict` returns it
 /// unchanged, `partner_freq = None` — byte-identical to today's Tx=Rx.
-fn compute_manual_tx_offset(
+pub fn compute_manual_tx_offset(
     dx_freq: f64,
     hold_mode: bool,
     held_hz: u64,
