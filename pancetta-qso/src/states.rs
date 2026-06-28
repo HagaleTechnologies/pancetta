@@ -406,6 +406,23 @@ pub struct QsoMetadata {
     /// [`Self::last_rx_text`].
     #[serde(default)]
     pub dx_repeat_count: u32,
+
+    /// Hound (DXpedition chaser) mode: this QSO calls a Fox low and QSYs up on
+    /// the Fox's report. `false` for every normal QSO.
+    #[serde(default)]
+    pub hound: bool,
+
+    /// The Fox's RX audio offset (Hz) — where we HEAR the Fox. Used by the
+    /// relevance gate instead of `frequency` (our TX offset) when set, because a
+    /// Hound transmits on a different offset than it listens. `None` for normal
+    /// QSOs (the gate falls back to `frequency`, unchanged behavior).
+    #[serde(default)]
+    pub partner_freq: Option<f64>,
+
+    /// Hound: whether we have already QSY'd up to the response region after the
+    /// Fox answered us (so the QSY fires exactly once).
+    #[serde(default)]
+    pub hound_qsyed: bool,
 }
 
 /// Signal reports exchanged
