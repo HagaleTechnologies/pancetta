@@ -371,8 +371,9 @@ pub struct FreqModalState {
 
 /// State for the `o`-key TX-audio-offset modal: a single integer Hz field.
 ///
-/// Valid range: 200–2900 Hz. Blank entry on Enter clears the held offset
-/// (→ Auto). Out-of-range input is rejected with a status message.
+/// Valid range: 300–2700 Hz (matching `pancetta_qso::TX_OFFSET_{MIN,MAX}_HZ`).
+/// Blank entry on Enter clears the held offset (→ Auto). Out-of-range input is
+/// rejected with a status message.
 #[derive(Debug, Clone, Default)]
 pub struct OffsetModalState {
     /// Modal visible.
@@ -392,9 +393,17 @@ pub fn parse_hz(s: &str) -> Option<u64> {
 }
 
 /// Valid TX audio offset range (inclusive), in Hz.
-pub const TX_OFFSET_MIN_HZ: u64 = 200;
+///
+/// Must match `pancetta_qso::TX_OFFSET_MIN_HZ` / `TX_OFFSET_MAX_HZ`
+/// (300.0 / 2700.0) — the coordinator clamps to those bounds via
+/// `deconflict_offset`, so accepting values outside them would cause the
+/// status chip to display an offset that is silently clamped on use.
+pub const TX_OFFSET_MIN_HZ: u64 = 300;
 /// Valid TX audio offset range (inclusive), in Hz.
-pub const TX_OFFSET_MAX_HZ: u64 = 2900;
+///
+/// Must match `pancetta_qso::TX_OFFSET_MAX_HZ` (2700.0). See
+/// [`TX_OFFSET_MIN_HZ`] for the rationale.
+pub const TX_OFFSET_MAX_HZ: u64 = 2700;
 
 #[derive(Debug, Clone)]
 pub struct DeviceSelectionState {

@@ -2798,7 +2798,7 @@ mod key_tests {
     async fn offset_modal_out_of_range_rejected() {
         let (mut r, cmd_rx, app) = make_runner().await;
         r.handle_key_event(key('o')).await.unwrap();
-        // Type "100" (below minimum 200).
+        // Type "100" (below minimum 300).
         for c in "100".chars() {
             r.handle_key_event(key(c)).await.unwrap();
         }
@@ -2816,6 +2816,26 @@ mod key_tests {
             cmd_rx.try_recv().is_err(),
             "no command emitted for out-of-range"
         );
+    }
+
+    /// Values in the old range [200, 299] and [2701, 2900] are now rejected
+    /// because they fall outside the coordinator's clamp range [300, 2700].
+    #[tokio::test]
+    async fn offset_modal_old_range_boundary_rejected() {
+        // 200 was valid under the old 200-2900 bounds but must now be rejected.
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('o')).await.unwrap();
+        for c in "200".chars() {
+            r.handle_key_event(key(c)).await.unwrap();
+        }
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let a = app.read().await;
+        assert!(a.offset_modal.visible, "200 Hz is below new minimum 300 — modal stays open");
+        assert!(a.status_message.contains("Invalid"), "status says invalid");
+        drop(a);
+        assert!(cmd_rx.try_recv().is_err(), "no command emitted");
     }
 
     /// Blank entry on Enter emits `SetTxOffset{None}` (→ Auto) and closes.
