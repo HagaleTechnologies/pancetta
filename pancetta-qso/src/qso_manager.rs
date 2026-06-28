@@ -35,6 +35,14 @@ const STUCK_TX_HOP_HZ: f64 = 300.0;
 const TX_OFFSET_MIN_HZ: f64 = 300.0;
 const TX_OFFSET_MAX_HZ: f64 = 2700.0;
 
+/// Hound calling region (low): Hounds call the Fox in 300–900 Hz.
+const HOUND_CALL_MIN_HZ: f64 = 300.0;
+const HOUND_CALL_MAX_HZ: f64 = 900.0;
+/// Hound response region (post-QSY): after the Fox answers, the Hound moves up
+/// to 1000–2700 Hz to send its R-report.
+const HOUND_RESPONSE_MIN_HZ: f64 = 1000.0;
+const HOUND_RESPONSE_MAX_HZ: f64 = 2700.0;
+
 /// Hop a stuck QSO's TX audio offset by [`STUCK_TX_HOP_HZ`], wrapping back to
 /// the low end of the passband when it would exceed [`TX_OFFSET_MAX_HZ`]. Pure
 /// and deterministic so the move is unit-testable; the goal is simply to vacate
@@ -50,6 +58,26 @@ fn stuck_hopped_offset(current: f64) -> f64 {
         next
     }
     .clamp(TX_OFFSET_MIN_HZ, TX_OFFSET_MAX_HZ)
+}
+
+/// Pick an audio offset in `[lo, hi]` deterministically from `seed` (e.g. a
+/// callsign), spreading distinct seeds across the region so concurrent Hound
+/// QSOs don't stack on one offset. Deterministic: same seed → same offset.
+pub(crate) fn hound_offset_for(seed: &str, lo: f64, hi: f64) -> f64 {
+    // Simple stable hash (FNV-1a style) → fraction of the range, snapped to 5 Hz.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in seed.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let span = (hi - lo).max(0.0);
+    if span == 0.0 {
+        return lo;
+    }
+    let frac = (h % 10_000) as f64 / 10_000.0; // [0,1)
+    let raw = lo + frac * span;
+    // snap to 5 Hz, clamp inside [lo, hi]
+    ((raw / 5.0).round() * 5.0).clamp(lo, hi)
 }
 
 /// The dial the station actually transmits on: the split TX dial when split is
@@ -626,6 +654,9 @@ impl QsoManager {
             progressed_this_cycle: false,
             last_rx_text: None,
             dx_repeat_count: 0,
+            hound: false,
+            partner_freq: None,
+            hound_qsyed: false,
         };
 
         let progress = QsoProgress {
@@ -742,6 +773,9 @@ impl QsoManager {
             progressed_this_cycle: false,
             last_rx_text: None,
             dx_repeat_count: 0,
+            hound: false,
+            partner_freq: None,
+            hound_qsyed: false,
         };
 
         let progress = QsoProgress {
@@ -932,6 +966,9 @@ impl QsoManager {
             progressed_this_cycle: false,
             last_rx_text: None,
             dx_repeat_count: 0,
+            hound: false,
+            partner_freq: None,
+            hound_qsyed: false,
         };
 
         // Send response message
@@ -1204,6 +1241,9 @@ impl QsoManager {
             progressed_this_cycle: false,
             last_rx_text: None,
             dx_repeat_count: 0,
+            hound: false,
+            partner_freq: None,
+            hound_qsyed: false,
         };
 
         // If we are opening at the close (SeventyThree → Completed), stamp the
@@ -4376,6 +4416,9 @@ mod tests {
                 progressed_this_cycle: false,
                 last_rx_text: None,
                 dx_repeat_count: 0,
+                hound: false,
+                partner_freq: None,
+                hound_qsyed: false,
             },
         };
         manager.qsos.write().await.insert(qso_id, progress);
@@ -6658,6 +6701,9 @@ mod has_active_or_recent_qso_tests {
             progressed_this_cycle: false,
             last_rx_text: None,
             dx_repeat_count: 0,
+            hound: false,
+            partner_freq: None,
+            hound_qsyed: false,
         }
     }
 
@@ -6800,5 +6846,114 @@ mod has_active_or_recent_qso_tests {
                 .await,
             "compound EA8/G8BCG QSO must match bare base G8BCG query"
         );
+    }
+}
+
+#[cfg(test)]
+mod hound_tests {
+    use super::{hound_offset_for, HOUND_CALL_MAX_HZ, HOUND_CALL_MIN_HZ};
+    use crate::states::{
+        CallInitiation, GridSquares, QsoMetadata, QsoRole, SignalReports,
+    };
+    use chrono::Utc;
+    use pancetta_core::slot::SlotParity;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    // ── QsoMetadata default field values ────────────────────────────────────
+
+    fn make_metadata() -> QsoMetadata {
+        let now = Utc::now();
+        QsoMetadata {
+            qso_id: Uuid::new_v4(),
+            our_callsign: "K5ARH".into(),
+            their_callsign: Some("KH8/K5ARH".into()),
+            frequency: 600.0,
+            mode: "FT8".into(),
+            start_time: now,
+            end_time: None,
+            reports: SignalReports::default(),
+            grids: GridSquares::default(),
+            contest_info: None,
+            tags: HashMap::new(),
+            notes: None,
+            tx_parity: Some(SlotParity::Even),
+            initiated_by: CallInitiation::Manual,
+            role: QsoRole::Caller,
+            call_count: 1,
+            first_call_at: Some(now),
+            last_call_at: Some(now),
+            progressed_this_cycle: false,
+            last_rx_text: None,
+            dx_repeat_count: 0,
+            hound: false,
+            partner_freq: None,
+            hound_qsyed: false,
+        }
+    }
+
+    #[test]
+    fn qso_metadata_hound_defaults_false() {
+        let md = make_metadata();
+        assert!(!md.hound, "hound must default to false");
+    }
+
+    #[test]
+    fn qso_metadata_partner_freq_defaults_none() {
+        let md = make_metadata();
+        assert_eq!(md.partner_freq, None, "partner_freq must default to None");
+    }
+
+    #[test]
+    fn qso_metadata_hound_qsyed_defaults_false() {
+        let md = make_metadata();
+        assert!(!md.hound_qsyed, "hound_qsyed must default to false");
+    }
+
+    // ── hound_offset_for ────────────────────────────────────────────────────
+
+    #[test]
+    fn hound_offset_in_range() {
+        for seed in &["K5ARH", "VK9X", "KH8B", "FT5ZM", "3B9FR"] {
+            let off = hound_offset_for(seed, HOUND_CALL_MIN_HZ, HOUND_CALL_MAX_HZ);
+            assert!(
+                off >= HOUND_CALL_MIN_HZ && off <= HOUND_CALL_MAX_HZ,
+                "offset {off} out of range [{HOUND_CALL_MIN_HZ}, {HOUND_CALL_MAX_HZ}] for seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn hound_offset_deterministic() {
+        let seed = "K5ARH";
+        let a = hound_offset_for(seed, HOUND_CALL_MIN_HZ, HOUND_CALL_MAX_HZ);
+        let b = hound_offset_for(seed, HOUND_CALL_MIN_HZ, HOUND_CALL_MAX_HZ);
+        assert_eq!(a, b, "same seed must produce same offset (determinism)");
+    }
+
+    #[test]
+    fn hound_offset_spreads_distinct_seeds() {
+        // These two seeds must produce different offsets under FNV-1a.
+        let a = hound_offset_for("K5ARH", HOUND_CALL_MIN_HZ, HOUND_CALL_MAX_HZ);
+        let b = hound_offset_for("VK9X", HOUND_CALL_MIN_HZ, HOUND_CALL_MAX_HZ);
+        assert_ne!(a, b, "distinct seeds must produce distinct offsets");
+    }
+
+    #[test]
+    fn hound_offset_snapped_to_5hz() {
+        for seed in &["K5ARH", "VK9X", "KH8B", "FT5ZM", "ZL9A"] {
+            let off = hound_offset_for(seed, HOUND_CALL_MIN_HZ, HOUND_CALL_MAX_HZ);
+            let remainder = off % 5.0;
+            assert!(
+                remainder.abs() < 1e-9,
+                "offset {off} for seed {seed} is not a multiple of 5 Hz (remainder {remainder})"
+            );
+        }
+    }
+
+    #[test]
+    fn hound_offset_degenerate_lo_eq_hi() {
+        let result = hound_offset_for("K5ARH", 500.0, 500.0);
+        assert_eq!(result, 500.0, "lo == hi must return lo");
     }
 }

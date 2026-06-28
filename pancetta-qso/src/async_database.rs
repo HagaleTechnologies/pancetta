@@ -1038,6 +1038,9 @@ mod tests {
                 progressed_this_cycle: false,
                 last_rx_text: None,
                 dx_repeat_count: 0,
+                hound: false,
+                partner_freq: None,
+                hound_qsyed: false,
             },
         };
 
@@ -1080,6 +1083,9 @@ mod tests {
                 progressed_this_cycle: false,
                 last_rx_text: None,
                 dx_repeat_count: 0,
+                hound: false,
+                partner_freq: None,
+                hound_qsyed: false,
             },
         };
 
