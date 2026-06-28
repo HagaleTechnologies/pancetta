@@ -835,6 +835,8 @@ async fn maybe_answer_caller(
     tx_policy: &std::sync::atomic::AtomicU8,
     max_concurrent: usize,
     message_bus: &MessageBus,
+    fox_mode: &std::sync::atomic::AtomicBool,
+    fox_max_streams: &std::sync::atomic::AtomicUsize,
 ) {
     // 1. TX policy: DISABLED blocks; RESPOND-ONLY / FULL allow responses.
     let policy =
@@ -880,8 +882,15 @@ async fn maybe_answer_caller(
         return;
     }
 
-    // 4. Capacity bound.
-    if qso_manager.active_qso_count().await >= max_concurrent {
+    // 4. Capacity bound. Fox mode raises the cap to fox_max_streams so the
+    //    station can work many Hound callers concurrently; normal mode uses
+    //    the operator's configured max_concurrent_qsos (passed as max_concurrent).
+    let effective_cap = if fox_mode.load(std::sync::atomic::Ordering::Relaxed) {
+        fox_max_streams.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        max_concurrent
+    };
+    if qso_manager.active_qso_count().await >= effective_cap {
         return;
     }
 
@@ -1024,18 +1033,17 @@ impl super::ApplicationCoordinator {
         // Global TX policy — the auto-73 re-send respects it (RESPOND-ONLY
         // allows, DISABLED blocks), exactly like every other response path.
         let tx_policy = self.tx_policy.clone();
-        // Fox-mode flag — Task 2 will read this inside the QSO task to switch
-        // to Fox-mode QSO sequencing. Captured here so it is in scope for the
-        // spawned task; unused this task (placeholder).
+        // Fox-mode flag — set true by SetFoxMode{on:true} to engage CQ loop +
+        // raise the caller-answer cap to fox_max_streams.
         let fox_mode = self.fox_mode();
+        // Maximum concurrent caller-answer QSOs while Fox mode is engaged.
+        // When fox_mode is false the normal auto_answer_max_concurrent cap applies.
+        let fox_max_streams = self.fox_max_streams();
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
                 use pancetta_qso::{HoundRegions, LoggerConfig, QsoManager, QsoManagerConfig};
-
-                // Task 2 will read fox_mode to switch to Fox-mode QSO sequencing.
-                let _ = &fox_mode;
 
                 let qso_config = QsoManagerConfig {
                     our_callsign: our_callsign.clone(),
@@ -2035,6 +2043,8 @@ impl super::ApplicationCoordinator {
                                                     &tx_policy,
                                                     auto_answer_max_concurrent,
                                                     &message_bus,
+                                                    &fox_mode,
+                                                    &fox_max_streams,
                                                 )
                                                 .await;
                                             }
@@ -2706,6 +2716,137 @@ impl super::ApplicationCoordinator {
                                                 "StopCq: cancelled {} un-answered CQ QSO(s)",
                                                 cancelled
                                             );
+                                        }
+
+                                        // Fox-mode engage/disengage. On engage:
+                                        //   1. TX-policy gate (Fox originates CQ = initiation).
+                                        //   2. Set fox_mode flag.
+                                        //   3. Start a repeating CQ (same path as StartCq / `c`).
+                                        //   4. Raise the caller-answer cap to fox_max_streams
+                                        //      (read dynamically in maybe_answer_caller).
+                                        // On disengage:
+                                        //   1. Clear fox_mode.
+                                        //   2. Cancel any active un-answered CallingCq QSO (StopCq path).
+                                        //   3. Normal cap automatically restored (fox_mode == false).
+                                        crate::message_bus::QsoMessage::SetFoxMode { on } => {
+                                            if on {
+                                                // Gate: Fox originates CQ — initiation only under Full.
+                                                let policy = pancetta_core::TxPolicy::from_u8(
+                                                    tx_policy
+                                                        .load(std::sync::atomic::Ordering::Relaxed),
+                                                );
+                                                if !policy.allows_initiation() {
+                                                    warn!(
+                                                        target: "tx.policy",
+                                                        "Refusing Fox mode: TX policy is {} \
+                                                         (initiation disallowed)",
+                                                        policy.label()
+                                                    );
+                                                    emit_status(
+                                                        &message_bus,
+                                                        format!(
+                                                            "Fox mode refused — TX policy is {} \
+                                                             (press g for Full)",
+                                                            policy.label()
+                                                        ),
+                                                    )
+                                                    .await;
+                                                    continue;
+                                                }
+
+                                                // Set the flag so maybe_answer_caller uses fox_max_streams.
+                                                fox_mode.store(
+                                                    true,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+
+                                                // Start the repeating Fox CQ (same as manual `c`):
+                                                // CallingCq QSO re-emits CQ every slot under the
+                                                // manual watchdog until a Hound answers.
+                                                // Use 1500 Hz (FT8 passband centre) as the default
+                                                // Fox CQ audio offset; tx_parity = None (Fox
+                                                // picks its own slot via the self-parity fallback).
+                                                const FOX_CQ_OFFSET_HZ: f64 = 1500.0;
+                                                match qso_manager
+                                                    .start_cq_manual(FOX_CQ_OFFSET_HZ, None)
+                                                    .await
+                                                {
+                                                    Ok(qso_id) => {
+                                                        let n = fox_max_streams.load(
+                                                            std::sync::atomic::Ordering::Relaxed,
+                                                        );
+                                                        info!(
+                                                            "Fox mode ON — CQ started: {} \
+                                                             ({:.0} Hz, up to {} streams)",
+                                                            qso_id, FOX_CQ_OFFSET_HZ, n
+                                                        );
+                                                        emit_status(
+                                                            &message_bus,
+                                                            format!(
+                                                                "Fox mode ON — CQ + up to {} \
+                                                                 streams",
+                                                                n
+                                                            ),
+                                                        )
+                                                        .await;
+                                                    }
+                                                    Err(e) => {
+                                                        // CQ start failed — still leave fox_mode
+                                                        // set so the cap raise takes effect and the
+                                                        // operator can manually call CQ.
+                                                        warn!(
+                                                            "Fox mode ON but CQ start failed: {}",
+                                                            e
+                                                        );
+                                                        emit_status(
+                                                            &message_bus,
+                                                            format!(
+                                                                "Fox mode ON (CQ start failed: \
+                                                                 {})",
+                                                                e
+                                                            ),
+                                                        )
+                                                        .await;
+                                                    }
+                                                }
+                                            } else {
+                                                // Disengage: clear flag first so cap drops
+                                                // immediately; then cancel CQ.
+                                                fox_mode.store(
+                                                    false,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+
+                                                let active = qso_manager.get_active_qsos().await;
+                                                let mut cancelled = 0usize;
+                                                for (id, progress) in active {
+                                                    if matches!(
+                                                        progress.state,
+                                                        pancetta_qso::QsoState::CallingCq { .. }
+                                                    ) {
+                                                        if let Err(e) =
+                                                            qso_manager.cancel_qso(id).await
+                                                        {
+                                                            warn!(
+                                                                "Fox mode OFF: cancel CQ {} \
+                                                                 failed: {}",
+                                                                id, e
+                                                            );
+                                                        } else {
+                                                            cancelled += 1;
+                                                        }
+                                                    }
+                                                }
+                                                info!(
+                                                    "Fox mode OFF — cancelled {} CQ QSO(s)",
+                                                    cancelled
+                                                );
+                                                emit_status(
+                                                    &message_bus,
+                                                    "Fox mode OFF".to_string(),
+                                                )
+                                                .await;
+                                            }
                                         }
                                     }
                                 }
