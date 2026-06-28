@@ -43,6 +43,37 @@ const HOUND_CALL_MAX_HZ: f64 = 900.0;
 const HOUND_RESPONSE_MIN_HZ: f64 = 1000.0;
 const HOUND_RESPONSE_MAX_HZ: f64 = 2700.0;
 
+/// Audio-offset boundaries for FT8 Hound (DXpedition chaser) mode.
+///
+/// Carried inside [`QsoManagerConfig`] so callers (e.g. the coordinator) can
+/// wire in operator-configured ranges from `pancetta-config::HoundConfig`
+/// without introducing a cross-crate dependency (pancetta-qso is a lower crate
+/// and must not depend on pancetta-config).
+///
+/// The defaults match the module-level `HOUND_*` constants (300/900/1000/2700).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HoundRegions {
+    /// Low calling-region minimum audio offset (Hz). Default 300.
+    pub call_min_hz: f64,
+    /// Low calling-region maximum audio offset (Hz). Default 900.
+    pub call_max_hz: f64,
+    /// Post-QSY response-region minimum audio offset (Hz). Default 1000.
+    pub response_min_hz: f64,
+    /// Post-QSY response-region maximum audio offset (Hz). Default 2700.
+    pub response_max_hz: f64,
+}
+
+impl Default for HoundRegions {
+    fn default() -> Self {
+        Self {
+            call_min_hz: HOUND_CALL_MIN_HZ,
+            call_max_hz: HOUND_CALL_MAX_HZ,
+            response_min_hz: HOUND_RESPONSE_MIN_HZ,
+            response_max_hz: HOUND_RESPONSE_MAX_HZ,
+        }
+    }
+}
+
 /// Hop a stuck QSO's TX audio offset by [`STUCK_TX_HOP_HZ`], wrapping back to
 /// the low end of the passband when it would exceed [`TX_OFFSET_MAX_HZ`]. Pure
 /// and deterministic so the move is unit-testable; the goal is simply to vacate
@@ -136,6 +167,15 @@ pub struct QsoManagerConfig {
 
     /// Duplicate checking settings
     pub duplicate_checking: DuplicateCheckConfig,
+
+    /// Hound (DXpedition chaser) audio-offset regions.
+    ///
+    /// Controls the calling region (low) and the post-QSY response region (high).
+    /// Defaults to 300–900 Hz (call) / 1000–2700 Hz (response), matching the
+    /// WSJT-X Fox/Hound conventions.  Populate from `pancetta_config::HoundConfig`
+    /// in the coordinator to honour operator-set ranges.
+    #[serde(default)]
+    pub hound: HoundRegions,
 }
 
 /// Timeout configuration
@@ -289,6 +329,7 @@ impl Default for QsoManagerConfig {
             contest_mode: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
         }
     }
 }
@@ -889,8 +930,13 @@ impl QsoManager {
         fox_grid: Option<&str>,
         dx_parity: Option<pancetta_core::slot::SlotParity>,
     ) -> Result<QsoId, QsoManagerError> {
-        // Compute our deterministic low calling offset for this Fox callsign.
-        let low_offset = hound_offset_for(fox_call, HOUND_CALL_MIN_HZ, HOUND_CALL_MAX_HZ);
+        // Compute our deterministic low calling offset for this Fox callsign,
+        // using the operator-configured (or default) call region bounds.
+        let low_offset = hound_offset_for(
+            fox_call,
+            self.config.hound.call_min_hz,
+            self.config.hound.call_max_hz,
+        );
 
         // Store the Fox's grid on `their_callsign`'s QSO (for logging); the TX
         // message itself uses *our* grid (station config), which respond_to_cq_with
@@ -921,13 +967,12 @@ impl QsoManager {
             if let Some(progress) = qsos.get_mut(&qso_id) {
                 progress.metadata.hound = true;
                 progress.metadata.partner_freq = Some(fox_freq);
-                // Tag the QSO as a Hound contact for ADIF/logbook consumers.
-                // Idempotent: HashMap insert replaces any prior "HOUND" entry.
-                progress
-                    .metadata
-                    .tags
-                    .entry("HOUND".to_string())
-                    .or_insert_with(|| "true".to_string());
+                // NOTE: do NOT insert "HOUND" into metadata.tags — that would
+                // produce a bare `<HOUND:4>true` ADIF field, which is not a
+                // valid ADIF name (must be `APP_`-prefixed per the ADIF spec)
+                // and can trip LoTW. The human-readable COMMENT "HOUND" and the
+                // machine-readable `APP_PANCETTA_HOUND` field are both written
+                // by `AdifProcessor::qso_to_adif` from `metadata.hound` directly.
             }
         }
 
@@ -1887,11 +1932,11 @@ impl QsoManager {
                     .their_callsign
                     .as_deref()
                     .unwrap_or("");
-                let qsy = hound_offset_for(
-                    fox_call,
-                    HOUND_RESPONSE_MIN_HZ,
-                    HOUND_RESPONSE_MAX_HZ,
+                let (resp_min, resp_max) = (
+                    self.config.hound.response_min_hz,
+                    self.config.hound.response_max_hz,
                 );
+                let qsy = hound_offset_for(fox_call, resp_min, resp_max);
                 let old_off = progress.metadata.frequency;
                 progress.metadata.frequency = qsy;
                 progress.metadata.hound_qsyed = true;
@@ -1911,7 +1956,7 @@ impl QsoManager {
                     qso_id = %qso_id,
                     fox = %fox_call,
                     "Hound: Fox answered — QSY TX {:.0} Hz -> {:.0} Hz (response region {}–{} Hz), sending R+report on new offset",
-                    old_off, qsy, HOUND_RESPONSE_MIN_HZ, HOUND_RESPONSE_MAX_HZ
+                    old_off, qsy, resp_min, resp_max
                 );
             }
         }
@@ -3552,6 +3597,7 @@ mod tests {
             contest_mode: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
         }
     }
 
@@ -5002,6 +5048,7 @@ mod sender_verification_tests {
             contest_mode: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
         };
         QsoManager::new(config)
     }
@@ -5348,6 +5395,7 @@ mod reply_emitter_tests {
             contest_mode: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
         };
         QsoManager::new(config)
     }
@@ -6225,6 +6273,7 @@ mod state_regression_tests {
             contest_mode: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
         };
         config.timeouts.manual_call_max_calls = max_calls;
         config.timeouts.manual_call_watchdog_minutes = watchdog_min;
@@ -6751,6 +6800,7 @@ mod stuck_dx_tests {
             contest_mode: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
         })
     }
 
@@ -6948,6 +6998,7 @@ mod has_active_or_recent_qso_tests {
             contest_mode: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
         })
     }
 
@@ -7240,6 +7291,7 @@ mod hound_tests {
             contest_mode: None,
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
         }
     }
 
@@ -7636,11 +7688,14 @@ mod hound_tests {
         );
     }
 
-    /// Task 6: engage_hound must stamp a "HOUND" entry in metadata.tags so the
-    /// ADIF renderer can pick it up for the COMMENT field and APP_PANCETTA_HOUND.
-    /// The tag must be present exactly once (idempotent HashMap insert).
+    /// Task 6 (updated): engage_hound must NOT insert a bare "HOUND" key into
+    /// metadata.tags — that would produce an invalid `<HOUND:4>true` ADIF field
+    /// (non-`APP_`-prefixed) that can trip LoTW.  The COMMENT "HOUND" signal and
+    /// the `APP_PANCETTA_HOUND` machine-readable field are both written by
+    /// `AdifProcessor::qso_to_adif` from `metadata.hound` directly, so the tag
+    /// is redundant AND harmful.  What we do require is `metadata.hound == true`.
     #[tokio::test]
-    async fn engage_hound_stamps_hound_tag_in_metadata() {
+    async fn engage_hound_no_stray_hound_tag_in_metadata() {
         let manager = QsoManager::new(hound_test_config());
 
         let qso_id = manager
@@ -7650,21 +7705,19 @@ mod hound_tests {
 
         let progress = manager.get_qso(qso_id).await.unwrap();
 
-        assert_eq!(
-            progress.metadata.tags.get("HOUND"),
-            Some(&"true".to_string()),
-            "metadata.tags must contain HOUND=true after engage_hound"
+        // The hound flag must be set — it drives COMMENT+APP_PANCETTA_HOUND in ADIF.
+        assert!(
+            progress.metadata.hound,
+            "metadata.hound must be true after engage_hound"
         );
 
-        // Count HOUND entries — HashMap can only have one key, but verify
-        // the value count is exactly 1 to confirm no accidental duplication.
-        let hound_count = progress
-            .metadata
-            .tags
-            .iter()
-            .filter(|(k, _)| *k == "HOUND")
-            .count();
-        assert_eq!(hound_count, 1, "tags must contain exactly one 'HOUND' entry");
+        // The bare "HOUND" tag must NOT be present — it would generate an invalid
+        // ADIF field `<HOUND:4>true` that can fail LoTW validation.
+        assert!(
+            !progress.metadata.tags.contains_key("HOUND"),
+            "metadata.tags must NOT contain a bare 'HOUND' key (would produce invalid ADIF); got tags={:?}",
+            progress.metadata.tags
+        );
     }
 
     /// T5-3: Non-Hound Caller QSO is completely unaffected by the QSY hook.

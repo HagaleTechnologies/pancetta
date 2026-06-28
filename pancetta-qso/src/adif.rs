@@ -1219,6 +1219,13 @@ ADIF Export for Test Program
             record_str.contains("HOUND"),
             "rendered ADIF must contain HOUND in COMMENT; got:\n{record_str}"
         );
+        // Regression guard: must NOT emit a bare non-APP_-prefixed HOUND field.
+        // A `<HOUND:4>true` field is not a valid ADIF field name and can trip
+        // LoTW validation. Only the `APP_PANCETTA_HOUND` variant is acceptable.
+        assert!(
+            !record_str.contains("<HOUND:"),
+            "must not emit a bare non-APP HOUND field; got:\n{record_str}"
+        );
     }
 
     /// A Hound QSO that already has operator notes must have COMMENT =

@@ -893,6 +893,11 @@ impl super::ApplicationCoordinator {
         // (default 1) so the policy is consistent with autonomous concurrency;
         // the parity gate additionally keeps all concurrent QSOs in one window.
         let auto_answer_max_concurrent = config.autonomous.max_concurrent_qsos.max(1) as usize;
+        // Snapshot the operator-configured Hound audio-offset regions so the
+        // QsoManager can use them in engage_hound + the QSY hook.  We capture
+        // them here (before drop) and pass them as `HoundRegions` to avoid
+        // introducing a pancetta-qso → pancetta-config dependency.
+        let hound_cfg = config.hound.clone();
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -935,11 +940,19 @@ impl super::ApplicationCoordinator {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                use pancetta_qso::{LoggerConfig, QsoManager, QsoManagerConfig};
+                use pancetta_qso::{
+                    HoundRegions, LoggerConfig, QsoManager, QsoManagerConfig,
+                };
 
                 let qso_config = QsoManagerConfig {
                     our_callsign: our_callsign.clone(),
                     our_grid: our_grid.clone(),
+                    hound: HoundRegions {
+                        call_min_hz: hound_cfg.call_min_hz,
+                        call_max_hz: hound_cfg.call_max_hz,
+                        response_min_hz: hound_cfg.response_min_hz,
+                        response_max_hz: hound_cfg.response_max_hz,
+                    },
                     ..Default::default()
                 };
 
