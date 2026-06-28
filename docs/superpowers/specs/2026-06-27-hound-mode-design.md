@@ -189,7 +189,8 @@ warning (mirrors existing config-validation style).
 
 ## Resolved decisions (operator, 2026-06-27)
 
-1. **Engage key = `h`** on the DX Hunter panel (Space=call, Enter=details remain).
+1. **Engage key = `Shift+H`** on the DX Hunter panel (Space=call, Enter=details remain). *(Shipped as
+   `Shift+H`, not `h`: lowercase `h` was already bound to StopTx — this is the spec's documented fallback.)*
 2. **Offsets = deterministic spread** — per-QSO offset derived from a counter/callsign hash into the
    region (300–900 low, 1000–2700 high); spreads concurrent Hound QSOs, fully deterministic.
 3. **Log flag = BOTH** — `"HOUND"` in `tags`→ADIF `COMMENT` **and** an app-defined `APP_PANCETTA_HOUND`
