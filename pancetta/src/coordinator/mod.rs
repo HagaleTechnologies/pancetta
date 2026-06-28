@@ -415,6 +415,11 @@ pub struct ApplicationCoordinator {
     /// `operating_frequency_hz`.
     split_tx_frequency_hz: Arc<std::sync::atomic::AtomicU64>,
 
+    /// Operator-held manual TX audio offset in Hz (0 = unset / auto). Set by the
+    /// TUI 'o' set-offset modal; read by the manual-call handler to place our TX
+    /// offset (WSJT-X "Hold Tx Freq" style) instead of defaulting to the DX's freq.
+    tx_offset_hold_hz: Arc<std::sync::atomic::AtomicU64>,
+
     /// `true` when the read-only `remote_gateway` component is enabled
     /// (`[network.remote_gateway].enabled`). Cached from config at construction
     /// so the display-event emit sites (decode fan-out, QSO snapshot, freq,
@@ -752,6 +757,9 @@ impl ApplicationCoordinator {
             // 0 = simplex; the TUI SetSplit relay writes the split TX dial when
             // the operator enables split mode on the rig.
             split_tx_frequency_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // 0 = unset / auto; the TUI 'o' modal writes the operator-held
+            // TX audio offset when the operator pins a specific frequency.
+            tx_offset_hold_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             gateway_enabled: Arc::new(AtomicBool::new(gateway_enabled_init)),
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
@@ -1051,6 +1059,14 @@ impl ApplicationCoordinator {
     /// relay, read by the QSO RF stamp.
     pub(crate) fn split_tx_frequency_hz(&self) -> Arc<std::sync::atomic::AtomicU64> {
         self.split_tx_frequency_hz.clone()
+    }
+
+    /// Operator-held manual TX audio offset atomic in Hz (0 = unset / auto).
+    /// Written by the TUI 'o' set-offset modal; read by the manual-call handler
+    /// in [`start_qso_component`] to place our TX at a held offset instead of
+    /// defaulting to the DX's audio frequency.
+    pub(crate) fn tx_offset_hold_hz(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.tx_offset_hold_hz.clone()
     }
 }
 
