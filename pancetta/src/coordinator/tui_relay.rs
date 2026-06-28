@@ -646,6 +646,10 @@ impl super::ApplicationCoordinator {
         // atomic; the QSO engine and autonomous operator read it to gate
         // autonomous frequency moves.
         let cmd_tx_freq_mode = self.tx_freq_mode.clone();
+        // Held TX audio offset in Hz (0 = Auto/unset). Written by the `o`-modal
+        // relay arm; read by the manual-call handler at QSO open to place our
+        // TX audio offset when the operator has set one.
+        let cmd_tx_offset_hold_hz = self.tx_offset_hold_hz();
         // Whether the autonomous component is running at all (config
         // gate). If it's config-disabled there is no decision loop to
         // re-enable — `a` should say so honestly instead of flipping a
@@ -1298,6 +1302,50 @@ impl super::ApplicationCoordinator {
                                     status: format!("TX freq: {}", next.label()),
                                 },
                             );
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::SetTxOffset { offset_hz } => {
+                            // Operator used the `o` modal to set or clear the held
+                            // TX audio offset.
+                            // Some(hz) → store hz, flip mode to Hold so the offset
+                            //            is actually used by the manual-call handler.
+                            // None     → store 0 (Auto/unset), flip mode to Auto.
+                            match offset_hz {
+                                Some(hz) => {
+                                    cmd_tx_offset_hold_hz.store(hz, Ordering::Relaxed);
+                                    cmd_tx_freq_mode.store(
+                                        pancetta_core::TxFreqMode::Hold.as_u8(),
+                                        Ordering::Release,
+                                    );
+                                    info!(
+                                        target: "tx.freq",
+                                        "Operator set TX offset hold @ {} Hz (mode → Hold)",
+                                        hz
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX".to_string(),
+                                            status: format!("TX offset held @ {} Hz", hz),
+                                        },
+                                    );
+                                }
+                                None => {
+                                    cmd_tx_offset_hold_hz.store(0, Ordering::Relaxed);
+                                    cmd_tx_freq_mode.store(
+                                        pancetta_core::TxFreqMode::Auto.as_u8(),
+                                        Ordering::Release,
+                                    );
+                                    info!(
+                                        target: "tx.freq",
+                                        "Operator cleared TX offset hold (mode → Auto)"
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX".to_string(),
+                                            status: "TX offset auto (Tx=Rx)".to_string(),
+                                        },
+                                    );
+                                }
+                            }
                         }
                         pancetta_tui::tui_runner::TuiCommand::StopTx => {
                             // Operator F8: abort the in-flight TX without
