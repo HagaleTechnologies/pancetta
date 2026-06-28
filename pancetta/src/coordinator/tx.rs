@@ -21,6 +21,25 @@ use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType}
 /// FT8 nominal pre-roll: audio starts 500ms past the slot boundary.
 const DELAY_MS: u64 = 500;
 
+/// Multi-TX coalesce collection window.
+///
+/// Fix for the "slow-start" bug: when the operator manually starts several
+/// same-window QSOs in quick succession, each opening is a separate keypress
+/// that crosses two async hops before its `TransmitRequest` reaches this worker.
+/// The worker used to coalesce the instant the FIRST request arrived (~10ms),
+/// committing the slot to a single stream; the sibling openings landed after the
+/// batch was formed and only joined on the next slot via keep-call rearm — so the
+/// streams trickled in one-per-cycle instead of all firing in the first window.
+///
+/// On popping a `TransmitRequest` head we now wait this brief window before
+/// coalescing, so same-parity openings emitted close together batch into one
+/// `MultiTransmitRequest`. The window is **absorbed by the subsequent
+/// slot-wait** (Step 6 keys PTT then sleeps to the slot boundary; audio still
+/// goes out at the boundary), so it adds no real latency in the common
+/// single-QSO case. Kept short so a request arriving in the final fraction
+/// before its slot is rarely pushed to the next slot.
+const COALESCE_COLLECT_WINDOW_MS: u64 = 800;
+
 /// Output of `schedule_tx`: where to TX, how much silence to pad in
 /// front, and how far into the modulated waveform to start emitting.
 #[derive(Debug, Clone, Copy)]
@@ -657,6 +676,18 @@ impl super::ApplicationCoordinator {
                             // back to exactly that one request — normal path
                             // unchanged.
                             if matches!(message.message_type, MessageType::TransmitRequest { .. }) {
+                                // Brief collection window so same-parity openings
+                                // started in quick succession (serial manual
+                                // keypresses, each crossing async hops) all arrive
+                                // before we coalesce — otherwise the first opening
+                                // commits the slot alone and siblings trickle in
+                                // one-per-cycle (the "slow-start" bug). Absorbed by
+                                // the Step-6 slot-wait, so no real added latency.
+                                // See COALESCE_COLLECT_WINDOW_MS.
+                                tokio::time::sleep(Duration::from_millis(
+                                    COALESCE_COLLECT_WINDOW_MS,
+                                ))
+                                .await;
                                 message.message_type = coalesce_backlog_into(
                                     message.message_type,
                                     &tx_rx,
