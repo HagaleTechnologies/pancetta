@@ -1,21 +1,33 @@
 #!/usr/bin/env bash
 # scripts/check.sh — local pre-push verification.
 #
-# Runs every check that CI runs (when the full lane runs), in roughly the
-# same order. With CI now scaled back so direct pushes to main only
-# trigger fmt + clippy, this script is the actual safety net for human
-# pushes — the heavy test/deny/build lanes only run in CI on PRs and the
-# weekly cron. Run it before every push.
+# GATE MODEL (2026-06-28): GitHub CI (.github/workflows/ci.yml) is the
+# AUTHORITATIVE gate. Its heavy lanes (full workspace tests, examples build,
+# cargo-deny, cross-platform) run on every PR *and* every push to main, so
+# `main` is comprehensively gated regardless of how a change lands. This script
+# is therefore a FAST local PRE-FLIGHT, not a full CI mirror.
+#
+#   - As a pre-push HOOK (auto-detected): runs the FAST lane — fmt + clippy +
+#     research-guard + `cargo check --workspace --examples` (compile/API-drift,
+#     incl. the CI-excluded pancetta-research examples) + cargo-deny. ~5 min.
+#     The full test RUN is left to CI (it runs on the resulting push/PR).
+#   - Run MANUALLY with no args for the FULL lane (adds the workspace test run)
+#     when you want local certainty before a big/risky change.
+#
+# The one thing CI does NOT cover is pancetta-research (local-only harness,
+# excluded from CI). The always-on `cargo check --workspace --examples` here is
+# its cheap drift guard — it type-checks the research example call-sites so a
+# decoder-API change can't silently break them (no codegen/linking of the dozens
+# of example binaries, which is what used to make this gate ~40 min).
 #
 # Usage:
-#   scripts/check.sh                # run all checks
-#   scripts/check.sh --fast         # skip the slowest jobs (full test suite)
+#   scripts/check.sh                # FULL lane (fast checks + workspace test run)
+#   scripts/check.sh --fast         # FAST lane only (same as the hook)
+#   scripts/check.sh --full         # force FULL lane even when run as a hook
 #   scripts/check.sh --fix          # `cargo fmt --all` and `cargo clippy --fix`
-#                                     to auto-correct what's safe
-#   scripts/check.sh --install-hook # symlink this script as the
-#                                     repo's .git/hooks/pre-push and exit
+#   scripts/check.sh --install-hook # symlink this script as the pre-push hook
 #
-# After --install-hook, every `git push` runs this script automatically.
+# After --install-hook, every `git push` runs the FAST lane automatically.
 # Skip it for one push with `git push --no-verify`.
 
 set -euo pipefail
@@ -23,21 +35,33 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 FAST=0
+FORCE_FULL=0
 FIX=0
 INSTALL_HOOK=0
-# When invoked as a git pre-push hook, git passes positional args
-# ($1=remote-name, $2=remote-url) and a list of refs on stdin. Detect
-# that case (script name is "pre-push" or first non-flag arg looks
-# like a remote name) and ignore positional args.
+# Hook auto-detection: when git runs this as a pre-push hook it passes the
+# remote name as $1 and the URL as $2 (positional, non-flag args), with refs on
+# stdin. A manual `scripts/check.sh` invocation has no positional args. So a
+# positional arg ⇒ hook context ⇒ default to the FAST lane (CI is the full
+# gate). `--full` overrides; `--fast` forces fast even when run manually.
+HOOK_CONTEXT=0
 for arg in "$@"; do
     case "$arg" in
         --fast)         FAST=1 ;;
+        --full)         FORCE_FULL=1 ;;
         --fix)          FIX=1 ;;
         --install-hook) INSTALL_HOOK=1 ;;
         --*)            echo "Unknown flag: $arg" >&2; exit 2 ;;
-        *)              ;;  # positional arg — likely from pre-push hook context, ignore
+        *)              HOOK_CONTEXT=1 ;;  # positional arg ⇒ pre-push hook context
     esac
 done
+# In hook context, default to FAST unless the operator forced --full.
+if [[ "$HOOK_CONTEXT" -eq 1 && "$FORCE_FULL" -eq 0 ]]; then
+    FAST=1
+fi
+# --full always wins (e.g. a manual `scripts/check.sh --full`).
+if [[ "$FORCE_FULL" -eq 1 ]]; then
+    FAST=0
+fi
 
 if [[ "$INSTALL_HOOK" -eq 1 ]]; then
     hook_path=".git/hooks/pre-push"
@@ -56,7 +80,8 @@ if [[ "$INSTALL_HOOK" -eq 1 ]]; then
     ln -s "$target" "$hook_path"
     chmod +x "$hook_path" 2>/dev/null || true
     echo "Installed pre-push hook: $hook_path → $target"
-    echo "Every \`git push\` will now run this script. Use \`git push --no-verify\` to skip."
+    echo "Every \`git push\` now runs the FAST lane (~5 min); CI is the full gate."
+    echo "Run \`scripts/check.sh\` (no args) for the full local lane. \`git push --no-verify\` skips."
     exit 0
 fi
 
@@ -85,11 +110,23 @@ run "clippy"            cargo clippy --workspace --features transmit
 
 run "research guard-ci" ./scripts/research-env.sh --guard-ci
 
-# --- Test lane (~5-10 min) -------------------------------------------------
+# --- Compile / drift lane (always; cheap with `check`) ----------------------
+#
+# `cargo check --workspace --examples` type-checks every crate's lib/bins AND
+# all example targets — including the CI-excluded pancetta-research examples —
+# so a decoder-API change that breaks an example call-site is caught here. We
+# `check` (not `build`): no codegen/linking of the dozens of example binaries
+# (that link step was the old ~40-min sink). CI does the full `build --examples`
+# + cross-platform on the PR/push.
+run "compile + examples (check)" cargo check --workspace --examples
+
+# --- Test lane (FULL only; CI runs this on every PR + main push) ------------
+#
+# The workspace test RUN is the expensive part. CI runs it authoritatively on
+# every PR and every push to main, so the hook (FAST) skips it; run the script
+# manually (no args / --full) when you want local certainty.
 
 if [[ "$FAST" -eq 0 ]]; then
-    run "workspace check"   cargo check --workspace
-    run "examples build"    cargo build --workspace --examples
     run "workspace tests"   cargo test --workspace --features transmit
 fi
 

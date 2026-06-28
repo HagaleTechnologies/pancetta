@@ -26,21 +26,21 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Job gating policy:
+# Job gating policy (revised 2026-06-28):
 #
-#   - clippy + fmt: run on every event (push, PR, schedule). Cheap and fast.
-#   - heavy lanes (ft8-tests, workspace-check, deny): run on PR (so
-#     dependabot is fully gated), schedule (weekly drift), or
-#     workflow_dispatch — but NOT on direct human pushes to main. The
-#     pre-push hook (scripts/check.sh) is the safety net for direct
-#     pushes; CI minutes are reserved for what only CI can catch.
-#   - cross-platform-check: PR-only and on schedule (slowest lane,
-#     macos+windows runners are 10x and 2x cost).
+# CI is the AUTHORITATIVE gate. The heavy lanes now run on every PR AND every
+# push to main, so `main` is comprehensively gated regardless of how a change
+# lands (PR merge or — if ever enabled — a direct push). This replaced the old
+# "skip heavy lanes on direct push; the pre-push hook covers it" policy: the
+# local pre-push hook (scripts/check.sh) is now a FAST pre-flight (~5 min) and
+# defers the full test run + examples build to CI here. See scripts/check.sh.
 #
-# `if: github.event_name != 'push' || github.actor == 'dependabot[bot]'`
-# means "skip on a human direct push to main; run everywhere else." The
-# dependabot carve-out is moot in practice (dependabot never pushes
-# directly, only via PR) but kept explicit for safety.
+#   - clippy + fmt: every event (push, PR, schedule). Cheap and fast.
+#   - heavy lanes (ft8-tests, workspace-check, deny): every PR + every push to
+#     main + schedule (weekly drift) + manual dispatch. (Path-filtered to code
+#     changes via `on.push.paths`, so docs-only pushes don't spend CI.)
+#   - cross-platform-check: PR + schedule + dispatch only (macos runners ~10x
+#     cost; not worth gating every main push).
 
 jobs:
   # Fast checks — run on every push and PR (~2 min)
@@ -82,12 +82,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-  # Full test suite — runs on PR (dependabot included), weekly schedule,
-  # and manual dispatch. Skipped on direct human pushes to main; the
-  # pre-push hook covers that case locally.
+  # FT8 crate checks + tests — runs on every PR and every push to main
+  # (plus weekly schedule + manual dispatch). Part of the authoritative gate.
   ft8-tests:
     name: FT8 Tests
-    if: github.event_name != 'push' || github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -114,7 +112,6 @@ jobs:
 
   workspace-check:
     name: Workspace Check
-    if: github.event_name != 'push' || github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
     env:
       # This lane links the whole workspace THREE times (check, examples,
@@ -204,11 +201,10 @@ jobs:
   # cargo-deny enforces license whitelist, banned-crate-source policy,
   # multi-version warnings, AND RustSec advisories — the latter subsumes
   # what cargo-audit would do separately. Single source of truth in
-  # deny.toml, including any documented advisory ignores. Skipped on
-  # direct human push to main; the pre-push hook covers it locally.
+  # deny.toml, including any documented advisory ignores. Runs on every PR and
+  # every push to main (part of the authoritative gate).
   deny:
     name: Cargo Deny
-    if: github.event_name != 'push' || github.actor == 'dependabot[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
