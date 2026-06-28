@@ -675,6 +675,11 @@ impl super::ApplicationCoordinator {
         // coordinator owns this — TUI just emits ToggleTune events.
         let cmd_tune_until: std::sync::Arc<tokio::sync::RwLock<Option<tokio::time::Instant>>> =
             std::sync::Arc::new(tokio::sync::RwLock::new(None));
+        // Fox-mode flag (shared with the QSO component). The ToggleFoxMode
+        // relay arm reads the current value and sends `SetFoxMode { on: !current }`
+        // so a single keypress always flips the authoritative state, even if the
+        // TUI's optimistic local flip diverged (network lag, failed engage, etc.).
+        let cmd_fox_mode = self.fox_mode();
         // Non-fatal config-load warnings to surface to the TUI as an error
         // banner once at startup (e.g. a pancetta.toml that failed to parse
         // and silently reverted to defaults).
@@ -1662,6 +1667,37 @@ impl super::ApplicationCoordinator {
                                         },
                                     );
                                 }
+                            }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::ToggleFoxMode => {
+                            // Operator pressed `Shift+X`: toggle Fox mode.
+                            // Read the authoritative atomic (not the TUI's
+                            // optimistic local flag) and flip it via
+                            // SetFoxMode so even a diverged TUI stays in sync.
+                            // The SetFoxMode handler in the QSO component is the
+                            // authority: it gates on TX policy (engage = initiation
+                            // → refuse under RespondOnly/Disabled), starts/stops
+                            // the repeating CQ, and raises/restores the
+                            // caller-answer cap. We just forward the toggle.
+                            let currently_on =
+                                cmd_fox_mode.load(std::sync::atomic::Ordering::Acquire);
+                            let on = !currently_on;
+                            info!(
+                                target: "operator.override",
+                                "Operator toggled Fox mode: {} -> {}",
+                                currently_on,
+                                on
+                            );
+                            let msg = ComponentMessage::new(
+                                ComponentId::Tui,
+                                ComponentId::Qso,
+                                MessageType::QsoMessage(
+                                    crate::message_bus::QsoMessage::SetFoxMode { on },
+                                ),
+                                Instant::now(),
+                            );
+                            if let Err(e) = cmd_message_bus.send_message(msg).await {
+                                warn!("Failed to forward ToggleFoxMode command: {}", e);
                             }
                         }
                         _ => {

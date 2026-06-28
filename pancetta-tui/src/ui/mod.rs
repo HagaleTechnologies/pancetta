@@ -250,6 +250,20 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         ));
     }
 
+    // Fox-mode chip: shown when Fox (DXpedition operator) mode is engaged.
+    // Magenta/bold so it stands out from the cyan SPLIT chip and the green TX
+    // chip. Off ⇒ no chip, no change to the title bar.
+    if app.fox_mode {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            " FOX ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     // TX audio offset chip: shown when the operator has set a held offset.
     // "TX off: NNNN (HOLD)" when set; hidden when Auto (no noise in the bar).
     if let Some(offset_hz) = app.tx_offset_hold_hz {

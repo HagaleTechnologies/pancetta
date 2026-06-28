@@ -341,6 +341,18 @@ pub enum TuiCommand {
         /// The Fox's Maidenhead grid square, if known (logging only).
         fox_grid: Option<String>,
     },
+    /// Operator pressed `Shift+X` — toggle Fox (DXpedition) mode.
+    ///
+    /// `x` is already bound to `ClearMessages`, so Fox-mode uses `Shift+X`
+    /// (spec's documented fallback). The coordinator's `SetFoxMode` handler
+    /// is the authority; the relay reads the current `fox_mode` atomic and
+    /// sends `SetFoxMode { on: !current }`. TX-policy gated on engage
+    /// (Fox originates CQ = initiation).
+    ///
+    /// The TUI flips its local `fox_mode` flag optimistically for immediate
+    /// chip feedback; the coordinator echoes the authoritative state via the
+    /// standard `StatusUpdate` path.
+    ToggleFoxMode,
 }
 
 /// TUI performance metrics
@@ -1143,6 +1155,16 @@ impl TuiRunner {
                         "Focus DX Hunter (H key) to engage Hound on selected station".to_string();
                 }
             }
+            // Shift+X — toggle Fox (DXpedition) mode. Lowercase `x` is taken
+            // by ClearMessages, so Fox uses Shift+X (spec's documented fallback).
+            // Flip local state optimistically for immediate chip feedback, then
+            // send ToggleFoxMode; the coordinator's SetFoxMode handler is the
+            // authority (TX-policy gated on engage, starts/stops repeating CQ,
+            // raises/restores the caller-answer cap).
+            KeyCode::Char('X') => {
+                app.toggle_fox_mode();
+                self.message_tx.send(TuiCommand::ToggleFoxMode)?;
+            }
             KeyCode::Char('p') => {
                 // TX-policy safety gate (mirror of the relay's authoritative
                 // check): refuse keying PTT while TX is Disabled. The relay
@@ -1622,6 +1644,8 @@ impl TuiRunner {
             ("p", "Toggle PTT (blocked while TX DISABLED)"),
             ("a", "Toggle autonomous mode"),
             ("Shift+P", "Pause / resume autonomous"),
+            ("Shift+H", "Engage Hound on selected DX Hunter station"),
+            ("Shift+X", "Toggle Fox (DXpedition) mode"),
             ("m", "Toggle audio monitoring"),
             ("d", "Device picker"),
             ("x", "Clear decoded messages"),
@@ -2893,5 +2917,56 @@ mod key_tests {
         assert_eq!(crate::app::parse_hz(""), None);
         assert_eq!(crate::app::parse_hz("abc"), None);
         assert_eq!(crate::app::parse_hz("-500"), None);
+    }
+
+    // === Fox mode (Shift+X) ===
+
+    /// `Shift+X` must emit `ToggleFoxMode` to the coordinator AND optimistically
+    /// flip `app.fox_mode` for immediate chip feedback — mirrors the `a`
+    /// (ToggleAutonomous) pattern.
+    #[tokio::test]
+    async fn key_shift_x_emits_toggle_fox_mode_and_flips_local_state() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        // Fox mode starts off.
+        assert!(!app.read().await.fox_mode, "fox_mode must start false");
+        r.handle_key_event(key_shift('X')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::ToggleFoxMode)),
+            "Shift+X must emit ToggleFoxMode"
+        );
+        assert!(
+            app.read().await.fox_mode,
+            "Shift+X must flip fox_mode to true optimistically"
+        );
+    }
+
+    /// Pressing `Shift+X` again toggles Fox mode back off.
+    #[tokio::test]
+    async fn key_shift_x_twice_returns_fox_mode_to_false() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key_shift('X')).await.unwrap();
+        let _ = cmd_rx.try_recv();
+        r.handle_key_event(key_shift('X')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::ToggleFoxMode)),
+            "second Shift+X must also emit ToggleFoxMode"
+        );
+        assert!(
+            !app.read().await.fox_mode,
+            "fox_mode must return to false after second Shift+X"
+        );
+    }
+
+    /// Lowercase `x` must NOT emit ToggleFoxMode — it is bound to ClearMessages.
+    #[tokio::test]
+    async fn key_lowercase_x_does_not_emit_toggle_fox_mode() {
+        let (mut r, cmd_rx, _app) = make_runner().await;
+        r.handle_key_event(key('x')).await.unwrap();
+        let cmd = cmd_rx.try_recv();
+        assert!(
+            !matches!(cmd, Ok(TuiCommand::ToggleFoxMode)),
+            "lowercase x must not emit ToggleFoxMode (got {:?})",
+            cmd
+        );
     }
 }
