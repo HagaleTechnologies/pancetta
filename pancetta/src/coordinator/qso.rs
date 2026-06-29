@@ -885,12 +885,25 @@ async fn maybe_answer_caller(
     // 4. Capacity bound. Fox mode raises the cap to fox_max_streams so the
     //    station can work many Hound callers concurrently; normal mode uses
     //    the operator's configured max_concurrent_qsos (passed as max_concurrent).
-    let effective_cap = if fox_mode.load(std::sync::atomic::Ordering::Relaxed) {
+    //
+    //    In Fox mode we count ONLY caller-answer QSOs (active_caller_qso_count),
+    //    NOT the CallingCq QSO: the CQ stream is an independent fixed slot; it
+    //    must not eat one of the N Hound-answer slots.  With fox_max_streams=5
+    //    this yields 5 Hounds + 1 CQ = 6 total streams (≤ MAX_RETAINED_TX_STREAMS=8).
+    //    The non-Fox path is UNCHANGED (active_qso_count vs max_concurrent —
+    //    regression guard).
+    let is_fox = fox_mode.load(std::sync::atomic::Ordering::Relaxed);
+    let effective_cap = if is_fox {
         fox_max_streams.load(std::sync::atomic::Ordering::Relaxed)
     } else {
         max_concurrent
     };
-    if qso_manager.active_qso_count().await >= effective_cap {
+    let active_count = if is_fox {
+        qso_manager.active_caller_qso_count().await
+    } else {
+        qso_manager.active_qso_count().await
+    };
+    if active_count >= effective_cap {
         return;
     }
 
@@ -2751,6 +2764,18 @@ impl super::ApplicationCoordinator {
                                                         ),
                                                     )
                                                     .await;
+                                                    // Echo the ACTUAL state (still false — refused)
+                                                    // so the TUI can correct its optimistic flip.
+                                                    let _ = message_bus
+                                                        .send_message(ComponentMessage::new(
+                                                            ComponentId::Qso,
+                                                            ComponentId::Tui,
+                                                            MessageType::FoxModeStatus {
+                                                                on: false,
+                                                            },
+                                                            Instant::now(),
+                                                        ))
+                                                        .await;
                                                     continue;
                                                 }
 
@@ -2809,6 +2834,15 @@ impl super::ApplicationCoordinator {
                                                         .await;
                                                     }
                                                 }
+                                                // Echo actual state (engaged = true) to TUI.
+                                                let _ = message_bus
+                                                    .send_message(ComponentMessage::new(
+                                                        ComponentId::Qso,
+                                                        ComponentId::Tui,
+                                                        MessageType::FoxModeStatus { on: true },
+                                                        Instant::now(),
+                                                    ))
+                                                    .await;
                                             } else {
                                                 // Disengage: clear flag first so cap drops
                                                 // immediately; then cancel CQ.
@@ -2846,6 +2880,15 @@ impl super::ApplicationCoordinator {
                                                     "Fox mode OFF".to_string(),
                                                 )
                                                 .await;
+                                                // Echo actual state (disengaged = false) to TUI.
+                                                let _ = message_bus
+                                                    .send_message(ComponentMessage::new(
+                                                        ComponentId::Qso,
+                                                        ComponentId::Tui,
+                                                        MessageType::FoxModeStatus { on: false },
+                                                        Instant::now(),
+                                                    ))
+                                                    .await;
                                             }
                                         }
                                     }

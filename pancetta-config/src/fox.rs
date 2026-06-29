@@ -21,10 +21,19 @@ fn default_max_streams() -> usize {
 /// single 15-second slot, each answering a different Hound caller.
 ///
 /// Corresponds to the `[fox]` section in the TOML config file.
+///
+/// # Stream accounting
+///
+/// While Fox mode is engaged there is always **one additional CQ stream** (the
+/// `CallingCq` QSO).  The validated ceiling is therefore 7, not 8:
+/// `max_streams` Hound answers + 1 CQ = at most 8 total streams ≤
+/// `MAX_RETAINED_TX_STREAMS`.  A value of 8 would require 9 streams and is
+/// rejected by [`FoxConfig::validate_section`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FoxConfig {
-    /// Maximum simultaneous TX streams per slot.  Must be ≥ 1 and ≤
-    /// [`MAX_RETAINED_TX_STREAMS`] (8).  Default 5.
+    /// Maximum simultaneous Hound-answer TX streams per slot.  Must be ≥ 1
+    /// and ≤ 7 (one slot is always reserved for the Fox CQ, so 7 answers +
+    /// 1 CQ = 8 = [`MAX_RETAINED_TX_STREAMS`]).  Default 5.
     #[serde(default = "default_max_streams")]
     pub max_streams: usize,
 }
@@ -37,9 +46,14 @@ impl Default for FoxConfig {
     }
 }
 
+/// Maximum value for [`FoxConfig::max_streams`].  One stream is always
+/// reserved for the Fox's own CQ, so Hound answers are capped at
+/// `MAX_RETAINED_TX_STREAMS - 1` (7).
+pub const MAX_FOX_ANSWER_STREAMS: usize = MAX_RETAINED_TX_STREAMS - 1;
+
 impl ConfigSection for FoxConfig {
     fn validate_section(&self) -> ConfigResult<()> {
-        if self.max_streams == 0 || self.max_streams > MAX_RETAINED_TX_STREAMS {
+        if self.max_streams == 0 || self.max_streams > MAX_FOX_ANSWER_STREAMS {
             return Err(ConfigError::InvalidValue {
                 field: "fox.max_streams".into(),
                 value: self.max_streams.to_string(),
@@ -89,16 +103,24 @@ mod tests {
 
     #[test]
     fn validate_rejects_above_ceiling() {
-        let cfg = FoxConfig { max_streams: 9 };
+        // Ceiling is now 7 (answers), not 8 — CQ + 8 answers would exceed
+        // MAX_RETAINED_TX_STREAMS=8.
+        let cfg9 = FoxConfig { max_streams: 9 };
         assert!(
-            cfg.validate_section().is_err(),
-            "max_streams = 9 must be invalid (> 8)"
+            cfg9.validate_section().is_err(),
+            "max_streams = 9 must be invalid (> 7)"
         );
 
         let cfg8 = FoxConfig { max_streams: 8 };
         assert!(
-            cfg8.validate_section().is_ok(),
-            "max_streams = 8 must be ok"
+            cfg8.validate_section().is_err(),
+            "max_streams = 8 must be invalid (CQ + 8 = 9 > MAX_RETAINED_TX_STREAMS=8)"
+        );
+
+        let cfg7 = FoxConfig { max_streams: 7 };
+        assert!(
+            cfg7.validate_section().is_ok(),
+            "max_streams = 7 must be ok (CQ + 7 answers = 8 = MAX_RETAINED_TX_STREAMS)"
         );
     }
 
