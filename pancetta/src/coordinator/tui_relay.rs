@@ -368,6 +368,14 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::SplitUpdate { tx_hz },
                             );
                         }
+                        MessageType::FoxModeStatus { on } => {
+                            // Echo the authoritative Fox-mode state to the TUI
+                            // FOX chip. Sent by the SetFoxMode handler on every
+                            // path (engage, refused engage, disengage).
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::FoxModeUpdate { on },
+                            );
+                        }
                         MessageType::ActiveQsosSnapshot {
                             ref qsos,
                             ref pending,
@@ -723,6 +731,16 @@ impl super::ApplicationCoordinator {
                     pancetta_core::TxPolicy::from_u8(cmd_tx_policy.load(Ordering::Acquire));
                 let _ = cmd_tui_msg_tx
                     .send(pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy });
+            }
+
+            // Seed the Fox-mode chip so it is authoritative from frame 1.
+            // Mirrors the TxPolicyUpdate seed above: fox_mode defaults false
+            // and the chip only corrects on SetFoxMode echo — push the real
+            // atomic value once so a pre-configured fox_mode=true shows correctly.
+            {
+                let on = cmd_fox_mode.load(Ordering::Acquire);
+                let _ =
+                    cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::FoxModeUpdate { on });
             }
 
             // Surface any non-fatal config-load warnings to the operator as an

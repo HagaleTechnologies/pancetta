@@ -528,6 +528,25 @@ impl QsoManager {
             .count()
     }
 
+    /// Count of currently-active (non-terminal) QSOs that are **not** in the
+    /// `CallingCq` state — i.e. caller-answer / in-exchange QSOs only.
+    ///
+    /// Used by the Fox-mode path in `maybe_answer_caller`: the Fox's own CQ
+    /// QSO is `CallingCq` and must not eat a Hound-answer slot.  With default
+    /// `fox_max_streams = 5`, this lets 5 Hounds be worked simultaneously
+    /// while the CQ keeps running (CQ + 5 answers = 6 streams ≤
+    /// `MAX_RETAINED_TX_STREAMS = 8`).
+    pub async fn active_caller_qso_count(&self) -> usize {
+        self.qsos
+            .read()
+            .await
+            .values()
+            .filter(|p| {
+                p.state.is_active() && !matches!(p.state, crate::states::QsoState::CallingCq { .. })
+            })
+            .count()
+    }
+
     /// Whether any *active* (non-terminal) QSO already exists with `callsign`
     /// (compound-call-aware via [`crate::exchange::callsigns_match`], so
     /// `EA8/G8BCG` and `G8BCG` count as the same station). Used by the

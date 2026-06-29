@@ -17,6 +17,12 @@
 //!
 //! **Regression guard**: fox_mode=false → the cap in `maybe_answer_caller` is
 //! exactly `max_concurrent` (unchanged from today's value).
+//!
+//! **T4 — active_caller_qso_count excludes CallingCq (Fix 1).**
+//! The Fox cap now uses `active_caller_qso_count` (not `active_qso_count`) so
+//! the CQ QSO does not eat a Hound-answer slot.  These tests verify that the
+//! new counter correctly ignores `CallingCq` QSOs and that with a CQ active
+//! the cap admits exactly `fox_max_streams` ANSWERS before rejecting.
 
 #![allow(clippy::expect_used)]
 
@@ -284,6 +290,131 @@ async fn fox_cap_admits_n_and_rejects_n_plus_1() {
     assert!(
         !would_admit_3rd,
         "3rd caller must be rejected (count={count} >= fox_max_streams={fox_max_streams})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T4 — active_caller_qso_count excludes CallingCq (Fix 1, off-by-one)
+// ---------------------------------------------------------------------------
+
+/// `active_caller_qso_count` must exclude `CallingCq` QSOs.
+/// Open one CallingCq QSO (the Fox's own CQ) and one caller-answer QSO;
+/// assert `active_caller_qso_count == 1` while `active_qso_count == 2`.
+#[tokio::test]
+async fn active_caller_qso_count_excludes_calling_cq() {
+    let config = QsoManagerConfig {
+        our_callsign: "K5ARH".to_string(),
+        our_grid: Some("EM10".to_string()),
+        ..Default::default()
+    };
+    let manager = QsoManager::new(config);
+    manager.start().await.expect("QsoManager::start");
+
+    // Open the Fox's own CQ (CallingCq state).
+    let _cq_id = manager
+        .start_cq_manual(1500.0, None)
+        .await
+        .expect("start_cq_manual");
+
+    // Open one Hound-answer QSO.
+    let _q1 = manager
+        .respond_to_caller(
+            "W1AAA".to_string(),
+            1200.0,
+            Some(pancetta_core::slot::SlotParity::Even),
+            pancetta_core::ResponseStep::Grid,
+            Some(-10.0),
+            None,
+            None,
+        )
+        .await
+        .expect("caller 1 admitted");
+
+    // total active = 2 (CQ + 1 answer)
+    let total = manager.active_qso_count().await;
+    assert_eq!(total, 2, "active_qso_count must be 2 (CQ + 1 answer)");
+
+    // caller-only active = 1 (CallingCq excluded)
+    let caller_only = manager.active_caller_qso_count().await;
+    assert_eq!(
+        caller_only, 1,
+        "active_caller_qso_count must be 1 (CallingCq excluded), got {caller_only}"
+    );
+}
+
+/// With a Fox CQ active and fox_max_streams=2, two Hound answers must be
+/// admitted before the cap rejects the third — the CQ does NOT consume a slot.
+/// This verifies Fix 1: `maybe_answer_caller` uses `active_caller_qso_count`
+/// in Fox mode instead of `active_qso_count`.
+#[tokio::test]
+async fn fox_cap_with_cq_active_admits_max_streams_answers() {
+    let config = QsoManagerConfig {
+        our_callsign: "K5ARH".to_string(),
+        our_grid: Some("EM10".to_string()),
+        ..Default::default()
+    };
+    let manager = QsoManager::new(config);
+    manager.start().await.expect("QsoManager::start");
+
+    let fox_max_streams = 2usize;
+
+    // Start the Fox CQ — this must NOT count against the Hound-answer cap.
+    let _cq_id = manager
+        .start_cq_manual(1500.0, None)
+        .await
+        .expect("start_cq_manual (Fox CQ)");
+
+    // Hound 1 — must be admitted (caller_count 0 < cap 2).
+    let _q1 = manager
+        .respond_to_caller(
+            "W1AAA".to_string(),
+            1200.0,
+            Some(pancetta_core::slot::SlotParity::Even),
+            pancetta_core::ResponseStep::Grid,
+            Some(-10.0),
+            None,
+            None,
+        )
+        .await
+        .expect("Hound 1 must be admitted");
+
+    // Hound 2 — must be admitted (caller_count 1 < cap 2).
+    let _q2 = manager
+        .respond_to_caller(
+            "W2BBB".to_string(),
+            1400.0,
+            Some(pancetta_core::slot::SlotParity::Even),
+            pancetta_core::ResponseStep::Grid,
+            Some(-12.0),
+            None,
+            None,
+        )
+        .await
+        .expect("Hound 2 must be admitted");
+
+    // active_caller_qso_count == 2 (CQ excluded → at cap).
+    let caller_count = manager.active_caller_qso_count().await;
+    assert_eq!(
+        caller_count, 2,
+        "two Hound answers must be active (CQ excluded from count)"
+    );
+
+    // A 3rd Hound would be rejected: caller_count (2) >= fox_max_streams (2).
+    let would_admit_3rd = caller_count < fox_max_streams;
+    assert!(
+        !would_admit_3rd,
+        "3rd Hound must be rejected when caller_count={caller_count} >= \
+         fox_max_streams={fox_max_streams}"
+    );
+
+    // Sanity: total QSO count is 3 (CQ + 2 answers).  Under the OLD
+    // active_qso_count path with fox_max_streams=2 we would have capped at 1
+    // Hound (CQ counted as slot 1 of 2) — confirm we have 3 total now.
+    let total = manager.active_qso_count().await;
+    assert_eq!(
+        total, 3,
+        "total active QSOs must be 3 (1 CQ + 2 Hounds); \
+         old off-by-one would have admitted only 1 Hound"
     );
 }
 

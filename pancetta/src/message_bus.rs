@@ -197,6 +197,17 @@ pub enum MessageType {
         tx_hz: u64,
     },
 
+    /// Fox-mode state echo for the TUI FOX chip.  Sent by the `SetFoxMode`
+    /// handler on every path (successful engage, refused engage, or disengage)
+    /// so the TUI `fox_mode` flag is always authoritative.  Without this the
+    /// TUI's optimistic Shift+X flip can desync when engage is refused under
+    /// RespondOnly/Disabled TX policy.  Observation only.
+    FoxModeStatus {
+        /// `true` if Fox mode was actually engaged; `false` if refused or
+        /// disengaged.
+        on: bool,
+    },
+
     /// Autonomous operator status update
     AutonomousStatus(AutonomousStatusData),
 

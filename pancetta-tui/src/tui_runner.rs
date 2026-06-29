@@ -175,6 +175,15 @@ pub enum TuiMessage {
         /// Current split TX frequency in Hz, or 0 for simplex.
         tx_hz: u64,
     },
+    /// Fox-mode authoritative echo. Sent by the coordinator's `SetFoxMode`
+    /// handler on every path — successful engage, refused engage (TX policy
+    /// blocks initiation), and disengage — carrying the **actual** resulting
+    /// state.  The TUI sets `app.fox_mode` from this, overriding the
+    /// optimistic Shift+X flip so the FOX chip is never stuck in a desync.
+    FoxModeUpdate {
+        /// `true` if Fox mode is now active; `false` if refused or disengaged.
+        on: bool,
+    },
     /// Available audio devices, enumerated by the coordinator (which owns
     /// the `pancetta-audio` host) and pushed to the TUI once at startup so
     /// the `d` device-selection picker can list them. Each entry is
@@ -640,6 +649,11 @@ impl TuiRunner {
             }
             TuiMessage::SplitUpdate { tx_hz } => {
                 app.split_tx_hz = tx_hz;
+            }
+            TuiMessage::FoxModeUpdate { on } => {
+                // Authoritative echo from the coordinator — overrides the
+                // optimistic Shift+X flip so the FOX chip is always correct.
+                app.fox_mode = on;
             }
             TuiMessage::DeviceListUpdate {
                 input,
@@ -2967,6 +2981,62 @@ mod key_tests {
             !matches!(cmd, Ok(TuiCommand::ToggleFoxMode)),
             "lowercase x must not emit ToggleFoxMode (got {:?})",
             cmd
+        );
+    }
+
+    // ── FoxModeUpdate authoritative echo (Fix 2) ─────────────────────────────
+
+    /// `FoxModeUpdate { on: true }` must set `app.fox_mode = true` — the
+    /// coordinator's successful-engage echo drives the chip authoritatively.
+    #[tokio::test]
+    async fn fox_mode_update_on_sets_flag() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        // Start false.
+        assert!(!app.read().await.fox_mode, "fox_mode must start false");
+        r.handle_message(TuiMessage::FoxModeUpdate { on: true })
+            .await
+            .unwrap();
+        assert!(
+            app.read().await.fox_mode,
+            "FoxModeUpdate{{on:true}} must set fox_mode=true"
+        );
+    }
+
+    /// `FoxModeUpdate { on: false }` must set `app.fox_mode = false` — mirrors
+    /// the refused-engage or disengage path from the coordinator.
+    #[tokio::test]
+    async fn fox_mode_update_off_clears_flag() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        // Pre-set to true to confirm it gets cleared.
+        app.write().await.fox_mode = true;
+        r.handle_message(TuiMessage::FoxModeUpdate { on: false })
+            .await
+            .unwrap();
+        assert!(
+            !app.read().await.fox_mode,
+            "FoxModeUpdate{{on:false}} must clear fox_mode"
+        );
+    }
+
+    /// Optimistic Shift+X flip followed by a refused-engage echo
+    /// (`FoxModeUpdate { on: false }`) must result in `fox_mode = false`.
+    /// This is the desync fix: before Fix 2 the chip stayed stuck on true.
+    #[tokio::test]
+    async fn refused_engage_echo_corrects_optimistic_flip() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        // Simulate Shift+X: optimistic flip to true.
+        r.handle_key_event(key_shift('X')).await.unwrap();
+        assert!(
+            app.read().await.fox_mode,
+            "after Shift+X, fox_mode should be true (optimistic)"
+        );
+        // Coordinator refuses and echoes FoxModeUpdate{on:false}.
+        r.handle_message(TuiMessage::FoxModeUpdate { on: false })
+            .await
+            .unwrap();
+        assert!(
+            !app.read().await.fox_mode,
+            "after refused-engage echo, fox_mode must be false (corrected)"
         );
     }
 }
