@@ -51,7 +51,7 @@ atomic = "0.6"
 clap = { version = "4.6", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = "1.1"
 
 # Logging and telemetry
 tracing = "0.1"
