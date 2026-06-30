@@ -22,7 +22,6 @@ rubato = "0.15"  # High-quality resampling
 biquad = "0.4"   # IIR filters
 
 # Numerical computing
-ndarray = "0.15"
 num-complex = "0.4"
 num-traits = "0.2"
 
