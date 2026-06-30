@@ -833,7 +833,10 @@ impl App {
             antenna: config.station.antenna.clone(),
             rig: config.station.rig.clone(),
             operating_frequency: config.station.default_frequency,
-            mode: "FT8".to_string(),
+            // Station-wide active operating mode (FT8/FT4/FT2) from [rig].mode
+            // (carried on StationConfig); backs the title-bar mode chip
+            // (rendered only when != FT8).
+            mode: config.station.mode.clone(),
         };
 
         // Find the band index matching the default frequency
