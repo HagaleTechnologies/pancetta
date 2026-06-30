@@ -251,6 +251,18 @@ pub(crate) fn protocol_from_mode(mode: pancetta_config::OperatingMode) -> pancet
     }
 }
 
+/// Canonical ADIF/display mode string for the station-wide
+/// [`pancetta_config::OperatingMode`]. Stamped into [`QsoMetadata::mode`]
+/// (→ ADIF `MODE`) and the TUI decode view. Derived once at startup from
+/// `rig_config.operating_mode()`; defaults to `"FT8"` on parse error.
+pub(crate) fn mode_str(mode: pancetta_config::OperatingMode) -> &'static str {
+    match mode {
+        pancetta_config::OperatingMode::Ft8 => "FT8",
+        pancetta_config::OperatingMode::Ft4 => "FT4",
+        pancetta_config::OperatingMode::Ft2 => "FT2",
+    }
+}
+
 /// Per-protocol timing values the DSP windowing thread needs, derived once at
 /// startup from a [`pancetta_ft8::ProtocolParams`] via [`derive_dsp_timing`].
 ///
@@ -1363,6 +1375,13 @@ mod tests {
             protocol_from_mode(pancetta_config::OperatingMode::Ft4),
             pancetta_ft8::Protocol::Ft4
         );
+    }
+
+    #[test]
+    fn mode_str_maps_each_operating_mode() {
+        assert_eq!(mode_str(pancetta_config::OperatingMode::Ft8), "FT8");
+        assert_eq!(mode_str(pancetta_config::OperatingMode::Ft4), "FT4");
+        assert_eq!(mode_str(pancetta_config::OperatingMode::Ft2), "FT2");
     }
 
     #[tokio::test]

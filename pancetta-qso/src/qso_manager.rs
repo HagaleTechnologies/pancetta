@@ -210,6 +210,20 @@ pub struct QsoManagerConfig {
     /// in the coordinator to honour operator-set ranges.
     #[serde(default)]
     pub hound: HoundRegions,
+
+    /// Station-wide active operating mode string (`"FT8"`, `"FT4"`, or
+    /// `"FT2"`), stamped into every [`QsoMetadata::mode`] this manager
+    /// creates and thus into the ADIF `MODE` field of logged QSOs. FT8 is a
+    /// station-global mode (not per-decode); the coordinator populates this
+    /// from `[rig].mode`. Defaults to `"FT8"` so the legacy path is
+    /// byte-identical.
+    #[serde(default = "default_active_mode")]
+    pub active_mode: String,
+}
+
+/// Default value for [`QsoManagerConfig::active_mode`]: `"FT8"`.
+fn default_active_mode() -> String {
+    "FT8".to_string()
 }
 
 /// Timeout configuration
@@ -364,6 +378,7 @@ impl Default for QsoManagerConfig {
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
+            active_mode: default_active_mode(),
         }
     }
 }
@@ -725,7 +740,7 @@ impl QsoManager {
             our_callsign: self.config.our_callsign.clone(),
             their_callsign: None,
             frequency,
-            mode: "FT8".to_string(),
+            mode: self.config.active_mode.clone(),
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -842,7 +857,7 @@ impl QsoManager {
             our_callsign: self.config.our_callsign.clone(),
             their_callsign: None,
             frequency,
-            mode: "FT8".to_string(),
+            mode: self.config.active_mode.clone(),
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -1137,7 +1152,7 @@ impl QsoManager {
             our_callsign: self.config.our_callsign.clone(),
             their_callsign: Some(target_callsign.clone()),
             frequency,
-            mode: "FT8".to_string(),
+            mode: self.config.active_mode.clone(),
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -1430,7 +1445,7 @@ impl QsoManager {
             our_callsign: self.config.our_callsign.clone(),
             their_callsign: Some(target.clone()),
             frequency,
-            mode: "FT8".to_string(),
+            mode: self.config.active_mode.clone(),
             start_time: now,
             end_time: None,
             reports: SignalReports::default(),
@@ -3698,6 +3713,7 @@ mod tests {
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
+            active_mode: default_active_mode(),
         }
     }
 
@@ -3765,6 +3781,70 @@ mod tests {
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert!(matches!(progress.state, QsoState::RespondingToCq { .. }));
         assert_eq!(progress.metadata.their_callsign, Some("K1DEF".to_string()));
+    }
+
+    // --- active_mode: QsoMetadata.mode follows the station-wide mode -------
+
+    /// Regression: default `QsoManagerConfig` stamps `mode == "FT8"` on every
+    /// QSO metadata it creates — byte-identical to pre-FT4 behavior.
+    #[tokio::test]
+    async fn default_config_stamps_mode_ft8() {
+        assert_eq!(QsoManagerConfig::default().active_mode, "FT8");
+        let manager = QsoManager::new(test_config());
+        // CallingCq metadata (start_cq path).
+        let cq_id = manager.start_cq(14074000.0, None).await.unwrap();
+        assert_eq!(manager.get_qso(cq_id).await.unwrap().metadata.mode, "FT8");
+        // RespondingToCq metadata (respond_to_cq path).
+        let rx_id = manager
+            .respond_to_cq("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        assert_eq!(manager.get_qso(rx_id).await.unwrap().metadata.mode, "FT8");
+    }
+
+    /// FT4 mode: a manager built with `active_mode = "FT4"` stamps `mode ==
+    /// "FT4"` into the metadata of QSOs it creates (→ ADIF `MODE:FT4`).
+    #[tokio::test]
+    async fn active_mode_ft4_stamps_metadata() {
+        let config = QsoManagerConfig {
+            active_mode: "FT4".to_string(),
+            ..test_config()
+        };
+        let manager = QsoManager::new(config);
+        let cq_id = manager.start_cq(14074000.0, None).await.unwrap();
+        assert_eq!(manager.get_qso(cq_id).await.unwrap().metadata.mode, "FT4");
+        let rx_id = manager
+            .respond_to_cq("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        assert_eq!(manager.get_qso(rx_id).await.unwrap().metadata.mode, "FT4");
+    }
+
+    /// An FT4 `QsoMetadata` (built by a manager in FT4 mode) renders ADIF
+    /// `MODE:FT4`; the default FT8 manager renders `MODE:FT8` — confirming
+    /// `mode` flows through `qso_to_adif` → `generate_record` unchanged.
+    #[tokio::test]
+    async fn adif_mode_follows_active_mode() {
+        use crate::adif::AdifProcessor;
+        let processor = AdifProcessor::new();
+        for mode in ["FT8", "FT4"] {
+            let config = QsoManagerConfig {
+                active_mode: mode.to_string(),
+                ..test_config()
+            };
+            let manager = QsoManager::new(config);
+            let qso_id = manager
+                .respond_to_cq("K1DEF".to_string(), 14074000.0, None)
+                .await
+                .unwrap();
+            let meta = manager.get_qso(qso_id).await.unwrap().metadata;
+            let record = processor.qso_to_adif(&meta, None);
+            let rendered = processor.generate_record(&record).unwrap();
+            assert!(
+                rendered.contains(&format!("<MODE:{}>{}", mode.len(), mode)),
+                "expected MODE:{mode} in ADIF, got: {rendered}"
+            );
+        }
     }
 
     // --- Fix 1 (security): compound-callsign logged-callsign upgrade ------
@@ -5150,6 +5230,7 @@ mod sender_verification_tests {
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
+            active_mode: "FT8".to_string(),
         };
         QsoManager::new(config)
     }
@@ -5497,6 +5578,7 @@ mod reply_emitter_tests {
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
+            active_mode: "FT8".to_string(),
         };
         QsoManager::new(config)
     }
@@ -6523,6 +6605,7 @@ mod state_regression_tests {
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
+            active_mode: "FT8".to_string(),
         };
         config.timeouts.manual_call_max_calls = max_calls;
         config.timeouts.manual_call_watchdog_minutes = watchdog_min;
@@ -7050,6 +7133,7 @@ mod stuck_dx_tests {
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
+            active_mode: "FT8".to_string(),
         })
     }
 
@@ -7248,6 +7332,7 @@ mod has_active_or_recent_qso_tests {
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
+            active_mode: "FT8".to_string(),
         })
     }
 
@@ -7541,6 +7626,7 @@ mod hound_tests {
             auto_sequence: AutoSequenceConfig::default(),
             duplicate_checking: DuplicateCheckConfig::default(),
             hound: HoundRegions::default(),
+            active_mode: "FT8".to_string(),
         }
     }
 
