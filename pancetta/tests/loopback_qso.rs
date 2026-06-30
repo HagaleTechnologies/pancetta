@@ -1111,7 +1111,13 @@ fn schedule_tx_late_press_targets_current_opposite_slot() {
 
     let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let now = base + chrono::Duration::milliseconds(20_000); // :20.0
-    let s = schedule_tx(now, SlotParity::Odd, 8000, 12_000);
+    let s = schedule_tx(
+        now,
+        SlotParity::Odd,
+        8000,
+        12_000,
+        pancetta_core::slot::SLOT_NS,
+    );
     // The Odd slot at :15 ends at :30. We want to land in *that* slot.
     assert_eq!((s.target_slot - base).num_seconds(), 15);
     assert_eq!(s.cursor_offset_samples, 4_500 * 12);
@@ -1129,7 +1135,13 @@ fn schedule_tx_no_collision_on_late_press_near_boundary() {
 
     let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
     let now = base + chrono::Duration::milliseconds(14_600); // :14.6
-    let s = schedule_tx(now, SlotParity::Odd, 8000, 12_000);
+    let s = schedule_tx(
+        now,
+        SlotParity::Odd,
+        8000,
+        12_000,
+        pancetta_core::slot::SLOT_NS,
+    );
     let secs = (s.target_slot - base).num_seconds();
     // MUST be :15 (Odd), NOT :30 (Even — would collide with DX).
     assert_eq!(secs, 15);
