@@ -1004,6 +1004,16 @@ impl super::ApplicationCoordinator {
         // them here (before drop) and pass them as `HoundRegions` to avoid
         // introducing a pancetta-qso → pancetta-config dependency.
         let hound_cfg = config.hound.clone();
+        // Station-wide active operating mode string ("FT8"/"FT4"/"FT2"),
+        // stamped into every QsoMetadata.mode (→ ADIF MODE). Defaults to FT8
+        // on parse error so the legacy path is unchanged.
+        let active_mode = super::mode_str(
+            config
+                .rig
+                .operating_mode()
+                .unwrap_or(pancetta_config::OperatingMode::Ft8),
+        )
+        .to_string();
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -1067,6 +1077,7 @@ impl super::ApplicationCoordinator {
                         response_min_hz: hound_cfg.response_min_hz,
                         response_max_hz: hound_cfg.response_max_hz,
                     },
+                    active_mode: active_mode.clone(),
                     ..Default::default()
                 };
 
