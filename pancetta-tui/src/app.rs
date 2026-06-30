@@ -1403,6 +1403,14 @@ impl App {
 
         let band = &self.config.bands.bands[self.current_band_index];
         let band_name = band.name.clone();
+        // TODO(ft4): manual band-change dial is mode-unaware here — the TUI's
+        // band table (`config.bands`) carries FT8 dial frequencies in MHz and
+        // the active operating mode lives in the coordinator's [rig] config,
+        // not threaded into the TUI. In FT4 mode the operator currently lands
+        // on the FT8 dial via the manual `=`/`-` path. The autonomous band-hop
+        // path IS mode-aware (coordinator/autonomous.rs ChangeBand handler,
+        // via pancetta_core::Band::ft4_frequency / dial_for). Wiring the TUI
+        // path needs the active mode + a per-band FT4 column threaded in.
         self.station_info.operating_frequency = band.ft8_frequency;
         let dial = (band.ft8_frequency * 1_000_000.0) as u64;
         let base_status = format!("Band: {} — {:.3} MHz", band_name, band.ft8_frequency);
