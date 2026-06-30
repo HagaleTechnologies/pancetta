@@ -16,6 +16,20 @@ pub enum Protocol {
     Ft2,
 }
 
+impl Protocol {
+    /// Slot length in nanoseconds for this protocol.
+    ///
+    /// Convenience over `ProtocolParams::{ft8,ft4,ft2}().slot_ns()`.
+    pub fn slot_ns(self) -> i64 {
+        match self {
+            Protocol::Ft8 => ProtocolParams::ft8().slot_ns(),
+            Protocol::Ft4 => ProtocolParams::ft4().slot_ns(),
+            #[cfg(feature = "ft2")]
+            Protocol::Ft2 => ProtocolParams::ft2().slot_ns(),
+        }
+    }
+}
+
 impl std::fmt::Display for Protocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -224,6 +238,16 @@ impl ProtocolParams {
     // ========================================================================
     // Derived parameters
     // ========================================================================
+
+    /// Slot length in nanoseconds (`cycle_duration` converted to ns).
+    ///
+    /// FT8 = 15_000_000_000, FT4 = 7_500_000_000. This is the period to feed
+    /// the period-generic slot-timing helpers in `pancetta_core::slot`
+    /// (`*_with_period` variants); the bare FT8 wrappers there hardcode
+    /// `SLOT_NS == ft8().slot_ns()`.
+    pub fn slot_ns(&self) -> i64 {
+        (self.cycle_duration * 1e9) as i64
+    }
 
     /// Samples per symbol at the given sample rate
     pub fn samples_per_symbol(&self, sample_rate: u32) -> usize {
@@ -463,6 +487,23 @@ mod tests {
     fn test_protocol_display() {
         assert_eq!(Protocol::Ft8.to_string(), "FT8");
         assert_eq!(Protocol::Ft4.to_string(), "FT4");
+    }
+
+    #[test]
+    fn test_slot_ns() {
+        assert_eq!(ProtocolParams::ft8().slot_ns(), 15_000_000_000);
+        assert_eq!(ProtocolParams::ft4().slot_ns(), 7_500_000_000);
+        // Protocol convenience matches ProtocolParams.
+        assert_eq!(Protocol::Ft8.slot_ns(), 15_000_000_000);
+        assert_eq!(Protocol::Ft4.slot_ns(), 7_500_000_000);
+    }
+
+    #[cfg(feature = "ft2")]
+    #[test]
+    fn test_slot_ns_ft2() {
+        let p = ProtocolParams::ft2();
+        assert_eq!(p.slot_ns(), (p.cycle_duration * 1e9) as i64);
+        assert_eq!(Protocol::Ft2.slot_ns(), p.slot_ns());
     }
 
     #[test]

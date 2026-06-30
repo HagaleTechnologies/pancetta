@@ -20,15 +20,24 @@ pub const PRE_ROLL_NS: i64 = 500_000_000;
 /// FT8 transmission duration (79 symbols × 0.16s).
 pub const TX_DURATION_NS: i64 = 12_640_000_000;
 
-/// Returns the start of the slot that contains `t`. Used by the TX
-/// scheduler to detect "we're inside a viable slot, target it" vs.
-/// "current slot is wrong parity or already too late, advance."
-pub fn current_slot_start(t: DateTime<Utc>) -> DateTime<Utc> {
+/// Returns the start of the slot that contains `t`, for an arbitrary slot
+/// period `slot_ns` (e.g. FT4's 7.5s). The FT8 wrapper [`current_slot_start`]
+/// delegates here with [`SLOT_NS`].
+pub fn current_slot_start_with_period(t: DateTime<Utc>, slot_ns: i64) -> DateTime<Utc> {
     let ns = t
         .timestamp_nanos_opt()
         .expect("system clock out of i64 ns range");
-    let slot_ns = ns.div_euclid(SLOT_NS) * SLOT_NS;
-    DateTime::<Utc>::from_timestamp_nanos(slot_ns)
+    let start_ns = ns.div_euclid(slot_ns) * slot_ns;
+    DateTime::<Utc>::from_timestamp_nanos(start_ns)
+}
+
+/// Returns the start of the slot that contains `t`. Used by the TX
+/// scheduler to detect "we're inside a viable slot, target it" vs.
+/// "current slot is wrong parity or already too late, advance."
+///
+/// FT8 (15s) wrapper over [`current_slot_start_with_period`].
+pub fn current_slot_start(t: DateTime<Utc>) -> DateTime<Utc> {
+    current_slot_start_with_period(t, SLOT_NS)
 }
 
 /// Parity of an FT8 slot. Even slots start at UTC seconds `:00` and
@@ -43,19 +52,28 @@ pub enum SlotParity {
 }
 
 impl SlotParity {
-    /// Parity of the slot containing `t`. Computed as `(t.timestamp / 15) % 2`,
-    /// where the slot index is the floor — so any instant inside the slot
-    /// resolves to the same parity as the slot's start boundary.
-    pub fn of(t: DateTime<Utc>) -> SlotParity {
+    /// Parity of the slot containing `t`, for an arbitrary slot period
+    /// `slot_ns`. The FT8 wrapper [`SlotParity::of`] delegates here with
+    /// [`SLOT_NS`].
+    pub fn of_with_period(t: DateTime<Utc>, slot_ns: i64) -> SlotParity {
         let ns = t
             .timestamp_nanos_opt()
             .expect("system clock out of i64 ns range");
-        let slot_index = ns.div_euclid(SLOT_NS);
+        let slot_index = ns.div_euclid(slot_ns);
         if slot_index % 2 == 0 {
             SlotParity::Even
         } else {
             SlotParity::Odd
         }
+    }
+
+    /// Parity of the slot containing `t`. Computed as `(t.timestamp / 15) % 2`,
+    /// where the slot index is the floor — so any instant inside the slot
+    /// resolves to the same parity as the slot's start boundary.
+    ///
+    /// FT8 (15s) wrapper over [`SlotParity::of_with_period`].
+    pub fn of(t: DateTime<Utc>) -> SlotParity {
+        SlotParity::of_with_period(t, SLOT_NS)
     }
 
     /// The other parity. `Even <-> Odd`. Idempotent under double-flip.
@@ -67,12 +85,14 @@ impl SlotParity {
     }
 }
 
-/// Returns the next 15-second slot boundary at or after `now + min_lead`.
-///
-/// Use `min_lead = Duration::zero()` to allow returning `now` itself when it
-/// happens to fall exactly on a boundary; pass a non-zero lead when the caller
-/// needs guaranteed headroom (e.g., to engage PTT before the slot starts).
-pub fn next_slot_start(now: DateTime<Utc>, min_lead: Duration) -> DateTime<Utc> {
+/// Returns the next slot boundary at or after `now + min_lead`, for an
+/// arbitrary slot period `slot_ns`. The FT8 wrapper [`next_slot_start`]
+/// delegates here with [`SLOT_NS`].
+pub fn next_slot_start_with_period(
+    now: DateTime<Utc>,
+    min_lead: Duration,
+    slot_ns: i64,
+) -> DateTime<Utc> {
     let now_ns = now
         .timestamp_nanos_opt()
         .expect("system clock out of i64 ns range");
@@ -80,11 +100,37 @@ pub fn next_slot_start(now: DateTime<Utc>, min_lead: Duration) -> DateTime<Utc> 
     // If now is past the start of the current slot, ((now / SLOT) + 1) * SLOT
     // is the next boundary. If now is exactly on a boundary, this still picks
     // the next one — desirable when callers need lead time.
-    let mut target_ns = ((now_ns / SLOT_NS) + 1) * SLOT_NS;
+    let mut target_ns = ((now_ns / slot_ns) + 1) * slot_ns;
     while target_ns - now_ns < lead_ns {
-        target_ns += SLOT_NS;
+        target_ns += slot_ns;
     }
     DateTime::<Utc>::from_timestamp_nanos(target_ns)
+}
+
+/// Returns the next 15-second slot boundary at or after `now + min_lead`.
+///
+/// Use `min_lead = Duration::zero()` to allow returning `now` itself when it
+/// happens to fall exactly on a boundary; pass a non-zero lead when the caller
+/// needs guaranteed headroom (e.g., to engage PTT before the slot starts).
+///
+/// FT8 (15s) wrapper over [`next_slot_start_with_period`].
+pub fn next_slot_start(now: DateTime<Utc>, min_lead: Duration) -> DateTime<Utc> {
+    next_slot_start_with_period(now, min_lead, SLOT_NS)
+}
+
+/// Returns the next slot start whose parity equals `wanted`, strictly after
+/// `now`, for an arbitrary slot period `slot_ns`. The FT8 wrapper
+/// [`next_slot_with_parity`] delegates here with [`SLOT_NS`].
+pub fn next_slot_with_parity_with_period(
+    now: DateTime<Utc>,
+    wanted: SlotParity,
+    slot_ns: i64,
+) -> DateTime<Utc> {
+    let mut candidate = next_slot_start_with_period(now, Duration::zero(), slot_ns);
+    if SlotParity::of_with_period(candidate, slot_ns) != wanted {
+        candidate += Duration::nanoseconds(slot_ns);
+    }
+    candidate
 }
 
 /// Returns the next slot start whose parity equals `wanted`, strictly after `now`.
@@ -93,19 +139,21 @@ pub fn next_slot_start(now: DateTime<Utc>, min_lead: Duration) -> DateTime<Utc> 
 /// matching slot still returns the *next* matching slot). This matches the
 /// semantics of `next_slot_start`: callers want a future TX target, never the
 /// present one.
+///
+/// FT8 (15s) wrapper over [`next_slot_with_parity_with_period`].
 pub fn next_slot_with_parity(now: DateTime<Utc>, wanted: SlotParity) -> DateTime<Utc> {
-    let mut candidate = next_slot_start(now, Duration::zero());
-    if SlotParity::of(candidate) != wanted {
-        candidate += Duration::nanoseconds(SLOT_NS);
-    }
-    candidate
+    next_slot_with_parity_with_period(now, wanted, SLOT_NS)
 }
 
-/// Returns the next moment FT8 audio should begin (`next_slot_start + 500ms`).
-///
-/// `min_lead` is measured from `now` to the audio-start instant, NOT to the
-/// slot boundary itself.
-pub fn next_audio_start(now: DateTime<Utc>, min_lead: Duration) -> DateTime<Utc> {
+/// Returns the next moment audio should begin (`next_slot_start + 500ms`), for
+/// an arbitrary slot period `slot_ns`. The pre-roll silence ([`PRE_ROLL_NS`])
+/// is the same for all periods. The FT8 wrapper [`next_audio_start`] delegates
+/// here with [`SLOT_NS`].
+pub fn next_audio_start_with_period(
+    now: DateTime<Utc>,
+    min_lead: Duration,
+    slot_ns: i64,
+) -> DateTime<Utc> {
     let pre_roll = Duration::nanoseconds(PRE_ROLL_NS);
     // The audio-start instant is slot_start + pre_roll. If the caller wants
     // the audio-start to be at least `min_lead` away, the slot boundary needs
@@ -115,7 +163,44 @@ pub fn next_audio_start(now: DateTime<Utc>, min_lead: Duration) -> DateTime<Utc>
     } else {
         Duration::zero()
     };
-    next_slot_start(now, slot_lead) + pre_roll
+    next_slot_start_with_period(now, slot_lead, slot_ns) + pre_roll
+}
+
+/// Returns the next moment FT8 audio should begin (`next_slot_start + 500ms`).
+///
+/// `min_lead` is measured from `now` to the audio-start instant, NOT to the
+/// slot boundary itself.
+///
+/// FT8 (15s) wrapper over [`next_audio_start_with_period`].
+pub fn next_audio_start(now: DateTime<Utc>, min_lead: Duration) -> DateTime<Utc> {
+    next_audio_start_with_period(now, min_lead, SLOT_NS)
+}
+
+/// Returns the next moment that is `offset` past a slot boundary, for an
+/// arbitrary slot period `slot_ns`. The FT8 wrapper [`next_phase`] delegates
+/// here with [`SLOT_NS`].
+///
+/// Panics if `offset` is outside `[0, slot_ns)` ns (a phase past the end of the
+/// slot is meaningless).
+pub fn next_phase_with_period(now: DateTime<Utc>, offset: Duration, slot_ns: i64) -> DateTime<Utc> {
+    let offset_ns = offset
+        .num_nanoseconds()
+        .expect("offset out of i64 ns range");
+    assert!(
+        (0..slot_ns).contains(&offset_ns),
+        "phase offset must be in [0, slot) ns"
+    );
+    let now_ns = now
+        .timestamp_nanos_opt()
+        .expect("system clock out of i64 ns range");
+    let current_slot_ns = (now_ns / slot_ns) * slot_ns;
+    let candidate = current_slot_ns + offset_ns;
+    let target_ns = if candidate > now_ns {
+        candidate
+    } else {
+        candidate + slot_ns
+    };
+    DateTime::<Utc>::from_timestamp_nanos(target_ns)
 }
 
 /// Returns the next moment that is `offset` past a slot boundary.
@@ -126,6 +211,10 @@ pub fn next_audio_start(now: DateTime<Utc>, min_lead: Duration) -> DateTime<Utc>
 /// otherwise advances to the next slot.
 ///
 /// Panics if `offset >= 15s` (a phase past the end of the slot is meaningless).
+///
+/// FT8 (15s) wrapper over [`next_phase_with_period`]. The bound check is
+/// duplicated here so the panic message names the concrete 15s slot length
+/// (the generic variant reports `[0, slot) ns`).
 pub fn next_phase(now: DateTime<Utc>, offset: Duration) -> DateTime<Utc> {
     let offset_ns = offset
         .num_nanoseconds()
@@ -134,17 +223,7 @@ pub fn next_phase(now: DateTime<Utc>, offset: Duration) -> DateTime<Utc> {
         (0..SLOT_NS).contains(&offset_ns),
         "phase offset must be in [0, 15s)"
     );
-    let now_ns = now
-        .timestamp_nanos_opt()
-        .expect("system clock out of i64 ns range");
-    let current_slot_ns = (now_ns / SLOT_NS) * SLOT_NS;
-    let candidate = current_slot_ns + offset_ns;
-    let target_ns = if candidate > now_ns {
-        candidate
-    } else {
-        candidate + SLOT_NS
-    };
-    DateTime::<Utc>::from_timestamp_nanos(target_ns)
+    next_phase_with_period(now, offset, SLOT_NS)
 }
 
 /// Returns `target - now` clamped to non-negative, as a `std::time::Duration`.
@@ -357,5 +436,64 @@ mod tests {
         assert_eq!(SlotParity::Even.opposite(), SlotParity::Odd);
         assert_eq!(SlotParity::Odd.opposite(), SlotParity::Even);
         assert_eq!(SlotParity::Even.opposite().opposite(), SlotParity::Even);
+    }
+
+    // ------------------------------------------------------------------
+    // Period-generic (_with_period) variants — FT4 uses a 7.5s slot.
+    // ------------------------------------------------------------------
+
+    /// FT4 slot length (7.5s) for the period-generic tests.
+    const FT4_NS: i64 = 7_500_000_000;
+
+    #[test]
+    fn current_slot_start_with_period_ft4() {
+        // 8.0s with a 7.5s period → slot start at 7.5s.
+        let target = current_slot_start_with_period(at(8.0), FT4_NS);
+        let delta = (target - at(0.0)).num_milliseconds();
+        assert_eq!(delta, 7_500);
+    }
+
+    #[test]
+    fn slot_parity_of_with_period_ft4() {
+        assert_eq!(
+            SlotParity::of_with_period(at(0.0), FT4_NS),
+            SlotParity::Even
+        );
+        assert_eq!(SlotParity::of_with_period(at(7.5), FT4_NS), SlotParity::Odd);
+        assert_eq!(
+            SlotParity::of_with_period(at(15.0), FT4_NS),
+            SlotParity::Even
+        );
+    }
+
+    #[test]
+    fn next_slot_start_with_period_ft4() {
+        // 5.0s with a 7.5s period, zero lead → next boundary at 7.5s.
+        let target = next_slot_start_with_period(at(5.0), Duration::zero(), FT4_NS);
+        let delta = (target - at(0.0)).num_milliseconds();
+        assert_eq!(delta, 7_500);
+    }
+
+    #[test]
+    fn next_slot_with_parity_with_period_ft4() {
+        // 0.0s is the start of even slot 0; next Odd slot is at 7.5s.
+        let target = next_slot_with_parity_with_period(at(0.0), SlotParity::Odd, FT4_NS);
+        let delta = (target - at(0.0)).num_milliseconds();
+        assert_eq!(delta, 7_500);
+    }
+
+    #[test]
+    fn next_phase_with_period_ft4_within_slot() {
+        // 2.0s in, asking for slot+6.5s → current slot's :6.5 mark.
+        let target = next_phase_with_period(at(2.0), Duration::milliseconds(6_500), FT4_NS);
+        let delta = (target - at(0.0)).num_milliseconds();
+        assert_eq!(delta, 6_500);
+    }
+
+    #[test]
+    #[should_panic(expected = "phase offset must be in [0, slot) ns")]
+    fn next_phase_with_period_ft4_rejects_offset_at_or_past_slot() {
+        // 8s offset ≥ 7.5s period → panic.
+        next_phase_with_period(at(0.0), Duration::seconds(8), FT4_NS);
     }
 }
