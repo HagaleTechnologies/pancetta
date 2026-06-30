@@ -7,6 +7,26 @@ use crate::{ConfigError, ConfigResult, ConfigSection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Station-wide selectable FT digital operating mode.
+///
+/// This is a config-local enum (the config crate intentionally does NOT
+/// depend on `pancetta-ft8`); the coordinator maps it to a
+/// `pancetta_ft8::Protocol` and wires the per-mode slot timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperatingMode {
+    /// FT8 — 15-second slots.
+    Ft8,
+    /// FT4 — 7.5-second slots.
+    Ft4,
+    /// FT2 — 2-second slots (experimental).
+    Ft2,
+}
+
+/// Default operating mode for [`RigConfig::mode`]: FT8.
+fn default_operating_mode() -> String {
+    "FT8".to_string()
+}
+
 /// Rig control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Container-level serde default: omitted fields fall back to defaults rather
@@ -15,6 +35,12 @@ use std::collections::HashMap;
 pub struct RigConfig {
     /// Transceiver model/manufacturer
     pub model: String,
+
+    /// Station-wide FT digital operating mode (`"FT8"`, `"FT4"`, or `"FT2"`,
+    /// case-insensitive). Defaults to `"FT8"`. Parse + validate via
+    /// [`RigConfig::operating_mode`].
+    #[serde(default = "default_operating_mode")]
+    pub mode: String,
 
     /// CAT interface configuration
     pub interface: CatInterfaceConfig,
@@ -724,6 +750,7 @@ impl Default for RigConfig {
     fn default() -> Self {
         Self {
             model: "Generic".to_string(),
+            mode: default_operating_mode(),
             interface: CatInterfaceConfig::default(),
             ptt: PttConfig::default(),
             frequency: FrequencyConfig::default(),
@@ -918,8 +945,29 @@ impl Default for TimingConfig {
     }
 }
 
+impl RigConfig {
+    /// Parse the configured [`RigConfig::mode`] string into an
+    /// [`OperatingMode`], case-insensitively (leading/trailing whitespace is
+    /// trimmed). Returns a [`ConfigError::Validation`] for any unrecognized
+    /// value.
+    pub fn operating_mode(&self) -> Result<OperatingMode, ConfigError> {
+        match self.mode.trim().to_uppercase().as_str() {
+            "FT8" => Ok(OperatingMode::Ft8),
+            "FT4" => Ok(OperatingMode::Ft4),
+            "FT2" => Ok(OperatingMode::Ft2),
+            _ => Err(ConfigError::Validation(format!(
+                "unknown operating mode '{}' (expected FT8, FT4, or FT2)",
+                self.mode
+            ))),
+        }
+    }
+}
+
 impl ConfigSection for RigConfig {
     fn validate_section(&self) -> ConfigResult<()> {
+        // Reject an unrecognized operating mode at config-load time.
+        self.operating_mode()?;
+
         // Validate CAT interface settings
         if self.interface.enabled {
             if self.interface.baud_rate == 0 {
@@ -971,6 +1019,9 @@ impl ConfigSection for RigConfig {
         // Always take the other value — only skip empty strings
         if !other.model.is_empty() {
             self.model = other.model;
+        }
+        if !other.mode.is_empty() {
+            self.mode = other.mode;
         }
 
         // Merge complex configurations
@@ -1121,5 +1172,41 @@ mod tests {
 
         assert_eq!(channel.frequency, 14_205_000);
         assert_eq!(channel.mode, "USB");
+    }
+
+    #[test]
+    fn test_default_operating_mode_is_ft8() {
+        let config = RigConfig::default();
+        assert_eq!(config.mode, "FT8");
+        assert_eq!(config.operating_mode().unwrap(), OperatingMode::Ft8);
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_operating_mode_case_insensitive_ft4() {
+        let mut config = RigConfig::default();
+        config.mode = "ft4".to_string();
+        assert_eq!(config.operating_mode().unwrap(), OperatingMode::Ft4);
+        config.mode = "FT4".to_string();
+        assert_eq!(config.operating_mode().unwrap(), OperatingMode::Ft4);
+        config.mode = "  Ft4 ".to_string();
+        assert_eq!(config.operating_mode().unwrap(), OperatingMode::Ft4);
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_operating_mode_ft2() {
+        let mut config = RigConfig::default();
+        config.mode = "FT2".to_string();
+        assert_eq!(config.operating_mode().unwrap(), OperatingMode::Ft2);
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_operating_mode_unknown_errors_and_fails_validation() {
+        let mut config = RigConfig::default();
+        config.mode = "FT9".to_string();
+        assert!(config.operating_mode().is_err());
+        assert!(config.validate_section().is_err());
     }
 }
