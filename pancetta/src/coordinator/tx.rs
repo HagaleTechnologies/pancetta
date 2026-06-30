@@ -70,16 +70,23 @@ pub struct TxSchedule {
 ///   `(mstr - DELAY_MS)` ms into the waveform. WSJT-X's `m_ic` analogue.
 /// - **Too late** (`mstr > tx_late_max_ms`): defer to the next slot of
 ///   the required parity (30s away), recompute as the early case.
+///
+/// `slot_ns` is the active slot period (FT8 = 15e9, FT4 = 7.5e9). All
+/// slot-grid math is computed against it; passing
+/// `pancetta_core::slot::SLOT_NS` is byte-identical to the FT8 behavior.
 pub fn schedule_tx(
     now: chrono::DateTime<chrono::Utc>,
     required_parity: pancetta_core::slot::SlotParity,
     tx_late_max_ms: u64,
     sample_rate: u32,
+    slot_ns: i64,
 ) -> TxSchedule {
-    use pancetta_core::slot::{current_slot_start, next_slot_with_parity, SlotParity};
+    use pancetta_core::slot::{
+        current_slot_start_with_period, next_slot_with_parity_with_period, SlotParity,
+    };
 
-    let cur_start = current_slot_start(now);
-    let cur_parity = SlotParity::of(cur_start);
+    let cur_start = current_slot_start_with_period(now, slot_ns);
+    let cur_parity = SlotParity::of_with_period(cur_start, slot_ns);
     let mstr_in_cur_slot = (now - cur_start).num_milliseconds().max(0) as u64;
 
     // Decide which slot to target. The current slot is viable iff its
@@ -88,7 +95,7 @@ pub fn schedule_tx(
     let target = if use_current {
         cur_start
     } else {
-        next_slot_with_parity(now, required_parity)
+        next_slot_with_parity_with_period(now, required_parity, slot_ns)
     };
     let deferred = !use_current;
 
@@ -638,6 +645,10 @@ impl super::ApplicationCoordinator {
             let latest_tx_intent = self.latest_tx_intent.clone();
             // Keyed-state flag for the SWR poll / TUI (set by PttGuard).
             let ptt_active = self.ptt_active.clone();
+            // Active slot period (FT8 = 15e9 ns, FT4 = 7.5e9 ns), set once at
+            // startup from `[rig].mode`. The TX scheduler keys against this so
+            // FT4 lands on the 7.5s grid; FT8 (15e9) is byte-identical.
+            let active_slot_ns = self.active_slot_ns();
 
             tokio::spawn(async move {
                 info!("FT8 transmitter component ready");
@@ -817,10 +828,12 @@ impl super::ApplicationCoordinator {
                                     };
 
                                     // --- Step 2: Resolve required parity ---
+                                    let slot_ns = active_slot_ns.load(Ordering::Relaxed);
                                     let required_parity = resolve_required_parity(
                                         tx_parity,
                                         tx_self_parity,
                                         chrono::Utc::now(),
+                                        slot_ns,
                                     );
 
                                     let schedule = schedule_tx(
@@ -828,6 +841,7 @@ impl super::ApplicationCoordinator {
                                         required_parity,
                                         tx_late_max_ms,
                                         sample_rate,
+                                        slot_ns,
                                     );
 
                                     info!(
@@ -1363,10 +1377,12 @@ impl super::ApplicationCoordinator {
                                     };
 
                                     // --- Step 2: Resolve required parity ---
+                                    let slot_ns = active_slot_ns.load(Ordering::Relaxed);
                                     let required_parity = resolve_required_parity(
                                         tx_parity,
                                         tx_self_parity,
                                         chrono::Utc::now(),
+                                        slot_ns,
                                     );
 
                                     let schedule = schedule_tx(
@@ -1374,6 +1390,7 @@ impl super::ApplicationCoordinator {
                                         required_parity,
                                         tx_late_max_ms,
                                         sample_rate,
+                                        slot_ns,
                                     );
 
                                     info!(
@@ -1761,9 +1778,10 @@ pub fn resolve_required_parity(
     tx_parity: Option<pancetta_core::slot::SlotParity>,
     tx_self_parity: pancetta_config::station::TxSelfParity,
     now: chrono::DateTime<chrono::Utc>,
+    slot_ns: i64,
 ) -> pancetta_core::slot::SlotParity {
     use pancetta_config::station::TxSelfParity;
-    use pancetta_core::slot::{next_slot_with_parity, SlotParity};
+    use pancetta_core::slot::{next_slot_with_parity_with_period, SlotParity};
     if let Some(p) = tx_parity {
         return p;
     }
@@ -1771,8 +1789,8 @@ pub fn resolve_required_parity(
         TxSelfParity::Even => SlotParity::Even,
         TxSelfParity::Odd => SlotParity::Odd,
         TxSelfParity::Auto => {
-            let next_even = next_slot_with_parity(now, SlotParity::Even);
-            let next_odd = next_slot_with_parity(now, SlotParity::Odd);
+            let next_even = next_slot_with_parity_with_period(now, SlotParity::Even, slot_ns);
+            let next_odd = next_slot_with_parity_with_period(now, SlotParity::Odd, slot_ns);
             if next_even <= next_odd {
                 SlotParity::Even
             } else {
@@ -1786,7 +1804,10 @@ pub fn resolve_required_parity(
 mod schedule_tx_tests {
     use super::*;
     use chrono::TimeZone;
-    use pancetta_core::slot::SlotParity;
+    use pancetta_core::slot::{SlotParity, SLOT_NS};
+
+    /// FT4 slot period in nanoseconds (7.5s). FT8 is `SLOT_NS` (15s).
+    const FT4_SLOT_NS: i64 = 7_500_000_000;
 
     fn at(seconds: f64) -> chrono::DateTime<chrono::Utc> {
         // Reference: 2026-01-01 00:00:00 UTC. timestamp() = 1767225600,
@@ -1800,7 +1821,7 @@ mod schedule_tx_tests {
         // now = :05.0 (Even slot 0). Required = Odd. Current slot is Even
         // (wrong), so we advance to next Odd = :15. mstr_relative_to_target
         // = max(0, :05 - :15) = 0. 0 < 500 → pad 500ms, cursor 0.
-        let s = schedule_tx(at(5.0), SlotParity::Odd, 8000, 12_000);
+        let s = schedule_tx(at(5.0), SlotParity::Odd, 8000, 12_000, SLOT_NS);
         assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
         assert_eq!(s.silent_pad_samples, 500 * 12); // 12 samples/ms at 12kHz
         assert_eq!(s.cursor_offset_samples, 0);
@@ -1811,7 +1832,7 @@ mod schedule_tx_tests {
         // now = :15.500 (Odd slot 1). Required = Odd. Current slot matches;
         // mstr_in_current_slot = 500ms ≤ 8000 → target current slot :15.
         // mstr_relative_to_target = 500 = DELAY_MS → pad 0, cursor 0.
-        let s = schedule_tx(at(15.5), SlotParity::Odd, 8000, 12_000);
+        let s = schedule_tx(at(15.5), SlotParity::Odd, 8000, 12_000, SLOT_NS);
         assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
         assert_eq!(s.silent_pad_samples, 0);
         assert_eq!(s.cursor_offset_samples, 0);
@@ -1822,7 +1843,7 @@ mod schedule_tx_tests {
         // now = :20.0 (Odd slot 1, 5s in). Required = Odd. Current matches;
         // mstr_in_current_slot = 5000 ≤ 8000 → target current slot :15.
         // mstr_relative_to_target = 5000 > 500 → cursor = 4500ms × SR.
-        let s = schedule_tx(at(20.0), SlotParity::Odd, 8000, 12_000);
+        let s = schedule_tx(at(20.0), SlotParity::Odd, 8000, 12_000, SLOT_NS);
         assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
         assert_eq!(s.silent_pad_samples, 0);
         assert_eq!(s.cursor_offset_samples, 4500 * 12);
@@ -1834,7 +1855,7 @@ mod schedule_tx_tests {
         // matches but mstr_in_current_slot = 9500 > 8000 → too late;
         // advance to next Odd = :45. mstr_relative_to_target = 0 (target
         // is in future) → pad 500ms, cursor 0.
-        let s = schedule_tx(at(24.5), SlotParity::Odd, 8000, 12_000);
+        let s = schedule_tx(at(24.5), SlotParity::Odd, 8000, 12_000, SLOT_NS);
         assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 45_000);
         assert_eq!(s.silent_pad_samples, 500 * 12);
         assert_eq!(s.cursor_offset_samples, 0);
@@ -1847,7 +1868,7 @@ mod schedule_tx_tests {
         // mstr_relative_to_target = max(0, :14.6 - :15) = 0 → pad 500ms,
         // cursor 0. Most importantly: target is :15, NEVER :30 (the
         // collision case the original bug produced).
-        let s = schedule_tx(at(14.6), SlotParity::Odd, 8000, 12_000);
+        let s = schedule_tx(at(14.6), SlotParity::Odd, 8000, 12_000, SLOT_NS);
         assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
         assert_ne!((s.target_slot - at(0.0)).num_milliseconds(), 30_000);
         assert_eq!(s.silent_pad_samples, 500 * 12);
@@ -1859,7 +1880,7 @@ mod schedule_tx_tests {
         // now = :15.000 exactly. Required = Odd. The :15 slot is Odd
         // and we're 0ms in — fully viable. Target the current slot,
         // pad 500ms before audio starts.
-        let s = schedule_tx(at(15.0), SlotParity::Odd, 8000, 12_000);
+        let s = schedule_tx(at(15.0), SlotParity::Odd, 8000, 12_000, SLOT_NS);
         assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 15_000);
         assert_eq!(s.silent_pad_samples, 500 * 12);
         assert_eq!(s.cursor_offset_samples, 0);
@@ -1870,17 +1891,65 @@ mod schedule_tx_tests {
         // now = :29.0 (Odd slot 1, 14s in — past tx_late_max_ms=8000).
         // Even though parity matches, we're too late for skip-ahead.
         // Defer to next Odd = :45.
-        let s = schedule_tx(at(29.0), SlotParity::Odd, 8000, 12_000);
+        let s = schedule_tx(at(29.0), SlotParity::Odd, 8000, 12_000, SLOT_NS);
         assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 45_000);
         assert_eq!(s.silent_pad_samples, 500 * 12);
         assert_eq!(s.cursor_offset_samples, 0);
     }
 
     #[test]
+    fn ft4_period_targets_7_5s_grid_boundary() {
+        // FT4 slot period = 7.5s. On this grid, at(0.0) is Even (slot
+        // 235630080 = even), at(7.5) Odd, at(15) Even, at(22.5) Odd.
+        // now = :05.0 (Even slot 0 on the FT4 grid). Required = Odd.
+        // Current parity Even ≠ Odd → advance to next Odd = :07.5.
+        // mstr_relative_to_target = max(0, :05 - :07.5) = 0 < 500 →
+        // pad 500ms, cursor 0. The target MUST land on a 7.5s-grid
+        // boundary of the requested (Odd) parity — :07.5, NOT :15.
+        let s = schedule_tx(at(5.0), SlotParity::Odd, 8000, 12_000, FT4_SLOT_NS);
+        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 7_500);
+        // boundary lands on the 7.5s grid
+        assert_eq!(
+            (s.target_slot - at(0.0)).num_milliseconds() % 7_500,
+            0,
+            "target must sit on a 7.5s slot boundary"
+        );
+        // and it is the requested (Odd) parity
+        assert_eq!(
+            pancetta_core::slot::SlotParity::of_with_period(s.target_slot, FT4_SLOT_NS),
+            SlotParity::Odd
+        );
+        assert_eq!(s.silent_pad_samples, 500 * 12);
+        assert_eq!(s.cursor_offset_samples, 0);
+    }
+
+    #[test]
+    fn ft4_period_late_skips_cursor_in_current_slot() {
+        // now = :10.0 (Odd slot at :07.5 on the FT4 grid, 2.5s in).
+        // Required = Odd. Current matches; mstr_in_current_slot = 2500
+        // ≤ 8000 → target current slot :07.5. mstr_relative_to_target
+        // = 2500 > 500 → cursor = 2000ms × SR; no defer to :22.5.
+        let s = schedule_tx(at(10.0), SlotParity::Odd, 8000, 12_000, FT4_SLOT_NS);
+        assert_eq!((s.target_slot - at(0.0)).num_milliseconds(), 7_500);
+        assert_eq!(s.silent_pad_samples, 0);
+        assert_eq!(s.cursor_offset_samples, 2_000 * 12);
+    }
+
+    #[test]
+    fn ft4_resolve_required_parity_auto_picks_nearest_next_slot() {
+        use pancetta_config::station::TxSelfParity;
+        // now = :05 (Even slot 0 on FT4 grid). Next Even = :15,
+        // next Odd = :07.5. Odd is closer → Auto picks Odd.
+        let p = resolve_required_parity(None, TxSelfParity::Auto, at(5.0), FT4_SLOT_NS);
+        assert_eq!(p, SlotParity::Odd);
+    }
+
+    #[test]
     fn resolve_required_parity_explicit_wins_over_config() {
         use pancetta_config::station::TxSelfParity;
         // tx_parity = Some(Even), config = Auto → returns Even
-        let p = resolve_required_parity(Some(SlotParity::Even), TxSelfParity::Auto, at(5.0));
+        let p =
+            resolve_required_parity(Some(SlotParity::Even), TxSelfParity::Auto, at(5.0), SLOT_NS);
         assert_eq!(p, SlotParity::Even);
     }
 
@@ -1888,16 +1957,17 @@ mod schedule_tx_tests {
     fn resolve_required_parity_explicit_wins_over_explicit_config() {
         use pancetta_config::station::TxSelfParity;
         // tx_parity = Some(Even), config = Odd → tx_parity wins → Even
-        let p = resolve_required_parity(Some(SlotParity::Even), TxSelfParity::Odd, at(5.0));
+        let p =
+            resolve_required_parity(Some(SlotParity::Even), TxSelfParity::Odd, at(5.0), SLOT_NS);
         assert_eq!(p, SlotParity::Even);
     }
 
     #[test]
     fn resolve_required_parity_falls_back_to_config_when_none() {
         use pancetta_config::station::TxSelfParity;
-        let p = resolve_required_parity(None, TxSelfParity::Even, at(5.0));
+        let p = resolve_required_parity(None, TxSelfParity::Even, at(5.0), SLOT_NS);
         assert_eq!(p, SlotParity::Even);
-        let p = resolve_required_parity(None, TxSelfParity::Odd, at(5.0));
+        let p = resolve_required_parity(None, TxSelfParity::Odd, at(5.0), SLOT_NS);
         assert_eq!(p, SlotParity::Odd);
     }
 
@@ -1906,11 +1976,11 @@ mod schedule_tx_tests {
         use pancetta_config::station::TxSelfParity;
         // now = :05 (in Even slot 0). Next Even = :30, next Odd = :15.
         // Odd is closer → Auto picks Odd.
-        let p = resolve_required_parity(None, TxSelfParity::Auto, at(5.0));
+        let p = resolve_required_parity(None, TxSelfParity::Auto, at(5.0), SLOT_NS);
         assert_eq!(p, SlotParity::Odd);
         // now = :20 (in Odd slot 1). Next Odd = :45, next Even = :30.
         // Even is closer → Auto picks Even.
-        let p = resolve_required_parity(None, TxSelfParity::Auto, at(20.0));
+        let p = resolve_required_parity(None, TxSelfParity::Auto, at(20.0), SLOT_NS);
         assert_eq!(p, SlotParity::Even);
     }
 
