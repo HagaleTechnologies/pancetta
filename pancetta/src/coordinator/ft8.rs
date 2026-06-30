@@ -235,9 +235,17 @@ impl super::ApplicationCoordinator {
         // to the prior `SlotParity::of` (which hardcodes 15e9).
         let active_slot_ns = self.active_slot_ns.clone();
 
+        // Active protocol decode phase (FT8 → 13e9, FT4 → 6.5e9 ns): how far
+        // past the slot boundary the window is received. Subtracted below to
+        // recover the slot start before parity-stamping. mode=FT8 is 13e9 ns,
+        // byte-identical to the prior hardcoded `Duration::seconds(13)`.
+        let active_decode_phase_ns = self.active_decode_phase_ns.clone();
+
         // Run FT8 decoder on a dedicated thread to avoid tokio starvation
         let handle = tokio::task::spawn_blocking(move || {
             let slot_ns = active_slot_ns.load(Ordering::Relaxed);
+            let decode_phase =
+                chrono::Duration::nanoseconds(active_decode_phase_ns.load(Ordering::Relaxed));
             let rt = tokio::runtime::Handle::current();
             info!("FT8 decoder thread started");
 
@@ -326,8 +334,7 @@ impl super::ApplicationCoordinator {
                             // current window as "slot N+1" for the
                             // look-up — seeds are from slot N which is the
                             // opposite parity).
-                            let now_slot_start =
-                                window_received_utc - chrono::Duration::seconds(13);
+                            let now_slot_start = window_received_utc - decode_phase;
                             let current_parity = pancetta_core::slot::SlotParity::of_with_period(
                                 now_slot_start,
                                 slot_ns,
@@ -438,8 +445,7 @@ impl super::ApplicationCoordinator {
                         // already-consumed messages by rejecting them at
                         // is_message_relevant (state has already advanced).
                         if !scoped_decodes.is_empty() {
-                            let scoped_slot_start =
-                                window_received_utc - chrono::Duration::seconds(13);
+                            let scoped_slot_start = window_received_utc - decode_phase;
                             let scoped_parity = pancetta_core::slot::SlotParity::of_with_period(
                                 scoped_slot_start,
                                 slot_ns,
@@ -645,7 +651,7 @@ impl super::ApplicationCoordinator {
                         // tag invariant under decode latency. (next_slot_start would
                         // give the wrong slot if decode pushes us into the next slot
                         // before we tag.)
-                        let slot_start = window_received_utc - chrono::Duration::seconds(13);
+                        let slot_start = window_received_utc - decode_phase;
                         let window_parity =
                             pancetta_core::slot::SlotParity::of_with_period(slot_start, slot_ns);
 

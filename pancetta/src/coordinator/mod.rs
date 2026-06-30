@@ -514,6 +514,15 @@ pub struct ApplicationCoordinator {
     /// once and not mutated at runtime (a live mode switch is a later task).
     active_slot_ns: Arc<std::sync::atomic::AtomicI64>,
 
+    /// Active protocol's decode phase in nanoseconds (FT8 → 13e9, FT4 → 6.5e9):
+    /// how far past the slot boundary the decode window is received. The decode
+    /// loop subtracts this from the window-received instant to recover the
+    /// containing slot's start before stamping `SlotParity`. Derived once at
+    /// startup from `[rig].mode` (the same `DspTiming.decode_phase` the DSP
+    /// thread uses); set once, not mutated at runtime. mode=FT8 is 13e9 ns,
+    /// byte-identical to the prior hardcoded `Duration::seconds(13)`.
+    active_decode_phase_ns: Arc<std::sync::atomic::AtomicI64>,
+
     /// `true` when the read-only `remote_gateway` component is enabled
     /// (`[network.remote_gateway].enabled`). Cached from config at construction
     /// so the display-event emit sites (decode fan-out, QSO snapshot, freq,
@@ -810,9 +819,17 @@ impl ApplicationCoordinator {
             }
         };
         let active_slot_ns_init = active_protocol.slot_ns();
+        // Decode phase (ns) the parity-stamping sites subtract to recover the
+        // slot start — same value the DSP thread derives (FT8 → 13e9).
+        let active_decode_phase_ns_init = derive_dsp_timing(
+            &pancetta_ft8::ProtocolParams::from_protocol(active_protocol),
+        )
+        .decode_phase
+        .num_nanoseconds()
+        .unwrap_or(13_000_000_000);
         info!(
-            "Active digital mode: {} (slot {} ns)",
-            active_protocol, active_slot_ns_init
+            "Active digital mode: {} (slot {} ns, decode phase {} ns)",
+            active_protocol, active_slot_ns_init, active_decode_phase_ns_init
         );
 
         // Wrap config in Arc<RwLock> for hot-reloading
@@ -889,6 +906,10 @@ impl ApplicationCoordinator {
             // Active protocol slot length, derived from [rig].mode above
             // (default 15e9 for FT8). Set once; read by the decode/DSP paths.
             active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(active_slot_ns_init)),
+            // Decode phase the parity-stamping sites subtract (FT8 → 13e9 ns).
+            active_decode_phase_ns: Arc::new(std::sync::atomic::AtomicI64::new(
+                active_decode_phase_ns_init,
+            )),
             gateway_enabled: Arc::new(AtomicBool::new(gateway_enabled_init)),
             fox_mode: Arc::new(AtomicBool::new(false)),
             fox_max_streams: Arc::new(AtomicUsize::new(fox_max_streams_init)),
