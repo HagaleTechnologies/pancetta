@@ -169,6 +169,40 @@ impl Band {
         }
     }
 
+    /// Get the standard FT4 dial frequency for this band (if applicable).
+    ///
+    /// FT4 uses different sub-band dial frequencies than FT8 and is not used
+    /// on every band (e.g. 60m, 160m, 2m). Bands without a standard FT4
+    /// frequency return `None`.
+    pub fn ft4_frequency(&self) -> Option<u64> {
+        match self {
+            Band::Band80m => Some(3_575_000),
+            Band::Band40m => Some(7_047_500),
+            Band::Band30m => Some(10_140_000),
+            Band::Band20m => Some(14_080_000),
+            Band::Band17m => Some(18_104_000),
+            Band::Band15m => Some(21_140_000),
+            Band::Band12m => Some(24_919_000),
+            Band::Band10m => Some(28_180_000),
+            Band::Band6m => Some(50_318_000),
+            _ => None,
+        }
+    }
+
+    /// Get the dial frequency for this band given the active mode.
+    ///
+    /// Callers pass `is_ft4 = (active mode == FT4)`. When `is_ft4` is true the
+    /// FT4 dial table is consulted; otherwise the FT8 table is used. This keeps
+    /// `pancetta-core` dependency-free (no knowledge of the config/ft8 crates)
+    /// while letting band selection be mode-aware at the point of use.
+    pub fn dial_for(&self, is_ft4: bool) -> Option<u64> {
+        if is_ft4 {
+            self.ft4_frequency()
+        } else {
+            self.ft8_frequency()
+        }
+    }
+
     /// Get numeric ID for this band (for hashing/indexing purposes)
     pub fn to_id(&self) -> u8 {
         match self {
@@ -258,6 +292,33 @@ mod tests {
     fn test_ft8_frequencies() {
         assert_eq!(Band::Band20m.ft8_frequency(), Some(14_074_000));
         assert_eq!(Band::Band40m.ft8_frequency(), Some(7_074_000));
+    }
+
+    #[test]
+    fn test_ft4_frequencies() {
+        assert_eq!(Band::Band20m.ft4_frequency(), Some(14_080_000));
+        assert_eq!(Band::Band40m.ft4_frequency(), Some(7_047_500));
+        assert_eq!(Band::Band6m.ft4_frequency(), Some(50_318_000));
+        // 60m has no standard FT4 frequency.
+        assert_eq!(Band::Band60m.ft4_frequency(), None);
+        // 160m / 2m / 70cm are not FT4 bands either.
+        assert_eq!(Band::Band160m.ft4_frequency(), None);
+        assert_eq!(Band::Band2m.ft4_frequency(), None);
+    }
+
+    #[test]
+    fn test_dial_for_mode() {
+        // FT4 mode picks the FT4 table.
+        assert_eq!(Band::Band20m.dial_for(true), Some(14_080_000));
+        assert_eq!(Band::Band40m.dial_for(true), Some(7_047_500));
+        // FT8 mode picks the FT8 table (regression: unchanged).
+        assert_eq!(Band::Band20m.dial_for(false), Some(14_074_000));
+        assert_eq!(Band::Band40m.dial_for(false), Some(7_074_000));
+        // dial_for(false) is identical to ft8_frequency for every band.
+        for band in Band::all() {
+            assert_eq!(band.dial_for(false), band.ft8_frequency());
+            assert_eq!(band.dial_for(true), band.ft4_frequency());
+        }
     }
 
     #[test]

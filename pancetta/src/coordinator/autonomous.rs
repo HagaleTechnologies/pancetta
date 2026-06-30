@@ -311,6 +311,16 @@ impl super::ApplicationCoordinator {
             recent_failure_penalty: config.autonomous.priorities.recent_failure_penalty,
             atno_bonus: config.autonomous.priorities.atno_bonus,
         };
+
+        // FT4-mode dial selection: the config-static band-hop entries carry
+        // FT8 dial frequencies. When the active mode is FT4 we override the
+        // hop dial with the band's FT4 sub-band frequency at the point of use
+        // (the ChangeBand handler below). FT8 mode leaves the configured dial
+        // untouched (byte-identical behavior).
+        let active_is_ft4 = matches!(
+            config.rig.operating_mode(),
+            Ok(pancetta_config::rig::OperatingMode::Ft4)
+        );
         drop(config);
 
         let cached_lookup = self.cached_lookup.clone();
@@ -511,6 +521,31 @@ impl super::ApplicationCoordinator {
                                         ));
                                     }
                                     pancetta_qso::OperatorAction::ChangeBand { dial_frequency } => {
+                                        // FT4-mode dial override: the band-hop
+                                        // config carries FT8 dials. In FT4 mode,
+                                        // resolve the hopped band and substitute
+                                        // its FT4 sub-band frequency. If the band
+                                        // has no FT4 frequency (e.g. 60m/160m) or
+                                        // can't be resolved, keep the configured
+                                        // (FT8) dial and warn. FT8 mode never
+                                        // enters this branch (byte-identical).
+                                        let dial_frequency = if active_is_ft4 {
+                                            match pancetta_core::Band::from_frequency(dial_frequency)
+                                                .and_then(|b| b.ft4_frequency())
+                                            {
+                                                Some(ft4) => ft4,
+                                                None => {
+                                                    warn!(
+                                                        target: "operator.override",
+                                                        "FT4 mode: no FT4 dial for band-hop target {} Hz; using configured (FT8) dial",
+                                                        dial_frequency
+                                                    );
+                                                    dial_frequency
+                                                }
+                                            }
+                                        } else {
+                                            dial_frequency
+                                        };
                                         // C9 — the autonomous operator is changing
                                         // band. An active QSO can't complete on the
                                         // new band, so tear active QSOs down (same
