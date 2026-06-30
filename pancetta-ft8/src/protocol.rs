@@ -160,6 +160,16 @@ static FT2_DATA_RANGES: [Range<usize>; 2] = [7..36, 43..72];
 // ============================================================================
 
 impl ProtocolParams {
+    /// Parameters for a given [`Protocol`] (dispatches to `ft8()`/`ft4()`/`ft2()`).
+    pub fn from_protocol(protocol: Protocol) -> Self {
+        match protocol {
+            Protocol::Ft8 => Self::ft8(),
+            Protocol::Ft4 => Self::ft4(),
+            #[cfg(feature = "ft2")]
+            Protocol::Ft2 => Self::ft2(),
+        }
+    }
+
     /// FT8 protocol parameters
     ///
     /// 8-CPFSK, 79 symbols, 0.16s symbol period, 6.25 Hz spacing, 15s cycle

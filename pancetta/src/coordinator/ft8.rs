@@ -229,8 +229,15 @@ impl super::ApplicationCoordinator {
         let cross_sequence_cache = self.cross_sequence_cache.clone();
         let cross_sequence_fp_filter = self.fp_filter.clone();
 
+        // Active protocol slot length (FT8 → 15e9, FT4 → 7.5e9), derived once
+        // at startup from `[rig].mode`. Read by the parity-stamping sites
+        // below via `SlotParity::of_with_period`. mode=FT8 is byte-identical
+        // to the prior `SlotParity::of` (which hardcodes 15e9).
+        let active_slot_ns = self.active_slot_ns.clone();
+
         // Run FT8 decoder on a dedicated thread to avoid tokio starvation
         let handle = tokio::task::spawn_blocking(move || {
+            let slot_ns = active_slot_ns.load(Ordering::Relaxed);
             let rt = tokio::runtime::Handle::current();
             info!("FT8 decoder thread started");
 
@@ -321,8 +328,10 @@ impl super::ApplicationCoordinator {
                             // opposite parity).
                             let now_slot_start =
                                 window_received_utc - chrono::Duration::seconds(13);
-                            let current_parity =
-                                pancetta_core::slot::SlotParity::of(now_slot_start);
+                            let current_parity = pancetta_core::slot::SlotParity::of_with_period(
+                                now_slot_start,
+                                slot_ns,
+                            );
                             let opposite_parity: u8 = match current_parity {
                                 pancetta_core::slot::SlotParity::Even => 1,
                                 pancetta_core::slot::SlotParity::Odd => 0,
@@ -431,8 +440,10 @@ impl super::ApplicationCoordinator {
                         if !scoped_decodes.is_empty() {
                             let scoped_slot_start =
                                 window_received_utc - chrono::Duration::seconds(13);
-                            let scoped_parity =
-                                pancetta_core::slot::SlotParity::of(scoped_slot_start);
+                            let scoped_parity = pancetta_core::slot::SlotParity::of_with_period(
+                                scoped_slot_start,
+                                slot_ns,
+                            );
                             for mut decoded_msg in scoped_decodes {
                                 decoded_msg.slot_parity = Some(scoped_parity);
                                 // I-16: sanitize at the bus boundary (scoped
@@ -635,7 +646,8 @@ impl super::ApplicationCoordinator {
                         // give the wrong slot if decode pushes us into the next slot
                         // before we tag.)
                         let slot_start = window_received_utc - chrono::Duration::seconds(13);
-                        let window_parity = pancetta_core::slot::SlotParity::of(slot_start);
+                        let window_parity =
+                            pancetta_core::slot::SlotParity::of_with_period(slot_start, slot_ns);
 
                         for decoded_msg in decoded_messages.iter_mut() {
                             decoded_msg.slot_parity = Some(window_parity);

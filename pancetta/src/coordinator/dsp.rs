@@ -252,7 +252,22 @@ impl super::ApplicationCoordinator {
         let config = self.config.read().await;
         let input_rate = config.audio.sample_rate;
         let _input_channels = config.audio.input_channels as u16;
+        // Derive the active protocol's DSP timing once at startup. mode=FT8
+        // yields exactly the historical 12.64s window / 13s decode phase /
+        // 15×rate overlap (asserted by `derive_dsp_timing_ft8_byte_identical`).
+        let protocol = super::protocol_from_mode(
+            config
+                .rig
+                .operating_mode()
+                .unwrap_or(pancetta_config::OperatingMode::Ft8),
+        );
         drop(config);
+        let timing =
+            super::derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(protocol));
+        let dsp_window_samples = timing.window_samples;
+        let dsp_decode_phase = timing.decode_phase;
+        let dsp_overlap_samples = timing.overlap_samples;
+        let dsp_slot_ns = timing.slot_ns;
 
         let handle = tokio::task::spawn_blocking(move || {
             // FT8 timing: transmissions start at 0/15/30/45 second marks.
@@ -267,13 +282,13 @@ impl super::ApplicationCoordinator {
                 ));
             }
             const FT8_SAMPLE_RATE: usize = 12000;
-            const FT8_WINDOW_SECONDS: f64 = 12.64;
-            const FT8_WINDOW_SAMPLES: usize =
-                (FT8_SAMPLE_RATE as f64 * FT8_WINDOW_SECONDS) as usize; // 151,680
+            // Protocol-derived window length (FT8 → 151_680 = 12.64s×12kHz;
+            // FT4 → 60_480 = 5.04s×12kHz). Captured from `DspTiming` above.
+            let ft8_window_samples = dsp_window_samples;
 
             let mut decimate_counter: usize = 0;
 
-            let mut ft8_buffer: Vec<f32> = Vec::with_capacity(FT8_WINDOW_SAMPLES * 2);
+            let mut ft8_buffer: Vec<f32> = Vec::with_capacity(ft8_window_samples * 2);
             let mut window_count: u64 = 0;
             let mut batch_count: u64 = 0;
             let _waiting_for_boundary = true;
@@ -312,17 +327,21 @@ impl super::ApplicationCoordinator {
 
             info!(
                 "DSP: {}Hz -> {}Hz mono (decimate {}:1, subsample), window={}",
-                input_rate, FT8_SAMPLE_RATE, decimation_factor, FT8_WINDOW_SAMPLES
+                input_rate, FT8_SAMPLE_RATE, decimation_factor, ft8_window_samples
             );
 
             // Continuously capture audio -- don't wait for boundaries.
             // FT8 has both even (0/30s) and odd (15/45s) time slots.
-            // We send overlapping windows: one at each 15-second mark.
+            // We send overlapping windows: one at each slot mark.
             // The decoder handles time alignment internally via Costas sync.
-            // Schedule decode at 13s past the slot start (message ends at 12.64s).
-            // Slots start at :00/:15/:30/:45, so decode at :13/:28/:43/:58.
-            let mut next_window_time =
-                pancetta_core::slot::next_phase(chrono::Utc::now(), chrono::Duration::seconds(13));
+            // Schedule decode `decode_phase` past the slot start (FT8 → 13s,
+            // 0.36s after the 12.64s message end; FT4 → 6.5s). Slots start at
+            // the protocol's `slot_ns` cadence aligned to UTC.
+            let mut next_window_time = pancetta_core::slot::next_phase_with_period(
+                chrono::Utc::now(),
+                dsp_decode_phase,
+                dsp_slot_ns,
+            );
             info!(
                 "DSP: first window at {}",
                 next_window_time.format("%H:%M:%S")
@@ -501,23 +520,26 @@ impl super::ApplicationCoordinator {
                         // to the *scheduled* boundary (derived from `next_window_time`)
                         // rather than `now` also removes the 0–1 s emit-trigger jitter
                         // from the DT value. See `WINDOW_LEAD_SECS` in `coordinator/mod.rs`.
-                        const IDEAL_SAMPLES: usize = FT8_SAMPLE_RATE * 15; // 180000
+                        // Overlap retained between windows = one full cycle
+                        // (FT8 → 180_000 = 15s×12kHz; FT4 → 90_000 = 7.5s×12kHz).
+                        let ideal_samples = dsp_overlap_samples;
                         let now = chrono::Utc::now();
-                        if ft8_buffer.len() >= FT8_WINDOW_SAMPLES && now >= next_window_time {
+                        if ft8_buffer.len() >= ft8_window_samples && now >= next_window_time {
                             // Scheduled slot boundary for this window: next_window_time
-                            // is the :13/:28/:43/:58 instant, 13 s past the boundary.
-                            let slot_boundary = next_window_time - chrono::Duration::seconds(13);
+                            // is the decode-phase instant, `decode_phase` past the
+                            // boundary (FT8 → :13/:28/:43/:58; FT4 → :6.5 cadence).
+                            let slot_boundary = next_window_time - dsp_decode_phase;
                             let (start, send_len) = boundary_anchored_slice(
                                 ft8_buffer.len(),
                                 now,
                                 slot_boundary,
                                 FT8_SAMPLE_RATE,
-                                FT8_WINDOW_SAMPLES,
+                                ft8_window_samples,
                             );
                             let window: Vec<f32> = ft8_buffer[start..start + send_len].to_vec();
                             // Keep overlap for next window — retain enough for the
-                            // full 15s ideal window at the next boundary
-                            let keep = IDEAL_SAMPLES;
+                            // full cycle's ideal window at the next boundary
+                            let keep = ideal_samples;
                             if ft8_buffer.len() > keep {
                                 ft8_buffer.drain(..ft8_buffer.len() - keep);
                                 last_live_wf_samples = ft8_buffer.len();
@@ -546,10 +568,12 @@ impl super::ApplicationCoordinator {
                             }
                             health_dsp_windows.fetch_add(1, Ordering::Relaxed);
                             health_last_rms.store(rms.to_bits(), Ordering::Relaxed);
-                            // Schedule next decode at 13s into the next slot
-                            next_window_time = pancetta_core::slot::next_phase(
+                            // Schedule next decode at `decode_phase` into the
+                            // next slot (FT8 → 13s; FT4 → 6.5s).
+                            next_window_time = pancetta_core::slot::next_phase_with_period(
                                 chrono::Utc::now(),
-                                chrono::Duration::seconds(13),
+                                dsp_decode_phase,
+                                dsp_slot_ns,
                             );
                         }
                     }

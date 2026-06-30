@@ -227,6 +227,91 @@ pub fn band_change_attributable_to_command(
 /// so the two halves of the fix can never drift apart.
 pub(crate) const WINDOW_LEAD_SECS: f64 = 0.5;
 
+/// The single 12 kHz sample rate the decode/DSP path is anchored to. The DSP
+/// thread decimates the incoming audio to this rate before windowing; all
+/// derived sample counts (`DspTiming`) are expressed at this rate.
+pub(crate) const FT8_SAMPLE_RATE: usize = 12000;
+
+/// Map the config-local [`pancetta_config::OperatingMode`] to a concrete
+/// [`pancetta_ft8::Protocol`]. The config crate intentionally does not depend
+/// on `pancetta-ft8`, so the coordinator owns this mapping. Derived once at
+/// startup from `rig_config.operating_mode()`.
+pub(crate) fn protocol_from_mode(mode: pancetta_config::OperatingMode) -> pancetta_ft8::Protocol {
+    match mode {
+        pancetta_config::OperatingMode::Ft8 => pancetta_ft8::Protocol::Ft8,
+        pancetta_config::OperatingMode::Ft4 => pancetta_ft8::Protocol::Ft4,
+        // FT2 is feature-gated in pancetta-ft8 behind `ft2`. When the feature
+        // is off, fall back to FT8 timing (the only mode actually wired); the
+        // config validator already accepts "FT2", so this keeps a stray FT2
+        // config from panicking on a host built without the feature.
+        #[cfg(feature = "ft2")]
+        pancetta_config::OperatingMode::Ft2 => pancetta_ft8::Protocol::Ft2,
+        #[cfg(not(feature = "ft2"))]
+        pancetta_config::OperatingMode::Ft2 => pancetta_ft8::Protocol::Ft8,
+    }
+}
+
+/// Per-protocol timing values the DSP windowing thread needs, derived once at
+/// startup from a [`pancetta_ft8::ProtocolParams`] via [`derive_dsp_timing`].
+///
+/// Threading these in (rather than hardcoding FT8 constants in the DSP thread)
+/// lets mode=FT4 run a 5.04s window + 6.5s decode phase + 7.5s overlap while
+/// mode=FT8 stays byte-identical to the historical 12.64 / 13 / 15×rate values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DspTiming {
+    /// Decode window length in 12 kHz samples (FT8 → 151_680, FT4 → 60_480).
+    pub window_samples: usize,
+    /// Phase past the slot boundary at which the decode fires (FT8 → 13s,
+    /// FT4 → 6.5s): `cycle_duration − decode_margin`.
+    pub decode_phase: chrono::Duration,
+    /// Overlap retained between windows in 12 kHz samples — one full cycle
+    /// (FT8 → 180_000 = 15×rate, FT4 → 90_000 = 7.5×rate).
+    pub overlap_samples: usize,
+    /// Slot length in nanoseconds (FT8 → 15e9, FT4 → 7.5e9). Fed to the
+    /// `*_with_period` slot helpers.
+    pub slot_ns: i64,
+}
+
+/// Margin (seconds) subtracted from the protocol's `cycle_duration` to get the
+/// decode-trigger phase: the decode fires this long *before* the next slot
+/// boundary, after the transmission's symbols have ended (FT8 tx is 12.64s of a
+/// 15s cycle → 2.0s margin → fire at 13s; FT4 tx is 5.04s of a 7.5s cycle, so a
+/// 1.0s margin fires at 6.5s, comfortably after symbol-end with headroom for the
+/// QSO state machine before the next TX boundary).
+fn decode_margin_secs(protocol: pancetta_ft8::Protocol) -> f64 {
+    match protocol {
+        pancetta_ft8::Protocol::Ft8 => 2.0,
+        _ => 1.0,
+    }
+}
+
+/// Derive the DSP windowing timing from the active protocol's parameters.
+///
+/// Pure function (no clock, no I/O) so it is unit-testable. The FT8 invariant is
+/// the hard regression guard: for `ProtocolParams::ft8()` this MUST yield the
+/// historical 12.64s window (151_680 samples), 13s decode phase, and 15×rate
+/// (180_000) overlap — see `derive_dsp_timing_ft8_byte_identical`.
+pub(crate) fn derive_dsp_timing(pp: &pancetta_ft8::ProtocolParams) -> DspTiming {
+    // Window covers the transmission's symbols: num_symbols × symbol_period.
+    let window_seconds = pp.num_symbols as f64 * pp.symbol_period;
+    let window_samples = (FT8_SAMPLE_RATE as f64 * window_seconds) as usize;
+
+    // Decode fires `decode_margin` before the next boundary.
+    let decode_phase_secs = pp.cycle_duration - decode_margin_secs(pp.protocol);
+    let decode_phase = chrono::Duration::nanoseconds((decode_phase_secs * 1e9) as i64);
+
+    // Overlap retained between windows = one full cycle.
+    let overlap_seconds = pp.cycle_duration;
+    let overlap_samples = (FT8_SAMPLE_RATE as f64 * overlap_seconds) as usize;
+
+    DspTiming {
+        window_samples,
+        decode_phase,
+        overlap_samples,
+        slot_ns: pp.slot_ns(),
+    }
+}
+
 /// How recently the operator must have interacted with the console for the
 /// autonomous engine to be allowed to INITIATE contact (call CQ / pounce).
 ///
@@ -421,6 +506,13 @@ pub struct ApplicationCoordinator {
     /// TUI 'o' set-offset modal; read by the manual-call handler to place our TX
     /// offset (WSJT-X "Hold Tx Freq" style) instead of defaulting to the DX's freq.
     tx_offset_hold_hz: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Active protocol's slot length in nanoseconds (FT8 → 15e9, FT4 → 7.5e9),
+    /// derived once at startup from `[rig].mode`. Read by the decode loop's
+    /// parity-stamping sites (`SlotParity::of_with_period`) and the DSP thread.
+    /// Held as an atomic to mirror the other shared-timing atomics; it is set
+    /// once and not mutated at runtime (a live mode switch is a later task).
+    active_slot_ns: Arc<std::sync::atomic::AtomicI64>,
 
     /// `true` when the read-only `remote_gateway` component is enabled
     /// (`[network.remote_gateway].enabled`). Cached from config at construction
@@ -705,6 +797,24 @@ impl ApplicationCoordinator {
         // while Fox mode is engaged.
         let fox_max_streams_init = config.fox.max_streams;
 
+        // Derive the active protocol's slot length from [rig].mode before
+        // config is moved into the Arc<RwLock>. The config validator already
+        // rejected an unknown mode at load time; an Err here would only mean a
+        // mode validated-then-mutated, so we fall back to FT8 timing rather
+        // than failing coordinator init.
+        let active_protocol = match config.rig.operating_mode() {
+            Ok(mode) => protocol_from_mode(mode),
+            Err(e) => {
+                warn!("invalid [rig].mode ({e}); defaulting protocol timing to FT8");
+                pancetta_ft8::Protocol::Ft8
+            }
+        };
+        let active_slot_ns_init = active_protocol.slot_ns();
+        info!(
+            "Active digital mode: {} (slot {} ns)",
+            active_protocol, active_slot_ns_init
+        );
+
         // Wrap config in Arc<RwLock> for hot-reloading
         let config = Arc::new(RwLock::new(config));
 
@@ -776,6 +886,9 @@ impl ApplicationCoordinator {
             // 0 = unset / auto; the TUI 'o' modal writes the operator-held
             // TX audio offset when the operator pins a specific frequency.
             tx_offset_hold_hz: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Active protocol slot length, derived from [rig].mode above
+            // (default 15e9 for FT8). Set once; read by the decode/DSP paths.
+            active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(active_slot_ns_init)),
             gateway_enabled: Arc::new(AtomicBool::new(gateway_enabled_init)),
             fox_mode: Arc::new(AtomicBool::new(false)),
             fox_max_streams: Arc::new(AtomicUsize::new(fox_max_streams_init)),
@@ -1087,6 +1200,13 @@ impl ApplicationCoordinator {
         self.tx_offset_hold_hz.clone()
     }
 
+    /// Active protocol slot-length atomic in nanoseconds (FT8 → 15e9, FT4 →
+    /// 7.5e9), derived once at startup from `[rig].mode`. Cloned into the
+    /// decode loop's parity-stamping sites (`SlotParity::of_with_period`).
+    pub(crate) fn active_slot_ns(&self) -> Arc<std::sync::atomic::AtomicI64> {
+        self.active_slot_ns.clone()
+    }
+
     /// Fox-mode activation flag. `false` by default (normal Hound / station
     /// operation). Toggled by [`QsoMessage::SetFoxMode`]; the QSO component
     /// reads it to switch to Fox-mode QSO sequencing and raise the answer cap.
@@ -1179,6 +1299,50 @@ mod tx_active_set_tests {
 mod tests {
     use super::*;
     use pancetta_config::Config;
+
+    // ------------------------------------------------------------------
+    // DspTiming derivation — FT8 byte-identical regression guard + FT4.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn derive_dsp_timing_ft8_byte_identical() {
+        // HARD REGRESSION INVARIANT: FT8 must yield exactly today's values.
+        let t = derive_dsp_timing(&pancetta_ft8::ProtocolParams::ft8());
+        // window_seconds = 79 * 0.16 = 12.64 → 12.64 * 12000 = 151_680.
+        assert_eq!(t.window_samples, 151_680);
+        // decode_phase = 15.0 - 2.0 = 13.0s.
+        assert_eq!(t.decode_phase, chrono::Duration::seconds(13));
+        // overlap = 15.0 * 12000 = 180_000 (= FT8_SAMPLE_RATE * 15).
+        assert_eq!(t.overlap_samples, FT8_SAMPLE_RATE * 15);
+        assert_eq!(t.overlap_samples, 180_000);
+        // slot_ns = 15e9.
+        assert_eq!(t.slot_ns, 15_000_000_000);
+    }
+
+    #[test]
+    fn derive_dsp_timing_ft4() {
+        let t = derive_dsp_timing(&pancetta_ft8::ProtocolParams::ft4());
+        // window_seconds = 105 * 0.048 = 5.04 → 5.04 * 12000 = 60_480.
+        assert_eq!(t.window_samples, 60_480);
+        // decode_phase = 7.5 - 1.0 = 6.5s = 6_500ms.
+        assert_eq!(t.decode_phase, chrono::Duration::milliseconds(6_500));
+        // overlap = 7.5 * 12000 = 90_000 (= FT8_SAMPLE_RATE * 7.5).
+        assert_eq!(t.overlap_samples, 90_000);
+        // slot_ns = 7.5e9.
+        assert_eq!(t.slot_ns, 7_500_000_000);
+    }
+
+    #[test]
+    fn protocol_from_mode_maps_ft8_and_ft4() {
+        assert_eq!(
+            protocol_from_mode(pancetta_config::OperatingMode::Ft8),
+            pancetta_ft8::Protocol::Ft8
+        );
+        assert_eq!(
+            protocol_from_mode(pancetta_config::OperatingMode::Ft4),
+            pancetta_ft8::Protocol::Ft4
+        );
+    }
 
     #[tokio::test]
     async fn test_coordinator_creation() {
