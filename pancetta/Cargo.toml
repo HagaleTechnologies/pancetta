@@ -99,6 +99,9 @@ metrics = []
 pancetta-hamlib = ["dep:pancetta-hamlib"]
 prometheus = ["metrics-exporter-prometheus"]
 tracing-json = []
+# Experimental FT2 digital mode (forwards to pancetta-ft8/ft2). Off by default;
+# when off, a configured FT2 mode falls back to FT8 timing in the coordinator.
+ft2 = ["pancetta-ft8/ft2"]
 
 [[bench]]
 name = "pipeline_bench"
