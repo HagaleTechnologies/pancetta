@@ -1757,6 +1757,7 @@ impl super::ApplicationCoordinator {
                 antenna: "Vertical".to_string(),
                 rig: tui_config_lock.rig.model.clone(),
                 default_frequency: 14.074,
+                mode: tui_config_lock.rig.mode.clone(),
                 tx_self_parity: tui_config_lock.station.tx_self_parity,
             },
             ui: pancetta_tui::config::UiConfig {

@@ -13,6 +13,11 @@ pub struct Config {
     pub bands: BandConfig,
 }
 
+/// Default for [`StationConfig::mode`] (and serde-missing fallback): FT8.
+fn default_station_mode() -> String {
+    "FT8".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StationConfig {
     pub call_sign: String,
@@ -21,6 +26,10 @@ pub struct StationConfig {
     pub antenna: String,
     pub rig: String,
     pub default_frequency: f64,
+    /// Station-wide active operating mode (FT8/FT4/FT2) from `[rig].mode`.
+    /// Backs the title-bar mode chip (rendered only when not FT8).
+    #[serde(default = "default_station_mode")]
+    pub mode: String,
     /// Configured TX slot parity. `Auto` means no preference (waterfall
     /// shows no persistent TX-cursor highlight when idle).
     pub tx_self_parity: pancetta_config::station::TxSelfParity,
@@ -102,6 +111,7 @@ impl Default for Config {
                 antenna: "Dipole".to_string(),
                 rig: "IC-7300".to_string(),
                 default_frequency: 14.074,
+                mode: default_station_mode(),
                 tx_self_parity: pancetta_config::station::TxSelfParity::Auto,
             },
             ui: UiConfig {
