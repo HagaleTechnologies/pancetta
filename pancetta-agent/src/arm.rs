@@ -10,7 +10,11 @@
 //! - **Dead-man / heartbeat auto-disarm.** A remote arm must be continuously
 //!   refreshed by heartbeats; if the client link goes silent for
 //!   [`HEARTBEAT_TIMEOUT_MS`], the station auto-disarms. A stale link can never
-//!   keep the transmitter armed.
+//!   keep the transmitter armed. Each heartbeat is bound to its arm: it must
+//!   name the current arm's `jti` (`armJti`) and carry a per-arm-**monotonic**
+//!   `seq`. A **replayed** or wrong-arm heartbeat is rejected and does NOT slide
+//!   the window (contract `$defs.txHeartbeat`), so a captured heartbeat can
+//!   never hold an arm open past its dead-man deadline.
 //! - **TTL.** Every grant carries a finite time-to-live; past it, the arm
 //!   expires regardless of heartbeats.
 //! - **Local-kill primacy.** The station's local kill switch (maps to
@@ -57,6 +61,10 @@ pub struct VerifiedArmGrant {
     /// Whether the grant carries TX scope. If `false`, the grant can never
     /// permit TX and [`ArmState::arm`] rejects it.
     pub scope_tx: bool,
+    /// The grant's unique id (`txArmGrant.jti`). Heartbeats must name this exact
+    /// arm via `armJti` (contract `$defs.txHeartbeat.armJti`); a heartbeat for a
+    /// different `jti` is rejected without sliding the dead-man window.
+    pub jti: String,
 }
 
 /// Why TX is (not) permitted, for audit `detail` and diagnostics.
@@ -133,6 +141,14 @@ pub enum ArmEffect {
         /// Why the session disarmed.
         reason: DisarmReason,
     },
+    /// A heartbeat was **rejected** (wrong `armJti`, or a non-monotonic /
+    /// replayed `seq`). The dead-man window was NOT slid; the arm is unchanged.
+    /// Accompanied by a corresponding `Audit` (`TxDenied`) effect so a replay
+    /// attempt is visible to the auditor.
+    HeartbeatRejected {
+        /// Why the heartbeat was rejected (stable short string).
+        reason: &'static str,
+    },
 }
 
 /// The private "currently armed" record. Absent (`None`) means not armed.
@@ -143,6 +159,13 @@ struct ArmedSession {
     ttl_ms: i64,
     last_heartbeat_ms: i64,
     scope_tx: bool,
+    /// The grant's `jti` — the arm this session represents. A heartbeat's
+    /// `armJti` must equal this or it is rejected (contract `$defs.txHeartbeat`).
+    current_jti: String,
+    /// The highest heartbeat `seq` accepted for this arm. A heartbeat with
+    /// `seq <= last_heartbeat_seq` is a replay/non-monotonic frame and is
+    /// rejected without sliding the window. `None` until the first heartbeat.
+    last_heartbeat_seq: Option<u64>,
 }
 
 impl ArmedSession {
@@ -229,6 +252,10 @@ impl ArmState {
             ttl_ms: grant.ttl_ms,
             last_heartbeat_ms: now_ms,
             scope_tx: true,
+            current_jti: grant.jti.clone(),
+            // A fresh arm resets the heartbeat sequence — a new arm's low seq is
+            // accepted even if a prior arm had reached a high seq.
+            last_heartbeat_seq: None,
         });
 
         vec![ArmEffect::Audit(AuditEvent {
@@ -239,16 +266,69 @@ impl ArmState {
         })]
     }
 
-    /// Refresh the dead-man heartbeat. Only meaningful while armed; a heartbeat
-    /// received while not armed is ignored (it can never resurrect an arm).
-    pub fn heartbeat(&mut self, now_ms: i64) {
-        if let Some(s) = self.session.as_mut() {
-            // Monotonic guard: never let a stale/replayed lower timestamp shrink
-            // the window, but do accept forward progress.
-            if now_ms > s.last_heartbeat_ms {
-                s.last_heartbeat_ms = now_ms;
+    /// Refresh the dead-man heartbeat, bound to the arm it names.
+    ///
+    /// Contract (`$defs.txHeartbeat`): a heartbeat carries the `armJti` of the
+    /// arm it keeps alive and a per-arm-monotonic `seq`. This method enforces
+    /// both so a **replayed** heartbeat can never hold an arm open past its
+    /// dead-man window:
+    ///
+    /// - Not armed → no-op (`vec![]`). A heartbeat can never resurrect/create an
+    ///   arm.
+    /// - `arm_jti != current arm's jti` → **rejected**: returns a
+    ///   [`ArmEffect::HeartbeatRejected`] + audit; the window is NOT slid.
+    /// - `seq <= last-accepted seq` (non-monotonic / replay) → **rejected** the
+    ///   same way; the window is NOT slid.
+    /// - Otherwise **accepted**: records `seq` as the new high-water mark and
+    ///   slides `last_heartbeat_ms` to `now_ms`. Returns `vec![]` (heartbeats
+    ///   were never audited on the happy path — kept quiet to avoid log spam).
+    ///
+    /// The `now_ms` slide is unconditional on acceptance (the monotonic `seq`
+    /// guard has already rejected replays), so a legitimately-delayed accepted
+    /// heartbeat still refreshes the window.
+    pub fn heartbeat(&mut self, arm_jti: &str, seq: u64, now_ms: i64) -> Vec<ArmEffect> {
+        let s = match self.session.as_mut() {
+            Some(s) => s,
+            // Not armed: a heartbeat can never create an arm. Silent no-op.
+            None => return Vec::new(),
+        };
+
+        // Bind to THIS arm: a heartbeat naming a different (or stale) arm must
+        // not slide the live arm's window.
+        if arm_jti != s.current_jti {
+            let reason = "arm_jti mismatch";
+            return vec![
+                ArmEffect::Audit(AuditEvent {
+                    ts_unix_ms: now_ms,
+                    kind: AuditKind::TxDenied,
+                    operator_callsign: Some(s.operator_callsign.clone()),
+                    detail: format!("heartbeat rejected: {reason}"),
+                }),
+                ArmEffect::HeartbeatRejected { reason },
+            ];
+        }
+
+        // Monotonic seq: reject a replayed or out-of-order heartbeat. This is
+        // THE guard that stops a replayed heartbeat from holding the arm open.
+        if let Some(last) = s.last_heartbeat_seq {
+            if seq <= last {
+                let reason = "non-monotonic seq";
+                return vec![
+                    ArmEffect::Audit(AuditEvent {
+                        ts_unix_ms: now_ms,
+                        kind: AuditKind::TxDenied,
+                        operator_callsign: Some(s.operator_callsign.clone()),
+                        detail: format!("heartbeat rejected: {reason} (seq={seq}, last={last})"),
+                    }),
+                    ArmEffect::HeartbeatRejected { reason },
+                ];
             }
         }
+
+        // Accept: advance the high-water seq and slide the dead-man window.
+        s.last_heartbeat_seq = Some(seq);
+        s.last_heartbeat_ms = now_ms;
+        Vec::new()
     }
 
     /// Explicit operator/coordinator disarm. No-op (empty effects) if not armed.
@@ -389,12 +469,22 @@ mod tests {
     const T0: i64 = 1_000_000; // arbitrary base "now"
     const TTL: i64 = 120_000; // 2 minutes
 
+    const JTI: &str = "arm-jti-1";
+
     fn grant(scope_tx: bool) -> VerifiedArmGrant {
         VerifiedArmGrant {
             operator_callsign: "K5ARH".to_string(),
             ttl_ms: TTL,
             scope_tx,
+            jti: JTI.to_string(),
         }
+    }
+
+    /// Assert an effect list contains a `HeartbeatRejected`.
+    fn is_hb_rejected(effects: &[ArmEffect]) -> bool {
+        effects
+            .iter()
+            .any(|e| matches!(e, ArmEffect::HeartbeatRejected { .. }))
     }
 
     /// A helper: armed at T0 with TX scope + consent ON, no kill.
@@ -463,20 +553,77 @@ mod tests {
     }
 
     #[test]
-    fn a_heartbeat_slides_the_deadman_window() {
+    fn valid_monotonic_heartbeats_each_slide_the_window() {
         let mut st = armed_consented();
-        let hb = T0 + 20_000;
-        st.heartbeat(hb);
-        // Now the window is measured from `hb`, not T0.
-        assert!(st.tx_permitted(hb + HEARTBEAT_TIMEOUT_MS - 1));
-        assert!(!st.tx_permitted(hb + HEARTBEAT_TIMEOUT_MS));
+        // seq 1, 2, 3 each accepted (empty effects) and each slides the window.
+        for (i, seq) in [1u64, 2, 3].into_iter().enumerate() {
+            let hb = T0 + (i as i64 + 1) * 5_000;
+            let effects = st.heartbeat(JTI, seq, hb);
+            assert!(effects.is_empty(), "accepted heartbeat emits no effects");
+            // Window now measured from `hb`: still permitted just before deadline.
+            assert!(st.tx_permitted(hb + HEARTBEAT_TIMEOUT_MS - 1));
+        }
+        // After the last accepted heartbeat (at T0+15_000) TX stays permitted
+        // across the whole interval up to its own deadline.
+        let last = T0 + 15_000;
+        assert!(st.tx_permitted(last + HEARTBEAT_TIMEOUT_MS - 1));
+        assert!(!st.tx_permitted(last + HEARTBEAT_TIMEOUT_MS));
+    }
+
+    /// THE finding: a **replayed** heartbeat must NOT hold the arm open past its
+    /// dead-man window. seq 5 is accepted; a later replay of seq 5 (and seq 3) is
+    /// rejected and the window does NOT slide, so `tx_permitted` flips false at
+    /// the ORIGINAL `seq-5-time + HEARTBEAT_TIMEOUT_MS` even though the replay
+    /// arrived after it.
+    #[test]
+    fn replayed_heartbeat_does_not_slide_the_deadman_window() {
+        let mut st = armed_consented();
+        let accepted_at = T0 + 10_000;
+        assert!(st.heartbeat(JTI, 5, accepted_at).is_empty());
+        let deadline = accepted_at + HEARTBEAT_TIMEOUT_MS;
+        // Replay seq 5 LATER (just before the deadline) — must be rejected and
+        // must NOT slide the window.
+        let replay_at = deadline - 1;
+        let e1 = st.heartbeat(JTI, 5, replay_at);
+        assert!(is_hb_rejected(&e1), "replayed seq must be rejected");
+        // An even-lower seq is likewise rejected.
+        let e2 = st.heartbeat(JTI, 3, replay_at);
+        assert!(is_hb_rejected(&e2), "lower seq must be rejected");
+        // Because neither replay slid the window, TX is denied at the ORIGINAL
+        // deadline — the dead-man still expires on schedule.
+        assert!(
+            st.tx_permitted(deadline - 1),
+            "permitted 1ms before deadline"
+        );
+        assert!(
+            !st.tx_permitted(deadline),
+            "dead-man expires on schedule; a replay cannot hold the arm open"
+        );
+        assert_eq!(
+            st.tx_permit_reason(deadline),
+            TxPermit::Denied(DenyReason::HeartbeatLost)
+        );
     }
 
     #[test]
-    fn heartbeat_while_not_armed_is_ignored() {
+    fn heartbeat_with_wrong_arm_jti_is_rejected_and_window_unchanged() {
+        let mut st = armed_consented();
+        let hb = T0 + 10_000;
+        let effects = st.heartbeat("some-other-arm", 1, hb);
+        assert!(is_hb_rejected(&effects), "wrong arm_jti must be rejected");
+        // The window was never seeded past T0: original dead-man deadline holds.
+        assert!(st.tx_permitted(T0 + HEARTBEAT_TIMEOUT_MS - 1));
+        assert!(!st.tx_permitted(T0 + HEARTBEAT_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn heartbeat_while_not_armed_is_a_noop() {
         let mut st = ArmState::new();
         st.set_local_consent(true, T0);
-        st.heartbeat(T0);
+        // Must not arm, must not panic, returns empty effects.
+        let effects = st.heartbeat(JTI, 1, T0);
+        assert!(effects.is_empty());
+        assert!(!st.is_armed());
         assert!(!st.tx_permitted(T0));
         assert_eq!(
             st.tx_permit_reason(T0),
@@ -484,13 +631,28 @@ mod tests {
         );
     }
 
+    /// A fresh arm (new grant, new jti) resets the seq high-water mark: a low seq
+    /// is accepted for the NEW arm even though the OLD arm reached a high seq.
     #[test]
-    fn stale_heartbeat_cannot_shrink_the_window() {
-        let mut st = armed_consented();
-        st.heartbeat(T0 + 10_000); // advance
-                                   // A replayed/older heartbeat must not move the window backward.
-        st.heartbeat(T0 + 5_000);
-        assert!(st.tx_permitted(T0 + 10_000 + HEARTBEAT_TIMEOUT_MS - 1));
+    fn fresh_arm_resets_the_heartbeat_seq() {
+        let mut st = ArmState::new();
+        st.set_local_consent(true, T0);
+        st.arm(grant(true), T0); // jti = JTI
+        assert!(st.heartbeat(JTI, 9, T0 + 1_000).is_empty());
+        // Re-arm with a DIFFERENT jti (fresh grant): seq resets.
+        let g2 = VerifiedArmGrant {
+            operator_callsign: "K5ARH".to_string(),
+            ttl_ms: TTL,
+            scope_tx: true,
+            jti: "arm-jti-2".to_string(),
+        };
+        st.arm(g2, T0 + 2_000);
+        // A low seq (1) is accepted for the NEW arm despite the old arm's seq 9.
+        let effects = st.heartbeat("arm-jti-2", 1, T0 + 3_000);
+        assert!(effects.is_empty(), "new arm accepts a low seq");
+        assert!(st.tx_permitted(T0 + 3_000 + HEARTBEAT_TIMEOUT_MS - 1));
+        // And the OLD arm's jti is now rejected (it names a defunct arm).
+        assert!(is_hb_rejected(&st.heartbeat(JTI, 10, T0 + 3_000)));
     }
 
     // --- TTL boundary ------------------------------------------------------
@@ -505,6 +667,7 @@ mod tests {
                 operator_callsign: "K5ARH".into(),
                 ttl_ms: short_ttl,
                 scope_tx: true,
+                jti: JTI.to_string(),
             },
             T0,
         );
@@ -536,8 +699,8 @@ mod tests {
             TxPermit::Denied(DenyReason::LocallyKilled)
         );
         // Fresh heartbeats cannot un-kill.
-        st.heartbeat(T0 + 1_000);
-        st.heartbeat(T0 + 2_000);
+        st.heartbeat(JTI, 1, T0 + 1_000);
+        st.heartbeat(JTI, 2, T0 + 2_000);
         assert!(!st.tx_permitted(T0 + 2_000));
         // Only clearing the kill restores permission (still armed + consented).
         st.set_local_kill(false, T0 + 3_000);
@@ -606,14 +769,17 @@ mod tests {
                 operator_callsign: "K5ARH".into(),
                 ttl_ms: short_ttl,
                 scope_tx: true,
+                jti: JTI.to_string(),
             },
             T0,
         );
         st.set_local_consent(true, T0);
         let after_expiry = T0 + short_ttl + 5;
         assert!(!st.tx_permitted(after_expiry));
-        // A heartbeat after expiry must NOT re-permit — the arm is dead.
-        st.heartbeat(after_expiry);
+        // A heartbeat after expiry must NOT re-permit — the arm is dead. (An
+        // expired arm is still `Some` until a tick/query removes it, but the
+        // window slide can't cure an already-elapsed TTL.)
+        st.heartbeat(JTI, 1, after_expiry);
         assert!(!st.tx_permitted(after_expiry));
         assert_eq!(
             st.tx_permit_reason(after_expiry),
@@ -625,6 +791,7 @@ mod tests {
                 operator_callsign: "K5ARH".into(),
                 ttl_ms: short_ttl,
                 scope_tx: true,
+                jti: JTI.to_string(),
             },
             after_expiry,
         );
@@ -642,7 +809,7 @@ mod tests {
             .iter()
             .any(|e| matches!(e, ArmEffect::Disarmed { reason } if *reason == DisarmReason::HeartbeatLost)));
         // A heartbeat now targets no session; still not permitted.
-        st.heartbeat(dead);
+        assert!(st.heartbeat(JTI, 1, dead).is_empty());
         assert!(!st.tx_permitted(dead));
         assert_eq!(
             st.tx_permit_reason(dead),
@@ -667,6 +834,7 @@ mod tests {
                 operator_callsign: "K5ARH".into(),
                 ttl_ms: 10_000,
                 scope_tx: true,
+                jti: JTI.to_string(),
             },
             T0,
         );
@@ -719,6 +887,7 @@ mod tests {
                 operator_callsign: "K5ARH".into(),
                 ttl_ms: 5_000,
                 scope_tx: true,
+                jti: JTI.to_string(),
             },
             T0,
         );
@@ -828,6 +997,12 @@ mod tests {
             let mut st = ArmState::new();
             let mut sh = Shadow::new();
             let mut now: i64 = 1_000_000;
+            // Per-arm jti + a monotonic heartbeat seq so every heartbeat this
+            // trajectory issues is accepted (named-arm + monotonic), preserving
+            // the old "slide on forward time" behavior the shadow models.
+            let mut arm_ordinal: u64 = 0;
+            let mut cur_jti = String::new();
+            let mut hb_seq: u64 = 0;
 
             for _ in 0..40 {
                 // Advance time by a bounded random amount (can cross deadlines).
@@ -838,11 +1013,14 @@ mod tests {
                         // arm (random scope, random ttl in [1ms, 90s])
                         let scope = rng.below(2) == 1;
                         let ttl = 1 + rng.below(90_000) as i64;
+                        arm_ordinal += 1;
+                        let jti = format!("arm-{arm_ordinal}");
                         st.arm(
                             VerifiedArmGrant {
                                 operator_callsign: "K5ARH".into(),
                                 ttl_ms: ttl,
                                 scope_tx: scope,
+                                jti: jti.clone(),
                             },
                             now,
                         );
@@ -853,11 +1031,19 @@ mod tests {
                             sh.ttl = ttl;
                             sh.last_hb = now;
                             sh.scope_tx = true;
+                            // A fresh arm resets the heartbeat sequence.
+                            cur_jti = jti;
+                            hb_seq = 0;
                         }
                         // (no-scope arm leaves prior session untouched, matching impl)
                     }
                     1 => {
-                        st.heartbeat(now);
+                        // Named-arm + monotonically-increasing seq ⇒ always
+                        // accepted while armed, so the shadow's forward-time
+                        // slide stays faithful. (Reject paths are covered by the
+                        // dedicated adversarial unit tests below.)
+                        hb_seq += 1;
+                        st.heartbeat(&cur_jti, hb_seq, now);
                         if sh.armed && now > sh.last_hb {
                             sh.last_hb = now;
                         }
