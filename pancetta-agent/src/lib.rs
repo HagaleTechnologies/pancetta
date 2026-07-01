@@ -6,3 +6,5 @@ pub mod capability;
 pub mod keys;
 pub mod noise;
 pub mod pairing;
+pub mod relay;
+pub mod session;

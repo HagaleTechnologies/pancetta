@@ -137,6 +137,17 @@ impl AgentIdentity {
         XPublicKey::from(&self.agreement).to_bytes()
     }
 
+    /// The raw 32-byte X25519 static agreement **private** key, needed to build
+    /// the Noise IK responder handshake (the agent's production role).
+    ///
+    /// Secret material: callers must not log or persist the return value beyond
+    /// what `snow` requires. It is exposed only so the session driver can seed
+    /// [`crate::noise::ResponderHandshake::new`]; it is never rendered by the
+    /// redacting `Debug` impl.
+    pub fn agreement_private_bytes(&self) -> [u8; 32] {
+        self.agreement.to_bytes()
+    }
+
     /// The agent's keyId: unpadded base64url SHA-256 of the Ed25519 identity
     /// SPKI DER (`302a300506032b6570032100` ‖ 32-byte raw key).
     pub fn key_id(&self) -> String {
