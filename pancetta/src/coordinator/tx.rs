@@ -294,6 +294,101 @@ fn tx_qso_is_live(
     }
 }
 
+/// Encode a text message to transmission symbols for the active protocol.
+///
+/// **FT8 is byte-identical to the legacy path**: `Protocol::Ft8` calls the exact
+/// `encoder.encode_message(text, None)` the worker always called and returns the
+/// 79-symbol array as a `Vec<u8>` (`.to_vec()` — no value change, only the
+/// container). FT4/FT2 call the protocol-aware `encode_message_protocol`, which
+/// emits the correct symbol count for the mode (FT4 → 105, 4-GFSK). The encoder
+/// must have been constructed with the matching protocol (see the worker's
+/// `Ft8Encoder::with_protocol` for the non-FT8 case) so `encode_message_protocol`
+/// applies the right sync/XOR/Gray mapping.
+fn encode_for_protocol(
+    encoder: &mut Ft8Encoder,
+    protocol: pancetta_ft8::Protocol,
+    text: &str,
+) -> pancetta_ft8::Ft8Result<Vec<u8>> {
+    match protocol {
+        pancetta_ft8::Protocol::Ft8 => encoder.encode_message(text, None).map(|s| s.to_vec()),
+        _ => encoder.encode_message_protocol(text, None),
+    }
+}
+
+/// Modulate transmission symbols into audio samples for the active protocol.
+///
+/// **FT8 is byte-identical to the legacy path**: `Protocol::Ft8` calls
+/// `modulator.modulate_symbols(&[u8; NUM_SYMBOLS], offset)` — the same FT8 GFSK
+/// shaping the worker always used (the 79-length slice is copied back into the
+/// fixed-size array the FT8 entry point requires). FT4/FT2 call
+/// `modulate_symbols_protocol(symbols, offset, &params)` with the active
+/// protocol's params, which carry the correct on-air shaping (FT4 → `Gfsk { bt:
+/// 1.0 }`) and symbol geometry.
+fn modulate_for_protocol(
+    modulator: &mut Ft8Modulator,
+    protocol: pancetta_ft8::Protocol,
+    symbols: &[u8],
+    offset: f64,
+) -> pancetta_ft8::Ft8Result<Vec<f32>> {
+    match protocol {
+        pancetta_ft8::Protocol::Ft8 => {
+            // The FT8 entry point requires the fixed-size array; the symbols came
+            // from `encode_message` (exactly NUM_SYMBOLS long) so this conversion
+            // never fails on the FT8 path.
+            let arr: [u8; pancetta_ft8::NUM_SYMBOLS] =
+                symbols
+                    .try_into()
+                    .map_err(|_| pancetta_ft8::Ft8Error::InvalidDataSize {
+                        expected: pancetta_ft8::NUM_SYMBOLS,
+                        actual: symbols.len(),
+                    })?;
+            modulator.modulate_symbols(&arr, offset)
+        }
+        _ => modulate_for_protocol_params(
+            modulator,
+            symbols,
+            offset,
+            &pancetta_ft8::ProtocolParams::from_protocol(protocol),
+        ),
+    }
+}
+
+/// Protocol-aware modulate for the non-FT8 path (small indirection so the branch
+/// above and any future caller share one call site).
+fn modulate_for_protocol_params(
+    modulator: &mut Ft8Modulator,
+    symbols: &[u8],
+    offset: f64,
+    params: &pancetta_ft8::ProtocolParams,
+) -> pancetta_ft8::Ft8Result<Vec<f32>> {
+    modulator.modulate_symbols_protocol(symbols, offset, params)
+}
+
+/// Full encode → modulate for one message under the active protocol, returning
+/// the audio samples. Constructs a fresh encoder/modulator for the protocol so
+/// it is self-contained and unit-testable. `base_offset` is passed straight to
+/// the modulator's `frequency_offset` (the worker instead pre-sets the base
+/// frequency and passes 0.0; both paths land at the same audio frequency).
+///
+/// **FT8 regression guarantee:** for `Protocol::Ft8` this calls the exact same
+/// `Ft8Encoder::new()` / `Ft8Modulator::new_default()` / `encode_message` /
+/// `modulate_symbols` sequence the worker used before the FT4 wiring, so its
+/// output is byte-identical to the legacy path for a given message and offset.
+#[cfg_attr(not(test), allow(dead_code))]
+fn encode_and_modulate(
+    protocol: pancetta_ft8::Protocol,
+    text: &str,
+    base_offset: f64,
+) -> pancetta_ft8::Ft8Result<Vec<f32>> {
+    let mut encoder = match protocol {
+        pancetta_ft8::Protocol::Ft8 => Ft8Encoder::new(),
+        _ => Ft8Encoder::with_protocol(pancetta_ft8::ProtocolParams::from_protocol(protocol)),
+    };
+    let mut modulator = Ft8Modulator::new_default()?;
+    let symbols = encode_for_protocol(&mut encoder, protocol, text)?;
+    modulate_for_protocol(&mut modulator, protocol, &symbols, base_offset)
+}
+
 /// Upper bound on the number of distinct TX streams the worker will retain
 /// when coalescing a backlog. Mirrors the "max simultaneous TX in one slot"
 /// ceiling: a single FT8 slot can only carry a handful of summed signals
@@ -649,11 +744,28 @@ impl super::ApplicationCoordinator {
             // startup from `[rig].mode`. The TX scheduler keys against this so
             // FT4 lands on the 7.5s grid; FT8 (15e9) is byte-identical.
             let active_slot_ns = self.active_slot_ns();
+            // Active digital-mode protocol from `[rig].mode`. The encode+modulate
+            // steps branch on this: `Ft8` runs the exact legacy calls
+            // (byte-identical), `Ft4`/`Ft2` emit the correct on-air waveform
+            // (FT4 → 4-GFSK, 105 symbols, GFSK BT=1.0). Without this the station
+            // would DECODE FT4 but TRANSMIT an FT8 waveform onto the 7.5s grid.
+            let active_protocol = self.active_protocol();
 
             tokio::spawn(async move {
-                info!("FT8 transmitter component ready");
+                info!(
+                    "FT8 transmitter component ready (protocol {})",
+                    active_protocol
+                );
 
-                let mut encoder = Ft8Encoder::new();
+                // For FT8 keep the exact legacy `Ft8Encoder::new()`; for FT4/FT2
+                // build the encoder with the mode's protocol params so
+                // `encode_message_protocol` applies the right sync/XOR/Gray map.
+                let mut encoder = match active_protocol {
+                    pancetta_ft8::Protocol::Ft8 => Ft8Encoder::new(),
+                    _ => Ft8Encoder::with_protocol(pancetta_ft8::ProtocolParams::from_protocol(
+                        active_protocol,
+                    )),
+                };
                 let mut modulator = match Ft8Modulator::new_default() {
                     Ok(m) => m,
                     Err(e) => {
@@ -792,11 +904,26 @@ impl super::ApplicationCoordinator {
                                         let _ = message_bus.send_message(complete_msg).await;
                                         continue;
                                     }
-                                    let (samples, _duration_ms) = match encoder
-                                        .encode_message(&message_text, None)
-                                        .and_then(|symbols| {
-                                            modulator.modulate_symbols(&symbols, 0.0)
-                                        }) {
+                                    // Encode + modulate under the active protocol.
+                                    // For FT8 this dispatches to the exact legacy
+                                    // `encode_message` + `modulate_symbols` calls
+                                    // (byte-identical); for FT4/FT2 it uses the
+                                    // protocol-aware `encode_message_protocol` +
+                                    // `modulate_symbols_protocol` so the on-air
+                                    // waveform matches the mode.
+                                    let (samples, _duration_ms) = match encode_for_protocol(
+                                        &mut encoder,
+                                        active_protocol,
+                                        &message_text,
+                                    )
+                                    .and_then(|symbols| {
+                                        modulate_for_protocol(
+                                            &mut modulator,
+                                            active_protocol,
+                                            &symbols,
+                                            0.0,
+                                        )
+                                    }) {
                                         Ok(s) => {
                                             let dur = (s.len() as f64 / 12000.0 * 1000.0) as u64;
                                             info!(
@@ -1290,15 +1417,27 @@ impl super::ApplicationCoordinator {
                                     .await;
 
                                     // --- Step 1: Encode + modulate up front ---
-                                    let ft8_params = pancetta_ft8::ProtocolParams::ft8();
+                                    // Per-item params for the active protocol.
+                                    // `Ft8` → `ProtocolParams::ft8()` (byte-identical
+                                    // to the previous hardcoded value);
+                                    // `Ft4`/`Ft2` → the mode's params (correct on-air
+                                    // shaping, e.g. FT4 GFSK BT=1.0), and encoding
+                                    // via `encode_message_protocol` (105 FT4 symbols).
+                                    let tx_params = pancetta_ft8::ProtocolParams::from_protocol(
+                                        active_protocol,
+                                    );
                                     let mut symbol_sets: Vec<Vec<u8>> = Vec::new();
                                     let mut item_texts: Vec<String> = Vec::new();
 
                                     for item in &items {
-                                        match encoder.encode_message(&item.message_text, None) {
+                                        match encode_for_protocol(
+                                            &mut encoder,
+                                            active_protocol,
+                                            &item.message_text,
+                                        ) {
                                             Ok(symbols) => {
                                                 item_texts.push(item.message_text.clone());
-                                                symbol_sets.push(symbols.to_vec());
+                                                symbol_sets.push(symbols);
                                             }
                                             Err(e) => {
                                                 warn!(
@@ -1322,7 +1461,7 @@ impl super::ApplicationCoordinator {
                                             symbols: symbols.as_slice(),
                                             frequency_offset: items[i].frequency_offset
                                                 - MULTI_TX_BASE_HZ,
-                                            params: &ft8_params,
+                                            params: &tx_params,
                                         });
                                     }
 
@@ -2306,5 +2445,120 @@ mod coalesce_tests {
         assert!(out.retained.is_empty());
         assert_eq!(out.dropped_terminal, 2);
         assert!(!out.is_noop());
+    }
+}
+
+#[cfg(test)]
+mod protocol_tx_tests {
+    //! Coordinator-level FT4 TX coverage (final-review blocker).
+    //!
+    //! Before this wiring the TX worker hardcoded FT8 encode+modulate, so in
+    //! `[rig].mode = "FT4"` the station DECODED FT4 but TRANSMITTED an FT8
+    //! waveform (8-GFSK, 79 symbols, 12.64s) onto the 7.5s grid — FT4 QSOs
+    //! could never complete. These tests pin the branch: FT4 emits the FT4
+    //! waveform (4-GFSK, 105 symbols, ~5.04s / 60_480 samples @ 12 kHz), and
+    //! the FT8 branch stays byte-identical to the legacy encode+modulate path.
+    use super::*;
+    use pancetta_ft8::{Ft8Encoder, Ft8Modulator, Protocol, ProtocolParams};
+
+    /// The message used across the protocol-branch tests. A standard grid
+    /// message so both FT8 and FT4 encode via `try_encode_standard`.
+    const MSG: &str = "CQ K5ARH EM12";
+
+    #[test]
+    fn ft4_encode_produces_105_symbols_not_79() {
+        let mut enc = Ft8Encoder::with_protocol(ProtocolParams::ft4());
+        let symbols =
+            encode_for_protocol(&mut enc, Protocol::Ft4, MSG).expect("FT4 encode should succeed");
+        assert_eq!(
+            symbols.len(),
+            105,
+            "FT4 must emit 105 symbols (4-GFSK), not FT8's 79"
+        );
+        // FT4 is 4-GFSK: every symbol must be in 0..=3.
+        assert!(
+            symbols.iter().all(|&s| s < 4),
+            "FT4 symbols must be 4-ary (0-3): {symbols:?}"
+        );
+    }
+
+    #[test]
+    fn ft4_waveform_is_ft4_length_not_ft8() {
+        // End-to-end encode+modulate for FT4 through the extracted helper.
+        let samples = encode_and_modulate(Protocol::Ft4, MSG, 0.0)
+            .expect("FT4 encode+modulate should succeed");
+        // FT4: 105 symbols × 0.048s × 12_000 Hz = 60_480 samples (~5.04s).
+        assert_eq!(
+            samples.len(),
+            60_480,
+            "FT4 waveform must be ~5.04s (60_480 samples @ 12 kHz), the 7.5s-grid FT4 length"
+        );
+        // Must NOT be the FT8 waveform length (79 × 0.16 × 12_000 = 151_680).
+        assert_ne!(
+            samples.len(),
+            151_680,
+            "FT4 must not emit an FT8-length (12.64s) waveform"
+        );
+    }
+
+    #[test]
+    fn ft8_waveform_is_ft8_length() {
+        let samples = encode_and_modulate(Protocol::Ft8, MSG, 0.0)
+            .expect("FT8 encode+modulate should succeed");
+        // FT8: 79 symbols × 0.16s × 12_000 Hz = 151_680 samples (~12.64s).
+        assert_eq!(
+            samples.len(),
+            151_680,
+            "FT8 waveform must be the ~12.64s length"
+        );
+    }
+
+    #[test]
+    fn ft8_branch_is_byte_identical_to_legacy_path() {
+        // Legacy path exactly as the TX worker called it pre-FT4-wiring:
+        // Ft8Encoder::new() + Ft8Modulator::new_default() + encode_message +
+        // modulate_symbols.
+        let legacy = {
+            let mut enc = Ft8Encoder::new();
+            let mut modu = Ft8Modulator::new_default().unwrap();
+            let symbols = enc.encode_message(MSG, None).unwrap();
+            modu.modulate_symbols(&symbols, 0.0).unwrap()
+        };
+        // New helper path with Protocol::Ft8.
+        let via_helper =
+            encode_and_modulate(Protocol::Ft8, MSG, 0.0).expect("FT8 helper should succeed");
+        assert_eq!(
+            legacy.len(),
+            via_helper.len(),
+            "FT8 helper sample count must match the legacy path"
+        );
+        assert_eq!(
+            legacy, via_helper,
+            "FT8 helper output must be byte-identical to the legacy encode+modulate path"
+        );
+    }
+
+    #[test]
+    fn ft8_split_helpers_match_legacy_combined_call() {
+        // Prove the split encode_for_protocol + modulate_for_protocol pair (what
+        // the worker's single-TX path now calls) is byte-identical to the legacy
+        // combined encode_message().and_then(modulate_symbols) call for FT8.
+        let legacy = {
+            let mut enc = Ft8Encoder::new();
+            let mut modu = Ft8Modulator::new_default().unwrap();
+            enc.encode_message(MSG, None)
+                .and_then(|symbols| modu.modulate_symbols(&symbols, 0.0))
+                .unwrap()
+        };
+        let split = {
+            let mut enc = Ft8Encoder::new();
+            let mut modu = Ft8Modulator::new_default().unwrap();
+            let symbols = encode_for_protocol(&mut enc, Protocol::Ft8, MSG).unwrap();
+            modulate_for_protocol(&mut modu, Protocol::Ft8, &symbols, 0.0).unwrap()
+        };
+        assert_eq!(
+            legacy, split,
+            "split FT8 encode/modulate helpers must equal the legacy combined call"
+        );
     }
 }
