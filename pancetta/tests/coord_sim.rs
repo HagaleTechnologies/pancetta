@@ -64,12 +64,13 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use pancetta_hamlib::{MockRig, PttState, RigControl, Vfo};
 use pancetta_lib::coordinator::{
-    active_tx_qso_key, coalesce_transmit_requests, tx_qso_is_live, CoalesceEntry,
+    active_tx_qso_key, coalesce_transmit_requests, remote_tx_permitted, tx_qso_is_live,
+    CoalesceEntry,
 };
 use pancetta_lib::message_bus::{
     ComponentId, ComponentMessage, MessageBus, MessageType, RigControlMessage,
@@ -127,6 +128,9 @@ pub enum DropReason {
     /// The request was superseded by a newer one for the same QSO during
     /// backlog coalescing (older keep-call frame).
     CoalescedAway,
+    /// A `TxOrigin::Remote` request that the station-agent arm gate did not
+    /// permit (unarmed / no local consent / expired / etc.) — fail-closed drop.
+    RemoteNotArmed,
 }
 
 /// Accumulated, readable record of everything a scenario drove. Mirrors the
@@ -324,6 +328,10 @@ pub struct CoordSim {
     /// Completed-QSO metadata collected by `pump_qso_events` from
     /// `QsoEvent::QsoCompleted`. Keyed by `qso_id.to_string()`.
     pub completed: Vec<QsoMetadata>,
+    /// Station-agent remote-TX arm gate, exactly as the coordinator holds it.
+    /// `drive_slot` consults it (via the real `remote_tx_permitted`) for any
+    /// `TxOrigin::Remote` pending item before keying PTT. Fresh = unarmed = deny.
+    pub remote_tx_arm: Arc<Mutex<pancetta_agent::arm::ArmState>>,
 }
 
 impl CoordSim {
@@ -362,6 +370,8 @@ impl CoordSim {
             dial_frequency_hz,
             split_tx_frequency_hz,
             completed: Vec::new(),
+            // Fresh (unarmed) arm — remote TX is denied until a scenario arms it.
+            remote_tx_arm: Arc::new(Mutex::new(pancetta_agent::arm::ArmState::new())),
         }
     }
 
@@ -381,6 +391,24 @@ impl CoordSim {
     /// Set the global TX policy (mirrors the operator's `g` cycle / Shift+Q).
     pub fn set_policy(&self, policy: TxPolicy) {
         self.tx_policy.store(policy.as_u8(), Ordering::Release);
+    }
+
+    /// Fully arm the remote-TX gate for a scenario: verified TX-scope grant +
+    /// local consent + a fresh heartbeat, so `remote_tx_permitted` returns true.
+    /// (Simulates a future P3 arm; in production nothing constructs the grant.)
+    pub fn arm_remote_tx(&self) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let mut st = self.remote_tx_arm.lock().expect("arm lock");
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "K5ARH".to_string(),
+                ttl_ms: 120_000,
+                scope_tx: true,
+            },
+            now_ms,
+        );
+        st.set_local_consent(true, now_ms);
+        st.heartbeat(now_ms);
     }
 
     /// Drain all currently-buffered `QsoEvent`s and apply the coordinator's
@@ -456,6 +484,7 @@ impl CoordSim {
                     frequency_offset: frequency,
                     qso_id: Some(qso_id.to_string()),
                     tx_parity,
+                    origin: pancetta_lib::message_bus::TxOrigin::Local,
                 });
             }
             _ => {}
@@ -479,6 +508,19 @@ impl CoordSim {
             frequency_offset: freq_hz,
             qso_id: None,
             tx_parity: None,
+            origin: pancetta_lib::message_bus::TxOrigin::Local,
+        }
+    }
+
+    /// Build a **remote-originated** manual TX request (for arm-gate scenarios).
+    /// `qso_id == None` so only the arm gate (not the drop-stale gate) governs.
+    pub fn remote_tx(&self, text: &str, freq_hz: f64) -> PendingTx {
+        PendingTx {
+            text: text.to_string(),
+            frequency_offset: freq_hz,
+            qso_id: None,
+            tx_parity: None,
+            origin: pancetta_lib::message_bus::TxOrigin::Remote,
         }
     }
 
@@ -496,6 +538,8 @@ impl CoordSim {
         self.timeline.last_slot = slot;
 
         // --- Step 0: TX-policy hard mute (Disabled) ---
+        // Policy primacy: Disabled drops EVERYTHING first, including Remote items
+        // with a live arm.
         if current_policy(&self.tx_policy) == TxPolicy::Disabled {
             for p in &pending {
                 self.timeline.dropped.push(DroppedTx {
@@ -508,7 +552,32 @@ impl CoordSim {
             return slot;
         }
 
+        // --- Step 0a: Remote-TX arm gate ---
+        // Drop any `TxOrigin::Remote` pending item the station-agent arm gate
+        // does not permit (fail-closed), exactly as the TX worker does before
+        // keying PTT. `Local` items pass through untouched (byte-identical).
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let pending: Vec<PendingTx> = pending
+            .into_iter()
+            .filter(|p| {
+                if p.origin == pancetta_lib::message_bus::TxOrigin::Remote
+                    && !remote_tx_permitted(&self.remote_tx_arm, now_ms)
+                {
+                    self.timeline.dropped.push(DroppedTx {
+                        slot,
+                        text: p.text.clone(),
+                        qso_id: p.qso_id.clone(),
+                        reason: DropReason::RemoteNotArmed,
+                    });
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
         // --- Coalesce backlog with the REAL production coalescer ---
+        // Preserve each entry's origin so a folded bundle carries it (fail-safe).
         let drained: Vec<CoalesceEntry> = pending
             .iter()
             .map(|p| CoalesceEntry {
@@ -516,6 +585,7 @@ impl CoordSim {
                 frequency_offset: p.frequency_offset,
                 qso_id: p.qso_id.clone(),
                 tx_parity: p.tx_parity,
+                origin: p.origin,
             })
             .collect();
         let active = self.active_tx_qsos.clone();
@@ -680,6 +750,9 @@ pub struct PendingTx {
     pub frequency_offset: f64,
     pub qso_id: Option<String>,
     pub tx_parity: Option<SlotParity>,
+    /// Origin of this request. `Local` (default) skips the remote-TX arm gate;
+    /// `Remote` is gated by the coordinator's `ArmState` in `drive_slot`.
+    pub origin: pancetta_lib::message_bus::TxOrigin,
 }
 
 // ---------------------------------------------------------------------------
@@ -876,18 +949,21 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
             frequency_offset: 1800.0,
             qso_id: Some(id.clone()),
             tx_parity: Some(SlotParity::Even),
+            origin: pancetta_lib::message_bus::TxOrigin::Local,
         },
         PendingTx {
             text: "KEEPCALL-OLD-2".to_string(),
             frequency_offset: 1800.0,
             qso_id: Some(id.clone()),
             tx_parity: Some(SlotParity::Even),
+            origin: pancetta_lib::message_bus::TxOrigin::Local,
         },
         PendingTx {
             text: "KEEPCALL-NEWEST".to_string(),
             frequency_offset: 1800.0,
             qso_id: Some(id.clone()),
             tx_parity: Some(SlotParity::Even),
+            origin: pancetta_lib::message_bus::TxOrigin::Local,
         },
     ];
 
@@ -1986,4 +2062,92 @@ async fn fox_mode_answers_two_callers_multistreamed_distinct_offsets() {
 
     // All PTT transitions cleanly released (no stuck PTT).
     sim.timeline.assert_all_released();
+}
+
+// ===========================================================================
+// Station-agent remote-TX arm gate (P2.3). These exercise the ONE change to
+// the live coordinator TX path: TxOrigin::Remote requests are gated by the
+// shared ArmState before keying PTT; Local requests are byte-identical.
+// ===========================================================================
+
+/// A remote-origin request with a FRESH (unarmed) arm is dropped — no PTT.
+#[tokio::test]
+async fn remote_tx_dropped_when_arm_fresh_unarmed() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    // Arm is fresh/unarmed by construction → tx_permitted() is false.
+    let remote = sim.remote_tx("CQ K5ARH EM10", 1500.0);
+    sim.drive_slot(vec![remote]).await;
+
+    sim.timeline.assert_silent();
+    assert!(
+        sim.timeline
+            .dropped
+            .iter()
+            .any(|d| d.reason == DropReason::RemoteNotArmed),
+        "expected a RemoteNotArmed drop.\n{}",
+        sim.timeline
+    );
+}
+
+/// A LOCAL-origin request keys PTT regardless of the arm state — byte-identical
+/// to the pre-gate path (the arm gate never applies to Local).
+#[tokio::test]
+async fn local_tx_unaffected_by_remote_arm() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    // Arm stays fresh/unarmed; a Local manual send must still key.
+    let local = sim.manual_tx("CQ K5ARH EM10", 1500.0);
+    sim.drive_slot(vec![local]).await;
+
+    assert!(
+        sim.timeline.keyed_anything(),
+        "a Local request must key PTT even with an unarmed remote arm.\n{}",
+        sim.timeline
+    );
+    sim.timeline.assert_all_released();
+    assert!(
+        !sim.timeline
+            .dropped
+            .iter()
+            .any(|d| d.reason == DropReason::RemoteNotArmed),
+        "a Local request must never be dropped by the remote arm gate.\n{}",
+        sim.timeline
+    );
+}
+
+/// With a fully-armed + consented + heartbeat-fresh arm, a Remote request keys
+/// PTT (the gate opens).
+#[tokio::test]
+async fn remote_tx_keys_when_armed_and_consented() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    sim.arm_remote_tx();
+    let remote = sim.remote_tx("CQ K5ARH EM10", 1500.0);
+    sim.drive_slot(vec![remote]).await;
+
+    assert!(
+        sim.timeline.keyed_anything(),
+        "a Remote request must key PTT when the arm is armed + consented.\n{}",
+        sim.timeline
+    );
+    sim.timeline.assert_all_released();
+}
+
+/// Policy primacy: `TxPolicy::Disabled` drops even a Remote request that has a
+/// live arm — the hard-mute runs first.
+#[tokio::test]
+async fn policy_disabled_drops_remote_tx_even_with_live_arm() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    sim.arm_remote_tx(); // arm would otherwise permit
+    sim.set_policy(TxPolicy::Disabled);
+    let remote = sim.remote_tx("CQ K5ARH EM10", 1500.0);
+    sim.drive_slot(vec![remote]).await;
+
+    sim.timeline.assert_silent();
+    assert!(
+        sim.timeline
+            .dropped
+            .iter()
+            .any(|d| d.reason == DropReason::PolicyDisabled),
+        "Disabled policy must drop the remote request first (policy primacy).\n{}",
+        sim.timeline
+    );
 }

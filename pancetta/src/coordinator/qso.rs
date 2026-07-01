@@ -1646,6 +1646,7 @@ impl super::ApplicationCoordinator {
                                                 frequency_offset: frequency,
                                                 qso_id: Some(qso_id.to_string()),
                                                 tx_parity,
+                                                origin: crate::message_bus::TxOrigin::Local,
                                             },
                                             Instant::now(),
                                         );

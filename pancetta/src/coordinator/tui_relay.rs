@@ -824,6 +824,7 @@ impl super::ApplicationCoordinator {
                                     frequency_offset,
                                     qso_id: None,
                                     tx_parity: None, // TUI manual send: no DX context
+                                    origin: crate::message_bus::TxOrigin::Local,
                                 },
                                 Instant::now(),
                             );

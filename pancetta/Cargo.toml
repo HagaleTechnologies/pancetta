@@ -31,6 +31,7 @@ pancetta-qso = { path = "../pancetta-qso" }
 pancetta-dx = { path = "../pancetta-dx" }
 pancetta-cqdx = { path = "../pancetta-cqdx" }
 pancetta-protocol = { path = "../pancetta-protocol" }
+pancetta-agent = { path = "../pancetta-agent" }
 geographiclib-rs = { workspace = true }
 
 # HTTP server and WebSocket upgrade (remote_gateway)

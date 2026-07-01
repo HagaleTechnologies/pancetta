@@ -789,6 +789,7 @@ impl super::ApplicationCoordinator {
                                             frequency_offset: item.frequency_offset,
                                             qso_id: item.qso_id,
                                             tx_parity,
+                                            origin: crate::message_bus::TxOrigin::Local,
                                         },
                                         Instant::now(),
                                     );
@@ -832,6 +833,7 @@ impl super::ApplicationCoordinator {
                                         MessageType::MultiTransmitRequest {
                                             items,
                                             tx_parity: bundle_parity,
+                                            origin: crate::message_bus::TxOrigin::Local,
                                         },
                                         Instant::now(),
                                     );

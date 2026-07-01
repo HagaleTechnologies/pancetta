@@ -79,6 +79,32 @@ impl std::fmt::Display for ComponentId {
     }
 }
 
+/// Where a transmit request originated.
+///
+/// This is a **safety-relevant** discriminator: the coordinator's TX worker
+/// applies the station-agent remote-TX arm gate **only** to
+/// [`TxOrigin::Remote`] requests. Every request built by the local pipeline
+/// (QSO state machine, autonomous operator, TUI, tune/test) is
+/// [`TxOrigin::Local`] and skips the arm check entirely, so local TX behavior
+/// is byte-identical to before this gate existed.
+///
+/// **`Default` is [`TxOrigin::Local`]** — the fail-safe direction: a request
+/// built without explicitly setting `origin` is treated as local (subject to
+/// the normal `TxPolicy` + drop-stale gates, never the remote arm). A remote
+/// request must *explicitly* opt into `Remote`, and until the P3 relay wire
+/// exists nothing constructs a `Remote` request, so the gate is inert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TxOrigin {
+    /// Locally-originated TX (QSO engine, autonomous, TUI, tune/test). Never
+    /// subject to the remote-TX arm gate — byte-identical to legacy behavior.
+    #[default]
+    Local,
+    /// Remote-originated TX (station-agent relay). Gated by the coordinator's
+    /// `ArmState::tx_permitted()` before PTT is keyed; dropped (fail-closed) if
+    /// not armed/permitted.
+    Remote,
+}
+
 /// Message types that can be sent between components
 #[derive(Debug, Clone)]
 pub enum MessageType {
@@ -139,6 +165,10 @@ pub enum MessageType {
         /// Required slot parity. `None` = no DX context (CQ);
         /// the scheduler falls back to the configured self-parity.
         tx_parity: Option<pancetta_core::slot::SlotParity>,
+        /// Where this request came from. `Local` (default) skips the
+        /// remote-TX arm gate; `Remote` is gated by `ArmState::tx_permitted()`.
+        #[allow(dead_code)]
+        origin: TxOrigin,
     },
 
     /// Transmit completed notification
@@ -219,6 +249,11 @@ pub enum MessageType {
         /// Required slot parity for the bundle. `None` = no DX context;
         /// the scheduler falls back to the configured self-parity.
         tx_parity: Option<pancetta_core::slot::SlotParity>,
+        /// Where this bundle came from. `Local` (default) skips the remote-TX
+        /// arm gate; `Remote` is gated by `ArmState::tx_permitted()`. The whole
+        /// bundle shares one origin (a bundle is one operator's slot).
+        #[allow(dead_code)]
+        origin: TxOrigin,
     },
 
     /// Audio output samples for transmission

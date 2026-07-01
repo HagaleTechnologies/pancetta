@@ -3044,6 +3044,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "num_cpus",
+ "pancetta-agent",
  "pancetta-audio",
  "pancetta-config",
  "pancetta-core",
