@@ -1203,6 +1203,42 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
+                                    // --- Step 4b-arm: re-check the remote-TX arm at
+                                    // the last instant before keying. The slot wait
+                                    // above can span up to ~30s — the dead-man
+                                    // heartbeat window. A Remote request admitted with
+                                    // a valid arm at pickup must NOT key PTT if, during
+                                    // the wait, the heartbeat lapsed, the TTL expired,
+                                    // local consent was revoked, or the local kill was
+                                    // engaged. Mirrors Step-4b's stale-QSO re-check so
+                                    // the dead-man/TTL/local-kill guarantees hold across
+                                    // the pre-PTT sleep. Local requests are never gated.
+                                    if origin == crate::message_bus::TxOrigin::Remote
+                                        && !remote_tx_permitted(
+                                            &remote_tx_arm,
+                                            chrono::Utc::now().timestamp_millis(),
+                                        )
+                                    {
+                                        info!(
+                                            target: "agent.tx",
+                                            "dropping remote TX at key-time — arm went stale during slot wait: '{}' (qso: {:?})",
+                                            message_text, qso_id
+                                        );
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        let complete_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Autonomous,
+                                            MessageType::TransmitComplete {
+                                                success: false,
+                                                message_text,
+                                                duration_ms: 0,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus.send_message(complete_msg).await;
+                                        continue;
+                                    }
+
                                     // --- Step 4c: late pivot to the freshest message ---
                                     // Our decoder finishes ~1.8s BEFORE the slot
                                     // boundary, but a fresher decode for THIS QSO can
@@ -1726,6 +1762,41 @@ impl super::ApplicationCoordinator {
                                         info!(
                                             target: "tx.policy",
                                             "dropping stale multi-TX bundle: all {} item(s) belong to ended QSOs",
+                                            items.len()
+                                        );
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: item.message_text.clone(),
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
+                                        continue;
+                                    }
+
+                                    // --- Step 4b-arm: re-check the remote-TX arm at the
+                                    // last instant before keying (mirrors the single-TX
+                                    // arm). The up-to-~30s slot wait can span the dead-man
+                                    // heartbeat window / TTL / a consent-revoke / a local
+                                    // kill; a Remote bundle admitted at pickup must not key
+                                    // PTT if the arm went stale during the wait. Local
+                                    // bundles are never gated.
+                                    if origin == crate::message_bus::TxOrigin::Remote
+                                        && !remote_tx_permitted(
+                                            &remote_tx_arm,
+                                            chrono::Utc::now().timestamp_millis(),
+                                        )
+                                    {
+                                        info!(
+                                            target: "agent.tx",
+                                            "dropping remote multi-TX at key-time — arm went stale during slot wait: {} item(s)",
                                             items.len()
                                         );
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
