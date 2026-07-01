@@ -526,6 +526,13 @@ pub struct ApplicationCoordinator {
     /// once and not mutated at runtime (a live mode switch is a later task).
     active_slot_ns: Arc<std::sync::atomic::AtomicI64>,
 
+    /// Active digital-mode protocol (FT8 / FT4 / FT2), derived once at startup
+    /// from `[rig].mode`. The TX worker branches its encode+modulate on this so
+    /// FT4 transmits a 4-GFSK / 105-symbol FT4 waveform (not the FT8 waveform);
+    /// `Protocol::Ft8` keeps the exact legacy calls (byte-identical). `Copy`, set
+    /// once, not mutated at runtime (a live mode switch is a later task).
+    active_protocol: pancetta_ft8::Protocol,
+
     /// Active protocol's decode phase in nanoseconds (FT8 → 13e9, FT4 → 6.5e9):
     /// how far past the slot boundary the decode window is received. The decode
     /// loop subtracts this from the window-received instant to recover the
@@ -926,6 +933,9 @@ impl ApplicationCoordinator {
             // Active protocol slot length, derived from [rig].mode above
             // (default 15e9 for FT8). Set once; read by the decode/DSP paths.
             active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(active_slot_ns_init)),
+            // Active digital-mode protocol from [rig].mode (default Ft8). The TX
+            // worker branches encode+modulate on this; Ft8 stays byte-identical.
+            active_protocol,
             // Decode phase the parity-stamping sites subtract (FT8 → 13e9 ns).
             active_decode_phase_ns: Arc::new(std::sync::atomic::AtomicI64::new(
                 active_decode_phase_ns_init,
@@ -1246,6 +1256,14 @@ impl ApplicationCoordinator {
     /// decode loop's parity-stamping sites (`SlotParity::of_with_period`).
     pub(crate) fn active_slot_ns(&self) -> Arc<std::sync::atomic::AtomicI64> {
         self.active_slot_ns.clone()
+    }
+
+    /// Active digital-mode protocol (FT8 / FT4 / FT2), derived once at startup
+    /// from `[rig].mode`. Captured into the TX worker so its encode+modulate
+    /// emits the correct on-air waveform for the mode (`Ft8` = legacy path,
+    /// byte-identical). `Copy`.
+    pub(crate) fn active_protocol(&self) -> pancetta_ft8::Protocol {
+        self.active_protocol
     }
 
     /// Fox-mode activation flag. `false` by default (normal Hound / station
