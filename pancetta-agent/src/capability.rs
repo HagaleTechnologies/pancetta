@@ -16,10 +16,14 @@
 //! 2. [`CapabilityVerifier::verify_arm_grant`] — the txArmGrant is verified
 //!    against the **client device key** (`clientSig`, Ed25519 over the canonical
 //!    grant bytes — station-rooted TX proof; cqdx never signs this, so a cloud
-//!    breach alone can NEVER forge a valid arm, per e2e-auth.v1 §4). Binds the
-//!    grant to the verified capability's `clientKeyId`, enforces the armed
-//!    window bound, the heartbeat interval bound, the `tx` scope, and a
-//!    single-use `jti` (replay).
+//!    breach alone can NEVER forge a valid arm, per e2e-auth.v1 §4). It further
+//!    honors the grant ONLY if the grant's `clientKeyId` is in the
+//!    **STATION-LOCAL TX-allow-list** (`tx_allow_list`, distinct from the pinned
+//!    IdP keys) — so a relay/cloud compromise alone can NEVER cause TX
+//!    (e2e-auth.v1 `$defs.txArmGrant`, "pancetta bound"). Binds the grant to the
+//!    verified capability's `clientKeyId` AND its `jti` (via the grant's
+//!    `capabilityJti`), enforces the armed window bound, the heartbeat interval
+//!    bound, the `tx` scope, and a single-use `jti` (replay).
 //!
 //! Canonicalization of the grant reuses the P3.0-proven approach
 //! (`BTreeMap<String, serde_json::Value>` → `serde_json::to_vec`, sorted keys,
@@ -31,12 +35,20 @@
 //!   compared against `now_ms / 1000`; [`VerifiedCapability::exp_ms`] is the
 //!   normalized millisecond form (`exp * 1000`).
 //! - `kid` lives in the **JWS header**, not the payload.
-//! - The armed-window / heartbeat bounds enforced here follow this task's
-//!   explicit constants ([`MAX_ARM_MS`] = 24h; heartbeat ∈ [1, 300] s), which
-//!   are looser than the schema's advisory prose (`armedUntil` ≤ 10 min,
-//!   heartbeat 5-15 s). The *enforcement direction is identical* (reject an
-//!   over-long arm / out-of-range heartbeat); only the numeric ceiling differs.
-//!   Tightening to the schema bounds is a one-constant change.
+//! - The armed-window / heartbeat bounds enforced here are the schema's
+//!   **normative** `$defs.txArmGrant` values (both labelled "pancetta bound",
+//!   i.e. pancetta MUST enforce): `armedUntil` window **≤ 10 min**
+//!   ([`MAX_ARM_MS`] = 600_000 ms) and `heartbeatIntervalSec` in **[5, 15] s**
+//!   ([`MIN_HEARTBEAT_SEC`], [`MAX_HEARTBEAT_SEC`]). Both are rejected (not
+//!   clamped) when out of range ([`CapError::ArmTooLong`] /
+//!   [`CapError::BadHeartbeat`]).
+//! - The grant's `clientKeyId` MUST be present in the caller-supplied
+//!   station-local `tx_allow_list` ([`CapError::ClientNotAllowed`]) and the
+//!   grant's `capabilityJti` MUST equal the verified capability's `jti`
+//!   ([`CapError::CapabilityMismatch`]).
+//
+// TODO(P3.4): enforce txHeartbeat.seq monotonicity (reject seq <= last-accepted)
+// + armJti match — contract $defs.txHeartbeat.
 
 use std::collections::HashSet;
 
@@ -50,13 +62,14 @@ use crate::pairing::IdpKey;
 /// The maximum armed-window length this agent will accept in a txArmGrant
 /// (`armedUntil - now`). A grant asking for a longer window is **rejected**
 /// ([`CapError::ArmTooLong`]) rather than silently clamped — an absurd arm is a
-/// red flag, not something to quietly truncate. 24 hours in milliseconds.
-pub const MAX_ARM_MS: i64 = 86_400_000;
+/// red flag, not something to quietly truncate. The e2e-auth.v1 normative bound
+/// is **10 minutes** in milliseconds (`$defs.txArmGrant.armedUntil`).
+pub const MAX_ARM_MS: i64 = 600_000;
 
-/// Minimum accepted `heartbeatIntervalSec`.
-pub const MIN_HEARTBEAT_SEC: i64 = 1;
-/// Maximum accepted `heartbeatIntervalSec`.
-pub const MAX_HEARTBEAT_SEC: i64 = 300;
+/// Minimum accepted `heartbeatIntervalSec` (e2e-auth.v1 normative bound: 5 s).
+pub const MIN_HEARTBEAT_SEC: i64 = 5;
+/// Maximum accepted `heartbeatIntervalSec` (e2e-auth.v1 normative bound: 15 s).
+pub const MAX_HEARTBEAT_SEC: i64 = 15;
 
 /// A verifier holding this agent's own keyId (the expected `aud`) and the set of
 /// PINNED IdP public keys. Constructed once from [`crate::pairing::PairedState`]
@@ -115,10 +128,19 @@ pub enum CapError {
     /// The grant's `clientKeyId` did not match the verified capability's.
     #[error("grant client does not match capability")]
     ClientMismatch,
+    /// The grant's `clientKeyId` is NOT in the station-local TX-allow-list — so
+    /// a relay/cloud compromise alone can never cause TX. An empty allow-list
+    /// rejects every grant (fail-closed default).
+    #[error("client key id not in station-local TX-allow-list")]
+    ClientNotAllowed,
+    /// The grant's `capabilityJti` did not equal the verified capability's `jti`
+    /// (the arm was not bound to this in-window capability).
+    #[error("grant capabilityJti does not match capability jti")]
+    CapabilityMismatch,
     /// `armedUntil - now` exceeded [`MAX_ARM_MS`] (rejected, not clamped).
     #[error("armed window too long")]
     ArmTooLong,
-    /// `heartbeatIntervalSec` was outside `[1, 300]`.
+    /// `heartbeatIntervalSec` was outside `[5, 15]` (e2e-auth.v1 normative).
     #[error("heartbeat interval out of bounds")]
     BadHeartbeat,
     /// The capability did not include the `"tx"` scope.
@@ -284,13 +306,18 @@ impl CapabilityVerifier {
     ///
     /// `capability` MUST come from a prior [`Self::verify_capability_token`] for
     /// the same session; `client_verifying_key` is the client's pinned identity
-    /// key (from the station-local TX-allow-list); `seen_jtis` is the
-    /// session-scoped single-use replay set.
+    /// key (from the station-local TX-allow-list); `tx_allow_list` is the
+    /// station-local set of allowed client keyIds (distinct from the pinned IdP
+    /// keys) — the grant is honored ONLY if its `clientKeyId` is present, so a
+    /// relay/cloud compromise alone can never cause TX (an **empty** allow-list
+    /// rejects every grant, fail-closed); `seen_jtis` is the session-scoped
+    /// single-use replay set.
     pub fn verify_arm_grant(
         &self,
         grant: &Value,
         capability: &VerifiedCapability,
         client_verifying_key: &VerifyingKey,
+        tx_allow_list: &HashSet<String>,
         now_ms: i64,
         seen_jtis: &mut HashSet<String>,
     ) -> Result<VerifiedArmGrant, CapError> {
@@ -328,8 +355,26 @@ impl CapabilityVerifier {
             .get("clientKeyId")
             .and_then(Value::as_str)
             .ok_or_else(|| CapError::MalformedClaim("clientKeyId".to_string()))?;
+
+        // 3a. STATION-LOCAL TX-allow-list — the CORE fail-closed gate. Check
+        //     EARLY, before trusting any downstream field: a grant whose
+        //     clientKeyId is not station-locally allow-listed is refused even if
+        //     perfectly signed. An empty allow-list rejects every grant.
+        if !tx_allow_list.contains(client_key_id) {
+            return Err(CapError::ClientNotAllowed);
+        }
+
         if client_key_id != capability.client_key_id {
             return Err(CapError::ClientMismatch);
+        }
+
+        // 3b. Bind the arm to THIS capability: capabilityJti == capability.jti.
+        let capability_jti = obj
+            .get("capabilityJti")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CapError::MalformedClaim("capabilityJti".to_string()))?;
+        if capability_jti != capability.jti {
+            return Err(CapError::CapabilityMismatch);
         }
 
         // 4. armedUntil window + heartbeat bounds.
