@@ -36,8 +36,8 @@ mod util;
 mod wav_playback;
 
 pub use tx::{
-    coalesce_transmit_requests, resolve_required_parity, schedule_tx, CoalesceEntry,
-    CoalesceOutcome, TxSchedule,
+    coalesce_transmit_requests, remote_tx_permitted, resolve_required_parity, schedule_tx,
+    CoalesceEntry, CoalesceOutcome, TxSchedule,
 };
 
 pub use qso::compute_manual_tx_offset;
@@ -658,6 +658,14 @@ pub struct ApplicationCoordinator {
     /// the QSO component as it forwards each `MessageToSend`; read by the TX
     /// worker at key-time to pivot to the freshest message for the QSO.
     pub(crate) latest_tx_intent: Arc<std::sync::RwLock<HashMap<String, LatestTxIntent>>>,
+    /// Station-agent remote-TX arm gate. The FINAL TX authority for
+    /// remote-originated (`TxOrigin::Remote`) transmit requests: the TX worker
+    /// checks `tx_permitted(now_ms)` before keying PTT for any remote request
+    /// and drops it (fail-closed) if not permitted. Seeded at startup with the
+    /// LOCAL operator consent from `[network.station_agent].remote_tx_enabled`
+    /// (default OFF), so with nothing arming it and no remote requests being
+    /// constructed (P0–P2), this gate is inert. Local TX never consults it.
+    pub(crate) remote_tx_arm: Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -820,6 +828,10 @@ impl ApplicationCoordinator {
         // the Arc<RwLock> — the additive dual-destination emit sites read this
         // atomic to gate their (cheap, additive) sends to the gateway.
         let gateway_enabled_init = config.network.remote_gateway.enabled;
+        // Snapshot the station-agent LOCAL remote-TX consent before config is
+        // moved into the Arc<RwLock>. Seeds the remote-TX arm's local-consent
+        // gate; default OFF, so remote TX can never be permitted this phase.
+        let remote_tx_consent_init = config.network.station_agent.remote_tx_enabled;
         // Snapshot fox.max_streams before config is moved into the Arc<RwLock>.
         // The QSO component reads this to cap concurrent caller-answer QSOs
         // while Fox mode is engaged.
@@ -961,6 +973,16 @@ impl ApplicationCoordinator {
             config_warnings,
             active_tx_qsos: Arc::new(std::sync::RwLock::new(HashSet::new())),
             latest_tx_intent: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            // Station-agent remote-TX arm. Fresh (unarmed, not killed), then
+            // seed the LOCAL operator consent from config. With consent OFF (the
+            // default) `tx_permitted()` is always false; nothing arms and no
+            // remote request is constructed in P0–P2, so the gate is inert.
+            remote_tx_arm: {
+                let mut st = pancetta_agent::arm::ArmState::new();
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let _ = st.set_local_consent(remote_tx_consent_init, now_ms);
+                Arc::new(std::sync::Mutex::new(st))
+            },
         };
 
         info!("Application Coordinator initialized with ID: {}", id);
@@ -1173,6 +1195,7 @@ impl ApplicationCoordinator {
                         frequency_offset: offset,
                         qso_id: None,
                         tx_parity: None, // test-TX injection: no DX context
+                        origin: crate::message_bus::TxOrigin::Local,
                     },
                     Instant::now(),
                 );
@@ -1256,6 +1279,15 @@ impl ApplicationCoordinator {
     /// decode loop's parity-stamping sites (`SlotParity::of_with_period`).
     pub(crate) fn active_slot_ns(&self) -> Arc<std::sync::atomic::AtomicI64> {
         self.active_slot_ns.clone()
+    }
+
+    /// Station-agent remote-TX arm gate (shared handle). Cloned into the TX
+    /// worker, which checks `tx_permitted(now_ms)` before keying PTT for any
+    /// `TxOrigin::Remote` request and drops it (fail-closed) if not permitted.
+    /// In P0–P2 nothing arms it and no remote request is constructed, so it is
+    /// inert; local TX never consults it.
+    pub(crate) fn remote_tx_arm(&self) -> Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>> {
+        self.remote_tx_arm.clone()
     }
 
     /// Active digital-mode protocol (FT8 / FT4 / FT2), derived once at startup

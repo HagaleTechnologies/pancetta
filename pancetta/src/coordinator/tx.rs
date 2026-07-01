@@ -294,6 +294,28 @@ fn tx_qso_is_live(
     }
 }
 
+/// Whether a **remote-originated** TX request is permitted to key PTT right now,
+/// per the station-agent arm gate.
+///
+/// This is the safety gate for `TxOrigin::Remote` requests only — the worker
+/// never calls it for `TxOrigin::Local` (local TX is byte-identical). It reads
+/// the shared [`ArmState`](pancetta_agent::arm::ArmState) and returns
+/// `arm.tx_permitted(now_ms)`.
+///
+/// **Fail-CLOSED on a poisoned lock** — the OPPOSITE of [`tx_qso_is_live`]'s
+/// fail-open. This is a safety gate: if the arm mutex is poisoned we can no
+/// longer prove the station consented, so remote TX is DENIED. `now_ms` is unix
+/// milliseconds (the one clock read; `ArmState` itself is pure).
+pub fn remote_tx_permitted(
+    arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    now_ms: i64,
+) -> bool {
+    match arm.lock() {
+        Ok(state) => state.tx_permitted(now_ms),
+        Err(_) => false,
+    }
+}
+
 /// Encode a text message to transmission symbols for the active protocol.
 ///
 /// **FT8 is byte-identical to the legacy path**: `Protocol::Ft8` calls the exact
@@ -407,6 +429,11 @@ pub struct CoalesceEntry {
     pub frequency_offset: f64,
     pub qso_id: Option<String>,
     pub tx_parity: Option<pancetta_core::slot::SlotParity>,
+    /// Origin of the drained request (`Local`/`Remote`). Threaded through the
+    /// coalescer so a folded bundle preserves it — if ANY folded entry is
+    /// `Remote`, the emitted request/bundle is `Remote` (the arm gate applies
+    /// to the whole bundle; fail-safe). Defaults to `Local`.
+    pub origin: crate::message_bus::TxOrigin,
 }
 
 /// Result of draining + coalescing a backlog of `TransmitRequest`s.
@@ -550,11 +577,13 @@ async fn coalesce_backlog_into(
             frequency_offset,
             qso_id,
             tx_parity,
+            origin,
         } => CoalesceEntry {
             message_text,
             frequency_offset,
             qso_id,
             tx_parity,
+            origin,
         },
         // Defensive: not a TransmitRequest — hand it back unchanged.
         other => return other,
@@ -570,12 +599,14 @@ async fn coalesce_backlog_into(
                 frequency_offset,
                 qso_id,
                 tx_parity,
+                origin,
             } => {
                 drained.push(CoalesceEntry {
                     message_text,
                     frequency_offset,
                     qso_id,
                     tx_parity,
+                    origin,
                 });
             }
             _ => {
@@ -601,6 +632,7 @@ async fn coalesce_backlog_into(
             frequency_offset: e.frequency_offset,
             qso_id: e.qso_id,
             tx_parity: e.tx_parity,
+            origin: e.origin,
         };
     }
 
@@ -631,6 +663,7 @@ async fn coalesce_backlog_into(
         return MessageType::MultiTransmitRequest {
             items: Vec::new(),
             tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
         };
     }
 
@@ -642,6 +675,7 @@ async fn coalesce_backlog_into(
             frequency_offset: e.frequency_offset,
             qso_id: e.qso_id,
             tx_parity: e.tx_parity,
+            origin: e.origin,
         };
     }
 
@@ -650,6 +684,18 @@ async fn coalesce_backlog_into(
     // freshest stream's parity (first retained entry, which the existing arm
     // resolves via resolve_required_parity).
     let bundle_parity = outcome.retained[0].tx_parity;
+    // Fail-safe origin fold: if ANY folded stream is Remote, the whole bundle is
+    // Remote so the arm gate applies. (In practice a coalesced backlog is one
+    // origin; this is defense-in-depth for a future mixed-origin backlog.)
+    let bundle_origin = if outcome
+        .retained
+        .iter()
+        .any(|e| e.origin == crate::message_bus::TxOrigin::Remote)
+    {
+        crate::message_bus::TxOrigin::Remote
+    } else {
+        crate::message_bus::TxOrigin::Local
+    };
     let items = outcome
         .retained
         .into_iter()
@@ -662,6 +708,7 @@ async fn coalesce_backlog_into(
     MessageType::MultiTransmitRequest {
         items,
         tx_parity: bundle_parity,
+        origin: bundle_origin,
     }
 }
 
@@ -750,6 +797,12 @@ impl super::ApplicationCoordinator {
             // (FT4 → 4-GFSK, 105 symbols, GFSK BT=1.0). Without this the station
             // would DECODE FT4 but TRANSMIT an FT8 waveform onto the 7.5s grid.
             let active_protocol = self.active_protocol();
+            // Station-agent remote-TX arm gate. Consulted ONLY for
+            // `TxOrigin::Remote` requests before keying PTT; `TxOrigin::Local`
+            // requests skip it entirely (byte-identical). Fail-CLOSED on a
+            // poisoned lock (safety gate). Inert in P0–P2 (nothing arms it, no
+            // remote request is constructed).
+            let remote_tx_arm = self.remote_tx_arm();
 
             tokio::spawn(async move {
                 info!(
@@ -826,6 +879,7 @@ impl super::ApplicationCoordinator {
                                     mut frequency_offset,
                                     qso_id,
                                     tx_parity,
+                                    origin,
                                 } => {
                                     info!(
                                         "Transmit request: '{}' at offset {:.0} Hz (qso: {:?})",
@@ -845,6 +899,42 @@ impl super::ApplicationCoordinator {
                                         info!(
                                             target: "tx.policy",
                                             "TX DISABLED (RX-only): blocking '{}' at {:.0} Hz (qso: {:?})",
+                                            message_text, frequency_offset, qso_id
+                                        );
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        let complete_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Autonomous,
+                                            MessageType::TransmitComplete {
+                                                success: false,
+                                                message_text,
+                                                duration_ms: 0,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus.send_message(complete_msg).await;
+                                        continue;
+                                    }
+
+                                    // --- Step 0a: Remote-TX arm gate ---
+                                    // Remote-originated requests must pass the
+                                    // station-agent arm gate (armed ∧ tx-scope ∧
+                                    // unexpired ∧ heartbeat-fresh ∧ local-consent ∧
+                                    // ¬local-kill). Local requests skip this entirely
+                                    // (byte-identical). This ANDs UNDER the TxPolicy
+                                    // hard-mute above (Disabled already dropped). Fail
+                                    // CLOSED on a poisoned arm lock. In P0–P2 nothing
+                                    // arms it and no Remote request is constructed, so
+                                    // this branch is never taken.
+                                    if origin == crate::message_bus::TxOrigin::Remote
+                                        && !remote_tx_permitted(
+                                            &remote_tx_arm,
+                                            chrono::Utc::now().timestamp_millis(),
+                                        )
+                                    {
+                                        info!(
+                                            target: "agent.tx",
+                                            "dropping remote TX — not armed/permitted: '{}' at {:.0} Hz (qso: {:?})",
                                             message_text, frequency_offset, qso_id
                                         );
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
@@ -1319,6 +1409,7 @@ impl super::ApplicationCoordinator {
                                 MessageType::MultiTransmitRequest {
                                     mut items,
                                     tx_parity,
+                                    origin,
                                 } => {
                                     info!("Multi-TX request: {} messages", items.len());
 
@@ -1333,6 +1424,40 @@ impl super::ApplicationCoordinator {
                                         info!(
                                             target: "tx.policy",
                                             "TX DISABLED (RX-only): blocking multi-TX bundle of {} items",
+                                            items.len()
+                                        );
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: item.message_text.clone(),
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
+                                        continue;
+                                    }
+
+                                    // --- Step 0a: Remote-TX arm gate (bundle) ---
+                                    // A Remote-origin bundle must pass the station-agent
+                                    // arm gate before ANY item keys PTT. Local bundles
+                                    // skip it (byte-identical). ANDs under the TxPolicy
+                                    // hard-mute above. Fail CLOSED on a poisoned lock.
+                                    // Inert in P0–P2 (no Remote bundle is constructed).
+                                    if origin == crate::message_bus::TxOrigin::Remote
+                                        && !remote_tx_permitted(
+                                            &remote_tx_arm,
+                                            chrono::Utc::now().timestamp_millis(),
+                                        )
+                                    {
+                                        info!(
+                                            target: "agent.tx",
+                                            "dropping remote TX — not armed/permitted: multi-TX bundle of {} items",
                                             items.len()
                                         );
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
@@ -2275,6 +2400,7 @@ mod coalesce_tests {
             frequency_offset: 1000.0,
             qso_id: qso_id.map(|s| s.to_string()),
             tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
         }
     }
 
@@ -2559,6 +2685,86 @@ mod protocol_tx_tests {
         assert_eq!(
             legacy, split,
             "split FT8 encode/modulate helpers must equal the legacy combined call"
+        );
+    }
+}
+
+/// Unit tests for the remote-TX arm gate helper (`remote_tx_permitted`).
+///
+/// These lock the safety-critical fail direction: a fresh (unarmed) `ArmState`
+/// denies, a fully-armed+consented state permits, and a **poisoned** arm lock
+/// **fails CLOSED** (denies) — the opposite of `tx_qso_is_live`'s fail-open.
+#[cfg(test)]
+mod remote_arm_gate_tests {
+    use super::remote_tx_permitted;
+    use pancetta_agent::arm::{ArmState, VerifiedArmGrant};
+    use std::sync::{Arc, Mutex};
+
+    const NOW: i64 = 1_000_000;
+
+    fn grant() -> VerifiedArmGrant {
+        VerifiedArmGrant {
+            operator_callsign: "K5ARH".to_string(),
+            ttl_ms: 120_000,
+            scope_tx: true,
+        }
+    }
+
+    #[test]
+    fn fresh_unarmed_state_denies() {
+        let arm = Arc::new(Mutex::new(ArmState::new()));
+        assert!(
+            !remote_tx_permitted(&arm, NOW),
+            "a fresh (unarmed) ArmState must deny remote TX"
+        );
+    }
+
+    #[test]
+    fn armed_consented_fresh_heartbeat_permits() {
+        let mut st = ArmState::new();
+        st.arm(grant(), NOW);
+        st.set_local_consent(true, NOW);
+        let arm = Arc::new(Mutex::new(st));
+        assert!(
+            remote_tx_permitted(&arm, NOW),
+            "armed + tx-scope + consent + fresh heartbeat must permit"
+        );
+    }
+
+    #[test]
+    fn armed_without_local_consent_denies() {
+        // Consent (remote_tx_enabled) is the LOCAL operator gate: default OFF.
+        let mut st = ArmState::new();
+        st.arm(grant(), NOW);
+        // no set_local_consent(true)
+        let arm = Arc::new(Mutex::new(st));
+        assert!(
+            !remote_tx_permitted(&arm, NOW),
+            "armed but no local consent must deny"
+        );
+    }
+
+    #[test]
+    fn poisoned_lock_fails_closed() {
+        // Arm + consent so that IF the lock were readable, it would permit.
+        let mut st = ArmState::new();
+        st.arm(grant(), NOW);
+        st.set_local_consent(true, NOW);
+        let arm = Arc::new(Mutex::new(st));
+
+        // Poison the mutex by panicking while holding the guard.
+        let a2 = arm.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = a2.lock().unwrap();
+            panic!("poison the arm mutex");
+        }));
+        assert!(arm.is_poisoned(), "mutex should be poisoned");
+
+        // Even though the underlying state WOULD permit, the poisoned lock must
+        // fail CLOSED (deny) — the opposite of tx_qso_is_live's fail-open.
+        assert!(
+            !remote_tx_permitted(&arm, NOW),
+            "SAFETY: a poisoned arm lock must fail CLOSED (deny remote TX)"
         );
     }
 }
