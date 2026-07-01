@@ -585,6 +585,94 @@ fn test_ft4_round_trip_all_message_types() {
     );
 }
 
+/// FT4 decode is NOT corrupted by the FT8-hardcoded residual-subtract
+/// path (Task 8 residual-path verification).
+///
+/// The readiness audit flagged `decoder.rs::codeword_to_symbols`, which
+/// hardcodes FT8 geometry (Costas at [0..7,36..43,72..79] + 3-bit Gray,
+/// 79 symbols). It is called unconditionally to stamp `tone_symbols` on
+/// every decode — including FT4 decodes, where it produces a meaningless
+/// 79-symbol FT8-shaped vector. The CONSUMERS of `tone_symbols`
+/// (`subtract_signal`, `coherent_subtract`) are the multi-pass residual
+/// cancellation path, engaged only between decode passes (`subtract_signal`
+/// fires when `max_decode_passes > 1`; the coherent path when
+/// `coherent_multipass_iterations > 0` — both off in the default config the
+/// coordinator builds for FT4, which keeps `max_decode_passes = 1`).
+///
+/// This test FORCES `max_decode_passes = 2` for an FT4 config so that, IF
+/// the residual path were reachable for FT4, the garbage tone_symbols would
+/// either corrupt the residual or drop valid decodes. FT4 messages must
+/// still round-trip correctly. (The hardcoded path stays FT8-only; for FT4
+/// it is either not reached or harmlessly skipped — never corrupts the
+/// production single-pass decode.)
+#[test]
+fn test_ft4_decode_unaffected_by_residual_subtract_path() {
+    use pancetta_ft8::Protocol;
+
+    // Production FT4 config differs from this only by `max_decode_passes`
+    // (coordinator default = 1). Forcing 2 makes the FT8-hardcoded
+    // residual-subtract path eligible to run between passes; FT4 decodes
+    // must survive it.
+    let multipass_config = Ft8Config {
+        protocol: Protocol::Ft4,
+        max_decode_passes: 2,
+        ..Ft8Config::default()
+    };
+
+    let messages = [
+        "CQ W1ABC FN42",
+        "K1DEF W1ABC FN42",
+        "K1DEF W1ABC -12",
+        "K1DEF W1ABC RR73",
+    ];
+
+    for msg in &messages {
+        let symbols = encode_ft4(msg);
+        let audio = modulate_ft4(&symbols, 0.0);
+        let mut decoder = Ft8Decoder::new(multipass_config.clone()).unwrap();
+        let decoded = decoder.decode_window(&audio).unwrap_or_default();
+        assert!(
+            decoded.iter().any(|m| m.text == *msg),
+            "FT4 multi-pass decode failed for '{}' — the FT8-hardcoded \
+             residual-subtract path must not corrupt FT4 decodes. Decoded: {:?}",
+            msg,
+            decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Production-representative FT4 decode: the coordinator builds the FT4
+/// decoder from `Ft8Config::default()` with only `protocol` flipped (the
+/// shared `max_decode_passes` default is 1). This asserts the single-pass
+/// production path — which never engages residual subtraction at all —
+/// round-trips FT4. The residual path (`codeword_to_symbols` consumers) is
+/// therefore not reached for production FT4 decode.
+#[test]
+fn test_ft4_production_representative_single_pass_decode() {
+    use pancetta_ft8::Protocol;
+
+    // Mirror exactly what the coordinator builds: default config + protocol.
+    let production_config = Ft8Config {
+        protocol: Protocol::Ft4,
+        ..Ft8Config::default()
+    };
+    // Production default is single-pass → no inter-pass subtraction.
+    assert_eq!(
+        production_config.max_decode_passes, 1,
+        "FT4 production config must be single-pass (no residual subtraction)"
+    );
+
+    let symbols = encode_ft4("CQ W1ABC FN42");
+    let audio = modulate_ft4(&symbols, 0.0);
+    let mut decoder = Ft8Decoder::new(production_config).unwrap();
+    let decoded = decoder.decode_window(&audio).unwrap_or_default();
+    assert!(
+        decoded.iter().any(|m| m.text == "CQ W1ABC FN42"),
+        "FT4 production-representative decode failed: {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+}
+
 // =========================================================================
 // Multi-TX round-trip tests
 // =========================================================================

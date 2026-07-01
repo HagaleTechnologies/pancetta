@@ -2841,6 +2841,25 @@ impl Ft8Decoder {
     /// This replicates the encoder's `generate_symbols` logic:
     /// - Costas sync arrays at positions 0-6, 36-42, 72-78
     /// - Data symbols from Gray-coded 3-bit groups at other positions
+    ///
+    /// **FT4 residual-path status (Task 8 verification):** this function is
+    /// FT8-only — it hardcodes FT8 geometry (79 symbols, 7-symbol Costas at
+    /// three positions, 3-bit Gray). It is called unconditionally to stamp
+    /// `DecodedMessage::tone_symbols` on *every* decode, so for an FT4 decode
+    /// it produces a meaningless 79-symbol FT8-shaped vector. That is SAFE:
+    /// the only consumers of `tone_symbols` — `subtract_signal` and the
+    /// `coherent_subtract` path — are the multi-pass residual-cancellation
+    /// loop, which fires only when `max_decode_passes > 1` (or
+    /// `coherent_multipass_iterations > 0`). The coordinator builds FT4 from
+    /// `Ft8Config::default()` with `max_decode_passes = 1`, so the residual
+    /// path is **never reached for production FT4 decode** and the garbage
+    /// tone symbols are never consumed. Proven by
+    /// `round_trip_tests::test_ft4_decode_unaffected_by_residual_subtract_path`
+    /// (forces `max_decode_passes = 2` and confirms FT4 still round-trips)
+    /// and `..._production_representative_single_pass_decode`. If FT4 ever
+    /// needs multi-pass subtraction, parameterize this by `&ProtocolParams`
+    /// (route Costas positions + bits-per-symbol by `num_tones`, mirroring
+    /// `generate_symbols_protocol`).
     fn codeword_to_symbols(corrected_bits: &bitvec::prelude::BitSlice) -> Vec<u8> {
         let mut symbols = vec![0u8; NUM_SYMBOLS];
         let mut bit_idx = 0usize;
