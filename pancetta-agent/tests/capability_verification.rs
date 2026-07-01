@@ -51,6 +51,12 @@ fn default_verifier() -> CapabilityVerifier {
     verifier_with_pin(&idp_key().verifying_key(), IDP_KID)
 }
 
+/// The station-local TX-allow-list containing the test client's keyId — the
+/// fail-closed gate honors a grant only if its `clientKeyId` is present here.
+fn allow_list() -> HashSet<String> {
+    HashSet::from([CLIENT_KEY_ID.to_string()])
+}
+
 // --- capabilityToken minting ------------------------------------------------
 
 /// Mint a compact JWS with the given header + payload, signed by `key`.
@@ -137,7 +143,7 @@ fn full_verify(
 ) -> Result<pancetta_agent::arm::VerifiedArmGrant, CapError> {
     let cap = v.verify_capability_token(token, now_ms)?;
     let mut seen = HashSet::new();
-    v.verify_arm_grant(grant, &cap, client_vk, now_ms, &mut seen)
+    v.verify_arm_grant(grant, &cap, client_vk, &allow_list(), now_ms, &mut seen)
 }
 
 // ===========================================================================
@@ -331,6 +337,7 @@ fn grant_wrong_client_sig_rejected() {
         &grant,
         &cap,
         &client_key().verifying_key(),
+        &allow_list(),
         NOW_MS,
         &mut seen,
     );
@@ -349,6 +356,7 @@ fn grant_mutated_field_after_signing_rejected() {
         &grant,
         &cap,
         &client_key().verifying_key(),
+        &allow_list(),
         NOW_MS,
         &mut seen,
     );
@@ -367,6 +375,7 @@ fn grant_wrong_aud_rejected() {
         &grant,
         &cap,
         &client_key().verifying_key(),
+        &allow_list(),
         NOW_MS,
         &mut seen,
     );
@@ -381,10 +390,14 @@ fn grant_client_key_id_mismatch_rejected() {
     g.insert("clientKeyId".to_string(), json!("differentClient0"));
     let grant = sign_grant(g, &client_key());
     let mut seen = HashSet::new();
+    // Allow-list the mutated client so the ClientMismatch gate (not the earlier
+    // allow-list gate) is the one that fires.
+    let list = HashSet::from(["differentClient0".to_string()]);
     let out = v.verify_arm_grant(
         &grant,
         &cap,
         &client_key().verifying_key(),
+        &list,
         NOW_MS,
         &mut seen,
     );
@@ -403,6 +416,7 @@ fn grant_armed_until_in_past_rejected() {
         &grant,
         &cap,
         &client_key().verifying_key(),
+        &allow_list(),
         NOW_MS,
         &mut seen,
     );
@@ -421,6 +435,7 @@ fn grant_armed_until_equal_now_rejected() {
         &grant,
         &cap,
         &client_key().verifying_key(),
+        &allow_list(),
         NOW_MS,
         &mut seen,
     );
@@ -440,6 +455,7 @@ fn grant_armed_until_ten_years_rejected_as_too_long() {
         &grant,
         &cap,
         &client_key().verifying_key(),
+        &allow_list(),
         NOW_MS,
         &mut seen,
     );
@@ -461,6 +477,7 @@ fn grant_armed_window_at_max_is_accepted_boundary() {
             &grant,
             &cap,
             &client_key().verifying_key(),
+            &allow_list(),
             NOW_MS,
             &mut seen,
         )
@@ -476,6 +493,7 @@ fn grant_armed_window_at_max_is_accepted_boundary() {
             &grant2,
             &cap,
             &client_key().verifying_key(),
+            &allow_list(),
             NOW_MS,
             &mut seen2,
         ),
@@ -496,6 +514,7 @@ fn grant_heartbeat_zero_rejected() {
             &grant,
             &cap,
             &client_key().verifying_key(),
+            &allow_list(),
             NOW_MS,
             &mut seen
         ),
@@ -516,10 +535,163 @@ fn grant_heartbeat_too_large_rejected() {
             &grant,
             &cap,
             &client_key().verifying_key(),
+            &allow_list(),
             NOW_MS,
             &mut seen
         ),
         Err(CapError::BadHeartbeat)
+    );
+}
+
+/// e2e-auth.v1 heartbeat boundary: 5 & 15 accepted, 4 & 16 rejected.
+#[test]
+fn grant_heartbeat_bounds_are_exact() {
+    let v = default_verifier();
+    let cap = valid_cap(&v);
+
+    let check = |hb: i64| -> Result<pancetta_agent::arm::VerifiedArmGrant, CapError> {
+        let mut g = base_grant();
+        g.insert("heartbeatIntervalSec".to_string(), json!(hb));
+        let grant = sign_grant(g, &client_key());
+        let mut seen = HashSet::new();
+        v.verify_arm_grant(
+            &grant,
+            &cap,
+            &client_key().verifying_key(),
+            &allow_list(),
+            NOW_MS,
+            &mut seen,
+        )
+    };
+
+    assert!(check(5).is_ok(), "hb=5 (min) accepted");
+    assert!(check(15).is_ok(), "hb=15 (max) accepted");
+    assert_eq!(check(4), Err(CapError::BadHeartbeat), "hb=4 rejected");
+    assert_eq!(check(16), Err(CapError::BadHeartbeat), "hb=16 rejected");
+}
+
+/// e2e-auth.v1 armedUntil boundary: window == 600_000 accepted, == 600_001
+/// rejected as ArmTooLong.
+#[test]
+fn grant_armed_window_600000_boundary_exact() {
+    assert_eq!(
+        MAX_ARM_MS, 600_000,
+        "MAX_ARM_MS is the 10-min normative bound"
+    );
+    let v = default_verifier();
+    let cap = valid_cap(&v);
+
+    let check = |window: i64| -> Result<pancetta_agent::arm::VerifiedArmGrant, CapError> {
+        let mut g = base_grant();
+        g.insert("armedUntil".to_string(), json!(NOW_MS + window));
+        let grant = sign_grant(g, &client_key());
+        let mut seen = HashSet::new();
+        v.verify_arm_grant(
+            &grant,
+            &cap,
+            &client_key().verifying_key(),
+            &allow_list(),
+            NOW_MS,
+            &mut seen,
+        )
+    };
+
+    assert!(check(600_000).is_ok(), "window == 600_000 accepted");
+    assert_eq!(
+        check(600_001),
+        Err(CapError::ArmTooLong),
+        "window == 600_001 rejected"
+    );
+}
+
+// --- Fix 1: station-local TX-allow-list ------------------------------------
+
+/// A perfectly-signed, otherwise-valid grant whose clientKeyId is NOT in the
+/// station-local TX-allow-list is rejected — a relay/cloud compromise alone can
+/// never cause TX.
+#[test]
+fn grant_client_not_in_allow_list_rejected() {
+    let v = default_verifier();
+    let cap = valid_cap(&v);
+    let grant = valid_grant(); // fully valid + correctly signed
+    let mut seen = HashSet::new();
+    // Allow-list does NOT contain CLIENT_KEY_ID (some other client only).
+    let other_list = HashSet::from(["someOtherClient0".to_string()]);
+    assert_eq!(
+        v.verify_arm_grant(
+            &grant,
+            &cap,
+            &client_key().verifying_key(),
+            &other_list,
+            NOW_MS,
+            &mut seen,
+        ),
+        Err(CapError::ClientNotAllowed)
+    );
+}
+
+/// Fail-closed default: an EMPTY allow-list rejects every grant.
+#[test]
+fn grant_empty_allow_list_rejects_all() {
+    let v = default_verifier();
+    let cap = valid_cap(&v);
+    let grant = valid_grant();
+    let mut seen = HashSet::new();
+    let empty = HashSet::new();
+    assert_eq!(
+        v.verify_arm_grant(
+            &grant,
+            &cap,
+            &client_key().verifying_key(),
+            &empty,
+            NOW_MS,
+            &mut seen,
+        ),
+        Err(CapError::ClientNotAllowed)
+    );
+}
+
+/// The same grant passes the allow-list gate (and the whole pipeline) when the
+/// station-local allow-list contains its clientKeyId.
+#[test]
+fn grant_client_in_allow_list_passes_gate() {
+    let v = default_verifier();
+    let cap = valid_cap(&v);
+    let grant = valid_grant();
+    let mut seen = HashSet::new();
+    let out = v.verify_arm_grant(
+        &grant,
+        &cap,
+        &client_key().verifying_key(),
+        &allow_list(), // contains CLIENT_KEY_ID
+        NOW_MS,
+        &mut seen,
+    );
+    assert!(out.is_ok(), "allow-listed client passes: {out:?}");
+}
+
+// --- Fix 2: capabilityJti bind ---------------------------------------------
+
+/// A grant whose capabilityJti does not equal the verified capability's jti is
+/// rejected — the arm must ride a specific in-window capability.
+#[test]
+fn grant_capability_jti_mismatch_rejected() {
+    let v = default_verifier();
+    let cap = valid_cap(&v); // cap.jti == "cap-jti-1"
+    let mut g = base_grant();
+    g.insert("capabilityJti".to_string(), json!("some-other-cap-jti"));
+    let grant = sign_grant(g, &client_key()); // re-signed so the sig is valid
+    let mut seen = HashSet::new();
+    assert_eq!(
+        v.verify_arm_grant(
+            &grant,
+            &cap,
+            &client_key().verifying_key(),
+            &allow_list(),
+            NOW_MS,
+            &mut seen,
+        ),
+        Err(CapError::CapabilityMismatch)
     );
 }
 
@@ -539,6 +711,7 @@ fn grant_capability_without_tx_scope_rejected() {
             &grant,
             &cap,
             &client_key().verifying_key(),
+            &allow_list(),
             NOW_MS,
             &mut seen
         ),
@@ -558,6 +731,7 @@ fn grant_same_jti_twice_second_is_replay() {
         &grant,
         &cap,
         &client_key().verifying_key(),
+        &allow_list(),
         NOW_MS,
         &mut seen,
     )
@@ -568,6 +742,7 @@ fn grant_same_jti_twice_second_is_replay() {
         &grant,
         &cap,
         &client_key().verifying_key(),
+        &allow_list(),
         NOW_MS,
         &mut seen,
     );
@@ -585,6 +760,7 @@ fn grant_missing_client_sig_rejected() {
             &grant,
             &cap,
             &client_key().verifying_key(),
+            &allow_list(),
             NOW_MS,
             &mut seen
         ),
@@ -688,10 +864,15 @@ fn run_flip(flip: Flip) -> Result<pancetta_agent::arm::VerifiedArmGrant, CapErro
         // Pre-seed the jti so this attempt is a replay.
         seen.insert("arm-jti-1".to_string());
     }
+    // Allow-list both the default client AND the GrantClient flip's mutated id,
+    // so that flip reaches the ClientMismatch gate (not the earlier allow-list
+    // gate). Every other flip's clientKeyId is CLIENT_KEY_ID, still allowed.
+    let list = HashSet::from([CLIENT_KEY_ID.to_string(), "otherClient00000".to_string()]);
     v.verify_arm_grant(
         &grant,
         &cap,
         &client_key().verifying_key(),
+        &list,
         NOW_MS,
         &mut seen,
     )
