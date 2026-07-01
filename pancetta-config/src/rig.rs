@@ -1183,6 +1183,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_operating_mode_case_insensitive_ft4() {
         let mut config = RigConfig::default();
         config.mode = "ft4".to_string();
@@ -1195,6 +1196,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_operating_mode_ft2() {
         let mut config = RigConfig::default();
         config.mode = "FT2".to_string();
@@ -1203,6 +1205,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_operating_mode_unknown_errors_and_fails_validation() {
         let mut config = RigConfig::default();
         config.mode = "FT9".to_string();
