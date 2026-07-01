@@ -3079,6 +3079,7 @@ dependencies = [
 name = "pancetta-agent"
 version = "0.9.5"
 dependencies = [
+ "dirs 5.0.1",
  "hex",
  "serde",
  "serde_json",
