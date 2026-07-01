@@ -1276,6 +1276,8 @@ impl QsoManager {
     /// The `Grid` step is exactly equivalent to `respond_to_cq_manual`, so the
     /// DX-Hunter path (which still uses `StartQso` → `respond_to_cq_manual`) is
     /// unaffected.
+    // arg count is intrinsic to the QSO-open signature
+    #[allow(clippy::too_many_arguments)]
     pub async fn respond_to_caller(
         &self,
         target: String,
@@ -7575,7 +7577,7 @@ mod hound_tests {
         for seed in &["K5ARH", "VK9X", "KH8B", "FT5ZM", "3B9FR"] {
             let off = hound_offset_for(seed, HOUND_CALL_MIN_HZ, HOUND_CALL_MAX_HZ);
             assert!(
-                off >= HOUND_CALL_MIN_HZ && off <= HOUND_CALL_MAX_HZ,
+                (HOUND_CALL_MIN_HZ..=HOUND_CALL_MAX_HZ).contains(&off),
                 "offset {off} out of range [{HOUND_CALL_MIN_HZ}, {HOUND_CALL_MAX_HZ}] for seed {seed}"
             );
         }
@@ -7672,7 +7674,7 @@ mod hound_tests {
         // Low calling offset in [300, 900]
         let freq = progress.metadata.frequency;
         assert!(
-            freq >= HOUND_CALL_MIN_HZ && freq <= HOUND_CALL_MAX_HZ,
+            (HOUND_CALL_MIN_HZ..=HOUND_CALL_MAX_HZ).contains(&freq),
             "metadata.frequency {freq} must be in [{HOUND_CALL_MIN_HZ}, {HOUND_CALL_MAX_HZ}]"
         );
 
@@ -7734,7 +7736,7 @@ mod hound_tests {
 
         // Frequency must be in the low calling region.
         assert!(
-            *event_freq >= HOUND_CALL_MIN_HZ && *event_freq <= HOUND_CALL_MAX_HZ,
+            (HOUND_CALL_MIN_HZ..=HOUND_CALL_MAX_HZ).contains(event_freq),
             "opening MessageToSend frequency {event_freq} must be in the low calling region [{HOUND_CALL_MIN_HZ}, {HOUND_CALL_MAX_HZ}]"
         );
 
@@ -7872,7 +7874,7 @@ mod hound_tests {
         );
         let (open_freq, _) = &opening_sends[0];
         assert!(
-            *open_freq >= HOUND_CALL_MIN_HZ && *open_freq <= HOUND_CALL_MAX_HZ,
+            (HOUND_CALL_MIN_HZ..=HOUND_CALL_MAX_HZ).contains(open_freq),
             "opening call freq {open_freq} must be in [{HOUND_CALL_MIN_HZ}, {HOUND_CALL_MAX_HZ}]"
         );
 
@@ -7911,7 +7913,7 @@ mod hound_tests {
         // TX offset must have QSY'd into the response region.
         let qsy_freq = progress.metadata.frequency;
         assert!(
-            qsy_freq >= HOUND_RESPONSE_MIN_HZ && qsy_freq <= HOUND_RESPONSE_MAX_HZ,
+            (HOUND_RESPONSE_MIN_HZ..=HOUND_RESPONSE_MAX_HZ).contains(&qsy_freq),
             "metadata.frequency {qsy_freq} must be in response region [{HOUND_RESPONSE_MIN_HZ}, {HOUND_RESPONSE_MAX_HZ}] after QSY"
         );
 
@@ -7934,7 +7936,7 @@ mod hound_tests {
         );
         let (ack_freq, ack_msg) = &report_acks[0];
         assert!(
-            *ack_freq >= HOUND_RESPONSE_MIN_HZ && *ack_freq <= HOUND_RESPONSE_MAX_HZ,
+            (HOUND_RESPONSE_MIN_HZ..=HOUND_RESPONSE_MAX_HZ).contains(ack_freq),
             "ReportAck must be emitted on the QSY'd offset {ack_freq} in [{HOUND_RESPONSE_MIN_HZ}, {HOUND_RESPONSE_MAX_HZ}]"
         );
         // ReportAck must be <D2UY> <us> R-NN.
@@ -7992,7 +7994,7 @@ mod hound_tests {
 
         let before_freq = manager.get_qso(qso_id).await.unwrap().metadata.frequency;
         assert!(
-            before_freq >= HOUND_CALL_MIN_HZ && before_freq <= HOUND_CALL_MAX_HZ,
+            (HOUND_CALL_MIN_HZ..=HOUND_CALL_MAX_HZ).contains(&before_freq),
             "before QSY, offset {before_freq} must be in the low calling region"
         );
 
@@ -8014,7 +8016,7 @@ mod hound_tests {
         let progress = manager.get_qso(qso_id).await.unwrap();
         let qsy_freq = progress.metadata.frequency;
         assert!(
-            qsy_freq >= HOUND_RESPONSE_MIN_HZ && qsy_freq <= HOUND_RESPONSE_MAX_HZ,
+            (HOUND_RESPONSE_MIN_HZ..=HOUND_RESPONSE_MAX_HZ).contains(&qsy_freq),
             "metadata.frequency {qsy_freq} must QSY into [{HOUND_RESPONSE_MIN_HZ}, {HOUND_RESPONSE_MAX_HZ}] even in Hold mode"
         );
         assert!(
@@ -8134,7 +8136,7 @@ mod deconflict_tests {
         // Candidate sits exactly on an occupied offset — must move by ≥ min_sep.
         let result = deconflict_offset(1500.0, &[1500.0], SEP, LO, HI);
         assert!(
-            result >= LO && result <= HI,
+            (LO..=HI).contains(&result),
             "result {result} must be within [{LO}, {HI}]"
         );
         assert!(
@@ -8148,7 +8150,7 @@ mod deconflict_tests {
         // Candidate 1520 Hz is only 20 Hz from occupied 1500 Hz (< 75 Hz sep) — must move.
         let result = deconflict_offset(1520.0, &[1500.0], SEP, LO, HI);
         assert!(
-            result >= LO && result <= HI,
+            (LO..=HI).contains(&result),
             "result {result} must be within [{LO}, {HI}]"
         );
         assert!(
@@ -8164,7 +8166,7 @@ mod deconflict_tests {
         // within the bracket — the search must escape to a clear slot elsewhere.
         let result = deconflict_offset(1500.0, &[1400.0, 1600.0], SEP, LO, HI);
         assert!(
-            result >= LO && result <= HI,
+            (LO..=HI).contains(&result),
             "result {result} must be within [{LO}, {HI}]"
         );
         assert!(

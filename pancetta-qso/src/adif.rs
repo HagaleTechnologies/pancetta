@@ -1148,7 +1148,7 @@ ADIF Export for Test Program
             end_time: None,
             reports: SignalReports {
                 sent: Some(-12),
-                received: Some(-09),
+                received: Some(-9),
             },
             grids: GridSquares {
                 ours: Some("EM20".into()),
