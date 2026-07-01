@@ -250,6 +250,33 @@ pub struct StationAgentConfig {
     /// crate default location.
     #[serde(default)]
     pub audit_log_path: Option<String>,
+
+    /// Relay WebSocket URL (e.g. `wss://relay.example/…`) the agent connects to
+    /// for remote control. `None` (default) → the component stays inert. Required
+    /// when [`enabled`](Self::enabled) is `true`.
+    #[serde(default)]
+    pub relay_url: Option<String>,
+
+    /// Base URL for the pairing HTTP POSTs (device pairing / capability fetch).
+    /// `None` (default) → the agent cannot pair. Required when
+    /// [`enabled`](Self::enabled) is `true`.
+    #[serde(default)]
+    pub pairing_api_url: Option<String>,
+
+    /// Directory holding the agent's identity keys ([`crate`]-adjacent
+    /// `AgentIdentity`) and `PairedState`. `None` (default) → the crate default
+    /// (`~/.pancetta/agent`).
+    #[serde(default)]
+    pub key_dir: Option<String>,
+
+    /// STATION-LOCAL allow-list of client `keyId`s permitted to arm TX. Empty
+    /// (default) → **no remote TX is possible** — this mirrors the fail-closed
+    /// capability check ([`crate`]-adjacent `capability`): a `txArmGrant` is only
+    /// honored when its `clientKeyId` is present here. A relay/cloud compromise
+    /// alone can never cause TX because the client-signed grant must reference a
+    /// key in this local list. The operator may populate it after pairing.
+    #[serde(default)]
+    pub tx_allow_list: Vec<String>,
 }
 
 /// PSKReporter service configuration
@@ -1375,16 +1402,68 @@ impl ConfigSection for NetworkConfig {
             }
         }
 
-        // Station-agent validation. The remote transport is unbuilt this phase,
-        // so `enabled` has no runtime effect and needs no dependent credentials
-        // (pairing/relay wiring lands in P3). We only reject a well-formed-ness
-        // error: an empty `audit_log_path` string (should be `None`, not "").
+        // Station-agent validation.
+        // Reject an empty `audit_log_path` string (should be `None`, not "").
         if let Some(path) = self.station_agent.audit_log_path.as_ref() {
             if path.trim().is_empty() {
                 return Err(ConfigError::Validation(
                     "station_agent.audit_log_path is set but empty".to_string(),
                 ));
             }
+        }
+
+        // When the station agent is enabled, the remote transport needs both the
+        // relay endpoint and the pairing API endpoint — without them the
+        // component cannot connect or pair, so an `enabled = true` config that
+        // omits either is a misconfiguration.
+        if self.station_agent.enabled {
+            if self
+                .station_agent
+                .relay_url
+                .as_ref()
+                .is_none_or(|s| s.trim().is_empty())
+            {
+                return Err(ConfigError::Validation(
+                    "station_agent.enabled = true requires a non-empty relay_url".to_string(),
+                ));
+            }
+            if self
+                .station_agent
+                .pairing_api_url
+                .as_ref()
+                .is_none_or(|s| s.trim().is_empty())
+            {
+                return Err(ConfigError::Validation(
+                    "station_agent.enabled = true requires a non-empty pairing_api_url".to_string(),
+                ));
+            }
+        }
+
+        // Optional-but-present URLs must be non-empty when supplied (even with
+        // the agent disabled), so a partial config isn't silently accepted.
+        for (name, val) in [
+            ("relay_url", &self.station_agent.relay_url),
+            ("pairing_api_url", &self.station_agent.pairing_api_url),
+            ("key_dir", &self.station_agent.key_dir),
+        ] {
+            if let Some(v) = val {
+                if v.trim().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "station_agent.{name} is set but empty"
+                    )));
+                }
+            }
+        }
+
+        // `remote_tx_enabled` with an empty `tx_allow_list` is NOT a hard error
+        // (the operator may add client keyIds after pairing), but no remote TX
+        // can occur until the allow-list is populated — surface it clearly.
+        if self.station_agent.remote_tx_enabled && self.station_agent.tx_allow_list.is_empty() {
+            tracing::warn!(
+                target: "config.station_agent",
+                "remote_tx_enabled = true but tx_allow_list is empty — NO remote TX can occur until \
+                 client keyIds are added to station_agent.tx_allow_list (fail-closed)"
+            );
         }
 
         Ok(())
@@ -1833,10 +1912,13 @@ audit_log_path = "/tmp/agent-audit.jsonl"
         let config = NetworkConfig::default();
         assert!(config.validate_section().is_ok());
 
-        // Enabling with no dependent creds is well-formed (transport unbuilt).
+        // As of P3.4, enabling the agent requires relay_url + pairing_api_url
+        // (the transport can't connect/pair without them).
         let mut config = NetworkConfig::default();
         config.station_agent.enabled = true;
         config.station_agent.remote_tx_enabled = true;
+        config.station_agent.relay_url = Some("wss://relay.example/ws".to_string());
+        config.station_agent.pairing_api_url = Some("https://pair.example/api".to_string());
         assert!(config.validate_section().is_ok());
     }
 
@@ -1851,5 +1933,115 @@ audit_log_path = "/tmp/agent-audit.jsonl"
 
         config.station_agent.audit_log_path = Some("/tmp/a.jsonl".to_string());
         assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_station_agent_p34_defaults_are_inert() {
+        // The P3.4 URL/allow-list fields default to None / empty, agent off.
+        let cfg = StationAgentConfig::default();
+        assert!(!cfg.enabled);
+        assert!(cfg.relay_url.is_none());
+        assert!(cfg.pairing_api_url.is_none());
+        assert!(cfg.key_dir.is_none());
+        assert!(cfg.tx_allow_list.is_empty());
+
+        // Absent section from TOML yields the same inert defaults.
+        let toml_str = "[network]\n";
+        let outer: toml::Value = toml::from_str(toml_str).expect("valid toml");
+        let net: NetworkConfig = outer
+            .get("network")
+            .cloned()
+            .unwrap_or(toml::Value::Table(Default::default()))
+            .try_into()
+            .expect("valid NetworkConfig");
+        assert!(net.station_agent.relay_url.is_none());
+        assert!(net.station_agent.pairing_api_url.is_none());
+        assert!(net.station_agent.key_dir.is_none());
+        assert!(net.station_agent.tx_allow_list.is_empty());
+    }
+
+    #[test]
+    fn test_station_agent_enabled_requires_urls() {
+        // enabled with no URLs → error.
+        let mut config = NetworkConfig::default();
+        config.station_agent.enabled = true;
+        let err = config.validate_section().unwrap_err().to_string();
+        assert!(err.contains("relay_url"), "got: {err}");
+
+        // relay_url present but pairing_api_url missing → error.
+        config.station_agent.relay_url = Some("wss://relay.example/ws".to_string());
+        let err = config.validate_section().unwrap_err().to_string();
+        assert!(err.contains("pairing_api_url"), "got: {err}");
+
+        // both present → ok.
+        config.station_agent.pairing_api_url = Some("https://pair.example/api".to_string());
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_station_agent_rejects_empty_urls() {
+        let mut config = NetworkConfig::default();
+        // Disabled but partial: empty relay_url string is rejected.
+        config.station_agent.relay_url = Some(String::new());
+        assert!(config.validate_section().is_err());
+
+        config.station_agent.relay_url = None;
+        config.station_agent.key_dir = Some("   ".to_string());
+        assert!(config.validate_section().is_err());
+    }
+
+    #[test]
+    fn test_station_agent_remote_tx_empty_allow_list_is_not_error() {
+        // remote_tx_enabled with an empty allow-list is a warn, NOT a hard error.
+        let mut config = NetworkConfig::default();
+        config.station_agent.remote_tx_enabled = true;
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_station_agent_p34_roundtrip() {
+        let toml_str = r#"
+[network.station_agent]
+enabled = true
+remote_tx_enabled = true
+relay_url = "wss://relay.example/ws"
+pairing_api_url = "https://pair.example/api"
+key_dir = "/home/op/.pancetta/agent"
+tx_allow_list = ["client-key-1", "client-key-2"]
+"#;
+        let outer: toml::Value = toml::from_str(toml_str).expect("valid toml");
+        let net: NetworkConfig = outer
+            .get("network")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .expect("valid NetworkConfig");
+        assert!(net.station_agent.enabled);
+        assert_eq!(
+            net.station_agent.relay_url.as_deref(),
+            Some("wss://relay.example/ws")
+        );
+        assert_eq!(
+            net.station_agent.pairing_api_url.as_deref(),
+            Some("https://pair.example/api")
+        );
+        assert_eq!(
+            net.station_agent.key_dir.as_deref(),
+            Some("/home/op/.pancetta/agent")
+        );
+        assert_eq!(
+            net.station_agent.tx_allow_list,
+            vec!["client-key-1".to_string(), "client-key-2".to_string()]
+        );
+        assert!(net.validate_section().is_ok());
+
+        // Round-trips through serialize/deserialize.
+        let ser = toml::to_string(&net).expect("serialize");
+        let reparsed: NetworkConfig = toml::from_str(&ser).expect("reparse");
+        assert_eq!(reparsed.station_agent.tx_allow_list.len(), 2);
+        assert_eq!(
+            reparsed.station_agent.relay_url.as_deref(),
+            Some("wss://relay.example/ws")
+        );
     }
 }

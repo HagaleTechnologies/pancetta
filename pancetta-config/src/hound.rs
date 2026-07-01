@@ -62,7 +62,7 @@ impl ConfigSection for HoundConfig {
             ("hound.response_min_hz", self.response_min_hz),
             ("hound.response_max_hz", self.response_max_hz),
         ] {
-            if val < AUDIO_MIN || val > AUDIO_MAX {
+            if !(AUDIO_MIN..=AUDIO_MAX).contains(&val) {
                 return Err(ConfigError::InvalidValue {
                     field: name.into(),
                     value: val.to_string(),
