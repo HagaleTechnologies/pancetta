@@ -64,6 +64,10 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub remote_gateway: RemoteGatewayConfig,
 
+    /// Station agent — remote-TX arm/consent gate (opt-in; default OFF).
+    #[serde(default)]
+    pub station_agent: StationAgentConfig,
+
     /// Custom service integrations
     #[serde(default)]
     pub custom_services: HashMap<String, CustomServiceConfig>,
@@ -215,6 +219,37 @@ impl Default for RemoteGatewayConfig {
             bind_addr: default_gateway_bind(),
         }
     }
+}
+
+/// Station agent configuration — the remote-TX arm/consent gate.
+///
+/// Default OFF on every field. This section governs the offline safety core
+/// of the station agent (P0–P2): [`enabled`](Self::enabled) will (in a later
+/// phase) gate the remote-control transport, and
+/// [`remote_tx_enabled`](Self::remote_tx_enabled) is the LOCAL operator
+/// consent gate seeded into the coordinator's `ArmState` at startup — while
+/// it is `false`, `ArmState::tx_permitted()` can never return `true`, so no
+/// remote-originated TX can ever key PTT regardless of any (future) arm grant.
+///
+/// In this phase the remote transport is not built, so [`enabled`](Self::enabled)
+/// has no runtime effect (it is only validated as well-formed).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct StationAgentConfig {
+    /// Enable the station-agent remote-control transport. No runtime effect in
+    /// this phase (transport unbuilt); default OFF.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// LOCAL operator consent gate for remote-originated TX. When `false`
+    /// (default), the coordinator's remote-TX arm can never permit TX — this
+    /// is the operator's local, physical-presence consent to remote keying.
+    #[serde(default)]
+    pub remote_tx_enabled: bool,
+
+    /// Optional path for the station-agent audit log. `None` (default) uses the
+    /// crate default location.
+    #[serde(default)]
+    pub audit_log_path: Option<String>,
 }
 
 /// PSKReporter service configuration
@@ -1340,6 +1375,18 @@ impl ConfigSection for NetworkConfig {
             }
         }
 
+        // Station-agent validation. The remote transport is unbuilt this phase,
+        // so `enabled` has no runtime effect and needs no dependent credentials
+        // (pairing/relay wiring lands in P3). We only reject a well-formed-ness
+        // error: an empty `audit_log_path` string (should be `None`, not "").
+        if let Some(path) = self.station_agent.audit_log_path.as_ref() {
+            if path.trim().is_empty() {
+                return Err(ConfigError::Validation(
+                    "station_agent.audit_log_path is set but empty".to_string(),
+                ));
+            }
+        }
+
         Ok(())
     }
 
@@ -1721,5 +1768,88 @@ mod tests {
             .expect("valid NetworkConfig");
         assert!(!net.remote_gateway.enabled);
         assert_eq!(net.remote_gateway.bind_addr, "127.0.0.1:4080");
+    }
+
+    #[test]
+    fn test_station_agent_defaults_when_section_absent() {
+        // Deserializing a TOML string with NO [network.station_agent] section
+        // must yield the default: everything OFF / None.
+        let toml_str = "[network]\n";
+        let outer: toml::Value = toml::from_str(toml_str).expect("valid toml");
+        let net: NetworkConfig = outer
+            .get("network")
+            .cloned()
+            .unwrap_or(toml::Value::Table(Default::default()))
+            .try_into()
+            .expect("valid NetworkConfig");
+        assert!(!net.station_agent.enabled);
+        assert!(!net.station_agent.remote_tx_enabled);
+        assert!(net.station_agent.audit_log_path.is_none());
+    }
+
+    #[test]
+    fn test_station_agent_default_impl() {
+        let cfg = StationAgentConfig::default();
+        assert!(!cfg.enabled);
+        assert!(!cfg.remote_tx_enabled);
+        assert!(cfg.audit_log_path.is_none());
+    }
+
+    #[test]
+    fn test_station_agent_roundtrip() {
+        let toml_str = r#"
+[network.station_agent]
+enabled = true
+remote_tx_enabled = true
+audit_log_path = "/tmp/agent-audit.jsonl"
+"#;
+        let outer: toml::Value = toml::from_str(toml_str).expect("valid toml");
+        let net: NetworkConfig = outer
+            .get("network")
+            .cloned()
+            .unwrap()
+            .try_into()
+            .expect("valid NetworkConfig");
+        assert!(net.station_agent.enabled);
+        assert!(net.station_agent.remote_tx_enabled);
+        assert_eq!(
+            net.station_agent.audit_log_path.as_deref(),
+            Some("/tmp/agent-audit.jsonl")
+        );
+
+        // Re-serialize and read back — round-trips.
+        let ser = toml::to_string(&net).expect("serialize NetworkConfig");
+        let reparsed: NetworkConfig = toml::from_str(&ser).expect("reparse");
+        assert!(reparsed.station_agent.enabled);
+        assert!(reparsed.station_agent.remote_tx_enabled);
+        assert_eq!(
+            reparsed.station_agent.audit_log_path.as_deref(),
+            Some("/tmp/agent-audit.jsonl")
+        );
+    }
+
+    #[test]
+    fn test_station_agent_validation_ok_by_default() {
+        let config = NetworkConfig::default();
+        assert!(config.validate_section().is_ok());
+
+        // Enabling with no dependent creds is well-formed (transport unbuilt).
+        let mut config = NetworkConfig::default();
+        config.station_agent.enabled = true;
+        config.station_agent.remote_tx_enabled = true;
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_station_agent_rejects_empty_audit_path() {
+        let mut config = NetworkConfig::default();
+        config.station_agent.audit_log_path = Some(String::new());
+        assert!(config.validate_section().is_err());
+
+        config.station_agent.audit_log_path = Some("   ".to_string());
+        assert!(config.validate_section().is_err());
+
+        config.station_agent.audit_log_path = Some("/tmp/a.jsonl".to_string());
+        assert!(config.validate_section().is_ok());
     }
 }
