@@ -29,6 +29,7 @@ mod qso;
 mod qso_filter;
 mod remote_gateway;
 mod shutdown;
+mod station_agent;
 mod tier;
 mod tui_relay;
 mod tx;
@@ -1216,6 +1217,7 @@ impl ApplicationCoordinator {
         self.start_dx_cluster_component().await?;
         self.start_pskreporter_component().await?;
         self.start_remote_gateway_component().await?;
+        self.start_station_agent_component().await?;
 
         // Start coordinator tasks
         self.start_coordinator_tasks().await?;
