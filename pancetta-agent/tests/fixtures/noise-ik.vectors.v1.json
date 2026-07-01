@@ -1,0 +1,73 @@
+{
+  "$comment": "Shared cross-implementation interop test vector for the e2e-auth.v1 Noise suite. Every implementation of the encrypted rig-control channel (cqdx @cqdx/noise [TS], panino NoiseSession [TS/RN], pancetta [Rust snow]) MUST reproduce this handshake BYTE-FOR-BYTE before it is trusted to interoperate. This is the single oracle that closes the JS<->Rust interop risk called out in the remote-rig build (ADR-0002 / e2e-auth.v1).",
+  "version": "1",
+  "suite": "Noise_IK_25519_ChaChaPoly_BLAKE2s",
+  "primitives": {
+    "dh": "X25519 (32-byte keys and shared secret)",
+    "cipher": "ChaCha20-Poly1305 (16-byte tag)",
+    "hash": "BLAKE2s-256 (32-byte digest)",
+    "kdf": "Noise HKDF built from HMAC-BLAKE2s (NOT HKDF-SHA256): temp_key = HMAC(ck, ikm); out1 = HMAC(temp_key, 0x01); out2 = HMAC(temp_key, out1 || 0x02); out3 = HMAC(temp_key, out2 || 0x03)"
+  },
+  "implementation_notes": {
+    "nonce_encoding": "The 96-bit ChaCha20-Poly1305 nonce is 4 zero bytes followed by the 64-bit Noise message counter `n` in little-endian (Noise spec 12.3). The counter is per-CipherState, starts at 0, and advances once per encrypt and once per decrypt.",
+    "handshake_payloads": "Each handshake message carries an (optionally empty) payload that is encrypted-and-hashed; in these vectors the payloads are non-empty (Austrian-economist names) and the prologue is non-empty ('John Galt' = 4a6f686e2047616c74).",
+    "transport_ad": "Post-handshake transport messages use EMPTY associated data.",
+    "ik_pattern": "Pre-message `<- s` (responder static, mixHash'd by both parties). msg1 tokens `e, es, s, ss` (initiator->responder). msg2 tokens `e, ee, se` (responder->initiator). After msg2 both split(): initiator { send: c1, recv: c2 }, responder { send: c2, recv: c1 }.",
+    "key_fields": "init_static / init_ephemeral / resp_static / resp_ephemeral are 32-byte X25519 PRIVATE keys (hex). init_remote_static is the responder's PUBLIC static key (hex). Derive public halves with X25519 base-point mult; e.g. pub(resp_static) == init_remote_static."
+  },
+  "message_directions": [
+    "messages[0]: handshake msg1, initiator -> responder (eph + enc-static + enc-payload)",
+    "messages[1]: handshake msg2, responder -> initiator (eph + enc-payload)",
+    "messages[2]: transport, initiator -> responder",
+    "messages[3]: transport, responder -> initiator",
+    "messages[4]: transport, initiator -> responder (initiator send nonce = 1)",
+    "messages[5]: transport, responder -> initiator (responder send nonce = 1)"
+  ],
+  "source": {
+    "name": "cacophony test vectors",
+    "origin": "https://github.com/mcginty/snow/blob/main/tests/vectors/cacophony.txt",
+    "note": "The canonical cacophony vector set that the Rust `snow` crate (pancetta's Noise implementation) validates against. Vendored here so all three repos share one byte-level oracle."
+  },
+  "conformance": {
+    "cqdx": "PASS - @cqdx/noise (hand-rolled on @noble/curves+ciphers+hashes) reproduces this handshake byte-for-byte (msg1, msg2, handshake_hash, and all transport messages incl. nonce=1). cqdx Step 3b-1.",
+    "panino": "PASS - panino NoiseSession conformance-tested byte-for-byte against this vector (dispensa Q-0011, 2026-06-28).",
+    "pancetta": "PASS - snow 0.9.6 (Noise_IK_25519_ChaChaPoly_BLAKE2s, fixed_ephemeral_key_for_testing_only) reproduces THIS entry byte-for-byte: msg1, msg2, handshake_hash (both initiator and responder), and all four transport messages incl. the nonce=1 pair (messages[4]/[5]). Confirmed by pancetta 2026-06-30 with a standalone snow harness against this exact vector; will land as a drift-guarded conformance test when the agent Noise layer is built."
+  },
+  "vector": {
+    "protocol_name": "Noise_IK_25519_ChaChaPoly_BLAKE2s",
+    "init_prologue": "4a6f686e2047616c74",
+    "init_static": "e61ef9919cde45dd5f82166404bd08e38bceb5dfdfded0a34c8df7ed542214d1",
+    "init_ephemeral": "893e28b9dc6ca8d611ab664754b8ceb7bac5117349a4439a6b0569da977c464a",
+    "init_remote_static": "31e0303fd6418d2f8c0e78b91f22e8caed0fbe48656dcf4767e4834f701b8f62",
+    "resp_prologue": "4a6f686e2047616c74",
+    "resp_static": "4a3acbfdb163dec651dfa3194dece676d437029c62a408b4c5ea9114246e4893",
+    "resp_ephemeral": "bbdb4cdbd309f1a1f2e1456967fe288cadd6f712d65dc7b7793d5e63da6b375b",
+    "handshake_hash": "48f3cb8bc9319da4ba1e9933991b1c4ed4034f1f126a76d3a1fbcfd7f94248d4",
+    "messages": [
+      {
+        "payload": "4c756477696720766f6e204d69736573",
+        "ciphertext": "ca35def5ae56cec33dc2036731ab14896bc4c75dbb07a61f879f8e3afa4c79440b03ddc7aac5123d06a1b23b71670e32e76c28239a7ca4ac8f784de7e44c1adbfc6e83fef7352a58d9d56157400c0a737b1d171ce368229c7b752ac25b8faf4eca690f6d896f543be02c996ab2b86b76"
+      },
+      {
+        "payload": "4d757272617920526f746862617264",
+        "ciphertext": "95ebc60d2b1fa672c1f46a8aa265ef51bfe38e7ccb39ec5be34069f144808843d9b5a8927f0ac9655ef76833bc7e5561f42e691ac8404efd6fbd6308b6a27c"
+      },
+      {
+        "payload": "462e20412e20486179656b",
+        "ciphertext": "2c256ed08fcd08c2980f954ee4beaccb61c9581340f5dd2fd1cf3b"
+      },
+      {
+        "payload": "4361726c204d656e676572",
+        "ciphertext": "d6033f70eee20945c7c9dba304e397ee3b284ff5e00fd9efb095d3"
+      },
+      {
+        "payload": "4a65616e2d426170746973746520536179",
+        "ciphertext": "a9c068ca5d8babf72560652d8e851adbfac35c8a66e810d560863173e96adf4cfe"
+      },
+      {
+        "payload": "457567656e2042f6686d20766f6e2042617765726b",
+        "ciphertext": "2a09d8f459e5927e40fdd2eddc99bdafb04e13a26f145cb5cfe9e6ba34c94331ebc17d5156"
+      }
+    ]
+  }
+}
