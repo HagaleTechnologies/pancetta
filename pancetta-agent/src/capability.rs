@@ -46,9 +46,12 @@
 //!   station-local `tx_allow_list` ([`CapError::ClientNotAllowed`]) and the
 //!   grant's `capabilityJti` MUST equal the verified capability's `jti`
 //!   ([`CapError::CapabilityMismatch`]).
-//
-// TODO(P3.4): enforce txHeartbeat.seq monotonicity (reject seq <= last-accepted)
-// + armJti match — contract $defs.txHeartbeat.
+//!
+//! The grant's own `jti` is carried onto [`VerifiedArmGrant::jti`] so the armed
+//! session can bind subsequent heartbeats to *this* arm (contract
+//! `$defs.txHeartbeat.armJti`): a heartbeat naming a different arm, or replaying
+//! a non-monotonic `seq`, is rejected without sliding the dead-man window (see
+//! [`crate::arm::ArmState::heartbeat`]).
 
 use std::collections::HashSet;
 
@@ -408,7 +411,7 @@ impl CapabilityVerifier {
             .and_then(Value::as_str)
             .ok_or_else(|| CapError::MalformedClaim("jti".to_string()))?
             .to_string();
-        if !seen_jtis.insert(jti) {
+        if !seen_jtis.insert(jti.clone()) {
             return Err(CapError::ReplayedJti);
         }
 
@@ -423,6 +426,7 @@ impl CapabilityVerifier {
             operator_callsign,
             ttl_ms,
             scope_tx: true,
+            jti,
         })
     }
 }
