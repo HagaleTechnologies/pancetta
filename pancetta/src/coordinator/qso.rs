@@ -780,26 +780,27 @@ fn classify_caller_answer(
     }
 }
 
-/// Always-answer-callers (#39 + #43 part 2): auto-open a reply to a station
-/// calling us, **independent of the autonomous-operator toggle**.
-///
-/// FT8 etiquette is to always come back to a station that calls you. This runs
-/// in the always-on decode loop, so it works whether or not autonomous mode is
-/// engaged. It is a *response*, not an unattended *initiation*, so the FCC
-/// §97.221 presence gate (which governs initiation) does not apply — but every
-/// other TX gate does:
-///
-/// 1. **TX policy** — `Disabled` blocks entirely; `RespondOnly`/`Full` allow.
-/// 2. **Already in QSO** — if `process_message` (run first) is already driving
-///    an exchange with this station, skip (no duplicate).
-/// 3. **Half-duplex parity** — we'd TX on `opposite(their_parity)`; if that
-///    crosses the window our active QSOs are committed to, defer (the operator
-///    can still pick them manually). Keeps us off sequential-window TX.
-/// 4. **Capacity** — at most `max_concurrent` concurrent caller-answers.
-///
-/// Because this path carries no failure-backoff state, it also satisfies #43
-/// part 2: after our initiation watchdog retires a QSO, if that DX then calls
-/// us we still answer.
+// Always-answer-callers (#39 + #43 part 2): auto-open a reply to a station
+// calling us, **independent of the autonomous-operator toggle**. See
+// `maybe_answer_caller` below for the implementation.
+//
+// FT8 etiquette is to always come back to a station that calls you. This runs
+// in the always-on decode loop, so it works whether or not autonomous mode is
+// engaged. It is a *response*, not an unattended *initiation*, so the FCC
+// §97.221 presence gate (which governs initiation) does not apply — but every
+// other TX gate does:
+//
+// 1. **TX policy** — `Disabled` blocks entirely; `RespondOnly`/`Full` allow.
+// 2. **Already in QSO** — if `process_message` (run first) is already driving
+//    an exchange with this station, skip (no duplicate).
+// 3. **Half-duplex parity** — we'd TX on `opposite(their_parity)`; if that
+//    crosses the window our active QSOs are committed to, defer (the operator
+//    can still pick them manually). Keeps us off sequential-window TX.
+// 4. **Capacity** — at most `max_concurrent` concurrent caller-answers.
+//
+// Because this path carries no failure-backoff state, it also satisfies #43
+// part 2: after our initiation watchdog retires a QSO, if that DX then calls
+// us we still answer.
 
 /// Compute a monotonically-increasing slot index from a decode timestamp.
 ///
@@ -3349,7 +3350,7 @@ mod pending_manual_tests {
         assert_ne!(tx_off, 1500.0, "must not stack on the occupied offset");
         // tx_off should be within [300, 2700].
         assert!(
-            tx_off >= 300.0 && tx_off <= 2700.0,
+            (300.0..=2700.0).contains(&tx_off),
             "tx_off={tx_off} is outside [300, 2700]"
         );
         // partner_freq must be Some so the DX's replies at 1200 Hz are routed.

@@ -871,8 +871,9 @@ impl TuiRunner {
                     } else {
                         match crate::app::parse_hz(&trimmed) {
                             Some(hz)
-                                if hz >= crate::app::TX_OFFSET_MIN_HZ
-                                    && hz <= crate::app::TX_OFFSET_MAX_HZ =>
+                                if (crate::app::TX_OFFSET_MIN_HZ
+                                    ..=crate::app::TX_OFFSET_MAX_HZ)
+                                    .contains(&hz) =>
                             {
                                 app.offset_modal.visible = false;
                                 app.offset_modal.buffer.clear();

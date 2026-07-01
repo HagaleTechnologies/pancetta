@@ -1452,7 +1452,7 @@ async fn hound_engage_keys_low_then_qsys_high_on_report() {
     // Verify the forwarded offset is in the LOW calling region before keying.
     let opening_offset = pending[0].frequency_offset;
     assert!(
-        opening_offset >= 300.0 && opening_offset <= 900.0,
+        (300.0..=900.0).contains(&opening_offset),
         "opening TransmitRequest must be in the Hound calling region [300, 900] Hz, got {opening_offset}"
     );
 
@@ -1468,7 +1468,7 @@ async fn hound_engage_keys_low_then_qsys_high_on_report() {
         .map(|k| k.freq_hz)
         .expect("a keyed TX must exist in slot 0");
     assert!(
-        low_freq >= 300.0 && low_freq <= 900.0,
+        (300.0..=900.0).contains(&low_freq),
         "slot 0 must key in the Hound calling region [300, 900] Hz, got {low_freq} Hz.\n{}",
         sim.timeline
     );
@@ -1496,7 +1496,7 @@ async fn hound_engage_keys_low_then_qsys_high_on_report() {
     // The ReportAck must be at the HIGH response offset (QSY'd), not the low one.
     let report_ack_offset = pending[0].frequency_offset;
     assert!(
-        report_ack_offset >= 1000.0 && report_ack_offset <= 2700.0,
+        (1000.0..=2700.0).contains(&report_ack_offset),
         "ReportAck TransmitRequest must be in the QSY'd response region [1000, 2700] Hz, \
          got {report_ack_offset} Hz.\n{}",
         sim.timeline
@@ -1512,7 +1512,7 @@ async fn hound_engage_keys_low_then_qsys_high_on_report() {
         .map(|k| k.freq_hz)
         .expect("a keyed TX must exist in slot 1 (ReportAck after QSY)");
     assert!(
-        high_freq >= 1000.0 && high_freq <= 2700.0,
+        (1000.0..=2700.0).contains(&high_freq),
         "slot 1 must key in the Hound response region [1000, 2700] Hz, got {high_freq} Hz.\n{}",
         sim.timeline
     );
