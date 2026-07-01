@@ -38,6 +38,12 @@ geographiclib-rs = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 
+# Station-agent transport adapters (relay WebSocket + pairing HTTP)
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
 # Async runtime and coordination
 tokio = { version = "1.50", features = ["full", "rt-multi-thread"] }
 
@@ -91,8 +97,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 assert_cmd = "2.2"
 predicates = "3.1"
 tracing-test = "0.2"
-tokio-tungstenite = { workspace = true }
-futures-util = { workspace = true }
+# Station-agent integration tests: hand-sign capabilityTokens + txArmGrants,
+# and drive the real AgentSession through a scripted Noise IK handshake.
+base64 = { workspace = true }
+snow = "0.9"
 
 [features]
 default = ["metrics", "pancetta-hamlib"]
