@@ -2,6 +2,7 @@
 
 pub mod arm;
 pub mod audit;
+pub mod capability;
 pub mod keys;
 pub mod noise;
 pub mod pairing;
