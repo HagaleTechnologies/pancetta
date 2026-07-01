@@ -852,7 +852,15 @@ impl ApplicationCoordinator {
         // cache if present, and spawns a background probe on cache miss.
         // The FT8 hot loop reads both fields without blocking on probe
         // completion.
-        let ft8_config = Arc::new(RwLock::new(Ft8Config::default()));
+        // Seed the shared decoder config with the active protocol from
+        // [rig].mode so the FT8 hot loop actually demodulates FT4 (4-GFSK / FT4
+        // Costas) in FT4 mode, not just retunes the slot grid. Without this the
+        // decoder would run FT8 geometry against FT4 audio. mode=FT8 →
+        // protocol=Ft8, byte-identical to the previous `Ft8Config::default()`.
+        let ft8_config = Arc::new(RwLock::new(Ft8Config {
+            protocol: active_protocol,
+            ..Ft8Config::default()
+        }));
         let scoped_fast_path = tier::initialize(ft8_config.clone()).await;
 
         let coordinator = Self {
