@@ -1365,6 +1365,149 @@ mod tests {
         assert_eq!(t.slot_ns, 7_500_000_000);
     }
 
+    // ------------------------------------------------------------------
+    // Cross-seam composition: derive_dsp_timing + Protocol::slot_ns +
+    // the slot.rs `_with_period` helpers must compose into one
+    // self-consistent grid (7.5s for FT4, 15s for FT8). This is the
+    // end-to-end "FT8 unchanged + FT4 7.5s grid" regression guard the
+    // FT4 plan (Task 8) calls for. It replicates the EXACT production
+    // parity-stamping seam in `coordinator/ft8.rs`:
+    //     slot_start = window_received_utc - decode_phase;
+    //     parity     = SlotParity::of_with_period(slot_start, slot_ns);
+    // so a window received `decode_phase` past a slot boundary recovers
+    // the correct slot start + parity on the protocol's own grid.
+    //
+    // Wall-clock-free: `now` is a fixed timestamp (the same 2026-01-01
+    // 00:00:00 UTC reference used by tx.rs::schedule_tx_tests — its
+    // unix timestamp 1767225600 is divisible by both 15 and 7.5, so
+    // slot 0 is Even on both grids).
+    // ------------------------------------------------------------------
+
+    /// Reference epoch: 2026-01-01 00:00:00 UTC (= 1767225600s), the same
+    /// instant tx.rs::schedule_tx_tests uses. Slot 0 is Even on the 15s
+    /// AND the 7.5s grid.
+    fn epoch_at(seconds: f64) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        let base = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        base + chrono::Duration::nanoseconds((seconds * 1_000_000_000.0) as i64)
+    }
+
+    /// Recover (slot_start, parity) from a window received `decode_phase`
+    /// past a slot boundary — the exact arithmetic the FT8 hot loop runs
+    /// at `coordinator/ft8.rs:654-656`.
+    fn recover_slot(
+        window_received: chrono::DateTime<chrono::Utc>,
+        t: &DspTiming,
+    ) -> (
+        chrono::DateTime<chrono::Utc>,
+        pancetta_core::slot::SlotParity,
+    ) {
+        let slot_start = window_received - t.decode_phase;
+        let parity = pancetta_core::slot::SlotParity::of_with_period(slot_start, t.slot_ns);
+        (slot_start, parity)
+    }
+
+    #[test]
+    fn ft4_timing_seam_composes_to_7_5s_grid() {
+        // FT4: derive timing, then walk several consecutive 7.5s slots and
+        // assert the decode-phase recovery lands on the right grid boundary
+        // with alternating parity. Slot 0 (:00.0) Even, slot 1 (:07.5) Odd,
+        // slot 2 (:15.0) Even, slot 3 (:22.5) Odd.
+        let t = derive_dsp_timing(&pancetta_ft8::ProtocolParams::ft4());
+        assert_eq!(t.slot_ns, 7_500_000_000);
+        // Protocol::slot_ns agrees with the derived value (single source).
+        assert_eq!(t.slot_ns, pancetta_ft8::Protocol::Ft4.slot_ns());
+
+        let decode_phase_secs = t.decode_phase.num_nanoseconds().unwrap() as f64 / 1e9;
+        assert!((decode_phase_secs - 6.5).abs() < 1e-9);
+
+        // For each slot k, a window received at slot_start + decode_phase
+        // must recover slot_start and the parity matching k.
+        for k in 0..4 {
+            let slot_start_secs = k as f64 * 7.5;
+            let window_received = epoch_at(slot_start_secs + decode_phase_secs);
+            let (recovered_start, parity) = recover_slot(window_received, &t);
+            assert_eq!(
+                recovered_start,
+                epoch_at(slot_start_secs),
+                "FT4 slot {k}: decode_phase recovery must land on the 7.5s boundary"
+            );
+            let expected = if k % 2 == 0 {
+                pancetta_core::slot::SlotParity::Even
+            } else {
+                pancetta_core::slot::SlotParity::Odd
+            };
+            assert_eq!(parity, expected, "FT4 slot {k}: parity mismatch");
+            // Cross-check against the canonical slot-start helper on the
+            // SAME grid (window_received still sits inside slot k).
+            assert_eq!(
+                pancetta_core::slot::current_slot_start_with_period(window_received, t.slot_ns),
+                epoch_at(slot_start_secs),
+                "FT4 slot {k}: current_slot_start_with_period disagrees"
+            );
+        }
+    }
+
+    #[test]
+    fn ft8_timing_seam_byte_identical_to_legacy_grid() {
+        // HARD REGRESSION INVARIANT: FT8 timing composed through the same
+        // seam must reproduce today's 15s grid AND match the FT8 wrapper
+        // helpers (SlotParity::of / current_slot_start, which hardcode
+        // SLOT_NS) exactly. Slot 0 (:00) Even, slot 1 (:15) Odd, etc.
+        let t = derive_dsp_timing(&pancetta_ft8::ProtocolParams::ft8());
+        assert_eq!(t.slot_ns, pancetta_core::slot::SLOT_NS);
+        assert_eq!(t.slot_ns, pancetta_ft8::Protocol::Ft8.slot_ns());
+        assert_eq!(t.decode_phase, chrono::Duration::seconds(13));
+
+        for k in 0..4 {
+            let slot_start_secs = k as f64 * 15.0;
+            let window_received = epoch_at(slot_start_secs + 13.0);
+            let (recovered_start, parity) = recover_slot(window_received, &t);
+            assert_eq!(recovered_start, epoch_at(slot_start_secs));
+            // The period-generic recovery must agree byte-for-byte with the
+            // FT8-hardcoded wrapper used before FT4 wiring landed.
+            let legacy_parity = pancetta_core::slot::SlotParity::of(recovered_start);
+            assert_eq!(
+                parity, legacy_parity,
+                "FT8 slot {k}: parity drift vs legacy"
+            );
+            assert_eq!(
+                pancetta_core::slot::current_slot_start(window_received),
+                epoch_at(slot_start_secs),
+                "FT8 slot {k}: current_slot_start drift"
+            );
+            let expected = if k % 2 == 0 {
+                pancetta_core::slot::SlotParity::Even
+            } else {
+                pancetta_core::slot::SlotParity::Odd
+            };
+            assert_eq!(parity, expected);
+        }
+    }
+
+    #[test]
+    fn ft4_grid_is_twice_as_dense_as_ft8() {
+        // A direct contrast: at the same instant past a boundary, FT8 and
+        // FT4 recover DIFFERENT slot starts because the grids differ. At
+        // :15.0 exactly, FT8 is at the slot-1 boundary (Odd) while FT4 is
+        // at its slot-2 boundary (Even) — proving the 7.5s grid is live,
+        // not a relabeled 15s grid.
+        let ft8 = derive_dsp_timing(&pancetta_ft8::ProtocolParams::ft8());
+        let ft4 = derive_dsp_timing(&pancetta_ft8::ProtocolParams::ft4());
+        // window received exactly decode_phase past the :15.0 boundary on
+        // each grid.
+        let ft8_recv = epoch_at(15.0 + 13.0);
+        let ft4_recv = epoch_at(15.0 + 6.5);
+        let (ft8_start, ft8_par) = recover_slot(ft8_recv, &ft8);
+        let (ft4_start, ft4_par) = recover_slot(ft4_recv, &ft4);
+        assert_eq!(ft8_start, epoch_at(15.0));
+        assert_eq!(ft4_start, epoch_at(15.0));
+        assert_eq!(ft8_par, pancetta_core::slot::SlotParity::Odd);
+        assert_eq!(ft4_par, pancetta_core::slot::SlotParity::Even);
+        assert_ne!(ft8.slot_ns, ft4.slot_ns);
+        assert_eq!(ft8.slot_ns, 2 * ft4.slot_ns);
+    }
+
     #[test]
     fn protocol_from_mode_maps_ft8_and_ft4() {
         assert_eq!(
