@@ -59,6 +59,11 @@ struct RecentManualCompletion {
     resends: u8,
     /// When we last auto-re-sent (one-per-slot guard). `None` = never yet.
     last_resend_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// SECURITY: `true` iff the completed QSO was remote-initiated. The auto-73
+    /// resend is itself a TX, so it must inherit the origin — a remote QSO's
+    /// auto-73 is `TxOrigin::Remote` and armed-TX gated (fail-closed: if the
+    /// arm lapsed after completion, the resend is dropped, never keyed as Local).
+    remote_origin: bool,
 }
 
 /// Shared map of recently-completed manual QSOs. Populated by the QSO-event
@@ -113,6 +118,11 @@ struct PendingManualCall {
     /// Together with [`held_hz`](Self::held_hz), restores the held-offset
     /// context at promotion time. Only meaningful for non-Hound calls.
     hold_mode: bool,
+    /// SECURITY: `true` iff this call was initiated by a REMOTE operator
+    /// (station agent). Carried across the cross-parity deferral so the
+    /// promoted QSO is opened with `remote_origin = true` — its TX stays
+    /// `TxOrigin::Remote` and armed-TX-gated. `false` for every local/TUI call.
+    remote_origin: bool,
 }
 
 impl PendingManualCall {
@@ -447,6 +457,7 @@ async fn promote_pending_manual_calls(
                     p.dx_parity,
                     pancetta_qso::CallInitiation::Manual,
                     partner,
+                    p.remote_origin,
                 )
                 .await
                 .map(|_| ())
@@ -606,6 +617,7 @@ async fn maybe_auto_resend_73(
     // the entry (resends/last_resend_at) here so the bound holds even if RR73
     // arrives every slot. We do NOT call into the QSO manager while holding
     // the lock.
+    let entry_remote_origin;
     {
         let mut map = completions.lock().await;
         // Prune expired entries every time we look.
@@ -635,6 +647,9 @@ async fn maybe_auto_resend_73(
         if dx_parity.is_some() {
             entry.dx_parity = dx_parity;
         }
+        // SECURITY: the auto-73 inherits the completed QSO's origin so a remote
+        // QSO's resend stays `TxOrigin::Remote` and armed-TX gated.
+        entry_remote_origin = entry.remote_origin;
     }
 
     // Don't fight a live QSO with this station: if one is active, skip the
@@ -679,7 +694,8 @@ async fn maybe_auto_resend_73(
             pancetta_core::ResponseStep::SeventyThree,
             None,
             None,
-            None, // auto-73: always Tx=Rx, no partner offset
+            None,                // auto-73: always Tx=Rx, no partner offset
+            entry_remote_origin, // inherit the completed QSO's origin
         )
         .await
     {
@@ -922,7 +938,8 @@ async fn maybe_answer_caller(
             answer.step,
             Some(snr),
             answer.their_report,
-            None, // classify_caller_answer: always Tx=Rx (answering a caller, no held-offset)
+            None,  // classify_caller_answer: always Tx=Rx (answering a caller, no held-offset)
+            false, // local decode-loop auto-answer, never remote
         )
         .await
     {
@@ -1615,6 +1632,7 @@ impl super::ApplicationCoordinator {
                                 message,
                                 frequency,
                                 tx_parity,
+                                remote_origin,
                             }) => {
                                 match pancetta_qso::utils::generate_ft8_message(
                                     &message,
@@ -1647,7 +1665,14 @@ impl super::ApplicationCoordinator {
                                                 frequency_offset: frequency,
                                                 qso_id: Some(qso_id.to_string()),
                                                 tx_parity,
-                                                origin: crate::message_bus::TxOrigin::Local,
+                                                // SECURITY: a remote-initiated QSO's TX MUST be
+                                                // `TxOrigin::Remote` so the armed-TX gate applies;
+                                                // a local QSO stays `Local` (byte-identical).
+                                                origin: if remote_origin {
+                                                    crate::message_bus::TxOrigin::Remote
+                                                } else {
+                                                    crate::message_bus::TxOrigin::Local
+                                                },
                                             },
                                             Instant::now(),
                                         );
@@ -1831,6 +1856,7 @@ impl super::ApplicationCoordinator {
                                             dx_parity: metadata.tx_parity.map(|p| p.opposite()),
                                             resends: 0,
                                             last_resend_at: None,
+                                            remote_origin: metadata.remote_origin,
                                         };
                                         let mut map = completions_for_events.lock().await;
                                         // Prune stale entries while we hold the lock so
@@ -2102,6 +2128,7 @@ impl super::ApplicationCoordinator {
                                             callsign,
                                             frequency,
                                             dx_parity,
+                                            remote_origin,
                                         } => {
                                             // Belt-and-suspenders: refuse to call our own
                                             // station regardless of how the command arrived.
@@ -2171,6 +2198,7 @@ impl super::ApplicationCoordinator {
                                                         fox_grid: None,
                                                         held_hz: queued_held,
                                                         hold_mode: queued_hold_mode,
+                                                        remote_origin,
                                                     });
                                                 }
                                                 let queue_depth = q.len();
@@ -2239,6 +2267,7 @@ impl super::ApplicationCoordinator {
                                                     dx_parity,
                                                     pancetta_qso::CallInitiation::Manual,
                                                     partner,
+                                                    remote_origin,
                                                 )
                                                 .await
                                             {
@@ -2325,8 +2354,11 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 None => {
                                                     // Calling CQ ourselves: `parity` is our TX
-                                                    // parity (not a DX parity).
-                                                    qso_manager.start_cq(frequency, parity).await
+                                                    // parity (not a DX parity). Autonomous CQ is
+                                                    // a LOCAL initiation, never remote.
+                                                    qso_manager
+                                                        .start_cq(frequency, parity, false)
+                                                        .await
                                                 }
                                             };
                                             match result {
@@ -2408,6 +2440,8 @@ impl super::ApplicationCoordinator {
                                                         // ignored on promotion when hound==true.
                                                         held_hz: 0,
                                                         hold_mode: false,
+                                                        // Hound (Shift+H) is a local operator action.
+                                                        remote_origin: false,
                                                     });
                                                 }
                                                 let queue_depth = q.len();
@@ -2485,6 +2519,7 @@ impl super::ApplicationCoordinator {
                                             dx_parity,
                                             step,
                                             snr,
+                                            remote_origin,
                                         } => {
                                             info!(
                                                 "Responding to caller {} on {} Hz at step {:?} \
@@ -2528,6 +2563,7 @@ impl super::ApplicationCoordinator {
                                                     snr,
                                                     None,
                                                     partner,
+                                                    remote_origin,
                                                 )
                                                 .await
                                             {
@@ -2686,9 +2722,14 @@ impl super::ApplicationCoordinator {
                                         crate::message_bus::QsoMessage::StartCq {
                                             frequency,
                                             tx_parity,
+                                            remote_origin,
                                         } => {
                                             match qso_manager
-                                                .start_cq_manual(frequency as f64, tx_parity)
+                                                .start_cq_manual(
+                                                    frequency as f64,
+                                                    tx_parity,
+                                                    remote_origin,
+                                                )
                                                 .await
                                             {
                                                 Ok(qso_id) => {
@@ -2806,7 +2847,7 @@ impl super::ApplicationCoordinator {
                                                 // picks its own slot via the self-parity fallback).
                                                 const FOX_CQ_OFFSET_HZ: f64 = 1500.0;
                                                 match qso_manager
-                                                    .start_cq_manual(FOX_CQ_OFFSET_HZ, None)
+                                                    .start_cq_manual(FOX_CQ_OFFSET_HZ, None, false)
                                                     .await
                                                 {
                                                     Ok(qso_id) => {
@@ -3168,6 +3209,7 @@ mod pending_manual_tests {
             fox_grid: None,
             held_hz: 0,
             hold_mode: false,
+            remote_origin: false,
         }
     }
 
@@ -3237,6 +3279,7 @@ mod pending_manual_tests {
             fox_grid: None,
             held_hz: 0,
             hold_mode: false,
+            remote_origin: false,
         }
     }
 
@@ -3315,6 +3358,7 @@ mod pending_manual_tests {
             fox_grid: None,
             held_hz: 1500,
             hold_mode: true,
+            remote_origin: false,
         };
         let active: Vec<f64> = vec![];
         let (tx_off, partner) =
@@ -3341,6 +3385,7 @@ mod pending_manual_tests {
             fox_grid: None,
             held_hz: 1500,
             hold_mode: true,
+            remote_origin: false,
         };
         // An active QSO is already on 1500 Hz at promotion time.
         let active: Vec<f64> = vec![1500.0];
@@ -3375,6 +3420,7 @@ mod pending_manual_tests {
             fox_grid: None,
             held_hz: 0,
             hold_mode: false,
+            remote_origin: false,
         };
         let active: Vec<f64> = vec![];
         let (tx_off, partner) =
@@ -3619,6 +3665,7 @@ mod snapshot_tests {
                 hound: false,
                 partner_freq: None,
                 hound_qsyed: false,
+                remote_origin: false,
             },
         }
     }
@@ -3805,6 +3852,7 @@ mod auto_73_tests {
                 dx_parity: Some(SlotParity::Even),
                 resends: 0,
                 last_resend_at: None,
+                remote_origin: false,
             },
         );
         Arc::new(Mutex::new(map))
@@ -3914,6 +3962,7 @@ mod auto_73_tests {
                     dx_parity: Some(SlotParity::Even),
                     resends: 0,
                     last_resend_at: None,
+                    remote_origin: false,
                 },
             );
             Arc::new(Mutex::new(m))
@@ -4729,6 +4778,7 @@ mod cqdx_upload_tests {
             hound: false,
             partner_freq: None,
             hound_qsyed: false,
+            remote_origin: false,
         }
     }
 
@@ -4799,6 +4849,7 @@ mod qrz_enrichment_tests {
             hound: false,
             partner_freq: None,
             hound_qsyed: false,
+            remote_origin: false,
         }
     }
 

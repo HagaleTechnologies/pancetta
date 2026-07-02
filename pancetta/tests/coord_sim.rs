@@ -472,6 +472,7 @@ impl CoordSim {
                 message,
                 frequency,
                 tx_parity,
+                remote_origin,
             } => {
                 // The coordinator renders the QsoMessage to FT8 text via
                 // pancetta_qso::utils::generate_ft8_message. We carry the raw
@@ -479,13 +480,22 @@ impl CoordSim {
                 // depend on the rendered text, only on qso_id / freq / policy /
                 // active-set, so a stable label is sufficient and avoids
                 // re-deriving the (private-ish) text rules here.
+                //
+                // SECURITY (B1 mirror): derive the TransmitRequest origin from
+                // the QSO's `remote_origin` exactly as coordinator/qso.rs does,
+                // so a remote QSO's forwarded TX is `Remote` (arm-gated) and a
+                // local QSO's is `Local` (byte-identical).
                 let text = render_message(&message, &self.our_callsign);
                 pending.push(PendingTx {
                     text,
                     frequency_offset: frequency,
                     qso_id: Some(qso_id.to_string()),
                     tx_parity,
-                    origin: pancetta_lib::message_bus::TxOrigin::Local,
+                    origin: if remote_origin {
+                        pancetta_lib::message_bus::TxOrigin::Remote
+                    } else {
+                        pancetta_lib::message_bus::TxOrigin::Local
+                    },
                 });
             }
             _ => {}
@@ -863,6 +873,7 @@ async fn ptt_keys_for_scheduled_qso() {
             Some(SlotParity::Even),
             CallInitiation::Auto,
             None,
+            false,
         )
         .await
         .expect("respond_to_cq_with");
@@ -895,6 +906,7 @@ async fn stale_tx_dropped_after_supersede_no_ptt() {
             Some(SlotParity::Odd),
             CallInitiation::Auto,
             None,
+            false,
         )
         .await
         .expect("respond_to_cq_with");
@@ -936,6 +948,7 @@ async fn coalesce_backlog_newest_wins_stale_not_keyed() {
             Some(SlotParity::Even),
             CallInitiation::Auto,
             None,
+            false,
         )
         .await
         .expect("respond_to_cq_with");
@@ -1009,6 +1022,7 @@ async fn two_simultaneous_qsos_key_on_distinct_freqs() {
             Some(SlotParity::Even),
             CallInitiation::Auto,
             None,
+            false,
         )
         .await
         .expect("qso a");
@@ -1020,6 +1034,7 @@ async fn two_simultaneous_qsos_key_on_distinct_freqs() {
             Some(SlotParity::Even),
             CallInitiation::Auto,
             None,
+            false,
         )
         .await
         .expect("qso b");
@@ -1057,6 +1072,7 @@ async fn tx_policy_disabled_is_silent() {
             Some(SlotParity::Even),
             CallInitiation::Auto,
             None,
+            false,
         )
         .await
         .expect("respond_to_cq_with");
@@ -1100,6 +1116,7 @@ async fn tx_policy_respond_only_keeps_qso_drops_initiation() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("respond_to_caller");
@@ -1145,6 +1162,7 @@ async fn tx_policy_full_keys_everything() {
             Some(SlotParity::Even),
             CallInitiation::Auto,
             None,
+            false,
         )
         .await
         .expect("respond_to_cq_with");
@@ -1187,6 +1205,7 @@ async fn requested_offset_is_used() {
             Some(SlotParity::Odd),
             CallInitiation::Auto,
             None,
+            false,
         )
         .await
         .expect("respond_to_cq_with");
@@ -1599,6 +1618,7 @@ async fn held_offset_honored_keys_at_held_not_dx_freq() {
             Some(SlotParity::Even),
             CallInitiation::Manual,
             partner, // DX's decode freq (700 Hz)
+            false,
         )
         .await
         .expect("respond_to_cq_with with held offset");
@@ -1699,6 +1719,7 @@ async fn multi_tx_deconfliction_offsets_are_distinct() {
             Some(SlotParity::Even),
             CallInitiation::Auto,
             None,
+            false,
         )
         .await
         .expect("qso A");
@@ -1739,6 +1760,7 @@ async fn multi_tx_deconfliction_offsets_are_distinct() {
             Some(SlotParity::Even),
             CallInitiation::Auto,
             None,
+            false,
         )
         .await
         .expect("qso B");
@@ -1828,6 +1850,7 @@ async fn auto_single_no_collision_is_tx_eq_rx() {
             Some(SlotParity::Odd),
             CallInitiation::Auto,
             partner, // None — Tx=Rx, no partner_freq split
+            false,
         )
         .await
         .expect("respond_to_cq_with Tx=Rx");
@@ -1935,6 +1958,7 @@ async fn fox_mode_answers_two_callers_multistreamed_distinct_offsets() {
             Some(-10.0),
             None,
             partner_a,
+            false,
         )
         .await
         .expect("Fox must be able to answer Hound A");
@@ -1972,6 +1996,7 @@ async fn fox_mode_answers_two_callers_multistreamed_distinct_offsets() {
             Some(-12.0),
             None,
             partner_b,
+            false,
         )
         .await
         .expect("Fox must be able to answer Hound B");
@@ -2149,6 +2174,125 @@ async fn policy_disabled_drops_remote_tx_even_with_live_arm() {
             .iter()
             .any(|d| d.reason == DropReason::PolicyDisabled),
         "Disabled policy must drop the remote request first (policy primacy).\n{}",
+        sim.timeline
+    );
+}
+
+// ============================================================================
+// B2 (P3.4c) — end-to-end: a REAL remote-origin QSO's TX is arm-gated.
+//
+// These drive the TX through the actual QSO engine (a `remote_origin=true`
+// QSO's `MessageToSend`), pumped through the faithful `pump_qso_events`
+// origin-derivation mirror, so they prove the whole chain
+//   QsoMetadata.remote_origin → MessageToSend → PendingTx.origin=Remote → arm gate
+// rather than a synthetic `remote_tx()` PendingTx.
+// ============================================================================
+
+/// A remote-origin QSO created but NOT armed: its opening TX is dropped (no PTT).
+#[tokio::test]
+async fn remote_origin_qso_tx_dropped_when_unarmed() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    // Arm is fresh/unarmed. Open a remote-origin QSO through the real engine.
+    sim.manager
+        .respond_to_cq_with(
+            "W1XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Manual,
+            None,
+            true, // remote_origin
+        )
+        .await
+        .expect("respond_to_cq_with");
+
+    let pending = sim.pump_qso_events();
+    // The forwarded frame MUST be Remote (else it would bypass the arm).
+    assert!(
+        pending
+            .iter()
+            .any(|p| p.origin == pancetta_lib::message_bus::TxOrigin::Remote),
+        "a remote_origin QSO's forwarded TX must be TxOrigin::Remote"
+    );
+    sim.drive_slot(pending).await;
+
+    // Unarmed → the whole slot is silent, dropped by the arm gate.
+    sim.timeline.assert_silent();
+    assert!(
+        sim.timeline
+            .dropped
+            .iter()
+            .any(|d| d.reason == DropReason::RemoteNotArmed),
+        "an unarmed remote QSO's TX must be dropped by the arm gate (no bypass).\n{}",
+        sim.timeline
+    );
+}
+
+/// The SAME remote-origin QSO keys PTT once the arm is armed + consented.
+#[tokio::test]
+async fn remote_origin_qso_tx_keys_when_armed() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    sim.arm_remote_tx();
+    sim.manager
+        .respond_to_cq_with(
+            "W1XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Manual,
+            None,
+            true, // remote_origin
+        )
+        .await
+        .expect("respond_to_cq_with");
+
+    let pending = sim.pump_qso_events();
+    sim.drive_slot(pending).await;
+
+    assert!(
+        sim.timeline.keyed_anything(),
+        "an armed remote QSO's TX must key PTT.\n{}",
+        sim.timeline
+    );
+    sim.timeline.assert_all_released();
+}
+
+/// Regression: a LOCAL QSO (remote_origin=false) keys PTT regardless of the
+/// unarmed remote arm — byte-identical to the pre-P3.4c path.
+#[tokio::test]
+async fn local_origin_qso_tx_unaffected_by_arm() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    // Arm stays unarmed; a local QSO must still key.
+    sim.manager
+        .respond_to_cq_with(
+            "W1XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Manual,
+            None,
+            false, // local
+        )
+        .await
+        .expect("respond_to_cq_with");
+
+    let pending = sim.pump_qso_events();
+    assert!(
+        pending
+            .iter()
+            .all(|p| p.origin == pancetta_lib::message_bus::TxOrigin::Local),
+        "a local QSO's forwarded TX must be TxOrigin::Local (regression)"
+    );
+    sim.drive_slot(pending).await;
+
+    assert!(
+        sim.timeline.keyed_anything(),
+        "a local QSO's TX must key PTT even with an unarmed remote arm.\n{}",
+        sim.timeline
+    );
+    assert!(
+        !sim.timeline
+            .dropped
+            .iter()
+            .any(|d| d.reason == DropReason::RemoteNotArmed),
+        "a local QSO must never be dropped by the remote arm gate.\n{}",
         sim.timeline
     );
 }

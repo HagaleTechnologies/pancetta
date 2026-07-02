@@ -134,8 +134,11 @@ enum Dispatch {
 ///   `TxDenied`) and the window is NOT slid (contract `$defs.txHeartbeat`).
 /// - `Disarm` → `arm.disarm()` + audit.
 /// - `Qsy` / `SetSplit` → coordinator `RigControlMessage` (NON-TX rig control).
-/// - `TxRequest(_)` → audited `TxRequested` + logged "not supported in v1";
-///   does NOT key TX (deferred to P3.4c).
+/// - `TxRequest(_)` → audited `TxRequested` + routed into the REAL QSO engine
+///   via a `remote_origin = true` `QsoMessage` (P3.4c). Creating the QSO is
+///   allowed; TRANSMISSION is gated — every TransmitRequest the QSO emits is
+///   `TxOrigin::Remote` and dropped by the armed-TX gate unless armed. This
+///   arm never keys TX directly (no bypass).
 /// - `StopCq` / `TakeControl` / `ReleaseControl` / `Unsupported` → logged no-op
 ///   in v1.
 async fn dispatch_action(
@@ -201,8 +204,17 @@ async fn dispatch_action(
             Dispatch::Continue
         }
         ControlAction::TxRequest(kind) => {
-            // DEFERRED to P3.4c: v1 does not route remote TX-initiation through
-            // the QSO engine. Audit the intent + log; never key TX.
+            // P3.4c: route the remote operator's TX-initiation through the REAL
+            // QSO engine, tagged `remote_origin = true` so every TransmitRequest
+            // the QSO emits is `TxOrigin::Remote` and therefore gated by the
+            // armed-TX gate at pickup + key-time (P2/P3).
+            //
+            // SECURITY: creating the QSO is NOT the gated act — TRANSMISSION is.
+            // We never key TX here. An unarmed remote operator's QSO is created
+            // but every frame it emits is dropped + audited by the TX worker's
+            // arm gate (because it is `TxOrigin::Remote`). There is deliberately
+            // NO code path here that keys TX outside the normal
+            // QSO → MessageToSend → TransmitRequest(Remote) → arm-gate flow.
             let detail = match &kind {
                 TxKind::CallStation { callsign, .. } => format!("callStation {callsign}"),
                 TxKind::AnswerCaller { callsign, step, .. } => {
@@ -218,12 +230,14 @@ async fn dispatch_action(
                     .lock()
                     .ok()
                     .and_then(|s| s.operator_callsign().map(str::to_string)),
-                detail: format!("remote TX-initiation not supported in v1 (P3.4c): {detail}"),
+                detail: detail.clone(),
             });
-            warn!(
+            let qso_msg = tx_kind_to_qso_message(kind);
+            send_qso(bus, qso_msg).await;
+            info!(
                 target: "agent.tx",
                 request = %detail,
-                "remote TX-initiation not supported in v1 (deferred to P3.4c); ignoring"
+                "routed remote TX-initiation to the QSO engine (remote_origin=true, arm-gated)"
             );
             Dispatch::Continue
         }
@@ -320,6 +334,87 @@ async fn send_rig(bus: &MessageBus, msg: RigControlMessage) {
     );
     if let Err(e) = bus.send_message(m).await {
         debug!(target: "agent.control", "rig-control forward failed: {e}");
+    }
+}
+
+/// Forward a QSO-control message to the QSO component. Used to route a remote
+/// operator's TX-initiation into the real QSO engine. The messages carry
+/// `remote_origin = true`, so the QSO's TransmitRequests are `TxOrigin::Remote`
+/// and armed-TX gated downstream (this call itself keys nothing).
+async fn send_qso(bus: &MessageBus, msg: crate::message_bus::QsoMessage) {
+    let m = ComponentMessage::new(
+        ComponentId::StationAgent,
+        ComponentId::Qso,
+        MessageType::QsoMessage(msg),
+        std::time::Instant::now(),
+    );
+    if let Err(e) = bus.send_message(m).await {
+        debug!(target: "agent.control", "qso-control forward failed: {e}");
+    }
+}
+
+/// Parse the rig-api.v1 `dxParity` wire string (`"even"` / `"odd"`) into a
+/// [`SlotParity`]. Any other value (or `None`) → `None` (the QSO scheduler
+/// falls back to its self-parity default), which is the safe, non-colliding
+/// choice when the client did not supply a parity.
+fn parse_dx_parity(s: Option<&str>) -> Option<pancetta_core::slot::SlotParity> {
+    match s {
+        Some("even") => Some(pancetta_core::slot::SlotParity::Even),
+        Some("odd") => Some(pancetta_core::slot::SlotParity::Odd),
+        _ => None,
+    }
+}
+
+/// Parse the rig-api.v1 `step` wire string into a [`ResponseStep`]. Unknown
+/// values default to [`ResponseStep::Grid`] (the historical opening reply),
+/// matching the engine's own default.
+fn parse_response_step(s: &str) -> pancetta_core::ResponseStep {
+    use pancetta_core::ResponseStep;
+    match s {
+        "report" => ResponseStep::Report,
+        "reportAck" => ResponseStep::ReportAck,
+        "rr73" => ResponseStep::Rr73,
+        "seventyThree" => ResponseStep::SeventyThree,
+        _ => ResponseStep::Grid,
+    }
+}
+
+/// Map a decrypted remote [`TxKind`] to the [`QsoMessage`](crate::message_bus::QsoMessage)
+/// that opens the corresponding QSO with `remote_origin = true`. This is the
+/// single point that stamps the remote origin, so the resulting QSO's TX is
+/// `TxOrigin::Remote` end to end.
+fn tx_kind_to_qso_message(kind: TxKind) -> crate::message_bus::QsoMessage {
+    use crate::message_bus::QsoMessage;
+    match kind {
+        TxKind::CallStation {
+            callsign,
+            frequency_hz,
+            dx_parity,
+        } => QsoMessage::StartQso {
+            callsign,
+            frequency: frequency_hz.max(0.0) as u64,
+            dx_parity: parse_dx_parity(dx_parity.as_deref()),
+            remote_origin: true,
+        },
+        TxKind::AnswerCaller {
+            callsign,
+            frequency_hz,
+            step,
+            dx_parity,
+            snr,
+        } => QsoMessage::RespondToCaller {
+            callsign,
+            frequency: frequency_hz.max(0.0) as u64,
+            dx_parity: parse_dx_parity(dx_parity.as_deref()),
+            step: parse_response_step(&step),
+            snr: snr.map(|v| v as f32),
+            remote_origin: true,
+        },
+        TxKind::StartCq { offset_hz } => QsoMessage::StartCq {
+            frequency: offset_hz.max(0.0) as u64,
+            tx_parity: None,
+            remote_origin: true,
+        },
     }
 }
 
@@ -1033,17 +1128,24 @@ mod tests {
         );
     }
 
-    // ── TX-initiation is audited but never keys TX in v1 ────────────────────
+    // ── TX-initiation routes to the QSO engine but NEVER arms (no bypass) ────
+    //
+    // P3.4c: a remote TxRequest is routed into the real QSO engine tagged
+    // `remote_origin = true`, but the dispatch NEVER arms/keys TX directly.
+    // TRANSMISSION is the gated act (the QSO's TransmitRequests are
+    // `TxOrigin::Remote` and dropped by the TX worker's arm gate unless armed).
     #[tokio::test]
-    async fn tx_request_is_deferred_and_never_arms() {
+    async fn tx_request_routes_to_qso_engine_but_never_arms() {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
+        // Subscribe to the QSO component's inbox so we can assert the routed msg.
+        let (_qso_tx, qso_rx) = bus.create_channel(ComponentId::Qso).await.unwrap();
         let d = dispatch_action(
             ControlAction::TxRequest(TxKind::CallStation {
                 callsign: "W1XYZ".into(),
                 frequency_hz: 1500.0,
-                dx_parity: None,
+                dx_parity: Some("odd".into()),
             }),
             &mut ctx,
             &bus,
@@ -1051,10 +1153,72 @@ mod tests {
         )
         .await;
         assert_eq!(d, Dispatch::Continue);
+        // The arm is UNTOUCHED — routing a TxRequest is never an arm/bypass.
         assert!(
             !ctx.arm.lock().unwrap().is_armed(),
-            "a TX-initiation must not arm or key TX in v1"
+            "routing a TX-initiation must not arm or key TX"
         );
+        // A StartQso with remote_origin=true was forwarded to the QSO engine.
+        let msg = qso_rx.try_recv().expect("StartQso must be routed to Qso");
+        match msg.message_type {
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::StartQso {
+                callsign,
+                remote_origin,
+                dx_parity,
+                ..
+            }) => {
+                assert_eq!(callsign, "W1XYZ");
+                assert!(
+                    remote_origin,
+                    "remote TxRequest MUST set remote_origin=true"
+                );
+                assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Odd));
+            }
+            other => panic!("expected StartQso, got {other:?}"),
+        }
+    }
+
+    // ── Each TxKind maps to the right remote-origin QsoMessage ──────────────
+    #[test]
+    fn tx_kind_answer_caller_maps_to_remote_respond() {
+        let msg = tx_kind_to_qso_message(TxKind::AnswerCaller {
+            callsign: "K2DEF".into(),
+            frequency_hz: 1200.0,
+            step: "reportAck".into(),
+            dx_parity: Some("even".into()),
+            snr: Some(-9.0),
+        });
+        match msg {
+            crate::message_bus::QsoMessage::RespondToCaller {
+                callsign,
+                step,
+                remote_origin,
+                dx_parity,
+                ..
+            } => {
+                assert_eq!(callsign, "K2DEF");
+                assert_eq!(step, pancetta_core::ResponseStep::ReportAck);
+                assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Even));
+                assert!(remote_origin, "answerCaller MUST be remote_origin=true");
+            }
+            other => panic!("expected RespondToCaller, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tx_kind_start_cq_maps_to_remote_cq() {
+        let msg = tx_kind_to_qso_message(TxKind::StartCq { offset_hz: 800.0 });
+        match msg {
+            crate::message_bus::QsoMessage::StartCq {
+                frequency,
+                remote_origin,
+                ..
+            } => {
+                assert_eq!(frequency, 800);
+                assert!(remote_origin, "startCq MUST be remote_origin=true");
+            }
+            other => panic!("expected StartCq, got {other:?}"),
+        }
     }
 
     // ========================================================================

@@ -1041,6 +1041,7 @@ mod tests {
                 hound: false,
                 partner_freq: None,
                 hound_qsyed: false,
+                remote_origin: false,
             },
         };
 
@@ -1086,6 +1087,7 @@ mod tests {
                 hound: false,
                 partner_freq: None,
                 hound_qsyed: false,
+                remote_origin: false,
             },
         };
 
