@@ -260,8 +260,28 @@ pub struct StationAgentConfig {
     /// Base URL for the pairing HTTP POSTs (device pairing / capability fetch).
     /// `None` (default) → the agent cannot pair. Required when
     /// [`enabled`](Self::enabled) is `true`.
+    ///
+    /// This **MUST include the API base path** (e.g. `https://host/api/v1`)
+    /// because the pairing client posts *relative* `/pair/*` paths onto it
+    /// (`{pairing_api_url}/pair/agent`, `…/pair/agent/complete`). Omitting the
+    /// `/api/v1` suffix makes the pairing POSTs hit the SPA fallback and get
+    /// HTML back instead of JSON, so pairing fails. The `/api/v1` prefix is
+    /// carried by this base URL — it is deliberately not hardcoded in the
+    /// client.
     #[serde(default)]
     pub pairing_api_url: Option<String>,
+
+    /// Optional CSRF `Origin` header value sent on mutating pairing POSTs
+    /// (e.g. `"https://cqdx.io"`). `None` (default) → **no `Origin` header is
+    /// sent**, which is the correct production posture once cqdx ships the
+    /// Bearer/API-key CSRF exemption.
+    ///
+    /// This is a **staging CSRF workaround**: cqdx's staging web currently
+    /// rejects mutating POSTs that lack an `Origin: https://cqdx.io` header, so
+    /// staging operators set this to `"https://cqdx.io"` until the API-key CSRF
+    /// exemption lands. Discovered during live-staging enrollment.
+    #[serde(default)]
+    pub pairing_origin: Option<String>,
 
     /// Directory holding the agent's identity keys ([`crate`]-adjacent
     /// `AgentIdentity`) and `PairedState`. `None` (default) → the crate default
@@ -1958,6 +1978,38 @@ audit_log_path = "/tmp/agent-audit.jsonl"
         assert!(net.station_agent.pairing_api_url.is_none());
         assert!(net.station_agent.key_dir.is_none());
         assert!(net.station_agent.tx_allow_list.is_empty());
+    }
+
+    #[test]
+    fn test_station_agent_pairing_origin_default_and_roundtrip() {
+        // Production default: no CSRF Origin header.
+        let cfg = StationAgentConfig::default();
+        assert!(cfg.pairing_origin.is_none());
+
+        // Absent from TOML → still None.
+        let toml_str = "[network]\n";
+        let outer: toml::Value = toml::from_str(toml_str).expect("valid toml");
+        let net: NetworkConfig = outer
+            .get("network")
+            .cloned()
+            .unwrap_or(toml::Value::Table(Default::default()))
+            .try_into()
+            .expect("valid NetworkConfig");
+        assert!(net.station_agent.pairing_origin.is_none());
+
+        // A configured staging value round-trips through TOML.
+        let toml_str = "[network.station_agent]\npairing_origin = \"https://cqdx.io\"\n";
+        let outer: toml::Value = toml::from_str(toml_str).expect("valid toml");
+        let net: NetworkConfig = outer
+            .get("network")
+            .cloned()
+            .expect("network table")
+            .try_into()
+            .expect("valid NetworkConfig");
+        assert_eq!(
+            net.station_agent.pairing_origin.as_deref(),
+            Some("https://cqdx.io")
+        );
     }
 
     #[test]
