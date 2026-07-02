@@ -75,6 +75,10 @@ fn default_header() -> Value {
 
 fn default_payload() -> Value {
     // exp is Unix epoch SECONDS per e2e-auth.v1; put it comfortably ahead.
+    // The valid fixture is TX-ENABLED: txEnabledUntil is present and equals exp
+    // (frozen e2e-auth.v1 — an enabled token's exp == txEnabledUntil ≤ 24h), so
+    // it passes both the token-verify enablement checks AND the arm-time
+    // require_tx_enabled gate.
     json!({
         "iss": "cqdx",
         "sub": "acct-1",
@@ -84,8 +88,14 @@ fn default_payload() -> Value {
         "scopes": ["status", "qsy", "tx"],
         "iat": NOW_MS / 1000 - 10,
         "exp": NOW_MS / 1000 + 600,
+        "txEnabledUntil": NOW_MS / 1000 + 600,
         "jti": "cap-jti-1"
     })
+}
+
+/// The empty (inert) best-effort revocation deny-list used by most tests.
+fn no_revocations() -> HashSet<String> {
+    HashSet::new()
 }
 
 fn valid_token() -> String {
@@ -143,7 +153,15 @@ fn full_verify(
 ) -> Result<pancetta_agent::arm::VerifiedArmGrant, CapError> {
     let cap = v.verify_capability_token(token, now_ms)?;
     let mut seen = HashSet::new();
-    v.verify_arm_grant(grant, &cap, client_vk, &allow_list(), now_ms, &mut seen)
+    v.verify_arm_grant(
+        grant,
+        &cap,
+        client_vk,
+        &allow_list(),
+        &no_revocations(),
+        now_ms,
+        &mut seen,
+    )
 }
 
 // ===========================================================================
@@ -338,6 +356,7 @@ fn grant_wrong_client_sig_rejected() {
         &cap,
         &client_key().verifying_key(),
         &allow_list(),
+        &no_revocations(),
         NOW_MS,
         &mut seen,
     );
@@ -357,6 +376,7 @@ fn grant_mutated_field_after_signing_rejected() {
         &cap,
         &client_key().verifying_key(),
         &allow_list(),
+        &no_revocations(),
         NOW_MS,
         &mut seen,
     );
@@ -376,6 +396,7 @@ fn grant_wrong_aud_rejected() {
         &cap,
         &client_key().verifying_key(),
         &allow_list(),
+        &no_revocations(),
         NOW_MS,
         &mut seen,
     );
@@ -398,6 +419,7 @@ fn grant_client_key_id_mismatch_rejected() {
         &cap,
         &client_key().verifying_key(),
         &list,
+        &no_revocations(),
         NOW_MS,
         &mut seen,
     );
@@ -417,6 +439,7 @@ fn grant_armed_until_in_past_rejected() {
         &cap,
         &client_key().verifying_key(),
         &allow_list(),
+        &no_revocations(),
         NOW_MS,
         &mut seen,
     );
@@ -436,6 +459,7 @@ fn grant_armed_until_equal_now_rejected() {
         &cap,
         &client_key().verifying_key(),
         &allow_list(),
+        &no_revocations(),
         NOW_MS,
         &mut seen,
     );
@@ -456,6 +480,7 @@ fn grant_armed_until_ten_years_rejected_as_too_long() {
         &cap,
         &client_key().verifying_key(),
         &allow_list(),
+        &no_revocations(),
         NOW_MS,
         &mut seen,
     );
@@ -478,6 +503,7 @@ fn grant_armed_window_at_max_is_accepted_boundary() {
             &cap,
             &client_key().verifying_key(),
             &allow_list(),
+            &no_revocations(),
             NOW_MS,
             &mut seen,
         )
@@ -494,6 +520,7 @@ fn grant_armed_window_at_max_is_accepted_boundary() {
             &cap,
             &client_key().verifying_key(),
             &allow_list(),
+            &no_revocations(),
             NOW_MS,
             &mut seen2,
         ),
@@ -515,6 +542,7 @@ fn grant_heartbeat_zero_rejected() {
             &cap,
             &client_key().verifying_key(),
             &allow_list(),
+            &no_revocations(),
             NOW_MS,
             &mut seen
         ),
@@ -536,6 +564,7 @@ fn grant_heartbeat_too_large_rejected() {
             &cap,
             &client_key().verifying_key(),
             &allow_list(),
+            &no_revocations(),
             NOW_MS,
             &mut seen
         ),
@@ -559,6 +588,7 @@ fn grant_heartbeat_bounds_are_exact() {
             &cap,
             &client_key().verifying_key(),
             &allow_list(),
+            &no_revocations(),
             NOW_MS,
             &mut seen,
         )
@@ -591,6 +621,7 @@ fn grant_armed_window_600000_boundary_exact() {
             &cap,
             &client_key().verifying_key(),
             &allow_list(),
+            &no_revocations(),
             NOW_MS,
             &mut seen,
         )
@@ -623,6 +654,7 @@ fn grant_client_not_in_allow_list_rejected() {
             &cap,
             &client_key().verifying_key(),
             &other_list,
+            &no_revocations(),
             NOW_MS,
             &mut seen,
         ),
@@ -644,6 +676,7 @@ fn grant_empty_allow_list_rejects_all() {
             &cap,
             &client_key().verifying_key(),
             &empty,
+            &no_revocations(),
             NOW_MS,
             &mut seen,
         ),
@@ -664,6 +697,7 @@ fn grant_client_in_allow_list_passes_gate() {
         &cap,
         &client_key().verifying_key(),
         &allow_list(), // contains CLIENT_KEY_ID
+        &no_revocations(),
         NOW_MS,
         &mut seen,
     );
@@ -688,6 +722,7 @@ fn grant_capability_jti_mismatch_rejected() {
             &cap,
             &client_key().verifying_key(),
             &allow_list(),
+            &no_revocations(),
             NOW_MS,
             &mut seen,
         ),
@@ -712,6 +747,7 @@ fn grant_capability_without_tx_scope_rejected() {
             &cap,
             &client_key().verifying_key(),
             &allow_list(),
+            &no_revocations(),
             NOW_MS,
             &mut seen
         ),
@@ -732,6 +768,7 @@ fn grant_same_jti_twice_second_is_replay() {
         &cap,
         &client_key().verifying_key(),
         &allow_list(),
+        &no_revocations(),
         NOW_MS,
         &mut seen,
     )
@@ -743,6 +780,7 @@ fn grant_same_jti_twice_second_is_replay() {
         &cap,
         &client_key().verifying_key(),
         &allow_list(),
+        &no_revocations(),
         NOW_MS,
         &mut seen,
     );
@@ -761,10 +799,247 @@ fn grant_missing_client_sig_rejected() {
             &cap,
             &client_key().verifying_key(),
             &allow_list(),
+            &no_revocations(),
             NOW_MS,
             &mut seen
         ),
         Err(CapError::MalformedClaim("clientSig".to_string()))
+    );
+}
+
+// ===========================================================================
+// Q-0015: txEnabledUntil (clock-2) + short-TTL backstop + arm-time deny-list
+// ===========================================================================
+
+/// A token WITHOUT `txEnabledUntil` still VERIFIES (for status/qsy) as long as
+/// its short TTL holds — but at ARM time `require_tx_enabled` refuses it. This
+/// is the core clock-2 negative: no enablement ⇒ never arm.
+#[test]
+fn cap_without_tx_enabled_until_verifies_but_never_arms() {
+    let v = default_verifier();
+    let mut payload = default_payload();
+    payload.as_object_mut().unwrap().remove("txEnabledUntil");
+    // Keep it inside the 900s non-enabled short-TTL cap so token-verify passes.
+    payload["iat"] = json!(NOW_MS / 1000 - 10);
+    payload["exp"] = json!(NOW_MS / 1000 + 600);
+    let token = mint_jws(&default_header(), &payload, &idp_key());
+
+    // Base verify SUCCEEDS (status/qsy are unaffected) and records None.
+    let cap = v
+        .verify_capability_token(&token, NOW_MS)
+        .expect("non-enabled token still verifies for status/qsy");
+    assert_eq!(cap.tx_enabled_until, None);
+
+    // But the arm path refuses it (NotTxEnabled).
+    let grant = valid_grant();
+    let mut seen = HashSet::new();
+    assert_eq!(
+        v.verify_arm_grant(
+            &grant,
+            &cap,
+            &client_key().verifying_key(),
+            &allow_list(),
+            &no_revocations(),
+            NOW_MS,
+            &mut seen,
+        ),
+        Err(CapError::NotTxEnabled)
+    );
+}
+
+/// A TX-enabled token whose enablement horizon is already in the past does NOT
+/// arm (require_tx_enabled needs `txEnabledUntil > now`).
+#[test]
+fn cap_tx_enabled_until_in_past_never_arms() {
+    let v = default_verifier();
+    // teu in the past; keep exp == teu (enabled-token invariant) but exp must be
+    // > now for the base Expired check to pass — so we verify the token at a
+    // `now` BEFORE exp, yet with teu already elapsed. Use exp = now+600 and set
+    // teu = exp (both future), then evaluate require_tx_enabled at a LATER now.
+    let cap = v
+        .verify_capability_token(&valid_token(), NOW_MS)
+        .expect("valid enabled token");
+    let teu_secs = cap.tx_enabled_until.expect("enabled");
+    // At a time strictly after the enablement horizon, arming is refused.
+    let after = (teu_secs + 1) * 1000;
+    let grant = {
+        // widen armedUntil so the arm-window bound isn't the one that fires.
+        let mut g = base_grant();
+        g.insert("armedUntil".to_string(), json!(after + 60_000));
+        sign_grant(g, &client_key())
+    };
+    let mut seen = HashSet::new();
+    assert_eq!(
+        v.verify_arm_grant(
+            &grant,
+            &cap,
+            &client_key().verifying_key(),
+            &allow_list(),
+            &no_revocations(),
+            after,
+            &mut seen,
+        ),
+        Err(CapError::NotTxEnabled)
+    );
+}
+
+/// A non-enabled token whose `exp − iat` exceeds 900s is rejected at token
+/// verify (short-TTL backstop). 901s → TtlTooLong.
+#[test]
+fn cap_non_enabled_ttl_over_900s_rejected() {
+    let v = default_verifier();
+    let mut payload = default_payload();
+    payload.as_object_mut().unwrap().remove("txEnabledUntil");
+    payload["iat"] = json!(NOW_MS / 1000);
+    payload["exp"] = json!(NOW_MS / 1000 + 901);
+    let token = mint_jws(&default_header(), &payload, &idp_key());
+    assert_eq!(
+        v.verify_capability_token(&token, NOW_MS),
+        Err(CapError::TtlTooLong)
+    );
+}
+
+/// The short-TTL boundary is exact: exactly 900s is accepted; 901s rejected.
+#[test]
+fn cap_non_enabled_ttl_900s_boundary_exact() {
+    let v = default_verifier();
+    let build = |ttl: i64| {
+        let mut payload = default_payload();
+        payload.as_object_mut().unwrap().remove("txEnabledUntil");
+        payload["iat"] = json!(NOW_MS / 1000);
+        payload["exp"] = json!(NOW_MS / 1000 + ttl);
+        mint_jws(&default_header(), &payload, &idp_key())
+    };
+    assert!(
+        v.verify_capability_token(&build(900), NOW_MS).is_ok(),
+        "exp-iat == 900 accepted"
+    );
+    assert_eq!(
+        v.verify_capability_token(&build(901), NOW_MS),
+        Err(CapError::TtlTooLong)
+    );
+}
+
+/// An enabled token whose `exp` does NOT equal `txEnabledUntil` is rejected
+/// (EnablementMismatch) — even though it is well within the short TTL.
+#[test]
+fn cap_enabled_exp_not_equal_tx_enabled_until_rejected() {
+    let v = default_verifier();
+    let mut payload = default_payload();
+    payload["iat"] = json!(NOW_MS / 1000 - 10);
+    payload["exp"] = json!(NOW_MS / 1000 + 600);
+    payload["txEnabledUntil"] = json!(NOW_MS / 1000 + 601); // != exp
+    let token = mint_jws(&default_header(), &payload, &idp_key());
+    assert_eq!(
+        v.verify_capability_token(&token, NOW_MS),
+        Err(CapError::EnablementMismatch)
+    );
+}
+
+/// An enabled token whose enablement window (`txEnabledUntil − iat`) exceeds
+/// 24h is rejected (EnablementTooLong). 25h → reject.
+#[test]
+fn cap_enabled_window_over_24h_rejected() {
+    let v = default_verifier();
+    let iat = NOW_MS / 1000;
+    let teu = iat + 25 * 3600; // 25 hours
+    let mut payload = default_payload();
+    payload["iat"] = json!(iat);
+    payload["exp"] = json!(teu);
+    payload["txEnabledUntil"] = json!(teu);
+    let token = mint_jws(&default_header(), &payload, &idp_key());
+    assert_eq!(
+        v.verify_capability_token(&token, NOW_MS),
+        Err(CapError::EnablementTooLong)
+    );
+}
+
+/// The 24h enablement boundary is exact: exactly 86_400s accepted; one past
+/// rejected. `now` is set so both tokens are still in-window (exp > now).
+#[test]
+fn cap_enabled_window_24h_boundary_exact() {
+    let v = default_verifier();
+    let iat = NOW_MS / 1000;
+    let now_ms = (iat + 5) * 1000; // just after iat, well before either exp
+    let build = |window: i64| {
+        let teu = iat + window;
+        let mut payload = default_payload();
+        payload["iat"] = json!(iat);
+        payload["exp"] = json!(teu);
+        payload["txEnabledUntil"] = json!(teu);
+        mint_jws(&default_header(), &payload, &idp_key())
+    };
+    assert!(
+        v.verify_capability_token(&build(86_400), now_ms).is_ok(),
+        "window == 86_400 accepted"
+    );
+    assert_eq!(
+        v.verify_capability_token(&build(86_401), now_ms),
+        Err(CapError::EnablementTooLong)
+    );
+}
+
+/// A capability whose `jti` is on the arm-time deny-list is refused (Revoked),
+/// even for an otherwise fully-valid enabled grant.
+#[test]
+fn grant_capability_jti_on_deny_list_rejected() {
+    let v = default_verifier();
+    let cap = valid_cap(&v); // cap.jti == "cap-jti-1"
+    let grant = valid_grant();
+    let mut seen = HashSet::new();
+    let revoked = HashSet::from(["cap-jti-1".to_string()]);
+    assert_eq!(
+        v.verify_arm_grant(
+            &grant,
+            &cap,
+            &client_key().verifying_key(),
+            &allow_list(),
+            &revoked,
+            NOW_MS,
+            &mut seen,
+        ),
+        Err(CapError::Revoked)
+    );
+}
+
+/// An EMPTY deny-list is INERT — it never blocks a valid grant (the
+/// station-local allow-list is the authoritative revoke). A deny-list holding
+/// some OTHER jti is likewise inert for this capability.
+#[test]
+fn grant_empty_or_unrelated_deny_list_is_inert() {
+    let v = default_verifier();
+    let cap = valid_cap(&v);
+    let grant = valid_grant();
+
+    let mut seen = HashSet::new();
+    assert!(
+        v.verify_arm_grant(
+            &grant,
+            &cap,
+            &client_key().verifying_key(),
+            &allow_list(),
+            &HashSet::new(),
+            NOW_MS,
+            &mut seen,
+        )
+        .is_ok(),
+        "empty deny-list must not block"
+    );
+
+    let unrelated = HashSet::from(["some-other-cap-jti".to_string()]);
+    let mut seen2 = HashSet::new();
+    assert!(
+        v.verify_arm_grant(
+            &valid_grant(),
+            &cap,
+            &client_key().verifying_key(),
+            &allow_list(),
+            &unrelated,
+            NOW_MS,
+            &mut seen2,
+        )
+        .is_ok(),
+        "deny-list holding an unrelated jti must not block"
     );
 }
 
@@ -873,6 +1148,7 @@ fn run_flip(flip: Flip) -> Result<pancetta_agent::arm::VerifiedArmGrant, CapErro
         &cap,
         &client_key().verifying_key(),
         &list,
+        &no_revocations(),
         NOW_MS,
         &mut seen,
     )
