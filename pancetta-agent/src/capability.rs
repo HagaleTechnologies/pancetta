@@ -13,7 +13,14 @@
 //!    dispensa e2e-auth.v1 §7). Confirms `aud == our agent keyId`, `exp` in the
 //!    future, and extracts the `scopes` / `clientKeyId` / `jti`.
 //!
-//! 2. [`CapabilityVerifier::verify_arm_grant`] — the txArmGrant is verified
+//! 2. [`CapabilityVerifier::verify_arm_grant`] — the arm path. It FIRST enforces
+//!    the frozen e2e-auth.v1 clock-2 gates: the capability must be **TX-enabled**
+//!    (`txEnabledUntil` present AND `> now`, [`require_tx_enabled`]) — an absent
+//!    or expired enablement horizon NEVER arms ([`CapError::NotTxEnabled`]) even
+//!    with a valid `tx` scope — and its `jti` must NOT be on the arm-time
+//!    **best-effort** revocation deny-list ([`CapError::Revoked`]; an empty
+//!    deny-list is inert, the station-local allow-list is the authoritative
+//!    revoke). Then the txArmGrant is verified
 //!    against the **client device key** (`clientSig`, Ed25519 over the canonical
 //!    grant bytes — station-rooted TX proof; cqdx never signs this, so a cloud
 //!    breach alone can NEVER forge a valid arm, per e2e-auth.v1 §4). It further
@@ -74,6 +81,20 @@ pub const MIN_HEARTBEAT_SEC: i64 = 5;
 /// Maximum accepted `heartbeatIntervalSec` (e2e-auth.v1 normative bound: 15 s).
 pub const MAX_HEARTBEAT_SEC: i64 = 15;
 
+/// Short-TTL backstop for **non-enabled** capabilityTokens (e2e-auth.v1 §6,
+/// `capabilityToken.exp`): a token WITHOUT `txEnabledUntil` is rejected if
+/// `exp − iat` exceeds this many **seconds** (15 min). A TX-enabled token
+/// (`txEnabledUntil` present) is intentionally longer-lived and skips this cap
+/// (see [`MAX_ENABLEMENT_SEC`]); its compensating controls are the arm-time
+/// deny-list check + the station-local TX-allow-list.
+pub const MAX_NON_ENABLED_TTL_SEC: i64 = 900;
+
+/// Maximum enablement horizon for a **TX-enabled** capabilityToken
+/// (e2e-auth.v1 `capabilityToken.txEnabledUntil`, `MAX_ENABLEMENT`): the
+/// enabled token's `exp` MUST equal `txEnabledUntil`, and `txEnabledUntil − iat`
+/// MUST NOT exceed this many **seconds** (24 h).
+pub const MAX_ENABLEMENT_SEC: i64 = 86_400;
+
 /// A verifier holding this agent's own keyId (the expected `aud`) and the set of
 /// PINNED IdP public keys. Constructed once from [`crate::pairing::PairedState`]
 /// after pairing; the pin set is never mutated from live network input.
@@ -100,6 +121,13 @@ pub struct VerifiedCapability {
     /// Expiry in **milliseconds** (normalized from the schema's epoch-seconds
     /// `exp`).
     pub exp_ms: i64,
+    /// The clock-2 TX enablement horizon in **epoch seconds**
+    /// (`capabilityToken.txEnabledUntil`), parsed straight from the token —
+    /// NEVER client-asserted at arm time. `None` ⇒ the token is NOT TX-enabled:
+    /// even with the `tx` scope the station MUST refuse to arm (status/qsy are
+    /// unaffected). `Some(t)` ⇒ arm is honored only if `t > now` (checked at arm
+    /// time via [`require_tx_enabled`]).
+    pub tx_enabled_until: Option<i64>,
 }
 
 /// Every way capability/arm verification can fail. There is intentionally no
@@ -152,6 +180,28 @@ pub enum CapError {
     /// The grant's `jti` was already seen this session (single-use replay).
     #[error("replayed jti")]
     ReplayedJti,
+    /// A **non-enabled** token (`txEnabledUntil` absent) exceeded the short-TTL
+    /// backstop `exp − iat ≤ 900s` (e2e-auth.v1 §6). Rejected at token verify.
+    #[error("token ttl too long for a non-enabled token")]
+    TtlTooLong,
+    /// A **TX-enabled** token's `exp` did not equal its `txEnabledUntil` (the
+    /// two MUST match for an enabled token, e2e-auth.v1 `txEnabledUntil`).
+    #[error("enabled token exp does not equal txEnabledUntil")]
+    EnablementMismatch,
+    /// A **TX-enabled** token's `txEnabledUntil − iat` exceeded
+    /// [`MAX_ENABLEMENT_SEC`] (24 h). Rejected at token verify.
+    #[error("enablement window too long")]
+    EnablementTooLong,
+    /// The clock-2 gate: the capability is NOT TX-enabled (`txEnabledUntil`
+    /// absent, or in the past at arm time) — the station MUST refuse to arm even
+    /// with a valid `tx` scope. Status/qsy paths never hit this.
+    #[error("capability is not tx-enabled")]
+    NotTxEnabled,
+    /// The capability's `jti` is on the arm-time best-effort revocation
+    /// deny-list. An EMPTY deny-list is inert (never blocks) — the
+    /// station-local TX-allow-list is the authoritative revoke.
+    #[error("capability jti is revoked")]
+    Revoked,
 }
 
 /// Decode unpadded (or padded) base64url into bytes. Fails closed to
@@ -192,6 +242,22 @@ fn canonical_grant_bytes(grant: &serde_json::Map<String, Value>) -> Result<Vec<u
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     serde_json::to_vec(&sorted).map_err(|_| CapError::MalformedClaim("grant".to_string()))
+}
+
+/// The clock-2 arm-time gate: a capability may arm TX only if it is TX-enabled
+/// (`txEnabledUntil` present) AND still in-window (`txEnabledUntil > now`). This
+/// is called ONLY from the arm path — status/qsy control never touches it, so an
+/// un-enabled token still works for read/QSY. `now_ms` is Unix epoch
+/// **milliseconds** (compared against the seconds horizon).
+///
+/// Absent enablement ⇒ NEVER arm ([`CapError::NotTxEnabled`]); an expired
+/// enablement horizon is likewise rejected. Fail-closed.
+pub fn require_tx_enabled(capability: &VerifiedCapability, now_ms: i64) -> Result<(), CapError> {
+    let now_s = now_ms.div_euclid(1000);
+    match capability.tx_enabled_until {
+        Some(teu) if teu > now_s => Ok(()),
+        _ => Err(CapError::NotTxEnabled),
+    }
 }
 
 impl CapabilityVerifier {
@@ -271,6 +337,47 @@ impl CapabilityVerifier {
             return Err(CapError::Expired);
         }
 
+        // iat is Unix epoch SECONDS (required for the TTL/enablement backstops).
+        let iat_s = payload
+            .get("iat")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| CapError::MalformedClaim("iat".to_string()))?;
+
+        // Clock-2 TX enablement (`txEnabledUntil`, epoch SECONDS) + the short-TTL
+        // backstop (e2e-auth.v1 §6). NEVER client-asserted at arm time — parsed
+        // straight from the signed token here.
+        //
+        // - ABSENT ⇒ non-enabled token: the 900s short-TTL cap applies
+        //   (`exp − iat ≤ 900`), else `TtlTooLong`.
+        // - PRESENT ⇒ TX-enabled token: it is intentionally longer-lived, so the
+        //   900s cap is waived, but `exp` MUST equal `txEnabledUntil`
+        //   (`EnablementMismatch`) and `txEnabledUntil − iat ≤ 86_400`
+        //   (`EnablementTooLong`).
+        //
+        // The *arm-time* "enabled AND still in-window" gate is separate
+        // (`require_tx_enabled`, called from the arm path) — status/qsy never
+        // check it, so a non-enabled token still verifies here for read/QSY.
+        let tx_enabled_until = match payload.get("txEnabledUntil") {
+            None => {
+                if exp_s.saturating_sub(iat_s) > MAX_NON_ENABLED_TTL_SEC {
+                    return Err(CapError::TtlTooLong);
+                }
+                None
+            }
+            Some(v) => {
+                let teu = v
+                    .as_i64()
+                    .ok_or_else(|| CapError::MalformedClaim("txEnabledUntil".to_string()))?;
+                if exp_s != teu {
+                    return Err(CapError::EnablementMismatch);
+                }
+                if teu.saturating_sub(iat_s) > MAX_ENABLEMENT_SEC {
+                    return Err(CapError::EnablementTooLong);
+                }
+                Some(teu)
+            }
+        };
+
         let scopes = payload
             .get("scopes")
             .and_then(Value::as_array)
@@ -300,6 +407,7 @@ impl CapabilityVerifier {
             client_key_id,
             jti,
             exp_ms: exp_s.saturating_mul(1000),
+            tx_enabled_until,
         })
     }
 
@@ -313,17 +421,42 @@ impl CapabilityVerifier {
     /// station-local set of allowed client keyIds (distinct from the pinned IdP
     /// keys) — the grant is honored ONLY if its `clientKeyId` is present, so a
     /// relay/cloud compromise alone can never cause TX (an **empty** allow-list
-    /// rejects every grant, fail-closed); `seen_jtis` is the session-scoped
-    /// single-use replay set.
+    /// rejects every grant, fail-closed); `revoked_jtis` is the arm-time
+    /// **best-effort** revocation deny-list keyed by the capability's `jti` — an
+    /// **empty** set is INERT (never blocks; the station-local allow-list is the
+    /// authoritative revoke); `seen_jtis` is the session-scoped single-use replay
+    /// set.
+    ///
+    /// Verification order (frozen e2e-auth.v1 `$defs.txArm`): the capability was
+    /// already verified by the caller; here we gate **txEnabledUntil present AND
+    /// > now** → **jti not on the best-effort deny-list** → clientSig → aud →
+    /// allow-list → clientKeyId bind → capabilityJti bind → bounds → tx scope →
+    /// single-use jti → mint.
+    #[allow(clippy::too_many_arguments)]
     pub fn verify_arm_grant(
         &self,
         grant: &Value,
         capability: &VerifiedCapability,
         client_verifying_key: &VerifyingKey,
         tx_allow_list: &HashSet<String>,
+        revoked_jtis: &HashSet<String>,
         now_ms: i64,
         seen_jtis: &mut HashSet<String>,
     ) -> Result<VerifiedArmGrant, CapError> {
+        // 0. Clock-2 TX enablement gate (frozen e2e-auth.v1): the capability must
+        //    be TX-enabled AND still in-window, else NEVER arm. Checked FIRST so
+        //    a non-enabled token can never proceed down the arm path (status/qsy
+        //    control never calls verify_arm_grant, so they are unaffected).
+        require_tx_enabled(capability, now_ms)?;
+
+        // 0a. Arm-time BEST-EFFORT revocation deny-list, keyed by the
+        //     capability's jti. An EMPTY deny-list is inert (does NOT block) —
+        //     the station-local TX-allow-list is the authoritative revoke. A
+        //     jti present here is refused even for an otherwise-valid grant.
+        if revoked_jtis.contains(&capability.jti) {
+            return Err(CapError::Revoked);
+        }
+
         let obj = grant
             .as_object()
             .ok_or_else(|| CapError::MalformedClaim("grant".to_string()))?;
