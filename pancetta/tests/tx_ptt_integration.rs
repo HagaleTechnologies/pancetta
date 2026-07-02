@@ -307,6 +307,7 @@ async fn qso_start_emits_statechanged_before_first_message() {
             Some(pancetta_core::slot::SlotParity::Even),
             CallInitiation::Auto,
             None,
+            false,
         )
         .await
         .expect("respond_to_cq_with");
@@ -369,6 +370,7 @@ async fn qso_start_populates_active_set_before_transmit_request() {
             None,
             None,
             None,
+            false,
         )
         .await
         .expect("respond_to_caller");

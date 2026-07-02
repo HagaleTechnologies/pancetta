@@ -386,7 +386,7 @@ impl QsoSystem {
 
     /// Start a CQ call
     pub async fn start_cq(&self, frequency: f64) -> QsoResult<QsoId> {
-        Ok(self.qso_manager.start_cq(frequency, None).await?)
+        Ok(self.qso_manager.start_cq(frequency, None, false).await?)
     }
 
     /// Respond to a CQ call

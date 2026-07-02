@@ -891,6 +891,8 @@ impl super::ApplicationCoordinator {
                                     callsign,
                                     frequency,
                                     dx_parity,
+                                    // TUI-initiated call is LOCAL (byte-identical to prior).
+                                    remote_origin: false,
                                 }),
                                 Instant::now(),
                             );
@@ -1000,6 +1002,8 @@ impl super::ApplicationCoordinator {
                                         dx_parity,
                                         step,
                                         snr,
+                                        // TUI-initiated answer is LOCAL.
+                                        remote_origin: false,
                                     },
                                 ),
                                 Instant::now(),
@@ -1187,6 +1191,8 @@ impl super::ApplicationCoordinator {
                                 MessageType::QsoMessage(crate::message_bus::QsoMessage::StartCq {
                                     frequency: frequency_offset.round().max(0.0) as u64,
                                     tx_parity: None,
+                                    // TUI `c` key CQ is LOCAL.
+                                    remote_origin: false,
                                 }),
                                 Instant::now(),
                             );

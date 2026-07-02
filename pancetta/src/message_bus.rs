@@ -472,6 +472,11 @@ pub enum QsoMessage {
         callsign: String,
         frequency: u64,
         dx_parity: Option<pancetta_core::slot::SlotParity>,
+        /// SECURITY: `true` iff this call was initiated by a REMOTE operator
+        /// (station agent). The QSO is opened with `remote_origin = true` so
+        /// every TX it emits is `TxOrigin::Remote` and armed-TX gated. `false`
+        /// for every local/TUI `StartQso` (byte-identical to prior behavior).
+        remote_origin: bool,
     },
     /// Respond to a station **calling us**, opening the exchange at an
     /// operator-chosen [`pancetta_core::ResponseStep`] rather than always
@@ -489,6 +494,10 @@ pub enum QsoMessage {
         step: pancetta_core::ResponseStep,
         /// Our measured SNR of the caller, used to derive the report we send.
         snr: Option<f32>,
+        /// SECURITY: `true` iff a REMOTE operator answered this caller. Opens
+        /// the QSO with `remote_origin = true` (all TX `TxOrigin::Remote`,
+        /// armed-TX gated). `false` for local/TUI answers.
+        remote_origin: bool,
     },
     /// Start a **manual** CQ call as a real `CallingCq` QSO (operator `c`).
     ///
@@ -503,6 +512,11 @@ pub enum QsoMessage {
         /// calling CQ). `None` lets the TX scheduler pick via the configured
         /// self-parity fallback.
         tx_parity: Option<pancetta_core::slot::SlotParity>,
+        /// SECURITY: `true` iff a REMOTE operator started this CQ (station
+        /// agent `startCq`). The `CallingCq` QSO is opened with
+        /// `remote_origin = true` (all TX `TxOrigin::Remote`, armed-TX gated).
+        /// `false` for the local/TUI `c` key (byte-identical to prior).
+        remote_origin: bool,
     },
     /// Stop the manual CQ: cancel any active `CallingCq` QSO that has not yet
     /// been answered (operator `s`). A `CallingCq` QSO that already advanced

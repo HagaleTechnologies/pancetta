@@ -423,6 +423,15 @@ pub struct QsoMetadata {
     /// Fox answered us (so the QSY fires exactly once).
     #[serde(default)]
     pub hound_qsyed: bool,
+
+    /// SECURITY: this QSO was initiated by a REMOTE operator (station agent).
+    /// Every `MessageToSend` this QSO emits is forwarded as a
+    /// `TransmitRequest`/`MultiTransmitRequest` tagged `TxOrigin::Remote`, so it
+    /// is gated by the armed-TX gate at pickup + key-time (P2/P3). `false` for
+    /// every Local / TUI / autonomous QSO (byte-identical to pre-existing
+    /// behavior). Defaults to `false`; MUST NEVER default `true`.
+    #[serde(default)]
+    pub remote_origin: bool,
 }
 
 /// Signal reports exchanged

@@ -194,6 +194,7 @@ async fn w5xo_double_space_continues_one_qso_and_stale_tx_does_not_key_ptt() {
             Some(pancetta_core::slot::SlotParity::Even),
             CallInitiation::Manual,
             None,
+            false,
         )
         .await
         .expect("first call");
@@ -221,6 +222,7 @@ async fn w5xo_double_space_continues_one_qso_and_stale_tx_does_not_key_ptt() {
             Some(pancetta_core::slot::SlotParity::Even),
             CallInitiation::Manual,
             None,
+            false,
         )
         .await
         .expect("second call (re-Space)");
@@ -327,6 +329,7 @@ async fn nine_a4aa_qso_start_keys_ptt_and_recall_continues_no_storm() {
             Some(pancetta_core::slot::SlotParity::Odd),
             CallInitiation::Manual,
             None,
+            false,
         )
         .await
         .expect("call 9A4AA");
@@ -400,6 +403,7 @@ async fn nine_a4aa_qso_start_keys_ptt_and_recall_continues_no_storm() {
             Some(pancetta_core::slot::SlotParity::Odd),
             CallInitiation::Manual,
             None,
+            false,
         )
         .await
         .expect("re-call 9A4AA");
