@@ -17,7 +17,9 @@
 //!   operator's local `remote_tx_enabled` consent is ON), a `TxOrigin::Remote`
 //!   transmit request will key PTT at the TX worker's arm gate.
 //! - **Heartbeat / disarm / control-loss** all drive the same `ArmState`:
-//!   a heartbeat slides the dead-man window; an explicit `Disarm`, a peer
+//!   a heartbeat that names the current arm (`arm_jti`) with a monotonic `seq`
+//!   slides the dead-man window (a replayed/wrong-arm one is rejected, window
+//!   unchanged); an explicit `Disarm`, a peer
 //!   `down` presence, a session teardown, or any terminal error **disarms**
 //!   (fail TX-off on control-channel loss, Part-97).
 //! - **Non-TX rig control** (`Qsy`, `SetSplit`) is forwarded onto the existing
@@ -94,6 +96,9 @@ fn apply_arm_effects(audit: &AuditLog, effects: &[ArmEffect]) {
             ArmEffect::Disarmed { reason } => {
                 debug!(target: "agent.tx", reason = ?reason, "remote arm disarmed");
             }
+            ArmEffect::HeartbeatRejected { reason } => {
+                warn!(target: "agent.tx", reason = %reason, "remote heartbeat rejected — window NOT slid");
+            }
         }
     }
 }
@@ -123,9 +128,10 @@ enum Dispatch {
 ///
 /// - `Arm` → verify capability + grant (fail-closed) → `arm.arm()` on success,
 ///   audited `TxDenied` on any verification error (NEVER arms on failure).
-/// - `Heartbeat` → `arm.heartbeat()` (slides the dead-man window).
-///   TODO(P3.4c): enforce `seq` monotonicity + `arm_jti` match (contract
-///   `$defs.txHeartbeat`).
+/// - `Heartbeat` → `arm.heartbeat(arm_jti, seq)`: slides the dead-man window
+///   only for a heartbeat that names the current arm (`arm_jti`) with a
+///   per-arm-monotonic `seq`; a replayed/wrong-arm heartbeat is rejected (audited
+///   `TxDenied`) and the window is NOT slid (contract `$defs.txHeartbeat`).
 /// - `Disarm` → `arm.disarm()` + audit.
 /// - `Qsy` / `SetSplit` → coordinator `RigControlMessage` (NON-TX rig control).
 /// - `TxRequest(_)` → audited `TxRequested` + logged "not supported in v1";
@@ -156,12 +162,15 @@ async fn dispatch_action(
             Dispatch::Continue
         }
         ControlAction::Heartbeat { arm_jti, seq } => {
-            // TODO(P3.4c): reject seq <= last-accepted for this arm_jti + require
-            // arm_jti == the current armed grant's jti (contract $defs.txHeartbeat).
-            let _ = (arm_jti, seq);
-            if let Ok(mut st) = ctx.arm.lock() {
-                st.heartbeat(now);
-            }
+            // Bind the heartbeat to the armed grant it names (arm_jti) and enforce
+            // per-arm `seq` monotonicity (contract $defs.txHeartbeat): a replayed
+            // or wrong-arm heartbeat is rejected and does NOT slide the dead-man
+            // window, so a captured heartbeat can never hold an arm open.
+            let effects = match ctx.arm.lock() {
+                Ok(mut st) => st.heartbeat(&arm_jti, seq, now),
+                Err(_) => Vec::new(),
+            };
+            apply_arm_effects(&ctx.audit, &effects);
             Dispatch::Continue
         }
         ControlAction::Disarm => {
@@ -829,6 +838,107 @@ mod tests {
                 .tx_permitted(NOW + 20_000 + HEARTBEAT_TIMEOUT_MS - 1),
             "a heartbeat must slide the dead-man window"
         );
+    }
+
+    // ── A stale-seq Heartbeat does NOT extend the arm (replay can't hold open) ─
+    #[tokio::test]
+    async fn stale_seq_heartbeat_does_not_extend_the_arm() {
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        // Arm at NOW; the grant's jti is "arm-jti-1" (signed_grant uses it).
+        dispatch_action(
+            ControlAction::Arm {
+                grant: signed_grant("arm-jti-1"),
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
+
+        // Accept seq 5 at NOW+5000 (slides the window to there).
+        let accepted_at = NOW + 5_000;
+        dispatch_action(
+            ControlAction::Heartbeat {
+                arm_jti: "arm-jti-1".into(),
+                seq: 5,
+            },
+            &mut ctx,
+            &bus,
+            accepted_at,
+        )
+        .await;
+        let deadline = accepted_at + HEARTBEAT_TIMEOUT_MS;
+
+        // Replay seq 5 (and a lower seq) LATER — must NOT slide the window.
+        dispatch_action(
+            ControlAction::Heartbeat {
+                arm_jti: "arm-jti-1".into(),
+                seq: 5,
+            },
+            &mut ctx,
+            &bus,
+            deadline - 1,
+        )
+        .await;
+        dispatch_action(
+            ControlAction::Heartbeat {
+                arm_jti: "arm-jti-1".into(),
+                seq: 3,
+            },
+            &mut ctx,
+            &bus,
+            deadline - 1,
+        )
+        .await;
+
+        // Dead-man expires on schedule despite the later replays.
+        assert!(ctx.arm.lock().unwrap().tx_permitted(deadline - 1));
+        assert!(
+            !ctx.arm.lock().unwrap().tx_permitted(deadline),
+            "a replayed-seq heartbeat must NOT hold the arm open past the dead-man deadline"
+        );
+    }
+
+    // ── A wrong-arm_jti Heartbeat is rejected and never extends the arm ──────
+    #[tokio::test]
+    async fn wrong_arm_jti_heartbeat_is_rejected() {
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        dispatch_action(
+            ControlAction::Arm {
+                grant: signed_grant("arm-jti-1"),
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        // A heartbeat naming a different arm must not slide the window.
+        dispatch_action(
+            ControlAction::Heartbeat {
+                arm_jti: "some-other-arm".into(),
+                seq: 1,
+            },
+            &mut ctx,
+            &bus,
+            NOW + 10_000,
+        )
+        .await;
+        // Original dead-man deadline (from the arm at NOW) still governs.
+        assert!(ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(NOW + HEARTBEAT_TIMEOUT_MS - 1));
+        assert!(!ctx
+            .arm
+            .lock()
+            .unwrap()
+            .tx_permitted(NOW + HEARTBEAT_TIMEOUT_MS));
     }
 
     // ── Case 5: consent OFF → even a valid Arm never permits TX ─────────────

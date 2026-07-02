@@ -404,11 +404,12 @@ impl CoordSim {
                 operator_callsign: "K5ARH".to_string(),
                 ttl_ms: 120_000,
                 scope_tx: true,
+                jti: "sim-arm-jti".to_string(),
             },
             now_ms,
         );
         st.set_local_consent(true, now_ms);
-        st.heartbeat(now_ms);
+        st.heartbeat("sim-arm-jti", 1, now_ms);
     }
 
     /// Drain all currently-buffered `QsoEvent`s and apply the coordinator's
