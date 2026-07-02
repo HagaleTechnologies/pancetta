@@ -83,8 +83,11 @@ enum Phase {
 pub struct AgentSession<'a, W: WsConn> {
     ws: W,
     identity: &'a AgentIdentity,
-    /// The client peer's keyId, learned from the capabilityToken during pairing
-    /// (config-supplied here). Used as `env.dst` and to validate `env.src`.
+    /// The client peer's keyId. Used as `env.dst` and to validate `env.src`.
+    /// May be supplied at construction (an operator-pinned expected peer) OR
+    /// **empty**, in which case the agent learns it from the DO-authenticated
+    /// `src` of the first inbound `env` (the responder cannot know the client
+    /// until it connects). Once set (either way) it is enforced on later frames.
     client_key_id: String,
     phase: Option<Phase>,
     /// The responder handshake, consumed on msg1 → transport transition.
@@ -193,15 +196,30 @@ impl<'a, W: WsConn> AgentSession<'a, W> {
     }
 
     /// Process an inbound `env`: msg1 → transport bootstrap, or a transport
-    /// ciphertext → decrypted plaintext. Applies the `src` guard.
+    /// ciphertext → decrypted plaintext. Learns the peer keyId from the first
+    /// `env.src` (the agent is the responder and cannot know the client's keyId
+    /// at construction), then applies the `src` guard on every later frame.
     fn process_env(
         &mut self,
         payload_b64: &str,
         src: Option<&str>,
     ) -> Result<Option<Vec<u8>>, SessionError> {
-        // src guard: if the DO stamped a src and it isn't our peer, drop it.
+        // Peer learning: the agent (Noise responder) does not know the client's
+        // keyId until it connects. The DO authenticates the client on admission
+        // and stamps the authenticated `src` on every forwarded `env`, so the
+        // first `src` is a trustworthy peer identity. Latch it if we don't yet
+        // have one; thereafter it also becomes our `env.dst` (msg2/replies).
+        // NOTE (security): learning the peer does NOT authorize TX — arming is
+        // gated separately by the station-local TX-allow-list in `capability`.
+        if self.client_key_id.is_empty() {
+            if let Some(src) = src {
+                self.client_key_id = src.to_string();
+            }
+        }
+        // src guard: once we know our peer, drop any `env` the DO stamped with a
+        // different src (cross-peer / spoofed routing).
         if let Some(src) = src {
-            if src != self.client_key_id {
+            if !self.client_key_id.is_empty() && src != self.client_key_id {
                 return Ok(None);
             }
         }
@@ -545,6 +563,74 @@ mod tests {
         assert!(
             !sess.is_transport_established(),
             "impostor env must not bootstrap the Noise handshake"
+        );
+    }
+
+    #[test]
+    fn agent_learns_peer_keyid_from_first_env_src() {
+        // Constructed WITHOUT a pinned peer (empty client_key_id): the agent
+        // must LEARN the peer from the DO-authenticated `src` of the first env
+        // (Noise msg1), not drop it. Then it enforces that peer on later frames.
+        let identity = AgentIdentity::generate();
+        let agent_static_pub = identity.agreement_public_raw();
+        let client_kp = {
+            let params: snow::params::NoiseParams =
+                "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+            snow::Builder::new(params).generate_keypair().unwrap()
+        };
+        let mut initiator = TestInitiator::new(&client_kp.private, &agent_static_pub);
+        let msg1 = initiator.write_msg1(b"");
+
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[7u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let ready = RelayFrame::Ready {
+            key_id: identity.key_id(),
+            peer_present: true,
+        }
+        .to_json()
+        .unwrap();
+        let peer = "LEARNED-PEER-KEYID".to_string();
+        let env_msg1 = RelayFrame::Env {
+            dst: identity.key_id(),
+            payload: b64url(&msg1),
+            src: Some(peer.clone()),
+        }
+        .to_json()
+        .unwrap();
+
+        let ws = MockWs::new(vec![hello, ready, env_msg1]);
+        // EMPTY client_key_id — the agent must learn it from the first env.
+        let mut sess = AgentSession::new(ws, &identity, String::new());
+        sess.authenticate().unwrap();
+        sess.process_next().unwrap(); // ready
+        sess.process_next().unwrap(); // env(msg1): learn peer + bootstrap Noise
+        assert!(
+            sess.is_transport_established(),
+            "first env with a DO-stamped src must be learned, not dropped"
+        );
+        // msg2 is addressed to the learned peer.
+        match parse_frame(&sess.ws.outbound[1]).unwrap() {
+            RelayFrame::Env { dst, .. } => {
+                assert_eq!(dst, peer, "agent addresses the learned peer as env.dst");
+            }
+            _ => panic!("expected env msg2"),
+        }
+        // After learning, an env from a DIFFERENT src is dropped (peer enforced).
+        let bad = RelayFrame::Env {
+            dst: identity.key_id(),
+            payload: b64url(b"x"),
+            src: Some("OTHER-SRC".to_string()),
+        }
+        .to_json()
+        .unwrap();
+        sess.ws.push_inbound(bad);
+        assert_eq!(
+            sess.process_next().unwrap(),
+            None,
+            "once the peer is learned, a different src is dropped"
         );
     }
 
