@@ -228,6 +228,13 @@ impl ArmState {
         self.session.as_ref().map(|s| s.operator_callsign.as_str())
     }
 
+    /// The `jti` of the currently-armed grant, if armed. Used by the station
+    /// agent to sanity-match a `txDisarm.armJti` against the live arm (a
+    /// mismatch still disarms — disarm-any is fail-safe — but is logged).
+    pub fn current_arm_jti(&self) -> Option<&str> {
+        self.session.as_ref().map(|s| s.current_jti.as_str())
+    }
+
     // --- events ------------------------------------------------------------
 
     /// Arm from a verified grant. Records `armed_at = now`, the TTL, operator,
