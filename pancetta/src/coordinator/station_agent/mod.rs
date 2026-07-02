@@ -81,6 +81,15 @@ struct ArmContext {
     /// grant's `clientSig` is checked against the key matching its `clientKeyId`.
     client_keys: std::collections::HashMap<String, VerifyingKey>,
     tx_allow_list: HashSet<String>,
+    /// Arm-time **best-effort** revocation deny-list, keyed by the
+    /// capabilityToken's `jti` (frozen e2e-auth.v1 §6-revocation). **EMPTY in
+    /// v1** — the station-local TX-allow-list is the authoritative revoke, and
+    /// an empty deny-list is inert (never blocks). SEAM: a future cqdx-fed
+    /// deny-list (fetched/pushed over the station's cqdx link) would populate
+    /// this set so a leaked long-lived enabled token can be fast-revoked; it
+    /// fails OPEN (stays empty) when the station is offline, per the contract's
+    /// "best-effort" posture.
+    revoked_jtis: HashSet<String>,
     seen_jtis: HashSet<String>,
     audit: AuditLog,
 }
@@ -126,13 +135,21 @@ enum Dispatch {
 /// mutation, audit writes, and best-effort bus sends. This is the security spine
 /// of the component and is unit-tested directly.
 ///
-/// - `Arm` → verify capability + grant (fail-closed) → `arm.arm()` on success,
-///   audited `TxDenied` on any verification error (NEVER arms on failure).
+/// - `Arm { capability_token, grant }` → verify the capabilityToken as a
+///   SEPARATE input (against the pinned IdP key) then verify the client-signed
+///   grant (fail-closed, including the `txEnabledUntil` clock-2 gate + the
+///   best-effort deny-list) → `arm.arm()` on success, audited `TxDenied` on any
+///   verification error (NEVER arms on failure). The token is NOT extracted from
+///   the grant — `clientSig` signs only the grant, which references the token
+///   via `capabilityJti`.
 /// - `Heartbeat` → `arm.heartbeat(arm_jti, seq)`: slides the dead-man window
 ///   only for a heartbeat that names the current arm (`arm_jti`) with a
 ///   per-arm-monotonic `seq`; a replayed/wrong-arm heartbeat is rejected (audited
 ///   `TxDenied`) and the window is NOT slid (contract `$defs.txHeartbeat`).
-/// - `Disarm` → `arm.disarm()` + audit.
+/// - `Disarm { arm_jti }` → `arm.disarm()` + audit (fail-safe TX-OFF). The
+///   `arm_jti` is a sanity match, NOT a security gate: disarm-any always
+///   proceeds; a non-empty arm_jti that doesn't match the live arm still
+///   disarms but logs a `warn!`.
 /// - `Qsy` / `SetSplit` → coordinator `RigControlMessage` (NON-TX rig control).
 /// - `TxRequest(_)` → audited `TxRequested` + routed into the REAL QSO engine
 ///   via a `remote_origin = true` `QsoMessage` (P3.4c). Creating the QSO is
@@ -148,8 +165,11 @@ async fn dispatch_action(
     now: i64,
 ) -> Dispatch {
     match action {
-        ControlAction::Arm { grant } => {
-            match verify_and_arm(&grant, ctx, now) {
+        ControlAction::Arm {
+            capability_token,
+            grant,
+        } => {
+            match verify_and_arm(&capability_token, &grant, ctx, now) {
                 Ok(()) => {}
                 Err(reason) => {
                     // Fail-closed: audit the denial, do NOT arm.
@@ -176,7 +196,26 @@ async fn dispatch_action(
             apply_arm_effects(&ctx.audit, &effects);
             Dispatch::Continue
         }
-        ControlAction::Disarm => {
+        ControlAction::Disarm { arm_jti } => {
+            // Disarm is fail-safe TX-OFF: it ALWAYS proceeds. The frozen
+            // e2e-auth.v1 $defs.txDisarm.armJti is a sanity match, not a gate —
+            // a non-empty arm_jti that doesn't name the live arm still disarms,
+            // but we warn so a mismatch is visible in the audit trail.
+            if !arm_jti.is_empty() {
+                let matches_live = ctx
+                    .arm
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.current_arm_jti().map(|j| j == arm_jti))
+                    .unwrap_or(false);
+                if !matches_live {
+                    warn!(
+                        target: "agent.tx",
+                        arm_jti = %arm_jti,
+                        "txDisarm armJti mismatch (disarming anyway — fail-safe)"
+                    );
+                }
+            }
             let effects = match ctx.arm.lock() {
                 Ok(mut st) => st.disarm(now),
                 Err(_) => Vec::new(),
@@ -262,19 +301,28 @@ fn action_name(a: &ControlAction) -> &'static str {
     }
 }
 
-/// Verify a raw `txArmGrant` (client-signed) and arm the shared `ArmState`.
+/// Verify the SIBLING `capabilityToken` + client-signed `txArmGrant` and arm the
+/// shared `ArmState`.
 ///
 /// Fail-closed: any verification error returns `Err(reason)` and the caller
 /// audits a `TxDenied` without arming. On success, `ArmState::arm` is called
 /// (which itself audits `Armed`, or refuses + audits a no-tx-scope grant).
 ///
-/// The grant must carry a `clientKeyId` present in the station-local
-/// TX-allow-list AND for which we hold a device verifying key; its `clientSig`
-/// is verified against that key. The capability half is verified from the grant
-/// via the pinned IdP keys — v1 expects the client to send the capabilityToken
-/// **inside** the grant object under `capabilityToken` (e2e-auth.v1 §4). If it
-/// is absent we fail closed.
-fn verify_and_arm(grant: &serde_json::Value, ctx: &mut ArmContext, now: i64) -> Result<(), String> {
+/// Per the frozen e2e-auth.v1 `$defs.txArm`, `capability_token` is a **separate
+/// input** from `grant` — the token is NEVER read from inside the grant (the
+/// grant's `clientSig` covers only the grant fields and references the token via
+/// `capabilityJti`). The token is verified against the pinned IdP keys FIRST;
+/// then `verify_arm_grant` enforces the `txEnabledUntil` clock-2 gate, the
+/// arm-time best-effort deny-list (`ctx.revoked_jtis`, empty/inert in v1), the
+/// `clientSig`, the station-local TX-allow-list, and the window/heartbeat/scope
+/// bounds. The grant must carry a `clientKeyId` present in the allow-list AND for
+/// which we hold a device verifying key.
+fn verify_and_arm(
+    capability_token: &str,
+    grant: &serde_json::Value,
+    ctx: &mut ArmContext,
+    now: i64,
+) -> Result<(), String> {
     let obj = grant.as_object().ok_or("grant is not a JSON object")?;
 
     // The client keyId this grant claims — used to pick the device key AND
@@ -293,14 +341,12 @@ fn verify_and_arm(grant: &serde_json::Value, ctx: &mut ArmContext, now: i64) -> 
         .get(client_key_id)
         .ok_or_else(|| format!("no device key for client {client_key_id}"))?;
 
-    // The capabilityToken (compact JWS) rides inside the grant in v1.
-    let token = obj
-        .get("capabilityToken")
-        .and_then(|v| v.as_str())
-        .ok_or("grant missing capabilityToken")?;
+    // Verify the capabilityToken as a SEPARATE input (frozen e2e-auth.v1
+    // $defs.txArm: token + grant are siblings; the token is NOT trusted from
+    // inside the grant). This also runs the short-TTL / enablement backstops.
     let cap = ctx
         .verifier
-        .verify_capability_token(token, now)
+        .verify_capability_token(capability_token, now)
         .map_err(|e| format!("capability: {e}"))?;
 
     let verified = ctx
@@ -310,6 +356,7 @@ fn verify_and_arm(grant: &serde_json::Value, ctx: &mut ArmContext, now: i64) -> 
             &cap,
             &client_vk,
             &ctx.tx_allow_list,
+            &ctx.revoked_jtis,
             now,
             &mut ctx.seen_jtis,
         )
@@ -638,6 +685,10 @@ async fn run_session_loop(cfg: RunConfig) {
         verifier: cfg.verifier,
         client_keys: cfg.client_keys,
         tx_allow_list: cfg.tx_allow_list,
+        // v1: no cqdx-fed deny-list yet (empty ⇒ inert; the station-local
+        // TX-allow-list is the authoritative revoke). Future seam: populate
+        // this from a cqdx revocation feed on (re)connect.
+        revoked_jtis: HashSet::new(),
         seen_jtis: HashSet::new(),
         audit: cfg.audit,
     };
@@ -780,6 +831,23 @@ mod tests {
     }
 
     fn valid_token() -> String {
+        // TX-enabled: txEnabledUntil present and == exp (frozen e2e-auth.v1), so
+        // the arm-time require_tx_enabled gate passes.
+        let header = json!({ "alg": "EdDSA", "kid": IDP_KID, "typ": "JWT" });
+        let payload = json!({
+            "iss": "cqdx", "sub": "acct-1", "operatorCallsign": OPERATOR,
+            "aud": AGENT_KEY_ID, "clientKeyId": CLIENT_KEY_ID,
+            "scopes": ["status", "qsy", "tx"],
+            "iat": NOW / 1000 - 10, "exp": NOW / 1000 + 600,
+            "txEnabledUntil": NOW / 1000 + 600, "jti": "cap-jti-1"
+        });
+        mint_jws(&header, &payload, &idp_key())
+    }
+
+    /// A capabilityToken with NO `txEnabledUntil` — verifies for status/qsy but
+    /// must NEVER arm (require_tx_enabled → NotTxEnabled). Kept inside the 900s
+    /// short-TTL cap so token verification itself succeeds.
+    fn non_enabled_token() -> String {
         let header = json!({ "alg": "EdDSA", "kid": IDP_KID, "typ": "JWT" });
         let payload = json!({
             "iss": "cqdx", "sub": "acct-1", "operatorCallsign": OPERATOR,
@@ -799,16 +867,15 @@ mod tests {
         serde_json::to_vec(&sorted).unwrap()
     }
 
-    /// Build a valid, client-signed grant carrying the capabilityToken inside it
-    /// (v1 convention), with a unique jti so replay tests can vary it.
+    /// Build a valid, client-signed `txArmGrant` (frozen e2e-auth.v1: the token
+    /// is a SIBLING carried separately, NOT inside the grant), with a unique jti
+    /// so replay tests can vary it.
     fn signed_grant(jti: &str) -> Value {
         let mut grant = json!({
-            "type": "txArmGrant",
             "aud": AGENT_KEY_ID,
             "clientKeyId": CLIENT_KEY_ID,
             "sessionId": "sess-1",
             "capabilityJti": "cap-jti-1",
-            "capabilityToken": valid_token(),
             "operatorCallsign": OPERATOR,
             "armedAt": NOW,
             "armedUntil": NOW + 300_000,
@@ -822,6 +889,15 @@ mod tests {
         let sig = client_key().sign(&canon);
         grant.insert("clientSig".to_string(), json!(b64url(&sig.to_bytes())));
         Value::Object(grant)
+    }
+
+    /// A convenience: the standard `ControlAction::Arm` (token sibling + grant)
+    /// used by most dispatch tests.
+    fn arm_action(jti: &str) -> ControlAction {
+        ControlAction::Arm {
+            capability_token: valid_token(),
+            grant: signed_grant(jti),
+        }
     }
 
     fn ctx_with(allow_client: bool, have_device_key: bool) -> ArmContext {
@@ -844,6 +920,7 @@ mod tests {
             },
             client_keys,
             tx_allow_list: allow,
+            revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
         }
@@ -866,15 +943,7 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        let d = dispatch_action(
-            ControlAction::Arm {
-                grant: signed_grant("arm-jti-1"),
-            },
-            &mut ctx,
-            &bus,
-            NOW,
-        )
-        .await;
+        let d = dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
         assert_eq!(d, Dispatch::Continue);
         assert!(
             ctx.arm.lock().unwrap().tx_permitted(NOW),
@@ -888,15 +957,7 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(
-            ControlAction::Arm {
-                grant: signed_grant("arm-jti-1"),
-            },
-            &mut ctx,
-            &bus,
-            NOW,
-        )
-        .await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
         assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
         // No further heartbeats: at the dead-man deadline, tx_permitted is false.
         let dead = NOW + HEARTBEAT_TIMEOUT_MS;
@@ -907,15 +968,7 @@ mod tests {
         // A heartbeat *before* the deadline slides the window.
         let mut ctx2 = ctx_with(true, true);
         with_consent(&ctx2, true);
-        dispatch_action(
-            ControlAction::Arm {
-                grant: signed_grant("arm-jti-1"),
-            },
-            &mut ctx2,
-            &bus,
-            NOW,
-        )
-        .await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx2, &bus, NOW).await;
         dispatch_action(
             ControlAction::Heartbeat {
                 arm_jti: "arm-jti-1".into(),
@@ -942,15 +995,7 @@ mod tests {
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
         // Arm at NOW; the grant's jti is "arm-jti-1" (signed_grant uses it).
-        dispatch_action(
-            ControlAction::Arm {
-                grant: signed_grant("arm-jti-1"),
-            },
-            &mut ctx,
-            &bus,
-            NOW,
-        )
-        .await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
         assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
 
         // Accept seq 5 at NOW+5000 (slides the window to there).
@@ -1003,15 +1048,7 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(
-            ControlAction::Arm {
-                grant: signed_grant("arm-jti-1"),
-            },
-            &mut ctx,
-            &bus,
-            NOW,
-        )
-        .await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
         // A heartbeat naming a different arm must not slide the window.
         dispatch_action(
             ControlAction::Heartbeat {
@@ -1042,15 +1079,7 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         // remote_tx_enabled is OFF (default): do NOT set consent on.
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(
-            ControlAction::Arm {
-                grant: signed_grant("arm-jti-1"),
-            },
-            &mut ctx,
-            &bus,
-            NOW,
-        )
-        .await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
         assert!(
             !ctx.arm.lock().unwrap().tx_permitted(NOW),
             "consent OFF must deny TX even after a valid arm"
@@ -1064,15 +1093,7 @@ mod tests {
         let mut ctx = ctx_with(false, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(
-            ControlAction::Arm {
-                grant: signed_grant("arm-jti-1"),
-            },
-            &mut ctx,
-            &bus,
-            NOW,
-        )
-        .await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
         assert!(
             !ctx.arm.lock().unwrap().is_armed(),
             "a grant from a non-allow-listed client must NOT arm"
@@ -1086,17 +1107,17 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
+        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
         dispatch_action(
-            ControlAction::Arm {
-                grant: signed_grant("arm-jti-1"),
+            ControlAction::Disarm {
+                arm_jti: "arm-jti-1".into(),
             },
             &mut ctx,
             &bus,
             NOW,
         )
         .await;
-        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
-        dispatch_action(ControlAction::Disarm, &mut ctx, &bus, NOW).await;
         assert!(
             !ctx.arm.lock().unwrap().is_armed(),
             "explicit disarm must clear the arm"
@@ -1112,6 +1133,7 @@ mod tests {
         let grant = signed_grant("arm-jti-1");
         dispatch_action(
             ControlAction::Arm {
+                capability_token: valid_token(),
                 grant: grant.clone(),
             },
             &mut ctx,
@@ -1120,11 +1142,102 @@ mod tests {
         )
         .await;
         // Disarm, then replay the SAME grant jti — must not re-arm.
-        dispatch_action(ControlAction::Disarm, &mut ctx, &bus, NOW).await;
-        dispatch_action(ControlAction::Arm { grant }, &mut ctx, &bus, NOW).await;
+        dispatch_action(
+            ControlAction::Disarm {
+                arm_jti: String::new(),
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        dispatch_action(
+            ControlAction::Arm {
+                capability_token: valid_token(),
+                grant,
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
         assert!(
             !ctx.arm.lock().unwrap().is_armed(),
             "a replayed grant jti must be rejected (single-use)"
+        );
+    }
+
+    // ── A token WITHOUT txEnabledUntil does NOT arm (clock-2 gate) ───────────
+    #[tokio::test]
+    async fn arm_with_non_enabled_token_never_arms() {
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        // A well-signed, allow-listed, correctly-bound grant — but the sibling
+        // capabilityToken carries NO txEnabledUntil, so require_tx_enabled fails.
+        dispatch_action(
+            ControlAction::Arm {
+                capability_token: non_enabled_token(),
+                grant: signed_grant("arm-jti-1"),
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "a token without txEnabledUntil must NEVER arm (clock-2 gate)"
+        );
+        assert!(!ctx.arm.lock().unwrap().tx_permitted(NOW));
+    }
+
+    // ── txDisarm{armJti} disarms a live arm (armJti is a sanity match) ──────
+    #[tokio::test]
+    async fn tx_disarm_with_arm_jti_disarms() {
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
+        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
+        // A txDisarm naming the live arm disarms it.
+        dispatch_action(
+            ControlAction::Disarm {
+                arm_jti: "arm-jti-1".into(),
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "txDisarm{{armJti}} must disarm the live arm"
+        );
+    }
+
+    // ── txDisarm with a MISMATCHED armJti still disarms (fail-safe) ──────────
+    #[tokio::test]
+    async fn tx_disarm_mismatched_arm_jti_still_disarms() {
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
+        assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
+        // A txDisarm naming a DIFFERENT arm still disarms (armJti is a sanity
+        // match, not a gate — disarm-any is fail-safe TX-OFF).
+        dispatch_action(
+            ControlAction::Disarm {
+                arm_jti: "some-other-arm".into(),
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "a mismatched txDisarm armJti must STILL disarm (fail-safe)"
         );
     }
 
@@ -1293,28 +1406,28 @@ mod tests {
         }
     }
 
-    /// Mint a valid capabilityToken whose `aud` is `agent_key_id`.
+    /// Mint a valid TX-enabled capabilityToken whose `aud` is `agent_key_id`.
     fn token_for_agent(agent_key_id: &str) -> String {
         let header = json!({ "alg": "EdDSA", "kid": IDP_KID, "typ": "JWT" });
         let payload = json!({
             "iss": "cqdx", "operatorCallsign": OPERATOR,
             "aud": agent_key_id, "clientKeyId": CLIENT_KEY_ID,
             "scopes": ["status", "tx"],
-            "iat": NOW / 1000 - 10, "exp": NOW / 1000 + 600, "jti": "cap-jti-1"
+            "iat": NOW / 1000 - 10, "exp": NOW / 1000 + 600,
+            "txEnabledUntil": NOW / 1000 + 600, "jti": "cap-jti-1"
         });
         mint_jws(&header, &payload, &idp_key())
     }
 
-    /// A valid client-signed grant whose `aud` is `agent_key_id`, carrying the
-    /// capabilityToken inside (v1 convention).
-    fn grant_for_agent(agent_key_id: &str) -> Value {
+    /// A full, frozen `txArm` INNER control frame whose `aud` is `agent_key_id`:
+    /// `{type:"txArm", capabilityToken, grant}` — the token is a SIBLING of the
+    /// client-signed grant (NOT inside it, per the frozen e2e-auth.v1 $defs).
+    fn tx_arm_frame_for_agent(agent_key_id: &str) -> Value {
         let mut grant = json!({
-            "type": "txArmGrant",
             "aud": agent_key_id,
             "clientKeyId": CLIENT_KEY_ID,
             "sessionId": "sess-1",
             "capabilityJti": "cap-jti-1",
-            "capabilityToken": token_for_agent(agent_key_id),
             "operatorCallsign": OPERATOR,
             "armedAt": NOW,
             "armedUntil": NOW + 300_000,
@@ -1327,7 +1440,11 @@ mod tests {
         let canon = canonical_bytes(&grant);
         let sig = client_key().sign(&canon);
         grant.insert("clientSig".to_string(), json!(b64url(&sig.to_bytes())));
-        Value::Object(grant)
+        json!({
+            "type": "txArm",
+            "capabilityToken": token_for_agent(agent_key_id),
+            "grant": Value::Object(grant),
+        })
     }
 
     /// The full end-to-end proof: a scripted relay + client drive the real
@@ -1390,9 +1507,10 @@ mod tests {
         initiator.read_msg2(&msg2);
         let mut client_transport = initiator.into_transport();
 
-        // Encrypt the Arm control frame and hand it to the session as an env.
-        let arm_grant = grant_for_agent(&agent_kid);
-        let plaintext = serde_json::to_vec(&arm_grant).unwrap();
+        // Encrypt the real txArm control frame (token+grant siblings) and hand
+        // it to the session as an env.
+        let arm_frame = tx_arm_frame_for_agent(&agent_kid);
+        let plaintext = serde_json::to_vec(&arm_frame).unwrap();
         let mut ct = vec![0u8; plaintext.len() + 16];
         let n = client_transport.write_message(&plaintext, &mut ct).unwrap();
         ct.truncate(n);
@@ -1458,6 +1576,7 @@ mod tests {
             },
             client_keys,
             tx_allow_list: allow,
+            revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
         }
