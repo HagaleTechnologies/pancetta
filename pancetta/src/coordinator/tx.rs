@@ -2778,6 +2778,7 @@ mod remote_arm_gate_tests {
             operator_callsign: "K5ARH".to_string(),
             ttl_ms: 120_000,
             scope_tx: true,
+            jti: "tx-test-arm-jti".to_string(),
         }
     }
 
