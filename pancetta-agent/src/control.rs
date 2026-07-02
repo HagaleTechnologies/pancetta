@@ -649,4 +649,56 @@ mod tests {
         assert!(map_client_frame(b"{unterminated").is_err());
         assert!(map_client_frame(b"").is_err());
     }
+
+    // ── Drift-guard: our txArm/txDisarm wire mapping must track the FROZEN
+    //    e2e-auth.v1 $defs (camelCase `capabilityToken`/`armJti`, `type` consts).
+    //    If cqdx/dispensa renames a field, these break loudly.
+    #[test]
+    fn drift_guard_tx_arm_frozen_field_names() {
+        // The frozen $defs.txArm shape: {type:"txArm", capabilityToken, grant}.
+        let action = map(json!({
+            "type": "txArm",
+            "capabilityToken": "hdr.pl.sig",
+            "grant": { "capabilityJti": "cap-1", "jti": "arm-1" }
+        }));
+        assert_eq!(
+            action,
+            ControlAction::Arm {
+                capability_token: "hdr.pl.sig".to_string(),
+                grant: json!({ "capabilityJti": "cap-1", "jti": "arm-1" }),
+            }
+        );
+        // A snake_case sibling (`capability_token`) is NOT the frozen name →
+        // treated as a missing token → hard error (drift caught).
+        let err = map_client_frame(
+            json!({ "type": "txArm", "capability_token": "x", "grant": {} })
+                .to_string()
+                .as_bytes(),
+        );
+        assert!(matches!(err, Err(ControlError::MalformedFrame(_))));
+        // Wrong `type` const → Unsupported (not an Arm).
+        assert_eq!(
+            map(json!({ "type": "txArmGrant", "capabilityToken": "x", "grant": {} })),
+            ControlAction::Unsupported
+        );
+    }
+
+    #[test]
+    fn drift_guard_tx_disarm_frozen_field_names() {
+        // Frozen $defs.txDisarm: {type:"txDisarm", armJti}.
+        assert_eq!(
+            map(json!({ "type": "txDisarm", "armJti": "arm-1" })),
+            ControlAction::Disarm {
+                arm_jti: "arm-1".to_string()
+            }
+        );
+        // snake_case `arm_jti` is NOT the frozen name → treated as absent
+        // (disarm-any, empty arm_jti) rather than picking it up.
+        assert_eq!(
+            map(json!({ "type": "txDisarm", "arm_jti": "arm-1" })),
+            ControlAction::Disarm {
+                arm_jti: String::new()
+            }
+        );
+    }
 }

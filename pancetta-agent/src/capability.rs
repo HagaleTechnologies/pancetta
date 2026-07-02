@@ -428,10 +428,11 @@ impl CapabilityVerifier {
     /// set.
     ///
     /// Verification order (frozen e2e-auth.v1 `$defs.txArm`): the capability was
-    /// already verified by the caller; here we gate **txEnabledUntil present AND
-    /// > now** → **jti not on the best-effort deny-list** → clientSig → aud →
-    /// allow-list → clientKeyId bind → capabilityJti bind → bounds → tx scope →
-    /// single-use jti → mint.
+    /// already verified by the caller; here we gate, in order, **txEnabledUntil
+    /// present AND still in-window**, then **jti not on the best-effort
+    /// deny-list**, then clientSig, aud, allow-list, clientKeyId bind,
+    /// capabilityJti bind, window/heartbeat bounds, tx scope, single-use jti, and
+    /// finally mint.
     #[allow(clippy::too_many_arguments)]
     pub fn verify_arm_grant(
         &self,
