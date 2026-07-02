@@ -48,8 +48,8 @@
 //!     let qso_manager = QsoManager::new(config);
 //!     qso_manager.start().await?;
 //!     
-//!     // Start a CQ call
-//!     let qso_id = qso_manager.start_cq(14074000.0, None).await?;
+//!     // Start a CQ call (remote_origin = false — local operator)
+//!     let qso_id = qso_manager.start_cq(14074000.0, None, false).await?;
 //!     println!("Started CQ: {}", qso_id);
 //!     
 //!     // Get QSO status
@@ -84,7 +84,7 @@
 //! let manager = QsoManager::new(config);
 //!
 //! // Start CQ and handle responses
-//! let qso_id = manager.start_cq(14074000.0, None).await?;
+//! let qso_id = manager.start_cq(14074000.0, None, false).await?;
 //!
 //! // Process incoming messages
 //! manager.process_message(
