@@ -134,16 +134,27 @@ pub struct ReqwestPairingHttp {
     handle: Handle,
     client: reqwest::Client,
     base_url: String,
+    /// Optional CSRF `Origin` header value sent on every POST. `None` → no
+    /// `Origin` header (production posture; set only as a staging CSRF
+    /// workaround until the API-key CSRF exemption ships).
+    origin: Option<String>,
 }
 
 impl ReqwestPairingHttp {
     /// Create a pairing HTTP client rooted at `base_url` (e.g.
-    /// `https://pair.example/api`). Must be constructed within a Tokio runtime.
-    pub fn new(base_url: String) -> Self {
+    /// `https://pair.example/api/v1`). Must be constructed within a Tokio
+    /// runtime.
+    ///
+    /// `base_url` must include the API base path (e.g. `/api/v1`); the pairing
+    /// client posts *relative* `/pair/*` paths onto it. When `origin` is
+    /// `Some(o)`, every POST carries `Origin: o` — a staging CSRF workaround;
+    /// `None` sends no `Origin` header.
+    pub fn new(base_url: String, origin: Option<String>) -> Self {
         Self {
             handle: Handle::current(),
             client: reqwest::Client::new(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            origin,
         }
     }
 }
@@ -152,10 +163,13 @@ impl PairingHttp for ReqwestPairingHttp {
     fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value, PairingError> {
         let url = format!("{}{}", self.base_url, path);
         let client = self.client.clone();
+        let origin = self.origin.clone();
         self.handle.block_on(async move {
-            let resp = client
-                .post(&url)
-                .json(&body)
+            let mut req = client.post(&url).json(&body);
+            if let Some(o) = origin {
+                req = req.header("Origin", o);
+            }
+            let resp = req
                 .send()
                 .await
                 .map_err(|e| PairingError::Transport(format!("POST {url}: {e}")))?;
@@ -169,5 +183,25 @@ impl PairingHttp for ReqwestPairingHttp {
                 .await
                 .map_err(|e| PairingError::MalformedResponse(e.to_string()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reqwest_pairing_http_threads_origin() {
+        // No origin → production posture: no Origin header will be sent.
+        let http = ReqwestPairingHttp::new("https://host/api/v1/".to_string(), None);
+        assert_eq!(http.base_url, "https://host/api/v1"); // trailing slash trimmed
+        assert!(http.origin.is_none());
+
+        // Some origin → carried through for the CSRF workaround.
+        let http = ReqwestPairingHttp::new(
+            "https://host/api/v1".to_string(),
+            Some("https://cqdx.io".to_string()),
+        );
+        assert_eq!(http.origin.as_deref(), Some("https://cqdx.io"));
     }
 }
