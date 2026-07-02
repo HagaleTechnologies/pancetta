@@ -319,8 +319,10 @@ fn extract_tag_text(xml: &str, tag: &str) -> Result<Option<String>> {
                 }
             }
             Ok(Event::Text(e)) if in_target => {
+                // quick-xml 0.41: BytesText::unescape() → xml10_content()
+                // (decode + XML-1.0 entity unescape; same Result<Cow<str>> shape).
                 let unescaped = e
-                    .unescape()
+                    .xml10_content()
                     .map_err(|err| DxError::Parse(format!("QRZ XML decode error: {err}")))?;
                 collected.push_str(&unescaped);
             }

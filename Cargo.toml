@@ -103,7 +103,7 @@ geographiclib-rs = "0.2"
 rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
 
 # XML and CSV parsing
-quick-xml = "0.36"
+quick-xml = "0.41"
 csv = "1.4"
 
 # Regular expressions
