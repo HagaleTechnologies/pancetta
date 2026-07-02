@@ -8,10 +8,12 @@
 //!    either `{frame:"hello", …}` or `{frame:"command", command:{cmd:"…", …}}`.
 //!    Only the `command` frames carry actions; `hello` is a handshake nicety and
 //!    maps to [`ControlAction::Unsupported`] here (handled elsewhere).
-//! 2. An **e2e-auth.v1** inner-control frame — either a `txHeartbeat`
-//!    (`$defs.txHeartbeat`, the dead-man keep-alive) or a `txArmGrant`
-//!    (`$defs.txArmGrant`, the explicitly-armed TX authorization) which may
-//!    arrive as an inner control frame to be verified by
+//! 2. An **e2e-auth.v1** inner-control frame — a `txHeartbeat`
+//!    (`$defs.txHeartbeat`, the dead-man keep-alive), a `txArm`
+//!    (`$defs.txArm`, the explicitly-armed TX authorization: the
+//!    `capabilityToken` + client-signed `grant` carried as SIBLINGS), or a
+//!    `txDisarm` (`$defs.txDisarm`, the explicit disarm carrying the
+//!    `armJti` it releases). The `txArm` token + grant are verified by
 //!    [`crate::capability`] before TX is armed.
 //!
 //! This module is **pure**: no IO, no coordinator dependency, no clock. It
@@ -32,14 +34,15 @@
 //! | `stopCq`           | —                                        | [`StopCq`](ControlAction::StopCq)    |
 //! | `takeControl`      | —                                        | [`TakeControl`](ControlAction::TakeControl)   |
 //! | `releaseControl`   | —                                        | [`ReleaseControl`](ControlAction::ReleaseControl) |
-//! | `setTransmitArmed` | `armed`                                  | [`Disarm`](ControlAction::Disarm) when `armed==false`; `armed==true` alone is NOT a grant (a real arm carries a signed `txArmGrant`) so it maps to [`Unsupported`](ControlAction::Unsupported) |
+//! | `setTransmitArmed` | `armed`                                  | [`Disarm`](ControlAction::Disarm) when `armed==false` (with an empty `arm_jti` — this command carries no armJti); `armed==true` alone is NOT a grant (a real arm carries a signed `txArm`) so it maps to [`Unsupported`](ControlAction::Unsupported) |
 //!
 //! ## e2e-auth.v1 inner-control frames
 //!
 //! | wire `type`   | [`ControlAction`]                          |
 //! |---------------|--------------------------------------------|
 //! | `txHeartbeat` | [`Heartbeat`](ControlAction::Heartbeat)    |
-//! | `txArmGrant`  | [`Arm`](ControlAction::Arm) (raw grant carried through for [`crate::capability`] verification) |
+//! | `txArm`       | [`Arm`](ControlAction::Arm) (`capabilityToken` + `grant` carried through as SIBLINGS for [`crate::capability`] verification; a missing token or grant is a **hard error**, NOT `Unsupported`) |
+//! | `txDisarm`    | [`Disarm`](ControlAction::Disarm) (carries the `armJti` being released — a sanity match, not a security gate) |
 //!
 //! ## Adaptations from the task brief
 //!
@@ -62,6 +65,12 @@ pub enum ControlError {
     /// The decrypted bytes were not valid JSON.
     #[error("malformed control frame JSON: {0}")]
     Json(#[from] serde_json::Error),
+    /// A well-formed-JSON but structurally-invalid **security** frame: a
+    /// `txArm` missing its `capabilityToken` or `grant`. This is a HARD error
+    /// (fail-closed) — never a silent [`ControlAction::Unsupported`] — because a
+    /// partial arm frame must never be treated as a benign no-op.
+    #[error("malformed security frame: {0}")]
+    MalformedFrame(String),
 }
 
 /// Which TX-initiation the client requested. Mirrors the three TX-capable
@@ -134,16 +143,30 @@ pub enum ControlAction {
         /// Monotonic per-arm sequence number (agent rejects `seq <= last`).
         seq: u64,
     },
-    /// e2e-auth.v1 `txArmGrant` arriving as an inner control frame. The raw
-    /// grant JSON is carried through untouched for [`crate::capability`] to
-    /// verify (client signature, allow-list, window, heartbeat bound). This
-    /// variant asserts *nothing* about validity.
+    /// e2e-auth.v1 `txArm` inner-control frame (`$defs.txArm`). Carries the
+    /// cqdx-issued `capabilityToken` (compact JWS) and the client-signed
+    /// `grant` as **SIBLINGS** — the token is NOT inside the grant's
+    /// `clientSig` canonical bytes (`clientSig` signs only the `txArmGrant`,
+    /// which references the token via `capabilityJti`). Both are carried
+    /// through untouched for [`crate::capability`] to verify as SEPARATE
+    /// inputs; this variant asserts *nothing* about validity.
     Arm {
-        /// The raw `txArmGrant` object, verified downstream (never trusted here).
+        /// The cqdx-issued capabilityToken (compact JWS), verified downstream
+        /// against the pinned IdP key — a SEPARATE input from `grant`.
+        capability_token: String,
+        /// The raw `txArmGrant` object, verified downstream (never trusted
+        /// here). Its `clientSig` covers only these grant fields.
         grant: Value,
     },
-    /// `setTransmitArmed { armed: false }` — explicit disarm request.
-    Disarm,
+    /// e2e-auth.v1 `txDisarm` (`$defs.txDisarm`) — explicit disarm. Carries the
+    /// `armJti` being released (a **sanity match** to the current arm, NOT a
+    /// security gate; disarm-any is fail-safe TX-OFF). Also produced by
+    /// `setTransmitArmed { armed: false }` (with an empty `arm_jti`, since that
+    /// legacy command carries no armJti).
+    Disarm {
+        /// The `txArmGrant.jti` this disarm targets (empty when unknown).
+        arm_jti: String,
+    },
     /// A well-formed but unknown/unsupported frame — logged + ignored upstream.
     Unsupported,
 }
@@ -157,7 +180,7 @@ pub fn map_client_frame(decrypted: &[u8]) -> Result<ControlAction, ControlError>
 
     // e2e-auth.v1 inner-control frames are discriminated by a `type` tag.
     if let Some(ty) = v.get("type").and_then(Value::as_str) {
-        return Ok(map_auth_control(ty, &v));
+        return map_auth_control(ty, &v);
     }
 
     // rig-api.v1 clientFrame is discriminated by a `frame` tag.
@@ -172,22 +195,55 @@ pub fn map_client_frame(decrypted: &[u8]) -> Result<ControlAction, ControlError>
 }
 
 /// Map an e2e-auth.v1 inner-control frame (`type`-tagged).
-fn map_auth_control(ty: &str, v: &Value) -> ControlAction {
+///
+/// A `txArm` missing its `capabilityToken` or `grant` is a **hard error**
+/// ([`ControlError::MalformedFrame`]) — a partial arm must fail closed, never be
+/// silently treated as [`ControlAction::Unsupported`]. Every other unknown or
+/// under-specified frame maps to `Unsupported` (benign no-op upstream).
+fn map_auth_control(ty: &str, v: &Value) -> Result<ControlAction, ControlError> {
     match ty {
         "txHeartbeat" => {
             let arm_jti = v.get("armJti").and_then(Value::as_str);
             let seq = v.get("seq").and_then(Value::as_u64);
             match (arm_jti, seq) {
-                (Some(arm_jti), Some(seq)) => ControlAction::Heartbeat {
+                (Some(arm_jti), Some(seq)) => Ok(ControlAction::Heartbeat {
                     arm_jti: arm_jti.to_string(),
                     seq,
-                },
+                }),
                 // Missing required fields → not a usable heartbeat.
-                _ => ControlAction::Unsupported,
+                _ => Ok(ControlAction::Unsupported),
             }
         }
-        "txArmGrant" => ControlAction::Arm { grant: v.clone() },
-        _ => ControlAction::Unsupported,
+        "txArm" => {
+            // capabilityToken + grant are SIBLINGS. Both are REQUIRED; a
+            // partial arm fails closed (a hard error), never a silent no-op.
+            let capability_token = v
+                .get("capabilityToken")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ControlError::MalformedFrame("txArm missing capabilityToken".to_string())
+                })?
+                .to_string();
+            let grant = v
+                .get("grant")
+                .cloned()
+                .ok_or_else(|| ControlError::MalformedFrame("txArm missing grant".to_string()))?;
+            Ok(ControlAction::Arm {
+                capability_token,
+                grant,
+            })
+        }
+        "txDisarm" => {
+            // armJti is a sanity match (not a gate); disarm-any is fail-safe.
+            // A missing armJti still disarms (empty string), never an error.
+            let arm_jti = v
+                .get("armJti")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Ok(ControlAction::Disarm { arm_jti })
+        }
+        _ => Ok(ControlAction::Unsupported),
     }
 }
 
@@ -269,8 +325,11 @@ fn map_client_command(cmd: &Value) -> ControlAction {
         "setTransmitArmed" => match cmd.get("armed").and_then(Value::as_bool) {
             // Only an explicit disarm is actionable from this command; a bare
             // `armed:true` is NOT a grant — a real arm carries a signed
-            // txArmGrant, so `armed:true` is a no-op here.
-            Some(false) => ControlAction::Disarm,
+            // `txArm`, so `armed:true` is a no-op here. This legacy command
+            // carries no armJti, so the disarm targets "any current arm".
+            Some(false) => ControlAction::Disarm {
+                arm_jti: String::new(),
+            },
             _ => ControlAction::Unsupported,
         },
         _ => ControlAction::Unsupported,
@@ -437,9 +496,13 @@ mod tests {
 
     #[test]
     fn set_transmit_armed_false_disarms_true_is_unsupported() {
+        // setTransmitArmed{armed:false} → Disarm with an empty arm_jti (this
+        // legacy command carries no armJti).
         assert_eq!(
             map(json!({"frame":"command","command":{"cmd":"setTransmitArmed","armed":false}})),
-            ControlAction::Disarm
+            ControlAction::Disarm {
+                arm_jti: String::new()
+            }
         );
         // armed:true alone is NOT a grant.
         assert_eq!(
@@ -474,20 +537,81 @@ mod tests {
     }
 
     #[test]
-    fn tx_arm_grant_carries_raw_grant_through() {
+    fn tx_arm_maps_token_and_grant_as_siblings() {
+        // Frozen e2e-auth.v1 $defs.txArm: {type, capabilityToken, grant} — the
+        // token is a SIBLING of the grant, NOT nested inside it.
         let grant = json!({
-            "type": "txArmGrant",
             "aud": "agent-1",
             "clientKeyId": "client-1",
             "sessionId": "sess-1",
+            "capabilityJti": "cap-abc",
             "operatorCallsign": "K5ARH",
             "armedUntil": 1719000600000_u64,
             "heartbeatIntervalSec": 10,
             "jti": "arm-abc-123",
             "clientSig": "sig-base64url"
         });
-        let action = map(grant.clone());
-        assert_eq!(action, ControlAction::Arm { grant });
+        let action = map(json!({
+            "type": "txArm",
+            "capabilityToken": "hdr.payload.sig",
+            "grant": grant.clone()
+        }));
+        assert_eq!(
+            action,
+            ControlAction::Arm {
+                capability_token: "hdr.payload.sig".to_string(),
+                grant,
+            }
+        );
+    }
+
+    #[test]
+    fn tx_arm_missing_capability_token_is_hard_error() {
+        // A partial arm (no capabilityToken) must fail CLOSED, not map to
+        // Unsupported.
+        let err = map_client_frame(
+            json!({
+                "type": "txArm",
+                "grant": { "jti": "arm-1", "clientSig": "s" }
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        assert!(matches!(err, Err(ControlError::MalformedFrame(_))));
+    }
+
+    #[test]
+    fn tx_arm_missing_grant_is_hard_error() {
+        let err = map_client_frame(
+            json!({
+                "type": "txArm",
+                "capabilityToken": "hdr.payload.sig"
+            })
+            .to_string()
+            .as_bytes(),
+        );
+        assert!(matches!(err, Err(ControlError::MalformedFrame(_))));
+    }
+
+    #[test]
+    fn tx_disarm_maps_arm_jti() {
+        assert_eq!(
+            map(json!({ "type": "txDisarm", "armJti": "arm-abc-123" })),
+            ControlAction::Disarm {
+                arm_jti: "arm-abc-123".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn tx_disarm_missing_arm_jti_still_disarms_any() {
+        // armJti is a sanity match, not a gate — a missing one still disarms.
+        assert_eq!(
+            map(json!({ "type": "txDisarm" })),
+            ControlAction::Disarm {
+                arm_jti: String::new()
+            }
+        );
     }
 
     #[test]
