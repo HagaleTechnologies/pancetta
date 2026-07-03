@@ -845,6 +845,14 @@ pub struct App {
     /// restart. `Operate` (the default) renders today's layout unchanged;
     /// later tasks (5-7) make Hunt/Run/Monitor render differently.
     pub active_view: crate::view::ActiveView,
+
+    /// When `true`, `z` has zoomed the focused panel (`active_panel`) to
+    /// fill the whole content area, bypassing the active view's grid
+    /// layout entirely. Orthogonal to `active_view` — zoom works the same
+    /// regardless of which of the 4 views is selected. `z` toggles it;
+    /// Esc or Tab also clear it. Never persisted (session-only, like
+    /// `help_visible`).
+    pub zoomed: bool,
 }
 
 /// Peak intensity in the latest waterfall row within ±radius_hz of center_hz.
@@ -960,6 +968,7 @@ impl App {
             radio_frequency: None,
             band_cache: HashMap::new(),
             active_view: Self::load_persisted_view(),
+            zoomed: false,
         };
 
         // Initialize audio monitoring if device specified

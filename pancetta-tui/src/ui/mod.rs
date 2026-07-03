@@ -87,15 +87,24 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     // Render title bar
     render_title_bar(f, chunks[0], app);
 
-    // Per-view content layout dispatch. Operate is today's layout (extracted
-    // verbatim below, byte-identical); Monitor is the vertical big-picture
-    // layout; Hunt is DX-Hunter-first (band activity narrowed to CQs via
-    // `App::displayed_messages`); Run is Callers-first for working a pileup.
-    match app.active_view {
-        crate::view::ActiveView::Operate => layout_operate(f, chunks[1], app)?,
-        crate::view::ActiveView::Monitor => layout_monitor(f, chunks[1], app)?,
-        crate::view::ActiveView::Hunt => layout_hunt(f, chunks[1], app)?,
-        crate::view::ActiveView::Run => layout_run(f, chunks[1], app)?,
+    // Panel zoom (`z`): the focused panel fills the whole content area,
+    // bypassing the active view's grid entirely. Orthogonal to the 4-view
+    // system — checked before the view dispatch so it applies identically
+    // regardless of `app.active_view`.
+    if app.zoomed {
+        render_zoomed_panel(f, chunks[1], app)?;
+    } else {
+        // Per-view content layout dispatch. Operate is today's layout
+        // (extracted verbatim below, byte-identical); Monitor is the
+        // vertical big-picture layout; Hunt is DX-Hunter-first (band
+        // activity narrowed to CQs via `App::displayed_messages`); Run is
+        // Callers-first for working a pileup.
+        match app.active_view {
+            crate::view::ActiveView::Operate => layout_operate(f, chunks[1], app)?,
+            crate::view::ActiveView::Monitor => layout_monitor(f, chunks[1], app)?,
+            crate::view::ActiveView::Hunt => layout_hunt(f, chunks[1], app)?,
+            crate::view::ActiveView::Run => layout_run(f, chunks[1], app)?,
+        }
     }
 
     // Render status bar
@@ -104,6 +113,23 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
 
     render_status_bar(f, chunks[3], app);
 
+    Ok(())
+}
+
+/// Renders the focused panel (`app.active_panel`) full-screen in `area`,
+/// bypassing whichever `ActiveView` grid is normally in effect. Calls the
+/// SAME `render_*` function each view's grid layout uses, just with the
+/// whole content rect instead of a sliced-down chunk. Covers all 5
+/// `ActivePanel` variants, including `StationInfo` (still valid until
+/// Task 18 removes it from the panel cycle).
+fn render_zoomed_panel(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
+    match app.active_panel {
+        ActivePanel::BandActivity => render_band_activity(f, area, app)?,
+        ActivePanel::QsoStatus => render_qso_status(f, area, app)?,
+        ActivePanel::StationInfo => render_station_info(f, area, app)?,
+        ActivePanel::Callers => render_callers(f, area, app)?,
+        ActivePanel::DxHunter => render_dx_hunter(f, area, app)?,
+    }
     Ok(())
 }
 
@@ -1193,5 +1219,20 @@ mod view_render_tests {
         assert!(buffer_contains(&buf, "Callers"));
         assert!(buffer_contains(&buf, "QSO Status"));
         assert!(!buffer_contains(&buf, "DX Hunter"));
+    }
+
+    #[tokio::test]
+    async fn zoom_renders_only_the_focused_panel() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.active_panel = crate::app::ActivePanel::DxHunter;
+        app.zoomed = true;
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(buffer_contains(&buf, "DX Hunter"));
+        assert!(!buffer_contains(&buf, "Band Activity"));
     }
 }

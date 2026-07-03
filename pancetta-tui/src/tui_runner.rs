@@ -1000,8 +1000,17 @@ impl TuiRunner {
                 app.status_message = "Operator-stop banner cleared".to_string();
             }
 
+            // `z` panel zoom: Esc restores the normal view layout (in
+            // addition to `z` itself toggling it off). Guarded so it only
+            // fires when nothing else claimed this Esc press above.
+            KeyCode::Esc if app.zoomed => {
+                app.zoomed = false;
+                app.status_message = "Zoom cleared".to_string();
+            }
+
             // Panel navigation
             KeyCode::Tab => {
+                app.zoomed = false;
                 app.next_panel();
             }
             KeyCode::BackTab => {
@@ -1376,6 +1385,18 @@ impl TuiRunner {
             KeyCode::Char('V') => {
                 app.cycle_view(false);
             }
+            // z - zoom the focused panel to fill the whole content area,
+            // bypassing the active view's grid. Orthogonal to v/V: works
+            // the same in any of the 4 views, and toggles the same panel
+            // back off (Esc also clears it; see the guarded Esc arm above).
+            KeyCode::Char('z') => {
+                app.zoomed = !app.zoomed;
+                app.status_message = if app.zoomed {
+                    "Panel zoomed".to_string()
+                } else {
+                    "Zoom cleared".to_string()
+                };
+            }
             // f - toggle TX-frequency mode Hold ↔ Auto. Hold (default) keeps the
             // offset you picked sticky; Auto lets pancetta choose/adjust it.
             // Optimistically flip the local chip; the coordinator flips the
@@ -1748,6 +1769,7 @@ impl TuiRunner {
             ("h", "Halt current TX"),
             ("p", "Toggle PTT (blocked while TX DISABLED)"),
             ("v / V", "Cycle activity view: Operate/Hunt/Run/Monitor"),
+            ("z", "Zoom focused panel (again/Esc to restore)"),
             ("a", "Toggle autonomous mode"),
             ("Shift+P", "Pause / resume autonomous"),
             ("Shift+H", "Engage Hound on selected DX Hunter station"),
@@ -2063,6 +2085,44 @@ mod key_tests {
             app.read().await.active_view,
             crate::view::ActiveView::Monitor
         );
+    }
+
+    /// `z` toggles panel zoom, local-only (no coordinator command).
+    #[tokio::test]
+    async fn key_z_toggles_zoom() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.zoomed = false;
+        r.handle_key_event(key('z')).await.unwrap();
+        assert!(app.read().await.zoomed);
+        r.handle_key_event(key('z')).await.unwrap();
+        assert!(!app.read().await.zoomed);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "zoom is local-only, no coordinator command should be sent"
+        );
+    }
+
+    /// Esc clears an active zoom (and does not fall through to any other
+    /// Esc behavior once zoom is cleared).
+    #[tokio::test]
+    async fn key_esc_clears_zoom() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        app.write().await.zoomed = true;
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!app.read().await.zoomed);
+    }
+
+    /// Tab clears an active zoom before switching panels.
+    #[tokio::test]
+    async fn key_tab_clears_zoom() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        app.write().await.zoomed = true;
+        r.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!app.read().await.zoomed);
     }
 
     #[tokio::test]
