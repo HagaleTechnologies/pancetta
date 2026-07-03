@@ -1310,6 +1310,7 @@ impl App {
             ActivePanel::BandActivity => {
                 self.band_activity_scroll =
                     self.band_activity_scroll.saturating_sub(Self::SCROLL_PAGE);
+                self.pin_band_activity_selection();
             }
             ActivePanel::DxHunter => {
                 self.dx_hunter_scroll = self.dx_hunter_scroll.saturating_sub(Self::SCROLL_PAGE);
@@ -1330,6 +1331,7 @@ impl App {
                 let max = self.decoded_messages.len().saturating_sub(1);
                 self.band_activity_scroll =
                     (self.band_activity_scroll + Self::SCROLL_PAGE).min(max);
+                self.pin_band_activity_selection();
             }
             ActivePanel::DxHunter => {
                 let max = self.displayed_dx_stations().len().saturating_sub(1);
@@ -2193,10 +2195,10 @@ impl App {
         let len = calls.len();
 
         if let Some(ref pin) = self.band_activity_pinned_call {
-            if let Some(idx) = calls.iter().position(|call| {
-                call.as_deref()
-                    .is_some_and(|c| c.eq_ignore_ascii_case(pin))
-            }) {
+            if let Some(idx) = calls
+                .iter()
+                .position(|call| call.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(pin)))
+            {
                 self.band_activity_scroll = idx;
                 return;
             }
@@ -4515,5 +4517,40 @@ mod tests {
         app.clear_messages();
         // Pinned call gone: index clamps to 0, pin cleared, no panic.
         assert_eq!(app.band_activity_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn band_activity_pageup_pagedown_pin_selection() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        // Add 15 messages so PageUp/PageDown (10-row jumps) have room to move.
+        for i in 0i32..15i32 {
+            app.add_decoded_message(fixture_view(&format!("K{:02}XXX", i), -20 + i))
+                .await
+                .unwrap();
+        }
+        // Newest-first: [K14XXX, K13XXX, ..., K0XXX]. Move to row 5 and page down.
+        app.band_activity_scroll = 5;
+        app.page_down();
+        // After page_down, we moved down 10 rows. The key is that band_activity_pinned_call
+        // should now be set to whatever station is at the new scroll position.
+        let (pinned_call_after, _, _) =
+            app.get_selected_station().expect("station after page_down");
+        assert_eq!(
+            app.band_activity_pinned_call,
+            Some(pinned_call_after.clone()),
+            "PageDown should pin to the new selection"
+        );
+        // Now add a high-priority directed-at-us decode that would normally shift indices.
+        // Without the fix, the pin would be stale and the cursor would snap to the old position.
+        app.add_decoded_message(fixture_view_directed("K99NEW", -2))
+            .await
+            .unwrap();
+        // Verify cursor stayed on the same pinned callsign despite the reorder.
+        let (current_call, _, _) = app.get_selected_station().expect("station after reorder");
+        assert_eq!(
+            current_call, pinned_call_after,
+            "PageDown pin should survive a reorder"
+        );
     }
 }
