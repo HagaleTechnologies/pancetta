@@ -2240,48 +2240,38 @@ impl Ft8Decoder {
                     max_depth: d,
                     npre2_preprocessing_enabled: ctx.osd_npre2_preprocessing_enabled,
                 });
-                let (iters_low, iters_mid, iters_high) = if ctx.adaptive_ldpc_iters {
-                    (ADAPTIVE_ITERS_LOW, ctx.ldpc_iterations, ADAPTIVE_ITERS_HIGH)
-                } else {
-                    (
-                        ctx.ldpc_iterations,
-                        ctx.ldpc_iterations,
-                        ctx.ldpc_iterations,
-                    )
+                let build = |iters: usize| {
+                    LdpcDecoder::new_with_osd(iters, osd_cfg)
+                        .expect("LDPC decoder init failed")
+                        .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
+                        .with_bp_offset_subtract(ctx.bp_offset_subtract)
+                        .with_layered(ctx.layered_bp)
+                        .with_feedback_refinement(
+                            ctx.ldpc_feedback_refinement_enabled,
+                            ctx.ldpc_feedback_boost_factor,
+                            ctx.ldpc_feedback_attenuate_factor,
+                            ctx.ldpc_feedback_erase_threshold,
+                        )
                 };
-                let ldpc_low = LdpcDecoder::new_with_osd(iters_low, osd_cfg)
-                    .expect("LDPC decoder init failed")
-                    .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
-                    .with_bp_offset_subtract(ctx.bp_offset_subtract)
-                    .with_layered(ctx.layered_bp)
-                    .with_feedback_refinement(
-                        ctx.ldpc_feedback_refinement_enabled,
-                        ctx.ldpc_feedback_boost_factor,
-                        ctx.ldpc_feedback_attenuate_factor,
-                        ctx.ldpc_feedback_erase_threshold,
-                    );
-                let ldpc_mid = LdpcDecoder::new_with_osd(iters_mid, osd_cfg)
-                    .expect("LDPC decoder init failed")
-                    .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
-                    .with_bp_offset_subtract(ctx.bp_offset_subtract)
-                    .with_layered(ctx.layered_bp)
-                    .with_feedback_refinement(
-                        ctx.ldpc_feedback_refinement_enabled,
-                        ctx.ldpc_feedback_boost_factor,
-                        ctx.ldpc_feedback_attenuate_factor,
-                        ctx.ldpc_feedback_erase_threshold,
-                    );
-                let ldpc_high = LdpcDecoder::new_with_osd(iters_high, osd_cfg)
-                    .expect("LDPC decoder init failed")
-                    .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
-                    .with_bp_offset_subtract(ctx.bp_offset_subtract)
-                    .with_layered(ctx.layered_bp)
-                    .with_feedback_refinement(
-                        ctx.ldpc_feedback_refinement_enabled,
-                        ctx.ldpc_feedback_boost_factor,
-                        ctx.ldpc_feedback_attenuate_factor,
-                        ctx.ldpc_feedback_erase_threshold,
-                    );
+                // Perf (decoder-analysis A3): when adaptive_ldpc_iters is off
+                // (the production default), iters_low == iters_mid ==
+                // iters_high, so all three decoders built below are
+                // byte-identical — build ONE and clone it into the other two
+                // slots instead of constructing three from scratch. Output-
+                // identical: decode_candidate_op selects among the three by
+                // sync_score, but in the non-adaptive case they behave
+                // identically regardless of which is picked, so which slot
+                // gets the "original" vs a clone is unobservable.
+                let (ldpc_low, ldpc_mid, ldpc_high) = if ctx.adaptive_ldpc_iters {
+                    (
+                        build(ADAPTIVE_ITERS_LOW),
+                        build(ctx.ldpc_iterations),
+                        build(ADAPTIVE_ITERS_HIGH),
+                    )
+                } else {
+                    let shared = build(ctx.ldpc_iterations);
+                    (shared.clone(), shared.clone(), shared)
+                };
                 let fft_buffer = vec![Complex::new(0.0, 0.0); sps];
                 (ldpc_low, ldpc_mid, ldpc_high, fft_buffer)
             };
@@ -9708,13 +9698,18 @@ fn min_abs_llr(llrs: &[f32; 174]) -> f32 {
 ///   production decoder path. Phase D 2026-06-02 audit (claim 18)
 ///   tightened this docstring from "sum-product or min-sum" — see
 ///   `docs/engineering/2026-06-02-engineering-substance-audit.md`.
+#[derive(Clone)]
 struct LdpcDecoder {
     max_iterations: usize,
-    /// Parity check matrix (83x174) - sparse representation
-    parity_check_matrix: ParityCheckMatrix,
+    /// Parity check matrix (83x174) - sparse representation. `Arc`-shared:
+    /// see [`shared_parity_check_data`] — this is identical, immutable data
+    /// for every `LdpcDecoder` instance (derived purely from const tables),
+    /// so it is built once per process instead of once per instance.
+    parity_check_matrix: std::sync::Arc<ParityCheckMatrix>,
     /// For each variable node, the position index within each connected check node's list.
     /// var_positions[var_idx] = [(check_idx, position_in_check), ...] with exactly 3 entries.
-    var_positions: Vec<Vec<(usize, usize)>>,
+    /// `Arc`-shared for the same reason as `parity_check_matrix` above.
+    var_positions: std::sync::Arc<Vec<Vec<(usize, usize)>>>,
     /// LDPC decoding algorithm
     algorithm: LdpcAlgorithm,
     /// Optional OSD fallback decoder
@@ -9847,27 +9842,59 @@ fn refine_llrs_from_hard_decisions(
     stats
 }
 
+/// Cached, process-lifetime-shared `(ParityCheckMatrix, var_positions)`,
+/// built once on first use instead of once per [`LdpcDecoder::new`] call.
+///
+/// Perf (decoder-analysis A2): both are 100% derived from `const` tables
+/// (`LDPC_NM`/`LDPC_MN`) with no dependency on `max_iterations`/algorithm/
+/// config — every `LdpcDecoder` instance previously rebuilt byte-identical
+/// data (≈430 small `Vec` allocations: 83 check rows + 174 variable rows +
+/// 174 position lists) from scratch. The `ldpc_init` closure alone
+/// constructs up to three decoders (`low`/`mid`/`high`) per Rayon worker per
+/// decode window, so this ran 3x per worker, every window, unconditionally.
+/// `(parity_check_matrix, var_positions)`, both `Arc`-shared — see
+/// [`shared_parity_check_data`].
+type SharedParityCheckData = (
+    std::sync::Arc<ParityCheckMatrix>,
+    std::sync::Arc<Vec<Vec<(usize, usize)>>>,
+);
+
+fn shared_parity_check_data() -> SharedParityCheckData {
+    static CACHE: std::sync::OnceLock<SharedParityCheckData> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let parity_check_matrix = ParityCheckMatrix::new_ft8();
+
+            // Pre-compute position lookup: for each variable node, find its
+            // position in each connected check node's variable list. This
+            // avoids O(degree) linear searches during belief propagation
+            // iterations.
+            let mut var_positions = Vec::with_capacity(174);
+            for var_idx in 0..174 {
+                let connected_checks = parity_check_matrix.get_connected_checks(var_idx);
+                let mut positions = Vec::with_capacity(connected_checks.len());
+                for &check_idx in connected_checks {
+                    let check_vars = parity_check_matrix.get_connected_variables(check_idx);
+                    let pos = check_vars
+                        .iter()
+                        .position(|&v| v == var_idx)
+                        .expect("Inconsistent parity check matrix");
+                    positions.push((check_idx, pos));
+                }
+                var_positions.push(positions);
+            }
+
+            (
+                std::sync::Arc::new(parity_check_matrix),
+                std::sync::Arc::new(var_positions),
+            )
+        })
+        .clone()
+}
+
 impl LdpcDecoder {
     fn new(max_iterations: usize) -> Ft8Result<Self> {
-        let parity_check_matrix = ParityCheckMatrix::new_ft8();
-
-        // Pre-compute position lookup: for each variable node, find its position
-        // in each connected check node's variable list. This avoids O(degree)
-        // linear searches during belief propagation iterations.
-        let mut var_positions = Vec::with_capacity(174);
-        for var_idx in 0..174 {
-            let connected_checks = parity_check_matrix.get_connected_checks(var_idx);
-            let mut positions = Vec::with_capacity(connected_checks.len());
-            for &check_idx in connected_checks {
-                let check_vars = parity_check_matrix.get_connected_variables(check_idx);
-                let pos = check_vars
-                    .iter()
-                    .position(|&v| v == var_idx)
-                    .expect("Inconsistent parity check matrix");
-                positions.push((check_idx, pos));
-            }
-            var_positions.push(positions);
-        }
+        let (parity_check_matrix, var_positions) = shared_parity_check_data();
 
         Ok(Self {
             max_iterations,
@@ -10399,11 +10426,27 @@ impl LdpcDecoder {
 
                     match self.algorithm {
                         LdpcAlgorithm::SumProduct => {
+                            // Perf (decoder-analysis A1): mirrors the flooding
+                            // branch's hoist below — the layered branch had the
+                            // SAME O(degree²) tanh recomputation (each edge's
+                            // tanh evaluated `degree` times inside the
+                            // target_pos loop) but the flooding-branch fix was
+                            // never applied here, even though `layered_bp` is
+                            // the PRODUCTION DEFAULT (so this was the actual
+                            // hot path paying the cost). Bit-identical:
+                            // `x / 2.0 == x * 0.5` exactly for f32, and each
+                            // product still multiplies the same operands in the
+                            // same order — only the redundant tanh evaluations
+                            // are removed.
+                            let mut tanh_half = [0.0f32; 7];
+                            for (pos, slot) in tanh_half.iter_mut().enumerate().take(degree) {
+                                *slot = fast_tanh(ext[pos] * 0.5);
+                            }
                             for target_pos in 0..degree {
                                 let mut product = 1.0f32;
-                                for pos in 0..degree {
+                                for (pos, &th) in tanh_half.iter().enumerate().take(degree) {
                                     if pos != target_pos {
-                                        product *= fast_tanh(ext[pos] / 2.0);
+                                        product *= th;
                                     }
                                 }
                                 let new_msg = 2.0 * fast_atanh(product);
@@ -11037,6 +11080,47 @@ mod tests {
         assert!(matches!(ldpc.algorithm, LdpcAlgorithm::SumProduct));
         // Early termination is always on (syndrome checked every iteration)
         assert!(!ldpc.var_positions.is_empty());
+    }
+
+    /// Perf (decoder-analysis A2): every `LdpcDecoder::new` call shares the
+    /// SAME cached parity-check-matrix/var-positions data — proven by `Arc`
+    /// pointer identity, not just value equality, so this actually catches a
+    /// regression to "build a fresh Arc each time" (which would still be
+    /// *correct* but defeat the caching).
+    #[test]
+    fn ldpc_decoders_share_the_same_cached_parity_check_data() {
+        let a = LdpcDecoder::new(50).unwrap();
+        let b = LdpcDecoder::new(100).unwrap(); // different max_iterations
+        assert!(
+            std::sync::Arc::ptr_eq(&a.parity_check_matrix, &b.parity_check_matrix),
+            "two LdpcDecoder instances must share one Arc<ParityCheckMatrix>, not each build their own"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&a.var_positions, &b.var_positions),
+            "two LdpcDecoder instances must share one Arc<var_positions>, not each build their own"
+        );
+        // Value correctness (unaffected by the sharing): still a valid FT8
+        // LDPC(174,91) matrix.
+        assert_eq!(a.parity_check_matrix.num_checks, 83);
+        assert_eq!(a.parity_check_matrix.num_variables, 174);
+        assert_eq!(a.var_positions.len(), 174);
+    }
+
+    /// Perf (decoder-analysis A3): when `adaptive_ldpc_iters` is off (the
+    /// production default), `ldpc_init`'s three decoders must be behavior-
+    /// identical (same `max_iterations`) regardless of which slot
+    /// `decode_candidate_op` happens to pick by `sync_score`. This is a
+    /// value-level regression guard for the low/mid/high selection logic
+    /// staying byte-identical after the clone-instead-of-rebuild change.
+    #[test]
+    fn non_adaptive_ldpc_decoders_have_identical_max_iterations() {
+        let shared = LdpcDecoder::new(100).unwrap();
+        let low = shared.clone();
+        let mid = shared.clone();
+        let high = shared;
+        assert_eq!(low.max_iterations, mid.max_iterations);
+        assert_eq!(mid.max_iterations, high.max_iterations);
+        assert_eq!(low.max_iterations, 100);
     }
 
     #[test]
