@@ -68,6 +68,17 @@ impl AudioCommShared {
         self.stream_error.load(Ordering::Acquire)
     }
 
+    /// Clear the stream-error flag (docs/audio-robustness-plan.md item 2).
+    ///
+    /// Only `set` existed before — once `stream_error` latched `true`,
+    /// `process_audio` returned `Err` on EVERY subsequent poll forever, with
+    /// no way to reset the flag on the EXISTING `AudioCommShared` short of
+    /// building a whole new stream manager. Called by the coordinator's
+    /// recovery path after a successful device reopen.
+    pub fn clear_stream_error(&self) {
+        self.stream_error.store(false, Ordering::Release);
+    }
+
     /// Get the number of dropped samples
     pub fn dropped_samples(&self) -> u64 {
         self.dropped_samples.load(Ordering::Relaxed)
@@ -278,6 +289,19 @@ mod tests {
         assert_eq!(consumer.audio_samples_available(), 0);
         assert_eq!(consumer.latency_measurements_available(), 0);
         assert!(!consumer.shared.should_stop());
+    }
+
+    /// docs/audio-robustness-plan.md item 2: `clear_stream_error` must
+    /// actually reset the flag, not just exist as a no-op stub.
+    #[test]
+    fn clear_stream_error_resets_the_flag() {
+        let (_producer, consumer) =
+            audio_comm_pair(DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
+        assert!(!consumer.shared.has_stream_error());
+        consumer.shared.set_stream_error();
+        assert!(consumer.shared.has_stream_error());
+        consumer.shared.clear_stream_error();
+        assert!(!consumer.shared.has_stream_error());
     }
 
     #[test]
