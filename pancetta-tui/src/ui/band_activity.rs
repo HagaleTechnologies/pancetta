@@ -15,10 +15,13 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
     let block = create_panel_block("Band Activity", is_active, app);
 
     // Prepare table data
-    let header_cells = [
-        "Time", "Freq", "Mode", "SNR", "DT", "DF", "Call", "Grid", "Dist", "Msg",
-    ]
-    .iter()
+    //
+    // Task 20a: `Freq` and `Mode` are per-row-constant — every row shows the
+    // same dial MHz and the same station-wide mode, so the columns carry no
+    // per-decode information (unlike SNR/DT/DF/Call/Grid/Dist which vary row
+    // to row). Dropped to give `Msg` more room.
+    let header_cells = ["Time", "SNR", "DT", "DF", "Call", "Grid", "Dist", "Msg"]
+        .iter()
     .map(|h| {
         Cell::from(*h).style(
             Style::default()
@@ -48,8 +51,6 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
                 Cell::from(""),
                 Cell::from(""),
                 Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
                 Cell::from("No messages"),
                 Cell::from(""),
                 Cell::from(""),
@@ -65,15 +66,13 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
 
     let widths = [
         Constraint::Length(8),  // Time
-        Constraint::Length(7),  // Freq
-        Constraint::Length(4),  // Mode
         Constraint::Length(4),  // SNR
         Constraint::Length(5),  // DT  (fits "-15.2")
         Constraint::Length(6),  // DF  (fits "+2800")
         Constraint::Length(10), // Call (widened to absorb the engaged "● " prefix)
         Constraint::Length(4),  // Grid
         Constraint::Length(6),  // Dist
-        Constraint::Min(10),    // Message
+        Constraint::Min(20),    // Message (freed space from dropped Freq/Mode columns)
     ];
 
     let table = Table::new(rows, widths)
@@ -136,7 +135,6 @@ fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
     // Always show HH:MM:SS in UTC — FT8 timing needs seconds granularity
     let time_short = msg.timestamp.format("%H:%M:%S").to_string();
 
-    let freq_str = format!("{:.3}", msg.frequency);
     let snr_str = format!("{:+}", msg.snr);
     let dt_str = format!("{:+.1}", msg.delta_time);
     let df_str = format!("{:+.0}", msg.delta_freq);
@@ -158,9 +156,11 @@ fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
     let grid_str = msg.grid_square.as_deref().unwrap_or("---");
     let dist_str = format_distance(msg.distance);
 
-    // Truncate long messages
-    let msg_str = if msg.message.len() > 30 {
-        format!("{}...", &msg.message[..27])
+    // Truncate long messages. Raised from 30 to 60 chars (Task 20a) — the
+    // Msg column absorbed the space freed by dropping the per-row-constant
+    // Freq/Mode columns.
+    let msg_str = if msg.message.len() > 60 {
+        format!("{}...", &msg.message[..57])
     } else {
         msg.message.clone()
     };
@@ -229,12 +229,6 @@ fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
 
     Row::new([
         Cell::from(time_short).style(muted_style),
-        Cell::from(freq_str).style(if msg.is_directed_at_us {
-            directed_style
-        } else {
-            Style::default().fg(app.theme.accent_color())
-        }),
-        Cell::from(msg.mode.clone()).style(neutral_style),
         Cell::from(snr_str).style(snr_style),
         Cell::from(dt_str).style(neutral_style),
         Cell::from(df_str).style(neutral_style),
