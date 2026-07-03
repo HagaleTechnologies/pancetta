@@ -59,6 +59,29 @@ pub(crate) fn classify_autonomous_opening(
     (dx, frequency, parity)
 }
 
+/// Maps the operator's parked TX offset (Hz) to the openness code (0-3) at
+/// that bin in a [`pancetta_qso::frequency::PlacementSnapshot`] — the
+/// coordinator-side counterpart to the TUI's own parked-bin lookup (Task
+/// 14's `apply_placement`), used to drive the persistent
+/// `DiagnosticEvent` warning below.
+///
+/// Returns `None` when `parked_hz == 0` (the `tx_offset_hold_hz` unset
+/// sentinel — matches the convention used elsewhere, e.g.
+/// `coordinator/qso.rs`'s `compute_manual_tx_offset`) or when the computed
+/// bin index falls outside `snap.openness` (shouldn't happen in practice,
+/// but the snapshot's range/bin_hz are a live read and not guaranteed to
+/// cover every possible parked Hz).
+fn parked_bin_coverage(
+    parked_hz: u64,
+    snap: &pancetta_qso::frequency::PlacementSnapshot,
+) -> Option<u8> {
+    if parked_hz == 0 {
+        return None;
+    }
+    let idx = ((parked_hz as f64 - snap.range.0) / snap.bin_hz) as usize;
+    snap.openness.get(idx).copied()
+}
+
 /// Parameters for opening one autonomous QSO (a resolved
 /// [`crate::message_bus::QsoMessage::StartAutonomousQso`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -402,6 +425,12 @@ impl super::ApplicationCoordinator {
         // now driving (autonomous Auto QSOs land here once created), and so we
         // don't open a second pounce while one is already in progress.
         let active_tx_qsos = self.active_tx_qsos.clone();
+        // Task 15: the operator's parked TX-offset atomic (0 = unparked),
+        // cloned into the task so the per-slot tick can read it alongside
+        // the placement snapshot it already computes (Task 9) and detect a
+        // degradation in coverage at the parked bin, independent of the
+        // TUI-side transient warning (Task 14).
+        let tx_offset_hold_hz = self.tx_offset_hold_hz();
         let auto_handle = {
             let shutdown = self.shutdown_signal.clone();
             let operator = operator.clone();
@@ -411,6 +440,14 @@ impl super::ApplicationCoordinator {
                 info!("Autonomous operator started");
 
                 let mut slot_messages: Vec<pancetta_qso::DecodedMessageInfo> = Vec::new();
+                // Task 15: coordinator-local edge-trigger baseline for the
+                // persistent tx.placement DiagnosticEvent, scoped to THIS
+                // task's own loop. Deliberately separate from the TUI-side
+                // `App::park_coverage_last` (Task 14) — different process,
+                // different update cadence, different purpose (retained
+                // diagnostic history vs. a transient status line) — the two
+                // are never unified.
+                let mut last_coverage: Option<u8> = None;
                 // Align slot timer to FT8 UTC boundaries (0/15/30/45 seconds)
                 // with sub-second precision. tokio::time::interval_at then
                 // keeps the cadence exact every 15s relative to that first tick.
@@ -486,6 +523,43 @@ impl super::ApplicationCoordinator {
                             // (single-scorer invariant). Sent regardless of
                             // whether autonomous mode is enabled (housekeeping).
                             if let Some(snapshot) = op.placement_snapshot(10) {
+                                // Task 15: persistent counterpart to the TUI's
+                                // transient parked-slice degradation warning
+                                // (Task 14). The TUI status line is missed if
+                                // the operator isn't looking at the moment it
+                                // fires; this lands the same finding in the
+                                // retained Shift+D diagnostic history. Reads
+                                // the SAME snapshot the TxPlacementUpdate below
+                                // carries (single-scorer invariant) and the
+                                // coordinator's own copy of the operator's
+                                // parked offset — a coordinator-local
+                                // edge-trigger (`last_coverage`), independent
+                                // of the TUI-side `park_coverage_last`.
+                                let parked_hz = tx_offset_hold_hz.load(Ordering::Relaxed);
+                                let coverage = parked_bin_coverage(parked_hz, &snapshot);
+                                if let (Some(prev), Some(code)) = (last_coverage, coverage) {
+                                    if code < prev {
+                                        let text = format!(
+                                            "Parked TX offset {parked_hz} Hz coverage \
+                                             degraded (openness {prev} -> {code})"
+                                        );
+                                        let diag_msg = ComponentMessage::new(
+                                            ComponentId::Autonomous,
+                                            ComponentId::Tui,
+                                            MessageType::DiagnosticEvent {
+                                                target: "tx.placement",
+                                                level: pancetta_core::DiagnosticLevel::Warn,
+                                                text,
+                                                qso_id: None,
+                                                callsign: None,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus.send_message(diag_msg).await;
+                                    }
+                                }
+                                last_coverage = coverage;
+
                                 let msg = ComponentMessage::new(
                                     ComponentId::Autonomous,
                                     ComponentId::Tui,
@@ -908,6 +982,39 @@ impl super::ApplicationCoordinator {
             .push((ComponentId::Autonomous, auto_handle));
         info!("Autonomous operator component started");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod parked_bin_coverage_tests {
+    use super::*;
+    use pancetta_qso::frequency::PlacementSnapshot;
+
+    #[test]
+    fn parked_bin_coverage_maps_hz_to_bin() {
+        let snap = PlacementSnapshot {
+            slices: vec![],
+            openness: vec![3, 1, 0],
+            bin_hz: 25.0,
+            range: (200.0, 275.0),
+        };
+        assert_eq!(parked_bin_coverage(0, &snap), None, "0 = unparked sentinel");
+        assert_eq!(parked_bin_coverage(225, &snap), Some(1));
+    }
+
+    #[test]
+    fn parked_bin_coverage_out_of_range_is_none() {
+        let snap = PlacementSnapshot {
+            slices: vec![],
+            openness: vec![3, 1, 0],
+            bin_hz: 25.0,
+            range: (200.0, 275.0),
+        };
+        assert_eq!(
+            parked_bin_coverage(1000, &snap),
+            None,
+            "bin index past the end of openness"
+        );
     }
 }
 
