@@ -142,6 +142,16 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
 }
 
 fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
+    // Cross-panel global focus (Task 2): when some OTHER panel is active and
+    // this row's callsign is the operator's current focus, flag it here too
+    // — but only when DX Hunter itself is NOT the active panel, so we never
+    // double up with the active panel's REVERSED row-highlight.
+    let is_active_panel = matches!(app.active_panel, ActivePanel::DxHunter);
+    let is_globally_focused = !is_active_panel && app.is_focused(&station.call_sign);
+
+    // Tier-2 highlight (Task 3): one of our current active-QSO partners.
+    let is_engaged = app.is_engaged(&station.call_sign);
+
     // Source indicator
     let src_str = station.source.to_string();
     let src_style = match station.source {
@@ -154,8 +164,9 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
     // `+` = needed DXCC (not ATNO), `★` = notable. Markers stack so an
     // ATNO that's also notable reads "!★CALL".
     let call_display = format!(
-        "{}{}",
+        "{}{}{}",
         need_marker(station.atno, station.needed, station.is_notable),
+        if is_engaged { "● " } else { "" },
         station.call_sign
     );
 
@@ -174,6 +185,10 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
 
     let call_style = if is_stale {
         Style::default().fg(app.theme.muted_color())
+    } else if is_globally_focused {
+        Style::default()
+            .fg(app.theme.selected_color())
+            .add_modifier(Modifier::BOLD)
     } else if station.atno {
         // ATNO — the highest-value catch. Bold magenta + underline so it
         // stands apart from merely-notable (bold magenta) rows.
@@ -203,6 +218,15 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
         Style::default()
             .fg(app.theme.success_color())
             .add_modifier(Modifier::BOLD)
+    };
+    // Tier-2 (engaged) highlight stacks on top of whatever the above chose —
+    // green + underline, without discarding e.g. the tier-1 BOLD.
+    let call_style = if is_engaged {
+        call_style
+            .fg(app.theme.success_color())
+            .add_modifier(Modifier::UNDERLINED)
+    } else {
+        call_style
     };
 
     let grid_str = station.grid_square.as_deref().unwrap_or("---").to_string();

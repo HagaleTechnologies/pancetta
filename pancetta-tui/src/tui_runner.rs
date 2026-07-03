@@ -1412,6 +1412,12 @@ impl TuiRunner {
             // Callers-Enter and fixes "I clicked to send 73 but it sent my
             // grid" — pressing Space on a station still sending us RR73 sends
             // another 73.
+            //
+            // Fix round 2 (operator-confirmed 2026-07-03): if the focused
+            // callsign already has a live QSO and nothing directed-at-us is
+            // pending, `resolve_space_action` returns `None` rather than a
+            // `Call` that would supersede it — surface a specific status
+            // message so the operator knows why nothing happened.
             KeyCode::Char(' ') => match app.resolve_space_action() {
                 Some(crate::app::SpaceAction::Reply {
                     callsign,
@@ -1446,7 +1452,12 @@ impl TuiRunner {
                     app.status_message = format!("Calling {}...", callsign);
                 }
                 None => {
-                    app.status_message = "No station selected".to_string();
+                    app.status_message = match app.focused_callsign() {
+                        Some(call) if app.is_engaged(&call) => {
+                            format!("{} already has an active QSO — cancel it first", call)
+                        }
+                        _ => "No station selected".to_string(),
+                    };
                 }
             },
 
@@ -3100,5 +3111,229 @@ mod key_tests {
             !app.read().await.fox_mode,
             "after refused-engage echo, fox_mode must be false (corrected)"
         );
+    }
+
+    /// Task 3: Space acts on the operator's GLOBAL focus
+    /// (`App::focused_callsign()`), not a hardcoded per-panel cursor. Pin
+    /// focus to a CQing station via the DX Hunter panel, press Space, and
+    /// confirm the resulting `CallStation` targets that pinned callsign.
+    #[tokio::test]
+    async fn space_targets_the_dx_hunter_pinned_focus() {
+        use chrono::Utc;
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::DxHunter;
+            // Inject a pure-CQer DX station directly into dx_stations so
+            // displayed_dx_stations() returns it (never directed at us, so
+            // Space resolves to SpaceAction::Call, not Reply).
+            a.dx_stations.insert(
+                "VK9XX".to_string(),
+                crate::app::DxStation {
+                    call_sign: "VK9XX".to_string(),
+                    grid_square: Some("QH30".to_string()),
+                    frequency: 14.074,
+                    mode: "FT8".to_string(),
+                    last_seen: Utc::now(),
+                    snr: -10,
+                    distance: None,
+                    bearing: None,
+                    worked_before: false,
+                    needed: true,
+                    atno: false,
+                    priority_score: 800,
+                    source: crate::app::SpotSource::Local,
+                    entity_name: None,
+                    rarity_tier: None,
+                    reporter_count: None,
+                    is_notable: false,
+                    notable_type: None,
+                    confidence: None,
+                    best_snr_network: None,
+                    last_seen_network: None,
+                    audio_offset_hz: Some(750),
+                    slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+                },
+            );
+            a.dx_hunter_scroll = 0;
+            // Pin the focus (mirrors what a deliberate cursor move does).
+            a.clamp_dx_hunter_selection();
+            assert_eq!(a.focused_callsign().as_deref(), Some("VK9XX"));
+        }
+        r.handle_key_event(key(' ')).await.unwrap();
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::CallStation {
+                callsign,
+                frequency,
+                dx_parity,
+            }) => {
+                assert_eq!(callsign, "VK9XX");
+                assert_eq!(frequency, 750);
+                assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Even));
+            }
+            other => panic!("Expected CallStation, got {:?}", other),
+        }
+    }
+
+    /// Task 3's actual behavior change: `resolve_space_action` used to key
+    /// off `get_selected_station()`, which only resolves a callsign for
+    /// BandActivity/DxHunter/Callers — Space was a silent no-op on the QSO
+    /// Status panel. Routed through the global `focused_callsign()`, Space
+    /// now also works from the QSO Status panel (via the Reply branch —
+    /// see `space_replies_for_an_engaged_qso_status_station_with_pending_reply`
+    /// below; the bare Call branch is blocked for an engaged station, see
+    /// `space_blocks_call_for_an_already_engaged_qso_status_station`).
+    ///
+    /// Fix round 1 (TX-safety regression found in review): `get_selected_station()`
+    /// has NO arm for `ActivePanel::QsoStatus`, so its filter in the Call-branch
+    /// fallback always fell through to the disconnected `(1500, None)` default,
+    /// discarding the real frequency/parity of a station already being worked.
+    ///
+    /// Fix round 2 (operator-confirmed 2026-07-03): stepping back further,
+    /// Space should never re-initiate/supersede an already-**engaged**
+    /// station at all — the QSO Status panel's `focused_callsign()` always
+    /// resolves to a live `active_qsos` entry, so this scenario (no pending
+    /// directed-at-us reply) now must be BLOCKED, not answered with a
+    /// (correctly-frequencied) `Call`. This supersedes fix round 1's test of
+    /// the same name/shape; see `space_blocks_call_for_an_already_engaged_qso_status_station`.
+    #[tokio::test]
+    async fn space_blocks_call_for_an_already_engaged_qso_status_station() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::QsoStatus;
+            a.apply_active_qsos(
+                vec![crate::app::ActiveQsoBanner {
+                    their_callsign: "JA1ABC".to_string(),
+                    state: "wait rpt".to_string(),
+                    started_at: chrono::Utc::now(),
+                    frequency_hz: 1234.0,
+                    tx_parity: Some(pancetta_core::slot::SlotParity::Odd),
+                    last_tx_text: None,
+                    last_tx_at: None,
+                    last_rx_text: None,
+                    last_rx_at: None,
+                    snr_rx: None,
+                    report_sent: None,
+                    report_received: None,
+                    exchange_count: 1,
+                    qso_id: "ja1abc-id".to_string(),
+                    initiated_by: "Manual".to_string(),
+                    ladder_labels: Vec::new(),
+                    ladder_ours: Vec::new(),
+                    ladder_index: 0,
+                    now_line: String::new(),
+                    next_line: String::new(),
+                    call_count: 0,
+                    max_calls: 0,
+                    watchdog_deadline: None,
+                    dx_last_activity: None,
+                    hound: false,
+                }],
+                Vec::new(),
+            );
+            a.qso_cursor = 0;
+            assert_eq!(a.focused_callsign().as_deref(), Some("JA1ABC"));
+            // No decode directed-at-us from JA1ABC is on record, so the only
+            // pre-round-2 option was Call/supersede — now blocked.
+            assert!(a.last_directed_at_us_from("JA1ABC").is_none());
+            assert!(a.is_engaged("JA1ABC"));
+        }
+        r.handle_key_event(key(' ')).await.unwrap();
+        // No TuiCommand at all — NOT a Call/supersede of the live QSO.
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "Space must not send any command for an already-engaged station \
+             with no pending directed-at-us reply"
+        );
+        let a = app.read().await;
+        assert_eq!(
+            a.status_message,
+            "JA1ABC already has an active QSO — cancel it first"
+        );
+    }
+
+    /// Sibling of the above: an engaged station (live `active_qsos` entry)
+    /// that HAS most-recently sent us something directed-at-us must still
+    /// get a `Reply` from Space — the block only narrows the `Call`
+    /// (fresh-initiation/supersede) branch, never the ordinary reply-in-an-
+    /// existing-exchange path (the whole point of the Task 3 feature).
+    #[tokio::test]
+    async fn space_replies_for_an_engaged_qso_status_station_with_pending_reply() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::QsoStatus;
+            a.apply_active_qsos(
+                vec![crate::app::ActiveQsoBanner {
+                    their_callsign: "G8KHF".to_string(),
+                    state: "wait rpt".to_string(),
+                    started_at: chrono::Utc::now(),
+                    frequency_hz: 2222.0,
+                    tx_parity: None,
+                    last_tx_text: None,
+                    last_tx_at: None,
+                    last_rx_text: None,
+                    last_rx_at: None,
+                    snr_rx: None,
+                    report_sent: None,
+                    report_received: None,
+                    exchange_count: 1,
+                    qso_id: "g8khf-id".to_string(),
+                    initiated_by: "Manual".to_string(),
+                    ladder_labels: Vec::new(),
+                    ladder_ours: Vec::new(),
+                    ladder_index: 0,
+                    now_line: String::new(),
+                    next_line: String::new(),
+                    call_count: 0,
+                    max_calls: 0,
+                    watchdog_deadline: None,
+                    dx_last_activity: None,
+                    hound: false,
+                }],
+                Vec::new(),
+            );
+            a.qso_cursor = 0;
+            // G8KHF most-recently sent us an RR73 directed at us — the Reply
+            // branch must fire (Space → our 73), never the blocked Call branch.
+            a.decoded_messages
+                .push_back(crate::app::DecodedMessageView {
+                    timestamp: chrono::Utc::now(),
+                    frequency: 14_074_000.0,
+                    mode: "FT8".to_string(),
+                    snr: -8,
+                    delta_time: 0.0,
+                    delta_freq: 2222.0,
+                    call_sign: Some("G8KHF".to_string()),
+                    grid_square: None,
+                    message: "K5ARH G8KHF RR73".to_string(),
+                    distance: None,
+                    bearing: None,
+                    slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+                    is_directed_at_us: true,
+                    worked_before: false,
+                    needed: false,
+                    atno: false,
+                    priority_score: None,
+                });
+            assert_eq!(a.focused_callsign().as_deref(), Some("G8KHF"));
+            assert!(a.is_engaged("G8KHF"));
+            assert!(a.last_directed_at_us_from("G8KHF").is_some());
+        }
+        r.handle_key_event(key(' ')).await.unwrap();
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::RespondToCaller {
+                callsign,
+                frequency,
+                dx_parity,
+                ..
+            }) => {
+                assert_eq!(callsign, "G8KHF");
+                assert_eq!(frequency, 2222);
+                assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Even));
+            }
+            other => panic!("Expected RespondToCaller targeting G8KHF, got {:?}", other),
+        }
     }
 }

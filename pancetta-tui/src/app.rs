@@ -669,6 +669,12 @@ pub struct App {
     pub station_info: StationInfo,
     pub dx_stations: HashMap<String, DxStation>,
     pub band_activity_scroll: usize,
+    /// The callsign the Band Activity cursor is pinned to. The list reorders
+    /// on EVERY decode window (directed-at-us pinned first, then newest-first),
+    /// so a bare positional index silently retargets Space onto a different
+    /// station. Same pattern as `dx_hunter_pinned_call` / `qso_pinned_id`.
+    /// `None` = not yet pinned (track whatever is at `band_activity_scroll`).
+    band_activity_pinned_call: Option<String>,
     pub dx_hunter_scroll: usize,
     /// The callsign the DX-Hunter cursor is pinned to. The DX-Hunter list
     /// re-sorts and grows under the cursor (needed-first / priority-desc),
@@ -893,6 +899,7 @@ impl App {
             station_info,
             dx_stations: HashMap::new(),
             band_activity_scroll: 0,
+            band_activity_pinned_call: None,
             dx_hunter_scroll: 0,
             dx_hunter_pinned_call: None,
             callers_scroll: 0,
@@ -1147,6 +1154,7 @@ impl App {
         // DX list). Re-derive both cursors from their pinned callsigns so the
         // operator's Space/Enter target doesn't silently shift onto whoever
         // just appeared.
+        self.clamp_band_activity_selection();
         self.clamp_dx_hunter_selection();
         self.clamp_callers_selection();
 
@@ -1181,6 +1189,7 @@ impl App {
                 if self.band_activity_scroll > 0 {
                     self.band_activity_scroll -= 1;
                 }
+                self.pin_band_activity_selection();
             }
             ActivePanel::DxHunter => {
                 if self.dx_hunter_scroll > 0 {
@@ -1205,6 +1214,7 @@ impl App {
                 if self.band_activity_scroll < max_scroll {
                     self.band_activity_scroll += 1;
                 }
+                self.pin_band_activity_selection();
             }
             ActivePanel::DxHunter => {
                 let max_scroll = self.displayed_dx_stations().len().saturating_sub(1);
@@ -1258,7 +1268,10 @@ impl App {
     /// "get me back to live" shortcut (Home / `g`), no more holding the arrow.
     pub fn scroll_to_top(&mut self) {
         match self.active_panel {
-            ActivePanel::BandActivity => self.band_activity_scroll = 0,
+            ActivePanel::BandActivity => {
+                self.band_activity_scroll = 0;
+                self.pin_band_activity_selection();
+            }
             ActivePanel::DxHunter => {
                 self.dx_hunter_scroll = 0;
                 self.repin_dx_hunter();
@@ -1277,6 +1290,7 @@ impl App {
         match self.active_panel {
             ActivePanel::BandActivity => {
                 self.band_activity_scroll = self.decoded_messages.len().saturating_sub(1);
+                self.pin_band_activity_selection();
             }
             ActivePanel::DxHunter => {
                 self.dx_hunter_scroll = self.displayed_dx_stations().len().saturating_sub(1);
@@ -1296,6 +1310,7 @@ impl App {
             ActivePanel::BandActivity => {
                 self.band_activity_scroll =
                     self.band_activity_scroll.saturating_sub(Self::SCROLL_PAGE);
+                self.pin_band_activity_selection();
             }
             ActivePanel::DxHunter => {
                 self.dx_hunter_scroll = self.dx_hunter_scroll.saturating_sub(Self::SCROLL_PAGE);
@@ -1316,6 +1331,7 @@ impl App {
                 let max = self.decoded_messages.len().saturating_sub(1);
                 self.band_activity_scroll =
                     (self.band_activity_scroll + Self::SCROLL_PAGE).min(max);
+                self.pin_band_activity_selection();
             }
             ActivePanel::DxHunter => {
                 let max = self.displayed_dx_stations().len().saturating_sub(1);
@@ -1334,6 +1350,7 @@ impl App {
     pub fn clear_messages(&mut self) {
         self.decoded_messages.clear();
         self.band_activity_scroll = 0;
+        self.clamp_band_activity_selection();
         self.status_message = "Messages cleared".to_string();
         info!("Cleared all decoded messages");
     }
@@ -2007,11 +2024,12 @@ impl App {
         })
     }
 
-    /// Resolve what the Space key should do for the currently-selected station,
+    /// Resolve what the Space key should do for the current global focus
+    /// (Task 3 — `App::focused_callsign()`, NOT any one panel's own cursor),
     /// unifying the Space and Callers-Enter paths into "do the right next
-    /// thing". Returns `None` when no station is selected.
+    /// thing". Returns `None` when nothing is focused.
     ///
-    /// - If the selected callsign has a most-recent decode directed at us (a
+    /// - If the focused callsign has a most-recent decode directed at us (a
     ///   grid/report/R-report/RR73/73), classify it with the SAME
     ///   [`classify_caller_reply`] logic the Callers panel uses and return
     ///   [`SpaceAction::Reply`] at that smart-default step (their `RR73` → we
@@ -2019,13 +2037,28 @@ impl App {
     /// - Otherwise (a pure CQer, or a DX-cluster spot we've never heard call
     ///   us) return [`SpaceAction::Call`] — the historical Space behavior of
     ///   answering their CQ at the grid step.
+    /// - **Fix round 2 (operator-confirmed 2026-07-03):** if neither of the
+    ///   above applies (no directed-at-us reply pending) AND the focused
+    ///   callsign already has a live QSO ([`Self::is_engaged`]), Space must
+    ///   NOT re-initiate/supersede it — that would blow away an in-progress
+    ///   (possibly autonomous) exchange. Returns `None` (the same "nothing to
+    ///   do" signal used when no station is focused at all); the caller
+    ///   surfaces an operator-facing status message naming the callsign. The
+    ///   operator must explicitly cancel the QSO first.
     ///
     /// The reply target's frequency/parity come from the directed decode itself
     /// (where we actually heard them) rather than the selected-row frequency,
     /// so a reply always lands on the right passband even if the operator
     /// selected the station from the DX Hunter (network-spot) row.
+    ///
+    /// The Call-branch frequency/parity fall back to whatever the active
+    /// panel's own cursor resolution knows about this same station (the
+    /// common case — a panel's pin and cursor stay in sync with its own
+    /// focus) and otherwise to the FT8 calling-frequency default (1500 Hz,
+    /// unknown parity) — e.g. focus resolved from the QSO Status panel,
+    /// which has no cursor-based frequency lookup of its own.
     pub fn resolve_space_action(&self) -> Option<SpaceAction> {
-        let (callsign, frequency, dx_parity) = self.get_selected_station()?;
+        let callsign = self.focused_callsign()?;
 
         if let Some(msg) = self.last_directed_at_us_from(&callsign) {
             let step = classify_caller_reply(&msg.message, &self.station_info.call_sign);
@@ -2040,6 +2073,43 @@ impl App {
                 snr: Some(msg.snr as f32),
             });
         }
+
+        // Fix round 2 (operator-confirmed 2026-07-03): Space must never
+        // re-initiate/supersede a station we already have a live QSO with.
+        // With no directed-at-us reply pending (the branch above), there is
+        // nothing safe left for Space to do — force the operator to cancel
+        // the QSO explicitly instead of silently superseding it. `None` is
+        // the same "nothing to do" signal already used elsewhere in this
+        // function (e.g. no station focused at all); the caller resolves the
+        // operator-facing message.
+        if self.is_engaged(&callsign) {
+            return None;
+        }
+
+        let (frequency, dx_parity) = self
+            .get_selected_station()
+            .filter(|(c, _, _)| pancetta_core::callsign::callsigns_match(c, &callsign))
+            .map(|(_, f, p)| (f, p))
+            .or_else(|| {
+                // `get_selected_station()` has no arm for `ActivePanel::QsoStatus`
+                // (and its filter above only matches when it DOES resolve the
+                // focused callsign), but `focused_callsign()` can still resolve
+                // to an already-engaged station via `self.active_qsos`. Falling
+                // all the way through to the (1500, None) default in that case
+                // would discard the QSO's real TX frequency/parity and — via
+                // `respond_to_cq_with`'s unfiltered `supersede_active_qsos_for`
+                // — could blow away a live QSO to start a fresh Manual one at a
+                // bogus 1500 Hz. Mirror exactly how `focused_callsign` resolves
+                // the QsoStatus panel: look the callsign up in `active_qsos` and
+                // use ITS real frequency/parity.
+                self.active_qsos
+                    .iter()
+                    .find(|q| {
+                        pancetta_core::callsign::callsigns_match(&q.their_callsign, &callsign)
+                    })
+                    .map(|q| (q.frequency_hz.round() as u64, q.tx_parity))
+            })
+            .unwrap_or((1500, None));
 
         Some(SpaceAction::Call {
             callsign,
@@ -2153,6 +2223,92 @@ impl App {
             self.dx_hunter_scroll = max;
         }
         self.dx_hunter_pinned_call = calls.get(self.dx_hunter_scroll).cloned();
+    }
+
+    /// The station under the operator's attention: the ACTIVE panel's pinned
+    /// (or cursor-resolved) callsign. One focus, shared by every panel —
+    /// renderers highlight it everywhere via `is_focused`.
+    pub fn focused_callsign(&self) -> Option<String> {
+        match self.active_panel {
+            ActivePanel::BandActivity => self
+                .band_activity_pinned_call
+                .clone()
+                .or_else(|| self.get_selected_station().map(|(call, _, _)| call)),
+            ActivePanel::DxHunter => self.dx_hunter_pinned_call.clone().or_else(|| {
+                self.displayed_dx_stations()
+                    .get(self.dx_hunter_scroll)
+                    .map(|s| s.call_sign.clone())
+            }),
+            ActivePanel::Callers => self.callers_pinned_call.clone().or_else(|| {
+                self.displayed_callers()
+                    .get(self.callers_scroll)
+                    .and_then(|m| m.call_sign.clone())
+            }),
+            ActivePanel::QsoStatus => self
+                .active_qsos
+                .get(self.qso_cursor)
+                .map(|q| q.their_callsign.clone()),
+            ActivePanel::StationInfo => None,
+        }
+    }
+
+    /// Compound-aware "is this callsign the current focus?"
+    pub fn is_focused(&self, call: &str) -> bool {
+        self.focused_callsign()
+            .is_some_and(|f| pancetta_core::callsign::callsigns_match(&f, call))
+    }
+
+    /// Is this callsign one of our current active-QSO partners (an "engaged"
+    /// stream)? Engaged stations get the tier-2 highlight (green ● + underline)
+    /// in every list — visible even while the focus is elsewhere (multi-TX).
+    pub fn is_engaged(&self, call: &str) -> bool {
+        self.active_qsos
+            .iter()
+            .any(|q| pancetta_core::callsign::callsigns_match(&q.their_callsign, call))
+    }
+
+    /// Pin the Band Activity selection to the callsign currently under the
+    /// cursor. Call after every deliberate cursor move.
+    pub fn pin_band_activity_selection(&mut self) {
+        self.band_activity_pinned_call = self
+            .displayed_messages()
+            .get(self.band_activity_scroll)
+            .and_then(|m| m.call_sign.clone());
+    }
+
+    /// Re-derive `band_activity_scroll` from the pinned callsign after any
+    /// list mutation. Falls back to a clamp (and clears the pin) if the
+    /// pinned callsign left the list.
+    pub fn clamp_band_activity_selection(&mut self) {
+        // Snapshot callsigns in display order (owned) to avoid holding a borrow
+        // of `self` while we mutate the cursor.
+        let calls: Vec<Option<String>> = self
+            .displayed_messages()
+            .iter()
+            .map(|m| m.call_sign.clone())
+            .collect();
+        let len = calls.len();
+
+        let mut pinned_aged_out = false;
+        if let Some(ref pin) = self.band_activity_pinned_call {
+            if let Some(idx) = calls.iter().position(|call| {
+                call.as_deref()
+                    .is_some_and(|c| pancetta_core::callsign::callsigns_match(c, pin))
+            }) {
+                self.band_activity_scroll = idx;
+                return;
+            }
+            // Pin was explicitly set but aged out of the list; clear it and re-adopt at scroll
+            self.band_activity_pinned_call = None;
+            pinned_aged_out = true;
+        }
+        let max = len.saturating_sub(1);
+        self.band_activity_scroll = self.band_activity_scroll.min(max);
+        // If the pinned call aged out, re-adopt whatever now sits at the resolved index
+        if pinned_aged_out {
+            self.band_activity_pinned_call =
+                calls.get(self.band_activity_scroll).and_then(|m| m.clone());
+        }
     }
 
     /// The currently-selected caller, if any.
@@ -4231,6 +4387,34 @@ mod tests {
         }
     }
 
+    /// Fix round 2 (operator-confirmed 2026-07-03): Space must NOT return a
+    /// `Call` (fresh-initiation/supersede) for a station that already has a
+    /// live QSO (`is_engaged`), even when the focus is resolved from a panel
+    /// OTHER than QSO Status (here, Band Activity) — the guard is keyed off
+    /// the callsign's engagement, not which panel it was focused from.
+    /// `resolve_space_action` returns `None`, same as "nothing selected".
+    #[tokio::test]
+    async fn space_blocks_call_for_an_engaged_station_seen_in_band_activity() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        // DL5XYZ is calling CQ (nothing directed at us) but we already have a
+        // live QSO with them (e.g. a concurrent multi-TX stream on another
+        // slot) — Space here must not re-initiate/supersede it.
+        app.add_decoded_message(fixture_view("DL5XYZ", -3))
+            .await
+            .unwrap();
+        app.band_activity_scroll = 0;
+        app.active_qsos = vec![fixture_banner("DL5XYZ", "Calling", None)];
+
+        assert!(app.is_engaged("DL5XYZ"));
+        assert!(app.last_directed_at_us_from("DL5XYZ").is_none());
+        assert!(
+            app.resolve_space_action().is_none(),
+            "Space must be a no-op for an already-engaged station with no \
+             pending directed-at-us reply"
+        );
+    }
+
     /// Space classifies each directed payload at the right rung: their grid →
     /// Report, their report → ReportAck, their R-report → Rr73, their RR73 → 73.
     #[tokio::test]
@@ -4421,5 +4605,166 @@ mod tests {
         assert_eq!(super::parse_mhz_to_hz(&m.tx_buffer), None);
         m.tx_buffer.push_str("14.090");
         assert_eq!(super::parse_mhz_to_hz(&m.tx_buffer), Some(14_090_000));
+    }
+
+    #[tokio::test]
+    async fn band_activity_cursor_follows_callsign_across_reorder() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        app.add_decoded_message(fixture_view("K1AAA", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K2BBB", -8))
+            .await
+            .unwrap();
+        // Newest-first display: [K2BBB, K1AAA]. Move cursor to K1AAA (row 1) and pin.
+        app.scroll_down();
+        app.pin_band_activity_selection();
+        let (call, _, _) = app.get_selected_station().expect("K1AAA selectable");
+        assert_eq!(call, "K1AAA");
+
+        // A new decode lands (K3CCC becomes row 0) AND a directed-at-us decode
+        // pins to the very top — both shift K1AAA's index.
+        app.add_decoded_message(fixture_view("K3CCC", -6))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view_directed("K4DDD", -4))
+            .await
+            .unwrap();
+
+        // The cursor must still resolve to K1AAA, not whatever occupies row 1 now.
+        let (call, _, _) = app.get_selected_station().expect("K1AAA still selectable");
+        assert_eq!(call, "K1AAA");
+    }
+
+    #[tokio::test]
+    async fn band_activity_pin_degrades_gracefully_when_station_ages_out() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        app.add_decoded_message(fixture_view("K1AAA", -10))
+            .await
+            .unwrap();
+        app.pin_band_activity_selection();
+        app.clear_messages();
+        // Pinned call gone: index clamps to 0, pin cleared, no panic.
+        assert_eq!(app.band_activity_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn band_activity_pageup_pagedown_pin_selection() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        // Add 15 messages so PageUp/PageDown (10-row jumps) have room to move.
+        for i in 0i32..15i32 {
+            app.add_decoded_message(fixture_view(&format!("K{:02}XXX", i), -20 + i))
+                .await
+                .unwrap();
+        }
+        // Newest-first: [K14XXX, K13XXX, ..., K0XXX]. Move to row 5 and page down.
+        app.band_activity_scroll = 5;
+        app.page_down();
+        // After page_down, we moved down 10 rows. The key is that band_activity_pinned_call
+        // should now be set to whatever station is at the new scroll position.
+        let (pinned_call_after, _, _) =
+            app.get_selected_station().expect("station after page_down");
+        assert_eq!(
+            app.band_activity_pinned_call,
+            Some(pinned_call_after.clone()),
+            "PageDown should pin to the new selection"
+        );
+        // Now add a high-priority directed-at-us decode that would normally shift indices.
+        // Without the fix, the pin would be stale and the cursor would snap to the old position.
+        app.add_decoded_message(fixture_view_directed("K99NEW", -2))
+            .await
+            .unwrap();
+        // Verify cursor stayed on the same pinned callsign despite the reorder.
+        let (current_call, _, _) = app.get_selected_station().expect("station after reorder");
+        assert_eq!(
+            current_call, pinned_call_after,
+            "PageDown pin should survive a reorder"
+        );
+    }
+
+    #[tokio::test]
+    async fn band_activity_pin_self_heals_when_station_ages_out() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        // Add three stations so we have backup after removing the pinned one
+        app.add_decoded_message(fixture_view("K1AAA", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K2BBB", -12))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K3CCC", -14))
+            .await
+            .unwrap();
+        // Newest-first: [K3CCC, K2BBB, K1AAA]
+        // Pin K2BBB (the middle station)
+        app.band_activity_scroll = 1;
+        app.pin_band_activity_selection();
+        assert_eq!(
+            app.band_activity_pinned_call,
+            Some("K2BBB".to_string()),
+            "Should pin to K2BBB at index 1"
+        );
+        // Manually remove K2BBB from the list to simulate it aging out
+        // (without clearing all messages)
+        app.decoded_messages
+            .retain(|m| m.call_sign.as_deref() != Some("K2BBB"));
+        // Displayed list is now [K3CCC, K1AAA]
+        app.clamp_band_activity_selection();
+        // After clamp with K2BBB gone:
+        // - K2BBB is not found, so pinned_call is cleared
+        // - Scroll was 1, now clamped to 1 (max index in a 2-element list)
+        // - Re-adoption should set pinned_call to whatever is at index 1, which is K1AAA
+        assert_eq!(
+            app.band_activity_pinned_call,
+            Some("K1AAA".to_string()),
+            "Pin should self-heal to K1AAA at the resolved scroll index"
+        );
+        // Now add a new high-priority decode that reorders the list
+        app.add_decoded_message(fixture_view_directed("K4DDD", -2))
+            .await
+            .unwrap();
+        // Displayed list is now [K4DDD (directed), K3CCC, K1AAA]
+        // The self-healed pin to K1AAA should survive this reorder
+        assert_eq!(
+            app.band_activity_pinned_call,
+            Some("K1AAA".to_string()),
+            "Self-healed pin should survive a reorder"
+        );
+        // Verify cursor is still on K1AAA despite the new decode at index 0
+        let (current_call, _, _) = app
+            .get_selected_station()
+            .expect("station after re-adopt reorder");
+        assert_eq!(
+            current_call, "K1AAA",
+            "Cursor should still resolve to K1AAA after reorder"
+        );
+    }
+
+    #[tokio::test]
+    async fn focused_callsign_follows_the_active_panel() {
+        let mut app = fixture_app().await;
+        app.add_decoded_message(fixture_view("K1AAA", -10))
+            .await
+            .unwrap();
+        app.active_panel = ActivePanel::BandActivity;
+        app.pin_band_activity_selection();
+        assert_eq!(app.focused_callsign().as_deref(), Some("K1AAA"));
+        // Compound equivalence: EA8/K1AAA is the same focus target.
+        assert!(app.is_focused("EA8/K1AAA"));
+        assert!(!app.is_focused("K1AAB"));
+    }
+
+    #[tokio::test]
+    async fn engaged_calls_are_flagged_compound_aware() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.active_qsos
+            .push(fixture_banner("JA1ABC", "wait rpt", None));
+        assert!(app.is_engaged("JA1ABC"));
+        assert!(app.is_engaged("JA1ABC/P"));
+        assert!(!app.is_engaged("JA1ABD"));
     }
 }
