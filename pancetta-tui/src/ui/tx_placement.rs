@@ -206,6 +206,24 @@ fn nearest_busy_gap_hz(bin: usize, openness: &[u8], bin_hz: f64) -> f64 {
     left_dist.min(right_dist) * bin_hz
 }
 
+/// Frequency (Hz) represented by column `col` within a `width`-wide strip
+/// spanning `range` — col's frequency is the midpoint of its fractional
+/// slice across `range`, mirroring `Waterfall::freq_to_col`'s inverse.
+/// `None` when `width == 0` (nothing to scale against).
+///
+/// `pub(crate)` (Task 19) so the click-to-park handler
+/// (`App::handle_mouse_event`) can map a clicked column to the exact
+/// frequency it will ask to park at, using the SAME column<->frequency
+/// scaling `bin_for_col` (below) and the strip renderer both use.
+pub(crate) fn freq_for_col(col: usize, width: usize, range: (f64, f64)) -> Option<f64> {
+    if width == 0 {
+        return None;
+    }
+    let (lo, hi) = range;
+    let frac = (col as f64 + 0.5) / width as f64;
+    Some(lo + frac * (hi - lo))
+}
+
 /// Map a screen column to a bin index in `openness`, using the same
 /// column<->frequency scaling as `Waterfall::freq_to_col` (col's frequency
 /// is the bin center of its fractional position across `range`).
@@ -213,10 +231,24 @@ fn bin_for_col(col: usize, width: usize, range: (f64, f64), bin_hz: f64, n_bins:
     if width == 0 || n_bins == 0 {
         return 0;
     }
-    let (lo, hi) = range;
-    let frac = (col as f64 + 0.5) / width as f64;
-    let freq = lo + frac * (hi - lo);
+    let freq = freq_for_col(col, width, range).unwrap_or(range.0);
     bin_index_for_freq(freq, range, bin_hz, n_bins).unwrap_or(0)
+}
+
+/// The openness strip's usable width in columns, given the panel's inner
+/// (border-stripped) width — i.e. `strip_width` after the legend
+/// ("█both ▀E ▄O") is carved off the tail, when there's room for one.
+/// Mirrors `render_openness_strip`'s own `show_legend`/`strip_width` math
+/// exactly (that function calls this rather than re-deriving it) so the
+/// Task 19 click-to-park column mapping always agrees with what the strip
+/// actually drew.
+pub(crate) fn strip_width_for(inner_width: usize) -> usize {
+    const LEGEND_WIDTH: usize = 11; // "█both ▀E ▄O" (glyphs render as width-1 cells)
+    if inner_width >= LEGEND_MIN_WIDTH {
+        inner_width.saturating_sub(LEGEND_WIDTH + 1)
+    } else {
+        inner_width
+    }
 }
 
 /// Bin index containing `freq_hz`, or `None` if outside `range` or the
@@ -292,11 +324,7 @@ fn render_openness_strip(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Pl
     let width = row.width as usize;
     let show_legend = width >= LEGEND_MIN_WIDTH;
     let legend_width: usize = 11; // "█both ▀E ▄O" (glyphs render as width-1 cells)
-    let strip_width = if show_legend {
-        width.saturating_sub(legend_width + 1)
-    } else {
-        width
-    };
+    let strip_width = strip_width_for(width);
     let n_bins = placement.openness.len();
 
     for col in 0..strip_width {
@@ -572,5 +600,32 @@ mod geometry_tests {
             bin_index_for_freq(1480.0, (200.0, 2600.0), 25.0, 96),
             Some(51)
         );
+    }
+
+    // --- Task 19: click-to-park column<->frequency helpers ------------
+
+    #[test]
+    fn freq_for_col_is_zero_width_safe() {
+        assert_eq!(freq_for_col(0, 0, (200.0, 2600.0)), None);
+    }
+
+    #[test]
+    fn freq_for_col_matches_bin_for_col_scaling() {
+        // Column 0 of a 100-wide strip over (200,2600) should land in the
+        // same bin bin_for_col derives internally (they now share the same
+        // freq_for_col math after the Task 19 refactor).
+        let range = (200.0, 2600.0);
+        let freq = freq_for_col(0, 100, range).expect("width > 0");
+        let bin = bin_index_for_freq(freq, range, 25.0, 96);
+        assert_eq!(bin, Some(bin_for_col(0, 100, range, 25.0, 96)));
+    }
+
+    #[test]
+    fn strip_width_for_matches_legend_threshold() {
+        // Below LEGEND_MIN_WIDTH (60): full width, no legend carved off.
+        assert_eq!(strip_width_for(59), 59);
+        // At/above the threshold: legend_width(11) + 1 separator column.
+        assert_eq!(strip_width_for(60), 60 - 12);
+        assert_eq!(strip_width_for(100), 100 - 12);
     }
 }

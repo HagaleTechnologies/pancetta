@@ -512,8 +512,19 @@ impl TuiRunner {
                         }
                     }
                     Event::Mouse(mouse_event) => {
-                        let mut app = self.app.write().await;
-                        app.handle_mouse_event(mouse_event).await?;
+                        let cmd = {
+                            let mut app = self.app.write().await;
+                            app.handle_mouse_event(mouse_event).await?
+                        };
+                        // Task 19: click-to-park (TxPlacement strip) is the
+                        // one mouse interaction that sends a `TuiCommand` —
+                        // `App` doesn't own `message_tx` (same reason every
+                        // key-event command send lives here, not in
+                        // `app.rs`), so it hands the command back for us to
+                        // send once the write lock is released.
+                        if let Some(cmd) = cmd {
+                            self.message_tx.send(cmd)?;
+                        }
                     }
                     Event::FocusLost => {
                         info!("TUI received FocusLost event");

@@ -85,15 +85,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     }
 
     // Create main layout
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // Title bar (incl. bold TX-policy banner)
-            Constraint::Min(1),    // Main content
-            Constraint::Length(1), // TX queue / now-sending strip
-            Constraint::Length(3), // Status bar
-        ])
-        .split(size);
+    let chunks = main_layout_chunks(size);
 
     // Render title bar
     render_title_bar(f, chunks[0], app);
@@ -127,6 +119,33 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     Ok(())
 }
 
+/// The top-level vertical split every frame renders from: title bar, main
+/// content, TX strip, status bar. Pulled out of `draw()` (Task 19) so the
+/// mouse hit-testing path (`App::handle_mouse_event`, which has no `Frame`
+/// to render into) can recover the exact same main-content `Rect` the
+/// renderer used via `content_area`, rather than re-deriving the split by
+/// hand and risking drift.
+fn main_layout_chunks(size: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Title bar (incl. bold TX-policy banner)
+            Constraint::Min(1),    // Main content
+            Constraint::Length(1), // TX queue / now-sending strip
+            Constraint::Length(3), // Status bar
+        ])
+        .split(size)
+}
+
+/// The main content `Rect` (`chunks[1]` from `draw()`) for a full-terminal
+/// `size` — title bar, TX strip, and status bar stripped off. This is the
+/// `area` that `view_rects`/`hit_test` expect; a click at absolute
+/// terminal coordinates only needs to be compared against panel rects
+/// computed from THIS rect, not the full terminal.
+pub fn content_area(size: Rect) -> Rect {
+    main_layout_chunks(size)[1]
+}
+
 /// Renders the focused panel (`app.active_panel`) full-screen in `area`,
 /// bypassing whichever `ActiveView` grid is normally in effect. Calls the
 /// SAME `render_*` function each view's grid layout uses, just with the
@@ -152,28 +171,39 @@ fn render_zoomed_panel(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     Ok(())
 }
 
-/// Today's Operate-view content layout: a FULL-WIDTH active-QSO banner and
-/// TX-placement instrument across the top, then a two-column lower region.
-/// The bottom row of each column lines up — QSO Status (left) sits directly
-/// across from Callers (right) — with DX Hunter moved up above Callers to
-/// make room for the wide strip.
-///
-/// The energy waterfall (originally `Percentage(30)` here) was swapped for
-/// the vacancy-first TX-placement instrument (`Length(7)`, Task 11) — the
-/// waterfall remains only in Monitor view (`layout_monitor`). The lower
-/// region is `Min(1)` (unconstrained-but-fills-remainder), so it
-/// automatically absorbs the space freed by the fixed-height swap; no
-/// further constraint changes were needed to "give the freed rows to the
-/// largest table" — that table (the two-column grid as a whole) already
-/// grows via `Min(1)`, and each column's internal Percentage split still
-/// allocates the largest per-column share to the panel it already favored
-/// (Band Activity / Callers).
-///
-/// Extracted verbatim from `draw()` (Task 5) — the two-column lower region
-/// still renders byte-identically to the pre-extraction layout; the top row
-/// visibly changed in this task (expected — see the Task 11 brief's Global
-/// Constraint note).
-fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
+// === Task 19: shared pure rect maps ========================================
+//
+// Each view's `Layout::split` chain used to live only inside its
+// `layout_*` render function (accumulated piecemeal across Tasks 5, 6, 11,
+// 18). That meant a mouse click had no reliable way to know which panel a
+// screen coordinate belonged to short of re-deriving the same split chain a
+// second time — and any future drift between the two copies would silently
+// break clicking without a compile error.
+//
+// The `compute_*_rects` functions below are now the ONE place each view's
+// split chain lives. Both the `layout_*` render functions (which place
+// every widget) and `view_rects`/`hit_test` (used by
+// `App::handle_mouse_event`) call them, so a click always lands on exactly
+// the boundary the renderer drew. The `compute_*_rects` functions return
+// every rect a layout needs (including non-`ActivePanel` slots like the
+// active-QSO banner and the station card); `view_rects` below filters that
+// down to just the navigable `(ActivePanel, Rect)` pairs.
+
+/// All rects the Operate view's layout needs.
+struct OperateRects {
+    banner: Rect,
+    tx_placement: Rect,
+    band_activity: Rect,
+    qso_status: Rect,
+    station_card: Rect,
+    dx_hunter: Rect,
+    callers: Rect,
+}
+
+/// Split chain extracted verbatim from the pre-Task-19 `layout_operate`
+/// (itself extracted verbatim from `draw()` in Task 5, then given its
+/// current top row in Task 11 and its station-card slot in Task 18).
+fn compute_operate_rects(content_area: Rect) -> OperateRects {
     let content = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -210,35 +240,96 @@ fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
         ])
         .split(lower[1]);
 
+    OperateRects {
+        banner: content[0],
+        tx_placement: content[1],
+        band_activity: left_chunks[0],
+        qso_status: left_chunks[1],
+        station_card: right_chunks[0],
+        dx_hunter: right_chunks[1],
+        callers: right_chunks[2],
+    }
+}
+
+/// Today's Operate-view content layout: a FULL-WIDTH active-QSO banner and
+/// TX-placement instrument across the top, then a two-column lower region.
+/// The bottom row of each column lines up — QSO Status (left) sits directly
+/// across from Callers (right) — with DX Hunter moved up above Callers to
+/// make room for the wide strip.
+///
+/// The energy waterfall (originally `Percentage(30)` here) was swapped for
+/// the vacancy-first TX-placement instrument (`Length(7)`, Task 11) — the
+/// waterfall remains only in Monitor view (`layout_monitor`). The lower
+/// region is `Min(1)` (unconstrained-but-fills-remainder), so it
+/// automatically absorbs the space freed by the fixed-height swap; no
+/// further constraint changes were needed to "give the freed rows to the
+/// largest table" — that table (the two-column grid as a whole) already
+/// grows via `Min(1)`, and each column's internal Percentage split still
+/// allocates the largest per-column share to the panel it already favored
+/// (Band Activity / Callers).
+///
+/// Extracted verbatim from `draw()` (Task 5) — the two-column lower region
+/// still renders byte-identically to the pre-extraction layout; the top row
+/// visibly changed in this task (expected — see the Task 11 brief's Global
+/// Constraint note). Task 19 pulled the actual `Layout::split` chain out
+/// into `compute_operate_rects` (this function now just renders from it) —
+/// the rects themselves are unchanged, so this stays byte-identical too.
+fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
+    let r = compute_operate_rects(content_area);
+
     // Render panels
-    render_active_qsos(f, content[0], app);
-    render_tx_placement(f, content[1], app)?;
-    render_band_activity(f, left_chunks[0], app)?;
-    render_qso_status(f, left_chunks[1], app)?;
-    render_station_card(f, right_chunks[0], app)?;
-    render_dx_hunter(f, right_chunks[1], app)?;
-    render_callers(f, right_chunks[2], app)?;
+    render_active_qsos(f, r.banner, app);
+    render_tx_placement(f, r.tx_placement, app)?;
+    render_band_activity(f, r.band_activity, app)?;
+    render_qso_status(f, r.qso_status, app)?;
+    render_station_card(f, r.station_card, app)?;
+    render_dx_hunter(f, r.dx_hunter, app)?;
+    render_callers(f, r.callers, app)?;
 
     // Render active panel highlight. The slice order MUST match the
     // ActivePanel enum order used by render_active_panel_highlight:
     // BandActivity, QsoStatus, Callers, DxHunter, TxPlacement. The
-    // full-width banner (content[0]) is not a navigable panel, and neither
-    // is the station card (right_chunks[0], Task 18) — it has no
-    // `ActivePanel` variant, so it's deliberately absent from this slice
-    // (unlike Station Info before it, which WAS highlightable).
+    // full-width banner is not a navigable panel, and neither is the
+    // station card (Task 18) — it has no `ActivePanel` variant, so it's
+    // deliberately absent from this slice (unlike Station Info before it,
+    // which WAS highlightable).
     render_active_panel_highlight(
         f,
         app,
         &[
-            left_chunks[0],  // BandActivity
-            left_chunks[1],  // QsoStatus
-            right_chunks[2], // Callers
-            right_chunks[1], // DxHunter
-            content[1],      // TxPlacement
+            r.band_activity, // BandActivity
+            r.qso_status,    // QsoStatus
+            r.callers,       // Callers
+            r.dx_hunter,     // DxHunter
+            r.tx_placement,  // TxPlacement
         ],
     );
 
     Ok(())
+}
+
+/// All rects the Monitor view's layout needs.
+struct MonitorRects {
+    banner: Rect,
+    waterfall: Rect,
+    band_activity: Rect,
+}
+
+fn compute_monitor_rects(content_area: Rect) -> MonitorRects {
+    let content = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
+            Constraint::Percentage(60), // Big waterfall (full width)
+            Constraint::Min(1),         // Band Activity (full width)
+        ])
+        .split(content_area);
+
+    MonitorRects {
+        banner: content[0],
+        waterfall: content[1],
+        band_activity: content[2],
+    }
 }
 
 /// Monitor-view content layout: a vertical stack — full-width active-QSO
@@ -253,20 +344,69 @@ fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
 /// `render_active_panel_highlight` — would blank the panel's title, since it
 /// draws a titleless border directly on top).
 fn layout_monitor(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
-    let content = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
-            Constraint::Percentage(60), // Big waterfall (full width)
-            Constraint::Min(1),         // Band Activity (full width)
-        ])
-        .split(content_area);
+    let r = compute_monitor_rects(content_area);
 
-    render_active_qsos(f, content[0], app);
-    render_waterfall(f, content[1], app);
-    render_band_activity(f, content[2], app)?;
+    render_active_qsos(f, r.banner, app);
+    render_waterfall(f, r.waterfall, app);
+    render_band_activity(f, r.band_activity, app)?;
 
     Ok(())
+}
+
+/// All rects the Hunt view's layout needs. `station_card` is `None` on a
+/// short terminal (see `compute_hunt_rects`).
+struct HuntRects {
+    banner: Rect,
+    tx_placement: Rect,
+    dx_hunter: Rect,
+    station_card: Option<Rect>,
+    band_activity: Rect,
+    qso_status: Rect,
+}
+
+fn compute_hunt_rects(content_area: Rect) -> HuntRects {
+    const STATION_CARD_HEIGHT: u16 = 5;
+    // Threshold picked so the `draw()` resize-guard floor (MIN_H=20 →
+    // content_area ~15 rows) never shows the card, while a normally-sized
+    // terminal (TestBackend's 120x40 fixture → content_area 35 rows) does.
+    const STATION_CARD_MIN_CONTENT_HEIGHT: u16 = 30;
+    let show_card = content_area.height >= STATION_CARD_MIN_CONTENT_HEIGHT;
+
+    let mut constraints = vec![
+        Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
+        Constraint::Length(7),      // TX Placement (full width)
+        Constraint::Percentage(45), // DX Hunter (full width)
+    ];
+    if show_card {
+        constraints.push(Constraint::Length(STATION_CARD_HEIGHT)); // Station card
+    }
+    constraints.push(Constraint::Percentage(25)); // Band Activity (full width, CQs-only)
+    constraints.push(Constraint::Min(5)); // QSO Status
+
+    let content = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(content_area);
+
+    let mut next_idx = 3;
+    let station_card = if show_card {
+        let r = content[next_idx];
+        next_idx += 1;
+        Some(r)
+    } else {
+        None
+    };
+    let band_activity = content[next_idx];
+    let qso_status = content[next_idx + 1];
+
+    HuntRects {
+        banner: content[0],
+        tx_placement: content[1],
+        dx_hunter: content[2],
+        station_card,
+        band_activity,
+        qso_status,
+    }
 }
 
 /// Hunt-view content layout: DX Hunter gets top billing (full width) for
@@ -296,41 +436,45 @@ fn layout_monitor(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
 /// via `create_panel_block` (and the station card is never the active panel
 /// anyway — it has no `ActivePanel` variant).
 fn layout_hunt(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
-    const STATION_CARD_HEIGHT: u16 = 5;
-    // Threshold picked so the `draw()` resize-guard floor (MIN_H=20 →
-    // content_area ~15 rows) never shows the card, while a normally-sized
-    // terminal (TestBackend's 120x40 fixture → content_area 35 rows) does.
-    const STATION_CARD_MIN_CONTENT_HEIGHT: u16 = 30;
-    let show_card = content_area.height >= STATION_CARD_MIN_CONTENT_HEIGHT;
+    let r = compute_hunt_rects(content_area);
 
-    let mut constraints = vec![
-        Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
-        Constraint::Length(7),      // TX Placement (full width)
-        Constraint::Percentage(45), // DX Hunter (full width)
-    ];
-    if show_card {
-        constraints.push(Constraint::Length(STATION_CARD_HEIGHT)); // Station card
+    render_active_qsos(f, r.banner, app);
+    render_tx_placement(f, r.tx_placement, app)?;
+    render_dx_hunter(f, r.dx_hunter, app)?;
+    if let Some(card) = r.station_card {
+        render_station_card(f, card, app)?;
     }
-    constraints.push(Constraint::Percentage(25)); // Band Activity (full width, CQs-only)
-    constraints.push(Constraint::Min(5)); // QSO Status
-
-    let content = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(content_area);
-
-    render_active_qsos(f, content[0], app);
-    render_tx_placement(f, content[1], app)?;
-    render_dx_hunter(f, content[2], app)?;
-    let mut next_idx = 3;
-    if show_card {
-        render_station_card(f, content[next_idx], app)?;
-        next_idx += 1;
-    }
-    render_band_activity(f, content[next_idx], app)?;
-    render_qso_status(f, content[next_idx + 1], app)?;
+    render_band_activity(f, r.band_activity, app)?;
+    render_qso_status(f, r.qso_status, app)?;
 
     Ok(())
+}
+
+/// All rects the Run view's layout needs.
+struct RunRects {
+    banner: Rect,
+    tx_placement: Rect,
+    callers: Rect,
+    qso_status: Rect,
+}
+
+fn compute_run_rects(content_area: Rect) -> RunRects {
+    let content = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
+            Constraint::Length(7),      // TX Placement (full width)
+            Constraint::Percentage(50), // Callers (full width)
+            Constraint::Min(5),         // QSO Status (multi-table "Active QSOs" mode)
+        ])
+        .split(content_area);
+
+    RunRects {
+        banner: content[0],
+        tx_placement: content[1],
+        callers: content[2],
+        qso_status: content[3],
+    }
 }
 
 /// Run-view content layout: Callers gets top billing (full width) for
@@ -350,22 +494,123 @@ fn layout_hunt(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
 /// `layout_monitor`: each panel renderer draws its own active-styled border
 /// via `create_panel_block`.
 fn layout_run(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
-    let content = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
-            Constraint::Length(7),      // TX Placement (full width)
-            Constraint::Percentage(50), // Callers (full width)
-            Constraint::Min(5),         // QSO Status (multi-table "Active QSOs" mode)
-        ])
-        .split(content_area);
+    let r = compute_run_rects(content_area);
 
-    render_active_qsos(f, content[0], app);
-    render_tx_placement(f, content[1], app)?;
-    render_callers(f, content[2], app)?;
-    render_qso_status(f, content[3], app)?;
+    render_active_qsos(f, r.banner, app);
+    render_tx_placement(f, r.tx_placement, app)?;
+    render_callers(f, r.callers, app)?;
+    render_qso_status(f, r.qso_status, app)?;
 
     Ok(())
+}
+
+/// The rect map for a given view/zoom state — the single source of truth
+/// shared by the `layout_*` render functions (via the `compute_*_rects`
+/// helpers above, which this calls) and `hit_test` (mouse click routing,
+/// Task 19). Returns one `(ActivePanel, Rect)` pair per NAVIGABLE panel the
+/// view currently shows — non-panel content (the active-QSO banner, the
+/// energy waterfall, the station card) is never included, since a click on
+/// it has no `ActivePanel` to focus.
+///
+/// `active_panel` is only consulted when `zoomed` — it's not part of the
+/// literal brief signature (`view_rects(view, zoomed, area)`), but
+/// `render_zoomed_panel`'s dispatch (which this mirrors) fills the WHOLE
+/// content area with whichever panel `app.active_panel` currently names,
+/// independent of `view`; there is no way to reproduce that pure-function
+/// side without knowing which panel is zoomed. Every non-zoomed call site
+/// in this task passes `app.active_panel` too, so it's always in scope at
+/// the caller.
+pub fn view_rects(
+    view: crate::view::ActiveView,
+    zoomed: bool,
+    active_panel: ActivePanel,
+    area: Rect,
+) -> Vec<(ActivePanel, Rect)> {
+    if zoomed {
+        // Mirrors `render_zoomed_panel`: the focused panel fills the whole
+        // content area regardless of which view is selected.
+        return vec![(active_panel, area)];
+    }
+    match view {
+        crate::view::ActiveView::Operate => {
+            let r = compute_operate_rects(area);
+            vec![
+                (ActivePanel::BandActivity, r.band_activity),
+                (ActivePanel::QsoStatus, r.qso_status),
+                (ActivePanel::Callers, r.callers),
+                (ActivePanel::DxHunter, r.dx_hunter),
+                (ActivePanel::TxPlacement, r.tx_placement),
+            ]
+        }
+        crate::view::ActiveView::Monitor => {
+            let r = compute_monitor_rects(area);
+            vec![(ActivePanel::BandActivity, r.band_activity)]
+        }
+        crate::view::ActiveView::Hunt => {
+            let r = compute_hunt_rects(area);
+            vec![
+                (ActivePanel::TxPlacement, r.tx_placement),
+                (ActivePanel::DxHunter, r.dx_hunter),
+                (ActivePanel::BandActivity, r.band_activity),
+                (ActivePanel::QsoStatus, r.qso_status),
+            ]
+        }
+        crate::view::ActiveView::Run => {
+            let r = compute_run_rects(area);
+            vec![
+                (ActivePanel::TxPlacement, r.tx_placement),
+                (ActivePanel::Callers, r.callers),
+                (ActivePanel::QsoStatus, r.qso_status),
+            ]
+        }
+    }
+}
+
+/// Row offset (border + header rows) between a panel's rect and its first
+/// data row, for the purposes of mapping a click to a row index. Table
+/// panels (Band Activity / DX Hunter / Callers / QSO Status's multi-QSO
+/// table) draw a 1-cell border plus a 1-row header before their first data
+/// row (verified against each panel's `Table::new(...).header(...)`
+/// construction). TxPlacement is not a table — it's a fixed 5-row
+/// instrument with a border but no header row, so row 0 (right after the
+/// border) IS the first real row (the openness strip).
+fn panel_row_offset(panel: ActivePanel) -> u16 {
+    match panel {
+        ActivePanel::TxPlacement => 1,
+        ActivePanel::BandActivity
+        | ActivePanel::QsoStatus
+        | ActivePanel::Callers
+        | ActivePanel::DxHunter => 2,
+    }
+}
+
+/// Map a click at absolute terminal coordinates `(x, y)` to the panel it
+/// landed in and the row within that panel's DATA rows (border/header
+/// rows already subtracted — see `panel_row_offset`). `None` when the
+/// point falls outside every navigable panel's rect (e.g. the active-QSO
+/// banner, the TX strip, or the status bar — none of which are part of
+/// `view_rects`'s output).
+///
+/// Pure geometry — computed from the SAME `view_rects` the renderer's
+/// `layout_*` functions draw from, so a click always lands on the panel
+/// boundary the operator actually sees on screen.
+pub fn hit_test(
+    view: crate::view::ActiveView,
+    zoomed: bool,
+    active_panel: ActivePanel,
+    area: Rect,
+    x: u16,
+    y: u16,
+) -> Option<(ActivePanel, u16)> {
+    for (panel, rect) in view_rects(view, zoomed, active_panel, area) {
+        if x < rect.x || x >= rect.x + rect.width || y < rect.y || y >= rect.y + rect.height {
+            continue;
+        }
+        let local_row = y - rect.y;
+        let row = local_row.saturating_sub(panel_row_offset(panel));
+        return Some((panel, row));
+    }
+    None
 }
 
 fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1626,5 +1871,205 @@ mod view_render_tests {
                 "expected {call} on both the Active-QSOs banner row AND the TX-placement stream-marker row"
             );
         }
+    }
+}
+
+/// Task 19: pure geometry tests for `view_rects`/`hit_test` — the shared
+/// rect map that makes mouse clicking reliable. No terminal/Frame involved;
+/// these test the `Layout::split` math directly, the same math
+/// `view_render_tests` above proves is unchanged by rendering through it.
+#[cfg(test)]
+mod hit_test_tests {
+    use super::*;
+    use crate::view::ActiveView;
+
+    fn rects_overlap(a: Rect, b: Rect) -> bool {
+        a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+    }
+
+    fn assert_no_overlaps(rects: &[(ActivePanel, Rect)]) {
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                assert!(
+                    !rects_overlap(rects[i].1, rects[j].1),
+                    "{:?} ({:?}) overlaps {:?} ({:?})",
+                    rects[i].0,
+                    rects[i].1,
+                    rects[j].0,
+                    rects[j].1
+                );
+            }
+        }
+    }
+
+    /// Step 1 of the brief: Operate returns 5 non-overlapping rects, all
+    /// within the content region, and every rect has positive area (no
+    /// degenerate 0-width/0-height panel). The 5 rects don't tile the FULL
+    /// content region pixel-for-pixel (the active-QSO banner and the
+    /// station card occupy real estate too, but neither is an
+    /// `ActivePanel` so `view_rects` never returns them) — this asserts
+    /// the union still covers the large majority of the area as a sanity
+    /// check on "covering the content region".
+    #[test]
+    fn view_rects_operate_returns_5_nonoverlapping_rects_covering_content() {
+        let area = Rect::new(0, 0, 120, 40);
+        let rects = view_rects(ActiveView::Operate, false, ActivePanel::BandActivity, area);
+        assert_eq!(rects.len(), 5, "Operate should show exactly 5 panels");
+
+        let mut seen: Vec<ActivePanel> = Vec::new();
+        let mut covered_area: u64 = 0;
+        for (panel, rect) in &rects {
+            assert!(!seen.contains(panel), "duplicate panel {:?}", panel);
+            seen.push(*panel);
+            assert!(
+                rect.width > 0 && rect.height > 0,
+                "{:?} is degenerate",
+                panel
+            );
+            assert!(
+                rect.x >= area.x
+                    && rect.y >= area.y
+                    && rect.x + rect.width <= area.x + area.width
+                    && rect.y + rect.height <= area.y + area.height,
+                "{:?} rect {:?} escapes content area {:?}",
+                panel,
+                rect,
+                area
+            );
+            covered_area += rect.width as u64 * rect.height as u64;
+        }
+        assert_no_overlaps(&rects);
+
+        let total_area = area.width as u64 * area.height as u64;
+        assert!(
+            covered_area * 100 >= total_area * 80,
+            "5 panels should cover most of the content region: {covered_area}/{total_area}"
+        );
+    }
+
+    #[test]
+    fn view_rects_monitor_returns_only_band_activity() {
+        let area = Rect::new(0, 0, 120, 40);
+        let rects = view_rects(ActiveView::Monitor, false, ActivePanel::BandActivity, area);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].0, ActivePanel::BandActivity);
+    }
+
+    #[test]
+    fn view_rects_hunt_has_no_callers_and_run_has_no_dx_hunter() {
+        let area = Rect::new(0, 0, 120, 40);
+        let hunt = view_rects(ActiveView::Hunt, false, ActivePanel::DxHunter, area);
+        assert!(hunt.iter().any(|(p, _)| *p == ActivePanel::DxHunter));
+        assert!(!hunt.iter().any(|(p, _)| *p == ActivePanel::Callers));
+        assert_no_overlaps(&hunt);
+
+        let run = view_rects(ActiveView::Run, false, ActivePanel::Callers, area);
+        assert!(run.iter().any(|(p, _)| *p == ActivePanel::Callers));
+        assert!(!run.iter().any(|(p, _)| *p == ActivePanel::DxHunter));
+        assert_no_overlaps(&run);
+    }
+
+    #[test]
+    fn view_rects_zoomed_returns_single_full_area_pair_for_active_panel() {
+        let area = Rect::new(0, 0, 120, 40);
+        let rects = view_rects(ActiveView::Run, true, ActivePanel::DxHunter, area);
+        assert_eq!(rects, vec![(ActivePanel::DxHunter, area)]);
+    }
+
+    /// Step 1 of the brief: a point inside Band Activity's data region
+    /// (row 3, i.e. 3 rows below its border+header) resolves to
+    /// `(BandActivity, 3)`.
+    #[test]
+    fn hit_test_band_activity_row_3() {
+        let area = Rect::new(0, 0, 120, 40);
+        let rects = view_rects(ActiveView::Operate, false, ActivePanel::BandActivity, area);
+        let (_, band_activity_rect) = rects
+            .into_iter()
+            .find(|(p, _)| *p == ActivePanel::BandActivity)
+            .unwrap();
+
+        // border(1) + header(1) + 3 data rows in.
+        let y = band_activity_rect.y + 2 + 3;
+        let x = band_activity_rect.x + 2;
+
+        let hit = hit_test(
+            ActiveView::Operate,
+            false,
+            ActivePanel::BandActivity,
+            area,
+            x,
+            y,
+        );
+        assert_eq!(hit, Some((ActivePanel::BandActivity, 3)));
+    }
+
+    /// Step 1 of the brief: a point outside every panel rect (e.g. the
+    /// status bar, which lives below the content `area` passed in) returns
+    /// `None`.
+    #[test]
+    fn hit_test_status_bar_returns_none() {
+        let area = Rect::new(0, 0, 120, 40);
+        // Below the content area entirely — where the status bar would be.
+        let hit = hit_test(
+            ActiveView::Operate,
+            false,
+            ActivePanel::BandActivity,
+            area,
+            5,
+            area.y + area.height + 1,
+        );
+        assert_eq!(hit, None);
+    }
+
+    /// A click on the TxPlacement panel's STRIP row (row 0, right after the
+    /// border — no header) resolves to row 0; a click further down (e.g.
+    /// the park line, row 3) resolves to that row instead — the
+    /// click-to-park handler uses this to tell "strip click" apart from
+    /// "just focus the panel".
+    #[test]
+    fn hit_test_tx_placement_strip_row_vs_other_rows() {
+        let area = Rect::new(0, 0, 120, 40);
+        let rects = view_rects(ActiveView::Run, false, ActivePanel::Callers, area);
+        let (_, tx_rect) = rects
+            .into_iter()
+            .find(|(p, _)| *p == ActivePanel::TxPlacement)
+            .unwrap();
+
+        let strip_hit = hit_test(
+            ActiveView::Run,
+            false,
+            ActivePanel::Callers,
+            area,
+            tx_rect.x + 2,
+            tx_rect.y + 1, // border(1) + row 0 (strip)
+        );
+        assert_eq!(strip_hit, Some((ActivePanel::TxPlacement, 0)));
+
+        let park_line_hit = hit_test(
+            ActiveView::Run,
+            false,
+            ActivePanel::Callers,
+            area,
+            tx_rect.x + 2,
+            tx_rect.y + 1 + 3, // border(1) + row 3 (park line)
+        );
+        assert_eq!(park_line_hit, Some((ActivePanel::TxPlacement, 3)));
+    }
+
+    /// Zoomed: a click anywhere in the (now full-content-area) rect
+    /// resolves to the zoomed panel, row-offset by ITS OWN table/instrument
+    /// convention (DxHunter here is a table: border+header offset 2).
+    #[test]
+    fn hit_test_respects_zoom() {
+        let area = Rect::new(0, 0, 120, 40);
+        let hit = hit_test(
+            ActiveView::Operate,
+            true,
+            ActivePanel::DxHunter,
+            area,
+            10,
+            area.y + 2 + 5,
+        );
+        assert_eq!(hit, Some((ActivePanel::DxHunter, 5)));
     }
 }
