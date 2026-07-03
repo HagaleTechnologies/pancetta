@@ -1412,6 +1412,12 @@ impl TuiRunner {
             // Callers-Enter and fixes "I clicked to send 73 but it sent my
             // grid" — pressing Space on a station still sending us RR73 sends
             // another 73.
+            //
+            // Fix round 2 (operator-confirmed 2026-07-03): if the focused
+            // callsign already has a live QSO and nothing directed-at-us is
+            // pending, `resolve_space_action` returns `None` rather than a
+            // `Call` that would supersede it — surface a specific status
+            // message so the operator knows why nothing happened.
             KeyCode::Char(' ') => match app.resolve_space_action() {
                 Some(crate::app::SpaceAction::Reply {
                     callsign,
@@ -1446,7 +1452,12 @@ impl TuiRunner {
                     app.status_message = format!("Calling {}...", callsign);
                 }
                 None => {
-                    app.status_message = "No station selected".to_string();
+                    app.status_message = match app.focused_callsign() {
+                        Some(call) if app.is_engaged(&call) => {
+                            format!("{} already has an active QSO — cancel it first", call)
+                        }
+                        _ => "No station selected".to_string(),
+                    };
                 }
             },
 
@@ -3168,17 +3179,25 @@ mod key_tests {
     /// off `get_selected_station()`, which only resolves a callsign for
     /// BandActivity/DxHunter/Callers — Space was a silent no-op on the QSO
     /// Status panel. Routed through the global `focused_callsign()`, Space
-    /// now also works from the QSO Status panel.
+    /// now also works from the QSO Status panel (via the Reply branch —
+    /// see `space_replies_for_an_engaged_qso_status_station_with_pending_reply`
+    /// below; the bare Call branch is blocked for an engaged station, see
+    /// `space_blocks_call_for_an_already_engaged_qso_status_station`).
     ///
     /// Fix round 1 (TX-safety regression found in review): `get_selected_station()`
     /// has NO arm for `ActivePanel::QsoStatus`, so its filter in the Call-branch
-    /// fallback always fails there — the buggy version ALWAYS fell through to
-    /// the disconnected `(1500, None)` default, discarding the real frequency
-    /// and parity of a station we're already actively working. This test uses
-    /// a non-1500 frequency (1234 Hz) and a non-None parity (Odd) specifically
-    /// so a regression to the `(1500, None)` fallback fails loudly.
+    /// fallback always fell through to the disconnected `(1500, None)` default,
+    /// discarding the real frequency/parity of a station already being worked.
+    ///
+    /// Fix round 2 (operator-confirmed 2026-07-03): stepping back further,
+    /// Space should never re-initiate/supersede an already-**engaged**
+    /// station at all — the QSO Status panel's `focused_callsign()` always
+    /// resolves to a live `active_qsos` entry, so this scenario (no pending
+    /// directed-at-us reply) now must be BLOCKED, not answered with a
+    /// (correctly-frequencied) `Call`. This supersedes fix round 1's test of
+    /// the same name/shape; see `space_blocks_call_for_an_already_engaged_qso_status_station`.
     #[tokio::test]
-    async fn space_works_from_qso_status_panel_via_global_focus() {
+    async fn space_blocks_call_for_an_already_engaged_qso_status_station() {
         let (mut r, cmd_rx, app) = make_runner().await;
         {
             let mut a = app.write().await;
@@ -3215,31 +3234,32 @@ mod key_tests {
             );
             a.qso_cursor = 0;
             assert_eq!(a.focused_callsign().as_deref(), Some("JA1ABC"));
+            // No decode directed-at-us from JA1ABC is on record, so the only
+            // pre-round-2 option was Call/supersede — now blocked.
+            assert!(a.last_directed_at_us_from("JA1ABC").is_none());
+            assert!(a.is_engaged("JA1ABC"));
         }
         r.handle_key_event(key(' ')).await.unwrap();
-        match cmd_rx.try_recv() {
-            Ok(TuiCommand::CallStation {
-                callsign,
-                frequency,
-                dx_parity,
-            }) => {
-                assert_eq!(callsign, "JA1ABC");
-                // TX-safety regression guard: must be the QSO's real
-                // frequency/parity, NOT the disconnected (1500, None) default.
-                assert_eq!(frequency, 1234);
-                assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Odd));
-            }
-            other => panic!("Expected CallStation targeting JA1ABC, got {:?}", other),
-        }
+        // No TuiCommand at all — NOT a Call/supersede of the live QSO.
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "Space must not send any command for an already-engaged station \
+             with no pending directed-at-us reply"
+        );
+        let a = app.read().await;
+        assert_eq!(
+            a.status_message,
+            "JA1ABC already has an active QSO — cancel it first"
+        );
     }
 
-    /// Sibling of the above: when the focused QSO-Status entry has NO known
-    /// parity (`tx_parity: None`) but a real, non-1500 frequency, Space must
-    /// still carry that real frequency through (only the parity is
-    /// legitimately `None`) — proves the fallback isn't overwriting the
-    /// frequency separately from the parity.
+    /// Sibling of the above: an engaged station (live `active_qsos` entry)
+    /// that HAS most-recently sent us something directed-at-us must still
+    /// get a `Reply` from Space — the block only narrows the `Call`
+    /// (fresh-initiation/supersede) branch, never the ordinary reply-in-an-
+    /// existing-exchange path (the whole point of the Task 3 feature).
     #[tokio::test]
-    async fn space_from_qso_status_carries_real_frequency_with_unknown_parity() {
+    async fn space_replies_for_an_engaged_qso_status_station_with_pending_reply() {
         let (mut r, cmd_rx, app) = make_runner().await;
         {
             let mut a = app.write().await;
@@ -3275,20 +3295,45 @@ mod key_tests {
                 Vec::new(),
             );
             a.qso_cursor = 0;
+            // G8KHF most-recently sent us an RR73 directed at us — the Reply
+            // branch must fire (Space → our 73), never the blocked Call branch.
+            a.decoded_messages
+                .push_back(crate::app::DecodedMessageView {
+                    timestamp: chrono::Utc::now(),
+                    frequency: 14_074_000.0,
+                    mode: "FT8".to_string(),
+                    snr: -8,
+                    delta_time: 0.0,
+                    delta_freq: 2222.0,
+                    call_sign: Some("G8KHF".to_string()),
+                    grid_square: None,
+                    message: "K5ARH G8KHF RR73".to_string(),
+                    distance: None,
+                    bearing: None,
+                    slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+                    is_directed_at_us: true,
+                    worked_before: false,
+                    needed: false,
+                    atno: false,
+                    priority_score: None,
+                });
             assert_eq!(a.focused_callsign().as_deref(), Some("G8KHF"));
+            assert!(a.is_engaged("G8KHF"));
+            assert!(a.last_directed_at_us_from("G8KHF").is_some());
         }
         r.handle_key_event(key(' ')).await.unwrap();
         match cmd_rx.try_recv() {
-            Ok(TuiCommand::CallStation {
+            Ok(TuiCommand::RespondToCaller {
                 callsign,
                 frequency,
                 dx_parity,
+                ..
             }) => {
                 assert_eq!(callsign, "G8KHF");
                 assert_eq!(frequency, 2222);
-                assert_eq!(dx_parity, None);
+                assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Even));
             }
-            other => panic!("Expected CallStation targeting G8KHF, got {:?}", other),
+            other => panic!("Expected RespondToCaller targeting G8KHF, got {:?}", other),
         }
     }
 }

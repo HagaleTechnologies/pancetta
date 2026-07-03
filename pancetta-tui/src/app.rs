@@ -2037,6 +2037,14 @@ impl App {
     /// - Otherwise (a pure CQer, or a DX-cluster spot we've never heard call
     ///   us) return [`SpaceAction::Call`] — the historical Space behavior of
     ///   answering their CQ at the grid step.
+    /// - **Fix round 2 (operator-confirmed 2026-07-03):** if neither of the
+    ///   above applies (no directed-at-us reply pending) AND the focused
+    ///   callsign already has a live QSO ([`Self::is_engaged`]), Space must
+    ///   NOT re-initiate/supersede it — that would blow away an in-progress
+    ///   (possibly autonomous) exchange. Returns `None` (the same "nothing to
+    ///   do" signal used when no station is focused at all); the caller
+    ///   surfaces an operator-facing status message naming the callsign. The
+    ///   operator must explicitly cancel the QSO first.
     ///
     /// The reply target's frequency/parity come from the directed decode itself
     /// (where we actually heard them) rather than the selected-row frequency,
@@ -2064,6 +2072,18 @@ impl App {
                 step,
                 snr: Some(msg.snr as f32),
             });
+        }
+
+        // Fix round 2 (operator-confirmed 2026-07-03): Space must never
+        // re-initiate/supersede a station we already have a live QSO with.
+        // With no directed-at-us reply pending (the branch above), there is
+        // nothing safe left for Space to do — force the operator to cancel
+        // the QSO explicitly instead of silently superseding it. `None` is
+        // the same "nothing to do" signal already used elsewhere in this
+        // function (e.g. no station focused at all); the caller resolves the
+        // operator-facing message.
+        if self.is_engaged(&callsign) {
+            return None;
         }
 
         let (frequency, dx_parity) = self
@@ -4365,6 +4385,34 @@ mod tests {
             SpaceAction::Call { callsign, .. } => assert_eq!(callsign, "DL5XYZ"),
             other => panic!("expected Call, got {:?}", other),
         }
+    }
+
+    /// Fix round 2 (operator-confirmed 2026-07-03): Space must NOT return a
+    /// `Call` (fresh-initiation/supersede) for a station that already has a
+    /// live QSO (`is_engaged`), even when the focus is resolved from a panel
+    /// OTHER than QSO Status (here, Band Activity) — the guard is keyed off
+    /// the callsign's engagement, not which panel it was focused from.
+    /// `resolve_space_action` returns `None`, same as "nothing selected".
+    #[tokio::test]
+    async fn space_blocks_call_for_an_engaged_station_seen_in_band_activity() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        // DL5XYZ is calling CQ (nothing directed at us) but we already have a
+        // live QSO with them (e.g. a concurrent multi-TX stream on another
+        // slot) — Space here must not re-initiate/supersede it.
+        app.add_decoded_message(fixture_view("DL5XYZ", -3))
+            .await
+            .unwrap();
+        app.band_activity_scroll = 0;
+        app.active_qsos = vec![fixture_banner("DL5XYZ", "Calling", None)];
+
+        assert!(app.is_engaged("DL5XYZ"));
+        assert!(app.last_directed_at_us_from("DL5XYZ").is_none());
+        assert!(
+            app.resolve_space_action().is_none(),
+            "Space must be a no-op for an already-engaged station with no \
+             pending directed-at-us reply"
+        );
     }
 
     /// Space classifies each directed payload at the right rung: their grid →
