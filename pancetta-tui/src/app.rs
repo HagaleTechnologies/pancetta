@@ -905,14 +905,23 @@ pub struct App {
     /// When the operator "parked" a TX-placement pick, if any. `None` = not
     /// parked. Set/cleared by later tasks (12).
     pub parked_since: Option<DateTime<Utc>>,
-    /// Openness code (0-3) at the parked frequency's bin, as of the LAST
-    /// `apply_placement` call — the edge-detect baseline for the one-shot
-    /// parked-slice degradation warning (Task 14). `None` whenever no park
-    /// is active (`tx_offset_hold_hz.is_none()`), so unparking/re-parking
-    /// always starts a fresh baseline (no stale comparison against a
-    /// frequency that's no longer held). Updated on every `apply_placement`
-    /// call regardless of whether the warning fired.
-    pub park_coverage_last: Option<u8>,
+    /// `(parked frequency Hz, openness code 0-3 at that frequency's bin)`
+    /// as of the LAST `apply_placement` call — the edge-detect baseline for
+    /// the one-shot parked-slice degradation warning (Task 14). The
+    /// frequency and code are bundled in one tuple so they can never drift
+    /// apart: `apply_placement` always updates/resets BOTH together, never
+    /// just the code. This matters because the operator can re-park to a
+    /// DIFFERENT frequency (Enter-park or the `o` modal, both in
+    /// `tui_runner.rs`) faster than a `PlacementView` snapshot arrives
+    /// (~every 15s FT8 window) — without the frequency half, the next
+    /// `apply_placement` call would compare the NEW frequency's fresh code
+    /// against the OLD frequency's stale code and could fire a spurious (or
+    /// miss a real) warning. `None` whenever no park is active
+    /// (`tx_offset_hold_hz.is_none()`), so unparking/re-parking always
+    /// starts a fresh baseline (no stale comparison against a frequency
+    /// that's no longer held). Updated on every `apply_placement` call
+    /// regardless of whether the warning fired.
+    pub park_coverage_last: Option<(u64, u8)>,
 }
 
 /// Peak intensity in the latest waterfall row within ±radius_hz of center_hz.
@@ -1996,15 +2005,28 @@ impl App {
     /// **Parked-slice degradation warning (Task 14, edge-triggered):** when
     /// a park is active (`tx_offset_hold_hz.is_some()`), looks up the
     /// openness code at the parked frequency's bin in the NEW snapshot and
-    /// compares it to `park_coverage_last` (the code as of the LAST call).
-    /// A STRICT decrease (e.g. 3->1, 3->0, 2->0 — worse coverage than
-    /// before) fires a one-shot `status_message` warning; an unchanged or
-    /// improved code does not. `park_coverage_last` is updated to the new
-    /// code every call regardless, so the fire is edge-triggered — a bin
-    /// that stays degraded across many consecutive snapshots warns exactly
-    /// once, on the transition, not on every update while still busy. No
-    /// park active -> `park_coverage_last` resets to `None` (a fresh park
-    /// always starts a clean baseline; see the field doc).
+    /// compares it to `park_coverage_last` (the `(frequency, code)` as of
+    /// the LAST call) — but ONLY when the tracked frequency still matches
+    /// the currently-held one. A STRICT decrease at the SAME frequency
+    /// (e.g. 3->1, 3->0, 2->0 — worse coverage than before) fires a
+    /// one-shot `status_message` warning; an unchanged or improved code
+    /// does not. `park_coverage_last` is updated to the new
+    /// `(frequency, code)` every call regardless, so the fire is
+    /// edge-triggered — a bin that stays degraded across many consecutive
+    /// snapshots warns exactly once, on the transition, not on every update
+    /// while still busy. No park active -> `park_coverage_last` resets to
+    /// `None` (a fresh park always starts a clean baseline; see the field
+    /// doc).
+    ///
+    /// **Re-park to a different frequency (Fix round 1):** the operator can
+    /// re-park (Enter-park or the `o` modal) faster than a `PlacementView`
+    /// snapshot arrives (~15s FT8 window), so `tx_offset_hold_hz` can change
+    /// between two `apply_placement` calls without an intervening update at
+    /// the OLD frequency. If the currently-held frequency doesn't match the
+    /// frequency `park_coverage_last` was tracking, that's treated as a
+    /// fresh baseline — same as `park_coverage_last == None` — so a
+    /// comparison is never made across two different frequencies (which
+    /// could otherwise fire a spurious warning, or mask a real one).
     pub fn apply_placement(&mut self, v: PlacementView) {
         let max_index = v.slices.len().saturating_sub(1);
 
@@ -2017,7 +2039,14 @@ impl App {
             )
             .and_then(|b| v.openness.get(b).copied());
 
-            if let (Some(old_code), Some(code)) = (self.park_coverage_last, new_code) {
+            // Only compare against the baseline if it was tracking THIS
+            // frequency; a mismatch (re-parked since the last snapshot)
+            // means there's no valid prior code to compare against here.
+            let baseline_code = self
+                .park_coverage_last
+                .and_then(|(old_hz, old_code)| (old_hz == hz).then_some(old_code));
+
+            if let (Some(old_code), Some(code)) = (baseline_code, new_code) {
                 if code < old_code {
                     let busy = match code {
                         0 => "both",
@@ -2034,7 +2063,7 @@ impl App {
                     );
                 }
             }
-            self.park_coverage_last = new_code;
+            self.park_coverage_last = new_code.map(|code| (hz, code));
         } else {
             self.park_coverage_last = None;
         }
@@ -5188,7 +5217,7 @@ mod tests {
         // prior baseline (`park_coverage_last` starts `None`), so this
         // must NOT fire — it only establishes the baseline.
         app.apply_placement(placement_view_with_bin_code(52, 3));
-        assert_eq!(app.park_coverage_last, Some(3));
+        assert_eq!(app.park_coverage_last, Some((1500, 3)));
         assert!(
             !app.status_message.contains("now busy"),
             "no warning on the baseline-establishing snapshot, got: {}",
@@ -5202,7 +5231,7 @@ mod tests {
             "expected a degradation warning, got: {}",
             app.status_message
         );
-        assert_eq!(app.park_coverage_last, Some(1));
+        assert_eq!(app.park_coverage_last, Some((1500, 1)));
 
         // Stash a sentinel, then apply an UNCHANGED (still code 1) snapshot.
         // Edge-triggered: must NOT re-fire / rewrite status_message.
@@ -5212,7 +5241,7 @@ mod tests {
             app.status_message, "SENTINEL",
             "warning must not repeat while still degraded (edge-triggered, not per-update)"
         );
-        assert_eq!(app.park_coverage_last, Some(1));
+        assert_eq!(app.park_coverage_last, Some((1500, 1)));
     }
 
     #[tokio::test]
@@ -5222,7 +5251,7 @@ mod tests {
 
         // Establish baseline at code 1.
         app.apply_placement(placement_view_with_bin_code(52, 1));
-        assert_eq!(app.park_coverage_last, Some(1));
+        assert_eq!(app.park_coverage_last, Some((1500, 1)));
 
         // Improves 1 -> 2: no warning.
         app.status_message = "SENTINEL".to_string();
@@ -5231,7 +5260,7 @@ mod tests {
             app.status_message, "SENTINEL",
             "an improvement must not trigger the degradation warning"
         );
-        assert_eq!(app.park_coverage_last, Some(2));
+        assert_eq!(app.park_coverage_last, Some((1500, 2)));
     }
 
     #[tokio::test]
@@ -5239,13 +5268,108 @@ mod tests {
         let mut app = App::new(Config::default(), None).await.unwrap();
         app.tx_offset_hold_hz = Some(1500);
         app.apply_placement(placement_view_with_bin_code(52, 3));
-        assert_eq!(app.park_coverage_last, Some(3));
+        assert_eq!(app.park_coverage_last, Some((1500, 3)));
 
         app.tx_offset_hold_hz = None;
         app.apply_placement(placement_view_with_bin_code(52, 3));
         assert_eq!(
             app.park_coverage_last, None,
             "no park active -> baseline resets to None"
+        );
+    }
+
+    /// Fix round 1 regression: re-parking to a DIFFERENT frequency between
+    /// two `apply_placement` calls (entirely plausible — the operator can
+    /// re-park faster than the ~15s FT8-window `PlacementView` cadence)
+    /// must NOT compare the new frequency's code against the old
+    /// frequency's stale baseline. Here bin 52 (freq A, 1500 Hz) degrades
+    /// 3->1 while parked, matching the genuine-degradation test above — but
+    /// the operator then re-parks to bin 10 (freq B, 450 Hz) BEFORE the
+    /// next snapshot arrives, and B's code hasn't moved at all (stays at
+    /// 3 across the re-park). No warning should fire on that next
+    /// `apply_placement`, because the tracked baseline was for A, not B.
+    #[tokio::test]
+    async fn re_park_to_different_frequency_does_not_compare_against_stale_baseline() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+
+        // Park at freq A (1500 Hz -> bin 52), establish baseline code 3.
+        app.tx_offset_hold_hz = Some(1500);
+        app.apply_placement(placement_view_with_bin_code(52, 3));
+        assert_eq!(app.park_coverage_last, Some((1500, 3)));
+
+        // Re-park to a DIFFERENT frequency B (450 Hz -> bin 10) WITHOUT an
+        // intervening apply_placement call at A — exactly the ordinary
+        // "oops, wrong slice" interaction the operator can trigger via
+        // Enter-park or the `o` modal faster than a snapshot arrives.
+        app.tx_offset_hold_hz = Some(450);
+
+        // Next snapshot: B's bin (10) is untouched (still code 3, i.e. no
+        // real degradation happened at B at all). A stale-baseline bug
+        // would compare B's code 3 against A's leftover baseline code 3 —
+        // which wouldn't spuriously fire here since they're equal, so
+        // additionally verify the baseline correctly rebases to B (not
+        // left pointing at A) and no warning fires.
+        app.status_message = "SENTINEL".to_string();
+        app.apply_placement(placement_view_with_bin_code(10, 3));
+        assert_eq!(
+            app.status_message, "SENTINEL",
+            "no real degradation at the newly-parked frequency -> no warning"
+        );
+        assert_eq!(
+            app.park_coverage_last,
+            Some((450, 3)),
+            "baseline must rebase to the newly-parked frequency, not stay on the old one"
+        );
+
+        // Now degrade B genuinely (3 -> 1) at the SAME frequency: this
+        // must warn, proving the rebase above established a real usable
+        // baseline (not just permanently suppressed).
+        app.apply_placement(placement_view_with_bin_code(10, 1));
+        assert!(
+            app.status_message.contains("now busy"),
+            "a genuine degradation at the (now-current) parked frequency must still warn, got: {}",
+            app.status_message
+        );
+        assert_eq!(app.park_coverage_last, Some((450, 1)));
+    }
+
+    /// Fix round 1 regression, the sharper case — this is the scenario that
+    /// would actually fire a SPURIOUS warning under the pre-fix code: park
+    /// at freq A with a HIGH tracked code (3), re-park to freq B whose OWN
+    /// code has always been LOWER (1, unrelated to A, no real change at
+    /// B), then apply a snapshot where B's code is unchanged. Comparing B's
+    /// code (1) against A's stale baseline (3) is a strict decrease
+    /// (1 < 3) and would incorrectly fire "now busy" purely from the
+    /// frequency swap, even though nothing degraded at B at all.
+    #[tokio::test]
+    async fn re_park_to_different_frequency_with_worse_baseline_does_not_spuriously_warn() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+
+        // Park at freq A (1500 Hz -> bin 52); baseline established at the
+        // BEST code (3) — this is the value a stale comparison would use.
+        app.tx_offset_hold_hz = Some(1500);
+        app.apply_placement(placement_view_with_bin_code(52, 3));
+        assert_eq!(app.park_coverage_last, Some((1500, 3)));
+
+        // Re-park to freq B (450 Hz -> bin 10), which has ALREADY been at
+        // code 1 the whole time (unrelated to A) — no real degradation
+        // occurs at B between this and the next snapshot.
+        app.tx_offset_hold_hz = Some(450);
+        app.status_message = "SENTINEL".to_string();
+        app.apply_placement(placement_view_with_bin_code(10, 1));
+
+        // The fix: B's fresh code (1) must NOT be compared against A's
+        // stale baseline (3) — that comparison (1 < 3) would spuriously
+        // fire. Since park_coverage_last was tracking A's frequency, not
+        // B's, this must be treated as a fresh baseline instead.
+        assert_eq!(
+            app.status_message, "SENTINEL",
+            "must not compare B's code against A's stale baseline across a re-park"
+        );
+        assert_eq!(
+            app.park_coverage_last,
+            Some((450, 1)),
+            "baseline must rebase to the newly-parked frequency B, not stay on A"
         );
     }
 }
