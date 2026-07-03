@@ -168,6 +168,10 @@ pub struct FrequencyCandidate {
     pub offset_hz: f64,
     pub score: f64,
     pub clear_both_slots: bool,
+    /// No decode activity within 50 Hz in the First (even) slot across retained history.
+    pub clear_first: bool,
+    /// No decode activity within 50 Hz in the Second (odd) slot across retained history.
+    pub clear_second: bool,
     pub noise_floor: f32,
 }
 
@@ -204,11 +208,15 @@ impl SmartFrequencyAllocator {
                 self.score_candidate(freq, spectral, history, own_frequencies, dx_target_hz);
             let noise = spectral.power_near(freq, 25.0);
             let clear = history.is_clear_both_slots(freq, 50.0);
+            let clear_first = history.activity_near_in_slot(freq, 50.0, TimeSlot::First) == 0;
+            let clear_second = history.activity_near_in_slot(freq, 50.0, TimeSlot::Second) == 0;
 
             candidates.push(FrequencyCandidate {
                 offset_hz: freq,
                 score,
                 clear_both_slots: clear,
+                clear_first,
+                clear_second,
                 noise_floor: noise,
             });
 
@@ -491,6 +499,35 @@ mod tests {
         );
         assert_eq!(history.activity_near(1200.0, 10.0), 1);
         assert_eq!(history.activity_near(1400.0, 10.0), 1);
+    }
+
+    #[test]
+    fn candidates_carry_per_slot_clear_flags() {
+        let alloc = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let spectral = SpectralSnapshot {
+            power_bins: vec![0.0; 128],
+            freq_min_hz: 200.0,
+            freq_max_hz: 3000.0,
+        };
+        let mut history = DecodeHistory::new(4);
+        // 1500 Hz busy in First slot only.
+        history.push_cycle(vec![DecodeRecord {
+            frequency_hz: 1500.0,
+            time_slot: TimeSlot::First,
+        }]);
+        let cands = alloc.rank_candidates(&spectral, &history, &[], None);
+        let at_1500 = cands
+            .iter()
+            .find(|c| (c.offset_hz - 1500.0).abs() < 1.0)
+            .unwrap();
+        assert!(!at_1500.clear_first);
+        assert!(at_1500.clear_second);
+        assert!(!at_1500.clear_both_slots);
+        let far = cands
+            .iter()
+            .find(|c| (c.offset_hz - 700.0).abs() < 1.0)
+            .unwrap();
+        assert!(far.clear_first && far.clear_second && far.clear_both_slots);
     }
 
     #[test]
