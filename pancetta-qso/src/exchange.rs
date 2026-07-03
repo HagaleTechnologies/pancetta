@@ -591,6 +591,26 @@ impl MessageExchange {
                 from_station: self.our_callsign.clone(),
             })),
 
+            // qso-state-machine-analysis GAP-1: the DX skips both remaining
+            // rungs and closes directly from our opening grid (RespondingToCq)
+            // with RR73 — answer our 73 to close, mirroring FIX-2's
+            // (SendingReport, FinalConfirmation) arm below.
+            (
+                QsoState::RespondingToCq {
+                    target_callsign, ..
+                },
+                MessageType::FinalConfirmation { .. },
+            ) => Ok(Some(MessageType::SeventyThree {
+                to_station: target_callsign.clone(),
+                from_station: self.our_callsign.clone(),
+            })),
+
+            // GAP-1: the DX closed with a plain 73 (not RR73) directly from
+            // our opening grid. The QSO is already complete from their side;
+            // do NOT re-send a 73 (matches the SendingReport+73 arm below —
+            // re-sending only adds QRM once they've already said 73).
+            (QsoState::RespondingToCq { .. }, MessageType::SeventyThree { .. }) => Ok(None),
+
             // Received report acknowledgment, send final confirmation
             (QsoState::SendingReport { their_callsign, .. }, MessageType::ReportAck { .. }) => {
                 Ok(Some(MessageType::FinalConfirmation {
