@@ -166,3 +166,6 @@ research/experiments/**/trajectories.parquet
 /decoded.txt
 /jt9_wisdom.dat
 .playwright-mcp/
+
+# Visual-brainstorm session artifacts (superpowers companion)
+.superpowers/
