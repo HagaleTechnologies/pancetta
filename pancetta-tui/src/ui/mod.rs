@@ -807,6 +807,19 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         ));
     }
 
+    // Session QSO counter (Task 20d): shown only once the operator has
+    // actually completed one, right before the clock — quiet at session
+    // start, unmissable once it matters.
+    if app.session_completed > 0 {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            format!("QSOs: {} ", app.session_completed),
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     // Calculate padding to right-align the UTC clock
     let left_len: usize = left_spans.iter().map(|s| s.width()).sum();
     let clock_len = utc_clock.len();
@@ -1576,6 +1589,30 @@ mod view_render_tests {
             "missing S-meter placeholder span"
         );
         assert!(buffer_contains(&buf, "Dev:"), "missing device span");
+    }
+
+    /// Task 20d: the "QSOs: N" title-bar chip is hidden at session start
+    /// (n=0) and shown once the session counter has ticked up.
+    #[tokio::test]
+    async fn title_bar_shows_session_qso_counter_only_after_first_completion() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        assert!(
+            !buffer_contains(term.backend().buffer(), "QSOs:"),
+            "counter chip must be hidden at n=0"
+        );
+
+        app.session_completed = 3;
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        assert!(
+            buffer_contains(term.backend().buffer(), "QSOs: 3"),
+            "counter chip must show the completed count"
+        );
     }
 
     #[tokio::test]

@@ -751,6 +751,16 @@ impl TuiRunner {
                 qso_id,
                 callsign,
             } => {
+                // Task 20d: session QSO counter, counted TUI-side from this
+                // same stream (no new bus message) — the coordinator's exact
+                // completion text ("QSO with {call} logged (RST …/…)",
+                // target "qso", Info) since PR #84.
+                if target == "qso"
+                    && level == pancetta_core::DiagnosticLevel::Info
+                    && text.starts_with("QSO with")
+                {
+                    app.session_completed += 1;
+                }
                 app.push_diagnostic_event(crate::app::DiagnosticEventRecord {
                     ts,
                     target,
@@ -2696,6 +2706,51 @@ mod key_tests {
             0,
             "SplitUpdate tx_hz=0 clears chip"
         );
+    }
+
+    /// Task 20d: the session QSO counter increments ONLY on a target="qso",
+    /// Info-level `DiagnosticEvent` whose text starts with the coordinator's
+    /// exact completion prefix ("QSO with ..."). A same-target Warn (e.g. a
+    /// QSO-failed event, which also flows through this same handler) must
+    /// NOT count.
+    #[tokio::test]
+    async fn diagnostic_event_qso_completed_increments_session_counter() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        assert_eq!(app.read().await.session_completed, 0);
+
+        r.handle_message(TuiMessage::DiagnosticEvent {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Info,
+            text: "QSO with K1ABC logged (RST -10/-05)".to_string(),
+            qso_id: None,
+            callsign: Some("K1ABC".to_string()),
+        })
+        .await
+        .unwrap();
+        r.handle_message(TuiMessage::DiagnosticEvent {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Info,
+            text: "QSO with W2XYZ logged (RST -05/-10)".to_string(),
+            qso_id: None,
+            callsign: Some("W2XYZ".to_string()),
+        })
+        .await
+        .unwrap();
+        // A same-target Warn (e.g. QSO failed) must not count.
+        r.handle_message(TuiMessage::DiagnosticEvent {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Warn,
+            text: "QSO failed: timeout".to_string(),
+            qso_id: None,
+            callsign: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.read().await.session_completed, 2);
     }
 
     /// Whole-branch-review fix (finding 1): `TxOffsetUpdate` (the

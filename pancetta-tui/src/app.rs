@@ -691,6 +691,12 @@ pub struct App {
     pub show_diagnostics: bool,
     /// Scroll cursor into `diagnostic_events` while the overlay is open.
     pub diagnostics_scroll: usize,
+    /// Count of QSOs completed this session (Task 20d). Counted TUI-side
+    /// from the diagnostic-event stream that already flows — no new bus
+    /// message — by matching the exact completion text the coordinator
+    /// emits (`"QSO with {call} logged (RST …/…)"`, target "qso", Info
+    /// level). Rendered as "QSOs: {n}" in the title bar once n > 0.
+    pub session_completed: u32,
 
     // Data
     pub decoded_messages: VecDeque<DecodedMessageView>,
@@ -983,6 +989,7 @@ impl App {
             diagnostic_events: VecDeque::with_capacity(500),
             show_diagnostics: false,
             diagnostics_scroll: 0,
+            session_completed: 0,
             decoded_messages: VecDeque::with_capacity(1000),
             qso_statuses: Vec::new(),
             active_qsos: Vec::new(),
