@@ -15,6 +15,7 @@ pub mod band_activity;
 pub mod callers;
 pub mod dx_hunter;
 pub mod qso_status;
+pub mod station_card;
 pub mod station_info;
 pub mod tx_placement;
 
@@ -25,6 +26,12 @@ use dx_hunter::render_dx_hunter;
 use qso_status::render_qso_status;
 use station_info::render_station_info;
 use tx_placement::{render_placement_zoom, render_tx_placement};
+
+// `station_card::render_station_card` is not yet called from any layout
+// function — Task 18 wires it into `layout_operate` / `layout_hunt`,
+// replacing/supplementing Station Info's slot. Registered here (module
+// declared above) so it builds and its own tests run; the `use` import is
+// deliberately omitted until a call site exists.
 
 /// Main UI rendering function
 pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
