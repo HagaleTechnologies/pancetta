@@ -1031,6 +1031,16 @@ impl App {
         } else {
             self.active_view.prev()
         };
+        // Hunt view narrows `displayed_messages()` to CQs + directed-at-us
+        // (see `displayed_messages`); a row the cursor/pin was sitting on
+        // (e.g. a third-party exchange) can vanish from the list the instant
+        // we switch views. Without this, `band_activity_scroll` would keep
+        // pointing past the shrunk list until the next decode arrived and
+        // happened to trigger a clamp — Space would silently select nothing
+        // in the meantime. Re-clamp immediately on every view switch (also a
+        // no-op, harmless call for the common case where the list didn't
+        // shrink).
+        self.clamp_band_activity_selection();
         if let Some(p) = Self::tui_state_path() {
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -1967,12 +1977,21 @@ impl App {
             .rev()
             .filter(|m| m.is_directed_at_us)
             .collect();
-        let others: Vec<&DecodedMessageView> = self
+        let mut others: Vec<&DecodedMessageView> = self
             .decoded_messages
             .iter()
             .rev()
             .filter(|m| !m.is_directed_at_us)
             .collect();
+        // Hunt view narrows the non-directed rows to CQs only (DXpedition /
+        // rare-station chasing wants CQ callers, not third-party exchange
+        // noise). Directed-at-us rows are always kept regardless of view —
+        // someone calling us must never be hidden. This lives here (not in
+        // the renderer) so the cursor, the renderer, and Space all agree on
+        // the same filtered list.
+        if self.active_view == crate::view::ActiveView::Hunt {
+            others.retain(|m| m.message.trim_start().starts_with("CQ"));
+        }
         directed.extend(others);
         directed
     }
@@ -3090,6 +3109,17 @@ mod tests {
         v
     }
 
+    /// Band Activity fixture builder: `directed = false` produces a plain
+    /// "CQ <call> ..." decode (via `fixture_view`); `directed = true`
+    /// produces a directed-at-us decode (via `fixture_view_directed`).
+    fn ba_fixture(call: &str, directed: bool) -> DecodedMessageView {
+        if directed {
+            fixture_view_directed(call, -10)
+        } else {
+            fixture_view(call, -10)
+        }
+    }
+
     async fn fixture_app() -> App {
         App::new(Config::default(), None)
             .await
@@ -3199,6 +3229,40 @@ mod tests {
         app.band_activity_scroll = 0;
         let selected = app.get_selected_station().expect("CALLER1 selectable");
         assert_eq!(selected.0, "CALLER1");
+    }
+
+    /// Hunt view narrows Band Activity to CQs-only among non-directed rows;
+    /// directed-at-us rows are always kept regardless of view. This is the
+    /// filter that drives the cursor, the renderer, and Space in Hunt view —
+    /// it must live inside `displayed_messages()` so all three agree.
+    #[tokio::test]
+    async fn hunt_view_filters_band_activity_to_cqs_and_directed() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.add_decoded_message(ba_fixture("K1AAA", false))
+            .await
+            .unwrap(); // "CQ K1AAA EM12"
+        let mut non_cq = ba_fixture("K2BBB", false);
+        non_cq.message = "K9ZZZ K2BBB -10".into();
+        app.add_decoded_message(non_cq).await.unwrap();
+        let mut directed = ba_fixture("K3CCC", true);
+        directed.message = "K5ARH K3CCC RR73".into();
+        app.add_decoded_message(directed).await.unwrap();
+
+        app.active_view = crate::view::ActiveView::Hunt;
+        let shown: Vec<_> = app
+            .displayed_messages()
+            .iter()
+            .filter_map(|m| m.call_sign.clone())
+            .collect();
+        assert!(shown.contains(&"K1AAA".to_string()), "CQ kept");
+        assert!(
+            shown.contains(&"K3CCC".to_string()),
+            "directed-at-us always kept"
+        );
+        assert!(
+            !shown.contains(&"K2BBB".to_string()),
+            "third-party exchange filtered"
+        );
     }
 
     #[tokio::test]

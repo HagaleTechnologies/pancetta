@@ -88,13 +88,14 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     render_title_bar(f, chunks[0], app);
 
     // Per-view content layout dispatch. Operate is today's layout (extracted
-    // verbatim below, byte-identical); Monitor is the new vertical big-picture
-    // layout. Hunt/Run land in Task 6 — until then they fall through to
-    // Operate as a placeholder.
+    // verbatim below, byte-identical); Monitor is the vertical big-picture
+    // layout; Hunt is DX-Hunter-first (band activity narrowed to CQs via
+    // `App::displayed_messages`); Run is Callers-first for working a pileup.
     match app.active_view {
         crate::view::ActiveView::Operate => layout_operate(f, chunks[1], app)?,
         crate::view::ActiveView::Monitor => layout_monitor(f, chunks[1], app)?,
-        _ => layout_operate(f, chunks[1], app)?,
+        crate::view::ActiveView::Hunt => layout_hunt(f, chunks[1], app)?,
+        crate::view::ActiveView::Run => layout_run(f, chunks[1], app)?,
     }
 
     // Render status bar
@@ -202,6 +203,61 @@ fn layout_monitor(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
     render_active_qsos(f, content[0], app);
     render_waterfall(f, content[1], app);
     render_band_activity(f, content[2], app)?;
+
+    Ok(())
+}
+
+/// Hunt-view content layout: DX Hunter gets top billing (full width) for
+/// picking a rare/needed station to chase, Band Activity underneath shows
+/// the narrowed CQs-only feed (see `App::displayed_messages`), and QSO
+/// Status anchors the bottom so the operator can track an in-progress call.
+/// No waterfall, no Callers, no Station Info — this view is about hunting,
+/// not answering.
+///
+/// No `render_active_panel_highlight` call, same rationale as
+/// `layout_monitor`: each panel renderer draws its own active-styled border
+/// via `create_panel_block`.
+fn layout_hunt(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
+    let content = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
+            Constraint::Percentage(45), // DX Hunter (full width)
+            Constraint::Percentage(35), // Band Activity (full width, CQs-only)
+            Constraint::Min(5),         // QSO Status
+        ])
+        .split(content_area);
+
+    render_active_qsos(f, content[0], app);
+    render_dx_hunter(f, content[1], app)?;
+    render_band_activity(f, content[2], app)?;
+    render_qso_status(f, content[3], app)?;
+
+    Ok(())
+}
+
+/// Run-view content layout: Callers gets top billing (full width) for
+/// working stations calling us, with QSO Status underneath in its existing
+/// multi-table ("Active QSOs") mode so the operator can track several
+/// concurrent exchanges at once. No waterfall, no DX Hunter, no Band
+/// Activity, no Station Info — this view is about answering, not hunting.
+///
+/// No `render_active_panel_highlight` call, same rationale as
+/// `layout_monitor`: each panel renderer draws its own active-styled border
+/// via `create_panel_block`.
+fn layout_run(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
+    let content = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
+            Constraint::Percentage(50), // Callers (full width)
+            Constraint::Min(5),         // QSO Status (multi-table "Active QSOs" mode)
+        ])
+        .split(content_area);
+
+    render_active_qsos(f, content[0], app);
+    render_callers(f, content[1], app)?;
+    render_qso_status(f, content[2], app)?;
 
     Ok(())
 }
@@ -1121,5 +1177,21 @@ mod view_render_tests {
         assert!(!buffer_contains(&buf, "Callers"));
         assert!(!buffer_contains(&buf, "QSO Status"));
         assert!(!buffer_contains(&buf, "Station Info"));
+    }
+
+    #[tokio::test]
+    async fn hunt_view_shows_dx_hunter_and_band_activity_not_callers() {
+        let buf = render_view(crate::view::ActiveView::Hunt).await;
+        assert!(buffer_contains(&buf, "DX Hunter"));
+        assert!(buffer_contains(&buf, "Band Activity"));
+        assert!(!buffer_contains(&buf, "Callers"));
+    }
+
+    #[tokio::test]
+    async fn run_view_shows_callers_and_qso_status_not_dx_hunter() {
+        let buf = render_view(crate::view::ActiveView::Run).await;
+        assert!(buffer_contains(&buf, "Callers"));
+        assert!(buffer_contains(&buf, "QSO Status"));
+        assert!(!buffer_contains(&buf, "DX Hunter"));
     }
 }
