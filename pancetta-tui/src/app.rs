@@ -2194,6 +2194,7 @@ impl App {
             .collect();
         let len = calls.len();
 
+        let mut pinned_aged_out = false;
         if let Some(ref pin) = self.band_activity_pinned_call {
             if let Some(idx) = calls
                 .iter()
@@ -2202,10 +2203,17 @@ impl App {
                 self.band_activity_scroll = idx;
                 return;
             }
+            // Pin was explicitly set but aged out of the list; clear it and re-adopt at scroll
             self.band_activity_pinned_call = None;
+            pinned_aged_out = true;
         }
         let max = len.saturating_sub(1);
         self.band_activity_scroll = self.band_activity_scroll.min(max);
+        // If the pinned call aged out, re-adopt whatever now sits at the resolved index
+        if pinned_aged_out {
+            self.band_activity_pinned_call =
+                calls.get(self.band_activity_scroll).and_then(|m| m.clone());
+        }
     }
 
     /// The currently-selected caller, if any.
@@ -4551,6 +4559,65 @@ mod tests {
         assert_eq!(
             current_call, pinned_call_after,
             "PageDown pin should survive a reorder"
+        );
+    }
+
+    #[tokio::test]
+    async fn band_activity_pin_self_heals_when_station_ages_out() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        // Add three stations so we have backup after removing the pinned one
+        app.add_decoded_message(fixture_view("K1AAA", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K2BBB", -12))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K3CCC", -14))
+            .await
+            .unwrap();
+        // Newest-first: [K3CCC, K2BBB, K1AAA]
+        // Pin K2BBB (the middle station)
+        app.band_activity_scroll = 1;
+        app.pin_band_activity_selection();
+        assert_eq!(
+            app.band_activity_pinned_call,
+            Some("K2BBB".to_string()),
+            "Should pin to K2BBB at index 1"
+        );
+        // Manually remove K2BBB from the list to simulate it aging out
+        // (without clearing all messages)
+        app.decoded_messages
+            .retain(|m| m.call_sign.as_deref() != Some("K2BBB"));
+        // Displayed list is now [K3CCC, K1AAA]
+        app.clamp_band_activity_selection();
+        // After clamp with K2BBB gone:
+        // - K2BBB is not found, so pinned_call is cleared
+        // - Scroll was 1, now clamped to 1 (max index in a 2-element list)
+        // - Re-adoption should set pinned_call to whatever is at index 1, which is K1AAA
+        assert_eq!(
+            app.band_activity_pinned_call,
+            Some("K1AAA".to_string()),
+            "Pin should self-heal to K1AAA at the resolved scroll index"
+        );
+        // Now add a new high-priority decode that reorders the list
+        app.add_decoded_message(fixture_view_directed("K4DDD", -2))
+            .await
+            .unwrap();
+        // Displayed list is now [K4DDD (directed), K3CCC, K1AAA]
+        // The self-healed pin to K1AAA should survive this reorder
+        assert_eq!(
+            app.band_activity_pinned_call,
+            Some("K1AAA".to_string()),
+            "Self-healed pin should survive a reorder"
+        );
+        // Verify cursor is still on K1AAA despite the new decode at index 0
+        let (current_call, _, _) = app
+            .get_selected_station()
+            .expect("station after re-adopt reorder");
+        assert_eq!(
+            current_call, "K1AAA",
+            "Cursor should still resolve to K1AAA after reorder"
         );
     }
 }
