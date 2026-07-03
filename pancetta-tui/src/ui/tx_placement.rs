@@ -125,7 +125,11 @@ fn freq_to_col(freq_hz: f64, range: (f64, f64), width: usize) -> Option<usize> {
 }
 
 /// Coverage label from a candidate slice's own clear flags (BEST row).
-fn coverage_label(clear_first: bool, clear_second: bool) -> &'static str {
+///
+/// `pub(crate)` so the Enter-park key handler (`tui_runner.rs`, Task 12) can
+/// build the SAME "Parked at {hz} Hz ({coverage})" label the BEST row shows,
+/// rather than re-deriving the E/O/E+O encoding a second time.
+pub(crate) fn coverage_label(clear_first: bool, clear_second: bool) -> &'static str {
     match (clear_first, clear_second) {
         (true, true) => "E+O",
         (true, false) => "E",

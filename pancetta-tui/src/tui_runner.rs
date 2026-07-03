@@ -1078,12 +1078,19 @@ impl TuiRunner {
             // Left/Right are globally TX-offset ±50 Hz, BUT when the Callers
             // panel is focused they cycle the reply sequence step for the
             // selected caller instead (so the operator can override the smart
-            // default without leaving the panel).
+            // default without leaving the panel), and when the TxPlacement
+            // panel is focused they step `placement_cursor` through the
+            // ranked BEST list instead (index-based, saturating) — a
+            // deliberate divergence from the original free-Hz-cursor spec
+            // sketch: the ranked slices ARE the instrument's point, and
+            // free-Hz parking already exists via the `o` modal.
             KeyCode::Left => {
                 if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
                     app.cycle_caller_reply(false);
                     let step = app.current_caller_reply_step();
                     app.status_message = format!("Reply step: {:?}", step);
+                } else if matches!(app.active_panel, crate::app::ActivePanel::TxPlacement) {
+                    app.placement_cursor = app.placement_cursor.saturating_sub(1);
                 } else {
                     app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(200.0);
                     app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
@@ -1094,6 +1101,14 @@ impl TuiRunner {
                     app.cycle_caller_reply(true);
                     let step = app.current_caller_reply_step();
                     app.status_message = format!("Reply step: {:?}", step);
+                } else if matches!(app.active_panel, crate::app::ActivePanel::TxPlacement) {
+                    if let Some(max_index) = app
+                        .placement
+                        .as_ref()
+                        .map(|p| p.slices.len().saturating_sub(1))
+                    {
+                        app.placement_cursor = (app.placement_cursor + 1).min(max_index);
+                    }
                 } else {
                     app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(2500.0);
                     app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
@@ -1514,9 +1529,12 @@ impl TuiRunner {
 
             // Enter - confirm the selected caller reply. When the Callers panel
             // is focused and a caller is selected, this commits the reply at the
-            // shown sequence step. Free-text TX now lives in compose mode (`/`),
-            // so outside Callers there's nothing for Enter to send — it hints
-            // the operator toward compose instead.
+            // shown sequence step. When the TxPlacement panel is focused, this
+            // parks at the cursor-selected BEST slice (via the EXISTING
+            // `SetTxOffset` command — the same path the `o` modal uses).
+            // Free-text TX now lives in compose mode (`/`), so outside
+            // Callers/TxPlacement there's nothing for Enter to send — it
+            // hints the operator toward compose instead.
             KeyCode::Enter => {
                 if matches!(app.active_panel, crate::app::ActivePanel::Callers) {
                     if let Some((callsign, frequency, dx_parity)) = app.get_selected_station() {
@@ -1532,6 +1550,28 @@ impl TuiRunner {
                         app.status_message = format!("Replying to {} ({:?})", callsign, step);
                     } else {
                         app.status_message = "No caller selected".to_string();
+                    }
+                } else if matches!(app.active_panel, crate::app::ActivePanel::TxPlacement) {
+                    if let Some(slice) = app
+                        .placement
+                        .as_ref()
+                        .and_then(|p| p.slices.get(app.placement_cursor))
+                        .cloned()
+                    {
+                        let hz = slice.offset_hz.round() as u64;
+                        let coverage = crate::ui::tx_placement::coverage_label(
+                            slice.clear_first,
+                            slice.clear_second,
+                        );
+                        app.tx_offset_hold_hz = Some(hz);
+                        app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
+                        app.parked_since = Some(chrono::Utc::now());
+                        app.status_message = format!("Parked at {hz} Hz ({coverage})");
+                        self.message_tx.send(TuiCommand::SetTxOffset {
+                            offset_hz: Some(hz),
+                        })?;
+                    } else {
+                        app.status_message = "No placement candidate selected".to_string();
                     }
                 } else {
                     app.status_message = "Press / to compose a free-text TX message".to_string();
@@ -1763,7 +1803,10 @@ impl TuiRunner {
             ("= / -", "Band up / down"),
             ("Space", "Call selected station"),
             ("/", "Compose free-text TX (Enter sends, Esc cancels)"),
-            ("Enter", "Callers: reply at shown step"),
+            (
+                "Enter",
+                "Callers: reply at shown step; TX Placement: park at selected slice",
+            ),
             ("c / s", "Start / stop CQ"),
             ("k", "Abort selected QSO (QSO Status panel only)"),
             ("r", "Re-send last TX (QSO Status panel only)"),
@@ -3129,6 +3172,223 @@ mod key_tests {
         assert!(!a.offset_modal.visible, "modal closed on Esc");
         drop(a);
         assert!(cmd_rx.try_recv().is_err(), "Esc must not emit a command");
+    }
+
+    // === TX Placement instrument (Task 12: cursor + Enter-park) ========
+
+    /// Builds a 3-slice `PlacementView` fixture for the placement-cursor
+    /// tests. Slice index 2 (the one Right-stepping should land on) is
+    /// 920 Hz — the offset the Enter-park test expects on the wire.
+    fn placement_fixture() -> crate::app::PlacementView {
+        crate::app::PlacementView {
+            slices: vec![
+                crate::app::PlacementSlice {
+                    offset_hz: 500.0,
+                    score: 90.0,
+                    clear_first: true,
+                    clear_second: true,
+                },
+                crate::app::PlacementSlice {
+                    offset_hz: 700.0,
+                    score: 80.0,
+                    clear_first: true,
+                    clear_second: false,
+                },
+                crate::app::PlacementSlice {
+                    offset_hz: 920.0,
+                    score: 70.0,
+                    clear_first: false,
+                    clear_second: true,
+                },
+            ],
+            openness: vec![3; 96],
+            bin_hz: 25.0,
+            range: (200.0, 2600.0),
+            received_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Left/Right step `placement_cursor` through the ranked BEST list
+    /// (index-based) when the TxPlacement panel is focused, saturating at
+    /// both ends — NOT the raw TX-offset nudge Left/Right performs for
+    /// every other panel.
+    #[tokio::test]
+    async fn tx_placement_left_right_step_cursor_and_saturate() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::TxPlacement;
+            a.apply_placement(placement_fixture());
+        }
+        assert_eq!(app.read().await.placement_cursor, 0);
+
+        r.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.placement_cursor, 1, "Right steps 0->1");
+
+        r.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.placement_cursor, 2, "Right steps 1->2");
+
+        // Saturate at the top (3 slices → max index 2).
+        r.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.read().await.placement_cursor,
+            2,
+            "Right saturates at len-1"
+        );
+
+        r.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.placement_cursor, 1, "Left steps 2->1");
+
+        r.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.placement_cursor, 0, "Left steps 1->0");
+
+        // Saturate at the bottom.
+        r.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.placement_cursor, 0, "Left saturates at 0");
+    }
+
+    /// With no placement snapshot loaded, Left/Right on the TxPlacement
+    /// panel must not panic (graceful no-op).
+    #[tokio::test]
+    async fn tx_placement_left_right_no_panic_when_no_placement() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        app.write().await.active_panel = crate::app::ActivePanel::TxPlacement;
+        r.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.placement_cursor, 0);
+    }
+
+    /// Left/Right for every OTHER panel must be completely unaffected —
+    /// still the raw TX-offset ±50 Hz nudge (regression guard).
+    #[tokio::test]
+    async fn tx_placement_cursor_guard_does_not_affect_other_panels() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::BandActivity;
+            a.apply_placement(placement_fixture());
+        }
+        let before = app.read().await.tx_frequency_offset;
+        r.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let a = app.read().await;
+        assert_eq!(
+            a.placement_cursor, 0,
+            "cursor untouched outside TxPlacement"
+        );
+        assert_eq!(
+            a.tx_frequency_offset,
+            (before + 50.0).min(2500.0),
+            "Right still nudges TX offset on Band Activity"
+        );
+        drop(a);
+        // No SetTxOffset command — the raw nudge doesn't touch the modal/park path.
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    /// Enter, with TxPlacement active and a slice at the cursor, parks via
+    /// the EXISTING `SetTxOffset` command — not a new TX-offset-setting path.
+    #[tokio::test]
+    async fn tx_placement_enter_parks_selected_slice_via_set_tx_offset() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::TxPlacement;
+            a.apply_placement(placement_fixture());
+        }
+        // Step to slice index 2 (920 Hz).
+        r.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.read().await.placement_cursor, 2);
+
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let a = app.read().await;
+        assert!(a.parked_since.is_some(), "parked_since stamped");
+        assert_eq!(a.tx_offset_hold_hz, Some(920), "held offset set to 920");
+        assert_eq!(
+            a.tx_freq_mode,
+            pancetta_core::TxFreqMode::Hold,
+            "mode flipped to Hold"
+        );
+        assert!(
+            a.status_message.contains("Parked at 920 Hz"),
+            "status message announces park: {}",
+            a.status_message
+        );
+        assert!(
+            a.status_message.contains('O'),
+            "status message includes the O coverage label: {}",
+            a.status_message
+        );
+        drop(a);
+        assert!(
+            matches!(
+                cmd_rx.try_recv(),
+                Ok(TuiCommand::SetTxOffset {
+                    offset_hz: Some(920)
+                })
+            ),
+            "SetTxOffset(Some(920)) emitted via the existing path"
+        );
+    }
+
+    /// Enter on TxPlacement with an empty slice list is a graceful no-op —
+    /// no command, no crash.
+    #[tokio::test]
+    async fn tx_placement_enter_no_op_when_no_slices() {
+        let (mut r, cmd_rx, app) = app_with_empty_placement().await;
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        let a = app.read().await;
+        assert!(a.parked_since.is_none());
+        assert!(a.tx_offset_hold_hz.is_none());
+        drop(a);
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    async fn app_with_empty_placement() -> (
+        TuiRunner,
+        crossbeam_channel::Receiver<TuiCommand>,
+        Arc<RwLock<App>>,
+    ) {
+        let (r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::TxPlacement;
+            a.apply_placement(crate::app::PlacementView {
+                slices: vec![],
+                openness: vec![3; 96],
+                bin_hz: 25.0,
+                range: (200.0, 2600.0),
+                received_at: chrono::Utc::now(),
+            });
+        }
+        (r, cmd_rx, app)
     }
 
     /// `parse_hz` unit tests.
