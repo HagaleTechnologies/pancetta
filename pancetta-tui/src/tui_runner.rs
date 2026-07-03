@@ -1527,9 +1527,15 @@ impl TuiRunner {
             }
 
             // === Display / housekeeping ===
+            // Task 20f: confirm-on-`x`. First press arms a 3s confirmation
+            // window (status hint, no clear); a second press within that
+            // window actually clears. `try_clear_decodes` returns `true`
+            // only when it cleared, so we only tell the coordinator to
+            // clear its side on the confirming press.
             KeyCode::Char('x') => {
-                app.clear_messages();
-                self.message_tx.send(TuiCommand::ClearMessages)?;
+                if app.try_clear_decodes() {
+                    self.message_tx.send(TuiCommand::ClearMessages)?;
+                }
             }
 
             // Space - context-aware action on the selected station ("do the
@@ -1893,7 +1899,7 @@ impl TuiRunner {
             ("Shift+X", "Toggle Fox (DXpedition) mode"),
             ("m", "Toggle audio monitoring"),
             ("d", "Device picker"),
-            ("x", "Clear decoded messages"),
+            ("x", "Clear decoded messages (press twice within 3s)"),
             ("q", "Quit (with confirm)"),
             ("Shift+Q", "EMERGENCY STOP (halt TX, autonomous off)"),
             ("Esc", "Dismiss overlay / cancel modal / clear stop banner"),
@@ -2376,9 +2382,51 @@ mod key_tests {
         }
     }
 
+    /// Task 20f: confirm-on-`x`. A single press must NOT clear (it only
+    /// arms); a second press within the 3s window does.
     #[tokio::test]
-    async fn key_x_emits_clear_messages() {
-        let (mut r, cmd_rx, _app) = make_runner().await;
+    async fn key_x_first_press_arms_second_press_within_window_clears() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+
+        r.handle_key_event(key('x')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err(), "first press must not clear yet");
+        assert!(app.read().await.clear_armed_at.is_some());
+        assert_eq!(
+            app.read().await.status_message,
+            "press x again within 3s to clear decodes"
+        );
+
+        r.handle_key_event(key('x')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::ClearMessages)));
+        assert!(
+            app.read().await.clear_armed_at.is_none(),
+            "confirming press disarms"
+        );
+    }
+
+    /// A press arriving AFTER the 3s window has expired must NOT clear —
+    /// it re-arms instead, restarting the 2-press sequence. Simulated by
+    /// stashing an artificially-past `Instant` (no real sleeping needed:
+    /// `Instant` supports subtracting a `Duration`).
+    #[tokio::test]
+    async fn key_x_press_after_window_expired_rearms_instead_of_clearing() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.clear_armed_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
+        }
+
+        r.handle_key_event(key('x')).await.unwrap();
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "expired arm must not clear on this press"
+        );
+        assert!(
+            app.read().await.clear_armed_at.is_some(),
+            "must re-arm rather than staying disarmed"
+        );
+
+        // The re-arm starts a fresh window: a follow-up press now clears.
         r.handle_key_event(key('x')).await.unwrap();
         assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::ClearMessages)));
     }

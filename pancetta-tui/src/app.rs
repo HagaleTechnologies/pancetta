@@ -697,6 +697,10 @@ pub struct App {
     /// emits (`"QSO with {call} logged (RST …/…)"`, target "qso", Info
     /// level). Rendered as "QSOs: {n}" in the title bar once n > 0.
     pub session_completed: u32,
+    /// Set by the first `x` press (Task 20f — confirm-on-`x`); a second
+    /// press within `CLEAR_CONFIRM_WINDOW` actually clears decodes. `None`
+    /// = not armed.
+    pub clear_armed_at: Option<std::time::Instant>,
 
     // Data
     pub decoded_messages: VecDeque<DecodedMessageView>,
@@ -990,6 +994,7 @@ impl App {
             show_diagnostics: false,
             diagnostics_scroll: 0,
             session_completed: 0,
+            clear_armed_at: None,
             decoded_messages: VecDeque::with_capacity(1000),
             qso_statuses: Vec::new(),
             active_qsos: Vec::new(),
@@ -1685,6 +1690,32 @@ impl App {
         self.clamp_band_activity_selection();
         self.status_message = "Messages cleared".to_string();
         info!("Cleared all decoded messages");
+    }
+
+    /// How long a first `x` press stays armed for a confirming second press
+    /// (Task 20f).
+    const CLEAR_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Confirm-on-`x`: the first press arms a 3-second confirmation window
+    /// (and leaves a status hint) instead of clearing immediately; a second
+    /// press WITHIN that window actually clears. A press after the window
+    /// expired doesn't clear — it re-arms, restarting the 2-press sequence.
+    /// Returns `true` iff decodes were actually cleared this call (the
+    /// caller uses this to decide whether to also tell the coordinator to
+    /// clear its side via `TuiCommand::ClearMessages`).
+    pub fn try_clear_decodes(&mut self) -> bool {
+        match self.clear_armed_at {
+            Some(armed_at) if armed_at.elapsed() <= Self::CLEAR_CONFIRM_WINDOW => {
+                self.clear_armed_at = None;
+                self.clear_messages();
+                true
+            }
+            _ => {
+                self.clear_armed_at = Some(std::time::Instant::now());
+                self.status_message = "press x again within 3s to clear decodes".to_string();
+                false
+            }
+        }
     }
 
     fn cleanup_old_data(&mut self) {
