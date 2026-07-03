@@ -548,16 +548,34 @@ impl super::ApplicationCoordinator {
                 .unwrap_or_else(pancetta_agent::audit::default_audit_path),
         );
 
-        // Learn the client peer keyId for env addressing. v1 uses the FIRST
-        // allow-listed client keyId as the expected peer (single-client v1).
-        let client_key_id = match tx_allow_list.iter().next().cloned() {
-            Some(c) => c,
-            None => {
-                info!(
-                    target: "agent",
-                    "station agent paired but tx_allow_list is empty — no client to admit; idle"
-                );
-                return self.spawn_station_agent_drain().await;
+        // Learn the client peer keyId for env addressing. v1 admits a SINGLE
+        // client peer. The allow-list may hold more than one keyId (e.g. staged
+        // for future multi-client), so pick DETERMINISTICALLY — the
+        // lexicographically smallest keyId — rather than relying on HashSet
+        // iteration order, which would silently vary the admitted peer across
+        // restarts and drop every other client's frames at the src guard.
+        let client_key_id = {
+            let mut ids: Vec<&String> = tx_allow_list.iter().collect();
+            ids.sort_unstable();
+            match ids.first().map(|s| (*s).clone()) {
+                Some(c) => {
+                    if ids.len() > 1 {
+                        warn!(
+                            target: "agent",
+                            admitted = %c,
+                            count = ids.len(),
+                            "tx_allow_list has multiple clients; v1 admits only the first (lexicographic) — other clients will not connect"
+                        );
+                    }
+                    c
+                }
+                None => {
+                    info!(
+                        target: "agent",
+                        "station agent paired but tx_allow_list is empty — no client to admit; idle"
+                    );
+                    return self.spawn_station_agent_drain().await;
+                }
             }
         };
 

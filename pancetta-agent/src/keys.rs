@@ -12,7 +12,8 @@
 use std::fmt;
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 use std::path::Path;
 
 use base64::Engine as _;
@@ -106,18 +107,16 @@ impl AgentIdentity {
     /// Persist both raw private keys to `dir` with 0600 perms, creating `dir`
     /// (0700) if needed.
     fn persist(&self, dir: &Path) -> Result<(), KeyError> {
-        if !dir.exists() {
-            fs::create_dir_all(dir).map_err(|e| KeyError::Io {
-                path: dir.display().to_string(),
-                source: e,
-            })?;
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
-                KeyError::Io {
-                    path: dir.display().to_string(),
-                    source: e,
-                }
-            })?;
-        }
+        fs::create_dir_all(dir).map_err(|e| KeyError::Io {
+            path: dir.display().to_string(),
+            source: e,
+        })?;
+        // Tighten to 0700 unconditionally — a pre-existing key dir may have been
+        // created with looser (umask-default) perms before we owned it.
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| KeyError::Io {
+            path: dir.display().to_string(),
+            source: e,
+        })?;
 
         let identity_path = dir.join(IDENTITY_KEY_FILE);
         let agreement_path = dir.join(AGREEMENT_KEY_FILE);
@@ -206,15 +205,28 @@ fn read_key_file(path: &Path) -> Result<[u8; 32], KeyError> {
 }
 
 /// Write a raw key file with 0600 permissions.
+///
+/// The file is **created** with mode 0600 in a single `open` (no umask-wide
+/// window between create and chmod). A pre-existing file is truncated and its
+/// perms are re-tightened to 0600 afterward (the create-mode only applies on
+/// creation), so re-persisting an identity can never leave secret bytes under
+/// looser perms.
 fn write_key_file(path: &Path, bytes: &[u8; 32]) -> Result<(), KeyError> {
-    fs::write(path, bytes).map_err(|e| KeyError::Io {
+    let io_err = |e: io::Error| KeyError::Io {
         path: path.display().to_string(),
         source: e,
-    })?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|e| KeyError::Io {
-        path: path.display().to_string(),
-        source: e,
-    })?;
+    };
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(io_err)?;
+    f.write_all(bytes).map_err(io_err)?;
+    // Belt-and-suspenders for the re-persist (pre-existing file) case, where the
+    // create-mode above is a no-op.
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(io_err)?;
     Ok(())
 }
 
@@ -271,6 +283,54 @@ mod tests {
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{f} must be 0600, got {mode:o}");
         }
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "key dir must be 0700, got {dir_mode:o}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_tightens_a_preexisting_world_readable_dir() {
+        // A key dir that already exists with loose (0755) perms must be tightened
+        // to 0700 on persist — the TOCTOU-hardening path.
+        let dir = temp_dir("loose-dir");
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let _ = AgentIdentity::load_or_generate(&dir).unwrap();
+
+        let dir_mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "pre-existing loose key dir must be tightened to 0700, got {dir_mode:o}"
+        );
+        for f in [IDENTITY_KEY_FILE, AGREEMENT_KEY_FILE] {
+            let mode = fs::metadata(dir.join(f)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{f} must be 0600 even under a loose dir");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_key_file_creates_with_0600_never_umask_wide() {
+        // Directly exercise write_key_file into a fresh path: the file must be
+        // 0600 immediately (created with the mode, not chmod'd after a wide open).
+        let dir = temp_dir("writefile");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("k");
+        write_key_file(&path, &[7u8; 32]).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "created key file must be 0600, got {mode:o}");
+        // Re-write over the existing file: still 0600.
+        write_key_file(&path, &[9u8; 32]).unwrap();
+        let mode2 = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode2, 0o600, "re-persisted key file must stay 0600");
+        assert_eq!(
+            read_key_file(&path).unwrap(),
+            [9u8; 32],
+            "content re-written"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
