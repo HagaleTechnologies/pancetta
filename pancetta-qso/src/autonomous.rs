@@ -11,7 +11,7 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::frequency::{
-    DecodeHistory, DecodeRecord, FrequencyAllocatorConfig, PlacementSnapshot,
+    DecodeHistory, DecodeRecord, FrequencyAllocatorConfig, FrequencyCandidate, PlacementSnapshot,
     SmartFrequencyAllocator, SpectralSnapshot, TimeSlot,
 };
 
@@ -1027,6 +1027,37 @@ impl AutonomousOperator {
 
     // -- frequency allocation -------------------------------------------------
 
+    /// CQ-mode live-spot rarity nudge, applied in place and then re-sorted
+    /// by score descending.
+    ///
+    /// Boosts every candidate within 200 Hz of a live cqdx spot whose
+    /// rarity exceeds 0.7 by `0.2 * rarity` (additive; multiple overlapping
+    /// spots stack). Shared by [`Self::allocate_smart_frequency`] (the real
+    /// CQ-frequency decision) and [`Self::placement_snapshot`] (the TX-
+    /// placement instrument) so both agree on the ranked order — the
+    /// single-scorer invariant. Callers gate the call on
+    /// `dx_target_hz.is_none() && !live_spot_frequencies.is_empty()`
+    /// (this nudge only applies to general CQ-mode ranking, not pouncing on
+    /// a specific DX).
+    fn apply_live_spot_rarity_boost(
+        candidates: &mut [FrequencyCandidate],
+        live_spot_frequencies: &[(f64, f64)],
+    ) {
+        for candidate in candidates.iter_mut() {
+            for &(spot_freq, spot_rarity) in live_spot_frequencies {
+                let distance = (candidate.offset_hz - spot_freq).abs();
+                if distance < 200.0 && spot_rarity > 0.7 {
+                    candidate.score += 0.2 * spot_rarity;
+                }
+            }
+        }
+        candidates.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
     /// Get the best frequency for a new QSO using the smart allocator.
     /// Falls back to the legacy allocator if no spectral data is available.
     fn allocate_smart_frequency(&self, dx_target_hz: Option<f64>) -> f64 {
@@ -1051,21 +1082,9 @@ impl AutonomousOperator {
                 dx_target_hz,
             );
 
-            // When calling CQ, prefer frequencies near rare DX spots
+            // When calling CQ, prefer frequencies near rare DX spots.
             if dx_target_hz.is_none() && !self.live_spot_frequencies.is_empty() {
-                for candidate in &mut candidates {
-                    for &(spot_freq, spot_rarity) in &self.live_spot_frequencies {
-                        let distance = (candidate.offset_hz - spot_freq).abs();
-                        if distance < 200.0 && spot_rarity > 0.7 {
-                            candidate.score += 0.2 * spot_rarity;
-                        }
-                    }
-                }
-                candidates.sort_by(|a, b| {
-                    b.score
-                        .partial_cmp(&a.score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
+                Self::apply_live_spot_rarity_boost(&mut candidates, &self.live_spot_frequencies);
             }
 
             if let Some(best) = candidates.first() {
@@ -1096,6 +1115,15 @@ impl AutonomousOperator {
         let mut cands =
             self.smart_allocator
                 .rank_candidates(spectral, &self.decode_history, &own, None);
+
+        // Same CQ-mode live-spot rarity nudge `allocate_smart_frequency`
+        // applies (dx_target_hz is always None here, so the gate collapses
+        // to just the live-spots check) — single-scorer invariant: this
+        // instrument must never diverge from the real decision's ranking.
+        if !self.live_spot_frequencies.is_empty() {
+            Self::apply_live_spot_rarity_boost(&mut cands, &self.live_spot_frequencies);
+        }
+
         cands.truncate(top_n);
 
         let (min_f, max_f) = self.smart_allocator.config().range;
@@ -2541,6 +2569,96 @@ mod tests {
             snap.openness[bin_1500], 1,
             "busy in First -> second-only-clear"
         );
+    }
+
+    /// Single-scorer invariant: the real CQ-frequency decision
+    /// (`allocate_smart_frequency`) and the TX-placement instrument
+    /// (`placement_snapshot`) must agree on the top-ranked candidate when
+    /// the CQ-mode live-spot rarity nudge is in play.
+    ///
+    /// With a flat spectral snapshot and empty decode history, every
+    /// candidate's natural score differs only by the center-bias term,
+    /// which — at the default `step_hz=25.0` / `range=(200,2800)` — steps
+    /// by ~0.192 per 25 Hz. A single rarity=1.0 live spot contributes a
+    /// flat +0.2 to every candidate within 200 Hz of it, which exceeds
+    /// that step. Placing the spot at 1720 Hz puts 1525 Hz (the natural
+    /// runner-up, 195 Hz away) inside the boost window while leaving the
+    /// natural #1 pick, 1500 Hz (220 Hz away, the exact center-bias peak),
+    /// just outside it — so the boost provably flips the winner from 1500
+    /// to 1525 Hz. If only one of the two code paths applied the boost,
+    /// they would disagree on the winner here.
+    #[test]
+    fn placement_snapshot_agrees_with_real_cq_decision_under_live_spot_boost() {
+        let config = AutonomousConfig {
+            enabled: true,
+            ..AutonomousConfig::default()
+        };
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+
+        // Auto mode: the real decision path only consults the smart
+        // allocator when the operator has released the TX offset.
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        op.update_live_spots(&[(1720.0, 1.0)]);
+
+        // Sanity: without the boost, the natural winner is the exact
+        // center-bias peak.
+        let unboosted = op
+            .smart_allocator
+            .rank_candidates(
+                op.spectral_snapshot.as_ref().unwrap(),
+                &op.decode_history,
+                &[],
+                None,
+            )
+            .first()
+            .unwrap()
+            .offset_hz;
+        assert_eq!(unboosted, 1500.0, "sanity: unboosted winner is band center");
+
+        // Real CQ-frequency decision path.
+        let real_freq = op.allocate_smart_frequency(None);
+
+        // TX-placement instrument.
+        let snap = op.placement_snapshot(usize::MAX).unwrap();
+        let instrument_top = &snap.slices[0];
+
+        assert_eq!(
+            real_freq, instrument_top.offset_hz,
+            "placement instrument's top pick must match the real CQ-frequency decision"
+        );
+        assert_eq!(
+            real_freq, 1525.0,
+            "boost should flip the winner away from the unboosted 1500 Hz peak"
+        );
+
+        // Full-order agreement, not just the top pick: re-derive the real
+        // path's boosted-and-sorted candidate list and compare offsets +
+        // scores 1:1 against the instrument's (unboosted-candidate order
+        // is a superset check since the instrument returns all of them
+        // here via usize::MAX).
+        let mut real_candidates = op.smart_allocator.rank_candidates(
+            op.spectral_snapshot.as_ref().unwrap(),
+            &op.decode_history,
+            &[],
+            None,
+        );
+        AutonomousOperator::apply_live_spot_rarity_boost(
+            &mut real_candidates,
+            &op.live_spot_frequencies,
+        );
+        assert_eq!(real_candidates.len(), snap.slices.len());
+        for (a, b) in real_candidates.iter().zip(snap.slices.iter()) {
+            assert_eq!(a.offset_hz, b.offset_hz);
+            assert_eq!(a.score, b.score);
+        }
     }
 }
 
