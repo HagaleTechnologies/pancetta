@@ -562,6 +562,10 @@ pub enum ActivePanel {
     /// one and replies at the correct sequence step (smart default + override).
     Callers,
     DxHunter,
+    /// The TX-placement instrument (Task 11). Not reachable via the `1`-`5`
+    /// panel-jump keys (those stay as-is) — only `Tab`/`Shift+Tab` cycle into
+    /// it. Has no "focused callsign" concept (see `focused_callsign`).
+    TxPlacement,
 }
 
 impl ActivePanel {
@@ -569,10 +573,13 @@ impl ActivePanel {
     // right column: BandActivity, QsoStatus (left) → StationInfo, DxHunter,
     // Callers (right). The full-width-waterfall layout put Callers BELOW DX
     // Hunter, so DxHunter precedes Callers here (the enum's declaration order is
-    // unrelated and left unchanged).
+    // unrelated and left unchanged). TxPlacement (Task 11) is inserted right
+    // after BandActivity — it sits directly below the active-QSO banner and
+    // above the rest of the grid on-screen in Operate.
     pub fn next(&self) -> Self {
         match self {
-            ActivePanel::BandActivity => ActivePanel::QsoStatus,
+            ActivePanel::BandActivity => ActivePanel::TxPlacement,
+            ActivePanel::TxPlacement => ActivePanel::QsoStatus,
             ActivePanel::QsoStatus => ActivePanel::StationInfo,
             ActivePanel::StationInfo => ActivePanel::DxHunter,
             ActivePanel::DxHunter => ActivePanel::Callers,
@@ -583,7 +590,8 @@ impl ActivePanel {
     pub fn previous(&self) -> Self {
         match self {
             ActivePanel::BandActivity => ActivePanel::Callers,
-            ActivePanel::QsoStatus => ActivePanel::BandActivity,
+            ActivePanel::TxPlacement => ActivePanel::BandActivity,
+            ActivePanel::QsoStatus => ActivePanel::TxPlacement,
             ActivePanel::StationInfo => ActivePanel::QsoStatus,
             ActivePanel::DxHunter => ActivePanel::StationInfo,
             ActivePanel::Callers => ActivePanel::DxHunter,
@@ -2421,6 +2429,10 @@ impl App {
                 .get(self.qso_cursor)
                 .map(|q| q.their_callsign.clone()),
             ActivePanel::StationInfo => None,
+            // The instrument has no "focused station" concept of its own —
+            // its own selection cursor is `placement_cursor` (a slice index,
+            // not a callsign).
+            ActivePanel::TxPlacement => None,
         }
     }
 
