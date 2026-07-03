@@ -555,6 +555,16 @@ impl AudioStreamManager {
             .take()
             .ok_or_else(|| AudioError::stream("Output consumer already taken"))?;
 
+        // docs/audio-robustness-plan.md item 4: this callback previously only
+        // `eprintln!`'d the error — invisible under the TUI (which owns the
+        // terminal) and never wired to `has_stream_error()`, so an OUTPUT
+        // device failure (e.g. the rig's USB CODEC disconnecting) was a
+        // silent "PTT keys, but no RF ever leaves the radio" failure with
+        // zero operator-visible signal anywhere. Reuse the SAME shared state
+        // the input side already latches into and that `process_audio()`
+        // already checks unconditionally on every call — no new plumbing.
+        let err_shared_output = self.shared.clone();
+
         // Create the output stream — drain TX samples from the ring buffer
         let stream = output_device.build_output_stream(
             &stream_config,
@@ -565,8 +575,9 @@ impl AudioStreamManager {
                     *sample = 0.0;
                 }
             },
-            |err| {
+            move |err| {
                 eprintln!("Output stream error: {}", err);
+                err_shared_output.set_stream_error();
             },
             None,
         )?;

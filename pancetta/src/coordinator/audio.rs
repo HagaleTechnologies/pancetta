@@ -312,6 +312,17 @@ impl super::ApplicationCoordinator {
                             let s = e.to_string();
                             error!("Audio processing error: {}", s);
                             maybe_report_runtime("processing error", s);
+                            // docs/audio-robustness-plan.md item 1: a stream
+                            // error (e.g. device disconnect) makes
+                            // process_audio() return Err on EVERY call from
+                            // here on — this arm had no sleep, so this loop
+                            // would spin as fast as the CPU allows, forever,
+                            // pegging a core and flooding the log with
+                            // "Audio processing error" lines (maybe_report_
+                            // runtime rate-limits the TUI-facing message, but
+                            // not this raw tracing line) until the process is
+                            // restarted. Back off like the Ok(None) arm below.
+                            std::thread::sleep(std::time::Duration::from_millis(200));
                         }
                     }
                 }
@@ -329,7 +340,25 @@ impl super::ApplicationCoordinator {
                 let raw_capture_samples = 48000 * 2 * 90; // 90s stereo
                 let mut raw_recorder: Option<Vec<f32>> =
                     Some(Vec::with_capacity(raw_capture_samples));
-                while let Some(samples) = result_rx.recv().await {
+                // docs/audio-robustness-plan.md item 3: `health_audio_alive`
+                // was write-once-true — set on the first batch and NEVER
+                // reset, so once ANY audio flowed the health log/TUI reported
+                // "alive" forever even after the stream genuinely died (device
+                // unplugged, stuck in the Err-backoff loop above). Batches
+                // normally arrive every ~170ms (buffer_size sizing), so 2s
+                // with no batch is comfortably past jitter and means the
+                // stream actually stalled — flip the flag back to false.
+                const AUDIO_STALE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+                loop {
+                    let samples =
+                        match tokio::time::timeout(AUDIO_STALE_TIMEOUT, result_rx.recv()).await {
+                            Ok(Some(samples)) => samples,
+                            Ok(None) => break, // sender dropped — audio thread stopped
+                            Err(_elapsed) => {
+                                health_audio_alive_relay.store(false, Ordering::Relaxed);
+                                continue;
+                            }
+                        };
                     // Perf (Pass 1 / A10): lock-free atomic store (was an async
                     // RwLock write on every audio batch — the hottest lock).
                     last_timestamp.store(super::now_epoch_ms(), Ordering::Relaxed);
