@@ -87,12 +87,35 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     // Render title bar
     render_title_bar(f, chunks[0], app);
 
-    // Main content layout: a FULL-WIDTH active-QSO banner and waterfall across
-    // the top (a wider waterfall = finer horizontal frequency resolution,
-    // ~25 Hz/col on a typical terminal), then a two-column lower region. The
-    // bottom row of each column lines up — QSO Status (left) sits directly
-    // across from Callers (right) — with DX Hunter moved up above Callers to
-    // make room for the wide waterfall.
+    // Per-view content layout dispatch. Operate is today's layout (extracted
+    // verbatim below, byte-identical); Monitor is the new vertical big-picture
+    // layout. Hunt/Run land in Task 6 — until then they fall through to
+    // Operate as a placeholder.
+    match app.active_view {
+        crate::view::ActiveView::Operate => layout_operate(f, chunks[1], app)?,
+        crate::view::ActiveView::Monitor => layout_monitor(f, chunks[1], app)?,
+        _ => layout_operate(f, chunks[1], app)?,
+    }
+
+    // Render status bar
+    // TX queue / now-sending strip (between content and status bar).
+    render_tx_strip(f, chunks[2], app);
+
+    render_status_bar(f, chunks[3], app);
+
+    Ok(())
+}
+
+/// Today's Operate-view content layout: a FULL-WIDTH active-QSO banner and
+/// waterfall across the top (a wider waterfall = finer horizontal frequency
+/// resolution, ~25 Hz/col on a typical terminal), then a two-column lower
+/// region. The bottom row of each column lines up — QSO Status (left) sits
+/// directly across from Callers (right) — with DX Hunter moved up above
+/// Callers to make room for the wide waterfall.
+///
+/// Extracted verbatim from `draw()` (Task 5) — must render byte-identically
+/// to the pre-extraction layout.
+fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
     let content = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -100,7 +123,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
             Constraint::Percentage(30), // Waterfall (full width)
             Constraint::Min(1),         // Lower region (two columns)
         ])
-        .split(chunks[1]);
+        .split(content_area);
 
     let lower = Layout::default()
         .direction(Direction::Horizontal)
@@ -136,12 +159,6 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     render_dx_hunter(f, right_chunks[1], app)?;
     render_callers(f, right_chunks[2], app)?;
 
-    // Render status bar
-    // TX queue / now-sending strip (between content and status bar).
-    render_tx_strip(f, chunks[2], app);
-
-    render_status_bar(f, chunks[3], app);
-
     // Render active panel highlight. The slice order MUST match the
     // ActivePanel enum order used by render_active_panel_highlight:
     // BandActivity, QsoStatus, StationInfo, Callers, DxHunter. The full-width
@@ -157,6 +174,34 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
             right_chunks[1], // DxHunter
         ],
     );
+
+    Ok(())
+}
+
+/// Monitor-view content layout: a vertical stack — full-width active-QSO
+/// banner, a big waterfall, and full-width Band Activity — with no side
+/// panels (QSO Status / Station Info / DX Hunter / Callers). Meant for a
+/// glance-and-walk-away big-picture view.
+///
+/// No `render_active_panel_highlight` call here: Band Activity is the only
+/// navigable panel in this view, and `render_band_activity`'s own
+/// `create_panel_block` already draws an active-styled border when it's the
+/// active panel, so the highlight overlay would be redundant (and — see
+/// `render_active_panel_highlight` — would blank the panel's title, since it
+/// draws a titleless border directly on top).
+fn layout_monitor(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
+    let content = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
+            Constraint::Percentage(60), // Big waterfall (full width)
+            Constraint::Min(1),         // Band Activity (full width)
+        ])
+        .split(content_area);
+
+    render_active_qsos(f, content[0], app);
+    render_waterfall(f, content[1], app);
+    render_band_activity(f, content[2], app)?;
 
     Ok(())
 }
@@ -999,5 +1044,54 @@ mod tests {
         assert_eq!(mode_chip_label("FT4"), Some("FT4".to_string()));
         assert_eq!(mode_chip_label("ft4"), Some("FT4".to_string()));
         assert_eq!(mode_chip_label("FT2"), Some("FT2".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod view_render_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    async fn render_view(view: crate::view::ActiveView) -> ratatui::buffer::Buffer {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.active_view = view;
+        // Pre-existing, out-of-scope-for-this-task quirk: `render_active_panel_highlight`
+        // draws a titleless border directly over the active panel's own area,
+        // which blanks that panel's title text (only its *border color*
+        // changes; ratatui's Block widget overwrites the whole perimeter,
+        // title included). That happens in Operate (which keeps the verbatim
+        // highlight call) but not Monitor (which skips it per the brief). Set
+        // the active panel to StationInfo — not asserted on below — so this
+        // unrelated quirk doesn't make an Operate-view title assertion flaky.
+        app.active_panel = crate::app::ActivePanel::StationInfo;
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        term.backend().buffer().clone()
+    }
+    fn buffer_contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
+        (0..buf.area.height).any(|y| {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            row.contains(needle)
+        })
+    }
+
+    #[tokio::test]
+    async fn operate_view_shows_all_five_panels() {
+        let buf = render_view(crate::view::ActiveView::Operate).await;
+        for t in ["Band Activity", "QSO Status", "DX Hunter", "Callers"] {
+            assert!(buffer_contains(&buf, t), "missing {t}");
+        }
+    }
+    #[tokio::test]
+    async fn monitor_view_drops_side_panels() {
+        let buf = render_view(crate::view::ActiveView::Monitor).await;
+        assert!(buffer_contains(&buf, "Band Activity"));
+        assert!(!buffer_contains(&buf, "DX Hunter"));
+        assert!(!buffer_contains(&buf, "Callers"));
     }
 }
