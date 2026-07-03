@@ -383,6 +383,19 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::SplitUpdate { tx_hz },
                             );
                         }
+                        MessageType::TxOffsetStatus { offset_hz } => {
+                            // Whole-branch-review fix (Task 16 auto-repark):
+                            // the autonomous task writes `tx_offset_hold_hz`
+                            // directly with no operator keypress, so the
+                            // TUI's own `App.tx_offset_hold_hz` copy would
+                            // otherwise go stale. Echo it through so the
+                            // park line + HOLD chip stay in sync.
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxOffsetUpdate {
+                                    offset_hz,
+                                },
+                            );
+                        }
                         MessageType::FoxModeStatus { on } => {
                             // Echo the authoritative Fox-mode state to the TUI
                             // FOX chip. Sent by the SetFoxMode handler on every

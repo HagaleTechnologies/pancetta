@@ -82,6 +82,27 @@ fn parked_bin_coverage(
     snap.openness.get(idx).copied()
 }
 
+/// Whole-branch-review fix (finding 2): resolves the active-QSO count fed
+/// into [`should_repark`]'s LIVE STREAM SAFETY gate, failing **CLOSED** on a
+/// poisoned `active_tx_qsos` lock — i.e. a lock-read error is treated as
+/// "assume a QSO may be active" (`usize::MAX`, so `should_repark`'s
+/// `active_qsos > 0` check trips and the repark is skipped this tick) rather
+/// than "assume zero" (which would let the gate happily proceed as if idle
+/// even though the lock state is unknown). This is the opposite of
+/// `active_now`'s `.unwrap_or(0)` a few lines above in the call site, which
+/// intentionally fails OPEN — that read feeds only the operator's
+/// `max_concurrent_qsos` display/gating count, a different, non-safety
+/// concern (the engine's own dedup/in-progress gates still apply there).
+/// Matches the codebase's established fail-closed convention for
+/// TX-adjacent gates under lock/state uncertainty (the remote-TX arm gate,
+/// `coordinator/tx.rs`). Kept as a tiny pure function over an
+/// already-resolved `Result` (rather than inlined at the call site) so the
+/// fail-closed behavior is directly unit-testable without spinning up the
+/// autonomous task.
+fn resolve_repark_active_qsos<E>(active_qsos_read: Result<usize, E>) -> usize {
+    active_qsos_read.unwrap_or(usize::MAX)
+}
+
 /// Opt-in auto-repark decision (Task 16). Repark ONLY when: `enabled` ∧ no
 /// active QSOs ∧ currently parked ∧ the parked bin is busy-both (openness
 /// code 0) ∧ the best available slice beats the parked slice's CURRENT
@@ -700,21 +721,39 @@ impl super::ApplicationCoordinator {
                             // Task 16: opt-in auto-repark (default OFF —
                             // `auto_repark_enabled` is inert unless the
                             // operator sets `[tx_placement].auto_repark =
-                            // true`). LIVE-STREAM SAFETY: `active_now` was
-                            // just read above with NO `.await` between that
-                            // read and the `tx_offset_hold_hz.store` below —
-                            // every statement in between is synchronous
-                            // Rust, so this is the freshest possible read of
-                            // the shared `active_tx_qsos` set relative to
-                            // the write; the gate cannot fire against a
-                            // state that went live between the decision and
-                            // the write. `should_repark` ALSO re-checks
-                            // `active_qsos > 0` internally — this is
-                            // belt-and-suspenders, not a substitute for the
-                            // freshness of this read.
+                            // true`). LIVE-STREAM SAFETY: read
+                            // `active_tx_qsos` again here, freshly, with NO
+                            // `.await` between this read and the
+                            // `tx_offset_hold_hz.store` below — every
+                            // statement in between is synchronous Rust, so
+                            // this is the freshest possible read of the
+                            // shared set relative to the write; the gate
+                            // cannot fire against a state that went live
+                            // between the decision and the write.
+                            //
+                            // Whole-branch-review fix (finding 2): fail
+                            // CLOSED on a poisoned lock. Deliberately a
+                            // SEPARATE read from `active_now` above —
+                            // `active_now` only feeds the operator's
+                            // `max_concurrent_qsos` count (a different,
+                            // non-safety concern, documented there as
+                            // intentionally fail-OPEN to 0). This one is
+                            // the plan's explicitly-labeled "LIVE STREAM
+                            // SAFETY" gate, so a lock-read error is treated
+                            // as "assume a QSO may be active" — skip the
+                            // repark this tick — matching the codebase's
+                            // established fail-closed convention for
+                            // TX-adjacent gates under lock/state
+                            // uncertainty (the remote-TX arm gate,
+                            // `coordinator/tx.rs`). `should_repark` ALSO
+                            // re-checks `active_qsos > 0` internally — this
+                            // is belt-and-suspenders, not a substitute for
+                            // the freshness/fail-closed-ness of this read.
+                            let repark_active_qsos =
+                                resolve_repark_active_qsos(active_tx_qsos.read().map(|s| s.len()));
                             if let Some(new_hz) = should_repark(
                                 auto_repark_enabled,
-                                active_now as usize,
+                                repark_active_qsos,
                                 repark_parked_hz.unwrap_or(0),
                                 repark_coverage,
                                 repark_parked_score,
@@ -749,6 +788,22 @@ impl super::ApplicationCoordinator {
                                     Instant::now(),
                                 );
                                 let _ = message_bus.send_message(diag_msg).await;
+                                // Whole-branch-review fix (finding 1): echo
+                                // the new offset back to the TUI. Every
+                                // OTHER writer of `tx_offset_hold_hz` is
+                                // TUI-initiated and updates `App`'s own
+                                // copy directly; auto-repark is
+                                // coordinator-initiated, so without this
+                                // the TUI's park line / HOLD chip / Task
+                                // 14 degradation baseline would keep
+                                // referencing the OLD frequency forever.
+                                let offset_msg = ComponentMessage::new(
+                                    ComponentId::Autonomous,
+                                    ComponentId::Tui,
+                                    MessageType::TxOffsetStatus { offset_hz: new_hz },
+                                    Instant::now(),
+                                );
+                                let _ = message_bus.send_message(offset_msg).await;
                             }
 
                             let listen_messages = slot_messages.clone();
@@ -1228,6 +1283,72 @@ mod should_repark_tests {
         assert_eq!(
             should_repark(true, 0, 1500, Some(0), Some(80.0), Some(&best), 20.0),
             None
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolve_repark_active_qsos_tests {
+    use super::*;
+    use std::sync::RwLock;
+
+    #[test]
+    fn ok_read_passes_through_the_count() {
+        assert_eq!(resolve_repark_active_qsos::<()>(Ok(0)), 0);
+        assert_eq!(resolve_repark_active_qsos::<()>(Ok(3)), 3);
+    }
+
+    #[test]
+    fn err_read_fails_closed_to_max_not_zero() {
+        // A poisoned lock must be treated as "assume active" (skip repark
+        // this tick), NOT "assume zero" (which would let the LIVE STREAM
+        // SAFETY gate proceed as if idle under genuine uncertainty).
+        let resolved = resolve_repark_active_qsos::<()>(Err(()));
+        assert_eq!(resolved, usize::MAX);
+        assert_ne!(resolved, 0, "must not fail open to zero");
+    }
+
+    /// End-to-end proof against a REAL poisoned `std::sync::RwLock`, the
+    /// exact type `active_tx_qsos` uses — not just the trivial
+    /// `Result::unwrap_or` semantics above.
+    #[test]
+    fn real_poisoned_lock_fails_closed_and_blocks_repark() {
+        let lock: std::sync::Arc<RwLock<std::collections::HashSet<String>>> =
+            std::sync::Arc::new(RwLock::new(std::collections::HashSet::new()));
+
+        // Poison the lock by panicking while holding the write guard.
+        {
+            let lock2 = lock.clone();
+            let _ = std::thread::spawn(move || {
+                let _guard = lock2.write().unwrap();
+                panic!("intentionally poisoning the lock for this test");
+            })
+            .join();
+        }
+        assert!(lock.is_poisoned(), "lock should be poisoned by the panic");
+
+        let active = resolve_repark_active_qsos(lock.read().map(|s| s.len()));
+        assert_eq!(
+            active,
+            usize::MAX,
+            "poisoned lock must resolve to the fail-closed sentinel"
+        );
+
+        // Feed straight into should_repark: even with every OTHER condition
+        // satisfied (enabled, parked, busy-both coverage, a strong best
+        // candidate), the fail-closed active count must hold the repark.
+        let best = pancetta_qso::frequency::FrequencyCandidate {
+            offset_hz: 920.0,
+            score: 95.0,
+            clear_both_slots: true,
+            clear_first: true,
+            clear_second: true,
+            noise_floor: 0.0,
+        };
+        assert_eq!(
+            should_repark(true, active, 1500, Some(0), Some(10.0), Some(&best), 20.0),
+            None,
+            "poisoned-lock read must skip the repark this tick"
         );
     }
 }

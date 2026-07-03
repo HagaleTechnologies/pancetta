@@ -266,6 +266,24 @@ pub enum MessageType {
         tx_hz: u64,
     },
 
+    /// TX-offset-hold state echo for the TUI's TX-placement park line +
+    /// title-bar chip. Every OTHER writer of `tx_offset_hold_hz` (the `o`
+    /// modal, Enter-park on the TX-placement instrument) is TUI-initiated,
+    /// so the TUI updates its own `App.tx_offset_hold_hz` optimistically
+    /// and never needs a round-trip. Task 16's opt-in auto-repark is
+    /// coordinator-INITIATED — the autonomous task writes the shared
+    /// atomic directly, with no operator keypress to update the TUI's
+    /// local copy — so this closes that gap: sent once, right after the
+    /// atomic write, so the TUI can re-sync `tx_offset_hold_hz` (and reset
+    /// its park-coverage baseline) to the new value. `offset_hz == 0`
+    /// means unheld/Auto (same sentinel convention as the atomic itself);
+    /// in practice auto-repark only ever sends a nonzero value. Observation
+    /// only — never drives TX.
+    TxOffsetStatus {
+        /// New held TX offset in Hz, or 0 for unheld/Auto.
+        offset_hz: u64,
+    },
+
     /// Fox-mode state echo for the TUI FOX chip.  Sent by the `SetFoxMode`
     /// handler on every path (successful engage, refused engage, or disengage)
     /// so the TUI `fox_mode` flag is always authoritative.  Without this the

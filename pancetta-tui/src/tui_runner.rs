@@ -187,6 +187,20 @@ pub enum TuiMessage {
         /// Current split TX frequency in Hz, or 0 for simplex.
         tx_hz: u64,
     },
+    /// TX-offset-hold authoritative echo. Sent by the coordinator relay
+    /// from `MessageType::TxOffsetStatus`, which Task 16's opt-in
+    /// auto-repark emits right after it writes the shared
+    /// `tx_offset_hold_hz` atomic — a coordinator-INITIATED write with no
+    /// operator keypress, so unlike the `o` modal / Enter-park (which set
+    /// `App.tx_offset_hold_hz` directly, optimistically, before this could
+    /// ever arrive), this is the ONLY way the TUI learns of it. Drives the
+    /// TX-placement instrument's park line + title-bar HOLD chip and
+    /// re-stamps `parked_since` so "holding N min" reflects the fresh
+    /// park, not the stale one.
+    TxOffsetUpdate {
+        /// New held TX offset in Hz, or 0 for unheld/Auto.
+        offset_hz: u64,
+    },
     /// Fox-mode authoritative echo. Sent by the coordinator's `SetFoxMode`
     /// handler on every path — successful engage, refused engage (TX policy
     /// blocks initiation), and disengage — carrying the **actual** resulting
@@ -670,6 +684,29 @@ impl TuiRunner {
             }
             TuiMessage::SplitUpdate { tx_hz } => {
                 app.split_tx_hz = tx_hz;
+            }
+            TuiMessage::TxOffsetUpdate { offset_hz } => {
+                // Whole-branch-review fix: auto-repark (Task 16) writes the
+                // shared `tx_offset_hold_hz` atomic with no operator
+                // keypress, so this coordinator echo is the ONLY path that
+                // updates the TUI's own copy — mirrors what the `o` modal /
+                // Enter-park handlers do locally (set the held offset +
+                // stamp `parked_since`), plus an explicit
+                // `park_coverage_last` reset so the degradation-warning
+                // tracker starts a fresh baseline against the NEW
+                // frequency instead of comparing against the old one's
+                // stale coverage code.
+                app.tx_offset_hold_hz = if offset_hz == 0 {
+                    None
+                } else {
+                    Some(offset_hz)
+                };
+                app.parked_since = if offset_hz == 0 {
+                    None
+                } else {
+                    Some(chrono::Utc::now())
+                };
+                app.park_coverage_last = None;
             }
             TuiMessage::FoxModeUpdate { on } => {
                 // Authoritative echo from the coordinator — overrides the
@@ -2643,6 +2680,110 @@ mod key_tests {
             app.read().await.split_tx_hz,
             0,
             "SplitUpdate tx_hz=0 clears chip"
+        );
+    }
+
+    /// Whole-branch-review fix (finding 1): `TxOffsetUpdate` (the
+    /// coordinator's auto-repark echo) must re-sync the TUI's OWN
+    /// `tx_offset_hold_hz` copy to the NEW frequency, re-stamp
+    /// `parked_since` for a fresh park, and reset `park_coverage_last` so
+    /// the Task-14 degradation-warning tracker starts a clean baseline
+    /// against the new frequency instead of comparing against the old
+    /// one's stale coverage code. Simulates the exact stale-state gap the
+    /// finding described: the operator was parked at 500 Hz with a
+    /// recorded (500, busy-both) baseline; auto-repark silently moved the
+    /// shared atomic to 920 Hz with no operator keypress.
+    #[tokio::test]
+    async fn tx_offset_update_resyncs_stale_park_state_after_auto_repark() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        let stale_park_time = chrono::Utc::now() - chrono::Duration::minutes(10);
+        {
+            let mut a = app.write().await;
+            a.tx_offset_hold_hz = Some(500);
+            a.parked_since = Some(stale_park_time);
+            a.park_coverage_last = Some((500, 0)); // busy-both baseline at the OLD freq
+        }
+
+        r.handle_message(TuiMessage::TxOffsetUpdate { offset_hz: 920 })
+            .await
+            .unwrap();
+
+        let a = app.read().await;
+        assert_eq!(
+            a.tx_offset_hold_hz,
+            Some(920),
+            "held offset must reflect the NEW auto-reparked frequency, not the stale 500"
+        );
+        assert!(
+            a.parked_since.is_some_and(|t| t > stale_park_time),
+            "parked_since must be re-stamped fresh, not left at the old park time"
+        );
+        assert_eq!(
+            a.park_coverage_last, None,
+            "park_coverage_last must be reset — the old (500, busy-both) baseline no \
+             longer applies to the new 920 Hz park"
+        );
+    }
+
+    /// `offset_hz: 0` (the unheld/Auto sentinel) clears the held offset and
+    /// park timestamp rather than parking at a bogus 0 Hz.
+    #[tokio::test]
+    async fn tx_offset_update_zero_clears_hold() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.tx_offset_hold_hz = Some(500);
+            a.parked_since = Some(chrono::Utc::now());
+            a.park_coverage_last = Some((500, 2));
+        }
+
+        r.handle_message(TuiMessage::TxOffsetUpdate { offset_hz: 0 })
+            .await
+            .unwrap();
+
+        let a = app.read().await;
+        assert_eq!(a.tx_offset_hold_hz, None);
+        assert_eq!(a.parked_since, None);
+        assert_eq!(a.park_coverage_last, None);
+    }
+
+    /// End-to-end proof that the reset baseline actually prevents a
+    /// spurious degradation warning at the OLD frequency: after
+    /// `TxOffsetUpdate` moves the park to 920 Hz, the next `apply_placement`
+    /// snapshot (which would show the OLD 500 Hz bin as busy-both, code 0)
+    /// must NOT fire the "parked … now busy" warning, because the tracked
+    /// frequency is now 920, not 500.
+    #[tokio::test]
+    async fn tx_offset_update_prevents_stale_frequency_degradation_warning() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.tx_offset_hold_hz = Some(500);
+            a.park_coverage_last = Some((500, 3)); // was clear at 500
+        }
+
+        r.handle_message(TuiMessage::TxOffsetUpdate { offset_hz: 920 })
+            .await
+            .unwrap();
+        {
+            let mut a = app.write().await;
+            a.status_message.clear();
+        }
+
+        // A fresh snapshot where the bin nearest 500 Hz (now unheld) is
+        // degraded to busy-both — if the tracker were still comparing
+        // against the OLD 500 Hz baseline, this would wrongly fire.
+        let mut view = placement_fixture();
+        view.openness = vec![3; 96];
+        // Degrade the bin at 500 Hz (index (500-200)/25 = 12) to busy-both.
+        view.openness[12] = 0;
+        app.write().await.apply_placement(view);
+
+        let a = app.read().await;
+        assert!(
+            !a.status_message.contains("parked 500"),
+            "must not warn about the OLD 500 Hz frequency after re-park to 920: {}",
+            a.status_message
         );
     }
 
