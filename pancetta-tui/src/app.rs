@@ -1304,7 +1304,7 @@ impl App {
     fn scroll_down(&mut self) {
         match self.active_panel {
             ActivePanel::BandActivity => {
-                let max_scroll = self.decoded_messages.len().saturating_sub(1);
+                let max_scroll = self.displayed_messages().len().saturating_sub(1);
                 if self.band_activity_scroll < max_scroll {
                     self.band_activity_scroll += 1;
                 }
@@ -1383,7 +1383,7 @@ impl App {
     pub fn scroll_to_bottom(&mut self) {
         match self.active_panel {
             ActivePanel::BandActivity => {
-                self.band_activity_scroll = self.decoded_messages.len().saturating_sub(1);
+                self.band_activity_scroll = self.displayed_messages().len().saturating_sub(1);
                 self.pin_band_activity_selection();
             }
             ActivePanel::DxHunter => {
@@ -1422,7 +1422,7 @@ impl App {
     pub fn page_down(&mut self) {
         match self.active_panel {
             ActivePanel::BandActivity => {
-                let max = self.decoded_messages.len().saturating_sub(1);
+                let max = self.displayed_messages().len().saturating_sub(1);
                 self.band_activity_scroll =
                     (self.band_activity_scroll + Self::SCROLL_PAGE).min(max);
                 self.pin_band_activity_selection();
@@ -3262,6 +3262,80 @@ mod tests {
         assert!(
             !shown.contains(&"K2BBB".to_string()),
             "third-party exchange filtered"
+        );
+    }
+
+    /// Regression: in Hunt view `displayed_messages()` is shorter than the
+    /// raw `decoded_messages` (non-CQ third-party rows are filtered out).
+    /// `scroll_down`/`page_down`/`scroll_to_bottom` on the BandActivity panel
+    /// must bound `band_activity_scroll` against the FILTERED length, not the
+    /// raw decode count — otherwise the cursor can land on an index that's
+    /// in-range for the raw list but out-of-range for the filtered one, and
+    /// `pin_band_activity_selection()` silently drops the pin to `None`
+    /// (`displayed_messages().get(band_activity_scroll)` misses), reintroducing
+    /// the "cursor outlives a list mutation unpinned" bug class in a new guise.
+    #[tokio::test]
+    async fn hunt_view_scroll_clamps_to_filtered_length_not_raw() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        app.active_view = crate::view::ActiveView::Hunt;
+
+        // 5 third-party (non-CQ) rows — filtered OUT of the Hunt view.
+        for i in 0i32..5i32 {
+            let mut m = fixture_view(&format!("K{i}NONCQ"), -10);
+            m.message = format!("K9ZZZ K{i}NONCQ -10");
+            app.add_decoded_message(m).await.unwrap();
+        }
+        // 2 CQ rows — kept in the Hunt view.
+        app.add_decoded_message(fixture_view("K1CQA", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K2CQB", -8))
+            .await
+            .unwrap();
+
+        // Raw list has 7 rows; the Hunt-filtered list has only 2.
+        assert_eq!(app.decoded_messages.len(), 7);
+        assert_eq!(app.displayed_messages().len(), 2);
+
+        // scroll_down repeatedly: with the bug, this walks past index 1
+        // (bounded against the raw len of 7) instead of clamping at 1.
+        for _ in 0..6 {
+            app.scroll_down();
+        }
+        assert_eq!(
+            app.band_activity_scroll, 1,
+            "scroll_down must clamp to the filtered list's last index"
+        );
+        assert!(
+            app.band_activity_pinned_call.is_some(),
+            "scroll_down must not drop the pin by walking past the filtered list"
+        );
+
+        // page_down from a mid-filtered-list position must clamp the same way.
+        app.band_activity_scroll = 0;
+        app.pin_band_activity_selection();
+        app.page_down();
+        assert_eq!(
+            app.band_activity_scroll, 1,
+            "page_down must clamp to the filtered list's last index"
+        );
+        assert!(
+            app.band_activity_pinned_call.is_some(),
+            "page_down must not drop the pin by walking past the filtered list"
+        );
+
+        // scroll_to_bottom (End/G) must land on the filtered list's last row too.
+        app.band_activity_scroll = 0;
+        app.pin_band_activity_selection();
+        app.scroll_to_bottom();
+        assert_eq!(
+            app.band_activity_scroll, 1,
+            "scroll_to_bottom must jump to the filtered list's last index"
+        );
+        assert!(
+            app.band_activity_pinned_call.is_some(),
+            "scroll_to_bottom must not drop the pin by jumping past the filtered list"
         );
     }
 
