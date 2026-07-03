@@ -2172,6 +2172,39 @@ impl App {
         self.dx_hunter_pinned_call = calls.get(self.dx_hunter_scroll).cloned();
     }
 
+    /// The station under the operator's attention: the ACTIVE panel's pinned
+    /// (or cursor-resolved) callsign. One focus, shared by every panel —
+    /// renderers highlight it everywhere via `is_focused`.
+    pub fn focused_callsign(&self) -> Option<String> {
+        match self.active_panel {
+            ActivePanel::BandActivity => self
+                .band_activity_pinned_call
+                .clone()
+                .or_else(|| self.get_selected_station().map(|(call, _, _)| call)),
+            ActivePanel::DxHunter => self.dx_hunter_pinned_call.clone().or_else(|| {
+                self.displayed_dx_stations()
+                    .get(self.dx_hunter_scroll)
+                    .map(|s| s.call_sign.clone())
+            }),
+            ActivePanel::Callers => self.callers_pinned_call.clone().or_else(|| {
+                self.displayed_callers()
+                    .get(self.callers_scroll)
+                    .and_then(|m| m.call_sign.clone())
+            }),
+            ActivePanel::QsoStatus => self
+                .active_qsos
+                .get(self.qso_cursor)
+                .map(|q| q.their_callsign.clone()),
+            ActivePanel::StationInfo => None,
+        }
+    }
+
+    /// Compound-aware "is this callsign the current focus?"
+    pub fn is_focused(&self, call: &str) -> bool {
+        self.focused_callsign()
+            .is_some_and(|f| pancetta_core::callsign::callsigns_match(&f, call))
+    }
+
     /// Pin the Band Activity selection to the callsign currently under the
     /// cursor. Call after every deliberate cursor move.
     pub fn pin_band_activity_selection(&mut self) {
@@ -2196,10 +2229,10 @@ impl App {
 
         let mut pinned_aged_out = false;
         if let Some(ref pin) = self.band_activity_pinned_call {
-            if let Some(idx) = calls
-                .iter()
-                .position(|call| call.as_deref().is_some_and(|c| c.eq_ignore_ascii_case(pin)))
-            {
+            if let Some(idx) = calls.iter().position(|call| {
+                call.as_deref()
+                    .is_some_and(|c| pancetta_core::callsign::callsigns_match(c, pin))
+            }) {
                 self.band_activity_scroll = idx;
                 return;
             }
@@ -4619,5 +4652,19 @@ mod tests {
             current_call, "K1AAA",
             "Cursor should still resolve to K1AAA after reorder"
         );
+    }
+
+    #[tokio::test]
+    async fn focused_callsign_follows_the_active_panel() {
+        let mut app = fixture_app().await;
+        app.add_decoded_message(fixture_view("K1AAA", -10))
+            .await
+            .unwrap();
+        app.active_panel = ActivePanel::BandActivity;
+        app.pin_band_activity_selection();
+        assert_eq!(app.focused_callsign().as_deref(), Some("K1AAA"));
+        // Compound equivalence: EA8/K1AAA is the same focus target.
+        assert!(app.is_focused("EA8/K1AAA"));
+        assert!(!app.is_focused("K1AAB"));
     }
 }

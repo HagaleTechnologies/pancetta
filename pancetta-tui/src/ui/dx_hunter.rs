@@ -142,6 +142,13 @@ pub fn render_dx_hunter(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> 
 }
 
 fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
+    // Cross-panel global focus (Task 2): when some OTHER panel is active and
+    // this row's callsign is the operator's current focus, flag it here too
+    // — but only when DX Hunter itself is NOT the active panel, so we never
+    // double up with the active panel's REVERSED row-highlight.
+    let is_active_panel = matches!(app.active_panel, ActivePanel::DxHunter);
+    let is_globally_focused = !is_active_panel && app.is_focused(&station.call_sign);
+
     // Source indicator
     let src_str = station.source.to_string();
     let src_style = match station.source {
@@ -174,6 +181,10 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
 
     let call_style = if is_stale {
         Style::default().fg(app.theme.muted_color())
+    } else if is_globally_focused {
+        Style::default()
+            .fg(app.theme.selected_color())
+            .add_modifier(Modifier::BOLD)
     } else if station.atno {
         // ATNO — the highest-value catch. Bold magenta + underline so it
         // stands apart from merely-notable (bold magenta) rows.

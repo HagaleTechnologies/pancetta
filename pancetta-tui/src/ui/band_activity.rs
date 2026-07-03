@@ -125,6 +125,17 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
 }
 
 fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
+    // Cross-panel global focus (Task 2): when some OTHER panel is active and
+    // this row's callsign is the operator's current focus, flag it here too
+    // — but only when Band Activity itself is NOT the active panel, so we
+    // never double up with the active panel's REVERSED row-highlight.
+    let is_active_panel = matches!(app.active_panel, ActivePanel::BandActivity);
+    let is_globally_focused = !is_active_panel
+        && msg
+            .call_sign
+            .as_deref()
+            .is_some_and(|c| app.is_focused(c));
+
     // Always show HH:MM:SS in UTC — FT8 timing needs seconds granularity
     let time_short = msg.timestamp.format("%H:%M:%S").to_string();
 
@@ -165,6 +176,10 @@ fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
 
     let call_style = if msg.is_directed_at_us {
         directed_style
+    } else if is_globally_focused {
+        Style::default()
+            .fg(app.theme.selected_color())
+            .add_modifier(Modifier::BOLD)
     } else if msg.worked_before {
         // Already in the log on this band — dim the callsign the same
         // way the DX hunter panel does, so the operator's eye skips

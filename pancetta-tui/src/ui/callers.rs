@@ -141,6 +141,13 @@ fn reply_label(step: pancetta_core::ResponseStep, report: i8) -> String {
 fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
     let call = msg.call_sign.clone().unwrap_or_default();
 
+    // Cross-panel global focus (Task 2): when some OTHER panel is active and
+    // this row's callsign is the operator's current focus, flag it here too
+    // — but only when Callers itself is NOT the active panel, so we never
+    // double up with the active panel's REVERSED row-highlight.
+    let is_active_panel = matches!(app.active_panel, ActivePanel::Callers);
+    let is_globally_focused = !is_active_panel && !call.is_empty() && app.is_focused(&call);
+
     // Truncate their raw message for the Msg column.
     let mut text = msg.message.clone();
     if text.chars().count() > 16 {
@@ -166,9 +173,15 @@ fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
     let flags_str = flags.join(" ");
 
     let dim = Style::default().fg(app.theme.foreground_color());
-    let call_style = Style::default()
-        .fg(app.theme.accent_color())
-        .add_modifier(Modifier::BOLD);
+    let call_style = if is_globally_focused {
+        Style::default()
+            .fg(app.theme.selected_color())
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(app.theme.accent_color())
+            .add_modifier(Modifier::BOLD)
+    };
     let snr_style = Style::default().fg(if msg.snr >= 0 {
         app.theme.success_color()
     } else if msg.snr >= -10 {

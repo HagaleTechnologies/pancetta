@@ -22,6 +22,7 @@
 
 #![warn(missing_docs)]
 
+pub mod callsign;
 pub mod diagnostic_level;
 pub mod error;
 pub mod gridsquare;
