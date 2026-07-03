@@ -830,6 +830,12 @@ pub struct App {
     /// fresh). Bounded to [`Self::BAND_CACHE_MAX`] bands and pruned of stale
     /// entries on each switch so it can't grow without bound.
     band_cache: HashMap<String, BandSnapshot>,
+
+    /// The operator's selected activity view (Phase 2 TUI redesign). `v`/`V`
+    /// cycle it; persisted to `~/.pancetta/tui_state.json` so it survives a
+    /// restart. `Operate` (the default) renders today's layout unchanged;
+    /// later tasks (5-7) make Hunt/Run/Monitor render differently.
+    pub active_view: crate::view::ActiveView,
 }
 
 /// Peak intensity in the latest waterfall row within ±radius_hz of center_hz.
@@ -944,6 +950,7 @@ impl App {
             current_band_index: default_band_index,
             radio_frequency: None,
             band_cache: HashMap::new(),
+            active_view: Self::load_persisted_view(),
         };
 
         // Initialize audio monitoring if device specified
@@ -957,6 +964,49 @@ impl App {
             app.station_info.call_sign
         );
         Ok(app)
+    }
+
+    /// Path to the persisted TUI state file (`~/.pancetta/tui_state.json`).
+    /// `None` if the home directory can't be resolved.
+    fn tui_state_path() -> Option<std::path::PathBuf> {
+        dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"))
+    }
+
+    /// Load the operator's last-selected activity view from disk. Best-effort:
+    /// a missing file, unreadable file, malformed JSON, or garbage value all
+    /// fall back to `ActiveView::Operate` — never fails App construction.
+    pub fn load_persisted_view() -> crate::view::ActiveView {
+        Self::tui_state_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| {
+                v.get("active_view")
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+            })
+            .map(|s| crate::view::ActiveView::from_str_or_default(&s))
+            .unwrap_or(crate::view::ActiveView::Operate)
+    }
+
+    /// Cycle the active view forward (`v`) or backward (`V`), persisting the
+    /// new value best-effort — a write failure (e.g. no home dir, read-only
+    /// filesystem) is silently ignored and never panics or fails the TUI.
+    pub fn cycle_view(&mut self, forward: bool) {
+        self.active_view = if forward {
+            self.active_view.next()
+        } else {
+            self.active_view.prev()
+        };
+        if let Some(p) = Self::tui_state_path() {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(
+                &p,
+                format!("{{\"active_view\":\"{}\"}}", self.active_view.as_str()),
+            );
+        }
+        self.status_message = format!("View: {:?}", self.active_view);
     }
 
     pub async fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {

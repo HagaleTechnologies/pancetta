@@ -251,6 +251,21 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         ));
     }
 
+    // Active-view chip (Phase 2 TUI redesign): shown only when the operator
+    // has switched away from Operate (the default) — `label()` returns
+    // `None` for Operate, so the title bar is byte-identical to today until
+    // the operator presses `v`/`V`.
+    if let Some(label) = app.active_view.label() {
+        left_spans.push(Span::raw(" "));
+        left_spans.push(Span::styled(
+            format!(" {} ", label),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     // Split-TX chip: shown when the rig is operating split (TX ≠ RX dial).
     if app.split_tx_hz != 0 {
         left_spans.push(Span::raw(" "));

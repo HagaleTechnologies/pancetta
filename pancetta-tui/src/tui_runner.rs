@@ -666,6 +666,12 @@ impl TuiRunner {
                 // Authoritative echo from the coordinator — overrides the
                 // optimistic Shift+X flip so the FOX chip is always correct.
                 app.fox_mode = on;
+                // Suggest-never-auto-switch (spec §1): Fox mode benefits from
+                // the Run view, but we never change the operator's view for
+                // them — just hint that `v` is available.
+                if on && app.active_view != crate::view::ActiveView::Run {
+                    app.status_message = "FOX on — press v for Run view".to_string();
+                }
             }
             TuiMessage::DeviceListUpdate {
                 input,
@@ -1358,6 +1364,18 @@ impl TuiRunner {
                 app.status_message = format!("TX policy: {}", next.label());
                 self.message_tx.send(TuiCommand::CycleTxPolicy)?;
             }
+
+            // === Activity views (Phase 2 TUI redesign) ===
+            // v / V - cycle the operator's active view forward/backward
+            // through the 4-value ring (Operate/Hunt/Run/Monitor). Local-only
+            // (no coordinator round-trip): every view still renders today's
+            // Operate layout until Tasks 5-7 land the per-view differences.
+            KeyCode::Char('v') => {
+                app.cycle_view(true);
+            }
+            KeyCode::Char('V') => {
+                app.cycle_view(false);
+            }
             // f - toggle TX-frequency mode Hold ↔ Auto. Hold (default) keeps the
             // offset you picked sticky; Auto lets pancetta choose/adjust it.
             // Optimistically flip the local chip; the coordinator flips the
@@ -1729,6 +1747,7 @@ impl TuiRunner {
             ("Shift+T", "Tune (12 s tone; blocked while TX DISABLED)"),
             ("h", "Halt current TX"),
             ("p", "Toggle PTT (blocked while TX DISABLED)"),
+            ("v / V", "Cycle activity view: Operate/Hunt/Run/Monitor"),
             ("a", "Toggle autonomous mode"),
             ("Shift+P", "Pause / resume autonomous"),
             ("Shift+H", "Engage Hound on selected DX Hunter station"),
@@ -1998,6 +2017,35 @@ mod key_tests {
         let (mut r, cmd_rx, _app) = make_runner().await;
         r.handle_key_event(key('c')).await.unwrap();
         assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq { .. })));
+    }
+
+    /// `v` cycles the active view forward, locally — no coordinator command
+    /// is sent (Task 4: the view ring only starts driving different layouts
+    /// in later tasks).
+    #[tokio::test]
+    async fn key_v_cycles_view_forward() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        // Force a known starting point regardless of any persisted
+        // `~/.pancetta/tui_state.json` from a prior run.
+        app.write().await.active_view = crate::view::ActiveView::Operate;
+        r.handle_key_event(key('v')).await.unwrap();
+        assert_eq!(app.read().await.active_view, crate::view::ActiveView::Hunt);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "view cycling is local-only, no coordinator command should be sent"
+        );
+    }
+
+    /// Shift+V (`V`) cycles the active view backward.
+    #[tokio::test]
+    async fn key_shift_v_cycles_view_backward() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        app.write().await.active_view = crate::view::ActiveView::Operate;
+        r.handle_key_event(key_shift('V')).await.unwrap();
+        assert_eq!(
+            app.read().await.active_view,
+            crate::view::ActiveView::Monitor
+        );
     }
 
     #[tokio::test]
@@ -3110,6 +3158,29 @@ mod key_tests {
         assert!(
             !app.read().await.fox_mode,
             "after refused-engage echo, fox_mode must be false (corrected)"
+        );
+    }
+
+    /// Suggest-never-auto-switch (spec §1): `FoxModeUpdate { on: true }`
+    /// while the operator is on Operate must NOT change the active view —
+    /// only hint that `v` is available.
+    #[tokio::test]
+    async fn fox_mode_on_hints_run_view_without_switching() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        app.write().await.active_view = crate::view::ActiveView::Operate;
+        r.handle_message(TuiMessage::FoxModeUpdate { on: true })
+            .await
+            .unwrap();
+        let a = app.read().await;
+        assert_eq!(
+            a.active_view,
+            crate::view::ActiveView::Operate,
+            "FoxModeUpdate must never auto-switch the operator's view"
+        );
+        assert!(
+            a.status_message.contains("press v"),
+            "expected a hint to press v, got: {}",
+            a.status_message
         );
     }
 
