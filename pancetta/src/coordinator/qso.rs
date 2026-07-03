@@ -1825,16 +1825,30 @@ impl super::ApplicationCoordinator {
                                         r.map(|v| format!("{v:+}"))
                                             .unwrap_or_else(|| "--".to_string())
                                     };
-                                    emit_status(
-                                        &snapshot_bus,
-                                        format!(
-                                            "QSO with {} logged (RST {}/{})",
-                                            their_call,
-                                            rst(metadata.reports.sent),
-                                            rst(metadata.reports.received),
-                                        ),
-                                    )
-                                    .await;
+                                    let completed_text = format!(
+                                        "QSO with {} logged (RST {}/{})",
+                                        their_call,
+                                        rst(metadata.reports.sent),
+                                        rst(metadata.reports.received),
+                                    );
+                                    emit_status(&snapshot_bus, completed_text.clone()).await;
+                                    // observability-diagnostics-plan.md Layer 2:
+                                    // also retain this outcome in the diagnostic
+                                    // history (the status line above is overwritten
+                                    // by the next status update within a frame).
+                                    let diag_msg = ComponentMessage::new(
+                                        ComponentId::Qso,
+                                        ComponentId::Tui,
+                                        MessageType::DiagnosticEvent {
+                                            target: "qso",
+                                            level: pancetta_core::DiagnosticLevel::Info,
+                                            text: completed_text,
+                                            qso_id: Some(qso_id.to_string()),
+                                            callsign: Some(their_call.clone()),
+                                        },
+                                        Instant::now(),
+                                    );
+                                    let _ = snapshot_bus.send_message(diag_msg).await;
 
                                     let band =
                                         pancetta_qso::utils::frequency_to_band(metadata.frequency);
@@ -1879,7 +1893,9 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                             Ok(pancetta_qso::QsoEvent::QsoFailed {
-                                qso_id, metadata, ..
+                                qso_id,
+                                reason,
+                                metadata,
                             }) => {
                                 // Drop-stale-TX gate: a failed QSO must stop
                                 // transmitting immediately. (StateChanged-into-
@@ -1941,9 +1957,33 @@ impl super::ApplicationCoordinator {
                                     )
                                     .await;
                                 }
+                                // observability-diagnostics-plan.md Layer 2: surface
+                                // WHY the QSO failed instead of letting it silently
+                                // vanish from the banner — `reason` was previously
+                                // destructured away (`..`) and never read anywhere.
+                                let reason_text = failure_reason_text(&reason);
+                                let diag_msg = ComponentMessage::new(
+                                    ComponentId::Qso,
+                                    ComponentId::Tui,
+                                    MessageType::DiagnosticEvent {
+                                        target: "qso",
+                                        level: pancetta_core::DiagnosticLevel::Warn,
+                                        text: format!("QSO failed: {reason_text}"),
+                                        qso_id: Some(qso_id.to_string()),
+                                        callsign: metadata.their_callsign.clone(),
+                                    },
+                                    Instant::now(),
+                                );
+                                let _ = snapshot_bus.send_message(diag_msg).await;
+
                                 if let Some(ref their_call) = metadata.their_callsign {
-                                    info!("QSO failed with {}, adding backoff", their_call);
+                                    info!(
+                                        "QSO failed with {}: {} (adding backoff)",
+                                        their_call, reason_text
+                                    );
                                     qso_lookup.record_failure(their_call);
+                                } else {
+                                    info!("QSO failed: {}", reason_text);
                                 }
                             }
                             Ok(_) => {} // Other events (StateChanged, etc.)

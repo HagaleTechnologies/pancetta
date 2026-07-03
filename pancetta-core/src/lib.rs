@@ -22,6 +22,7 @@
 
 #![warn(missing_docs)]
 
+pub mod diagnostic_level;
 pub mod error;
 pub mod gridsquare;
 pub mod response_step;
@@ -31,6 +32,7 @@ pub mod tx_policy;
 pub mod types;
 
 // Re-export core types at the crate root for convenience
+pub use diagnostic_level::DiagnosticLevel;
 pub use response_step::ResponseStep;
 pub use tx_freq_mode::TxFreqMode;
 pub use tx_policy::TxPolicy;

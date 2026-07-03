@@ -513,6 +513,27 @@ impl super::ApplicationCoordinator {
                                 },
                             );
                         }
+                        MessageType::DiagnosticEvent {
+                            target,
+                            level,
+                            ref text,
+                            ref qso_id,
+                            ref callsign,
+                        } => {
+                            // docs/observability-diagnostics-plan.md Layer 1 —
+                            // relay the retained diagnostic stream into the TUI's
+                            // bounded event history (Shift+D overlay).
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::DiagnosticEvent {
+                                    ts: chrono::Utc::now(),
+                                    target,
+                                    level,
+                                    text: text.clone(),
+                                    qso_id: qso_id.clone(),
+                                    callsign: callsign.clone(),
+                                },
+                            );
+                        }
                         _ => {}
                     }
                 }
