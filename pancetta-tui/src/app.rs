@@ -905,6 +905,14 @@ pub struct App {
     /// When the operator "parked" a TX-placement pick, if any. `None` = not
     /// parked. Set/cleared by later tasks (12).
     pub parked_since: Option<DateTime<Utc>>,
+    /// Openness code (0-3) at the parked frequency's bin, as of the LAST
+    /// `apply_placement` call — the edge-detect baseline for the one-shot
+    /// parked-slice degradation warning (Task 14). `None` whenever no park
+    /// is active (`tx_offset_hold_hz.is_none()`), so unparking/re-parking
+    /// always starts a fresh baseline (no stale comparison against a
+    /// frequency that's no longer held). Updated on every `apply_placement`
+    /// call regardless of whether the warning fired.
+    pub park_coverage_last: Option<u8>,
 }
 
 /// Peak intensity in the latest waterfall row within ±radius_hz of center_hz.
@@ -1024,6 +1032,7 @@ impl App {
             placement: None,
             placement_cursor: 0,
             parked_since: None,
+            park_coverage_last: None,
         };
 
         // Initialize audio monitoring if device specified
@@ -1983,8 +1992,53 @@ impl App {
     /// method stores it as-is. Clamps `placement_cursor` into the new
     /// (possibly shorter) `slices` list — the same "cursor must survive a
     /// mutation" invariant Band Activity/DX Hunter/Callers established.
+    ///
+    /// **Parked-slice degradation warning (Task 14, edge-triggered):** when
+    /// a park is active (`tx_offset_hold_hz.is_some()`), looks up the
+    /// openness code at the parked frequency's bin in the NEW snapshot and
+    /// compares it to `park_coverage_last` (the code as of the LAST call).
+    /// A STRICT decrease (e.g. 3->1, 3->0, 2->0 — worse coverage than
+    /// before) fires a one-shot `status_message` warning; an unchanged or
+    /// improved code does not. `park_coverage_last` is updated to the new
+    /// code every call regardless, so the fire is edge-triggered — a bin
+    /// that stays degraded across many consecutive snapshots warns exactly
+    /// once, on the transition, not on every update while still busy. No
+    /// park active -> `park_coverage_last` resets to `None` (a fresh park
+    /// always starts a clean baseline; see the field doc).
     pub fn apply_placement(&mut self, v: PlacementView) {
         let max_index = v.slices.len().saturating_sub(1);
+
+        if let Some(hz) = self.tx_offset_hold_hz {
+            let new_code = crate::ui::tx_placement::bin_index_for_freq(
+                hz as f64,
+                v.range,
+                v.bin_hz,
+                v.openness.len(),
+            )
+            .and_then(|b| v.openness.get(b).copied());
+
+            if let (Some(old_code), Some(code)) = (self.park_coverage_last, new_code) {
+                if code < old_code {
+                    let busy = match code {
+                        0 => "both",
+                        1 => "E",
+                        _ => "O",
+                    };
+                    let best = v
+                        .slices
+                        .first()
+                        .map(|s| format!("{:.0}", s.offset_hz))
+                        .unwrap_or_else(|| "\u{2014}".to_string());
+                    self.status_message = format!(
+                        "\u{26a0} parked {hz} now busy in {busy} \u{2014} \u{2460} {best} better"
+                    );
+                }
+            }
+            self.park_coverage_last = new_code;
+        } else {
+            self.park_coverage_last = None;
+        }
+
         self.placement = Some(v);
         self.placement_cursor = self.placement_cursor.min(max_index);
     }
@@ -5102,5 +5156,96 @@ mod tests {
             received_at: Utc::now(),
         });
         assert_eq!(app.placement_cursor, 0);
+    }
+
+    /// Build a 96-bin PlacementView (matching `range`/`bin_hz` used
+    /// elsewhere in this test module) with every bin at code 3 (both
+    /// clear) except `parked_bin`, which is set to `code`.
+    fn placement_view_with_bin_code(parked_bin: usize, code: u8) -> PlacementView {
+        let mut openness = vec![3u8; 96];
+        openness[parked_bin] = code;
+        PlacementView {
+            slices: vec![PlacementSlice {
+                offset_hz: 900.0,
+                score: 80.0,
+                clear_first: true,
+                clear_second: true,
+            }],
+            openness,
+            bin_hz: 25.0,
+            range: (200.0, 2600.0),
+            received_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn park_degradation_warning_fires_once_on_edge_transition() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        // Park at 1500 Hz -> bin (1500-200)/25 = 52.
+        app.tx_offset_hold_hz = Some(1500);
+
+        // First snapshot after parking: bin is fully clear (code 3). No
+        // prior baseline (`park_coverage_last` starts `None`), so this
+        // must NOT fire — it only establishes the baseline.
+        app.apply_placement(placement_view_with_bin_code(52, 3));
+        assert_eq!(app.park_coverage_last, Some(3));
+        assert!(
+            !app.status_message.contains("now busy"),
+            "no warning on the baseline-establishing snapshot, got: {}",
+            app.status_message
+        );
+
+        // Coverage degrades 3 -> 1 (strict decrease): fires exactly once.
+        app.apply_placement(placement_view_with_bin_code(52, 1));
+        assert!(
+            app.status_message.contains("now busy"),
+            "expected a degradation warning, got: {}",
+            app.status_message
+        );
+        assert_eq!(app.park_coverage_last, Some(1));
+
+        // Stash a sentinel, then apply an UNCHANGED (still code 1) snapshot.
+        // Edge-triggered: must NOT re-fire / rewrite status_message.
+        app.status_message = "SENTINEL".to_string();
+        app.apply_placement(placement_view_with_bin_code(52, 1));
+        assert_eq!(
+            app.status_message, "SENTINEL",
+            "warning must not repeat while still degraded (edge-triggered, not per-update)"
+        );
+        assert_eq!(app.park_coverage_last, Some(1));
+    }
+
+    #[tokio::test]
+    async fn park_degradation_warning_does_not_fire_on_improvement_or_lateral_move() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.tx_offset_hold_hz = Some(1500);
+
+        // Establish baseline at code 1.
+        app.apply_placement(placement_view_with_bin_code(52, 1));
+        assert_eq!(app.park_coverage_last, Some(1));
+
+        // Improves 1 -> 2: no warning.
+        app.status_message = "SENTINEL".to_string();
+        app.apply_placement(placement_view_with_bin_code(52, 2));
+        assert_eq!(
+            app.status_message, "SENTINEL",
+            "an improvement must not trigger the degradation warning"
+        );
+        assert_eq!(app.park_coverage_last, Some(2));
+    }
+
+    #[tokio::test]
+    async fn park_coverage_last_resets_to_none_when_not_parked() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.tx_offset_hold_hz = Some(1500);
+        app.apply_placement(placement_view_with_bin_code(52, 3));
+        assert_eq!(app.park_coverage_last, Some(3));
+
+        app.tx_offset_hold_hz = None;
+        app.apply_placement(placement_view_with_bin_code(52, 3));
+        assert_eq!(
+            app.park_coverage_last, None,
+            "no park active -> baseline resets to None"
+        );
     }
 }

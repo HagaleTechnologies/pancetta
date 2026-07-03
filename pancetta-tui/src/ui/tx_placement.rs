@@ -221,7 +221,11 @@ fn bin_for_col(col: usize, width: usize, range: (f64, f64), bin_hz: f64, n_bins:
 
 /// Bin index containing `freq_hz`, or `None` if outside `range` or the
 /// snapshot has no bins / non-positive bin width.
-fn bin_index_for_freq(
+///
+/// `pub(crate)` so `App::apply_placement` (Task 14) can look up the parked
+/// frequency's bin code using the SAME column/bin math the panel itself
+/// renders with, rather than re-deriving it.
+pub(crate) fn bin_index_for_freq(
     freq_hz: f64,
     range: (f64, f64),
     bin_hz: f64,
@@ -426,31 +430,39 @@ fn render_best_row(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Placemen
 }
 
 /// Row 4: park line — current held offset (if any), its coverage, and how
-/// long it's been held, plus the interaction hint. Degradation flagging
-/// (Task 14) is deliberately not implemented here.
+/// long it's been held, plus the interaction hint. When the current bin's
+/// coverage code is `< 3` (not fully clear), prefixes a `⚠` degradation
+/// flag (Task 14) — this is a per-render DISPLAY of the CURRENT state
+/// (always visible while degraded), distinct from `App::apply_placement`'s
+/// one-shot `status_message` warning fired on the transition INTO
+/// degradation (Task 14's edge-triggered event notification).
 fn render_park_line(f: &mut Frame<'_>, row: Rect, app: &App, placement: &PlacementView) {
     if row.width == 0 || row.height == 0 {
         return;
     }
     let main = if let Some(hz) = app.tx_offset_hold_hz {
-        let coverage = bin_index_for_freq(
+        let code = bin_index_for_freq(
             hz as f64,
             placement.range,
             placement.bin_hz,
             placement.openness.len(),
         )
-        .and_then(|b| placement.openness.get(b).copied())
-        .map(coverage_label_for_code)
-        .unwrap_or("\u{2014}");
-        // `parked_since` is set by the (not-yet-built) park interaction
-        // (Task 12); a held offset without a park timestamp (e.g. set via
-        // the `o` modal rather than an instrument park) shows 0 min rather
-        // than omitting the clause.
+        .and_then(|b| placement.openness.get(b).copied());
+        let coverage = code.map(coverage_label_for_code).unwrap_or("\u{2014}");
+        // `parked_since` is set by the park interaction (Task 12); a held
+        // offset without a park timestamp (e.g. set via the `o` modal
+        // rather than an instrument park) shows 0 min rather than omitting
+        // the clause.
         let mins = app
             .parked_since
             .map(|t| (chrono::Utc::now() - t).num_minutes().max(0))
             .unwrap_or(0);
-        format!("parked: {hz} ({coverage}, holding {mins} min)")
+        let warn = if code.is_some_and(|c| c < 3) {
+            "\u{26a0} "
+        } else {
+            ""
+        };
+        format!("{warn}parked: {hz} ({coverage}, holding {mins} min)")
     } else {
         "not parked \u{2014} Enter parks \u{2460}".to_string()
     };
