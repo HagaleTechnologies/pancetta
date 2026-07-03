@@ -6,8 +6,13 @@
 //! 1. A **rig-api.v1** `clientFrame` (`dispensa contracts/rig/rig-api.v1.schema.json`)
 //!    — the read/control surface the remote gateway speaks. A `clientFrame` is
 //!    either `{frame:"hello", …}` or `{frame:"command", command:{cmd:"…", …}}`.
-//!    Only the `command` frames carry actions; `hello` is a handshake nicety and
-//!    maps to [`ControlAction::Unsupported`] here (handled elsewhere).
+//!    `hello` maps to [`ControlAction::Hello`] (Q-0019 #5, cqdx PR #144,
+//!    2026-07-02): it MAY carry a `capabilityToken` that the dispatcher
+//!    verifies against the pinned IdP keys and binds to the E2E-connected
+//!    client identity, rooting read/qsy scope in that verified identity —
+//!    never in relay admission (the relay envelope's `src` is
+//!    relay-forgeable). A `hello` with no/invalid/mismatched token is served
+//!    nothing scoped (v1 back-compat: the token is optional on the wire).
 //! 2. An **e2e-auth.v1** inner-control frame — a `txHeartbeat`
 //!    (`$defs.txHeartbeat`, the dead-man keep-alive), a `txArm`
 //!    (`$defs.txArm`, the explicitly-armed TX authorization: the
@@ -167,6 +172,17 @@ pub enum ControlAction {
         /// The `txArmGrant.jti` this disarm targets (empty when unknown).
         arm_jti: String,
     },
+    /// rig-api.v1 `hello` (dispensa Q-0019 #5, cqdx PR #144, amended
+    /// 2026-07-02). Carries an OPTIONAL `capabilityToken` (compact JWS) that
+    /// roots read/qsy authorization in the E2E identity, never in relay
+    /// admission (the relay envelope's `src` is relay-forgeable). Optional on
+    /// the wire for v1 back-compat, but a session with no/invalid/mismatched
+    /// token is served nothing scoped — see the dispatcher.
+    Hello {
+        /// The cqdx-issued capabilityToken, if the client sent one. `None` on
+        /// a legacy hello (v1 back-compat) — served nothing scoped.
+        capability_token: Option<String>,
+    },
     /// A well-formed but unknown/unsupported frame — logged + ignored upstream.
     Unsupported,
 }
@@ -189,7 +205,19 @@ pub fn map_client_frame(decrypted: &[u8]) -> Result<ControlAction, ControlError>
             Some(cmd) => Ok(map_client_command(cmd)),
             None => Ok(ControlAction::Unsupported),
         },
-        // "hello" (and any other frame) has no coordinator action.
+        // "hello" carries an OPTIONAL capabilityToken (Q-0019 #5) that the
+        // dispatcher verifies to root read/qsy scope for the rest of the
+        // session. A hello with no `hello` object, or a non-string token
+        // field, is treated as carrying no token (back-compat), not an error.
+        Some("hello") => {
+            let capability_token = v
+                .get("hello")
+                .and_then(|h| h.get("capabilityToken"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Ok(ControlAction::Hello { capability_token })
+        }
+        // Any other frame has no coordinator action.
         _ => Ok(ControlAction::Unsupported),
     }
 }
@@ -615,12 +643,34 @@ mod tests {
     }
 
     #[test]
-    fn hello_frame_is_unsupported() {
+    fn hello_frame_without_token_carries_none() {
+        // v1 back-compat: a legacy hello with no capabilityToken maps to
+        // Hello{capability_token: None}, not Unsupported — the dispatcher
+        // decides what "no token" means for scope (nothing scoped).
         let action = map(json!({
             "frame": "hello",
             "hello": { "protocolVersion": 1, "clientName": "Panino", "clientVersion": "0.1.0" }
         }));
-        assert_eq!(action, ControlAction::Unsupported);
+        assert_eq!(
+            action,
+            ControlAction::Hello {
+                capability_token: None
+            }
+        );
+    }
+
+    #[test]
+    fn hello_frame_with_token_carries_it() {
+        let action = map(json!({
+            "frame": "hello",
+            "hello": { "protocolVersion": 1, "capabilityToken": "eyJ.abc.def" }
+        }));
+        assert_eq!(
+            action,
+            ControlAction::Hello {
+                capability_token: Some("eyJ.abc.def".to_string())
+            }
+        );
     }
 
     #[test]

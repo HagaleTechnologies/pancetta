@@ -92,6 +92,35 @@ struct ArmContext {
     revoked_jtis: HashSet<String>,
     seen_jtis: HashSet<String>,
     audit: AuditLog,
+    /// The clientKeyId this session is Noise-connected to (config-pinned at
+    /// component start from the station-local TX-allow-list — NOT learned from
+    /// the relay-stamped `env.src`, which is relay-forgeable). A `hello`'s
+    /// `capabilityToken.clientKeyId` MUST equal this before its scopes are
+    /// honored (Q-0019 #5) — this is what roots read/qsy authorization in the
+    /// E2E-connected identity rather than relay admission.
+    expected_client_key_id: String,
+    /// Scopes granted by the most recent verified `hello.capabilityToken` THIS
+    /// session (`None` = no scoped action served — v1 back-compat default, and
+    /// the fail-closed state after any invalid/mismatched token). Reset to
+    /// `None` at the start of every new session (`run_one_session`) — a stale
+    /// session's authorization never carries into a reconnect.
+    hello_scopes: Option<Vec<String>>,
+}
+
+/// rig-api.v1 scope hierarchy (Q-0019 #5): `status` ⊂ `qsy` ⊂ `tx` — a token
+/// scoped for a higher tier implicitly covers every lower tier. Returns
+/// whether `scopes` grants at least `required`.
+fn scope_at_least(scopes: &[String], required: &str) -> bool {
+    let tier = |s: &str| match s {
+        "status" => 1,
+        "qsy" => 2,
+        "tx" => 3,
+        _ => 0,
+    };
+    let required_tier = tier(required);
+    scopes
+        .iter()
+        .any(|s| tier(s) >= required_tier && required_tier > 0)
 }
 
 /// Apply the accumulated [`ArmEffect`]s from an `ArmState` transition: write
@@ -223,7 +252,19 @@ async fn dispatch_action(
             apply_arm_effects(&ctx.audit, &effects);
             Dispatch::Continue
         }
+        ControlAction::Hello { capability_token } => {
+            dispatch_hello(capability_token, ctx, now);
+            Dispatch::Continue
+        }
         ControlAction::Qsy { vfo, frequency_hz } => {
+            if !ctx
+                .hello_scopes
+                .as_deref()
+                .is_some_and(|s| scope_at_least(s, "qsy"))
+            {
+                warn!(target: "agent.control", "setFrequency refused — no qsy-scoped hello token this session");
+                return Dispatch::Continue;
+            }
             let msg = RigControlMessage::SetFrequency {
                 vfo: vfo.clamp(0, u8::MAX as i64) as u8,
                 frequency: frequency_hz.max(0.0) as u64,
@@ -235,6 +276,14 @@ async fn dispatch_action(
             enabled,
             tx_frequency_hz,
         } => {
+            if !ctx
+                .hello_scopes
+                .as_deref()
+                .is_some_and(|s| scope_at_least(s, "qsy"))
+            {
+                warn!(target: "agent.control", "setSplit refused — no qsy-scoped hello token this session");
+                return Dispatch::Continue;
+            }
             let msg = RigControlMessage::SetSplit {
                 enabled,
                 tx_frequency: tx_frequency_hz.max(0.0) as u64,
@@ -298,6 +347,44 @@ fn action_name(a: &ControlAction) -> &'static str {
         ControlAction::TakeControl => "takeControl",
         ControlAction::ReleaseControl => "releaseControl",
         _ => "other",
+    }
+}
+
+/// Handle a `hello.capabilityToken` (Q-0019 #5): verify it against the pinned
+/// IdP keys, bind it to THIS session's E2E-connected client identity, and set
+/// `ctx.hello_scopes` accordingly. Fail-closed: any missing/invalid/mismatched
+/// token clears scopes (served nothing scoped), never partially trusts one.
+///
+/// `capability_token: None` (a legacy hello, v1 back-compat) also clears
+/// scopes — the token is optional on the wire but required at runtime for any
+/// scoped action.
+fn dispatch_hello(capability_token: Option<String>, ctx: &mut ArmContext, now: i64) {
+    let Some(token) = capability_token else {
+        ctx.hello_scopes = None;
+        return;
+    };
+    match ctx.verifier.verify_capability_token(&token, now) {
+        Ok(cap) if cap.client_key_id == ctx.expected_client_key_id => {
+            debug!(
+                target: "agent.control",
+                scopes = ?cap.scopes,
+                "hello capabilityToken verified — scopes granted for this session"
+            );
+            ctx.hello_scopes = Some(cap.scopes);
+        }
+        Ok(cap) => {
+            warn!(
+                target: "agent.control",
+                token_client = %cap.client_key_id,
+                expected_client = %ctx.expected_client_key_id,
+                "hello capabilityToken clientKeyId does not match the E2E-connected identity — no scope granted"
+            );
+            ctx.hello_scopes = None;
+        }
+        Err(e) => {
+            warn!(target: "agent.control", reason = %e, "hello capabilityToken invalid — no scope granted");
+            ctx.hello_scopes = None;
+        }
     }
 }
 
@@ -709,6 +796,8 @@ async fn run_session_loop(cfg: RunConfig) {
         revoked_jtis: HashSet::new(),
         seen_jtis: HashSet::new(),
         audit: cfg.audit,
+        expected_client_key_id: cfg.client_key_id.clone(),
+        hello_scopes: None,
     };
 
     while !cfg.shutdown.load(Ordering::Acquire) {
@@ -772,6 +861,9 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
     ctx: &mut ArmContext,
     bus: &MessageBus,
 ) {
+    // A new session starts with zero granted read/qsy scope — a prior
+    // session's verified hello never carries across a reconnect (Q-0019 #5).
+    ctx.hello_scopes = None;
     let mut sess = AgentSession::new(ws, identity, client_key_id.to_string());
     if let Err(e) = sess.authenticate() {
         debug!(target: "agent", "relay authenticate failed: {e}");
@@ -885,6 +977,17 @@ mod tests {
         serde_json::to_vec(&sorted).unwrap()
     }
 
+    /// Domain-separation tag for txArmGrant.clientSig (dispensa Q-0019 #6,
+    /// 2026-07-02). Mirrors `pancetta_agent::capability::TX_ARM_GRANT_DOMAIN_TAG`.
+    const TX_ARM_GRANT_DOMAIN_TAG: &str = "cqdx-tx-arm-grant-v1";
+
+    fn domain_separated(canon: &[u8]) -> Vec<u8> {
+        let mut out = TX_ARM_GRANT_DOMAIN_TAG.as_bytes().to_vec();
+        out.push(0x00);
+        out.extend_from_slice(canon);
+        out
+    }
+
     /// Build a valid, client-signed `txArmGrant` (frozen e2e-auth.v1: the token
     /// is a SIBLING carried separately, NOT inside the grant), with a unique jti
     /// so replay tests can vary it.
@@ -904,7 +1007,7 @@ mod tests {
         .unwrap()
         .clone();
         let canon = canonical_bytes(&grant);
-        let sig = client_key().sign(&canon);
+        let sig = client_key().sign(&domain_separated(&canon));
         grant.insert("clientSig".to_string(), json!(b64url(&sig.to_bytes())));
         Value::Object(grant)
     }
@@ -941,6 +1044,8 @@ mod tests {
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
+            expected_client_key_id: CLIENT_KEY_ID.to_string(),
+            hello_scopes: None,
         }
     }
 
@@ -966,6 +1071,203 @@ mod tests {
         assert!(
             ctx.arm.lock().unwrap().tx_permitted(NOW),
             "a valid arm + consent must permit remote TX"
+        );
+    }
+
+    // ── Q-0019 #5: hello.capabilityToken roots read/qsy authorization ───────
+
+    #[tokio::test]
+    async fn qsy_refused_without_prior_hello_token() {
+        // No hello has been dispatched this session — ctx.hello_scopes is None
+        // by construction (ctx_with's default) — so setFrequency must be a no-op.
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let d = dispatch_action(
+            ControlAction::Qsy {
+                vfo: 0,
+                frequency_hz: 14_074_000.0,
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        assert_eq!(d, Dispatch::Continue);
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "setFrequency must be refused with no verified hello token this session"
+        );
+    }
+
+    #[tokio::test]
+    async fn qsy_permitted_after_valid_hello_token_from_expected_client() {
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        // valid_token() carries scopes=["status","qsy","tx"] for CLIENT_KEY_ID,
+        // which matches ctx_with's expected_client_key_id (CLIENT_KEY_ID).
+        let d1 = dispatch_action(
+            ControlAction::Hello {
+                capability_token: Some(valid_token()),
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        assert_eq!(d1, Dispatch::Continue);
+        let d2 = dispatch_action(
+            ControlAction::Qsy {
+                vfo: 0,
+                frequency_hz: 14_074_000.0,
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        assert_eq!(d2, Dispatch::Continue);
+        let msg = hamlib_rx
+            .try_recv()
+            .expect("setFrequency must be forwarded after a valid qsy-scoped hello");
+        match msg.message_type {
+            MessageType::RigControl(RigControlMessage::SetFrequency { frequency, .. }) => {
+                assert_eq!(frequency, 14_074_000);
+            }
+            other => panic!("expected SetFrequency, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn qsy_never_arms_tx_even_with_a_tx_scoped_hello() {
+        // Read/qsy authorization (hello.capabilityToken) and TX authorization
+        // (txArm) are independent gates — a qsy-scoped session must never
+        // touch the ArmState.
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        dispatch_action(
+            ControlAction::Hello {
+                capability_token: Some(valid_token()),
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        dispatch_action(
+            ControlAction::Qsy {
+                vfo: 0,
+                frequency_hz: 7_074_000.0,
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "a qsy-scoped hello must never arm TX — arm requires a separate txArm"
+        );
+    }
+
+    #[tokio::test]
+    async fn qsy_refused_when_hello_token_client_key_id_mismatches_session() {
+        // A token that verifies (valid IdP signature, unexpired) but whose
+        // clientKeyId does NOT match the session's E2E-connected identity must
+        // grant NOTHING — this is the exact "relay-admission-rooted" gap
+        // Q-0019 #5 closes: a mismatched token must not silently authorize.
+        let mut ctx = ctx_with(true, true);
+        ctx.expected_client_key_id = "someOtherClientKeyId0".to_string();
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        dispatch_action(
+            ControlAction::Hello {
+                capability_token: Some(valid_token()), // clientKeyId == CLIENT_KEY_ID
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        let d = dispatch_action(
+            ControlAction::Qsy {
+                vfo: 0,
+                frequency_hz: 14_074_000.0,
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        assert_eq!(d, Dispatch::Continue);
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "a hello token whose clientKeyId != the E2E-connected identity must grant no scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn qsy_permitted_by_a_non_tx_enabled_token_carrying_qsy_scope() {
+        // require_tx_enabled (the clock-2 TX gate) is orthogonal to read/qsy
+        // scope: a token with no txEnabledUntil still verifies and still
+        // grants qsy, because qsy never touches ArmState/require_tx_enabled.
+        let mut ctx = ctx_with(true, true);
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        dispatch_action(
+            ControlAction::Hello {
+                capability_token: Some(non_enabled_token()),
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        let d = dispatch_action(
+            ControlAction::Qsy {
+                vfo: 0,
+                frequency_hz: 21_074_000.0,
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        assert_eq!(d, Dispatch::Continue);
+        assert!(
+            hamlib_rx.try_recv().is_ok(),
+            "a non-tx-enabled token with qsy scope must still permit setFrequency"
+        );
+    }
+
+    #[tokio::test]
+    async fn new_session_clears_stale_hello_scope() {
+        // The per-session reset in run_one_session ("ctx.hello_scopes = None")
+        // is exercised indirectly here: simulate a stale prior grant by setting
+        // hello_scopes directly, then confirm the field is what gates dispatch
+        // (i.e. an explicit reset to None — the reconnect boundary — really
+        // does deny qsy, proving the gate reads hello_scopes and nothing else).
+        let mut ctx = ctx_with(true, true);
+        ctx.hello_scopes = Some(vec!["qsy".to_string()]);
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        // Simulate the reconnect-boundary reset a fresh run_one_session performs.
+        ctx.hello_scopes = None;
+        let d = dispatch_action(
+            ControlAction::Qsy {
+                vfo: 0,
+                frequency_hz: 14_074_000.0,
+            },
+            &mut ctx,
+            &bus,
+            NOW,
+        )
+        .await;
+        assert_eq!(d, Dispatch::Continue);
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "a reset session must not inherit a prior session's granted scope"
         );
     }
 
@@ -1456,7 +1758,7 @@ mod tests {
         .unwrap()
         .clone();
         let canon = canonical_bytes(&grant);
-        let sig = client_key().sign(&canon);
+        let sig = client_key().sign(&domain_separated(&canon));
         grant.insert("clientSig".to_string(), json!(b64url(&sig.to_bytes())));
         json!({
             "type": "txArm",
@@ -1597,6 +1899,8 @@ mod tests {
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
+            expected_client_key_id: CLIENT_KEY_ID.to_string(),
+            hello_scopes: None,
         }
     }
 }
