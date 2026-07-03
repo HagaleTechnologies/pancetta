@@ -2070,6 +2070,25 @@ impl App {
             .get_selected_station()
             .filter(|(c, _, _)| pancetta_core::callsign::callsigns_match(c, &callsign))
             .map(|(_, f, p)| (f, p))
+            .or_else(|| {
+                // `get_selected_station()` has no arm for `ActivePanel::QsoStatus`
+                // (and its filter above only matches when it DOES resolve the
+                // focused callsign), but `focused_callsign()` can still resolve
+                // to an already-engaged station via `self.active_qsos`. Falling
+                // all the way through to the (1500, None) default in that case
+                // would discard the QSO's real TX frequency/parity and — via
+                // `respond_to_cq_with`'s unfiltered `supersede_active_qsos_for`
+                // — could blow away a live QSO to start a fresh Manual one at a
+                // bogus 1500 Hz. Mirror exactly how `focused_callsign` resolves
+                // the QsoStatus panel: look the callsign up in `active_qsos` and
+                // use ITS real frequency/parity.
+                self.active_qsos
+                    .iter()
+                    .find(|q| {
+                        pancetta_core::callsign::callsigns_match(&q.their_callsign, &callsign)
+                    })
+                    .map(|q| (q.frequency_hz.round() as u64, q.tx_parity))
+            })
             .unwrap_or((1500, None));
 
         Some(SpaceAction::Call {

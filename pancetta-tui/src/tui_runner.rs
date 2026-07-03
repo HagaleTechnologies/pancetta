@@ -3169,6 +3169,14 @@ mod key_tests {
     /// BandActivity/DxHunter/Callers — Space was a silent no-op on the QSO
     /// Status panel. Routed through the global `focused_callsign()`, Space
     /// now also works from the QSO Status panel.
+    ///
+    /// Fix round 1 (TX-safety regression found in review): `get_selected_station()`
+    /// has NO arm for `ActivePanel::QsoStatus`, so its filter in the Call-branch
+    /// fallback always fails there — the buggy version ALWAYS fell through to
+    /// the disconnected `(1500, None)` default, discarding the real frequency
+    /// and parity of a station we're already actively working. This test uses
+    /// a non-1500 frequency (1234 Hz) and a non-None parity (Odd) specifically
+    /// so a regression to the `(1500, None)` fallback fails loudly.
     #[tokio::test]
     async fn space_works_from_qso_status_panel_via_global_focus() {
         let (mut r, cmd_rx, app) = make_runner().await;
@@ -3181,7 +3189,7 @@ mod key_tests {
                     state: "wait rpt".to_string(),
                     started_at: chrono::Utc::now(),
                     frequency_hz: 1234.0,
-                    tx_parity: None,
+                    tx_parity: Some(pancetta_core::slot::SlotParity::Odd),
                     last_tx_text: None,
                     last_tx_at: None,
                     last_rx_text: None,
@@ -3210,10 +3218,77 @@ mod key_tests {
         }
         r.handle_key_event(key(' ')).await.unwrap();
         match cmd_rx.try_recv() {
-            Ok(TuiCommand::CallStation { callsign, .. }) => {
+            Ok(TuiCommand::CallStation {
+                callsign,
+                frequency,
+                dx_parity,
+            }) => {
                 assert_eq!(callsign, "JA1ABC");
+                // TX-safety regression guard: must be the QSO's real
+                // frequency/parity, NOT the disconnected (1500, None) default.
+                assert_eq!(frequency, 1234);
+                assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Odd));
             }
             other => panic!("Expected CallStation targeting JA1ABC, got {:?}", other),
+        }
+    }
+
+    /// Sibling of the above: when the focused QSO-Status entry has NO known
+    /// parity (`tx_parity: None`) but a real, non-1500 frequency, Space must
+    /// still carry that real frequency through (only the parity is
+    /// legitimately `None`) — proves the fallback isn't overwriting the
+    /// frequency separately from the parity.
+    #[tokio::test]
+    async fn space_from_qso_status_carries_real_frequency_with_unknown_parity() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::QsoStatus;
+            a.apply_active_qsos(
+                vec![crate::app::ActiveQsoBanner {
+                    their_callsign: "G8KHF".to_string(),
+                    state: "wait rpt".to_string(),
+                    started_at: chrono::Utc::now(),
+                    frequency_hz: 2222.0,
+                    tx_parity: None,
+                    last_tx_text: None,
+                    last_tx_at: None,
+                    last_rx_text: None,
+                    last_rx_at: None,
+                    snr_rx: None,
+                    report_sent: None,
+                    report_received: None,
+                    exchange_count: 1,
+                    qso_id: "g8khf-id".to_string(),
+                    initiated_by: "Manual".to_string(),
+                    ladder_labels: Vec::new(),
+                    ladder_ours: Vec::new(),
+                    ladder_index: 0,
+                    now_line: String::new(),
+                    next_line: String::new(),
+                    call_count: 0,
+                    max_calls: 0,
+                    watchdog_deadline: None,
+                    dx_last_activity: None,
+                    hound: false,
+                }],
+                Vec::new(),
+            );
+            a.qso_cursor = 0;
+            assert_eq!(a.focused_callsign().as_deref(), Some("G8KHF"));
+        }
+        r.handle_key_event(key(' ')).await.unwrap();
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::CallStation {
+                callsign,
+                frequency,
+                dx_parity,
+            }) => {
+                assert_eq!(callsign, "G8KHF");
+                assert_eq!(frequency, 2222);
+                assert_eq!(dx_parity, None);
+            }
+            other => panic!("Expected CallStation targeting G8KHF, got {:?}", other),
         }
     }
 }
