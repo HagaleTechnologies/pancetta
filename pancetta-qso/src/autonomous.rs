@@ -11,8 +11,8 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::frequency::{
-    DecodeHistory, DecodeRecord, FrequencyAllocatorConfig, SmartFrequencyAllocator,
-    SpectralSnapshot, TimeSlot,
+    DecodeHistory, DecodeRecord, FrequencyAllocatorConfig, PlacementSnapshot,
+    SmartFrequencyAllocator, SpectralSnapshot, TimeSlot,
 };
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1075,65 @@ impl AutonomousOperator {
 
         // Fallback: legacy allocator
         self.frequency_allocator.allocate_cq_frequency()
+    }
+
+    /// Rank the current band openness for the TX-placement instrument.
+    ///
+    /// Returns `None` until the first spectral snapshot arrives. This is a
+    /// pure read — it does NOT allocate or mutate — over the SAME
+    /// `smart_allocator` / `decode_history` / `spectral_snapshot` /
+    /// `frequency_allocator` fields [`Self::allocate_smart_frequency`] uses
+    /// to make real TX-frequency decisions (single-scorer invariant): the
+    /// TUI instrument never re-derives scores from a separate computation.
+    pub fn placement_snapshot(&self, top_n: usize) -> Option<PlacementSnapshot> {
+        let spectral = self.spectral_snapshot.as_ref()?;
+        let own: Vec<f64> = self
+            .frequency_allocator
+            .own_frequencies()
+            .values()
+            .copied()
+            .collect();
+        let mut cands =
+            self.smart_allocator
+                .rank_candidates(spectral, &self.decode_history, &own, None);
+        cands.truncate(top_n);
+
+        let (min_f, max_f) = self.smart_allocator.config().range;
+        let bin_hz = self.smart_allocator.config().step_hz;
+        let bins = ((max_f - min_f) / bin_hz).ceil() as usize;
+        let openness = (0..bins)
+            .map(|i| {
+                let f = min_f + i as f64 * bin_hz;
+                let cf = self
+                    .decode_history
+                    .activity_near_in_slot(f, 50.0, TimeSlot::First)
+                    == 0;
+                let cs = self
+                    .decode_history
+                    .activity_near_in_slot(f, 50.0, TimeSlot::Second)
+                    == 0;
+                match (cf, cs) {
+                    (true, true) => 3u8,
+                    (true, false) => 2,
+                    (false, true) => 1,
+                    (false, false) => 0,
+                }
+            })
+            .collect();
+
+        Some(PlacementSnapshot {
+            slices: cands,
+            openness,
+            bin_hz,
+            range: (min_f, max_f),
+        })
+    }
+
+    /// Test-only mutable accessor to `decode_history`, so tests can seed
+    /// occupancy without going through `feed_decoded_messages`.
+    #[cfg(test)]
+    pub(crate) fn decode_history_mut_for_test(&mut self) -> &mut DecodeHistory {
+        &mut self.decode_history
     }
 
     /// Tell the operator how many QSOs the auto-sequencer is currently managing.
@@ -2445,6 +2504,43 @@ mod tests {
 
         // Should NOT add a third QSO
         assert_eq!(tx_count, 2, "Should not exceed max_concurrent_qsos");
+    }
+
+    #[test]
+    fn placement_snapshot_ranks_and_bins() {
+        // Build the operator fixture the same way existing autonomous tests
+        // do, then feed spectral + one busy decode and ask for a snapshot.
+        let config = AutonomousConfig {
+            enabled: true,
+            ..AutonomousConfig::default()
+        };
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+
+        // No spectral snapshot yet -> None.
+        assert!(op.placement_snapshot(10).is_none());
+
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0; 128],
+            freq_min_hz: 200.0,
+            freq_max_hz: 3000.0,
+        });
+        op.decode_history_mut_for_test()
+            .push_cycle(vec![DecodeRecord {
+                frequency_hz: 1500.0,
+                time_slot: TimeSlot::First,
+            }]);
+
+        let snap = op.placement_snapshot(10).unwrap();
+        assert_eq!(snap.slices.len(), 10);
+        assert!(
+            snap.slices.windows(2).all(|w| w[0].score >= w[1].score),
+            "sorted by score desc"
+        );
+        let bin_1500 = ((1500.0 - snap.range.0) / snap.bin_hz) as usize;
+        assert_eq!(
+            snap.openness[bin_1500], 1,
+            "busy in First -> second-only-clear"
+        );
     }
 }
 

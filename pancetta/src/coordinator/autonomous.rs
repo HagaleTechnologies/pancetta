@@ -478,6 +478,23 @@ impl super::ApplicationCoordinator {
                             }
 
                             op.feed_decoded_messages(&slot_messages, evaluator.as_ref());
+
+                            // TX-placement instrument feed (docs/superpowers/specs/
+                            // 2026-07-03-tui-redesign-design.md §2): per-window
+                            // read of the SAME allocator/history the autonomous
+                            // path just used above — not a separate computation
+                            // (single-scorer invariant). Sent regardless of
+                            // whether autonomous mode is enabled (housekeeping).
+                            if let Some(snapshot) = op.placement_snapshot(10) {
+                                let msg = ComponentMessage::new(
+                                    ComponentId::Autonomous,
+                                    ComponentId::Tui,
+                                    MessageType::TxPlacementUpdate { snapshot },
+                                    Instant::now(),
+                                );
+                                let _ = message_bus.send_message(msg).await;
+                            }
+
                             // Phase 5: sync the operator's active-QSO count from
                             // the shared active-QSO set so `max_concurrent_qsos`
                             // gating is honored (fail-open to 0 on a poisoned

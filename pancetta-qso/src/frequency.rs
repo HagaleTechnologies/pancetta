@@ -175,6 +175,26 @@ pub struct FrequencyCandidate {
     pub noise_floor: f32,
 }
 
+/// A ranked snapshot of band openness for the TX-placement instrument
+/// (see `docs/superpowers/specs/2026-07-03-tui-redesign-design.md` §2).
+///
+/// Produced by [`crate::autonomous::AutonomousOperator::placement_snapshot`]
+/// as a pure read of the SAME allocator/history state the autonomous
+/// operator uses to make real TX-frequency decisions — never a separate
+/// computation (single-scorer invariant).
+#[derive(Debug, Clone)]
+pub struct PlacementSnapshot {
+    /// Top-N ranked candidates, sorted by score descending.
+    pub slices: Vec<FrequencyCandidate>,
+    /// Per-bin openness code across the full allocation range:
+    /// 0=busy-both, 1=second-only-clear, 2=first-only-clear, 3=clear-both.
+    pub openness: Vec<u8>,
+    /// Bin width in Hz (matches the allocator's `step_hz`).
+    pub bin_hz: f64,
+    /// Allocation range (min, max) in Hz.
+    pub range: (f64, f64),
+}
+
 /// Stateless frequency allocator. Given spectral + decode data, returns ranked candidates.
 pub struct SmartFrequencyAllocator {
     config: FrequencyAllocatorConfig,
@@ -183,6 +203,13 @@ pub struct SmartFrequencyAllocator {
 impl SmartFrequencyAllocator {
     pub fn new(config: FrequencyAllocatorConfig) -> Self {
         Self { config }
+    }
+
+    /// Access the allocator's configuration (range, step size, etc.) — used
+    /// by the TX-placement snapshot to bin openness at the same resolution
+    /// the allocator scores candidates at.
+    pub fn config(&self) -> &FrequencyAllocatorConfig {
+        &self.config
     }
 
     /// Score and rank all candidate frequencies.

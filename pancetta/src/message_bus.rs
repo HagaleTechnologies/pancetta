@@ -167,6 +167,18 @@ pub enum MessageType {
         callsign: Option<String>,
     },
 
+    /// Per-window TX-placement ranking for the TUI instrument
+    /// (docs/superpowers/specs/2026-07-03-tui-redesign-design.md §2). Computed
+    /// in the autonomous tick from the SAME `SmartFrequencyAllocator` /
+    /// `DecodeHistory` / `SpectralSnapshot` the autonomous path allocates
+    /// with (`AutonomousOperator::placement_snapshot`) — the TUI never
+    /// re-derives scores from a separate computation (single-scorer
+    /// invariant). Sent every FT8 window regardless of whether autonomous
+    /// mode is enabled (housekeeping, not an action).
+    TxPlacementUpdate {
+        snapshot: pancetta_qso::frequency::PlacementSnapshot,
+    },
+
     /// Hamlib rig control messages
     RigControl(RigControlMessage),
 
