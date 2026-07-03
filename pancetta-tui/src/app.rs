@@ -557,44 +557,44 @@ impl DeviceSelectionState {
 pub enum ActivePanel {
     BandActivity,
     QsoStatus,
-    StationInfo,
     /// Stations currently calling US (directed-at-us decodes). Operator picks
     /// one and replies at the correct sequence step (smart default + override).
     Callers,
     DxHunter,
-    /// The TX-placement instrument (Task 11). Not reachable via the `1`-`5`
-    /// panel-jump keys (those stay as-is) — only `Tab`/`Shift+Tab` cycle into
-    /// it. Has no "focused callsign" concept (see `focused_callsign`).
+    /// The TX-placement instrument. Reachable via `5` (Task 18 renumbered the
+    /// panel-jump keys after Station Info was demoted) as well as
+    /// `Tab`/`Shift+Tab`. Has no "focused callsign" concept (see
+    /// `focused_callsign`).
     TxPlacement,
 }
 
 impl ActivePanel {
     // Tab cycle follows the on-screen layout top-to-bottom, left column then
-    // right column: BandActivity, QsoStatus (left) → StationInfo, DxHunter,
-    // Callers (right). The full-width-waterfall layout put Callers BELOW DX
-    // Hunter, so DxHunter precedes Callers here (the enum's declaration order is
+    // right column: BandActivity, QsoStatus (left) → DxHunter, Callers
+    // (right). The full-width-waterfall layout put Callers BELOW DX Hunter,
+    // so DxHunter precedes Callers here (the enum's declaration order is
     // unrelated and left unchanged). TxPlacement (Task 11) is inserted right
     // after BandActivity — it sits directly below the active-QSO banner and
-    // above the rest of the grid on-screen in Operate.
+    // above the rest of the grid on-screen in Operate. `StationInfo` was
+    // removed from the cycle in Task 18 (demoted to a non-navigable station
+    // card + status-bar spans — it no longer has an `ActivePanel` variant).
     pub fn next(&self) -> Self {
         match self {
             ActivePanel::BandActivity => ActivePanel::TxPlacement,
             ActivePanel::TxPlacement => ActivePanel::QsoStatus,
-            ActivePanel::QsoStatus => ActivePanel::StationInfo,
-            ActivePanel::StationInfo => ActivePanel::DxHunter,
-            ActivePanel::DxHunter => ActivePanel::Callers,
-            ActivePanel::Callers => ActivePanel::BandActivity,
+            ActivePanel::QsoStatus => ActivePanel::Callers,
+            ActivePanel::Callers => ActivePanel::DxHunter,
+            ActivePanel::DxHunter => ActivePanel::BandActivity,
         }
     }
 
     pub fn previous(&self) -> Self {
         match self {
-            ActivePanel::BandActivity => ActivePanel::Callers,
-            ActivePanel::TxPlacement => ActivePanel::BandActivity,
+            ActivePanel::BandActivity => ActivePanel::DxHunter,
+            ActivePanel::DxHunter => ActivePanel::Callers,
+            ActivePanel::Callers => ActivePanel::QsoStatus,
             ActivePanel::QsoStatus => ActivePanel::TxPlacement,
-            ActivePanel::StationInfo => ActivePanel::QsoStatus,
-            ActivePanel::DxHunter => ActivePanel::StationInfo,
-            ActivePanel::Callers => ActivePanel::DxHunter,
+            ActivePanel::TxPlacement => ActivePanel::BandActivity,
         }
     }
 }
@@ -1739,13 +1739,30 @@ impl App {
     /// follows the hamlib STRENGTH convention (0 dB = S9, 6 dB per
     /// S-unit below S9).
     pub fn s_meter_display(&self) -> Option<String> {
-        const STALE_AFTER_SECS: i64 = 10;
         let db = self.signal_strength_db?;
         let at = self.signal_strength_at?;
-        if (Utc::now() - at).num_seconds() > STALE_AFTER_SECS {
+        if (Utc::now() - at).num_seconds() > SIGNAL_STRENGTH_STALE_AFTER_SECS {
             return None;
         }
         Some(format_s_meter(db))
+    }
+
+    /// Status-bar S-meter span text (Task 18 — demoted from the Station Info
+    /// panel): `"S:{db:+}"` (raw signed dB relative to S9) when the last
+    /// hamlib STRENGTH reading is fresh, else `"S:---"`. Reuses the exact
+    /// same fields + staleness gate as `s_meter_display` (same data/logic);
+    /// only the display FORMAT differs (raw signed dB, not the S-unit
+    /// conversion) — that's what the status bar's compact single-span layout
+    /// calls for.
+    pub fn signal_strength_status_bar(&self) -> String {
+        match (self.signal_strength_db, self.signal_strength_at) {
+            (Some(db), Some(at))
+                if (Utc::now() - at).num_seconds() <= SIGNAL_STRENGTH_STALE_AFTER_SECS =>
+            {
+                format!("S:{db:+}")
+            }
+            _ => "S:---".to_string(),
+        }
     }
 
     /// Get the primary (first) QSO status, or a default standby entry.
@@ -2511,7 +2528,6 @@ impl App {
                 .active_qsos
                 .get(self.qso_cursor)
                 .map(|q| q.their_callsign.clone()),
-            ActivePanel::StationInfo => None,
             // The instrument has no "focused station" concept of its own —
             // its own selection cursor is `placement_cursor` (a slice index,
             // not a callsign).
@@ -3177,6 +3193,12 @@ fn is_committed_exchange_payload(tok: &str) -> bool {
     }
     false
 }
+
+/// Shared staleness window for rig S-meter readings, used by both
+/// `App::s_meter_display` and `App::signal_strength_status_bar` so the two
+/// displays (Station panel history / status bar) never disagree about when
+/// a reading has gone stale.
+const SIGNAL_STRENGTH_STALE_AFTER_SECS: i64 = 10;
 
 /// Format a hamlib STRENGTH reading (dB relative to S9) as a
 /// conventional S-meter string: "S0".."S9" below S9, "S9+NN" above.
@@ -4191,6 +4213,31 @@ mod tests {
         // Backdate the reading past the staleness window.
         app.signal_strength_at = Some(Utc::now() - chrono::Duration::seconds(11));
         assert_eq!(app.s_meter_display(), None, "stale reading must hide");
+    }
+
+    /// Task 18 status-bar S-meter span: raw signed dB (NOT the S-unit
+    /// conversion `s_meter_display` uses), same staleness gate/fields.
+    #[tokio::test]
+    async fn signal_strength_status_bar_reflects_reading_and_staleness() {
+        let mut app = fixture_app().await;
+        assert_eq!(app.signal_strength_status_bar(), "S:---", "no reading yet");
+        app.update_signal_strength(20);
+        assert_eq!(app.signal_strength_status_bar(), "S:+20");
+        app.update_signal_strength(-12);
+        assert_eq!(app.signal_strength_status_bar(), "S:-12");
+        app.update_signal_strength(0);
+        assert_eq!(
+            app.signal_strength_status_bar(),
+            "S:+0",
+            "Rust's {{:+}} formats zero with an explicit sign"
+        );
+        // Backdate the reading past the shared staleness window.
+        app.signal_strength_at = Some(Utc::now() - chrono::Duration::seconds(11));
+        assert_eq!(
+            app.signal_strength_status_bar(),
+            "S:---",
+            "stale reading must hide behind the same S:--- placeholder"
+        );
     }
 
     /// hamlib STRENGTH convention: 0 dB = S9, 6 dB per S-unit below.

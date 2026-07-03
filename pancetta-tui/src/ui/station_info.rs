@@ -8,10 +8,17 @@ use ratatui::{
 };
 
 use super::create_panel_block;
-use crate::app::{ActivePanel, App};
+use crate::app::App;
 
+/// The Station Info panel. Kept intact but **unrouted** (Task 18 — demoted
+/// to the station card, `ui/station_card.rs`, plus a couple of live spans
+/// on the status bar; `ActivePanel::StationInfo` no longer exists, so this
+/// is never called from any layout function). Left as dead-but-compiling
+/// code rather than deleted, per the task brief.
 pub fn render_station_info(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
-    let is_active = matches!(app.active_panel, ActivePanel::StationInfo);
+    // Always `false`: there's no longer an `ActivePanel` variant this panel
+    // could match against (it's not navigable/focusable anymore).
+    let is_active = false;
     let block = create_panel_block("Station Info", is_active, app);
 
     // Section order is by how often the operator needs it, because the

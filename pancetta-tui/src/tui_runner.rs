@@ -1184,8 +1184,12 @@ impl TuiRunner {
                 })?;
             }
 
-            // Panel jump 1-5 (advertised in help; map matches the historic
-            // app.rs binding). 1=Band, 2=QSO, 3=Station, 4=Callers, 5=DX.
+            // Panel jump 1-5 (advertised in help). Task 18: Station Info was
+            // removed from `ActivePanel` (demoted to a non-navigable station
+            // card + status-bar spans), which freed up a number key —
+            // TxPlacement now gets one (`5`), unlike Task 11's original
+            // "no number key" scoping. 1=Band, 2=QSO, 3=Callers, 4=DX,
+            // 5=Placement.
             KeyCode::Char('1') => {
                 app.active_panel = crate::app::ActivePanel::BandActivity;
                 app.status_message = "Panel: Band Activity".to_string();
@@ -1195,16 +1199,16 @@ impl TuiRunner {
                 app.status_message = "Panel: QSO Status".to_string();
             }
             KeyCode::Char('3') => {
-                app.active_panel = crate::app::ActivePanel::StationInfo;
-                app.status_message = "Panel: Station Info".to_string();
-            }
-            KeyCode::Char('4') => {
                 app.active_panel = crate::app::ActivePanel::Callers;
                 app.status_message = "Panel: Callers".to_string();
             }
-            KeyCode::Char('5') => {
+            KeyCode::Char('4') => {
                 app.active_panel = crate::app::ActivePanel::DxHunter;
                 app.status_message = "Panel: DX Hunter".to_string();
+            }
+            KeyCode::Char('5') => {
+                app.active_panel = crate::app::ActivePanel::TxPlacement;
+                app.status_message = "Panel: TX Placement".to_string();
             }
 
             // === Quit (with confirm modal) ===
@@ -1831,7 +1835,7 @@ impl TuiRunner {
                 "Jump to newest (realtime) / oldest",
             ),
             ("PgUp / PgDn", "Page scroll"),
-            ("1/2/3/4/5", "Jump: Band/QSO/Station/Callers/DX"),
+            ("1/2/3/4/5", "Jump: Band/QSO/Callers/DX/Placement"),
             (
                 "Left / Right",
                 "TX offset −/+ 50 Hz (Callers: cycle reply step)",
@@ -2992,13 +2996,16 @@ mod key_tests {
     }
 
     /// Digit keys 1-5 jump panels in the production handler (were dead before).
+    /// Task 18 renumbered these after `StationInfo` was removed from
+    /// `ActivePanel`: 1=Band, 2=QSO, 3=Callers, 4=DX, 5=TxPlacement (which
+    /// gets a number key now that Station Info's slot freed one up).
     #[tokio::test]
     async fn digits_jump_panels() {
         let (mut r, _cmd_rx, app) = make_runner().await;
         r.handle_key_event(key('5')).await.unwrap();
         assert_eq!(
             app.read().await.active_panel,
-            crate::app::ActivePanel::DxHunter
+            crate::app::ActivePanel::TxPlacement
         );
         r.handle_key_event(key('2')).await.unwrap();
         assert_eq!(
@@ -3009,6 +3016,16 @@ mod key_tests {
         assert_eq!(
             app.read().await.active_panel,
             crate::app::ActivePanel::BandActivity
+        );
+        r.handle_key_event(key('3')).await.unwrap();
+        assert_eq!(
+            app.read().await.active_panel,
+            crate::app::ActivePanel::Callers
+        );
+        r.handle_key_event(key('4')).await.unwrap();
+        assert_eq!(
+            app.read().await.active_panel,
+            crate::app::ActivePanel::DxHunter
         );
     }
 

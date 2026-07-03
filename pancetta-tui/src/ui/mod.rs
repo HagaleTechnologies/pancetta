@@ -15,6 +15,7 @@ pub mod band_activity;
 pub mod callers;
 pub mod dx_hunter;
 pub mod qso_status;
+pub mod station_card;
 pub mod station_info;
 pub mod tx_placement;
 
@@ -23,8 +24,16 @@ use band_activity::render_band_activity;
 use callers::render_callers;
 use dx_hunter::render_dx_hunter;
 use qso_status::render_qso_status;
-use station_info::render_station_info;
+use station_card::render_station_card;
 use tx_placement::{render_placement_zoom, render_tx_placement};
+
+// Task 18: `ActivePanel::StationInfo` was removed and `render_station_info`
+// is no longer called from any layout function — the station card
+// (`render_station_card`, above) took its slot in `layout_operate` (and was
+// added below DX Hunter in `layout_hunt` when there's room). `ui/station_info.rs`
+// is kept intact (not deleted, per the task brief) but is now unrouted; its
+// module is still declared above so it continues to build and its own unit
+// tests (grid/distance/bearing math) still run.
 
 /// Main UI rendering function
 pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
@@ -125,13 +134,14 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
 /// `TxPlacement` (Task 13), which zooms into a genuinely different,
 /// more-detailed top-10 table view (`render_placement_zoom`) rather than
 /// the compact BEST-row instrument rendered bigger. Covers all 5
-/// `ActivePanel` variants, including `StationInfo` (still valid until
-/// Task 18 removes it from the panel cycle).
+/// `ActivePanel` variants. (Task 18 removed `StationInfo` from the panel
+/// cycle — the station card that replaced it has no `ActivePanel` variant
+/// of its own, so it has no zoom entry here either; it's never the focused
+/// panel.)
 fn render_zoomed_panel(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     match app.active_panel {
         ActivePanel::BandActivity => render_band_activity(f, area, app)?,
         ActivePanel::QsoStatus => render_qso_status(f, area, app)?,
-        ActivePanel::StationInfo => render_station_info(f, area, app)?,
         ActivePanel::Callers => render_callers(f, area, app)?,
         ActivePanel::DxHunter => render_dx_hunter(f, area, app)?,
         // TxPlacement is the one panel whose zoom is NOT just "the same
@@ -187,12 +197,14 @@ fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
         ])
         .split(lower[0]);
 
-    // Right column: Station Info (small) on top, DX Hunter (moved up) in the
-    // middle, Callers on the bottom — aligned with QSO Status across the gutter.
+    // Right column: the station card (Task 18 — took over Station Info's
+    // slot; a static summary of the global focus, not a navigable panel) on
+    // top, DX Hunter (moved up) in the middle, Callers on the bottom —
+    // aligned with QSO Status across the gutter.
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Percentage(20), // Station Info
+            Constraint::Percentage(20), // Station card
             Constraint::Percentage(40), // DX Hunter
             Constraint::Percentage(40), // Callers (bottom; across from QSO Status)
         ])
@@ -203,21 +215,23 @@ fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
     render_tx_placement(f, content[1], app)?;
     render_band_activity(f, left_chunks[0], app)?;
     render_qso_status(f, left_chunks[1], app)?;
-    render_station_info(f, right_chunks[0], app)?;
+    render_station_card(f, right_chunks[0], app)?;
     render_dx_hunter(f, right_chunks[1], app)?;
     render_callers(f, right_chunks[2], app)?;
 
     // Render active panel highlight. The slice order MUST match the
     // ActivePanel enum order used by render_active_panel_highlight:
-    // BandActivity, QsoStatus, StationInfo, Callers, DxHunter, TxPlacement.
-    // The full-width banner (content[0]) is not a navigable panel.
+    // BandActivity, QsoStatus, Callers, DxHunter, TxPlacement. The
+    // full-width banner (content[0]) is not a navigable panel, and neither
+    // is the station card (right_chunks[0], Task 18) — it has no
+    // `ActivePanel` variant, so it's deliberately absent from this slice
+    // (unlike Station Info before it, which WAS highlightable).
     render_active_panel_highlight(
         f,
         app,
         &[
             left_chunks[0],  // BandActivity
             left_chunks[1],  // QsoStatus
-            right_chunks[0], // StationInfo
             right_chunks[2], // Callers
             right_chunks[1], // DxHunter
             content[1],      // TxPlacement
@@ -229,7 +243,7 @@ fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
 
 /// Monitor-view content layout: a vertical stack — full-width active-QSO
 /// banner, a big waterfall, and full-width Band Activity — with no side
-/// panels (QSO Status / Station Info / DX Hunter / Callers). Meant for a
+/// panels (QSO Status / station card / DX Hunter / Callers). Meant for a
 /// glance-and-walk-away big-picture view.
 ///
 /// No `render_active_panel_highlight` call here: Band Activity is the only
@@ -257,37 +271,64 @@ fn layout_monitor(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
 
 /// Hunt-view content layout: DX Hunter gets top billing (full width) for
 /// picking a rare/needed station to chase, the TX-placement instrument sits
-/// underneath (per-stream markers matter here too — Task 11), Band Activity
+/// underneath (per-stream markers matter here too — Task 11), the station
+/// card (Task 18) drops in below DX Hunter when there's room, Band Activity
 /// shows the narrowed CQs-only feed, and QSO Status anchors the bottom so
-/// the operator can track an in-progress call. No Callers, no Station Info,
-/// no energy waterfall (that stays in Monitor only) — this view is about
-/// hunting, not answering.
+/// the operator can track an in-progress call. No Callers, no energy
+/// waterfall (that stays in Monitor only) — this view is about hunting, not
+/// answering.
 ///
 /// Task 6 never gave Hunt a waterfall row to "replace", so the placement
 /// strip is new real estate here rather than a swap; DX Hunter (the
 /// dominant table per the design spec) keeps its 45% share, and Band
 /// Activity's share shrinks (35%→25%) to make room instead.
 ///
+/// The station card is genuinely conditional (per the Task 17 brief: "below
+/// DX Hunter if ≥4 rows spare") — a short terminal (near the `draw()`
+/// MIN_W/MIN_H resize-guard floor, whose content area is ~15 rows) keeps the
+/// pre-card layout untouched rather than starving DX Hunter/Band
+/// Activity/QSO Status for a card that would barely fit; a taller terminal
+/// gets the extra 5-row block (3 content lines + 2 border, matching
+/// `render_station_card`'s Operate-view sizing).
+///
 /// No `render_active_panel_highlight` call, same rationale as
 /// `layout_monitor`: each panel renderer draws its own active-styled border
-/// via `create_panel_block`.
+/// via `create_panel_block` (and the station card is never the active panel
+/// anyway — it has no `ActivePanel` variant).
 fn layout_hunt(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
+    const STATION_CARD_HEIGHT: u16 = 5;
+    // Threshold picked so the `draw()` resize-guard floor (MIN_H=20 →
+    // content_area ~15 rows) never shows the card, while a normally-sized
+    // terminal (TestBackend's 120x40 fixture → content_area 35 rows) does.
+    const STATION_CARD_MIN_CONTENT_HEIGHT: u16 = 30;
+    let show_card = content_area.height >= STATION_CARD_MIN_CONTENT_HEIGHT;
+
+    let mut constraints = vec![
+        Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
+        Constraint::Length(7),      // TX Placement (full width)
+        Constraint::Percentage(45), // DX Hunter (full width)
+    ];
+    if show_card {
+        constraints.push(Constraint::Length(STATION_CARD_HEIGHT)); // Station card
+    }
+    constraints.push(Constraint::Percentage(25)); // Band Activity (full width, CQs-only)
+    constraints.push(Constraint::Min(5)); // QSO Status
+
     let content = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
-            Constraint::Length(7),      // TX Placement (full width)
-            Constraint::Percentage(45), // DX Hunter (full width)
-            Constraint::Percentage(25), // Band Activity (full width, CQs-only)
-            Constraint::Min(5),         // QSO Status
-        ])
+        .constraints(constraints)
         .split(content_area);
 
     render_active_qsos(f, content[0], app);
     render_tx_placement(f, content[1], app)?;
     render_dx_hunter(f, content[2], app)?;
-    render_band_activity(f, content[3], app)?;
-    render_qso_status(f, content[4], app)?;
+    let mut next_idx = 3;
+    if show_card {
+        render_station_card(f, content[next_idx], app)?;
+        next_idx += 1;
+    }
+    render_band_activity(f, content[next_idx], app)?;
+    render_qso_status(f, content[next_idx + 1], app)?;
 
     Ok(())
 }
@@ -297,7 +338,7 @@ fn layout_hunt(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
 /// (its per-stream TX markers matter most here — serving a pileup), and QSO
 /// Status anchors the bottom in its existing multi-table ("Active QSOs")
 /// mode so the operator can track several concurrent exchanges at once. No
-/// DX Hunter, no Band Activity, no Station Info, no energy waterfall — this
+/// DX Hunter, no Band Activity, no station card, no energy waterfall — this
 /// view is about answering, not hunting.
 ///
 /// Task 6 never gave Run a waterfall row to "replace" either (see
@@ -713,6 +754,23 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             Style::default().fg(app.theme.foreground_color()),
         ),
         Span::raw(" | "),
+        // Rig S-meter (Task 18 — demoted from the Station Info panel). Reuses
+        // `App::signal_strength_status_bar`, which shares the exact same
+        // `signal_strength_db`/`signal_strength_at` fields + staleness gate
+        // as the pre-existing `s_meter_display` (just a compact
+        // "S:{signed dB}" / "S:---" format, sized for this one-line bar).
+        Span::styled(
+            app.signal_strength_status_bar(),
+            Style::default().fg(app.theme.foreground_color()),
+        ),
+        Span::raw(" | "),
+        // Audio device short name — same source `station_info.rs` used
+        // (`app.audio_device`, falling back to "Default").
+        Span::styled(
+            format!("Dev: {}", app.audio_device.as_deref().unwrap_or("Default")),
+            Style::default().fg(app.theme.foreground_color()),
+        ),
+        Span::raw(" | "),
         Span::styled(
             format!("Msgs: {}", messages_count),
             Style::default().fg(app.theme.foreground_color()),
@@ -884,10 +942,9 @@ fn render_active_panel_highlight(f: &mut Frame<'_>, app: &App, panel_areas: &[Re
     let active_area = match app.active_panel {
         ActivePanel::BandActivity => panel_areas[0],
         ActivePanel::QsoStatus => panel_areas[1],
-        ActivePanel::StationInfo => panel_areas[2],
-        ActivePanel::Callers => panel_areas[3],
-        ActivePanel::DxHunter => panel_areas[4],
-        ActivePanel::TxPlacement => panel_areas[5],
+        ActivePanel::Callers => panel_areas[2],
+        ActivePanel::DxHunter => panel_areas[3],
+        ActivePanel::TxPlacement => panel_areas[4],
     };
 
     // Draw a subtle highlight border around the active panel
@@ -1198,10 +1255,13 @@ mod view_render_tests {
     }
 
     async fn render_view(view: crate::view::ActiveView) -> ratatui::buffer::Buffer {
-        // Station Info is not asserted on by the (single-render) callers of
-        // this helper, so it's the panel we sacrifice to the title-blanking
-        // quirk above.
-        render_view_with_panel(view, crate::app::ActivePanel::StationInfo).await
+        // Blanking (see the quirk note above) only ever applies in Operate
+        // (the only view that calls `render_active_panel_highlight`), and
+        // callers of this helper never target Operate directly (they build
+        // their own renders — see `operate_view_shows_all_six_panels`), so
+        // any `ActivePanel` value is fine here. `BandActivity` (the app's
+        // own default) keeps this helper boring.
+        render_view_with_panel(view, crate::app::ActivePanel::BandActivity).await
     }
     fn buffer_contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
         (0..buf.area.height).any(|y| {
@@ -1232,35 +1292,55 @@ mod view_render_tests {
 
     #[tokio::test]
     async fn operate_view_shows_all_six_panels() {
-        // Render #1: Station Info active — its own title is blanked by
-        // `render_active_panel_highlight` (see the quirk note above), but
-        // this proves the other five panels' titles render. Task 11 swapped
-        // the waterfall for the TX-placement instrument here, so "TX
-        // Placement" replaces the old waterfall-presence assertion.
+        // Task 18: `StationInfo` is no longer an `ActivePanel` variant, so
+        // the station card that took its slot (title "Station") is NEVER
+        // blanked by `render_active_panel_highlight` — only one of the 5
+        // remaining NAVIGABLE panels is blanked per render. Two renders with
+        // different active panels still cover all 5 + the always-visible
+        // card.
+        //
+        // Render #1: Band Activity active (blanks Band Activity) — proves
+        // QSO Status / Callers / DX Hunter / TX Placement / the station card
+        // all render. Task 11 swapped the waterfall for the TX-placement
+        // instrument here, so "TX Placement" replaces the old
+        // waterfall-presence assertion.
         let buf = render_view(crate::view::ActiveView::Operate).await;
         for t in [
-            "Band Activity",
             "QSO Status",
             "DX Hunter",
             "Callers",
             "TX Placement",
+            "Station",
         ] {
             assert!(buffer_contains(&buf, t), "missing {t}");
         }
 
-        // Render #2: a DIFFERENT panel (Band Activity, the app default)
-        // active instead, so Station Info's own title is no longer blanked
-        // and can be asserted — completing coverage of all 5 panels.
+        // Render #2: a DIFFERENT panel (DX Hunter) active instead, so Band
+        // Activity's own title is no longer blanked and can be asserted —
+        // completing coverage of all 5 navigable panels.
         let buf2 = render_view_with_panel(
             crate::view::ActiveView::Operate,
-            crate::app::ActivePanel::BandActivity,
+            crate::app::ActivePanel::DxHunter,
         )
         .await;
         assert!(
-            buffer_contains(&buf2, "Station Info"),
-            "missing Station Info"
+            buffer_contains(&buf2, "Band Activity"),
+            "missing Band Activity"
         );
     }
+
+    /// Task 18: the S-meter and audio-device spans that used to live only
+    /// in the (now-unrouted) Station Info panel join the status bar.
+    #[tokio::test]
+    async fn status_bar_shows_s_meter_and_device_spans() {
+        let buf = render_view(crate::view::ActiveView::Operate).await;
+        assert!(
+            buffer_contains(&buf, "S:---"),
+            "missing S-meter placeholder span"
+        );
+        assert!(buffer_contains(&buf, "Dev:"), "missing device span");
+    }
+
     #[tokio::test]
     async fn monitor_view_drops_side_panels() {
         let buf = render_view(crate::view::ActiveView::Monitor).await;
@@ -1268,7 +1348,9 @@ mod view_render_tests {
         assert!(!buffer_contains(&buf, "DX Hunter"));
         assert!(!buffer_contains(&buf, "Callers"));
         assert!(!buffer_contains(&buf, "QSO Status"));
-        assert!(!buffer_contains(&buf, "Station Info"));
+        // Neither the (removed) Station Info panel nor the station card that
+        // replaced it are ever rendered in Monitor.
+        assert!(!buffer_contains(&buf, "Station"));
     }
 
     #[tokio::test]
@@ -1278,6 +1360,38 @@ mod view_render_tests {
         assert!(buffer_contains(&buf, "Band Activity"));
         assert!(buffer_contains(&buf, "TX Placement"));
         assert!(!buffer_contains(&buf, "Callers"));
+        // TestBackend's 120x40 fixture gives Hunt a 35-row content area,
+        // comfortably over the `layout_hunt` STATION_CARD_MIN_CONTENT_HEIGHT
+        // (30), so the station card (Task 18) should show up below DX Hunter.
+        assert!(
+            buffer_contains(&buf, "Station"),
+            "station card should render below DX Hunter when there's room"
+        );
+    }
+
+    /// `layout_hunt` only adds the station card when the terminal has room
+    /// to spare (Task 17 brief: "below DX Hunter if ≥4 rows spare") — a
+    /// short terminal keeps the pre-card layout so DX Hunter / Band Activity
+    /// / QSO Status aren't starved, and (just as importantly) never panics
+    /// trying to lay out a row that doesn't fit.
+    #[tokio::test]
+    async fn hunt_view_omits_station_card_on_a_short_terminal() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.active_view = crate::view::ActiveView::Hunt;
+        // 80x24: above the draw() resize-guard floor (80x20) but well under
+        // the station-card room threshold once title/strip/status-bar rows
+        // are subtracted (content area = 24 - 1 - 1 - 3 = 19 rows).
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(buffer_contains(&buf, "DX Hunter"));
+        assert!(
+            !buffer_contains(&buf, "Station"),
+            "station card should be omitted on a short terminal"
+        );
     }
 
     #[tokio::test]
