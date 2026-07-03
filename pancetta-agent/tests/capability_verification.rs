@@ -114,10 +114,18 @@ fn canonical_bytes(grant: &serde_json::Map<String, Value>) -> Vec<u8> {
     serde_json::to_vec(&sorted).unwrap()
 }
 
-/// Sign `grant` with `key` and insert `clientSig`.
+/// Domain-separation tag for txArmGrant.clientSig (dispensa Q-0019 #6,
+/// 2026-07-02, interop-locked). Mirrors `pancetta_agent::capability::TX_ARM_GRANT_DOMAIN_TAG`.
+const TX_ARM_GRANT_DOMAIN_TAG: &str = "cqdx-tx-arm-grant-v1";
+
+/// Sign `grant` with `key` and insert `clientSig`, over the DOMAIN-SEPARATED
+/// canonical bytes (tag || 0x00 || canon) per Q-0019 #6.
 fn sign_grant(mut grant: serde_json::Map<String, Value>, key: &SigningKey) -> Value {
     let canon = canonical_bytes(&grant);
-    let sig = key.sign(&canon);
+    let mut signed_msg = TX_ARM_GRANT_DOMAIN_TAG.as_bytes().to_vec();
+    signed_msg.push(0x00);
+    signed_msg.extend_from_slice(&canon);
+    let sig = key.sign(&signed_msg);
     grant.insert("clientSig".to_string(), json!(b64url(&sig.to_bytes())));
     Value::Object(grant)
 }

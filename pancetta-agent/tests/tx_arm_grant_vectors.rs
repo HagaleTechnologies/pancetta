@@ -18,6 +18,18 @@ use serde_json::Value;
 
 const FIXTURE: &str = include_str!("fixtures/tx-arm-grant.vectors.v1.json");
 
+/// Domain-separation tag for `clientSig` (dispensa Q-0019 #6, 2026-07-02,
+/// interop-locked). Mirrors `pancetta_agent::capability::TX_ARM_GRANT_DOMAIN_TAG`.
+const TX_ARM_GRANT_DOMAIN_TAG: &str = "cqdx-tx-arm-grant-v1";
+
+/// `domainSep(tag, canon) = tag.as_bytes() || 0x00 || canon`.
+fn domain_separated(canon: &[u8]) -> Vec<u8> {
+    let mut out = TX_ARM_GRANT_DOMAIN_TAG.as_bytes().to_vec();
+    out.push(0x00);
+    out.extend_from_slice(canon);
+    out
+}
+
 /// Decode unpadded base64url (`-`→`+`, `_`→`/`, re-pad to a multiple of 4).
 fn decode_b64url(input: &str) -> Vec<u8> {
     let mut s: String = input
@@ -93,8 +105,8 @@ fn client_sig_verifies_over_canonical_bytes() {
     let vk = VerifyingKey::from_bytes(&pk_bytes).expect("valid ed25519 verifying key");
     let sig = Signature::from_bytes(&sig_bytes);
 
-    vk.verify_strict(&canon, &sig)
-        .expect("clientSig must verify over canonical bytes");
+    vk.verify_strict(&domain_separated(&canon), &sig)
+        .expect("clientSig must verify over domain-separated canonical bytes (Q-0019 #6)");
 }
 
 #[test]
@@ -133,7 +145,7 @@ fn mutated_grant_fails_verification() {
     let sig = Signature::from_bytes(&sig_bytes);
 
     assert!(
-        vk.verify_strict(&canon, &sig).is_err(),
+        vk.verify_strict(&domain_separated(&canon), &sig).is_err(),
         "verification must FAIL for a mutated grant"
     );
 }

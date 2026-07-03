@@ -21,9 +21,11 @@
 //!    **best-effort** revocation deny-list ([`CapError::Revoked`]; an empty
 //!    deny-list is inert, the station-local allow-list is the authoritative
 //!    revoke). Then the txArmGrant is verified
-//!    against the **client device key** (`clientSig`, Ed25519 over the canonical
-//!    grant bytes — station-rooted TX proof; cqdx never signs this, so a cloud
-//!    breach alone can NEVER forge a valid arm, per e2e-auth.v1 §4). It further
+//!    against the **client device key** (`clientSig`, Ed25519 over the
+//!    domain-separated canonical grant bytes — `domainSep("cqdx-tx-arm-grant-v1",
+//!    canon)`, dispensa Q-0019 #6 — station-rooted TX proof; cqdx never signs
+//!    this, so a cloud breach alone can NEVER forge a valid arm, per
+//!    e2e-auth.v1 §4). It further
 //!    honors the grant ONLY if the grant's `clientKeyId` is in the
 //!    **STATION-LOCAL TX-allow-list** (`tx_allow_list`, distinct from the pinned
 //!    IdP keys) — so a relay/cloud compromise alone can NEVER cause TX
@@ -101,6 +103,12 @@ pub const MAX_ENABLEMENT_SEC: i64 = 86_400;
 /// enough to be meaningful, large enough to absorb normal NTP jitter between the
 /// IdP and the station.
 pub const MAX_IAT_SKEW_SEC: i64 = 120;
+
+/// Domain-separation tag for `txArmGrant.clientSig` (dispensa `e2e-auth.v1`,
+/// Q-0019 #6, 2026-07-02, interop-locked — all three implementations moved
+/// together; see `contracts/auth/tx-arm-grant.vectors.v1.json`). The signed
+/// preimage is `tag.as_bytes() || 0x00 || canonicalGrantBytes`.
+pub const TX_ARM_GRANT_DOMAIN_TAG: &str = "cqdx-tx-arm-grant-v1";
 
 /// A verifier holding this agent's own keyId (the expected `aud`) and the set of
 /// PINNED IdP public keys. Constructed once from [`crate::pairing::PairedState`]
@@ -509,7 +517,20 @@ impl CapabilityVerifier {
             .ok_or_else(|| CapError::MalformedClaim("clientSig".to_string()))?;
         let canon = canonical_grant_bytes(obj)?;
 
-        // 2. Verify clientSig (Ed25519, verify_strict) over the canonical bytes.
+        // 2. Verify clientSig (Ed25519, verify_strict) over the DOMAIN-SEPARATED
+        //    canonical bytes: domainSep("cqdx-tx-arm-grant-v1", canon) =
+        //    tag.as_bytes() || 0x00 || canon (dispensa Q-0019 #6, 2026-07-02,
+        //    interop-locked: all three impls moved together; canonicalization
+        //    itself is UNCHANGED, only the signed preimage gained the tag
+        //    prefix). Matches every other identity-key signature in the system
+        //    (see `TX_ARM_GRANT_DOMAIN_TAG`, `pairing::IDSIG_TAG`,
+        //    `session::AUTH_DOMAIN_TAG`) — closes the "clientSig was the sole
+        //    untagged signature, safe only by canonical-JSON's leading `{`
+        //    byte never colliding with a `cqdx-` tag prefix" finding from the
+        //    2026-07-02 security review.
+        let mut signed_msg = TX_ARM_GRANT_DOMAIN_TAG.as_bytes().to_vec();
+        signed_msg.push(0x00);
+        signed_msg.extend_from_slice(&canon);
         let sig_raw = decode_b64url(client_sig_b64).map_err(|_| CapError::BadSignature)?;
         let sig_bytes: [u8; 64] = sig_raw
             .as_slice()
@@ -517,7 +538,7 @@ impl CapabilityVerifier {
             .map_err(|_| CapError::BadSignature)?;
         let sig = Signature::from_bytes(&sig_bytes);
         client_verifying_key
-            .verify_strict(&canon, &sig)
+            .verify_strict(&signed_msg, &sig)
             .map_err(|_| CapError::BadSignature)?;
 
         // 3. aud == our agent keyId; clientKeyId == the verified capability's.
