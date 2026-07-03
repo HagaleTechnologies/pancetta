@@ -279,6 +279,8 @@ async fn main() -> Result<()> {
     // Initialize logging first
     let _log_guard = init_logging(&cli, cli.headless)?;
 
+    install_panic_hook();
+
     info!(
         "Starting Pancetta v{} - High-Performance Amateur Radio FT8 Processing",
         env!("CARGO_PKG_VERSION")
@@ -1227,6 +1229,54 @@ async fn test_rig_command(args: TestRigArgs, cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+/// Count of panics observed process-wide since startup, via [`install_panic_hook`].
+/// docs/task-supervision-plan.md item 4 ("panics are never silent") — mirrors
+/// the existing `DECODE_PANIC_COUNT` pattern in `coordinator/ft8.rs`, but
+/// process-wide rather than scoped to the two catch_unwind sites in the
+/// decode loop.
+static PANIC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Install a process-wide panic hook so a panic ANYWHERE (including inside a
+/// spawned component task — qso/hamlib/autonomous/etc. currently have no
+/// `catch_unwind` at all) is guaranteed to reach the file log, not just
+/// stderr.
+///
+/// docs/task-supervision-plan.md problem statement: "no `set_panic_hook`
+/// anywhere" — a panic in a background task previously produced only the
+/// default Rust panic message on stderr, which is INVISIBLE under the TUI
+/// (which owns the terminal via an alternate screen) and easily missed even
+/// headless. The task then silently dies: `check_task_handles` polls
+/// `is_finished()`, marks it `Failed`, and nothing ever inspected WHY.
+///
+/// This does not change panic behavior (still `panic = "unwind"`, still
+/// unwinds only the panicking task/thread — the process survives) and does
+/// not attempt recovery; it only guarantees the panic is *logged with full
+/// context* and *counted*, chaining onto the default hook so interactive
+/// `cargo run` still shows the familiar stderr message too.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let n = PANIC_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        error!(
+            target: "panic",
+            "PANIC #{n} on thread '{thread_name}' at {location}: {payload}"
+        );
+        default_hook(info);
+    }));
+}
+
 fn init_logging(cli: &Cli, headless: bool) -> Result<tracing_appender::non_blocking::WorkerGuard> {
     let log_level = if cli.verbose {
         "trace"
@@ -1292,6 +1342,26 @@ mod tests {
     use super::*;
     use assert_cmd::Command;
     use predicates::prelude::*;
+
+    /// docs/task-supervision-plan.md item 4: a panic must be counted and
+    /// logged (not just chained to the default hook silently). Uses a
+    /// before/after delta rather than an absolute count since `PANIC_COUNT`
+    /// is process-global and other tests in this binary may also panic
+    /// concurrently.
+    #[test]
+    fn panic_hook_counts_and_survives_via_catch_unwind() {
+        install_panic_hook();
+        let before = PANIC_COUNT.load(Ordering::Relaxed);
+        let result = std::panic::catch_unwind(|| {
+            panic!("test panic for install_panic_hook coverage");
+        });
+        assert!(result.is_err(), "catch_unwind should observe the panic");
+        let after = PANIC_COUNT.load(Ordering::Relaxed);
+        assert!(
+            after > before,
+            "PANIC_COUNT must increase after a panic (before={before}, after={after})"
+        );
+    }
 
     #[test]
     fn test_cli_help() {
