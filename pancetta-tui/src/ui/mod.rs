@@ -24,7 +24,7 @@ use callers::render_callers;
 use dx_hunter::render_dx_hunter;
 use qso_status::render_qso_status;
 use station_info::render_station_info;
-use tx_placement::render_tx_placement;
+use tx_placement::{render_placement_zoom, render_tx_placement};
 
 /// Main UI rendering function
 pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
@@ -121,7 +121,10 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
 /// Renders the focused panel (`app.active_panel`) full-screen in `area`,
 /// bypassing whichever `ActiveView` grid is normally in effect. Calls the
 /// SAME `render_*` function each view's grid layout uses, just with the
-/// whole content rect instead of a sliced-down chunk. Covers all 5
+/// whole content rect instead of a sliced-down chunk — EXCEPT
+/// `TxPlacement` (Task 13), which zooms into a genuinely different,
+/// more-detailed top-10 table view (`render_placement_zoom`) rather than
+/// the compact BEST-row instrument rendered bigger. Covers all 5
 /// `ActivePanel` variants, including `StationInfo` (still valid until
 /// Task 18 removes it from the panel cycle).
 fn render_zoomed_panel(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
@@ -131,7 +134,10 @@ fn render_zoomed_panel(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
         ActivePanel::StationInfo => render_station_info(f, area, app)?,
         ActivePanel::Callers => render_callers(f, area, app)?,
         ActivePanel::DxHunter => render_dx_hunter(f, area, app)?,
-        ActivePanel::TxPlacement => render_tx_placement(f, area, app)?,
+        // TxPlacement is the one panel whose zoom is NOT just "the same
+        // renderer, bigger" (Task 13) — it swaps to a full-screen top-10
+        // ranked table with columns the compact 5-row instrument can't fit.
+        ActivePanel::TxPlacement => render_placement_zoom(f, area, app)?,
     }
     Ok(())
 }
@@ -1359,6 +1365,59 @@ mod view_render_tests {
             bin_hz: 25.0,
             range: (200.0, 2600.0),
             received_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A canned 10-slice `PlacementView` for the Task-13 top-10 zoom-table
+    /// test — distinct from `fixture_placement_view` (3 slices, used by the
+    /// compact-instrument tests) because the zoom table needs a full top-10
+    /// to prove all 10 rows render, not just the 5 the BEST row shows.
+    fn fixture_placement_view_10() -> crate::app::PlacementView {
+        let mut slices = Vec::new();
+        for i in 0..10 {
+            slices.push(crate::app::PlacementSlice {
+                offset_hz: 1480.0 - (i as f64) * 10.0,
+                score: 98.0 - i as f64,
+                clear_first: true,
+                clear_second: true,
+            });
+        }
+        crate::app::PlacementView {
+            slices,
+            openness: vec![3; 96],
+            bin_hz: 25.0,
+            range: (200.0, 2600.0),
+            received_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn zoom_tx_placement_shows_top_10_table() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.active_view = crate::view::ActiveView::Operate;
+        app.active_panel = crate::app::ActivePanel::TxPlacement;
+        app.zoomed = true;
+        app.apply_placement(fixture_placement_view_10());
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        assert!(buffer_contains(&buf, "Freq"), "missing Freq header");
+        assert!(
+            buffer_contains(&buf, "\u{2460} 1480"),
+            "missing rank-1 row ① 1480"
+        );
+        // All 10 slices should render as distinct rows — check a spread of
+        // offsets across the fixture (first, middle, last).
+        for needle in ["1480", "1430", "1390"] {
+            assert!(
+                buffer_contains(&buf, needle),
+                "missing candidate offset {needle}"
+            );
         }
     }
 

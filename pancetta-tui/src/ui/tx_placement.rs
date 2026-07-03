@@ -18,15 +18,21 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Cell, Paragraph, Row, Table},
     Frame,
 };
 
 use super::create_panel_block;
 use crate::app::{ActivePanel, App, PlacementView};
 
-/// Circled digits for the BEST row's ranked candidates (①-⑤).
-const CIRCLED_DIGITS: [char; 5] = ['\u{2460}', '\u{2461}', '\u{2462}', '\u{2463}', '\u{2464}'];
+/// Circled digits for ranked candidates (①-⑩) — shared by the compact
+/// BEST row (Task 11, top 5) and the full-screen top-10 zoom table
+/// (Task 13, `render_placement_zoom`), so both call sites use one rank
+/// convention.
+const CIRCLED_DIGITS: [char; 10] = [
+    '\u{2460}', '\u{2461}', '\u{2462}', '\u{2463}', '\u{2464}', '\u{2465}', '\u{2466}', '\u{2467}',
+    '\u{2468}', '\u{2469}',
+];
 
 /// Fixed tick frequencies for the axis row, mirroring `Waterfall`'s
 /// `TICK_FREQS` (`widgets/mod.rs`). Only ticks that fall inside the
@@ -77,6 +83,127 @@ pub fn render_tx_placement(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<(
     render_freq_axis(f, rows[4], app, placement);
 
     Ok(())
+}
+
+/// Render the full-screen top-10 zoom table for the TX-placement panel
+/// (pressing `z` while the panel is focused — see
+/// `ui/mod.rs::render_zoomed_panel`). Unlike `render_tx_placement`'s
+/// compact BEST row (top 5, 4 fields squeezed onto one line), this shows
+/// the SAME allocator snapshot (`app.placement`, top-10 — the coordinator
+/// already requests `placement_snapshot(10)`) as a proper ranked table with
+/// more columns: `#, Freq, Windows, Score, Gap(Hz), Quiet`.
+///
+/// `Quiet` is a **deliberate placeholder** — the instrument only carries a
+/// single per-snapshot `received_at` timestamp, not per-slice decode-
+/// activity history, so a real "time since activity near this frequency"
+/// value isn't available in v1. Every row renders `-` rather than fabricate
+/// one; a real per-slice quiet-duration column is a documented follow-up.
+pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
+    let is_active = matches!(app.active_panel, ActivePanel::TxPlacement);
+    let block = create_panel_block("TX Placement \u{2014} Top 10", is_active, app);
+
+    let Some(placement) = app.placement.as_ref() else {
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.width > 0 && inner.height > 0 {
+            let msg = Paragraph::new(
+                "Waiting for TX-placement data (first autonomous tick pending)\u{2026}",
+            )
+            .style(Style::default().fg(app.theme.muted_color()));
+            f.render_widget(msg, inner);
+        }
+        return Ok(());
+    };
+
+    let header_cells = ["#", "Freq", "Windows", "Score", "Gap(Hz)", "Quiet"]
+        .iter()
+        .map(|h| {
+            Cell::from(*h).style(
+                Style::default()
+                    .fg(app.theme.accent_color())
+                    .add_modifier(Modifier::BOLD),
+            )
+        });
+    let header = Row::new(header_cells).height(1).bottom_margin(0);
+
+    let n_bins = placement.openness.len();
+    let mut rows: Vec<Row> = placement
+        .slices
+        .iter()
+        .take(10)
+        .enumerate()
+        .map(|(i, slice)| {
+            let rank = CIRCLED_DIGITS
+                .get(i)
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| (i + 1).to_string());
+            let coverage = coverage_label(slice.clear_first, slice.clear_second);
+            let gap =
+                bin_index_for_freq(slice.offset_hz, placement.range, placement.bin_hz, n_bins)
+                    .map(|bin| nearest_busy_gap_hz(bin, &placement.openness, placement.bin_hz))
+                    .map(|hz| format!("{hz:.0}"))
+                    .unwrap_or_else(|| "\u{2014}".to_string());
+
+            Row::new([
+                Cell::from(rank),
+                Cell::from(format!("{:.0}", slice.offset_hz)),
+                Cell::from(coverage),
+                Cell::from(format!("{:.0}", slice.score)),
+                Cell::from(gap),
+                Cell::from("-"),
+            ])
+        })
+        .collect();
+
+    if rows.is_empty() {
+        rows.push(Row::new([
+            Cell::from(""),
+            Cell::from("no clear placement candidates yet"),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+        ]));
+    }
+
+    let widths = [
+        Constraint::Length(1), // #
+        Constraint::Length(6), // Freq
+        Constraint::Length(7), // Windows
+        Constraint::Length(7), // Score
+        Constraint::Length(8), // Gap(Hz)
+        Constraint::Length(6), // Quiet
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(1)
+        .style(Style::default().fg(app.theme.foreground_color()));
+
+    f.render_widget(table, area);
+    Ok(())
+}
+
+/// Distance (in Hz) from `bin` to the nearest bin whose openness code is
+/// `0` (busy in both time slots — the openness strip's muted `·` glyph),
+/// searching outward on both sides and reporting the smaller distance.
+///
+/// Edge case (no busy bin at all on one or both sides within `openness`):
+/// falls back to the vec's edge index on that side, per the task brief —
+/// so on a fully-clear band this reports the distance to whichever edge of
+/// the scanned range is closer, rather than treating "found nothing" as an
+/// error or infinity.
+fn nearest_busy_gap_hz(bin: usize, openness: &[u8], bin_hz: f64) -> f64 {
+    let n = openness.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let left_idx = (0..bin).rev().find(|&i| openness[i] == 0).unwrap_or(0);
+    let right_idx = ((bin + 1)..n).find(|&i| openness[i] == 0).unwrap_or(n - 1);
+    let left_dist = bin.saturating_sub(left_idx) as f64;
+    let right_dist = right_idx.saturating_sub(bin) as f64;
+    left_dist.min(right_dist) * bin_hz
 }
 
 /// Map a screen column to a bin index in `openness`, using the same
@@ -362,6 +489,31 @@ fn render_freq_axis(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Placeme
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
+
+    #[test]
+    fn nearest_busy_gap_hz_finds_nearer_busy_bin_on_either_side() {
+        // busy at bins 2 and 8; bin 5 is 3 away from each side, so the
+        // gap should be 3 * bin_hz regardless of which side wins the tie.
+        let openness = [3, 3, 0, 3, 3, 3, 3, 3, 0, 3];
+        assert_eq!(nearest_busy_gap_hz(5, &openness, 25.0), 75.0);
+        // bin 3 is 1 away from the busy bin at 2, 5 away from the one at 8.
+        assert_eq!(nearest_busy_gap_hz(3, &openness, 25.0), 25.0);
+    }
+
+    #[test]
+    fn nearest_busy_gap_hz_falls_back_to_vec_edge_when_no_busy_bin_exists() {
+        // Fully-clear band: no bin is ever 0, so both searches exhaust and
+        // fall back to the edges (index 0 / n-1) per the documented
+        // edge-case choice — the reported gap is the distance to whichever
+        // edge of the scanned range is closer.
+        let openness = [3; 10];
+        // bin 2: left edge is 2 away, right edge (idx 9) is 7 away -> min 2.
+        assert_eq!(nearest_busy_gap_hz(2, &openness, 25.0), 50.0);
+        // bin 0 is already the left edge (0 away); right edge is 9 away.
+        assert_eq!(nearest_busy_gap_hz(0, &openness, 25.0), 0.0);
+        // bin 9 is already the right edge (0 away); left edge is 9 away.
+        assert_eq!(nearest_busy_gap_hz(9, &openness, 25.0), 0.0);
+    }
 
     #[test]
     fn freq_to_col_matches_waterfall_scaling() {
