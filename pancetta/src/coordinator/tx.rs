@@ -834,6 +834,20 @@ impl super::ApplicationCoordinator {
                     abort_current_tx.store(false, Ordering::Release);
                     match tx_rx.try_recv() {
                         Ok(mut message) => {
+                            // qso-state-machine-analysis Symptom B fix: capture
+                            // "now" HERE, at pickup, before the collection sleep
+                            // below (and any coalescing). Both scheduling sites
+                            // downstream (TransmitRequest and MultiTransmitRequest
+                            // arms) reuse this SAME timestamp instead of re-reading
+                            // the clock after the sleep. Without this, the
+                            // COALESCE_COLLECT_WINDOW_MS sleep itself could push a
+                            // request that was genuinely viable for the CURRENT
+                            // slot (arrived with, say, 7.5s left before
+                            // tx_late_max_ms) past the late-cap purely by the
+                            // scheduling decision being made ~800ms later than the
+                            // request actually arrived — an unforced ~30s defer.
+                            let request_received_at = chrono::Utc::now();
+
                             // --- Backpressure / staleness coalescing ---
                             // The worker processes one request at a time and a
                             // single transmit spans ~13-28s, while keep-call +
@@ -1049,12 +1063,12 @@ impl super::ApplicationCoordinator {
                                     let required_parity = resolve_required_parity(
                                         tx_parity,
                                         tx_self_parity,
-                                        chrono::Utc::now(),
+                                        request_received_at,
                                         slot_ns,
                                     );
 
                                     let schedule = schedule_tx(
-                                        chrono::Utc::now(),
+                                        request_received_at,
                                         required_parity,
                                         tx_late_max_ms,
                                         sample_rate,
@@ -1681,12 +1695,12 @@ impl super::ApplicationCoordinator {
                                     let required_parity = resolve_required_parity(
                                         tx_parity,
                                         tx_self_parity,
-                                        chrono::Utc::now(),
+                                        request_received_at,
                                         slot_ns,
                                     );
 
                                     let schedule = schedule_tx(
-                                        chrono::Utc::now(),
+                                        request_received_at,
                                         required_parity,
                                         tx_late_max_ms,
                                         sample_rate,
