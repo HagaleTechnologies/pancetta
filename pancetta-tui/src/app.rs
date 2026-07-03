@@ -369,6 +369,38 @@ pub struct DiagnosticEventRecord {
     pub callsign: Option<String>,
 }
 
+/// One scored candidate slice in the TX-placement instrument, mirroring
+/// `pancetta_qso::frequency::FrequencyCandidate` field-for-field (minus
+/// `clear_both_slots`/`noise_floor`, which the instrument doesn't need).
+/// Deliberately a TUI-local type — `pancetta-tui` must not depend on
+/// `pancetta-qso`; the coordinator's relay layer (`tui_relay.rs`) converts.
+#[derive(Debug, Clone)]
+pub struct PlacementSlice {
+    pub offset_hz: f64,
+    pub score: f64,
+    pub clear_first: bool,
+    pub clear_second: bool,
+}
+
+/// A ranked snapshot of band openness for the TX-placement instrument,
+/// mirroring `pancetta_qso::frequency::PlacementSnapshot`. TUI-local type
+/// (see `PlacementSlice`); relayed from `MessageType::TxPlacementUpdate` via
+/// `TuiMessage::TxPlacementUpdate`.
+#[derive(Debug, Clone)]
+pub struct PlacementView {
+    /// Top-N ranked candidates, sorted by score descending.
+    pub slices: Vec<PlacementSlice>,
+    /// Per-bin openness code across the full allocation range:
+    /// 0=busy-both, 1=second-only-clear, 2=first-only-clear, 3=clear-both.
+    pub openness: Vec<u8>,
+    /// Bin width in Hz (matches the allocator's `step_hz`).
+    pub bin_hz: f64,
+    /// Allocation range (min, max) in Hz.
+    pub range: (f64, f64),
+    /// When this snapshot was received by the TUI.
+    pub received_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Which field of the frequency-entry modal is focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FreqModalField {
@@ -853,6 +885,18 @@ pub struct App {
     /// Esc or Tab also clear it. Never persisted (session-only, like
     /// `help_visible`).
     pub zoomed: bool,
+
+    /// Latest TX-placement instrument snapshot (relayed from
+    /// `MessageType::TxPlacementUpdate` via `apply_placement`). `None` until
+    /// the first snapshot arrives. Tasks 11-16 render/interact with this.
+    pub placement: Option<PlacementView>,
+    /// Selection cursor into `placement.slices`. Clamped to
+    /// `slices.len().saturating_sub(1)` on every `apply_placement` call so a
+    /// shorter new snapshot never leaves the cursor pointing past the end.
+    pub placement_cursor: usize,
+    /// When the operator "parked" a TX-placement pick, if any. `None` = not
+    /// parked. Set/cleared by later tasks (12).
+    pub parked_since: Option<DateTime<Utc>>,
 }
 
 /// Peak intensity in the latest waterfall row within ±radius_hz of center_hz.
@@ -969,6 +1013,9 @@ impl App {
             band_cache: HashMap::new(),
             active_view: Self::load_persisted_view(),
             zoomed: false,
+            placement: None,
+            placement_cursor: 0,
+            parked_since: None,
         };
 
         // Initialize audio monitoring if device specified
@@ -1919,6 +1966,19 @@ impl App {
         if was_at_end || self.show_diagnostics && self.diagnostic_events.len() == 1 {
             self.diagnostics_scroll = self.diagnostic_events.len().saturating_sub(1);
         }
+    }
+
+    /// Apply a fresh TX-placement snapshot (relayed from the coordinator's
+    /// `MessageType::TxPlacementUpdate`). `v.received_at` is stamped by the
+    /// relay layer (`tui_relay.rs`) at conversion time, since it owns the
+    /// `pancetta_qso::PlacementSnapshot` -> `PlacementView` mapping; this
+    /// method stores it as-is. Clamps `placement_cursor` into the new
+    /// (possibly shorter) `slices` list — the same "cursor must survive a
+    /// mutation" invariant Band Activity/DX Hunter/Callers established.
+    pub fn apply_placement(&mut self, v: PlacementView) {
+        let max_index = v.slices.len().saturating_sub(1);
+        self.placement = Some(v);
+        self.placement_cursor = self.placement_cursor.min(max_index);
     }
 
     pub fn update_component_status(&mut self, component: String, status: String) {
@@ -5011,5 +5071,24 @@ mod tests {
         assert!(app.is_engaged("JA1ABC"));
         assert!(app.is_engaged("JA1ABC/P"));
         assert!(!app.is_engaged("JA1ABD"));
+    }
+
+    #[tokio::test]
+    async fn placement_update_clamps_cursor() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.placement_cursor = 7;
+        app.apply_placement(PlacementView {
+            slices: vec![PlacementSlice {
+                offset_hz: 1480.0,
+                score: 98.0,
+                clear_first: true,
+                clear_second: true,
+            }],
+            openness: vec![3; 96],
+            bin_hz: 25.0,
+            range: (200.0, 2600.0),
+            received_at: Utc::now(),
+        });
+        assert_eq!(app.placement_cursor, 0);
     }
 }

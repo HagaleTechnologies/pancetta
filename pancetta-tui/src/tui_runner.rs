@@ -219,6 +219,15 @@ pub enum TuiMessage {
         /// `true` = system-default fallback (misconfig).
         is_default: bool,
     },
+    /// TX-placement instrument snapshot, relayed from the coordinator's
+    /// `MessageType::TxPlacementUpdate` (which carries a
+    /// `pancetta_qso::frequency::PlacementSnapshot`). The relay
+    /// (`tui_relay.rs`) converts it to the TUI-local `PlacementView` field-
+    /// for-field so `pancetta-tui` never depends on `pancetta-qso`.
+    TxPlacementUpdate {
+        /// TUI-local mirror of the qso-crate snapshot.
+        view: crate::app::PlacementView,
+    },
 }
 
 /// Commands sent from TUI
@@ -702,6 +711,9 @@ impl TuiRunner {
                     qso_id,
                     callsign,
                 });
+            }
+            TuiMessage::TxPlacementUpdate { view } => {
+                app.apply_placement(view);
             }
         }
 

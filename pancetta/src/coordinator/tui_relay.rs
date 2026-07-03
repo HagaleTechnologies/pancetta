@@ -534,6 +534,34 @@ impl super::ApplicationCoordinator {
                                 },
                             );
                         }
+                        MessageType::TxPlacementUpdate { ref snapshot } => {
+                            // TX-placement instrument (Task 9/10): convert the
+                            // qso-crate PlacementSnapshot into the TUI-local
+                            // PlacementView field-for-field — pancetta-tui must
+                            // not depend on pancetta-qso, so this relay is the
+                            // ONLY place the conversion happens.
+                            let slices = snapshot
+                                .slices
+                                .iter()
+                                .map(|c| pancetta_tui::app::PlacementSlice {
+                                    offset_hz: c.offset_hz,
+                                    score: c.score,
+                                    clear_first: c.clear_first,
+                                    clear_second: c.clear_second,
+                                })
+                                .collect();
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxPlacementUpdate {
+                                    view: pancetta_tui::app::PlacementView {
+                                        slices,
+                                        openness: snapshot.openness.clone(),
+                                        bin_hz: snapshot.bin_hz,
+                                        range: snapshot.range,
+                                        received_at: chrono::Utc::now(),
+                                    },
+                                },
+                            );
+                        }
                         _ => {}
                     }
                 }
