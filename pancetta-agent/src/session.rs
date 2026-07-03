@@ -211,17 +211,24 @@ impl<'a, W: WsConn> AgentSession<'a, W> {
         // have one; thereafter it also becomes our `env.dst` (msg2/replies).
         // NOTE (security): learning the peer does NOT authorize TX — arming is
         // gated separately by the station-local TX-allow-list in `capability`.
-        if self.client_key_id.is_empty() {
-            if let Some(src) = src {
-                self.client_key_id = src.to_string();
+        // src guard. The DO stamps an authenticated `src` on EVERY forwarded
+        // env, so an inbound env with no `src` is anomalous and unattributable —
+        // drop it rather than trust an unidentified peer. Otherwise: learn the
+        // peer from the first src (responder can't know it at construction), and
+        // thereafter require every env's src to match.
+        match src {
+            None => return Ok(None),
+            Some(s) if self.client_key_id.is_empty() => {
+                // Peer learning — the DO already authenticated this src. NOTE
+                // (security): learning the peer does NOT authorize TX; arming is
+                // gated separately by the station-local TX-allow-list.
+                self.client_key_id = s.to_string();
             }
-        }
-        // src guard: once we know our peer, drop any `env` the DO stamped with a
-        // different src (cross-peer / spoofed routing).
-        if let Some(src) = src {
-            if !self.client_key_id.is_empty() && src != self.client_key_id {
+            Some(s) if s != self.client_key_id => {
+                // Cross-peer / spoofed routing for a known peer — drop.
                 return Ok(None);
             }
+            Some(_) => {}
         }
         let payload = decode_env_payload(payload_b64)?;
 
@@ -563,6 +570,43 @@ mod tests {
         assert!(
             !sess.is_transport_established(),
             "impostor env must not bootstrap the Noise handshake"
+        );
+    }
+
+    #[test]
+    fn env_with_absent_src_is_dropped() {
+        // An env with NO `src` stamp is unattributable (the DO stamps src on all
+        // forwards) — it must be dropped, never bootstrap Noise, even though the
+        // session has a pinned peer.
+        let identity = AgentIdentity::generate();
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[1u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let ready = RelayFrame::Ready {
+            key_id: identity.key_id(),
+            peer_present: true,
+        }
+        .to_json()
+        .unwrap();
+        let no_src_env = RelayFrame::Env {
+            dst: identity.key_id(),
+            payload: b64url(b"garbage-msg1"),
+            src: None,
+        }
+        .to_json()
+        .unwrap();
+
+        let ws = MockWs::new(vec![hello, ready, no_src_env]);
+        let mut sess = AgentSession::new(ws, &identity, client_key_id());
+        sess.authenticate().unwrap();
+        sess.process_next().unwrap(); // ready
+        let out = sess.process_next().unwrap(); // src-less env dropped
+        assert_eq!(out, None);
+        assert!(
+            !sess.is_transport_established(),
+            "src-less env must not bootstrap the Noise handshake"
         );
     }
 

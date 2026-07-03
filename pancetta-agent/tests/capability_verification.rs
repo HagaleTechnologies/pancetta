@@ -1199,3 +1199,109 @@ fn property_each_flip_hits_its_gate() {
         assert_eq!(run_flip(*flip), Err(expected.clone()));
     }
 }
+
+// ===========================================================================
+// SECURITY-REVIEW HARDENINGS (2026-07-02)
+// ===========================================================================
+
+/// A token whose `iat` is dated well into the future must be rejected — a token
+/// minted to become valid later must not verify now (only `exp` bounded the
+/// window before this gate).
+#[test]
+fn cap_future_iat_rejected() {
+    let v = default_verifier();
+    let mut payload = default_payload();
+    // iat 10 minutes in the future; exp still further out so exp alone wouldn't catch it.
+    payload["iat"] = json!(NOW_MS / 1000 + 600);
+    payload["exp"] = json!(NOW_MS / 1000 + 1200);
+    payload["txEnabledUntil"] = json!(NOW_MS / 1000 + 1200);
+    let token = mint_jws(&default_header(), &payload, &idp_key());
+    assert_eq!(
+        v.verify_capability_token(&token, NOW_MS),
+        Err(CapError::FutureIat)
+    );
+}
+
+/// An `iat` within the small skew tolerance (< MAX_IAT_SKEW_SEC) is accepted —
+/// normal NTP jitter must not reject a legitimate freshly-minted token.
+#[test]
+fn cap_iat_within_skew_accepted() {
+    let v = default_verifier();
+    let mut payload = default_payload();
+    // 60s in the future — inside the 120s tolerance.
+    payload["iat"] = json!(NOW_MS / 1000 + 60);
+    let token = mint_jws(&default_header(), &payload, &idp_key());
+    assert!(
+        v.verify_capability_token(&token, NOW_MS).is_ok(),
+        "an iat within the skew window must verify"
+    );
+}
+
+/// When the IdP-signed token carries an `operatorCallsign`, a properly
+/// client-signed grant that claims a DIFFERENT callsign is rejected — the client
+/// can't self-attribute a call the IdP didn't issue. (The grant is re-signed so
+/// the mismatch is caught by the callsign bind, not the signature check.)
+#[test]
+fn grant_callsign_mismatch_with_token_rejected() {
+    let v = default_verifier();
+    let mut grant = base_grant();
+    grant.insert("operatorCallsign".to_string(), json!("W1AW"));
+    let grant = sign_grant(grant, &client_key()); // validly signed, different call
+    assert_eq!(
+        full_verify(
+            &v,
+            &valid_token(),
+            &grant,
+            &client_key().verifying_key(),
+            NOW_MS
+        ),
+        Err(CapError::CallsignMismatch)
+    );
+}
+
+/// A grant whose `operatorCallsign` matches the token's still mints (the common
+/// case — regression guard that the bind doesn't reject the happy path).
+#[test]
+fn grant_callsign_matching_token_accepted() {
+    let v = default_verifier();
+    let out = full_verify(
+        &v,
+        &valid_token(),
+        &valid_grant(),
+        &client_key().verifying_key(),
+        NOW_MS,
+    )
+    .expect("matching callsign must mint");
+    assert_eq!(out.operator_callsign, OPERATOR);
+}
+
+/// When the token carries NO `operatorCallsign` claim, the grant's callsign is
+/// accepted as-is (nothing to bind against) — back-compat for tokens without the
+/// claim.
+#[test]
+fn token_without_callsign_accepts_grant_callsign() {
+    let v = default_verifier();
+    let mut payload = default_payload();
+    payload.as_object_mut().unwrap().remove("operatorCallsign");
+    let token = mint_jws(&default_header(), &payload, &idp_key());
+
+    let cap = v.verify_capability_token(&token, NOW_MS).expect("token ok");
+    assert_eq!(cap.operator_callsign, None);
+
+    let mut grant = base_grant();
+    grant.insert("operatorCallsign".to_string(), json!("W1AW"));
+    let grant = sign_grant(grant, &client_key());
+    let mut seen = HashSet::new();
+    let out = v
+        .verify_arm_grant(
+            &grant,
+            &cap,
+            &client_key().verifying_key(),
+            &allow_list(),
+            &no_revocations(),
+            NOW_MS,
+            &mut seen,
+        )
+        .expect("no token callsign ⇒ grant callsign accepted");
+    assert_eq!(out.operator_callsign, "W1AW");
+}

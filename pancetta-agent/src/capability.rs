@@ -95,6 +95,13 @@ pub const MAX_NON_ENABLED_TTL_SEC: i64 = 900;
 /// MUST NOT exceed this many **seconds** (24 h).
 pub const MAX_ENABLEMENT_SEC: i64 = 86_400;
 
+/// Clock-skew tolerance (seconds) for the `iat` future-dating check. A token
+/// whose `iat` is more than this far in the future is rejected (`FutureIat`) —
+/// closing the window where a token minted for later use verifies now. Small
+/// enough to be meaningful, large enough to absorb normal NTP jitter between the
+/// IdP and the station.
+pub const MAX_IAT_SKEW_SEC: i64 = 120;
+
 /// A verifier holding this agent's own keyId (the expected `aud`) and the set of
 /// PINNED IdP public keys. Constructed once from [`crate::pairing::PairedState`]
 /// after pairing; the pin set is never mutated from live network input.
@@ -128,6 +135,12 @@ pub struct VerifiedCapability {
     /// unaffected). `Some(t)` ⇒ arm is honored only if `t > now` (checked at arm
     /// time via [`require_tx_enabled`]).
     pub tx_enabled_until: Option<i64>,
+    /// The operator callsign the IdP bound into this token (Part-97
+    /// attribution), if any. When `Some`, an arm grant's client-signed
+    /// `operatorCallsign` MUST equal it — otherwise the client could log a
+    /// different call than the IdP issued. `None` ⇒ the token carried no
+    /// callsign claim and the grant's callsign is accepted as-is.
+    pub operator_callsign: Option<String>,
 }
 
 /// Every way capability/arm verification can fail. There is intentionally no
@@ -202,6 +215,15 @@ pub enum CapError {
     /// station-local TX-allow-list is the authoritative revoke.
     #[error("capability jti is revoked")]
     Revoked,
+    /// The token's `iat` is dated more than [`MAX_IAT_SKEW_SEC`] in the future —
+    /// a token minted to become valid later must not verify now.
+    #[error("token iat is in the future")]
+    FutureIat,
+    /// The arm grant's client-signed `operatorCallsign` did not match the
+    /// `operatorCallsign` the IdP bound into the capability token (Part-97
+    /// attribution integrity).
+    #[error("grant operatorCallsign does not match the token's")]
+    CallsignMismatch,
 }
 
 /// Decode unpadded (or padded) base64url into bytes. Fails closed to
@@ -342,6 +364,13 @@ impl CapabilityVerifier {
             .get("iat")
             .and_then(Value::as_i64)
             .ok_or_else(|| CapError::MalformedClaim("iat".to_string()))?;
+        // Reject a future-dated `iat` (beyond a small skew tolerance): a token
+        // minted to become valid later must not verify now. Without this, only
+        // `exp` bounds the window, so a token with `iat` in the future but `exp`
+        // further out would be accepted for read/QSY before it was meant to be.
+        if iat_s > now_s.saturating_add(MAX_IAT_SKEW_SEC) {
+            return Err(CapError::FutureIat);
+        }
 
         // Clock-2 TX enablement (`txEnabledUntil`, epoch SECONDS) + the short-TTL
         // backstop (e2e-auth.v1 §6). NEVER client-asserted at arm time — parsed
@@ -402,12 +431,23 @@ impl CapabilityVerifier {
             .ok_or_else(|| CapError::MalformedClaim("jti".to_string()))?
             .to_string();
 
+        // operatorCallsign (Part-97 attribution) — carried in the IdP-signed
+        // token when present. Optional here (not every token issues it), but when
+        // present it pins the callsign the arm's client-signed grant must match
+        // (see verify_arm_grant), so a client can't self-attribute a different
+        // call in the audit trail than the IdP issued.
+        let operator_callsign = payload
+            .get("operatorCallsign")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
         Ok(VerifiedCapability {
             scopes,
             client_key_id,
             jti,
             exp_ms: exp_s.saturating_mul(1000),
             tx_enabled_until,
+            operator_callsign,
         })
     }
 
@@ -555,6 +595,15 @@ impl CapabilityVerifier {
             .and_then(Value::as_str)
             .ok_or_else(|| CapError::MalformedClaim("operatorCallsign".to_string()))?
             .to_string();
+        // Bind attribution to the IdP: when the token carried an operatorCallsign
+        // claim, the client-signed grant MUST match it. The grant's clientSig
+        // alone can't be trusted to self-attribute, since the client holds that
+        // key — the IdP-signed claim is the authority for who's on the air.
+        if let Some(token_call) = &capability.operator_callsign {
+            if token_call != &operator_callsign {
+                return Err(CapError::CallsignMismatch);
+            }
+        }
 
         Ok(VerifiedArmGrant {
             operator_callsign,
