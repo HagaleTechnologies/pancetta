@@ -1052,7 +1052,10 @@ mod view_render_tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
 
-    async fn render_view(view: crate::view::ActiveView) -> ratatui::buffer::Buffer {
+    async fn render_view_with_panel(
+        view: crate::view::ActiveView,
+        active_panel: crate::app::ActivePanel,
+    ) -> ratatui::buffer::Buffer {
         let mut app = crate::app::App::new(crate::config::Config::default(), None)
             .await
             .unwrap();
@@ -1062,14 +1065,21 @@ mod view_render_tests {
         // which blanks that panel's title text (only its *border color*
         // changes; ratatui's Block widget overwrites the whole perimeter,
         // title included). That happens in Operate (which keeps the verbatim
-        // highlight call) but not Monitor (which skips it per the brief). Set
-        // the active panel to StationInfo — not asserted on below — so this
-        // unrelated quirk doesn't make an Operate-view title assertion flaky.
-        app.active_panel = crate::app::ActivePanel::StationInfo;
+        // highlight call) but not Monitor (which skips it per the brief).
+        // Callers pick whichever panel they need NOT blanked for their
+        // assertions and set `active_panel` accordingly.
+        app.active_panel = active_panel;
         let backend = TestBackend::new(120, 40);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &app).unwrap()).unwrap();
         term.backend().buffer().clone()
+    }
+
+    async fn render_view(view: crate::view::ActiveView) -> ratatui::buffer::Buffer {
+        // Station Info is not asserted on by the (single-render) callers of
+        // this helper, so it's the panel we sacrifice to the title-blanking
+        // quirk above.
+        render_view_with_panel(view, crate::app::ActivePanel::StationInfo).await
     }
     fn buffer_contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
         (0..buf.area.height).any(|y| {
@@ -1082,10 +1092,26 @@ mod view_render_tests {
 
     #[tokio::test]
     async fn operate_view_shows_all_five_panels() {
+        // Render #1: Station Info active — its own title is blanked by
+        // `render_active_panel_highlight` (see the quirk note above), but
+        // this proves the other four panels' titles render.
         let buf = render_view(crate::view::ActiveView::Operate).await;
         for t in ["Band Activity", "QSO Status", "DX Hunter", "Callers"] {
             assert!(buffer_contains(&buf, t), "missing {t}");
         }
+
+        // Render #2: a DIFFERENT panel (Band Activity, the app default)
+        // active instead, so Station Info's own title is no longer blanked
+        // and can be asserted — completing coverage of all 5 panels.
+        let buf2 = render_view_with_panel(
+            crate::view::ActiveView::Operate,
+            crate::app::ActivePanel::BandActivity,
+        )
+        .await;
+        assert!(
+            buffer_contains(&buf2, "Station Info"),
+            "missing Station Info"
+        );
     }
     #[tokio::test]
     async fn monitor_view_drops_side_panels() {
@@ -1093,5 +1119,7 @@ mod view_render_tests {
         assert!(buffer_contains(&buf, "Band Activity"));
         assert!(!buffer_contains(&buf, "DX Hunter"));
         assert!(!buffer_contains(&buf, "Callers"));
+        assert!(!buffer_contains(&buf, "QSO Status"));
+        assert!(!buffer_contains(&buf, "Station Info"));
     }
 }
