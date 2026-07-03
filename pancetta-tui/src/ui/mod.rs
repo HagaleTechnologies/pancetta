@@ -132,7 +132,7 @@ fn main_layout_chunks(size: Rect) -> std::rc::Rc<[Rect]> {
             Constraint::Length(1), // Title bar (incl. bold TX-policy banner)
             Constraint::Min(1),    // Main content
             Constraint::Length(1), // TX queue / now-sending strip
-            Constraint::Length(3), // Status bar
+            Constraint::Length(2), // Status bar (status line + help line)
         ])
         .split(size)
 }
@@ -1093,14 +1093,12 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw(":Quit"),
     ]);
 
-    // Split status bar into two lines
+    // Split status bar into two lines (Task 20c: the third row — a purely
+    // decorative "─" border with no information — was dropped, along with
+    // the outer layout's matching `Length(3)` -> `Length(2)`).
     let status_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
 
     let status_paragraph = Paragraph::new(status_line).style(
@@ -1117,12 +1115,6 @@ fn render_status_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     f.render_widget(status_paragraph, status_chunks[0]);
     f.render_widget(help_paragraph, status_chunks[1]);
-
-    // Border line
-    let border_line = Line::from(vec![Span::raw("─".repeat(area.width as usize))]);
-    let border_paragraph =
-        Paragraph::new(border_line).style(Style::default().fg(app.theme.border_color()));
-    f.render_widget(border_paragraph, status_chunks[2]);
 }
 
 fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
