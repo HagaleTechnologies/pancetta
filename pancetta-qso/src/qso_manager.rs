@@ -1961,6 +1961,21 @@ impl QsoManager {
                 progress.metadata.progressed_this_cycle = true;
             }
 
+            // Rearm-coordination fix: a genuine forward advance stamps
+            // `last_call_at` exactly like the manual-regression re-send does
+            // (below). Without this, the per-slot keep-call rearm
+            // (`rearm_manual_calls_at`) has no way to know a response arrived
+            // THIS slot — if the DX's decode lands late in the slot, the 5s
+            // watchdog tick can re-emit the OLD rung (rearm fires on stale
+            // `last_call_at`) in the same slot the response just advanced us
+            // to a NEW rung, producing two TransmitRequests for one slot (a
+            // redundant re-TX the operator observed). Stamping here suppresses
+            // that slot's rearm at the source, the same way the regression
+            // stamp already suppresses a double-send on a repeated DX frame.
+            if qso_initiated_by == CallInitiation::Manual {
+                progress.metadata.last_call_at = Some(message.timestamp);
+            }
+
             progress.state = new_state.clone();
             progress.state_history.push(StateTransition {
                 from_state: old_state.clone(),
@@ -2487,6 +2502,56 @@ impl QsoManager {
                     frequency: *frequency,
                     grid_square: None,
                     started_at: Utc::now(),
+                })
+            }
+
+            // qso-state-machine-analysis GAP-1: the DX skips BOTH remaining
+            // rungs and closes directly from our opening grid (RespondingToCq)
+            // with RR73/73 — they copied us on the first exchange and are
+            // impatient. Mirrors the FIX-2 early-close below (SendingReport)
+            // and the A5 early-close (WaitingForReport), which is asymmetric
+            // without this arm: RespondingToCq had no early-close, so this
+            // exchange previously stalled at grid until the watchdog retired
+            // it. their_report is unknown (we never received one) — default to
+            // -15 like every other early-close; our_report is best-effort from
+            // this closing frame's SNR (we never got a chance to compute it
+            // any other way, matching the skip-rung arm above).
+            (
+                QsoState::RespondingToCq {
+                    target_callsign,
+                    frequency,
+                    ..
+                },
+                MessageType::FinalConfirmation {
+                    from_station,
+                    to_station,
+                }
+                | MessageType::SeventyThree {
+                    from_station,
+                    to_station,
+                },
+            ) => {
+                if !Self::is_partner(from_station, target_callsign) || !self.is_us(to_station) {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %target_callsign,
+                        got_from = %from_station,
+                        got_to = %to_station,
+                        "spurious RR73/73 in RespondingToCq ignored"
+                    );
+                    return Ok(current_state.clone());
+                }
+                let our_report = signal_strength
+                    .map(|snr| (snr.round() as i8).clamp(-30, 50))
+                    .unwrap_or(-15);
+                Ok(QsoState::Completed {
+                    their_callsign: target_callsign.clone(),
+                    their_report: -15,
+                    our_report,
+                    frequency: *frequency,
+                    grid_square: None,
+                    completed_at: Utc::now(),
+                    duration_seconds: 0,
                 })
             }
 
@@ -3447,14 +3512,34 @@ impl QsoManager {
                         responding_station: self.config.our_callsign.clone(),
                         grid: self.config.our_grid.clone(),
                     },
-                    // FIX 4: we sent R and the DX re-sent their report (they
-                    // did not copy our R) — re-send our R-report each slot,
-                    // under the SAME watchdog, until the DX advances (RR73)
-                    // or the watchdog retires us. Without this we went silent
-                    // and stalled. Reconstruct the R-report from the report
-                    // latched in the state.
+                    // SendingReport is entered two ways with DIFFERENT last-sent
+                    // frames, so the rearm must re-send the SAME rung we're
+                    // actually at, not always escalate to R-report:
+                    //   - their_report == None: we're at the plain-report rung
+                    //     (entered via the stuck-at-grid arm — RespondingToCq +
+                    //     CqResponse — or a manual Report-step answer). We sent
+                    //     a plain SignalReport (-NN) and have NOT yet heard the
+                    //     DX's report, so keep-calling MUST re-send -NN, never
+                    //     R-NN — escalating here was the KJ5NJF bug: we'd
+                    //     advance our own TX to R-report with zero DX input.
+                    //   - their_report == Some: FIX 4 — we sent R and the DX
+                    //     re-sent their report (they did not copy our R) —
+                    //     re-send our R-report each slot, under the SAME
+                    //     watchdog, until the DX advances (RR73) or the
+                    //     watchdog retires us.
                     QsoState::SendingReport {
                         their_callsign,
+                        their_report: None,
+                        our_report,
+                        ..
+                    } => MessageType::SignalReport {
+                        to_station: their_callsign.clone(),
+                        from_station: self.config.our_callsign.clone(),
+                        report: *our_report,
+                    },
+                    QsoState::SendingReport {
+                        their_callsign,
+                        their_report: Some(_),
                         our_report,
                         ..
                     } => MessageType::ReportAck {
@@ -4648,6 +4733,293 @@ mod tests {
             }
             other => panic!("expected ReportAck re-send, got {:?}", other),
         }
+    }
+
+    /// The KJ5NJF bug (docs/qso-engine-bugs.md BUG 2 / qso-state-machine-
+    /// analysis.md GAP-2): a caller who entered SendingReport via the
+    /// stuck-at-grid arm (DX re-sent grid/call, not a report — so we sent a
+    /// PLAIN SignalReport and their_report is still None) must have the rearm
+    /// re-send that SAME plain SignalReport, never escalate to a ReportAck
+    /// (R-report) we never actually sent. Escalating here previously drove the
+    /// QSO's own outbound rung forward with zero input from the DX.
+    #[tokio::test]
+    async fn rearm_resends_plain_report_when_their_report_is_none() {
+        let manager = QsoManager::new(test_config());
+        let mut events = manager.subscribe();
+
+        let qso_id = manager
+            .respond_to_cq_manual("KJ5NJF".to_string(), 1650.0, None)
+            .await
+            .unwrap();
+        // The DX re-sends our grid exchange (K5ARH KJ5NJF EM12) — copied us,
+        // but has NOT sent a report yet. This is the stuck-at-grid arm:
+        // RespondingToCq + CqResponse -> SendingReport{their_report: None}.
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "KJ5NJF".to_string(),
+                    grid: Some("EM12".to_string()),
+                },
+                "W1ABC KJ5NJF EM12".to_string(),
+                1650.0,
+                Some(-14.0),
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        match &progress.state {
+            QsoState::SendingReport { their_report, .. } => {
+                assert!(
+                    their_report.is_none(),
+                    "stuck-at-grid entry must carry their_report=None"
+                );
+            }
+            other => panic!("expected SendingReport, got {:?}", other),
+        }
+        while events.try_recv().is_ok() {}
+
+        // A slot later, with the DX STILL not having sent a report, the rearm
+        // must re-send our plain -NN report, NOT escalate to R-NN.
+        let last = progress.metadata.last_call_at.unwrap();
+        manager
+            .rearm_manual_calls_at(last + Duration::seconds(15))
+            .await;
+        let mut resends = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::MessageToSend { message, .. } = ev {
+                resends.push(message);
+            }
+        }
+        assert_eq!(resends.len(), 1, "exactly one re-send, got {:?}", resends);
+        match &resends[0] {
+            MessageType::SignalReport {
+                to_station,
+                from_station,
+                report,
+            } => {
+                assert_eq!(to_station, "KJ5NJF");
+                assert_eq!(from_station, "W1ABC");
+                assert_eq!(*report, -14, "re-sends our latched (unacked) report");
+            }
+            other => panic!(
+                "expected a plain SignalReport re-send (NOT ReportAck — the KJ5NJF bug), got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Rearm-coordination fix (qso-state-machine-analysis.md Symptom A): a
+    /// forward state advance stamps `last_call_at`, so the per-slot rearm does
+    /// NOT also fire (with the stale/old rung) in the same slot the DX's
+    /// response just advanced us. Without this, a late-decoding response and
+    /// the wall-clock rearm could both queue a TransmitRequest for one slot.
+    #[tokio::test]
+    async fn forward_advance_stamps_last_call_at_suppressing_same_slot_rearm() {
+        let manager = QsoManager::new(test_config());
+        let mut events = manager.subscribe();
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        // The DX's report arrives 12s into the slot (a realistically late
+        // decode — well under the 15s SLOT_SECONDS rearm threshold measured
+        // from `opened_at`, but this IS a genuine forward advance).
+        let response_at = opened_at + Duration::seconds(12);
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -7,
+                },
+                "W1ABC K1DEF -07".to_string(),
+                14074000.0,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(matches!(progress.state, QsoState::SendingReport { .. }));
+        // The forward advance emits its own auto-sequenced reply (R-report) —
+        // drain it so only the REARM's output (if any) remains below.
+        while events.try_recv().is_ok() {}
+
+        // Call the rearm at the ORIGINAL slot boundary (opened_at + 15s) --
+        // before this fix, last_call_at was untouched by the advance, so this
+        // would still see elapsed_since_last >= 15s from opened_at and
+        // re-emit a stale rung in the very slot the DX just answered.
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+            .await;
+        let mut resends = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::MessageToSend { message, .. } = ev {
+                resends.push(message);
+            }
+        }
+        assert!(
+            resends.is_empty(),
+            "the rearm must be suppressed the same slot a forward advance occurred, got {:?}",
+            resends
+        );
+
+        // Sanity: the rearm is NOT permanently disabled — one full slot after
+        // the ADVANCE (not the original open), it does fire again.
+        manager
+            .rearm_manual_calls_at(response_at + Duration::seconds(15))
+            .await;
+        let mut resends2 = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::MessageToSend { message, .. } = ev {
+                resends2.push(message);
+            }
+        }
+        assert_eq!(
+            resends2.len(),
+            1,
+            "rearm must resume one slot after the advance, got {:?}",
+            resends2
+        );
+    }
+
+    /// qso-state-machine-analysis GAP-1: a DX that copies us on the first
+    /// exchange and closes straight from our opening grid (RespondingToCq)
+    /// with RR73 must complete the QSO (previously stalled at grid forever).
+    #[tokio::test]
+    async fn responding_to_cq_early_close_with_rr73_completes() {
+        let manager = QsoManager::new(test_config());
+        let mut events = manager.subscribe();
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        manager
+            .process_message(
+                MessageType::FinalConfirmation {
+                    from_station: "K1DEF".to_string(),
+                    to_station: "W1ABC".to_string(),
+                },
+                "W1ABC K1DEF RR73".to_string(),
+                14074000.0,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::Completed { .. }),
+            "expected Completed, got {:?}",
+            progress.state
+        );
+
+        // The auto-sequenced reply must be our closing 73.
+        let mut sent = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::MessageToSend { message, .. } = ev {
+                sent.push(message);
+            }
+        }
+        assert_eq!(sent.len(), 1, "expected exactly one reply, got {:?}", sent);
+        match &sent[0] {
+            MessageType::SeventyThree {
+                to_station,
+                from_station,
+            } => {
+                assert_eq!(to_station, "K1DEF");
+                assert_eq!(from_station, "W1ABC");
+            }
+            other => panic!("expected SeventyThree reply, got {:?}", other),
+        }
+    }
+
+    /// GAP-1: a plain "73" close (not RR73) from RespondingToCq also
+    /// completes, and — matching the SendingReport+73 arm — we do NOT
+    /// re-send our own 73 (they're already done; re-sending only adds QRM).
+    #[tokio::test]
+    async fn responding_to_cq_early_close_with_plain_73_completes_no_resend() {
+        let manager = QsoManager::new(test_config());
+        let mut events = manager.subscribe();
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    from_station: "K1DEF".to_string(),
+                    to_station: "W1ABC".to_string(),
+                },
+                "W1ABC K1DEF 73".to_string(),
+                14074000.0,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(matches!(progress.state, QsoState::Completed { .. }));
+
+        let mut sent = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::MessageToSend { message, .. } = ev {
+                sent.push(message);
+            }
+        }
+        assert!(
+            sent.is_empty(),
+            "must NOT re-send a 73 once the DX already said 73, got {:?}",
+            sent
+        );
+    }
+
+    /// GAP-1 sender verification: a spoofed RR73 (wrong from_station) must
+    /// NOT complete the QSO — every other arm is sender-verified and this new
+    /// one must be too.
+    #[tokio::test]
+    async fn responding_to_cq_early_close_rejects_spoofed_sender() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+
+        manager
+            .process_message(
+                MessageType::FinalConfirmation {
+                    from_station: "W9ZZZ".to_string(), // NOT the QSO partner
+                    to_station: "W1ABC".to_string(),
+                },
+                "W1ABC W9ZZZ RR73".to_string(),
+                14074000.0,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "a spoofed RR73 must not advance the QSO, got {:?}",
+            progress.state
+        );
     }
 
     /// FIX 4: the watchdog still retires a SendingReport manual QSO that
