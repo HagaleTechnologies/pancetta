@@ -2024,11 +2024,12 @@ impl App {
         })
     }
 
-    /// Resolve what the Space key should do for the currently-selected station,
+    /// Resolve what the Space key should do for the current global focus
+    /// (Task 3 — `App::focused_callsign()`, NOT any one panel's own cursor),
     /// unifying the Space and Callers-Enter paths into "do the right next
-    /// thing". Returns `None` when no station is selected.
+    /// thing". Returns `None` when nothing is focused.
     ///
-    /// - If the selected callsign has a most-recent decode directed at us (a
+    /// - If the focused callsign has a most-recent decode directed at us (a
     ///   grid/report/R-report/RR73/73), classify it with the SAME
     ///   [`classify_caller_reply`] logic the Callers panel uses and return
     ///   [`SpaceAction::Reply`] at that smart-default step (their `RR73` → we
@@ -2041,8 +2042,15 @@ impl App {
     /// (where we actually heard them) rather than the selected-row frequency,
     /// so a reply always lands on the right passband even if the operator
     /// selected the station from the DX Hunter (network-spot) row.
+    ///
+    /// The Call-branch frequency/parity fall back to whatever the active
+    /// panel's own cursor resolution knows about this same station (the
+    /// common case — a panel's pin and cursor stay in sync with its own
+    /// focus) and otherwise to the FT8 calling-frequency default (1500 Hz,
+    /// unknown parity) — e.g. focus resolved from the QSO Status panel,
+    /// which has no cursor-based frequency lookup of its own.
     pub fn resolve_space_action(&self) -> Option<SpaceAction> {
-        let (callsign, frequency, dx_parity) = self.get_selected_station()?;
+        let callsign = self.focused_callsign()?;
 
         if let Some(msg) = self.last_directed_at_us_from(&callsign) {
             let step = classify_caller_reply(&msg.message, &self.station_info.call_sign);
@@ -2057,6 +2065,12 @@ impl App {
                 snr: Some(msg.snr as f32),
             });
         }
+
+        let (frequency, dx_parity) = self
+            .get_selected_station()
+            .filter(|(c, _, _)| pancetta_core::callsign::callsigns_match(c, &callsign))
+            .map(|(_, f, p)| (f, p))
+            .unwrap_or((1500, None));
 
         Some(SpaceAction::Call {
             callsign,
@@ -2203,6 +2217,15 @@ impl App {
     pub fn is_focused(&self, call: &str) -> bool {
         self.focused_callsign()
             .is_some_and(|f| pancetta_core::callsign::callsigns_match(&f, call))
+    }
+
+    /// Is this callsign one of our current active-QSO partners (an "engaged"
+    /// stream)? Engaged stations get the tier-2 highlight (green ● + underline)
+    /// in every list — visible even while the focus is elsewhere (multi-TX).
+    pub fn is_engaged(&self, call: &str) -> bool {
+        self.active_qsos
+            .iter()
+            .any(|q| pancetta_core::callsign::callsigns_match(&q.their_callsign, call))
     }
 
     /// Pin the Band Activity selection to the callsign currently under the
@@ -4666,5 +4689,15 @@ mod tests {
         // Compound equivalence: EA8/K1AAA is the same focus target.
         assert!(app.is_focused("EA8/K1AAA"));
         assert!(!app.is_focused("K1AAB"));
+    }
+
+    #[tokio::test]
+    async fn engaged_calls_are_flagged_compound_aware() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.active_qsos
+            .push(fixture_banner("JA1ABC", "wait rpt", None));
+        assert!(app.is_engaged("JA1ABC"));
+        assert!(app.is_engaged("JA1ABC/P"));
+        assert!(!app.is_engaged("JA1ABD"));
     }
 }

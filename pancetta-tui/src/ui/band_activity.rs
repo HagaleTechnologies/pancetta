@@ -64,16 +64,16 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
     }
 
     let widths = [
-        Constraint::Length(8), // Time
-        Constraint::Length(7), // Freq
-        Constraint::Length(4), // Mode
-        Constraint::Length(4), // SNR
-        Constraint::Length(5), // DT  (fits "-15.2")
-        Constraint::Length(6), // DF  (fits "+2800")
-        Constraint::Length(8), // Call
-        Constraint::Length(4), // Grid
-        Constraint::Length(6), // Dist
-        Constraint::Min(10),   // Message
+        Constraint::Length(8),  // Time
+        Constraint::Length(7),  // Freq
+        Constraint::Length(4),  // Mode
+        Constraint::Length(4),  // SNR
+        Constraint::Length(5),  // DT  (fits "-15.2")
+        Constraint::Length(6),  // DF  (fits "+2800")
+        Constraint::Length(10), // Call (widened to absorb the engaged "● " prefix)
+        Constraint::Length(4),  // Grid
+        Constraint::Length(6),  // Dist
+        Constraint::Min(10),    // Message
     ];
 
     let table = Table::new(rows, widths)
@@ -130,11 +130,8 @@ fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
     // — but only when Band Activity itself is NOT the active panel, so we
     // never double up with the active panel's REVERSED row-highlight.
     let is_active_panel = matches!(app.active_panel, ActivePanel::BandActivity);
-    let is_globally_focused = !is_active_panel
-        && msg
-            .call_sign
-            .as_deref()
-            .is_some_and(|c| app.is_focused(c));
+    let is_globally_focused =
+        !is_active_panel && msg.call_sign.as_deref().is_some_and(|c| app.is_focused(c));
 
     // Always show HH:MM:SS in UTC — FT8 timing needs seconds granularity
     let time_short = msg.timestamp.format("%H:%M:%S").to_string();
@@ -144,10 +141,17 @@ fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
     let dt_str = format!("{:+.1}", msg.delta_time);
     let df_str = format!("{:+.0}", msg.delta_freq);
 
+    // Tier-2 highlight (Task 3): one of our current active-QSO partners.
+    // Directed-at-us styling still wins, so this only applies otherwise.
+    let is_engaged =
+        !msg.is_directed_at_us && msg.call_sign.as_deref().is_some_and(|c| app.is_engaged(c));
+
     // Lead the call column with "→" for directed-at-us decodes so even
-    // colorblind / monochrome terminals can spot them at a glance.
+    // colorblind / monochrome terminals can spot them at a glance, or "● "
+    // for an engaged (active-QSO) station.
     let call_str = match msg.call_sign.as_deref() {
         Some(c) if msg.is_directed_at_us => format!("→ {}", c),
+        Some(c) if is_engaged => format!("● {}", c),
         Some(c) => c.to_string(),
         None => "---".to_string(),
     };
@@ -191,6 +195,15 @@ fn create_message_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(app.theme.muted_color())
+    };
+    // Tier-2 (engaged) highlight stacks on top of whatever the above chose —
+    // green + underline, without discarding e.g. the tier-1 BOLD.
+    let call_style = if is_engaged {
+        call_style
+            .fg(app.theme.success_color())
+            .add_modifier(Modifier::UNDERLINED)
+    } else {
+        call_style
     };
 
     let msg_style = if msg.is_directed_at_us {

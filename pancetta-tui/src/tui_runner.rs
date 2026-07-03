@@ -3101,4 +3101,119 @@ mod key_tests {
             "after refused-engage echo, fox_mode must be false (corrected)"
         );
     }
+
+    /// Task 3: Space acts on the operator's GLOBAL focus
+    /// (`App::focused_callsign()`), not a hardcoded per-panel cursor. Pin
+    /// focus to a CQing station via the DX Hunter panel, press Space, and
+    /// confirm the resulting `CallStation` targets that pinned callsign.
+    #[tokio::test]
+    async fn space_targets_the_dx_hunter_pinned_focus() {
+        use chrono::Utc;
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::DxHunter;
+            // Inject a pure-CQer DX station directly into dx_stations so
+            // displayed_dx_stations() returns it (never directed at us, so
+            // Space resolves to SpaceAction::Call, not Reply).
+            a.dx_stations.insert(
+                "VK9XX".to_string(),
+                crate::app::DxStation {
+                    call_sign: "VK9XX".to_string(),
+                    grid_square: Some("QH30".to_string()),
+                    frequency: 14.074,
+                    mode: "FT8".to_string(),
+                    last_seen: Utc::now(),
+                    snr: -10,
+                    distance: None,
+                    bearing: None,
+                    worked_before: false,
+                    needed: true,
+                    atno: false,
+                    priority_score: 800,
+                    source: crate::app::SpotSource::Local,
+                    entity_name: None,
+                    rarity_tier: None,
+                    reporter_count: None,
+                    is_notable: false,
+                    notable_type: None,
+                    confidence: None,
+                    best_snr_network: None,
+                    last_seen_network: None,
+                    audio_offset_hz: Some(750),
+                    slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+                },
+            );
+            a.dx_hunter_scroll = 0;
+            // Pin the focus (mirrors what a deliberate cursor move does).
+            a.clamp_dx_hunter_selection();
+            assert_eq!(a.focused_callsign().as_deref(), Some("VK9XX"));
+        }
+        r.handle_key_event(key(' ')).await.unwrap();
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::CallStation {
+                callsign,
+                frequency,
+                dx_parity,
+            }) => {
+                assert_eq!(callsign, "VK9XX");
+                assert_eq!(frequency, 750);
+                assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Even));
+            }
+            other => panic!("Expected CallStation, got {:?}", other),
+        }
+    }
+
+    /// Task 3's actual behavior change: `resolve_space_action` used to key
+    /// off `get_selected_station()`, which only resolves a callsign for
+    /// BandActivity/DxHunter/Callers — Space was a silent no-op on the QSO
+    /// Status panel. Routed through the global `focused_callsign()`, Space
+    /// now also works from the QSO Status panel.
+    #[tokio::test]
+    async fn space_works_from_qso_status_panel_via_global_focus() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.active_panel = crate::app::ActivePanel::QsoStatus;
+            a.apply_active_qsos(
+                vec![crate::app::ActiveQsoBanner {
+                    their_callsign: "JA1ABC".to_string(),
+                    state: "wait rpt".to_string(),
+                    started_at: chrono::Utc::now(),
+                    frequency_hz: 1234.0,
+                    tx_parity: None,
+                    last_tx_text: None,
+                    last_tx_at: None,
+                    last_rx_text: None,
+                    last_rx_at: None,
+                    snr_rx: None,
+                    report_sent: None,
+                    report_received: None,
+                    exchange_count: 1,
+                    qso_id: "ja1abc-id".to_string(),
+                    initiated_by: "Manual".to_string(),
+                    ladder_labels: Vec::new(),
+                    ladder_ours: Vec::new(),
+                    ladder_index: 0,
+                    now_line: String::new(),
+                    next_line: String::new(),
+                    call_count: 0,
+                    max_calls: 0,
+                    watchdog_deadline: None,
+                    dx_last_activity: None,
+                    hound: false,
+                }],
+                Vec::new(),
+            );
+            a.qso_cursor = 0;
+            assert_eq!(a.focused_callsign().as_deref(), Some("JA1ABC"));
+        }
+        r.handle_key_event(key(' ')).await.unwrap();
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::CallStation { callsign, .. }) => {
+                assert_eq!(callsign, "JA1ABC");
+            }
+            other => panic!("Expected CallStation targeting JA1ABC, got {:?}", other),
+        }
+    }
 }

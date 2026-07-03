@@ -148,6 +148,9 @@ fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
     let is_active_panel = matches!(app.active_panel, ActivePanel::Callers);
     let is_globally_focused = !is_active_panel && !call.is_empty() && app.is_focused(&call);
 
+    // Tier-2 highlight (Task 3): one of our current active-QSO partners.
+    let is_engaged = !call.is_empty() && app.is_engaged(&call);
+
     // Truncate their raw message for the Msg column.
     let mut text = msg.message.clone();
     if text.chars().count() > 16 {
@@ -172,6 +175,12 @@ fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
     }
     let flags_str = flags.join(" ");
 
+    let call_display = if is_engaged {
+        format!("● {}", call)
+    } else {
+        call.clone()
+    };
+
     let dim = Style::default().fg(app.theme.foreground_color());
     let call_style = if is_globally_focused {
         Style::default()
@@ -181,6 +190,15 @@ fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
         Style::default()
             .fg(app.theme.accent_color())
             .add_modifier(Modifier::BOLD)
+    };
+    // Tier-2 (engaged) highlight stacks on top of whatever the above chose —
+    // green + underline, without discarding e.g. the tier-1 BOLD.
+    let call_style = if is_engaged {
+        call_style
+            .fg(app.theme.success_color())
+            .add_modifier(Modifier::UNDERLINED)
+    } else {
+        call_style
     };
     let snr_style = Style::default().fg(if msg.snr >= 0 {
         app.theme.success_color()
@@ -196,7 +214,7 @@ fn caller_row<'a>(msg: &'a DecodedMessageView, app: &App) -> Row<'a> {
     };
 
     Row::new([
-        Cell::from(call).style(call_style),
+        Cell::from(call_display).style(call_style),
         Cell::from(text).style(dim),
         Cell::from(snr_str).style(snr_style),
         Cell::from(freq_str).style(Style::default().fg(app.theme.accent_color())),
