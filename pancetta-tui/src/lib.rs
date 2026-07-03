@@ -30,6 +30,7 @@ pub mod dxcc;
 mod dxcc_table;
 pub mod tui_runner;
 pub mod ui;
+pub mod view;
 pub mod widgets;
 
 // Re-export main types for convenience
@@ -38,6 +39,7 @@ pub use app::{
     DeviceSelectionState, DxStation, PipelineHealth, QsoStatus, StationInfo,
 };
 pub use config::{Config, Theme};
+pub use view::ActiveView;
 
 /// TUI library version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

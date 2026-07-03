@@ -666,6 +666,12 @@ impl TuiRunner {
                 // Authoritative echo from the coordinator — overrides the
                 // optimistic Shift+X flip so the FOX chip is always correct.
                 app.fox_mode = on;
+                // Suggest-never-auto-switch (spec §1): Fox mode benefits from
+                // the Run view, but we never change the operator's view for
+                // them — just hint that `v` is available.
+                if on && app.active_view != crate::view::ActiveView::Run {
+                    app.status_message = "FOX on — press v for Run view".to_string();
+                }
             }
             TuiMessage::DeviceListUpdate {
                 input,
@@ -994,8 +1000,17 @@ impl TuiRunner {
                 app.status_message = "Operator-stop banner cleared".to_string();
             }
 
+            // `z` panel zoom: Esc restores the normal view layout (in
+            // addition to `z` itself toggling it off). Guarded so it only
+            // fires when nothing else claimed this Esc press above.
+            KeyCode::Esc if app.zoomed => {
+                app.zoomed = false;
+                app.status_message = "Zoom cleared".to_string();
+            }
+
             // Panel navigation
             KeyCode::Tab => {
+                app.zoomed = false;
                 app.next_panel();
             }
             KeyCode::BackTab => {
@@ -1357,6 +1372,30 @@ impl TuiRunner {
                 app.tx_policy = next;
                 app.status_message = format!("TX policy: {}", next.label());
                 self.message_tx.send(TuiCommand::CycleTxPolicy)?;
+            }
+
+            // === Activity views (Phase 2 TUI redesign) ===
+            // v / V - cycle the operator's active view forward/backward
+            // through the 4-value ring (Operate/Hunt/Run/Monitor). Local-only
+            // (no coordinator round-trip): every view still renders today's
+            // Operate layout until Tasks 5-7 land the per-view differences.
+            KeyCode::Char('v') => {
+                app.cycle_view(true);
+            }
+            KeyCode::Char('V') => {
+                app.cycle_view(false);
+            }
+            // z - zoom the focused panel to fill the whole content area,
+            // bypassing the active view's grid. Orthogonal to v/V: works
+            // the same in any of the 4 views, and toggles the same panel
+            // back off (Esc also clears it; see the guarded Esc arm above).
+            KeyCode::Char('z') => {
+                app.zoomed = !app.zoomed;
+                app.status_message = if app.zoomed {
+                    "Panel zoomed".to_string()
+                } else {
+                    "Zoom cleared".to_string()
+                };
             }
             // f - toggle TX-frequency mode Hold ↔ Auto. Hold (default) keeps the
             // offset you picked sticky; Auto lets pancetta choose/adjust it.
@@ -1729,6 +1768,8 @@ impl TuiRunner {
             ("Shift+T", "Tune (12 s tone; blocked while TX DISABLED)"),
             ("h", "Halt current TX"),
             ("p", "Toggle PTT (blocked while TX DISABLED)"),
+            ("v / V", "Cycle activity view: Operate/Hunt/Run/Monitor"),
+            ("z", "Zoom focused panel (again/Esc to restore)"),
             ("a", "Toggle autonomous mode"),
             ("Shift+P", "Pause / resume autonomous"),
             ("Shift+H", "Engage Hound on selected DX Hunter station"),
@@ -1963,11 +2004,26 @@ mod key_tests {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
+    /// Monotonic counter giving each `make_runner()` call its own
+    /// `tui_state_path()` override, so concurrently-running tests never
+    /// share (and race on) the same file — see `App::set_test_tui_state_path`.
+    static TEST_STATE_PATH_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     async fn make_runner() -> (
         TuiRunner,
         crossbeam_channel::Receiver<TuiCommand>,
         Arc<RwLock<App>>,
     ) {
+        // Test seam: every test that builds an App via make_runner() gets
+        // its own throwaway state-file path, so no test — including the
+        // `v`/`V` view-cycling tests, which actually write to it — ever
+        // touches the operator's real `~/.pancetta/tui_state.json`, and no
+        // two tests running in parallel can race on the same file.
+        let n = TEST_STATE_PATH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let state_path = std::env::temp_dir().join(format!("pancetta_tui_test_state_{n}.json"));
+        App::set_test_tui_state_path(state_path);
+
         let app = Arc::new(RwLock::new(
             App::new(Config::default(), None).await.unwrap(),
         ));
@@ -1998,6 +2054,75 @@ mod key_tests {
         let (mut r, cmd_rx, _app) = make_runner().await;
         r.handle_key_event(key('c')).await.unwrap();
         assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::StartCq { .. })));
+    }
+
+    /// `v` cycles the active view forward, locally — no coordinator command
+    /// is sent (Task 4: the view ring only starts driving different layouts
+    /// in later tasks).
+    #[tokio::test]
+    async fn key_v_cycles_view_forward() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        // Force a known starting point regardless of whatever
+        // make_runner()'s throwaway state file happened to contain
+        // (it's a per-test path — see TEST_STATE_PATH_COUNTER — so this is
+        // just belt-and-suspenders, not working around cross-test state).
+        app.write().await.active_view = crate::view::ActiveView::Operate;
+        r.handle_key_event(key('v')).await.unwrap();
+        assert_eq!(app.read().await.active_view, crate::view::ActiveView::Hunt);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "view cycling is local-only, no coordinator command should be sent"
+        );
+    }
+
+    /// Shift+V (`V`) cycles the active view backward.
+    #[tokio::test]
+    async fn key_shift_v_cycles_view_backward() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        app.write().await.active_view = crate::view::ActiveView::Operate;
+        r.handle_key_event(key_shift('V')).await.unwrap();
+        assert_eq!(
+            app.read().await.active_view,
+            crate::view::ActiveView::Monitor
+        );
+    }
+
+    /// `z` toggles panel zoom, local-only (no coordinator command).
+    #[tokio::test]
+    async fn key_z_toggles_zoom() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        app.write().await.zoomed = false;
+        r.handle_key_event(key('z')).await.unwrap();
+        assert!(app.read().await.zoomed);
+        r.handle_key_event(key('z')).await.unwrap();
+        assert!(!app.read().await.zoomed);
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "zoom is local-only, no coordinator command should be sent"
+        );
+    }
+
+    /// Esc clears an active zoom (and does not fall through to any other
+    /// Esc behavior once zoom is cleared).
+    #[tokio::test]
+    async fn key_esc_clears_zoom() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        app.write().await.zoomed = true;
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!app.read().await.zoomed);
+    }
+
+    /// Tab clears an active zoom before switching panels.
+    #[tokio::test]
+    async fn key_tab_clears_zoom() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        app.write().await.zoomed = true;
+        r.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!app.read().await.zoomed);
     }
 
     #[tokio::test]
@@ -3110,6 +3235,29 @@ mod key_tests {
         assert!(
             !app.read().await.fox_mode,
             "after refused-engage echo, fox_mode must be false (corrected)"
+        );
+    }
+
+    /// Suggest-never-auto-switch (spec §1): `FoxModeUpdate { on: true }`
+    /// while the operator is on Operate must NOT change the active view —
+    /// only hint that `v` is available.
+    #[tokio::test]
+    async fn fox_mode_on_hints_run_view_without_switching() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        app.write().await.active_view = crate::view::ActiveView::Operate;
+        r.handle_message(TuiMessage::FoxModeUpdate { on: true })
+            .await
+            .unwrap();
+        let a = app.read().await;
+        assert_eq!(
+            a.active_view,
+            crate::view::ActiveView::Operate,
+            "FoxModeUpdate must never auto-switch the operator's view"
+        );
+        assert!(
+            a.status_message.contains("press v"),
+            "expected a hint to press v, got: {}",
+            a.status_message
         );
     }
 

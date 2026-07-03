@@ -8,6 +8,15 @@ use tracing::{debug, info};
 
 use crate::config::{Config, Theme};
 
+// Test-only thread-local backing `App::set_test_tui_state_path` /
+// `App::tui_state_path`. See those for why this is a thread-local rather
+// than a process-global env var. Never compiled into production builds.
+#[cfg(test)]
+thread_local! {
+    static TEST_TUI_STATE_PATH_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Terminal color support level, detected at startup
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorCapability {
@@ -830,6 +839,20 @@ pub struct App {
     /// fresh). Bounded to [`Self::BAND_CACHE_MAX`] bands and pruned of stale
     /// entries on each switch so it can't grow without bound.
     band_cache: HashMap<String, BandSnapshot>,
+
+    /// The operator's selected activity view (Phase 2 TUI redesign). `v`/`V`
+    /// cycle it; persisted to `~/.pancetta/tui_state.json` so it survives a
+    /// restart. `Operate` (the default) renders today's layout unchanged;
+    /// later tasks (5-7) make Hunt/Run/Monitor render differently.
+    pub active_view: crate::view::ActiveView,
+
+    /// When `true`, `z` has zoomed the focused panel (`active_panel`) to
+    /// fill the whole content area, bypassing the active view's grid
+    /// layout entirely. Orthogonal to `active_view` — zoom works the same
+    /// regardless of which of the 4 views is selected. `z` toggles it;
+    /// Esc or Tab also clear it. Never persisted (session-only, like
+    /// `help_visible`).
+    pub zoomed: bool,
 }
 
 /// Peak intensity in the latest waterfall row within ±radius_hz of center_hz.
@@ -944,6 +967,8 @@ impl App {
             current_band_index: default_band_index,
             radio_frequency: None,
             band_cache: HashMap::new(),
+            active_view: Self::load_persisted_view(),
+            zoomed: false,
         };
 
         // Initialize audio monitoring if device specified
@@ -957,6 +982,84 @@ impl App {
             app.station_info.call_sign
         );
         Ok(app)
+    }
+
+    /// Path to the persisted TUI state file (`~/.pancetta/tui_state.json`).
+    /// `None` if the home directory can't be resolved.
+    ///
+    /// Test-only seam: honors a thread-local override (see
+    /// [`Self::set_test_tui_state_path`]) so the unit test suite never reads
+    /// or writes the operator's real state file — compiled out of
+    /// production builds entirely (`#[cfg(test)]`), so this is a no-op for
+    /// the real TUI.
+    fn tui_state_path() -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        {
+            if let Some(p) = TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| cell.borrow().clone()) {
+                return Some(p);
+            }
+        }
+        dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"))
+    }
+
+    /// Test-only: point [`Self::tui_state_path`] at `path` for the calling
+    /// thread only, so tests never touch `~/.pancetta/tui_state.json`.
+    /// `#[tokio::test]` defaults to a current-thread runtime, so a value set
+    /// here is visible for the rest of the test body (including any tasks
+    /// it spawns) — unlike a process-global env var, a thread-local can't
+    /// leak into (or race with) a *different* test running concurrently on
+    /// another thread. Call this before constructing `App` or calling
+    /// `cycle_view`, at the top of the test.
+    #[cfg(test)]
+    pub(crate) fn set_test_tui_state_path(path: std::path::PathBuf) {
+        TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(path));
+    }
+
+    /// Load the operator's last-selected activity view from disk. Best-effort:
+    /// a missing file, unreadable file, malformed JSON, or garbage value all
+    /// fall back to `ActiveView::Operate` — never fails App construction.
+    pub fn load_persisted_view() -> crate::view::ActiveView {
+        Self::tui_state_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| {
+                v.get("active_view")
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+            })
+            .map(|s| crate::view::ActiveView::from_str_or_default(&s))
+            .unwrap_or(crate::view::ActiveView::Operate)
+    }
+
+    /// Cycle the active view forward (`v`) or backward (`V`), persisting the
+    /// new value best-effort — a write failure (e.g. no home dir, read-only
+    /// filesystem) is silently ignored and never panics or fails the TUI.
+    pub fn cycle_view(&mut self, forward: bool) {
+        self.active_view = if forward {
+            self.active_view.next()
+        } else {
+            self.active_view.prev()
+        };
+        // Hunt view narrows `displayed_messages()` to CQs + directed-at-us
+        // (see `displayed_messages`); a row the cursor/pin was sitting on
+        // (e.g. a third-party exchange) can vanish from the list the instant
+        // we switch views. Without this, `band_activity_scroll` would keep
+        // pointing past the shrunk list until the next decode arrived and
+        // happened to trigger a clamp — Space would silently select nothing
+        // in the meantime. Re-clamp immediately on every view switch (also a
+        // no-op, harmless call for the common case where the list didn't
+        // shrink).
+        self.clamp_band_activity_selection();
+        if let Some(p) = Self::tui_state_path() {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(
+                &p,
+                format!("{{\"active_view\":\"{}\"}}", self.active_view.as_str()),
+            );
+        }
+        self.status_message = format!("View: {:?}", self.active_view);
     }
 
     pub async fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {
@@ -1210,7 +1313,7 @@ impl App {
     fn scroll_down(&mut self) {
         match self.active_panel {
             ActivePanel::BandActivity => {
-                let max_scroll = self.decoded_messages.len().saturating_sub(1);
+                let max_scroll = self.displayed_messages().len().saturating_sub(1);
                 if self.band_activity_scroll < max_scroll {
                     self.band_activity_scroll += 1;
                 }
@@ -1289,7 +1392,7 @@ impl App {
     pub fn scroll_to_bottom(&mut self) {
         match self.active_panel {
             ActivePanel::BandActivity => {
-                self.band_activity_scroll = self.decoded_messages.len().saturating_sub(1);
+                self.band_activity_scroll = self.displayed_messages().len().saturating_sub(1);
                 self.pin_band_activity_selection();
             }
             ActivePanel::DxHunter => {
@@ -1328,7 +1431,7 @@ impl App {
     pub fn page_down(&mut self) {
         match self.active_panel {
             ActivePanel::BandActivity => {
-                let max = self.decoded_messages.len().saturating_sub(1);
+                let max = self.displayed_messages().len().saturating_sub(1);
                 self.band_activity_scroll =
                     (self.band_activity_scroll + Self::SCROLL_PAGE).min(max);
                 self.pin_band_activity_selection();
@@ -1883,12 +1986,21 @@ impl App {
             .rev()
             .filter(|m| m.is_directed_at_us)
             .collect();
-        let others: Vec<&DecodedMessageView> = self
+        let mut others: Vec<&DecodedMessageView> = self
             .decoded_messages
             .iter()
             .rev()
             .filter(|m| !m.is_directed_at_us)
             .collect();
+        // Hunt view narrows the non-directed rows to CQs only (DXpedition /
+        // rare-station chasing wants CQ callers, not third-party exchange
+        // noise). Directed-at-us rows are always kept regardless of view —
+        // someone calling us must never be hidden. This lives here (not in
+        // the renderer) so the cursor, the renderer, and Space all agree on
+        // the same filtered list.
+        if self.active_view == crate::view::ActiveView::Hunt {
+            others.retain(|m| m.message.trim_start().starts_with("CQ"));
+        }
         directed.extend(others);
         directed
     }
@@ -2963,6 +3075,20 @@ mod tests {
         assert!(m.rx_buffer.is_empty() && m.tx_buffer.is_empty());
     }
 
+    /// With the test-only override unset, `tui_state_path()` must resolve
+    /// to exactly `~/.pancetta/tui_state.json` — the real production path.
+    /// This is a computation-only check (it never reads/writes the file
+    /// itself), so it's safe to run without touching the operator's real
+    /// state file.
+    #[test]
+    fn tui_state_path_default_is_real_home_pancetta_path() {
+        // Explicitly clear any override a prior test on this thread may
+        // have left behind, so this test is order-independent.
+        TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        let expected = dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"));
+        assert_eq!(App::tui_state_path(), expected);
+    }
+
     fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {
         DecodedMessageView {
             timestamp: chrono::Utc::now(),
@@ -2990,6 +3116,17 @@ mod tests {
         v.is_directed_at_us = true;
         v.message = format!("K5ARH {} -10", call);
         v
+    }
+
+    /// Band Activity fixture builder: `directed = false` produces a plain
+    /// "CQ <call> ..." decode (via `fixture_view`); `directed = true`
+    /// produces a directed-at-us decode (via `fixture_view_directed`).
+    fn ba_fixture(call: &str, directed: bool) -> DecodedMessageView {
+        if directed {
+            fixture_view_directed(call, -10)
+        } else {
+            fixture_view(call, -10)
+        }
     }
 
     async fn fixture_app() -> App {
@@ -3101,6 +3238,114 @@ mod tests {
         app.band_activity_scroll = 0;
         let selected = app.get_selected_station().expect("CALLER1 selectable");
         assert_eq!(selected.0, "CALLER1");
+    }
+
+    /// Hunt view narrows Band Activity to CQs-only among non-directed rows;
+    /// directed-at-us rows are always kept regardless of view. This is the
+    /// filter that drives the cursor, the renderer, and Space in Hunt view —
+    /// it must live inside `displayed_messages()` so all three agree.
+    #[tokio::test]
+    async fn hunt_view_filters_band_activity_to_cqs_and_directed() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.add_decoded_message(ba_fixture("K1AAA", false))
+            .await
+            .unwrap(); // "CQ K1AAA EM12"
+        let mut non_cq = ba_fixture("K2BBB", false);
+        non_cq.message = "K9ZZZ K2BBB -10".into();
+        app.add_decoded_message(non_cq).await.unwrap();
+        let mut directed = ba_fixture("K3CCC", true);
+        directed.message = "K5ARH K3CCC RR73".into();
+        app.add_decoded_message(directed).await.unwrap();
+
+        app.active_view = crate::view::ActiveView::Hunt;
+        let shown: Vec<_> = app
+            .displayed_messages()
+            .iter()
+            .filter_map(|m| m.call_sign.clone())
+            .collect();
+        assert!(shown.contains(&"K1AAA".to_string()), "CQ kept");
+        assert!(
+            shown.contains(&"K3CCC".to_string()),
+            "directed-at-us always kept"
+        );
+        assert!(
+            !shown.contains(&"K2BBB".to_string()),
+            "third-party exchange filtered"
+        );
+    }
+
+    /// Regression: in Hunt view `displayed_messages()` is shorter than the
+    /// raw `decoded_messages` (non-CQ third-party rows are filtered out).
+    /// `scroll_down`/`page_down`/`scroll_to_bottom` on the BandActivity panel
+    /// must bound `band_activity_scroll` against the FILTERED length, not the
+    /// raw decode count — otherwise the cursor can land on an index that's
+    /// in-range for the raw list but out-of-range for the filtered one, and
+    /// `pin_band_activity_selection()` silently drops the pin to `None`
+    /// (`displayed_messages().get(band_activity_scroll)` misses), reintroducing
+    /// the "cursor outlives a list mutation unpinned" bug class in a new guise.
+    #[tokio::test]
+    async fn hunt_view_scroll_clamps_to_filtered_length_not_raw() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        app.active_view = crate::view::ActiveView::Hunt;
+
+        // 5 third-party (non-CQ) rows — filtered OUT of the Hunt view.
+        for i in 0i32..5i32 {
+            let mut m = fixture_view(&format!("K{i}NONCQ"), -10);
+            m.message = format!("K9ZZZ K{i}NONCQ -10");
+            app.add_decoded_message(m).await.unwrap();
+        }
+        // 2 CQ rows — kept in the Hunt view.
+        app.add_decoded_message(fixture_view("K1CQA", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K2CQB", -8))
+            .await
+            .unwrap();
+
+        // Raw list has 7 rows; the Hunt-filtered list has only 2.
+        assert_eq!(app.decoded_messages.len(), 7);
+        assert_eq!(app.displayed_messages().len(), 2);
+
+        // scroll_down repeatedly: with the bug, this walks past index 1
+        // (bounded against the raw len of 7) instead of clamping at 1.
+        for _ in 0..6 {
+            app.scroll_down();
+        }
+        assert_eq!(
+            app.band_activity_scroll, 1,
+            "scroll_down must clamp to the filtered list's last index"
+        );
+        assert!(
+            app.band_activity_pinned_call.is_some(),
+            "scroll_down must not drop the pin by walking past the filtered list"
+        );
+
+        // page_down from a mid-filtered-list position must clamp the same way.
+        app.band_activity_scroll = 0;
+        app.pin_band_activity_selection();
+        app.page_down();
+        assert_eq!(
+            app.band_activity_scroll, 1,
+            "page_down must clamp to the filtered list's last index"
+        );
+        assert!(
+            app.band_activity_pinned_call.is_some(),
+            "page_down must not drop the pin by walking past the filtered list"
+        );
+
+        // scroll_to_bottom (End/G) must land on the filtered list's last row too.
+        app.band_activity_scroll = 0;
+        app.pin_band_activity_selection();
+        app.scroll_to_bottom();
+        assert_eq!(
+            app.band_activity_scroll, 1,
+            "scroll_to_bottom must jump to the filtered list's last index"
+        );
+        assert!(
+            app.band_activity_pinned_call.is_some(),
+            "scroll_to_bottom must not drop the pin by jumping past the filtered list"
+        );
     }
 
     #[tokio::test]
