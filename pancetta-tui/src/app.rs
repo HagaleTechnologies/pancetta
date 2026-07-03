@@ -669,6 +669,12 @@ pub struct App {
     pub station_info: StationInfo,
     pub dx_stations: HashMap<String, DxStation>,
     pub band_activity_scroll: usize,
+    /// The callsign the Band Activity cursor is pinned to. The list reorders
+    /// on EVERY decode window (directed-at-us pinned first, then newest-first),
+    /// so a bare positional index silently retargets Space onto a different
+    /// station. Same pattern as `dx_hunter_pinned_call` / `qso_pinned_id`.
+    /// `None` = not yet pinned (track whatever is at `band_activity_scroll`).
+    band_activity_pinned_call: Option<String>,
     pub dx_hunter_scroll: usize,
     /// The callsign the DX-Hunter cursor is pinned to. The DX-Hunter list
     /// re-sorts and grows under the cursor (needed-first / priority-desc),
@@ -893,6 +899,7 @@ impl App {
             station_info,
             dx_stations: HashMap::new(),
             band_activity_scroll: 0,
+            band_activity_pinned_call: None,
             dx_hunter_scroll: 0,
             dx_hunter_pinned_call: None,
             callers_scroll: 0,
@@ -1147,6 +1154,7 @@ impl App {
         // DX list). Re-derive both cursors from their pinned callsigns so the
         // operator's Space/Enter target doesn't silently shift onto whoever
         // just appeared.
+        self.clamp_band_activity_selection();
         self.clamp_dx_hunter_selection();
         self.clamp_callers_selection();
 
@@ -1181,6 +1189,7 @@ impl App {
                 if self.band_activity_scroll > 0 {
                     self.band_activity_scroll -= 1;
                 }
+                self.pin_band_activity_selection();
             }
             ActivePanel::DxHunter => {
                 if self.dx_hunter_scroll > 0 {
@@ -1205,6 +1214,7 @@ impl App {
                 if self.band_activity_scroll < max_scroll {
                     self.band_activity_scroll += 1;
                 }
+                self.pin_band_activity_selection();
             }
             ActivePanel::DxHunter => {
                 let max_scroll = self.displayed_dx_stations().len().saturating_sub(1);
@@ -1258,7 +1268,10 @@ impl App {
     /// "get me back to live" shortcut (Home / `g`), no more holding the arrow.
     pub fn scroll_to_top(&mut self) {
         match self.active_panel {
-            ActivePanel::BandActivity => self.band_activity_scroll = 0,
+            ActivePanel::BandActivity => {
+                self.band_activity_scroll = 0;
+                self.pin_band_activity_selection();
+            }
             ActivePanel::DxHunter => {
                 self.dx_hunter_scroll = 0;
                 self.repin_dx_hunter();
@@ -1277,6 +1290,7 @@ impl App {
         match self.active_panel {
             ActivePanel::BandActivity => {
                 self.band_activity_scroll = self.decoded_messages.len().saturating_sub(1);
+                self.pin_band_activity_selection();
             }
             ActivePanel::DxHunter => {
                 self.dx_hunter_scroll = self.displayed_dx_stations().len().saturating_sub(1);
@@ -1334,6 +1348,7 @@ impl App {
     pub fn clear_messages(&mut self) {
         self.decoded_messages.clear();
         self.band_activity_scroll = 0;
+        self.clamp_band_activity_selection();
         self.status_message = "Messages cleared".to_string();
         info!("Cleared all decoded messages");
     }
@@ -2153,6 +2168,42 @@ impl App {
             self.dx_hunter_scroll = max;
         }
         self.dx_hunter_pinned_call = calls.get(self.dx_hunter_scroll).cloned();
+    }
+
+    /// Pin the Band Activity selection to the callsign currently under the
+    /// cursor. Call after every deliberate cursor move.
+    pub fn pin_band_activity_selection(&mut self) {
+        self.band_activity_pinned_call = self
+            .displayed_messages()
+            .get(self.band_activity_scroll)
+            .and_then(|m| m.call_sign.clone());
+    }
+
+    /// Re-derive `band_activity_scroll` from the pinned callsign after any
+    /// list mutation. Falls back to a clamp (and clears the pin) if the
+    /// pinned callsign left the list.
+    pub fn clamp_band_activity_selection(&mut self) {
+        // Snapshot callsigns in display order (owned) to avoid holding a borrow
+        // of `self` while we mutate the cursor.
+        let calls: Vec<Option<String>> = self
+            .displayed_messages()
+            .iter()
+            .map(|m| m.call_sign.clone())
+            .collect();
+        let len = calls.len();
+
+        if let Some(ref pin) = self.band_activity_pinned_call {
+            if let Some(idx) = calls.iter().position(|call| {
+                call.as_deref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(pin))
+            }) {
+                self.band_activity_scroll = idx;
+                return;
+            }
+            self.band_activity_pinned_call = None;
+        }
+        let max = len.saturating_sub(1);
+        self.band_activity_scroll = self.band_activity_scroll.min(max);
     }
 
     /// The currently-selected caller, if any.
@@ -4421,5 +4472,48 @@ mod tests {
         assert_eq!(super::parse_mhz_to_hz(&m.tx_buffer), None);
         m.tx_buffer.push_str("14.090");
         assert_eq!(super::parse_mhz_to_hz(&m.tx_buffer), Some(14_090_000));
+    }
+
+    #[tokio::test]
+    async fn band_activity_cursor_follows_callsign_across_reorder() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        app.add_decoded_message(fixture_view("K1AAA", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K2BBB", -8))
+            .await
+            .unwrap();
+        // Newest-first display: [K2BBB, K1AAA]. Move cursor to K1AAA (row 1) and pin.
+        app.scroll_down();
+        app.pin_band_activity_selection();
+        let (call, _, _) = app.get_selected_station().expect("K1AAA selectable");
+        assert_eq!(call, "K1AAA");
+
+        // A new decode lands (K3CCC becomes row 0) AND a directed-at-us decode
+        // pins to the very top — both shift K1AAA's index.
+        app.add_decoded_message(fixture_view("K3CCC", -6))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view_directed("K4DDD", -4))
+            .await
+            .unwrap();
+
+        // The cursor must still resolve to K1AAA, not whatever occupies row 1 now.
+        let (call, _, _) = app.get_selected_station().expect("K1AAA still selectable");
+        assert_eq!(call, "K1AAA");
+    }
+
+    #[tokio::test]
+    async fn band_activity_pin_degrades_gracefully_when_station_ages_out() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        app.add_decoded_message(fixture_view("K1AAA", -10))
+            .await
+            .unwrap();
+        app.pin_band_activity_selection();
+        app.clear_messages();
+        // Pinned call gone: index clamps to 0, pin cleared, no panic.
+        assert_eq!(app.band_activity_scroll, 0);
     }
 }
