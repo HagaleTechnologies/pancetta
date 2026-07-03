@@ -561,9 +561,10 @@ pub enum ActivePanel {
     /// one and replies at the correct sequence step (smart default + override).
     Callers,
     DxHunter,
-    /// The TX-placement instrument (Task 11). Not reachable via the `1`-`5`
-    /// panel-jump keys (those stay as-is) — only `Tab`/`Shift+Tab` cycle into
-    /// it. Has no "focused callsign" concept (see `focused_callsign`).
+    /// The TX-placement instrument. Reachable via `5` (Task 18 renumbered the
+    /// panel-jump keys after Station Info was demoted) as well as
+    /// `Tab`/`Shift+Tab`. Has no "focused callsign" concept (see
+    /// `focused_callsign`).
     TxPlacement,
 }
 
