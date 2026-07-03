@@ -108,6 +108,11 @@ pub enum TxOrigin {
     Remote,
 }
 
+/// Severity of a [`MessageType::DiagnosticEvent`]. Re-exported from
+/// `pancetta-core` so `pancetta-tui` (which cannot depend on this crate) can
+/// share the same type across the bus boundary.
+pub use pancetta_core::DiagnosticLevel;
+
 /// Message types that can be sent between components
 #[derive(Debug, Clone)]
 pub enum MessageType {
@@ -141,6 +146,25 @@ pub enum MessageType {
         component_id: ComponentId,
         error_message: String,
         error_code: Option<u32>,
+    },
+
+    /// A retained, operator-facing diagnostic event (docs/observability-
+    /// diagnostics-plan.md Layer 1). Unlike `Error`/`StatusUpdate` (which
+    /// exist only to be relayed into the TUI's single, overwrite-prone
+    /// status line), this is meant to be RETAINED in a bounded history —
+    /// `target` reuses the project's existing `tracing` target vocabulary
+    /// (`qso.security`, `tx.policy`, `qso.autonomous`, …) so a diagnostic
+    /// panel can filter by the same taxonomy the log file already uses.
+    /// Emit sparingly (state changes, drops, rejects, outcomes) — this is
+    /// the curated stream, not the tracing firehose.
+    DiagnosticEvent {
+        target: &'static str,
+        level: DiagnosticLevel,
+        text: String,
+        /// The QSO this event concerns, if any (uppercased qso_id string).
+        qso_id: Option<String>,
+        /// The DX callsign involved, if any (for at-a-glance filtering).
+        callsign: Option<String>,
     },
 
     /// Hamlib rig control messages

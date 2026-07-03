@@ -119,6 +119,18 @@ pub enum TuiMessage {
     Error { component: String, message: String },
     /// Status update
     StatusUpdate { component: String, status: String },
+    /// A retained, operator-facing diagnostic event (docs/observability-
+    /// diagnostics-plan.md Layer 1) — relayed from
+    /// `MessageType::DiagnosticEvent`. Appended to `App`'s bounded event
+    /// history rather than overwriting the single status line.
+    DiagnosticEvent {
+        ts: chrono::DateTime<chrono::Utc>,
+        target: &'static str,
+        level: pancetta_core::DiagnosticLevel,
+        text: String,
+        qso_id: Option<String>,
+        callsign: Option<String>,
+    },
     /// Waterfall display data (normalized power rows, each Vec<f32> is one time-slice)
     WaterfallUpdate { rows: Vec<Vec<f32>> },
     /// Live spot groups from cqdx.io
@@ -668,6 +680,23 @@ impl TuiRunner {
             TuiMessage::AudioOutputDefault { is_default } => {
                 app.tx_output_default = is_default;
             }
+            TuiMessage::DiagnosticEvent {
+                ts,
+                target,
+                level,
+                text,
+                qso_id,
+                callsign,
+            } => {
+                app.push_diagnostic_event(crate::app::DiagnosticEventRecord {
+                    ts,
+                    target,
+                    level,
+                    text,
+                    qso_id,
+                    callsign,
+                });
+            }
         }
 
         Ok(())
@@ -934,6 +963,27 @@ impl TuiRunner {
             return Ok(true);
         }
 
+        // Diagnostics overlay (docs/observability-diagnostics-plan.md). A
+        // read-only scrollback of retained DiagnosticEvents, so unlike the
+        // input modals above there is no text-entry surface — just dismiss
+        // (Esc or the same Shift+D toggle) and scroll (Up/Down/j/k).
+        if app.show_diagnostics {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('D') => {
+                    app.show_diagnostics = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.diagnostics_scroll = app.diagnostics_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let max = app.diagnostic_events.len().saturating_sub(1);
+                    app.diagnostics_scroll = (app.diagnostics_scroll + 1).min(max);
+                }
+                _ => {} // swallow other keys while the overlay is open
+            }
+            return Ok(true);
+        }
+
         match key.code {
             // hb-161: Esc clears the operator-stop banner without re-enabling
             // anything. Re-enabling autonomous still requires `a`. Bound here
@@ -1140,6 +1190,15 @@ impl TuiRunner {
                 // h - Halt current TX. Releases PTT within ~150ms; pancetta
                 // keeps running and listening.
                 self.message_tx.send(TuiCommand::StopTx)?;
+            }
+            // Shift+D — toggle the diagnostics overlay (retained
+            // DiagnosticEvent history: QSO outcomes, drops, rejects — why
+            // things happened, not just that they did). Lowercase `d` is
+            // taken by the device-selection modal, so diagnostics uses D.
+            // Opens scrolled to the newest event.
+            KeyCode::Char('D') => {
+                app.show_diagnostics = true;
+                app.diagnostics_scroll = app.diagnostic_events.len().saturating_sub(1);
             }
             // Shift+H — Engage Hound mode on the selected DX-Hunter station.
             // Lowercase `h` is taken by StopTx (halt TX), so Hound uses H.
@@ -1475,6 +1534,8 @@ impl TuiRunner {
                 crate::ui::render_freq_modal(f, f.area(), &app.freq_modal);
             } else if app.offset_modal.visible {
                 crate::ui::render_offset_modal(f, f.area(), &app.offset_modal);
+            } else if app.show_diagnostics {
+                crate::ui::render_diagnostics_overlay(f, f.area(), &app);
             }
         })?;
 

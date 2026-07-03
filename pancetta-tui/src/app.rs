@@ -346,6 +346,20 @@ pub enum DevicePanel {
     Output,
 }
 
+/// One retained diagnostic event (docs/observability-diagnostics-plan.md
+/// Layer 1) — relayed from `MessageType::DiagnosticEvent`. `target` reuses
+/// the project's existing `tracing` target vocabulary so the overlay reads
+/// like a curated slice of the log, not a new ad-hoc taxonomy.
+#[derive(Debug, Clone)]
+pub struct DiagnosticEventRecord {
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub target: &'static str,
+    pub level: pancetta_core::DiagnosticLevel,
+    pub text: String,
+    pub qso_id: Option<String>,
+    pub callsign: Option<String>,
+}
+
 /// Which field of the frequency-entry modal is focused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FreqModalField {
@@ -617,6 +631,16 @@ pub struct App {
     pub terminal_size: (u16, u16),
     pub status_message: String,
     pub theme: Theme,
+    /// Retained diagnostic-event history (docs/observability-diagnostics-
+    /// plan.md Layer 1) — unlike `status_message` (a single, overwrite-
+    /// prone line), this is a bounded scrollback of WHY things happened:
+    /// QSO outcomes, drops, rejects. Toggled into view alongside the
+    /// existing panels; see `ActivePanel`.
+    pub diagnostic_events: VecDeque<DiagnosticEventRecord>,
+    /// Shift+D overlay visibility for `diagnostic_events`.
+    pub show_diagnostics: bool,
+    /// Scroll cursor into `diagnostic_events` while the overlay is open.
+    pub diagnostics_scroll: usize,
 
     // Data
     pub decoded_messages: VecDeque<DecodedMessageView>,
@@ -857,6 +881,9 @@ impl App {
             terminal_size: (80, 24),
             status_message: "Pancetta TUI Ready".to_string(),
             theme: config.ui.theme,
+            diagnostic_events: VecDeque::with_capacity(500),
+            show_diagnostics: false,
+            diagnostics_scroll: 0,
             decoded_messages: VecDeque::with_capacity(1000),
             qso_statuses: Vec::new(),
             active_qsos: Vec::new(),
@@ -1754,6 +1781,24 @@ impl App {
 
     pub fn add_error_message(&mut self, error: String) {
         self.status_message = format!("Error: {}", error);
+    }
+
+    /// Append a retained diagnostic event, evicting the oldest once the
+    /// bounded history is full (docs/observability-diagnostics-plan.md
+    /// Layer 1). Auto-follows: if the overlay is open and was already
+    /// scrolled to the newest entry, the cursor advances to the new newest
+    /// entry so a live event stream doesn't leave the operator staring at a
+    /// stale scroll position.
+    pub fn push_diagnostic_event(&mut self, event: DiagnosticEventRecord) {
+        const MAX_DIAGNOSTIC_EVENTS: usize = 500;
+        let was_at_end = self.diagnostic_events.len().saturating_sub(1) == self.diagnostics_scroll;
+        self.diagnostic_events.push_back(event);
+        while self.diagnostic_events.len() > MAX_DIAGNOSTIC_EVENTS {
+            self.diagnostic_events.pop_front();
+        }
+        if was_at_end || self.show_diagnostics && self.diagnostic_events.len() == 1 {
+            self.diagnostics_scroll = self.diagnostic_events.len().saturating_sub(1);
+        }
     }
 
     pub fn update_component_status(&mut self, component: String, status: String) {
@@ -2980,6 +3025,71 @@ mod tests {
         assert_eq!(q.snr_tx, Some(-15));
         assert_eq!(q.snr_rx, Some(-12));
         assert_eq!(q.exchange_count, 3);
+    }
+
+    fn fixture_diag_event(text: &str) -> DiagnosticEventRecord {
+        DiagnosticEventRecord {
+            ts: Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Info,
+            text: text.to_string(),
+            qso_id: None,
+            callsign: None,
+        }
+    }
+
+    /// docs/observability-diagnostics-plan.md Layer 1: pushing events grows
+    /// the retained history, and it's bounded (oldest evicted past the cap).
+    #[tokio::test]
+    async fn push_diagnostic_event_appends_and_bounds_history() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        assert!(app.diagnostic_events.is_empty());
+
+        app.push_diagnostic_event(fixture_diag_event("first"));
+        app.push_diagnostic_event(fixture_diag_event("second"));
+        assert_eq!(app.diagnostic_events.len(), 2);
+        assert_eq!(app.diagnostic_events[0].text, "first");
+        assert_eq!(app.diagnostic_events[1].text, "second");
+
+        for i in 0..600 {
+            app.push_diagnostic_event(fixture_diag_event(&format!("event-{i}")));
+        }
+        assert!(
+            app.diagnostic_events.len() <= 500,
+            "diagnostic history must stay bounded, got {}",
+            app.diagnostic_events.len()
+        );
+        // The oldest entries ("first"/"second") must have been evicted.
+        assert!(!app.diagnostic_events.iter().any(|e| e.text == "first"));
+    }
+
+    /// The scroll cursor auto-follows new events when it was already at the
+    /// newest entry (so a live event stream doesn't leave the operator
+    /// staring at a stale position), but does NOT jump the cursor if the
+    /// operator had scrolled back to review history.
+    #[tokio::test]
+    async fn push_diagnostic_event_auto_follows_only_when_at_the_end() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.push_diagnostic_event(fixture_diag_event("a"));
+        app.push_diagnostic_event(fixture_diag_event("b"));
+        assert_eq!(
+            app.diagnostics_scroll, 1,
+            "cursor starts at the newest entry"
+        );
+
+        app.push_diagnostic_event(fixture_diag_event("c"));
+        assert_eq!(
+            app.diagnostics_scroll, 2,
+            "cursor auto-follows when it was at the end"
+        );
+
+        // Operator scrolls back to review history.
+        app.diagnostics_scroll = 0;
+        app.push_diagnostic_event(fixture_diag_event("d"));
+        assert_eq!(
+            app.diagnostics_scroll, 0,
+            "cursor must NOT jump while the operator is scrolled back"
+        );
     }
 
     /// Stale QSOs leave the detail panel when the next snapshot omits

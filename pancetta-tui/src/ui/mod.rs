@@ -799,6 +799,92 @@ pub fn render_offset_modal(f: &mut Frame<'_>, area: Rect, m: &crate::app::Offset
     f.render_widget(Paragraph::new(body).block(block), modal_area);
 }
 
+/// Render the Shift+D diagnostics overlay: a scrollable, retained history of
+/// `DiagnosticEvent`s (docs/observability-diagnostics-plan.md Layer 1) — the
+/// "why did that happen" surface, as opposed to the single overwrite-prone
+/// status line. Nearly full-screen (unlike the small input modals above)
+/// since it's a scrollback list, not a form.
+pub fn render_diagnostics_overlay(f: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.width < 20 || area.height < 6 {
+        return;
+    }
+    let modal_width = area.width.saturating_sub(4);
+    let modal_height = area.height.saturating_sub(4);
+    let modal_area = Rect {
+        x: (area.width.saturating_sub(modal_width)) / 2,
+        y: (area.height.saturating_sub(modal_height)) / 2,
+        width: modal_width,
+        height: modal_height,
+    };
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " Diagnostics ({}/{}) — \u{2191}\u{2193}/jk scroll, Esc/D close ",
+            app.diagnostic_events.len().min(app.diagnostics_scroll + 1),
+            app.diagnostic_events.len()
+        ))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(modal_area);
+    f.render_widget(block, modal_area);
+
+    if app.diagnostic_events.is_empty() {
+        f.render_widget(
+            Paragraph::new(" No diagnostic events yet this session."),
+            inner,
+        );
+        return;
+    }
+
+    // Show a window of rows ending at (or centered near) diagnostics_scroll,
+    // newest-appropriate: one line per event, oldest-first within the window
+    // (matches reading a log top-to-bottom).
+    let visible_rows = inner.height as usize;
+    let cursor = app
+        .diagnostics_scroll
+        .min(app.diagnostic_events.len().saturating_sub(1));
+    let end = cursor + 1;
+    let start = end.saturating_sub(visible_rows);
+
+    let lines: Vec<Line> = app
+        .diagnostic_events
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(end - start)
+        .map(|(i, ev)| {
+            let color = match ev.level {
+                pancetta_core::DiagnosticLevel::Info => Color::Gray,
+                pancetta_core::DiagnosticLevel::Warn => Color::Yellow,
+                pancetta_core::DiagnosticLevel::Error => Color::Red,
+            };
+            let who = ev
+                .callsign
+                .as_deref()
+                .map(|c| format!(" [{c}]"))
+                .unwrap_or_default();
+            let line = format!(
+                "{} {:<14} {}{}",
+                ev.ts.format("%H:%M:%S"),
+                ev.target,
+                ev.text,
+                who
+            );
+            let style = if i == cursor {
+                Style::default()
+                    .fg(color)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(color)
+            };
+            Line::from(Span::styled(line, style))
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// Render the required out-of-band acknowledgment modal.
 pub fn render_out_of_band_modal(f: &mut Frame<'_>, area: Rect, tx_rf_hz: u64) {
     if area.width < 10 || area.height < 4 {
