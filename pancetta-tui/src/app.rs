@@ -8,6 +8,15 @@ use tracing::{debug, info};
 
 use crate::config::{Config, Theme};
 
+// Test-only thread-local backing `App::set_test_tui_state_path` /
+// `App::tui_state_path`. See those for why this is a thread-local rather
+// than a process-global env var. Never compiled into production builds.
+#[cfg(test)]
+thread_local! {
+    static TEST_TUI_STATE_PATH_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Terminal color support level, detected at startup
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorCapability {
@@ -968,8 +977,33 @@ impl App {
 
     /// Path to the persisted TUI state file (`~/.pancetta/tui_state.json`).
     /// `None` if the home directory can't be resolved.
+    ///
+    /// Test-only seam: honors a thread-local override (see
+    /// [`Self::set_test_tui_state_path`]) so the unit test suite never reads
+    /// or writes the operator's real state file — compiled out of
+    /// production builds entirely (`#[cfg(test)]`), so this is a no-op for
+    /// the real TUI.
     fn tui_state_path() -> Option<std::path::PathBuf> {
+        #[cfg(test)]
+        {
+            if let Some(p) = TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| cell.borrow().clone()) {
+                return Some(p);
+            }
+        }
         dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"))
+    }
+
+    /// Test-only: point [`Self::tui_state_path`] at `path` for the calling
+    /// thread only, so tests never touch `~/.pancetta/tui_state.json`.
+    /// `#[tokio::test]` defaults to a current-thread runtime, so a value set
+    /// here is visible for the rest of the test body (including any tasks
+    /// it spawns) — unlike a process-global env var, a thread-local can't
+    /// leak into (or race with) a *different* test running concurrently on
+    /// another thread. Call this before constructing `App` or calling
+    /// `cycle_view`, at the top of the test.
+    #[cfg(test)]
+    pub(crate) fn set_test_tui_state_path(path: std::path::PathBuf) {
+        TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = Some(path));
     }
 
     /// Load the operator's last-selected activity view from disk. Best-effort:
@@ -3011,6 +3045,20 @@ mod tests {
         assert!(!m.visible);
         assert_eq!(m.field, super::FreqModalField::RxDial);
         assert!(m.rx_buffer.is_empty() && m.tx_buffer.is_empty());
+    }
+
+    /// With the test-only override unset, `tui_state_path()` must resolve
+    /// to exactly `~/.pancetta/tui_state.json` — the real production path.
+    /// This is a computation-only check (it never reads/writes the file
+    /// itself), so it's safe to run without touching the operator's real
+    /// state file.
+    #[test]
+    fn tui_state_path_default_is_real_home_pancetta_path() {
+        // Explicitly clear any override a prior test on this thread may
+        // have left behind, so this test is order-independent.
+        TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
+        let expected = dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"));
+        assert_eq!(App::tui_state_path(), expected);
     }
 
     fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {

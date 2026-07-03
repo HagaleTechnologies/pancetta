@@ -102,6 +102,9 @@ mod tests {
         ] {
             assert_eq!(ActiveView::from_str_or_default(v.as_str()), v);
         }
-        assert_eq!(ActiveView::from_str_or_default("garbage"), ActiveView::Operate);
+        assert_eq!(
+            ActiveView::from_str_or_default("garbage"),
+            ActiveView::Operate
+        );
     }
 }

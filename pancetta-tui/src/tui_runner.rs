@@ -1982,11 +1982,26 @@ mod key_tests {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
+    /// Monotonic counter giving each `make_runner()` call its own
+    /// `tui_state_path()` override, so concurrently-running tests never
+    /// share (and race on) the same file — see `App::set_test_tui_state_path`.
+    static TEST_STATE_PATH_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     async fn make_runner() -> (
         TuiRunner,
         crossbeam_channel::Receiver<TuiCommand>,
         Arc<RwLock<App>>,
     ) {
+        // Test seam: every test that builds an App via make_runner() gets
+        // its own throwaway state-file path, so no test — including the
+        // `v`/`V` view-cycling tests, which actually write to it — ever
+        // touches the operator's real `~/.pancetta/tui_state.json`, and no
+        // two tests running in parallel can race on the same file.
+        let n = TEST_STATE_PATH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let state_path = std::env::temp_dir().join(format!("pancetta_tui_test_state_{n}.json"));
+        App::set_test_tui_state_path(state_path);
+
         let app = Arc::new(RwLock::new(
             App::new(Config::default(), None).await.unwrap(),
         ));
@@ -2025,8 +2040,10 @@ mod key_tests {
     #[tokio::test]
     async fn key_v_cycles_view_forward() {
         let (mut r, cmd_rx, app) = make_runner().await;
-        // Force a known starting point regardless of any persisted
-        // `~/.pancetta/tui_state.json` from a prior run.
+        // Force a known starting point regardless of whatever
+        // make_runner()'s throwaway state file happened to contain
+        // (it's a per-test path — see TEST_STATE_PATH_COUNTER — so this is
+        // just belt-and-suspenders, not working around cross-test state).
         app.write().await.active_view = crate::view::ActiveView::Operate;
         r.handle_key_event(key('v')).await.unwrap();
         assert_eq!(app.read().await.active_view, crate::view::ActiveView::Hunt);
