@@ -512,8 +512,19 @@ impl TuiRunner {
                         }
                     }
                     Event::Mouse(mouse_event) => {
-                        let mut app = self.app.write().await;
-                        app.handle_mouse_event(mouse_event).await?;
+                        let cmd = {
+                            let mut app = self.app.write().await;
+                            app.handle_mouse_event(mouse_event).await?
+                        };
+                        // Task 19: click-to-park (TxPlacement strip) is the
+                        // one mouse interaction that sends a `TuiCommand` —
+                        // `App` doesn't own `message_tx` (same reason every
+                        // key-event command send lives here, not in
+                        // `app.rs`), so it hands the command back for us to
+                        // send once the write lock is released.
+                        if let Some(cmd) = cmd {
+                            self.message_tx.send(cmd)?;
+                        }
                     }
                     Event::FocusLost => {
                         info!("TUI received FocusLost event");
@@ -740,6 +751,16 @@ impl TuiRunner {
                 qso_id,
                 callsign,
             } => {
+                // Task 20d: session QSO counter, counted TUI-side from this
+                // same stream (no new bus message) — the coordinator's exact
+                // completion text ("QSO with {call} logged (RST …/…)",
+                // target "qso", Info) since PR #84.
+                if target == "qso"
+                    && level == pancetta_core::DiagnosticLevel::Info
+                    && text.starts_with("QSO with")
+                {
+                    app.session_completed += 1;
+                }
                 app.push_diagnostic_event(crate::app::DiagnosticEventRecord {
                     ts,
                     target,
@@ -1506,9 +1527,15 @@ impl TuiRunner {
             }
 
             // === Display / housekeeping ===
+            // Task 20f: confirm-on-`x`. First press arms a 3s confirmation
+            // window (status hint, no clear); a second press within that
+            // window actually clears. `try_clear_decodes` returns `true`
+            // only when it cleared, so we only tell the coordinator to
+            // clear its side on the confirming press.
             KeyCode::Char('x') => {
-                app.clear_messages();
-                self.message_tx.send(TuiCommand::ClearMessages)?;
+                if app.try_clear_decodes() {
+                    self.message_tx.send(TuiCommand::ClearMessages)?;
+                }
             }
 
             // Space - context-aware action on the selected station ("do the
@@ -1872,7 +1899,7 @@ impl TuiRunner {
             ("Shift+X", "Toggle Fox (DXpedition) mode"),
             ("m", "Toggle audio monitoring"),
             ("d", "Device picker"),
-            ("x", "Clear decoded messages"),
+            ("x", "Clear decoded messages (press twice within 3s)"),
             ("q", "Quit (with confirm)"),
             ("Shift+Q", "EMERGENCY STOP (halt TX, autonomous off)"),
             ("Esc", "Dismiss overlay / cancel modal / clear stop banner"),
@@ -2355,9 +2382,51 @@ mod key_tests {
         }
     }
 
+    /// Task 20f: confirm-on-`x`. A single press must NOT clear (it only
+    /// arms); a second press within the 3s window does.
     #[tokio::test]
-    async fn key_x_emits_clear_messages() {
-        let (mut r, cmd_rx, _app) = make_runner().await;
+    async fn key_x_first_press_arms_second_press_within_window_clears() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+
+        r.handle_key_event(key('x')).await.unwrap();
+        assert!(cmd_rx.try_recv().is_err(), "first press must not clear yet");
+        assert!(app.read().await.clear_armed_at.is_some());
+        assert_eq!(
+            app.read().await.status_message,
+            "press x again within 3s to clear decodes"
+        );
+
+        r.handle_key_event(key('x')).await.unwrap();
+        assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::ClearMessages)));
+        assert!(
+            app.read().await.clear_armed_at.is_none(),
+            "confirming press disarms"
+        );
+    }
+
+    /// A press arriving AFTER the 3s window has expired must NOT clear —
+    /// it re-arms instead, restarting the 2-press sequence. Simulated by
+    /// stashing an artificially-past `Instant` (no real sleeping needed:
+    /// `Instant` supports subtracting a `Duration`).
+    #[tokio::test]
+    async fn key_x_press_after_window_expired_rearms_instead_of_clearing() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.clear_armed_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(4));
+        }
+
+        r.handle_key_event(key('x')).await.unwrap();
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "expired arm must not clear on this press"
+        );
+        assert!(
+            app.read().await.clear_armed_at.is_some(),
+            "must re-arm rather than staying disarmed"
+        );
+
+        // The re-arm starts a fresh window: a follow-up press now clears.
         r.handle_key_event(key('x')).await.unwrap();
         assert!(matches!(cmd_rx.try_recv(), Ok(TuiCommand::ClearMessages)));
     }
@@ -2685,6 +2754,51 @@ mod key_tests {
             0,
             "SplitUpdate tx_hz=0 clears chip"
         );
+    }
+
+    /// Task 20d: the session QSO counter increments ONLY on a target="qso",
+    /// Info-level `DiagnosticEvent` whose text starts with the coordinator's
+    /// exact completion prefix ("QSO with ..."). A same-target Warn (e.g. a
+    /// QSO-failed event, which also flows through this same handler) must
+    /// NOT count.
+    #[tokio::test]
+    async fn diagnostic_event_qso_completed_increments_session_counter() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        assert_eq!(app.read().await.session_completed, 0);
+
+        r.handle_message(TuiMessage::DiagnosticEvent {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Info,
+            text: "QSO with K1ABC logged (RST -10/-05)".to_string(),
+            qso_id: None,
+            callsign: Some("K1ABC".to_string()),
+        })
+        .await
+        .unwrap();
+        r.handle_message(TuiMessage::DiagnosticEvent {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Info,
+            text: "QSO with W2XYZ logged (RST -05/-10)".to_string(),
+            qso_id: None,
+            callsign: Some("W2XYZ".to_string()),
+        })
+        .await
+        .unwrap();
+        // A same-target Warn (e.g. QSO failed) must not count.
+        r.handle_message(TuiMessage::DiagnosticEvent {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Warn,
+            text: "QSO failed: timeout".to_string(),
+            qso_id: None,
+            callsign: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.read().await.session_completed, 2);
     }
 
     /// Whole-branch-review fix (finding 1): `TxOffsetUpdate` (the

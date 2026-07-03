@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossterm::event::MouseEvent;
+use ratatui::layout::Rect;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
@@ -690,6 +691,16 @@ pub struct App {
     pub show_diagnostics: bool,
     /// Scroll cursor into `diagnostic_events` while the overlay is open.
     pub diagnostics_scroll: usize,
+    /// Count of QSOs completed this session (Task 20d). Counted TUI-side
+    /// from the diagnostic-event stream that already flows — no new bus
+    /// message — by matching the exact completion text the coordinator
+    /// emits (`"QSO with {call} logged (RST …/…)"`, target "qso", Info
+    /// level). Rendered as "QSOs: {n}" in the title bar once n > 0.
+    pub session_completed: u32,
+    /// Set by the first `x` press (Task 20f — confirm-on-`x`); a second
+    /// press within `CLEAR_CONFIRM_WINDOW` actually clears decodes. `None`
+    /// = not armed.
+    pub clear_armed_at: Option<std::time::Instant>,
 
     // Data
     pub decoded_messages: VecDeque<DecodedMessageView>,
@@ -982,6 +993,8 @@ impl App {
             diagnostic_events: VecDeque::with_capacity(500),
             show_diagnostics: false,
             diagnostics_scroll: 0,
+            session_completed: 0,
+            clear_armed_at: None,
             decoded_messages: VecDeque::with_capacity(1000),
             qso_statuses: Vec::new(),
             active_qsos: Vec::new(),
@@ -1135,8 +1148,17 @@ impl App {
         self.status_message = format!("View: {:?}", self.active_view);
     }
 
-    pub async fn handle_mouse_event(&mut self, mouse: MouseEvent) -> Result<()> {
-        use crossterm::event::MouseEventKind;
+    /// Returns the `TuiCommand` to send as a result of this event, if any.
+    /// `App` doesn't own the outgoing channel (only `TuiRunner` does, same
+    /// as every key-event command send), so a click that needs to send one
+    /// (click-to-park on the TX-placement strip) hands it back to the
+    /// caller rather than sending it itself — mirroring how key events are
+    /// dispatched in `tui_runner.rs`.
+    pub async fn handle_mouse_event(
+        &mut self,
+        mouse: MouseEvent,
+    ) -> Result<Option<crate::tui_runner::TuiCommand>> {
+        use crossterm::event::{MouseButton, MouseEventKind};
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_up();
@@ -1144,9 +1166,148 @@ impl App {
             MouseEventKind::ScrollDown => {
                 self.scroll_down();
             }
+            MouseEventKind::Down(MouseButton::Left) => {
+                return Ok(self.handle_left_click(mouse.column, mouse.row));
+            }
             _ => {}
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// Task 19: click-to-focus and click-to-park. Maps a left-click at
+    /// absolute terminal coordinates `(x, y)` to a panel + row via the
+    /// pure `ui::hit_test` — the SAME rect map `ui::draw` renders from, so
+    /// a click always lands on the panel boundary the operator actually
+    /// sees. A hit on any panel other than TxPlacement sets `active_panel`
+    /// and moves+pins that panel's cursor to the clicked row, mirroring
+    /// Tab + arrow-key navigation (reusing each panel's existing pin
+    /// method — no new pinning logic). A hit on the TxPlacement panel's
+    /// openness-STRIP row (row 0; other instrument rows just focus the
+    /// panel) parks at the clicked frequency via `click_park_tx_placement`.
+    fn handle_left_click(&mut self, x: u16, y: u16) -> Option<crate::tui_runner::TuiCommand> {
+        let content_area =
+            crate::ui::content_area(Rect::new(0, 0, self.terminal_size.0, self.terminal_size.1));
+        let (panel, row) = crate::ui::hit_test(
+            self.active_view,
+            self.zoomed,
+            self.active_panel,
+            content_area,
+            x,
+            y,
+        )?;
+
+        if panel != ActivePanel::TxPlacement {
+            self.active_panel = panel;
+            let row = row as usize;
+            match panel {
+                ActivePanel::BandActivity => {
+                    let len = self.displayed_messages().len();
+                    if len > 0 {
+                        self.band_activity_scroll = row.min(len - 1);
+                        self.pin_band_activity_selection();
+                    }
+                }
+                ActivePanel::DxHunter => {
+                    let len = self.displayed_dx_stations().len();
+                    if len > 0 {
+                        self.dx_hunter_scroll = row.min(len - 1);
+                        self.repin_dx_hunter();
+                    }
+                }
+                ActivePanel::Callers => {
+                    let len = self.displayed_callers().len();
+                    if len > 0 {
+                        self.callers_scroll = row.min(len - 1);
+                        self.repin_callers();
+                    }
+                }
+                ActivePanel::QsoStatus => {
+                    if !self.active_qsos.is_empty() {
+                        self.qso_cursor = row.min(self.active_qsos.len() - 1);
+                        self.repin_qso_selection();
+                    }
+                }
+                ActivePanel::TxPlacement => unreachable!("excluded by the guard above"),
+            }
+            return None;
+        }
+
+        // TxPlacement: focus the panel regardless of which row was clicked.
+        self.active_panel = ActivePanel::TxPlacement;
+        if row != 0 {
+            // Only the openness strip (row 0) parks; the other instrument
+            // rows (stream markers / BEST row / park line / freq axis)
+            // just focus the panel, per the brief.
+            return None;
+        }
+        self.click_park_tx_placement(x, content_area)
+    }
+
+    /// Row-0 (openness strip) click on the TX-placement instrument: map
+    /// the clicked column to a frequency bin using the SAME column<->
+    /// frequency scaling the strip renderer uses (`ui::tx_placement::
+    /// freq_for_col` + `strip_width_for`, reused rather than
+    /// re-derived), then park there — collision-aware per spec §2:
+    /// a bin busy in BOTH windows (openness code 0) refuses to park;
+    /// codes 1/2 (busy in exactly one window) park but name which window
+    /// is busy; code 3 (fully clear) parks normally. Uses the EXISTING
+    /// `TuiCommand::SetTxOffset` path (same one the `o` modal and the
+    /// TxPlacement Enter-park key use) — no new command.
+    fn click_park_tx_placement(
+        &mut self,
+        x: u16,
+        content_area: Rect,
+    ) -> Option<crate::tui_runner::TuiCommand> {
+        let placement = self.placement.clone()?;
+        let rect = crate::ui::view_rects(
+            self.active_view,
+            self.zoomed,
+            self.active_panel,
+            content_area,
+        )
+        .into_iter()
+        .find(|(p, _)| *p == ActivePanel::TxPlacement)
+        .map(|(_, r)| r)?;
+
+        // Inner (border-stripped) geometry, mirroring `block.inner(area)`.
+        if rect.width < 3 || x < rect.x + 1 {
+            return None;
+        }
+        let inner_width = (rect.width - 2) as usize;
+        let strip_width = crate::ui::tx_placement::strip_width_for(inner_width);
+        let col = (x - (rect.x + 1)) as usize;
+        if col >= strip_width {
+            // Clicked the legend ("█both ▀E ▄O"), not the strip itself.
+            return None;
+        }
+
+        let freq = crate::ui::tx_placement::freq_for_col(col, strip_width, placement.range)?;
+        let n_bins = placement.openness.len();
+        let bin = crate::ui::tx_placement::bin_index_for_freq(
+            freq,
+            placement.range,
+            placement.bin_hz,
+            n_bins,
+        )?;
+        let hz = freq.round().max(0.0) as u64;
+        let code = placement.openness.get(bin).copied().unwrap_or(0);
+
+        if code == 0 {
+            self.status_message = format!("\u{26a0} {hz} Hz busy in both windows — not parking");
+            return None;
+        }
+
+        self.tx_offset_hold_hz = Some(hz);
+        self.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
+        self.parked_since = Some(chrono::Utc::now());
+        self.status_message = match code {
+            1 => format!("Parked at {hz} Hz (O) \u{2014} Even window busy"),
+            2 => format!("Parked at {hz} Hz (E) \u{2014} Odd window busy"),
+            _ => format!("Parked at {hz} Hz (E+O)"),
+        };
+        Some(crate::tui_runner::TuiCommand::SetTxOffset {
+            offset_hz: Some(hz),
+        })
     }
 
     pub async fn handle_resize(&mut self, width: u16, height: u16) -> Result<()> {
@@ -1529,6 +1690,32 @@ impl App {
         self.clamp_band_activity_selection();
         self.status_message = "Messages cleared".to_string();
         info!("Cleared all decoded messages");
+    }
+
+    /// How long a first `x` press stays armed for a confirming second press
+    /// (Task 20f).
+    const CLEAR_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Confirm-on-`x`: the first press arms a 3-second confirmation window
+    /// (and leaves a status hint) instead of clearing immediately; a second
+    /// press WITHIN that window actually clears. A press after the window
+    /// expired doesn't clear — it re-arms, restarting the 2-press sequence.
+    /// Returns `true` iff decodes were actually cleared this call (the
+    /// caller uses this to decide whether to also tell the coordinator to
+    /// clear its side via `TuiCommand::ClearMessages`).
+    pub fn try_clear_decodes(&mut self) -> bool {
+        match self.clear_armed_at {
+            Some(armed_at) if armed_at.elapsed() <= Self::CLEAR_CONFIRM_WINDOW => {
+                self.clear_armed_at = None;
+                self.clear_messages();
+                true
+            }
+            _ => {
+                self.clear_armed_at = Some(std::time::Instant::now());
+                self.status_message = "press x again within 3s to clear decodes".to_string();
+                false
+            }
+        }
     }
 
     fn cleanup_old_data(&mut self) {
@@ -5417,6 +5604,238 @@ mod tests {
             app.park_coverage_last,
             Some((450, 1)),
             "baseline must rebase to the newly-parked frequency B, not stay on A"
+        );
+    }
+
+    // === Task 19: mouse click-to-focus / click-to-park =====================
+
+    fn left_click(x: u16, y: u16) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: x,
+            row: y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    /// Both the click handler and the test derive the panel's rect from
+    /// the SAME `ui::view_rects` the renderer draws from — so this proves
+    /// the click lands on the boundary the operator actually sees, not
+    /// just on whatever coordinates the test happened to hand-compute.
+    fn operate_panel_rect(app: &App, panel: ActivePanel) -> ratatui::layout::Rect {
+        let content_area =
+            crate::ui::content_area(Rect::new(0, 0, app.terminal_size.0, app.terminal_size.1));
+        crate::ui::view_rects(app.active_view, app.zoomed, app.active_panel, content_area)
+            .into_iter()
+            .find(|(p, _)| *p == panel)
+            .map(|(_, r)| r)
+            .unwrap_or_else(|| panic!("{:?} not present in this view", panel))
+    }
+
+    #[tokio::test]
+    async fn click_band_activity_row_focuses_and_pins_it() {
+        let mut app = fixture_app().await;
+        app.terminal_size = (120, 40);
+        app.active_panel = ActivePanel::DxHunter; // start on a different panel
+        app.add_decoded_message(fixture_view("K1AAA", -10))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view("K2BBB", -5))
+            .await
+            .unwrap();
+        // Newest-first: row 0 = K2BBB, row 1 = K1AAA.
+        assert_eq!(
+            app.displayed_messages()[1].call_sign.as_deref(),
+            Some("K1AAA")
+        );
+
+        let rect = operate_panel_rect(&app, ActivePanel::BandActivity);
+        // border(1) + header(1) + row 1 (K1AAA).
+        let y = rect.y + 2 + 1;
+        let x = rect.x + 2;
+
+        let cmd = app.handle_mouse_event(left_click(x, y)).await.unwrap();
+        assert!(cmd.is_none(), "click-to-focus never sends a TuiCommand");
+        assert_eq!(app.active_panel, ActivePanel::BandActivity);
+        assert_eq!(app.band_activity_scroll, 1);
+        assert_eq!(
+            app.band_activity_pinned_call.as_deref(),
+            Some("K1AAA"),
+            "click must pin via the SAME pin_band_activity_selection Up/Down uses"
+        );
+    }
+
+    #[tokio::test]
+    async fn click_dx_hunter_row_focuses_and_pins_it() {
+        let mut app = fixture_app().await;
+        app.terminal_size = (120, 40);
+        app.active_panel = ActivePanel::Callers;
+        app.dx_stations.insert(
+            "W1AW".to_string(),
+            dx_fixture("W1AW", 50, -10, 14_074_000.0, false),
+        );
+
+        let rect = operate_panel_rect(&app, ActivePanel::DxHunter);
+        let y = rect.y + 2; // border(1) + header(1) + row 0
+        let x = rect.x + 2;
+
+        let cmd = app.handle_mouse_event(left_click(x, y)).await.unwrap();
+        assert!(cmd.is_none());
+        assert_eq!(app.active_panel, ActivePanel::DxHunter);
+        assert_eq!(app.dx_hunter_pinned_call.as_deref(), Some("W1AW"));
+    }
+
+    #[tokio::test]
+    async fn click_outside_every_panel_is_a_no_op() {
+        let mut app = fixture_app().await;
+        app.terminal_size = (120, 40);
+        app.active_panel = ActivePanel::BandActivity;
+
+        // Row 0 of the terminal is the title bar — outside the content
+        // area `view_rects` was computed from, so no panel rect contains
+        // it (mirrors the brief's "point on the status bar" case).
+        let cmd = app.handle_mouse_event(left_click(5, 0)).await.unwrap();
+        assert!(cmd.is_none());
+        assert_eq!(
+            app.active_panel,
+            ActivePanel::BandActivity,
+            "a miss must not change focus"
+        );
+    }
+
+    #[tokio::test]
+    async fn click_tx_placement_non_strip_row_only_focuses_no_park() {
+        let mut app = fixture_app().await;
+        app.terminal_size = (120, 40);
+        app.active_panel = ActivePanel::Callers;
+        app.apply_placement(placement_view_with_bin_code(0, 3));
+
+        let rect = operate_panel_rect(&app, ActivePanel::TxPlacement);
+        // border(1) + row 3 (park line) — NOT the strip row (row 0).
+        let y = rect.y + 1 + 3;
+        let x = rect.x + 2;
+
+        let cmd = app.handle_mouse_event(left_click(x, y)).await.unwrap();
+        assert!(cmd.is_none(), "non-strip row must not park");
+        assert_eq!(app.active_panel, ActivePanel::TxPlacement);
+        assert!(app.tx_offset_hold_hz.is_none(), "no park happened");
+    }
+
+    /// Clicking the openness strip on a fully-clear bin (code 3) parks
+    /// normally via the EXISTING `SetTxOffset` command path.
+    #[tokio::test]
+    async fn click_tx_placement_strip_clear_bin_parks() {
+        let mut app = fixture_app().await;
+        app.terminal_size = (120, 40);
+        app.active_panel = ActivePanel::Callers;
+        // Every bin clear (code 3) — whatever bin the click lands on will
+        // be code 3.
+        app.apply_placement(placement_view_with_bin_code(0, 3));
+
+        let rect = operate_panel_rect(&app, ActivePanel::TxPlacement);
+        let y = rect.y + 1; // border(1) + row 0 (strip)
+        let x = rect.x + 1 + 5; // a few columns into the strip
+
+        let cmd = app.handle_mouse_event(left_click(x, y)).await.unwrap();
+        match cmd {
+            Some(crate::tui_runner::TuiCommand::SetTxOffset {
+                offset_hz: Some(hz),
+            }) => {
+                assert_eq!(app.tx_offset_hold_hz, Some(hz));
+                assert_eq!(app.tx_freq_mode, pancetta_core::TxFreqMode::Hold);
+                assert!(app.parked_since.is_some());
+                assert!(
+                    app.status_message.contains(&format!("Parked at {hz} Hz")),
+                    "status: {}",
+                    app.status_message
+                );
+            }
+            other => panic!("expected SetTxOffset(Some(_)), got {other:?}"),
+        }
+    }
+
+    /// Collision-aware refusal (spec §2): a bin busy in BOTH windows
+    /// (openness code 0) refuses to park — no `SetTxOffset` is sent, and
+    /// `tx_offset_hold_hz` is left untouched.
+    #[tokio::test]
+    async fn click_tx_placement_strip_busy_both_windows_refuses_to_park() {
+        let mut app = fixture_app().await;
+        app.terminal_size = (120, 40);
+        app.active_panel = ActivePanel::Callers;
+
+        let rect = operate_panel_rect(&app, ActivePanel::TxPlacement);
+        let y = rect.y + 1;
+        let x = rect.x + 1 + 5;
+
+        // Figure out which bin this column resolves to, then mark THAT bin
+        // busy-both (code 0) so the click is guaranteed to land on it.
+        let inner_width = (rect.width - 2) as usize;
+        let strip_width = crate::ui::tx_placement::strip_width_for(inner_width);
+        let col = (x - (rect.x + 1)) as usize;
+        let range = (200.0, 2600.0);
+        let freq = crate::ui::tx_placement::freq_for_col(col, strip_width, range).unwrap();
+        let bin = crate::ui::tx_placement::bin_index_for_freq(freq, range, 25.0, 96).unwrap();
+        app.apply_placement(placement_view_with_bin_code(bin, 0));
+
+        let cmd = app.handle_mouse_event(left_click(x, y)).await.unwrap();
+        assert!(cmd.is_none(), "busy-both-windows must refuse to park");
+        assert!(
+            app.tx_offset_hold_hz.is_none(),
+            "no park should have been latched"
+        );
+        assert!(
+            app.status_message
+                .contains("busy in both windows — not parking"),
+            "status: {}",
+            app.status_message
+        );
+    }
+
+    /// Codes 1/2 (busy in exactly one window) still park, but the status
+    /// message names which window is busy.
+    #[tokio::test]
+    async fn click_tx_placement_strip_partial_busy_parks_and_names_window() {
+        let mut app = fixture_app().await;
+        app.terminal_size = (120, 40);
+        app.active_panel = ActivePanel::Callers;
+
+        let rect = operate_panel_rect(&app, ActivePanel::TxPlacement);
+        let y = rect.y + 1;
+        let x = rect.x + 1 + 5;
+        let inner_width = (rect.width - 2) as usize;
+        let strip_width = crate::ui::tx_placement::strip_width_for(inner_width);
+        let col = (x - (rect.x + 1)) as usize;
+        let range = (200.0, 2600.0);
+        let freq = crate::ui::tx_placement::freq_for_col(col, strip_width, range).unwrap();
+        let bin = crate::ui::tx_placement::bin_index_for_freq(freq, range, 25.0, 96).unwrap();
+
+        // Code 1 = second (Odd) window clear, first (Even) window busy.
+        app.apply_placement(placement_view_with_bin_code(bin, 1));
+        let cmd = app.handle_mouse_event(left_click(x, y)).await.unwrap();
+        assert!(matches!(
+            cmd,
+            Some(crate::tui_runner::TuiCommand::SetTxOffset { offset_hz: Some(_) })
+        ));
+        assert!(app.tx_offset_hold_hz.is_some(), "code 1 still parks");
+        assert!(
+            app.status_message.contains("Even window busy"),
+            "status: {}",
+            app.status_message
+        );
+
+        // Code 2 = first (Even) window clear, second (Odd) window busy.
+        app.tx_offset_hold_hz = None;
+        app.apply_placement(placement_view_with_bin_code(bin, 2));
+        let cmd = app.handle_mouse_event(left_click(x, y)).await.unwrap();
+        assert!(matches!(
+            cmd,
+            Some(crate::tui_runner::TuiCommand::SetTxOffset { offset_hz: Some(_) })
+        ));
+        assert!(app.tx_offset_hold_hz.is_some(), "code 2 still parks");
+        assert!(
+            app.status_message.contains("Odd window busy"),
+            "status: {}",
+            app.status_message
         );
     }
 }
