@@ -676,29 +676,28 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     ));
 
     // TX-frequency mode chip: HOLD (operator's offset is sticky) vs AUTO
-    // (pancetta picks/adjusts). Cyan = HOLD (locked), Magenta = AUTO (free).
-    let (freq_text, freq_bg) = match app.tx_freq_mode {
-        pancetta_core::TxFreqMode::Hold => (" FREQ: HOLD ".to_string(), Color::Cyan),
-        pancetta_core::TxFreqMode::Auto => (" FREQ: AUTO ".to_string(), Color::Magenta),
+    // (pancetta picks/adjusts). Task 20e: informational, not urgent — no
+    // background; accent fg + bold like the other informational chips below.
+    let freq_text = match app.tx_freq_mode {
+        pancetta_core::TxFreqMode::Hold => " FREQ: HOLD ".to_string(),
+        pancetta_core::TxFreqMode::Auto => " FREQ: AUTO ".to_string(),
     };
     left_spans.push(Span::raw(" "));
     left_spans.push(Span::styled(
         freq_text,
         Style::default()
-            .fg(Color::Black)
-            .bg(freq_bg)
+            .fg(app.theme.accent_color())
             .add_modifier(Modifier::BOLD),
     ));
 
     // Active operating-mode chip: shown only when the station mode is NOT FT8
-    // (e.g. cyan "FT4"). FT8 ⇒ no chip ⇒ title bar byte-identical to today.
+    // (e.g. "FT4"). FT8 ⇒ no chip ⇒ title bar byte-identical to today.
     if let Some(label) = mode_chip_label(&app.station_info.mode) {
         left_spans.push(Span::raw(" "));
         left_spans.push(Span::styled(
             format!(" {} ", label),
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(app.theme.accent_color())
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -719,13 +718,13 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     // Split-TX chip: shown when the rig is operating split (TX ≠ RX dial).
+    // Task 20e: informational — no background.
     if app.split_tx_hz != 0 {
         left_spans.push(Span::raw(" "));
         left_spans.push(Span::styled(
             format!(" SPLIT TX {:.3} ", app.split_tx_hz as f64 / 1e6),
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(app.theme.accent_color())
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -746,13 +745,13 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     // TX audio offset chip: shown when the operator has set a held offset.
     // "TX off: NNNN (HOLD)" when set; hidden when Auto (no noise in the bar).
+    // Task 20e: informational — no background.
     if let Some(offset_hz) = app.tx_offset_hold_hz {
         left_spans.push(Span::raw(" "));
         left_spans.push(Span::styled(
             format!(" TX off: {} (HOLD) ", offset_hz),
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .fg(app.theme.accent_color())
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -1612,6 +1611,60 @@ mod view_render_tests {
         assert!(
             buffer_contains(term.backend().buffer(), "QSOs: 3"),
             "counter chip must show the completed count"
+        );
+    }
+
+    /// Task 20e: the informational title-bar chips (FREQ mode, SPLIT, TX
+    /// offset, active-mode) render with NO background — accent fg + bold
+    /// only — while the TX-policy banner keeps its colored background. Finds
+    /// a cell in row 0 by its glyph and checks the style directly (rather
+    /// than a substring scan) so we're asserting on the actual `Style`, not
+    /// just presence of the text.
+    #[tokio::test]
+    async fn informational_chips_have_no_background_tx_policy_banner_keeps_its_own() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
+        app.split_tx_hz = 14_074_000;
+        app.tx_offset_hold_hz = Some(920);
+        app.station_info.mode = "FT4".to_string();
+
+        let backend = TestBackend::new(160, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        // Row 0 is the title bar. Walk every cell and assert: any cell whose
+        // fg is the theme's accent color carries NO background paint (the
+        // chip's bg must equal the plain title-bar background), while at
+        // least one cell still carries the TX-policy banner's Green bg (that
+        // one is untouched by this task).
+        let accent = app.theme.accent_color();
+        let bg = app.theme.background_color();
+        let mut found_accent_chip = false;
+        let mut found_policy_banner = false;
+        for x in 0..buf.area.width {
+            let cell = &buf[(x, 0)];
+            if cell.fg == accent && cell.symbol() != " " {
+                found_accent_chip = true;
+                assert_eq!(
+                    cell.bg, bg,
+                    "informational chip cell at x={x} must have no background (found {:?})",
+                    cell.bg
+                );
+            }
+            if cell.bg == ratatui::style::Color::Green {
+                found_policy_banner = true;
+            }
+        }
+        assert!(
+            found_accent_chip,
+            "expected at least one accent-fg chip cell"
+        );
+        assert!(
+            found_policy_banner,
+            "TX-policy banner (Green bg) must be untouched"
         );
     }
 
