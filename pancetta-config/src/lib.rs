@@ -64,6 +64,7 @@ pub mod loader;
 pub mod network;
 pub mod rig;
 pub mod station;
+pub mod tx_placement;
 pub mod ui;
 
 pub use audio::*;
@@ -74,6 +75,7 @@ pub use loader::*;
 pub use network::*;
 pub use rig::*;
 pub use station::*;
+pub use tx_placement::*;
 pub use ui::*;
 
 /// Configuration error types
@@ -149,6 +151,10 @@ pub struct Config {
     #[serde(default)]
     pub fox: fox::FoxConfig,
 
+    /// TX-placement instrument configuration (opt-in auto-repark)
+    #[serde(default)]
+    pub tx_placement: tx_placement::TxPlacementConfig,
+
     /// Metadata about the configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ConfigMetadata>,
@@ -181,6 +187,7 @@ impl Default for Config {
             autonomous: AutonomousConfig::default(),
             hound: hound::HoundConfig::default(),
             fox: fox::FoxConfig::default(),
+            tx_placement: tx_placement::TxPlacementConfig::default(),
             metadata: Some(ConfigMetadata {
                 version: "1.0".to_string(),
                 last_modified: Some(chrono::Utc::now()),
@@ -230,6 +237,7 @@ impl Config {
         self.autonomous.validate_section()?;
         self.hound.validate_section()?;
         self.fox.validate_section()?;
+        self.tx_placement.validate_section()?;
 
         info!("Configuration validation successful");
         Ok(())
@@ -247,6 +255,7 @@ impl Config {
         self.autonomous.merge_with(other.autonomous);
         self.hound.merge_with(other.hound);
         self.fox.merge_with(other.fox);
+        self.tx_placement.merge_with(other.tx_placement);
 
         // Update metadata
         if let Some(ref mut metadata) = self.metadata {

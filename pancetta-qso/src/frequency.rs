@@ -168,7 +168,31 @@ pub struct FrequencyCandidate {
     pub offset_hz: f64,
     pub score: f64,
     pub clear_both_slots: bool,
+    /// No decode activity within 50 Hz in the First (even) slot across retained history.
+    pub clear_first: bool,
+    /// No decode activity within 50 Hz in the Second (odd) slot across retained history.
+    pub clear_second: bool,
     pub noise_floor: f32,
+}
+
+/// A ranked snapshot of band openness for the TX-placement instrument
+/// (see `docs/superpowers/specs/2026-07-03-tui-redesign-design.md` §2).
+///
+/// Produced by [`crate::autonomous::AutonomousOperator::placement_snapshot`]
+/// as a pure read of the SAME allocator/history state the autonomous
+/// operator uses to make real TX-frequency decisions — never a separate
+/// computation (single-scorer invariant).
+#[derive(Debug, Clone)]
+pub struct PlacementSnapshot {
+    /// Top-N ranked candidates, sorted by score descending.
+    pub slices: Vec<FrequencyCandidate>,
+    /// Per-bin openness code across the full allocation range:
+    /// 0=busy-both, 1=second-only-clear, 2=first-only-clear, 3=clear-both.
+    pub openness: Vec<u8>,
+    /// Bin width in Hz (matches the allocator's `step_hz`).
+    pub bin_hz: f64,
+    /// Allocation range (min, max) in Hz.
+    pub range: (f64, f64),
 }
 
 /// Stateless frequency allocator. Given spectral + decode data, returns ranked candidates.
@@ -179,6 +203,13 @@ pub struct SmartFrequencyAllocator {
 impl SmartFrequencyAllocator {
     pub fn new(config: FrequencyAllocatorConfig) -> Self {
         Self { config }
+    }
+
+    /// Access the allocator's configuration (range, step size, etc.) — used
+    /// by the TX-placement snapshot to bin openness at the same resolution
+    /// the allocator scores candidates at.
+    pub fn config(&self) -> &FrequencyAllocatorConfig {
+        &self.config
     }
 
     /// Score and rank all candidate frequencies.
@@ -204,11 +235,15 @@ impl SmartFrequencyAllocator {
                 self.score_candidate(freq, spectral, history, own_frequencies, dx_target_hz);
             let noise = spectral.power_near(freq, 25.0);
             let clear = history.is_clear_both_slots(freq, 50.0);
+            let clear_first = history.activity_near_in_slot(freq, 50.0, TimeSlot::First) == 0;
+            let clear_second = history.activity_near_in_slot(freq, 50.0, TimeSlot::Second) == 0;
 
             candidates.push(FrequencyCandidate {
                 offset_hz: freq,
                 score,
                 clear_both_slots: clear,
+                clear_first,
+                clear_second,
                 noise_floor: noise,
             });
 
@@ -491,6 +526,35 @@ mod tests {
         );
         assert_eq!(history.activity_near(1200.0, 10.0), 1);
         assert_eq!(history.activity_near(1400.0, 10.0), 1);
+    }
+
+    #[test]
+    fn candidates_carry_per_slot_clear_flags() {
+        let alloc = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let spectral = SpectralSnapshot {
+            power_bins: vec![0.0; 128],
+            freq_min_hz: 200.0,
+            freq_max_hz: 3000.0,
+        };
+        let mut history = DecodeHistory::new(4);
+        // 1500 Hz busy in First slot only.
+        history.push_cycle(vec![DecodeRecord {
+            frequency_hz: 1500.0,
+            time_slot: TimeSlot::First,
+        }]);
+        let cands = alloc.rank_candidates(&spectral, &history, &[], None);
+        let at_1500 = cands
+            .iter()
+            .find(|c| (c.offset_hz - 1500.0).abs() < 1.0)
+            .unwrap();
+        assert!(!at_1500.clear_first);
+        assert!(at_1500.clear_second);
+        assert!(!at_1500.clear_both_slots);
+        let far = cands
+            .iter()
+            .find(|c| (c.offset_hz - 700.0).abs() < 1.0)
+            .unwrap();
+        assert!(far.clear_first && far.clear_second && far.clear_both_slots);
     }
 
     #[test]

@@ -59,6 +59,136 @@ pub(crate) fn classify_autonomous_opening(
     (dx, frequency, parity)
 }
 
+/// Maps the operator's parked TX offset (Hz) to the openness code (0-3) at
+/// that bin in a [`pancetta_qso::frequency::PlacementSnapshot`] — the
+/// coordinator-side counterpart to the TUI's own parked-bin lookup (Task
+/// 14's `apply_placement`), used to drive the persistent
+/// `DiagnosticEvent` warning below.
+///
+/// Returns `None` when `parked_hz == 0` (the `tx_offset_hold_hz` unset
+/// sentinel — matches the convention used elsewhere, e.g.
+/// `coordinator/qso.rs`'s `compute_manual_tx_offset`) or when the computed
+/// bin index falls outside `snap.openness` (shouldn't happen in practice,
+/// but the snapshot's range/bin_hz are a live read and not guaranteed to
+/// cover every possible parked Hz).
+fn parked_bin_coverage(
+    parked_hz: u64,
+    snap: &pancetta_qso::frequency::PlacementSnapshot,
+) -> Option<u8> {
+    if parked_hz == 0 {
+        return None;
+    }
+    let idx = ((parked_hz as f64 - snap.range.0) / snap.bin_hz) as usize;
+    snap.openness.get(idx).copied()
+}
+
+/// Whole-branch-review fix (finding 2): resolves the active-QSO count fed
+/// into [`should_repark`]'s LIVE STREAM SAFETY gate, failing **CLOSED** on a
+/// poisoned `active_tx_qsos` lock — i.e. a lock-read error is treated as
+/// "assume a QSO may be active" (`usize::MAX`, so `should_repark`'s
+/// `active_qsos > 0` check trips and the repark is skipped this tick) rather
+/// than "assume zero" (which would let the gate happily proceed as if idle
+/// even though the lock state is unknown). This is the opposite of
+/// `active_now`'s `.unwrap_or(0)` a few lines above in the call site, which
+/// intentionally fails OPEN — that read feeds only the operator's
+/// `max_concurrent_qsos` display/gating count, a different, non-safety
+/// concern (the engine's own dedup/in-progress gates still apply there).
+/// Matches the codebase's established fail-closed convention for
+/// TX-adjacent gates under lock/state uncertainty (the remote-TX arm gate,
+/// `coordinator/tx.rs`). Kept as a tiny pure function over an
+/// already-resolved `Result` (rather than inlined at the call site) so the
+/// fail-closed behavior is directly unit-testable without spinning up the
+/// autonomous task.
+fn resolve_repark_active_qsos<E>(active_qsos_read: Result<usize, E>) -> usize {
+    active_qsos_read.unwrap_or(usize::MAX)
+}
+
+/// Opt-in auto-repark decision (Task 16). Repark ONLY when: `enabled` ∧ no
+/// active QSOs ∧ currently parked ∧ the parked bin is busy-both (openness
+/// code 0) ∧ the best available slice beats the parked slice's CURRENT
+/// score by ≥ `min_gain`. Returns the new offset (Hz) to park at, or `None`
+/// to hold.
+///
+/// **Live-stream safety**: `active_qsos > 0` short-circuits to `None`
+/// unconditionally, before any other check. This function only ever
+/// *decides*; the caller is responsible for re-checking `active_tx_qsos`
+/// at write-time (see the loop wiring below) so the gate can never fire
+/// against a state that went live between the decision and the write.
+///
+/// **Hysteresis**: reparking only fires out of the worst openness code (0 =
+/// busy-both). Any other code (1/2/3 — at least one slot still clear) holds,
+/// so a marginally-degraded-but-still-usable parked slice is left alone.
+/// The `min_gain` threshold on top of that prevents chasing a trivially
+/// better slice.
+fn should_repark(
+    enabled: bool,
+    active_qsos: usize,
+    parked_hz: u64,
+    parked_coverage: Option<u8>,
+    parked_score: Option<f64>,
+    best: Option<&pancetta_qso::frequency::FrequencyCandidate>,
+    min_gain: f64,
+) -> Option<u64> {
+    if !enabled {
+        return None;
+    }
+    // LIVE STREAM SAFETY: never repark while any QSO is active. This is the
+    // one hard gate in this function; nothing below can override it.
+    if active_qsos > 0 {
+        return None;
+    }
+    if parked_hz == 0 {
+        // Not currently parked — nothing to repark.
+        return None;
+    }
+    // Hysteresis: only repark out of the worst openness code (busy-both).
+    let coverage = parked_coverage?;
+    if coverage != 0 {
+        return None;
+    }
+    let best = best?;
+    // If the parked offset fell out of the top-N snapshot entirely, treat
+    // its current score as 0.0 (worst case) rather than skipping the
+    // decision — an untracked parked bin under busy-both coverage is, by
+    // definition, not a good place to stay parked.
+    let parked_score = parked_score.unwrap_or(0.0);
+    if best.score - parked_score >= min_gain {
+        Some(best.offset_hz as u64)
+    } else {
+        None
+    }
+}
+
+/// Looks up the parked offset's CURRENT score in a
+/// [`pancetta_qso::frequency::PlacementSnapshot`]'s top-N `slices` (the
+/// candidate whose `offset_hz` falls within half a bin width of
+/// `parked_hz`), for feeding [`should_repark`]'s `parked_score` parameter.
+///
+/// **Documented ambiguity resolution (Task 16 brief):** the snapshot only
+/// carries the top-N ranked candidates, so the parked bin may not be among
+/// them — either it never scored well enough, or it degraded out of the
+/// top-N this tick. Re-deriving a fresh score for that one bin would mean a
+/// SECOND allocator/scorer invocation, breaking the single-scorer invariant
+/// this instrument holds everywhere else (every other consumer reads the
+/// SAME `placement_snapshot` the autonomous decision engine itself used).
+/// So an absent parked bin resolves to `None` here — the caller
+/// (`should_repark`'s call site) maps that to a worst-case `Some(0.0)`,
+/// i.e. "no evidence this is a good slice to stay on," rather than
+/// re-scoring or skipping the repark decision entirely.
+fn parked_score_in_slices(
+    parked_hz: u64,
+    snap: &pancetta_qso::frequency::PlacementSnapshot,
+) -> Option<f64> {
+    if parked_hz == 0 {
+        return None;
+    }
+    let parked = parked_hz as f64;
+    snap.slices
+        .iter()
+        .find(|c| (c.offset_hz - parked).abs() <= snap.bin_hz / 2.0)
+        .map(|c| c.score)
+}
+
 /// Parameters for opening one autonomous QSO (a resolved
 /// [`crate::message_bus::QsoMessage::StartAutonomousQso`]).
 #[derive(Debug, Clone, PartialEq)]
@@ -321,6 +451,13 @@ impl super::ApplicationCoordinator {
             config.rig.operating_mode(),
             Ok(pancetta_config::rig::OperatingMode::Ft4)
         );
+
+        // Task 16: opt-in auto-repark. Default OFF — read once at startup
+        // (mirrors every other config extraction in this fn); a config
+        // hot-reload changing this mid-run is out of scope for v1, same as
+        // the other autonomous-loop settings extracted here.
+        let auto_repark_enabled = config.tx_placement.auto_repark;
+        let repark_min_score_gain = config.tx_placement.repark_min_score_gain;
         drop(config);
 
         let cached_lookup = self.cached_lookup.clone();
@@ -402,6 +539,12 @@ impl super::ApplicationCoordinator {
         // now driving (autonomous Auto QSOs land here once created), and so we
         // don't open a second pounce while one is already in progress.
         let active_tx_qsos = self.active_tx_qsos.clone();
+        // Task 15: the operator's parked TX-offset atomic (0 = unparked),
+        // cloned into the task so the per-slot tick can read it alongside
+        // the placement snapshot it already computes (Task 9) and detect a
+        // degradation in coverage at the parked bin, independent of the
+        // TUI-side transient warning (Task 14).
+        let tx_offset_hold_hz = self.tx_offset_hold_hz();
         let auto_handle = {
             let shutdown = self.shutdown_signal.clone();
             let operator = operator.clone();
@@ -411,6 +554,14 @@ impl super::ApplicationCoordinator {
                 info!("Autonomous operator started");
 
                 let mut slot_messages: Vec<pancetta_qso::DecodedMessageInfo> = Vec::new();
+                // Task 15: coordinator-local edge-trigger baseline for the
+                // persistent tx.placement DiagnosticEvent, scoped to THIS
+                // task's own loop. Deliberately separate from the TUI-side
+                // `App::park_coverage_last` (Task 14) — different process,
+                // different update cadence, different purpose (retained
+                // diagnostic history vs. a transient status line) — the two
+                // are never unified.
+                let mut last_coverage: Option<u8> = None;
                 // Align slot timer to FT8 UTC boundaries (0/15/30/45 seconds)
                 // with sub-second precision. tokio::time::interval_at then
                 // keeps the cadence exact every 15s relative to that first tick.
@@ -478,6 +629,84 @@ impl super::ApplicationCoordinator {
                             }
 
                             op.feed_decoded_messages(&slot_messages, evaluator.as_ref());
+
+                            // Task 16: opt-in auto-repark inputs, captured
+                            // (if this tick has a snapshot) BEFORE
+                            // `snapshot` moves into the TxPlacementUpdate
+                            // message below — the decision itself is made
+                            // further down, after the freshest possible
+                            // read of `active_tx_qsos` (see there for why).
+                            // `None` when this tick has no snapshot yet
+                            // (`should_repark` correctly holds on `None`).
+                            let mut repark_parked_hz: Option<u64> = None;
+                            let mut repark_coverage: Option<u8> = None;
+                            let mut repark_parked_score: Option<f64> = None;
+                            let mut repark_best: Option<
+                                pancetta_qso::frequency::FrequencyCandidate,
+                            > = None;
+
+                            // TX-placement instrument feed (docs/superpowers/specs/
+                            // 2026-07-03-tui-redesign-design.md §2): per-window
+                            // read of the SAME allocator/history the autonomous
+                            // path just used above — not a separate computation
+                            // (single-scorer invariant). Sent regardless of
+                            // whether autonomous mode is enabled (housekeeping).
+                            if let Some(snapshot) = op.placement_snapshot(10) {
+                                // Task 15: persistent counterpart to the TUI's
+                                // transient parked-slice degradation warning
+                                // (Task 14). The TUI status line is missed if
+                                // the operator isn't looking at the moment it
+                                // fires; this lands the same finding in the
+                                // retained Shift+D diagnostic history. Reads
+                                // the SAME snapshot the TxPlacementUpdate below
+                                // carries (single-scorer invariant) and the
+                                // coordinator's own copy of the operator's
+                                // parked offset — a coordinator-local
+                                // edge-trigger (`last_coverage`), independent
+                                // of the TUI-side `park_coverage_last`.
+                                let parked_hz = tx_offset_hold_hz.load(Ordering::Relaxed);
+                                let coverage = parked_bin_coverage(parked_hz, &snapshot);
+                                if let (Some(prev), Some(code)) = (last_coverage, coverage) {
+                                    if code < prev {
+                                        let text = format!(
+                                            "Parked TX offset {parked_hz} Hz coverage \
+                                             degraded (openness {prev} -> {code})"
+                                        );
+                                        let diag_msg = ComponentMessage::new(
+                                            ComponentId::Autonomous,
+                                            ComponentId::Tui,
+                                            MessageType::DiagnosticEvent {
+                                                target: "tx.placement",
+                                                level: pancetta_core::DiagnosticLevel::Warn,
+                                                text,
+                                                qso_id: None,
+                                                callsign: None,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus.send_message(diag_msg).await;
+                                    }
+                                }
+                                last_coverage = coverage;
+
+                                // Task 16: capture the repark inputs against
+                                // THIS snapshot before it moves into the
+                                // TxPlacementUpdate message just below.
+                                repark_parked_hz = Some(parked_hz);
+                                repark_coverage = coverage;
+                                repark_parked_score =
+                                    parked_score_in_slices(parked_hz, &snapshot);
+                                repark_best = snapshot.slices.first().cloned();
+
+                                let msg = ComponentMessage::new(
+                                    ComponentId::Autonomous,
+                                    ComponentId::Tui,
+                                    MessageType::TxPlacementUpdate { snapshot },
+                                    Instant::now(),
+                                );
+                                let _ = message_bus.send_message(msg).await;
+                            }
+
                             // Phase 5: sync the operator's active-QSO count from
                             // the shared active-QSO set so `max_concurrent_qsos`
                             // gating is honored (fail-open to 0 on a poisoned
@@ -488,6 +717,95 @@ impl super::ApplicationCoordinator {
                                 .map(|s| s.len() as u32)
                                 .unwrap_or(0);
                             op.set_active_qso_count(active_now);
+
+                            // Task 16: opt-in auto-repark (default OFF —
+                            // `auto_repark_enabled` is inert unless the
+                            // operator sets `[tx_placement].auto_repark =
+                            // true`). LIVE-STREAM SAFETY: read
+                            // `active_tx_qsos` again here, freshly, with NO
+                            // `.await` between this read and the
+                            // `tx_offset_hold_hz.store` below — every
+                            // statement in between is synchronous Rust, so
+                            // this is the freshest possible read of the
+                            // shared set relative to the write; the gate
+                            // cannot fire against a state that went live
+                            // between the decision and the write.
+                            //
+                            // Whole-branch-review fix (finding 2): fail
+                            // CLOSED on a poisoned lock. Deliberately a
+                            // SEPARATE read from `active_now` above —
+                            // `active_now` only feeds the operator's
+                            // `max_concurrent_qsos` count (a different,
+                            // non-safety concern, documented there as
+                            // intentionally fail-OPEN to 0). This one is
+                            // the plan's explicitly-labeled "LIVE STREAM
+                            // SAFETY" gate, so a lock-read error is treated
+                            // as "assume a QSO may be active" — skip the
+                            // repark this tick — matching the codebase's
+                            // established fail-closed convention for
+                            // TX-adjacent gates under lock/state
+                            // uncertainty (the remote-TX arm gate,
+                            // `coordinator/tx.rs`). `should_repark` ALSO
+                            // re-checks `active_qsos > 0` internally — this
+                            // is belt-and-suspenders, not a substitute for
+                            // the freshness/fail-closed-ness of this read.
+                            let repark_active_qsos =
+                                resolve_repark_active_qsos(active_tx_qsos.read().map(|s| s.len()));
+                            if let Some(new_hz) = should_repark(
+                                auto_repark_enabled,
+                                repark_active_qsos,
+                                repark_parked_hz.unwrap_or(0),
+                                repark_coverage,
+                                repark_parked_score,
+                                repark_best.as_ref(),
+                                repark_min_score_gain,
+                            ) {
+                                let old_hz = repark_parked_hz.unwrap_or(0);
+                                tx_offset_hold_hz.store(new_hz, Ordering::Relaxed);
+                                info!(
+                                    target: "tx.placement",
+                                    "auto-reparked {old_hz} Hz -> {new_hz} Hz"
+                                );
+                                let text =
+                                    format!("Auto-reparked TX offset {old_hz} Hz -> {new_hz} Hz");
+                                let status_msg = ComponentMessage::new(
+                                    ComponentId::Autonomous,
+                                    ComponentId::Tui,
+                                    MessageType::StatusUpdate(text.clone()),
+                                    Instant::now(),
+                                );
+                                let _ = message_bus.send_message(status_msg).await;
+                                let diag_msg = ComponentMessage::new(
+                                    ComponentId::Autonomous,
+                                    ComponentId::Tui,
+                                    MessageType::DiagnosticEvent {
+                                        target: "tx.placement",
+                                        level: pancetta_core::DiagnosticLevel::Info,
+                                        text,
+                                        qso_id: None,
+                                        callsign: None,
+                                    },
+                                    Instant::now(),
+                                );
+                                let _ = message_bus.send_message(diag_msg).await;
+                                // Whole-branch-review fix (finding 1): echo
+                                // the new offset back to the TUI. Every
+                                // OTHER writer of `tx_offset_hold_hz` is
+                                // TUI-initiated and updates `App`'s own
+                                // copy directly; auto-repark is
+                                // coordinator-initiated, so without this
+                                // the TUI's park line / HOLD chip / Task
+                                // 14 degradation baseline would keep
+                                // referencing the OLD frequency forever.
+                                let offset_msg = ComponentMessage::new(
+                                    ComponentId::Autonomous,
+                                    ComponentId::Tui,
+                                    MessageType::TxOffsetStatus { offset_hz: new_hz },
+                                    Instant::now(),
+                                );
+                                let _ = message_bus.send_message(offset_msg).await;
+                            }
+
                             let listen_messages = slot_messages.clone();
                             slot_messages.clear();
                             let actions = op.decide();
@@ -891,6 +1209,147 @@ impl super::ApplicationCoordinator {
             .push((ComponentId::Autonomous, auto_handle));
         info!("Autonomous operator component started");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod parked_bin_coverage_tests {
+    use super::*;
+    use pancetta_qso::frequency::PlacementSnapshot;
+
+    #[test]
+    fn parked_bin_coverage_maps_hz_to_bin() {
+        let snap = PlacementSnapshot {
+            slices: vec![],
+            openness: vec![3, 1, 0],
+            bin_hz: 25.0,
+            range: (200.0, 275.0),
+        };
+        assert_eq!(parked_bin_coverage(0, &snap), None, "0 = unparked sentinel");
+        assert_eq!(parked_bin_coverage(225, &snap), Some(1));
+    }
+
+    #[test]
+    fn parked_bin_coverage_out_of_range_is_none() {
+        let snap = PlacementSnapshot {
+            slices: vec![],
+            openness: vec![3, 1, 0],
+            bin_hz: 25.0,
+            range: (200.0, 275.0),
+        };
+        assert_eq!(
+            parked_bin_coverage(1000, &snap),
+            None,
+            "bin index past the end of openness"
+        );
+    }
+}
+
+#[cfg(test)]
+mod should_repark_tests {
+    use super::*;
+
+    #[test]
+    fn repark_gates() {
+        let best = pancetta_qso::frequency::FrequencyCandidate {
+            offset_hz: 920.0,
+            score: 95.0,
+            clear_both_slots: true,
+            clear_first: true,
+            clear_second: true,
+            noise_floor: 0.0,
+        };
+        // disabled → never
+        assert_eq!(
+            should_repark(false, 0, 1500, Some(0), Some(10.0), Some(&best), 20.0),
+            None
+        );
+        // active QSO → never (LIVE STREAM SAFETY)
+        assert_eq!(
+            should_repark(true, 1, 1500, Some(0), Some(10.0), Some(&best), 20.0),
+            None
+        );
+        // parked slice still usable (code 2) → hold (hysteresis)
+        assert_eq!(
+            should_repark(true, 0, 1500, Some(2), Some(60.0), Some(&best), 20.0),
+            None
+        );
+        // busy-both + big gain → repark
+        assert_eq!(
+            should_repark(true, 0, 1500, Some(0), Some(10.0), Some(&best), 20.0),
+            Some(920)
+        );
+        // busy-both but marginal gain → hold
+        assert_eq!(
+            should_repark(true, 0, 1500, Some(0), Some(80.0), Some(&best), 20.0),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod resolve_repark_active_qsos_tests {
+    use super::*;
+    use std::sync::RwLock;
+
+    #[test]
+    fn ok_read_passes_through_the_count() {
+        assert_eq!(resolve_repark_active_qsos::<()>(Ok(0)), 0);
+        assert_eq!(resolve_repark_active_qsos::<()>(Ok(3)), 3);
+    }
+
+    #[test]
+    fn err_read_fails_closed_to_max_not_zero() {
+        // A poisoned lock must be treated as "assume active" (skip repark
+        // this tick), NOT "assume zero" (which would let the LIVE STREAM
+        // SAFETY gate proceed as if idle under genuine uncertainty).
+        let resolved = resolve_repark_active_qsos::<()>(Err(()));
+        assert_eq!(resolved, usize::MAX);
+        assert_ne!(resolved, 0, "must not fail open to zero");
+    }
+
+    /// End-to-end proof against a REAL poisoned `std::sync::RwLock`, the
+    /// exact type `active_tx_qsos` uses — not just the trivial
+    /// `Result::unwrap_or` semantics above.
+    #[test]
+    fn real_poisoned_lock_fails_closed_and_blocks_repark() {
+        let lock: std::sync::Arc<RwLock<std::collections::HashSet<String>>> =
+            std::sync::Arc::new(RwLock::new(std::collections::HashSet::new()));
+
+        // Poison the lock by panicking while holding the write guard.
+        {
+            let lock2 = lock.clone();
+            let _ = std::thread::spawn(move || {
+                let _guard = lock2.write().unwrap();
+                panic!("intentionally poisoning the lock for this test");
+            })
+            .join();
+        }
+        assert!(lock.is_poisoned(), "lock should be poisoned by the panic");
+
+        let active = resolve_repark_active_qsos(lock.read().map(|s| s.len()));
+        assert_eq!(
+            active,
+            usize::MAX,
+            "poisoned lock must resolve to the fail-closed sentinel"
+        );
+
+        // Feed straight into should_repark: even with every OTHER condition
+        // satisfied (enabled, parked, busy-both coverage, a strong best
+        // candidate), the fail-closed active count must hold the repark.
+        let best = pancetta_qso::frequency::FrequencyCandidate {
+            offset_hz: 920.0,
+            score: 95.0,
+            clear_both_slots: true,
+            clear_first: true,
+            clear_second: true,
+            noise_floor: 0.0,
+        };
+        assert_eq!(
+            should_repark(true, active, 1500, Some(0), Some(10.0), Some(&best), 20.0),
+            None,
+            "poisoned-lock read must skip the repark this tick"
+        );
     }
 }
 

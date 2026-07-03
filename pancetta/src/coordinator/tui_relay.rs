@@ -383,6 +383,19 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::SplitUpdate { tx_hz },
                             );
                         }
+                        MessageType::TxOffsetStatus { offset_hz } => {
+                            // Whole-branch-review fix (Task 16 auto-repark):
+                            // the autonomous task writes `tx_offset_hold_hz`
+                            // directly with no operator keypress, so the
+                            // TUI's own `App.tx_offset_hold_hz` copy would
+                            // otherwise go stale. Echo it through so the
+                            // park line + HOLD chip stay in sync.
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxOffsetUpdate {
+                                    offset_hz,
+                                },
+                            );
+                        }
                         MessageType::FoxModeStatus { on } => {
                             // Echo the authoritative Fox-mode state to the TUI
                             // FOX chip. Sent by the SetFoxMode handler on every
@@ -531,6 +544,34 @@ impl super::ApplicationCoordinator {
                                     text: text.clone(),
                                     qso_id: qso_id.clone(),
                                     callsign: callsign.clone(),
+                                },
+                            );
+                        }
+                        MessageType::TxPlacementUpdate { ref snapshot } => {
+                            // TX-placement instrument (Task 9/10): convert the
+                            // qso-crate PlacementSnapshot into the TUI-local
+                            // PlacementView field-for-field — pancetta-tui must
+                            // not depend on pancetta-qso, so this relay is the
+                            // ONLY place the conversion happens.
+                            let slices = snapshot
+                                .slices
+                                .iter()
+                                .map(|c| pancetta_tui::app::PlacementSlice {
+                                    offset_hz: c.offset_hz,
+                                    score: c.score,
+                                    clear_first: c.clear_first,
+                                    clear_second: c.clear_second,
+                                })
+                                .collect();
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxPlacementUpdate {
+                                    view: pancetta_tui::app::PlacementView {
+                                        slices,
+                                        openness: snapshot.openness.clone(),
+                                        bin_hz: snapshot.bin_hz,
+                                        range: snapshot.range,
+                                        received_at: chrono::Utc::now(),
+                                    },
                                 },
                             );
                         }

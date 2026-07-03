@@ -167,6 +167,18 @@ pub enum MessageType {
         callsign: Option<String>,
     },
 
+    /// Per-window TX-placement ranking for the TUI instrument
+    /// (docs/superpowers/specs/2026-07-03-tui-redesign-design.md §2). Computed
+    /// in the autonomous tick from the SAME `SmartFrequencyAllocator` /
+    /// `DecodeHistory` / `SpectralSnapshot` the autonomous path allocates
+    /// with (`AutonomousOperator::placement_snapshot`) — the TUI never
+    /// re-derives scores from a separate computation (single-scorer
+    /// invariant). Sent every FT8 window regardless of whether autonomous
+    /// mode is enabled (housekeeping, not an action).
+    TxPlacementUpdate {
+        snapshot: pancetta_qso::frequency::PlacementSnapshot,
+    },
+
     /// Hamlib rig control messages
     RigControl(RigControlMessage),
 
@@ -252,6 +264,24 @@ pub enum MessageType {
     SplitStatus {
         /// Current split TX frequency in Hz, or 0 for simplex.
         tx_hz: u64,
+    },
+
+    /// TX-offset-hold state echo for the TUI's TX-placement park line +
+    /// title-bar chip. Every OTHER writer of `tx_offset_hold_hz` (the `o`
+    /// modal, Enter-park on the TX-placement instrument) is TUI-initiated,
+    /// so the TUI updates its own `App.tx_offset_hold_hz` optimistically
+    /// and never needs a round-trip. Task 16's opt-in auto-repark is
+    /// coordinator-INITIATED — the autonomous task writes the shared
+    /// atomic directly, with no operator keypress to update the TUI's
+    /// local copy — so this closes that gap: sent once, right after the
+    /// atomic write, so the TUI can re-sync `tx_offset_hold_hz` (and reset
+    /// its park-coverage baseline) to the new value. `offset_hz == 0`
+    /// means unheld/Auto (same sentinel convention as the atomic itself);
+    /// in practice auto-repark only ever sends a nonzero value. Observation
+    /// only — never drives TX.
+    TxOffsetStatus {
+        /// New held TX offset in Hz, or 0 for unheld/Auto.
+        offset_hz: u64,
     },
 
     /// Fox-mode state echo for the TUI FOX chip.  Sent by the `SetFoxMode`

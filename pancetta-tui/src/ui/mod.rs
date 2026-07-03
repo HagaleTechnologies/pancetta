@@ -16,6 +16,7 @@ pub mod callers;
 pub mod dx_hunter;
 pub mod qso_status;
 pub mod station_info;
+pub mod tx_placement;
 
 use active_qsos::render_active_qsos;
 use band_activity::render_band_activity;
@@ -23,6 +24,7 @@ use callers::render_callers;
 use dx_hunter::render_dx_hunter;
 use qso_status::render_qso_status;
 use station_info::render_station_info;
+use tx_placement::{render_placement_zoom, render_tx_placement};
 
 /// Main UI rendering function
 pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
@@ -119,7 +121,10 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
 /// Renders the focused panel (`app.active_panel`) full-screen in `area`,
 /// bypassing whichever `ActiveView` grid is normally in effect. Calls the
 /// SAME `render_*` function each view's grid layout uses, just with the
-/// whole content rect instead of a sliced-down chunk. Covers all 5
+/// whole content rect instead of a sliced-down chunk — EXCEPT
+/// `TxPlacement` (Task 13), which zooms into a genuinely different,
+/// more-detailed top-10 table view (`render_placement_zoom`) rather than
+/// the compact BEST-row instrument rendered bigger. Covers all 5
 /// `ActivePanel` variants, including `StationInfo` (still valid until
 /// Task 18 removes it from the panel cycle).
 fn render_zoomed_panel(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
@@ -129,26 +134,42 @@ fn render_zoomed_panel(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
         ActivePanel::StationInfo => render_station_info(f, area, app)?,
         ActivePanel::Callers => render_callers(f, area, app)?,
         ActivePanel::DxHunter => render_dx_hunter(f, area, app)?,
+        // TxPlacement is the one panel whose zoom is NOT just "the same
+        // renderer, bigger" (Task 13) — it swaps to a full-screen top-10
+        // ranked table with columns the compact 5-row instrument can't fit.
+        ActivePanel::TxPlacement => render_placement_zoom(f, area, app)?,
     }
     Ok(())
 }
 
 /// Today's Operate-view content layout: a FULL-WIDTH active-QSO banner and
-/// waterfall across the top (a wider waterfall = finer horizontal frequency
-/// resolution, ~25 Hz/col on a typical terminal), then a two-column lower
-/// region. The bottom row of each column lines up — QSO Status (left) sits
-/// directly across from Callers (right) — with DX Hunter moved up above
-/// Callers to make room for the wide waterfall.
+/// TX-placement instrument across the top, then a two-column lower region.
+/// The bottom row of each column lines up — QSO Status (left) sits directly
+/// across from Callers (right) — with DX Hunter moved up above Callers to
+/// make room for the wide strip.
 ///
-/// Extracted verbatim from `draw()` (Task 5) — must render byte-identically
-/// to the pre-extraction layout.
+/// The energy waterfall (originally `Percentage(30)` here) was swapped for
+/// the vacancy-first TX-placement instrument (`Length(7)`, Task 11) — the
+/// waterfall remains only in Monitor view (`layout_monitor`). The lower
+/// region is `Min(1)` (unconstrained-but-fills-remainder), so it
+/// automatically absorbs the space freed by the fixed-height swap; no
+/// further constraint changes were needed to "give the freed rows to the
+/// largest table" — that table (the two-column grid as a whole) already
+/// grows via `Min(1)`, and each column's internal Percentage split still
+/// allocates the largest per-column share to the panel it already favored
+/// (Band Activity / Callers).
+///
+/// Extracted verbatim from `draw()` (Task 5) — the two-column lower region
+/// still renders byte-identically to the pre-extraction layout; the top row
+/// visibly changed in this task (expected — see the Task 11 brief's Global
+/// Constraint note).
 fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
     let content = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
-            Constraint::Percentage(30), // Waterfall (full width)
-            Constraint::Min(1),         // Lower region (two columns)
+            Constraint::Length(1), // Active-QSOs banner (full width, 1 row)
+            Constraint::Length(7), // TX Placement (full width; 5 content rows + 2 border)
+            Constraint::Min(1),    // Lower region (two columns)
         ])
         .split(content_area);
 
@@ -179,7 +200,7 @@ fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
 
     // Render panels
     render_active_qsos(f, content[0], app);
-    render_waterfall(f, content[1], app);
+    render_tx_placement(f, content[1], app)?;
     render_band_activity(f, left_chunks[0], app)?;
     render_qso_status(f, left_chunks[1], app)?;
     render_station_info(f, right_chunks[0], app)?;
@@ -188,8 +209,8 @@ fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
 
     // Render active panel highlight. The slice order MUST match the
     // ActivePanel enum order used by render_active_panel_highlight:
-    // BandActivity, QsoStatus, StationInfo, Callers, DxHunter. The full-width
-    // banner (content[0]) and waterfall (content[1]) are not navigable panels.
+    // BandActivity, QsoStatus, StationInfo, Callers, DxHunter, TxPlacement.
+    // The full-width banner (content[0]) is not a navigable panel.
     render_active_panel_highlight(
         f,
         app,
@@ -199,6 +220,7 @@ fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
             right_chunks[0], // StationInfo
             right_chunks[2], // Callers
             right_chunks[1], // DxHunter
+            content[1],      // TxPlacement
         ],
     );
 
@@ -234,11 +256,17 @@ fn layout_monitor(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
 }
 
 /// Hunt-view content layout: DX Hunter gets top billing (full width) for
-/// picking a rare/needed station to chase, Band Activity underneath shows
-/// the narrowed CQs-only feed (see `App::displayed_messages`), and QSO
-/// Status anchors the bottom so the operator can track an in-progress call.
-/// No waterfall, no Callers, no Station Info — this view is about hunting,
-/// not answering.
+/// picking a rare/needed station to chase, the TX-placement instrument sits
+/// underneath (per-stream markers matter here too — Task 11), Band Activity
+/// shows the narrowed CQs-only feed, and QSO Status anchors the bottom so
+/// the operator can track an in-progress call. No Callers, no Station Info,
+/// no energy waterfall (that stays in Monitor only) — this view is about
+/// hunting, not answering.
+///
+/// Task 6 never gave Hunt a waterfall row to "replace", so the placement
+/// strip is new real estate here rather than a swap; DX Hunter (the
+/// dominant table per the design spec) keeps its 45% share, and Band
+/// Activity's share shrinks (35%→25%) to make room instead.
 ///
 /// No `render_active_panel_highlight` call, same rationale as
 /// `layout_monitor`: each panel renderer draws its own active-styled border
@@ -248,25 +276,34 @@ fn layout_hunt(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
+            Constraint::Length(7),      // TX Placement (full width)
             Constraint::Percentage(45), // DX Hunter (full width)
-            Constraint::Percentage(35), // Band Activity (full width, CQs-only)
+            Constraint::Percentage(25), // Band Activity (full width, CQs-only)
             Constraint::Min(5),         // QSO Status
         ])
         .split(content_area);
 
     render_active_qsos(f, content[0], app);
-    render_dx_hunter(f, content[1], app)?;
-    render_band_activity(f, content[2], app)?;
-    render_qso_status(f, content[3], app)?;
+    render_tx_placement(f, content[1], app)?;
+    render_dx_hunter(f, content[2], app)?;
+    render_band_activity(f, content[3], app)?;
+    render_qso_status(f, content[4], app)?;
 
     Ok(())
 }
 
 /// Run-view content layout: Callers gets top billing (full width) for
-/// working stations calling us, with QSO Status underneath in its existing
-/// multi-table ("Active QSOs") mode so the operator can track several
-/// concurrent exchanges at once. No waterfall, no DX Hunter, no Band
-/// Activity, no Station Info — this view is about answering, not hunting.
+/// working stations calling us, the TX-placement instrument sits underneath
+/// (its per-stream TX markers matter most here — serving a pileup), and QSO
+/// Status anchors the bottom in its existing multi-table ("Active QSOs")
+/// mode so the operator can track several concurrent exchanges at once. No
+/// DX Hunter, no Band Activity, no Station Info, no energy waterfall — this
+/// view is about answering, not hunting.
+///
+/// Task 6 never gave Run a waterfall row to "replace" either (see
+/// `layout_hunt`'s doc comment); Callers (the dominant table) keeps its 50%
+/// share, and QSO Status's `Min(5)` absorbs the new fixed-height row same as
+/// it already absorbed the pre-existing remainder.
 ///
 /// No `render_active_panel_highlight` call, same rationale as
 /// `layout_monitor`: each panel renderer draws its own active-styled border
@@ -276,14 +313,16 @@ fn layout_run(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),      // Active-QSOs banner (full width, 1 row)
+            Constraint::Length(7),      // TX Placement (full width)
             Constraint::Percentage(50), // Callers (full width)
             Constraint::Min(5),         // QSO Status (multi-table "Active QSOs" mode)
         ])
         .split(content_area);
 
     render_active_qsos(f, content[0], app);
-    render_callers(f, content[1], app)?;
-    render_qso_status(f, content[2], app)?;
+    render_tx_placement(f, content[1], app)?;
+    render_callers(f, content[2], app)?;
+    render_qso_status(f, content[3], app)?;
 
     Ok(())
 }
@@ -848,6 +887,7 @@ fn render_active_panel_highlight(f: &mut Frame<'_>, app: &App, panel_areas: &[Re
         ActivePanel::StationInfo => panel_areas[2],
         ActivePanel::Callers => panel_areas[3],
         ActivePanel::DxHunter => panel_areas[4],
+        ActivePanel::TxPlacement => panel_areas[5],
     };
 
     // Draw a subtle highlight border around the active panel
@@ -1172,13 +1212,39 @@ mod view_render_tests {
         })
     }
 
+    /// Count of ROWS containing `needle` (not overlapping occurrences within
+    /// a row — one row can only ever contribute a marker-row callsign once).
+    /// Used to distinguish "the stream-marker row rendered this callsign"
+    /// from "the pre-existing Active-QSOs banner (a completely separate
+    /// renderer, row 1) already shows every active QSO's callsign" — both
+    /// are always present when there are active QSOs, so a bare
+    /// `buffer_contains` can't tell them apart.
+    fn buffer_row_count_containing(buf: &ratatui::buffer::Buffer, needle: &str) -> usize {
+        (0..buf.area.height)
+            .filter(|&y| {
+                let row: String = (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect();
+                row.contains(needle)
+            })
+            .count()
+    }
+
     #[tokio::test]
-    async fn operate_view_shows_all_five_panels() {
+    async fn operate_view_shows_all_six_panels() {
         // Render #1: Station Info active — its own title is blanked by
         // `render_active_panel_highlight` (see the quirk note above), but
-        // this proves the other four panels' titles render.
+        // this proves the other five panels' titles render. Task 11 swapped
+        // the waterfall for the TX-placement instrument here, so "TX
+        // Placement" replaces the old waterfall-presence assertion.
         let buf = render_view(crate::view::ActiveView::Operate).await;
-        for t in ["Band Activity", "QSO Status", "DX Hunter", "Callers"] {
+        for t in [
+            "Band Activity",
+            "QSO Status",
+            "DX Hunter",
+            "Callers",
+            "TX Placement",
+        ] {
             assert!(buffer_contains(&buf, t), "missing {t}");
         }
 
@@ -1210,6 +1276,7 @@ mod view_render_tests {
         let buf = render_view(crate::view::ActiveView::Hunt).await;
         assert!(buffer_contains(&buf, "DX Hunter"));
         assert!(buffer_contains(&buf, "Band Activity"));
+        assert!(buffer_contains(&buf, "TX Placement"));
         assert!(!buffer_contains(&buf, "Callers"));
     }
 
@@ -1218,6 +1285,7 @@ mod view_render_tests {
         let buf = render_view(crate::view::ActiveView::Run).await;
         assert!(buffer_contains(&buf, "Callers"));
         assert!(buffer_contains(&buf, "QSO Status"));
+        assert!(buffer_contains(&buf, "TX Placement"));
         assert!(!buffer_contains(&buf, "DX Hunter"));
     }
 
@@ -1234,5 +1302,215 @@ mod view_render_tests {
         let buf = term.backend().buffer().clone();
         assert!(buffer_contains(&buf, "DX Hunter"));
         assert!(!buffer_contains(&buf, "Band Activity"));
+    }
+
+    /// Minimal `ActiveQsoBanner` fixture for TX-placement stream-marker
+    /// tests. Mirrors `app.rs`'s private `fixture_banner` test helper
+    /// (not visible across the module boundary), trimmed to the fields
+    /// these tests actually vary. Defaults `frequency_hz` to 1234.0 like
+    /// its `app.rs` counterpart.
+    fn fixture_banner(call: &str) -> crate::app::ActiveQsoBanner {
+        crate::app::ActiveQsoBanner {
+            their_callsign: call.into(),
+            state: "wait rpt".into(),
+            started_at: chrono::Utc::now(),
+            frequency_hz: 1234.0,
+            tx_parity: None,
+            last_tx_text: None,
+            last_tx_at: None,
+            last_rx_text: None,
+            last_rx_at: None,
+            snr_rx: None,
+            report_sent: None,
+            report_received: None,
+            exchange_count: 0,
+            qso_id: format!("{call}-id"),
+            initiated_by: "Manual".into(),
+            ladder_labels: Vec::new(),
+            ladder_ours: Vec::new(),
+            ladder_index: 0,
+            now_line: String::new(),
+            next_line: String::new(),
+            call_count: 0,
+            max_calls: 0,
+            watchdog_deadline: None,
+            dx_last_activity: None,
+            hound: false,
+        }
+    }
+
+    fn fixture_placement_view() -> crate::app::PlacementView {
+        crate::app::PlacementView {
+            slices: vec![
+                crate::app::PlacementSlice {
+                    offset_hz: 1480.0,
+                    score: 98.0,
+                    clear_first: true,
+                    clear_second: true,
+                },
+                crate::app::PlacementSlice {
+                    offset_hz: 920.0,
+                    score: 91.0,
+                    clear_first: true,
+                    clear_second: true,
+                },
+                crate::app::PlacementSlice {
+                    offset_hz: 310.0,
+                    score: 71.0,
+                    clear_first: false,
+                    clear_second: true,
+                },
+            ],
+            openness: vec![3; 96],
+            bin_hz: 25.0,
+            range: (200.0, 2600.0),
+            received_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A canned 10-slice `PlacementView` for the Task-13 top-10 zoom-table
+    /// test — distinct from `fixture_placement_view` (3 slices, used by the
+    /// compact-instrument tests) because the zoom table needs a full top-10
+    /// to prove all 10 rows render, not just the 5 the BEST row shows.
+    fn fixture_placement_view_10() -> crate::app::PlacementView {
+        let mut slices = Vec::new();
+        for i in 0..10 {
+            slices.push(crate::app::PlacementSlice {
+                offset_hz: 1480.0 - (i as f64) * 10.0,
+                score: 98.0 - i as f64,
+                clear_first: true,
+                clear_second: true,
+            });
+        }
+        crate::app::PlacementView {
+            slices,
+            openness: vec![3; 96],
+            bin_hz: 25.0,
+            range: (200.0, 2600.0),
+            received_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn zoom_tx_placement_shows_top_10_table() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.active_view = crate::view::ActiveView::Operate;
+        app.active_panel = crate::app::ActivePanel::TxPlacement;
+        app.zoomed = true;
+        app.apply_placement(fixture_placement_view_10());
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        assert!(buffer_contains(&buf, "Freq"), "missing Freq header");
+        assert!(
+            buffer_contains(&buf, "\u{2460} 1480"),
+            "missing rank-1 row ① 1480"
+        );
+        // All 10 slices should render as distinct rows — check a spread of
+        // offsets across the fixture (first, middle, last).
+        for needle in ["1480", "1430", "1390"] {
+            assert!(
+                buffer_contains(&buf, needle),
+                "missing candidate offset {needle}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tx_placement_shows_best_row_and_stream_marker_not_old_waterfall() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        // Pin Operate explicitly (App::new loads the OPERATOR's real
+        // persisted `~/.pancetta/tui_state.json` view, same footgun
+        // `render_view_with_panel` above already guards against).
+        app.active_view = crate::view::ActiveView::Operate;
+        app.apply_placement(fixture_placement_view());
+        let mut b = fixture_banner("JA1ABC");
+        b.frequency_hz = 1650.0;
+        app.active_qsos.push(b);
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        assert!(
+            buffer_contains(&buf, "\u{2460} 1480"),
+            "missing BEST row rank ① 1480"
+        );
+        assert!(buffer_contains(&buf, "E+O"), "missing E+O coverage label");
+        // JA1ABC legitimately appears TWICE: once in the pre-existing
+        // Active-QSOs banner (row 1, unrelated to this task) and once as
+        // the TX-placement stream-marker label this task adds — a bare
+        // `buffer_contains` can't distinguish "the instrument rendered it"
+        // from "the banner already did", so require 2 rows.
+        assert_eq!(
+            buffer_row_count_containing(&buf, "JA1ABC"),
+            2,
+            "expected JA1ABC on both the Active-QSOs banner row AND the TX-placement stream-marker row"
+        );
+        assert!(
+            !buffer_contains(&buf, "\u{25bc}"),
+            "old waterfall decode ticks (▼) should be gone from Operate"
+        );
+    }
+
+    #[tokio::test]
+    async fn tx_placement_zero_streams_renders_without_panic() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.active_view = crate::view::ActiveView::Operate;
+        app.apply_placement(fixture_placement_view());
+        assert!(app.active_qsos.is_empty());
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        // No panic, and the instrument itself still renders.
+        assert!(buffer_contains(&buf, "TX Placement"));
+    }
+
+    #[tokio::test]
+    async fn tx_placement_three_streams_shows_three_distinct_labels() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.active_view = crate::view::ActiveView::Operate;
+        app.apply_placement(fixture_placement_view());
+        let mut a = fixture_banner("K1AAA");
+        a.frequency_hz = 400.0;
+        let mut b = fixture_banner("K2BBB");
+        b.frequency_hz = 1200.0;
+        let mut c = fixture_banner("K3CCC");
+        c.frequency_hz = 2200.0;
+        app.active_qsos.push(a);
+        app.active_qsos.push(b);
+        app.active_qsos.push(c);
+
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        // Each callsign should appear on 2 rows: the Active-QSOs banner
+        // (row 1, pre-existing) AND the TX-placement stream-marker row
+        // this task adds (see the comment on the ①-slice test above for
+        // why a bare `buffer_contains` isn't a strong enough check here).
+        for call in ["K1AAA", "K2BBB", "K3CCC"] {
+            assert_eq!(
+                buffer_row_count_containing(&buf, call),
+                2,
+                "expected {call} on both the Active-QSOs banner row AND the TX-placement stream-marker row"
+            );
+        }
     }
 }
