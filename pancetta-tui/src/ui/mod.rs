@@ -243,7 +243,7 @@ fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
 
 /// Monitor-view content layout: a vertical stack — full-width active-QSO
 /// banner, a big waterfall, and full-width Band Activity — with no side
-/// panels (QSO Status / Station Info / DX Hunter / Callers). Meant for a
+/// panels (QSO Status / station card / DX Hunter / Callers). Meant for a
 /// glance-and-walk-away big-picture view.
 ///
 /// No `render_active_panel_highlight` call here: Band Activity is the only
@@ -338,7 +338,7 @@ fn layout_hunt(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
 /// (its per-stream TX markers matter most here — serving a pileup), and QSO
 /// Status anchors the bottom in its existing multi-table ("Active QSOs")
 /// mode so the operator can track several concurrent exchanges at once. No
-/// DX Hunter, no Band Activity, no Station Info, no energy waterfall — this
+/// DX Hunter, no Band Activity, no station card, no energy waterfall — this
 /// view is about answering, not hunting.
 ///
 /// Task 6 never gave Run a waterfall row to "replace" either (see
