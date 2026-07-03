@@ -711,13 +711,57 @@ impl QsoManager {
         self.event_sender.subscribe()
     }
 
+    /// Resolve a CQ opening's TX parity to a CONCRETE value, latching it once.
+    ///
+    /// docs/qso-engine-bugs.md BUG 1: calling CQ transmitted on EVERY 15s
+    /// window instead of alternating. Root cause: `start_cq`/`start_cq_manual`
+    /// accepted `tx_parity: None` (the caller's "Auto, no fixed preference"
+    /// case — the DEFAULT for both the manual and autonomous CQ paths) and
+    /// stored `None` directly into `QsoMetadata.tx_parity`. Every subsequent
+    /// emission (the opening CQ AND every per-slot keep-call rearm) then
+    /// re-asked the TX scheduler's `resolve_required_parity(None, Auto, now,
+    /// …)` to pick "the nearest next slot" FRESH each time — which is just
+    /// "whichever window is next," not a fixed side. Over consecutive calls
+    /// that alternates Even/Odd/Even/Odd… i.e. TRANSMITS ON BOTH PARITIES,
+    /// so the opposite (reply) window is never free and we never hear anyone
+    /// answering our own CQ.
+    ///
+    /// Fix: resolve `None` to a CONCRETE parity exactly ONCE, here, at QSO
+    /// creation, using the same "nearest next slot of either parity" rule the
+    /// TX scheduler's `Auto` mode uses (mirrored here with only
+    /// `pancetta_core::slot` primitives, since this crate has no dependency
+    /// on the coordinator's `TxSelfParity` type) — then that ONE resolved
+    /// value is stored in `QsoMetadata.tx_parity` and reused, unchanged, by
+    /// the opening CQ and every rearm for the life of the QSO. A caller that
+    /// already supplied a fixed preference (`Some(Even)`/`Some(Odd)`, e.g. a
+    /// station configured for a specific side) is untouched — this only
+    /// resolves the previously-ambiguous `None` case.
+    fn latch_cq_parity_if_none(
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+        now: DateTime<Utc>,
+    ) -> Option<pancetta_core::slot::SlotParity> {
+        use pancetta_core::slot::{next_slot_with_parity, SlotParity};
+        Some(tx_parity.unwrap_or_else(|| {
+            let next_even = next_slot_with_parity(now, SlotParity::Even);
+            let next_odd = next_slot_with_parity(now, SlotParity::Odd);
+            if next_even <= next_odd {
+                SlotParity::Even
+            } else {
+                SlotParity::Odd
+            }
+        }))
+    }
+
     /// Start a new CQ call
     /// Start a CQ call.
     ///
-    /// `tx_parity` is the parity we want our CQ to land on. `None`
-    /// lets the TX scheduler pick (using the configured self-parity
-    /// fallback). Callers driving auto-CQ from the autonomous operator
-    /// will typically supply a fixed parity to keep cycles consistent.
+    /// `tx_parity` is the parity we want our CQ to land on, if the caller has
+    /// a fixed preference. `None` (no preference — the Auto-config default)
+    /// is resolved to a CONCRETE parity ONCE at creation
+    /// ([`Self::latch_cq_parity_if_none`]) and held for the life of the QSO —
+    /// it does NOT mean "let the scheduler re-pick every slot" (that was BUG
+    /// 1: re-picking "nearest slot" every call alternates both parities,
+    /// i.e. transmits every window and never listens).
     pub async fn start_cq(
         &self,
         frequency: f64,
@@ -734,6 +778,10 @@ impl QsoManager {
         }
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
+        // BUG 1 fix (docs/qso-engine-bugs.md): latch a concrete parity ONCE at
+        // QSO creation when the caller has no fixed preference (`None`, the
+        // Auto-config default) — see `latch_cq_parity_if_none` doc.
+        let tx_parity = Self::latch_cq_parity_if_none(tx_parity, now);
 
         let state = QsoState::CallingCq {
             frequency,
@@ -829,9 +877,12 @@ impl QsoManager {
     /// per-slot rearm does not double-send the first CQ within the opening
     /// slot.
     ///
-    /// `tx_parity` is the parity we want our CQ to land on; `None` lets the
-    /// TX scheduler pick using the configured self-parity fallback. (Calling
-    /// CQ, we choose our own slot parity — there is no DX parity to oppose.)
+    /// `tx_parity` is the parity we want our CQ to land on, if fixed; `None`
+    /// (no preference) is resolved to a CONCRETE parity ONCE here
+    /// ([`Self::latch_cq_parity_if_none`]) and held for the life of the QSO —
+    /// see that function's doc for the BUG 1 (transmit-every-window) history.
+    /// (Calling CQ, we choose our own slot parity — there is no DX parity to
+    /// oppose.)
     pub async fn start_cq_manual(
         &self,
         frequency: f64,
@@ -848,6 +899,10 @@ impl QsoManager {
         }
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
+        // BUG 1 fix (docs/qso-engine-bugs.md): latch a concrete parity ONCE at
+        // QSO creation when the caller has no fixed preference (`None`, the
+        // Auto-config default) — see `latch_cq_parity_if_none` doc.
+        let tx_parity = Self::latch_cq_parity_if_none(tx_parity, now);
 
         let state = QsoState::CallingCq {
             frequency,
@@ -3888,6 +3943,27 @@ mod tests {
         assert_eq!(progress.metadata.frequency, 14074000.0);
     }
 
+    /// docs/qso-engine-bugs.md BUG 1, autonomous path: `SlotParityConfig::Auto`
+    /// resolves to `tx_parity: None` for a self-CQ opening (see
+    /// `classify_autonomous_opening`), so the AUTONOMOUS CQ path is exposed to
+    /// the identical bug as the manual path — `start_cq` must latch a concrete
+    /// parity too.
+    #[tokio::test]
+    async fn autonomous_cq_with_no_parity_preference_latches_a_concrete_parity() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        assert!(
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .tx_parity
+                .is_some(),
+            "start_cq(tx_parity: None) must latch a concrete parity, not leave it None"
+        );
+    }
+
     #[tokio::test]
     async fn test_respond_to_cq() {
         let manager = QsoManager::new(test_config());
@@ -5458,6 +5534,82 @@ mod tests {
         let p = manager.get_qso(qso_id).await.unwrap();
         assert!(matches!(p.state, QsoState::CallingCq { .. }));
         assert_eq!(p.metadata.call_count, 2, "1 opening + 1 rearm");
+    }
+
+    /// docs/qso-engine-bugs.md BUG 1: a `tx_parity: None` (no fixed
+    /// preference — the Auto-config default) CallingCq QSO MUST latch a
+    /// single concrete parity at creation and hold it for the life of the
+    /// QSO — the opening CQ and EVERY keep-call rearm across many slots must
+    /// all carry the SAME parity. Before the fix, `tx_parity` stayed `None`
+    /// and each emission re-asked "nearest slot" fresh, alternating parities
+    /// (i.e. transmitting on both — the station never heard replies).
+    #[tokio::test]
+    async fn manual_cq_with_no_parity_preference_latches_one_parity_for_life_of_qso() {
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        let qso_id = manager.start_cq_manual(freq, None, false).await.unwrap();
+
+        // The opening CQ must have latched a CONCRETE (not None) parity.
+        let latched = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .tx_parity
+            .expect(
+                "start_cq_manual(tx_parity: None) must latch a concrete parity, not leave it None",
+            );
+
+        let mut events = manager.subscribe();
+        let start = Utc::now();
+
+        // Drive 6 consecutive keep-call rearms (6 slots = 90s of CQing).
+        for slot in 1..=6i64 {
+            manager
+                .rearm_manual_calls_at(start + Duration::seconds(15 * slot + 1))
+                .await;
+        }
+
+        let mut cq_parities = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::MessageToSend {
+                message: MessageType::Cq { .. },
+                tx_parity,
+                ..
+            } = ev
+            {
+                cq_parities.push(tx_parity);
+            }
+        }
+        assert_eq!(cq_parities.len(), 6, "one CQ per slot across 6 slots");
+        for (i, p) in cq_parities.iter().enumerate() {
+            assert_eq!(
+                *p,
+                Some(latched),
+                "rearm #{i} transmitted on a DIFFERENT parity than the opening CQ \
+                 — this is BUG 1: transmitting on every window instead of alternating"
+            );
+        }
+    }
+
+    /// A caller-supplied FIXED parity preference (`Some(_)`) must be honored
+    /// as-is — the latch-on-None fix must not override an explicit choice.
+    #[tokio::test]
+    async fn manual_cq_with_explicit_parity_preference_is_not_overridden() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .start_cq_manual(
+                14074000.0,
+                Some(pancetta_core::slot::SlotParity::Odd),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.tx_parity,
+            Some(pancetta_core::slot::SlotParity::Odd),
+            "an explicit parity preference must be honored unchanged"
+        );
     }
 
     /// The manual CQ watchdog retires an un-answered CallingCq QSO once it
