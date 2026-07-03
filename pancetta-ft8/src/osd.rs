@@ -466,6 +466,7 @@ fn npre2_residual_signature(
 
 /// OSD decoder that attempts to decode LLRs using ordered statistics decoding
 /// at depths 0, 1, 2, and 3 with CRC-14 validation.
+#[derive(Clone)]
 pub struct OsdDecoder {
     config: OsdConfig,
     generator: [PackedRow; LDPC_INFO_BITS],
